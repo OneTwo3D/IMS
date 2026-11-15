@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import type { ComparableInvoice } from '../../lib/domain/accounting/eu-vat-shadow-compare'
 import { parseEuVatShadowArgs, renderEuVatShadowText, euVatShadowJson, renderEuVatShadowUsage } from '../../lib/tax/eu-vat-shadow-cli'
 import { runEuVatShadow, shadowExitCode, SHADOW_HARD_MAX_ORDERS, type ShadowImsBuild, type ShadowPorts, type ShadowXeroFetch } from '../../lib/tax/eu-vat-shadow-run'
+import { classifyShadowRefusal, shadowRefusalDetail, SHADOW_REFUSAL_TEXT } from '../../lib/tax/eu-vat-shadow-refusal'
 import { runEuVatShadowCli } from '../../scripts/eu-vat-shadow-report'
 
 /**
@@ -13,7 +14,7 @@ import { runEuVatShadowCli } from '../../scripts/eu-vat-shadow-report'
 const PII = ['Jane Private', 'jane@example.invalid', '1 Secret Street']
 
 const invoice = (vatAmount = '20.24'): ComparableInvoice => ({
-  currency: 'EUR', lineAmountsIncludeTax: false, total: '126.74',
+  currency: 'EUR', foreignCurrency: false, currencyRate: null, lineAmountsIncludeTax: false, total: '126.74',
   lines: [
     { kind: 'goods', accountCode: '200', taxType: 'TAX131', lineAmount: '106.50', taxAmount: '0.00' },
     { kind: 'vat', accountCode: '821', taxType: 'NONE', lineAmount: vatAmount, taxAmount: '0.00' },
@@ -53,7 +54,7 @@ test('every outcome is classified: match, differs, review (boundary), no Xero do
     '1003': { ims: boundary, xero: { kind: 'found', invoice: xeroFor('20.25', 126.75) } },
     '1004': { ims: boundary },
     '1005': { xero: { kind: 'none' } },
-    '1006': { ims: { kind: 'refused', reason: 'the order carries store credit, and IMS refuses a store-credit invoice whole' } },
+    '1006': { ims: { kind: 'refused', code: 'store_credit' } },
     '1007': { xero: { kind: 'ambiguous', count: 2 } },
     '1008': { xero: { kind: 'error', code: 'http_429' } },
     '1009': { invoiceNumber: null },
@@ -63,7 +64,7 @@ test('every outcome is classified: match, differs, review (boundary), no Xero do
   const by = Object.fromEntries(report.results.map((r) => [r.orderNumber, r.status]))
   assert.deepEqual(by, { '1001': 'match', '1002': 'differs', '1003': 'review', '1004': 'match', '1005': 'no_xero_doc', '1006': 'ims_refused', '1007': 'not_comparable', '1008': 'not_comparable', '1009': 'not_comparable', '1010': 'not_comparable', '1011': 'no_xero_doc' })
   assert.deepEqual(report.counts, { match: 2, differs: 1, review: 1, no_xero_doc: 2, ims_refused: 1, not_comparable: 4 })
-  assert.equal(report.results.find((r) => r.orderNumber === '1006')?.detail, 'the order carries store credit, and IMS refuses a store-credit invoice whole')
+  assert.match(report.results.find((r) => r.orderNumber === '1006')?.detail ?? '', /^store_credit: the order carries store credit/)
   assert.equal(shadowExitCode(report), 1)
 })
 
@@ -107,7 +108,7 @@ test('the maximum is hard: the run asks for one more than the cap, never more th
 
 test('no personal data reaches the text or the JSON: only the order number and the compared figures', async () => {
   const report = await runEuVatShadow(ports({
-    '1001': {}, '1002': { xero: { kind: 'found', invoice: xeroFor('20.25', 126.75) } }, '1003': { ims: { kind: 'refused', reason: 'a refusal IMS wrote' } },
+    '1001': {}, '1002': { xero: { kind: 'found', invoice: xeroFor('20.25', 126.75) } }, '1003': { ims: { kind: 'refused', code: 'tax_mismatch' } },
   }), { selection: { kind: 'orders', refs: ['x'] }, maxOrders: 10 })
   const text = renderEuVatShadowText(report)
   const json = JSON.stringify(euVatShadowJson(report))
@@ -115,7 +116,7 @@ test('no personal data reaches the text or the JSON: only the order number and t
   assert.match(text, /Order 1002: DIFFERS/)
   assert.match(text, /821 NONE 20\.24/)
   assert.match(text, /Summary \(3 compared\)/)
-  assert.match(text, /IMS refusals:\n {2}1003: a refusal IMS wrote/)
+  assert.match(text, /IMS refusals:\n {2}1003: tax_mismatch: /)
 })
 
 test('arguments: a selection is required, the maximum is bounded, a credential-shaped value is refused unseen', () => {
@@ -170,6 +171,41 @@ test('an order whose comparison is incomplete (a figure unavailable) is not_comp
   assert.equal(report.results[0]!.status, 'not_comparable')
   assert.match(report.results[0]!.detail ?? '', /not fully compared: .*no Total/)
   assert.equal(shadowExitCode(report), 1)
+})
+
+/**
+ * REFUSALS ARE CLOSED CODES. The importer's sentences can quote a line or fee name; whatever they say, none of it reaches the text or the JSON.
+ */
+const MARKER = 'SECRET-LINE-NAME-Jane-Private'
+const IMPORTER_SENTENCES = [
+  `the document does not total the order: line "${MARKER}": document 12.00 vs WooCommerce 13.00`,
+  `the EU IOSS/VOEC/DDP treatment refuses it now: the marked fee "${MARKER}" carries VAT outside the scheme`,
+  `the EU IOSS/VOEC/DDP treatment refuses it now: the order's EU VAT regime cannot be established (voucher_status_unknown) for ${MARKER}`,
+  `the EU IOSS/VOEC/DDP treatment refuses it now: gift_card_flag_missing on ${MARKER}`,
+  `the EU IOSS/VOEC/DDP treatment refuses it now: the scheme posting type TAX131 cannot be shown (${MARKER})`,
+  `anything else about ${MARKER}`,
+]
+
+test('every refusal path reports a closed code: no importer sentence, and so no line name, reaches the text or the JSON', async () => {
+  for (const sentence of IMPORTER_SENTENCES) {
+    const code = classifyShadowRefusal(sentence)
+    assert.ok(code in SHADOW_REFUSAL_TEXT)
+    assert.equal(shadowRefusalDetail(code).includes(MARKER), false)
+    const report = await runEuVatShadow(ports({ '1': { ims: { kind: 'refused', code } } }), { selection: { kind: 'orders', refs: ['x'] }, maxOrders: 5 })
+    assert.equal(renderEuVatShadowText(report).includes(MARKER), false)
+    assert.equal(JSON.stringify(euVatShadowJson(report)).includes(MARKER), false)
+  }
+  assert.deepEqual(IMPORTER_SENTENCES.map(classifyShadowRefusal), ['tax_mismatch', 'fee_or_account_missing', 'regime_refused', 'gift_card_flag_missing', 'scheme_posting_type', 'other'])
+})
+
+test('the shadow build and the live ports never put an importer, treatment or builder sentence into a result', () => {
+  const importer = readFileSync(new URL('../../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url), 'utf8')
+  const inner = sliceFunction(importer, 'async function buildShadowWcSalesInvoiceInner(')
+  const live = readFileSync(new URL('../../lib/tax/eu-vat-shadow-live.ts', import.meta.url), 'utf8')
+  const run = readFileSync(new URL('../../lib/tax/eu-vat-shadow-run.ts', import.meta.url), 'utf8')
+  for (const [name, source] of [['shadow build', inner], ['live ports', live.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')], ['run', run.replace(/\/\*[\s\S]*?\*\//g, '')]] as const) {
+    for (const pattern of [/\.reason\b(?!\s*===)/, /error\.message/, /\.message\b/, /reason:\s*[`'"]/]) assert.equal(pattern.test(source.replace(/reading\.reason/g, '')), false, `${name} matches ${pattern}`)
+  }
 })
 
 /**

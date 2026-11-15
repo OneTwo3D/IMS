@@ -68,7 +68,7 @@ const xeroPlugin = (over: { reorder?: boolean; vatAccount?: string; vatAmount?: 
 
 function compare(xeroRaw: unknown, rate = rateOf) {
   const ims = imsInvoice()
-  const mine = comparableFromBuiltPayload(ims.built, ims.lines, rate)
+  const mine = comparableFromBuiltPayload(ims.built, ims.lines, rate, 'EUR')
   assert.ok(mine.ok, mine.ok ? '' : mine.reason)
   const theirs = comparableFromXeroInvoice(xeroRaw)
   assert.ok(theirs.ok, theirs.ok ? '' : theirs.reason)
@@ -154,7 +154,7 @@ test('a boundary-FX order that differs is REVIEW, never differs; one that matche
 })
 
 test('a taxed (route none) invoice: tax is the net times the rate, within one minor unit per line', () => {
-  const ims: ComparableInvoice = { currency: 'GBP', lineAmountsIncludeTax: false, total: '120.00', lines: [{ kind: 'goods', accountCode: '200', taxType: 'OUTPUT2', lineAmount: '100.00', taxAmount: '20.00' }] }
+  const ims: ComparableInvoice = { currency: 'GBP', foreignCurrency: false, currencyRate: null, lineAmountsIncludeTax: false, total: '120.00', lines: [{ kind: 'goods', accountCode: '200', taxType: 'OUTPUT2', lineAmount: '100.00', taxAmount: '20.00' }] }
   const near: ComparableInvoice = { ...ims, total: '120.01', lines: [{ ...ims.lines[0]!, taxAmount: '20.01' }] }
   const far: ComparableInvoice = { ...ims, total: '120.05', lines: [{ ...ims.lines[0]!, taxAmount: '20.05' }] }
   assert.equal(compareComparableInvoices(ims, near).verdict, 'match')
@@ -190,4 +190,51 @@ test('a provisional stamp mirrors the real one and a refusal gives none', () => 
   assert.equal(stamp?.schemePostingTaxType, 'TAX131')
   assert.equal(provisionalStampFromDecision({ kind: 'REFUSE', code: 'rate_unmapped', reason: 'x' } as never, at), null)
   assert.deepEqual(provisionalStampFromDecision({ kind: 'SKIP', reason: 'no_scheme_vat', vatExemptB2b: false, warnings: [] }, at), { regime: null, vatAccount: null, stampedAt: at })
+})
+
+/**
+ * THE EXCHANGE RATE of a foreign-currency invoice is compared (to Xero's 6 decimal places); a base-currency invoice is unchanged.
+ */
+const foreign = (rate: number | null): ComparableInvoice => ({ currency: 'NOK', foreignCurrency: true, currencyRate: rate, lineAmountsIncludeTax: false, total: '100.00', lines: [{ kind: 'goods', accountCode: '200', taxType: 'TAX122', lineAmount: '100.00', taxAmount: '0.00' }] })
+
+test('foreign currency: equal rates match (IMS full precision against Xero at 6 places); different rates differ; a boundary order that differs on rate is review', () => {
+  assert.equal(compareComparableInvoices(foreign(0.0731234567), foreign(0.073123)).verdict, 'match')
+  assert.equal(compareComparableInvoices(foreign(0.0731234567), foreign(0.073123)).incomplete.length, 0)
+  const different = compareComparableInvoices(foreign(0.0731234567), foreign(0.0742))
+  assert.equal(different.verdict, 'differs')
+  assert.ok(different.differences.some((d) => d.startsWith('currency rate:')))
+  assert.equal(statusOfComparison(different, true), 'review')
+  assert.equal(statusOfComparison(different, false), 'differs')
+})
+
+test('foreign currency: a missing rate on either side is not_comparable with currency_rate_unavailable, never a match', () => {
+  for (const [a, b] of [[null, 0.073123], [0.073123, null], [null, null]] as const) {
+    const c = compareComparableInvoices(foreign(a), foreign(b))
+    assert.equal(c.verdict, 'not_comparable')
+    assert.ok(c.incomplete.some((r) => r.startsWith('currency_rate_unavailable')))
+  }
+})
+
+test('base currency: the rate is not compared at all (unchanged behaviour)', () => {
+  const base = (rate: number | null): ComparableInvoice => ({ ...foreign(rate), currency: 'EUR', foreignCurrency: false })
+  assert.equal(compareComparableInvoices(base(null), base(null)).verdict, 'match')
+  assert.equal(compareComparableInvoices(base(1.1), base(null)).verdict, 'match')
+})
+
+test('the built side carries the CurrencyRate of the real builder for a foreign invoice, and flags foreign against the base currency', () => {
+  const ims = imsInvoice()
+  const built = { ...ims.built, CurrencyRate: 0.8512345678, CurrencyCode: 'GBP' }
+  const mine = comparableFromBuiltPayload(built, ims.lines, rateOf, 'EUR')
+  assert.ok(mine.ok)
+  if (mine.ok) { assert.equal(mine.invoice.foreignCurrency, true); assert.equal(mine.invoice.currencyRate, 0.8512345678) }
+  const baseOne = comparableFromBuiltPayload(ims.built, ims.lines, rateOf, 'EUR')
+  assert.ok(baseOne.ok && baseOne.invoice.foreignCurrency === false)
+  const xero = comparableFromXeroInvoice({ ...xeroPlugin(), CurrencyRate: 0.851235 })
+  assert.ok(xero.ok && xero.invoice.currencyRate === 0.851235)
+})
+
+test('free text from Xero never survives: a non-code AccountCode, TaxType or Status becomes ?', () => {
+  const reading = comparableFromXeroInvoice({ ...xeroPlugin(), Status: 'Jane Private', LineItems: [{ AccountCode: 'Jane Private', TaxType: 'a@b.invalid', LineAmount: 1, TaxAmount: 0 }] })
+  assert.ok(reading.ok)
+  if (reading.ok) { assert.equal(reading.status, '?'); assert.equal(reading.invoice.lines[0]!.accountCode, '?'); assert.equal(reading.invoice.lines[0]!.taxType, '?') }
 })

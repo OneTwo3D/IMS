@@ -77,6 +77,7 @@ import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-livenes
 import {
   UNRECONCILED_TAX_PAYLOAD_KEY, buildUnreconciledTaxMarker,
 } from '@/lib/domain/accounting/document-tax-reconciliation'
+import { classifyShadowRefusal, type ShadowRefusalCode } from '@/lib/tax/eu-vat-shadow-refusal'
 import { getSettingValue, withoutSettingMigration } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
@@ -2124,7 +2125,7 @@ async function buildFreshWcSalesInvoice(p: {
   chart: string
   withTreatment: boolean
   shadow?: boolean
-}): Promise<{ ok: true; payload: Record<string, unknown>; policy?: RegimePolicy; warnings?: RegimeWarning[]; stampSource?: 'stored' | 'provisional' } | { ok: false; reason: string }> {
+}): Promise<{ ok: true; payload: Record<string, unknown>; policy?: RegimePolicy; warnings?: RegimeWarning[]; stampSource?: 'stored' | 'provisional' } | { ok: false; reason: string; /** The reason classified to a closed code, for the shadow report (the sentence itself can quote a line name and is never reported). */ code: ShadowRefusalCode }> {
   const { client, orderId, wcOrder, withTreatment, chart } = p
   const { currency, mappedLines, coupons, amounts, settings, accounts } = p.inputs
   const resolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
@@ -2153,11 +2154,11 @@ async function buildFreshWcSalesInvoice(p: {
   }),
   }
   if (!withTreatment) return { ok: true, payload: core }
-  if (rec.unreconciledReason !== null) return { ok: false, reason: `the document does not total the order: ${rec.unreconciledReason}` }
+  if (rec.unreconciledReason !== null) return { ok: false, reason: `the document does not total the order: ${rec.unreconciledReason}`, code: 'tax_mismatch' }
   const outcome = await previewTreatedSalesInvoice(client, {
     orderId, wcOrder, payload: core, mappedLines, connector: chart, taxBindingDeps: { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, invoiceTypes: types }, accounts, storeCreditForeign: coupons.storeCreditForeign, now: new Date(),
   }, p.shadow === true ? { assumeSwitchOn: true, provisionalStamp: true } : undefined)
-  if (outcome.kind === 'refused') return { ok: false, reason: `the EU IOSS/VOEC/DDP treatment refuses it now: ${outcome.reason}` }
+  if (outcome.kind === 'refused') return { ok: false, reason: `the EU IOSS/VOEC/DDP treatment refuses it now: ${outcome.reason}`, code: classifyShadowRefusal(outcome.reason) }
   return { ok: true, payload: outcome.kind === 'treated' ? outcome.payload : core, ...(outcome.kind === 'treated' ? { policy: outcome.regimePolicy, warnings: outcome.warnings, ...(outcome.stampSource ? { stampSource: outcome.stampSource } : {}) } : {}) }
 }
 
@@ -2171,7 +2172,8 @@ async function buildFreshWcSalesInvoice(p: {
  */
 export type ShadowWcInvoiceBuild =
   | { kind: 'built'; payload: Record<string, unknown>; warnings: RegimeWarning[]; stampSource: 'stored' | 'provisional' | 'none'; chartConnector: string | null }
-  | { kind: 'refused'; reason: string }
+  /** A CLOSED CODE, never the importer's sentence (which can quote a line or fee name): see lib/tax/eu-vat-shadow-refusal.ts. */
+  | { kind: 'refused'; code: ShadowRefusalCode; unmappedRateIds?: number[] }
 
 export async function buildShadowWcSalesInvoice(orderId: string, wcOrder: WcFullOrder): Promise<ShadowWcInvoiceBuild> {
   // Every settings read below (accounting settings, EU regime settings, the gift-card cut-in) decrypts and never migrates: a legacy plaintext secret is not re-encrypted by a read the shadow report makes.
@@ -2181,14 +2183,15 @@ export async function buildShadowWcSalesInvoice(orderId: string, wcOrder: WcFull
 async function buildShadowWcSalesInvoiceInner(orderId: string, wcOrder: WcFullOrder): Promise<ShadowWcInvoiceBuild> {
   const prep = await readFreshWcInvoiceInputs(wcOrder)
   if (!prep.ok) {
-    return { kind: 'refused', reason: prep.code === 'currency' ? 'the order\u2019s currency is missing or unreadable' : prep.code === 'store_credit' ? 'the order carries store credit, and IMS refuses a store-credit invoice whole' : 'its coupons cannot be classified' }
+    return { kind: 'refused', code: prep.code === 'currency' ? 'currency_unreadable' : prep.code === 'store_credit' ? 'store_credit' : 'coupons_unclassifiable' }
   }
   const chart = prep.inputs.settings.connector
-  if (chart !== 'xero') return { kind: 'refused', reason: 'the accounting connector is not Xero, so no Xero document would be built' }
+  if (chart !== 'xero') return { kind: 'refused', code: 'connector_not_xero' }
   // The tax resolution runs inside the collector: an unmapped WooCommerce rate is recorded, not logged, and the order is refused rather than built on the default rate's substitution.
   const { result: built, unmapped } = await collectingUnmappedWcRates(() => buildFreshWcSalesInvoice({ client: db as unknown as Prisma.TransactionClient, orderId, wcOrder, inputs: prep.inputs, chart, withTreatment: true, shadow: true }))
-  if (unmapped.length > 0) return { kind: 'refused', reason: `unmapped_tax_rate: WooCommerce tax rate ${unmapped.join(', ')} is not mapped to an IMS tax rate, so IMS would substitute the default rate; the order is not built` }
-  if (!built.ok) return { kind: 'refused', reason: built.reason }
+  if (unmapped.length > 0) return { kind: 'refused', code: 'unmapped_tax_rate', unmappedRateIds: unmapped }
+  // The importer's sentence is classified and discarded here: it can quote a line or fee name.
+  if (!built.ok) return { kind: 'refused', code: built.code }
   return { kind: 'built', payload: built.payload, warnings: built.warnings ?? [], stampSource: built.stampSource ?? 'none', chartConnector: chart }
 }
 

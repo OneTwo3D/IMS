@@ -76,7 +76,7 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
 
     async buildIms(ref, wc): Promise<ShadowImsBuild> {
       const shadow = await buildShadowWcSalesInvoice(ref.orderId, wc.order as WcFullOrder)
-      if (shadow.kind === 'refused') return { kind: 'refused', reason: shadow.reason }
+      if (shadow.kind === 'refused') return { kind: 'refused', code: shadow.code, ...(shadow.unmappedRateIds ? { unmappedRateIds: shadow.unmappedRateIds } : {}) }
       const payload = shadow.payload
       const lines = Array.isArray(payload.lines) ? (payload.lines as Array<{ noTaxKind?: unknown }>) : []
       let built: Record<string, unknown>
@@ -86,11 +86,13 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
         const contactName = 'shadow'
         built = buildSalesInvoicePayload({ ...(payload as unknown as InvoiceData), invoiceNumber: wc.invoiceNumber ?? 'SHADOW', contactName }, 'DRAFT', 'shadow-contact', new Set<string>(), baseCurrency)
       } catch (error) {
-        if (isXeroForeignCurrencyRateError(error) || isXeroSalesDocumentTaxTypeError(error)) return { kind: 'refused', reason: error.message }
-        return { kind: 'refused', reason: 'the invoice builder failed on this order' }
+        // The builder's message can quote a line description: only its kind is reported.
+        if (isXeroSalesDocumentTaxTypeError(error)) return { kind: 'refused', code: 'tax_type_missing' }
+        if (isXeroForeignCurrencyRateError(error)) return { kind: 'refused', code: 'currency_rate_missing' }
+        return { kind: 'refused', code: 'builder_failed' }
       }
-      const comparable = comparableFromBuiltPayload(built, lines, rateOf)
-      if (!comparable.ok) return { kind: 'refused', reason: comparable.reason }
+      const comparable = comparableFromBuiltPayload(built, lines, rateOf, baseCurrency)
+      if (!comparable.ok) return { kind: 'refused', code: 'not_comparable_built' }
       const marker = payload[EU_VAT_TREATMENT_PAYLOAD_KEY] as { route?: unknown; regime?: unknown } | undefined
       return {
         kind: 'built',

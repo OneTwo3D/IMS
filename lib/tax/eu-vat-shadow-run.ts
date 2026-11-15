@@ -5,10 +5,11 @@
  * comparator (lib/domain/accounting/eu-vat-shadow-compare.ts). Every effect lives behind a port: the order list and the build are IMS reads, the WooCommerce order and the Xero invoice are `GET`s. Nothing
  * here enqueues, writes, posts or stamps, and nothing here can: a port that wrote would be a defect in the port, and the live ports (eu-vat-shadow-live.ts) call only reads.
  *
- * WHAT IS KEPT. A result holds the order NUMBER, a status, closed figures (account, TaxType, amounts), refusal reasons IMS wrote itself, and closed codes for anything a vendor said. It never holds a name, an
+ * WHAT IS KEPT. A result holds the order NUMBER, a status, closed figures (account, TaxType, amounts), a CLOSED CODE for any refusal (the importer's sentence can quote a line or fee name and is never carried: eu-vat-shadow-refusal.ts), and closed codes for anything a vendor said. It never holds a name, an
  * email, an address, a description, a raw response or a credential, so the report can be printed and pasted.
  */
 import { SCHEME_DESTINATIONS, normaliseDestination } from '@/lib/domain/accounting/eu-vat-regime'
+import { shadowRefusalDetail, type ShadowRefusalCode } from '@/lib/tax/eu-vat-shadow-refusal'
 import {
   compareComparableInvoices, comparableFromXeroInvoice, isBoundaryOrder, statusOfComparison,
   type ComparableInvoice, type InvoiceComparison, type ShadowStatus,
@@ -29,7 +30,7 @@ export type ShadowWcOrder = { destination: string | null; invoiceNumber: string 
 
 export type ShadowImsBuild =
   | { kind: 'built'; invoice: ComparableInvoice; warnings: Array<{ code: string }>; stampSource: 'stored' | 'provisional' | 'none'; route: string; regime: string | null }
-  | { kind: 'refused'; reason: string }
+  | { kind: 'refused'; code: ShadowRefusalCode; unmappedRateIds?: number[] }
 
 export type ShadowXeroFetch =
   | { kind: 'found'; /** The raw invoice; only the compared fields are read from it, by `comparableFromXeroInvoice`. */ invoice: unknown }
@@ -105,7 +106,7 @@ async function runOne(ports: ShadowPorts, ref: ShadowOrderRef): Promise<ShadowOr
   if (!SCHEME_DESTINATIONS.has(destination)) return 'not_eu'
 
   const built = await ports.buildIms(ref, loaded.wc)
-  if (built.kind === 'refused') return blank(ref.orderNumber, 'ims_refused', built.reason)
+  if (built.kind === 'refused') return blank(ref.orderNumber, 'ims_refused', shadowRefusalDetail(built.code, built.unmappedRateIds))
 
   const boundary = isBoundaryOrder(built.warnings)
   const base: ShadowOrderResult = { ...blank(ref.orderNumber, 'match', null), boundary, route: built.route, regime: built.regime, stampSource: built.stampSource, warningCodes: built.warnings.map((w) => w.code) }

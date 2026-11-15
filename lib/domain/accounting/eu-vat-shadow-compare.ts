@@ -32,17 +32,27 @@ export type ComparableLine = {
 
 export type ComparableInvoice = {
   currency: string
+  /** True when the currency is not the organisation's base currency: then the exchange rate is part of the comparison. */
+  foreignCurrency: boolean
+  /** The `CurrencyRate` the document carries (Xero's direction: base units per one document-currency unit), or null when it carries none. */
+  currencyRate: number | null
   lineAmountsIncludeTax: boolean
   lines: ComparableLine[]
   /** The document total, or null when it cannot be stated (a tax rate is unknown). */
   total: string | null
 }
 
+/** One unit in the 6th decimal place: the precision at which Xero stores `CurrencyRate`. */
+export const CURRENCY_RATE_TOLERANCE = 1e-6
+
 const IMS_NO_TAX_KIND_TO_LINE_KIND: Readonly<Record<string, ShadowLineKind>> = { 'eu-vat-recovery': 'vat', 'fee-no-tax': 'fee', 'rounding-difference': 'rounding' }
 
 type XeroLineItem = { Quantity?: unknown; UnitAmount?: unknown; DiscountAmount?: unknown; AccountCode?: unknown; TaxType?: unknown; Description?: unknown }
 
 const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '')
+/** A code that a vendor sent, kept only if it looks like a code (an account code, a tax type, a status): anything else is free text that could carry a name, and is replaced. */
+const code = (value: unknown): string => { const t = text(value); return /^[A-Za-z0-9._-]{0,32}$/.test(t) ? t : '?' }
+const rateOrNull = (value: unknown): number | null => (isFiniteNumber(value) && value > 0 ? value : null)
 const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 
 function numeric(value: unknown): Decimal | null {
@@ -59,8 +69,9 @@ export function comparableFromBuiltPayload(
   built: Record<string, unknown>,
   imsLines: ReadonlyArray<{ noTaxKind?: unknown }>,
   rateOf: (taxType: string) => number | null,
+  baseCurrency: string,
 ): { ok: true; invoice: ComparableInvoice } | { ok: false; reason: string } {
-  const currency = text(built.CurrencyCode)
+  const currency = code(built.CurrencyCode)
   const items = built.LineItems
   if (currency === '' || !Array.isArray(items)) return { ok: false, reason: 'the built payload has no currency or no line items' }
   const inclusive = built.LineAmountTypes === 'Inclusive'
@@ -74,7 +85,7 @@ export function comparableFromBuiltPayload(
     if (quantity === null || unit === null) return { ok: false, reason: `line ${i + 1} of the built payload has an unreadable quantity or amount` }
     const discount = isFiniteNumber(item.DiscountAmount) && item.DiscountAmount > 0 ? toDecimal(item.DiscountAmount).toDecimalPlaces(2, 4) : toDecimal(0)
     const amount = roundMoney(quantity.times(unit).minus(discount), currency)
-    const taxType = text(item.TaxType)
+    const taxType = code(item.TaxType)
     const rate = rateOf(taxType)
     let tax: Decimal | null = null
     if (rate !== null) {
@@ -85,12 +96,12 @@ export function comparableFromBuiltPayload(
     let kind: ShadowLineKind | null
     if (i < imsLines.length) kind = IMS_NO_TAX_KIND_TO_LINE_KIND[text(imsLines[i]!.noTaxKind)] ?? 'goods'
     else kind = text(item.Description) === 'Order discount' ? 'discount' : 'shipping'
-    lines.push({ kind, accountCode: text(item.AccountCode), taxType, lineAmount: amount.toFixed(currencyMinorUnits(currency)), taxAmount: tax === null ? null : tax.toFixed(currencyMinorUnits(currency)) })
+    lines.push({ kind, accountCode: code(item.AccountCode), taxType, lineAmount: amount.toFixed(currencyMinorUnits(currency)), taxAmount: tax === null ? null : tax.toFixed(currencyMinorUnits(currency)) })
     total = total.plus(amount)
     if (tax === null) totalKnown = false
     else if (!inclusive) total = total.plus(tax)
   }
-  return { ok: true, invoice: { currency, lineAmountsIncludeTax: inclusive, lines, total: totalKnown ? roundMoney(total, currency).toFixed(currencyMinorUnits(currency)) : null } }
+  return { ok: true, invoice: { currency, foreignCurrency: currency !== baseCurrency, currencyRate: rateOrNull(built.CurrencyRate), lineAmountsIncludeTax: inclusive, lines, total: totalKnown ? roundMoney(total, currency).toFixed(currencyMinorUnits(currency)) : null } }
 }
 
 /** The invoice Xero holds, reduced to the compared fields. Reads only the fields named here, from the shape Xero returns (`Invoices[0]`); anything else in the response is ignored and never kept. */
@@ -101,7 +112,7 @@ export type XeroInvoiceReading =
 export function comparableFromXeroInvoice(raw: unknown): XeroInvoiceReading {
   const invoice = raw as Record<string, unknown> | null
   if (invoice === null || typeof invoice !== 'object') return { ok: false, reason: 'the Xero invoice could not be read' }
-  const currency = text(invoice.CurrencyCode)
+  const currency = code(invoice.CurrencyCode)
   const items = invoice.LineItems
   if (currency === '' || !Array.isArray(items)) return { ok: false, reason: 'the Xero invoice has no currency or no line items' }
   const lines: ComparableLine[] = []
@@ -112,8 +123,8 @@ export function comparableFromXeroInvoice(raw: unknown): XeroInvoiceReading {
     const tax = numeric(item.TaxAmount)
     lines.push({
       kind: null,
-      accountCode: text(item.AccountCode),
-      taxType: text(item.TaxType),
+      accountCode: code(item.AccountCode),
+      taxType: code(item.TaxType),
       lineAmount: roundMoney(amount, currency).toFixed(currencyMinorUnits(currency)),
       taxAmount: tax === null ? null : roundMoney(tax, currency).toFixed(currencyMinorUnits(currency)),
     })
@@ -121,8 +132,8 @@ export function comparableFromXeroInvoice(raw: unknown): XeroInvoiceReading {
   const total = numeric(invoice.Total)
   return {
     ok: true,
-    status: text(invoice.Status),
-    invoice: { currency, lineAmountsIncludeTax: invoice.LineAmountTypes === 'Inclusive', lines, total: total === null ? null : roundMoney(total, currency).toFixed(currencyMinorUnits(currency)) },
+    status: code(invoice.Status),
+    invoice: { currency, foreignCurrency: false, currencyRate: rateOrNull(invoice.CurrencyRate), lineAmountsIncludeTax: invoice.LineAmountTypes === 'Inclusive', lines, total: total === null ? null : roundMoney(total, currency).toFixed(currencyMinorUnits(currency)) },
   }
 }
 
@@ -209,7 +220,14 @@ export function compareComparableInvoices(ims: ComparableInvoice, xero: Comparab
   const totalMatch = !totalCompared || toDecimal(ims.total!).minus(toDecimal(xero.total!)).abs().lte(tolerance.times(taxedLines))
   const currencyMatch = ims.currency === xero.currency
 
+  // THE EXCHANGE RATE, for a foreign-currency invoice only. IMS stamps 1/rate (full precision); Xero stores the rate to 6 decimal places, so IMS's is rounded to 6 places and the two must agree within one unit of the
+  // 6th place (1e-6 absolute). A missing rate on either side is not a match: the order is not comparable (`currency_rate_unavailable`).
+  const rateUnavailable = ims.foreignCurrency && (ims.currencyRate === null || xero.currencyRate === null)
+  const rateDiffers = ims.foreignCurrency && ims.currencyRate !== null && xero.currencyRate !== null
+    && Math.abs(Math.round(ims.currencyRate * 1e6) / 1e6 - xero.currencyRate) > CURRENCY_RATE_TOLERANCE
+
   const differences: string[] = []
+  if (rateDiffers) differences.push(`currency rate: IMS ${Math.round(ims.currencyRate! * 1e6) / 1e6}, Xero ${xero.currencyRate}`)
   if (!currencyMatch) differences.push(`currency: IMS ${ims.currency}, Xero ${xero.currency}`)
   rows.forEach((row, index) => {
     if (row.verdict === 'differs') differences.push(`line ${index + 1}${row.kind ? ` (${row.kind})` : ''}: ${row.fields.join(', ')} differ`)
@@ -221,6 +239,7 @@ export function compareComparableInvoices(ims: ComparableInvoice, xero: Comparab
 
   // MATCH MEANS FULLY COMPARED. A figure that was not available is never read as equal.
   const incomplete: string[] = []
+  if (rateUnavailable) incomplete.push('currency_rate_unavailable: the exchange rate of a foreign-currency invoice is missing on the IMS side or on the Xero side')
   const unknownRates = new Set<string>()
   ims.lines.forEach((line) => { if (line.taxAmount === null) unknownRates.add(line.taxType) })
   if (unknownRates.size > 0) incomplete.push(`the tax rate of ${[...unknownRates].sort().join(', ')} is not known, so the tax amount was not compared`)
