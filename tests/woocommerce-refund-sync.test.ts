@@ -1808,3 +1808,32 @@ test('a zero-amount fee line on a refund is not a refunded fee and does not park
   const result = await syncWcRefund(1001, makeRefund({ fee_lines: [{ name: 'Ghost', total: '0', total_tax: '0' }] }), state.dependencies)
   assert.equal(refundIsInIms(result.outcome), true, result.error)
 })
+
+test('a refunded fee with TAX but NO net quarantines (it would be counted in the gross then dropped by the writer\'s line filter), with goods alongside or alone; no refund is created (o3d-k26m.14)', async () => {
+  for (const withGoods of [true, false]) {
+    const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+    const refund = makeRefund({
+      amount: withGoods ? '15.40' : '0.40',
+      line_items: withGoods ? [goodsRefundLine] : [],
+      fee_lines: [{ name: 'EU Handling Fee', total: '0', total_tax: '-0.40' }],
+    })
+    const result = await syncWcRefund(1001, refund, state.dependencies)
+    assert.equal(result.outcome, 'quarantined-refusal', `withGoods=${withGoods}`)
+    assert.match(result.error ?? '', /tax but no net cannot be recorded automatically/)
+    assert.equal(state.createRefundCalls, 0)
+  }
+})
+
+test('EVERY mapped fee line that contributes to the gross reaches the refund write: net-only, and net plus tax, fees are passed to createRefund with a positive base net (o3d-k26m.14)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+  const refund = makeRefund({
+    amount: '16.50',
+    line_items: [{ ...goodsRefundLine, subtotal_tax: '0', total_tax: '0', refund_total: 12.5 }],
+    fee_lines: [{ name: 'EU Customs Fee', total: '-4.00', total_tax: '0' }],
+  })
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  const sent = state.createRefundLines.filter((line) => line.lineId === 'fee-1')
+  assert.equal(sent.length, 1)
+  assert.ok((sent[0]?.totalBase ?? 0) > 0 || (sent[0]?.qty ?? 0) > 0, 'the writer\'s filter keeps it')
+})

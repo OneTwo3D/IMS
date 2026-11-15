@@ -975,9 +975,15 @@ export async function syncWcRefund(
     if (refundedFeeLines.length > 0) {
       const matched = matchRefundedFeeLines(refundedFeeLines, so.lines)
       const unmatched = refundedFeeLines.filter((_, index) => matched[index] === null)
-      if (unmatched.length > 0) {
-        const names = unmatched.map((feeLine) => `"${feeLine.name ?? '(unnamed)'}" (${parseDecimalAbs(feeLine.total).toFixed(2)} net, ${parseDecimalAbs(feeLine.total_tax).toFixed(2)} tax)`).join(', ')
-        const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} refunds fee ${names} that IMS cannot match to exactly one fee line on the original order (it matches by name, and only when no other fee on the order has that name), so the refund was NOT recorded and nothing was sent to Xero. Record the refund manually from the order, crediting that fee line.`)
+      // EVERY mapped fee line that adds to the gross must reach the refund write, whose line filter keeps a line only if it has a quantity or a positive base net. A fee with tax but no net (or a net that rounds to zero in base) would be counted in
+      // the gross and then dropped, leaving the credit note short by its tax, so it is quarantined like an unmatched fee. (Net with no tax is kept by the filter, so it is not a problem.)
+      const unwritable = refundedFeeLines.filter((feeLine, index) => matched[index] !== null && !(divideRoundedNumber(parseDecimalAbs(feeLine.total), fxRate, 4) > 0))
+      if (unmatched.length > 0 || unwritable.length > 0) {
+        const describe = (feeLine: (typeof refundedFeeLines)[number]) => `"${feeLine.name ?? '(unnamed)'}" (${parseDecimalAbs(feeLine.total).toFixed(2)} net, ${parseDecimalAbs(feeLine.total_tax).toFixed(2)} tax)`
+        const parts: string[] = []
+        if (unmatched.length > 0) parts.push(`refunds fee ${unmatched.map(describe).join(', ')} that IMS cannot match to exactly one fee line on the original order (it matches by name, and only when no other fee on the order has that name)`)
+        if (unwritable.length > 0) parts.push(`refunds fee ${unwritable.map(describe).join(', ')}: a fee refund carrying tax but no net cannot be recorded automatically`)
+        const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} ${parts.join(' and ')}, so the refund was NOT recorded and nothing was sent to Xero. Record the refund manually from the order, crediting that fee line.`)
         await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
         await writeActivity({
           entityType: 'SALES_ORDER',
