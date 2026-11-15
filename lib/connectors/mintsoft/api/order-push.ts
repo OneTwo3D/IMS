@@ -1089,9 +1089,10 @@ export async function addMintsoftOrderComment(externalOrderId: string, comment: 
     body: JSON.stringify({ Comment: comment.slice(0, 1000), Admin: true }),
   })
   if (result.error) {
-    // DEFINITE only when nothing was accepted: the outbound-write hold refused it before it left IMS, or Mintsoft answered a 4xx
-    // (not a 408 timeout). A timeout, a 5xx or a transport error may have been accepted: those stay plain errors (uncertain).
-    const refused = result.held === true || (result.status >= 400 && result.status < 500 && result.status !== 408)
+    // DEFINITE only when nothing was accepted: the outbound-write hold refused it before it left IMS, or Mintsoft answered a 4xx (not a
+    // 408 timeout) DIRECTLY, with zero redirect hops. A response reached after a followed redirect, or with unknown provenance, proves nothing
+    // about the original request (an earlier hop may have accepted the POST), so it is uncertain, like a timeout, a 5xx or a transport error.
+    const refused = result.held === true || (result.status >= 400 && result.status < 500 && result.status !== 408 && result.redirectsFollowed === 0)
     throw refused ? new MintsoftCommentNotSentError(result.error) : new Error(result.error)
   }
 }

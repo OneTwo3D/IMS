@@ -1145,7 +1145,7 @@ export interface WmsOrderPushPort {
    */
   recordRemovalNote?(connector: string, note: { linkId: string; orderId: string; externalOrderId: string; items: RemovalNoteItem[] }): Promise<WmsRemovalNoteObligation>
   readRemovalNote?(connector: string, linkId: string, externalOrderId: string): Promise<WmsRemovalNoteObligation | null>
-  updateRemovalNote?(connector: string, linkId: string, externalOrderId: string, patch: Partial<Pick<WmsRemovalNoteObligation, 'state' | 'attempted' | 'items' | 'detail'>>): Promise<boolean>
+  updateRemovalNote?(connector: string, linkId: string, externalOrderId: string, patch: Partial<Pick<WmsRemovalNoteObligation, 'state' | 'attempted' | 'items' | 'detail' | 'verified'>>): Promise<boolean>
   pendingRemovalNotes?(connector: string, limit: number): Promise<WmsRemovalNoteObligation[]>
   clearRemovalNote?(connector: string, linkId: string, externalOrderId: string): Promise<boolean>
   removalNoteContext?(linkId: string): Promise<{ linkState: string; externalOrderId: string | null; orderId: string; orderNumber: string | null; erased: boolean; cancellable: boolean } | null>
@@ -1538,7 +1538,7 @@ export async function runWmsOrderPushSweepCore(
      */
     const completeRemoval = async (removed: WmsOrderItemRef[], obligation: WmsRemovalNoteObligation | null) => {
       if (obligation && obligation.state === 'intended') {
-        await port.updateRemovalNote!(connectorId, link.id, survivorId, { state: 'owed', items: removed.map(toRemovalNoteItem) })
+        await port.updateRemovalNote!(connectorId, link.id, survivorId, { state: 'owed', verified: true, items: removed.map(toRemovalNoteItem) })
       }
       // A link that moved on is not closed, audited or noted: whatever obligation remains is judged against the link as it now is.
       if (!(await settleCancelled())) return
@@ -1564,15 +1564,28 @@ export async function runWmsOrderPushSweepCore(
     // recorded for an earlier warehouse order (the dispatch sweep re-pointed the link) is never found here, so it can neither complete this
     // removal nor be overwritten by it; it is judged by the retry pass, which posts a VERIFIED (owed) note to its own warehouse order.
     if (obligation && obligation.orderId !== link.orderId) obligation = null
+    // A needs_check that came from a PARTIAL interrupted removal (never verified) is for an operator: it must not close the link, and the
+    // removal is not retried over it. (One that came after a verified removal has `verified` and closes the link as before.)
+    if (obligation && obligation.state === 'needs_check' && obligation.verified !== true) return
     if (obligation && (obligation.state === 'owed' || obligation.state === 'needs_check')) {
       await completeRemoval(obligation.items, obligation)
       return
     }
     if (obligation && obligation.state === 'intended' && connector.fetchOrderItemRefs) {
       const lines = await connector.fetchOrderItemRefs(survivorId).catch(() => null)
-      if (lines && !obligation.items.some((item) => lines.some((line) => line.externalItemId === item.externalItemId))) {
-        await completeRemoval(obligation.items, obligation)
-        return
+      if (lines) {
+        const present = obligation.items.filter((item) => lines.some((line) => line.externalItemId === item.externalItemId)).length
+        if (present === 0) {
+          await completeRemoval(obligation.items, obligation)
+          return
+        }
+        if (present < obligation.items.length) {
+          // SOME of the recorded lines are gone and some are not: an earlier attempt stopped part way. The generic "a recorded line is
+          // already missing" refusal would stamp a cancel notice and take the link out of the cancel pass with the cron still green; this
+          // goes to needs_check (the cron goes red once) instead, with nothing posted and nothing closed.
+          await markRemovalNoteNeedsCheck(obligation, 'an earlier removal stopped part way: only some of the recorded lines are still on the warehouse order')
+          return
+        }
       }
     }
     // Persist the obligation BEFORE the first remote delete (an existing one is left as it is). If it cannot be written, nothing is deleted.
@@ -3395,9 +3408,14 @@ export async function runWmsOrderPushSweepCore(
         const present = lines === null ? null : ob.items.filter((item) => lines.some((line) => line.externalItemId === item.externalItemId)).length
         const confirmedGone = present === 0
         const repointed = ctx.externalOrderId !== ob.externalOrderId
+        if (present !== null && present > 0 && present < ob.items.length) {
+          // PARTIAL (an earlier removal stopped part way), re-pointed or not: never left intended, never dropped, never posted.
+          await markRemovalNoteNeedsCheck(ob, 'an earlier removal stopped part way: only some of the recorded lines are still on the warehouse order')
+          continue
+        }
         if (confirmedGone) {
-          if (!(await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'owed' }).catch(() => false))) continue
-          current = { ...ob, state: 'owed' }
+          if (!(await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'owed', verified: true }).catch(() => false))) continue
+          current = { ...ob, state: 'owed', verified: true }
         } else if (repointed) {
           // The link was re-pointed away from the warehouse order this obligation was recorded for. NEVER dropped blind: every line still
           // there = the removal never ran on it (stale, dropped); anything else (some gone, or the read failed / is unavailable) = it may have

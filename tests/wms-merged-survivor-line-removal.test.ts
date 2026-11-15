@@ -42,7 +42,7 @@ const fake = {
   orders: new Map<string, FakeOrder>(),
   requests: [] as Array<{ method: string; path: string }>,
   comments: [] as Array<{ id: string; comment: string }>,
-  commentAnswer: null as { status: number; error: string } | null,
+  commentAnswer: null as { status: number; error: string; redirectsFollowed: number | null } | null,
   failDeleteOf: new Set<number>(),
   deleteKeepsLine: new Set<number>(),
   itemsReadFailsAfterDeletes: null as number | null,
@@ -167,7 +167,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       }
       const commentMatch = pathname.match(/^\/api\/Order\/([^/]+)\/Comments$/)
       if (commentMatch && method === 'POST') {
-        if (fake.commentAnswer) return { data: null, error: fake.commentAnswer.error, status: fake.commentAnswer.status }
+        if (fake.commentAnswer) return { data: null, error: fake.commentAnswer.error, status: fake.commentAnswer.status, redirectsFollowed: fake.commentAnswer.redirectsFollowed }
         fake.comments.push({ id: commentMatch[1], comment: String(JSON.parse(init?.body ?? '{}').Comment) })
         return { data: { Success: true }, status: 200 }
       }
@@ -537,17 +537,57 @@ test('A DEFINITE refusal (nothing sent) clears the attempt and the note is retri
   })
 })
 
-test('MINTSOFT COMMENT ANSWERS: a 4xx (not 408) and a hold are DEFINITE (retried); a 500 and a 408 are UNCERTAIN (needs_check, never re-posted)', async () => {
-  for (const [status, expectDefinite] of [[404, true], [422, true], [500, false], [408, false]] as const) {
+test('MINTSOFT COMMENT ANSWERS: only a DIRECT 4xx (zero redirect hops, not 408) is definite and retried; a 4xx after a redirect or of unknown provenance, a 500 and a 408 are UNCERTAIN (needs_check, attempted, never re-posted)', async () => {
+  const cases: Array<[number, number | null, boolean]> = [[404, 0, true], [422, 0, true], [404, 1, false], [404, null, false], [500, 0, false], [408, 0, false]]
+  for (const [status, redirectsFollowed, expectDefinite] of cases) {
+    const name = `${status} redirects=${redirectsFollowed}`
     await withEnv(OFF, async () => {
       seedMerged()
-      fake.commentAnswer = { status, error: `Mintsoft request failed with status ${status}` }
+      fake.commentAnswer = { status, redirectsFollowed, error: `Mintsoft request failed with status ${status}` }
       const h = makePort({ cancellable: [absorbedLinkRef()], items: storedD })
       const first = await sweep(h.port)
-      assert.equal(first.removalNoteNeedsCheck, expectDefinite ? undefined : 1, String(status))
-      assert.equal(h.removalNotes.get('link-d')?.state, expectDefinite ? 'owed' : 'needs_check', String(status))
-      assert.equal(h.removalNotes.get('link-d')?.attempted, !expectDefinite, String(status))
+      assert.equal(first.removalNoteNeedsCheck, expectDefinite ? undefined : 1, name)
+      assert.equal(h.removalNotes.get('link-d')?.state, expectDefinite ? 'owed' : 'needs_check', name)
+      assert.equal(h.removalNotes.get('link-d')?.attempted, !expectDefinite, name)
       assert.equal(fake.comments.length, 0)
+      if (!expectDefinite) {
+        // Even if the warehouse would now accept it, it is not re-posted.
+        fake.commentAnswer = null
+        h.port.cancellableLinks = async () => []
+        await sweep(h.port)
+        await sweep(h.port)
+        assert.equal(fake.comments.length, 0, `${name}: never re-posted`)
+      }
+    })
+  }
+})
+
+test('PARTIAL INTERRUPTED REMOVAL: a crash after deleting the first of two lines goes to needs_check on the next sweep (red once), with no post, no cancel notice and the link not closed; the retry pass alone flags it too', async () => {
+  for (const viaCancelPass of [true, false]) {
+    await withEnv(OFF, async () => {
+      seedMerged()
+      const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+      const crashing = { removeOrderItems: async (id: string) => {
+        const order = fake.orders.get(id)!
+        order.items = order.items.filter((l) => l.ID !== 3603106) // the first delete lands...
+        throw new Error('worker crashed') // ...and the process stops
+      } }
+      await sweep(h.port, crashing)
+      assert.equal(h.removalNotes.get('link-d')?.state, 'intended')
+      assert.ok(!h.writes.some((w) => w.data.state === 'CANCELLED'))
+      if (!viaCancelPass) { h.port.cancellableLinks = async () => []; h.noteContext.cancellable = false }
+      const next = await sweep(h.port)
+      const label = viaCancelPass ? 'cancel pass' : 'retry pass'
+      assert.equal(h.removalNotes.get('link-d')?.state, 'needs_check', label)
+      assert.equal(next.removalNoteNeedsCheck, 1, `${label}: the cron goes red`)
+      assert.equal(next.operatorNotices, undefined, `${label}: no generic cancel notice`)
+      assert.equal(fake.comments.length, 0, `${label}: nothing posted`)
+      assert.ok(!h.writes.some((w) => w.data.state === 'CANCELLED'), `${label}: the link is not closed`)
+      assert.ok(!h.writes.some((w) => w.data.cancelNoticeAt), `${label}: no cancel notice stamped`)
+      const again = await sweep(h.port)
+      assert.equal(again.removalNoteNeedsCheck, undefined, `${label}: raised once`)
+      assert.equal(fake.comments.length, 0)
+      assert.ok(!h.writes.some((w) => w.data.state === 'CANCELLED'), `${label}: still not closed after the next sweep`)
     })
   }
 })

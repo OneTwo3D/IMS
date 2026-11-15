@@ -31,6 +31,8 @@ export type WmsRemovalNoteObligation = {
   state: RemovalNoteState
   /** A send may have gone out (see above). */
   attempted: boolean
+  /** True once the removal of these lines was VERIFIED on `externalOrderId` (set when it becomes owed). A needs_check row without it came from a PARTIAL interrupted removal and must never close a link. */
+  verified?: boolean
   items: RemovalNoteItem[]
   /** Why it needs a check (no personal data). */
   detail?: string
@@ -66,7 +68,7 @@ export function parseRemovalNote(value: string): WmsRemovalNoteObligation | null
       if (!item || typeof item.externalItemId !== 'string' || typeof item.sku !== 'string' || typeof item.quantity !== 'number') return null
       items.push({ externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })
     }
-    return { id: p.id, linkId: p.linkId, orderId: p.orderId, externalOrderId: p.externalOrderId, state: p.state, attempted: p.attempted, items, ...(typeof p.detail === 'string' ? { detail: p.detail } : {}) }
+    return { id: p.id, linkId: p.linkId, orderId: p.orderId, externalOrderId: p.externalOrderId, state: p.state, attempted: p.attempted, items, ...(p.verified === true ? { verified: true } : {}), ...(typeof p.detail === 'string' ? { detail: p.detail } : {}) }
   } catch {
     return null
   }
