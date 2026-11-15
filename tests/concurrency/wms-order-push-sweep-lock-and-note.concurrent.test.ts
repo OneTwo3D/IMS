@@ -43,21 +43,77 @@ test('the push sweep lock is released when the sweep throws', SKIP, async () => 
   assert.equal(await withOrderPushSweepLockOrSkip('conn-throw', async () => 'after'), 'after', 'arm 3')
 })
 
-test('the removal-note obligation is idempotent and cleared once', SKIP, async (t) => {
+test('the removal-note obligation store: recorded once as intended, patched under a row lock, listed, cleared', SKIP, async (t) => {
   loadEnv()
   const { db } = await import('@/lib/db')
-  const { createPrismaWmsOrderPushPort, REMOVAL_NOTE_KEY_PREFIX } = await import('@/lib/domain/wms/order-push-sweep')
+  const { createPrismaWmsOrderPushPort } = await import('@/lib/domain/wms/order-push-sweep')
+  const { REMOVAL_NOTE_KEY_PREFIX } = await import('@/lib/domain/wms/removal-note-obligation')
   const port = createPrismaWmsOrderPushPort()
   const connector = 'test-removal-note-connector'
   t.after(async () => { await db.setting.deleteMany({ where: { key: { startsWith: `${REMOVAL_NOTE_KEY_PREFIX}${connector}:` } } }) })
-  const note = { linkId: 'link-1', orderId: 'order-1', externalOrderId: 'wms-1', comment: 'first text' }
+  const note = { linkId: 'link-1', orderId: 'order-1', externalOrderId: 'wms-1', items: [{ externalItemId: '10', sku: 'SKU-A', quantity: 2 }] }
 
-  await port.recordRemovalNote!(connector, note)
-  await port.recordRemovalNote!(connector, { ...note, comment: 'second text' })
-  const owed = await port.pendingRemovalNotes!(connector, 10)
-  assert.deepEqual(owed, [note], 'arm 4: one obligation, the first text kept')
+  const first = await port.recordRemovalNote!(connector, note)
+  const second = await port.recordRemovalNote!(connector, { ...note, items: [] })
+  assert.equal(second.id, first.id, 'idempotent: the first obligation (and its marker id) is kept')
+  assert.deepEqual(second.items, note.items)
+  assert.equal(first.state, 'intended')
+  assert.equal(await port.updateRemovalNote!(connector, 'link-1', { state: 'owed' }), true)
+  assert.equal(await port.updateRemovalNote!(connector, 'link-1', { attempted: true }), true)
+  const [owed] = await port.pendingRemovalNotes!(connector, 10)
+  assert.equal(owed.state, 'owed')
+  assert.equal(owed.attempted, true, 'patches merge')
+  assert.equal(await port.updateRemovalNote!(connector, 'no-such-link', { state: 'owed' }), false)
   assert.deepEqual(await port.pendingRemovalNotes!('another-connector', 10), [], 'scoped to the connector')
   assert.equal(await port.clearRemovalNote!(connector, 'link-1'), true)
   assert.equal(await port.clearRemovalNote!(connector, 'link-1'), false)
-  assert.deepEqual(await port.pendingRemovalNotes!(connector, 10), [])
+})
+
+test('real database: an owed note posts ONCE with its marker; after the order is deleted (reset) or erased the obligation is dropped and nothing is posted', SKIP, async (t) => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { createPrismaWmsOrderPushPort, runWmsOrderPushSweepCore } = await import('@/lib/domain/wms/order-push-sweep')
+  const { removalNoteKey, removalNoteMarker, serializeRemovalNote } = await import('@/lib/domain/wms/removal-note-obligation')
+  const { randomUUID } = await import('node:crypto')
+  const tag = `rn${randomUUID().slice(0, 8)}`
+  const connectorId = 'mintsoft'
+  const ids: string[] = []
+  const keys: string[] = []
+  t.after(async () => {
+    await db.setting.deleteMany({ where: { key: { in: keys } } })
+    await db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+  })
+  const seed = async (suffix: string) => {
+    const id = `${tag}${suffix}`
+    ids.push(id)
+    await db.salesOrder.create({ data: { id, orderNumber: `IMSTEST-${id}`, status: 'CANCELLED', currency: 'GBP', subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100 } })
+    const link = await db.wmsOrderPushLink.create({ data: { orderId: id, connector: connectorId, state: 'CANCELLED', externalOrderId: `surv-${id}`, externalOrderNumber: 'MS-1' } })
+    const ob = { id: 'ob1', linkId: link.id, orderId: id, externalOrderId: `surv-${id}`, state: 'owed' as const, attempted: false, items: [{ externalItemId: '10', sku: 'SKU-A', quantity: 1 }] }
+    await db.setting.create({ data: { key: removalNoteKey(connectorId, link.id), value: serializeRemovalNote(ob) } })
+    keys.push(removalNoteKey(connectorId, link.id))
+    return { id, ob, linkId: link.id }
+  }
+  const posted: Array<{ id: string; comment: string }> = []
+  const connector = {
+    pushOrder: async () => { throw new Error('not used') },
+    cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }),
+    addOrderComment: async (id: string, comment: string) => { posted.push({ id, comment }) },
+  }
+  const run = () => runWmsOrderPushSweepCore(connector as never, connectorId, createPrismaWmsOrderPushPort(), { batchSize: 500 })
+
+  const live = await seed('a')
+  const reset = await seed('b')
+  const erased = await seed('c')
+  await db.salesOrder.deleteMany({ where: { id: reset.id } }) // the reset: orders go, the link cascades, the setting survives
+  await db.salesOrder.update({ where: { id: erased.id }, data: { erasedAt: new Date() } })
+
+  await run()
+  const mine = (id: string) => posted.filter((p) => p.id === `surv-${id}`)
+  assert.equal(mine(live.id).length, 1, 'the live obligation posts once')
+  assert.ok(mine(live.id)[0].comment.startsWith(removalNoteMarker(live.ob)), 'the note carries its marker first')
+  assert.equal(mine(reset.id).length, 0, 'after a reset nothing is posted')
+  assert.equal(mine(erased.id).length, 0, 'an erased order is never posted')
+  for (const x of [live, reset, erased]) assert.equal(await db.setting.count({ where: { key: removalNoteKey(connectorId, x.linkId) } }), 0, 'obligation gone')
+  await run()
+  assert.equal(mine(live.id).length, 1, 'and never again')
 })
