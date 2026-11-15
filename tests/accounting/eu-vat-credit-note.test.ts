@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import { roundMoney, toDecimal } from '../../lib/domain/math/decimal'
 import {
-  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal, wholeOrderReversalFigures, reversalNotProvenRefusal, invoiceToReverse,
+  applyEuVatCreditNoteTreatment, easRefundRefusal, refusedCreditNoteError, refusedCreditNotePayload, EAS_REFUND_TAX_RATE_ID, noStampRefusal, refundTaxAndTotal, refundTaxOnEasRate, refundStatedTax, eas182RefundFigures, refund182HeldRefusal, wholeOrderReversalFigures, reversalNotProvenRefusal, invoiceToReverse, reversalAccountsDifference,
   type CreditNoteLineKind, type EuVatCreditNotePlan,
 } from '../../lib/domain/accounting/eu-vat-credit-note'
 import { findSalesDocumentTaxTypeProblems } from '../../lib/domain/accounting/sales-document-tax-types'
@@ -398,4 +398,29 @@ test('[reversal] a newer update PROVEN never sent (cancelled before any call) is
   const never = row('2026-11-02', { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true })
   assert.deepEqual(invoiceToReverse([row('2026-11-01', {}), never]), { ok: true, payload: { v: '2026-11-01' } })
   assert.deepEqual(invoiceToReverse([]), { ok: true, payload: null })
+})
+
+// ---- o3d-k26m.13 (Codex R2): the reversal books through the invoice's accounts, not the settings in force now ----
+const CN_LINES = [
+  { description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'TAX131' },
+  { description: 'Shipping', quantity: 1, unitAmount: 10, accountCode: '260', taxType: 'TAX131' },
+  { description: 'IOSS VAT refunded', quantity: 1, unitAmount: 21.99, accountCode: '821', taxType: 'NONE', noTaxKind: 'eu-vat-recovery' },
+]
+test('[reversal accounts] an identical mapping passes (VAT and rounding lines excluded; separate invoice shipping and discount amounts count as the lines they post as)', () => {
+  assert.equal(reversalAccountsDifference(invoice({}, [ROUNDING]), CN_LINES, 'EUR'), null)
+  const split = invoice({ shippingAmount: 10, shippingAccountCode: '260', shippingTaxType: 'TAX131', lines: [
+    { description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'TAX131' },
+    { description: 'IOSS VAT collected', quantity: 1, unitAmount: 21.99, accountCode: '821', taxType: 'NONE', noTaxKind: 'eu-vat-recovery' },
+  ] })
+  assert.equal(reversalAccountsDifference(split, CN_LINES, 'EUR'), null)
+})
+
+test('[reversal accounts] equal totals but a different REVENUE account, SHIPPING account or tax type refuse, naming the first differing account', () => {
+  const revenue = reversalAccountsDifference(invoice(), CN_LINES.map((l) => (l.accountCode === '200' ? { ...l, accountCode: '201' } : l)), 'EUR')
+  assert.match(revenue ?? '', /account 200 on tax type TAX131: the invoice booked 100 EUR and the credit note would book 0 EUR/)
+  const shipping = reversalAccountsDifference(invoice(), CN_LINES.map((l) => (l.accountCode === '260' ? { ...l, accountCode: '261' } : l)), 'EUR')
+  assert.match(shipping ?? '', /account 260 on tax type TAX131/)
+  const type = reversalAccountsDifference(invoice(), CN_LINES.map((l) => (l.accountCode === '200' ? { ...l, taxType: 'TAX999' } : l)), 'EUR')
+  assert.match(type ?? '', /account 200 on tax type TAX131/)
+  assert.match(reversalAccountsDifference(invoice({ shippingAmount: 10, shippingAccountCode: '260', shippingTaxType: 'TAX131', lines: (invoice().lines as unknown[]).filter((l) => (l as { accountCode: string }).accountCode !== '260') }), CN_LINES.map((l) => (l.accountCode === '260' ? { ...l, accountCode: '261' } : l)), 'EUR') ?? '', /account 260/)
 })

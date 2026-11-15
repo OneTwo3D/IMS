@@ -365,3 +365,43 @@ export function invoiceToReverse<T extends LedgerStandingRow & { createdAt: Date
   }
   return { ok: true, payload: null }
 }
+
+
+/**
+ * A WHOLE-ORDER REVERSAL BOOKS THROUGH THE SAME ACCOUNTS AS THE INVOICE IT CANCELS. Pure. The totals can match while the credit note's goods, shipping and discount lines use the CURRENT account settings and the invoice used the ones in force when it was posted: the money would
+ * then come off different accounts. Both sides are aggregated by (account code, tax type) to net amounts, the invoice's separate shipping and discount amounts counted as the lines they post as, and the VAT line and the rounding line (checked separately) left out. The two must have
+ * the same keys and equal amounts to the minor unit. Returns null when they agree, otherwise a sentence naming the first differing account (keys in sorted order). It never rebuilds a line.
+ */
+export function reversalAccountsDifference(invoice: Record<string, unknown>, creditLines: readonly TreatableLine[], currency: string): string | null {
+  const keyOf = (line: { accountCode?: unknown; taxType?: unknown }) => `${String(line.accountCode ?? '').trim()}\u0000${String(line.taxType ?? '').trim()}`
+  const isExcluded = (line: TreatableLine) => line.noTaxKind === 'eu-vat-recovery' || line.noTaxKind === 'rounding-difference'
+  const add = (map: Map<string, Decimal>, key: string, amount: Decimal) => map.set(key, (map.get(key) ?? toDecimal(0)).plus(amount))
+  const aggregate = (lines: readonly TreatableLine[], extra: Array<{ key: string; amount: Decimal }>): Map<string, Decimal> | null => {
+    const map = new Map<string, Decimal>()
+    for (const line of lines) {
+      if (isExcluded(line)) continue
+      const amount = predictedUntaxedTotal({ currency, lines: [{ ...line, accountCode: line.accountCode }] } as TreatablePayload)
+      if (amount === null) return null
+      add(map, keyOf(line), amount)
+    }
+    for (const entry of extra) add(map, entry.key, entry.amount)
+    return map
+  }
+  const extras: Array<{ key: string; amount: Decimal }> = []
+  const shipping = dec(invoice.shippingAmount)
+  if (shipping !== null && shipping.gt(0) && String(invoice.shippingAccountCode ?? '').trim() !== '') extras.push({ key: keyOf({ accountCode: invoice.shippingAccountCode, taxType: invoice.shippingTaxType }), amount: roundMoney(shipping, currency) })
+  const discount = dec(invoice.discountAmount)
+  if (discount !== null && discount.gt(0) && String(invoice.discountAccountCode ?? '').trim() !== '') extras.push({ key: keyOf({ accountCode: invoice.discountAccountCode, taxType: invoice.discountTaxType }), amount: roundMoney(discount, currency).negated() })
+  const invoiceSide = aggregate((invoice.lines ?? []) as TreatableLine[], extras)
+  const creditSide = aggregate(creditLines, [])
+  if (invoiceSide === null || creditSide === null) return 'a line amount cannot be read, so the accounts of the invoice and the credit note cannot be compared'
+  for (const key of [...new Set([...invoiceSide.keys(), ...creditSide.keys()])].sort()) {
+    const a = roundMoney(invoiceSide.get(key) ?? toDecimal(0), currency)
+    const b = roundMoney(creditSide.get(key) ?? toDecimal(0), currency)
+    if (!a.eq(b)) {
+      const [account, taxType] = key.split('\u0000')
+      return `account ${account || '(none)'} on tax type ${taxType || '(none)'}: the invoice booked ${a.toString()} ${currency} and the credit note would book ${b.toString()} ${currency}, so it would reverse the money through different accounts than the invoice used (an account mapping changed since the invoice was posted)`
+    }
+  }
+  return null
+}

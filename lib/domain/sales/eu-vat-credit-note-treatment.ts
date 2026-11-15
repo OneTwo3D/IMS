@@ -23,7 +23,7 @@ import type { AccountingEnqueueOutcome } from '@/lib/accounting'
 import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
 import { decideRefund182Hold } from '@/lib/domain/sales/refund-182-hold'
 import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
-import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, reversalNotProvenRefusal, wholeOrderReversalFigures, invoiceToReverse, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { applyEuVatCreditNoteTreatment, eas182RefundFigures, persistedSchemeUntreatableRefusal, refund182HeldRefusal, noFrozenBasisRefusal, noInvoicedTypeRefusal, noStampRefusal, refundTaxAndTotal, reversalNotProvenRefusal, wholeOrderReversalFigures, invoiceToReverse, reversalAccountsDifference, EU_VAT_TREATMENT_PAYLOAD_KEY, type CreditNoteLineKind, type EuVatCreditNotePlan } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { storedSchemePostingTypeProblem } from '@/lib/connectors/xero/scheme-posting-check'
 
 export type EuVatCreditNoteAccounts = { ioss: string | null; ddp: string | null; fee: string | null; rounding: string | null }
@@ -162,6 +162,7 @@ export async function treatCreditNotePayload(params: {
   // The refund's own tax total, and the amount the document must total. A whole-order reversal (the payment poller's chargeback) reverses the order's whole collected VAT.
   let figures: ReturnType<typeof refundTaxAndTotal>
   let reversalRounding: { amount: string; accountCode: string } | null = null
+  let reversedInvoice: Record<string, unknown> | null = null
   if (refund.source === 'CHARGEBACK_POLLER') {
     // The target, the VAT and any rounding reversal come from the invoice payload of the version CONFIRMED in Xero (`invoiceToReverse`: a newer row that is queued, failed or of unknown outcome refuses), and the reversal must equal it.
     const invoiceRows = await db.accountingSyncLog.findMany({
@@ -173,6 +174,7 @@ export async function treatCreditNotePayload(params: {
     const proven = wholeOrderReversalFigures({ invoice: picked.payload, currency: payload.currency, net })
     if (!proven.ok) return { kind: 'refused', reason: reversalNotProvenRefusal(number, proven.reason), code: 'hand_post' }
     reversalRounding = proven.rounding
+    reversedInvoice = picked.payload
     figures = { ok: true, vatAmount: proven.vatAmount, refundTotal: proven.refundTotal }
   } else if (rate182) {
     // RATE 182: the tax the refund states across ALL its rate ids, confirmed against its own gross and held to the order's VAT not already refunded.
@@ -200,6 +202,11 @@ export async function treatCreditNotePayload(params: {
   }
   const treated = applyEuVatCreditNoteTreatment(payload, plan)
   if (!treated.ok) return { kind: 'refused', reason: `Credit note ${number}: ${treated.reason}. Nothing was queued.` }
+  // A whole-order reversal must book through the SAME accounts and tax types as the invoice it cancels, not the settings in force now.
+  if (reversedInvoice !== null) {
+    const accountsDiffer = reversalAccountsDifference(reversedInvoice, treated.payload.lines as never, payload.currency)
+    if (accountsDiffer !== null) return { kind: 'refused', reason: reversalNotProvenRefusal(number, accountsDiffer), code: 'hand_post' }
+  }
   // THE HOLD, decided last: only a credit note that would otherwise post is counted. The first N rate-182 credit notes are a refused, settle-by-hand row (never sent); after that they post.
   if (rate182) {
     const hold = await decideRefund182Hold(params.refundId, async (place) => params.enqueueHeldRow(refund182HeldRefusal({ creditNoteNumber: number, heldNumber: place.heldNumber, threshold: place.threshold ?? place.heldNumber, vatAccount, vatAmount: figures.vatAmount, refundTotal: figures.refundTotal, currency: payload.currency })))
