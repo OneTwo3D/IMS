@@ -49,6 +49,7 @@
     "tax:rekey": "tsx scripts/tax-rekey.ts",
     "eu-vat:preflight": "tsx scripts/eu-vat-preflight.ts",
     "eu-vat:seed": "tsx scripts/eu-vat-seed.ts",
+    "eu-vat:shadow": "tsx scripts/eu-vat-shadow-report.ts",
     "woo:tax-plan": "tsx scripts/woo-tax-plan.ts",
     "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",
     "inventory:snapshots:backfill": "tsx scripts/backfill-inventory-snapshots.ts",

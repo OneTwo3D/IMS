@@ -236,6 +236,7 @@ IMS holds the configuration for treating EU (IOSS), Norway (VOEC) and delivered-
 - **Regional rates are fine.** A WooCommerce rate limited to a state, postcode or city (for example the Canary Islands) is not a difference by itself. It is compared like any other rate against the IMS rate it is mapped to (percentage, class, compound, shipping, and the country, which must be equal); the region is shown in its own column for information.
 - **Until go-live you correct WooCommerce by hand.** IMS does not write WooCommerce tax rates yet. Open **WooCommerce > Settings > Tax**, change the rate or setting named in the row so it matches Xero, then run **Compare VAT rates** again until every tab says *no differences*. A row about IMS or Xero (for example a type missing in IMS) is fixed in IMS (Import purchase tax rates from Xero, above) or in Xero first.
 - **A refusal is not "no differences".** If the stored Xero list is missing, stale or does not belong to the connected organisation, or WooCommerce cannot be read, the panel says why and compares nothing.
+- **"No differences" is about rate configuration only.** The comparison never reads a posted invoice, so for the IOSS and VOEC schemes it says nothing about how an order's invoice is posted. The built, switched-off tool that compares real invoices with what IMS would post is `npm run eu-vat:shadow` (see the EU go-live runbook in *Xero sync*).
 - Your system administrator can also run the same report from the server.
 
 ### WooCommerce tax-rate writer (not yet switched on)
