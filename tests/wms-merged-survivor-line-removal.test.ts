@@ -244,10 +244,14 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
   const dropped: string[][] = []
   const recordedItems: Array<{ orderId: string; externalOrderId: string; items: WmsOrderItemRef[] }> = []
   const events: Array<{ action: string; outcome: string; summary: string }> = []
-  const removalNotes = new Map<string, WmsRemovalNoteObligation>()
-  const noteContext = { value: 'live' as 'live' | 'gone' | 'erased' | 'repointed', cancellable: true }
+  // Keyed (link, warehouse order) like the real store. `get('link-d')` / `set('link-d', ob)` address the obligation for the survivor / the one `ob` names.
+  class NoteStore extends Map<string, WmsRemovalNoteObligation> {
+    override get(k: string) { return super.get(k.includes('|') ? k : `${k}|${SURVIVOR}`) }
+    override set(k: string, v: WmsRemovalNoteObligation) { return super.set(`${v.linkId}|${v.externalOrderId}`, v) }
+  }
+  const removalNotes = new NoteStore()
+  const noteContext = { value: 'live' as 'live' | 'gone' | 'erased' | 'repointed', cancellable: true, external: null as string | null }
   const removalNoteLog: string[] = []
-  const quarantined: WmsRemovalNoteObligation[] = []
   const link = { state: options.cancellable[0]?.state ?? 'SYNCED', externalOrderId: options.cancellable[0]?.externalOrderId ?? '' }
   const port: WmsOrderPushPort = {
     activeBindings: async () => BINDINGS,
@@ -273,27 +277,26 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
     noticesAwaitingComment: async () => [],
     recordRemovalNote: async (_c, note) => {
       removalNoteLog.push(`record:${note.linkId}`)
-      const existing = removalNotes.get(note.linkId)
+      const existing = removalNotes.get(`${note.linkId}|${note.externalOrderId}`)
       if (existing) return existing
       const fresh: WmsRemovalNoteObligation = { id: `ob${removalNotes.size + 1}`, ...note, state: 'intended', attempted: false }
-      removalNotes.set(note.linkId, fresh)
+      removalNotes.set('', fresh)
       return fresh
     },
-    readRemovalNote: async (_c, linkId) => removalNotes.get(linkId) ?? null,
-    updateRemovalNote: async (_c, linkId, patch) => {
-      const cur = removalNotes.get(linkId)
+    readRemovalNote: async (_c, linkId, ext) => removalNotes.get(`${linkId}|${ext}`) ?? null,
+    updateRemovalNote: async (_c, linkId, ext, patch) => {
+      const cur = removalNotes.get(`${linkId}|${ext}`)
       if (!cur) return false
       removalNoteLog.push(`update:${JSON.stringify(patch.state ?? (patch.attempted === undefined ? '' : `attempted=${patch.attempted}`))}`)
-      removalNotes.set(linkId, { ...cur, ...patch })
+      removalNotes.set('', { ...cur, ...patch })
       return true
     },
-    pendingRemovalNotes: async () => [...removalNotes.values()],
-    clearRemovalNote: async (_c, linkId) => { removalNoteLog.push(`clear:${linkId}`); return removalNotes.delete(linkId) },
-    quarantineRemovalNote: async (_c, linkId) => { const ob = removalNotes.get(linkId); if (ob) { quarantined.push(ob); removalNotes.delete(linkId) } },
+    pendingRemovalNotes: async () => [...removalNotes.values()].filter((o) => o.state !== 'needs_check'),
+    clearRemovalNote: async (_c, linkId, ext) => { removalNoteLog.push(`clear:${linkId}`); return removalNotes.delete(`${linkId}|${ext}`) },
     removalNoteContext: async (linkId) => {
-      const ob = removalNotes.get(linkId)
+      const ob = [...removalNotes.values()].find((o) => o.linkId === linkId)
       if (!ob || noteContext.value === 'gone') return null
-      return { linkState: link.state, externalOrderId: noteContext.value === 'repointed' ? 'other-order' : ob.externalOrderId, orderId: ob.orderId, orderNumber: 'IMSTEST-D', erased: noteContext.value === 'erased', cancellable: noteContext.cancellable }
+      return { linkState: link.state, externalOrderId: noteContext.value === 'repointed' ? 'other-order' : (noteContext.external ?? SURVIVOR), orderId: ob.orderId, orderNumber: 'IMSTEST-D', erased: noteContext.value === 'erased', cancellable: noteContext.cancellable }
     },
     updateLinkIfLinked: async (id, expect, data) => {
       if (link.state !== expect.state || link.externalOrderId !== expect.externalOrderId) return false
@@ -307,7 +310,7 @@ function makePort(options: { cancellable: WmsPushLinkRef[]; items: WmsOrderItemR
     dropOrderItems: async (_linkId, ids) => { dropped.push(ids) },
     recordEvent: async (event) => { events.push({ action: String(event.action), outcome: String(event.outcome), summary: String(event.summary) }) },
   }
-  return { port, writes, dropped, recordedItems, events, link, upserts, createdWrites, removalNotes, removalNoteLog, noteContext, quarantined }
+  return { port, writes, dropped, recordedItems, events, link, upserts, createdWrites, removalNotes, removalNoteLog, noteContext }
 }
 
 async function sweep(port: WmsOrderPushPort, overrides: Record<string, unknown> = {}) {
@@ -414,7 +417,7 @@ test('CRASH BETWEEN THE DELETES AND THE RECORD: the failed write after the delet
     const h = makePort({ cancellable: [absorbedLinkRef()], items: storedD })
     const real = h.port.updateRemovalNote!
     let failed = false
-    h.port.updateRemovalNote = async (c, l, patch) => { if (!failed && patch.state === 'owed') { failed = true; throw new Error('crash after the deletes') } return real(c, l, patch) }
+    h.port.updateRemovalNote = async (c, l, e, patch) => { if (!failed && patch.state === 'owed') { failed = true; throw new Error('crash after the deletes') } return real(c, l, e, patch) }
     await sweep(h.port)
     assert.deepEqual(deletedIds(), ['3603106', '3603107'], 'the lines really were deleted')
     assert.equal(h.removalNotes.get('link-d')?.state, 'intended')
@@ -437,7 +440,7 @@ test('CRASH BETWEEN THE DELETES AND THE RECORD: with the link no longer selected
     const h = makePort({ cancellable: [absorbedLinkRef()], items: storedD })
     const real = h.port.updateRemovalNote!
     let failed = false
-    h.port.updateRemovalNote = async (c, l, patch) => { if (!failed && patch.state === 'owed') { failed = true; throw new Error('crash') } return real(c, l, patch) }
+    h.port.updateRemovalNote = async (c, l, e, patch) => { if (!failed && patch.state === 'owed') { failed = true; throw new Error('crash') } return real(c, l, e, patch) }
     await bothSweeps(h)
     assert.equal(h.removalNotes.get('link-d')?.state, 'intended')
     h.noteContext.cancellable = false // the cancel pass no longer selects the link, so the retry pass delivers
@@ -552,34 +555,76 @@ test('MINTSOFT COMMENT ANSWERS: a 4xx (not 408) and a hold are DEFINITE (retried
 const OLD_ORDER = 'old-warehouse-order'
 const staleOb = (state: 'owed' | 'needs_check' | 'intended'): WmsRemovalNoteObligation => ({ id: 'old1', linkId: 'link-d', orderId: 'so-d', externalOrderId: OLD_ORDER, state, attempted: state === 'needs_check', items: storedD })
 
-test('REPOINTED LINK after needs_check: the stale obligation is kept for the operator but does not short-circuit; the cancel pass does the NORMAL removal on the new warehouse order and notes it there', async () => {
+test('REPOINTED LINK after needs_check: the needs_check obligation for the OLD warehouse order stays for the operator and does not short-circuit; the cancel pass does the NORMAL removal on the new warehouse order and notes it there', async () => {
   await withEnv(OFF, async () => {
     seedMerged()
     const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
-    h.removalNotes.set('link-d', staleOb('needs_check'))
+    h.removalNotes.set('', staleOb('needs_check'))
     await sweep(h.port)
     assert.deepEqual(deletedIds(), ['3603106', '3603107'], 'the lines were really removed from the NEW warehouse order')
     assert.ok(h.writes.some((w) => w.data.state === 'CANCELLED'))
-    assert.deepEqual(h.quarantined.map((q) => [q.id, q.state, q.externalOrderId]), [['old1', 'needs_check', OLD_ORDER]], 'the stale row is kept for an operator')
+    assert.equal(h.removalNotes.get(`link-d|${OLD_ORDER}`)?.state, 'needs_check', 'the old row is untouched, for an operator')
     assert.equal(fake.comments.length, 1)
     assert.equal(fake.comments[0].id, SURVIVOR, 'the note went to the current warehouse order only')
   })
 })
 
-test('REPOINTED LINK with an OWED note for the old warehouse order: nothing is posted to the old order, the stale obligation is dropped and the current order is processed normally', async () => {
-  for (const state of ['owed', 'intended'] as const) {
-    await withEnv(OFF, async () => {
-      seedMerged()
-      const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
-      h.removalNotes.set('link-d', staleOb(state))
-      await sweep(h.port)
-      assert.ok(fake.comments.every((c) => c.id === SURVIVOR), `${state}: no post to the old order`)
-      assert.equal(fake.comments.filter((c) => c.id === OLD_ORDER).length, 0)
-      assert.deepEqual(deletedIds(), ['3603106', '3603107'], state)
-      assert.equal(h.quarantined.length, 0)
-      assert.equal(h.removalNotes.size, 0, 'the new obligation was delivered and cleared; the stale one is gone')
-    })
-  }
+test('REPOINTED LINK, OWED note for the OLD warehouse order (its removal was VERIFIED there): the note is posted to THAT order, once; the current order is processed normally (this premise changed in R3: an owed note is not stale)', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    fake.orders.set(OLD_ORDER, { status: 9, number: 'OLD', items: [], merged: true })
+    const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+    h.removalNotes.set('', staleOb('owed'))
+    await sweep(h.port)
+    assert.deepEqual(deletedIds(), ['3603106', '3603107'], 'the current order got its own normal removal')
+    const toOld = fake.comments.filter((c) => c.id === OLD_ORDER)
+    assert.equal(toOld.length, 1, 'the verified note went to its own warehouse order')
+    assert.match(toOld[0].comment, /^\[IMS removal-note link-d-old1\] /)
+    assert.equal(fake.comments.filter((c) => c.id === SURVIVOR).length, 1, 'and the current order was noted for its own removal')
+    assert.equal(h.removalNotes.size, 0)
+    await sweep(h.port)
+    assert.equal(fake.comments.filter((c) => c.id === OLD_ORDER).length, 1, 'never again')
+  })
+})
+
+test('REPOINTED LINK, only INTENDED for the old warehouse order (never verified): dropped, nothing posted to it, the current order processed normally', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+    h.removalNotes.set('', staleOb('intended'))
+    await sweep(h.port)
+    assert.equal(fake.comments.filter((c) => c.id === OLD_ORDER).length, 0)
+    assert.equal(h.removalNotes.get(`link-d|${OLD_ORDER}`), undefined, 'dropped')
+    assert.deepEqual(deletedIds(), ['3603106', '3603107'])
+  })
+})
+
+test('R3 RACE: the link is re-pointed after the deletion is verified and before the close: the close writes nothing, and the VERIFIED owed note still posts ONCE to the original warehouse order, never dropped', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+    const real = h.port.updateLinkIfLinked!
+    h.port.updateLinkIfLinked = async (id, expect, data) => {
+      if (data.state !== 'CANCELLED') return real(id, expect, data)
+      // the dispatch sweep's re-point lands now
+      h.link.externalOrderId = 'new-warehouse-order'
+      h.noteContext.external = 'new-warehouse-order'
+      return false
+    }
+    const first = await sweep(h.port)
+    assert.equal(first.cancelled, 0, 'not closed')
+    assert.deepEqual(deletedIds(), ['3603106', '3603107'])
+    assert.equal(h.removalNotes.get('link-d')?.state, 'owed', 'the verified obligation is kept')
+    assert.equal(fake.comments.length, 0)
+    h.port.cancellableLinks = async () => []
+    await sweep(h.port)
+    assert.equal(fake.comments.length, 1, 'posted once')
+    assert.equal(fake.comments[0].id, SURVIVOR, 'to the ORIGINAL warehouse order')
+    assert.match(fake.comments[0].comment, /^\[IMS removal-note link-d-ob1\] /)
+    assert.equal(h.removalNotes.size, 0)
+    await sweep(h.port)
+    assert.equal(fake.comments.length, 1)
+  })
 })
 
 test('A LINK THAT MOVED ON BETWEEN THE READ AND THE CLOSE: the conditional update writes nothing, so the link is not counted closed, audited or noted', async () => {
@@ -607,15 +652,16 @@ test('RESET (the link and order are gone), then a sweep: the old obligation is d
   })
 })
 
-test('an obligation whose link now names ANOTHER warehouse order, or whose order was erased, is dropped, never posted', async () => {
+test('an owed obligation whose link now names ANOTHER warehouse order is still posted to its own; one whose order was erased is dropped, never posted', async () => {
   for (const value of ['repointed', 'erased'] as const) {
     await withEnv(OFF, async () => {
       seedMerged()
       const h = makePort({ cancellable: [], items: storedD })
-      h.removalNotes.set('link-d', { id: 'ob1', linkId: 'link-d', orderId: 'so-d', externalOrderId: SURVIVOR, state: 'owed', attempted: false, items: storedD })
+      h.removalNotes.set('', { id: 'ob1', linkId: 'link-d', orderId: 'so-d', externalOrderId: SURVIVOR, state: 'owed', attempted: false, items: storedD })
       h.noteContext.value = value
+      h.noteContext.cancellable = false
       await sweep(h.port)
-      assert.equal(fake.comments.length, 0, value)
+      assert.equal(fake.comments.length, value === 'repointed' ? 1 : 0, value)
       assert.equal(h.removalNotes.size, 0, value)
     })
   }

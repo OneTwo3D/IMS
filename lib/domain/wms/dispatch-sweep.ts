@@ -2879,6 +2879,9 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           id: linkId,
           state: { in: ['SYNCED', 'MERGED'] },
           ...(from?.externalOrderId ? { externalOrderId: from.externalOrderId } : {}),
+          // NOT while the push sweep holds the link's amendment lease: its merged-line removal (the deletes, the close and the note) runs under
+          // that lease and must see the link it started with. Skipped this pass; the merge is followed again on a later one.
+          OR: [{ amendLeaseExpiresAt: null }, { amendLeaseExpiresAt: { lt: new Date() } }],
         },
         data: {
           externalOrderId: to.externalOrderId,

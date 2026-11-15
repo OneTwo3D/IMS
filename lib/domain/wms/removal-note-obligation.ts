@@ -36,8 +36,13 @@ export type WmsRemovalNoteObligation = {
   detail?: string
 }
 
-export function removalNoteKey(connector: string, linkId: string): string {
-  return `${REMOVAL_NOTE_KEY_PREFIX}${connector}:${linkId}`
+/**
+ * One obligation per (link, warehouse order). The note belongs to the warehouse order the removal was verified on; the dispatch sweep can
+ * re-point a link at another warehouse order, and keying by that order keeps an obligation for the old order from ever being mistaken for
+ * (or overwritten by) one for the new order.
+ */
+export function removalNoteKey(connector: string, linkId: string, externalOrderId: string): string {
+  return `${REMOVAL_NOTE_KEY_PREFIX}${connector}:${linkId}:${externalOrderId}`
 }
 
 /** The text a note carries so a re-read of the order's comments can prove it was posted. FIRST in the note: the connector truncates a long comment from the end. */

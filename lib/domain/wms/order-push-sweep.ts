@@ -1144,12 +1144,10 @@ export interface WmsOrderPushPort {
    * `removalNoteContext` reads what the obligation's link and order are NOW, so a row that no longer describes anything is never posted.
    */
   recordRemovalNote?(connector: string, note: { linkId: string; orderId: string; externalOrderId: string; items: RemovalNoteItem[] }): Promise<WmsRemovalNoteObligation>
-  readRemovalNote?(connector: string, linkId: string): Promise<WmsRemovalNoteObligation | null>
-  updateRemovalNote?(connector: string, linkId: string, patch: Partial<Pick<WmsRemovalNoteObligation, 'state' | 'attempted' | 'items' | 'detail'>>): Promise<boolean>
+  readRemovalNote?(connector: string, linkId: string, externalOrderId: string): Promise<WmsRemovalNoteObligation | null>
+  updateRemovalNote?(connector: string, linkId: string, externalOrderId: string, patch: Partial<Pick<WmsRemovalNoteObligation, 'state' | 'attempted' | 'items' | 'detail'>>): Promise<boolean>
   pendingRemovalNotes?(connector: string, limit: number): Promise<WmsRemovalNoteObligation[]>
-  clearRemovalNote?(connector: string, linkId: string): Promise<boolean>
-  /** Move a needs_check obligation out of its link's slot (it stays under the same prefix for an operator, and is never listed as pending). */
-  quarantineRemovalNote?(connector: string, linkId: string): Promise<void>
+  clearRemovalNote?(connector: string, linkId: string, externalOrderId: string): Promise<boolean>
   removalNoteContext?(linkId: string): Promise<{ linkState: string; externalOrderId: string | null; orderId: string; orderNumber: string | null; erased: boolean; cancellable: boolean } | null>
   /** Notices whose warehouse note was never delivered (the comment failed, was shadowed, or the connector could not post). */
   noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date }>>
@@ -1333,7 +1331,7 @@ export async function runWmsOrderPushSweepCore(
    * REMOVAL_NOTE_KEY_PREFIX with the reason in `detail`, until an operator has looked at the warehouse order's comments.
    */
   const markRemovalNoteNeedsCheck = async (ob: WmsRemovalNoteObligation, detail: string) => {
-    const moved = await port.updateRemovalNote?.(connectorId, ob.linkId, { state: 'needs_check', detail }).catch(() => false)
+    const moved = await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'needs_check', detail }).catch(() => false)
     if (!moved) return
     removalNoteNeedsCheckCount += 1
     console.error(`[wms-order-push] removal note for link ${ob.linkId} on WMS order ${ob.externalOrderId} needs a check: ${detail}`)
@@ -1350,7 +1348,7 @@ export async function runWmsOrderPushSweepCore(
    * (anything but a definite "nothing was sent"), go to needs_check. Only a definite refusal clears the flag and is retried.
    */
   const deliverRemovalNote = async (ob: WmsRemovalNoteObligation, orderLabel: string): Promise<'posted' | 'pending' | 'needs_check'> => {
-    const clear = () => port.clearRemovalNote?.(connectorId, ob.linkId).catch((e) => console.error('[wms-order-push] could not clear the removal note obligation', e))
+    const clear = () => port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch((e) => console.error('[wms-order-push] could not clear the removal note obligation', e))
     const marker = removalNoteMarker(ob)
     if (ob.attempted) {
       if (!connector.readOrderComments) {
@@ -1370,7 +1368,7 @@ export async function runWmsOrderPushSweepCore(
       }
       // The marker is not there: the earlier attempt provably did not land, so one post is correct.
     }
-    const armed = await port.updateRemovalNote?.(connectorId, ob.linkId, { attempted: true }).catch(() => false)
+    const armed = await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { attempted: true }).catch(() => false)
     // Nothing is sent that cannot first be recorded as sent.
     if (!armed) return 'pending'
     const out = await attemptComment(ob.externalOrderId, `${marker} ${wmsMergedRemovalComment(orderLabel, ob.items)}`, ob.orderId)
@@ -1379,7 +1377,7 @@ export async function runWmsOrderPushSweepCore(
       return 'posted'
     }
     if (out.result === 'skipped' || out.definiteRefusal) {
-      await port.updateRemovalNote?.(connectorId, ob.linkId, { attempted: false }).catch((e) => console.error('[wms-order-push] could not re-arm the removal note', e))
+      await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { attempted: false }).catch((e) => console.error('[wms-order-push] could not re-arm the removal note', e))
       return 'pending'
     }
     // UNCERTAIN (it may have been accepted). `attempted` stays set. A connector that can read the order's comments settles it on the next
@@ -1540,7 +1538,7 @@ export async function runWmsOrderPushSweepCore(
      */
     const completeRemoval = async (removed: WmsOrderItemRef[], obligation: WmsRemovalNoteObligation | null) => {
       if (obligation && obligation.state === 'intended') {
-        await port.updateRemovalNote!(connectorId, link.id, { state: 'owed', items: removed.map(toRemovalNoteItem) })
+        await port.updateRemovalNote!(connectorId, link.id, survivorId, { state: 'owed', items: removed.map(toRemovalNoteItem) })
       }
       // A link that moved on is not closed, audited or noted: whatever obligation remains is judged against the link as it now is.
       if (!(await settleCancelled())) return
@@ -1554,24 +1552,18 @@ export async function runWmsOrderPushSweepCore(
         return
       }
       if (obligation.state === 'needs_check') return
-      const current = await port.readRemovalNote?.(connectorId, link.id)
+      const current = await port.readRemovalNote?.(connectorId, link.id, survivorId)
       if (current && current.state === 'owed') await deliverRemovalNote(current, orderLabel)
     }
     // CONSULT THE OBLIGATION FIRST. A removal that was interrupted after the (irreversible) deletes leaves the lines gone, and asking the
     // connector to delete them again would be refused as "lines already missing". The obligation, written before the first delete, says
     // what was being removed: when it is already owed (or needs a check) the lines were verified gone; when it is only intended, a
     // read-only look at the warehouse order decides (every line absent = the removal happened).
-    let obligation: WmsRemovalNoteObligation | null = port.readRemovalNote ? await port.readRemovalNote(connectorId, link.id) : null
-    // THE OBLIGATION MUST BE ABOUT THIS ORDER ON THIS WAREHOUSE ORDER. The dispatch sweep can re-point a live link at another warehouse
-    // order, so an obligation is used only when its order id and warehouse order id equal the current link's. A stale one never completes a
-    // removal or posts a note: owed / intended is dropped (and logged); needs_check is kept for the operator but moved out of this link's
-    // slot, so it neither short-circuits the current warehouse order nor shadows the obligation recorded for it.
-    if (obligation && (obligation.orderId !== link.orderId || obligation.externalOrderId !== survivorId)) {
-      console.error(`[wms-order-push] removal note obligation (${obligation.state}) for link ${link.id} was recorded for WMS order ${obligation.externalOrderId}, not ${survivorId}: it is not used`)
-      if (obligation.state === 'needs_check') await port.quarantineRemovalNote!(connectorId, link.id)
-      else await port.clearRemovalNote?.(connectorId, link.id)
-      obligation = null
-    }
+    let obligation: WmsRemovalNoteObligation | null = port.readRemovalNote ? await port.readRemovalNote(connectorId, link.id, survivorId) : null
+    // Obligations are keyed by (link, warehouse order), so the one read here is for the warehouse order this link names NOW: an obligation
+    // recorded for an earlier warehouse order (the dispatch sweep re-pointed the link) is never found here, so it can neither complete this
+    // removal nor be overwritten by it; it is judged by the retry pass, which posts a VERIFIED (owed) note to its own warehouse order.
+    if (obligation && obligation.orderId !== link.orderId) obligation = null
     if (obligation && (obligation.state === 'owed' || obligation.state === 'needs_check')) {
       await completeRemoval(obligation.items, obligation)
       return
@@ -1596,7 +1588,7 @@ export async function runWmsOrderPushSweepCore(
     }
     if (removal.kind === 'ONLY_LINES_LEFT') {
       // Nothing was deleted and no note applies on this path (the survivor is cancelled instead, or a notice raised).
-      await port.clearRemovalNote?.(connectorId, link.id).catch(() => {})
+      await port.clearRemovalNote?.(connectorId, link.id, survivorId).catch(() => {})
       // The merged order holds nothing but this order's lines (the other order's were taken out, or it was cancelled before): it is
       // cancelled like any order, through the same clearance.
       const cancel = await connector.cancelMergedOrder!(survivorId, { orderNumber: link.externalOrderNumber ?? null }, items, seam.clearance)
@@ -1624,7 +1616,7 @@ export async function runWmsOrderPushSweepCore(
     // REFUSED: whatever was deleted is forgotten (it is no longer on the warehouse order), and the notice names both halves.
     // A partial removal is told to the operator by that notice, so no removal note is owed. A refusal that deleted nothing keeps the
     // 'intended' obligation: if the lines are later found gone it becomes owed; if the removal is no longer wanted it is dropped.
-    if (removal.removed.length > 0) await port.clearRemovalNote?.(connectorId, link.id).catch(() => {})
+    if (removal.removed.length > 0) await port.clearRemovalNote?.(connectorId, link.id, survivorId).catch(() => {})
     if (removal.removed.length > 0) await port.dropOrderItems?.(link.id, removal.removed.map((item) => item.externalItemId)).catch(() => {})
     const reason = scrubWmsError(removal.reason, 'the removal was refused')
     const removedText = removal.removed.length > 0 ? `REMOVED so far: ${describeWmsOrderItems(removal.removed)}. ` : 'Nothing was removed. '
@@ -3385,9 +3377,15 @@ export async function runWmsOrderPushSweepCore(
       if (ob.state === 'needs_check') continue
       const ctx = await port.removalNoteContext?.(ob.linkId).catch(() => undefined)
       if (ctx === undefined) continue
-      if (ctx === null || ctx.orderId !== ob.orderId || ctx.erased || ctx.externalOrderId !== ob.externalOrderId) {
-        console.error(`[wms-order-push] dropping removal note obligation for link ${ob.linkId}: its link or order no longer matches (reset, deletion, erasure or a re-pointed link); nothing is posted`)
-        await port.clearRemovalNote?.(connectorId, ob.linkId).catch(() => {})
+      // A link or order that is gone (a reset, a deletion), an erased order, or a link that is another order's is never posted for. The
+      // link's CURRENT warehouse order is NOT compared for an OWED obligation: owed means the removal was verified on THIS obligation's
+      // warehouse order, so its note belongs there even if the link has since been re-pointed. An INTENDED one for an order the link no
+      // longer names was never verified (the removal did not run on, or cannot be tied to, the current order): stale, dropped.
+      const gone = ctx === null || ctx.orderId !== ob.orderId || ctx.erased
+      const staleIntended = ob.state === 'intended' && ctx !== null && ctx.externalOrderId !== ob.externalOrderId
+      if (gone || staleIntended) {
+        console.error(`[wms-order-push] dropping removal note obligation for link ${ob.linkId}: ${gone ? 'its link or order is gone, erased or no longer the same order (reset, deletion, erasure)' : 'it was only intended for a warehouse order the link no longer names'}; nothing is posted`)
+        await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
         continue
       }
       let current = ob
@@ -3395,16 +3393,16 @@ export async function runWmsOrderPushSweepCore(
         const lines = connector.fetchOrderItemRefs ? await connector.fetchOrderItemRefs(ob.externalOrderId).catch(() => null) : null
         const confirmedGone = lines !== null && !ob.items.some((item) => lines.some((line) => line.externalItemId === item.externalItemId))
         if (confirmedGone) {
-          if (!(await port.updateRemovalNote?.(connectorId, ob.linkId, { state: 'owed' }).catch(() => false))) continue
+          if (!(await port.updateRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId, { state: 'owed' }).catch(() => false))) continue
           current = { ...ob, state: 'owed' }
         } else {
-          if (lines !== null && !ctx.cancellable) await port.clearRemovalNote?.(connectorId, ob.linkId).catch(() => {})
+          if (lines !== null && !ctx.cancellable) await port.clearRemovalNote?.(connectorId, ob.linkId, ob.externalOrderId).catch(() => {})
           continue
         }
       }
       // A link that is still LIVE and still cancellable is closed by the cancel pass (which consults this obligation and delivers the note
       // after closing it): delivering here first would leave the link open with the note spent.
-      if (ctx.linkState !== 'CANCELLED' && ctx.cancellable) continue
+      if (ctx.externalOrderId === ob.externalOrderId && ctx.linkState !== 'CANCELLED' && ctx.cancellable) continue
       if (await deliverRemovalNote(current, ctx.orderNumber ?? current.orderId) === 'posted') noticeCommentsRetried += 1
     }
     for (const link of await port.holdableLinks(connectorId, batchSize)) {
@@ -4250,7 +4248,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       return hold.count + cancel.count
     },
     async recordRemovalNote(connector, note) {
-      const key = removalNoteKey(connector, note.linkId)
+      const key = removalNoteKey(connector, note.linkId, note.externalOrderId)
       const fresh: WmsRemovalNoteObligation = { id: randomUUID(), linkId: note.linkId, orderId: note.orderId, externalOrderId: note.externalOrderId, state: 'intended', attempted: false, items: note.items }
       // update: {} — an obligation already recorded (an interrupted removal retried) is left exactly as it was.
       await db.setting.upsert({ where: { key }, create: { key, value: serializeRemovalNote(fresh) }, update: {} })
@@ -4259,12 +4257,12 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (!stored) throw new Error(`the removal note obligation for link ${note.linkId} could not be read back`)
       return stored
     },
-    async readRemovalNote(connector, linkId) {
-      const row = await db.setting.findUnique({ where: { key: removalNoteKey(connector, linkId) }, select: { value: true } })
+    async readRemovalNote(connector, linkId, externalOrderId) {
+      const row = await db.setting.findUnique({ where: { key: removalNoteKey(connector, linkId, externalOrderId) }, select: { value: true } })
       return row ? parseRemovalNote(row.value) : null
     },
-    async updateRemovalNote(connector, linkId, patch) {
-      const key = removalNoteKey(connector, linkId)
+    async updateRemovalNote(connector, linkId, externalOrderId, patch) {
+      const key = removalNoteKey(connector, linkId, externalOrderId)
       return db.$transaction(async (tx) => {
         const rows = await tx.$queryRaw<Array<{ value: string }>>`SELECT value FROM settings WHERE key = ${key} FOR UPDATE`
         const current = rows[0] ? parseRemovalNote(rows[0].value) : null
@@ -4292,18 +4290,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       }
       return owed
     },
-    async quarantineRemovalNote(connector, linkId) {
-      const key = removalNoteKey(connector, linkId)
-      await db.$transaction(async (tx) => {
-        const row = await tx.setting.findUnique({ where: { key }, select: { value: true } })
-        const ob = row ? parseRemovalNote(row.value) : null
-        if (!row || !ob) return
-        await tx.setting.create({ data: { key: `${key}:stale:${ob.id}`, value: row.value } })
-        await tx.setting.delete({ where: { key } })
-      })
-    },
-    async clearRemovalNote(connector, linkId) {
-      const { count } = await db.setting.deleteMany({ where: { key: removalNoteKey(connector, linkId) } })
+    async clearRemovalNote(connector, linkId, externalOrderId) {
+      const { count } = await db.setting.deleteMany({ where: { key: removalNoteKey(connector, linkId, externalOrderId) } })
       return count > 0
     },
     async removalNoteContext(linkId) {
