@@ -120,16 +120,42 @@ test('negative opening stock keeps the row visible as already below', () => {
   assert.equal(result.firstShortageDate, '2026-06-10')
 })
 
-test('an inbound due today does not turn an already-below row into a projection (opening stock decides)', () => {
+test('an arrival due today counts in day-0 stock: opening 15 + 500 due today is not already below and not overdue', () => {
   const result = project({ openingQty: 15, inbound: [{ date: '2026-06-10', qty: 500 }] })
-  assert.equal(result.basis, 'already_below')
+  assert.equal(result.basis, 'projected')
+  assert.equal(result.latestPoOverdue, false)
+  // 515 - 10k <= 20 first at k = 50
+  assert.equal(result.requiredReceiptDate, '2026-07-30')
 })
 
-test('a late (past-dated) PO is clamped to today for the shortage date', () => {
+test('an arrival due today that is too small to lift day-0 stock above safety stock stays already below', () => {
+  const result = project({ openingQty: 15, inbound: [{ date: '2026-06-10', qty: 5 }] }) // 20 <= 20
+  assert.equal(result.basis, 'already_below')
+  assert.equal(result.latestPoOverdue, true)
+})
+
+test('a late (past-dated) PO is NOT assured stock: dates and Overdue ignore it and it is reported separately', () => {
   const late = project({ inbound: [{ date: '2026-05-01', qty: 150 }] })
-  const today = project({ inbound: [{ date: '2026-06-10', qty: 150 }] })
-  assert.equal(late.requiredReceiptDate, today.requiredReceiptDate)
-  assert.equal(late.requiredReceiptDate, '2026-07-03')
+  const none = project()
+  assert.equal(late.requiredReceiptDate, none.requiredReceiptDate)
+  assert.equal(late.latestPoDate, none.latestPoDate)
+  assert.equal(late.lateInboundQty.toString(), '150')
+  assert.equal(late.lateInboundEarliestDate, '2026-05-01')
+  assert.equal(none.lateInboundQty.toString(), '0')
+  assert.equal(none.lateInboundEarliestDate, null)
+})
+
+test('a late PO cannot hide Overdue on an already-below row', () => {
+  const result = project({ openingQty: 15, inbound: [{ date: '2026-06-01', qty: 5000 }, { date: '2026-06-05', qty: 100 }] })
+  assert.equal(result.basis, 'already_below')
+  assert.equal(result.latestPoOverdue, true)
+  assert.equal(result.lateInboundQty.toString(), '5100')
+  assert.equal(result.lateInboundEarliestDate, '2026-06-01')
+})
+
+test('late stock is reported even with no demand or beyond the horizon', () => {
+  assert.equal(project({ averageDailyDemand: 0, inbound: [{ date: '2026-06-01', qty: 7 }] }).lateInboundQty.toString(), '7')
+  assert.equal(project({ openingQty: 100000, inbound: [{ date: '2026-06-01', qty: 7 }] }).lateInboundQty.toString(), '7')
 })
 
 test('lead time 0: latestPoDate equals requiredReceiptDate and is not overdue', () => {

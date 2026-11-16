@@ -34,6 +34,8 @@ function row(over: Partial<ReorderReportRow> & { productId: string }): ReorderRe
     latestPoDate: null,
     latestPoOverdue: false,
     timingBasis: 'no_demand',
+    lateInboundQty: '0',
+    lateInboundDueDate: null,
     firstShortageDate: null,
     neededFor: ['Direct sales'],
   }

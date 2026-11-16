@@ -16,8 +16,12 @@ import { UTC_DAY_MS, dateOnly, parseOptionalDateOnly, startOfUtcDay, subtractUtc
  *
  * Model: day 0 is `asOf` (UTC day) holding `openingQty`. Each later day consumes
  * `averageDailyDemand`. An inbound arrival dated D is added to the stock of day D (it is on the
- * shelf for that day's check). Arrivals dated before `asOf` (late POs) are clamped to day 0.
- * Arrivals beyond the horizon are ignored. Callers must pass only DATED arrivals: an unknown
+ * shelf for that day's check), including arrivals dated today (day 0): the day-0 stock is opening
+ * plus day-0 arrivals, and the "already below safety stock" test uses that same figure.
+ * Arrivals dated BEFORE `asOf` are LATE: still unreceived, so no date is known for them. They are
+ * excluded from the projection (assured stock only) and reported as `lateInboundQty` /
+ * `lateInboundEarliestDate` so the caller can show them separately. Arrivals beyond the horizon
+ * are ignored. Callers must pass only DATED arrivals: an unknown
  * arrival date cannot rescue a shortage date.
  */
 
@@ -64,23 +68,36 @@ export type StockProjection = {
   firstShortageDate: string | null
   /** latestPoDate is before asOf: the PO should already have been placed. */
   latestPoOverdue: boolean
+  /** Unreceived quantity whose expected delivery is before asOf. NOT in the projection above. */
+  lateInboundQty: Prisma.Decimal
+  /** Earliest of those past due dates (YYYY-MM-DD), or null when nothing is late. */
+  lateInboundEarliestDate: string | null
   basis: StockProjectionBasis
 }
 
 const ZERO = new Prisma.Decimal(0)
 
-function arrivalOffsets(input: StockProjectionInput, asOfDay: Date, horizon: number): Map<number, Prisma.Decimal> {
+type Arrivals = { offsets: Map<number, Prisma.Decimal>; lateQty: Prisma.Decimal; lateEarliest: string | null }
+
+function arrivalOffsets(input: StockProjectionInput, asOfDay: Date, horizon: number): Arrivals {
   const offsets = new Map<number, Prisma.Decimal>()
+  let lateQty = ZERO
+  let lateEarliest: string | null = null
   for (const arrival of input.inbound) {
     const qty = toDecimal(arrival.qty)
     if (qty.lte(0)) continue
     const parsed = parseOptionalDateOnly(arrival.date)
     if (!parsed) throw new RangeError(`Invalid inbound arrival date: ${arrival.date}`)
-    const offset = Math.max(0, Math.round((parsed.getTime() - asOfDay.getTime()) / UTC_DAY_MS))
+    const offset = Math.round((parsed.getTime() - asOfDay.getTime()) / UTC_DAY_MS)
+    if (offset < 0) {
+      lateQty = lateQty.add(qty)
+      if (lateEarliest == null || arrival.date < lateEarliest) lateEarliest = arrival.date
+      continue
+    }
     if (offset > horizon) continue
     offsets.set(offset, (offsets.get(offset) ?? ZERO).add(qty))
   }
-  return offsets
+  return { offsets, lateQty, lateEarliest }
 }
 
 /**
@@ -119,7 +136,8 @@ export function projectStockPosition(input: StockProjectionInput): StockProjecti
   const opening = toDecimal(input.openingQty)
   const demand = toDecimal(input.averageDailyDemand)
   const safety = toDecimal(input.safetyStockQty)
-  const arrivals = arrivalOffsets(input, asOfDay, horizon)
+  const { offsets: arrivals, lateQty, lateEarliest } = arrivalOffsets(input, asOfDay, horizon)
+  const late = { lateInboundQty: lateQty, lateInboundEarliestDate: lateEarliest }
   const dayDate = (offset: number): string => dateOnly(new Date(asOfDay.getTime() + offset * UTC_DAY_MS))
 
   const dailyQty: StockProjectionDay[] = []
@@ -133,16 +151,17 @@ export function projectStockPosition(input: StockProjectionInput): StockProjecti
   }
 
   if (demand.lte(0)) {
-    return { dailyQty, requiredReceiptDate: null, latestPoDate: null, firstShortageDate: null, latestPoOverdue: false, basis: 'no_demand' }
+    return { dailyQty, requiredReceiptDate: null, latestPoDate: null, firstShortageDate: null, latestPoOverdue: false, basis: 'no_demand', ...late }
   }
 
   const shortageOffset = firstDayAtOrBelow(ZERO, opening, demand, arrivals, horizon)
   const firstShortageDate = shortageOffset == null ? null : dayDate(shortageOffset)
-  const alreadyBelow = opening.lte(safety)
+  // Day-0 stock is opening plus arrivals dated today: the same curve the date solver uses.
+  const alreadyBelow = opening.add(arrivals.get(0) ?? ZERO).lte(safety)
   const requiredOffset = alreadyBelow ? 0 : firstDayAtOrBelow(safety, opening, demand, arrivals, horizon)
 
   if (requiredOffset == null) {
-    return { dailyQty, requiredReceiptDate: null, latestPoDate: null, firstShortageDate, latestPoOverdue: false, basis: 'beyond_horizon' }
+    return { dailyQty, requiredReceiptDate: null, latestPoDate: null, firstShortageDate, latestPoOverdue: false, basis: 'beyond_horizon', ...late }
   }
   const requiredDate = new Date(asOfDay.getTime() + requiredOffset * UTC_DAY_MS)
   const latestPo = subtractUtcDays(requiredDate, input.leadTimeDays)
@@ -153,5 +172,6 @@ export function projectStockPosition(input: StockProjectionInput): StockProjecti
     firstShortageDate,
     latestPoOverdue: latestPo.getTime() < asOfDay.getTime(),
     basis: alreadyBelow ? 'already_below' : 'projected',
+    ...late,
   }
 }

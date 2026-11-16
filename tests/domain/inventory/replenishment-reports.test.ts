@@ -172,6 +172,47 @@ test('reorder timing steps dated open POs in, excludes undated ones and says so 
   assert.ok(report.notices.some((notice) => /1 row\(s\) have open PO quantity with no expected delivery date/.test(notice)))
 })
 
+test('reorder timing: a late PO is not assured stock, a PO due today is (o3d-s8n.2 review)', async () => {
+  const mk = (id: string, sku: string) => ({
+    id, sku, name: sku, type: ProductType.SIMPLE, stockUnit: 'pcs',
+    reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('20'), leadTimeDays: 5,
+    category, preferredSupplier: null,
+    supplierProducts: [{ supplierId: 'supplier-1', supplierSku: sku, lastUnitCost: decimal('2'), leadTimeDays: 5, supplier }],
+  })
+  const level = (productId: string) => ({ productId, warehouseId: 'warehouse-1', quantity: decimal('15'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } })
+  const sale = (productId: string, sku: string) => ({
+    productId, qty: decimal('900'), totalValueBase: decimal('1800'), createdAt: new Date('2026-05-20T12:00:00.000Z'),
+    product: { sku, name: sku, category, supplierProducts: [{ supplier }] },
+  })
+  const poLine = (productId: string, expected: string) => ({
+    productId, qty: decimal('500'), qtyReceived: decimal('0'), qtyReturned: decimal('0'),
+    po: { supplierId: 'supplier-1', expectedDelivery: new Date(expected), destinationWarehouseId: 'warehouse-1', supplier },
+  })
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: { findMany: async () => [mk('late', 'LATE'), mk('today', 'TODAY')] },
+    stockLevel: { findMany: async () => [level('late'), level('today')] },
+    stockMovement: { findMany: async () => [sale('late', 'LATE'), sale('today', 'TODAY')] },
+    purchaseOrderLine: { findMany: async () => [poLine('late', '2026-05-25T00:00:00.000Z'), poLine('today', '2026-06-01T00:00:00.000Z')] },
+  }
+  const report = await getReorderReport(
+    { thresholdDays: 90, includeZero: true },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+  const late = report.rows.find((row) => row.sku === 'LATE')
+  // Opening 15 <= safety 20; the 500 PO is a week overdue and not assured: stays overdue.
+  assert.equal(late?.timingBasis, 'already_below')
+  assert.equal(late?.latestPoOverdue, true)
+  assert.equal(late?.lateInboundQty, '500')
+  assert.equal(late?.lateInboundDueDate, '2026-05-25')
+  const today = report.rows.find((row) => row.sku === 'TODAY')
+  // 515 on day 0 clears safety stock: projected, not overdue, nothing late.
+  assert.equal(today?.timingBasis, 'projected')
+  assert.equal(today?.latestPoOverdue, false)
+  assert.equal(today?.lateInboundQty, '0')
+  assert.ok(report.notices.some((notice) => /1 row\(s\) have open PO quantity past its expected delivery date/.test(notice)))
+})
+
 test('reorder demand is scoped to the filtered warehouse, like the stock it is compared against (o3d-s8n.1)', async () => {
   // Demand must come from the SAME warehouse as availableQty. Its siblings already scope — stock levels
   // by warehouseId, open POs by destinationWarehouseId — so a company-wide demand figure divided into

@@ -262,6 +262,10 @@ export type ReorderReportRow = {
   /** latestPoDate is before today. */
   latestPoOverdue: boolean
   timingBasis: StockProjectionBasis
+  /** Unreceived open PO quantity whose expected delivery has passed. Excluded from the dates above. */
+  lateInboundQty: string
+  /** Earliest past expected-delivery date among those late lines, or null. */
+  lateInboundDueDate: string | null
   /** First day projected available is at or below zero. */
   firstShortageDate: string | null
   /**
@@ -854,6 +858,7 @@ export async function getReorderReport(
   const inboundArrivals = inboundArrivalsByProduct(openPoLines)
   const undatedInboundIds = undatedInboundProductIds(openPoLines)
   let undatedInboundRows = 0
+  let lateInboundRows = 0
   const velocityByProduct = new Map(calculateDailyVelocity(velocityInputs, window).map((row) => [row.productId, row]))
   const defaultLeadTimeSkus: string[] = []
   const derivedLeadTimeSkus: string[] = []
@@ -1124,6 +1129,7 @@ export async function getReorderReport(
       inbound: inboundArrivals.get(candidate.product.id) ?? [],
     })
     if (undatedInboundIds.has(candidate.product.id)) undatedInboundRows += 1
+    if (timing.lateInboundQty.gt(0)) lateInboundRows += 1
 
     // Supplier-column label policy: BOM rows surface manufacturer info from
     // the latest ProductionOrder; everything else shows the resolved supplier.
@@ -1176,6 +1182,8 @@ export async function getReorderReport(
       latestPoDate: timing.latestPoDate,
       latestPoOverdue: timing.latestPoOverdue,
       timingBasis: timing.basis,
+      lateInboundQty: integerQuantityString(timing.lateInboundQty),
+      lateInboundDueDate: timing.lateInboundEarliestDate,
       firstShortageDate: timing.firstShortageDate,
       neededFor,
     })
@@ -1230,7 +1238,8 @@ export async function getReorderReport(
       'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
       'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
-      'Required receipt is the day projected available stock falls to safety stock (to zero when safety stock is 0): current available, less daily demand, plus each open PO on its expected delivery date. Latest PO date is that day minus the lead time; it is the same statement as the reorder point, in dates. BOM-driven component demand and a manually set reorder point change the reorder point but not these dates.',
+      'Required receipt is the day projected available stock falls to safety stock (to zero when safety stock is 0): current available, less daily demand, plus each open PO on its expected delivery date (POs already past due are left out and flagged as late). Latest PO date is that day minus the lead time; it is the same statement as the reorder point, in dates. BOM-driven component demand and a manually set reorder point change the reorder point but not these dates.',
+      ...(lateInboundRows > 0 ? [`${lateInboundRows} row(s) have open PO quantity past its expected delivery date (late POs). That stock is not yet received, so it is left out of Required receipt, Latest PO date and Overdue and shown separately as a Late PO badge.`] : []),
       ...(undatedInboundRows > 0 ? [`${undatedInboundRows} row(s) have open PO quantity with no expected delivery date. Those quantities are counted in Inbound PO but excluded from the dates, because an unknown arrival cannot rescue a run-out date.`] : []),
       ...(unplannedBomSkus.length > 0 ? [`No claimed recipe: component demand not planned for ${unplannedBomSkus.length} BOM product(s) that need building: ${unplannedBomSkus.slice(0, 10).join(', ')}${unplannedBomSkus.length > 10 ? ', ...' : ''}. Import or claim a recipe for them.`] : []),
       ...(derivedLeadTimeSkus.length > 0 ? [`Supplier/category median lead time used for ${derivedLeadTimeSkus.length} SKU(s) with no configured or observed lead time of their own: ${derivedLeadTimeSkus.slice(0, 10).join(', ')}${derivedLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),

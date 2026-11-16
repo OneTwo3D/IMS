@@ -78,7 +78,25 @@ const ABC_BADGE: Record<ReorderReportRow['abcClass'], string> = {
 const MUTED_DASH = '\u2014'
 
 /** Latest PO date with a red Overdue badge, or an em dash and a muted reason when no date exists. */
+function LatePoBadge({ row }: { row: ReorderReportRow }) {
+  if (Number(row.lateInboundQty) <= 0) return null
+  return (
+    <span className="mt-0.5 block w-fit rounded border border-amber-200 bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800" title="Open PO quantity past its expected delivery date. Not counted in the dates here until it is received or re-dated.">
+      Late PO: {row.lateInboundQty} due {row.lateInboundDueDate}
+    </span>
+  )
+}
+
 function LatestPoDateCell({ row }: { row: ReorderReportRow }) {
+  return (
+    <div>
+      <LatestPoDateText row={row} />
+      <LatePoBadge row={row} />
+    </div>
+  )
+}
+
+function LatestPoDateText({ row }: { row: ReorderReportRow }) {
   if (row.latestPoDate == null) {
     return (
       <span className="text-muted-foreground" title={row.timingBasis === 'no_demand' ? 'No sales demand, so no run-out date' : `No depletion within ${PROJECTION_HORIZON_LABEL}`}>

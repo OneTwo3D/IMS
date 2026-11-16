@@ -13,7 +13,7 @@ import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
 import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const EXPORT_COLUMNS: Record<string, string[]> = {
-  'reorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency', 'requiredReceiptDate', 'latestPoDate', 'latestPoOverdue', 'timingBasis', 'firstShortageDate'],
+  'reorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency', 'requiredReceiptDate', 'latestPoDate', 'latestPoOverdue', 'timingBasis', 'firstShortageDate', 'lateInboundQty', 'lateInboundDueDate'],
   'backorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt'],
   'component-shortage': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts'],
 }
@@ -126,6 +126,8 @@ export async function GET(req: NextRequest) {
         latestPoOverdue: row.latestPoOverdue ? 'yes' : 'no',
         timingBasis: row.timingBasis,
         firstShortageDate: row.firstShortageDate ?? '',
+        lateInboundQty: row.lateInboundQty,
+        lateInboundDueDate: row.lateInboundDueDate ?? '',
       }))
       return csvResponseWithNotices(toCsv(data, EXPORT_COLUMNS['reorder']), `reorder-${date}.csv`, report.notices, { includeInBody })
     }
