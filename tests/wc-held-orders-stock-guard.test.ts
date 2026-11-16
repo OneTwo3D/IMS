@@ -92,7 +92,7 @@ test('held units come out of warehouse rows in turn and never below zero', () =>
 })
 
 test('fails closed when the order read errors, throws, is not a list, or is truncated', async () => {
-  const bad = async (d: Partial<WcHeldUnitsDeps>) => (await loadWcHeldUnitsByProduct(deps(d))).ok
+  const bad = async (d: Partial<WcHeldUnitsDeps> & { pages?: unknown[][] }) => (await loadWcHeldUnitsByProduct(deps(d))).ok
   assert.equal(await bad({ fetchOrdersPage: async () => ({ data: null, error: 'WC API error: 500' }) }), false)
   assert.equal(await bad({ fetchOrdersPage: async () => { throw new Error('boom') } }), false)
   assert.equal(await bad({ fetchOrdersPage: async () => ({ data: { not: 'a list' } }) }), false)
