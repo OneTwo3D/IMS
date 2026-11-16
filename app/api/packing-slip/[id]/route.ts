@@ -128,7 +128,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         line.product.name,
         '', // Location — no shelf field in schema yet
         String(Number(line.qty)),
-        '\u2610', // ☐ ballot box
+        '[   ]', // tick box (the built-in and embedded fonts have no ballot-box glyph)
       ])
 
       drawTable(doc, columns, rows, branding)
@@ -174,7 +174,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         product?.name ?? row.name,
         '',
         String(row.qty),
-        '\u2610',
+        '[   ]',
       ]
     })
 

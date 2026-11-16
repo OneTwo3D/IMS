@@ -23,6 +23,7 @@ function baseInput(overrides: Partial<Parameters<typeof planMintsoftAlignDown>[0
     reasonConfigured: true,
     thresholds: { absoluteDelta: 5, percentDelta: null },
     openAsnPendingQty: 0,
+    inFlightDispatchQty: 0,
     priorDiscrepancy: { delta: -3, lastSeenAt: PRIOR_RUN },
     runStartedAt: RUN_START,
     ...overrides,
@@ -123,4 +124,14 @@ test('planMintsoftAlignDown accepts a prior delta equal within tolerance (Decima
     priorDiscrepancy: { delta: -3.00001, lastSeenAt: PRIOR_RUN },
   }))
   assert.equal(withinTolerance.action, 'apply')
+})
+
+test('planMintsoftAlignDown holds while a despatch is in flight, even when the delta has persisted', () => {
+  const decision = planMintsoftAlignDown(baseInput({ inFlightDispatchQty: 2 }))
+  assert.equal(decision.action, 'hold')
+  if (decision.action === 'hold') assert.match(decision.reason, /despatched at the WMS but not yet recorded as shipped/)
+})
+
+test('planMintsoftAlignDown applies again once no despatch is in flight', () => {
+  assert.equal(planMintsoftAlignDown(baseInput({ inFlightDispatchQty: 0 })).action, 'apply')
 })

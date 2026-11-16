@@ -79,6 +79,7 @@ run_step 'type-check'                     npm run type-check
 run_step 'decimal boundaries'             npm run check:decimal-boundaries
 run_step 'connector fetch boundaries'     npm run check:connector-fetch-boundaries
 run_step 'migration conventions'          npm run check:migration-conventions
+run_step 'changelog fragments'            npm run check:changelog-fragments
 # o3d-ok6hk: these four were in check:all but in no workflow and not here, so they ran only when
 # someone typed check:all. They are ALSO run by .github/workflows/static-guards.yml, which is ungated
 # (this script's CI job is classifier-gated and skips a Markdown-only diff, and check:documented-env-vars

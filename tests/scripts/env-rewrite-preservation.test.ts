@@ -935,6 +935,7 @@ test('re-run: the decoder is bounded, and a value still decodable at the bound i
 
 /** Environment variables read by the code that a re-run deliberately does NOT carry, each with the reason. */
 const NOT_CARRIED: Record<string, string> = {
+  GITHUB_HEAD_REF: 'set by GitHub Actions on pull requests; read only by scripts/check-changelog-fragments.mjs in CI',
   // secrets and credentials: copied from the root-only backup by an operator who needs them
   ANTHROPIC_API_KEY: 'secret',
   ENCRYPTION_KEY: 'secret',
