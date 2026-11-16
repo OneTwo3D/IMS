@@ -2607,6 +2607,8 @@ model StockCount {
   completedAt DateTime?
   /// When the counted lines were last reconciled against live on-hand (the instant each line's reconciledQty was stamped). Null = never.
   reconciledAt DateTime?
+  /// True when the operator chose the product list before counting started (a prepared stocktake); false = whole-warehouse snapshot.
+  prepared    Boolean          @default(false)
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
 
@@ -2631,6 +2633,7 @@ model StockCountLine {
 
   count           StockCount @relation(fields: [countId], references: [id])
 
+  @@unique([countId, productId])
   @@index([countId])
   @@index([productId])
   @@index([sku(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_count_lines_sku_trgm_idx")
