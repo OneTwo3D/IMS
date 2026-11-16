@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
+import { Prisma } from '@/app/generated/prisma/client'
 
 /**
  * LOCATION BUFFER: the save path, its audit entry and permission, the enqueue, and the fence around who may read bufferQty.
@@ -42,7 +43,7 @@ const tx = {
   // The FOR UPDATE read of the one row (tagged template: values are [productId, warehouseId]).
   $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
     state.ops.push({ op: 'lock', warehouseId: String(values[1]) })
-    return [{ bufferQty: { toString: () => String(state.rows.get(String(values[1])) ?? 0) } }]
+    return [{ bufferQty: new Prisma.Decimal(String(state.rows.get(String(values[1])) ?? 0)) }]
   },
   activityLog: { create: async (args: { data: Record<string, unknown> }) => { state.activity.push(args.data) } },
 }
