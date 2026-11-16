@@ -97,6 +97,12 @@ An open task never turns the `wms-order-push` job red; the job's result reports 
 
 **Integrations > Exceptions** is the inbox for items the warehouse link could not finish. Sections include a maintenance window, blocked order pushes, dead inbound events, despatches that could not be reconciled, unreadable records, order-level drift and order-total mismatches. Each row has **Replay** (try again safely) and **Dismiss**, or **Mark as handled** once you have fixed it by hand. A despatch for an order under a withdrawal hold is held back again when replayed. Unreadable records can be isolated so that one bad record does not stop the rest.
 
+### Possible double postage on merged orders
+
+When Mintsoft merges several orders into one parcel and more than one of them charged the customer postage, the customer may have paid postage twice. IMS cannot decide that for you and **never refunds it automatically**. The absorbed order appears under **Integrations > Exceptions** in **Merged orders - possible double postage**, with the orders in the merge and the amount each charged. The flag is only raised when at least two live (not cancelled) orders of the merge charged postage above zero. It is for you, not the warehouse: IMS writes nothing to Mintsoft and adds no warehouse query task for it.
+
+Check the orders, refund the extra postage by hand if it is due, then press **Clear**. Clear needs the sync permission and a fresh sign-in, and the activity log records who cleared it and what the flag said. The flag is raised again only if Mintsoft merges the order into a further order and the rule applies again.
+
 ### Holds, cancels and merged orders
 
 - **A hold or cancel Mintsoft cannot honour.** If the order is already picking, packing or despatched, or Mintsoft merged it into another order, IMS cannot cancel it there. It stays live, shows under Exceptions as **Hold not honoured** or **Cancel not honoured**, and a **Raise a warehouse query** task is added for the warehouse (IMS writes no note on the Mintsoft order). A despatch after a hold is recorded as normal. A despatch after a cancel, or after a full refund while the order was still undespatched, is not recorded automatically: it appears as a stuck despatch for you to decide what happens to the goods.

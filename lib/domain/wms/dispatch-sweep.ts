@@ -40,6 +40,7 @@ import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { scrubWmsError } from './error-scrub'
 import { recordWmsMutationEvent } from './mutation-audit'
 import { proveMergeLineage, type MergeLineageProof } from './merge-lineage'
+import { flagDoublePostageForMergedLink } from './double-postage'
 
 /**
  * Connector-agnostic WMS dispatch sweep (q66in.1.1/1.5 + G2, hoisted to the generic
@@ -2905,6 +2906,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           cancelNoticeCommentAt: null,
         },
       })
+      // o3d-zvec.14: more than one order of the merge charged postage -> flag it for an IMS operator (best effort, never throws).
+      if (moved.count > 0) await flagDoublePostageForMergedLink(linkId)
       return moved.count > 0
     },
     /**

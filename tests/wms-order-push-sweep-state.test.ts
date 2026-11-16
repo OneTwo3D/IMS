@@ -1208,6 +1208,27 @@ test('update: a past-NEW order is not amended but pushedAt is bumped (no futile 
   assert.equal('firstClaimedAt' in updates[0].data, false, 'a rejected amendment never rewrites the first-claim stamp')
 })
 
+test('o3d-zvec.14: an amendment that finds a MERGED survivor marks the link MERGED AND raises the double-postage check', async () => {
+  const link: WmsPushUpdateLink = { id: 'link-1', externalOrderId: 'wms-1', order: { ...candidate(), shipFromWarehouseId: 'wh-1' } }
+  const merged = connector({ updateOrder: async () => ({ updated: false, status: 'MERGED_SURVIVOR', mergedSurvivorNumber: 'A+B' }) as never })
+  const { port, updates } = makePort({ updatable: [link] })
+  const flagged: string[] = []
+  port.flagDoublePostage = async (linkId) => { flagged.push(linkId) }
+  await runWmsOrderPushSweepCore(merged, 'mintsoft', port, { now: NOW })
+  assert.ok(updates.some((u) => u.data.state === 'MERGED'), 'the link was re-pointed as MERGED')
+  assert.deepEqual(flagged, ['link-1'], 'and the flag check ran for it, once')
+})
+
+test('o3d-zvec.14: an amendment that finds the warehouse order NOT NEW raises no double-postage check', async () => {
+  const link: WmsPushUpdateLink = { id: 'link-1', externalOrderId: 'wms-1', order: { ...candidate(), shipFromWarehouseId: 'wh-1' } }
+  const notNew = connector({ updateOrder: async () => ({ updated: false, status: 'NOT_NEW' }) })
+  const { port } = makePort({ updatable: [link] })
+  const flagged: string[] = []
+  port.flagDoublePostage = async (linkId) => { flagged.push(linkId) }
+  await runWmsOrderPushSweepCore(notNew, 'mintsoft', port, { now: NOW })
+  assert.deepEqual(flagged, [])
+})
+
 test('hold: an ON_HOLD pushed order is cancelled in the WMS and parked HELD', async () => {
   const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
