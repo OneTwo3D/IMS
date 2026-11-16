@@ -266,6 +266,8 @@ export type ReorderReportRow = {
   lateInboundQty: string
   /** Earliest past expected-delivery date among those late lines, or null. */
   lateInboundDueDate: string | null
+  /** Why a zero-quantity row is still listed (late PO cover / overdue), else null. */
+  reorderNote: string | null
   /** First day projected available is at or below zero. */
   firstShortageDate: string | null
   /**
@@ -1108,15 +1110,6 @@ export async function getReorderReport(
       candidate.targetCoverQty,
       candidate.configuredReorderQty,
     ))
-    // Default view shows only products needing at least one unit; the show-all
-    // toggle / CSV export (includeAll) keeps zero-reorder products too.
-    if (!includeAll && suggestedReorderQty.lt(1)) continue
-    const urgency: ReorderReportRow['urgency'] = candidate.projectedAvailableQty.lte(0)
-      ? 'critical'
-      : candidate.projectedAvailableQty.lte(reorderPoint)
-        ? 'reorder'
-        : 'watch'
-
     // Date-domain restatement of the reorder point (see reorder-timing.ts). Opening stock is the
     // warehouse-scoped available quantity; inbound POs are stepped in on their expected delivery.
     // Rows are never dropped here: every edge case keeps the row with a timing basis.
@@ -1128,8 +1121,32 @@ export async function getReorderReport(
       leadTimeDays: candidate.leadTimeDays,
       inbound: inboundArrivals.get(candidate.product.id) ?? [],
     })
+
+    // Timing says action is needed even though the quantity is 0 (o3d-s8n.2): the PO date has passed, or
+    // the stock is short today while a late PO is the only cover. Such rows stay in the default view.
+    // The late PO is NOT netted out of the suggestion (it is on order, only late; re-ordering it would
+    // double-buy), so the quantity may be 0 and no draft is generated: chase or cancel the late PO.
+    const hasLatePo = timing.lateInboundQty.gt(0)
+    const shortToday = timing.basis === 'already_below'
+      || (timing.latestPoDate != null && timing.latestPoDate <= dateOnly(generatedAt))
+    const needsAttention = timing.latestPoOverdue || (hasLatePo && shortToday)
+    // Default view shows only products needing at least one unit (or needing attention, above); the
+    // show-all toggle / CSV export (includeAll) keeps zero-reorder products too.
+    if (!includeAll && suggestedReorderQty.lt(1) && !needsAttention) continue
+    const baseUrgency: ReorderReportRow['urgency'] = candidate.projectedAvailableQty.lte(0)
+      ? 'critical'
+      : candidate.projectedAvailableQty.lte(reorderPoint)
+        ? 'reorder'
+        : 'watch'
+    // An overdue PO date is urgent whatever the quantity says.
+    const urgency: ReorderReportRow['urgency'] = timing.latestPoOverdue && baseUrgency === 'watch' ? 'reorder' : baseUrgency
+    const reorderNote: string | null = suggestedReorderQty.lt(1) && needsAttention
+      ? (hasLatePo
+        ? 'Covered by a late PO: chase the supplier. IMS does not re-order stock already on order.'
+        : 'Overdue, but dated inbound POs cover the quantity: check they will arrive in time.')
+      : null
     if (undatedInboundIds.has(candidate.product.id)) undatedInboundRows += 1
-    if (timing.lateInboundQty.gt(0)) lateInboundRows += 1
+    if (hasLatePo) lateInboundRows += 1
 
     // Supplier-column label policy: BOM rows surface manufacturer info from
     // the latest ProductionOrder; everything else shows the resolved supplier.
@@ -1184,6 +1201,7 @@ export async function getReorderReport(
       timingBasis: timing.basis,
       lateInboundQty: integerQuantityString(timing.lateInboundQty),
       lateInboundDueDate: timing.lateInboundEarliestDate,
+      reorderNote,
       firstShortageDate: timing.firstShortageDate,
       neededFor,
     })

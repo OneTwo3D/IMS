@@ -7,6 +7,7 @@ import {
   getReorderReport,
   type ReplenishmentReportClient,
 } from '@/lib/domain/inventory/replenishment-reports'
+import { selectReorderPoCandidates } from '@/lib/domain/purchasing/reorder-po-planning'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 function decimal(value: string | number): Prisma.Decimal {
@@ -211,6 +212,49 @@ test('reorder timing: a late PO is not assured stock, a PO due today is (o3d-s8n
   assert.equal(today?.latestPoOverdue, false)
   assert.equal(today?.lateInboundQty, '0')
   assert.ok(report.notices.some((notice) => /1 row\(s\) have open PO quantity past its expected delivery date/.test(notice)))
+})
+
+test('default report keeps an overdue row covered only by a late PO: quantity 0, flagged, urgent, never drafted', async () => {
+  const product = (id: string, sku: string) => ({
+    id, sku, name: sku, type: ProductType.SIMPLE, stockUnit: 'pcs',
+    reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('20'), leadTimeDays: 5,
+    category, preferredSupplier: null,
+    supplierProducts: [{ supplierId: 'supplier-1', supplierSku: sku, lastUnitCost: decimal('2'), leadTimeDays: 5, supplier }],
+  })
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: { findMany: async () => [product('late', 'LATE'), product('fine', 'FINE')] },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'late', warehouseId: 'warehouse-1', quantity: decimal('15'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+        { productId: 'fine', warehouseId: 'warehouse-1', quantity: decimal('5000'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+      ],
+    },
+    stockMovement: {
+      findMany: async () => ['late', 'fine'].map((productId) => ({
+        productId, qty: decimal('900'), totalValueBase: decimal('1800'), createdAt: new Date('2026-05-20T12:00:00.000Z'),
+        product: { sku: productId, name: productId, category, supplierProducts: [{ supplier }] },
+      })),
+    },
+    purchaseOrderLine: {
+      findMany: async () => [{
+        productId: 'late', qty: decimal('500'), qtyReceived: decimal('0'), qtyReturned: decimal('0'),
+        po: { supplierId: 'supplier-1', expectedDelivery: new Date('2026-05-25T00:00:00.000Z'), destinationWarehouseId: 'warehouse-1', supplier },
+      }],
+    },
+  }
+  // No includeZero: the default view.
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.deepEqual(report.rows.map((row) => row.sku), ['LATE']) // FINE (healthy, nothing late) stays hidden
+  const row = report.rows[0]
+  assert.equal(row.suggestedReorderQty, '0') // on order, only late: not re-ordered
+  assert.equal(row.latestPoOverdue, true)
+  assert.equal(row.lateInboundQty, '500')
+  assert.equal(row.urgency, 'reorder') // overdue is urgent even at quantity 0
+  assert.match(row.reorderNote ?? '', /late PO/i)
+  const { bySupplier, skipped } = selectReorderPoCandidates(report.rows, ['late'])
+  assert.equal(bySupplier.size, 0)
+  assert.deepEqual(skipped.map((entry) => entry.reason), ['no_positive_qty'])
 })
 
 test('reorder demand is scoped to the filtered warehouse, like the stock it is compared against (o3d-s8n.1)', async () => {

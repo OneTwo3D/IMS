@@ -92,6 +92,7 @@ function LatestPoDateCell({ row }: { row: ReorderReportRow }) {
     <div>
       <LatestPoDateText row={row} />
       <LatePoBadge row={row} />
+      {row.reorderNote ? <span className="mt-0.5 block max-w-[16rem] text-[11px] text-amber-800">{row.reorderNote}</span> : null}
     </div>
   )
 }
