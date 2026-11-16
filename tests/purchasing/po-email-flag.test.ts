@@ -81,3 +81,43 @@ test('delivery boundary: flag turned OFF between preparation and send sends noth
   assert.deepEqual(await runUnderPoEmailSendLock(lockClient(() => flag, []), async () => { sends++ }), { refused: PO_EMAIL_DISABLED_REASON })
   assert.equal(sends, 0)
 })
+
+test('SMTP hangs past the deadline: unknown outcome, the send is not retried, the transaction (lock) is released', async () => {
+  const { runUnderPoEmailSendLock, PO_SEND_UNKNOWN_OUTCOME } = await import('../../lib/purchase-order-email.ts')
+  let sends = 0
+  let txEnded = false
+  const client = {
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+      try {
+        return await fn({
+          $executeRaw: async () => undefined,
+          setting: { findUnique: async () => ({ value: 'true' }) },
+        })
+      } finally { txEnded = true }
+    },
+  }
+  const out = await runUnderPoEmailSendLock(client, () => { sends++; return new Promise<never>(() => undefined) }, { backstopMs: 20 })
+  assert.deepEqual(out, { unknown: PO_SEND_UNKNOWN_OUTCOME })
+  assert.match(PO_SEND_UNKNOWN_OUTCOME, /Outcome unknown/)
+  assert.equal(sends, 1, 'a timed-out send is never retried')
+  assert.equal(txEnded, true, 'the lock-holding transaction ended')
+})
+
+test('a transaction failure AFTER the send answered returns the answer, so a sent email is not left retryable', async () => {
+  const { runUnderPoEmailSendLock } = await import('../../lib/purchase-order-email.ts')
+  const client = {
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+      await fn({ $executeRaw: async () => undefined, setting: { findUnique: async () => ({ value: 'true' }) } })
+      throw new Error('commit failed')
+    },
+  }
+  assert.deepEqual(await runUnderPoEmailSendLock(client, async () => 'delivered'), { value: 'delivered' })
+})
+
+test('a transaction failure BEFORE any send still throws (nothing was sent)', async () => {
+  const { runUnderPoEmailSendLock } = await import('../../lib/purchase-order-email.ts')
+  let sends = 0
+  const client = { $transaction: async () => { throw new Error('lock wait failed') } }
+  await assert.rejects(() => runUnderPoEmailSendLock(client, async () => { sends++ }), /lock wait failed/)
+  assert.equal(sends, 0)
+})

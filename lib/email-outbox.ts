@@ -2549,6 +2549,7 @@ export async function processPendingEmailOutbox(
         subject: prepared?.subject ?? email.subject,
         html: prepared?.html ?? email.html,
         attachments,
+        ...(prepared?.sendDeadlineMs ? { deadlineMs: prepared.sendDeadlineMs } : {}),
       }
       let sendResult: Awaited<ReturnType<typeof smtp.send>>
       if (prepared?.sendGuard) {
@@ -2556,6 +2557,11 @@ export async function processPendingEmailOutbox(
         const guarded = await prepared.sendGuard(() => smtp.send(outgoing))
         if (guarded.refused !== undefined) {
           await refuseRecipient(guarded.refused, { keepAddress: true })
+          continue
+        }
+        if (guarded.unknown !== undefined) {
+          // The send may have been accepted but its outcome is unknown: terminal FAILED, never retried; a person re-queues it.
+          await refuseRecipient(guarded.unknown, { keepAddress: true })
           continue
         }
         sendResult = guarded.value
