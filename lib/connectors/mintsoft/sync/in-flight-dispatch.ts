@@ -45,7 +45,7 @@ export type InFlightDispatchHold = {
   orderId: string
   orderNumber: string
   qty: number
-  reason: 'despatched_at_wms' | 'despatch_state_unknown' | 'status_snapshot_missing' | 'status_snapshot_stale'
+  reason: 'despatched_at_wms' | 'despatch_state_unknown' | 'status_lookup_failed' | 'status_snapshot_missing' | 'status_snapshot_stale'
 }
 
 export async function loadInFlightDispatch(
@@ -74,7 +74,7 @@ export async function loadInFlightDispatch(
         select: {
           id: true,
           orderNumber: true,
-          wmsOrderStatus: { select: { status: true, fetchedAt: true } },
+          wmsOrderStatus: { select: { status: true, fetchedAt: true, lastError: true } },
           wmsOrderPush: { select: { dispatchDeadLetteredAt: true, dispatchUnresolvedAt: true } },
         },
       },
@@ -93,6 +93,13 @@ export async function loadInFlightDispatch(
     let reason: InFlightDispatchHold['reason'] | null = null
     if (MINTSOFT_DISPATCHED_STATUSES.has(cachedStatus)) reason = 'despatched_at_wms'
     else if (row.order.wmsOrderPush?.dispatchDeadLetteredAt != null || row.order.wmsOrderPush?.dispatchUnresolvedAt != null) reason = 'despatch_state_unknown'
+    // A FAILED REFRESH IS NOT A FRESH READ (Codex R2 HIGH). When a lookup throws, or cannot resolve the
+    // order, the status sweep writes `fetchedAt = now` and `lastError` but KEEPS the old `status`
+    // (order-status-sweep.ts, the two `update: { fetchedAt: new Date(), lastError }` writes), and a
+    // successful read always writes `lastError: null`. So `lastError` set means the latest lookup is not
+    // the last successful read, and `fetchedAt` is then the time of a FAILURE: the cached status is held
+    // against, however recent that stamp is. When `lastError` is null `fetchedAt` is the successful read.
+    else if (snapshot?.lastError != null) reason = 'status_lookup_failed'
     else if (!snapshot || cachedStatus === '') reason = 'status_snapshot_missing'
     else if (snapshot.fetchedAt.getTime() < freshCutoff) reason = 'status_snapshot_stale'
     if (reason) {
