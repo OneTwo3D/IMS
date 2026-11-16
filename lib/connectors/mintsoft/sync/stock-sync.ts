@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { loadInFlightDispatchQty } from '@/lib/connectors/mintsoft/sync/in-flight-dispatch'
+import { describeInFlightHolds, loadInFlightDispatch } from '@/lib/connectors/mintsoft/sync/in-flight-dispatch'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { classifyUnresolvedWmsSku } from '@/lib/domain/wms/stock-sync-helpers'
 import { createCostLayer } from '@/lib/cost-layers'
@@ -2393,13 +2393,13 @@ async function applyMintsoftAlignDownForProduct(params: {
   stockEnqueue?: Exclude<StockEnqueueOutcome, 'ok'>
   reason: string
 }> {
-  const [priorDiscrepancy, openAsnPendingQty, inFlightDispatchQty, stockLevel, alignDownReason] = await Promise.all([
+  const [priorDiscrepancy, openAsnPendingQty, inFlightDispatch, stockLevel, alignDownReason] = await Promise.all([
     db.wmsStockDiscrepancy.findFirst({
       where: buildDiscrepancyWhere(params.binding, 'QTY_MISMATCH', params.productId, params.sku),
       select: { delta: true, lastSeenAt: true },
     }),
     getOpenAsnPendingQty(params.binding, params.productId),
-    loadInFlightDispatchQty(db, { productId: params.productId, warehouseId: params.binding.warehouseId }),
+    loadInFlightDispatch(db, { productId: params.productId, warehouseId: params.binding.warehouseId, now: new Date(), runStartedAt: new Date(params.runStartedAt) }),
     db.stockLevel.findUnique({
       where: {
         productId_warehouseId: {
@@ -2429,7 +2429,7 @@ async function applyMintsoftAlignDownForProduct(params: {
     reasonConfigured: Boolean(alignDownReason?.active && alignDownReason?.accountCode),
     thresholds: parseMintsoftThresholds(params.binding.discrepancyThresholds),
     openAsnPendingQty,
-    inFlightDispatchQty,
+    inFlightDispatchQty: inFlightDispatch.qty,
     priorDiscrepancy: priorDiscrepancy
       ? {
           delta: priorDiscrepancy.delta == null ? null : Number(priorDiscrepancy.delta),
@@ -2440,6 +2440,17 @@ async function applyMintsoftAlignDownForProduct(params: {
   })
 
   if (decision.action === 'hold') {
+    if (inFlightDispatch.qty > 0) {
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: params.binding.id,
+        tag: 'sync',
+        action: 'mintsoft_align_down_held_in_flight',
+        description: `Held Mintsoft align-down for ${params.sku} in ${params.binding.warehouse.code}: ${describeInFlightHolds(inFlightDispatch.holds)}`,
+        metadata: { productId: params.productId, sku: params.sku, warehouseId: params.binding.warehouseId, holds: inFlightDispatch.holds },
+        resolveUser: false,
+      })
+    }
     return { applied: false, dryRun: false, reason: decision.reason }
   }
 
@@ -2460,6 +2471,21 @@ async function applyMintsoftAlignDownForProduct(params: {
       return {
         applied: false as const,
         reason: `IMS stock moved during the sync run (${formatQuantity(params.imsQty)} → ${formatQuantity(locked.quantity)}); align-down skipped this run.`,
+      }
+    }
+
+    // Re-checked HERE, under the stock-level lock and at the moment of the write, not only at planning time:
+    // a despatch or a snapshot going stale between the two must not let the write-off through (o3d-hqvrp.118).
+    const inFlightNow = await loadInFlightDispatch(tx, {
+      productId: params.productId,
+      warehouseId: params.binding.warehouseId,
+      now: new Date(),
+      runStartedAt: new Date(params.runStartedAt),
+    })
+    if (inFlightNow.qty > 0) {
+      return {
+        applied: false as const,
+        reason: `${inFlightNow.qty} unit(s) of ${params.sku} may be despatched at the WMS and not yet recorded as shipped in IMS (${describeInFlightHolds(inFlightNow.holds)}); align-down skipped this run.`,
       }
     }
 

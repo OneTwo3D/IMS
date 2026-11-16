@@ -337,11 +337,11 @@ export type MintsoftAlignDownInput = {
    */
   openAsnPendingQty: number
   /**
-   * Units the WMS has despatched (or may have: the despatch sweep gave up on the order) that IMS has not yet
-   * recorded as SHIPPED: they still sit in IMS on-hand and reservedQty, while Mintsoft has already taken
+   * Units the WMS has despatched (or may have: the despatch sweep gave up on the order, or the cached WMS
+   * status is missing or stale) that IMS has not yet recorded as SHIPPED: they still sit in IMS on-hand and reservedQty, while Mintsoft has already taken
    * them off its balance. A positive value means a lower Mintsoft balance can be an unrecorded despatch, so
    * writing it off here would be undone-and-doubled when the despatch lands and decrements stock again
-   * (o3d-hqvrp.118). The source is `loadInFlightDispatchQty` in stock-sync.ts.
+   * (o3d-hqvrp.118). The source is `loadInFlightDispatch` in in-flight-dispatch.ts.
    */
   inFlightDispatchQty: number
   /**
