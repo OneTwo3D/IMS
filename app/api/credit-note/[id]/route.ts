@@ -7,7 +7,7 @@ import { formatCountryDisplay } from '@/lib/countries'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, drawTemplateNotes, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { drawTotalsRows } from '@/lib/pdf-order-money'
 import { creditNoteLineFacts } from '@/lib/domain/sales/credit-note-display'
-import { draftCreditNoteModel, postedCreditNoteModel } from '@/lib/domain/sales/credit-note-document'
+import { type CreditNoteDocumentModel, CreditNoteRateUnprovableError, draftCreditNoteModel, postedCreditNoteModel, postedLineVatRate } from '@/lib/domain/sales/credit-note-document'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { refusedCreditNoteError } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
@@ -75,33 +75,32 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     select: { payload: true },
   })
   const payload = syncRow?.payload && typeof syncRow.payload === 'object' && !Array.isArray(syncRow.payload) ? (syncRow.payload as Record<string, unknown>) : null
-  const payloadLines = payload && Array.isArray(payload.lines) ? (payload.lines as Array<{ description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }>) : []
+  const payloadLines = payload && Array.isArray(payload.lines) ? (payload.lines as Array<{ refundLineId?: unknown; taxType?: unknown; description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }>) : []
   const posted = payload !== null && payloadLines.length > 0 && refusedCreditNoteError(payload) === null
 
   const orderRate = so.taxRatePercent != null ? Number(so.taxRatePercent) : null
-  const orderLineOf = (id: string | null) => (id ? so.lines.find((l) => l.id === id) : undefined)
-  let model
+  let model: CreditNoteDocumentModel
   if (posted) {
-    // Frozen rates only: the refund line's own snapshot, the VAT the source stated, else the order line's stored VAT over its stored net.
-    const unused = [...refund.lines]
-    const rateOf = (index: number): number => {
-      const desc = payloadLines[index]?.description
-      const at = unused.findIndex((l) => l.description === desc)
-      if (at < 0) return Number(orderRate ?? 0)
-      const [rl] = unused.splice(at, 1)
-      if (rl.schemeTaxRateValue != null) return Number(rl.schemeTaxRateValue)
-      const net = Number(rl.totalForeign)
-      if (rl.chargedTaxForeign != null && net > 0) return Number(rl.chargedTaxForeign) / net
-      const ol = orderLineOf(rl.salesOrderLineId)
-      if (ol && Number(ol.totalForeign) > 0) return Number(ol.taxForeign ?? 0) / Number(ol.totalForeign)
-      return Number(orderRate ?? 0)
-    }
+    // Frozen rates only, each from the refund line the payload line names (refundLineId), never a description match: see postedLineVatRate.
+    const rateOf = (index: number): number | null => postedLineVatRate({
+      payloadLine: payloadLines[index],
+      refundLines: refund.lines,
+      orderLines: so.lines,
+      orderRate,
+      orderDefaultTaxType: orderDefaultRate?.accountingTaxType ?? null,
+    })
+    try {
     model = postedCreditNoteModel({
+      currency: so.currency,
       payloadLines,
       lineAmountsIncludeTax: payload?.lineAmountsIncludeTax === true,
       vatIsOwnLine: payload?.[EU_VAT_TREATMENT_PAYLOAD_KEY] != null,
       rateOf,
     })
+    } catch (e) {
+      if (e instanceof CreditNoteRateUnprovableError) return NextResponse.json({ error: e.message }, { status: 409 })
+      throw e
+    }
   } else {
     const facts = creditNoteLineFacts({
       orderCurrency: so.currency,
@@ -113,6 +112,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       refundLines: refund.lines,
     })
     model = draftCreditNoteModel({
+      currency: so.currency,
       orderTaxRatePercent: orderRate,
       orderLines: so.lines.map((l) => ({
         id: l.id, qty: Number(l.qty), unitPriceForeign: Number(l.unitPriceForeign), discountAmount: Number(l.discountAmount ?? 0),
@@ -124,7 +124,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   }
 
   const sym = currencyRow?.symbol ?? (so.currency === 'GBP' ? '£' : so.currency)
-  const money = (n: number) => formatMoney(n, sym, currencyRow?.symbolPosition ?? 'PREFIX')
+  const digits = model.digits
+  const money = (n: number) => formatMoney(n, sym, currencyRow?.symbolPosition ?? 'PREFIX', digits)
   const reference = refund.creditNoteNumber ?? (typeof payload?.creditNoteNumber === 'string' ? payload.creditNoteNumber : null) ?? 'Not yet numbered'
   const against = so.invoiceNumber ?? getSalesOrderReference(so)
   const billAddr = so.billingAddress as Record<string, string> | null
@@ -152,8 +153,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     { label: `VAT (${sym})`, width: 60, align: 'right' },
     { label: `Credit (${sym})`, width: 65, align: 'right' },
   ]
-  const tableRows = model.rows.map((r, i) => [String(i + 1), r.description, String(r.qty), r.net.toFixed(2), r.vat.toFixed(2), r.gross.toFixed(2)])
-  if (model.rounding) tableRows.push(['', 'Rounding', '', model.rounding.net.toFixed(2), model.rounding.vat.toFixed(2), model.rounding.gross.toFixed(2)])
+  const tableRows = model.rows.map((r, i) => [String(i + 1), r.description, String(r.qty), r.net.toFixed(digits), r.vat.toFixed(digits), r.gross.toFixed(digits)])
+  if (model.rounding) tableRows.push(['', 'Rounding', '', model.rounding.net.toFixed(digits), model.rounding.vat.toFixed(digits), model.rounding.gross.toFixed(digits)])
   drawTable(doc, columns, tableRows, branding)
   if (doc.y + 90 > 780) doc.addPage()
   drawTotalsRows(doc, [

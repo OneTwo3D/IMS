@@ -2364,6 +2364,8 @@ async function queueRefundAccountingActions(input: {
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
     lines: input.lines.map((line) => ({
+      // Never sent: ties this posted line to its refund line so the credit-note PDF can read that line's frozen VAT rate (a description cannot: it may be blank or repeated).
+      refundLineId: line.id,
       description: line.description || 'Refund line',
       quantity: line.qty > 0 ? line.qty : 1,
       unitAmount: orderForCN?.currency === baseCurrency
