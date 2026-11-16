@@ -151,7 +151,10 @@ test('REAL PORT: a hold past NEW is ONE attempt - the link stays SYNCED with a n
   assert.equal(first.operatorNotices, 1)
   assert.equal(second.operatorNotices ?? 0, 0)
   assert.equal(double.calls.cancel, 1, 'one warehouse call for the whole life of the notice')
-  assert.equal(double.calls.comment, 1, 'one warehouse note')
+  assert.equal(double.calls.comment, 0, 'IMS writes no warehouse comment')
+  const tasks = await d.db.wmsOperatorTask.findMany({ where: { orderId: s.orderId } })
+  assert.deepEqual(tasks.map((t) => [t.reason, t.status, t.externalOrderId]), [['PUSH_CONFLICT', 'OPEN', 'p-1']], 'ONE operator task for the whole life of the notice')
+  assert.match(tasks[0]!.queryText, /ON HOLD/)
   assert.equal(link.state, 'SYNCED', 'NOT dead-lettered: dispatch polling carries on')
   assert.ok(link.holdNoticeAt)
   assert.match(String(link.lastError), /past NEW/)
@@ -233,32 +236,41 @@ test('REAL PORT: release then RE-HOLD - the stale hold notice is cleared, and th
   const again = await run()
   assert.equal(again.operatorNotices, 1, 'the second hold is noticed afresh')
   assert.equal(double.calls.cancel, 2, 'and sent to the warehouse again')
+  assert.equal(await d.db.wmsOperatorTask.count({ where: { orderId: s.orderId, reason: 'PUSH_CONFLICT' } }), 2, 'a new episode of the notice is a NEW task (the first may be done already)')
   assert.ok((await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })).holdNoticeAt)
 })
 
-test('REAL PORT: a failed warehouse note is retried on a later sweep and then stamped delivered; the notice stays throughout', { skip }, async (t) => {
+test('REAL PORT: a task that could not be recorded is raised on a later sweep and then the notice is stamped; the notice stays throughout, and the task is never doubled', { skip }, async (t) => {
   const d = await deps()
   const tag = `ncm${randomUUID().slice(0, 8)}`
   const s = await seed(d, tag, 'ON_HOLD')
   t.after(() => cleanup(d, s))
   await d.db.wmsOrderPushLink.create({ data: { orderId: s.orderId, connector: 'mintsoft', state: 'SYNCED', externalOrderId: 'n-1', externalOrderNumber: 'MS-N1', pushedAt: new Date() } })
   const double = connector({ cancel: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
-  let commentOk = false
-  const flaky = { ...double.connector, addOrderComment: async () => { double.calls.comment += 1; if (!commentOk) throw new Error('comments endpoint down') } }
-  const run = () => d.sweep.runWmsOrderPushSweepCore(flaky as never, 'mintsoft', d.sweep.createPrismaWmsOrderPushPort(), { batchSize: 500 })
+  let taskOk = false
+  const flakyPort = () => {
+    const port = d.sweep.createPrismaWmsOrderPushPort()
+    const raise = port.raiseOperatorTask!
+    port.raiseOperatorTask = async (task) => { if (!taskOk) throw new Error('database unavailable'); return raise(task) }
+    return port
+  }
+  const run = () => d.sweep.runWmsOrderPushSweepCore(double.connector as never, 'mintsoft', flakyPort(), { batchSize: 500 })
 
-  await run()
+  const first = await run()
   let link = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })
   assert.ok(link.holdNoticeAt)
-  assert.equal(link.holdNoticeCommentAt, null, 'the note failed: not delivered')
-  commentOk = true
+  assert.equal(link.holdNoticeCommentAt, null, 'the task was not recorded: the notice is not stamped')
+  assert.equal(first.operatorTaskErrors, 1, 'counted (the cron reports it)')
+  assert.equal(await d.db.wmsOperatorTask.count({ where: { orderId: s.orderId } }), 0)
+  taskOk = true
   const second = await run()
-  assert.equal(second.noticeCommentsRetried, 1)
+  assert.equal(second.operatorTasksRaised, 1)
   link = await d.db.wmsOrderPushLink.findUniqueOrThrow({ where: { orderId: s.orderId } })
   assert.ok(link.holdNoticeAt, 'the notice is still there')
-  assert.ok(link.holdNoticeCommentAt, 'and the note is now stamped delivered')
+  assert.ok(link.holdNoticeCommentAt, 'and is now stamped: its task is recorded')
   await run()
-  assert.equal(double.calls.comment, 2, 'one failed attempt, one delivery, nothing after')
+  assert.equal(await d.db.wmsOperatorTask.count({ where: { orderId: s.orderId } }), 1, 'one task, nothing after')
+  assert.equal(double.calls.comment, 0, 'no comment is ever written')
   assert.equal(double.calls.cancel, 1)
 })
 
@@ -382,9 +394,12 @@ test('REAL PORT: a cancelled order merged into a survivor has ITS recorded lines
   assert.equal(after.state, 'CANCELLED')
   assert.ok(after.cancelledAt)
   assert.equal(after.cancelNoticeAt, null, 'no notice')
-  assert.equal(seen.comments.length, 1)
-  assert.match(seen.comments[0], new RegExp(`MSO-${tag}`), 'the note names the IMS order')
-  assert.match(seen.comments[0], /2 x 243632999 \(line 3603106\), 1 x 923663020 \(line 3603107\)/)
+  assert.equal(seen.comments.length, 0, 'IMS writes no comment')
+  const tasks = await d.db.wmsOperatorTask.findMany({ where: { orderId: s.orderId } })
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0]!.reason, 'MERGED_LINES_REMOVED')
+  assert.match(tasks[0]!.queryText, new RegExp(`MSO-${tag}`), 'the task names the IMS order')
+  assert.match(tasks[0]!.queryText, /2 x 243632999 \(line 3603106\), 1 x 923663020 \(line 3603107\)/)
 })
 
 test('REAL PORT: a refused removal raises the notice with what was removed and what remains, forgets the removed line and keeps the link live', { skip }, async (t) => {
@@ -414,6 +429,11 @@ test('REAL PORT: a refused removal raises the notice with what was removed and w
   assert.match(String(after.lastError), /REMOVED so far: 2 x A \(line 1\)/)
   assert.match(String(after.lastError), /STILL ON THE MERGED ORDER[^]*1 x B \(line 2\)/)
   assert.deepEqual((await d.db.wmsOrderPushItem.findMany({ where: { linkId: link.id } })).map((r) => r.externalItemId), ['2'], 'the removed line is forgotten')
+  const tasks = await d.db.wmsOperatorTask.findMany({ where: { orderId: s.orderId } })
+  assert.deepEqual(tasks.map((t) => t.reason), ['CANCEL_NOTICE'], 'the operator is asked to raise a query that names what remains')
+  assert.match(tasks[0]!.queryText, /REMOVED so far: 2 x A \(line 1\)/)
+  assert.match(tasks[0]!.queryText, /STILL ON THE MERGED ORDER[^]*1 x B \(line 2\)/)
+  assert.doesNotMatch(tasks[0]!.queryText, /boom/, 'the connector\'s error text is not copied into the task')
 })
 
 test('REAL PORT: ids marked untrustworthy read as none until a verified replacement clears the mark in the same write', { skip }, async (t) => {

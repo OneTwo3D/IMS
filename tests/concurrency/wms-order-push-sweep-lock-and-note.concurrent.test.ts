@@ -4,7 +4,7 @@ import test from 'node:test'
 import { loadEnv } from './po-landed-fixtures'
 
 /**
- * THE WMS ORDER-PUSH SWEEP IS SINGLE-FLIGHT, AND A REMOVAL NOTE IS A DURABLE OBLIGATION.
+ * THE WMS ORDER-PUSH SWEEP IS SINGLE-FLIGHT, AND A MERGED-LINE REMOVAL IS A DURABLE OBLIGATION THAT BECOMES AN OPERATOR TASK (IMS WRITES NO COMMENT).
  *
  *   arm 1  while one push sweep holds the connector's lock a second is SKIPPED (not queued); once it finishes a third runs
  *   arm 2  another connector is not blocked, and the dispatch sweep's lock (same hash, other namespace) does not exclude the push sweep
@@ -59,24 +59,27 @@ test('the removal-note obligation store: recorded once as intended, patched unde
   assert.deepEqual(second.items, note.items)
   assert.equal(first.state, 'intended')
   assert.equal(await port.updateRemovalNote!(connector, 'link-1', 'wms-1', { state: 'owed' }), true)
-  assert.equal(await port.updateRemovalNote!(connector, 'link-1', 'wms-1', { attempted: true }), true)
+  assert.equal(await port.updateRemovalNote!(connector, 'link-1', 'wms-1', { verified: true }), true)
   const [owed] = await port.pendingRemovalNotes!(connector, 10)
   assert.equal(owed.state, 'owed')
-  assert.equal(owed.attempted, true, 'patches merge')
+  assert.equal(owed.verified, true, 'patches merge')
   assert.equal(await port.updateRemovalNote!(connector, 'no-such-link', 'wms-1', { state: 'owed' }), false)
   const other = await port.recordRemovalNote!(connector, { ...note, externalOrderId: 'wms-2' })
   assert.notEqual(other.id, first.id, 'one obligation per (link, warehouse order)')
+  // A row whose operator task is raised (a partial removal waiting on a person) is excluded from the pending list IN THE QUERY.
+  assert.equal(await port.updateRemovalNote!(connector, 'link-1', 'wms-2', { state: 'needs_check', taskRaised: true }), true)
+  assert.deepEqual((await port.pendingRemovalNotes!(connector, 10)).map((o) => o.externalOrderId), ['wms-1'], 'task-raised rows are not offered again')
   assert.equal(await port.clearRemovalNote!(connector, 'link-1', 'wms-2'), true)
   assert.deepEqual(await port.pendingRemovalNotes!('another-connector', 10), [], 'scoped to the connector')
   assert.equal(await port.clearRemovalNote!(connector, 'link-1', 'wms-1'), true)
   assert.equal(await port.clearRemovalNote!(connector, 'link-1', 'wms-1'), false)
 })
 
-test('real database: an owed note posts ONCE with its marker; after the order is deleted (reset) or erased the obligation is dropped and nothing is posted', SKIP, async (t) => {
+test('real database: an owed obligation raises ONE operator task (and writes no comment); after the order is deleted (reset) or erased the obligation is dropped and no task is raised', SKIP, async (t) => {
   loadEnv()
   const { db } = await import('@/lib/db')
   const { createPrismaWmsOrderPushPort, runWmsOrderPushSweepCore } = await import('@/lib/domain/wms/order-push-sweep')
-  const { removalNoteKey, removalNoteMarker, serializeRemovalNote } = await import('@/lib/domain/wms/removal-note-obligation')
+  const { removalNoteKey, serializeRemovalNote } = await import('@/lib/domain/wms/removal-note-obligation')
   const { randomUUID } = await import('node:crypto')
   const tag = `rn${randomUUID().slice(0, 8)}`
   const connectorId = 'mintsoft'
@@ -91,7 +94,7 @@ test('real database: an owed note posts ONCE with its marker; after the order is
     ids.push(id)
     await db.salesOrder.create({ data: { id, orderNumber: `IMSTEST-${id}`, status: 'CANCELLED', currency: 'GBP', subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100 } })
     const link = await db.wmsOrderPushLink.create({ data: { orderId: id, connector: connectorId, state: 'CANCELLED', externalOrderId: `surv-${id}`, externalOrderNumber: 'MS-1' } })
-    const ob = { id: 'ob1', linkId: link.id, orderId: id, externalOrderId: `surv-${id}`, state: 'owed' as const, attempted: false, items: [{ externalItemId: '10', sku: 'SKU-A', quantity: 1 }] }
+    const ob = { id: 'ob1', linkId: link.id, orderId: id, externalOrderId: `surv-${id}`, state: 'owed' as const, items: [{ externalItemId: '10', sku: 'SKU-A', quantity: 1 }] }
     await db.setting.create({ data: { key: removalNoteKey(connectorId, link.id, `surv-${id}`), value: serializeRemovalNote(ob) } })
     keys.push(removalNoteKey(connectorId, link.id, `surv-${id}`))
     return { id, ob, linkId: link.id }
@@ -100,7 +103,7 @@ test('real database: an owed note posts ONCE with its marker; after the order is
   const connector = {
     pushOrder: async () => { throw new Error('not used') },
     cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }),
-    addOrderComment: async (id: string, comment: string) => { posted.push({ id, comment }) },
+    addOrderComment: async (id: string, comment: string) => { posted.push({ id, comment }) }, // never called: IMS writes no comment
   }
   const run = () => runWmsOrderPushSweepCore(connector as never, connectorId, createPrismaWmsOrderPushPort(), { batchSize: 500 })
 
@@ -111,17 +114,22 @@ test('real database: an owed note posts ONCE with its marker; after the order is
   await db.salesOrder.update({ where: { id: erased.id }, data: { erasedAt: new Date() } })
 
   await run()
-  const mine = (id: string) => posted.filter((p) => p.id === `surv-${id}`)
-  assert.equal(mine(live.id).length, 1, 'the live obligation posts once')
-  assert.ok(mine(live.id)[0].comment.startsWith(removalNoteMarker(live.ob)), 'the note carries its marker first')
-  assert.equal(mine(reset.id).length, 0, 'after a reset nothing is posted')
-  assert.equal(mine(erased.id).length, 0, 'an erased order is never posted')
+  const mine = (id: string) => db.wmsOperatorTask.findMany({ where: { orderId: id } })
+  assert.equal((await mine(live.id)).length, 1, 'the live obligation raises one task')
+  const task = (await mine(live.id))[0]!
+  assert.equal(task.reason, 'MERGED_LINES_REMOVED')
+  assert.equal(task.status, 'OPEN')
+  assert.equal(task.externalOrderId, `surv-${live.id}`)
+  assert.match(task.queryText, /1 x SKU-A \(line 10\)/)
+  assert.equal((await mine(reset.id)).length, 0, 'after a reset no task is raised')
+  assert.equal((await mine(erased.id)).length, 0, 'an erased order gets no task')
+  assert.equal(posted.length, 0, 'and nothing is written to the warehouse')
   for (const x of [live, reset, erased]) assert.equal(await db.setting.count({ where: { key: removalNoteKey(connectorId, x.linkId, x.ob.externalOrderId) } }), 0, 'obligation gone')
   await run()
-  assert.equal(mine(live.id).length, 1, 'and never again')
+  assert.equal((await mine(live.id)).length, 1, 'and never again')
 })
 
-test('real database: 30 needs_check rows (the oldest) do not starve a newer owed note out of a 25-row batch', SKIP, async (t) => {
+test('real database: 30 task-raised needs_check rows (the oldest) do not starve a newer owed obligation out of a 25-row batch', SKIP, async (t) => {
   loadEnv()
   const { db } = await import('@/lib/db')
   const { createPrismaWmsOrderPushPort, runWmsOrderPushSweepCore } = await import('@/lib/domain/wms/order-push-sweep')
@@ -138,19 +146,19 @@ test('real database: 30 needs_check rows (the oldest) do not starve a newer owed
   for (let i = 0; i < 30; i += 1) {
     const key = removalNoteKey(connectorId, `${tag}-stuck-${i}`, 'y')
     keys.push(key)
-    await db.setting.create({ data: { key, value: serializeRemovalNote({ id: `s${i}`, linkId: `${tag}-stuck-${i}`, orderId: 'x', externalOrderId: 'y', state: 'needs_check', attempted: true, items: item }) } })
+    await db.setting.create({ data: { key, value: serializeRemovalNote({ id: `s${i}`, linkId: `${tag}-stuck-${i}`, orderId: 'x', externalOrderId: 'y', state: 'needs_check', taskRaised: true, items: item }) } })
   }
   const id = `${tag}o`
   await db.salesOrder.create({ data: { id, orderNumber: `IMSTEST-${id}`, status: 'CANCELLED', currency: 'GBP', subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100 } })
   const link = await db.wmsOrderPushLink.create({ data: { orderId: id, connector: connectorId, state: 'CANCELLED', externalOrderId: `surv-${id}`, externalOrderNumber: 'MS-1' } })
   const owedKey = removalNoteKey(connectorId, link.id, `surv-${id}`)
   keys.push(owedKey)
-  await db.setting.create({ data: { key: owedKey, value: serializeRemovalNote({ id: 'ob1', linkId: link.id, orderId: id, externalOrderId: `surv-${id}`, state: 'owed', attempted: false, items: item }) } })
+  await db.setting.create({ data: { key: owedKey, value: serializeRemovalNote({ id: 'ob1', linkId: link.id, orderId: id, externalOrderId: `surv-${id}`, state: 'owed', items: item }) } })
 
   const port = createPrismaWmsOrderPushPort()
   const batch = await port.pendingRemovalNotes!(connectorId, 25)
   assert.ok(batch.some((o) => o.linkId === link.id), 'the owed note is in the batch')
-  assert.ok(batch.every((o) => o.state !== 'needs_check'), 'needs_check rows are excluded by the query')
+  assert.ok(batch.every((o) => o.taskRaised !== true), 'task-raised rows are excluded by the query')
 
   const posted: Array<{ id: string; comment: string }> = []
   const connector = {
@@ -159,8 +167,9 @@ test('real database: 30 needs_check rows (the oldest) do not starve a newer owed
     addOrderComment: async (target: string, comment: string) => { posted.push({ id: target, comment }) },
   }
   await runWmsOrderPushSweepCore(connector as never, connectorId, port, { batchSize: 25 })
-  assert.equal(posted.filter((p) => p.id === `surv-${id}`).length, 1, 'the owed note posts')
-  assert.equal(await db.setting.count({ where: { key: { in: keys.filter((k) => k !== owedKey) } } }), 30, 'the 30 needs_check rows are untouched')
+  assert.equal(await db.wmsOperatorTask.count({ where: { orderId: id } }), 1, 'the owed obligation raises its task')
+  assert.equal(posted.length, 0)
+  assert.equal(await db.setting.count({ where: { key: { in: keys.filter((k) => k !== owedKey) } } }), 30, 'the 30 task-raised rows are untouched')
 })
 
 test('real database: the dispatch sweep re-point is REFUSED while the amendment lease is held, and succeeds without one or once it has expired', SKIP, async (t) => {
@@ -188,7 +197,7 @@ test('real database: the dispatch sweep re-point is REFUSED while the amendment 
   assert.equal(await deps.repointLink(link.id, { externalOrderId: 'new-2', externalOrderNumber: 'MS-3' }, { externalOrderId: 'old-2' }), true, 'no lease: it repoints')
 })
 
-test('real database: the link is re-pointed after the removal is verified and before the close: the note still posts ONCE to the ORIGINAL warehouse order and is not dropped', SKIP, async (t) => {
+test('real database: the link is re-pointed after the removal is verified and before the close: the task is still raised ONCE, about the ORIGINAL warehouse order, and is not dropped', SKIP, async (t) => {
   loadEnv()
   const { db } = await import('@/lib/db')
   const { createPrismaWmsOrderPushPort, runWmsOrderPushSweepCore } = await import('@/lib/domain/wms/order-push-sweep')
@@ -227,17 +236,19 @@ test('real database: the link is re-pointed after the removal is verified and be
   const afterFirst = await db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
   assert.notEqual(afterFirst.state, 'CANCELLED', 'the close did not land on a link that moved on')
   assert.equal(first.cancelled, 0)
-  const mine = () => posted.filter((p) => p.id === orig)
+  // (the re-pointed link's NEW warehouse order refuses these lines, which raises its own cancel notice: only the removal task is counted)
+  const mine = () => db.wmsOperatorTask.findMany({ where: { orderId: id, reason: 'MERGED_LINES_REMOVED' } })
+  assert.equal((await mine()).length, 1, 'the task was recorded before the close was attempted')
   await run()
-  assert.equal(mine().length, 1, 'the verified note posted once, to the original warehouse order')
-  assert.match(mine()[0].comment, /^\[IMS removal-note /)
-  assert.equal(posted.filter((p) => p.id === 'new-warehouse-order' && p.comment.startsWith('[IMS removal-note')).length, 0, 'and no removal note went to the new order')
+  assert.equal((await mine()).length, 1, 'still ONE task (the cancel pass and the obligation pass raise the same one)')
+  assert.equal((await mine())[0]!.externalOrderId, orig, 'about the original warehouse order')
+  assert.equal(posted.length, 0, 'nothing written to the warehouse')
   await run()
-  assert.equal(mine().length, 1, 'never again')
+  assert.equal((await mine()).length, 1, 'never again')
   assert.equal(await db.setting.count({ where: { key: { endsWith: `${link.id}:${orig}` } } }), 0, 'the original order\'s obligation is cleared')
 })
 
-test('real database: crash after the deletes, lease expiry, the REAL dispatch re-point, then the retry: the note posts ONCE to the original warehouse order', SKIP, async (t) => {
+test('real database: crash after the deletes, lease expiry, the REAL dispatch re-point, then the retry: ONE task, about the original warehouse order', SKIP, async (t) => {
   loadEnv()
   const { db } = await import('@/lib/db')
   const { createPrismaWmsOrderPushPort, runWmsOrderPushSweepCore } = await import('@/lib/domain/wms/order-push-sweep')
@@ -274,7 +285,7 @@ test('real database: crash after the deletes, lease expiry, the REAL dispatch re
   const run = () => runWmsOrderPushSweepCore(connector as never, 'mintsoft', createPrismaWmsOrderPushPort(), { batchSize: 50 })
 
   await run()
-  assert.equal(posted.length, 0)
+  assert.equal(await db.wmsOperatorTask.count({ where: { orderId: id } }), 0)
   assert.equal(lines.size, 0, 'the deletes went through')
   assert.equal(await db.setting.count({ where: { key: { endsWith: `${linkId}:${orig}` } } }), 1, 'the obligation survived as intended')
   // The lease expires (the crashed worker never released it); the dispatch sweep's real re-point now succeeds.
@@ -283,10 +294,12 @@ test('real database: crash after the deletes, lease expiry, the REAL dispatch re
   assert.equal(moved, true)
 
   await run()
-  const mine = () => posted.filter((p) => p.id === orig && p.comment.startsWith('[IMS removal-note'))
-  assert.equal(mine().length, 1, 'the verified note posted once, to the original order')
-  assert.equal(posted.filter((p) => p.id === 'new-warehouse-order' && p.comment.startsWith('[IMS removal-note')).length, 0)
+  // (the re-pointed link's NEW warehouse order refuses these lines, which raises its own cancel notice: only the removal task is counted)
+  const mine = () => db.wmsOperatorTask.findMany({ where: { orderId: id, reason: 'MERGED_LINES_REMOVED' } })
+  assert.equal((await mine()).length, 1, 'the verified removal\'s task was raised once')
+  assert.equal((await mine())[0]!.externalOrderId, orig, 'about the original order')
+  assert.equal(posted.length, 0, 'nothing written to the warehouse')
   await run()
-  assert.equal(mine().length, 1, 'never again')
+  assert.equal((await mine()).length, 1, 'never again')
   assert.equal(await db.setting.count({ where: { key: { endsWith: `${linkId}:${orig}` } } }), 0, 'cleared')
 })

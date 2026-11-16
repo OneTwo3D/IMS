@@ -23,6 +23,7 @@ import { currencyMinorUnits } from '../lib/domain/math/decimal.ts'
 import { reconcilePushTotals } from '../lib/domain/wms/push-total-guard.ts'
 import type { WmsOrderCancelResult, WmsOrderPushInput, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
+import { recordingTaskPort } from './helpers/operator-task-port.ts'
 
 const NOW = () => new Date('2026-06-26T00:00:00.000Z')
 const BINDINGS = [{ warehouseId: 'wh-1', externalWarehouseId: '301' }]
@@ -128,6 +129,7 @@ function makePort(seed: Seed) {
   const events: WmsMutationEventInput[] = []
   const claims: string[] = []
   const ownedWrites: Array<{ orderId: string; data: Record<string, unknown> }> = []
+  const taskPort = recordingTaskPort()
   // The create dispatch stamp as the real link row carries it, so interleavings can be driven against it.
   const link: { state: string; lastAttemptAt: Date | null } = { state: 'PENDING_CREATE', lastAttemptAt: null }
   const port: WmsOrderPushPort = {
@@ -175,9 +177,11 @@ function makePort(seed: Seed) {
       updates.push({ id, data, ifState: fromState })
       return true
     },
+    raiseOperatorTask: taskPort.raiseOperatorTask,
+    countOpenOperatorTasks: taskPort.countOpenOperatorTasks,
     recordEvent: async (event) => { events.push(event) },
   }
-  return { port, upserts, updates, events, claims, validationFailures, guardMisses, link, ownedWrites }
+  return { port, upserts, updates, events, claims, validationFailures, guardMisses, link, ownedWrites, tasks: taskPort.tasks }
 }
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
@@ -187,8 +191,6 @@ function connector(overrides: {
   pushOrder?: (input: WmsOrderPushInput) => Promise<WmsOrderPushResult>
   updateOrder?: () => Promise<WmsOrderUpdateResult>
   cancelOrder?: () => Promise<WmsOrderCancelResult>
-  comments?: Array<{ externalOrderId: string; comment: string }>
-  addOrderComment?: () => Promise<void>
   verifyPushedOrder?: (
     externalOrderId: string,
     reference: { orderNumber: string | null; externalReference: string | null },
@@ -203,10 +205,6 @@ function connector(overrides: {
     pushOrder: overrides.pushOrder ?? okPush,
     updateOrder: overrides.updateOrder ?? (async () => ({ updated: true, status: 'NEW' })),
     cancelOrder: overrides.cancelOrder ?? (async () => ({ cancelled: true, status: 'CANCELLED' })),
-    addOrderComment: overrides.addOrderComment
-      ?? (overrides.comments
-        ? async (externalOrderId: string, comment: string) => { overrides.comments!.push({ externalOrderId, comment }) }
-        : undefined),
   }
 }
 
@@ -227,18 +225,21 @@ test('create: a bound, eligible order is pushed and marked SYNCED', async () => 
   assert.equal(upserts[0].create.totalMismatchPence, null)
 })
 
-test('create: a courier-fallback push posts a warehouse-visible verify-courier comment (G6c)', async () => {
-  const comments: Array<{ externalOrderId: string; comment: string }> = []
+// IMS writes no comment to the warehouse (its staff do not read them): what used to be a comment is an operator task, "raise a query".
+test('create: a courier-fallback push raises a verify-courier operator task, and writes no comment (G6c)', async () => {
   const fallbackPush = connector({
     pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true }),
-    comments,
   })
-  const { port, upserts } = makePort({ createCandidates: [candidate()] })
+  const { port, upserts, tasks } = makePort({ createCandidates: [candidate()] })
   const r = await runWmsOrderPushSweepCore(fallbackPush, 'mintsoft', port, { now: NOW })
   assert.equal(r.created, 1)
-  assert.equal(comments.length, 1)
-  assert.equal(comments[0].externalOrderId, 'wms-1')
-  assert.match(comments[0].comment, /default courier/i)
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0].reason, 'COURIER_FALLBACK')
+  assert.equal(tasks[0].externalOrderId, 'wms-1')
+  assert.match(tasks[0].queryText, /default courier/i)
+  assert.match(tasks[0].queryText, /WN-1/, 'names the warehouse order by its number')
+  assert.equal(r.operatorTasksRaised, 1)
+  assert.equal(r.failed, 0, 'an open task is not a failure')
   // G6: the courier-pending flag is persisted on the link for the operator view.
   assert.equal(upserts[0].create.courierPending, true)
 })
@@ -414,12 +415,57 @@ test('create: a component check that THROWS is contained locally; the payload ch
   assert.equal(upserts[0].create.totalMismatchPence, 200, 'the payload check still ran')
 })
 
-test('create: a normal (no-fallback) push posts no courier comment', async () => {
-  const comments: Array<{ externalOrderId: string; comment: string }> = []
-  const { port } = makePort({ createCandidates: [candidate()] })
-  const r = await runWmsOrderPushSweepCore(connector({ comments }), 'mintsoft', port, { now: NOW })
+test('create: a courier task that cannot be recorded stays DUE on the link (written with it) and the next sweep records it with no order change, once', async () => {
+  const fallbackPush = connector({ pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true }) })
+  const first = makePort({ createCandidates: [candidate()] })
+  first.port.raiseOperatorTask = async () => { throw new Error('database unavailable') }
+  const r1 = await runWmsOrderPushSweepCore(fallbackPush, 'mintsoft', first.port, { now: NOW })
+  assert.equal(r1.created, 1)
+  assert.equal(r1.operatorTaskErrors, 1, 'visible: the cron reports it')
+  assert.equal(first.upserts[0].create.courierTaskService, 'Royal Mail', 'the due-marker is written in the same write as the SYNCED link')
+  assert.equal(first.upserts[0].update.courierTaskService, 'Royal Mail')
+  // Next sweep: nothing created, nothing amended; the link carries the marker and the pass records the task.
+  const cleared: string[] = []
+  const next = makePort({})
+  next.port.courierTasksDue = async () => [{ orderId: 'so-1', externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', orderNumber: 'SO-1', service: 'Royal Mail' }]
+  next.port.clearCourierTaskDue = async (orderId, service) => { cleared.push(`${orderId}:${service}`) }
+  const r2 = await runWmsOrderPushSweepCore(connector(), 'mintsoft', next.port, { now: NOW })
+  assert.equal(r2.operatorTasksRaised, 1)
+  assert.deepEqual(next.tasks.map((t) => [t.reason, t.externalOrderId]), [['COURIER_FALLBACK', 'wms-1']])
+  assert.match(next.tasks[0].queryText, /'Royal Mail'/)
+  assert.deepEqual(cleared, ['so-1:Royal Mail'])
+})
+
+test('create: the courier marker and task name the service of the RELOADED order, not the candidate list\'s earlier read', async () => {
+  const fallbackPush = connector({ pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true }) })
+  const h = makePort({ createCandidates: [candidate({ shippingService: 'Royal Mail' })] })
+  h.port.reloadOrderForPush = async () => ({ shippingService: 'DPD Next Day', erasedAt: null })
+  const r = await runWmsOrderPushSweepCore(fallbackPush, 'mintsoft', h.port, { now: NOW })
   assert.equal(r.created, 1)
-  assert.equal(comments.length, 0)
+  assert.equal(h.upserts[0].create.courierTaskService, 'DPD Next Day')
+  assert.match(h.tasks[0].queryText, /'DPD Next Day'/)
+  assert.equal(h.tasks[0].dedupeBasis, 'courier-fallback:DPD Next Day')
+})
+
+test('courier tasks are keyed to the service: a fallback for another service is a different task with its own text', async () => {
+  const a = makePort({})
+  const b = makePort({})
+  const run = (h: ReturnType<typeof makePort>, service: string) => {
+    h.port.courierTasksDue = async () => [{ orderId: 'so-1', externalOrderId: 'wms-1', externalOrderNumber: null, orderNumber: 'SO-1', service }]
+    return runWmsOrderPushSweepCore(connector(), 'mintsoft', h.port, { now: NOW })
+  }
+  await run(a, 'Royal Mail')
+  await run(b, 'DPD Next Day')
+  assert.notEqual(a.tasks[0].dedupeBasis, b.tasks[0].dedupeBasis)
+  assert.match(b.tasks[0].queryText, /DPD Next Day/)
+  assert.doesNotMatch(b.tasks[0].queryText, /Royal Mail/)
+})
+
+test('create: a normal (no-fallback) push raises no courier task', async () => {
+  const { port, tasks } = makePort({ createCandidates: [candidate()] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(tasks.length, 0)
 })
 
 test('create: a candidate whose warehouse is not bound is skipped (no write)', async () => {
@@ -1169,10 +1215,9 @@ test('hold: an ON_HOLD pushed order is cancelled in the WMS and parked HELD', as
   assert.equal(updates[0].data.state, 'HELD')
 })
 
-test('hold: a no-longer-cancellable WMS order keeps its link LIVE with an operator notice + posts a warehouse comment', async () => {
-  const comments: Array<{ externalOrderId: string; comment: string }> = []
-  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }), comments })
-  const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
+test('hold: a no-longer-cancellable WMS order keeps its link LIVE with an operator notice + raises a "raise a query" task', async () => {
+  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
+  const { port, updates, tasks } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
   assert.equal(r.deadLettered, 0)
   assert.equal(r.held, 0)
@@ -1180,29 +1225,32 @@ test('hold: a no-longer-cancellable WMS order keeps its link LIVE with an operat
   // NOT dead-lettered: a dead letter leaves dispatch polling, and the despatch that follows would never be recorded.
   assert.equal(updates[0].data.state, undefined)
   assert.ok(updates[0].data.holdNoticeAt)
-  assert.equal(comments.length, 1)
-  assert.equal(comments[0].externalOrderId, 'wms-1')
-  assert.match(comments[0].comment, /ON HOLD/)
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0].reason, 'PUSH_CONFLICT')
+  assert.equal(tasks[0].externalOrderId, 'wms-1')
+  assert.match(tasks[0].queryText, /ON HOLD/)
+  // The notice is stamped as followed up (the task is recorded), so the retry pass has nothing to do for it.
+  assert.ok(updates[0].data.holdNoticeAt)
+  assert.ok(updates.some((u) => u.data.holdNoticeCommentAt), 'the notice is stamped once its task is recorded')
 })
 
-test('hold: a successful (NEW) cancel does not post a warehouse comment', async () => {
-  const comments: Array<{ externalOrderId: string; comment: string }> = []
-  const { port } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
-  const r = await runWmsOrderPushSweepCore(connector({ comments }), 'mintsoft', port, { now: NOW })
+test('hold: a successful (NEW) cancel raises no task', async () => {
+  const { port, tasks } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
   assert.equal(r.held, 1)
-  assert.equal(comments.length, 0)
+  assert.equal(tasks.length, 0)
 })
 
-test('hold: a thrown addOrderComment does not break the operator-notice path', async () => {
-  const dispatched = connector({
-    cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }),
-    addOrderComment: async () => { throw new Error('comments endpoint down') },
-  })
+test('hold: a task that cannot be recorded does not break the operator-notice path; the notice stays and is raised next sweep', async () => {
+  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) })
   const { port, updates } = makePort({ holdable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
+  port.raiseOperatorTask = async () => { throw new Error('database unavailable') }
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
   assert.equal(r.deadLettered, 0)
   assert.equal(r.operatorNotices, 1)
   assert.ok(updates[0].data.holdNoticeAt)
+  assert.equal(r.operatorTaskErrors, 1, 'counted, so the cron reports it')
+  assert.equal(updates.some((u) => u.data.holdNoticeCommentAt), false, 'not stamped: the retry pass raises it')
 })
 
 test('cancel: an IMS-cancelled pushed order is cancelled in the WMS', async () => {
@@ -1222,10 +1270,9 @@ test('cancel: a WMS order that 404s is NOT treated as cancelled (it may be merge
   assert.ok(updates[0].data.cancelNoticeAt)
 })
 
-test('cancel: a past-NEW order (full refund or IMS cancel) keeps its link live with a raise-a-query notice + warehouse comment', async () => {
-  const comments: Array<{ externalOrderId: string; comment: string }> = []
-  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'PROCESSING' }), comments })
-  const { port, updates } = makePort({ cancellable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
+test('cancel: a past-NEW order (full refund or IMS cancel) keeps its link live with a raise-a-query notice + operator task', async () => {
+  const dispatched = connector({ cancelOrder: async () => ({ cancelled: false, status: 'PROCESSING' }) })
+  const { port, updates, tasks } = makePort({ cancellable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   const r = await runWmsOrderPushSweepCore(dispatched, 'mintsoft', port, { now: NOW })
   assert.equal(r.deadLettered, 0)
   assert.equal(r.cancelled, 0)
@@ -1233,8 +1280,9 @@ test('cancel: a past-NEW order (full refund or IMS cancel) keeps its link live w
   assert.equal(updates[0].data.state, undefined, 'still polled for despatch')
   assert.ok(updates[0].data.cancelNoticeAt)
   assert.match(String(updates[0].data.lastError), /raise a cancellation query/i)
-  assert.equal(comments.length, 1)
-  assert.match(comments[0].comment, /cancelled \/ fully refunded/i)
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0].reason, 'CANCEL_NOTICE')
+  assert.match(tasks[0].queryText, /cancelled \/ fully refunded/i)
 })
 
 // --- q66in.4.6: audit-grade mutation events -------------------------------
@@ -1297,10 +1345,9 @@ test('audit: release / hold / cancel each record their state transition', async 
   assert.equal((cancel.after as { state: string }).state, 'CANCELLED')
 })
 
-test('audit: a past-NEW cancel conflict records a FAILED order_cancel + an order_comment event', async () => {
+test('audit: a past-NEW cancel conflict records a FAILED order_cancel and NO order_comment event (nothing is written to the warehouse)', async () => {
   const conflicted = connector({
     cancelOrder: async () => ({ cancelled: false, status: 'PICKING' }),
-    comments: [],
   })
   const { port, events } = makePort({ cancellable: [{ id: 'link-1', orderId: 'o1', externalOrderId: 'wms-1' }] })
   await runWmsOrderPushSweepCore(conflicted, 'mintsoft', port, { now: NOW })
@@ -1308,10 +1355,7 @@ test('audit: a past-NEW cancel conflict records a FAILED order_cancel + an order
   assert.ok(cancel)
   assert.equal(cancel.outcome, 'FAILED')
   assert.match(cancel.error ?? '', /past NEW/)
-  const comment = events.find((entry) => entry.action === 'order_comment')
-  assert.ok(comment)
-  assert.equal(comment.outcome, 'SUCCEEDED')
-  assert.equal(comment.entityId, 'o1')
+  assert.equal(events.some((entry) => entry.action === 'order_comment'), false)
 })
 
 test('audit: an update no-op (past NEW) records a FAILED order_update with the WMS status', async () => {
@@ -1593,35 +1637,32 @@ test('[o3d-bjc.8] an unknown that never resolves is escalated, not retried forev
   assert.ok(events.some((e) => e.outcome === 'FAILED'))
 })
 
-test('[o3d-bjc.8] the courier-fallback note waits until the id is proven ours', async () => {
-  // The comment guard proves the row is under our tenant, not that it is OUR
-  // order — so a same-client wrong id would get a misleading IMS note about a
-  // shipping method that has nothing to do with it.
-  type Note = { externalOrderId: string; comment: string }
-  const beforeVerify: Note[] = []
-  const { port } = makePort({ createCandidates: [candidate({ shippingService: 'Royal Mail' })] })
+test('[o3d-bjc.8] the courier-fallback task waits until the id is proven ours', async () => {
+  // The id is not yet proven to be OUR order — a task would name a warehouse order that may be someone else's.
+  const { port, tasks: beforeVerify } = makePort({ createCandidates: [candidate({ shippingService: 'Royal Mail' })] })
   await runWmsOrderPushSweepCore(
     connector({
-      comments: beforeVerify,
       pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true, needsVerification: true }),
       verifyPushedOrder: async () => 'unknown',
     }),
     'mintsoft', port, { now: NOW },
   )
-  assert.equal(beforeVerify.length, 0, 'nothing is written to an unproven order')
+  assert.equal(beforeVerify.length, 0, 'nothing is raised about an unproven order')
 
   // ...and it lands once verification promotes the link.
   const promoted = makePort({
     verifiable: [{ ...VERIFY_LINK, courierPending: true, shippingService: 'Royal Mail' }],
   })
-  const afterVerify: Note[] = []
   await runWmsOrderPushSweepCore(
-    connector({ comments: afterVerify, verifyPushedOrder: async () => 'ours' }),
+    connector({ verifyPushedOrder: async () => 'ours' }),
     'mintsoft', promoted.port, { now: NOW },
   )
+  const afterVerify = promoted.tasks
+  assert.equal(promoted.updates.find((u) => u.data.state === 'SYNCED')?.data.courierTaskService, 'Royal Mail', 'the due-marker is written in the promotion write itself')
   assert.equal(afterVerify.length, 1)
   const note = afterVerify[0]!
-  assert.match(note.comment, /Royal Mail/)
+  assert.equal(note.reason, 'COURIER_FALLBACK')
+  assert.match(note.queryText, /Royal Mail/)
   assert.equal(note.externalOrderId, 'wms-1')
 })
 
