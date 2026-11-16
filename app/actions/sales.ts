@@ -8,6 +8,7 @@ import { db } from '@/lib/db'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
+import { findOrderShipmentShortfall } from '@/lib/domain/sales/shipment-service'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { freshAuthFailureResult, requireFreshPermission, requireInternalUser, requirePermission } from '@/lib/auth/server'
@@ -287,6 +288,8 @@ export type SoRow = {
   wmsPush: { state: string; lastError: string | null } | null
   /** Statuses of the order's shipments, oldest first (drives the fulfilment summary on the status badge). */
   shipmentStatuses: string[]
+  /** Units still owed (ordered - refunded - shipped); computed only when every parcel is SHIPPED on an order still in ALLOCATED/PICKING/PACKING, else null. */
+  shipmentOutstandingQty: number | null
 }
 
 export type SoDetail = SoRow & {
@@ -638,6 +641,7 @@ function mapSoRow(so: {
   return {
     id: so.id,
     shipmentStatuses: (so.shipments ?? []).map((sh) => sh.status),
+    shipmentOutstandingQty: null,
     wmsPush: so.wmsOrderPush
       ? (so.wmsOrderPush.connector !== undefined && wmsPushIsPreCutover(
         { state: so.wmsOrderPush.state, attempts: so.wmsOrderPush.attempts ?? 0, externalOrderId: so.wmsOrderPush.externalOrderId ?? null },
@@ -791,6 +795,14 @@ export type SoListResult = ListPage & {
  * A search covers order number, external order number, customer name and email, tracking number
  * and line SKU, and always includes completed and archived orders.
  */
+/** The fulfilment chip needs the order's remaining quantity only when every parcel has left yet the order has not advanced. */
+async function attachShipmentOutstanding(row: SoRow): Promise<void> {
+  if (!['ALLOCATED', 'PICKING', 'PACKING'].includes(row.status)) return
+  if (row.shipmentStatuses.length === 0 || row.shipmentStatuses.some((st) => st !== 'SHIPPED')) return
+  const shortfall = await findOrderShipmentShortfall(db, row.id)
+  row.shipmentOutstandingQty = (shortfall ?? []).reduce((sum, l) => sum + l.outstandingQty, 0)
+}
+
 export async function getSalesOrders(params: SoListParams = {}): Promise<SoListResult> {
   await requireInternalUser()
   const filter: SoListFilter = {
@@ -837,6 +849,7 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     }
     return row
   })
+  await Promise.all(rows.map(attachShipmentOutstanding))
   return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
@@ -984,8 +997,11 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     refundLines: r.lines,
   })]))
 
+  const detailRow = mapSoRow(so)
+  await attachShipmentOutstanding(detailRow)
+
   return {
-    ...mapSoRow(so),
+    ...detailRow,
     settlement,
     billingAddress: so.billingAddress,
     shippingAddress: so.shippingAddress,

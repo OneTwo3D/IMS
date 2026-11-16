@@ -131,7 +131,7 @@ function loadCols(): ColKey[] {
 // ---------------------------------------------------------------------------
 
 function FulfilmentChip({ so }: { so: SoRow }) {
-  const f = summariseFulfilment(so.status, so.shipmentStatuses)
+  const f = summariseFulfilment(so.status, so.shipmentStatuses, so.shipmentOutstandingQty)
   if (!f) return null
   return (
     <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${FULFILMENT_TONE_CLASS[f.tone]}`}>

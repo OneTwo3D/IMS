@@ -877,14 +877,16 @@ function ShipmentsPanel({
                 })()}
               </div>
               <div className="flex items-center gap-1.5">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 text-xs"
-                  onClick={() => window.open(packingSlipUrl(orderId, s.id), '_blank')}
-                >
-                  <Package className="h-3 w-3 mr-1" />Packing slip
-                </Button>
+                {orderPackingSlipAvailable(orderStatus) && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => window.open(packingSlipUrl(orderId, s.id), '_blank')}
+                  >
+                    <Package className="h-3 w-3 mr-1" />Packing slip
+                  </Button>
+                )}
                 {nextAction && s.status !== 'SHIPPED' && (
                   <Button size="sm" className="h-7 text-xs" onClick={() => handleAdvance(s.id, nextAction.target)} disabled={isPending}>
                     {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
@@ -1273,7 +1275,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {STATUS_LABELS[so.status]}
         </span>
         {(() => {
-          const fulfilment = summariseFulfilment(so.status, shipments.map((sh) => sh.status))
+          const fulfilment = summariseFulfilment(so.status, shipments.map((sh) => sh.status), so.shipmentOutstandingQty)
           return fulfilment ? (
             <span
               className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${FULFILMENT_TONE_CLASS[fulfilment.tone]}`}

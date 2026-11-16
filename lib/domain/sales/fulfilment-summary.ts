@@ -16,6 +16,12 @@ const SUMMARISED_ORDER_STATUSES: ReadonlySet<string> = new Set(['ALLOCATED', 'PI
 export function summariseFulfilment(
   orderStatus: string,
   shipmentStatuses: readonly string[],
+  /**
+   * Units still owed on the order (ordered - refunded - shipped, from `findOrderShipmentShortfall`),
+   * or null when not computed. It matters only once every parcel has left: a shipped parcel is not a
+   * fully dispatched order when ordered units were never put on a shipment.
+   */
+  outstandingQty: number | null = null,
 ): FulfilmentSummary | null {
   if (!SUMMARISED_ORDER_STATUSES.has(orderStatus)) return null
   const total = shipmentStatuses.length
@@ -25,7 +31,11 @@ export function summariseFulfilment(
   const packed = count('PACKED')
   const picking = count('PICKING')
 
-  if (shipped === total) return { label: `Dispatched ${shipped}/${total} parcels`, tone: 'dispatched' }
+  if (shipped === total) {
+    if (outstandingQty === null) return { label: `All ${total} parcels dispatched`, tone: 'dispatched' }
+    if (outstandingQty > 0) return { label: `Partially shipped — ${outstandingQty} still to ship`, tone: 'partial' }
+    return { label: `Dispatched ${shipped}/${total} parcels`, tone: 'dispatched' }
+  }
   if (shipped > 0) return { label: `Partially shipped ${shipped}/${total}`, tone: 'partial' }
   if (packed === total) return { label: 'Packed — ready to ship', tone: 'packed' }
   if (picking > 0) return { label: `Picking (${picking} of ${total} parcels)`, tone: 'picking' }

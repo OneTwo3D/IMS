@@ -17,7 +17,7 @@ import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
-import { selectShipmentsForSlip } from '@/lib/domain/sales/packing-slip-scope'
+import { packingSlipRefusal, selectShipmentsForSlip } from '@/lib/domain/sales/packing-slip-scope'
 
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireApiAuth()
@@ -30,6 +30,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     where: { id },
     select: {
       id: true,
+      status: true,
       orderNumber: true,
       externalOrderNumber: true,
       customerName: true,
@@ -51,6 +52,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     },
   })
   if (!so) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  // Same status rule as the buttons: no slip for a cancelled order (its goods must not be picked).
+  const refusal = packingSlipRefusal(so.status)
+  if (refusal) return NextResponse.json({ error: refusal }, { status: 409 })
 
   // ?shipment=<id> narrows the slip to one parcel (available from PENDING, so it can be printed to pick from).
   const requestedShipmentId = new URL(req.url).searchParams.get('shipment')

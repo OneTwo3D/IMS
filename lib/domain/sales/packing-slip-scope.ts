@@ -22,3 +22,8 @@ export function selectShipmentsForSlip<T extends { id: string }>(
   const match = shipments.filter((s) => s.id === requestedShipmentId)
   return match.length > 0 ? match : null
 }
+
+/** Why the route refuses a slip for this order status, or null. Cancelled goods must not be picked. */
+export function packingSlipRefusal(orderStatus: string): string | null {
+  return orderStatus === 'CANCELLED' ? 'Order is cancelled; no packing slip' : null
+}
