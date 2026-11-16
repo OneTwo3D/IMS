@@ -19,6 +19,8 @@ const state = {
   seamPayloads: [] as Row[],
   productUpdates: [] as Row[],
   discrepancyCreates: [] as Row[],
+  /** What the database holds NOW, when an operator edited the product after the snapshot was read. */
+  liveProduct: null as Row | null,
 }
 
 const baseProduct = (over: Row): Row => ({
@@ -41,9 +43,17 @@ mock.module('@/lib/db', {
       },
       externalWmsBinding: { findMany: async () => [{ warehouseId: 'wh-1', warehouse: { code: 'MAIN' } }] },
       product: {
-        findUnique: async () => state.product,
+        findUnique: async () => state.liveProduct ?? state.product,
         findFirst: async () => null,
         update: async ({ data }: { data: Row }) => { state.productUpdates.push(data); return {} },
+        // Compare-and-set: matches only while the stored values equal the ones the plan was built from.
+        updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+          const current = state.liveProduct ?? state.product
+          if (where.barcode !== (current.barcode ?? null) || where.mpn !== (current.mpn ?? null)) return { count: 0 }
+          state.productUpdates.push(data)
+          Object.assign(current, data) // the database now holds the written values
+          return { count: 1 }
+        },
       },
       wmsSyncJob: { create: async () => ({ id: 'job-1' }), update: async () => ({}) },
       wmsSyncLog: { createMany: async ({ data }: { data: Row[] }) => ({ count: data.length }) },
@@ -88,6 +98,7 @@ function reset(over: { flag?: string; product?: Row; wms?: Row | null }) {
   state.seamPayloads.length = 0
   state.productUpdates.length = 0
   state.discrepancyCreates.length = 0
+  state.liveProduct = null
 }
 
 // Loaded AFTER the mocks above: a static import would be hoisted above them and bind the real database.
@@ -274,4 +285,35 @@ test('flag ON: a GTIN backfill over a part number in Product.barcode moves that 
   const { dto } = state.upserts[0]!
   assert.equal(dto.barcode, GTIN)
   assert.equal(dto.mpn, 'LN00000059')
+})
+
+test('flag ON: an operator edit of mpn after the snapshot is not overwritten by the GTIN backfill; a conflict is reported', async () => {
+  reset({ flag: 'true', product: { barcode: null, mpn: null }, wms: { ProductId: 168, SKU: 'SKU-1', EAN: GTIN } })
+  // findUnique (the sync's snapshot) is read first; the operator saves an mpn before the backfill's update.
+  const snapshot = state.product
+  let reads = 0
+  const { db } = await import('@/lib/db')
+  const original = db.product.findUnique
+  ;(db.product as unknown as { findUnique: unknown }).findUnique = async () => {
+    reads += 1
+    if (reads === 1) return snapshot
+    return { ...snapshot, mpn: 'OPERATOR-EDIT' }
+  }
+  state.liveProduct = { ...snapshot, mpn: 'OPERATOR-EDIT' }
+  try {
+    await run()
+  } finally {
+    ;(db.product as unknown as { findUnique: unknown }).findUnique = original
+  }
+  assert.deepEqual(state.productUpdates, [], 'the edit is preserved: nothing written')
+  const conflict = state.discrepancyCreates.find((row) => row.category === 'BARCODE_CONFLICT')
+  assert.ok(conflict)
+  assert.match(String(conflict.message), /changed .*while the Mintsoft sync was running/)
+  assert.match(String(conflict.imsValue), /OPERATOR-EDIT/)
+})
+
+test('flag ON: a normal backfill into an empty product still lands (compare-and-set matches null with null)', async () => {
+  reset({ flag: 'true', product: { barcode: null, mpn: null }, wms: { ProductId: 168, SKU: 'SKU-1', EAN: GTIN, UPC: 'LN00000282' } })
+  await run()
+  assert.deepEqual(state.productUpdates, [{ barcode: GTIN }, { mpn: 'LN00000282' }])
 })

@@ -632,17 +632,53 @@ async function fetchAuthoritativeMintsoftProduct(context: ProductSyncContext): P
   }
 }
 
-async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode: string, alsoSet: { mpn?: string } = {}): Promise<{
+type PlannedIdentifiers = { barcode: string | null; mpn: string | null }
+
+/**
+ * Identifier split only: a backfill is a compare-and-set against the barcode and mpn the plan was built from, so an operator
+ * edit made after the product snapshot was read is never overwritten. Zero rows means the values moved: report it on the
+ * BARCODE_CONFLICT channel and write nothing (the next run re-plans from the fresh values).
+ */
+async function updateIdentifiersIfUnchanged(
+  context: ProductSyncContext,
+  expected: PlannedIdentifiers,
+  data: { barcode?: string; mpn?: string },
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const result = await db.product.updateMany({
+    where: { id: context.product.id, barcode: expected.barcode, mpn: expected.mpn },
+    data,
+  })
+  if (result.count > 0) return { ok: true }
+  const fresh = await db.product.findUnique({ where: { id: context.product.id }, select: { barcode: true, mpn: true } })
+  const message = `IMS barcode/MPN changed (now barcode ${fresh?.barcode ?? '(none)'}, MPN ${fresh?.mpn ?? '(none)'}) while the Mintsoft sync was running; nothing was backfilled from Mintsoft. It is re-planned on the next run.`
+  await upsertProductDiscrepancy({
+    scopes: context.scopes,
+    productId: context.product.id,
+    sku: context.product.sku,
+    category: 'BARCODE_CONFLICT',
+    imsValue: `barcode ${fresh?.barcode ?? '(none)'}, MPN ${fresh?.mpn ?? '(none)'}`,
+    wmsValue: [data.barcode && `GTIN ${data.barcode}`, data.mpn && `MPN ${data.mpn}`].filter(Boolean).join(', ') || null,
+    message,
+  })
+  return { ok: false, message }
+}
+
+async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode: string, alsoSet: { mpn?: string } = {}, expected?: PlannedIdentifiers): Promise<{
   ok: true
 } | {
   ok: false
   message: string
 }> {
   try {
-    await db.product.update({
-      where: { id: context.product.id },
-      data: { barcode, ...alsoSet },
-    })
+    if (expected) {
+      const guarded = await updateIdentifiersIfUnchanged(context, expected, { barcode, ...alsoSet })
+      if (!guarded.ok) return guarded
+    } else {
+      await db.product.update({
+        where: { id: context.product.id },
+        data: { barcode, ...alsoSet },
+      })
+    }
 
     await createBarcodeBackfillAudit({
       scopes: context.scopes,
@@ -677,8 +713,9 @@ async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode:
 }
 
 /** Identifier split only: copy the MPN Mintsoft holds into an IMS product that has none. Product.mpn is not unique. */
-async function backfillMpnFromMintsoft(context: ProductSyncContext, mpn: string): Promise<void> {
-  await db.product.update({ where: { id: context.product.id }, data: { mpn } })
+async function backfillMpnFromMintsoft(context: ProductSyncContext, mpn: string, expected: PlannedIdentifiers): Promise<{ ok: true } | { ok: false; message: string }> {
+  const guarded = await updateIdentifiersIfUnchanged(context, expected, { mpn })
+  if (!guarded.ok) return guarded
   await createBarcodeBackfillAudit({
     scopes: context.scopes,
     productId: context.product.id,
@@ -686,6 +723,7 @@ async function backfillMpnFromMintsoft(context: ProductSyncContext, mpn: string)
     barcode: mpn,
     label: 'MPN',
   })
+  return { ok: true }
 }
 
 async function syncOneMintsoftProduct(
@@ -795,17 +833,22 @@ async function syncOneMintsoftProduct(
     // IMS part number the conflict is about (barcode = part number A, Mintsoft EAN = a GTIN, Mintsoft UPC = a different part
     // number B). The conflict is reported below and a human decides.
     const mayBackfill = identifierPlan.kind !== 'conflict'
+    // The values the plan was built from; each successful backfill advances it.
+    let planned: PlannedIdentifiers = { barcode: context.product.barcode, mpn: context.product.mpn ?? null }
     if (mayBackfill && identifierPlan.gtin.kind === 'backfill' && wmsCodes.gtin) {
       // A part number sitting in Product.barcode is moved to Product.mpn in the SAME update, before barcode is replaced.
       const movedPartNumber = context.product.barcode?.trim() && !context.product.mpn?.trim() && imsCodes?.mpn
         ? { mpn: imsCodes.mpn }
         : {}
-      const backfill = await backfillBarcodeFromMintsoft(context, wmsCodes.gtin, movedPartNumber)
+      const backfill = await backfillBarcodeFromMintsoft(context, wmsCodes.gtin, movedPartNumber, planned)
       if (!backfill.ok) return failedBackfillResult(backfill.message, wmsCodes.gtin)
+      planned = { barcode: wmsCodes.gtin, mpn: movedPartNumber.mpn ?? planned.mpn }
       dto = { ...dto, barcode: wmsCodes.gtin }
     }
     if (mayBackfill && identifierPlan.mpn.kind === 'backfill' && wmsCodes.mpn) {
-      await backfillMpnFromMintsoft(context, wmsCodes.mpn)
+      const mpnBackfill = await backfillMpnFromMintsoft(context, wmsCodes.mpn, planned)
+      if (!mpnBackfill.ok) return failedBackfillResult(mpnBackfill.message, wmsCodes.mpn)
+      planned = { ...planned, mpn: wmsCodes.mpn }
       dto = { ...dto, mpn: wmsCodes.mpn }
     }
     payloadHash = hashMintsoftProductDto(dto)
