@@ -3176,6 +3176,7 @@ export async function runWmsOrderPushSweepCore(
       link: WmsPushUpdateLink,
       applied: { courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'; courierFormName?: string | null; courierFallback?: boolean },
       markerSetHere = false,
+      earlierRecorded = false,
     ) => {
       const service = link.order.shippingService
       const raised = applied.courierFallback
@@ -3190,7 +3191,7 @@ export async function runWmsOrderPushSweepCore(
         linkFields: {
           ...(applied.courierForm && !retryable ? { courierForm: applied.courierForm, courierFormName: applied.courierFormName ?? null } : {}),
           // Courier fallback: flag it, and keep the task DUE (for this service) until it is recorded, so it is retried even if the order is never amended again.
-          ...(applied.courierFallback ? { courierPending: true, ...(raised ? {} : { courierTaskService: service ?? '—' }) } : {}),
+          ...(applied.courierFallback ? { courierPending: true, ...(raised || (link.courierTaskService != null && !earlierRecorded && link.courierTaskService !== (service ?? '—')) ? {} : { courierTaskService: service ?? '—' }) } : {}),
           // The amendment did not apply the fallback: the marker this attempt persisted before the call is cleared in the normal write.
           ...(!applied.courierFallback && markerSetHere ? { courierTaskService: null } : {}),
         } as LinkWrite,
@@ -3204,6 +3205,7 @@ export async function runWmsOrderPushSweepCore(
       let update: Awaited<ReturnType<NonNullable<PushConnector['updateOrder']>>> | null = null
       let lineToken: string | undefined
       let courierMarkerSetHere = false
+      let earlierCourierTaskRecorded = false
       try {
         // An erased order is not amended: the pass settles it locally (no remote call, no retry loop) instead of
         // building a payload from placeholders. Propagating an erasure to the warehouse is separate work.
@@ -3252,6 +3254,17 @@ export async function runWmsOrderPushSweepCore(
         // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
         // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
         // amendment or a failed cleanup therefore always leaves them untrusted. If the mark cannot be written, nothing is sent.
+        // AN OLDER WAREHOUSE QUERY IS RECORDED BEFORE THE ORDER IS CHANGED AGAIN: a courier task still due for this link (an earlier insert failed) is
+        // recorded first, so a pending marker is never overwritten by this amendment's. If it still cannot be recorded the amendment is SKIPPED this sweep
+        // (nothing sent, nothing written; the failure is already counted in operatorTaskErrors) and the next sweep retries.
+        if (link.courierTaskService != null) {
+          const recorded = await raiseCourierTask({
+            orderId: link.order.id, externalOrderId: link.externalOrderId, warehouseRef: link.externalOrderId,
+            orderRef: link.order.orderNumber ?? link.order.id, orderNumber: link.order.orderNumber ?? null, service: link.courierTaskService === '—' ? null : link.courierTaskService,
+          })
+          if (!recorded) continue
+          earlierCourierTaskRecorded = true
+        }
         const acquired = await port.setLineIdsUnsafe?.(link.id, true)
         // Another sweep holds this link's amendment lease: the link stays due and is neither amended, stamped nor noticed here.
         if (acquired === null) continue
@@ -3260,7 +3273,7 @@ export async function runWmsOrderPushSweepCore(
         // THE COURIER TASK IS DUE BEFORE THE CALL: the marker (the service being applied) is persisted first, so a fallback the amendment applies can never
         // be lost to a failed task insert followed by a failed link write. It is cleared once the task is recorded, or in the normal write when no fallback
         // was applied. If it cannot be written nothing is sent. (An existing marker is left as it is.)
-        if (link.courierTaskService == null && port.setCourierTaskDue) courierMarkerSetHere = await port.setCourierTaskDue(link.order.id, link.order.shippingService ?? '—')
+        if ((link.courierTaskService == null || earlierCourierTaskRecorded) && port.setCourierTaskDue) courierMarkerSetHere = await port.setCourierTaskDue(link.order.id, link.order.shippingService ?? '—')
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
         // Nothing was written by THIS attempt. The mark is cleared only if this acquisition set it; a mark that was already set (an earlier
         // amendment was interrupted after changing lines but before its snapshot) stays until a verified replacement or a deletion of the ids.
@@ -3320,7 +3333,7 @@ export async function runWmsOrderPushSweepCore(
         }
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
         // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
-        const settled = await settleAmendedCourier(link, update.updated ? update : {}, courierMarkerSetHere)
+        const settled = await settleAmendedCourier(link, update.updated ? update : {}, courierMarkerSetHere, earlierCourierTaskRecorded)
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
         await port.updateLink(link.id, {
@@ -3354,7 +3367,7 @@ export async function runWmsOrderPushSweepCore(
         // A refusal that provably sent nothing (the outbound-write hold) applied no fallback: the marker this attempt set is withdrawn. Any other failure
         // may have been accepted, so the marker stays and the courier pass records the task.
         if (courierMarkerSetHere && !(error instanceof WmsOrderUpdatePartialError) && isOutboundWriteHeldError(error) && error.nothingSent) await port.clearCourierTaskDue?.(link.order.id, link.order.shippingService ?? '—').catch(() => {})
-        const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied, courierMarkerSetHere).catch(() => null) : null
+        const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied, courierMarkerSetHere, earlierCourierTaskRecorded).catch(() => null) : null
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
           action: 'order_update', outcome: update?.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,

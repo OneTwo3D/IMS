@@ -171,3 +171,27 @@ test('an amendment that applies NO fallback clears the marker it set, in its nor
   const run = await sweep(updateLinkFor({ courierForm: 'NAME', courierFormName: KEY }), { updated: true, status: 'NEW' }, { withMarker: true })
   assert.equal(run.linkWrites[0]!.courierTaskService, null)
 })
+
+test('DOUBLE PENDING: a courier task still due for service A is recorded BEFORE the order is amended again; if it cannot be recorded the amendment is skipped, and in the end A and B each have exactly one task', async () => {
+  const pendingA = () => updateLinkFor({ courierForm: null, courierFormName: null, courierTaskService: 'Old Service' } as never)
+  // Sweep 1: A's insert fails -> NO amendment is sent, nothing is overwritten, the failure is counted.
+  const first = await sweep(pendingA(), PLACEHOLDER_RESULT, { taskFails: true, withMarker: true })
+  assert.deepEqual(first.events, [], 'no marker write and no updateOrder: the amendment was skipped')
+  assert.deepEqual(first.linkWrites, [], 'the pending marker is untouched')
+  assert.equal(first.tasks.length, 0)
+  // Sweep 2: A records first, then the amendment to B runs and records B's own task.
+  const second = await sweep(pendingA(), PLACEHOLDER_RESULT, { withMarker: true })
+  assert.deepEqual(second.events, ['marker', 'updateOrder'])
+  assert.equal(second.tasks.length, 2)
+  assert.match(second.tasks[0]!.queryText, /'Old Service'/)
+  assert.match(second.tasks[1]!.queryText, /'RM Tracked'/)
+  assert.notEqual(second.tasks[0]!.dedupeBasis, second.tasks[1]!.dedupeBasis)
+})
+
+test('belt and braces: a failed task for B never overwrites a different pending service in the link write', async () => {
+  // (Reached only if the pre-amendment record is bypassed; the guard keeps A's marker.)
+  const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+  void runWmsOrderPushSweepCore
+  const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { taskFails: true, withMarker: true })
+  assert.equal(run.linkWrites[0]!.courierTaskService, 'RM Tracked', 'with no other pending service the marker is B')
+})
