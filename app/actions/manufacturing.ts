@@ -13,7 +13,10 @@ import {
   cogsEntryDataFromConsumed,
   consumeFifoLayersStrict,
   createCostLayer,
+  getManufacturingConsumedQtyForCostLayer,
   getReturnedQtyForCostLayer,
+  getReversalConsumedQtyForCostLayer,
+  getTransferConsumedQtyForCostLayer,
   recordCostLayerRevaluation,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
@@ -38,6 +41,9 @@ import {
   parseProductionOrderComponentSnapshot,
   type ProductionOrderComponentSnapshot,
 } from '@/lib/domain/manufacturing/component-consumption'
+import { splitManufacturingRevaluation } from '@/lib/domain/manufacturing/cost-edit-split'
+import { lockLandedCostRevaluationScope } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { defaultLandedCostServiceDeps, propagateLandedCostToOutputs } from '@/lib/domain/purchasing/landed-cost-service'
 import { resolveAssemblyOutputQty } from '@/lib/domain/manufacturing/production-completion'
 import {
   evaluateProductionOrderCompletion,
@@ -1715,6 +1721,14 @@ async function recalculateManufacturingCostLayers(
   // -> cost_layers (these) -> snapshot child rows. A production order is not a row the revaluation takes, and
   // this transaction takes no transfer or purchase order, so it cannot be a link in a cycle with
   // 2a -> 2b-2d -> 6 (see lib/domain/wms/transfer-asn-lock-order.ts). Everything is READ after this line.
+  // ACC-H14: the edit now propagates into every layer hanging off the output layers (transfer destinations,
+  // later production runs), exactly as a landed-cost revaluation does, so it takes the SAME scope lock in the
+  // same order (transfers, then the layers of the closure, ascending). The production order is held by the
+  // caller and no revaluation takes one, so there is no cycle. The statement below then re-locks what is held.
+  const outputLayerRows = await tx.costLayer.findMany({ where: { productionOrderId }, select: { id: true } })
+  if (outputLayerRows.length > 0) {
+    await lockLandedCostRevaluationScope(tx, { rootLayerIds: outputLayerRows.map((row) => row.id) })
+  }
   await tx.$queryRaw`SELECT id FROM cost_layers WHERE production_order_id = ${productionOrderId} ORDER BY id FOR NO KEY UPDATE`
 
   const layers = await tx.costLayer.findMany({
@@ -1764,17 +1778,15 @@ async function recalculateManufacturingCostLayers(
       reason: 'manufacturing_recompute',
     })
 
-    const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)
-    const consumedQty = li.receivedQty.sub(li.remainingQty).sub(returnedQty)
-    if (consumedQty.gt(0)) {
-      netCogsDeltaBase = addMoney(netCogsDeltaBase, multiplyMoney(consumedQty, unitDelta))
-    }
-    // The remainingQty units stayed in inventory; their value just shifted
-    // by unitDelta. Capture so the caller can post the inventory leg of
-    // the reclass journal.
-    if (li.remainingQty.gt(0)) {
-      netInventoryDeltaBase = addMoney(netInventoryDeltaBase, multiplyMoney(li.remainingQty, unitDelta))
-    }
+    // ACC-H14: see splitManufacturingRevaluation. Units that were transferred, returned or re-used are NOT
+    // sold, so they are excluded from the COGS leg exactly as the landed-cost revaluation excludes them.
+    const consumedQty = li.receivedQty.sub(li.remainingQty)
+    const exclusionsNeeded = consumedQty.gt(0)
+    const zero = toDecimal(0)
+    const returnedQty = exclusionsNeeded ? await getReturnedQtyForCostLayer(tx, li.id) : zero
+    const transferredQty = exclusionsNeeded ? await getTransferConsumedQtyForCostLayer(tx, li.id) : zero
+    const manufacturingConsumedQty = exclusionsNeeded ? await getManufacturingConsumedQtyForCostLayer(tx, li.id) : zero
+    const reversalConsumedQty = exclusionsNeeded ? await getReversalConsumedQtyForCostLayer(tx, li.id) : zero
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
     const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, {
@@ -1786,15 +1798,47 @@ async function recalculateManufacturingCostLayers(
       revaluationContext: { source: 'manufacturing_recompute', operation: 'recompute_production_order', productionOrderId },
     })
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
-    // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass
-    // journal's COGS leg to avoid double-posting COGS for sold units.
-    netCogsDeltaBase = subtractMoney(netCogsDeltaBase, shipmentRefresh.cogsRevaluationDelta)
+    // (COGS_REVERSAL now / daily batch later), so it is removed from the reclass COGS leg to avoid
+    // double-posting COGS for sold units — and, ACC-H14, ADDED to the Inventory leg, because that path
+    // credits Inventory for it. The split keeps the two legs summing to the whole edit.
+    const split = splitManufacturingRevaluation({
+      unitDelta: toDecimal(unitDelta),
+      receivedQty: li.receivedQty,
+      remainingQty: li.remainingQty,
+      returnedQty,
+      transferredQty,
+      manufacturingConsumedQty,
+      reversalConsumedQty,
+      shipmentOwnedDelta: toDecimal(shipmentRefresh.cogsRevaluationDelta),
+    })
+    netCogsDeltaBase = addMoney(netCogsDeltaBase, split.cogsDelta)
+    // Whole edit on this layer; Inventory is taken as this less the COGS leg once the downstream legs are in.
+    netInventoryDeltaBase = addMoney(netInventoryDeltaBase, split.cogsDelta.add(split.inventoryDelta))
+    // ACC-H14: the units this edit moved on (transferred, re-used as a component) are carried by LAYERS that hang
+    // off this one. Their cost, their snapshots and the COGS of any of them already sold follow the same path a
+    // landed-cost revaluation takes. Each downstream layer reports the COGS it still owes net of what its own
+    // shipments post; that joins the COGS leg here, and Inventory stays the balance of the whole edit, so the
+    // journal equals the overhead credit however deep the chain goes.
+    await propagateLandedCostToOutputs(
+      tx,
+      defaultLandedCostServiceDeps,
+      li.id,
+      unitDelta,
+      (downstreamCogsDelta) => { netCogsDeltaBase = addMoney(netCogsDeltaBase, downstreamCogsDelta) },
+      new Set<string>(),
+      0,
+      recalcRunId,
+      revaluedAt,
+      { source: 'manufacturing_recompute', operation: 'recompute_production_order', productionOrderId },
+      // The reclass journal's own chart: every downstream COGS_REVERSAL and ownership decision is about it.
+      reclassChart,
+    )
     await refreshSalesOrderLineCogsForCostLayerChange(tx, li.id)
   }
 
   return {
     cogsDeltaBase: roundQuantity(netCogsDeltaBase, 6).toNumber(),
-    inventoryDeltaBase: roundQuantity(netInventoryDeltaBase, 6).toNumber(),
+    inventoryDeltaBase: roundQuantity(subtractMoney(netInventoryDeltaBase, netCogsDeltaBase), 6).toNumber(),
   }
 }
 
@@ -1939,8 +1983,24 @@ export async function updateManufacturingCostLines(
             if (!settings || !settings.inventoryAccount || !settings.cogsAccount) {
               throw new Error('Cannot update completed manufacturing costs: configure Inventory and COGS accounts in Settings.')
             }
-            pushLine(settings.inventoryAccount, inventoryDeltaBase, 'capitalisation')
-            pushLine(settings.cogsAccount, cogsDeltaBase, 'capitalisation')
+            // ACC-H14: the credit side (overhead) is posted per account at 2dp, so the Inventory leg is
+            // taken as what balances it AFTER the COGS leg is rounded, rather than rounded on its own — three
+            // independently rounded legs can drift a cent or two apart and that used to be refused as an
+            // "unbalanced reclass journal". The two figures agree to within a rounding step by construction
+            // (the split is exact); a larger gap is a real inconsistency and is still refused below.
+            const cogsRounded = Math.abs(cogsDeltaBase) < 0.005 ? 0 : roundCurrency(cogsDeltaBase)
+            const overheadNet = roundCurrency(
+              [...overheadAccountDeltas.deltas.values()].reduce(
+                (sum, delta) => sum + (Math.abs(delta) < 0.005 ? 0 : Math.sign(delta) * roundCurrency(Math.abs(delta))),
+                0,
+              ),
+            )
+            const inventoryBalancing = roundCurrency(overheadNet - cogsRounded)
+            const inventoryForJournal = Math.abs(inventoryBalancing - inventoryDeltaBase) < 0.05
+              ? inventoryBalancing
+              : inventoryDeltaBase
+            pushLine(settings.inventoryAccount, inventoryForJournal, 'capitalisation')
+            pushLine(settings.cogsAccount, cogsRounded, 'capitalisation')
           }
 
           for (const [account, delta] of [...overheadAccountDeltas.deltas.entries()].sort(([a], [b]) => compareAccountCodes(a, b))) {

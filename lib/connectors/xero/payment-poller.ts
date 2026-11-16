@@ -50,6 +50,7 @@ import {
   withheldEntityKey,
   WITHHELD_RECHECK_BATCH,
 } from '@/lib/domain/accounting/withheld-reversal-markers'
+import { xeroDocumentRevisionAt } from './document-revision'
 import { parseXeroDateOrNull } from './xero-date'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
@@ -167,7 +168,29 @@ async function notifyReversalAdmins(
  * on, and it is IMS's OWN registration rows that withheld it, because one of them may have put a
  * payment into the ledger that this read did not see.
  */
-type WithheldAmountReason = 'part-payment' | 'amount-not-stated' | 'zero-paid-unproven'
+type WithheldAmountReason = 'part-payment' | 'amount-not-stated' | 'zero-paid-unproven' | 'removal-grace'
+
+/**
+ * o3d-hqvrp.28 (ACC-H6) — HOW LONG A REMOVED PAYMENT IS LEFT ALONE BEFORE IT IS TREATED AS A CHARGEBACK.
+ *
+ * A zero paid on an AUTHORISED invoice is what an accountant looking at Xero's payment screen produces
+ * on the way to RE-MATCHING a payment: remove it, then apply it again against the right invoice or
+ * bank line, usually minutes apart. A chargeback credit note raised in that gap reverses recognised
+ * revenue for a customer who paid and is about to be shown as paid again.
+ *
+ * So an invoice whose own revision stamp (`UpdatedDateUTC`, Xero's clock, advanced by the payment
+ * removal itself) is younger than this is WITHHELD for a recheck — the same durable, alerting,
+ * hourly-rechecked lifecycle as every other withheld verdict — and only a zero that has STOOD for this
+ * long is admitted as a reversal. The recheck interval (one hour) is longer than this, so by the time
+ * the document is asked again the window has always elapsed. A removed-and-reapplied payment is PAID
+ * again at the recheck, which closes the marker with nothing raised.
+ *
+ * A VOIDED invoice has no grace: Xero itself reversed AR/revenue and no chargeback is raised for it.
+ * A revision stamp that cannot be read does not withhold (there is nothing to measure), which is the
+ * behaviour before this window existed.
+ */
+export const XERO_PAYMENT_REMOVAL_GRACE_MS = 30 * 60 * 1000
+
 
 /**
  * One of an invoice's two stated amounts, as text — or the sentence that says Xero did not state it.
@@ -190,6 +213,8 @@ function ledgerAmountText(invoice: XeroInvoice | undefined, field: 'AmountPaid' 
  * "our payment has been deleted and nobody noticed".
  */
 function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmountReason): string {
+  // The grace verdict is about the AGE of the removal, not about whose payment the ledger holds.
+  if (reason === 'removal-grace') return ''
   switch (verdict.verdict) {
     case 'STILL_HELD':
       return reason === 'zero-paid-unproven'
@@ -425,6 +450,8 @@ async function readResidualVerdicts<T extends {
   registrationType: 'BILL_PAYMENT' | 'INVOICE_PAYMENT',
   referenceType: 'PurchaseInvoice' | 'SalesOrder',
   ledgerObservedBefore: LedgerReadFence | null,
+  /** Sales only: the removal grace window and the instant it is measured at. Absent = no grace (bills). */
+  removalGrace?: { ms: number; now: Date },
 ): Promise<ResidualReading<T>> {
   const out = emptyResidual<T>()
   if (docs.length === 0) return out
@@ -465,7 +492,13 @@ async function readResidualVerdicts<T extends {
 
     if (zeroPaidInvoiceIds.has(invoice.InvoiceID)) {
       if (zeroPaidIsProvenReversal(verdict)) {
-        out.zeroPaidReversed.add(invoice.InvoiceID)
+        const revisedAt = removalGrace ? xeroDocumentRevisionAt(invoice) : null
+        if (removalGrace && revisedAt && removalGrace.now.getTime() - revisedAt.getTime() < removalGrace.ms) {
+          // Too fresh to tell a removal from the first half of a re-match: no chargeback yet.
+          out.withheld.push({ doc, invoice, verdict, reason: 'removal-grace' })
+        } else {
+          out.zeroPaidReversed.add(invoice.InvoiceID)
+        }
       } else {
         out.withheld.push({ doc, invoice, verdict, reason: 'zero-paid-unproven' })
       }
@@ -524,6 +557,9 @@ function billWithheldDescription(bill: WithheldBillDoc, invoice: XeroInvoice, re
         + `payload did not state how much has been paid, so IMS cannot tell a part payment from a `
         + `removed one. paidAt was left set rather than guessed — clearing it would re-arm Mark Paid and `
         + `risk a second supplier payment. Check the bill in Xero and reconcile it by hand.`)
+    case 'removal-grace':
+      // Not reachable: bills are read without a grace window (a bill reversal raises no credit note).
+      return withLedgerCheck(`Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero with nothing paid against it; paidAt was left set pending a recheck.`)
     case 'zero-paid-unproven':
       return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero with NOTHING paid against it, `
         + `which normally means the payment was removed. paidAt was LEFT SET anyway: IMS holds a payment `
@@ -628,6 +664,12 @@ function salesWithheldDescription(
         + `did not state how much has been paid, so IMS cannot tell a part payment from a removed one. `
         + `paidAt was left set and NO chargeback credit note was raised. Check the invoice in Xero and `
         + `reconcile it by hand.`)
+    case 'removal-grace':
+      return `Invoice for order ${ref} is ${invoice.Status} in Xero with NOTHING paid against it and was `
+        + `changed in the last ${Math.round(XERO_PAYMENT_REMOVAL_GRACE_MS / 60000)} minutes. That is what removing a payment in order to `
+        + `re-apply it looks like, so paidAt was LEFT SET and NO chargeback credit note was raised yet. IMS asks `
+        + `Xero again within the hour: if the payment is back the warning closes by itself and nothing is `
+        + `raised; if the invoice is still unpaid then, it is treated as a genuine reversal.`
     case 'zero-paid-unproven':
       // The sales side of the same race: an INVOICE_PAYMENT registered and not yet posted reads as a
       // zero, and a chargeback raised there reverses recognised revenue against a payment about to land.
@@ -730,6 +772,7 @@ export async function readSalesResidualVerdicts(
   candidateInvoices: Map<string, XeroInvoice>,
   zeroPaidInvoiceIds: ReadonlySet<string>,
   ledgerObservedBefore: LedgerReadFence | null,
+  now: Date = new Date(),
 ): Promise<ResidualReading<WithheldOrderDoc>> {
   const candidateOrders = candidateInvoices.size === 0 ? [] : await db.salesOrder.findMany({
     where: { accountingInvoiceId: { in: [...candidateInvoices.keys()] }, paidAt: { not: null } },
@@ -744,6 +787,7 @@ export async function readSalesResidualVerdicts(
   })
   return await readResidualVerdicts(
     candidateOrders, candidateInvoices, zeroPaidInvoiceIds, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
+    { ms: XERO_PAYMENT_REMOVAL_GRACE_MS, now },
   )
 }
 
