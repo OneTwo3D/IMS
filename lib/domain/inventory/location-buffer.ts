@@ -11,7 +11,10 @@ import { toDecimal } from '@/lib/domain/math/decimal'
  *     units CAN be allocated to an IMS order (the buffer says what the storefront may sell, not what the warehouse may ship).
  *   - The WMS stock alignment pass reconciles real on-hand and never reads it: the buffer applies only to the channel push.
  *
- * Every change writes an activity-log row in the SAME transaction (who, when, old value, new value, REQUIRED reason), so a
+ * A buffer lives in its own table (location_stock_buffers), never on StockLevel: setting one must not create a stock row, which would make
+ * the product a stock-push candidate and look like opening-stock history. A buffer at a location with no stock row has no effect.
+ *
+ * Every APPLIED change writes an activity-log row in the SAME transaction (who, when, old value, new value, REQUIRED reason), so a
  * buffer can never change unaudited. The reason is operator text about stock, entity type PRODUCT: it is not customer or order
  * personal data, so it sits outside the erasure scope (no customer/order-linked table carries it).
  */
@@ -37,7 +40,8 @@ export function parseBufferInput(raw: string | null | undefined): BufferInputRes
   return { ok: true, value }
 }
 
-export type BufferRowInput = { warehouseId: string; bufferQty: string | null }
+/** One edited cell: the value the editor loaded for that warehouse and the value the operator typed. Untouched warehouses are never sent. */
+export type BufferEditInput = { warehouseId: string; expectedOld: string | null; bufferQty: string | null }
 
 export type BufferChange = {
   warehouseId: string
@@ -46,15 +50,22 @@ export type BufferChange = {
   newValue: string
 }
 
+export type StaleBufferCell = { warehouseId: string; warehouseCode: string }
+
 export type ApplyBufferResult =
-  | { ok: true; changes: BufferChange[] }
+  | { ok: true; changes: BufferChange[]; stale: StaleBufferCell[] }
   | { ok: false; error: string; fieldErrors?: Record<string, string> }
 
-type TxClient = Pick<Prisma.TransactionClient, 'product' | 'warehouse' | 'stockLevel' | 'activityLog'>
+type TxClient = Pick<Prisma.TransactionClient, 'product' | 'warehouse' | 'locationStockBuffer' | 'activityLog' | '$queryRaw'>
 
+/**
+ * Compare-and-set per edited warehouse. Each row is locked (insert-if-absent, then SELECT ... FOR UPDATE), the current value is
+ * compared with the one the editor loaded, and a cell that moved is refused as stale while the other cells still save. Only
+ * applied changes are audited, with the true old value. A buffer that ends at 0 is removed (no row means no buffer).
+ */
 export async function applyLocationBuffers(
   tx: TxClient,
-  input: { productId: string; userId: string | null; reason: string | null | undefined; rows: BufferRowInput[] },
+  input: { productId: string; userId: string | null; reason: string | null | undefined; edits: BufferEditInput[] },
 ): Promise<ApplyBufferResult> {
   const product = await tx.product.findUnique({ where: { id: input.productId }, select: { id: true, sku: true, type: true } })
   if (!product) return { ok: false, error: 'Product not found.' }
@@ -63,36 +74,30 @@ export async function applyLocationBuffers(
   }
 
   const seen = new Set<string>()
-  for (const row of input.rows) {
-    if (seen.has(row.warehouseId)) return { ok: false, error: 'A warehouse appears twice in the request.' }
-    seen.add(row.warehouseId)
+  for (const edit of input.edits) {
+    if (seen.has(edit.warehouseId)) return { ok: false, error: 'A warehouse appears twice in the request.' }
+    seen.add(edit.warehouseId)
   }
 
   const fieldErrors: Record<string, string> = {}
-  const parsed: Array<{ warehouseId: string; value: Prisma.Decimal }> = []
-  for (const row of input.rows) {
-    const result = parseBufferInput(row.bufferQty)
-    if (result.ok) parsed.push({ warehouseId: row.warehouseId, value: result.value })
-    else fieldErrors[row.warehouseId] = result.error
+  const parsed: Array<{ warehouseId: string; expected: Prisma.Decimal; value: Prisma.Decimal }> = []
+  for (const edit of input.edits) {
+    const next = parseBufferInput(edit.bufferQty)
+    const expected = parseBufferInput(edit.expectedOld)
+    if (!next.ok) fieldErrors[edit.warehouseId] = next.error
+    else if (!expected.ok) return { ok: false, error: 'The page is out of date. Reload and try again.' }
+    else parsed.push({ warehouseId: edit.warehouseId, expected: expected.value, value: next.value })
   }
   if (Object.keys(fieldErrors).length > 0) return { ok: false, error: 'Fix the highlighted values.', fieldErrors }
 
   const warehouses = await tx.warehouse.findMany({ where: { id: { in: [...seen] } }, select: { id: true, code: true } })
   const warehouseById = new Map(warehouses.map((w) => [w.id, w]))
-  for (const row of input.rows) if (!warehouseById.has(row.warehouseId)) return { ok: false, error: 'Unknown warehouse.' }
+  for (const edit of input.edits) if (!warehouseById.has(edit.warehouseId)) return { ok: false, error: 'Unknown warehouse.' }
 
-  const existing = await tx.stockLevel.findMany({
-    where: { productId: product.id, warehouseId: { in: [...seen] } },
-    select: { warehouseId: true, bufferQty: true },
-  })
-  const existingByWarehouse = new Map(existing.map((s) => [s.warehouseId, s]))
+  const wanted = parsed.filter(({ expected, value }) => !expected.equals(value))
+  if (wanted.length === 0) return { ok: true, changes: [], stale: [] }
 
-  const pending = parsed
-    .map(({ warehouseId, value }) => ({ warehouseId, value, before: existingByWarehouse.get(warehouseId)?.bufferQty ?? toDecimal(0) }))
-    .filter(({ value, before }) => !before.equals(value))
-  if (pending.length === 0) return { ok: true, changes: [] }
-
-  // The reason is the "why" of the audit trail, so a change without one is refused. Nothing is written yet.
+  // The reason is the "why" of the audit trail, so an intended change without one is refused. Nothing is written yet.
   const reason = (input.reason ?? '').trim()
   if (reason === '') return { ok: false, error: 'Give a reason for the change.', fieldErrors: { reason: 'A reason is required.' } }
   if (reason.length > BUFFER_REASON_MAX_LENGTH) {
@@ -100,19 +105,25 @@ export async function applyLocationBuffers(
   }
 
   const changes: BufferChange[] = []
-  for (const { warehouseId, value, before } of pending) {
+  const stale: StaleBufferCell[] = []
+  for (const { warehouseId, expected, value } of wanted) {
     const warehouse = warehouseById.get(warehouseId)!
-    if (existingByWarehouse.has(warehouseId)) {
-      await tx.stockLevel.update({ where: { productId_warehouseId: { productId: product.id, warehouseId } }, data: { bufferQty: value } })
-    } else {
-      // No stock row yet: create it at zero so the buffer has a home (a concurrent receipt that created it first is kept).
-      await tx.stockLevel.upsert({
-        where: { productId_warehouseId: { productId: product.id, warehouseId } },
-        create: { productId: product.id, warehouseId, quantity: 0, bufferQty: value },
-        update: { bufferQty: value },
-      })
+    // Lock the row: insert it at 0 if absent (ON CONFLICT DO NOTHING), then read it FOR UPDATE.
+    await tx.locationStockBuffer.createMany({ data: [{ productId: product.id, warehouseId, bufferQty: 0 }], skipDuplicates: true })
+    const locked = await tx.$queryRaw<Array<{ bufferQty: Prisma.Decimal }>>`
+      SELECT "bufferQty" FROM location_stock_buffers WHERE "productId" = ${product.id} AND "warehouseId" = ${warehouseId} FOR UPDATE`
+    const current = toDecimal(locked[0]?.bufferQty ?? 0)
+    if (!current.equals(expected)) {
+      stale.push({ warehouseId, warehouseCode: warehouse.code })
+      if (current.isZero()) await tx.locationStockBuffer.deleteMany({ where: { productId: product.id, warehouseId, bufferQty: 0 } })
+      continue
     }
-    changes.push({ warehouseId, warehouseCode: warehouse.code, oldValue: before.toString(), newValue: value.toString() })
+    if (value.isZero()) {
+      await tx.locationStockBuffer.deleteMany({ where: { productId: product.id, warehouseId } })
+    } else {
+      await tx.locationStockBuffer.update({ where: { productId_warehouseId: { productId: product.id, warehouseId } }, data: { bufferQty: value } })
+    }
+    changes.push({ warehouseId, warehouseCode: warehouse.code, oldValue: current.toString(), newValue: value.toString() })
   }
 
   for (const change of changes) {
@@ -135,5 +146,5 @@ export async function applyLocationBuffers(
     })
   }
 
-  return { ok: true, changes }
+  return { ok: true, changes, stale }
 }

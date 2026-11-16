@@ -10,28 +10,39 @@ import test, { mock } from 'node:test'
 const state = {
   denied: false,
   asked: [] as string[],
-  levels: new Map<string, { bufferQty: number }>(), // by warehouseId
-  writes: [] as Array<{ kind: string; data: unknown }>,
+  rows: new Map<string, number>(), // location_stock_buffers by warehouseId (this product)
+  ops: [] as Array<{ op: string; warehouseId: string; value?: number }>,
   activity: [] as Array<Record<string, unknown>>,
   enqueued: [] as Array<{ ids: string[]; reason: string }>,
   enqueueThrows: false,
   fallbackLogs: [] as Array<Record<string, unknown>>,
 }
 
-const Dec = (n: number) => ({ equals: (o: unknown) => Number(String(o)) === n, toString: () => String(n), valueOf: () => n })
+const num = (v: { toString(): string }) => Number(v.toString())
 const tx = {
   product: { findUnique: async () => ({ id: 'p1', sku: 'SKU-1', type: 'SIMPLE' }) },
   warehouse: { findMany: async () => [{ id: 'w1', code: 'EAR2' }, { id: 'w2', code: 'EAR3' }] },
-  stockLevel: {
-    findMany: async () => [...state.levels].map(([warehouseId, l]) => ({ warehouseId, bufferQty: Dec(l.bufferQty) })),
+  locationStockBuffer: {
+    createMany: async (args: { data: Array<{ warehouseId: string }>; skipDuplicates: boolean }) => {
+      assert.equal(args.skipDuplicates, true)
+      for (const d of args.data) if (!state.rows.has(d.warehouseId)) { state.rows.set(d.warehouseId, 0); state.ops.push({ op: 'insert', warehouseId: d.warehouseId }) }
+    },
     update: async (args: { where: { productId_warehouseId: { warehouseId: string } }; data: { bufferQty: { toString(): string } } }) => {
-      state.writes.push({ kind: 'update', data: args.data })
-      state.levels.set(args.where.productId_warehouseId.warehouseId, { bufferQty: Number(args.data.bufferQty.toString()) })
+      const w = args.where.productId_warehouseId.warehouseId
+      state.rows.set(w, num(args.data.bufferQty))
+      state.ops.push({ op: 'update', warehouseId: w, value: num(args.data.bufferQty) })
     },
-    upsert: async (args: { create: { warehouseId: string; quantity: number; bufferQty: { toString(): string } } }) => {
-      state.writes.push({ kind: 'upsert', data: args.create })
-      state.levels.set(args.create.warehouseId, { bufferQty: Number(args.create.bufferQty.toString()) })
+    deleteMany: async (args: { where: { warehouseId: string; bufferQty?: number } }) => {
+      const w = args.where.warehouseId
+      if (args.where.bufferQty === 0 && state.rows.get(w) !== 0) return
+      state.rows.delete(w)
+      state.ops.push({ op: 'delete', warehouseId: w })
     },
+  },
+  // The FOR UPDATE read of the one row (tagged template: values are [productId, warehouseId]).
+  $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+    state.ops.push({ op: 'lock', warehouseId: String(values[1]) })
+    return [{ bufferQty: { toString: () => String(state.rows.get(String(values[1])) ?? 0) } }]
   },
   activityLog: { create: async (args: { data: Record<string, unknown> }) => { state.activity.push(args.data) } },
 }
@@ -65,13 +76,15 @@ mock.module('@/lib/activity-log', {
 function reset() {
   state.denied = false
   state.asked = []
-  state.levels = new Map([['w1', { bufferQty: 0 }]])
-  state.writes = []
+  state.rows = new Map()
+  state.ops = []
   state.activity = []
   state.enqueued = []
   state.enqueueThrows = false
   state.fallbackLogs = []
 }
+
+const cwd = new URL('../../..', import.meta.url).pathname
 
 test('parseBufferInput: blank is 0; decimals allowed; negatives, junk and too many places are refused', async () => {
   const { parseBufferInput } = await import('@/lib/domain/inventory/location-buffer')
@@ -80,12 +93,17 @@ test('parseBufferInput: blank is 0; decimals allowed; negatives, junk and too ma
   for (const bad of ['-1', '1e3', 'abc', '1,5', '0.0000001', '999999999']) assert.equal(parseBufferInput(bad).ok, false, bad)
 })
 
-test('saving writes the buffer, an audit row with who/old/new/reason, and enqueues the normal stock push', async () => {
+const E = (warehouseId: string, expectedOld: string, bufferQty: string) => ({ warehouseId, expectedOld, bufferQty })
+const writesTo = (w: string) => state.ops.filter((o) => o.warehouseId === w && o.op !== 'lock')
+
+test('saving writes only the edited buffer, an audit row with who/old/new/reason, and enqueues the normal stock push', async () => {
   reset()
   const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
-  const result = await saveLocationBuffers('p1', [{ warehouseId: 'w1', bufferQty: '20' }, { warehouseId: 'w2', bufferQty: '' }], 'Hold for the trade show')
-  assert.deepEqual(result, { success: true, changed: 1 }) // w2 stays 0: unchanged, nothing written
+  const result = await saveLocationBuffers('p1', [E('w1', '', '20')], 'Hold for the trade show')
+  assert.deepEqual(result, { success: true, changed: 1, stale: [] })
   assert.deepEqual(state.asked, ['inventory.edit'])
+  assert.equal(state.rows.get('w1'), 20)
+  assert.deepEqual(writesTo('w2'), [], 'an untouched warehouse is never written')
   assert.equal(state.activity.length, 1)
   const row = state.activity[0] as { userId: string; entityType: string; entityId: string; action: string; description: string; metadata: Record<string, unknown> }
   assert.equal(row.userId, 'u1')
@@ -97,51 +115,82 @@ test('saving writes the buffer, an audit row with who/old/new/reason, and enqueu
   assert.deepEqual(state.enqueued, [{ ids: ['p1'], reason: 'IMS_CHANGE' }])
 })
 
-test('the reason is REQUIRED when something changes: refused, nothing written, no push', async () => {
+test('a STALE cell is refused with the other cells still saved; the audit carries the true old value; one push', async () => {
+  reset()
+  state.rows.set('w1', 10) // another operator set 10 after this page loaded (it expected 0)
+  state.rows.set('w2', 4)
+  const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
+  const result = await saveLocationBuffers('p1', [E('w1', '', '3'), E('w2', '4', '6')], 'rebalance')
+  assert.deepEqual(result, { success: true, changed: 1, stale: ['EAR2'] })
+  assert.equal(state.rows.get('w1'), 10, 'the stale cell was not overwritten')
+  assert.equal(state.rows.get('w2'), 6)
+  assert.deepEqual(writesTo('w1'), [], 'nothing written to the stale warehouse')
+  assert.deepEqual(state.activity.map((a) => (a.metadata as Record<string, unknown>).warehouseCode), ['EAR3'])
+  assert.equal((state.activity[0]!.metadata as Record<string, unknown>).oldValue, '4')
+  assert.equal(state.enqueued.length, 1)
+})
+
+test('when every edited cell is stale nothing is audited and NO push is queued', async () => {
+  reset()
+  state.rows.set('w1', 10)
+  const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
+  const result = await saveLocationBuffers('p1', [E('w1', '', '3')], 'why')
+  assert.deepEqual(result, { success: true, changed: 0, stale: ['EAR2'] })
+  assert.deepEqual([state.activity, state.enqueued], [[], []])
+  assert.equal(state.rows.get('w1'), 10)
+})
+
+test('a stale expectation of a row that has since been removed leaves no stray zero row', async () => {
+  reset() // the page loaded 5, the row is gone (0)
+  const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
+  const result = await saveLocationBuffers('p1', [E('w1', '5', '8')], 'why')
+  assert.deepEqual(result, { success: true, changed: 0, stale: ['EAR2'] })
+  assert.equal(state.rows.has('w1'), false)
+})
+
+test('setting a buffer back to 0 removes the row', async () => {
+  reset()
+  state.rows.set('w1', 5)
+  const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
+  assert.deepEqual(await saveLocationBuffers('p1', [E('w1', '5', '')], 'released'), { success: true, changed: 1, stale: [] })
+  assert.equal(state.rows.has('w1'), false)
+  assert.equal(state.activity[0]!.description && (state.activity[0]!.metadata as Record<string, unknown>).newValue, '0')
+})
+
+test('the reason is REQUIRED when something is to change: refused, nothing written, no push', async () => {
   reset()
   const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
   for (const reason of ['', '   ']) {
-    const result = await saveLocationBuffers('p1', [{ warehouseId: 'w1', bufferQty: '5' }], reason)
+    const result = await saveLocationBuffers('p1', [E('w1', '', '5')], reason)
     assert.equal(result.success, false)
     assert.ok(!result.success && result.fieldErrors?.reason)
   }
-  const tooLong = await saveLocationBuffers('p1', [{ warehouseId: 'w1', bufferQty: '5' }], 'x'.repeat(501))
+  const tooLong = await saveLocationBuffers('p1', [E('w1', '', '5')], 'x'.repeat(501))
   assert.equal(tooLong.success, false)
-  assert.deepEqual(state.writes, [])
-  assert.deepEqual(state.activity, [])
-  assert.deepEqual(state.enqueued, [])
+  assert.deepEqual([state.ops, state.activity, state.enqueued], [[], [], []])
 })
 
-test('an unchanged save needs no reason and writes, audits and pushes nothing', async () => {
+test('an unchanged cell needs no reason and writes, audits and pushes nothing', async () => {
   reset()
   const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
-  assert.deepEqual(await saveLocationBuffers('p1', [{ warehouseId: 'w1', bufferQty: '' }], ''), { success: true, changed: 0 })
-  assert.deepEqual([state.writes, state.activity, state.enqueued], [[], [], []])
-})
-
-test('a location with no stock row gets one at zero quantity to carry the buffer', async () => {
-  reset()
-  const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
-  await saveLocationBuffers('p1', [{ warehouseId: 'w2', bufferQty: '4' }], 'reserve for B2B')
-  assert.equal(state.writes.length, 1)
-  assert.equal(state.writes[0]!.kind, 'upsert')
-  assert.equal((state.writes[0]!.data as { quantity: number }).quantity, 0)
+  assert.deepEqual(await saveLocationBuffers('p1', [E('w1', '', '')], ''), { success: true, changed: 0, stale: [] })
+  assert.deepEqual([state.ops, state.activity, state.enqueued], [[], [], []])
 })
 
 test('without inventory.edit nothing is written, audited or pushed', async () => {
   reset()
   state.denied = true
   const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
-  await assert.rejects(saveLocationBuffers('p1', [{ warehouseId: 'w1', bufferQty: '5' }], 'why'), /Forbidden/)
+  await assert.rejects(saveLocationBuffers('p1', [E('w1', '', '5')], 'why'), /Forbidden/)
   assert.deepEqual(state.asked, ['inventory.edit'])
-  assert.deepEqual([state.writes, state.activity, state.enqueued], [[], [], []])
+  assert.deepEqual([state.ops, state.activity, state.enqueued], [[], [], []])
 })
 
 test('a failed enqueue does not undo the saved buffer; it is logged as a warning', async () => {
   reset()
   state.enqueueThrows = true
   const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
-  assert.deepEqual(await saveLocationBuffers('p1', [{ warehouseId: 'w1', bufferQty: '5' }], 'why'), { success: true, changed: 1 })
+  assert.deepEqual(await saveLocationBuffers('p1', [E('w1', '', '5')], 'why'), { success: true, changed: 1, stale: [] })
   assert.equal(state.fallbackLogs.length, 1)
   assert.equal(state.fallbackLogs[0]!.level, 'WARNING')
 })
@@ -149,9 +198,17 @@ test('a failed enqueue does not undo the saved buffer; it is logged as a warning
 test('negative and malformed buffers are refused before anything is written', async () => {
   reset()
   const { saveLocationBuffers } = await import('@/app/actions/location-buffer')
-  const result = await saveLocationBuffers('p1', [{ warehouseId: 'w1', bufferQty: '-3' }], 'why')
+  const result = await saveLocationBuffers('p1', [E('w1', '', '-3')], 'why')
   assert.equal(result.success, false)
-  assert.deepEqual([state.writes, state.activity, state.enqueued], [[], [], []])
+  assert.deepEqual([state.ops, state.activity, state.enqueued], [[], [], []])
+})
+
+test('the buffer editor never touches stock_levels', () => {
+  for (const file of ['lib/domain/inventory/location-buffer.ts', 'app/actions/location-buffer.ts']) {
+    const src = readFileSync(`${cwd}${file}`, 'utf8')
+    assert.ok(!/stockLevel\.(create|upsert|update|delete)/.test(src), `${file} must not write stock rows`)
+  }
+  assert.ok(!/stockLevel/.test(readFileSync(`${cwd}lib/domain/inventory/location-buffer.ts`, 'utf8')))
 })
 
 /**
@@ -159,7 +216,6 @@ test('negative and malformed buffers are refused before anything is written', as
  * store may sell, not what the warehouse may ship), on-hand/reserved maths and the Mintsoft alignment pass must keep working on real
  * stock, so none of them may read it. A new reader fails here until it is decided.
  */
-const cwd = new URL('../../..', import.meta.url).pathname
 test('only the WooCommerce stock push, the buffer editor and the schema read or write bufferQty', () => {
   const files = execFileSync('git', ['grep', '--untracked', '-lw', 'bufferQty', '--', 'app', 'lib', 'components', 'prisma/schema.prisma', ':!app/generated'], { encoding: 'utf8', cwd }).trim().split('\n').filter(Boolean).sort()
   assert.deepEqual(files, [
@@ -185,5 +241,5 @@ test('the buffer reason is operator text on a PRODUCT activity row, which erasur
   const { IDENTITY_BEARING_ENTITY_TYPES } = await import('@/lib/domain/erasure/activity-identity')
   assert.ok(!IDENTITY_BEARING_ENTITY_TYPES.includes('PRODUCT' as never))
   const { ERASURE_CLASSIFICATION } = await import('@/lib/domain/erasure/erasure-classification')
-  assert.ok(!('StockLevel' in ERASURE_CLASSIFICATION), 'stock_levels is not customer- or order-linked, and carries no text column')
+  assert.ok(!('LocationStockBuffer' in ERASURE_CLASSIFICATION), 'location_stock_buffers is not customer- or order-linked, and carries no text column')
 })

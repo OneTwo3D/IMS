@@ -13,13 +13,13 @@ import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants
 
 const ORIGIN = 'https://shop.example.com'
 const settings = new Map<string, string>()
-type Level = { productId: string; warehouseId: string; quantity: number; reservedQty: number; bufferQty?: number }
+type Level = { productId: string; warehouseId: string; quantity: number; reservedQty: number }
 let levels: Level[] = []
+/** Rows of location_stock_buffers (independent of stock rows). */
+let bufferRows: Array<{ productId: string; warehouseId: string; bufferQty: number }> = []
+let bufferReads = 0
 let candidates: Array<Record<string, unknown>> = []
 let posts: Array<{ path: string; body: unknown }> = []
-/** When false the fake DB returns rows WITHOUT a bufferQty key: the exact shape the code read before this feature. */
-let returnBufferColumn = true
-let selectedBuffer = false
 
 function modelProxy(name: string) {
   return new Proxy({}, {
@@ -30,15 +30,18 @@ function modelProxy(name: string) {
       }
       if (name === 'setting' && method === 'findMany') return [...settings].map(([key, value]) => ({ key, value }))
       if (name === 'warehouse' && method === 'findMany') return [{ id: 'w1' }, { id: 'w2' }]
-      if (name === 'stockLevel' && method === 'findMany') {
-        if (args?.select?.bufferQty) selectedBuffer = true
-        return levels.map((l) => {
-          const row: Record<string, unknown> = { productId: l.productId, warehouseId: l.warehouseId, quantity: l.quantity, reservedQty: l.reservedQty }
-          if (returnBufferColumn && args?.select?.bufferQty) row.bufferQty = l.bufferQty ?? 0
-          return row
-        })
+      if (name === 'locationStockBuffer' && method === 'findMany') {
+        bufferReads += 1
+        return bufferRows.filter((b) => b.bufferQty > 0)
       }
-      if (name === 'product' && method === 'findMany') return candidates
+      if (name === 'stockLevel' && method === 'findMany') {
+        return levels.map((l) => ({ productId: l.productId, warehouseId: l.warehouseId, quantity: l.quantity, reservedQty: l.reservedQty }))
+      }
+      if (name === 'product' && method === 'findMany') {
+        // Like the real query: an unscoped run only selects products that have a stock row (or KITs).
+        const ids = (args as { where?: { OR?: Array<{ id?: { in?: string[] } }> } } | undefined)?.where?.OR?.[0]?.id?.in
+        return Array.isArray(ids) ? candidates.filter((c) => ids.includes(c.id as string)) : candidates
+      }
       if (name === 'product' && method === 'updateMany') return { count: 1 }
       if (name === 'product' && method === 'findUnique') {
         const found = candidates.find((p) => p.id === (args as { where?: { id?: string } } | undefined)?.where?.id)
@@ -79,12 +82,12 @@ const product = (id: string, sku: string, externalProductId: bigint) => ({
   id, sku, type: 'SIMPLE', lifecycleStatus: 'ACTIVE', externalProductId, parent: null, productComponents: [],
 })
 
-function reset(list: Level[], withBufferColumn = true) {
+function reset(list: Level[], buffers: Array<{ productId: string; warehouseId: string; bufferQty: number }> = []) {
   settings.clear()
   for (const [key, value] of Object.entries({ wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_stock_sync_enabled: 'true', last_wc_order_sync_at: '2026-11-15T00:00:00.000Z' })) settings.set(key, value)
   levels = list
-  returnBufferColumn = withBufferColumn
-  selectedBuffer = false
+  bufferRows = buffers
+  bufferReads = 0
   posts = []
   candidates = [product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))]
 }
@@ -107,51 +110,54 @@ const quantities = () => {
   return out
 }
 
-test('a buffer reduces the pushed quantity; the floor is 0; IMS figures are not what is sent', async () => {
-  reset([
-    { productId: 'a', warehouseId: 'w1', quantity: 10, reservedQty: 2, bufferQty: 3 }, // available 8, buffer 3 -> 5
-    { productId: 'b', warehouseId: 'w1', quantity: 4, reservedQty: 0, bufferQty: 9 },  // buffer exceeds available -> 0
-  ])
+const L = (productId: string, warehouseId: string, quantity: number, reservedQty = 0): Level => ({ productId, warehouseId, quantity, reservedQty })
+const B = (productId: string, warehouseId: string, bufferQty: number) => ({ productId, warehouseId, bufferQty })
+
+test('a buffer reduces the pushed quantity; the floor is 0', async () => {
+  reset([L('a', 'w1', 10, 2), L('b', 'w1', 4)], [B('a', 'w1', 3), B('b', 'w1', 9)]) // a: 8-3 = 5; b: buffer exceeds available -> 0
   const result = await run()
   assert.deepEqual(result.errors, [])
-  assert.equal(selectedBuffer, true, 'the sync reads bufferQty')
+  assert.ok(bufferReads > 0, 'the sync reads the buffer table')
   assert.deepEqual(quantities(), { 1: 5, 2: 0 })
 })
 
 test('the buffer is per location: it comes off its own warehouse, then the locations are summed', async () => {
-  reset([
-    { productId: 'a', warehouseId: 'w1', quantity: 10, reservedQty: 0, bufferQty: 4 }, // 6
-    { productId: 'a', warehouseId: 'w2', quantity: 5, reservedQty: 0, bufferQty: 0 },  // 5
-    { productId: 'b', warehouseId: 'w1', quantity: 1, reservedQty: 0, bufferQty: 5 },  // 0 (not -4 against the other warehouse)
-    { productId: 'b', warehouseId: 'w2', quantity: 7, reservedQty: 0, bufferQty: 0 },  // 7
-  ])
+  reset(
+    [L('a', 'w1', 10), L('a', 'w2', 5), L('b', 'w1', 1), L('b', 'w2', 7)],
+    [B('a', 'w1', 4), B('b', 'w1', 5)], // a: 6 + 5; b: 0 (not -4 against the other warehouse) + 7
+  )
   await run()
   assert.deepEqual(quantities(), { 1: 11, 2: 7 })
 })
 
-test('BYTE-IDENTITY: with every buffer 0 the posted payloads equal the payloads of rows that carry no buffer at all', async () => {
-  const base: Level[] = [
-    { productId: 'a', warehouseId: 'w1', quantity: 10, reservedQty: 2 },
-    { productId: 'a', warehouseId: 'w2', quantity: 3, reservedQty: 5 },
-    { productId: 'b', warehouseId: 'w1', quantity: 4, reservedQty: 0 },
-  ]
-  reset(base.map((l) => ({ ...l })), false) // today's row shape: no bufferQty key at all
+test('a buffer at a warehouse with NO stock row has no effect and does not make the product a candidate', async () => {
+  // b has a buffer at w1 but no stock row anywhere: nothing to buffer, nothing pushed for it. a is unaffected by b's buffer.
+  reset([L('a', 'w1', 10)], [B('b', 'w1', 5), B('a', 'w2', 7)])
+  const result = await run()
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(quantities(), { 1: 10 }, 'only the stocked product is pushed; the buffer-only product is not a candidate and a buffer at a stockless warehouse changes nothing')
+})
+
+test('BYTE-IDENTITY: with no buffer rows, or only zero rows, the posted payloads are identical', async () => {
+  const base: Level[] = [L('a', 'w1', 10, 2), L('a', 'w2', 3, 5), L('b', 'w1', 4)]
+  reset(base.map((l) => ({ ...l })), [])
   await run()
   const before = JSON.stringify(posts)
   assert.ok(posts.length > 0 && before.includes('stock_quantity'))
 
-  reset(base.map((l) => ({ ...l, bufferQty: 0 })), true)
+  reset(base.map((l) => ({ ...l })), [B('a', 'w1', 0), B('b', 'w1', 0)])
   await run()
   assert.equal(JSON.stringify(posts), before)
 })
 
-test('the unreserved-order guard is untouched by the buffer when every buffer is 0, and the buffer never goes negative', async () => {
-  const { buildStockMaps } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
+test('the unreserved-order guard is untouched by the buffer when every buffer is 0, and the buffer comes off before it', async () => {
+  const { buildStockMaps, bufferKey } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
   const held = new Map([['a', 3]])
-  const plain = buildStockMaps([{ productId: 'a', warehouseId: 'w1', quantity: 10, reservedQty: 0 }], held)
-  const zero = buildStockMaps([{ productId: 'a', warehouseId: 'w1', quantity: 10, reservedQty: 0, bufferQty: 0 }], held)
+  const rows = [{ productId: 'a', warehouseId: 'w1', quantity: 10, reservedQty: 0 }]
+  const plain = buildStockMaps(rows, held)
+  const zero = buildStockMaps(rows, held, new Map())
   assert.deepEqual([...zero.stockByProduct], [...plain.stockByProduct])
   assert.equal(plain.stockByProduct.get('a'), 7)
-  const buffered = buildStockMaps([{ productId: 'a', warehouseId: 'w1', quantity: 10, reservedQty: 0, bufferQty: 2 }], held)
+  const buffered = buildStockMaps(rows, held, new Map([[bufferKey('a', 'w1'), 2]]))
   assert.equal(buffered.stockByProduct.get('a'), 5) // 10 - 2 shown to the store, minus the 3 it already took
 })

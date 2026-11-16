@@ -681,7 +681,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       warehouseId: { in: whIds },
       ...(scopedStockProductIds ? { productId: { in: scopedStockProductIds } } : {}),
     },
-    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true, bufferQty: true },
+    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
 
   const cogsSetting = await db.setting.findUnique({ where: { key: 'wc_cogs_sync_enabled' } })
@@ -819,7 +819,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     if (missingComponentIds.length > 0) {
       const siblingStockLevels = await db.stockLevel.findMany({
         where: { warehouseId: { in: whIds }, productId: { in: missingComponentIds } },
-        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true, bufferQty: true },
+        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
       stockLevelsForMaps = [...stockLevels, ...siblingStockLevels]
       scopedStockIdsWithSiblings = [...scopedStockProductIds, ...missingComponentIds]
@@ -869,7 +869,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // ACCEPTED RACE (inter-system, documented, not fixed): an order WooCommerce takes AFTER the read above and BEFORE this run's
   // write has been decremented by the store but is in neither the read nor IMS, so that one write can still give its units
   // back. The window is one push run; the next push (or the daily forceAll reconcile) sees the order and corrects it.
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps, heldByProduct)
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps, heldByProduct, await loadLocationBuffers(whIds, scopedStockIdsWithSiblings))
 
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
@@ -1671,21 +1671,30 @@ export type StockLevelSnapshotRow = {
   warehouseId: string
   quantity: Prisma.Decimal | number
   reservedQty: Prisma.Decimal | number
-  /**
-   * Units held back from channels at this location (StockLevel.bufferQty). Optional: absent counts as 0, which
-   * is the pre-buffer behaviour exactly.
-   */
-  bufferQty?: Prisma.Decimal | number | null
 }
 
 /**
  * Build the per-product and per-(product,warehouse) available-stock maps from a
  * stockLevel snapshot. `available = max(0, quantity - reservedQty)`, then the location buffer is taken off
- * (`max(0, available - bufferQty)`): THE ONE PLACE the buffer reduces what a channel is told. Nothing else
- * (allocation, on-hand, the WMS alignment pass) reads it. Extracted so
+ * (`max(0, available - buffer)`, the buffer being the LocationStockBuffer row for that product and warehouse): THE ONE
+ * PLACE the buffer reduces what a channel is told. It is looked up per stock row, so a buffer with no stock row has no effect
+ * and never makes a product a candidate. Nothing else (allocation, on-hand, the WMS alignment pass) reads it. Extracted so
  * the exact same availability basis can be recomputed against a fresh re-read
  * immediately before pushing (the 1qsb stale-snapshot oversell guard).
  */
+export function bufferKey(productId: string, warehouseId: string): string {
+  return `${productId}\u0000${warehouseId}`
+}
+
+/** The location buffers for these warehouses (and, when scoped, these products). Read failure throws: never push unbuffered by accident. */
+export async function loadLocationBuffers(whIds: string[], productIds: string[] | null): Promise<Map<string, number>> {
+  const rows = await db.locationStockBuffer.findMany({
+    where: { warehouseId: { in: whIds }, bufferQty: { gt: 0 }, ...(productIds ? { productId: { in: productIds } } : {}) },
+    select: { productId: true, warehouseId: true, bufferQty: true },
+  })
+  return new Map(rows.map((r) => [bufferKey(r.productId, r.warehouseId), Number(r.bufferQty)]))
+}
+
 export function buildStockMaps(
   stockLevels: StockLevelSnapshotRow[],
   /**
@@ -1694,6 +1703,8 @@ export function buildStockMaps(
    * rows in turn, never below 0.
    */
   heldUnits?: ReadonlyMap<string, number>,
+  /** Units held back per location, keyed by bufferKey(productId, warehouseId). Absent or empty means no buffer anywhere. */
+  buffers?: ReadonlyMap<string, number>,
 ): {
   stockByProduct: Map<string, number>
   stockByProductWarehouse: Map<string, Map<string, number>>
@@ -1705,7 +1716,7 @@ export function buildStockMaps(
     let available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
     // The buffer comes off BEFORE the unreserved-order guard: WooCommerce only ever saw the buffered figure, so the
     // units it already took for orders IMS holds no reservation for came out of that, not out of the held-back units.
-    const buffer = Number(sl.bufferQty ?? 0)
+    const buffer = buffers?.get(bufferKey(sl.productId, sl.warehouseId)) ?? 0
     if (buffer > 0) available = Math.max(0, available - buffer)
     const held = heldRemaining.get(sl.productId) ?? 0
     if (held > 0 && available > 0) {
@@ -1885,9 +1896,9 @@ async function computeFreshAvailableByProduct(
       warehouseId: { in: whIds },
       ...(scopedStockProductIds ? { productId: { in: scopedStockProductIds } } : {}),
     },
-    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true, bufferQty: true },
+    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels, heldUnits)
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels, heldUnits, await loadLocationBuffers(whIds, scopedStockProductIds))
   // Throwaway error sink: any kit-cycle diagnostics were already surfaced from the
   // snapshot pass; recomputing here must not double-report them.
   return computeAvailableByProduct(

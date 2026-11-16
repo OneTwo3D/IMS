@@ -8,11 +8,17 @@ import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { saveLocationBuffers, type LocationBuffers } from '@/app/actions/location-buffer'
 
+const loaded = (qty: string) => (qty === '0' ? '' : qty)
+const normalise = (qty: string) => {
+  const t = qty.trim()
+  return t === '' ? '0' : String(Number(t))
+}
+
 export function LocationBuffer({ data, canEdit }: { data: LocationBuffers; canEdit: boolean }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
   const [values, setValues] = useState<Record<string, string>>(() =>
-    Object.fromEntries(data.warehouses.map((w) => [w.warehouseId, w.bufferQty === '0' ? '' : w.bufferQty])),
+    Object.fromEntries(data.warehouses.map((w) => [w.warehouseId, loaded(w.bufferQty)])),
   )
   const [reason, setReason] = useState('')
   const [message, setMessage] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null)
@@ -22,13 +28,20 @@ export function LocationBuffer({ data, canEdit }: { data: LocationBuffers; canEd
     setMessage(null)
     setFieldErrors({})
     startTransition(async () => {
-      const result = await saveLocationBuffers(
-        data.productId,
-        data.warehouses.map((w) => ({ warehouseId: w.warehouseId, bufferQty: values[w.warehouseId] ?? '' })),
-        reason,
-      )
+      // Only the warehouses this operator edited are sent, each with the value the page loaded, so a save can never overwrite
+      // another warehouse's buffer (or a newer value) with stale data.
+      const edits = data.warehouses
+        .map((w) => ({ warehouseId: w.warehouseId, expectedOld: loaded(w.bufferQty), bufferQty: values[w.warehouseId] ?? '' }))
+        .filter((e) => normalise(e.bufferQty) !== normalise(e.expectedOld))
+      if (edits.length === 0) {
+        setMessage({ tone: 'ok', text: 'No changes to save.' })
+        return
+      }
+      const result = await saveLocationBuffers(data.productId, edits, reason)
       if (result.success) {
-        setMessage({ tone: 'ok', text: result.changed === 0 ? 'No changes to save.' : `Saved ${result.changed} change${result.changed === 1 ? '' : 's'}. The store quantity is being updated.` })
+        const saved = result.changed > 0 ? `Saved ${result.changed} change${result.changed === 1 ? '' : 's'}. The store quantity is being updated.` : ''
+        const stale = result.stale.length > 0 ? `${result.stale.join(', ')}: changed by someone else since you opened this page, so not saved. Reload to see the current value.` : ''
+        setMessage({ tone: result.stale.length > 0 ? 'error' : 'ok', text: [saved, stale].filter(Boolean).join(' ') || 'No changes to save.' })
         if (result.changed > 0) setReason('')
         router.refresh()
       } else {

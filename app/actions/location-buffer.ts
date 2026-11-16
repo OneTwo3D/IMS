@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { logActivity } from '@/lib/activity-log'
-import { applyLocationBuffers, type BufferRowInput } from '@/lib/domain/inventory/location-buffer'
+import { applyLocationBuffers, type BufferEditInput } from '@/lib/domain/inventory/location-buffer'
 
 export type LocationBufferRow = {
   warehouseId: string
@@ -22,13 +22,15 @@ export type LocationBuffers = { productId: string; stockUnit: string; warehouses
 
 export async function getLocationBuffers(productId: string): Promise<LocationBuffers | null> {
   await requirePermission('inventory')
-  const [product, warehouses, levels] = await Promise.all([
+  const [product, warehouses, levels, buffers] = await Promise.all([
     db.product.findUnique({ where: { id: productId }, select: { id: true, stockUnit: true } }),
     db.warehouse.findMany({ where: { active: true }, select: { id: true, code: true, name: true, syncToStore: true }, orderBy: { code: 'asc' } }),
-    db.stockLevel.findMany({ where: { productId }, select: { warehouseId: true, quantity: true, reservedQty: true, bufferQty: true } }),
+    db.stockLevel.findMany({ where: { productId }, select: { warehouseId: true, quantity: true, reservedQty: true } }),
+    db.locationStockBuffer.findMany({ where: { productId }, select: { warehouseId: true, bufferQty: true } }),
   ])
   if (!product) return null
   const levelByWarehouse = new Map(levels.map((l) => [l.warehouseId, l]))
+  const bufferByWarehouse = new Map(buffers.map((b) => [b.warehouseId, b.bufferQty]))
   return {
     productId: product.id,
     stockUnit: product.stockUnit,
@@ -41,24 +43,24 @@ export async function getLocationBuffers(productId: string): Promise<LocationBuf
         syncsToStore: w.syncToStore,
         onHand: (level?.quantity ?? 0).toString(),
         available: Math.max(0, Number(level?.quantity ?? 0) - Number(level?.reservedQty ?? 0)).toString(),
-        bufferQty: (level?.bufferQty ?? 0).toString(),
+        bufferQty: (bufferByWarehouse.get(w.id) ?? 0).toString(),
       }
     }),
   }
 }
 
 export type SaveLocationBuffersResult =
-  | { success: true; changed: number }
+  | { success: true; changed: number; stale: string[] }
   | { success: false; error: string; fieldErrors?: Record<string, string> }
 
 export async function saveLocationBuffers(
   productId: string,
-  rows: BufferRowInput[],
+  edits: BufferEditInput[],
   reason: string,
 ): Promise<SaveLocationBuffersResult> {
   const session = await requirePermission('inventory.edit')
   const result = await db.$transaction(
-    (tx) => applyLocationBuffers(tx, { productId, userId: session.user.id ?? null, reason, rows }),
+    (tx) => applyLocationBuffers(tx, { productId, userId: session.user.id ?? null, reason, edits }),
     { maxWait: 5000, timeout: 30000 },
   )
   if (!result.ok) return { success: false, error: result.error, fieldErrors: result.fieldErrors }
@@ -79,5 +81,5 @@ export async function saveLocationBuffers(
       })
     }
   }
-  return { success: true, changed: result.changes.length }
+  return { success: true, changed: result.changes.length, stale: result.stale.map((c) => c.warehouseCode) }
 }

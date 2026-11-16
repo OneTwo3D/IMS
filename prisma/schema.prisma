@@ -637,6 +637,7 @@ model Warehouse {
   updatedAt             DateTime      @updatedAt
 
   stockLevels           StockLevel[]
+  locationStockBuffers  LocationStockBuffer[]
   costLayers            CostLayer[]
   inventorySnapshots    InventorySnapshot[]
   inventoryReservationSnapshots InventoryReservationSnapshot[]
@@ -755,6 +756,7 @@ model Product {
   variants        Product[]   @relation("ProductVariants")
 
   stockLevels     StockLevel[]
+  locationStockBuffers LocationStockBuffer[]
   costLayers      CostLayer[]
   inventorySnapshots InventorySnapshot[]
   inventoryReservationSnapshots InventoryReservationSnapshot[]
@@ -869,15 +871,32 @@ model StockLevel {
   quantity        Decimal   @db.Decimal(14, 6) @default(0) // enforced non-negative in DB; 6dp matches cost_layers/FIFO engine
   reservedQty     Decimal   @db.Decimal(14, 6) @default(0) // enforced non-negative in DB; in transit / allocated; 6dp matches cost_layers
   updatedAt       DateTime  @updatedAt
-  /// Units held back from connected sales channels at this location. Availability control only: the WooCommerce
-  /// push sends max(0, available - bufferQty). Never read by allocation, on-hand, reserved or the WMS alignment pass. >= 0 enforced in DB.
-  bufferQty       Decimal   @db.Decimal(14, 6) @default(0)
 
   product         Product   @relation(fields: [productId], references: [id])
   warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
 
   @@unique([productId, warehouseId])
   @@map("stock_levels")
+}
+
+/// Units an operator holds back at a location so they never reach connected sales channels (o3d-ngmt.4). A SEPARATE table, never a
+/// StockLevel column, so setting one can never create a stock row (a lone zero-quantity row would make the product a stock-push
+/// candidate and a first-load "history" row). Read ONLY by the WooCommerce stock push (buildStockMaps), looked up per stock row:
+/// a buffer with no stock row has no effect. Allocation, on-hand, reserved and the WMS alignment never read it. >= 0 enforced in DB.
+model LocationStockBuffer {
+  id          String    @id @default(cuid())
+  productId   String
+  warehouseId String
+  bufferQty   Decimal   @db.Decimal(14, 6) @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, warehouseId])
+  @@index([warehouseId])
+  @@map("location_stock_buffers")
 }
 
 /// FIFO cost layers — one row per goods receipt (or opening stock seed)
