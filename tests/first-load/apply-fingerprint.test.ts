@@ -68,7 +68,7 @@ function meaningfulChange(column: string, c: string): string {
   if (column === 'lifecycleStatus') return c === 'DRAFT' ? 'ARCHIVED' : 'DRAFT'
   if (column === 'active') return /^false$/i.test(c.trim()) ? 'TRUE' : 'FALSE'
   if (column === 'taxRateValue' || column === 'orderTaxRateValue') return c === '' ? '0.2' : String(Number(c) + 0.05)
-  if (column === 'expectedDelivery') return c === '' ? '2027-01-01' : '2027-02-02'
+  if (column === 'expectedDelivery' || column === 'lineExpectedDelivery') return c === '' ? '2027-01-01' : '2027-02-02'
   return c === '' ? '7' : /^-?\d+(\.\d+)?$/.test(c) ? String(Number(c) + 3) : `${c}x`
 }
 

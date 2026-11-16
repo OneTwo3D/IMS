@@ -2,10 +2,11 @@
  * The purchase order PDF: load a real order into the plain `PurchaseOrderDocument` shape and draw it. The Settings > Documents
  * preview draws sample data through the same `renderPurchaseOrderPdf`, so what is previewed is what a supplier receives.
  */
+import { effectiveLineEta, lineEtaDiffersFromHeader } from '@/lib/domain/purchasing/line-eta'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
-import { formatDateTime } from '@/lib/format-datetime'
+import { formatCalendarDate, formatDateTime } from '@/lib/format-datetime'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
 import {
   createPdfDocument,
@@ -87,7 +88,7 @@ export async function loadPurchaseOrderDocument(id: string): Promise<PurchaseOrd
       lines: {
         orderBy: { sortOrder: 'asc' },
         select: {
-          productId: true, description: true, qty: true, purchaseUnitQty: true, unitCostForeign: true, discountAmount: true, totalForeign: true,
+          productId: true, description: true, qty: true, purchaseUnitQty: true, unitCostForeign: true, discountAmount: true, totalForeign: true, expectedDelivery: true,
           purchaseUnit: { select: { abbreviation: true, stockUnitName: true } },
           product: { select: { sku: true, name: true, barcode: true, mpn: true } },
         },
@@ -117,6 +118,8 @@ export async function loadPurchaseOrderDocument(id: string): Promise<PurchaseOrd
     unitCost: Number(l.unitCostForeign),
     discountAmount: Number(l.discountAmount),
     total: Number(l.totalForeign),
+    // Shown only where the line's date differs from the header's; a line that follows the header needs no repeat.
+    deliveryDate: lineEtaDiffersFromHeader(l.expectedDelivery, po.expectedDelivery) ? effectiveLineEta(l.expectedDelivery, po.expectedDelivery) : null,
   }))
   const w = po.destinationWarehouse
   return {
@@ -180,7 +183,7 @@ export async function renderPurchaseOrderPdf(
   if (branding.vatNumber) facts.push(`Our VAT no: ${branding.vatNumber}`)
   if (po.supplier.accountNumber) facts.push(`Our account with you: ${po.supplier.accountNumber}`)
   if (po.supplier.paymentTermsDays != null) facts.push(`Payment terms: ${po.supplier.paymentTermsDays} days`)
-  if (po.expectedDelivery) facts.push(`Expected delivery: ${formatDateTime(po.expectedDelivery, long, opts.timeZone)}`)
+  if (po.expectedDelivery) facts.push(`Expected delivery: ${formatCalendarDate(po.expectedDelivery, long)}`)
   doc.font('Helvetica').fontSize(9).fillColor('#333333').text(facts.join('   |   '), 50, doc.y, { width: 495 })
   doc.y += 4
   if (po.shipTo) {
@@ -192,7 +195,7 @@ export async function renderPurchaseOrderPdf(
 
   const flags = poLayoutFlags(po.lines)
   const columns: PdfTableColumn[] = poDocumentColumns(po.currencySymbol, flags)
-  drawTable(doc, columns, poDocumentRows(po.lines, flags), branding)
+  drawTable(doc, columns, poDocumentRows(po.lines, { ...flags, formatDate: (d) => formatCalendarDate(d, { day: 'numeric', month: 'short', year: 'numeric' }) }), branding)
 
   // Totals block, right-aligned under the last column.
   doc.y += 6

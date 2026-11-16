@@ -22,7 +22,7 @@ type MintsoftWebhookSweeperCronResult = ProcessMintsoftBookedInEventsResult & { 
 export const mintsoftCronOutcomes = {
   // status: SKIPPED | SUCCEEDED | PARTIAL | FAILED; errors: number
   'mintsoft-bundle-verify': (r: MintsoftBundleVerifyResult) => enumResult(r, ['errors']),
-  // status enum; errors: number; outboundHeld: number
+  // status enum; errors: number; outboundHeld: number; systemicSuppressed: links left undead-lettered by a pass read as a connector-wide fault (already counted in `errors`, so the run is PARTIAL and fails: an outage handled gracefully is still an outage)
   'mintsoft-dispatch-sync': (r: WmsDispatchSweepResult) => enumResult(r, ['errors']),
   // status enum; errors: number
   'mintsoft-product-verify': (r: MintsoftProductSyncResult) => enumResult(r, ['errors']),

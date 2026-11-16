@@ -2095,7 +2095,7 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, fxGuard: FxTabl
     orderTaxRateValue?: number
     orderDiscountForeign?: number
     invalid: boolean
-    lines: { productId: string; sku: string; productName: string; qty: number; unitCostForeign: number; discountAmount?: number; discountStr?: string; taxRateId?: string }[]
+    lines: { productId: string; sku: string; productName: string; qty: number; unitCostForeign: number; discountAmount?: number; discountStr?: string; taxRateId?: string; expectedDelivery?: string }[]
   }>()
 
   for (let i = 0; i < rows.length; i++) {
@@ -2133,6 +2133,14 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, fxGuard: FxTabl
     const destinationWarehouseId = destinationWarehouseCode ? warehouseCodeToId.get(destinationWarehouseCode) : undefined
     if (destinationWarehouseCode && !destinationWarehouseId) {
       result.errors.push(`Row ${lineNum}: warehouse "${destinationWarehouseCode}" not found`)
+      result.skipped++
+      continue
+    }
+
+    // Optional per-line delivery date (blank = the line follows the order's expectedDelivery). A date-only value, like the order's.
+    const lineExpectedDelivery = readCsvValue(row, 'lineExpectedDelivery', 'lineexpecteddelivery').trim()
+    if (lineExpectedDelivery !== '' && !/^\d{4}-\d{2}-\d{2}$/.test(lineExpectedDelivery)) {
+      result.errors.push(`Row ${lineNum}: lineExpectedDelivery "${lineExpectedDelivery}" is not YYYY-MM-DD`)
       result.skipped++
       continue
     }
@@ -2201,6 +2209,7 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, fxGuard: FxTabl
       discountAmount: parseOptionalNumber(readCsvValue(row, 'lineDiscountForeign', 'discountAmount', 'lineDiscountAmount')) ?? undefined,
       discountStr: readCsvValue(row, 'lineDiscountStr', 'discountStr', 'linediscountstr').trim() || undefined,
       taxRateId: resolvedLineTaxRateId,
+      expectedDelivery: lineExpectedDelivery || undefined,
     })
   }
 

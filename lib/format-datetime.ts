@@ -22,6 +22,14 @@ export function formatDateTime(
   return new Date(value).toLocaleString(APP_LOCALE, { timeZone, ...options })
 }
 
+/**
+ * A DATE-ONLY value (an expected-delivery day entered as YYYY-MM-DD and stored at UTC midnight) has no time zone: formatting it in the
+ * organisation's zone prints the previous day west of UTC. Always render the stored calendar day.
+ */
+export function formatCalendarDate(value: string | number | Date, options?: Intl.DateTimeFormatOptions): string {
+  return formatDateTime(value, options, 'UTC')
+}
+
 /** True when `tz` is a valid IANA timezone the runtime accepts. */
 export function isValidTimeZone(tz: string): boolean {
   if (!tz) return false
