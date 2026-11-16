@@ -97,7 +97,13 @@ mock.module('@/lib/connectors/xero/auth', {
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
     connectorFetch: async (url: string, init: { method?: string; headers?: Record<string, string> }) => {
-      const path = url.replace('https://api.xero.com/api.xro/2.0/', '')
+      let path = url.replace('https://api.xero.com/api.xro/2.0/', '')
+      // A line-item document write carries unitdp=4 (Xero would otherwise round unit prices to 2dp). The trace names the resource, so the
+      // parameter is asserted here and removed from the name rather than repeated in every expectation below.
+      if ((init?.method ?? 'GET') !== 'GET' && /^(Invoices|CreditNotes)(\/[^/?]+)?\?/.test(path)) {
+        assert.ok(path.endsWith('?unitdp=4'), `a document write carries unitdp=4: ${path}`)
+        path = path.slice(0, -'?unitdp=4'.length)
+      }
       trace.push(`wire:${init?.method ?? 'GET'} ${path}`)
       lastHeaders = init?.headers ?? {}
       const isWrite = (init?.method ?? 'GET') !== 'GET'

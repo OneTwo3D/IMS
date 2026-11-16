@@ -35,6 +35,15 @@ Dates printed on PDF documents and in the emails sent with them (order date, inv
 - Totals are right-aligned with the last column of the line items table for a clean, professional appearance.
 
 
+## What every document prints
+
+- **Your VAT registration number and company number** are printed under your address (the FROM block) on every document: sales orders, invoices, credit notes, packing slips and purchase documents. Set them under **Settings > Company** (VAT number, Company number). A blank one is left out.
+- **The reference is the order number** you see on the order page, never an internal code. An invoice shows its **invoice number**, with the order number beside it.
+- **An invoice with no invoice number yet** is titled **Pro-forma Invoice**: it is not a VAT invoice. Once the accounting system has numbered the invoice, the stored invoice is what is served.
+- **Amounts add up.** Lines, shipping and discount are all shown on the same basis (the column headings say "incl. VAT" or "excl. VAT"), the VAT is shown, and the Total is the sum of the printed parts. The emailed PDFs use the same figures as the downloaded ones.
+- **Names and notes in any Latin, Greek or Cyrillic script** (for example Mueller with an umlaut, a Polish name, an em dash in a note) print correctly. Chinese, Japanese, Korean and emoji are not supported and may print as empty boxes.
+- **Credit notes**: each recorded refund on the order page has a **PDF** link. Once the credit note has been sent to (or queued for) your accounting system, the PDF shows exactly the lines that were posted, and does not change if tax settings are edited later. A refund that has not been queued yet is recalculated and titled **Draft Credit Note**. Any rounding difference between the lines and the total is shown as its own **Rounding** row. It works without an accounting connection; the number shows "Not yet numbered" until one is assigned.
+
 ## Secure PDF Links
 
 Invoice and credit-note PDFs are served behind **single-use, time-limited tokens** rather than direct file paths. When you click "View PDF" or "Email PDF":

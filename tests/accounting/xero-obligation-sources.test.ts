@@ -134,7 +134,7 @@ const INLINE_SITES: Array<{ types: string[]; file: string; pattern: RegExp }> = 
   { types: ['DAILY_BATCH_INVENTORY_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Inventory reconciliation/ },
   { types: ['DAILY_BATCH_COGS_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `COGS reconciliation/ },
   { types: ['DAILY_BATCH_TRANSIT_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Transit reconciliation/ },
-  { types: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: today,/ },
+  { types: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: (?:plan\.)?group\.date,/ },
 ]
 
 test('INLINE PRODUCERS: the declared date field sits in the payload each producer enqueues, and every declared payload type is covered by a builder test or a pinned site', () => {

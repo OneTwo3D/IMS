@@ -134,6 +134,10 @@ const tx = {
   costLayer: { update: async () => ({}) },
 }
 
+// ACC-H11: the batch imports the Xero books lock date at the start of a run; offline, and not what this file tests.
+mock.module('@/lib/connectors/xero/books-lock-date', {
+  namedExports: { refreshXeroBooksLockDate: async () => ({ lockDate: null, refreshed: false }) },
+})
 mock.module('@/lib/db', {
   namedExports: {
     db: {
@@ -271,7 +275,7 @@ for (const connector of CONNECTORS) {
 
     const journal = world.created.find((log) => log.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
     assert.ok(journal, 'the deferral journal is staged')
-    assert.deepEqual(journal.payload.orderDeferrals, [{ orderId: ORDER_ID, amount: 90 }], '100 − 10')
+    assert.deepEqual(journal.payload.orderDeferrals, [{ orderId: ORDER_ID, amount: 90, grossAmount: 90 }], '100 − 10')
     assert.equal(world.orderUpdates[0]?.data.unearnedRevenueAmount, 90, 'and the stamp agrees with it')
   })
 

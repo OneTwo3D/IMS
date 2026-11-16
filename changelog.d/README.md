@@ -1,0 +1,9 @@
+# Changelog fragments
+
+Each PR records its changelog entry here, as its own file. It does **not** edit `CHANGELOG.md`. One file per PR means two open PRs never conflict on the changelog.
+
+- **Name:** after the branch, e.g. `fix-p1-woo-sync-batch.md`. Any unique name works.
+- **Content:** exactly what would have gone under `## Unreleased` in `CHANGELOG.md`. Start with a `### Title (area)` heading, then the bullets. Do not add a `## Unreleased` line.
+- **Release cut:** the release PR moves every fragment into `CHANGELOG.md` under the new `## x.y.z - YYYY-MM-DD` heading, in merge order, and deletes the fragments. See "Cut a release" in `docs/development.md`.
+
+Entries already under `## Unreleased` in `CHANGELOG.md` stay valid; the release cut takes both.

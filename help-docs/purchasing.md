@@ -119,6 +119,10 @@ When goods arrive, open the PO and click **Receive Goods**. You can receive all 
 
 **Lines with an open warehouse ASN are booked in through the ASN, not by hand.** If a line's Mintsoft (warehouse) ASN is still open, partly booked in, or being created, **Receive Goods** refuses that line and names the SKU and the ASN. Use **Recheck booked-in** on the order once the warehouse has booked the goods, so the stock is added once. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received here.
 
+**The supplier will not send the rest of a part-delivered ASN.** In the order's warehouse ASN table, press **Close short** on the partly booked-in ASN and give a reason. Nothing is booked or written off; the units the warehouse already booked in stay received, and the undelivered quantity becomes outstanding again, so you can receive it by hand or create a new ASN. It is refused while the ASN has a booked-in update that has not been applied yet (use **Recheck booked-in** first). If goods for a closed ASN turn up later, put them on a new ASN.
+
+**Over-delivery.** If the warehouse books in more than the ASN expected, the update waits for an administrator to approve it. The review shows the quantity that will be booked. On approval all of it is received into stock at the order's unit cost and counted against the order line.
+
 When stock is received:
 
 - A **FIFO cost layer** is created for each line, recording the quantity and unit cost.
