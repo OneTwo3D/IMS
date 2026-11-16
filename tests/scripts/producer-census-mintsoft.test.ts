@@ -80,13 +80,14 @@ test('PRECONDITION: the real tree is green, and the census reached every part of
   assert.equal(report.counts.seamFunctions, MINT_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamFunctionsConsulting, MINT_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamOperationsNamed, report.counts.seamOperations)
-  assert.equal(report.counts.writeCalls, 15, 'the sweep (9 + comment), the refund note, the product, bundle and content writers and the two ASN buttons')
+  // 13: the comment writers are gone (the sweep's note and the refund note: IMS raises operator tasks instead), so the sweep has 9 and the rest are unchanged.
+  assert.equal(report.counts.writeCalls, 13, 'the sweep (9), the product, bundle and content writers and the two ASN buttons')
   assert.equal(report.counts.writeCallsWithClearance, report.counts.writeCalls)
   assert.equal(report.counts.transportSites, 3, 'sendMintsoftRequest and the two login helpers')
   assert.equal(report.counts.clearanceCasts, 1)
   assert.equal(report.counts.mintCalls, 2, 'one in the generic seam (an unregistered connector) and one in the destination seam')
   assert.equal(report.counts.mapOperationsGoverned, report.counts.mapOperations)
-  assert.ok(report.counts.consultCalls >= 15)
+  assert.ok(report.counts.consultCalls >= 13)
 })
 
 test('MUTATION MINT-1 (the barrier is moved AFTER the key lookup): red, naming the function', () => {
@@ -116,7 +117,6 @@ test('MUTATION MINT-1 (each producer stops asking): red, one finding each, namin
     ['lib/connectors/mintsoft/sync/product-content-sync.ts', 'await mintsoftProducerSeam(', (text) => text.replace('await mintsoftProducerSeam(', 'await Promise.resolve('), 'syncMintsoftProductContent'],
     ['app/actions/wms-order-push.ts', 'wmsOrderCreateReArmShadow(', (text) => text.replace('await wmsOrderCreateReArmShadow(', 'await Promise.resolve('), 'replayWmsOrderPush'],
     ['app/actions/sync-exceptions.ts', 'wmsOrderCreateReArmShadow(', (text) => text.replace('await wmsOrderCreateReArmShadow(', 'await Promise.resolve('), 'repushMissingWmsOrder'],
-    ['app/actions/sales.ts', 'wmsProducerSeam(', (text) => text.replace('await wmsProducerSeam(', 'await Promise.resolve('), 'createRefund'],
     ['lib/domain/wms/order-push-sweep.ts', 'wmsProducerHold(', (text) => text.replace('wmsProducerHold(connectorId, producerContext).held', 'false'), 'runWmsOrderPushSweepCore'],
   ]
   for (const [file, , mutate, decl] of cases) {
@@ -252,10 +252,10 @@ test('the declared sweep sites are SEAM sites and SEAM-1 confirms each is preced
   const green = seamFindings(new Map([[file, text]]), scanSource(text, file), DECLARATIONS)
   assert.deepEqual(green.failures, [], 'CONTROL: the real sweep passes SEAM-1')
   const seamSites = DECLARATIONS.filter((d) => d.key.startsWith(`${file}::`) && d.mechanism === 'seam')
-  assert.equal(seamSites.length, 9)
+  assert.equal(seamSites.length, 8, 'the sweep\'s seam sites: the comment seam is gone')
   const mutated = text.replaceAll('wmsProducerSeam(', 'Promise.resolve(').replaceAll('wmsProducerHold(', 'Promise.resolve(')
   const report = seamFindings(new Map([[file, mutated]]), scanSource(mutated, file), DECLARATIONS)
-  assert.equal(report.failures.filter((f) => f.startsWith('SEAM-1')).length, 9, JSON.stringify(report.failures))
+  assert.equal(report.failures.filter((f) => f.startsWith('SEAM-1')).length, 8, JSON.stringify(report.failures))
 })
 
 test('a direct call of a Mintsoft writer from a NEW file is an undeclared producer site (the connector facade cannot be bypassed quietly)', () => {

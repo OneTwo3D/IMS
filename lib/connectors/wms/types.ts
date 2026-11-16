@@ -716,13 +716,12 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
    * these are the only lines left it answers ONLY_LINES_LEFT and writes nothing.
    */
   removeOrderItems?(externalOrderId: string, expected: WmsExpectedOrder, items: WmsOrderItemRef[], clearance: WmsWriteClearance<'order.cancel'>): Promise<WmsMergedItemRemoval>
-  /** Post an operator-facing note onto the WMS order — e.g. to flag a refund to the
-   *  warehouse when the API cannot auto-apply it (a past-NEW order). */
+  /** Post a note onto the WMS order. KEPT FOR THE CONTRACT ONLY: IMS calls it nowhere (the warehouse's staff do not read order comments; IMS raises an
+   *  operator task instead, lib/domain/wms/operator-tasks.ts), and tests/wms-no-order-comment-writes.test.ts is red if a call is reintroduced. */
   addOrderComment?(externalOrderId: string, comment: string, clearance: WmsWriteClearance<'order.comment'>): Promise<void>
   /**
-   * The texts of the comments already on a warehouse order (a read-only fetch), so a note IMS may already have posted can be recognised by
-   * its marker instead of being posted twice. Throws when the comments cannot be read (never answers an empty list for "unknown"). Optional:
-   * a connector that cannot read them leaves every uncertain note to an operator (see removal-note-obligation.ts).
+   * The texts of the comments already on a warehouse order (a read-only fetch). Throws when the comments cannot be read (never answers an empty
+   * list for "unknown"). Optional. IMS no longer posts comments (it raises operator tasks), so the order-push sweep does not use this.
    */
   readOrderComments?(externalOrderId: string): Promise<string[]>
   verifyWebhookSignature?(

@@ -110,8 +110,8 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
   {
     file: 'lib/domain/wms/order-push-sweep.ts', decl: 'runWmsOrderPushSweepCore', role: 'sweep',
     mustCall: ['wmsProducerHold'], beforeCalls: ['releasableHeldOrders', 'revalidatableLinks', 'ambiguousCreateLinks', 'createCandidates'],
-    operations: ['order.create', 'order.amend', 'order.cancel', 'order.hold', 'order.comment'],
-    why: 'The order-push sweep: the passes that only re-open creates stand down while the warehouse is held, and every create, amendment, cancellation, hold and note asks first.',
+    operations: ['order.create', 'order.amend', 'order.cancel', 'order.hold'],
+    why: 'The order-push sweep: the passes that only re-open creates stand down while the warehouse is held, and every create, amendment, cancellation and hold asks first (it writes no note: the warehouse does not read them, so it raises an operator task).',
   },
   {
     file: 'app/actions/wms-order-push.ts', decl: 'replayWmsOrderPush', role: 'operator-rearm',
@@ -155,12 +155,6 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
     operations: ['asn.create'],
     why: 'The transfer ASN button: it asks before the sync job, the reservation or the create, so a shadow reserves nothing.',
   },
-  {
-    file: 'app/actions/sales.ts', decl: 'createRefund', role: 'producer',
-    mustCall: ['wmsProducerSeam'], beforeCalls: ['addOrderComment'],
-    operations: ['order.comment'],
-    why: 'The refund note on a pushed order: shadowed it is kept as a record and the refund goes on.',
-  },
 ]
 
 /**
@@ -169,6 +163,7 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
  */
 export const MINT_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>> = {
   'auth.login': 'Key minting is not a business write (map owner nobody) and has no seam: requestMintsoftAuthSession refuses it itself (assertMintsoftKeyMintingAllowed) while the producer hold is enforced and the installation is not live; the outbound-write hold\'s login grant governs it as well.',
+  'order.comment': 'IMS writes no order comment any more (the warehouse does not read them: owner ruling 2026-11-15; IMS raises an operator task instead). Nothing calls the connector\'s addOrderComment, and tests/wms-no-order-comment-writes.test.ts is red if a call is reintroduced; were one added, MINT-5 still requires it to pass a clearance.',
 }
 
 /** The only places a Mintsoft transport call may sit, besides the barrier's own sendMintsoftRequest. */
