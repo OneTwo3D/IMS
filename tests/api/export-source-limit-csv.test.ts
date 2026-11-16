@@ -58,7 +58,7 @@ test('finance exports return the not-computed CSV for every report', async () =>
 
 test('replenishment exports return the not-computed CSV for every report', async () => {
   const { GET } = await import('../../app/api/export/replenishment/route.ts')
-  const last: Record<string, string> = { reorder: 'urgency', backorder: 'oldestOrderAt', 'component-shortage': 'outputProducts' }
+  const last: Record<string, string> = { reorder: 'firstShortageDate', backorder: 'oldestOrderAt', 'component-shortage': 'outputProducts' }
   for (const [type, lastColumn] of Object.entries(last)) {
     const response = await GET(new NextRequest(`http://localhost/api/export/replenishment?type=${type}`))
     const header = (await response.clone().text()).split('\r\n')[0]

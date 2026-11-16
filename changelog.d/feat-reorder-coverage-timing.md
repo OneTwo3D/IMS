@@ -1,0 +1,6 @@
+### Reorder Planning: latest PO date, required receipt and coverage weeks (Analytics)
+
+- **New: Latest PO date and Required receipt on every Reorder Planning row.** Required receipt is the day projected available stock falls to safety stock (to zero when there is none), stepping each dated open purchase order in on its expected delivery; Latest PO date is that day minus the lead time. It is the reorder point restated in dates, so the two cannot disagree. A Latest PO date in the past shows a red **Overdue** badge. Rows with no demand or no run-out within 365 days stay on the list with a dash. Open PO lines with no expected delivery are excluded from the dates and counted in a notice.
+- **New: Order qty and Coverage weeks.** Edit the quantity and the weeks of cover follow, or type the weeks and the quantity follows; each row has a Reset to the system suggestion. Planning only: not saved, and Generate still drafts the system suggestion.
+- **Changed: the Reorder Planning CSV** adds Required receipt, Latest PO date, Overdue, timing basis and First shortage date columns. Rows with no supplier now show an amber **Unassigned** tag.
+- No schema change.

@@ -30,6 +30,11 @@ function row(over: Partial<ReorderReportRow> & { productId: string }): ReorderRe
     suggestedReorderQty: over.suggestedReorderQty ?? '5',
     abcClass: over.abcClass ?? 'C',
     urgency: over.urgency ?? 'reorder',
+    requiredReceiptDate: null,
+    latestPoDate: null,
+    latestPoOverdue: false,
+    timingBasis: 'no_demand',
+    firstShortageDate: null,
     neededFor: ['Direct sales'],
   }
 }

@@ -110,6 +110,66 @@ test('reorder report nets available and inbound open PO against lead-time demand
   assert.equal(report.rows[0]?.suggestedReorderQty, '62')
   assert.equal(report.rows[0]?.leadTimeDays, 10)
   assert.equal(report.rows[0]?.urgency, 'reorder')
+  // Opening 3 is at or below safety stock 5, so receipt was already required today and the PO is overdue.
+  assert.equal(report.rows[0]?.timingBasis, 'already_below')
+  assert.equal(report.rows[0]?.requiredReceiptDate, '2026-06-01')
+  assert.equal(report.rows[0]?.latestPoDate, '2026-05-22')
+  assert.equal(report.rows[0]?.latestPoOverdue, true)
+})
+
+test('reorder timing steps dated open POs in, excludes undated ones and says so (o3d-s8n.2)', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('10'), leadTimeDays: 10,
+        category, preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S1', lastUnitCost: decimal('2'), leadTimeDays: 10, supplier }],
+      }, {
+        id: 'product-2', sku: 'SKU-2', name: 'Idle', type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('0'), leadTimeDays: 10,
+        category, preferredSupplier: null, supplierProducts: [],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('100'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+        { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('5'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+      ],
+    },
+    stockMovement: {
+      findMany: async () => [{
+        productId: 'product-1', qty: decimal('90'), totalValueBase: decimal('180'), createdAt: new Date('2026-05-20T12:00:00.000Z'),
+        product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
+      }],
+    },
+    purchaseOrderLine: {
+      findMany: async () => [
+        { productId: 'product-1', qty: decimal('50'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), po: { supplierId: 'supplier-1', expectedDelivery: new Date('2026-06-21T00:00:00.000Z'), destinationWarehouseId: 'warehouse-1', supplier } },
+        { productId: 'product-1', qty: decimal('30'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), po: { supplierId: 'supplier-1', expectedDelivery: null, destinationWarehouseId: 'warehouse-1', supplier } },
+      ],
+    },
+  }
+
+  const report = await getReorderReport(
+    { thresholdDays: 90, includeZero: true },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+  const widget = report.rows.find((row) => row.sku === 'SKU-1')
+  // Demand 1/day, opening 100, +50 on day 20 (dated), +30 undated is NOT counted: 150 - k <= 10 at k = 140.
+  assert.equal(widget?.inboundOpenPoQty, '80')
+  assert.equal(widget?.timingBasis, 'projected')
+  assert.equal(widget?.requiredReceiptDate, '2026-10-19')
+  assert.equal(widget?.latestPoDate, '2026-10-09')
+  assert.equal(widget?.latestPoOverdue, false)
+  assert.equal(widget?.firstShortageDate, '2026-10-29')
+  // No demand keeps the row visible with null dates.
+  const idle = report.rows.find((row) => row.sku === 'SKU-2')
+  assert.equal(idle?.timingBasis, 'no_demand')
+  assert.equal(idle?.latestPoDate, null)
+  assert.equal(idle?.requiredReceiptDate, null)
+  assert.ok(report.notices.some((notice) => /1 row\(s\) have open PO quantity with no expected delivery date/.test(notice)))
 })
 
 test('reorder demand is scoped to the filtered warehouse, like the stock it is compared against (o3d-s8n.1)', async () => {
