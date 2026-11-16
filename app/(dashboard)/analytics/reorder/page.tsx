@@ -12,6 +12,8 @@ import {
   stockPositionSelectedFilterOptionInputs,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
+import Link from 'next/link'
+import { BarChart3 } from 'lucide-react'
 import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
 import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { hasPermission } from '@/lib/permissions'
@@ -21,6 +23,7 @@ import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-cont
 import { parseSelectedParam } from '@/lib/analytics/reorder-selection'
 import { ReorderCoverageProvider, ReorderCoverageWeeksCell, ReorderOrderQtyCell } from './reorder-coverage-cells'
 import { ReorderSelectAllCheckbox, ReorderRowCheckbox } from './reorder-selection-checkboxes'
+import { currentParams } from '../_components/report-utils'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -153,6 +156,15 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     includeZero: filters.includeZero,
     pageSize: String(filters.pageSize ?? 100),
   }
+  // Carry the filters that shape one product's figures into the demand chart drill-down.
+  const chartQuery = currentParams({
+    warehouseId: filters.warehouseId,
+    categoryId: filters.categoryId,
+    supplierId: filters.supplierId,
+    productType: filters.productType,
+    thresholdDays: filters.thresholdDays,
+    targetCoverWeeks: filters.targetCoverWeeks,
+  }).toString()
   const columns: Array<StockPositionColumn<ReorderReportRow>> = [
     {
       key: 'sku',
@@ -198,6 +210,20 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       render: (row) => <ReorderCoverageWeeksCell productId={row.productId} suggestedQty={row.suggestedReorderQty} averageDailyDemand={row.averageDailyDemand} label={row.sku} />,
     },
     { key: 'urgency', label: 'Status', render: (row) => urgencyLabel(row.urgency) },
+    {
+      key: 'demandChart',
+      label: 'Chart',
+      render: (row) => (
+        <Link
+          href={`/analytics/reorder/${encodeURIComponent(row.productId)}${chartQuery ? `?${chartQuery}` : ''}`}
+          aria-label={`Demand chart for ${row.sku}`}
+          title={`Demand chart for ${row.sku}`}
+          className="inline-flex text-muted-foreground hover:text-foreground"
+        >
+          <BarChart3 className="h-4 w-4" aria-hidden="true" />
+        </Link>
+      ),
+    },
   ]
 
   const toolbarRows = report.rows.map((row) => ({
