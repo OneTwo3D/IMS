@@ -9,7 +9,7 @@ import {
 } from '@/lib/domain/wms/systemic-failure'
 
 /** The sweeps the breaker guards. The name is part of the persisted key, so it is a contract. */
-export const SYSTEMIC_SWEEPS = ['order-push', 'dispatch'] as const
+export const SYSTEMIC_SWEEPS = ['order-push', 'order-push-verify', 'dispatch'] as const
 export type SystemicSweep = (typeof SYSTEMIC_SWEEPS)[number]
 
 /** Where a sweep's breaker state persists, per connector. One row, and the row IS the incident. Reserved: see reserved-setting-keys.ts. */
@@ -17,8 +17,9 @@ export function systemicFailureStateKey(connector: string, sweep: string): strin
   return `wms_systemic_failure:${connector}:${sweep}`
 }
 
-const SWEEP_LABEL: Record<string, string> = {
+const SWEEP_LABEL: Record<(typeof SYSTEMIC_SWEEPS)[number], string> = {
   'order-push': 'Order push',
+  'order-push-verify': 'Order push verification',
   dispatch: 'Dispatch sync',
 }
 
@@ -42,7 +43,7 @@ export function createDbSystemicFailureStore(connector: string): SystemicFailure
       return true
     },
     async raise(incident: SystemicIncident) {
-      const label = SWEEP_LABEL[incident.sweep] ?? incident.sweep
+      const label = (SWEEP_LABEL as Record<string, string>)[incident.sweep] ?? incident.sweep
       await logActivity({
         entityType: 'SYSTEM',
         tag: 'sync',
@@ -70,7 +71,7 @@ export function createDbSystemicFailureStore(connector: string): SystemicFailure
       })))
     },
     async resolve({ sweep, connector: resolvedConnector, consecutive }) {
-      const label = SWEEP_LABEL[sweep] ?? sweep
+      const label = (SWEEP_LABEL as Record<string, string>)[sweep] ?? sweep
       await logActivity({
         entityType: 'SYSTEM',
         tag: 'sync',
@@ -101,9 +102,21 @@ export type SystemicFailureIncidentRow = {
 /** The open incidents for the given connectors: what /sync/exceptions shows. An incident exists exactly while its state row carries the open marker. */
 export async function loadSystemicFailureIncidents(connectors: readonly string[]): Promise<SystemicFailureIncidentRow[]> {
   if (connectors.length === 0) return []
-  const keys = connectors.flatMap((connector) => SYSTEMIC_SWEEPS.map((sweep) => ({ connector, sweep, key: systemicFailureStateKey(connector, sweep) })))
+  const keys = systemicIncidentKeys(connectors)
   const rows = await db.setting.findMany({ where: { key: { in: keys.map((entry) => entry.key) } }, select: { key: true, value: true } })
-  const byKey = new Map(rows.map((row) => [row.key, row.value]))
+  return buildSystemicIncidents(keys, new Map(rows.map((row) => [row.key, row.value])))
+}
+
+/** Every state key the inbox reads: one per connector per sweep in SYSTEMIC_SWEEPS, so a sweep added there cannot be missed. */
+export function systemicIncidentKeys(connectors: readonly string[]) {
+  return connectors.flatMap((connector) => SYSTEMIC_SWEEPS.map((sweep) => ({ connector, sweep, key: systemicFailureStateKey(connector, sweep) })))
+}
+
+/** Pure: the open incidents among the stored rows. */
+export function buildSystemicIncidents(
+  keys: ReadonlyArray<{ connector: string; sweep: string; key: string }>,
+  byKey: ReadonlyMap<string, string>,
+): SystemicFailureIncidentRow[] {
   const incidents: SystemicFailureIncidentRow[] = []
   for (const entry of keys) {
     const state: SystemicState = parseSystemicState(byKey.get(entry.key))
@@ -111,7 +124,7 @@ export async function loadSystemicFailureIncidents(connectors: readonly string[]
     incidents.push({
       connector: entry.connector,
       sweep: entry.sweep,
-      label: SWEEP_LABEL[entry.sweep] ?? entry.sweep,
+      label: (SWEEP_LABEL as Record<string, string>)[entry.sweep] ?? entry.sweep,
       openedAt: state.incidentOpenedAt,
       lastSeenAt: state.lastSeenAt,
       consecutive: state.consecutive,

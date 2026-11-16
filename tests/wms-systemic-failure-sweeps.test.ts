@@ -429,3 +429,32 @@ test('order push: after a definite-refusal outage the next pass creates every or
   assert.equal(m.resolved.length, 1)
   void links
 })
+
+// --- the inbox reads every sweep key the breaker writes ------------------------------------------------------------------------
+
+import { readFileSync } from 'node:fs'
+import { buildSystemicIncidents, systemicFailureStateKey, systemicIncidentKeys, SYSTEMIC_SWEEPS } from '../lib/domain/wms/systemic-failure-store.ts'
+import { runSystemicPass } from '../lib/domain/wms/systemic-failure.ts'
+
+test('inbox: every sweep key the sweeps write is queried', () => {
+  const written = new Set<string>()
+  for (const file of ['lib/domain/wms/order-push-sweep.ts', 'lib/domain/wms/dispatch-sweep.ts']) {
+    for (const match of readFileSync(file, 'utf8').matchAll(/runSystemicPass\([^)]*?sweep: '([a-z-]+)'/g)) written.add(match[1])
+  }
+  assert.deepEqual([...written].sort(), ['dispatch', 'order-push', 'order-push-verify'], 'precondition: the scan found the sweeps')
+  const queried = new Set(systemicIncidentKeys(['mintsoft']).map((entry) => entry.key))
+  for (const sweep of written) assert.ok(queried.has(systemicFailureStateKey('mintsoft', sweep)), `${sweep} is missing from the inbox query`)
+  assert.deepEqual([...SYSTEMIC_SWEEPS].sort(), [...written].sort())
+})
+
+test('inbox: a suppressed verification pass appears in the summary count and the section rows', async () => {
+  const m = memoryStore()
+  await runSystemicPass(m.store, { sweep: 'order-push-verify', connector: 'mintsoft', outcomes: { attempted: 3, failed: 3, exhausted: 3 }, now: new Date('2026-11-16T00:00:00Z'), reason: 'HTTP 500' })
+  const stored = new Map([...m.rows].map(([sweep, state]) => [systemicFailureStateKey('mintsoft', sweep), JSON.stringify(state)]))
+  const rows = buildSystemicIncidents(systemicIncidentKeys(['mintsoft']), stored)
+  assert.equal(rows.length, 1, 'the summary counts rows.length')
+  assert.equal(rows[0].sweep, 'order-push-verify')
+  assert.equal(rows[0].label, 'Order push verification')
+  assert.equal(rows[0].failed, 3)
+  assert.equal(rows[0].isolating, false)
+})
