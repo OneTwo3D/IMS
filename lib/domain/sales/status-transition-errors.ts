@@ -55,3 +55,10 @@ export function isPermanentStatusTransitionError(error: unknown): boolean {
     (error as { permanent?: unknown }).permanent === true
   )
 }
+
+/**
+ * The message prefix of a refusal made against the CURRENT status under the order lock by a caller-supplied guard
+ * (the WooCommerce status sync, o3d-hqvrp.81). The caller reads the status first and writes later; between the two a
+ * dispatch can commit. The refusal is permanent (the same request meets the same status) and the caller treats it as a skip.
+ */
+export const STATUS_GUARD_REFUSAL_PREFIX = 'Status change refused under the order lock: '

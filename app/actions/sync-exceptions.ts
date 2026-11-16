@@ -37,6 +37,7 @@ import {
   describeFollowUpObligationBacklogRow,
   readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
+import { wcOrderEditDriftWhere } from '@/lib/connectors/woocommerce/sync/order-edit-drift'
 import { giftCardUnsettledHoldWhere } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
@@ -505,6 +506,16 @@ export type BlockedWcOrderRow = {
   blockedAt: string
 }
 
+export type WcOrderEditDriftRow = {
+  id: string
+  orderId: string | null
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  /** What differs between the WooCommerce order and the IMS order. */
+  detail: string | null
+  foundAt: string
+}
+
 export type ProductStructureConflictRow = {
   id: string
   /** The IMS product the WooCommerce object was paired with. */
@@ -764,6 +775,8 @@ export type ExceptionInboxSummary = {
   pennyMismatches: number
   orderReconcileDrift: number
   productStructureConflicts: number
+  /** WooCommerce orders whose lines or total were edited after import (IMS keeps the original content). */
+  wcOrderEdits: number
   /** WooCommerce orders a guard refused to import, recorded in the by-id queue. */
   blockedWcOrders: number
   /** Held invoices refused for a gift-card flag the store left unsettled: an operator answers per line (counted in the total). */
@@ -814,6 +827,7 @@ export type ExceptionInboxData = {
   pennyMismatches: PennyMismatchRow[]
   orderReconcileDrift: OrderReconcileDriftRow[]
   productStructureConflicts: ProductStructureConflictRow[]
+  wcOrderEdits: WcOrderEditDriftRow[]
   blockedWcOrders: BlockedWcOrderRow[]
   unresolvedDrift: UnresolvedDriftRow[]
   accountingFollowUpObligations: AccountingFollowUpObligationRow[]
@@ -1012,6 +1026,35 @@ async function loadProductStructureConflicts(): Promise<ProductStructureConflict
   })
 }
 
+function countWcOrderEdits(): Promise<number> {
+  return db.shoppingSyncLog.count({ where: wcOrderEditDriftWhere() })
+}
+
+async function loadWcOrderEdits(): Promise<WcOrderEditDriftRow[]> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: wcOrderEditDriftWhere(),
+    orderBy: { createdAt: 'desc' },
+    take: SECTION_LIMIT,
+    select: { id: true, entityId: true, externalId: true, errorMessage: true, createdAt: true },
+  })
+  const orderIds = rows.map((row) => row.entityId).filter((id): id is string => Boolean(id))
+  const orders = orderIds.length > 0
+    ? await db.salesOrder.findMany({ where: { id: { in: orderIds } }, select: { id: true, orderNumber: true, externalOrderNumber: true } })
+    : []
+  const byId = new Map(orders.map((order) => [order.id, order]))
+  return rows.map((row) => {
+    const order = row.entityId ? byId.get(row.entityId) : undefined
+    return {
+      id: row.id,
+      orderId: row.entityId,
+      orderNumber: order?.orderNumber ?? null,
+      externalOrderNumber: order?.externalOrderNumber ?? row.externalId,
+      detail: row.errorMessage,
+      foundAt: row.createdAt.toISOString(),
+    }
+  })
+}
+
 function countBlockedWcOrders(): Promise<number> {
   return db.shoppingSyncLog.count({ where: wcBlockedOrderQueueWhere() })
 }
@@ -1104,7 +1147,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, deadShoppingWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, blockedWcOrders, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals, handPostClaims] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, deadShoppingWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, wcOrderEdits, blockedWcOrders, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals, handPostClaims] = await Promise.all([
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
@@ -1120,6 +1163,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     countStuckDispatches(),
     countOrderReconcileDrift(),
     countProductStructureConflicts(),
+    countWcOrderEdits(),
     countBlockedWcOrders(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
@@ -1157,6 +1201,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     pennyMismatches,
     orderReconcileDrift,
     productStructureConflicts,
+    wcOrderEdits,
     blockedWcOrders,
     giftCardLinesToResolve,
     wmsOperatorTasksOpen,
@@ -1167,7 +1212,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + blockedWcOrders + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }
@@ -1243,7 +1288,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
   // apart cannot change which side of a five-minute grace a row falls on.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, deadShoppingWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, blockedWcOrderRows, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, deadShoppingWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, wcOrderEditRows, blockedWcOrderRows, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: WMS_PUSH_INBOX_WHERE,
       orderBy: { lastAttemptAt: 'desc' },
@@ -1349,6 +1394,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     }),
     loadOrderReconcileDrift(),
     loadProductStructureConflicts(),
+    loadWcOrderEdits(),
     loadBlockedWcOrders(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
@@ -1711,6 +1757,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     })),
     orderReconcileDrift,
     productStructureConflicts,
+    wcOrderEdits: wcOrderEditRows,
     blockedWcOrders: blockedWcOrderRows,
     unresolvedDrift: driftIncidents.map((incident) => ({
       connector: incident.connector,
