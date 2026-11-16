@@ -23,7 +23,7 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
 import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
-import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, repriceDiscountStr, repriceUnitPrice, usableRate } from '@/lib/currencies/form-fx-rate'
+import { FX_RATE_CHANGED_FORM_MESSAGE, convertAnchored, convertDiscountAnchored, fxBlocksSubmit, isFxRateChangedError, usableRate, type MoneyAnchor } from '@/lib/currencies/form-fx-rate'
 
 type Warehouse = { id: string; code: string; name: string; isDefault?: boolean }
 
@@ -166,6 +166,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const fxRate = fx ? usableRate(fx) : null // null while loading or when the currency has no rate: base-currency figures show a dash
   // The rate the line prices are currently expressed at (1 while in the base currency), so a currency change can re-price them.
   const pricedAtRate = useRef(1)
+  const moneyAnchors = useRef(new Map<string, MoneyAnchor>())
+  const latest = useRef({ lines: [] as LineItem[], orderDiscount: '', shippingAmount: 0, fees: [] as FeeLine[] })
   // Pre-select the default warehouse (falls back to the first one).
   const [warehouseId, setWarehouseId] = useState(
     warehouses.find((w) => w.isDefault)?.id ?? warehouses[0]?.id ?? '',
@@ -187,6 +189,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const [shippingService, setShippingService] = useState('')
   const [fees, setFees] = useState<FeeLine[]>([])
   const [orderDiscount, setOrderDiscount] = useState('')
+  latest.current = { lines, orderDiscount, shippingAmount, fees }
 
   const [error, setError] = useState('')
 
@@ -232,11 +235,23 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
       pricedAtRate.current = next
       if (from === next) return
       // Every absolute money amount is restated; percentage discounts stay percentages.
-      const conv = (n: number) => repriceUnitPrice(n, from, next) ?? n
-      setLines((prev) => prev.map((l) => ({ ...l, unitPrice: conv(l.unitPrice), discount: repriceDiscountStr(l.discount, from, next) })))
-      setOrderDiscount((prev) => repriceDiscountStr(prev, from, next))
-      setShippingAmount((prev) => conv(prev))
-      setFees((prev) => prev.map((f) => ({ ...f, amount: conv(f.amount) })))
+      // Each field remembers its full-precision base amount (moneyAnchors), so A -> B -> A returns the original figure instead of compounding the rounding.
+      const cur = latest.current
+      const anchors = moneyAnchors.current
+      const num = (key: string, v: number) => {
+        const r = convertAnchored(v, anchors.get(key), from, next)
+        if (r.anchor) anchors.set(key, r.anchor)
+        return r.value
+      }
+      const disc = (key: string, v: string) => {
+        const r = convertDiscountAnchored(v, anchors.get(key), from, next)
+        if (r.anchor) anchors.set(key, r.anchor)
+        return r.value
+      }
+      setLines(cur.lines.map((l) => ({ ...l, unitPrice: num(`p:${l.key}`, l.unitPrice), discount: disc(`d:${l.key}`, l.discount) })))
+      setOrderDiscount(disc('orderDisc', cur.orderDiscount))
+      setShippingAmount(num('ship', cur.shippingAmount))
+      setFees(cur.fees.map((f) => ({ ...f, amount: num(`f:${f.key}`, f.amount) })))
     })
   }
 

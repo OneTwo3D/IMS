@@ -13,10 +13,10 @@ export function useFormFxRate(initial: FormFxRate) {
   const [fx, setFx] = useState<FormFxRate | null>(initial)
   const seq = useRef(0)
 
-  const load = useCallback((currency: string, isBase: boolean, onResolved?: (r: FormFxRate) => void) => {
+  const load = useCallback((currency: string, isBase: boolean, onResolved?: (r: FormFxRate) => void, fixed?: FormFxRate) => {
     const n = ++seq.current
-    if (isBase) {
-      const r: FormFxRate = { state: 'base' }
+    if (isBase || fixed) {
+      const r: FormFxRate = fixed ?? { state: 'base' }
       setFx(r)
       onResolved?.(r)
       return

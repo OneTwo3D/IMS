@@ -4,7 +4,7 @@ import test from 'node:test'
 import { formFxRateFromError } from '@/lib/currencies/form-fx-rate-server'
 import { MissingFxRateError } from '@/lib/currencies/fx-select'
 import {
-  describeFxSource, fxBlocksSubmit, isFxRateChangedError, repriceDiscountStr, missingFormFxRate, missingFxRateMessage, repriceUnitPrice, usableRate,
+  convertAnchored, convertDiscountAnchored, describeFxSource, fxBlocksSubmit, fxRateChangedMessage, isFxRateChangedError, repriceDiscountStr, missingFormFxRate, missingFxRateMessage, repriceUnitPrice, usableRate,
   type FormFxRate,
 } from '@/lib/currencies/form-fx-rate'
 
@@ -70,4 +70,39 @@ test('the rate-changed refusal is recognised by its code', () => {
   assert.equal(isFxRateChangedError('FX_RATE_CHANGED: the EUR table rate moved from 1.1 to 1.2 since it was checked; nothing was written'), true)
   assert.equal(isFxRateChangedError('Missing GBP FX rate'), false)
   assert.equal(isFxRateChangedError(undefined), false)
+})
+
+test('A -> B -> A returns the original price (no compounding rounding)', () => {
+  const rates = [1, 1.17, 0.8333, 1.3]
+  for (const start of [28.8, 9.99, 0.07, 1234.56]) {
+    let value = start
+    let anchor = undefined as ReturnType<typeof convertAnchored>['anchor']
+    let from = rates[0]
+    for (const to of [1.17, 0.8333, 1.3, 1.17, 1]) {
+      const r = convertAnchored(value, anchor, from, to)
+      value = r.value
+      anchor = r.anchor
+      from = to
+    }
+    assert.equal(value, start)
+  }
+})
+
+test('an edited field restarts from what it shows', () => {
+  const a = convertAnchored(10, undefined, 1, 1.2) // 12
+  const edited = convertAnchored(20, a.anchor, 1.2, 1) // user typed 20, not 12
+  assert.equal(edited.value, 16.67)
+})
+
+test('discount anchors: percentage kept, absolute round-trips', () => {
+  const a = convertDiscountAnchored('3.33', undefined, 1, 1.17)
+  const b = convertDiscountAnchored(a.value, a.anchor, 1.17, 1)
+  assert.equal(b.value, '3.33')
+  assert.equal(convertDiscountAnchored('10%', undefined, 1, 1.17).value, '10%')
+})
+
+test('the rate-changed refusal text carries the code and both rates', () => {
+  const m = fxRateChangedMessage('USD', 1.25, 1.3)
+  assert.equal(isFxRateChangedError(m), true)
+  assert.match(m, /USD table rate moved from 1.25 to 1.3/)
 })

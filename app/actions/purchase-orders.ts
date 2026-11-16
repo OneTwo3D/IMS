@@ -161,6 +161,7 @@ import {
   settlementAsOfFromInput,
 } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { fxRateChangedMessage } from '@/lib/currencies/form-fx-rate'
 import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
@@ -1600,7 +1601,7 @@ function checkAmendHeader(
   return null
 }
 
-export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf' | 'expectedFxRate'>> & { refreshFxRate?: boolean }
+export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf'>> & { refreshFxRate?: boolean }
 
 export async function updatePurchaseOrder(
   id: string,
@@ -1712,6 +1713,10 @@ export async function updatePurchaseOrder(
             asOf: new Date(),
           })
         : Number(locked.fxRateToBase)
+      // The rate the form displayed must be the rate this save uses (the stored rate when the currency is unchanged, the table rate when it changed): a mismatch is refused, nothing written.
+      if (input.expectedFxRate !== undefined && !rateOnlyFxRefresh && input.expectedFxRate !== fxRate) {
+        return { refused: fxRateChangedMessage(input.currency ?? locked.currency, input.expectedFxRate, fxRate) }
+      }
       const inclVat = !!input.pricesIncludeVat
       const vatRate = input.taxRateValue ?? 0
 

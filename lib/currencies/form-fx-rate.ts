@@ -51,16 +51,32 @@ export function repriceUnitPrice(price: number, fromRate: number | null, toRate:
 }
 
 /**
- * A discount field ("10%" or "5"): a percentage is a ratio and stays as typed, an absolute amount is restated like a price,
- * blank stays blank. An unreadable or unconvertible value is returned unchanged (the caller blocks submit separately).
+ * Full-precision memory for a converted money field, so repeated currency changes do not compound the 2dp rounding:
+ * `base` is the amount in the base currency, `shown` the rounded figure the field was last given. While the field still
+ * shows `shown` (the user has not edited it) the next conversion starts from `base`; an edited field starts from what it shows.
  */
-export function repriceDiscountStr(input: string, fromRate: number | null, toRate: number | null): string {
+export type MoneyAnchor = { shown: number; base: number }
+
+export function convertAnchored(value: number, anchor: MoneyAnchor | undefined, fromRate: number | null, toRate: number | null): { value: number; anchor: MoneyAnchor | undefined } {
+  if (fromRate === null || toRate === null || !(fromRate > 0) || !(toRate > 0) || !Number.isFinite(value)) return { value, anchor }
+  const base = anchor && anchor.shown === value ? anchor.base : value / fromRate
+  const next = Math.round(base * toRate * 100) / 100
+  return { value: next, anchor: { shown: next, base } }
+}
+
+/** A discount field ("10%" or "5"), anchored like a price: a percentage stays as typed, blank stays blank, an unreadable value is returned unchanged. */
+export function convertDiscountAnchored(input: string, anchor: MoneyAnchor | undefined, fromRate: number | null, toRate: number | null): { value: string; anchor: MoneyAnchor | undefined } {
   const s = input.trim()
-  if (!s || s.endsWith('%')) return input
+  if (!s || s.endsWith('%')) return { value: input, anchor }
   const abs = parseFloat(s)
-  if (Number.isNaN(abs)) return input
-  const next = repriceUnitPrice(abs, fromRate, toRate)
-  return next === null ? input : String(next)
+  if (Number.isNaN(abs)) return { value: input, anchor }
+  const r = convertAnchored(abs, anchor, fromRate, toRate)
+  return { value: String(r.value), anchor: r.anchor }
+}
+
+/** Unanchored form of the discount conversion (one step, no memory). */
+export function repriceDiscountStr(input: string, fromRate: number | null, toRate: number | null): string {
+  return convertDiscountAnchored(input, undefined, fromRate, toRate).value
 }
 
 /** The FX_RATE_CHANGED refusal the create actions return when the table rate moved after the form read it. */
@@ -69,3 +85,7 @@ export function isFxRateChangedError(error: string | undefined): boolean {
 }
 
 export const FX_RATE_CHANGED_FORM_MESSAGE = 'The exchange rate changed while you were working. The rate and the amounts shown have been updated: check them, then submit again.'
+
+export function fxRateChangedMessage(currency: string, expected: number, actual: number): string {
+  return `FX_RATE_CHANGED: the ${currency} table rate moved from ${expected} to ${actual} since it was checked; nothing was written`
+}

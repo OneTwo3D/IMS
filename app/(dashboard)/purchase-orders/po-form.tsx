@@ -434,6 +434,11 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
 
   function setCurrencyAndRate(code: string) {
     setCurrency(code)
+    // Editing: going back to the order's own currency shows (and sends) the rate the order is stored at, which is what a save keeps.
+    if (existingPo && code === existingPo.currency) {
+      loadFxRate(code, true, undefined, initialFx)
+      return
+    }
     loadFxRate(code, code === baseCurrency.code)
   }
 
@@ -722,10 +727,13 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
 
     startTransition(async () => {
       if (isEditMode && existingPo) {
-        const result = await updatePurchaseOrder(existingPo.id, payload)
+        const result = await updatePurchaseOrder(existingPo.id, { ...payload, expectedFxRate: fxRate ?? undefined })
         if (result.success) {
           router.refresh()
           onClose()
+        } else if (isFxRateChangedError(result.error)) {
+          setCurrencyAndRate(currency)
+          setError(FX_RATE_CHANGED_FORM_MESSAGE)
         } else {
           setError(result.error ?? 'Failed to update PO')
         }
