@@ -128,6 +128,11 @@ export type BookedInDryRunLineInput = {
   lastProcessedReceivedQty?: number
   localLineExists?: boolean
   /**
+   * o3d-hqvrp.119. The line's over-receipt is received in full once approved (a purchase-order line), so the review
+   * the operator sees shows the quantity approval will book, not the clamped one. See `reconcileBookedInQuantities`.
+   */
+  allowOverReceipt?: boolean
+  /**
    * o3d-papk. False when the line's parent order is in a status that expects nothing more (a CANCELLED or CLOSED
    * purchase order). Absent means "not known to be unusable" (a transfer line, whose status is enforced where it is
    * locked). Raises `parent_not_receivable` for a line that has something to apply.
@@ -259,10 +264,19 @@ export function reconcileBookedInQuantities(input: {
   lastProcessedReceivedQty: number
   qtyAccountedViaSnapshot?: number
   qtyAccountedViaReceipt?: number
+  /**
+   * o3d-hqvrp.119. True ONLY for a purchase-order line whose over-receipt has been approved: the WMS booked in
+   * more than the ASN expected and a person acknowledged it, so the FULL booked quantity is received instead of
+   * being clamped to `expectedQty`. Default false (the clamp), which is what every caller that has not been through
+   * the `received_over_expected` review wants. A clamped approval was the defect: the excess sat in Mintsoft's
+   * stock with no stock row, cost layer, PO line quantity or journal in IMS, and the ASN closed on top of it.
+   */
+  allowOverReceipt?: boolean
 }): ReconciledBookedInQuantities {
   const expectedQty = Math.max(0, input.expectedQty)
-  const currentReceivedQty = Math.min(expectedQty, Math.max(0, input.currentReceivedQty))
-  const lastProcessedReceivedQty = Math.min(expectedQty, Math.max(0, input.lastProcessedReceivedQty))
+  const upperBound = input.allowOverReceipt ? Number.POSITIVE_INFINITY : expectedQty
+  const currentReceivedQty = Math.min(upperBound, Math.max(0, input.currentReceivedQty))
+  const lastProcessedReceivedQty = Math.min(upperBound, Math.max(0, input.lastProcessedReceivedQty))
   const qtyAccountedViaSnapshot = Math.min(expectedQty, Math.max(0, input.qtyAccountedViaSnapshot ?? 0))
   const qtyAccountedViaReceipt = Math.min(expectedQty, Math.max(0, input.qtyAccountedViaReceipt ?? 0))
   const delta = Math.max(0, currentReceivedQty - lastProcessedReceivedQty)
@@ -319,6 +333,7 @@ export function buildBookedInDryRun(input: {
       lastProcessedReceivedQty,
       qtyAccountedViaSnapshot,
       qtyAccountedViaReceipt,
+      allowOverReceipt: line.allowOverReceipt === true,
     })
     const warnings: BookedInDryRunWarningCode[] = []
 
@@ -332,7 +347,11 @@ export function buildBookedInDryRun(input: {
     } else {
       // Conservative policy: every over-receipt requires review because it can affect stock valuation,
       // supplier billing, and accounting variance. It remains approval-allowed after acknowledgement.
-      if (currentRemoteReceivedQty > expectedQty + WMS_RECEIPT_QTY_EPSILON) {
+      //
+      // o3d-hqvrp.119: only the part NOT YET ACCOUNTED counts. Once an approved over-receipt has been received in
+      // full, `lastProcessedReceivedQty` is above `expectedQty`; a later re-check of the same ASN reads the same
+      // remote figure and must not put the same, already-approved excess back into review.
+      if (currentRemoteReceivedQty > Math.max(expectedQty, lastProcessedReceivedQty) + WMS_RECEIPT_QTY_EPSILON) {
         warnings.push('received_over_expected')
       }
       if (currentRemoteReceivedQty + WMS_RECEIPT_QTY_EPSILON < Math.max(lastProcessedReceivedQty, qtyAccountedViaSnapshot)) {

@@ -610,10 +610,17 @@ export async function processBookedInEvent(
             remoteQuantityRefusal: remote.refusal,
             remoteArrivedQty: remote.arrivedAtWarehouseQty,
             remoteQuantityBasis: remote.basis,
-            currentReceivedQty: Math.min(
-              Number(line.expectedQty),
-              currentRemoteReceivedQty,
-            ),
+            // o3d-hqvrp.119. THIS WAS `Math.min(expectedQty, remote)` FOR EVERY LINE, so an APPROVED
+            // over-receipt booked only the expected quantity and the ASN closed on it: the excess units
+            // were in Mintsoft's stock and in no IMS stock row, cost layer, PO line or journal, and
+            // nothing could absorb them afterwards. An over-receipt never reaches this point unapproved
+            // (`received_over_expected` holds the event for review), so a PURCHASE-ORDER line receives
+            // the full booked quantity here. The clamp stays for everything else: a transfer line has no
+            // cost layers beyond what was dispatched, so its excess cannot be costed and is left to the
+            // operator (stock adjustment) rather than receiving units with no cost basis.
+            currentReceivedQty: line.sourceType === 'PURCHASE_ORDER_LINE'
+              ? currentRemoteReceivedQty
+              : Math.min(Number(line.expectedQty), currentRemoteReceivedQty),
           }
         })
 
@@ -774,6 +781,7 @@ export async function processBookedInEvent(
             qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
             lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
             parentReceivable: purchaseLine ? isPurchaseOrderUsableForWmsReceipt(purchaseLine.po.status) : undefined,
+            allowOverReceipt: line.sourceType === 'PURCHASE_ORDER_LINE',
             localLineExists: line.sourceType === 'PURCHASE_ORDER_LINE'
               ? Boolean(purchaseLine)
               : line.sourceType === 'STOCK_TRANSFER_LINE'
@@ -1064,6 +1072,7 @@ export async function processBookedInEvent(
             lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
             qtyAccountedViaSnapshot: receiptLine.qtyAccountedViaSnapshot,
             qtyAccountedViaReceipt: receiptLine.qtyAccountedViaReceipt,
+            allowOverReceipt: true,
           })
 
           return {

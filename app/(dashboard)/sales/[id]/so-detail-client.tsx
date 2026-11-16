@@ -1987,6 +1987,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 <div className="flex items-center gap-2">
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                   <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                  <a href={`/api/credit-note/${r.id}`} target="_blank" rel="noreferrer" className="text-xs text-primary underline">PDF</a>
                 </div>
                 <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>

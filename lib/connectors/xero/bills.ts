@@ -3,6 +3,8 @@
  */
 
 import { xeroPost, xeroPut } from './api'
+import { assertXeroLineQuantitiesKept, xeroUnitDpFields, xeroUnitDpRoundingLine } from './write-path'
+import { resolveUnitDpRoundingAccount } from './unit-dp-rounding'
 import { findOrCreateContact } from './contacts'
 import { xeroDocumentRevisionAt } from './document-revision'
 import { foreignCurrencyRateProblem, isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
@@ -34,12 +36,23 @@ type XeroInvoiceResponse = {
 }
 
 // Exported for unit tests (o3d-q0x56.3): the CurrencyRate decision is made here.
+/** Each line's quantity and exact per-unit price after any line discount, which is folded into the unit price (ACCPAY has no line discount). Quantity is never altered. */
+function billEffectiveLines(data: BillData): Array<{ quantity: number; unitAmount: number }> {
+  return data.lines.map((line: InvoiceLine) => {
+    let unitAmount = line.unitAmount
+    if (line.discountAmount && line.discountAmount > 0 && line.quantity > 0) unitAmount = Math.max(0, line.unitAmount - line.discountAmount / line.quantity)
+    return { quantity: line.quantity, unitAmount }
+  })
+}
+
 export function buildPurchaseBillPayload(
   data: BillData,
   status: string,
   contactId: string,
   /** The organisation's base currency. REQUIRED: whether a missing CurrencyRate is allowed depends on it (o3d-q0x56.3). */
   baseCurrency: string,
+  /** The Rounding account the unitdp=4 penny posts to; required only when the lines need one. */
+  roundingAccount?: string | null,
 ): Record<string, unknown> {
   // o3d-q0x56.3: decided FIRST. A foreign bill with no usable IMS rate THROWS; a base-currency bill with none omits the field, unchanged.
   const xeroCurrencyRate = xeroCurrencyRateOrRefuse({
@@ -59,23 +72,20 @@ export function buildPurchaseBillPayload(
   // reducing `UnitAmount`. Keeping the Xero-specific handling inside the
   // connector means callers can pass the same generic `discountAmount` field
   // regardless of whether the target system is Xero or (future) QuickBooks.
-  const lineItems = data.lines.map((line: InvoiceLine) => {
-    let effectiveUnitAmount = line.unitAmount
-    if (line.discountAmount && line.discountAmount > 0 && line.quantity > 0) {
-      const perUnitDiscount = line.discountAmount / line.quantity
-      effectiveUnitAmount = Math.round((line.unitAmount - perUnitDiscount) * 10000) / 10000
-      if (effectiveUnitAmount < 0) effectiveUnitAmount = 0
-    }
+  const effectiveLines = billEffectiveLines(data)
+  const lineItems = data.lines.map((line: InvoiceLine, i) => {
     const xeroLine: Record<string, unknown> = {
       Description: line.description,
-      Quantity: line.quantity,
-      UnitAmount: effectiveUnitAmount,
+      ...xeroUnitDpFields(line.quantity, effectiveLines[i]!.unitAmount),
       AccountCode: line.accountCode,
       TaxType: line.taxType,
     }
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
     return xeroLine
   })
+  const roundingLine = xeroUnitDpRoundingLine(effectiveLines, roundingAccount, `Purchase bill ${data.invoiceNumber ?? '(no number)'}`)
+  if (roundingLine) lineItems.push(roundingLine)
+  assertXeroLineQuantitiesKept(data.lines, lineItems)
 
   // DueDate is mandatory for AUTHORISED bills — fall back to the bill date.
   const dueDate = data.dueDate || data.date
@@ -112,6 +122,8 @@ async function preparePurchaseBillPayload(
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Purchase bill ${data.invoiceNumber ?? '(no number)'}`,
   })
   if (rateProblem) return { success: false, error: rateProblem }
+  const rounding = await resolveUnitDpRoundingAccount(billEffectiveLines(data), `Purchase bill ${data.invoiceNumber ?? '(no number)'}`)
+  if (!rounding.ok) return { success: false, error: rounding.error }
 
   // Find or create the supplier contact
   const contactResult = await findOrCreateContact(data.contactName, opts?.supplierEmail, true, { supplierId: opts?.supplierId })
@@ -132,7 +144,7 @@ async function preparePurchaseBillPayload(
   try {
     return {
       success: true,
-      invoice: buildPurchaseBillPayload(data, status, contactResult.contactId, baseCurrency),
+      invoice: buildPurchaseBillPayload(data, status, contactResult.contactId, baseCurrency, rounding.account),
     }
   } catch (error) {
     if (isXeroForeignCurrencyRateError(error) || isXeroPurchaseDocumentTaxTypeError(error)) return { success: false, error: error.message }
