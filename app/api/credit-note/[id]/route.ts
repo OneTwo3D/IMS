@@ -7,7 +7,7 @@ import { formatCountryDisplay } from '@/lib/countries'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, drawTemplateNotes, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { drawTotalsRows } from '@/lib/pdf-order-money'
 import { creditNoteLineFacts } from '@/lib/domain/sales/credit-note-display'
-import { type CreditNoteDocumentModel, CreditNoteRateUnprovableError, draftCreditNoteModel, postedCreditNoteModel, postedLineVatRate } from '@/lib/domain/sales/credit-note-document'
+import { type CreditNoteDocumentModel, CreditNoteDocumentRefusedError, draftCreditNoteModel, postedCreditNoteModel, postedLineVatRate } from '@/lib/domain/sales/credit-note-document'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { refusedCreditNoteError } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
@@ -92,7 +92,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       rateOf,
     })
     } catch (e) {
-      if (e instanceof CreditNoteRateUnprovableError) return NextResponse.json({ error: e.message }, { status: 409 })
+      if (e instanceof CreditNoteDocumentRefusedError) return NextResponse.json({ error: e.message }, { status: 409 })
       throw e
     }
   } else {

@@ -97,7 +97,7 @@ test("a draft credit note's rows add up to its total, at each line's own rate", 
   assert.equal(rounding, null)
 })
 
-test('two 0.005 lines: the printed rows plus an explicit Rounding row sum to the printed total', () => {
+test('two 0.005 lines: each posts as 0.01 (Xero rounds the line amount), so the rows sum to the total with no Rounding row', () => {
   const { rows, rounding, total } = postedCreditNoteModel({
     currency: 'GBP',
     payloadLines: [{ description: 'A', quantity: 1, unitAmount: 0.005 }, { description: 'B', quantity: 1, unitAmount: 0.005 }],
@@ -106,8 +106,8 @@ test('two 0.005 lines: the printed rows plus an explicit Rounding row sum to the
     rateOf: () => 0,
   })
   assert.deepEqual(rows.map((r) => r.gross), [0.01, 0.01])
-  assert.deepEqual(total, { net: 0.01, vat: 0, gross: 0.01 })
-  assert.deepEqual(rounding, { net: -0.01, vat: 0, gross: -0.01 })
+  assert.deepEqual(total, { net: 0.02, vat: 0, gross: 0.02 })
+  assert.equal(rounding, null)
   const sum = (k: 'net' | 'vat' | 'gross') => Math.round((rows.reduce((s, r) => s + r[k], 0) + (rounding?.[k] ?? 0)) * 100) / 100
   assert.deepEqual({ net: sum('net'), vat: sum('vat'), gross: sum('gross') }, total)
 })

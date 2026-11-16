@@ -14,6 +14,7 @@
  */
 import { lineVatRate, type CreditNoteLineFacts, type MoneyViewLine, type RefundAmounts } from '@/lib/domain/sales/sales-order-money-view'
 import { currencyMinorUnits } from '@/lib/domain/math/decimal'
+import { planXeroRoundingLine, predictXeroDocumentTotal, xeroUnitDpFields } from '@/lib/connectors/xero/write-path'
 
 export type CreditNoteDocumentRow = { description: string; qty: number; net: number; vat: number; gross: number }
 export type RawCreditNoteLine = { description: string; qty: number; net: number; vat: number }
@@ -52,8 +53,19 @@ export function roundMinor(n: number, currency: string | null | undefined): numb
   return Math.round((n + Number.EPSILON) * f) / f
 }
 
+/** Base of the refusals the PDF route turns into a 409 with operator wording. */
+export class CreditNoteDocumentRefusedError extends Error {}
+
+/** The posted credit note's lines cannot be reproduced the way the writer posts them (its own planner would refuse the document). */
+export class CreditNotePostingUnprovableError extends CreditNoteDocumentRefusedError {
+  constructor(why: string) {
+    super(`This credit note's PDF cannot be printed: ${why} IMS will not guess a total. Use the credit note in your accounting system as the document of record.`)
+    this.name = 'CreditNotePostingUnprovableError'
+  }
+}
+
 /** A posted credit note line whose VAT rate cannot be proven from anything frozen at posting. The PDF is refused rather than printed with a guessed rate. */
-export class CreditNoteRateUnprovableError extends Error {
+export class CreditNoteRateUnprovableError extends CreditNoteDocumentRefusedError {
   constructor(readonly lineNumbers: number[]) {
     super(
       `This credit note's VAT cannot be printed: line${lineNumbers.length === 1 ? '' : 's'} ${lineNumbers.join(', ')} of the posted credit note `
@@ -88,15 +100,21 @@ export type PostedPayloadLine = { refundLineId?: unknown; taxRatePosted?: unknow
  */
 export function postedCreditNoteModel(input: {
   currency: string
-  payloadLines: ReadonlyArray<PostedPayloadLine>
+  payloadLines: ReadonlyArray<PostedPayloadLine & { taxType?: unknown }>
   lineAmountsIncludeTax: boolean
   vatIsOwnLine: boolean
   rateOf: (index: number) => number | null
 }): CreditNoteDocumentModel {
   const unprovable: number[] = []
-  const model = finishCreditNoteRows(input.payloadLines.map((l, i) => {
+  // Each line exactly as the credit-note writer sends it: Quantity x UnitAmount at Xero's 4 decimals (xeroUnitDpFields), the line amount rounded to
+  // the minor unit, tax per line on that amount at the frozen rate of the line's posted code.
+  const sent = input.payloadLines.map((l) => {
     const qty = Number(l.quantity ?? 1)
-    const amount = qty * Number(l.unitAmount ?? 0)
+    const unit = xeroUnitDpFields(qty, Number(l.unitAmount ?? 0)).UnitAmount
+    return { qty, unit, amount: roundMinor(qty * unit, input.currency) }
+  })
+  const raws = input.payloadLines.map((l, i) => {
+    const { qty, amount } = sent[i]
     const description = typeof l.description === 'string' ? l.description : 'Refund line'
     // The scheme credit note's ONE VAT line (noTaxKind 'eu-vat-recovery') IS the VAT: it prints as VAT, not as net. Fee and rounding lines stay
     // net lines of their own kind (a fee on NONE carries no VAT of its own; the rounding line is the rounding the credit note itself posts).
@@ -109,10 +127,39 @@ export function postedCreditNoteModel(input: {
       const vat = roundMinor(amount - amount / (1 + rate), input.currency)
       return { description, qty, net: amount - vat, vat }
     }
-    return { description, qty, net: amount, vat: roundMinor(roundMinor(amount, input.currency) * rate, input.currency) }
-  }), input.currency)
+    return { description, qty, net: amount, vat: roundMinor(amount * rate, input.currency) }
+  })
   if (unprovable.length > 0) throw new CreditNoteRateUnprovableError(unprovable)
-  return model
+
+  // The untaxed "Rounding adjustment" line the writer adds when 4-decimal unit prices change a line amount: sized by the writer's own planner on the
+  // frozen rates, so the document's total is the one the posting produces. A document the planner would refuse is refused here.
+  const ratePercentByType = new Map<string, number>()
+  input.payloadLines.forEach((l) => {
+    const r = postedLineVatRate(l)
+    if (typeof l.taxType === 'string' && r !== null && !ratePercentByType.has(l.taxType.trim())) ratePercentByType.set(l.taxType.trim(), r * 100)
+  })
+  const planLines = input.payloadLines.map((l, i) => ({ quantity: sent[i].qty, unitAmount: Number(l.unitAmount ?? 0), taxType: typeof l.taxType === 'string' ? l.taxType : null }))
+  let adjustment: Record<string, unknown> | null
+  try {
+    // The account is not printed; any non-blank value lets the planner size the line (the posting already had one, or it would have been refused).
+    adjustment = planXeroRoundingLine({ lines: planLines, lineAmountsIncludeTax: input.lineAmountsIncludeTax, rateOf: (t) => ratePercentByType.get(t.trim()) ?? null, account: 'rounding', what: 'This credit note' })
+  } catch (e) {
+    throw new CreditNotePostingUnprovableError(e instanceof Error ? e.message : String(e))
+  }
+  if (adjustment !== null) raws.push({ description: String(adjustment.Description), qty: Number(adjustment.Quantity), net: Number(adjustment.UnitAmount), vat: 0 })
+  return finishCreditNoteRows(raws, input.currency)
+}
+
+/** The total a posted credit note's lines make in Xero (the writer's own prediction), for cross-checking a model's total. */
+export function predictedPostedTotal(input: { currency: string; payloadLines: ReadonlyArray<PostedPayloadLine & { taxType?: unknown }>; lineAmountsIncludeTax: boolean }): number | null {
+  const ratePercentByType = new Map<string, number>()
+  for (const l of input.payloadLines) {
+    const r = postedLineVatRate(l)
+    if (typeof l.taxType === 'string' && r !== null && !ratePercentByType.has(l.taxType.trim())) ratePercentByType.set(l.taxType.trim(), r * 100)
+  }
+  const lines = input.payloadLines.map((l) => ({ quantity: Number(l.quantity ?? 1), unitAmount: Number(l.unitAmount ?? 0), taxType: typeof l.taxType === 'string' ? l.taxType : null }))
+  const predicted = predictXeroDocumentTotal(lines, input.lineAmountsIncludeTax, (t) => ratePercentByType.get(t.trim()) ?? null)
+  return predicted.ok ? predicted.total.toNumber() : null
 }
 
 /**
