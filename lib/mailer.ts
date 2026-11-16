@@ -170,7 +170,9 @@ export async function sendEmailWithSmtpSettings(
     if (opts.singleSend) {
       unknownOutcomeProbe = (e) => {
         const responseCode = (e as { responseCode?: unknown } | null)?.responseCode
-        if (typeof responseCode === 'number') return false // a definite answer from the server: the ordinary classification applies
+        // Only an explicit 4xx/5xx is a definite failure answer (ordinary classification). A 2xx/3xx code on a transport error is a PARTIAL final
+        // reply (nodemailer attaches the half-read response to 'Connection closed unexpectedly'): the server may have accepted the message.
+        if (typeof responseCode === 'number' && responseCode >= 400 && responseCode < 600) return false
         // Classified by the OBSERVED phase: no DATA seen means nothing was handed over, so a rejection is retryable however late it comes.
         // (The deadline TIMER below stays terminal: it leaves the send in flight, so its phase cannot be known.)
         return dataStarted

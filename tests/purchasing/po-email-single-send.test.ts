@@ -64,6 +64,27 @@ test('mailer: a disconnect after DATA is written but before the 354 reply is ret
   assert.equal(late.unknownOutcome, true)
 })
 
+test('mailer: a truncated final 2xx reply followed by a disconnect is unknown; a final 451 stays retryable and a final 550 permanent', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('ECONNECTION', 'Connection closed unexpectedly', { responseCode: 250 }) }
+  const partial = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
+  assert.equal(partial.permanent, true)
+  assert.equal(partial.unknownOutcome, true)
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('ECONNECTION', 'Connection closed unexpectedly', { responseCode: 354 }) }
+  assert.equal((await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })).unknownOutcome, true)
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('EMESSAGE', 'Message failed', { responseCode: 451 }) }
+  const soft = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
+  assert.equal(soft.permanent, false)
+  assert.equal(soft.unknownOutcome, undefined)
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('EMESSAGE', 'Message failed', { responseCode: 550 }) }
+  const hard = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
+  assert.equal(hard.permanent, true)
+  assert.equal(hard.unknownOutcome, undefined)
+  // Before the 354 a code on the error never makes it unknown.
+  behave = async (o) => { sendDataCommandOnly(o); throw reject('ECONNECTION', 'Connection closed unexpectedly', { responseCode: 250 }) }
+  assert.equal((await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })).permanent, false)
+})
+
 test('mailer: the installed nodemailer logs the DATA command and the server reply the way the phase tracker reads them (version pin)', async () => {
   const { readFileSync } = await import('node:fs')
   const { createRequire } = await import('node:module')
@@ -73,6 +94,7 @@ test('mailer: the installed nodemailer logs the DATA command and the server repl
   assert.match(src, /this\._sendCommand\('DATA'\)/, 'nodemailer writes DATA itself')
   assert.match(src, /tnx: 'client'/, "client commands are logged with tnx 'client' when transactionLog is on")
   assert.match(src, /tnx: 'server'/, "server replies are logged with tnx 'server' before the response action runs")
+  assert.match(src, /new Error\('Connection closed unexpectedly'\), 'ECONNECTION', serverResponse, 'CONN'/, 'a mid-reply close attaches the partial response (and so a responseCode) to the ECONNECTION error')
   assert.match(src, /_actionDATA\(str, callback\) \{\s*\n[^\n]*\n[^\n]*\n\s*if \(!\/\^\[23\]\/\.test\(str\)\)/, 'DATA accepts a 2xx/3xx reply, then streams')
 })
 
