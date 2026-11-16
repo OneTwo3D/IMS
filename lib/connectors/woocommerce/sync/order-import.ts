@@ -32,6 +32,7 @@ import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
+import { surfaceWcOrderEditDrift } from './order-edit-drift'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
@@ -1386,6 +1387,8 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
+  // The lines and total are never rewritten here; an edit in WooCommerce is surfaced instead (o3d-hqvrp.84).
+  await surfaceWcOrderEditDrift(orderId, wcOrder)
   let outcome: PaidBlockOutcome = { blocked: false }
   if (transition.kind === 'record') outcome = await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId, snapshotVersion)
   if (transition.kind === 'blocked') throw transition.error
@@ -4561,6 +4564,58 @@ export async function noteWcOrderAdmissionRefusal(modifiedAtIso: string | null |
   }
 }
 
+/**
+ * THE CANCELLATION BACKSTOP (o3d-hqvrp.82). A cancellation (or a trash) in WooCommerce reaches IMS through
+ * one `order.updated` delivery, and the sweeps ask WooCommerce only for the operator's selected statuses
+ * (plus completed and the withdrawal statuses), so an order that moved to `cancelled` never comes back:
+ * a lost delivery meant the order stayed allocated and went on to the warehouse.
+ *
+ * This reads the orders WooCommerce holds as `cancelled` (and, best effort, `trash`) modified since the
+ * sweep's window, and applies the cancellation to the ones IMS ALREADY HOLDS, through `syncWcOrderStatus`
+ * (state machine, withdrawal rules and the WMS cancel pass included). It never imports an order IMS has not
+ * seen, so the operator's status selection is unaffected. It does not touch the cursor: a failure of the
+ * required `cancelled` read, or a cancellation that fails to apply, is an ERROR on the run, which holds the
+ * cursor exactly as a failed import does. The `trash` read is best effort (a store that rejects the status
+ * must not stall the sweep): its failure is logged and the `cancelled` read still stands.
+ */
+export async function sweepWcCancellations(modifiedAfter: string, result: SyncResult, mode: string): Promise<void> {
+  for (const slug of ['cancelled', 'trash'] as const) {
+    const required = slug === 'cancelled'
+    let page = 1
+    let endedOnEmptyPage = false
+    while (page <= MAX_WC_PAGE_WALK_PAGES) {
+      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', modified_after: modifiedAfter })
+      if (error || !Array.isArray(data)) {
+        const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
+        if (required) result.errors.push(message)
+        else await logActivity({ entityType: 'SYNC', action: 'wc_order_trash_read_failed', tag: 'sync', level: 'WARNING', description: message, metadata: { mode }, resolveUser: false }).catch(() => undefined)
+        break
+      }
+      const orders = data as WcFullOrder[]
+      if (orders.length === 0) { endedOnEmptyPage = true; break }
+      for (const order of orders) {
+        try {
+          const link = await db.shoppingOrderLink.findUnique({
+            where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(order.id) } },
+            select: { order: { select: { status: true } } },
+          })
+          if (!link?.order || link.order.status === 'CANCELLED') continue
+          const { syncWcOrderStatus } = await import('./order-status')
+          // A trashed order is a cancellation as far as IMS is concerned.
+          const outcome = await syncWcOrderStatus(slug === 'trash' ? { ...order, status: 'cancelled' } : order)
+          if (!outcome.success && !outcome.permanent) result.errors.push(`cancellation backstop #${order.id}: ${outcome.error ?? 'unknown error'}`)
+        } catch (e) {
+          result.errors.push(`cancellation backstop #${order.id}: ${String(e)}`)
+        }
+      }
+      page++
+    }
+    if (required && !endedOnEmptyPage && result.errors.length === 0) {
+      result.errors.push(describeWcPageWalkCeilingStall('order', `${mode} cancellation backstop`))
+    }
+  }
+}
+
 export async function syncNewWcOrders(
   opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
 ): Promise<SyncResult> {
@@ -4887,6 +4942,12 @@ export async function syncNewWcOrders(
     ? await walkOrders(statuses, lastSync)
     : { endedOnEmptyPage: false, page: 1 }
   const { endedOnEmptyPage, page } = walked
+
+  // A cancellation WooCommerce holds but no delivery brought (see sweepWcCancellations). Only after a clean
+  // main walk, and only with a window to read from: the first sweep has nothing to back-stop.
+  if (endedOnEmptyPage && result.errors.length === 0 && lastSync) {
+    await sweepWcCancellations(lastSync, result, mode)
+  }
 
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a

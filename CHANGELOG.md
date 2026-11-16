@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce order import: no backwards status, cancellation backstop, edits surfaced (sync)
+
+- **Fixed: a WooCommerce status could move a shipped order backwards.** The status sync applied the WooCommerce status through the full transition bypass, so a stale retry, an unrelated plugin save or an admin edit carrying `processing`, `on-hold` or `pending` dragged a SHIPPED, COMPLETED or DELIVERED order back to a live, unshipped state, and an unchanged `processing` undid ALLOCATED / PICKING / PACKING progress. The IMS state machine is now asked first; a move it does not allow, and `processing` over fulfilment progress, is skipped and recorded as `status_sync_skipped_backwards`.
+- **Fixed: a cancellation lost in transit let the order ship.** A cancel (or trash) in WooCommerce reached IMS only through one `order.updated` delivery. The order poll and reconciliation now also read WooCommerce's `cancelled` (and, best effort, `trash`) orders changed since the sweep window and cancel the IMS orders they match. Orders IMS has not imported are never imported by it; a failed read or apply holds the sweep cursor like any other error.
+- **Fixed: an order edited in WooCommerce after import was dropped without a trace.** Re-syncing edited lines is a design question (allocations, shipments, the invoice and the warehouse order hang off them), so the safe minimum is detection: a delivery whose goods lines, quantities or total differ from what IMS holds now raises a row under Sync > Exceptions and a WARNING in the order's activity log; the order is not changed, and the row clears when the two agree again. No migration.
+
 ### Xero paid date and EU VAT update refusals (backend / sync)
 
 - **Fixed: the Xero date reader accepted days that do not exist.** `FullyPaidOnDate` and the other Xero dates read `2026-02-30` as 2 March (the platform parser rolls such days on). An ISO date whose written year, month and day are not a real calendar day (zoned or zone-less, or an hour of 24 that would roll the day on) is now unreadable, so the payment poller leaves the document pending and retries it instead of writing a wrong `paidAt`.
