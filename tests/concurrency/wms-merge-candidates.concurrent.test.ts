@@ -92,7 +92,7 @@ test('overlapping runs whose view of the groups differs: the second skips, and t
   const [c, d] = [await newOrder(w, e2, 'g'), await newOrder(w, e2, 'h')]
   const mine = new Set([a, b, c, d])
   t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id: { in: [...mine] } } }) })
-  const scoped = { ...w.port, loadOrders: async () => (await w.port.loadOrders()).filter((o) => mine.has(o.orderId)) }
+  const scoped = { ...w.port, loadOrders: async (ids?: readonly string[]) => (await w.port.loadOrders(ids)).filter((o) => mine.has(o.orderId)) }
   const open = () => w.db.wmsOperatorTask.findMany({ where: { reason: 'MERGE_CANDIDATE', status: 'OPEN', orderId: { in: [...mine] } }, select: { orderId: true } })
 
   // Run A reads both groups, then stalls while holding the pass lock.
@@ -100,7 +100,7 @@ test('overlapping runs whose view of the groups differs: the second skips, and t
   const gate = new Promise<void>((resolve) => { release = resolve })
   let loaded!: () => void
   const hasLoaded = new Promise<void>((resolve) => { loaded = resolve })
-  const slow = { ...scoped, loadOrders: async () => { const view = await scoped.loadOrders(); loaded(); await gate; return view } }
+  const slow = { ...scoped, loadOrders: async (ids?: readonly string[]) => { const view = await scoped.loadOrders(ids); loaded(); await gate; return view } }
   const runA = w.mc.runMergeCandidateDetection(slow)
   await hasLoaded
 
@@ -113,15 +113,64 @@ test('overlapping runs whose view of the groups differs: the second skips, and t
   assert.equal((await open()).length, 0, 'the skipped run wrote nothing')
 
   release()
-  await runA // A acts on its (now stale) view: raises both groups.
-  assert.equal((await open()).length, 2)
+  await runA // A acts on its stale view of c+d, but re-reads the members under their locks first: only a+b is raised, and the owed marker B left makes A rerun once.
+  assert.equal((await open()).length, 1)
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { reason: 'MERGE_CANDIDATE', orderId: { in: [c, d] } } }), 0, 'no task for the stale group')
 
-  // The next pass sees the current membership: only a+b qualifies, and c+d's task is resolved.
+  // The next pass agrees: only a+b qualifies.
   await w.mc.runMergeCandidateDetection(scoped)
   const finalOpen = await open()
   assert.equal(finalOpen.length, 1, 'exactly the groups that qualify now')
   assert.ok([a, b].includes(finalOpen[0].orderId))
-  const cdTask = await w.db.wmsOperatorTask.findFirst({ where: { reason: 'MERGE_CANDIDATE', orderId: { in: [c, d] } } })
-  assert.equal(cdTask?.status, 'DONE')
-  assert.equal(cdTask?.doneBy, w.mc.MERGE_TASK_SYSTEM_ACTOR)
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { reason: 'MERGE_CANDIDATE', orderId: { in: [c, d] } } }), 0, 'still no task for the group that no longer qualifies')
+})
+
+test('the status sweep skips while a pass holds the lock after one order moved to PICKING: no task is raised for the stale group, and the owed marker reconciles', SKIP, async (t) => {
+  const w = await world()
+  const email = `mc-${randomUUID().slice(0, 8)}@example.test`
+  const [a, b] = [await newOrder(w, email, 'i'), await newOrder(w, email, 'j')]
+  const mine = new Set([a, b])
+  t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id: { in: [...mine] } } }) })
+  const scoped = { ...w.port, loadOrders: async (ids?: readonly string[]) => (await w.port.loadOrders(ids)).filter((o) => mine.has(o.orderId)) }
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let loaded!: () => void
+  const hasLoaded = new Promise<void>((resolve) => { loaded = resolve })
+  let first = true
+  const slow = { ...scoped, loadOrders: async (ids?: readonly string[]) => { const view = await scoped.loadOrders(ids); if (first) { first = false; loaded(); await gate } return view } }
+  const earlier = w.mc.runMergeCandidateDetection(slow) // read the group: both NEW
+  await hasLoaded
+  await w.db.wmsOrderStatusSnapshot.update({ where: { orderId: b }, data: { status: 'PICKING' } }) // the status sweep refreshes a snapshot ...
+  const sweep = await w.mc.runMergeCandidateDetection(scoped) // ... and its detection pass cannot get the lock
+  assert.equal('skipped' in sweep, true)
+  assert.equal(await w.port.isOwed('mintsoft'), true, 'the skipped pass left the owed marker')
+  release()
+  await earlier
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { reason: 'MERGE_CANDIDATE', orderId: { in: [a, b] } } }), 0, 'no task claims both orders are NEW')
+  assert.equal(await w.port.isOwed('mintsoft'), false, 'the holder reconciled the marker')
+})
+
+test('a marker left by a skipped pass triggers exactly one reconciliation that picks up a group formed meanwhile', SKIP, async (t) => {
+  const w = await world()
+  const e1 = `mc-${randomUUID().slice(0, 8)}@example.test`
+  const e2 = `mc-${randomUUID().slice(0, 8)}@example.test`
+  const [a, b] = [await newOrder(w, e1, 'k'), await newOrder(w, e1, 'l')]
+  const mine = new Set([a, b])
+  t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id: { in: [...mine] } } }) })
+  let passes = 0
+  const scoped = { ...w.port, loadOrders: async (ids?: readonly string[]) => (await w.port.loadOrders(ids)).filter((o) => mine.has(o.orderId)) }
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let loaded!: () => void
+  const hasLoaded = new Promise<void>((resolve) => { loaded = resolve })
+  const counting = { ...scoped, loadOrders: async (ids?: readonly string[]) => { const view = await scoped.loadOrders(ids); if (!ids) { passes += 1; if (passes === 1) { loaded(); await gate } } return view } }
+  const holder = w.mc.runMergeCandidateDetection(counting)
+  await hasLoaded
+  const [c, d] = [await newOrder(w, e2, 'm'), await newOrder(w, e2, 'n')]
+  mine.add(c); mine.add(d)
+  assert.equal('skipped' in await w.mc.runMergeCandidateDetection(scoped), true)
+  release()
+  await holder
+  assert.equal(passes, 2, 'one pass plus exactly one reconciliation')
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { reason: 'MERGE_CANDIDATE', status: 'OPEN', orderId: { in: [a, b, c, d] } } }), 2, 'the group formed meanwhile is flagged without waiting for another sweep')
 })

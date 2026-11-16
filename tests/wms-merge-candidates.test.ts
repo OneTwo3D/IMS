@@ -238,9 +238,10 @@ test('the mode: only `flag` is on; off, blank, unknown and the reserved `hold` a
 // ---------------------------------------------------------------------------------------------------------------------------------------
 
 type Task = { key: string; basis: string; status: 'OPEN' | 'DONE'; doneBy: string | null; queryText: string; orderId: string; externalOrderId: string }
-function fakePort(opts: { mode: 'off' | 'flag'; orders: MergeCandidateOrder[]; backordered?: string[]; tenantScoped?: boolean; environment?: { skipped: string }; lockHeld?: boolean }) {
+function fakePort(opts: { mode: 'off' | 'flag'; orders: MergeCandidateOrder[]; backordered?: string[]; tenantScoped?: boolean; environment?: { skipped: string }; lockHeld?: boolean; afterLoad?: () => void }) {
   const state = { mode: opts.mode, orders: opts.orders, backordered: new Set(opts.backordered ?? []), tenantScoped: opts.tenantScoped ?? true }
   const tasks: Task[] = []
+  const owed = { value: false }
   const log: string[] = []
   const writes: string[] = []
   const reads: string[] = []
@@ -249,9 +250,16 @@ function fakePort(opts: { mode: 'off' | 'flag'; orders: MergeCandidateOrder[]; b
     withLock: async (_connector, fn) => (opts.lockHeld ? null : fn()),
     readMode: async () => { reads.push('mode'); return state.mode },
     environment: async () => { reads.push('environment'); return opts.environment ?? { connectorId: 'mintsoft', connectorLabel: 'Mintsoft', tenantScoped: state.tenantScoped } },
-    loadOrders: async () => { reads.push('orders'); return state.orders },
+    loadOrders: async () => { reads.push('orders'); const view = state.orders; opts.afterLoad?.(); return view },
+    markOwed: async () => { owed.value = true },
+    clearOwed: async () => { owed.value = false },
+    isOwed: async () => owed.value,
     backorderedAmong: async (orderIds) => new Set(orderIds.filter((id) => state.backordered.has(id))),
-    async raiseGroupTask(connector, group, queryText): Promise<MergeTaskOutcome> {
+    async raiseGroupTask(env, group, queryText): Promise<MergeTaskOutcome> {
+      const connector = env.connectorId
+      // The real port re-reads the members' CURRENT state under their order locks and raises only if the group still qualifies.
+      const current = findMergeCandidateGroups(state.orders, { connectorId: env.connectorId, tenantScoped: env.tenantScoped, now: NOW, excludedOrderIds: state.backordered })
+      if (!current.some((candidate) => candidate.basis === group.basis)) return 'stale'
       writes.push('raise')
       const anchor = group.members[0]
       const key = [connector, anchor.orderId, anchor.externalOrderId, MERGE_TASK_REASON, wmsOperatorTaskHash({ reason: MERGE_TASK_REASON, queryText, dedupeBasis: group.basis })].join('|')
@@ -278,7 +286,7 @@ function fakePort(opts: { mode: 'off' | 'flag'; orders: MergeCandidateOrder[]; b
       return n
     },
   }
-  return { port, state, tasks, log, writes, reads }
+  return { port, state, tasks, log, writes, reads, owed }
 }
 
 test('mode off (the default): nothing is computed and nothing is written', async () => {
@@ -376,6 +384,35 @@ test('a pass that cannot get the connector lock skips and writes nothing', async
   assert.equal('skipped' in result, true)
   assert.deepEqual(f.writes, [])
   assert.deepEqual(f.tasks, [])
+})
+
+test('a group that goes stale between the read and the raise is not raised (an order moved to PICKING mid-pass)', async () => {
+  const a = order({})
+  const b = order({})
+  const f = fakePort({ mode: 'flag', orders: [a, b], afterLoad: () => { f.state.orders = [a, { ...b, snapshot: { ...b.snapshot!, status: 'PICKING' } }] } })
+  const result = await runMergeCandidateDetection(f.port)
+  assert.deepEqual(f.tasks, [], 'no task says every order is NEW')
+  assert.deepEqual(result.groups, [])
+})
+
+test('a skipped pass leaves an owed marker; the holder reruns exactly once when it finishes', async () => {
+  const a = order({})
+  const b = order({})
+  let passes = 0
+  const f = fakePort({ mode: 'flag', orders: [a, b], afterLoad: () => { passes += 1; if (passes === 1) f.owed.value = true } })
+  await runMergeCandidateDetection(f.port)
+  assert.equal(passes, 2, 'one pass plus one rerun')
+  assert.equal(f.owed.value, false)
+  // A marker set again during the rerun is left for the next sweep: no third pass.
+  passes = 0
+  const g = fakePort({ mode: 'flag', orders: [a, b], afterLoad: () => { passes += 1; g.owed.value = true } })
+  await runMergeCandidateDetection(g.port)
+  assert.equal(passes, 2, 'bounded: at most one rerun')
+  assert.equal(g.owed.value, true, 'left for the next sweep')
+  // The skipper sets the marker.
+  const h = fakePort({ mode: 'flag', orders: [a, b], lockHeld: true })
+  await runMergeCandidateDetection(h.port)
+  assert.equal(h.owed.value, true)
 })
 
 test('a detection failure never throws out of the safe wrapper (it must not affect the push)', async () => {

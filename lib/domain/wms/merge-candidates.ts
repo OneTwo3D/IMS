@@ -1,4 +1,6 @@
 import { db } from '@/lib/db'
+import type { Prisma } from '@/app/generated/prisma/client'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { logActivityInTransaction } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
@@ -41,17 +43,27 @@ export const MERGE_TASK_REASON = 'MERGE_CANDIDATE' as const
 export const MERGE_TASK_SYSTEM_ACTOR = 'system:merge-candidate-cleared'
 
 export type MergeCandidateEnvironment = { connectorId: string; /** The connector's display name, for the task text. */ connectorLabel: string; tenantScoped: boolean }
-export type MergeTaskOutcome = 'created' | 'reopened' | 'unchanged'
+/** `stale`: the group no longer qualifies on the CURRENT snapshots, so nothing was raised. */
+export type MergeTaskOutcome = 'created' | 'reopened' | 'unchanged' | 'stale'
 
 export type MergeCandidatePort = {
   readMode(): Promise<WmsMergeCandidateMode>
   /** The active connector and whether it is client-scoped, or why detection cannot run. */
   environment(): Promise<MergeCandidateEnvironment | { skipped: string }>
-  loadOrders(): Promise<MergeCandidateOrder[]>
+  loadOrders(orderIds?: readonly string[]): Promise<MergeCandidateOrder[]>
   /** Which of these orders have a line the stock does not cover. */
   backorderedAmong(orderIds: readonly string[]): Promise<Set<string>>
-  /** Record the group's task (and, for a new or re-opened one, an activity entry per member), atomically. */
-  raiseGroupTask(connector: string, group: MergeGroup, queryText: string): Promise<MergeTaskOutcome>
+  /**
+   * Record the group's task (and, for a new or re-opened one, an activity entry per member), atomically, ONLY IF the group still qualifies:
+   * the members' CURRENT state is re-read under their order locks (the same locks the status sweep takes to write a snapshot), so a snapshot
+   * refreshed after the group was computed cannot be followed by a task that says every order is NEW. Returns `stale` when it does not.
+   */
+  raiseGroupTask(env: MergeCandidateEnvironment, group: MergeGroup, queryText: string): Promise<MergeTaskOutcome>
+  /** A pass that skipped because the lock was busy records that detection is owed; the lock holder reconciles it. */
+  markOwed(connector: string): Promise<void>
+  /** Clear the owed marker (a pass clears it as it starts: it reads current data, so it satisfies every request made before). */
+  clearOwed(connector: string): Promise<void>
+  isOwed(connector: string): Promise<boolean>
   /** Resolve this connector's OPEN merge-candidate tasks whose group is not in `keepBases`. Returns how many. */
   resolveTasksNotIn(connector: string, keepBases: readonly string[]): Promise<number>
   /** Run the whole compute, raise, resolve pass holding the connector's detection lock; `null` when another pass holds it. */
@@ -97,19 +109,41 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
   // ONE pass at a time per connector: a pass resolves every open task its own groups do not include, so two overlapping passes that saw
   // different groups would each resolve the task the other had just raised. A pass that cannot get the lock skips; the next sweep runs it again.
   // (The alternative, re-checking membership per task under a lock, still needs a lock and still reads the groups twice.)
-  const pass = await port.withLock(env.connectorId, async (): Promise<MergeCandidateRun> => {
+  //
+  // A SKIPPED PASS IS NEVER JUST DROPPED. The status sweep refreshes the snapshots and then runs detection; if it cannot get the lock, the holder
+  // is working from older snapshots. So the skipper leaves an "owed" marker, and the holder, when it finishes, runs ONE more pass if the marker
+  // is set (it clears the marker as that pass starts). A marker set during that rerun is left for the next sweep: at most one rerun, bounded.
+  // Independently of the marker, each group's task is raised only after the members are re-read under their order locks (raiseGroupTask).
+  const onePass = async (): Promise<Extract<MergeCandidateRun, { created: number }>> => {
+    await port.clearOwed(env.connectorId)
     const groups = await computeGroups(port, env)
     let created = 0
     let reopened = 0
+    const kept: string[] = []
     for (const group of groups) {
-      const outcome = await port.raiseGroupTask(env.connectorId, group, mergeGroupTaskText(group, env.connectorLabel))
+      const outcome = await port.raiseGroupTask(env, group, mergeGroupTaskText(group, env.connectorLabel))
+      if (outcome === 'stale') continue
+      kept.push(group.basis)
       if (outcome === 'created') created += 1
       else if (outcome === 'reopened') reopened += 1
     }
-    const resolved = await port.resolveTasksNotIn(env.connectorId, groups.map((group) => group.basis))
-    return { mode, groups, created, reopened, resolved }
+    // A stale group is not kept: an open task it already had is resolved like any group that stopped qualifying.
+    const resolved = await port.resolveTasksNotIn(env.connectorId, kept)
+    return { mode: 'flag', groups: groups.filter((group) => kept.includes(group.basis)), created, reopened, resolved }
+  }
+  const pass = await port.withLock(env.connectorId, async () => {
+    let result = await onePass()
+    if (await port.isOwed(env.connectorId)) {
+      const again = await onePass()
+      result = { mode: 'flag', groups: again.groups, created: result.created + again.created, reopened: result.reopened + again.reopened, resolved: result.resolved + again.resolved }
+    }
+    return result
   })
-  return pass ?? { mode, skipped: 'Another merge-candidate pass is running', groups: [] }
+  if (pass === null) {
+    await port.markOwed(env.connectorId)
+    return { mode, skipped: 'Another merge-candidate pass is running; detection is owed and the holder will reconcile it', groups: [] }
+  }
+  return pass
 }
 
 /** For the sweeps: never throws. A failed detection is logged and must not affect the push or the status sweep. */
@@ -126,6 +160,49 @@ export async function runMergeCandidateDetectionSafe(trigger: string, port?: Mer
 function taskHash(group: MergeGroup, queryText: string): string {
   return wmsOperatorTaskHash({ reason: MERGE_TASK_REASON, queryText, dedupeBasis: group.basis })
 }
+
+/** The open orders that are NEW in the warehouse by their stored snapshot (all of them, or only these). Takes a client so a caller can read inside its own transaction. */
+async function loadOrderRows(client: Pick<Prisma.TransactionClient, 'salesOrder'>, orderIds?: readonly string[]): Promise<MergeCandidateOrder[]> {
+  const rows = await client.salesOrder.findMany({
+    where: {
+      ...(orderIds ? { id: { in: [...orderIds] } } : {}),
+      status: { in: [...MERGE_OPEN_STATUSES] as never },
+      shippedAt: null,
+      erasedAt: null,
+      wmsOrderStatus: { is: { status: { equals: 'NEW', mode: 'insensitive' } } },
+      wmsOrderPush: { is: { state: { in: ['SYNCED', 'MERGED'] } } },
+    },
+    select: {
+      id: true, orderNumber: true, createdAt: true, status: true, shippedAt: true, refundStatus: true, withdrawalHoldAt: true, withdrawalApprovedAt: true,
+      erasedAt: true, archived: true, customerName: true, customerEmail: true, billingAddress: true, shippingAddress: true,
+      shippingService: true, courierKey: true, shippingMethodId: true,
+      wmsOrderPush: { select: { connector: true, state: true, externalOrderId: true, externalOrderNumber: true } },
+      wmsOrderStatus: { select: { connector: true, status: true, externalOrderId: true, externalOrderNumber: true, isSplit: true, fetchedAt: true, lastError: true } },
+    },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  })
+  return rows.map((row): MergeCandidateOrder => ({
+    orderId: row.id,
+    orderNumber: row.orderNumber,
+    createdAt: row.createdAt,
+    status: row.status,
+    shippedAt: row.shippedAt,
+    refundStatus: row.refundStatus,
+    withdrawalHoldAt: row.withdrawalHoldAt,
+    withdrawalApprovedAt: row.withdrawalApprovedAt,
+    erasedAt: row.erasedAt,
+    archived: row.archived,
+    customerName: row.customerName,
+    customerEmail: row.customerEmail,
+    billingAddress: row.billingAddress,
+    shippingAddress: row.shippingAddress,
+    courierText: [row.shippingService, row.courierKey, row.shippingMethodId],
+    link: row.wmsOrderPush,
+    snapshot: row.wmsOrderStatus,
+  }))
+}
+
+const owedKey = (connector: string) => `wms_merge_candidate_owed:${connector}`
 
 const memberLabel = (member: { orderNumber: string | null; orderId: string }) => member.orderNumber ?? member.orderId
 
@@ -149,45 +226,18 @@ export const prismaMergeCandidatePort: MergeCandidatePort = {
     return { connectorId: resolution.id, connectorLabel: getWmsConnectorDef(resolution.id).label, tenantScoped: scoped }
   },
 
-  async loadOrders() {
-    const rows = await db.salesOrder.findMany({
-      where: {
-        status: { in: [...MERGE_OPEN_STATUSES] as never },
-        shippedAt: null,
-        erasedAt: null,
-        wmsOrderStatus: { is: { status: { equals: 'NEW', mode: 'insensitive' } } },
-        wmsOrderPush: { is: { state: { in: ['SYNCED', 'MERGED'] } } },
-      },
-      select: {
-        id: true, orderNumber: true, createdAt: true, status: true, shippedAt: true, refundStatus: true, withdrawalHoldAt: true, withdrawalApprovedAt: true,
-        erasedAt: true, archived: true, customerName: true, customerEmail: true, billingAddress: true, shippingAddress: true,
-        shippingService: true, courierKey: true, shippingMethodId: true,
-        wmsOrderPush: { select: { connector: true, state: true, externalOrderId: true, externalOrderNumber: true } },
-        wmsOrderStatus: { select: { connector: true, status: true, externalOrderId: true, externalOrderNumber: true, isSplit: true, fetchedAt: true, lastError: true } },
-      },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    })
-    return rows.map((row): MergeCandidateOrder => ({
-      orderId: row.id,
-      orderNumber: row.orderNumber,
-      createdAt: row.createdAt,
-      status: row.status,
-      shippedAt: row.shippedAt,
-      refundStatus: row.refundStatus,
-      withdrawalHoldAt: row.withdrawalHoldAt,
-      withdrawalApprovedAt: row.withdrawalApprovedAt,
-      erasedAt: row.erasedAt,
-      archived: row.archived,
-      customerName: row.customerName,
-      customerEmail: row.customerEmail,
-      billingAddress: row.billingAddress,
-      shippingAddress: row.shippingAddress,
-      courierText: [row.shippingService, row.courierKey, row.shippingMethodId],
-      link: row.wmsOrderPush,
-      snapshot: row.wmsOrderStatus,
-    }))
+  loadOrders: (orderIds?: readonly string[]) => loadOrderRows(db, orderIds),
+  async markOwed(connector) {
+    const key = owedKey(connector)
+    const value = new Date().toISOString()
+    await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
   },
-
+  async clearOwed(connector) {
+    await db.setting.deleteMany({ where: { key: owedKey(connector) } })
+  },
+  async isOwed(connector) {
+    return (await db.setting.findUnique({ where: { key: owedKey(connector) }, select: { key: true } })) !== null
+  },
   async backorderedAmong(orderIds) {
     const out = new Set<string>()
     for (const id of new Set(orderIds)) {
@@ -197,15 +247,23 @@ export const prismaMergeCandidatePort: MergeCandidatePort = {
     return out
   },
 
-  async raiseGroupTask(connector, group, queryText) {
+  async raiseGroupTask(env, group, queryText) {
+    const connector = env.connectorId
     const anchor = group.members[0]
+    const memberIds = group.members.map((member) => member.orderId)
+    const backordered = await prismaMergeCandidatePort.backorderedAmong(memberIds)
     const payload: WmsOperatorTaskPayload = {
       orderNumber: anchor.orderNumber,
       externalOrderNumber: anchor.externalOrderNumber,
       members: group.members.map((member) => ({ orderId: member.orderId, orderNumber: member.orderNumber, externalOrderNumber: member.externalOrderNumber })),
     }
     const hash = taskHash(group, queryText)
-    return db.$transaction(async (tx) => {
+    return db.$transaction(async (tx): Promise<MergeTaskOutcome> => {
+      // Under the members' order locks (the status sweep takes the same lock to write a snapshot) read their CURRENT state and raise only if
+      // the group still qualifies exactly as computed.
+      for (const id of [...memberIds].sort()) await lockSalesOrder(tx, id)
+      const fresh = findMergeCandidateGroups(await loadOrderRows(tx, memberIds), { connectorId: env.connectorId, tenantScoped: env.tenantScoped, now: new Date(), excludedOrderIds: backordered })
+      if (!fresh.some((candidate) => candidate.basis === group.basis)) return 'stale'
       const created = await raiseWmsOperatorTask(tx, {
         connector, orderId: anchor.orderId, externalOrderId: anchor.externalOrderId, reason: MERGE_TASK_REASON, queryText, payload, dedupeBasis: group.basis,
       })
