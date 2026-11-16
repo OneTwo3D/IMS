@@ -53,6 +53,7 @@ import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatCalendarDate } from '@/lib/format-datetime'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { PoFormDialog } from '../po-form'
@@ -2411,7 +2412,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <span className="text-muted-foreground">Expected Delivery</span>
             <p className="font-medium">
               {po.expectedDelivery
-                ? formatDateTime(po.expectedDelivery, { day: 'numeric', month: 'long', year: 'numeric' })
+                ? formatCalendarDate(po.expectedDelivery, { day: 'numeric', month: 'long', year: 'numeric' })
                 : '—'}
             </p>
           </div>
@@ -2631,7 +2632,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   )}
                   <TableCell className="px-4 text-right tabular-nums text-xs whitespace-nowrap" data-testid="po-line-eta">
                     {line.effectiveDelivery
-                      ? formatDateTime(line.effectiveDelivery, { day: 'numeric', month: 'short', year: 'numeric' })
+                      ? formatCalendarDate(line.effectiveDelivery, { day: 'numeric', month: 'short', year: 'numeric' })
                       : '—'}
                     {line.expectedDelivery && (
                       <span className="ml-1 text-[10px] text-muted-foreground" title="This line has its own date">(line)</span>

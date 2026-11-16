@@ -22,7 +22,7 @@ const HEADERS = [
   'pricesIncludeVat',
   'supplierRef',
   'expectedDelivery',
-  // Export-only for now: the line's own date (blank = follows expectedDelivery). The importer does not read it yet.
+  // The line's own date (blank = follows expectedDelivery). Read back by the importer (importPurchaseOrdersCsv).
   'lineExpectedDelivery',
   'orderDiscountForeign',
   'notes',

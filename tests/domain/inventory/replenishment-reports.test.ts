@@ -5,6 +5,8 @@ import {
   getBackorderDemandReport,
   getComponentShortageReport,
   earliestInboundDateByProduct,
+  inboundArrivalsByProduct,
+  undatedInboundProductIds,
   getReorderReport,
   type ReplenishmentReportClient,
 } from '@/lib/domain/inventory/replenishment-reports'
@@ -1722,4 +1724,37 @@ test('earliestInboundDateByProduct uses the line date over the order date and ig
   assert.equal(dates.get('product-1'), '2026-06-05', 'the line date beats the later order date')
   assert.equal(dates.get('product-2'), '2026-06-25', 'a later line date is not capped at the order date')
   assert.equal(dates.get('product-3'), '2026-06-20', 'a received line no longer counts; the other follows the order')
+})
+
+test('inbound arrivals and the late-PO logic use the effective line date (line date, else the order date)', async () => {
+  const po = { supplierId: 'supplier-1', expectedDelivery: new Date('2026-05-25T00:00:00.000Z'), destinationWarehouseId: null, supplier }
+  const base = { qty: decimal('10'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), po }
+  const lines = [
+    { ...base, productId: 'a', expectedDelivery: new Date('2026-06-10T00:00:00.000Z') }, // order date is past, the line date is not
+    { ...base, productId: 'a', expectedDelivery: null },
+    { ...base, productId: 'b', expectedDelivery: null, po: { ...po, expectedDelivery: null } },
+    { ...base, productId: 'b', expectedDelivery: new Date('2026-06-12T00:00:00.000Z'), po: { ...po, expectedDelivery: null } },
+  ]
+  const arrivals = inboundArrivalsByProduct(lines)
+  assert.deepEqual(arrivals.get('a')?.map((x) => [x.date, String(x.qty)]), [['2026-05-25', '10'], ['2026-06-10', '10']])
+  assert.deepEqual(arrivals.get('b')?.map((x) => [x.date, String(x.qty)]), [['2026-06-12', '10']], 'a line date dates a line whose order has none')
+  assert.deepEqual([...undatedInboundProductIds(lines)], ['b'], 'only the line with neither date is undated')
+
+  // End to end: the order date is a week overdue, but the line says the goods are due later, so nothing is late.
+  const mk = { id: 'p1', sku: 'P1', name: 'P1', type: ProductType.SIMPLE, stockUnit: 'pcs', reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('20'), leadTimeDays: 5,
+    category, preferredSupplier: null, supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'P1', lastUnitCost: decimal('2'), leadTimeDays: 5, supplier }] }
+  const client = (lineDate: Date | null): ReplenishmentReportClient => ({
+    ...unusedClient(),
+    product: { findMany: async () => [mk] },
+    stockLevel: { findMany: async () => [{ productId: 'p1', warehouseId: 'warehouse-1', quantity: decimal('15'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } }] },
+    stockMovement: { findMany: async () => [{ productId: 'p1', qty: decimal('900'), totalValueBase: decimal('1800'), createdAt: new Date('2026-05-20T12:00:00.000Z'), product: { sku: 'P1', name: 'P1', category, supplierProducts: [{ supplier }] } }] },
+    purchaseOrderLine: { findMany: async () => [{ productId: 'p1', qty: decimal('500'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), expectedDelivery: lineDate, po: { ...po, destinationWarehouseId: 'warehouse-1' } }] },
+  })
+  const run = (c: ReplenishmentReportClient) => getReorderReport({ thresholdDays: 90, includeZero: true }, { deps: { client: c, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  const followsOrder = (await run(client(null))).rows[0]
+  assert.equal(followsOrder?.lateInboundQty, '500', 'no line date: the past order date makes it late')
+  const ownDate = (await run(client(new Date('2026-06-20T00:00:00.000Z')))).rows[0]
+  assert.equal(ownDate?.lateInboundQty, '0', 'a future line date overrides the past order date')
+  const lateLine = (await run(client(new Date('2026-05-28T00:00:00.000Z')))).rows[0]
+  assert.equal(lateLine?.lateInboundDueDate, '2026-05-28', 'a past line date is the late due date')
 })

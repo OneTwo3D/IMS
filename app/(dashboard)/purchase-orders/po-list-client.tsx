@@ -15,7 +15,7 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuSep
 import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import { ChevronRight, Search, Settings2, Filter } from 'lucide-react'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
-import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { formatCalendarDate } from '@/lib/format-datetime'
 import { formatMoney } from '@/lib/utils'
 
 function timeAgo(iso: string): string {
@@ -142,8 +142,8 @@ type Props = {
 
 export function PoListClient({ list, currencySymbols = {}, currencyPositions = {} }: Props) {
   const baseCurrency = useBaseCurrency()
-  const formatDateTime = useFormatDateTime()
-  const fmtDate = (iso: string | null) => (iso ? formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—')
+  // expectedDelivery is a date-only value stored at UTC midnight: render the calendar day, not the organisation zone's.
+  const fmtEta = (iso: string | null) => (iso ? formatCalendarDate(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—')
   const sym = (code: string) => currencySymbols[code] ?? (code === baseCurrency.code ? baseCurrency.symbol : code)
   const symPos = (code: string) => currencyPositions[code] ?? (code === baseCurrency.code ? baseCurrency.symbolPosition : undefined)
   const fmtForeign = (value: number, code: string) => formatMoney(value, sym(code), symPos(code))
@@ -296,7 +296,7 @@ export function PoListClient({ list, currencySymbols = {}, currencyPositions = {
           </TableCell>
         )
       case 'expected':
-        return <TableCell key={key} className="text-muted-foreground text-xs">{fmtDate(po.expectedDelivery)}</TableCell>
+        return <TableCell key={key} className="text-muted-foreground text-xs">{fmtEta(po.expectedDelivery)}</TableCell>
       case 'created':
         return <TableCell key={key} className="text-muted-foreground text-xs">{timeAgo(po.createdAt)}</TableCell>
       case 'lines':
@@ -446,7 +446,7 @@ export function PoListClient({ list, currencySymbols = {}, currencyPositions = {
                     </div>
 
                     <div className="mt-3 grid grid-cols-2 gap-2">
-                      <MobileRecordField label="Expected" value={fmtDate(po.expectedDelivery)} />
+                      <MobileRecordField label="Expected" value={fmtEta(po.expectedDelivery)} />
                       <MobileRecordField label="Created" value={timeAgo(po.createdAt)} />
                       <MobileRecordField label="Warehouse" value={po.destinationWarehouseName ?? '—'} />
                       <MobileRecordField label="Lines" value={po.lineCount} />

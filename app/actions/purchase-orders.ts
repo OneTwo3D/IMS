@@ -1795,6 +1795,8 @@ export async function updatePurchaseOrder(
         // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
         const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
         const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx, priorLineRates)
+        // A line whose `expectedDelivery` is ABSENT keeps its stored date (a caller that predates the field must not erase it); an explicit null or blank clears it.
+        const storedLineEta = new Map((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true } })).map((l) => [l.id, l.expectedDelivery]))
 
         // FULL edit: delete existing lines and recreate. AMEND: lines are reconciled in place further down (ids are kept).
         if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
@@ -1841,7 +1843,9 @@ export async function updatePurchaseOrder(
             unitCostBase,
             discountStr: l.discountStr ?? null,
             discountAmount: discAmt,
-            expectedDelivery: parseLineEtaInput(l.expectedDelivery),
+            expectedDelivery: l.expectedDelivery === undefined
+              ? (l.poLineId ? storedLineEta.get(l.poLineId) ?? null : null)
+              : parseLineEtaInput(l.expectedDelivery),
             taxRateId: resolvedId,
             taxForeign: lineTaxForeign,
             taxBase: lineTaxBase,

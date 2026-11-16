@@ -87,7 +87,7 @@ An order has one **Expected Delivery** date, but a supplier sometimes ships one 
 - Receiving goods, in full or in part, never changes a line's date.
 - The **Reorder** report's inbound arrival date uses the effective date, so a product arriving in a later batch is no longer shown as arriving with the earliest line of the order. The **Open purchase orders** report shows the earliest effective date of the lines still to come.
 - The **PO PDF** (and so the emailed PO) adds a **Delivery** column when at least one line's date differs from the order's. Lines that follow the order's date show a dash there.
-- The purchase order CSV export has a **lineExpectedDelivery** column. It is export-only for now: importing a CSV does not read it.
+- The purchase order CSV export and import have a **lineExpectedDelivery** column (YYYY-MM-DD, blank = follows the order's date), so a round trip keeps the line dates.
 - A line's date can be changed on any order that can still be edited, including one that has been part-received.
 
 ## Editing a Purchase Order

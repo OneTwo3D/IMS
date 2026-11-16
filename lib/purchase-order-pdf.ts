@@ -6,7 +6,7 @@ import { effectiveLineEta, lineEtaDiffersFromHeader } from '@/lib/domain/purchas
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
-import { formatDateTime } from '@/lib/format-datetime'
+import { formatCalendarDate, formatDateTime } from '@/lib/format-datetime'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
 import {
   createPdfDocument,
@@ -183,7 +183,7 @@ export async function renderPurchaseOrderPdf(
   if (branding.vatNumber) facts.push(`Our VAT no: ${branding.vatNumber}`)
   if (po.supplier.accountNumber) facts.push(`Our account with you: ${po.supplier.accountNumber}`)
   if (po.supplier.paymentTermsDays != null) facts.push(`Payment terms: ${po.supplier.paymentTermsDays} days`)
-  if (po.expectedDelivery) facts.push(`Expected delivery: ${formatDateTime(po.expectedDelivery, long, opts.timeZone)}`)
+  if (po.expectedDelivery) facts.push(`Expected delivery: ${formatCalendarDate(po.expectedDelivery, long)}`)
   doc.font('Helvetica').fontSize(9).fillColor('#333333').text(facts.join('   |   '), 50, doc.y, { width: 495 })
   doc.y += 4
   if (po.shipTo) {
@@ -195,7 +195,7 @@ export async function renderPurchaseOrderPdf(
 
   const flags = poLayoutFlags(po.lines)
   const columns: PdfTableColumn[] = poDocumentColumns(po.currencySymbol, flags)
-  drawTable(doc, columns, poDocumentRows(po.lines, { ...flags, formatDate: (d) => formatDateTime(d, { day: 'numeric', month: 'short', year: 'numeric' }, opts.timeZone) }), branding)
+  drawTable(doc, columns, poDocumentRows(po.lines, { ...flags, formatDate: (d) => formatCalendarDate(d, { day: 'numeric', month: 'short', year: 'numeric' }) }), branding)
 
   // Totals block, right-aligned under the last column.
   doc.y += 6

@@ -651,13 +651,15 @@ export function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string
  * expectedDelivery are EXCLUDED (an unknown arrival cannot rescue a run-out date), so
  * sum(arrivals) <= inboundOpenPoQty; undatedInboundProductIds reports the gap.
  */
-function inboundArrivalsByProduct(lines: OpenPoLineRow[]): Map<string, InboundArrival[]> {
+export function inboundArrivalsByProduct(lines: OpenPoLineRow[]): Map<string, InboundArrival[]> {
   const byProductDate = new Map<string, Map<string, Prisma.Decimal>>()
   for (const line of lines) {
     const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
-    if (qty.lte(0) || !line.po.expectedDelivery) continue
+    // The line's own date wins, else the order's (lib/domain/purchasing/line-eta.ts); the late-PO logic reads these same dates.
+    const eta = effectiveLineEta(line.expectedDelivery, line.po.expectedDelivery)
+    if (qty.lte(0) || !eta) continue
     const dates = byProductDate.get(line.productId) ?? new Map<string, Prisma.Decimal>()
-    addToMap(dates, dateOnly(line.po.expectedDelivery), qty)
+    addToMap(dates, dateOnly(eta), qty)
     byProductDate.set(line.productId, dates)
   }
   return new Map([...byProductDate].map(([productId, dates]) => [
@@ -666,11 +668,11 @@ function inboundArrivalsByProduct(lines: OpenPoLineRow[]): Map<string, InboundAr
   ]))
 }
 
-function undatedInboundProductIds(lines: OpenPoLineRow[]): Set<string> {
+export function undatedInboundProductIds(lines: OpenPoLineRow[]): Set<string> {
   const ids = new Set<string>()
   for (const line of lines) {
     const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
-    if (qty.gt(0) && !line.po.expectedDelivery) ids.add(line.productId)
+    if (qty.gt(0) && !effectiveLineEta(line.expectedDelivery, line.po.expectedDelivery)) ids.add(line.productId)
   }
   return ids
 }
