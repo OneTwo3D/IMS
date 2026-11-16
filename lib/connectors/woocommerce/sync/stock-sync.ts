@@ -39,6 +39,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
+import { commitDirtyOrderOutcome, loadDirtyOrdersForGuard, parseDirtySnapshot } from './stock-dirty-orders'
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
@@ -829,10 +830,21 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // push nothing (see stock-held-orders.ts for why that is the only safe answer).
   const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at', WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY] } } })
   const cursorValue = (key: string) => cursorRows.find((r) => r.key === key)?.value ?? null
+  // Orders IMS released or deleted (stock-dirty-orders.ts): all of this connection generation's entries are charged every run, a rotating slice
+  // re-read live. Read before the walk, so a release that commits later keeps its entry (every write-back is a compare-and-set on the token).
+  const dirtyRows = await loadDirtyOrdersForGuard(db, syncVersion)
   const held = await loadWcHeldUnitsByProduct(
     buildWcHeldUnitsDeps(creds),
     completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at'), trustedCoveredHistoryBoundary(cursorValue(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, cursorValue(WC_ORDER_RESET_MARKER_KEY))),
+    dirtyRows.map((r) => ({ wcOrderId: r.wcOrderId, snapshot: parseDirtySnapshot(r.lines, r.lineStatus) })),
   )
+  if (held.ok && (held.settledDirtyWcOrderIds.length > 0 || held.refreshedDirty.length > 0)) {
+    await commitDirtyOrderOutcome(db, syncVersion, {
+      tokenOf: new Map(dirtyRows.map((r) => [r.wcOrderId, r.token])),
+      settled: held.settledDirtyWcOrderIds,
+      refreshed: held.refreshedDirty,
+    }).catch(() => false)
+  }
   if (held.ok && held.completedHistoryCoveredAtMs !== null) {
     // Proven: completed history older than this walk is settled, so later runs (poll mode has no reconcile cursor) read only what changed since.
     // The write is a compare-and-set under the credential-mutation lock: it is refused when the connection generation moved since this run

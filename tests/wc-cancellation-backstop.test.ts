@@ -320,3 +320,27 @@ test('backfill: the time budget also ends a run, without an error', async () => 
   assert.equal(state.asked.length, 0)
   assert.equal(state.settings.has(CURSOR), false)
 })
+
+test('transaction reset: the reset clears the backstop cursor and backfill, and the next run backfills from the start', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const { WC_CANCELLATION_BACKSTOP_CURSOR_KEY, WC_CANCELLATION_BACKFILL_KEY } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  assert.equal(WC_CANCELLATION_BACKSTOP_CURSOR_KEY, CURSOR)
+  assert.equal(WC_CANCELLATION_BACKFILL_KEY, BACKFILL)
+  const source = await readFile(new URL('../app/actions/reset.ts', import.meta.url), 'utf8')
+  const block = source.slice(source.indexOf('const WC_ORDER_SYNC_STATE_KEYS'), source.indexOf('] as const', source.indexOf('const WC_ORDER_SYNC_STATE_KEYS')))
+  const cleared = [...block.matchAll(/'([a-z_]+)'/g)].map((m) => m[1])
+  assert.ok(cleared.includes(CURSOR) && cleared.includes(BACKFILL), 'both keys are in the reset\'s cleared intake-state keys')
+
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.settings.set(CURSOR, '2026-11-10T00:00:00.000Z')
+  state.settings.set(BACKFILL, JSON.stringify({ status: 'trash', after: '2026-11-01T00:00:00.000Z', startedAt: '2026-11-09T00:00:00.000Z' }))
+  for (const key of cleared) state.settings.delete(key) // what clearSettingKeys does
+  state.settings.set('wc_initial_import_completed', 'true') // the re-import after the reset
+  state.pages.cancelled = [[{ id: 1, status: 'cancelled' }]]
+  state.linked = { '1': 'ALLOCATED' }
+  const r = await job()
+  assert.deepEqual(r.errors, [])
+  assert.ok(state.asked.length >= 2 && state.asked.every((p) => !('modified_after' in p)), 'backfill from the start, not the old cursor window')
+  assert.deepEqual(state.applied, [{ id: 1, status: 'cancelled' }], 're-imported order older than the old cursor is re-checked')
+})
