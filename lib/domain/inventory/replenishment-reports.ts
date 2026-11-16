@@ -66,8 +66,12 @@ type FindManyDelegate = {
   findMany(args?: unknown): Promise<unknown[]>
 }
 
+type CountableFindManyDelegate = FindManyDelegate & {
+  count?(args?: unknown): Promise<number>
+}
+
 export type ReplenishmentReportClient = {
-  product: FindManyDelegate
+  product: CountableFindManyDelegate
   stockLevel: FindManyDelegate
   stockMovement: FindManyDelegate
   purchaseOrderLine: FindManyDelegate
@@ -89,18 +93,44 @@ type ThresholdOverrideRow = {
   reorderQty: DecimalInput | null
 }
 
-async function loadThresholdOverrides(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<ThresholdOverrideRow[]> {
-  if (!client.reorderThresholdOverride) return []
-  const rows = await client.reorderThresholdOverride.findMany({
+const OVERRIDE_IN_BATCH = 1000
+
+/**
+ * Overrides for ONE warehouse, only for the report's own products, keyed by product (the table is unique per
+ * product and warehouse). Batched with IN so no query is bounded by the size of the whole table; the result is
+ * at most one row per report product, which the product source limit already bounds.
+ */
+async function loadWarehouseThresholdOverrides(
+  client: ReplenishmentReportClient,
+  warehouseId: string,
+  productIds: string[],
+): Promise<Map<string, ThresholdOverrideRow>> {
+  const byProduct = new Map<string, ThresholdOverrideRow>()
+  if (!client.reorderThresholdOverride) return byProduct
+  for (let i = 0; i < productIds.length; i += OVERRIDE_IN_BATCH) {
+    const rows = await client.reorderThresholdOverride.findMany({
+      where: { warehouseId, productId: { in: productIds.slice(i, i + OVERRIDE_IN_BATCH) } },
+      select: { productId: true, warehouseId: true, reorderPoint: true, safetyStockQty: true, reorderQty: true },
+    }) as ThresholdOverrideRow[]
+    for (const row of rows) byProduct.set(row.productId, row)
+  }
+  return byProduct
+}
+
+/**
+ * The all-warehouses view applies no override, so it only needs HOW MANY report products have one (for a notice).
+ * A count query: no override row is loaded, so a large override table can never make the report refuse.
+ */
+async function countProductsWithThresholdOverrides(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<number> {
+  if (!client.product.count) return 0
+  return client.product.count({
     where: {
-      ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
-      product: productWhere(filters),
+      AND: [
+        productWhere(filters),
+        { reorderThresholdOverrides: { some: { OR: [{ reorderPoint: { not: null } }, { safetyStockQty: { not: null } }, { reorderQty: { not: null } }] } } },
+      ],
     },
-    select: { productId: true, warehouseId: true, reorderPoint: true, safetyStockQty: true, reorderQty: true },
-    take: SOURCE_ROW_LIMIT + 1,
-  }) as ThresholdOverrideRow[]
-  assertSourceLimit(rows.length, SOURCE_ROW_LIMIT, 'Replenishment threshold override source rows')
-  return rows
+  })
 }
 
 export type ReplenishmentReportDeps = {
@@ -856,7 +886,7 @@ export async function getReorderReport(
   // including those with a zero suggested quantity.
   const includeAll = filters.includeZero === true
   const window = demandWindow(generatedAt, demandDays)
-  const [products, stockLevels, velocityInputs, openPoLines, latestMoRows, bomItemRows, thresholdOverrides] = await Promise.all([
+  const [products, stockLevels, velocityInputs, openPoLines, latestMoRows, bomItemRows] = await Promise.all([
     client.product.findMany({
       where: productWhere(filters),
       select: {
@@ -934,7 +964,6 @@ export async function getReorderReport(
       qty: DecimalInput
       bom: { productId: string | null }
     }>>,
-    loadThresholdOverrides(client, filters),
   ])
   assertSourceLimit(products.length, SOURCE_ROW_LIMIT, 'Replenishment product source rows')
 
@@ -1032,19 +1061,10 @@ export async function getReorderReport(
   // Per-warehouse thresholds apply when the report is scoped to ONE warehouse: that warehouse's StockLevel
   // override, else the Product value. The unscoped report is a consolidated, product-level view (stock is summed
   // over every warehouse), so it keeps the Product thresholds. Overrides it does not apply are counted in a notice.
-  const overrideByProduct = new Map<string, ThresholdOverrideRow>()
-  let productsWithUnappliedOverrides = 0
-  if (filters.warehouseId) {
-    for (const row of thresholdOverrides) {
-      if (row.warehouseId === filters.warehouseId) overrideByProduct.set(row.productId, row)
-    }
-  } else {
-    productsWithUnappliedOverrides = new Set(
-      thresholdOverrides
-        .filter((o) => o.reorderPoint != null || o.safetyStockQty != null || o.reorderQty != null)
-        .map((o) => o.productId),
-    ).size
-  }
+  const overrideByProduct = filters.warehouseId
+    ? await loadWarehouseThresholdOverrides(client, filters.warehouseId, products.map((p) => p.id))
+    : new Map<string, ThresholdOverrideRow>()
+  const productsWithUnappliedOverrides = filters.warehouseId ? 0 : await countProductsWithThresholdOverrides(client, filters)
   const candidatesByProductId = new Map<string, Candidate>()
   for (const product of products) {
     const thresholds = resolveReorderThresholds(product, overrideByProduct.get(product.id))

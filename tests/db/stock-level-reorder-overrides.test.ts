@@ -155,3 +155,23 @@ test('save path: creates override rows only, never a stock row, compare-and-sets
   assert.equal(out.cleared.ok, true)
   assert.equal(out.mainRows, 0)
 })
+
+test('report against the real database: consolidated view counts products with overrides, filtered view applies them', { skip }, async () => {
+  const { getReorderReport } = await import('../../lib/domain/inventory/replenishment-reports')
+  const out = await withRollback(async (tx: Tx) => {
+    const { product, main, sat } = await fixture(tx)
+    await tx.reorderThresholdOverride.create({ data: { productId: product.id, warehouseId: sat.id, reorderPoint: '7', safetyStockQty: '2' } })
+    const deps = { client: tx, now: () => new Date('2026-06-01T18:00:00.000Z') }
+    const all = await getReorderReport({ includeZero: true, search: product.sku }, { deps })
+    const satReport = await getReorderReport({ warehouseId: sat.id, includeZero: true, search: product.sku }, { deps })
+    const mainReport = await getReorderReport({ warehouseId: main.id, includeZero: true, search: product.sku }, { deps })
+    return { all, satReport, mainReport }
+  })
+  // The count is over the whole catalogue, not just the searched product, so assert on the notice's presence.
+  assert.ok(out.all.notices.some((n: string) => /product\(s\) have a per-warehouse threshold override that this all-warehouses view does not apply/.test(n)))
+  assert.equal(out.all.rows[0]?.reorderPoint, '100')
+  assert.equal(out.satReport.rows[0]?.reorderPoint, '7')
+  assert.equal(out.satReport.rows[0]?.safetyStockQty, '2')
+  assert.deepEqual(out.satReport.rows[0]?.thresholdOverrides, ['reorderPoint', 'safetyStockQty'])
+  assert.equal(out.mainReport.rows[0]?.reorderPoint, '100')
+})
