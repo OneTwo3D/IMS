@@ -24,6 +24,7 @@ import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRem
 import { scrubWmsError } from './error-scrub'
 import { courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
+import { flagDoublePostageForMergedLink } from './double-postage'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 import {
   createWmsPushStateSchemaGate,
@@ -1169,6 +1170,8 @@ export interface WmsOrderPushPort {
   clearCourierTaskDue?(orderId: string, service: string): Promise<void>
   /** Operator tasks still open for this connector (information for the sweep's result). */
   countOpenOperatorTasks?(connector: string): Promise<number>
+  /** Test seam for the double-postage flag raised after a link is re-pointed as MERGED; production leaves it unset (the real function runs). */
+  flagDoublePostage?(linkId: string): Promise<unknown>
   updateLinkIfLinked?(
     id: string,
     expect: {
@@ -1700,6 +1703,7 @@ export async function runWmsOrderPushSweepCore(
       ? await port.updateLinkIfLinked(link.id, { state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId }, repoint)
       : (await port.updateLink(link.id, repoint), true)
     if (!moved) return
+    await (port.flagDoublePostage ?? flagDoublePostageForMergedLink)(link.id)
     const repointed = { ...link, state: 'MERGED' as const, ...(number ? { externalOrderNumber: number } : {}) }
     if (intent === 'CANCEL') await handleMergedCancel(repointed, ts)
     else await raiseMergedNotice(repointed, intent, ts)
@@ -1787,6 +1791,7 @@ export async function runWmsOrderPushSweepCore(
         ? await port.updateLinkIfLinked(link.id, { state: link.state ?? 'SYNCED', externalOrderId: link.externalOrderId }, repoint)
         : (await port.updateLink(link.id, repoint), true)
       if (!moved) return
+      await (port.flagDoublePostage ?? flagDoublePostageForMergedLink)(link.id)
       const repointed = { ...link, state: 'MERGED' as const, externalOrderId: survivor.externalOrderId, externalOrderNumber: survivor.externalOrderNumber }
       if (intent === 'CANCEL') await handleMergedCancel(repointed, ts)
       else await raiseMergedNotice(repointed, intent, ts)
@@ -3358,6 +3363,8 @@ export async function runWmsOrderPushSweepCore(
           const moved = port.updateLinkIfLinked
             ? await port.updateLinkIfLinked(link.id, { state: 'SYNCED', externalOrderId: link.externalOrderId }, { state: 'MERGED', amendNoticeAt: ts, ...(update.mergedSurvivorNumber ? { externalOrderNumber: update.mergedSurvivorNumber } : {}), ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' })
             : (await port.updateLink(link.id, { state: 'MERGED', amendNoticeAt: ts, ...RESET_DISPATCH_FAILURES, lastAttemptAt: ts, lastError: 'This order\'s change was NOT sent to the WMS: the WMS order is a MERGED order that also holds other orders\' goods, so IMS did not amend it. Apply the change in the WMS by hand.' }), true)
+          // o3d-zvec.14: the link was just marked MERGED, as in the other merge paths: flag a possible double postage (best effort, never throws).
+          if (moved) await (port.flagDoublePostage ?? flagDoublePostageForMergedLink)(link.id)
           await audit({
             action: 'order_update', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
             summary: `Order ${link.order.orderNumber ?? link.order.id} amendment NOT propagated — the WMS order is a merged order${moved ? '; link marked merged' : ''}`,
