@@ -10,6 +10,15 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Customer PDFs: references, seller VAT / company numbers, Unicode, credit-note PDF (user-facing)
+
+- **Fixed: the sales-order PDF, and the order-confirmation email and its attachment, used the database id (for example `cmw9y3di`) as the reference.** They now print the order number shown on the order page.
+- **Fixed: the emailed sales-order and invoice PDFs printed shipping net beside gross lines, so the figures did not add up to the Total.** All four renderers (the two download routes and the two email attachments) now share one totals helper (`lib/pdf-order-money.ts`), on the same basis as the invoice payload, with labelled columns and a VAT breakdown.
+- **Changed: an invoice PDF that has no invoice number is titled "Pro-forma Invoice"** and shows the order number; a numbered invoice shows the invoice number with the order number beside it.
+- **New: every generated document prints "VAT reg. no." and "Company no."** (from Settings > Company) under the FROM block.
+- **Fixed: non-Latin-1 characters were dropped** (em dash, Polish, Greek, Cyrillic names). Documents now embed Liberation Sans (`public/fonts`, SIL OFL). The packing-slip tick box is now `[   ]` (no glyph exists in either font).
+- **New: `GET /api/credit-note/[refundId]`** renders a credit note PDF from the recorded refund lines (the figures the credit note posts), with a **PDF** link on each refund in the order page.
+
 ### Mintsoft: IMS writes no order comments; it raises operator tasks instead (backend / sync / UI)
 
 - **Changed: IMS no longer writes any comment to a Mintsoft order.** The warehouse staff do not read order comments; only a Mintsoft query reaches them, and the API cannot raise one. Every place IMS used to post a note now records an **operator task** instead, listed on **Sync > Exceptions** under **Raise a warehouse query** (warehouse order number, link to the IMS order, reason, copy-ready query text with a Copy button, and a **Done** button needing the sync permission and a fresh sign-in, recorded with who and when). The sites are: the merged-line removal note (the earlier removal-note obligation), the courier-fallback note (on create, on verify and on amend), the hold / cancel notices (past NEW, merged, and a removal that could not finish), and the refund note on a pushed order. The open count is in the Exceptions banner total. The `wms-order-push` cron is NOT red for an open task (its result reports `operatorTasksOpen` and `operatorTasksRaised`); it is red only if a task could not be recorded (`operatorTaskErrors`, retried next run).
