@@ -78,6 +78,7 @@ import {
   type ForeignJournalState,
 } from '@/lib/domain/accounting/allocation-debit-passes'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import { loadUnjournaledReturnCredits, unjournaledReturnKey } from '@/lib/domain/accounting/unjournaled-return-cogs'
 import { clampRecreateWindowToCutoff, recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { cancelledClaimIsResolved } from '@/lib/domain/accounting/unresolved-abandoned-claim'
@@ -2509,6 +2510,19 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const processedShipmentCount = shipmentResults.size
       const totalCogsNumber = round2Decimal(totalCogs)
 
+      // o3d-hqvrp.32: stock that came back from these shipments before they were journaled has no COGS
+      // reversal of its own (refund staging only reads journaled shipments), so it is booked here, in the
+      // same journal: DR Inventory / CR COGS. Booked per source shipment, capped by that shipment's COGS.
+      const batchShipmentCogs: Array<{ shipmentId: string; orderId: string; cogs: number }> = []
+      for (const shipment of shipments) {
+        const shipmentResult = shipmentResults.get(shipment.id)
+        if (shipmentResult) batchShipmentCogs.push({ shipmentId: shipment.id, orderId: shipment.orderId, cogs: shipmentResult.cogs })
+      }
+      const unjournaledReturnCredits = await loadUnjournaledReturnCredits(tx, batchShipmentCogs)
+      const unjournaledReturnTotal = round2Decimal(
+        unjournaledReturnCredits.reduce((sum, credit) => addMoney(sum, credit.amount), toDecimal(0)),
+      )
+
       if (totalRevenue > 0) {
         journalLines.push(
           { accountCode: settings.xero_unearned_revenue_account, description: `Revenue recognition — ${processedShipmentCount} shipment(s)`, debit: totalRevenue },
@@ -2521,6 +2535,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           { accountCode: settings.xero_cogs_account, description: `COGS — ${processedShipmentCount} shipment(s)`, debit: totalCogsNumber },
           { accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${processedShipmentCount} shipment(s)`, credit: totalCogsNumber },
         )
+        if (unjournaledReturnTotal > 0) {
+          journalLines.push(
+            { accountCode: settings.xero_inventory_account, description: `Returned before journaled — ${processedShipmentCount} shipment(s)`, debit: unjournaledReturnTotal },
+            { accountCode: settings.xero_cogs_account, description: `Returned before journaled — ${processedShipmentCount} shipment(s)`, credit: unjournaledReturnTotal },
+          )
+        }
       }
 
       // o3d-0qoo: identity over the shipments that actually made it into this batch —
@@ -2618,6 +2638,20 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           baseDelta: resultForShipment.cogs,
           journalDate: today,
         })
+      }
+
+      // The reversal above is in the journal only when COGS is (`totalCogsNumber > 0`), and each refund is
+      // recorded once, under the same transaction as the journal.
+      if (totalCogsNumber > 0 && unjournaledReturnTotal > 0) {
+        for (const credit of unjournaledReturnCredits) {
+          await recordCogsSubledgerMovement(tx, {
+            sourceType: 'REFUND_REVERSAL',
+            sourceRef: credit.refundId,
+            idempotencyKey: unjournaledReturnKey(credit.refundId, credit.shipmentId),
+            baseDelta: credit.amount.negated(),
+            journalDate: today,
+          })
+        }
       }
 
       for (const [layerId, decrement] of layerDecrements) {

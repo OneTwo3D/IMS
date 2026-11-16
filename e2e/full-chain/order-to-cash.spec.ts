@@ -472,8 +472,8 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     // shipped COGS basis (recreating a valued cost layer) ONLY when the source shipment has been JOURNALED
     // — accounting_shipment_journal_date is set solely by the daily batch (daily-sync.ts). In sync mode the
     // shipment is never journaled, so stageRefundAccountingReversals finds no cost snapshot and the restock
-    // falls back to buildRefundFallbackReturnRows, which carries QUANTITY ONLY (no cost) by design: the
-    // units re-enter physically, valuation deferred. PRODUCTION runs the daily batch (stage has
+    // falls back to buildRefundFallbackReturnRows, which since o3d-hqvrp.32 prices the units at the
+    // shipment's issued (dispatch) cost, so a cost layer is recreated here too; this test still does not assert it. PRODUCTION runs the daily batch (stage has
     // xero_daily_batch_enabled), so there it re-enters at posted COGS with a recreated layer — that VALUED
     // path plus the COGS_REVERSAL journal are the batch-mode tests' job (OC-08 / X-01, which drive
     // runDailyBatchSync). Asserting a £10 layer here would either fail (sync mode) or force this test to run

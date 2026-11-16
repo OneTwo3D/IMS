@@ -613,7 +613,9 @@ test('a received-but-unbilled order: the header discount cannot be changed, and 
   const { updatePurchaseOrder } = await actions()
   const { db } = await import('@/lib/db')
   const po = await seedPo('ed-disc-recv', [100, 20])
-  await db.purchaseOrder.update({ where: { id: po.poId }, data: { discountAmount: 10, discountStr: '10' } })
+  // The stored totals carry the discount (600 less 10), as a created order's do: a save that changes no line money must
+  // recompute to the same figures.
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { discountAmount: 10, discountStr: '10', subtotalForeign: 590, subtotalBase: 590, totalForeign: 590, totalBase: 590 } })
   assert.equal((await receive(po, po.lines[0]!, 60)).success, true)
   const read = () => db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { discountAmount: true, discountStr: true, totalForeign: true } })
   const before = await read()
@@ -623,13 +625,20 @@ test('a received-but-unbilled order: the header discount cannot be changed, and 
   assert.match(changed.error ?? '', /order discount cannot be changed/)
   assert.deepEqual(await read(), before, 'a refused edit changes nothing')
 
-  // Omitted: the stored discount is kept, not defaulted to zero, and the total reflects it.
-  const omitted = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 25 }]))
+  // A line save that changes line money on a header-discounted order with received stock is refused: it would change the
+  // discount spread on units already received, and nothing revalues their layers.
+  const lineChange = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 25 }]))
+  assert.equal(lineChange.success, false)
+  assert.match(lineChange.error ?? '', /discount spread on received units/)
+  assert.deepEqual(await read(), before, 'a refused edit changes nothing')
+
+  // Omitted discount, no line money changed: the stored discount is kept, not defaulted to zero, and the total reflects it.
+  const omitted = await updatePurchaseOrder(po.poId, editFor(po, [{ qty: 100 }, { qty: 20 }]))
   assert.equal(omitted.success, true, String(omitted.error))
   const after = await read()
   assert.equal(Number(after.discountAmount), 10)
   assert.equal(after.discountStr, '10')
-  assert.equal(Number(after.totalForeign), 100 * 5 + 25 * 5 - 10)
+  assert.equal(Number(after.totalForeign), 100 * 5 + 20 * 5 - 10)
 })
 
 test('a billed order: a line edit that omits the order discount keeps it; changing it is refused', SKIP, async () => {

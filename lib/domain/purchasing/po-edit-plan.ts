@@ -47,6 +47,19 @@ export const PO_COST_LINES_PART_RECEIVED_MESSAGE =
   + 'Changing quantities, prices or discounts, or adding or removing lines, would change the cost of goods already in stock. '
   + 'Close the unreceived balance and raise a new order for any extra goods.'
 
+export const PO_HEADER_DISCOUNT_PART_RECEIVED_MESSAGE =
+  'This PO has received stock; changing line prices or quantities would change the discount spread on received units. '
+  + 'Receive or cancel the remaining lines, or raise a new PO.'
+
+/**
+ * The header discount is spread over the lines as `subtotal / SUM(line totals)` and the layers laid for received units carry
+ * that spread, so once anything has landed a change to any line's value is refused (nothing revalues those layers).
+ * Returns the refusal, or null.
+ */
+export function headerDiscountAmendRefusal(input: { anyLanded: boolean; headerDiscountForeign: number; lineMoneyChanged: boolean }): string | null {
+  return input.anyLanded && input.headerDiscountForeign > 0 && input.lineMoneyChanged ? PO_HEADER_DISCOUNT_PART_RECEIVED_MESSAGE : null
+}
+
 export type PoEditLineFact = {
   id: string
   productId: string
