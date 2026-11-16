@@ -1,0 +1,5 @@
+### Foreign-currency PO and sales-order forms: the real table rate, or a clear refusal (UI)
+
+- **Fixed: the PO and sales-order forms showed a made-up rate of 1 for a currency with no rate.** Choosing a foreign currency now reads the real rate from the FX Rates table (which Aelia feeds) through a server action, and shows it with its source and date. When the currency has no rate the form shows a blocking message ("No exchange rate for EUR yet: rates come from the store (Aelia)...") with a link to Settings, Accounting, FX Rates, the base-currency totals show a dash, and Create / Save as Draft stay disabled. A missing rate is never replaced by 1; the server still re-reads the table rate on save and refuses a missing one.
+- **Fixed: changing the currency on the sales-order form did not re-price the lines.** The lines are now restated through the base currency at the new rate (a line priced 28.80 in GBP becomes 33.70 at 1 GBP = 1.17 EUR). If the new currency has no rate the lines are left alone and submit is blocked. No manual rate field was added: a rate is pinned by an admin on the FX Rates page, as before. Help documents: Purchasing and Sales.
+

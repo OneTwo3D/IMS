@@ -238,7 +238,7 @@ function ReceiveDialog({
     <Dialog open onOpenChange={() => {}}>
       <DialogContent
         showCloseButton={false}
-        className="flex max-h-[85vh] w-full max-w-4xl flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl"
+        className="flex max-h-[85vh] w-full max-w-4xl flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl max-sm:top-0 max-sm:left-0 max-sm:h-dvh max-sm:max-h-dvh max-sm:max-w-none max-sm:translate-x-0 max-sm:translate-y-0 max-sm:rounded-none"
       >
         <DialogHeader className="shrink-0 border-b px-5 py-4">
           <DialogTitle>Receive Goods — {po.reference}</DialogTitle>
@@ -252,8 +252,9 @@ function ReceiveDialog({
         {/* Only this middle region scrolls — the header and footer stay put. */}
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 space-y-4">
           <div className="rounded-md border">
-            <Table className="w-full table-fixed">
-              <TableHeader className="bg-muted/40">
+            {/* Phone: each line is a stacked card (the table elements are re-laid out with CSS, one DOM). */}
+            <Table className="w-full table-fixed max-sm:block">
+              <TableHeader className="bg-muted/40 max-sm:hidden">
                 <TableRow>
                   <TableHead className="px-3 text-xs">Product</TableHead>
                   <TableHead className="px-3 text-xs text-right w-16">Ordered</TableHead>
@@ -263,18 +264,18 @@ function ReceiveDialog({
                   <TableHead className="px-3 text-xs w-44">Warehouse</TableHead>
                 </TableRow>
               </TableHeader>
-              <TableBody>
+              <TableBody className="max-sm:block">
                 {receiptLines.map((l) => (
-                  <TableRow key={l.poLineId} className="align-top">
-                    <TableCell className="px-3 py-2">
+                  <TableRow key={l.poLineId} className="align-top max-sm:grid max-sm:grid-cols-3 max-sm:gap-x-3 max-sm:gap-y-2 max-sm:p-3">
+                    <TableCell className="px-3 py-2 max-sm:col-span-3 max-sm:block max-sm:p-0">
                       <div className="flex min-w-0">
                         <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
                       </div>
                     </TableCell>
-                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyOrdered}</TableCell>
-                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReceived}</TableCell>
-                    <TableCell className="px-3 py-2 text-right tabular-nums font-medium">{l.qtyRemaining}</TableCell>
-                    <TableCell className="px-3 py-2">
+                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)] max-sm:text-left" data-label="Ordered">{l.qtyOrdered}</TableCell>
+                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)] max-sm:text-left" data-label="Received">{l.qtyAlreadyReceived}</TableCell>
+                    <TableCell className="px-3 py-2 text-right tabular-nums font-medium max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)] max-sm:text-left" data-label="Remaining">{l.qtyRemaining}</TableCell>
+                    <TableCell className="px-3 py-2 max-sm:col-span-3 max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)]" data-label="Receive now">
                       <Input
                         type="number"
                         min={0}
@@ -282,14 +283,14 @@ function ReceiveDialog({
                         step={1}
                         value={l.qtyToReceive}
                         onChange={(e) => updateLine(l.poLineId, 'qtyToReceive', Number(e.target.value))}
-                        className="h-8 text-sm text-right w-full font-mono"
+                        className="h-8 text-sm text-right w-full font-mono max-sm:h-11 max-sm:text-base"
                       />
                     </TableCell>
-                    <TableCell className="px-3 py-2">
+                    <TableCell className="px-3 py-2 max-sm:col-span-3 max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)]" data-label="Warehouse">
                       <select
                         value={l.warehouseId}
                         onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
-                        className={`h-8 w-full rounded-md border bg-background px-2 text-xs ${lineDiverges(l) ? 'border-amber-400 ring-1 ring-amber-300 dark:border-amber-600' : 'border-input'}`}
+                        className={`h-8 w-full rounded-md border bg-background px-2 text-xs max-sm:h-11 max-sm:text-base ${lineDiverges(l) ? 'border-amber-400 ring-1 ring-amber-300 dark:border-amber-600' : 'border-input'}`}
                       >
                         <option value="">Select…</option>
                         {warehouses.map((w) => (
