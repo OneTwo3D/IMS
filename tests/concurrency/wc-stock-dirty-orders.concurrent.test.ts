@@ -67,6 +67,15 @@ async function cleanup(rig: Rig, fx: Awaited<ReturnType<typeof seed>> | undefine
   await db.product.delete({ where: { id: fx.productId } }).catch(() => {})
 }
 
+async function withVersion(rig: Rig, version: string, fn: () => Promise<void>) {
+  const before = await rig.db.setting.findUnique({ where: { key: 'wc_settings_version' } })
+  await rig.db.setting.upsert({ where: { key: 'wc_settings_version' }, create: { key: 'wc_settings_version', value: version }, update: { value: version } })
+  try { await fn() } finally {
+    if (before) await rig.db.setting.update({ where: { key: 'wc_settings_version' }, data: { value: before.value } })
+    else await rig.db.setting.delete({ where: { key: 'wc_settings_version' } }).catch(() => {})
+  }
+}
+
 const suffix = () => randomUUID().replace(/-/g, '').slice(0, 12)
 
 test('a release of a Woo-linked order records it in the same transaction; a re-release replaces the token, so a clear on the old token loses nothing', { skip }, async () => {
@@ -136,6 +145,51 @@ test('a reservation, an order with no WooCommerce link, and a zero release recor
   } finally {
     await cleanup(rig, fx)
     await cleanup(rig, plain)
+    await rig.db.$disconnect()
+    await rig.pool.end()
+  }
+})
+
+test('entries are bound to the connection generation: a rebind retires the old rows, an old-generation run cannot write, and a reused id is not charged', { skip }, async () => {
+  const rig = await openRig()
+  let fx: Awaited<ReturnType<typeof seed>> | undefined
+  try {
+    fx = await seed(rig, suffix(), true)
+    const seeded = fx
+    await withVersion(rig, '7', async () => {
+      await rig.db.$transaction(async (tx) => { await rig.markWcOrderDirtyForStockGuard(tx, seeded.orderId) })
+      const row = await rig.db.wcStockDirtyOrder.findUnique({ where: { wcOrderId: seeded.wcOrderId } })
+      assert.equal(row?.syncVersion, '7', 'bound to the generation it was written under')
+      const snap = [{ wcOrderId: seeded.wcOrderId, status: 'completed', lines: [{ productId: 1, variationId: 0, sku: 'X', quantity: 2 }] }]
+      const tokenOf = new Map([[seeded.wcOrderId, row!.token]])
+      // an in-flight run of generation 6 (the old store) cannot write: its compare-and-set includes the generation
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '6', { tokenOf, settled: [seeded.wcOrderId], refreshed: snap }), false)
+      assert.ok(await rig.db.wcStockDirtyOrder.findUnique({ where: { wcOrderId: seeded.wcOrderId } }), 'not cleared by the old run')
+      // the current generation's run: a snapshot is written, then read back for the guard
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '7', { tokenOf, settled: [], refreshed: snap }), true)
+      const [loaded] = await rig.loadDirtyOrdersForGuard(rig.db as never, '7')
+      assert.deepEqual(rig.parseDirtySnapshot(loaded!.lines, loaded!.lineStatus)?.lines, snap[0]!.lines)
+      // a stale token (a release during the run) is neither cleared nor overwritten
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '7', { tokenOf: new Map([[seeded.wcOrderId, 'stale']]), settled: [seeded.wcOrderId], refreshed: [] }), true)
+      assert.ok(await rig.db.wcStockDirtyOrder.findUnique({ where: { wcOrderId: seeded.wcOrderId } }))
+    })
+    // REBIND: the generation moves to 8 (the rebind transaction deletes the rows; here a row of 7 is left behind as a racing release could)
+    await withVersion(rig, '8', async () => {
+      assert.deepEqual(await rig.loadDirtyOrdersForGuard(rig.db as never, '8'), [], 'the old generation\'s rows are ignored, so positives are not held by them')
+      // the same numeric id on the NEW store: re-bound by the new release, with the old snapshot dropped, never charged as the old order
+      await rig.db.$transaction(async (tx) => { await rig.markWcOrderDirtyForStockGuard(tx, seeded.orderId) })
+      const [rebound] = await rig.loadDirtyOrdersForGuard(rig.db as never, '8')
+      assert.equal(rebound?.wcOrderId, seeded.wcOrderId)
+      assert.equal(rebound?.lines, null)
+      assert.equal(rebound?.checkedAt, null)
+      // and an old-run commit leaves nothing but the current generation
+      await rig.db.wcStockDirtyOrder.create({ data: { wcOrderId: `stale-${seeded.wcOrderId}`, orderId: 'x', token: 't', syncVersion: '7' } })
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '8', { tokenOf: new Map(), settled: [], refreshed: [] }), true)
+      assert.equal(await rig.db.wcStockDirtyOrder.count({ where: { wcOrderId: `stale-${seeded.wcOrderId}` } }), 0, 'leftovers of an older generation are retired')
+    })
+  } finally {
+    await rig.db.wcStockDirtyOrder.deleteMany({ where: { wcOrderId: { startsWith: 'stale-' } } }).catch(() => {})
+    await cleanup(rig, fx)
     await rig.db.$disconnect()
     await rig.pool.end()
   }

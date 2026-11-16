@@ -39,6 +39,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
+import { commitDirtyOrderOutcome, loadDirtyOrdersForGuard, parseDirtySnapshot } from './stock-dirty-orders'
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
@@ -53,7 +54,7 @@ import {
   WOO_STOCK_SYNC_PRODUCT_STATUSES,
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
-import { WC_DIRTY_MAX_PER_RUN, completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
+import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -829,21 +830,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // push nothing (see stock-held-orders.ts for why that is the only safe answer).
   const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at', WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY] } } })
   const cursorValue = (key: string) => cursorRows.find((r) => r.key === key)?.value ?? null
-  // Orders IMS released or deleted (stock-dirty-orders.ts): re-fetched by id whatever the boundary says. Read before the walk, so a release that
-  // commits later keeps its entry (the clear below is a compare-and-set on the entry's token).
-  const dirtyRows = await db.wcStockDirtyOrder.findMany({ orderBy: [{ releasedAt: 'asc' }, { id: 'asc' }], take: WC_DIRTY_MAX_PER_RUN + 1, select: { wcOrderId: true, token: true } })
+  // Orders IMS released or deleted (stock-dirty-orders.ts): all of this connection generation's entries are charged every run, a rotating slice
+  // re-read live. Read before the walk, so a release that commits later keeps its entry (every write-back is a compare-and-set on the token).
+  const dirtyRows = await loadDirtyOrdersForGuard(db, syncVersion)
   const held = await loadWcHeldUnitsByProduct(
     buildWcHeldUnitsDeps(creds),
     completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at'), trustedCoveredHistoryBoundary(cursorValue(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, cursorValue(WC_ORDER_RESET_MARKER_KEY))),
-    dirtyRows.map((r) => r.wcOrderId),
+    dirtyRows.map((r) => ({ wcOrderId: r.wcOrderId, snapshot: parseDirtySnapshot(r.lines, r.lineStatus) })),
   )
-  if (held.ok && held.settledDirtyWcOrderIds.length > 0) {
-    // Only entries this run re-checked and found settled, and only if untouched since (token): a release during the run replaced the token.
-    const tokenOf = new Map(dirtyRows.map((r) => [r.wcOrderId, r.token]))
-    for (const wcOrderId of held.settledDirtyWcOrderIds) {
-      const token = tokenOf.get(wcOrderId)
-      if (token !== undefined) await db.wcStockDirtyOrder.deleteMany({ where: { wcOrderId, token } }).catch(() => undefined)
-    }
+  if (held.ok && (held.settledDirtyWcOrderIds.length > 0 || held.refreshedDirty.length > 0)) {
+    await commitDirtyOrderOutcome(db, syncVersion, {
+      tokenOf: new Map(dirtyRows.map((r) => [r.wcOrderId, r.token])),
+      settled: held.settledDirtyWcOrderIds,
+      refreshed: held.refreshedDirty,
+    }).catch(() => false)
   }
   if (held.ok && held.completedHistoryCoveredAtMs !== null) {
     // Proven: completed history older than this walk is settled, so later runs (poll mode has no reconcile cursor) read only what changed since.

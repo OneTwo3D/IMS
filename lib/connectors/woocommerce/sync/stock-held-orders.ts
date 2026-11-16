@@ -85,15 +85,19 @@ export const WC_COMPLETED_HISTORY_COVERED_KEY = 'wc_completed_history_covered_at
 export const WC_ORDER_RESET_MARKER_KEY = 'wc_order_reset_at'
 
 /**
- * DIRTY ORDERS (see stock-dirty-orders.ts): orders whose IMS allocation was released, reduced or deleted. Whatever the boundary says, each is
- * fetched from WooCommerce by id (`include`, WC_DIRTY_FETCH_BATCH per request) and charged like any unimported completed order. At most
- * WC_DIRTY_MAX_PER_RUN are fetched per run (the rest make the picture incomplete, so positives wait); a fetch that fails, or an order WooCommerce
- * does not return, also makes it incomplete and its entry is kept. An entry is SETTLED (the caller may clear it) only when WooCommerce no longer
- * holds the order, or IMS accounts for it again; an order still held and still uncovered stays charged on every run, because the boundary will
- * keep omitting it.
+ * DIRTY ORDERS (see stock-dirty-orders.ts): orders whose IMS allocation was released, reduced or deleted. Whatever the boundary says, EVERY one
+ * is charged on every run like an unimported completed order, from one of two sources:
+ *   - live: fetched from WooCommerce by id (`include`, WC_DIRTY_FETCH_BATCH per request), and then remembered on the entry (its line quantities
+ *     and status) by the caller;
+ *   - the remembered snapshot of an earlier live read, for the rest. At most WC_DIRTY_MAX_FETCH_PER_RUN orders are fetched per run, the caller
+ *     orders entries never-fetched first and then least recently fetched, so a large persistent set is refreshed in a rotating slice and
+ *     never blocks: only an entry with NO snapshot yet that this run could not fetch (error, not returned, over budget) makes the picture
+ *     incomplete (its units are unknown), and the next run fetches those first, so it always progresses.
+ * A refresh that fails keeps charging the snapshot (never less than the last proven picture). An entry is SETTLED (the caller may clear it) only
+ * when WooCommerce no longer holds the order, or IMS accounts for it again.
  */
 export const WC_DIRTY_FETCH_BATCH = 100
-export const WC_DIRTY_MAX_PER_RUN = 1000
+export const WC_DIRTY_MAX_FETCH_PER_RUN = 500
 
 export const WC_HELD_ORDERS_PAGE_SIZE = 100
 /** Safety ceiling only; the walk normally ends on a short page. */
@@ -175,6 +179,11 @@ export type HeldProductRef = {
   components: { componentId: string; qty: number }[]
 }
 
+/** What a dirty entry remembers of its WooCommerce order: the status and the line quantities, as last read live. */
+export type DirtyOrderSnapshot = { wcOrderId: string; status: string; lines: HeldLine[] }
+/** A dirty entry as the loader receives it, in the order it should be refreshed; `snapshot` is null when it was never read live. */
+export type DirtyOrderInput = { wcOrderId: string; snapshot: { status: string; lines: HeldLine[] } | null }
+
 export type WcHeldUnitsResult =
   | {
       ok: true
@@ -192,6 +201,8 @@ export type WcHeldUnitsResult =
       completedHistoryCoveredAtMs: number | null
       /** The dirty WooCommerce order ids (see DIRTY ORDERS) this run re-checked and found settled; the caller clears exactly these entries. */
       settledDirtyWcOrderIds: string[]
+      /** Dirty orders read live this run and still held: what the caller remembers on the entry (see DIRTY ORDERS). */
+      refreshedDirty: DirtyOrderSnapshot[]
     }
   | { ok: false; reason: string }
 
@@ -367,66 +378,85 @@ async function walkOrders(deps: WcHeldUnitsDeps, label: string, filter: Record<s
 
 const HOLDING_OR_COMPLETED = new Set<string>([...WC_STOCK_HOLDING_ORDER_STATUSES, 'completed'])
 
+const pseudoOrder = (id: string, snapshot: { status: string; lines: HeldLine[] }): WcFullOrder => ({
+  id: Number(id),
+  status: snapshot.status,
+  line_items: snapshot.lines.map((l) => ({ product_id: l.productId, variation_id: l.variationId, sku: l.sku, quantity: l.quantity })),
+}) as unknown as WcFullOrder
+
 /**
- * Fetch the dirty orders by id and add the ones WooCommerce still holds to `orders` (once each: an order the walks already read is not
- * added twice). Orders in another status are settled at once. `pendingDirty` gets the held ones, decided after they are charged.
+ * Charge every dirty order (see DIRTY ORDERS): fetch a budgeted slice by id and add the ones WooCommerce still holds to `orders` (once each: an
+ * order the walks already read is not added twice); everything else is charged from its snapshot. Orders in another status are settled at once.
+ * `pending` gets the held ones, decided after they are charged.
  */
 async function recheckDirtyOrders(
   deps: WcHeldUnitsDeps,
-  dirtyWcOrderIds: readonly string[],
+  dirtyInput: readonly DirtyOrderInput[],
   orders: WcFullOrder[],
   settled: Set<string>,
   pending: Set<string>,
+  refreshed: DirtyOrderSnapshot[],
   reasons: string[],
-): Promise<{ fatal?: string }> {
-  let wanted = [...new Set(dirtyWcOrderIds.filter((id) => id !== ''))]
-  if (wanted.length === 0) return {}
-  if (wanted.length > WC_DIRTY_MAX_PER_RUN) {
-    reasons.push(`dirty orders: ${wanted.length} released orders await a re-check, more than the ${WC_DIRTY_MAX_PER_RUN} one run reads`)
-    wanted = wanted.slice(0, WC_DIRTY_MAX_PER_RUN)
-  }
+): Promise<void> {
+  const seen = new Set<string>()
+  const entries = dirtyInput.filter((e) => e.wcOrderId !== '' && !seen.has(e.wcOrderId) && seen.add(e.wcOrderId))
+  if (entries.length === 0) return
   const have = new Set(orders.map((o) => String(o?.id ?? '')))
-  for (let i = 0; i < wanted.length; i += WC_DIRTY_FETCH_BATCH) {
-    const batch = wanted.slice(i, i + WC_DIRTY_FETCH_BATCH)
-    let response: { data: unknown; error?: string }
-    try {
-      response = await deps.fetchOrdersPage({ include: batch.join(','), per_page: String(WC_DIRTY_FETCH_BATCH), page: '1' })
-    } catch (e) {
-      reasons.push(`dirty orders: re-check read threw: ${e instanceof Error ? e.message : String(e)}`)
-      continue
+  let unknown = 0
+  let readError = ''
+  const fromSnapshot = (e: DirtyOrderInput): void => {
+    if (!e.snapshot) { unknown++; return }
+    pending.add(e.wcOrderId)
+    if (!have.has(e.wcOrderId)) {
+      orders.push(pseudoOrder(e.wcOrderId, e.snapshot))
+      have.add(e.wcOrderId)
     }
-    if (response.error || !Array.isArray(response.data)) {
-      reasons.push(`dirty orders: re-check read failed: ${response.error ?? 'the answer was not a list'}`)
+  }
+  const slice = entries.slice(0, WC_DIRTY_MAX_FETCH_PER_RUN)
+  for (const e of entries.slice(WC_DIRTY_MAX_FETCH_PER_RUN)) fromSnapshot(e)
+  for (let i = 0; i < slice.length; i += WC_DIRTY_FETCH_BATCH) {
+    const batch = slice.slice(i, i + WC_DIRTY_FETCH_BATCH)
+    let response: { data: unknown; error?: string } | null = null
+    try {
+      response = await deps.fetchOrdersPage({ include: batch.map((e) => e.wcOrderId).join(','), per_page: String(WC_DIRTY_FETCH_BATCH), page: '1' })
+    } catch (e) {
+      readError = `re-check read threw: ${e instanceof Error ? e.message : String(e)}`
+    }
+    if (response && (response.error || !Array.isArray(response.data))) {
+      readError = `re-check read failed: ${response.error ?? 'the answer was not a list'}`
+      response = null
+    }
+    if (!response) {
+      for (const e of batch) fromSnapshot(e)
       continue
     }
     const returned = new Map<string, WcFullOrder>()
     for (const o of response.data as WcFullOrder[]) returned.set(String(o?.id ?? ''), o)
-    for (const id of batch) {
-      const order = returned.get(id)
-      if (!order) {
-        reasons.push(`dirty orders: WooCommerce did not return order ${id}`)
-        continue
-      }
+    for (const e of batch) {
+      const order = returned.get(e.wcOrderId)
+      if (!order) { fromSnapshot(e); continue }
       if (!HOLDING_OR_COMPLETED.has(String(order.status))) {
-        settled.add(id)
+        settled.add(e.wcOrderId)
         continue
       }
-      pending.add(id)
-      if (!have.has(id)) {
+      pending.add(e.wcOrderId)
+      const lines = toLines(order)
+      if (lines !== null) refreshed.push({ wcOrderId: e.wcOrderId, status: String(order.status), lines })
+      if (!have.has(e.wcOrderId)) {
         orders.push(order)
-        have.add(id)
+        have.add(e.wcOrderId)
       }
     }
   }
-  return {}
+  if (unknown > 0) reasons.push(`dirty orders: ${unknown} released order(s) could not be read from WooCommerce and have no earlier reading, so their units are unknown${readError ? ` (${readError})` : ''}`)
 }
 
 export async function loadWcHeldUnitsByProduct(
   deps: WcHeldUnitsDeps,
   /** `modified_after` for the completed-order read (see completedOrdersModifiedAfter); null = cannot be bounded, so read them all. */
   completedModifiedAfter: string | null,
-  /** WooCommerce ids of the dirty orders to re-check by id (see DIRTY ORDERS). */
-  dirtyWcOrderIds: readonly string[] = [],
+  /** The dirty orders (see DIRTY ORDERS), never-read first and then least recently read. */
+  dirtyOrders: readonly DirtyOrderInput[] = [],
 ): Promise<WcHeldUnitsResult> {
   const statuses = WC_STOCK_HOLDING_ORDER_STATUSES.join(',')
   const open = await walkOrders(deps, statuses, { status: statuses })
@@ -439,8 +469,8 @@ export async function loadWcHeldUnitsByProduct(
   orders.push(...completed.orders)
   const settledDirty = new Set<string>()
   const pendingDirty = new Set<string>()
-  const dirty = await recheckDirtyOrders(deps, dirtyWcOrderIds, orders, settledDirty, pendingDirty, incompleteReasons)
-  if (dirty.fatal) return { ok: false, reason: dirty.fatal }
+  const refreshedDirty: DirtyOrderSnapshot[] = []
+  await recheckDirtyOrders(deps, dirtyOrders, orders, settledDirty, pendingDirty, refreshedDirty, incompleteReasons)
   const truncated = incompleteReasons.length > 0
   const completedIds = new Set(completed.orders.map((o) => String(o?.id ?? '')))
   let completedSettled = true
@@ -461,7 +491,7 @@ export async function loadWcHeldUnitsByProduct(
   const blockedProductIds = new Set<string>()
   if (allLines.length === 0) {
     for (const id of pendingDirty) settledDirty.add(id) // held but nothing on it: nothing to charge
-    return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: 0, completedHistoryCoveredAtMs: coveredAtIfSettled, settledDirtyWcOrderIds: [...settledDirty] }
+    return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: 0, completedHistoryCoveredAtMs: coveredAtIfSettled, settledDirtyWcOrderIds: [...settledDirty], refreshedDirty }
   }
 
   const externalIds = [...new Set(allLines.flatMap((l) => [l.variationId, l.productId]).filter((n) => n > 0))]
@@ -482,5 +512,5 @@ export async function loadWcHeldUnitsByProduct(
   if (unresolvedParents.size > 0) {
     for (const id of await deps.findVariationIdsByParentExternalId([...unresolvedParents])) blockedProductIds.add(id)
   }
-  return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: considered, completedHistoryCoveredAtMs: completedSettled ? coveredAtIfSettled : null, settledDirtyWcOrderIds: [...settledDirty] }
+  return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: considered, completedHistoryCoveredAtMs: completedSettled ? coveredAtIfSettled : null, settledDirtyWcOrderIds: [...settledDirty], refreshedDirty }
 }

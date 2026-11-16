@@ -10,7 +10,8 @@ import {
   trustedCoveredHistoryBoundary,
   WC_ORDER_RESET_MARKER_KEY,
   WC_COMPLETED_HISTORY_COVERED_KEY,
-  WC_DIRTY_MAX_PER_RUN,
+  WC_DIRTY_MAX_FETCH_PER_RUN,
+  type DirtyOrderInput,
   WC_HELD_ORDERS_MAX_PAGES,
   WC_HELD_ORDERS_PAGE_SIZE,
   type HeldProductRef,
@@ -370,6 +371,7 @@ test('a stale in-flight boundary write is refused after a reset or a rebind; a f
 
 // --- o3d-hqvrp.385: an order whose allocation was released or deleted is re-checked by id; the boundary stays ---
 
+const fresh = (...ids: string[]): DirtyOrderInput[] => ids.map((wcOrderId) => ({ wcOrderId, snapshot: null }))
 const heldOrder = (id: number, status: string, ...lines: [number, number, number][]) => ({ ...order(id, ...lines), status })
 
 /** Serves the bounded/unbounded completed walks and `include=` fetches; records what was asked. */
@@ -403,7 +405,7 @@ const BOUND = completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoun
 test('after a release the guard still uses the boundary AND fetches the released order by id; positives are not held and the order is charged', async () => {
   assert.ok(BOUND !== null)
   const { d, asked } = dirtyDeps({ dirty: { '9': heldOrder(9, 'completed', [11, 0, 3]) } })
-  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['9'])
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, fresh('9'))
   assert.ok(r.ok)
   assert.equal(r.incomplete, false, 'positive pushes stay enabled')
   assert.equal(r.heldByProduct.get('p1'), 3, 'the released, still-completed order is charged like an unimported completed order')
@@ -415,7 +417,7 @@ test('after a release the guard still uses the boundary AND fetches the released
 test('a released order IMS accounts for again, or one WooCommerce no longer holds, is settled; a charged one is not', async () => {
   const dirty = { '1': heldOrder(1, 'completed', [11, 0, 2]), '2': heldOrder(2, 'cancelled', [11, 0, 2]), '3': heldOrder(3, 'refunded', [11, 0, 2]), '4': heldOrder(4, 'processing', [11, 0, 5]) }
   const { d } = dirtyDeps({ dirty, imported: new Map([['1', new Map([['p1', 2]])]]) })
-  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['1', '2', '3', '4'])
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, fresh('1', '2', '3', '4'))
   assert.ok(r.ok)
   assert.deepEqual([...r.settledDirtyWcOrderIds].sort(), ['1', '2', '3'])
   assert.equal(r.heldByProduct.get('p1'), 5, 'only order 4 is charged')
@@ -424,19 +426,19 @@ test('a released order IMS accounts for again, or one WooCommerce no longer hold
 test('a dirty order the bulk walk already read is charged once, not twice', async () => {
   const o = heldOrder(9, 'completed', [11, 0, 3])
   const { d } = dirtyDeps({ dirty: { '9': o }, completedBounded: [o] })
-  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['9'])
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, fresh('9'))
   assert.ok(r.ok)
   assert.equal(r.heldByProduct.get('p1'), 3)
 })
 
 test('a failed fetch of a dirty order holds positives (incomplete) and settles nothing, so the entry is kept', async () => {
-  const failed = await loadWcHeldUnitsByProduct(dirtyDeps({ includeError: 'WC API error: 503' }).d, BOUND, ['9'])
+  const failed = await loadWcHeldUnitsByProduct(dirtyDeps({ includeError: 'WC API error: 503' }).d, BOUND, fresh('9'))
   assert.ok(failed.ok)
   assert.equal(failed.incomplete, true)
-  assert.match(failed.incompleteReasons.join(';'), /dirty orders: re-check read failed/)
+  assert.match(failed.incompleteReasons.join(';'), /could not be read from WooCommerce.*re-check read failed/)
   assert.deepEqual(failed.settledDirtyWcOrderIds, [])
   assert.equal(failed.completedHistoryCoveredAtMs, null)
-  const missing = await loadWcHeldUnitsByProduct(dirtyDeps({ dirty: {} }).d, BOUND, ['9'])
+  const missing = await loadWcHeldUnitsByProduct(dirtyDeps({ dirty: {} }).d, BOUND, fresh('9'))
   assert.ok(missing.ok)
   assert.equal(missing.incomplete, true, 'WooCommerce did not return it: not provable, never dropped')
   assert.deepEqual(missing.settledDirtyWcOrderIds, [])
@@ -444,7 +446,7 @@ test('a failed fetch of a dirty order holds positives (incomplete) and settles n
 
 test('a store past the 10,000-order walk ceiling keeps pushing positives after a release (the boundary still bounds the read)', async () => {
   const { d, asked } = dirtyDeps({ ceiling: true, dirty: { '9': heldOrder(9, 'completed', [11, 0, 3]) } })
-  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['9'])
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, fresh('9'))
   assert.ok(r.ok)
   assert.equal(r.incomplete, false)
   assert.equal(r.heldByProduct.get('p1'), 3)
@@ -455,15 +457,69 @@ test('a store past the 10,000-order walk ceiling keeps pushing positives after a
   assert.equal(exhaustive.incomplete, true)
 })
 
-test('dirty orders are fetched in batches of 100 by id and more than one run reads are reported incomplete', async () => {
+test('dirty orders are fetched in batches of 100 by id, within the per-run fetch budget', async () => {
   const ids = Array.from({ length: 250 }, (_, i) => String(5000 + i))
   const { d, asked } = dirtyDeps({ dirty: Object.fromEntries(ids.map((id) => [id, heldOrder(Number(id), 'cancelled', [11, 0, 1])])) })
-  const r = await loadWcHeldUnitsByProduct(d, BOUND, ids)
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, fresh(...ids))
   assert.ok(r.ok)
   assert.equal(asked.filter((p) => 'include' in p).length, 3)
   assert.equal(r.settledDirtyWcOrderIds.length, 250)
-  const many = Array.from({ length: WC_DIRTY_MAX_PER_RUN + 1 }, (_, i) => String(9000 + i))
-  const over = await loadWcHeldUnitsByProduct(dirtyDeps({ dirty: Object.fromEntries(many.map((id) => [id, heldOrder(Number(id), 'cancelled', [11, 0, 1])])) }).d, BOUND, many)
-  assert.ok(over.ok)
-  assert.equal(over.incomplete, true)
+})
+
+test('a failed refresh keeps charging the earlier snapshot (not incomplete); a never-read order that cannot be read is incomplete', async () => {
+  const snap = { status: 'completed', lines: [{ productId: 11, variationId: 0, sku: '', quantity: 4 }] }
+  const withSnapshot = await loadWcHeldUnitsByProduct(dirtyDeps({ includeError: 'WC API error: 503' }).d, BOUND, [{ wcOrderId: '9', snapshot: snap }])
+  assert.ok(withSnapshot.ok)
+  assert.equal(withSnapshot.heldByProduct.get('p1'), 4, 'never less than the last proven picture')
+  assert.equal(withSnapshot.incomplete, false)
+  assert.deepEqual(withSnapshot.settledDirtyWcOrderIds, [])
+  const neverRead = await loadWcHeldUnitsByProduct(dirtyDeps({ includeError: 'WC API error: 503' }).d, BOUND, fresh('9'))
+  assert.ok(neverRead.ok)
+  assert.equal(neverRead.incomplete, true)
+})
+
+test('a live read still held is returned for the caller to remember; the snapshot of an order IMS now covers is settled', async () => {
+  const { d } = dirtyDeps({ dirty: { '9': heldOrder(9, 'completed', [11, 0, 3]) } })
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, fresh('9'))
+  assert.ok(r.ok)
+  assert.deepEqual(r.refreshedDirty, [{ wcOrderId: '9', status: 'completed', lines: [{ productId: 11, variationId: 0, sku: '', quantity: 3 }] }])
+  const snap = { status: 'completed', lines: [{ productId: 11, variationId: 0, sku: '', quantity: 3 }] }
+  const covered = await loadWcHeldUnitsByProduct(dirtyDeps({ includeError: 'down', imported: new Map([['9', new Map([['p1', 3]])]]) }).d, BOUND, [{ wcOrderId: '9', snapshot: snap }])
+  assert.ok(covered.ok)
+  assert.deepEqual(covered.settledDirtyWcOrderIds, ['9'])
+  assert.equal(covered.heldByProduct.get('p1'), undefined)
+})
+
+test('a persistent set far above the fetch budget never blocks for ever: positives go out within a few runs and every held order stays charged', async () => {
+  const N = WC_DIRTY_MAX_FETCH_PER_RUN * 2 + 200
+  const ids = Array.from({ length: N }, (_, i) => String(20_000 + i))
+  const live = Object.fromEntries(ids.map((id) => [id, heldOrder(Number(id), 'completed', [11, 0, 1])]))
+  const state = new Map<string, { snapshot: DirtyOrderInput['snapshot']; checkedAt: number }>(ids.map((id) => [id, { snapshot: null, checkedAt: 0 }]))
+  const outcomes: Array<{ incomplete: boolean; held: number | undefined; fetched: number }> = []
+  for (let run = 1; run <= 8; run++) {
+    const entries = [...state.entries()]
+      .sort(([, a], [, b]) => (a.snapshot === null ? 0 : 1) - (b.snapshot === null ? 0 : 1) || a.checkedAt - b.checkedAt)
+      .map(([wcOrderId, e]) => ({ wcOrderId, snapshot: e.snapshot }))
+    const { d, asked } = dirtyDeps({ dirty: live })
+    const r = await loadWcHeldUnitsByProduct(d, BOUND, entries)
+    assert.ok(r.ok)
+    for (const x of r.refreshedDirty) state.set(x.wcOrderId, { snapshot: { status: x.status, lines: x.lines }, checkedAt: run })
+    outcomes.push({ incomplete: r.incomplete, held: r.heldByProduct.get('p1'), fetched: asked.filter((p) => 'include' in p).length })
+  }
+  assert.ok(outcomes.every((o) => o.fetched <= WC_DIRTY_MAX_FETCH_PER_RUN / 100), 'the fetch budget bounds every run')
+  assert.equal(outcomes[0]!.incomplete, true, 'unknown orders hold positives while they have never been read')
+  const firstOk = outcomes.findIndex((o) => !o.incomplete)
+  assert.ok(firstOk > 0 && firstOk <= 3, `positives go out by run ${firstOk + 1}`)
+  for (const o of outcomes.slice(firstOk)) {
+    assert.equal(o.incomplete, false)
+    assert.equal(o.held, N, 'every held order is charged on every run, from its snapshot or a live read')
+  }
+})
+
+test('both paths that bump the connection generation retire the dirty entries in the same transaction', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const src = await readFile(new URL('../app/actions/wc-sync.ts', import.meta.url), 'utf8')
+  const bumps = [...src.matchAll(/create: \{ key: WC_SETTINGS_VERSION_KEY, value: nextVersion \},\n\s+update: \{ value: nextVersion \},\n\s+\}\)\n\s+\/\/[^\n]*\n\s+\/\/[^\n]*\n\s+await tx\.wcStockDirtyOrder\.deleteMany\(\{\}\)/g)]
+  assert.equal(bumps.length, 2, 'saveWcCredentials (rebind) and resetWcProductIdCache each delete the rows right after the bump, inside their transaction')
+  assert.equal([...src.matchAll(/WC_SETTINGS_VERSION_KEY, value: nextVersion/g)].length, 2, 'and there is no third bump this misses')
 })

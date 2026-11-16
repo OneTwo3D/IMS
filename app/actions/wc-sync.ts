@@ -523,6 +523,9 @@ export async function saveWcCredentials(url: string, key: string, secret: string
       create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
       update: { value: nextVersion },
     })
+    // The released-order records belong to the generation just left (their ids are the old store's): retired in this same transaction, which
+    // also holds the lock every guard write-back takes, so a run still on the old generation cannot write them back afterwards.
+    await tx.wcStockDirtyOrder.deleteMany({})
 
     // Operator gift-card answers are bound to the store they were given for: those of any other store than the one now configured are deleted with the rebind (the activity log keeps who answered what).
     await tx.euVatGiftCardLineResolution.deleteMany({ where: { NOT: { storeIdentity: normaliseStoreIdentity(validatedUrl.normalizedUrl) ?? '' } } })
@@ -621,6 +624,9 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
       create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
       update: { value: nextVersion },
     })
+    // The released-order records belong to the generation just left (their ids are the old store's): retired in this same transaction, which
+    // also holds the lock every guard write-back takes, so a run still on the old generation cannot write them back afterwards.
+    await tx.wcStockDirtyOrder.deleteMany({})
     const cleared = await tx.product.updateMany({
       where: { externalProductId: { not: null } },
       data: { externalProductId: null },
