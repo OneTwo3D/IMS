@@ -124,7 +124,6 @@ import {
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
 import {
-  expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExtraMapping, isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
@@ -179,6 +178,8 @@ import {
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
+import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
+import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -294,6 +295,8 @@ export type SoRow = {
 }
 
 export type SoDetail = SoRow & {
+  /** The linked customer, so the edit form can pre-select it. */
+  customerId: string | null
   billingAddress: unknown
   shippingAddress: unknown
   lines: SoLineRow[]
@@ -901,6 +904,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     where: { id },
     select: {
       ...SO_SELECT,
+      customerId: true,
       billingAddress: true,
       shippingAddress: true,
       lines: {
@@ -1004,6 +1008,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
   return {
     ...detailRow,
     settlement,
+    customerId: so.customerId,
     billingAddress: so.billingAddress,
     shippingAddress: so.shippingAddress,
     lines: so.lines.map(mapLine),
@@ -1050,15 +1055,254 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
  */
 export type CreateSalesOrderResult = { success: boolean; order?: SoRow; error?: string; postCommitWarnings?: string[] }
 
+/**
+ * Everything a sales order's write needs that is READ rather than computed, then the pure builder: the table FX rate (a missing rate refuses), the lines' products (sellable only), each line's tax rate
+ * (manual override, else the category / destination resolver, else the order default), the inclusive-prices-without-a-rate refusal and the caller's tax assertions. Shared by createSalesOrder and
+ * updateSalesOrder so an edited draft is priced by the same path as a fresh one (no second pricing path). Writes nothing.
+ */
+async function prepareSalesOrderWrite(input: CreateSoInput) {
+  // THE ORDER'S RATE IS THE TABLE RATE (owner ruling 2026-10-25, one rate). There is no typed rate: a foreign order is priced by the central lookup at the moment it is created
+  // (end-of-day rule inside getFxRateToBase), and a missing rate REFUSES the order ("Missing <base> FX rate for <cur> on or before <date>"); it is never read as 1:1. The base currency is 1.
+  const fxRate = await resolveFxRateToBase(db, input.currency, await getBaseCurrencyCode(), new Date())
+  if (input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { ok: false as const, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
+  const vatRate = input.taxRateValue ?? 0
+  const inclVat = !!input.pricesIncludeVat
+  // --- Tax category resolution ---------------------------------------
+  // Load each line's product category + the order default rate so we can
+  // resolve a per-line VAT rate via `(destCountry, category, SALES)`.
+  // Manual overrides (input.lines[i].taxRateId) skip the resolver and use
+  // the rate row directly.
+  const shipAddr = input.shippingAddress as { country?: string | null } | null | undefined
+  const billAddr = input.billingAddress as { country?: string | null } | null | undefined
+  let destCountryRaw: string | null =
+    (shipAddr?.country as string | null | undefined) ??
+    (billAddr?.country as string | null | undefined) ??
+    null
+  if (!destCountryRaw) {
+    try {
+      const { getOrganisation } = await import('./company')
+      const org = await getOrganisation()
+      destCountryRaw = org?.country ?? null
+    } catch { /* Fallback to null — resolver will use order default */ }
+  }
+  // Normalize free-text country values ("United Kingdom", "UK", "gb") to
+  // the lowercase ISO-2 code the resolver compares against.
+  const destCountryIso = toIsoCountryCode(destCountryRaw)
+  const destCountry: string | null = destCountryIso ? destCountryIso.toLowerCase() : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
+
+  const productIds = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
+  const productRows = productIds.length
+    ? await db.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, taxCategory: true, lifecycleStatus: true },
+      })
+    : []
+  const invalidSalesProduct = productRows.find((p) => !isSellableProductStatus(p.lifecycleStatus))
+  if (invalidSalesProduct) {
+    return { ok: false as const, error: 'Only active products can be sold on sales orders' }
+  }
+  const productCategoryById = new Map<string, TaxCategory>(
+    productRows.map((p) => [p.id, p.taxCategory]),
+  )
+
+  // Order-level default for the resolver fallback step
+  const orderDefaultRate = input.taxRateName
+    ? await db.taxRate.findFirst({
+        where: { name: input.taxRateName, active: true },
+        select: taxRateProfileSelect,
+      })
+    : null
+  const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
+  const orderDefaultCtx = {
+    id: orderDefaultProfile?.taxRateId ?? null,
+    name: orderDefaultProfile?.taxRateName ?? input.taxRateName ?? null,
+    rate: orderDefaultProfile?.taxRateValue ?? vatRate,
+    accountingTaxType: orderDefaultProfile?.accountingTaxType ?? null,
+    isCompound: orderDefaultProfile?.isCompound ?? false,
+    reverseCharge: orderDefaultProfile?.reverseCharge ?? false,
+    reportingCategory: orderDefaultProfile?.reportingCategory ?? null,
+    components: orderDefaultProfile?.components ?? [],
+  }
+
+  // Batch-resolve all lines that don't already carry a manual taxRateId.
+  const autoLines = input.lines
+    .map((l, idx) => ({
+      id: String(idx),
+      productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
+      override: l.taxRateId ?? null,
+    }))
+    .filter((l) => !l.override)
+  const resolvedMap = await resolveLineTaxRateBatch(autoLines, {
+    destinationCountry: destCountry,
+    usedFor: 'SALES',
+    orderDefault: orderDefaultCtx,
+  })
+
+  // Load any manual override tax rates in one query.
+  const overrideIds = Array.from(
+    new Set(
+      input.lines
+        .map((l) => l.taxRateId)
+        .filter((x): x is string => typeof x === 'string' && x.length > 0),
+    ),
+  )
+  const overrideRows = overrideIds.length
+    ? await db.taxRate.findMany({
+        where: { id: { in: overrideIds } },
+        select: taxRateProfileSelect,
+      })
+    : []
+  const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
+
+  const lineResolved: ResolvedTaxRate[] = input.lines.map((l, idx) => {
+    if (l.taxRateId) {
+      const row = overrideById.get(l.taxRateId)
+      if (row) {
+        return resolvedTaxRateFromProfile(row, 'exact')
+      }
+    }
+    return (
+      resolvedMap.get(String(idx)) ?? {
+        taxRateId: orderDefaultCtx.id,
+        taxRateName: orderDefaultCtx.name,
+        taxRateValue: orderDefaultCtx.rate,
+        accountingTaxType: orderDefaultCtx.accountingTaxType,
+        isCompound: orderDefaultCtx.isCompound,
+        reverseCharge: orderDefaultCtx.reverseCharge,
+        reportingCategory: orderDefaultCtx.reportingCategory,
+        components: orderDefaultCtx.components,
+        matched: 'fallback',
+        warning: null,
+      }
+    )
+  })
+
+  // One basis for the whole document: inclusive prices with no default rate but VAT-bearing lines is refused, not guessed at.
+  if (inclusivePricesWithoutOrderRate({ pricesIncludeVat: inclVat, orderRate: vatRate, anyLineCarriesVat: lineResolved.some((r) => r.taxRateValue > 0) })) {
+    return { ok: false as const, error: INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE }
+  }
+
+  const taxValidation = validateSalesOrderLineTaxInputs(
+    input.lines.map((line, idx) => ({
+      sku: line.sku,
+      qty: line.qty,
+      unitPriceForeign: line.unitPriceForeign,
+      discountAmount: line.discountAmount ?? 0,
+      taxRateValue: lineResolved[idx]?.taxRateValue ?? 0,
+      taxForeign: line.taxForeign ?? null,
+    })),
+    inclVat,
+  )
+  if (!taxValidation.success) return { ok: false as const, error: taxValidation.error }
+
+  const model = buildSalesOrderWriteModel({
+    fxRate,
+    vatRate,
+    pricesIncludeVat: inclVat,
+    shippingForeign: input.shippingForeign,
+    fees: input.fees,
+    orderDiscountForeign: input.orderDiscountForeign,
+    lines: input.lines.map((l, idx) => ({ input: l, rate: lineResolved[idx].taxRateValue, taxRateId: lineResolved[idx].taxRateId })),
+  })
+  return { ok: true as const, fxRate, vatRate, inclVat, model, lineResolved, taxValidation, destCountry, productCategoryById, orderDefaultRate }
+}
+
+/**
+ * The header columns a manual sales order's write sets from the caller's input and the prepared money (everything but the order's identity, status and lines). One definition for createSalesOrder and
+ * updateSalesOrder, so an edited draft's header is exactly what creating that order fresh writes. `customerId` and `taxRateName` are NOT here: each writer names them in its own `data`, beside its own lock of the
+ * customer / named rate, because the censuses of customer-linking and tax-rate-name writers (tests/erasure-customer-writers.test.ts, tests/tax/sales-order-tax-rate-name-writers-census.test.ts) read them there.
+ */
+function salesOrderHeaderData(input: CreateSoInput, prepared: { fxRate: number; vatRate: number; inclVat: boolean; model: SalesOrderWriteModel }) {
+  const { fxRate, vatRate, inclVat } = prepared
+  const t = prepared.model.totals
+  return {
+    currency: input.currency,
+    fxRateToBase: fxRate,
+    customerName: input.customerName,
+    customerEmail: input.customerEmail || null,
+    billingAddress: input.billingAddress ?? undefined,
+    shippingAddress: input.shippingAddress ?? undefined,
+    subtotalForeign: t.subtotalForeign,
+    shippingService: input.shippingService || null,
+    shippingForeign: t.shippingForeign,
+    taxRatePercent: vatRate > 0 ? vatRate : null,
+    taxForeign: t.taxForeign,
+    pricesIncludeVat: inclVat,
+    totalForeign: t.totalForeign,
+    subtotalBase: t.subtotalBase,
+    shippingBase: t.shippingBase,
+    taxBase: t.taxBase,
+    totalBase: t.totalBase,
+    shipFromWarehouseId: input.shipFromWarehouseId || null,
+    expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
+    salesRep: input.salesRep || null,
+    discountStr: input.orderDiscountStr || null,
+    discountAmount: t.discountAmount,
+    notes: input.notes || null,
+    internalNotes: input.internalNotes || null,
+  }
+}
+
+/** The two warning entries a write leaves on the order's activity log: a caller tax assertion that was omitted, and lines that fell back to the order-default rate. Shared by both writers. */
+async function logSalesOrderTaxWarnings(
+  so: { id: string; orderNumber: string | null; externalOrderNumber: string | null },
+  input: CreateSoInput,
+  prepared: { inclVat: boolean; taxValidation: { warnings?: { sku: string; expectedTaxForeign: unknown }[] }; lineResolved: ResolvedTaxRate[]; productCategoryById: Map<string, TaxCategory>; destCountry: string | null },
+): Promise<void> {
+  const { inclVat, taxValidation, lineResolved, productCategoryById, destCountry } = prepared
+  for (const warning of taxValidation.warnings ?? []) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'sales_order_line_tax_assertion_missing',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Sales order ${getSalesOrderReference(so)} line ${warning.sku} omitted caller tax assertion`,
+      metadata: {
+        sku: warning.sku,
+        expectedTaxForeign: warning.expectedTaxForeign,
+        pricesIncludeVat: inclVat,
+        currency: input.currency,
+      },
+    })
+  }
+  // Aggregated warning when any line fell back to the order default.
+  const fallbackLines = lineResolved
+    .map((r, i) => ({ r, sku: input.lines[i].sku, cat: productCategoryById.get(input.lines[i].productId) ?? 'STANDARD' }))
+    .filter((x) => x.r.matched === 'fallback')
+  if (fallbackLines.length > 0) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'tax_rate_fallback',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `No matching tax rate for ${destCountry?.toUpperCase() ?? 'unknown country'} on ${fallbackLines.length} line(s); used order default.`,
+      metadata: {
+        orderNumber: so.orderNumber,
+        destCountry,
+        lines: fallbackLines.map((x) => ({ sku: x.sku, category: x.cat })),
+      },
+    })
+  }
+}
+
+/** The input rules both writers share. */
+function validateSalesOrderInput(input: CreateSoInput): string | null {
+  if (!input.lines.length) return 'Add at least one line item'
+  if (!input.customerName?.trim()) return 'Customer name is required'
+  for (const l of input.lines) {
+    if (l.qty <= 0) return `Invalid qty for ${l.sku}`
+    if (l.unitPriceForeign < 0) return `Negative price for ${l.sku}`
+  }
+  return null
+}
+
 export async function createSalesOrder(input: CreateSoInput): Promise<CreateSalesOrderResult> {
   try {
     await requirePermission('sales.create')
-    if (!input.lines.length) return { success: false, error: 'Add at least one line item' }
-    if (!input.customerName?.trim()) return { success: false, error: 'Customer name is required' }
-    for (const l of input.lines) {
-      if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
-      if (l.unitPriceForeign < 0) return { success: false, error: `Negative price for ${l.sku}` }
-    }
+    const inputError = validateSalesOrderInput(input)
+    if (inputError) return { success: false, error: inputError }
     const externalOrderNumber = input.externalOrderNumber?.trim() || null
     if (externalOrderNumber) {
       const existing = await db.salesOrder.findFirst({
@@ -1068,249 +1312,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       if (existing) return { success: false, error: `Order ${externalOrderNumber} already exists` }
     }
 
-    // THE ORDER'S RATE IS THE TABLE RATE (owner ruling 2026-10-25, one rate). There is no typed rate: a foreign order is priced by the central lookup at the moment it is created
-    // (end-of-day rule inside getFxRateToBase), and a missing rate REFUSES the order ("Missing <base> FX rate for <cur> on or before <date>"); it is never read as 1:1. The base currency is 1.
-    const fxRate = await resolveFxRateToBase(db, input.currency, await getBaseCurrencyCode(), new Date())
-    if (input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { success: false, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
-    const vatRate = input.taxRateValue ?? 0
-    const inclVat = !!input.pricesIncludeVat
-    // Storage convention:
-    //   All *Foreign / *Gbp totals on SalesOrder are NET of tax (subtotal,
-    //   shipping, discount). `taxForeign` holds the total VAT, `totalForeign`
-    //   is the grand total (net + tax). Line rows also store NET totals.
-    //   When pricesIncludeVat is true, unitPriceForeign remains the gross
-    //   user-entered price so the UI can display gross values, but every
-    //   aggregate field is net. The Xero payload reconstructs gross from
-    //   stored net when lineAmountsIncludeTax is true.
-    let linesSubtotalForeign = toDecimal(0) // sum of line NETs, before order discount
-    let linesSubtotalBase = toDecimal(0)
-    let totalTaxForeign = toDecimal(0)
-    let totalTaxBase = toDecimal(0)
-
-    const round4 = (value: DecimalInput) => roundDecimalNumber(value, 4)
-
-    // --- Tax category resolution ---------------------------------------
-    // Load each line's product category + the order default rate so we can
-    // resolve a per-line VAT rate via `(destCountry, category, SALES)`.
-    // Manual overrides (input.lines[i].taxRateId) skip the resolver and use
-    // the rate row directly.
-    const shipAddr = input.shippingAddress as { country?: string | null } | null | undefined
-    const billAddr = input.billingAddress as { country?: string | null } | null | undefined
-    let destCountryRaw: string | null =
-      (shipAddr?.country as string | null | undefined) ??
-      (billAddr?.country as string | null | undefined) ??
-      null
-    if (!destCountryRaw) {
-      try {
-        const { getOrganisation } = await import('./company')
-        const org = await getOrganisation()
-        destCountryRaw = org?.country ?? null
-      } catch { /* Fallback to null — resolver will use order default */ }
-    }
-    // Normalize free-text country values ("United Kingdom", "UK", "gb") to
-    // the lowercase ISO-2 code the resolver compares against.
-    const destCountryIso = toIsoCountryCode(destCountryRaw)
-    const destCountry: string | null = destCountryIso ? destCountryIso.toLowerCase() : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
-
-    const productIds = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
-    const productRows = productIds.length
-      ? await db.product.findMany({
-          where: { id: { in: productIds } },
-          select: { id: true, taxCategory: true, lifecycleStatus: true },
-        })
-      : []
-    const invalidSalesProduct = productRows.find((p) => !isSellableProductStatus(p.lifecycleStatus))
-    if (invalidSalesProduct) {
-      return { success: false, error: 'Only active products can be sold on sales orders' }
-    }
-    const productCategoryById = new Map<string, TaxCategory>(
-      productRows.map((p) => [p.id, p.taxCategory]),
-    )
-
-    // Order-level default for the resolver fallback step
-    const orderDefaultRate = input.taxRateName
-      ? await db.taxRate.findFirst({
-          where: { name: input.taxRateName, active: true },
-          select: taxRateProfileSelect,
-        })
-      : null
-    const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
-    const orderDefaultCtx = {
-      id: orderDefaultProfile?.taxRateId ?? null,
-      name: orderDefaultProfile?.taxRateName ?? input.taxRateName ?? null,
-      rate: orderDefaultProfile?.taxRateValue ?? vatRate,
-      accountingTaxType: orderDefaultProfile?.accountingTaxType ?? null,
-      isCompound: orderDefaultProfile?.isCompound ?? false,
-      reverseCharge: orderDefaultProfile?.reverseCharge ?? false,
-      reportingCategory: orderDefaultProfile?.reportingCategory ?? null,
-      components: orderDefaultProfile?.components ?? [],
-    }
-
-    // Batch-resolve all lines that don't already carry a manual taxRateId.
-    const autoLines = input.lines
-      .map((l, idx) => ({
-        id: String(idx),
-        productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
-        override: l.taxRateId ?? null,
-      }))
-      .filter((l) => !l.override)
-    const resolvedMap = await resolveLineTaxRateBatch(autoLines, {
-      destinationCountry: destCountry,
-      usedFor: 'SALES',
-      orderDefault: orderDefaultCtx,
-    })
-
-    // Load any manual override tax rates in one query.
-    const overrideIds = Array.from(
-      new Set(
-        input.lines
-          .map((l) => l.taxRateId)
-          .filter((x): x is string => typeof x === 'string' && x.length > 0),
-      ),
-    )
-    const overrideRows = overrideIds.length
-      ? await db.taxRate.findMany({
-          where: { id: { in: overrideIds } },
-          select: taxRateProfileSelect,
-        })
-      : []
-    const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
-
-    const lineResolved: ResolvedTaxRate[] = input.lines.map((l, idx) => {
-      if (l.taxRateId) {
-        const row = overrideById.get(l.taxRateId)
-        if (row) {
-          return resolvedTaxRateFromProfile(row, 'exact')
-        }
-      }
-      return (
-        resolvedMap.get(String(idx)) ?? {
-          taxRateId: orderDefaultCtx.id,
-          taxRateName: orderDefaultCtx.name,
-          taxRateValue: orderDefaultCtx.rate,
-          accountingTaxType: orderDefaultCtx.accountingTaxType,
-          isCompound: orderDefaultCtx.isCompound,
-          reverseCharge: orderDefaultCtx.reverseCharge,
-          reportingCategory: orderDefaultCtx.reportingCategory,
-          components: orderDefaultCtx.components,
-          matched: 'fallback',
-          warning: null,
-        }
-      )
-    })
-
-    // One basis for the whole document: inclusive prices with no default rate but VAT-bearing lines is refused, not guessed at.
-    if (inclusivePricesWithoutOrderRate({ pricesIncludeVat: inclVat, orderRate: vatRate, anyLineCarriesVat: lineResolved.some((r) => r.taxRateValue > 0) })) {
-      return { success: false, error: INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE }
-    }
-
-    const taxValidation = validateSalesOrderLineTaxInputs(
-      input.lines.map((line, idx) => ({
-        sku: line.sku,
-        qty: line.qty,
-        unitPriceForeign: line.unitPriceForeign,
-        discountAmount: line.discountAmount ?? 0,
-        taxRateValue: lineResolved[idx]?.taxRateValue ?? 0,
-        taxForeign: line.taxForeign ?? null,
-      })),
-      inclVat,
-    )
-    if (!taxValidation.success) return { success: false, error: taxValidation.error }
-
-    const lineData = input.lines.map((l, idx) => {
-      const resolved = lineResolved[idx]
-      const lineRate = resolved.taxRateValue
-      const lineInclVat = inclVat && lineRate > 0
-      const discAmt = l.discountAmount ?? 0 // in gross if inclVat, else net
-      const lineGross = toDecimal(l.qty).mul(l.unitPriceForeign).sub(discAmt)
-      const netForeign = lineInclVat ? lineGross.div(toDecimal(1).add(lineRate)) : lineGross
-      const unitPriceBase = divideRoundedNumber(l.unitPriceForeign, fxRate, 6)
-      const totalForeign = round4(netForeign)
-      const totalBase = divideRoundedNumber(totalForeign, fxRate, 4)
-      const lineTax = expectedSalesOrderLineTaxForeign({
-        sku: l.sku,
-        qty: l.qty,
-        unitPriceForeign: l.unitPriceForeign,
-        discountAmount: discAmt,
-        taxRateValue: lineRate,
-        taxForeign: l.taxForeign ?? null,
-      }, inclVat)
-      const lineTaxForeign = round4(lineTax)
-      const lineTaxBase = divideRoundedNumber(lineTaxForeign, fxRate, 4)
-      linesSubtotalForeign = linesSubtotalForeign.add(totalForeign)
-      linesSubtotalBase = linesSubtotalBase.add(totalBase)
-      totalTaxForeign = totalTaxForeign.add(lineTaxForeign)
-      totalTaxBase = totalTaxBase.add(lineTaxBase)
-      return {
-        productId: l.productId,
-        sku: l.sku,
-        description: l.description,
-        qty: l.qty,
-        unitPriceForeign: l.unitPriceForeign, // ORIGINAL (gross if inclVat)
-        unitPriceBase,
-        discountStr: l.discountStr || null,
-        discountAmount: discAmt,
-        taxForeign: lineTaxForeign,
-        taxBase: lineTaxBase,
-        totalForeign, // NET
-        totalBase,
-        taxRateId: resolved.taxRateId,
-      }
-    })
-
-    // Shipping (+ fees). Input shippingForeign is gross when inclVat.
-    // Shipping / fees / order discount are always taxed at the order-default
-    // rate (the per-line resolver only applies to line items).
-    const shippingInclVat = inclVat && vatRate > 0
-    const shippingInput = input.shippingForeign ?? 0
-    let feesTotalForeign = toDecimal(0)
-    if (input.fees?.length) for (const f of input.fees) feesTotalForeign = feesTotalForeign.add(f.amount)
-    const totalShippingInput = toDecimal(shippingInput).add(feesTotalForeign)
-    const shippingNetForeign = shippingInclVat ? totalShippingInput.div(toDecimal(1).add(vatRate)) : totalShippingInput
-    const shippingTaxForeign = shippingInclVat
-      ? totalShippingInput.sub(shippingNetForeign)
-      : (vatRate > 0 ? shippingNetForeign.mul(vatRate) : toDecimal(0))
-    const shippingNetForeignR = round4(shippingNetForeign)
-    const shippingTaxForeignR = round4(shippingTaxForeign)
-    const shippingNetBase = divideRoundedNumber(shippingNetForeignR, fxRate, 4)
-    const shippingTaxBase = divideRoundedNumber(shippingTaxForeignR, fxRate, 4)
-    totalTaxForeign = totalTaxForeign.add(shippingTaxForeignR)
-    totalTaxBase = totalTaxBase.add(shippingTaxBase)
-
-    // Order-level discount — cap at line subtotal (compare in gross when inclVat).
-    const rawOrderDisc = input.orderDiscountForeign ?? 0
-    const linesGrossForCap = shippingInclVat
-      ? toDecimal(linesSubtotalForeign).mul(toDecimal(1).add(vatRate))
-      : toDecimal(linesSubtotalForeign)
-    const orderDiscForeign = Prisma.Decimal.min(toDecimal(rawOrderDisc), linesGrossForCap)
-    const discNetForeign = shippingInclVat ? orderDiscForeign.div(toDecimal(1).add(vatRate)) : orderDiscForeign
-    const discTaxForeign = shippingInclVat ? orderDiscForeign.sub(discNetForeign) : (vatRate > 0 ? discNetForeign.mul(vatRate) : toDecimal(0))
-    const discNetForeignR = round4(discNetForeign)
-    const discTaxForeignR = round4(discTaxForeign)
-    const discNetBase = divideRoundedNumber(discNetForeignR, fxRate, 4)
-    const discTaxBase = divideRoundedNumber(discTaxForeignR, fxRate, 4)
-    totalTaxForeign = totalTaxForeign.sub(discTaxForeignR)
-    totalTaxBase = totalTaxBase.sub(discTaxBase)
-
-    // Subtotal stored PRE-discount (sum of line nets) — matches the WC
-    // importer convention so display / accounting code can handle both
-    // sources uniformly.
-    const subtotalForeign = round4(linesSubtotalForeign)
-    const subtotalBase = round4(linesSubtotalBase)
-    const totalTaxForeignRounded = round4(totalTaxForeign)
-    const totalTaxBaseRounded = round4(totalTaxBase)
-
-    // Grand total = subtotal (net, pre-discount) − net discount + net
-    // shipping + total tax. Tax already nets the discount VAT above.
-    const grandTotalForeign = round4(toDecimal(subtotalForeign).sub(discNetForeignR).add(shippingNetForeignR).add(totalTaxForeignRounded))
-    const grandTotalBase = round4(toDecimal(subtotalBase).sub(discNetBase).add(shippingNetBase).add(totalTaxBaseRounded))
-
-    // Keep locals that downstream Prisma / accounting queue references expect.
-    const totalShippingForeign = shippingNetForeignR
-    const totalShippingBase = shippingNetBase
-    // Store the order discount in the same convention as WC import: the raw
-    // user-entered amount (gross when inclVat).
-    const storedDiscountAmount = round4(orderDiscForeign)
+    const prepared = await prepareSalesOrderWrite(input)
+    if (!prepared.ok) return { success: false, error: prepared.error }
+    const { orderDefaultRate } = prepared
+    const lineData = prepared.model.lines
 
     // Generate order number using configured prefix (Settings → Company → Numbering)
     const { getNumberingFormats } = await import('./company')
@@ -1345,32 +1350,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
           externalOrderNumber,
           orderNumber,
           status: initialStatus,
-          currency: input.currency,
-          fxRateToBase: fxRate,
           customerId: input.customerId || null,
-          customerName: input.customerName,
-          customerEmail: input.customerEmail || null,
-          billingAddress: input.billingAddress ?? undefined,
-          shippingAddress: input.shippingAddress ?? undefined,
-          subtotalForeign,
-          shippingService: input.shippingService || null,
-          shippingForeign: totalShippingForeign,
           taxRateName: input.taxRateName || null,
-          taxRatePercent: vatRate > 0 ? vatRate : null,
-          taxForeign: totalTaxForeignRounded,
-          pricesIncludeVat: inclVat,
-          totalForeign: grandTotalForeign,
-          subtotalBase,
-          shippingBase: totalShippingBase,
-          taxBase: totalTaxBaseRounded,
-          totalBase: grandTotalBase,
-          shipFromWarehouseId: input.shipFromWarehouseId || null,
-          expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
-          salesRep: input.salesRep || null,
-          discountStr: input.orderDiscountStr || null,
-          discountAmount: storedDiscountAmount,
-          notes: input.notes || null,
-          internalNotes: input.internalNotes || null,
+          ...salesOrderHeaderData(input, prepared),
           lines: { create: lineData },
         },
         select: SO_SELECT,
@@ -1387,22 +1369,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     }, STOCK_TX_OPTIONS)
 
     const postCommitWarnings: string[] = []
-    for (const warning of taxValidation.warnings ?? []) {
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: so.id,
-        action: 'sales_order_line_tax_assertion_missing',
-        tag: 'sales',
-        level: 'WARNING',
-        description: `Sales order ${getSalesOrderReference(so)} line ${warning.sku} omitted caller tax assertion`,
-        metadata: {
-          sku: warning.sku,
-          expectedTaxForeign: warning.expectedTaxForeign,
-          pricesIncludeVat: inclVat,
-          currency: input.currency,
-        },
-      })
-    }
+    await logSalesOrderTaxWarnings(so, input, prepared)
 
     // Auto-allocate stock across warehouses. Drafts stay unallocated —
     // allocation happens when the draft is finalised so the draft can still
@@ -1440,26 +1407,6 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
 
     // (The accounting sales invoice of a live order was queued inside the creating transaction above; a draft is invoiced when it is finalised.)
 
-    // Aggregated warning when any line fell back to the order default.
-    const fallbackLines = lineResolved
-      .map((r, i) => ({ r, sku: input.lines[i].sku, cat: productCategoryById.get(input.lines[i].productId) ?? 'STANDARD' }))
-      .filter((x) => x.r.matched === 'fallback')
-    if (fallbackLines.length > 0) {
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: so.id,
-        action: 'tax_rate_fallback',
-        tag: 'sales',
-        level: 'WARNING',
-        description: `No matching tax rate for ${destCountry?.toUpperCase() ?? 'unknown country'} on ${fallbackLines.length} line(s); used order default.`,
-        metadata: {
-          orderNumber: so.orderNumber,
-          destCountry,
-          lines: fallbackLines.map((x) => ({ sku: x.sku, category: x.cat })),
-        },
-      })
-    }
-
     try { revalidatePath('/sales') } catch { /* cache refresh only */ }
     const mapped = mapSoRow(so)
     await logActivity({
@@ -1482,6 +1429,113 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       tag: 'sales',
       level: 'ERROR',
       description: `Failed to create sales order: ${String(e)}`,
+      metadata: null,
+    })
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Edit a DRAFT sales order: its header (customer, addresses, shipping, tax basis, discount, notes) and its lines, re-priced by the same builder createSalesOrder uses.
+ *
+ * Only an order nothing else holds a copy of can be rewritten (resolveSalesOrderEditBlock): a draft with no allocation, shipment, posted invoice, warehouse push or shopping-connector link. Every one of those is
+ * re-read under the order row lock, so an allocation, push or webhook link that commits first refuses the edit; the lock and the rewrite are one transaction, so the old lines stay until the new ones commit.
+ * Editing a CONFIRMED order (invoice update, reallocation, warehouse amendment, and the owner-ruled warning that the edit desyncs it from WooCommerce) is not built: it is refused here.
+ * The order number, status and external order number are never edited. Writes nothing outbound: a draft is not invoiced, allocated or pushed.
+ */
+export async function updateSalesOrder(id: string, input: CreateSoInput): Promise<{ success: boolean; order?: SoRow; error?: string }> {
+  try {
+    await requirePermission('sales.create')
+    const inputError = validateSalesOrderInput(input)
+    if (inputError) return { success: false, error: inputError }
+
+    const prepared = await prepareSalesOrderWrite(input)
+    if (!prepared.ok) return { success: false, error: prepared.error }
+    const lineData = prepared.model.lines
+
+    const outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, id)
+      const current = await tx.salesOrder.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          status: true,
+          erasedAt: true,
+          accountingInvoiceId: true,
+          orderNumber: true,
+          externalOrderNumber: true,
+          totalForeign: true,
+          currency: true,
+          _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true } },
+          wmsOrderPush: { select: { id: true } },
+        },
+      })
+      if (!current) return { error: 'Order not found' } as const
+      const block = resolveSalesOrderEditBlock({
+        status: current.status,
+        allocations: current._count.allocations,
+        shipments: current._count.shipments,
+        accountingInvoiceId: current.accountingInvoiceId,
+        wmsPush: current.wmsOrderPush !== null,
+        hasExternalSource: current._count.shoppingLinks > 0,
+        erased: current.erasedAt !== null,
+      })
+      if (block) return { error: block.reason } as const
+
+      // Same locks as create: the rates the order rests on (lines and the header's named rate), then the customer link.
+      await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: prepared.orderDefaultRate === null })
+      await resolveLinesTaxRates(tx, lineData)
+      await lockCustomerForOrderLink(tx, input.customerId)
+      await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
+      const written = await tx.salesOrder.update({
+        where: { id },
+        data: {
+          customerId: input.customerId || null,
+          taxRateName: input.taxRateName || null,
+          ...salesOrderHeaderData(input, prepared),
+          // An edit that clears an address clears it (create simply leaves the column unset).
+          billingAddress: (input.billingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
+          shippingAddress: (input.shippingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
+          lines: { create: lineData },
+        },
+        select: SO_SELECT,
+      })
+      return { written, previous: { totalForeign: Number(current.totalForeign), currency: current.currency, lineCount: current._count.lines } } as const
+    }, STOCK_TX_OPTIONS)
+
+    if ('error' in outcome) return { success: false, error: outcome.error }
+    const { written, previous } = outcome
+
+    await logSalesOrderTaxWarnings(written, input, prepared)
+    try { revalidatePath('/sales'); revalidatePath(`/sales/${id}`) } catch { /* cache refresh only */ }
+    const mapped = mapSoRow(written)
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Edited draft sales order ${mapped.displayOrderNumber}`,
+      metadata: {
+        orderNumber: mapped.displayOrderNumber,
+        previousTotalForeign: previous.totalForeign,
+        previousCurrency: previous.currency,
+        previousLineCount: previous.lineCount,
+        totalForeign: mapped.totalForeign,
+        currency: mapped.currency,
+        lineCount: lineData.length,
+      },
+    })
+    return { success: true, order: mapped }
+  } catch (e) {
+    if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to edit sales order: ${String(e)}`,
       metadata: null,
     })
     return { success: false, error: String(e) }
