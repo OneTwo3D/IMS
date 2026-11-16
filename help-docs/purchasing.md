@@ -409,7 +409,10 @@ From **Analytics > Reorder Planning** (the standalone Reorder Forecast page has 
 2. Tick the rows you want, or leave all unticked to act on every visible row (a confirmation names the row count).
 3. Click **Generate from selection** (or **Generate POs + draft MOs for all visible rows**). One draft PO is created per supplier with one line per product; manufactured (BOM) rows get a draft production order instead.
 4. Each line carries **reorder evidence** — forecast metadata (stock at forecast time, demand rate, lead time, days of cover) stored on the line for later audit.
-5. A supplier that already received a reorder draft within the last few minutes is skipped (the result names how many), so a double click does not create duplicates.
+5. A supplier that already received a reorder draft **for the same destination warehouse** within the last few minutes is skipped (the result names how many), so a double click does not create duplicates. Reorder runs for two different warehouses create two drafts for the same supplier.
+6. **Destination.** The draft's destination warehouse is the Warehouse filter on Reorder Planning. With no warehouse filter the draft has no destination and you choose one when editing it; Reorder Planning shows "Select a warehouse to set the PO destination".
+7. **Estimated delivery.** Each draft line's estimated delivery is the row's Required receipt date, but no earlier than today plus the product's lead time. A line with no Required receipt has no date. The draft's own date is the earliest line date. Edit them on the draft like any other (see per-line estimated delivery above).
+8. **Supplier override.** A row's supplier can be changed in Reorder Planning before generating; the line then goes to the chosen supplier's draft. Only suppliers that carry the product in their catalog are accepted. The line's reorder evidence records the override and the default supplier.
 6. Review and adjust quantities, then send the PO normally.
 
 Lifecycle exclusions apply: only Draft and Active products are planned. EOL and Archived products are skipped.

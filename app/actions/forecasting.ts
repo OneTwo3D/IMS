@@ -8,7 +8,13 @@ import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { claimedActiveBomIdsByProduct, partitionReorderMoCandidates, type ReorderMoSkip } from '@/lib/domain/manufacturing/reorder-mo-planning'
-import { selectReorderPoCandidates, type ReorderPoSkip } from '@/lib/domain/purchasing/reorder-po-planning'
+import {
+  earliestLineDelivery,
+  reorderLineExpectedDelivery,
+  sanitizeSupplierOverrides,
+  selectReorderPoCandidates,
+  type ReorderPoSkip,
+} from '@/lib/domain/purchasing/reorder-po-planning'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { ProductType } from '@/app/generated/prisma/client'
 
@@ -407,7 +413,7 @@ export async function generateForecasts(options: GenerateForecastOptions = {}): 
 
 export async function createReorderPOs(
   productIds: string[],
-  options: { filters?: ReorderActionFilters } = {},
+  options: { filters?: ReorderActionFilters; supplierOverrides?: Record<string, string> } = {},
 ): Promise<{ success: boolean; poCount: number; skippedSupplierCount?: number; skippedProducts?: ReorderPoSkip[]; error?: string }> {
   await requirePermission('purchasing.create')
   try {
@@ -419,7 +425,11 @@ export async function createReorderPOs(
     // generateForecasts engine, which used a different quantity and urgency model.
     const { getReorderReport } = await import('@/lib/domain/inventory/replenishment-reports')
     const report = await getReorderReport(actionFilters as StockPositionFilters, { paginate: false })
-    const { bySupplier, skipped: skippedProducts } = selectReorderPoCandidates(report.rows, productIds)
+    const supplierOverrides = sanitizeSupplierOverrides(options.supplierOverrides, productIds)
+    const { bySupplier, skipped: skippedProducts } = selectReorderPoCandidates(report.rows, productIds, { supplierOverrides })
+    // The receipt location is the warehouse the report was filtered to. Unfiltered there is no defensible
+    // destination, so it stays null (never a first-warehouse guess: goods would go to the wrong site).
+    const destinationWarehouseId = actionFilters.warehouseId ?? null
 
     const baseCurrency = await getBaseCurrencyCode()
     // audit-M-mfg #2: double-click idempotency — skip suppliers that already have
@@ -428,6 +438,8 @@ export async function createReorderPOs(
     const recentReorderPos = await db.purchaseOrder.findMany({
       where: {
         supplierId: { in: [...bySupplier.keys()] },
+        // Two warehouses' reorder runs for one supplier are two legitimate POs.
+        destinationWarehouseId,
         status: 'DRAFT',
         createdAt: { gte: recentReorderPoCutoff },
         // Match the marker in internalNotes (current) OR notes (POs created by the
@@ -462,7 +474,9 @@ export async function createReorderPOs(
 
       const ref = `PO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
 
+      const now = new Date()
       let subtotal = 0
+      const lineDates: Array<Date | null> = []
       const lineData = items.map((candidate, i) => {
         const row = candidate.row
         const qty = candidate.qty
@@ -471,11 +485,16 @@ export async function createReorderPOs(
         const unitCostBase = Math.round((unitCost / fxRate) * 1000000) / 1000000
         const totalBase = Math.round((total / fxRate) * 10000) / 10000
         subtotal += total
+        const delivery = reorderLineExpectedDelivery(row, now)
+        lineDates.push(delivery.expectedDelivery)
         const reorderEvidence = {
           source: 'reorder_planning',
           generatedAt,
           filters: actionFilters,
           supplierId,
+          defaultSupplierId: row.supplierId,
+          supplierOverridden: candidate.supplierOverridden,
+          destinationWarehouseId,
           productId: row.productId,
           sku: row.sku,
           averageDailyDemand: row.averageDailyDemand,
@@ -487,6 +506,12 @@ export async function createReorderPOs(
           safetyStockQty: row.safetyStockQty,
           suggestedReorderQty: row.suggestedReorderQty,
           urgency: row.urgency,
+          requiredReceiptDate: delivery.rawRequiredReceiptDate,
+          latestPoDate: row.latestPoDate,
+          latestPoOverdue: row.latestPoOverdue,
+          timingBasis: row.timingBasis,
+          earliestPossibleDate: delivery.earliestPossibleDate,
+          expectedDeliveryClamped: delivery.clamped,
         }
         return {
           productId: row.productId,
@@ -496,6 +521,7 @@ export async function createReorderPOs(
           taxForeign: 0, taxBase: 0,
           totalForeign: total,
           totalBase,
+          expectedDelivery: delivery.expectedDelivery,
           reorderEvidence,
           sortOrder: i,
         }
@@ -515,6 +541,9 @@ export async function createReorderPOs(
           totalForeign: subtotal,
           totalBase: subtotalBase,
           internalNotes: REORDER_PO_NOTE,
+          destinationWarehouseId,
+          // Each line carries its own date; the header is the earliest of them (null when no line is dated).
+          expectedDelivery: earliestLineDelivery(lineDates),
           lines: { create: lineData },
         },
       })

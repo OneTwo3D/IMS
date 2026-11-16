@@ -13,7 +13,7 @@ import {
 } from '../../lib/analytics/reorder-selection.ts'
 
 function stateOf(ids: string[]): ReorderSelectionState {
-  return { selected: new Set(ids) }
+  return { selected: new Set(ids), supplierOverrides: {} }
 }
 
 test('toggle adds an unselected id', () => {
@@ -149,4 +149,24 @@ test('sumSelectedField ignores non-finite field values', () => {
 test('sumSelectedField ignores selected ids not present in rows', () => {
   const rows = [{ productId: 'p1', qty: 4 }]
   assert.equal(sumSelectedField(rows, new Set(['p1', 'p9']), (r) => r.qty), 4)
+})
+
+test('setSupplierOverride sets, replaces and removes a per-row override without touching the selection', () => {
+  const picked = reorderSelectionReducer(stateOf(['p1']), { type: 'setSupplierOverride', productId: 'p1', supplierId: 'sup-b' })
+  assert.deepEqual(picked.supplierOverrides, { p1: 'sup-b' })
+  assert.deepEqual([...picked.selected], ['p1'])
+  const replaced = reorderSelectionReducer(picked, { type: 'setSupplierOverride', productId: 'p1', supplierId: 'sup-c' })
+  assert.deepEqual(replaced.supplierOverrides, { p1: 'sup-c' })
+  const removed = reorderSelectionReducer(replaced, { type: 'setSupplierOverride', productId: 'p1', supplierId: null })
+  assert.deepEqual(removed.supplierOverrides, {})
+})
+
+test('toggle, toggleAll and set keep overrides; clear drops them with the selection', () => {
+  const start = reorderSelectionReducer(stateOf(['p1']), { type: 'setSupplierOverride', productId: 'p1', supplierId: 'sup-b' })
+  assert.deepEqual(reorderSelectionReducer(start, { type: 'toggle', id: 'p2' }).supplierOverrides, { p1: 'sup-b' })
+  assert.deepEqual(reorderSelectionReducer(start, { type: 'toggleAll', visibleIds: ['p1', 'p2'] }).supplierOverrides, { p1: 'sup-b' })
+  assert.deepEqual(reorderSelectionReducer(start, { type: 'set', ids: ['p3'] }).supplierOverrides, { p1: 'sup-b' })
+  const cleared = reorderSelectionReducer(start, { type: 'clear' })
+  assert.deepEqual(cleared.supplierOverrides, {})
+  assert.equal(cleared.selected.size, 0)
 })
