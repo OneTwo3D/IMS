@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState, useTransition } from 'react'
+import { useEffect, useRef, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { Search, X, Plus, Loader2, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -189,7 +189,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const [shippingService, setShippingService] = useState('')
   const [fees, setFees] = useState<FeeLine[]>([])
   const [orderDiscount, setOrderDiscount] = useState('')
-  latest.current = { lines, orderDiscount, shippingAmount, fees }
+  useEffect(() => { latest.current = { lines, orderDiscount, shippingAmount, fees } }, [lines, orderDiscount, shippingAmount, fees])
 
   const [error, setError] = useState('')
 
