@@ -126,7 +126,7 @@ async function generateSalesOrderPreview(branding: Branding, today: string) {
   return pdfToBuffer(doc)
 }
 
-async function generatePurchaseOrderPreview(branding: Branding, today: string) {
+async function generatePurchaseOrderPreview(branding: Branding, _today: string) {
   const tpl = await getTemplate('purchase_order')
   const tz = await getDisplayTimeZone()
   // The same renderer as the real /api/purchase-order/[id] PDF, fed sample data, so the preview is what a supplier receives.
