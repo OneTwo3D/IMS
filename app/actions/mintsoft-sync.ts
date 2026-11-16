@@ -97,6 +97,7 @@ import {
   type PurchaseOrderLineOutstandingQty,
 } from '@/lib/domain/inventory/po-line-landed-quantity'
 import { lockPurchaseOrders, lockStockTransfers, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { closeAsnShort } from '@/lib/domain/wms/asn-close-short'
 import { loadUnreconciledManualReceiptQty } from '@/lib/domain/wms/manual-receipt-pool'
 import {
   assertPendingAsnReservationStillOurs,
@@ -2860,6 +2861,59 @@ export async function recheckMintsoftAsnBookedIn(
       success: false,
       error: error instanceof Error ? error.message : 'Could not re-check the ASN with the warehouse.',
     }
+  }
+}
+
+/**
+ * o3d-hqvrp.117 — CLOSE A SHORT-DELIVERED PURCHASE-ORDER ASN.
+ *
+ * The supplier has shipped less than the ASN expected and will not send the rest on it. Until closed, the ASN
+ * kept the remainder blocked: no manual receipt, no new ASN, and align-down held for the SKU. Closing releases
+ * it (the units already received stay received; nothing is booked or written off). It is an operator decision:
+ * Mintsoft keeps booking against an ASN in a PARTIALLY BOOKED status, so no remote status says "finished".
+ * See `lib/domain/wms/asn-close-short.ts`. Same permission as the recheck beside it.
+ */
+export async function closeMintsoftAsnShort(
+  externalAsnId: unknown,
+  reason: unknown,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requirePermission('purchasing.receive')
+
+  const parsed = MintsoftExternalAsnIdSchema.safeParse(externalAsnId)
+  if (!parsed.success) {
+    return { success: false, error: getValidationErrorMessage(parsed.error) }
+  }
+  const reasonText = typeof reason === 'string' ? reason.trim() : ''
+  if (reasonText.length < 3 || reasonText.length > 500) {
+    return { success: false, error: 'Give a reason for closing the ASN short (3 to 500 characters).' }
+  }
+
+  try {
+    const result = await db.$transaction(
+      (tx) => closeAsnShort(tx, { connector: 'mintsoft', externalAsnId: parsed.data, now: new Date() }),
+      { maxWait: 5000, timeout: 20000 },
+    )
+    if (result.kind === 'refused') return { success: false, error: result.error }
+
+    await logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: result.purchaseOrderId,
+      tag: 'sync',
+      action: 'mintsoft_asn_closed_short',
+      level: 'WARNING',
+      description: `Closed Mintsoft ASN ${result.externalAsnId} short: ${reasonText}`,
+      metadata: { externalAsnId: result.externalAsnId, reason: reasonText, shortLines: result.shortLines },
+    })
+    revalidatePath('/purchasing')
+    revalidatePath('/sync/exceptions')
+    const shortUnits = result.shortLines.reduce((sum, line) => sum + line.shortQty, 0)
+    return {
+      success: true,
+      message: `ASN ${result.externalAsnId} closed short (${shortUnits} unit(s) not delivered). Receive the remainder by hand or create a new ASN.`,
+    }
+  } catch (error) {
+    console.error(error)
+    return { success: false, error: error instanceof Error ? error.message : 'Could not close the ASN.' }
   }
 }
 

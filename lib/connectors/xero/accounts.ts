@@ -5,6 +5,8 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { xeroGet, xeroGetCached } from './api'
+import { refreshXeroBooksLockDate } from './books-lock-date'
+import { getSettingValue } from '@/lib/settings-store'
 import { XERO_CHART_OF_ACCOUNTS_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
 
@@ -150,6 +152,11 @@ export async function syncChartOfAccounts(
     return { synced: 0, errors: [`Chart of accounts was not stored: ${String(e)}`] }
   }
   if (!fenced.ok) return { synced: 0, errors: [fenced.error] }
+  // Refresh the imported books lock date wherever the chart refreshes (scheduled and manual). Best effort: it
+  // never throws and never changes this result.
+  try {
+    await refreshXeroBooksLockDate(await getSettingValue('xero_books_lock_date'))
+  } catch { /* best effort: the chart result stands whatever this does */ }
   return { synced: fenced.value, errors: [] }
 }
 
