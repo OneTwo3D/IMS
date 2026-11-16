@@ -188,6 +188,34 @@ export function preBatchRefundedNetBase(refunds: DeferralInputs['refunds']): num
 }
 
 /**
+ * ACC-H12 — HOW MUCH OF EACH PRE-BATCH REFUND CAME OUT OF REVENUE THAT A1 ACTUALLY DEFERRED.
+ *
+ * Shipments the batch costed on shipment (before payment) recognised revenue without a journal: that revenue stayed
+ * in Sales, and Group A1 defers only `grossDeferral - shippedRevenue`. A refund entered before A1 takes its value out of
+ * the deferral only up to what was deferred; the rest is a refund of shipped goods, whose revenue is still in Sales
+ * and is reversed by the credit note alone. Refunds consume the not-yet-shipped part first, the same order the refund
+ * service uses, taken in refund-date order, so the split is deterministic and can be recomputed by a rebuild.
+ *
+ * With no shipped revenue the capacity is the whole deferral and every refund is its own deferred part: unchanged.
+ */
+export function preBatchRefundDeferredParts(
+  refunds: DeferralInputs['refunds'],
+  grossDeferral: number,
+  shippedRevenue: number,
+): Array<PreBatchRefundAdjustment & { deferredPart: number }> {
+  const adjustments = preBatchRefundAdjustments(refunds)
+    .slice()
+    .sort((a, b) => ((a.refundedAt?.getTime() ?? 0) - (b.refundedAt?.getTime() ?? 0)) || String(a.refundId).localeCompare(String(b.refundId)))
+  if (!(shippedRevenue > 0)) return adjustments.map((adjustment) => ({ ...adjustment, deferredPart: adjustment.amount }))
+  let capacity = Math.max(0, roundToGlPrecisionNumber(grossDeferral - shippedRevenue))
+  return adjustments.map((adjustment) => {
+    const deferredPart = roundToGlPrecisionNumber(Math.min(adjustment.amount, capacity))
+    capacity = roundToGlPrecisionNumber(capacity - deferredPart)
+    return { ...adjustment, deferredPart }
+  })
+}
+
+/**
  * LOCK every member order and re-derive its deferral; throw if any disagrees with what the batch
  * computed outside the transaction.
  *

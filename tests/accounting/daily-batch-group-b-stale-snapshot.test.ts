@@ -259,9 +259,12 @@ for (const connector of CONNECTORS) {
 
     await runDailyBatchSync()
 
-    // The whole fix, as an order: the first three things Group B does to this window.
+    // ACC-H12: Group B now runs two passes, the costed-on-shipment one first. For this window it probes, finds nothing
+    // of its own and takes no lock, so the ordinary pass's sequence starts one event later.
+    assert.equal(world.events[0], 'probe-window', 'the direct pass only probes')
+    // The whole fix, as an order: the first three things the ordinary pass does to this window.
     assert.deepEqual(
-      world.events.slice(0, 3),
+      world.events.slice(1, 4),
       ['probe-window', 'lock-cost-layers', 'read-window'],
       `Group B must probe, lock, then read: ${JSON.stringify(world.events)}`,
     )

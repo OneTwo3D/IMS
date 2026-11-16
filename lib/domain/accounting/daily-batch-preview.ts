@@ -156,8 +156,10 @@ export async function computeDailyBatchA1A2Preview(): Promise<DailyBatchA1A2Prev
       allocations: {
         select: { productId: true, warehouseId: true, qty: true },
       },
+      _count: { select: { shipments: { where: { status: 'SHIPPED', cogsRelievedFromInventoryAt: { not: null } } } } },
       shipments: {
-        where: { status: 'SHIPPED' },
+        // ACC-H12: shipments costed straight out of Inventory before payment are not A2's to reclassify.
+        where: { status: 'SHIPPED', cogsRelievedFromInventoryAt: null },
         select: {
           lines: {
             select: {
@@ -174,7 +176,7 @@ export async function computeDailyBatchA1A2Preview(): Promise<DailyBatchA1A2Prev
   let a2Total = toDecimal(0)
   const a2Snapshot = await buildPreviewLayerSnapshot(
     a2OrdersRaw.flatMap((order) =>
-      order.shipments.length > 0
+      order.shipments.length > 0 || order._count.shipments > 0
         ? []
         : order.allocations.map((alloc) => ({
             productId: alloc.productId,
@@ -183,7 +185,9 @@ export async function computeDailyBatchA1A2Preview(): Promise<DailyBatchA1A2Prev
     ),
   )
   for (const order of a2OrdersRaw) {
-    const cost = order.shipments.length > 0
+    // An order that already has shipments costed on shipment previews only its remaining shipments: the
+    // allocation rows still hold the units those shipments took, so valuing the rows would count them twice.
+    const cost = order.shipments.length > 0 || order._count.shipments > 0
       ? order.shipments.reduce((sum, shipment) => (
           addMoney(sum, shipment.lines.reduce((lineSum, line) => {
             if (Number(line.qty) <= 0) return lineSum

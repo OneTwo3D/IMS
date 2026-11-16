@@ -5122,6 +5122,22 @@ model Shipment {
   allocatedReliefConnector   String? @map("accounting_allocated_relief_connector")
   allocatedReliefAccountCode String? @map("accounting_allocated_relief_account_code")
 
+  // COGS ON SHIPMENT, PAID OR NOT (ACC-H12). The daily batch posts a shipment's cost when the goods leave. For
+  // an order that has not been deferred yet (not paid, or paid but not yet picked up by Group A1) Group A2 has
+  // not run, so Allocated Inventory holds no debit for the units: the cost is relieved straight out of
+  // Inventory (DR COGS / CR Inventory) and this marker records that it was. Group A2 and Group B read it to skip
+  // units that are already costed, and the refund service reads it to reverse their cost to Inventory, never to
+  // Allocated Inventory. NULL on every shipment costed the ordinary way (DR COGS / CR Allocated Inventory).
+  //
+  //   cogsRelievedFromInventoryAt         the marker: set in the same statement as `shipmentJournalDate`.
+  //   cogsRelievedFromInventoryAmount     the DR COGS / CR Inventory pounds, recorded once and never revalued
+  //                                       (`cogsBatchAmount` is rewritten in place by landed-cost correction).
+  //   cogsRelievedFromInventorySyncLogId  the journal's own AccountingSyncLog id; NULL when the window's rounded
+  //                                       COGS total was zero and no journal line was raised.
+  cogsRelievedFromInventoryAt        DateTime? @map("accounting_cogs_relieved_from_inventory_at")
+  cogsRelievedFromInventoryAmount    Decimal?  @db.Decimal(18, 4) @map("accounting_cogs_relieved_from_inventory_amount")
+  cogsRelievedFromInventorySyncLogId String?   @map("accounting_cogs_relieved_from_inventory_sync_log_id")
+
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
