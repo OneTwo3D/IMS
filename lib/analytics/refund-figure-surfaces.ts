@@ -708,6 +708,55 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     reason:
       'Test fixture seeding ledger fields.',
   },
+  {
+    file: 'app/(dashboard)/purchase-orders/[id]/page.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/[id]/po-detail-client.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/page.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/po-form.tsx',
+    figures: ['marginAmount', 'marginByKey', 'marginPct', 'marginRequestKey', 'showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Renders the PO margin column and order margin box. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/po-page-client.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/actions/purchase-order-margin.ts',
+    figures: ['previewPoLineMargins'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Server action computing the PO margin preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/line-margin.ts',
+    figures: ['computeLineMargin', 'computePoMarginTotal', 'margin', 'marginAmount', 'marginPct'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Pure margin computation for the PO preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
 ]
 
 /** Look a file up. Used by the coverage test and useful from a REPL when triaging a red run. */
