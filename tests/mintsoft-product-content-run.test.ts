@@ -46,6 +46,8 @@ const linkWrites: Row[] = []
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // The product sync reads the identifier-split flag; absent = off, the behaviour this test is about.
+      setting: { findUnique: async () => null },
       externalWmsBinding: { findMany: async () => [{ warehouseId: 'wh-1', warehouse: { code: 'MAIN' } }] },
       product: { findUnique: async () => PRODUCT },
       wmsSyncJob: {

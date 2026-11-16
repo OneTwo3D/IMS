@@ -17,6 +17,7 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createPurchaseOrder, updatePurchaseOrder, getSupplierLastPrices, type PoDetail } from '@/app/actions/purchase-orders'
 import { createSupplier, type SupplierRow } from '@/app/actions/suppliers'
+import { previewPoLineMargins, type PoMarginPreview } from '@/app/actions/purchase-order-margin'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
@@ -41,6 +42,11 @@ type Props = {
   /** Fallback destination country when the receiving warehouse has none. */
   companyHomeCountry?: string | null
   onClose: () => void
+  /**
+   * Internal profit-margin column (o3d-ywzag). The page sets it from `inventory.prices`, the permission that already
+   * guards cost and price figures; the server action re-checks it. Never rendered for a supplier.
+   */
+  showMargin?: boolean
   /**
    * When set, the dialog opens in **edit mode** — prefilled with the saved
    * PO and wired to call `updatePurchaseOrder` on save instead of creating
@@ -174,7 +180,7 @@ function parseDiscount(input: string, lineTotal: number): number {
   return isNaN(abs) ? 0 : abs
 }
 
-export function PoFormDialog({ suppliers, products, warehouses, currencies, taxRates: taxRatesProp, purchaseUnits, companyHomeCountry, onClose, existingPo }: Props) {
+export function PoFormDialog({ suppliers, products, warehouses, currencies, taxRates: taxRatesProp, purchaseUnits, companyHomeCountry, onClose, existingPo, showMargin = false }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const isEditMode = !!existingPo
@@ -664,6 +670,37 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const grandTotalForeign = lineSubtotalForeign + taxTotalForeign + additionalCostTotal
   const grandTotalBase = fxRate === null ? null : grandTotalForeign / fxRate
 
+  // Internal margin preview (o3d-ywzag slice 1, read-only). The server computes on Decimal from the product's list
+  // price; the form only sends what was typed. Debounced, and a stale answer never overwrites a newer one.
+  const [marginPreview, setMarginPreview] = useState<PoMarginPreview | null>(null)
+  const marginRequestKey = showMargin
+    ? JSON.stringify({
+        pricesIncludeVat,
+        fxRate,
+        lines: lines.map((l) => ({
+          key: l.key,
+          productId: l.productId,
+          qty: l.qty,
+          unitCost: l.unitCostForeign,
+          discount: l.discount,
+          purchaseUnitFactor: unitMap[l.purchaseUnitId]?.conversionFactor ?? 1,
+          taxRate: l.taxRateValue,
+        })),
+      })
+    : ''
+  useEffect(() => {
+    if (!showMargin || !marginRequestKey) return
+    let cancelled = false
+    const timer = setTimeout(() => {
+      previewPoLineMargins(JSON.parse(marginRequestKey))
+        .then((r) => { if (!cancelled) setMarginPreview(r) })
+        .catch(() => { if (!cancelled) setMarginPreview({ success: false, error: 'Margin unavailable' }) })
+    }, 300)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [showMargin, marginRequestKey])
+  const marginByKey = new Map((marginPreview && marginPreview.success ? marginPreview.lines : []).map((r) => [r.key, r]))
+  const baseMoney = (n: string) => formatMoney(Number(n), baseCurrency.symbol, baseCurrency.symbolPosition) // decimal-boundary-ok: display-only
+
   const filteredProducts = products.filter((p) => {
     if (!productSearch) return true
     const q = productSearch.toLowerCase()
@@ -967,6 +1004,9 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 <TableHead className="text-xs text-center w-24">Discount</TableHead>
                 <TableHead className="text-xs text-center w-32">VAT</TableHead>
                 <TableHead className="text-xs text-right w-28">Line Total ({sym})</TableHead>
+                {showMargin && (
+                  <TableHead className="text-xs text-right w-44" title="Internal only. Never shown to suppliers.">Margin (internal)</TableHead>
+                )}
                 <TableHead className="w-8" />
               </TableRow>
             </TableHeader>
@@ -1051,6 +1091,43 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                       </div>
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">{money(netForeign)}</TableCell>
+                    {showMargin && (() => {
+                      const row = marginByKey.get(line.key)
+                      const lastPrice = lastPrices[line.productId]
+                      const lastSym = lastPrice ? (symbolMap[lastPrice.currency] ?? lastPrice.currency) : ''
+                      const lastPos = lastPrice ? (positionMap[lastPrice.currency] ?? 'PREFIX') : 'PREFIX'
+                      return (
+                        <TableCell className="text-right text-xs align-top" data-testid="po-line-margin">
+                          {!row ? (
+                            <span className="text-muted-foreground">…</span>
+                          ) : row.result.kind === 'ok' ? (
+                            <div
+                              className={row.result.negative ? 'text-destructive font-medium' : ''}
+                              title="Gross margin = (sales price - cost) / sales price. Sales price: the product's list price, ex-VAT. Cost: the entered unit price, ex-VAT, after the line discount, at this order's exchange rate. Plain unit price: freight, duty and other landed costs are not included."
+                            >
+                              <div className="font-mono flex items-center justify-end gap-1">
+                                {row.result.negative && <AlertTriangle className="h-3 w-3" aria-label="Negative margin" />}
+                                {row.result.marginPct}%
+                              </div>
+                              <div className="font-mono text-[11px] text-muted-foreground">{baseMoney(row.result.marginAmount)} / unit</div>
+                              <div className="font-mono text-[11px] text-muted-foreground">sells {baseMoney(row.result.salesPrice)}</div>
+                            </div>
+                          ) : (
+                            <div className="text-muted-foreground" title={row.result.message}>
+                              <div>—</div>
+                              <div className="text-[11px]">{row.result.message}</div>
+                            </div>
+                          )}
+                          {(row?.currentCostBase || lastPrice) && (
+                            <div className="font-mono text-[11px] text-muted-foreground">
+                              {row?.currentCostBase && <span title="Average landed cost of the stock on hand">cost now {baseMoney(row.currentCostBase)}</span>}
+                              {row?.currentCostBase && lastPrice && ' · '}
+                              {lastPrice && <span title="This supplier's last purchase price, ex-VAT">last {formatMoney(lastPrice.lastUnitCost, lastSym, lastPos)}</span>}
+                            </div>
+                          )}
+                        </TableCell>
+                      )
+                    })()}
                     <TableCell>
                       {!line.locked && (
                         <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
@@ -1063,6 +1140,31 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               })}
             </TableBody>
           </Table>
+        )}
+
+        {showMargin && lines.length > 0 && (
+          <div className="rounded-md border bg-muted/30 p-3 text-xs space-y-1" data-testid="po-margin-total">
+            {marginPreview && marginPreview.success && marginPreview.total.marginPct !== null ? (
+              <div className={`flex flex-wrap justify-between gap-2 ${marginPreview.total.negative ? 'text-destructive font-medium' : ''}`}>
+                <span>
+                  Order margin (internal), {marginPreview.total.includedLines} of {lines.length} line{lines.length === 1 ? '' : 's'}
+                  {marginPreview.total.excludedLines > 0 ? `, ${marginPreview.total.excludedLines} left out` : ''}
+                </span>
+                <span className="font-mono">
+                  {marginPreview.total.negative && <AlertTriangle className="inline h-3 w-3 mr-1" aria-label="Negative margin" />}
+                  {marginPreview.total.marginPct}% · {baseMoney(marginPreview.total.marginAmount)}
+                </span>
+              </div>
+            ) : (
+              <div className="text-muted-foreground">
+                {marginPreview && !marginPreview.success ? marginPreview.error : 'Order margin (internal): no line has a margin yet.'}
+              </div>
+            )}
+            <p className="text-muted-foreground">
+              Internal only; never shown to suppliers. Margin is on the plain unit price (ex-VAT, after line discounts, at this order&apos;s exchange rate),
+              not landed cost, against each product&apos;s list price ex-VAT in {baseCurrency.code}. Lines without a sales price are left out of the total.
+            </p>
+          </div>
         )}
 
         {/* Product search */}

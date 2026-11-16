@@ -3,7 +3,7 @@
  */
 
 import { xeroPost, xeroPut } from './api'
-import { assertXeroLineQuantitiesKept, xeroUnitDpFields, xeroUnitDpRoundingLine } from './write-path'
+import { assertXeroLineQuantitiesKept, planXeroRoundingLine, xeroUnitDpFields, type XeroTaxRateOf } from './write-path'
 import { resolveUnitDpRoundingAccount } from './unit-dp-rounding'
 import { findOrCreateContact } from './contacts'
 import { xeroDocumentRevisionAt } from './document-revision'
@@ -37,11 +37,11 @@ type XeroInvoiceResponse = {
 
 // Exported for unit tests (o3d-q0x56.3): the CurrencyRate decision is made here.
 /** Each line's quantity and exact per-unit price after any line discount, which is folded into the unit price (ACCPAY has no line discount). Quantity is never altered. */
-function billEffectiveLines(data: BillData): Array<{ quantity: number; unitAmount: number }> {
+function billEffectiveLines(data: BillData): Array<{ quantity: number; unitAmount: number; taxType?: string }> {
   return data.lines.map((line: InvoiceLine) => {
     let unitAmount = line.unitAmount
     if (line.discountAmount && line.discountAmount > 0 && line.quantity > 0) unitAmount = Math.max(0, line.unitAmount - line.discountAmount / line.quantity)
-    return { quantity: line.quantity, unitAmount }
+    return { quantity: line.quantity, unitAmount, taxType: line.taxType }
   })
 }
 
@@ -53,6 +53,8 @@ export function buildPurchaseBillPayload(
   baseCurrency: string,
   /** The Rounding account the unitdp=4 penny posts to; required only when the lines need one. */
   roundingAccount?: string | null,
+  /** The effective rate of a Xero tax type, to predict the document's total with tax; needed only when the lines need a rounding adjustment. */
+  taxRateOf?: XeroTaxRateOf,
 ): Record<string, unknown> {
   // o3d-q0x56.3: decided FIRST. A foreign bill with no usable IMS rate THROWS; a base-currency bill with none omits the field, unchanged.
   const xeroCurrencyRate = xeroCurrencyRateOrRefuse({
@@ -83,7 +85,7 @@ export function buildPurchaseBillPayload(
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
     return xeroLine
   })
-  const roundingLine = xeroUnitDpRoundingLine(effectiveLines, roundingAccount, `Purchase bill ${data.invoiceNumber ?? '(no number)'}`)
+  const roundingLine = planXeroRoundingLine({ lines: effectiveLines, lineAmountsIncludeTax: false, account: roundingAccount, rateOf: taxRateOf, what: `Purchase bill ${data.invoiceNumber ?? '(no number)'}` })
   if (roundingLine) lineItems.push(roundingLine)
   assertXeroLineQuantitiesKept(data.lines, lineItems)
 
@@ -122,7 +124,7 @@ async function preparePurchaseBillPayload(
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Purchase bill ${data.invoiceNumber ?? '(no number)'}`,
   })
   if (rateProblem) return { success: false, error: rateProblem }
-  const rounding = await resolveUnitDpRoundingAccount(billEffectiveLines(data), `Purchase bill ${data.invoiceNumber ?? '(no number)'}`)
+  const rounding = await resolveUnitDpRoundingAccount({ lines: billEffectiveLines(data), lineAmountsIncludeTax: false, what: `Purchase bill ${data.invoiceNumber ?? '(no number)'}` })
   if (!rounding.ok) return { success: false, error: rounding.error }
 
   // Find or create the supplier contact
@@ -144,7 +146,7 @@ async function preparePurchaseBillPayload(
   try {
     return {
       success: true,
-      invoice: buildPurchaseBillPayload(data, status, contactResult.contactId, baseCurrency, rounding.account),
+      invoice: buildPurchaseBillPayload(data, status, contactResult.contactId, baseCurrency, rounding.account, rounding.rateOf),
     }
   } catch (error) {
     if (isXeroForeignCurrencyRateError(error) || isXeroPurchaseDocumentTaxTypeError(error)) return { success: false, error: error.message }

@@ -1232,6 +1232,13 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
               <input type="checkbox" checked={s.wc_sync_product_enabled === 'true'} onChange={(e) => setS({ ...s, wc_sync_product_enabled: e.target.checked ? 'true' : 'false' })} className="rounded border-input" />
               <span className="text-sm font-medium">Enable product sync</span>
             </label>
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={s.product_identifier_split_enabled === 'true'} onChange={(e) => setS({ ...s, product_identifier_split_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
+              <div>
+                <span className="text-sm font-medium">Split product identifiers (GTIN / MPN)</span>
+                <p className="text-xs text-muted-foreground">Off by default. When on, IMS sends only a real GTIN to WooCommerce&apos;s GTIN field and the part number to the Yoast MPN field, and writes the GTIN to the warehouse EAN field and the part number to the warehouse UPC field. Applies to both connectors.</p>
+              </div>
+            </label>
             {s.wc_sync_product_enabled === 'true' && (
               <div className="space-y-2">
                 <Label>Direction</Label>
