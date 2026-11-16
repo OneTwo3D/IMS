@@ -22,6 +22,8 @@ export const stockDiscrepancyWhere = (connector: string) => ({ connector, status
 
 /** How many unannounced rows one pass announces (one notification covers them all); the rest follow on the next pass. */
 export const ANNOUNCE_BATCH_LIMIT = 200
+/** Page size when walking an open set or the announcement table, so no query carries an unbounded id list. */
+export const ID_PAGE_SIZE = 500
 
 type IdRow = { id: string }
 
@@ -117,18 +119,14 @@ export async function stillOpenAmong(deps: SourceDeps, key: AnnouncedCategoryKey
   return (await query.run({ id: { in: announced } })).map((row) => row.id)
 }
 
-/**
- * Open rows that have NOT been announced, oldest id first, at most `limit`. The exclusion is done in
- * the database, so rows beyond any earlier batch are reached on the next pass rather than never.
- */
-export async function nextUnannounced(
+/** Ids of open rows with an id greater than `afterId` (null = from the start), oldest first, at most `take`. */
+export async function listOpenAfter(
   deps: SourceDeps,
   key: AnnouncedCategoryKey,
-  announced: string[],
-  limit = ANNOUNCE_BATCH_LIMIT,
+  afterId: string | null,
+  take = ID_PAGE_SIZE,
 ): Promise<string[]> {
   const query = await openQuery(deps, key)
   if (!query) return []
-  const extra = announced.length > 0 ? { id: { notIn: announced } } : {}
-  return (await query.run(extra, limit)).map((row) => row.id)
+  return (await query.run(afterId === null ? {} : { id: { gt: afterId } }, take)).map((row) => row.id)
 }

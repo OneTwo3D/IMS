@@ -4924,6 +4924,19 @@ model Notification {
   @@map("notifications")
 }
 
+/// Which failing source rows the "Needs attention" bell has already announced (one row per category and source row). Operational state
+/// of the announcer, not business data: it starts empty, holds only ids (no personal data), and a row is deleted when its source row is
+/// no longer open, so the same row failing again is announced again. The unique key makes the announcement exactly-once under concurrent
+/// passes: the insert that wins is the one that sends the notification.
+model NeedsAttentionAnnouncement {
+  category    String
+  sourceId    String   @map("source_id")
+  announcedAt DateTime @default(now()) @map("announced_at")
+
+  @@id([category, sourceId])
+  @@map("needs_attention_announcements")
+}
+
 /// Per-user read receipt for notifications.
 /// Broadcast notifications (userId=null) use this table so that marking them
 /// read only affects the calling user, not everyone.

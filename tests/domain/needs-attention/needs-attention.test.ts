@@ -11,7 +11,6 @@ import {
 } from '@/lib/domain/needs-attention/categories'
 import { countsFromSnapshot, createNeedsAttentionLoader, type InboxSummarySlice } from '@/lib/domain/needs-attention/counts'
 import {
-  ANNOUNCED_KEY_PREFIX,
   ANNOUNCE_SPECS,
   announceNeedsAttention,
   type AnnounceDeps,
@@ -31,33 +30,39 @@ type Rows = {
 
 type Notif = { userId: string; title: string; message: string; actionUrl: string }
 
-function makeDb(rows: Rows, settings = new Map<string, string>(), calls = { counts: 0 }) {
+function makeDb(rows: Rows, announcements = new Set<string>(), calls = { counts: 0 }) {
   const notifications: Notif[] = []
   let lock: Promise<void> = Promise.resolve()
   const failures = { notificationInsert: 0 }
   // The fake does not evaluate the real WHERE; it honours only the id filters the announcer adds.
-  const list = (ids: string[]) => async (args: { where?: { AND?: Array<{ id?: { in?: string[]; notIn?: string[] } }> }; take?: number }) => {
+  const list = (ids: string[]) => async (args: { where?: { AND?: Array<{ id?: { in?: string[]; gt?: string } }> }; take?: number }) => {
     const idFilter = args.where?.AND?.[1]?.id
-    let out = ids
+    let out = [...ids].sort()
     if (idFilter?.in) out = out.filter((id) => idFilter.in!.includes(id))
-    if (idFilter?.notIn) out = out.filter((id) => !idFilter.notIn!.includes(id))
+    if (idFilter?.gt !== undefined) out = out.filter((id) => id > idFilter.gt!)
     return (args.take === undefined ? out : out.slice(0, args.take)).map((id) => ({ id }))
   }
   const count = (ids: string[]) => async () => { calls.counts += 1; return ids.length }
-  const settingApi = (store: Map<string, string>) => ({
-    async findUnique({ where }: { where: { key: string } }) {
-      const value = store.get(where.key)
-      return value === undefined ? null : { value }
+  const key = (category: string, sourceId: string) => `${category}|${sourceId}`
+  const announcementApi = (store: Set<string>) => ({
+    async findMany({ where, take }: { where: { category: string; sourceId: { in?: string[]; gt?: string } }; take?: number }) {
+      let ids = [...store].filter((k) => k.startsWith(`${where.category}|`)).map((k) => k.slice(where.category.length + 1)).sort()
+      if (where.sourceId.in) ids = ids.filter((id) => where.sourceId.in!.includes(id))
+      if (where.sourceId.gt !== undefined) ids = ids.filter((id) => id > where.sourceId.gt!)
+      return (take === undefined ? ids : ids.slice(0, take)).map((sourceId) => ({ sourceId }))
     },
-    async createMany({ data }: { data: Array<{ key: string; value: string }> }) {
+    async deleteMany({ where }: { where: { category: string; sourceId: { in: string[] } } }) {
       let n = 0
-      for (const row of data) if (!store.has(row.key)) { store.set(row.key, row.value); n += 1 }
+      for (const id of where.sourceId.in) if (store.delete(key(where.category, id))) n += 1
       return { count: n }
     },
-    async updateMany({ where, data }: { where: { key: string; value: string }; data: { value: string } }) {
-      if (store.get(where.key) !== where.value) return { count: 0 }
-      store.set(where.key, data.value)
-      return { count: 1 }
+    async createManyAndReturn({ data }: { data: Array<{ category: string; sourceId: string }> }) {
+      const inserted: Array<{ sourceId: string }> = []
+      for (const row of data) {
+        const k = key(row.category, row.sourceId)
+        if (!store.has(k)) { store.add(k); inserted.push({ sourceId: row.sourceId }) }
+      }
+      return inserted
     },
   })
   const users = [
@@ -67,34 +72,11 @@ function makeDb(rows: Rows, settings = new Map<string, string>(), calls = { coun
     { id: 'ro', role: 'READONLY' },
     { id: 'sup', role: 'SUPPLIER' },
   ]
-  return {
-    settings,
-    notifications,
-    failures,
-    calls,
-    db: {
-      wmsOrderPushLink: { count: count(rows.push), findMany: list(rows.push) },
-      shoppingSyncLog: { findMany: list(rows.parks) },
-      accountingSyncLog: { count: count(rows.failed), findMany: list(rows.failed) },
-      wmsInboundReceiptEvent: { count: count(rows.reviews), findMany: list(rows.reviews) },
-      wmsStockDiscrepancy: { count: count(rows.discrepancies), findMany: list(rows.discrepancies) },
-      setting: settingApi(settings),
-      // Interactive transaction with rollback semantics (writes land only if the callback resolves),
-      // serialised, modelling the row lock a real compare-and-set takes.
-      async $transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
-        const turn = lock
-        let release!: () => void
-        lock = new Promise<void>((resolve) => { release = resolve })
-        await turn
-        try { return await run(fn) } finally { release() }
-      },
-    },
-  }
   async function run<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
-    const stagedSettings = new Map(settings)
+    const staged = new Set(announcements)
     const stagedNotifications: Notif[] = []
     const tx = {
-      setting: settingApi(stagedSettings),
+      needsAttentionAnnouncement: announcementApi(staged),
       user: { async findMany() { return users } },
       notification: {
         async createMany({ data }: { data: Notif[] }) {
@@ -105,10 +87,33 @@ function makeDb(rows: Rows, settings = new Map<string, string>(), calls = { coun
       },
     }
     const result = await fn(tx)
-    settings.clear()
-    for (const [k, v] of stagedSettings) settings.set(k, v)
+    announcements.clear()
+    for (const k of staged) announcements.add(k)
     notifications.push(...stagedNotifications)
     return result
+  }
+  return {
+    announcements,
+    notifications,
+    failures,
+    calls,
+    db: {
+      wmsOrderPushLink: { count: count(rows.push), findMany: list(rows.push) },
+      shoppingSyncLog: { findMany: list(rows.parks) },
+      accountingSyncLog: { count: count(rows.failed), findMany: list(rows.failed) },
+      wmsInboundReceiptEvent: { count: count(rows.reviews), findMany: list(rows.reviews) },
+      wmsStockDiscrepancy: { count: count(rows.discrepancies), findMany: list(rows.discrepancies) },
+      needsAttentionAnnouncement: announcementApi(announcements),
+      // Interactive transaction with rollback semantics (writes land only if the callback resolves),
+      // serialised to model the lock a unique-key insert takes.
+      async $transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
+        const turn = lock
+        let release!: () => void
+        lock = new Promise<void>((resolve) => { release = resolve })
+        await turn
+        try { return await run(fn) } finally { release() }
+      },
+    },
   }
 }
 
@@ -121,7 +126,7 @@ function announceHarness(rows: Rows, connector: string | null = 'xero') {
     activeAccountingConnector: async () => connector,
     activeWmsConnector: async () => 'wms-a',
   } as unknown as AnnounceDeps
-  return { deps, sent: fake.notifications, settings: fake.settings, fake }
+  return { deps, sent: fake.notifications, announcements: fake.announcements, fake }
 }
 
 // ---- count loader ------------------------------------------------------------------------------
@@ -302,12 +307,12 @@ test('announce: no storm under concurrent passes', async () => {
 })
 
 test('announce: a failure after the claim rolls the claim back and the next pass retries', async () => {
-  const { deps, sent, settings, fake } = announceHarness({ ...emptyRows(), push: ['p1'] })
+  const { deps, sent, announcements, fake } = announceHarness({ ...emptyRows(), push: ['p1'] })
   fake.failures.notificationInsert = 1
   const first = await announceNeedsAttention(deps)
   assert.deepEqual(first.failed, ['wmsPushBlocked'])
   assert.equal(sent.length, 0)
-  assert.equal(settings.has(`${ANNOUNCED_KEY_PREFIX}wmsPushBlocked`), false, 'nothing was claimed')
+  assert.equal(announcements.size, 0, 'nothing was marked announced')
   const second = await announceNeedsAttention(deps)
   assert.deepEqual(second.announced, ['wmsPushBlocked'])
   assert.deepEqual(sent.map((n) => n.userId).sort(), ['admin', 'manager'])
@@ -324,34 +329,47 @@ test('announce: a partial insert failure writes no recipient and the retry reach
 
 test('announce: with no eligible recipient nothing is claimed, so rows are announced once someone exists', async () => {
   const rows = { ...emptyRows(), reviews: ['e1'] }
-  const { deps, sent, settings, fake } = announceHarness(rows)
+  const { deps, sent, announcements, fake } = announceHarness(rows)
   const realDb = fake.db as unknown as { $transaction: (fn: (tx: { user: unknown }) => Promise<unknown>) => Promise<unknown> }
   const original = realDb.$transaction.bind(realDb)
   let empty = true
   realDb.$transaction = (fn) => original((tx) => fn(empty ? { ...(tx as object), user: { findMany: async () => [] } } as { user: unknown } : tx))
   await announceNeedsAttention(deps)
-  assert.equal(settings.has(`${ANNOUNCED_KEY_PREFIX}receiptReviews`), false)
+  assert.equal(announcements.size, 0)
   empty = false
   const result = await announceNeedsAttention(deps)
   assert.deepEqual(result.announced, ['receiptReviews'])
   assert.deepEqual(sent.map((n) => n.userId), ['admin'])
 })
 
-test('announce: 250 open items plus a new one - every row is announced over successive passes, the new one included', async () => {
+test('announce: every row is announced over successive passes in batches of 200', async () => {
   const ids = Array.from({ length: 250 }, (_, i) => `a${String(i).padStart(4, '0')}`)
   const rows = { ...emptyRows(), failed: [...ids] }
   const { deps, sent } = announceHarness(rows)
-  await announceNeedsAttention(deps) // first batch: 200
+  await announceNeedsAttention(deps)
   assert.match(sent.find((n) => n.userId === 'admin')!.message, /^200\+ accounting sync rows failed/)
-  rows.failed.push('zzzz-new') // sorts after every existing id, beyond any earlier batch
   sent.length = 0
-  await announceNeedsAttention(deps) // remaining 50 + the new one
-  const second = sent.filter((n) => n.userId === 'admin')
-  assert.equal(second.length, 1)
-  assert.match(second[0].message, /^51 accounting sync rows failed/)
+  await announceNeedsAttention(deps)
+  assert.match(sent.find((n) => n.userId === 'admin')!.message, /^50 accounting sync rows failed/)
   sent.length = 0
   await announceNeedsAttention(deps)
   assert.equal(sent.length, 0, 'nothing left unannounced')
+})
+
+test('announce: 5,001 open items already announced do not block a new failure (no cap)', async () => {
+  const ids = Array.from({ length: 5001 }, (_, i) => `a${String(i).padStart(5, '0')}`)
+  const rows = { ...emptyRows(), failed: [...ids] }
+  const { deps, sent, announcements } = announceHarness(rows)
+  for (let i = 0; i < 27; i += 1) await announceNeedsAttention(deps) // 5,001 rows / 200 per pass
+  assert.equal(announcements.size, 5001)
+  sent.length = 0
+  rows.failed.push('zzzzz-new')
+  const result = await announceNeedsAttention(deps)
+  assert.deepEqual(result.announced, ['failedAccounting'])
+  const adminMsg = sent.filter((n) => n.userId === 'admin')
+  assert.equal(adminMsg.length, 1)
+  assert.match(adminMsg[0].message, /^1 accounting sync row failed/)
+  assert.equal(announcements.size, 5002)
 })
 
 test('announce: dispatch dead-letters are not re-announced (the sweep already bells them)', () => {

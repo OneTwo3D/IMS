@@ -2,7 +2,8 @@ import { hasPermission, type Permission } from '@/lib/permissions'
 import { NEEDS_ATTENTION_CATEGORIES } from './categories'
 import {
   ANNOUNCE_BATCH_LIMIT,
-  nextUnannounced,
+  ID_PAGE_SIZE,
+  listOpenAfter,
   stillOpenAmong,
   type AnnouncedCategoryKey,
   type SourceDeps,
@@ -12,30 +13,28 @@ import {
  * Bell notifications for the failure categories that did not notify before. One notification per
  * category per pass, only for rows that have not been announced.
  *
- * STATE. One Setting row per category (`needs_attention_announced:<key>`, the Setting-claim
- * convention the dispatch sweep uses) holds the ids already announced. It is a SET rather than a
- * high-water mark because no source here has a monotonic "became failed" timestamp: a FAILED
- * accounting row, a blocked push link or a paused receipt is an EXISTING row that changes state, so
- * its id or createdAt is never newer than a mark when it fails again. The set handles that directly:
- * an id that is no longer open is dropped from it, so the same row failing again is announced again.
+ * STATE. One row per announced item in `needs_attention_announcements` (category, source id), unique
+ * on that pair. It is a set of ids rather than a high-water mark because no source here has a
+ * monotonic "became failed" timestamp: a FAILED accounting row, a blocked push link or a paused
+ * receipt is an EXISTING row that changes state, so its id or createdAt is never newer than a mark
+ * when it fails again. Each pass deletes the announcements whose source row is no longer open, so the
+ * same row failing again is announced again. There is no cap: the table grows with the open set and
+ * shrinks as it clears.
  *
- * COVERAGE. Unannounced rows are found by excluding the set IN THE DATABASE (`id NOT IN announced`),
- * a batch at a time, so rows beyond one batch are announced on the following passes rather than never.
- * The set is capped; at the cap no further rows are recorded (logged), which bounds the stored value.
+ * COVERAGE. The open set is walked in id order a page at a time and checked against the table, so
+ * every unannounced row is reached however many announced ones precede it. One pass announces at most
+ * ANNOUNCE_BATCH_LIMIT rows; the rest follow on the next pass.
  *
- * ATOMICITY. The claim (compare-and-set of the set) and the notification rows are written in ONE
- * transaction, with the recipients read inside it. Any failure rolls the claim back, so nothing is
- * marked announced unless EVERY recipient's row was written, and the next pass retries all of them.
- * Two concurrent passes cannot both win the compare-and-set.
+ * EXACTLY ONCE. In ONE transaction: INSERT the batch ... ON CONFLICT DO NOTHING RETURNING the rows
+ * actually inserted, then write the notifications for those rows only. Of two concurrent passes the
+ * second blocks on the unique key until the first commits, then inserts nothing and notifies nobody.
+ * If the notification insert fails the announcement rows roll back with it, so the next pass retries
+ * every recipient; nothing is marked announced unless every recipient's row was written.
  *
  * NOT covered here, deliberately, because they already bell at the transition: dispatch-sweep dead
  * letters / quarantines / withdrawal holds, the order-reconcile and watchdog sweeps, and the systemic
  * failure incidents.
  */
-export const ANNOUNCED_KEY_PREFIX = 'needs_attention_announced:'
-/** Upper bound on the stored set (about 125 KB of cuids). */
-export const ANNOUNCED_SET_CAP = 5000
-
 type AnnounceSpec = {
   key: AnnouncedCategoryKey
   title: string
@@ -79,11 +78,24 @@ export const ANNOUNCE_SPECS: readonly AnnounceSpec[] = [
   },
 ]
 
+type AnnouncementTable = {
+  findMany(args: {
+    where: { category: string; sourceId: { in: string[] } | { gt: string } }
+    select: { sourceId: true }
+    orderBy?: { sourceId: 'asc' }
+    take?: number
+  }): Promise<Array<{ sourceId: string }>>
+}
+
 /** What one announcement transaction can do; the Prisma transaction client satisfies it. */
 export type AnnounceTx = {
-  setting: {
-    createMany(args: { data: Array<{ key: string; value: string }>; skipDuplicates: true }): Promise<{ count: number }>
-    updateMany(args: { where: { key: string; value: string }; data: { value: string } }): Promise<{ count: number }>
+  needsAttentionAnnouncement: {
+    /** INSERT ... ON CONFLICT DO NOTHING RETURNING: only the rows this call actually inserted come back. */
+    createManyAndReturn(args: {
+      data: Array<{ category: string; sourceId: string }>
+      skipDuplicates: true
+      select: { sourceId: true }
+    }): Promise<Array<{ sourceId: string }>>
   }
   user: {
     findMany(args: { where: { active: true }; select: { id: true; role: true } }): Promise<Array<{ id: string; role: string }>>
@@ -96,23 +108,13 @@ export type AnnounceTx = {
 }
 
 export type AnnounceDb = {
-  setting: AnnounceTx['setting'] & {
-    findUnique(args: { where: { key: string } }): Promise<{ value: string } | null>
+  needsAttentionAnnouncement: AnnouncementTable & {
+    deleteMany(args: { where: { category: string; sourceId: { in: string[] } } }): Promise<{ count: number }>
   }
   $transaction<T>(fn: (tx: AnnounceTx) => Promise<T>): Promise<T>
 }
 
 export type AnnounceDeps = SourceDeps & { db: SourceDeps['db'] & AnnounceDb }
-
-function parseAnnounced(raw: string | null | undefined): string[] {
-  if (!raw) return []
-  try {
-    const parsed: unknown = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : []
-  } catch {
-    return []
-  }
-}
 
 function permissionFor(key: AnnouncedCategoryKey): Permission {
   const category = NEEDS_ATTENTION_CATEGORIES.find((c) => c.key === key)
@@ -140,45 +142,73 @@ export async function announceNeedsAttention(deps: AnnounceDeps): Promise<Announ
   return result
 }
 
-async function announceOne(deps: AnnounceDeps, spec: AnnounceSpec): Promise<boolean> {
-  const settingKey = `${ANNOUNCED_KEY_PREFIX}${spec.key}`
-  const row = await deps.db.setting.findUnique({ where: { key: settingKey } })
-  const previousRaw = row?.value ?? null
-  const announced = parseAnnounced(previousRaw)
-
-  // Rows that cleared are forgotten, so a recurrence is a new transition.
-  const kept = await stillOpenAmong(deps, spec.key, announced)
-  const room = Math.max(0, ANNOUNCED_SET_CAP - kept.length)
-  if (room === 0 && kept.length > 0) console.error(`[needs-attention] ${spec.key}: announced set is at its cap (${ANNOUNCED_SET_CAP}); new rows are not recorded`)
-  const fresh = room > 0 ? await nextUnannounced(deps, spec.key, kept, Math.min(ANNOUNCE_BATCH_LIMIT, room)) : []
-  const nextRaw = JSON.stringify([...kept, ...fresh])
-
-  if (fresh.length === 0) {
-    // Housekeeping only: persist the pruned set. Losing this race is harmless.
-    if (previousRaw !== null && nextRaw !== previousRaw) {
-      await deps.db.setting.updateMany({ where: { key: settingKey, value: previousRaw }, data: { value: nextRaw } })
-    }
-    return false
+/** Delete the announcements whose source row is no longer open, a page at a time. */
+async function pruneCleared(deps: AnnounceDeps, key: AnnouncedCategoryKey): Promise<void> {
+  const table = deps.db.needsAttentionAnnouncement
+  let cursor: string | null = null
+  for (;;) {
+    const page: Array<{ sourceId: string }> = await table.findMany({
+      where: { category: key, sourceId: cursor === null ? { gt: '' } : { gt: cursor } },
+      select: { sourceId: true },
+      orderBy: { sourceId: 'asc' },
+      take: ID_PAGE_SIZE,
+    })
+    if (page.length === 0) return
+    cursor = page[page.length - 1].sourceId
+    const ids = page.map((r) => r.sourceId)
+    const open = new Set(await stillOpenAmong(deps, key, ids))
+    const gone = ids.filter((id) => !open.has(id))
+    if (gone.length > 0) await table.deleteMany({ where: { category: key, sourceId: { in: gone } } })
   }
+}
+
+/** Open rows with no announcement, oldest id first, at most `limit`, found by walking the open set. */
+async function findUnannounced(deps: AnnounceDeps, key: AnnouncedCategoryKey, limit: number): Promise<string[]> {
+  const fresh: string[] = []
+  let cursor: string | null = null
+  while (fresh.length < limit) {
+    const page = await listOpenAfter(deps, key, cursor)
+    if (page.length === 0) break
+    cursor = page[page.length - 1]
+    const known = new Set(
+      (await deps.db.needsAttentionAnnouncement.findMany({
+        where: { category: key, sourceId: { in: page } },
+        select: { sourceId: true },
+      })).map((r) => r.sourceId),
+    )
+    for (const id of page) {
+      if (!known.has(id) && fresh.length < limit) fresh.push(id)
+    }
+  }
+  return fresh
+}
+
+async function announceOne(deps: AnnounceDeps, spec: AnnounceSpec): Promise<boolean> {
+  await pruneCleared(deps, spec.key)
+  const fresh = await findUnannounced(deps, spec.key, ANNOUNCE_BATCH_LIMIT)
+  if (fresh.length === 0) return false
 
   const permission = permissionFor(spec.key)
-  const count = `${fresh.length}${fresh.length >= ANNOUNCE_BATCH_LIMIT ? '+' : ''}`
-  const message = spec.message(count)
 
   return deps.db.$transaction(async (tx) => {
-    // Recipients are read inside the transaction. None means nothing can be told: write nothing, so
-    // the rows stay unannounced until someone eligible exists.
+    // Recipients are read inside the transaction. None means nobody can be told: write nothing, so the
+    // rows stay unannounced until someone eligible exists.
     const users = await tx.user.findMany({ where: { active: true }, select: { id: true, role: true } })
     const recipients = users.filter((u) => hasPermission(u.role, permission))
     if (recipients.length === 0) return false
 
-    const won = previousRaw === null
-      ? (await tx.setting.createMany({ data: [{ key: settingKey, value: nextRaw }], skipDuplicates: true })).count === 1
-      : (await tx.setting.updateMany({ where: { key: settingKey, value: previousRaw }, data: { value: nextRaw } })).count === 1
-    if (!won) return false
+    const inserted = await tx.needsAttentionAnnouncement.createManyAndReturn({
+      data: fresh.map((sourceId) => ({ category: spec.key, sourceId })),
+      skipDuplicates: true,
+      select: { sourceId: true },
+    })
+    // A concurrent pass announced these first: it sent the notification, so this one sends nothing.
+    if (inserted.length === 0) return false
 
-    // One statement for every recipient, in the same transaction as the claim: if it throws, the
-    // claim is rolled back with it and the next pass retries all of them.
+    const count = `${inserted.length}${inserted.length >= ANNOUNCE_BATCH_LIMIT ? '+' : ''}`
+    const message = spec.message(count)
+    // One statement for every recipient, in the same transaction as the announcement rows: if it throws,
+    // they roll back with it and the next pass retries all of them.
     await tx.notification.createMany({
       data: recipients.map((u) => ({
         userId: u.id,
