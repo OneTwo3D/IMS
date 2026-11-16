@@ -4,6 +4,7 @@ import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import {
   getBackorderDemandReport,
   getComponentShortageReport,
+  earliestInboundDateByProduct,
   getReorderReport,
   type ReplenishmentReportClient,
 } from '@/lib/domain/inventory/replenishment-reports'
@@ -1561,4 +1562,19 @@ test('component shortage has no no-claimed-recipe notice when every draft has a 
   }
   const report = await getComponentShortageReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
   assert.equal(report.notices.some((n) => /no claimed recipe/.test(n)), false)
+})
+
+test('earliestInboundDateByProduct uses the line date over the order date and ignores fully received lines', () => {
+  const po = { supplierId: 'supplier-1', expectedDelivery: new Date('2026-06-20T00:00:00.000Z'), destinationWarehouseId: null, supplier }
+  const base = { productId: 'product-1', qty: decimal('10'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), po }
+  const dates = earliestInboundDateByProduct([
+    { ...base, expectedDelivery: new Date('2026-06-05T00:00:00.000Z') },
+    { ...base, expectedDelivery: null },
+    { ...base, productId: 'product-2', expectedDelivery: new Date('2026-06-25T00:00:00.000Z') },
+    { ...base, productId: 'product-3', expectedDelivery: new Date('2026-06-01T00:00:00.000Z'), qtyReceived: decimal('10') },
+    { ...base, productId: 'product-3', expectedDelivery: null },
+  ])
+  assert.equal(dates.get('product-1'), '2026-06-05', 'the line date beats the later order date')
+  assert.equal(dates.get('product-2'), '2026-06-25', 'a later line date is not capped at the order date')
+  assert.equal(dates.get('product-3'), '2026-06-20', 'a received line no longer counts; the other follows the order')
 })

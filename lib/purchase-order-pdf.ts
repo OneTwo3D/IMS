@@ -2,6 +2,7 @@
  * The purchase order PDF: load a real order into the plain `PurchaseOrderDocument` shape and draw it. The Settings > Documents
  * preview draws sample data through the same `renderPurchaseOrderPdf`, so what is previewed is what a supplier receives.
  */
+import { effectiveLineEta, lineEtaDiffersFromHeader } from '@/lib/domain/purchasing/line-eta'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
@@ -87,7 +88,7 @@ export async function loadPurchaseOrderDocument(id: string): Promise<PurchaseOrd
       lines: {
         orderBy: { sortOrder: 'asc' },
         select: {
-          productId: true, description: true, qty: true, purchaseUnitQty: true, unitCostForeign: true, discountAmount: true, totalForeign: true,
+          productId: true, description: true, qty: true, purchaseUnitQty: true, unitCostForeign: true, discountAmount: true, totalForeign: true, expectedDelivery: true,
           purchaseUnit: { select: { abbreviation: true, stockUnitName: true } },
           product: { select: { sku: true, name: true, barcode: true, mpn: true } },
         },
@@ -117,6 +118,8 @@ export async function loadPurchaseOrderDocument(id: string): Promise<PurchaseOrd
     unitCost: Number(l.unitCostForeign),
     discountAmount: Number(l.discountAmount),
     total: Number(l.totalForeign),
+    // Shown only where the line's date differs from the header's; a line that follows the header needs no repeat.
+    deliveryDate: lineEtaDiffersFromHeader(l.expectedDelivery, po.expectedDelivery) ? effectiveLineEta(l.expectedDelivery, po.expectedDelivery) : null,
   }))
   const w = po.destinationWarehouse
   return {
@@ -192,7 +195,7 @@ export async function renderPurchaseOrderPdf(
 
   const flags = poLayoutFlags(po.lines)
   const columns: PdfTableColumn[] = poDocumentColumns(po.currencySymbol, flags)
-  drawTable(doc, columns, poDocumentRows(po.lines, flags), branding)
+  drawTable(doc, columns, poDocumentRows(po.lines, { ...flags, formatDate: (d) => formatDateTime(d, { day: 'numeric', month: 'short', year: 'numeric' }, opts.timeZone) }), branding)
 
   // Totals block, right-aligned under the last column.
   doc.y += 6

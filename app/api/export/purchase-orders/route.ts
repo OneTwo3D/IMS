@@ -22,6 +22,8 @@ const HEADERS = [
   'pricesIncludeVat',
   'supplierRef',
   'expectedDelivery',
+  // Export-only for now: the line's own date (blank = follows expectedDelivery). The importer does not read it yet.
+  'lineExpectedDelivery',
   'orderDiscountForeign',
   'notes',
   // The order's created day (UTC). A SYSTEM import (the first load) prices a foreign order at the end of this day; any other import prices it now.
@@ -48,6 +50,7 @@ export async function GET(req: NextRequest) {
           unitCostForeign: true,
           discountAmount: true,
           discountStr: true,
+          expectedDelivery: true,
           taxRate: { select: { name: true, rate: true } },
           product: { select: { sku: true } },
         },
@@ -78,6 +81,7 @@ export async function GET(req: NextRequest) {
         pricesIncludeVat: 'FALSE',
         supplierRef: po.supplierRef ?? '',
         expectedDelivery: po.expectedDelivery?.toISOString().slice(0, 10),
+        lineExpectedDelivery: l.expectedDelivery?.toISOString().slice(0, 10) ?? '',
         orderDiscountForeign: Number(po.discountAmount ?? 0).toFixed(4),
         notes: po.notes ?? '',
         createdOn: po.createdAt.toISOString().slice(0, 10),

@@ -2581,6 +2581,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 {(po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) && (
                   <TableHead className="px-4 text-xs text-right w-28">Gross Cost (£)</TableHead>
                 )}
+                <TableHead className="px-4 text-xs text-right w-28" title="The line's own date, else the order's Expected Delivery">Expected</TableHead>
                 <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
                 <TableHead className="px-4 text-xs text-right w-20">Received</TableHead>
                 <TableHead className="px-4 text-xs text-right w-20">Returned</TableHead>
@@ -2628,6 +2629,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                       )}
                     </TableCell>
                   )}
+                  <TableCell className="px-4 text-right tabular-nums text-xs whitespace-nowrap" data-testid="po-line-eta">
+                    {line.effectiveDelivery
+                      ? formatDateTime(line.effectiveDelivery, { day: 'numeric', month: 'short', year: 'numeric' })
+                      : '—'}
+                    {line.expectedDelivery && (
+                      <span className="ml-1 text-[10px] text-muted-foreground" title="This line has its own date">(line)</span>
+                    )}
+                  </TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">
                     {money(line.totalForeign)}
                     {line.taxRatePercent != null && po.taxRatePercent != null && Math.abs(line.taxRatePercent - po.taxRatePercent) > 0.0001 && (
@@ -2645,10 +2654,10 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <tfoot className="border-t bg-muted/30 text-sm">
               {(() => {
                 const hasDiscountCol = po.lines.some((l) => l.discountAmount > 0)
-                // Columns before "Total ({sym})": 4 always present (thumbnail, Product,
-                // Qty, Unit Cost {sym}) plus each conditional column. labelSpan must
+                // Columns before "Total ({sym})": 5 always present (thumbnail, Product,
+                // Qty, Unit Cost {sym}, Expected) plus each conditional column. labelSpan must
                 // equal that count so the amount cell lands under the Total header.
-                const labelSpan = 4 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + ((po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) ? 1 : 0)
+                const labelSpan = 5 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + ((po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) ? 1 : 0)
                 // Total discount = sum of line discounts + order-level
                 // discount. The stored `subtotalForeign` is already
                 // post-discount; we surface the breakdown for clarity.

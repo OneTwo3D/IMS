@@ -1,5 +1,6 @@
 'use server'
 
+import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { billTaxCodeDisagreementMessage, billTaxCodeDisagreements, inactiveBillRatesMessage, inactiveOrderRateMessage, inactiveOrderRateName, resolveOrderRateTaxCode, type OrderRateCandidate } from '@/lib/domain/purchasing/order-rate-tax-code'
@@ -212,6 +213,10 @@ export type PoLineRow = {
   qtyToReceive: number  // qty - qtyReceived (still outstanding)
   qtyRemaining: number  // qtyReceived - qtyReturned (net on hand)
   sortOrder: number
+  /** The line's own estimated delivery (ISO), or null when it inherits the order's. */
+  expectedDelivery: string | null
+  /** Line date, else the order's date (lib/domain/purchasing/line-eta.ts). */
+  effectiveDelivery: string | null
   /** Per-line tax rate id (the order/supplier rate, or a per-line override). */
   taxRateId: string | null
   /** Per-line effective rate percentage (0..1). Null when no per-line rate. */
@@ -352,6 +357,8 @@ export type PoLineInput = {
   purchaseUnitQty?: number // qty in purchase units
   unitCostForeign: number // user-entered cost per stock unit (gross if pricesIncludeVat, else net) — pre-discount
   sortOrder?: number
+  /** Optional estimated delivery for this line (YYYY-MM-DD). Blank/omitted = inherit the order's date. */
+  expectedDelivery?: string | null
   /**
    * Optional manual override of the tax rate for this line. When null/omitted
    * the line takes the order/supplier rate (the PO's order-level tax rate).
@@ -485,6 +492,7 @@ const PO_SELECT = {
       qtyReceived: true,
       qtyReturned: true,
       sortOrder: true,
+      expectedDelivery: true,
       taxRateId: true,
       taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
       landedUnitCostBase: true,
@@ -598,10 +606,11 @@ function mapLine(l: {
   qtyReceived: unknown
   qtyReturned: unknown
   sortOrder: number
+  expectedDelivery?: Date | null
   taxRateId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
   product: { sku: string; name: string; imageUrl: string | null; parent?: { imageUrl: string | null } | null }
-}): PoLineRow {
+}, headerEta: Date | null = null): PoLineRow {
   const qty = Number(l.qty)
   const qtyReceived = Number(l.qtyReceived)
   const qtyReturned = Number(l.qtyReturned)
@@ -630,6 +639,8 @@ function mapLine(l: {
     qtyToReceive: Math.max(0, qty - qtyReceived),
     qtyRemaining: Math.max(0, qtyReceived - qtyReturned),
     sortOrder: l.sortOrder,
+    expectedDelivery: l.expectedDelivery?.toISOString() ?? null,
+    effectiveDelivery: effectiveLineEta(l.expectedDelivery, headerEta)?.toISOString() ?? null,
     taxRateId: l.taxRateId ?? l.taxRate?.id ?? null,
     taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null,
     taxRateName: l.taxRate?.name ?? null,
@@ -990,7 +1001,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     }
   })
 
-  const mappedLines = po.lines.map(mapLine).map((line) => {
+  const mappedLines = po.lines.map((line) => mapLine(line, po.expectedDelivery)).map((line) => {
     return {
       ...line,
       grossUnitCostBase: grossUnitCostBaseByLine.get(line.id)?.toNumber() ?? line.unitCostBase,
@@ -1384,6 +1395,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         unitCostBase,
         discountStr: l.discountStr || null,
         discountAmount: discAmt,
+        expectedDelivery: parseLineEtaInput(l.expectedDelivery),
         taxRateId: resolved.taxRateId,
         taxForeign: lineTaxForeign,
         taxBase: lineTaxBase,
@@ -1829,6 +1841,7 @@ export async function updatePurchaseOrder(
             unitCostBase,
             discountStr: l.discountStr ?? null,
             discountAmount: discAmt,
+            expectedDelivery: parseLineEtaInput(l.expectedDelivery),
             taxRateId: resolvedId,
             taxForeign: lineTaxForeign,
             taxBase: lineTaxBase,
@@ -1870,6 +1883,7 @@ export async function updatePurchaseOrder(
                   ...(k.qtyChanged ? { purchaseUnitQty: row.purchaseUnitQty, ...scaleLineDiscountForQty(k.fact, req.qty) } : {}),
                   description: row.description,
                   sortOrder: row.sortOrder,
+                  expectedDelivery: row.expectedDelivery,
                 },
               })
               finalRows.push(scaled)
@@ -1884,7 +1898,7 @@ export async function updatePurchaseOrder(
                 // Unchanged: the stored figures stand. Recomputing under the request's VAT convention can differ by rounding (and
                 // the form sends net prices), and an unchanged save must not move a stored money field.
                 const stored = { totalForeign: k.fact.totalForeign, totalBase: k.fact.totalBase, taxForeign: k.fact.taxForeign, taxBase: k.fact.taxBase }
-                lineUpdates.push({ id: k.fact.id, data: { description: row.description, sortOrder: row.sortOrder } })
+                lineUpdates.push({ id: k.fact.id, data: { description: row.description, sortOrder: row.sortOrder, expectedDelivery: row.expectedDelivery } })
                 finalRows.push(stored)
               } else {
                 lineMoneyChanged = true

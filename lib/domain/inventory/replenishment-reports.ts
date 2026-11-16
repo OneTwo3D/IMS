@@ -1,3 +1,4 @@
+import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
 import { Prisma, ProductType, SalesOrderStatus, StockMovementType } from '@/app/generated/prisma/client'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { db } from '@/lib/db'
@@ -133,6 +134,8 @@ type OpenPoLineRow = {
   qty: DecimalInput
   qtyReceived: DecimalInput
   qtyReturned: DecimalInput
+  /** The line's own estimated delivery; null = it follows `po.expectedDelivery` (effectiveLineEta). */
+  expectedDelivery?: Date | null
   po: {
     supplierId: string
     expectedDelivery: Date | null
@@ -577,6 +580,7 @@ async function loadOpenPoLines(client: ReplenishmentReportClient, filters: Stock
       qty: true,
       qtyReceived: true,
       qtyReturned: true,
+      expectedDelivery: true,
       po: {
         select: {
           supplierId: true,
@@ -610,13 +614,15 @@ function inboundOpenPoByStock(lines: OpenPoLineRow[]): Map<string, Prisma.Decima
   return inbound
 }
 
-function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, string> {
+export function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, string> {
   const dates = new Map<string, Date>()
   for (const line of lines) {
     const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
-    if (qty.lte(0) || !line.po.expectedDelivery) continue
+    // The line's own date wins, else the order's (lib/domain/purchasing/line-eta.ts).
+    const eta = effectiveLineEta(line.expectedDelivery, line.po.expectedDelivery)
+    if (qty.lte(0) || !eta) continue
     const existing = dates.get(line.productId)
-    if (!existing || line.po.expectedDelivery.getTime() < existing.getTime()) dates.set(line.productId, line.po.expectedDelivery)
+    if (!existing || eta.getTime() < existing.getTime()) dates.set(line.productId, eta)
   }
   return new Map([...dates.entries()].map(([key, value]) => [key, dateOnly(value)]))
 }
