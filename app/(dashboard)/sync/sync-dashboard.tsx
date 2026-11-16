@@ -1,7 +1,6 @@
 'use client'
 
 import { Card } from '@/components/ui/card'
-import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
 import { WMS_PANEL_ENTRIES, WmsSyncPanel, listWmsIntegrationCards } from './wms-sync-panel'
@@ -97,14 +96,6 @@ const NON_WMS_CONNECTORS: ConnectorDef[] = [
     available: true,
   },
   {
-    id: 'rest-api',
-    name: 'REST API',
-    description: 'Integrate any system via the One Two Inventory REST API',
-    logo: '',
-    category: 'shopping',
-    available: true,
-  },
-  {
     id: 'xero',
     name: 'Xero',
     description: 'Sync invoices, COGS journals and purchase invoices',
@@ -140,14 +131,6 @@ function wmsConnectorCards(availableWmsConnectorIds: readonly WmsConnectorId[]):
 const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   // eslint-disable-next-line @next/next/no-img-element
   woocommerce: <img src="/images/woocommerce.svg" alt="WooCommerce" className="h-8 object-contain" />,
-  'rest-api': (
-    <div className="h-8 flex items-center gap-2">
-      <svg viewBox="0 0 24 24" className="h-7 w-7 text-primary" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M16 18l6-6-6-6" /><path d="M8 6l-6 6 6 6" />
-      </svg>
-      <span className="text-base font-bold tracking-tight">REST API</span>
-    </div>
-  ),
   // The WMS logos come from the same total record the cards and panels do.
   ...Object.fromEntries(WMS_PANEL_ENTRIES.map((entry) => [entry.id, entry.logo])),
   // eslint-disable-next-line @next/next/no-img-element
@@ -190,81 +173,6 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     if (isWmsConnectorId(connector.id)) return pluginState[connector.id]
     return true
   })
-
-  if (activeConnector === 'rest-api') {
-    const baseUrl = typeof window !== 'undefined' ? window.location.origin : ''
-    const endpoints = [
-      { method: 'GET', path: '/api/v1/products', description: 'List all products' },
-      { method: 'GET', path: '/api/v1/products/:id', description: 'Get product by ID' },
-      { method: 'GET', path: '/api/v1/stock-levels', description: 'List stock levels across warehouses' },
-      { method: 'GET', path: '/api/v1/orders', description: 'List sales orders' },
-      { method: 'GET', path: '/api/v1/orders/:id', description: 'Get order by ID' },
-      { method: 'POST', path: '/api/v1/orders', description: 'Create a sales order' },
-      { method: 'PUT', path: '/api/v1/orders/:id/status', description: 'Update order status' },
-      { method: 'GET', path: '/api/v1/warehouses', description: 'List warehouses' },
-      { method: 'GET', path: '/api/v1/customers', description: 'List customers' },
-      { method: 'POST', path: '/api/v1/stock-adjustments', description: 'Adjust stock levels' },
-    ]
-    return (
-      <div className="space-y-4">
-        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
-          ← Back to Integrations
-        </button>
-        <div className="flex items-center gap-3 mb-2">
-          {CONNECTOR_LOGOS['rest-api']}
-          <div>
-            <h2 className="text-lg font-semibold">REST API</h2>
-            <p className="text-xs text-muted-foreground">Integrate any external system with the One Two Inventory API</p>
-          </div>
-        </div>
-
-        <Card className="p-6 space-y-4">
-          <h3 className="text-base font-semibold">Authentication</h3>
-          <p className="text-sm text-muted-foreground">
-            All API requests require a Bearer token. Generate an API key in Settings → User Management, then include it in the <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono">Authorization</code> header.
-          </p>
-          <div className="bg-muted/50 rounded-lg p-4 font-mono text-xs space-y-1">
-            <p className="text-muted-foreground"># Example request</p>
-            <p>curl -H &quot;Authorization: Bearer YOUR_API_KEY&quot; \</p>
-            <p className="pl-5">{baseUrl}/api/v1/products</p>
-          </div>
-        </Card>
-
-        <Card className="p-6 space-y-4">
-          <h3 className="text-base font-semibold">Available Endpoints</h3>
-          <p className="text-sm text-muted-foreground">
-            Base URL: <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono">{baseUrl}/api/v1</code>
-          </p>
-          <Table className="rounded-md border">
-            <TableHeader className="bg-muted/50">
-              <TableRow>
-                <TableHead className="text-xs w-20">Method</TableHead>
-                <TableHead className="text-xs">Endpoint</TableHead>
-                <TableHead className="text-xs">Description</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {endpoints.map((e, i) => (
-                <TableRow key={i}>
-                  <TableCell>
-                    <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-mono font-medium ${e.method === 'GET' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : e.method === 'POST' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'}`}>
-                      {e.method}
-                    </span>
-                  </TableCell>
-                  <TableCell className="font-mono text-xs">{e.path}</TableCell>
-                  <TableCell className="text-muted-foreground">{e.description}</TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          <p className="text-xs text-muted-foreground">
-            All responses return JSON. List endpoints support <code className="bg-muted px-1 rounded">?limit</code> and <code className="bg-muted px-1 rounded">?offset</code> pagination.
-            The API is under active development — additional endpoints will be added.
-          </p>
-        </Card>
-      </div>
-    )
-  }
 
   if (isAccountingConnectorUiId(activeConnector)) {
     return (

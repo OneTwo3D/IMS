@@ -244,13 +244,14 @@ test('both customer PDFs print the shared view and totals block', () => {
   for (const file of ['app/api/sales-order/[id]/route.ts', 'app/api/invoice/[id]/route.ts']) {
     const src = readFileSync(file, 'utf8')
     assert.match(src, /view\.lines\[i\]\.total\.toFixed\(2\)/, `${file}: lines come from the view`)
-    assert.ok(src.includes('shoppingLinks: so.shoppingLinks,'), `${file}: the basis sees the order's links (WooCommerce is net)`)
-    assert.match(src, /documentTotalsRows\(view, documentVatRows\(/, `${file}: totals come from the shared block`)
-    assert.match(src, /storeCreditForeign: Number\(so\.storeCreditForeign \?\? 0\)/, `${file}: the credit reaches the view`)
-    assert.match(src, /doc\.text\(money\(row\.amount\)/, `${file}: every row's amount is printed`)
+    assert.ok(src.includes('orderDocumentMoney(so)') && src.includes('drawTotalsRows('), `${file}: totals come from the shared helper`)
     assert.match(src, /Price \$\{view\.basisLabel\}/, `${file}: the price column is labelled`)
     assert.match(src, /Total \$\{view\.basisLabel\}/, `${file}: the total column is labelled`)
-  }
+  }  const helper = readFileSync('lib/pdf-order-money.ts', 'utf8')
+  assert.ok(helper.includes('shoppingLinks: so.shoppingLinks,'), "the basis sees the order's links (WooCommerce is net)")
+  assert.match(helper, /documentTotalsRows\(view, documentVatRows\(/, 'totals come from the shared block')
+  assert.match(helper, /storeCreditForeign: n\(so\.storeCreditForeign\)/, 'the credit reaches the view')
+  assert.match(helper, /doc\.text\(money\(row\.amount\)/, "every row's amount is printed")
 })
 
 // [mutation: tolerance of a whole unit; per-line gross without VAT; VAT unrounded; prior refunds of OTHER lines counted; minor units ignored]

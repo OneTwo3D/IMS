@@ -2,6 +2,7 @@
  * Xero HTTP client with automatic token refresh and rate-limit handling.
  */
 
+import { xeroWritePath } from './write-path'
 import { getAccessToken, getStoredTenantBlockReason } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { accountingPostingIntentRefusal } from '@/lib/connectors/accounting-posting-intent'
@@ -832,7 +833,7 @@ async function xeroFetchWithAuth<T = unknown>(
   let url: string
   let init: RequestInit
   try {
-    url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
+    url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${xeroWritePath(method, path)}`
 
     const headers: Record<string, string> = {
       'Authorization': `Bearer ${auth.accessToken}`,

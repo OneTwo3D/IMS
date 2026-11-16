@@ -209,7 +209,9 @@ test(
     const applied = (await snapshotOf(po, line)).stock - stockBefore
     console.log(`# A-D6: dry run shows stockQtyToAdd=${shown}, approved book-in added ${applied}`)
     assert.equal(shown, applied, 'the review and the applied book-in must agree')
-    assert.equal(applied, 6, 'ASN B adds all 6 of its expectation')
+    // o3d-hqvrp.119: an APPROVED over-receipt on a PO line receives the FULL booked quantity (7 against an
+    // expectation of 6), not the clamp. Nothing is double counted: ASN A's 4 are already in `stockBefore`.
+    assert.equal(applied, 7, 'the approved over-receipt adds everything the warehouse booked: 7')
     console.log('# A-D6: evaluated 1 review + approval')
   },
 )

@@ -64,6 +64,8 @@ const WRITERS: Record<string, Record<string, number>> = {
     'lib/domain/sales/refund-basis-backfill.ts': 1, 'lib/domain/sales/refund-service.ts': 7,
     // Stamps `stockCorrectionQueuedAt`, a timestamp: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
     'lib/connectors/woocommerce/sync/refund-stock-correction.ts': 1,
+    // Stamps `deferralAdjustmentRef`, a daily-batch journal reference: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
+    'lib/connectors/xero/daily-sync.ts': 1,
   },
 }
 
