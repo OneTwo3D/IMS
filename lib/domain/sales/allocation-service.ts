@@ -50,7 +50,7 @@ import {
   assertNoSalesInvoicePostingInFlight,
   cancelPendingSalesInvoiceSyncForOrder,
 } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { PermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { PermanentStatusTransitionError, STATUS_GUARD_REFUSAL_PREFIX } from '@/lib/domain/sales/status-transition-errors'
 import {
   validateManualSalesOrderStatusTransition,
   validateSalesOrderStatusTransition,
@@ -2233,6 +2233,12 @@ export async function updateSalesOrderStatusUnderLock(
     targetStatus: SalesOrderStatus
     data?: Prisma.SalesOrderUpdateInput
     bypass?: boolean
+    /**
+     * Asked with the CURRENT status, under the order lock, before anything is written; a non-null answer refuses the
+     * move. For callers that decided from a status they read earlier and write through the bypass (the WooCommerce
+     * status sync): a transition that committed in between must not be overwritten.
+     */
+    guardUnderLock?: (currentStatus: string) => string | null
     beforeUpdate?: (context: {
       tx: Prisma.TransactionClient
       previousStatus: string
@@ -2245,6 +2251,8 @@ export async function updateSalesOrderStatusUnderLock(
     select: { status: true },
   })
   if (!lockedOrder) throw new Error('Order not found')
+  const guardRefusal = input.guardUnderLock?.(lockedOrder.status) ?? null
+  if (guardRefusal) throw new PermanentStatusTransitionError(`${STATUS_GUARD_REFUSAL_PREFIX}${guardRefusal}`)
 
   const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, input.targetStatus, {
     bypass: input.bypass,

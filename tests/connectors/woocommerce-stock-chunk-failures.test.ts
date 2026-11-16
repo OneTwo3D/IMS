@@ -23,6 +23,13 @@ type Fetch = (path: string, params: Record<string, string>) => { data: unknown; 
 type Post = (path: string, body: unknown) => { data: unknown; error?: string }
 let fetchImpl: Fetch = () => ({ data: [] })
 let postImpl: Post = () => ({ data: { update: [] } })
+let ordersImpl: (params: Record<string, string>) => { data: unknown; error?: string } = () => ({ data: [] })
+// The guard's order read wants the X-WP-Total header; a count read (per_page=1) reports the whole list.
+function ordersAnswer(params: Record<string, string>) {
+  const r = ordersImpl(params)
+  if (r.error || !Array.isArray(r.data)) return r
+  return { ...r, totalItems: r.data.length, totalItemsPresent: true, data: params.per_page === '1' ? r.data.slice(0, 1) : r.data }
+}
 
 function modelProxy(name: string) {
   return new Proxy({}, {
@@ -63,7 +70,8 @@ mock.module('@/lib/db', { namedExports: { db: fakeDb } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined, logActivityPersisted: async () => true } })
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
-    wcFetch: async (path: string, params: Record<string, string>) => fetchImpl(path, params),
+    // The unreserved-order guard reads /orders before anything else; no on-hold/processing orders here.
+    wcFetch: async (path: string, params: Record<string, string>) => (path === '/orders' ? ordersAnswer(params) : fetchImpl(path, params)),
     wcPost: async (path: string, body: unknown) => postImpl(path, body),
   },
 })
@@ -74,10 +82,11 @@ const product = (id: string, sku: string, externalProductId: bigint | null) => (
 
 function reset(list: Array<Record<string, unknown>>) {
   settings.clear()
-  for (const [key, value] of Object.entries({ wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_stock_sync_enabled: 'true' })) settings.set(key, value)
+  for (const [key, value] of Object.entries({ wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_stock_sync_enabled: 'true', last_wc_order_sync_at: '2026-11-15T00:00:00.000Z' })) settings.set(key, value)
   candidates = list
   fetchImpl = () => ({ data: [] })
   postImpl = () => ({ data: { update: [] } })
+  ordersImpl = () => ({ data: [] })
 }
 
 async function run(options: { forceAll?: boolean; chunk?: { afterId: string | null; limit: number }; productIds?: string[] } = { forceAll: true, chunk: { afterId: null, limit: 10 } }) {
@@ -308,4 +317,63 @@ test('kit cycle: a kit that contains itself is reported as an error, so the wind
   const result = await run()
   assert.ok(result.errors.length > 0, 'the cycle is reported')
   assert.equal(result.chunk, undefined)
+})
+
+test('WCO-H3: an on-hold order IMS never imported is subtracted from the pushed stock', async () => {
+  reset([product('a', 'S1', BigInt(1))]) // stock 5, nothing reserved
+  ordersImpl = (params) => (!params.status?.includes('on-hold') ? { data: [] } : { data: [{ id: 900, line_items: [{ product_id: 1, variation_id: 0, quantity: 2, sku: 'S1' }] }] })
+  fetchImpl = okPreflight
+  let pushed: Array<{ id: number; stock_quantity: number }> = []
+  postImpl = (_p, body) => { pushed = (body as { update: typeof pushed }).update; return okUpdate([1]) }
+  await run()
+  assert.equal(pushed.length, 1)
+  assert.equal(pushed[0].stock_quantity, 3)
+})
+
+test('WCO-H3: if the on-hold/processing orders cannot be read, NOTHING is pushed', async () => {
+  reset([product('a', 'S1', BigInt(1))])
+  ordersImpl = () => ({ data: null, error: 'WC API error: 500' })
+  fetchImpl = okPreflight
+  let posts = 0
+  postImpl = () => { posts++; return okUpdate([1]) }
+  const result = await run()
+  assert.equal(posts, 0)
+  assert.equal(result.pushed, false)
+  assert.ok(result.errors.some((e) => e.includes('Stock push skipped')))
+})
+
+test('WCO-H3: a multi-unit unimported order is subtracted in full (linked/partial cases are unit-tested in wc-held-orders-stock-guard)', async () => {
+  reset([product('a', 'S1', BigInt(1))]) // stock 5; allocation rows are not modelled by this mock, so coverage is empty
+  ordersImpl = (params) => (!params.status?.includes('on-hold') ? { data: [] } : { data: [{ id: 901, line_items: [{ product_id: 1, variation_id: 0, quantity: 4, sku: 'S1' }] }] })
+  fetchImpl = okPreflight
+  let pushed: Array<{ id: number; stock_quantity: number }> = []
+  postImpl = (_p, body) => { pushed = (body as { update: typeof pushed }).update; return okUpdate([1]) }
+  await run()
+  assert.equal(pushed[0].stock_quantity, 1)
+})
+
+test('WCO-H3: an unimported COMPLETED order inside the cursor window is subtracted too', async () => {
+  reset([product('a', 'S1', BigInt(1))])
+  let completedAfter = ''
+  ordersImpl = (params) => {
+    if (params.status === 'completed') { completedAfter = params.modified_after ?? ''; return { data: [{ id: 950, line_items: [{ product_id: 1, variation_id: 0, quantity: 2, sku: 'S1' }] }] } }
+    return { data: [] }
+  }
+  fetchImpl = okPreflight
+  let pushed: Array<{ id: number; stock_quantity: number }> = []
+  postImpl = (_p, body) => { pushed = (body as { update: typeof pushed }).update; return okUpdate([1]) }
+  await run()
+  assert.equal(pushed[0].stock_quantity, 3)
+  assert.equal(completedAfter, '2026-11-14T00:00:00.000Z') // cursor minus the one-day overlap
+})
+
+test('WCO-H3: with no order-sweep cursor, positive pushes are withheld', async () => {
+  reset([product('a', 'S1', BigInt(1))])
+  settings.delete('last_wc_order_sync_at')
+  fetchImpl = okPreflight
+  let posts = 0
+  postImpl = () => { posts++; return okUpdate([1]) }
+  const result = await run()
+  assert.equal(posts, 0)
+  assert.ok(result.errors.some((e) => e.includes('cursor is missing')))
 })

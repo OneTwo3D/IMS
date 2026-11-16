@@ -1440,6 +1440,43 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {data.wcOrderEdits.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`WooCommerce orders — edited after import (${data.summary.wcOrderEdits})`}
+            detail="These orders were changed in WooCommerce (a line added, removed or swapped, a quantity or the total changed) after IMS imported them. IMS does not rewrite an imported order's lines or total, so it keeps allocating, sending to the warehouse and invoicing the ORIGINAL content. Compare the two orders and decide: amend the IMS order or the warehouse order by hand, or undo the edit in WooCommerce. There is nothing to acknowledge: the row clears itself when a later WooCommerce update shows the two orders agree again."
+            shown={data.wcOrderEdits.length}
+            total={data.summary.wcOrderEdits}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead>What differs</TableHead>
+                <TableHead>Found</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.wcOrderEdits.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell>
+                    {row.orderId ? (
+                      <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>
+                        {row.externalOrderNumber ?? row.orderNumber ?? row.orderId}
+                      </Link>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">—</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[560px]" title={row.detail ?? ''}>{row.detail ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.foundAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
       {data.blockedWcOrders.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading

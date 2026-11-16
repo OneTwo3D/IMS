@@ -27,7 +27,7 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 
 ### FX rate
 
-**One rate means the table rate.** A foreign-currency PO is always raised at the exchange rate held in Settings > Accounting > FX Rates (the `fx_rates` table) for its currency: the latest rate on or before the moment the PO is saved. There is no rate field to type, no override band and no warning: the number the PO form shows is the rate the PO is stored at. A currency with no stored rate cannot be used; the PO is refused with "Missing ... FX rate".
+**One rate means the table rate.** A foreign-currency PO is always raised at the exchange rate held in Settings > Accounting > FX Rates (the `fx_rates` table) for its currency: the latest rate on or before the moment the PO is saved. There is no rate field to type, no override band and no warning: the number the PO form shows is the rate the PO is stored at. The form reads the rate when you choose the currency and shows it with its source and date. A currency with no stored rate cannot be used: the form shows "No exchange rate for <currency> yet: rates come from the store (Aelia)", the base-currency total shows a dash, and **Create Purchase Order** stays disabled until an admin has synced the rates or pinned one on the FX Rates page and you pick the currency again. The rate is never shown or used as 1.
 
 - **A different rate for a deliberate reason** (a forward contract, a supplier-specific rate): an admin pins a **manual override** on Settings > Accounting > FX Rates (the pencil icon). The override is a new row in the table and is the latest rate, so every PO saved after it uses it, and the daily fetch skips that currency until the override is cleared. It applies to all POs in that currency, not to one.
 - **Existing POs keep the rate they were stored with.** A stored rate is never rewritten when the table changes.
@@ -170,6 +170,8 @@ The system refuses to cancel a PO that has had nothing received but already has 
 
 If goods need to be sent back to the supplier, create a purchase return against the original PO. The return reduces stock at the relevant warehouse and records the adjustment.
 
+A supplier return takes stock out at the cost of the **purchase order being returned**, not the warehouse's oldest stock: only the stock attributable to the returned order line can go back (including stock moved to another warehouse by a transfer), so the amount reversed out of inventory matches the supplier credit note. If you try to return more than is still attributable to that line (for example some of it has been sold), the return is refused and tells you how much can be returned.
+
 A return does not strand the rest of the order. While quantity is still due on any line, the order stays **Partially Received** after a return: you can still receive the balance, edit, close or cancel it, and the balance stays in the incoming figures. The order moves to **Partially Returned** or **Returned** only when nothing is left to receive.
 
 
@@ -259,6 +261,8 @@ If a freight PO is added or updated after goods have already been received, the 
 
 - Existing FIFO cost layers from the affected receipts are revalued with the new unit costs.
 - If any of those layers have already been consumed by sales shipments, a COGS revaluation journal is queued for Xero — it reverses the old COGS amount and posts the new one.
+  The extra cost on units already sold is charged to COGS and cleared from **Stock in Transit** (debit COGS, credit Stock in Transit), not taken out of Inventory, so the freight bill's transit debit drains in full and Inventory ends at the cost of the units still on hand.
+- **An order-level discount reduces the unit cost.** Once a discounted order has received stock, its line prices and quantities can no longer be changed (receive or cancel the remaining lines, or raise a new PO). A header discount on a purchase order (for example 10% off the whole order) is spread over its lines, so the cost laid at receipt, shown on the order and used for returns is the discounted cost and the stock value equals the bill.
 - All cost-layer snapshot changes are recorded in the activity log so finance can trace what changed and why.
 - **A credit or zero cost line is applied the same way at receipt and at recalculation.** A cost line with a
   negative amount (a discount or credit from the supplier) reduces the cost spread over the goods it is allocated to,

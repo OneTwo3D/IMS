@@ -2739,7 +2739,7 @@ test('createSalesOrderRefund rejects stock returns for packed shipments', async 
       shipmentJournalDate: null,
       revenueRecognizedAmount: null,
       cogsBatchAmount: null,
-      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [] }],
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }] }],
     }],
   })
 
@@ -2759,7 +2759,7 @@ test('createSalesOrderRefund rejects stock returns for packed shipments', async 
   assert.equal(state.movements.length, 0)
 })
 
-test('createSalesOrderRefund records accounting warnings without fallback stock returns', async () => {
+test('createSalesOrderRefund refuses a stock return whose shipped units have no cost on record', async () => {
   const state = baseState({
     orders: [{
       id: 'order-1',
@@ -2792,13 +2792,12 @@ test('createSalesOrderRefund records accounting warnings without fallback stock 
     creditNotePrefix: 'CN-',
     accountingSettings,
   })
-
-  assert.equal(result.success, true)
-  assert.match(result.success ? result.accountingWarning ?? '' : '', /accounting reversal staging failed/)
-  assert.match(result.success ? result.accountingWarning ?? '' : '', /Cannot reverse COGS/)
-  assert.equal(state.refunds.length, 1)
-  assert.equal(state.refunds[0].accountingRetryRequired, true)
-  assert.match(state.refunds[0].accountingWarning ?? '', /Cannot reverse COGS/)
+  // o3d-hqvrp.32: the shipment has no cost on record (empty snapshot, no dispatch CogsEntry rows), so the
+  // operator's return is REFUSED up front, naming why, instead of restocking costless units and leaving the
+  // accounting to fail later. Nothing is committed.
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : result.error, /cost of the shipped units is not on record/)
+  assert.equal(state.refunds.length, 0)
   assert.equal(state.movements.length, 0)
   assert.equal(state.stockLevels.length, 0)
 })
@@ -3639,6 +3638,7 @@ test('createSalesOrderRefund falls back to shipment snapshot cost when cost laye
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
     reason: 'Customer return after layer cleanup',
     creditNotePrefix: 'CN-',
+    returnWarehouseId: 'warehouse-returns',
     accountingSettings,
   })
 
@@ -4702,7 +4702,7 @@ test('createSalesOrderRefund fallback stock return excludes the current refund f
       shipmentJournalDate: null,
       revenueRecognizedAmount: null,
       cogsBatchAmount: null,
-      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [] }],
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }] }],
     }],
   })
 
@@ -4757,7 +4757,7 @@ test('createSalesOrderRefund rejects restocking a refund line with no shipped so
       shipmentJournalDate: null,
       revenueRecognizedAmount: null,
       cogsBatchAmount: null,
-      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 1, costLayerSnapshot: [] }],
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] }],
     }],
   })
 
@@ -4848,8 +4848,8 @@ test('createSalesOrderRefund keeps same-product refund lines as distinct inbound
       revenueRecognizedAmount: null,
       cogsBatchAmount: null,
       lines: [
-        { id: 'shipment-line-1', lineId: 'line-1', qty: 1, costLayerSnapshot: [] },
-        { id: 'shipment-line-2', lineId: 'line-2', qty: 1, costLayerSnapshot: [] },
+        { id: 'shipment-line-1', lineId: 'line-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
+        { id: 'shipment-line-2', lineId: 'line-2', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
       ],
     }],
   })
@@ -7934,6 +7934,7 @@ const YPKK_WHOLE_LINE_REFUND = {
   lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 10, totalBase: 100 }],
   reason: 'Customer cancelled the rest',
   creditNotePrefix: 'CN-',
+  returnWarehouseId: 'warehouse-returns',
 }
 
 test('o3d-ypkk: refunding a partially-shipped order finds a cost basis for the UNSHIPPED units', async () => {
@@ -8085,6 +8086,7 @@ test('o3d-2sm1: a persist that never lands takes the un-stage down with it', asy
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
     reason: 'Customer cancelled',
     creditNotePrefix: 'CN-',
+    returnWarehouseId: 'warehouse-returns',
     accountingSettings,
   })
 
@@ -8245,6 +8247,7 @@ test('o3d-2sm1 r6: a crash after the staging transaction commits and before queu
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
     reason: 'Customer cancelled',
     creditNotePrefix: 'CN-',
+    returnWarehouseId: 'warehouse-returns',
     accountingSettings,
   })
 
@@ -8867,6 +8870,7 @@ test('o3d-j625: every staged reversal names the chart its account codes came fro
     lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
     reason: 'Customer cancelled',
     creditNotePrefix: 'CN-',
+    returnWarehouseId: 'warehouse-returns',
     accountingSettings,
     activeAccountingConnector: 'xero',
   })
@@ -9293,7 +9297,7 @@ function unshippedRefundState(shippedQty: number, overrides: Partial<State> = {}
           shipmentJournalDate: null,
           revenueRecognizedAmount: null,
           cogsBatchAmount: null,
-          lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: shippedQty, costLayerSnapshot: [] }],
+          lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: shippedQty, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: shippedQty, unitCostBase: 10 }] }],
         }]
       : [],
     ...overrides,
@@ -9400,7 +9404,7 @@ test('[o3d-zvec.21 b2] ship a DIFFERENT line, refund the wholly unshipped one: n
   state.shipments.push({
     id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
     revenueRecognizedAmount: null, cogsBatchAmount: null,
-    lines: [{ id: 'shipment-line-2', lineId: 'line-2', qty: 1, costLayerSnapshot: [] }],
+    lines: [{ id: 'shipment-line-2', lineId: 'line-2', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] }],
   })
   assert.equal(
     state.shipments[0].lines.some((line) => line.lineId === 'line-1'),
@@ -9561,8 +9565,8 @@ test('[o3d-zvec.21 h] two lines of the SAME product: successive refunds of line 
     id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
     revenueRecognizedAmount: null, cogsBatchAmount: null,
     lines: [
-      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
-      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
     ],
   })
   assert.equal(shippedUnits(state), 2, 'PRECONDITION: the product shipped 2 units in total')
@@ -9597,8 +9601,8 @@ test('[o3d-zvec.21 i] an earlier UNLINKED return that took line B\'s unit does n
     id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
     revenueRecognizedAmount: null, cogsBatchAmount: null,
     lines: [
-      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
-      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
     ],
   })
   assert.equal(shippedUnits(state), 2, 'PRECONDITION: A and B each shipped one unit')
@@ -9728,8 +9732,8 @@ for (const variant of ['linked', 'unlinked'] as const) {
       id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
       revenueRecognizedAmount: null, cogsBatchAmount: null,
       lines: [
-        { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
-        { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+        { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
+        { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
       ],
     })
     assert.equal(shippedUnits(state), 2, 'PRECONDITION: two units shipped, one per line')
@@ -9758,8 +9762,8 @@ test('[o3d-zvec.21 n] a line\'s UNSHIPPED share is consumed before the refund mo
     id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
     revenueRecognizedAmount: null, cogsBatchAmount: null,
     lines: [
-      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
-      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] },
     ],
   })
   assert.equal(shippedUnits(state), 2, 'PRECONDITION: A shipped 1 of its 2, B shipped its 1')
@@ -9785,7 +9789,7 @@ test('[o3d-zvec.21 o] an earlier refund that restocked NOTHING is still replayed
   state.shipments.push({
     id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
     revenueRecognizedAmount: null, cogsBatchAmount: null,
-    lines: [{ id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] }],
+    lines: [{ id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }] }],
   })
   assert.equal(shippedUnits(state), 1, 'PRECONDITION: only B\'s unit shipped; A shipped nothing')
 
@@ -10490,9 +10494,8 @@ test('[in transit] a refund that returns nothing (no return warehouse) is not in
   assert.equal(result.success, true)
   assert.equal(state.refunds[0].returnInTransit, false)
   assert.equal(state.returnExpectations, undefined)
-  const { payload, debit } = cogsReversalLines(result)
-  assert.equal(debit?.accountCode, '1200', 'unchanged: nothing is coming back, so nothing sits in transit')
-  assert.equal(payload._returnInTransit, undefined)
+  // o3d-hqvrp.26: nothing is coming back, so the shipped COGS is not reversed at all (no Inventory debit, no transit debit).
+  assert.equal(result.success && result.accountingSyncs.some((entry) => entry.type === 'COGS_REVERSAL'), false)
 })
 
 test('[in transit] ON with accounting off: a document with NO ledger link (nothing sits in transit in the books)', async () => {
@@ -10795,4 +10798,53 @@ test('[q0x56.8] a foreign order with a usable stored rate converts at THAT rate 
   const result = await createSalesOrderRefund(createClient(state), MONETARY_REFUND)
   assert.equal(result.success, true, JSON.stringify(result))
   assert.equal(Number(state.refunds[0].totalForeign), 62.5, '50 base x the booked 1.25')
+})
+
+// o3d-hqvrp.26 — a refund that returns NO stock reverses no shipped COGS (the goods are not back, so there is
+// nothing to put into Inventory). The cost stays expensed, as for a chargeback.
+test('[o3d-hqvrp.26] a refund of shipped units with no stock return posts no COGS reversal and keeps the shipped cost unconsumed', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1', externalOrderNumber: null, orderNumber: 'SO-1', status: 'SHIPPED', fxRateToBase: 1, totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'), allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100, cogsBatchAmount: 20,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }] }],
+    }],
+    costLayers: [],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Goodwill, no return',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.accountingSyncs.some((entry) => entry.type === 'COGS_REVERSAL'), false)
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [], 'no shipped cost consumed: a later refund that returns the unit still has it')
+  assert.equal(state.movements.length, 0)
+})
+
+// o3d-hqvrp.32 — a restocked unit carries the ISSUED cost of the shipment, even when the shipment was never journaled.
+test('[o3d-hqvrp.32] a return of a not-yet-journaled shipment restocks at the dispatch cost with a cost layer', async () => {
+  const state = unshippedRefundState(3)
+  state.shipments[0].lines[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 3, unitCostBase: 7 }]
+  const result = await createSalesOrderRefund(createClient(state), wooRefundInput(2, 4001))
+  assert.equal(result.success, true)
+  assert.equal(stockOnHand(state), 2)
+  assert.equal(state.costLayers.filter((layer) => layer.id.startsWith('return-layer-')).length, 1)
+  assert.equal(Number(state.costLayers.find((layer) => layer.id.startsWith('return-layer-'))?.unitCostBase), 7)
+})
+
+test('[o3d-hqvrp.32] a storefront return whose shipped units have no cost on record is parked with a WARNING, never restocked costless', async () => {
+  const state = unshippedRefundState(3)
+  state.shipments[0].lines[0].costLayerSnapshot = []
+  const result = await createSalesOrderRefund(createClient(state), wooRefundInput(2, 4002))
+  assert.equal(result.success, true)
+  assert.equal(stockOnHand(state), 0)
+  assert.equal(state.refunds[0].returnWarehouseId ?? null, null)
 })

@@ -29,7 +29,7 @@ import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-war
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
-import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer } from '@/lib/cost-layers'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getPoLineAttributableLayerQty } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 // o3d-papk: "how much of this line is still to come" is `qty - LANDED`, not `qty - qtyReceived`. The WMS
 // alignment lands units by crediting wms_asn_line_maps.qtyAccountedViaSnapshot and never writes qtyReceived.
@@ -108,7 +108,7 @@ import {
   queueLandedCostAdjustmentJournals,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
-import { unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import {
   assertFreightTotalNotNegative,
   buildFreightCostLineRows,
@@ -129,6 +129,7 @@ import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancella
 import {
   isPurchaseOrderEditableStatus,
   normaliseCostLinesForCompare,
+  headerDiscountAmendRefusal,
   planLineAmend,
   PO_COST_LINES_PART_RECEIVED_MESSAGE,
   PO_EDIT_REFUSED_STATUS_MESSAGE,
@@ -164,6 +165,7 @@ import {
   settlementAsOfFromInput,
 } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import { fxRateChangedMessage } from '@/lib/currencies/form-fx-rate'
 import { isMissingStoredFxRateError, resolveStoredFxRateToBase } from '@/lib/currencies/stored-document-rate'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
@@ -928,6 +930,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   // THE ONE ALLOCATION, the same one receipt and recalculation use. `freightLinks` is read unfiltered
   // because it also LISTS cancelled freight for the operator, so the COST inputs are filtered here: a
   // cancelled freight PO's lines count toward neither receipt nor recalculation.
+  const headerDiscountFactor = headerDiscountFactorForPo(po)
   const landedAllocation = computeLandedCostForPendingLines({
     lines: po.lines.map((line) => ({
       id: line.id,
@@ -936,6 +939,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       totalBase: line.totalBase,
       landedUnitCostBase: line.landedUnitCostBase,
       weight: line.product?.weight ?? null,
+      headerDiscountFactor,
     })),
     directCostLines: po.freightCostLines.map((costLine) => ({
       id: costLine.id,
@@ -1603,7 +1607,7 @@ function checkAmendHeader(
   return null
 }
 
-export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf' | 'expectedFxRate'>> & { refreshFxRate?: boolean }
+export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf'>> & { refreshFxRate?: boolean }
 
 export async function updatePurchaseOrder(
   id: string,
@@ -1715,6 +1719,10 @@ export async function updatePurchaseOrder(
             asOf: new Date(),
           })
         : Number(locked.fxRateToBase)
+      // The rate the form displayed must be the rate this save uses (the stored rate when the currency is unchanged, the table rate when it changed): a mismatch is refused, nothing written.
+      if (input.expectedFxRate !== undefined && !rateOnlyFxRefresh && input.expectedFxRate !== fxRate) {
+        return { refused: fxRateChangedMessage(input.currency ?? locked.currency, input.expectedFxRate, fxRate) }
+      }
       const inclVat = !!input.pricesIncludeVat
       const vatRate = input.taxRateValue ?? 0
 
@@ -1887,6 +1895,15 @@ export async function updatePurchaseOrder(
             }
           }
           if (plan.create.length > 0 || plan.remove.length > 0) lineMoneyChanged = true
+          // The header discount is spread over the lines (headerDiscountFactorForPo) and the layers laid for received units carry
+          // that spread. Changing a line's value after something has landed changes the spread and nothing revalues the layers
+          // already in stock, so it is refused (the discount amount itself is already frozen by checkAmendHeader).
+          const discountRefusal = headerDiscountAmendRefusal({
+            anyLanded: editFacts.anyLanded,
+            headerDiscountForeign: Number(locked.discountAmount ?? 0),
+            lineMoneyChanged,
+          })
+          if (discountRefusal) return { refused: discountRefusal }
           for (const index of plan.create) finalRows.push(lineData[index]!)
           if (plan.remove.length > 0) {
             await tx.purchaseOrderLine.deleteMany({ where: { poId: id, id: { in: plan.remove.map((l) => l.id) } } })
@@ -2476,6 +2493,7 @@ export async function receivePurchaseOrder(
         select: {
           reference: true,
           status: true,
+          subtotalBase: true,
           lines: {
             select: {
               id: true,
@@ -2528,6 +2546,7 @@ export async function receivePurchaseOrder(
       // THE ONE ALLOCATION (landed-cost-allocation.ts): the same cost recalculation will compute for these
       // units, so a receipt followed by a recalculation with unchanged cost lines posts nothing. A negative
       // landed cost is applied, and the zero floor's footprint comes back in `floors`.
+      const headerDiscountFactor = headerDiscountFactorForPo(currentPo)
       const landedAllocation = computeLandedCostForPendingLines({
         lines: currentPo.lines.map((line) => ({
           id: line.id,
@@ -2536,6 +2555,7 @@ export async function receivePurchaseOrder(
           totalBase: line.totalBase,
           landedUnitCostBase: line.landedUnitCostBase,
           weight: line.product?.weight ?? null,
+          headerDiscountFactor,
         })),
         directCostLines: currentPo.freightCostLines.map((costLine) => ({
           id: costLine.id,
@@ -3212,7 +3232,14 @@ export async function returnPurchaseOrder(
             referenceId: purchaseReturn.id,
           },
         })
-        const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
+        // Only the returned PO line's own layers (or layers a transfer recreated from them): the units going back cost what THIS
+        // order paid, which is what the supplier credit note is for. Taking other orders' layers would value the reversal
+        // differently from the credit and strand the difference in transit, so a return beyond that quantity is refused.
+        const attributableQty = await getPoLineAttributableLayerQty(tx, poLine.productId, rl.warehouseId, rl.poLineId)
+        if (attributableQty.lt(toDecimal(rl.qtyReturned).sub('0.000001'))) {
+          throw new Error(`Cannot return ${rl.qtyReturned} against this order's line: only ${roundQuantity(attributableQty, 6).toNumber()} of the stock in this warehouse is still attributable to it (the rest has been sold, used or came from other orders). Return no more than ${roundQuantity(attributableQty, 6).toNumber()}.`)
+        }
+        const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned, { onlyPoLineId: rl.poLineId })
         await tx.stockMovement.update({
           where: { id: movement.id },
           data: buildStockMovementValueFieldsFromConsumed(consumed, rl.qtyReturned),
