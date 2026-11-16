@@ -1,0 +1,3 @@
+### Purchase order email: sent at most once (mailer / outbox)
+
+- **Fixed:** Purchase order emails are now sent at most once. Once the mail server has been handed the message (the DATA step began), any socket or connection failure, or a timeout at the send deadline, ends the email as Failed with "Outcome unknown" instead of being retried, so a supplier can no longer receive the same PO twice. The PO's activity shows a warning; check with the supplier, then use Email PO to send it again if needed. Failures before the message was handed over (DNS, refused connection, login) are still retried. Other email types are unchanged.

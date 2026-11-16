@@ -2073,6 +2073,7 @@ export async function processPendingEmailOutbox(
           success: answer.success === true,
           permanent: answer.permanent === true,
           invalidRecipient: answer.invalidRecipient === true,
+          unknownOutcome: answer.unknownOutcome === true,
           error: answer.error,
         })
         sendReturned = true
@@ -2406,6 +2407,30 @@ export async function processPendingEmailOutbox(
     )
   }
 
+  // A send whose outcome is UNKNOWN (the message may have been accepted) ends FAILED and is never retried. For a purchase order the operator
+  // must see it ON THE ORDER, so it is recorded on the order's activity at WARNING. After the settlement, and best effort: a failure to
+  // write the note must never reach the row's `catch`, which would requeue it.
+  const recordUnknownOutcomeOnReference = async (
+    email: { id: string; kind: string; referenceType: string | null; referenceId: string | null },
+    reason: string,
+  ): Promise<void> => {
+    if (email.referenceType !== 'PurchaseOrder' || !email.referenceId) return
+    try {
+      await log({
+        entityType: 'PURCHASE_ORDER',
+        entityId: email.referenceId,
+        action: 'email_outcome_unknown',
+        tag: 'purchase',
+        level: 'WARNING',
+        description: `Purchase order email: ${reason} It was not retried. Check with the supplier, then use Email PO to send it again if needed.`,
+        metadata: { emailOutboxId: email.id, kind: email.kind },
+        resolveUser: false,
+      })
+    } catch (logError) {
+      console.error('[email-outbox] failed to record an unknown outcome on the purchase order:', logError)
+    }
+  }
+
   for (const email of pending) {
     const claimedAt = now()
     const token = randomUUID()
@@ -2550,6 +2575,7 @@ export async function processPendingEmailOutbox(
         html: prepared?.html ?? email.html,
         attachments,
         ...(prepared?.sendDeadlineMs ? { deadlineMs: prepared.sendDeadlineMs } : {}),
+        ...(prepared?.singleSend ? { singleSend: true } : {}),
       }
       let sendResult: Awaited<ReturnType<typeof smtp.send>>
       if (prepared?.sendGuard) {
@@ -2562,6 +2588,7 @@ export async function processPendingEmailOutbox(
         if (guarded.unknown !== undefined) {
           // The send may have been accepted but its outcome is unknown: terminal FAILED, never retried; a person re-queues it.
           await refuseRecipient(guarded.unknown, { keepAddress: true })
+          await recordUnknownOutcomeOnReference(email, guarded.unknown)
           continue
         }
         sendResult = guarded.value
@@ -2634,6 +2661,7 @@ export async function processPendingEmailOutbox(
       // see the top of this file and o3d-hpeg — because that part no fence can close.)
       if (settled) result.failed++
       else await recordConflict(claim, 'a failed send', smtp)
+      if (sendResult.unknownOutcome) await recordUnknownOutcomeOnReference(email, sendError ?? 'Outcome unknown')
     } catch (error) {
       const attempts = email.attempts + 1
       const permanentFailure = attempts >= EMAIL_MAX_ATTEMPTS
