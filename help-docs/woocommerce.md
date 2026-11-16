@@ -439,6 +439,10 @@ the cursor can advance, or raise the ceiling for that store.
 the notification is the whole remedy — it reports as *incomplete* rather than complete, and tells you
 to re-run the same dates.
 
+### GTIN and MPN (flag, default OFF)
+
+By default IMS pushes the barcode to WooCommerce's GTIN field whenever it is all digits, and pushes no part number. Setting `product_identifier_split_enabled` (**Sync > Products > Split product identifiers (GTIN / MPN)**, off by default) changes the IMS-to-WooCommerce write only: the GTIN field is then sent only for a real GTIN (valid length and check digit, fewer than four leading zeros), so a zero-padded counter such as `00000287` is no longer sent there, and the product's MPN is written to Yoast's product identifier **MPN** field (`wpseo_global_identifier_values`, or `wpseo_variation_global_identifiers_values` for a variation). WooCommerce itself strips letters from the GTIN field, which is why the part number cannot live there. The same switch governs the Mintsoft EAN/UPC write; see [Warehouse (Mintsoft)](warehouse.md) and [Barcode versus MPN](inventory.md#barcode-versus-mpn). Importing from WooCommerce is not changed by it.
+
 ### What the connector will NOT change
 
 WooCommerce models two product shapes (`simple`, `variable`); IMS models six. A WooCommerce type is therefore an *absence* of information about everything else IMS knows, never an assertion that the product has none — so the import may set a product's type only when the existing IMS row is **SIMPLE**. On any other type the type write is dropped and everything else in the payload (name, price, images, dimensions, trade fields, category, WooCommerce mapping) still applies:

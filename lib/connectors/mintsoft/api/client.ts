@@ -310,7 +310,7 @@ export async function fetchMintsoftReturns(since: Date): Promise<WmsReturnRecord
     .filter((item): item is WmsReturnRecord => Boolean(item))
 }
 
-function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolean): Record<string, unknown> {
+function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolean, omitMpn: boolean): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     SKU: product.sku,
     Name: product.name,
@@ -319,6 +319,9 @@ function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolea
   const customsDescription = clampCustomsDescription(product.customsDescription)
   if (customsDescription) payload.CustomsDescription = customsDescription
   if (!omitBarcode && product.barcode) payload.EAN = product.barcode
+  // The MPN goes to UPC. `product.mpn` is only ever set by the identifier split (flag on), so with the flag off this
+  // line never fires and the payload is exactly what it was.
+  if (!omitMpn && product.mpn) payload.UPC = product.mpn
   if (product.weightKg != null) payload.Weight = product.weightKg
   if (product.heightCm != null) payload.Height = product.heightCm
   if (product.widthCm != null) payload.Width = product.widthCm
@@ -520,7 +523,8 @@ export function buildMintsoftProductUpsertRequest(
 } {
   const externalProductId = options?.externalProductId?.trim() || null
   const omitBarcode = options?.omitBarcode ?? false
-  const payload = buildMintsoftProductPayload(product, omitBarcode)
+  const omitMpn = options?.omitMpn ?? false
+  const payload = buildMintsoftProductPayload(product, omitBarcode, omitMpn)
 
   if (externalProductId) {
     const parsedExternalProductId = /^\d+$/.test(externalProductId)
