@@ -302,6 +302,14 @@ export function provesNoRemoteWmsCall(
   // picking up "…and none may have been dispatched" (o3d-2k5r r3).
   return !wmsCreateOutcomeIsAmbiguous(link)
 }
+/**
+ * Did this create DEFINITELY not reach the warehouse? Only a connector that says so counts: an error carrying `nothingSent: true` (the
+ * outbound-write hold's own class, and any connector error that adopts the flag). Every other failure of a create (a timeout, a 5xx, a
+ * refusal that came back from the far side) may have been honoured, so its outcome is ambiguous and is never retried blind.
+ */
+export function isDefiniteCreateRefusal(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { nothingSent?: unknown }).nothingSent === true
+}
 const DEFAULT_BATCH_SIZE = 25
 /** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
 const EMPTY_ORDER_ID_SET: ReadonlySet<string> = new Set<string>()
@@ -1304,7 +1312,7 @@ export async function runWmsOrderPushSweepCore(
   // broken connector can be told apart. Without a breaker on the port, exhaustion parks inline exactly as it always did.
   const breaker = port.systemicBreaker
   const createPass = { attempted: 0, failed: 0, lastError: null as string | null }
-  const exhaustedCreates: Array<{ orderId: string; orderNumber: string | null; attempts: number; message: string; stamp: Date }> = []
+  const exhaustedCreates: Array<{ orderId: string; orderNumber: string | null; attempts: number; message: string; stamp: Date; definite: boolean }> = []
   const verifyPass = { attempted: 0, failed: 0, lastError: null as string | null }
   let systemicSuppressed = 0
   const exhaustedVerifies: Array<{ linkId: string; orderId: string; externalOrderId: string; attempts: number; message: string; stamp: Date }> = []
@@ -2942,7 +2950,7 @@ export async function runWmsOrderPushSweepCore(
           createPass.failed += 1
           createPass.lastError = message
         }
-        if (deferPark) exhaustedCreates.push({ orderId: order.id, orderNumber: order.orderNumber ?? null, attempts, message, stamp: ts })
+        if (deferPark) exhaustedCreates.push({ orderId: order.id, orderNumber: order.orderNumber ?? null, attempts, message, stamp: ts, definite: isDefiniteCreateRefusal(error) })
         const state: PushState = dead && !deferPark ? 'DEAD_LETTER' : 'PENDING_CREATE'
         // `lastAttemptAt` IS the create dispatch stamp (decideCreateClaim): a stamped PENDING_CREATE link is
         // skipped until its lease expires and then parked AMBIGUOUS_CREATE ("a create may have left"). A
@@ -2970,8 +2978,11 @@ export async function runWmsOrderPushSweepCore(
               )
               .catch(() => {})
           } else {
+            // A create the connector PROVED was not sent leaves no dispatch stamp (so the order is offered again next sweep instead of
+            // lapsing into AMBIGUOUS_CREATE); a parked or about-to-be-decided one keeps it for the compare-and-set.
+            const stamp = isDefiniteCreateRefusal(error) && !dead ? null : ts
             await port
-              .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: ts }, { state, attempts, lastError: message, lastAttemptAt: ts })
+              .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: stamp }, { state, attempts, lastError: message, lastAttemptAt: stamp })
               .catch(() => {})
           }
         }
@@ -3821,6 +3832,20 @@ export async function runWmsOrderPushSweepCore(
     if (create.suppress) {
       systemicSuppressed += exhaustedCreates.length
       console.warn(`[wms-order-push] ${createPass.failed}/${createPass.attempted} creates failed this pass — treated as a connector fault, ${exhaustedCreates.length} exhausted order(s) NOT parked`)
+      // A suppressed order must be able to RECOVER. A link left PENDING_CREATE with its dispatch stamp is skipped until the lease
+      // lapses and is then parked AMBIGUOUS_CREATE: never created again. So where the connector PROVED the create was not sent
+      // (nothingSent), the claim is released here (stamp cleared, compare-and-set on the stamp this pass wrote) and the order is offered
+      // for a fresh create next pass, as a held create is. An AMBIGUOUS failure keeps its stamp and its AMBIGUOUS_CREATE path untouched:
+      // a create that may have landed is never retried blind, breaker or not.
+      for (const exhaustedCreate of exhaustedCreates) {
+        if (!exhaustedCreate.definite) continue
+        try {
+          await port.updateLinkIfCreateClaimOwned?.(exhaustedCreate.orderId, exhaustedCreate.stamp, { state: 'PENDING_CREATE', attempts: exhaustedCreate.attempts, lastError: exhaustedCreate.message, lastAttemptAt: null })
+        } catch (error) {
+          console.error('[wms-order-push] failed to release the create claim of a suppressed order', exhaustedCreate.orderId, error)
+          result.linkWriteErrors += 1
+        }
+      }
     } else {
       for (const exhaustedCreate of exhaustedCreates) {
         const parkData = { state: 'DEAD_LETTER' as const, attempts: exhaustedCreate.attempts, lastError: exhaustedCreate.message, lastAttemptAt: exhaustedCreate.stamp }

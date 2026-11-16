@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import { cronOutcome } from '../lib/ops/cron-outcomes.ts'
 import {
+  decideCreateClaim,
   runWmsOrderPushSweepCore,
   type WmsOrderPushPort,
   type WmsPushCandidate,
@@ -73,9 +74,14 @@ function ladderPort(orders: string[], startAttempts: number, breaker: SystemicFa
     createCandidates: async () => orders
       .filter((id) => links.get(id)!.state === 'PENDING_CREATE')
       .map((id) => candidate(id, links.get(id)!.attempts)),
+    // THE PRODUCTION CLAIM RULE (decideCreateClaim, with its real lease): a stamped PENDING_CREATE link is skipped while the lease is
+    // fresh and parked AMBIGUOUS_CREATE once it lapses; only an unstamped one is claimed.
     claimForCreate: async (orderId, _connector, attemptedAt) => {
-      links.get(orderId)!.lastAttemptAt = attemptedAt
-      return 'CLAIMED'
+      const row = links.get(orderId)!
+      const decision = decideCreateClaim({ state: row.state, lastAttemptAt: row.lastAttemptAt }, attemptedAt)
+      if (decision === 'CLAIM') { row.lastAttemptAt = attemptedAt; return 'CLAIMED' }
+      if (decision === 'PARK_AMBIGUOUS') { row.state = 'AMBIGUOUS_CREATE'; return 'PARKED_AMBIGUOUS' }
+      return 'SKIPPED'
     },
     verifiableLinks: async () => [],
     updatableLinks: async () => [],
@@ -96,6 +102,7 @@ function ladderPort(orders: string[], startAttempts: number, breaker: SystemicFa
       if (row.state !== 'PENDING_CREATE' || row.lastAttemptAt?.getTime() !== stamp.getTime()) return false
       const next = data as Partial<LinkRow>
       Object.assign(row, { state: next.state ?? row.state, attempts: next.attempts ?? row.attempts, lastError: next.lastError ?? row.lastError })
+      if ('lastAttemptAt' in data) row.lastAttemptAt = (data.lastAttemptAt as Date | null) ?? null
       return true
     },
     updateLinkIfState: async () => true,
@@ -110,11 +117,18 @@ function ladderPort(orders: string[], startAttempts: number, breaker: SystemicFa
 let clock = 0
 const NOW = () => new Date(Date.UTC(2026, 10, 16, 0, clock++))
 
-function pushConnector(behaviour: { down: boolean; failOnly?: Set<string> }) {
+type Behaviour = { down: boolean; failOnly?: Set<string>; ambiguous?: boolean; calls?: string[]; created?: string[] }
+
+/** A DEFINITE refusal (the connector proves nothing was sent) unless `ambiguous`, which is a 5xx that may have been honoured. */
+class NotSentError extends Error { readonly nothingSent = true }
+
+function pushConnector(behaviour: Behaviour) {
   return {
     pushOrder: async (input: WmsOrderPushInput): Promise<WmsOrderPushResult> => {
+      behaviour.calls?.push(input.orderNumber)
       const broken = behaviour.down || behaviour.failOnly?.has(input.orderNumber)
-      if (broken) throw new Error('HTTP 500 from the WMS')
+      if (broken) throw behaviour.ambiguous ? new Error('HTTP 500 from the WMS') : new NotSentError('HTTP 400 from the WMS: refused before creating')
+      behaviour.created?.push(input.orderNumber)
       return { externalOrderId: `wms-${input.orderNumber}`, externalOrderNumber: input.orderNumber, status: 'NEW' }
     },
     updateOrder: async () => ({ updated: true, status: 'NEW' }),
@@ -122,7 +136,7 @@ function pushConnector(behaviour: { down: boolean; failOnly?: Set<string> }) {
   }
 }
 
-async function pushPass(connectorBehaviour: { down: boolean; failOnly?: Set<string> }, port: WmsOrderPushPort) {
+async function pushPass(connectorBehaviour: Behaviour, port: WmsOrderPushPort) {
   return runWmsOrderPushSweepCore(pushConnector(connectorBehaviour), 'mintsoft', port, { now: NOW })
 }
 
@@ -359,4 +373,59 @@ test('dispatch: without a breaker the dead-letter is inline, exactly as before',
   const r = await runWmsDispatchSweepCore(h.deps)
   assert.equal(h.parked.size, 3)
   assert.equal(r.systemicSuppressed, 0)
+})
+
+// --- the production claim rule and lease -------------------------------------------------------------------------------------
+
+test('order push: a DEFINITE-refusal outage is retried every pass, suppressed for 5 passes, isolated on the 6th (production claim rule)', async () => {
+  const m = memoryStore()
+  const { port, links } = ladderPort(['1', '2', '3'], 4, m.store)
+  const calls: string[] = []
+  for (let pass = 1; pass <= 5; pass += 1) {
+    const before = calls.length
+    const r = await pushPass({ down: true, calls }, port)
+    assert.equal(calls.length - before, 3, `pass ${pass}: all three were offered a fresh create (the claim was released, not left to lapse into AMBIGUOUS_CREATE)`)
+    assert.equal(r.systemicSuppressed, 3)
+    assert.equal(r.deadLettered, 0)
+    for (const row of links.values()) {
+      assert.equal(row.state, 'PENDING_CREATE')
+      assert.equal(row.lastAttemptAt, null, 'the dispatch stamp was released')
+    }
+  }
+  assert.equal(m.raised.length, 1)
+  const sixth = await pushPass({ down: true, calls }, port)
+  assert.equal(sixth.deadLettered, 3)
+  assert.ok([...links.values()].every((row) => row.state === 'DEAD_LETTER'))
+  assert.equal(m.raised[1].kind, 'escalate')
+})
+
+test('order push: an AMBIGUOUS failure keeps its AMBIGUOUS_CREATE path and is never retried blind', async () => {
+  const m = memoryStore()
+  const { port, links } = ladderPort(['1', '2', '3'], 4, m.store)
+  const calls: string[] = []
+  const first = await pushPass({ down: true, ambiguous: true, calls }, port)
+  assert.equal(first.systemicSuppressed, 3, 'it still counts as a failure for the ratio, and nothing is parked')
+  assert.equal(calls.length, 3)
+  assert.ok([...links.values()].every((row) => row.lastAttemptAt !== null), 'the stamp stands: a create may have landed')
+  // inside the lease: no second create
+  await pushPass({ down: true, ambiguous: true, calls }, port)
+  assert.equal(calls.length, 3, 'a fresh lease is never claimed over')
+  // after the lease lapses: AMBIGUOUS_CREATE, still no create
+  clock += 10
+  await pushPass({ down: true, ambiguous: true, calls }, port)
+  assert.equal(calls.length, 3, 'never retried blind')
+  assert.ok([...links.values()].every((row) => row.state === 'AMBIGUOUS_CREATE'))
+})
+
+test('order push: after a definite-refusal outage the next pass creates every order exactly once', async () => {
+  const m = memoryStore()
+  const { port, links } = ladderPort(['1', '2', '3'], 4, m.store)
+  const created: string[] = []
+  await pushPass({ down: true, created }, port)
+  await pushPass({ down: true, created }, port)
+  const recovered = await pushPass({ down: false, created }, port)
+  assert.equal(recovered.created, 3)
+  assert.deepEqual(created.sort(), ['SO-1', 'SO-2', 'SO-3'], 'each order was created once: no duplicate')
+  assert.equal(m.resolved.length, 1)
+  void links
 })
