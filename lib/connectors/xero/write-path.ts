@@ -66,6 +66,14 @@ export function unitDpLineGap(lines: readonly PricedLine[]): Decimal {
 }
 
 /**
+ * True when 4dp changes the amount of ANY single line. This, not a zero SUM of the gaps, decides whether the document total has to be predicted: gaps of +0.03 on a 20% line and
+ * -0.03 on a 0% line sum to zero but leave Xero's total (tax included) a penny off. Only when no line changes at all is the prediction (and the settings and rate-list reads) skipped.
+ */
+export function unitDpChangesAnyLine(lines: readonly PricedLine[]): boolean {
+  return lines.some((l) => !unitDpLineGap([l]).isZero())
+}
+
+/**
  * THE XERO TAX MODEL USED TO PREDICT A DOCUMENT TOTAL. `rateOf` gives the effective percentage of a Xero tax type (null: not known).
  * NONE is always 0. Everything else comes from the stored Xero tax-rate list (tax-rate-lookup.ts), never from a guess.
  */
@@ -135,7 +143,7 @@ function adjustmentCap(input: XeroRoundingPlanInput): Decimal {
  */
 export function planXeroRoundingLine(input: XeroRoundingPlanInput): Record<string, unknown> | null {
   const { lines, extraLines = [], lineAmountsIncludeTax: inclusive, rateOf, what } = input
-  if (unitDpLineGap(lines).isZero()) return null
+  if (!unitDpChangesAnyLine(lines)) return null
   const toTotalLine = (l: PricedLine & { taxType?: string | null }, unit: number): XeroTotalLine => ({ quantity: l.quantity, unitAmount: unit, taxType: l.taxType, discountAmount: l.discountAmount })
   const imsSide = [...lines.map((l) => toTotalLine(l, l.unitAmount)), ...extraLines]
   const xeroSide = [...lines.map((l) => toTotalLine(l, xeroUnitDpFields(l.quantity, l.unitAmount).UnitAmount)), ...extraLines]

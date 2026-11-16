@@ -188,6 +188,58 @@ test('the poster sends the reconciled document: invoice with 6dp prices posts li
   assert.equal(sent.length, 0)
 })
 
+// ---- offsetting line gaps: a zero SUM of the gaps must not skip the prediction ---------------------------------------------------------
+
+const lineA = () => line({ description: 'A', quantity: 1000, unitAmount: 0.333333 }) // 333.33 -> Xero 333.30: +0.03
+const lineB = (taxType: string) => line({ description: 'B', quantity: 1000, unitAmount: 0.333267, taxType }) // 333.27 -> Xero 333.30: -0.03
+
+test('offsetting gaps at DIFFERENT rates (+0.03 at 20%, -0.03 at 0%): the prediction still runs, the adjustment is 0.01 and the document totals 733.27 (builder and preflight)', async () => {
+  const b = await builders()
+  const { unitDpLineGap, unitDpChangesAnyLine } = await import('@/lib/connectors/xero/write-path')
+  const lines = [lineA(), lineB('ZERORATEDOUTPUT')]
+  assert.equal(unitDpLineGap(lines).toNumber(), 0, 'the summed gap is zero')
+  assert.equal(unitDpChangesAnyLine(lines), true, 'but 4dp changes a line')
+  const items = b.buildSalesInvoicePayload(invoiceOf(lines), 'AUTHORISED', 'c1', new Set(), 'GBP', '860', rateOf).LineItems as Wire[]
+  assert.equal(items.length, 3)
+  assert.deepEqual(items[2], { Description: 'Rounding adjustment', Quantity: 1, UnitAmount: 0.01, AccountCode: '860', TaxType: 'NONE' })
+  assert.equal(xeroTotal(items.slice(0, 2), false), 733.26, 'Xero without the adjustment')
+  assert.equal(xeroTotal(items, false), 733.27)
+  // Without a rate for the 20% line the builder cannot skip: it refuses rather than posting 733.26.
+  assert.throws(() => b.buildSalesInvoicePayload(invoiceOf(lines), 'AUTHORISED', 'c1', new Set(), 'GBP', '860'), /not known/)
+  // The preflight (the poster) does the same, before anything is sent.
+  const { pushSalesInvoice } = await import('@/lib/connectors/xero/invoices')
+  assert.equal((await pushSalesInvoice(invoiceOf(lines), 'AUTHORISED')).success, true)
+  assert.equal(xeroTotal(sent[0]!.body.LineItems as Wire[], false), 733.27)
+  sent.length = 0
+  rateList = { ok: false, error: 'the stored Xero tax-rate list cannot be relied on (XERO_LIST_STALE: too old), so the tax Xero will compute cannot be predicted.' }
+  const refused = await pushSalesInvoice(invoiceOf(lines), 'AUTHORISED')
+  assert.equal(refused.success, false, 'the preflight ran although the summed gap is zero')
+  assert.match(String(refused.error), /XERO_LIST_STALE.*Nothing was sent/)
+  assert.equal(sent.length, 0)
+  roundingAccount = ''
+  rateList = { ok: true, rateOf }
+  const noAccount = await pushSalesInvoice(invoiceOf(lines), 'AUTHORISED')
+  assert.equal(noAccount.success, false)
+  assert.match(String(noAccount.error), /rounding adjustment of 0\.01.*Map a Rounding account/)
+})
+
+test('offsetting gaps at the SAME rate: tax cancels too, the prediction runs (the list is read), no adjustment line is added and it posts', async () => {
+  const b = await builders()
+  const lines = [lineA(), lineB('OUTPUT2')]
+  let asked = 0
+  const spy = (t: string) => { asked++; return rateOf(t) }
+  const items = b.buildSalesInvoicePayload(invoiceOf(lines), 'AUTHORISED', 'c1', new Set(), 'GBP', '860', spy).LineItems as Wire[]
+  assert.ok(asked > 0, 'the prediction ran')
+  assert.equal(items.length, 2, 'no rounding line')
+  assert.equal(xeroTotal(items, false), 799.92)
+  assert.equal(xeroTotal([{ Quantity: 1000, UnitAmount: 0.333333, TaxType: 'OUTPUT2' }, { Quantity: 1000, UnitAmount: 0.333267, TaxType: 'OUTPUT2' }], false), 799.92, 'IMS total is the same')
+  // Needs no Rounding account, because no adjustment is needed.
+  roundingAccount = ''
+  const { pushSalesInvoice } = await import('@/lib/connectors/xero/invoices')
+  assert.equal((await pushSalesInvoice(invoiceOf(lines), 'AUTHORISED')).success, true)
+  assert.equal((sent[0]!.body.LineItems as Wire[]).length, 2)
+})
+
 // ---- the EU VAT shadow report --------------------------------------------------------------------------------------------------------
 
 test('the shadow comparator names the appended rounding line (kind rounding), and the built invoice compares equal to a Xero invoice that carries it', async () => {
