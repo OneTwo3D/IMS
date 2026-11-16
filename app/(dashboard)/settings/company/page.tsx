@@ -11,6 +11,7 @@ import {
 } from '@/app/actions/company'
 import { getCurrencies } from '@/app/actions/currencies'
 import { authorizePage } from '@/lib/auth/server'
+import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
 import { CompanySettingsClient } from './company-client'
 
 export const metadata: Metadata = { title: 'Company Settings' }
@@ -24,7 +25,7 @@ export default async function CompanySettingsPage() {
   if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
   const session = gate.session
-  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies] = await Promise.all([
+  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled] = await Promise.all([
     getOrganisation(),
     getBaseCurrencySettings(),
     getNumberingFormats(),
@@ -33,6 +34,7 @@ export default async function CompanySettingsPage() {
     getDocumentTemplates(),
     getShoppingConnectors(),
     getCurrencies(false),
+    isPurchaseOrderEmailEnabled(),
   ])
 
   return (
@@ -46,6 +48,7 @@ export default async function CompanySettingsPage() {
       shoppingConnectors={shoppingConnectors}
       currencies={currencies}
       testEmailDefault={session.user.email}
+      purchaseOrderEmailEnabled={poEmailEnabled}
     />
   )
 }

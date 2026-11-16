@@ -45,6 +45,7 @@ test('CENSUS 1: every file that RENDERS a PDF document is classified', () => {
     'app/api/manufacturing-order/[id]/route.ts': EXEMPT('manufacturing order: no customer, no sales order'),
     'app/api/credit-note/[id]/route.ts': EXEMPT('credit note for a recorded refund: prints the refund lines and its credit, not an order total'),
     'app/api/rfq/[id]/route.ts': EXEMPT('request for quotation to a supplier: no sales order'),
+    'lib/purchase-order-pdf.ts': EXEMPT('purchase order to a supplier (shared by the route, the email and the preview): no customer, no sales order'),
   }
   const found = grepFiles('createPdfDocument\\(')
   const guarded = Object.values(table).filter((v) => v.guarded).length
