@@ -32,6 +32,11 @@ import { refundCreditsAsGross, type TurnoverBound, type TurnoverRefund } from '@
  *    LEDGER receipt is registered), so the uncovered remainder is treated as received off-ledger at
  *    `paidAt`: receipts = max(customer receipts in base, invoiceGross). Cash paid out is then
  *    subtracted as usual, and an over-payment stays an over-payment.
+ *    KNOWN LIMIT (pre-dates o3d-cdhl, applies to every order): `paidAt` is the CURRENT flag, not a history. An order whose
+ *    paid state was later cleared (a full payment reversal, delete-payment, the Mark Paid toggle) reads as unpaid for every
+ *    `asOf`, so a report dated before the clear no longer treats it as settled by `paidAt`. Only the Payment rows still
+ *    stand for it. The cleared `paidAt` value is not kept anywhere (activity rows are retention-swept and do not carry it), so
+ *    there is no reliable record to derive the earlier state from without a new column.
  *  - A PART REMOVED FROM THE LEDGER (o3d-cdhl): when the accounting ledger no longer holds part of the payment, that
  *    part (`paymentRemovedForeign`, order currency, at the booked rate) comes off the receipts, so the balance owed
  *    includes it from the moment it was recorded.
