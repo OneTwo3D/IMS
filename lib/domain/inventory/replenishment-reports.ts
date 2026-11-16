@@ -3,6 +3,7 @@ import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
+import { projectStockPosition, type InboundArrival, type StockProjectionBasis } from '@/lib/domain/inventory/reorder-timing'
 import { calculateDailyVelocity, saleMovementCogsBase, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
@@ -251,6 +252,24 @@ export type ReorderReportRow = {
   // Always computed (by demand volume) — never null. See computeAbcByVolume.
   abcClass: 'A' | 'B' | 'C'
   urgency: 'critical' | 'reorder' | 'watch'
+  /**
+   * Day (YYYY-MM-DD) projected available stock falls to SAFETY STOCK, stepping each dated open PO in
+   * on its expected delivery. Null when there is no demand or no depletion within the horizon.
+   */
+  requiredReceiptDate: string | null
+  /** requiredReceiptDate minus lead time: the last day a PO can be placed. Null with requiredReceiptDate. */
+  latestPoDate: string | null
+  /** latestPoDate is before today. */
+  latestPoOverdue: boolean
+  timingBasis: StockProjectionBasis
+  /** Unreceived open PO quantity whose expected delivery has passed. Excluded from the dates above. */
+  lateInboundQty: string
+  /** Earliest past expected-delivery date among those late lines, or null. */
+  lateInboundDueDate: string | null
+  /** Why a zero-quantity row is still listed (late PO cover / overdue), else null. */
+  reorderNote: string | null
+  /** First day projected available is at or below zero. */
+  firstShortageDate: string | null
   /**
    * Why this product needs replenishment. Sources are:
    *   - "Direct sales" — average daily demand > 0 from the velocity window
@@ -621,6 +640,35 @@ function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, strin
   return new Map([...dates.entries()].map(([key, value]) => [key, dateOnly(value)]))
 }
 
+/**
+ * Dated open PO quantities per product, ascending by expected delivery. Lines with no
+ * expectedDelivery are EXCLUDED (an unknown arrival cannot rescue a run-out date), so
+ * sum(arrivals) <= inboundOpenPoQty; undatedInboundProductIds reports the gap.
+ */
+function inboundArrivalsByProduct(lines: OpenPoLineRow[]): Map<string, InboundArrival[]> {
+  const byProductDate = new Map<string, Map<string, Prisma.Decimal>>()
+  for (const line of lines) {
+    const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
+    if (qty.lte(0) || !line.po.expectedDelivery) continue
+    const dates = byProductDate.get(line.productId) ?? new Map<string, Prisma.Decimal>()
+    addToMap(dates, dateOnly(line.po.expectedDelivery), qty)
+    byProductDate.set(line.productId, dates)
+  }
+  return new Map([...byProductDate].map(([productId, dates]) => [
+    productId,
+    [...dates].sort(([a], [b]) => a.localeCompare(b)).map(([date, qty]) => ({ date, qty })),
+  ]))
+}
+
+function undatedInboundProductIds(lines: OpenPoLineRow[]): Set<string> {
+  const ids = new Set<string>()
+  for (const line of lines) {
+    const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
+    if (qty.gt(0) && !line.po.expectedDelivery) ids.add(line.productId)
+  }
+  return ids
+}
+
 function demandWindow(now: Date, days: number): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
   const window = defaultUtcDateWindow(now, days)
   return { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
@@ -809,6 +857,10 @@ export async function getReorderReport(
   }
   const warehouseBreakdown = availabilityBreakdownByProduct(stockLevels)
   const inboundByProduct = inboundOpenPoByProduct(openPoLines)
+  const inboundArrivals = inboundArrivalsByProduct(openPoLines)
+  const undatedInboundIds = undatedInboundProductIds(openPoLines)
+  let undatedInboundRows = 0
+  let lateInboundRows = 0
   const velocityByProduct = new Map(calculateDailyVelocity(velocityInputs, window).map((row) => [row.productId, row]))
   const defaultLeadTimeSkus: string[] = []
   const derivedLeadTimeSkus: string[] = []
@@ -1058,14 +1110,43 @@ export async function getReorderReport(
       candidate.targetCoverQty,
       candidate.configuredReorderQty,
     ))
-    // Default view shows only products needing at least one unit; the show-all
-    // toggle / CSV export (includeAll) keeps zero-reorder products too.
-    if (!includeAll && suggestedReorderQty.lt(1)) continue
-    const urgency: ReorderReportRow['urgency'] = candidate.projectedAvailableQty.lte(0)
+    // Date-domain restatement of the reorder point (see reorder-timing.ts). Opening stock is the
+    // warehouse-scoped available quantity; inbound POs are stepped in on their expected delivery.
+    // Rows are never dropped here: every edge case keeps the row with a timing basis.
+    const timing = projectStockPosition({
+      asOf: generatedAt,
+      openingQty: candidate.availableQty,
+      averageDailyDemand: candidate.averageDailyDemand,
+      safetyStockQty: candidate.safetyStockQty,
+      leadTimeDays: candidate.leadTimeDays,
+      inbound: inboundArrivals.get(candidate.product.id) ?? [],
+    })
+
+    // Timing says action is needed even though the quantity is 0 (o3d-s8n.2): the PO date has passed, or
+    // the stock is short today while a late PO is the only cover. Such rows stay in the default view.
+    // The late PO is NOT netted out of the suggestion (it is on order, only late; re-ordering it would
+    // double-buy), so the quantity may be 0 and no draft is generated: chase or cancel the late PO.
+    const hasLatePo = timing.lateInboundQty.gt(0)
+    const shortToday = timing.basis === 'already_below'
+      || (timing.latestPoDate != null && timing.latestPoDate <= dateOnly(generatedAt))
+    const needsAttention = timing.latestPoOverdue || (hasLatePo && shortToday)
+    // Default view shows only products needing at least one unit (or needing attention, above); the
+    // show-all toggle / CSV export (includeAll) keeps zero-reorder products too.
+    if (!includeAll && suggestedReorderQty.lt(1) && !needsAttention) continue
+    const baseUrgency: ReorderReportRow['urgency'] = candidate.projectedAvailableQty.lte(0)
       ? 'critical'
       : candidate.projectedAvailableQty.lte(reorderPoint)
         ? 'reorder'
         : 'watch'
+    // An overdue PO date is urgent whatever the quantity says.
+    const urgency: ReorderReportRow['urgency'] = timing.latestPoOverdue && baseUrgency === 'watch' ? 'reorder' : baseUrgency
+    const reorderNote: string | null = suggestedReorderQty.lt(1) && needsAttention
+      ? (hasLatePo
+        ? 'Covered by a late PO: chase the supplier. IMS does not re-order stock already on order.'
+        : 'Overdue, but dated inbound POs cover the quantity: check they will arrive in time.')
+      : null
+    if (undatedInboundIds.has(candidate.product.id)) undatedInboundRows += 1
+    if (hasLatePo) lateInboundRows += 1
 
     // Supplier-column label policy: BOM rows surface manufacturer info from
     // the latest ProductionOrder; everything else shows the resolved supplier.
@@ -1114,6 +1195,14 @@ export async function getReorderReport(
       suggestedReorderQty: suggestedReorderQty.toString(),
       abcClass: candidate.abcClass,
       urgency,
+      requiredReceiptDate: timing.requiredReceiptDate,
+      latestPoDate: timing.latestPoDate,
+      latestPoOverdue: timing.latestPoOverdue,
+      timingBasis: timing.basis,
+      lateInboundQty: integerQuantityString(timing.lateInboundQty),
+      lateInboundDueDate: timing.lateInboundEarliestDate,
+      reorderNote,
+      firstShortageDate: timing.firstShortageDate,
       neededFor,
     })
   }
@@ -1167,6 +1256,9 @@ export async function getReorderReport(
       'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
       'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
+      'Required receipt is the day projected available stock falls to safety stock (to zero when safety stock is 0): current available, less daily demand, plus each open PO on its expected delivery date (POs already past due are left out and flagged as late). Latest PO date is that day minus the lead time; it is the same statement as the reorder point, in dates. BOM-driven component demand and a manually set reorder point change the reorder point but not these dates.',
+      ...(lateInboundRows > 0 ? [`${lateInboundRows} row(s) have open PO quantity past its expected delivery date (late POs). That stock is not yet received, so it is left out of Required receipt, Latest PO date and Overdue and shown separately as a Late PO badge.`] : []),
+      ...(undatedInboundRows > 0 ? [`${undatedInboundRows} row(s) have open PO quantity with no expected delivery date. Those quantities are counted in Inbound PO but excluded from the dates, because an unknown arrival cannot rescue a run-out date.`] : []),
       ...(unplannedBomSkus.length > 0 ? [`No claimed recipe: component demand not planned for ${unplannedBomSkus.length} BOM product(s) that need building: ${unplannedBomSkus.slice(0, 10).join(', ')}${unplannedBomSkus.length > 10 ? ', ...' : ''}. Import or claim a recipe for them.`] : []),
       ...(derivedLeadTimeSkus.length > 0 ? [`Supplier/category median lead time used for ${derivedLeadTimeSkus.length} SKU(s) with no configured or observed lead time of their own: ${derivedLeadTimeSkus.slice(0, 10).join(', ')}${derivedLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
       ...(defaultLeadTimeSkus.length > 0 ? [`Default ${DEFAULT_LEAD_TIME_DAYS}-day lead time used for ${defaultLeadTimeSkus.length} SKU(s) with no configured/observed lead time and no supplier or category peers to derive one from: ${defaultLeadTimeSkus.slice(0, 10).join(', ')}${defaultLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
