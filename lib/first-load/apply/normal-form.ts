@@ -282,15 +282,16 @@ function enteredLineAmount(qty: Dec, unitCost: Dec, discount: Dec): Dec {
 }
 
 /** The line fields that do not depend on the tax token, as the prefix of the line string. */
-function linePrefix(parts: { sku: string; qty: Dec; amount: Dec; discount: Dec; discountStr: string }): string {
-  return [parts.sku.toUpperCase(), fmtFixed(parts.qty, 4), fmtFixed(parts.amount, 4), fmtFixed(parts.discount, 4), parts.discountStr.trim()].join('|')
+function linePrefix(parts: { sku: string; qty: Dec; amount: Dec; discount: Dec; discountStr: string; eta: string }): string {
+  // `eta` is the line's own delivery day (YYYY-MM-DD) or '' when the line follows the order's date.
+  return [parts.sku.toUpperCase(), fmtFixed(parts.qty, 4), fmtFixed(parts.amount, 4), fmtFixed(parts.discount, 4), parts.discountStr.trim(), parts.eta].join('|')
 }
 
 /** One FILE line as a string (the caller has already parsed and range-checked qty and unit cost). */
 export function purchaseOrderLine(cells: CellRecord, qty: Dec, unitCost: Dec): string {
   const discountParsed = parseDecimal(cell(cells, 'lineDiscountForeign'), 'discount', { maxIntDigits: 18, maxDp: 8 }, { allowNegative: true })
   const discount = discountParsed.ok && discountParsed.value.gt(new D(0)) ? discountParsed.value : new D(0)
-  const prefix = linePrefix({ sku: cell(cells, 'sku'), qty, amount: enteredLineAmount(qty, unitCost, discount), discount, discountStr: cell(cells, 'lineDiscountStr') })
+  const prefix = linePrefix({ sku: cell(cells, 'sku'), qty, amount: enteredLineAmount(qty, unitCost, discount), discount, discountStr: cell(cells, 'lineDiscountStr'), eta: cell(cells, 'lineExpectedDelivery').trim() })
   return `${prefix}|${fileLineTaxToken(cells)}`
 }
 
@@ -321,6 +322,8 @@ export interface DbPurchaseOrder {
     taxForeign: DecimalLike
     discountAmount: DecimalLike
     discountStr: string | null
+    /** The line's own delivery date; null when it follows the order's. */
+    expectedDelivery?: Date | null
     taxRate: { name: string; rate: DecimalLike; /** Digest of the rate's accounting profile as it is now. */ profileDigest?: string } | null
   }>
 }
@@ -362,7 +365,7 @@ export function purchaseOrderFingerprintFromDb(columns: readonly string[], po: D
   const stored = po.lines.map((line) => {
     const total = new D(line.totalForeign.toFixed())
     const amount = po.pricesIncludeVat ? total.plus(new D(line.taxForeign.toFixed())) : total
-    const prefix = linePrefix({ sku: line.product.sku, qty: new D(line.qty.toFixed()), amount, discount: new D(line.discountAmount.toFixed()), discountStr: line.discountStr ?? '' })
+    const prefix = linePrefix({ sku: line.product.sku, qty: new D(line.qty.toFixed()), amount, discount: new D(line.discountAmount.toFixed()), discountStr: line.discountStr ?? '', eta: line.expectedDelivery ? line.expectedDelivery.toISOString().slice(0, 10) : '' })
     const name = line.taxRate ? line.taxRate.name.trim().toLowerCase() : null
     const digest = line.taxRate?.profileDigest ?? null
     const rate4 = line.taxRate ? fmtFixed(new D(line.taxRate.rate.toFixed()), 4) : null

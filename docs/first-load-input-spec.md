@@ -600,10 +600,10 @@ transferKey,fromWarehouseCode,toWarehouseCode,status,sku,qty,notes
 Importer: `importPurchaseOrdersCsv` (app/actions/import.ts). Template: `app/api/export/purchase-orders/route.ts`. Orders are created as DRAFT by the importer and stay DRAFT.
 
 ```text
-orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,unitCostForeign,lineDiscountForeign,lineDiscountStr,taxRateName,taxRateValue,orderTaxRateName,orderTaxRateValue,pricesIncludeVat,supplierRef,expectedDelivery,orderDiscountForeign,notes,createdOn
+orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,unitCostForeign,lineDiscountForeign,lineDiscountStr,taxRateName,taxRateValue,orderTaxRateName,orderTaxRateValue,pricesIncludeVat,supplierRef,expectedDelivery,lineExpectedDelivery,orderDiscountForeign,notes,createdOn
 ```
 
-`createdOn` (the last column) is the order's created day, written only for a foreign-currency order: a SYSTEM import (the apply runner) prices the order at the END of that day, so the stored rate is the `fx_rates` rate at that instant. The importer takes NO rate from the file: a stated `fxRateToBase` that is not exactly that table rate refuses the order (a web import ignores `createdOn` and is held to the rate now). The apply rail `po-fx-rate` checks the same equality, decimal-exact, with no tolerance and no comparison with today's rate.
+`lineExpectedDelivery` is an optional per-line YYYY-MM-DD date (blank = the line follows `expectedDelivery`); the first-load transform leaves it blank. `createdOn` (the last column) is the order's created day, written only for a foreign-currency order: a SYSTEM import (the apply runner) prices the order at the END of that day, so the stored rate is the `fx_rates` rate at that instant. The importer takes NO rate from the file: a stated `fxRateToBase` that is not exactly that table rate refuses the order (a web import ignores `createdOn` and is held to the rate now). The apply rail `po-fx-rate` checks the same equality, decimal-exact, with no tolerance and no comparison with today's rate.
 
 `tests/first-load/importer-headers.test.ts` reads each route's source with the TypeScript parser and compares the list passed to `buildTemplateCsv(...)` with these, so a renamed header on either side fails the test.
 

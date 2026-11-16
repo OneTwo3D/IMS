@@ -25,6 +25,11 @@ export type PoDocumentLine = {
   discountAmount: number
   /** The line's net total. */
   total: number
+  /**
+   * The line's delivery date, set ONLY when it differs from the order's header date (lib/domain/purchasing/line-eta.ts); null/omitted
+   * when the line simply follows the header. Any line carrying one switches the "Delivery" column on for the whole document.
+   */
+  deliveryDate?: Date | null
 }
 
 export type PoDocumentTotals = {
@@ -48,7 +53,7 @@ export type PoTotalsRow = { label: string; amount: string; strong?: boolean; mut
 const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100
 
 /** Page content width is 495pt (A4 less 50pt margins); the columns below add up to it. */
-export function poDocumentColumns(symbol: string, opts: { showSupplierSku: boolean; showPurchaseUnits: boolean }): PoColumn[] {
+export function poDocumentColumns(symbol: string, opts: { showSupplierSku: boolean; showPurchaseUnits: boolean; showLineEta?: boolean }): PoColumn[] {
   const cols: PoColumn[] = [
     { label: '#', width: 22, align: 'right' },
     { label: 'SKU', width: 62 },
@@ -58,6 +63,7 @@ export function poDocumentColumns(symbol: string, opts: { showSupplierSku: boole
   cols.push({ label: 'Barcode / EAN', width: 66 })
   cols.push({ label: 'Qty', width: opts.showPurchaseUnits ? 64 : 40, align: 'right' })
   cols.push({ label: opts.showPurchaseUnits ? `Cost/unit (${symbol})` : `Unit cost (${symbol})`, width: 56, align: 'right' })
+  if (opts.showLineEta) cols.push({ label: 'Delivery', width: 56, align: 'right' })
   cols.push({ label: `Total (${symbol})`, width: 56, align: 'right' })
   const fixed = cols.reduce((s, c) => s + c.width, 0)
   const product = cols.find((c) => c.label === 'Product')!
@@ -75,19 +81,23 @@ export function formatPoQty(line: Pick<PoDocumentLine, 'qty' | 'purchaseUnitQty'
 
 export function poDocumentRows(
   lines: readonly PoDocumentLine[],
-  opts: { showSupplierSku: boolean },
+  opts: { showSupplierSku: boolean; showLineEta?: boolean; formatDate?: (d: Date) => string },
 ): string[][] {
   return lines.map((l, i) => {
     const row = [String(i + 1), l.sku]
     if (opts.showSupplierSku) row.push(l.supplierSku ?? '—')
     row.push(l.name, l.barcode ?? '—', formatPoQty(l), l.unitCost.toFixed(2))
+    if (opts.showLineEta) row.push(l.deliveryDate ? (opts.formatDate ?? isoDay)(l.deliveryDate) : '—')
     row.push(l.total.toFixed(2))
     return row
   })
 }
 
-export function poLayoutFlags(lines: readonly PoDocumentLine[]): { showSupplierSku: boolean; showPurchaseUnits: boolean } {
+const isoDay = (d: Date): string => d.toISOString().slice(0, 10)
+
+export function poLayoutFlags(lines: readonly PoDocumentLine[]): { showSupplierSku: boolean; showPurchaseUnits: boolean; showLineEta: boolean } {
   return {
+    showLineEta: lines.some((l) => l.deliveryDate != null),
     showSupplierSku: lines.some((l) => l.supplierSku),
     showPurchaseUnits: lines.some((l) => l.purchaseUnitQty != null && l.purchaseUnitAbbreviation),
   }
