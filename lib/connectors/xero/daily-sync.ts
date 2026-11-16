@@ -1046,7 +1046,7 @@ export async function recreateMissingDailyBatchLogs(
     if (!summary) continue
     summary.orderCount += 1
     const nettedBack = preBatchRefundsNettedIntoStoredDeferral(order)
-    const shippedBeforeDeferral = order.shipments.reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
+    const shippedBeforeDeferral = (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
     summary.total += Math.max(0, Number(order.unearnedRevenueAmount ?? 0) + nettedBack - shippedBeforeDeferral)
   }
 
@@ -1633,7 +1633,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // ACC-H12: only the part not yet shipped moves from Sales to Unearned Revenue. `amount` (what the order
         // stores and the fence re-derives) keeps the full figure, so Group B's true-up and the refund service's
         // open balance still see the whole deferral less what shipments recognised.
-        grossAmount: Math.max(0, round2(revenueDeferralGrossAmount(order) - order.shipments.reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0))),
+        grossAmount: Math.max(0, round2(revenueDeferralGrossAmount(order) - (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0))),
       }))
       // ACC-H11: one journal per EVENT date (the day the order was paid), each with its own reference. The
       // fence below still covers EVERY order of the run in one lock, once.
@@ -2596,7 +2596,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // ACC-H12: an order Group A1 has not deferred yet is costed on shipment (DR COGS / CR Inventory). Its
         // shipments still record their revenue share, sized from the figure A1 will store as the deferral, but
         // post no revenue leg: the invoice already put the revenue in Sales.
-        const costedOnShipment = firstShipment.order.revenueDeferredDate == null
+        const costedOnShipment = firstShipment.order.revenueDeferredDate === null
         const deferredBase = costedOnShipment
           ? revenueDeferralAmount({ id: orderId, ...firstShipment.order })
           : Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
@@ -2833,7 +2833,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       )
       // ACC-H12: a shipment of an order that is not deferred yet is costed on its own journal, dated the day the
       // goods left (there is no payment to wait for), so its group never mixes with the ordinary ones.
-      const isCostedOnShipment = (shipment: (typeof shipments)[number]): boolean => shipment.order.revenueDeferredDate == null
+      const isCostedOnShipment = (shipment: (typeof shipments)[number]): boolean => shipment.order.revenueDeferredDate === null
       const bDated = groupByPostingDate(processedShipments.filter((shipment) => !isCostedOnShipment(shipment)), groupBDay, dateContext)
       const bDatedDirect = groupByPostingDate(
         processedShipments.filter(isCostedOnShipment),

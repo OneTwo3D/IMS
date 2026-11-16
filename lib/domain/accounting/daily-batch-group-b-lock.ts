@@ -89,9 +89,9 @@ export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
       shipmentJournalDate: null,
       order: {
         refundStatus: { not: 'FULL' },
+        // The invoice (`accountingInvoiceId`) is what put this order's revenue in Sales, and what makes the order
+        // undeletable under a journal (see Group A1). A shipment of an order IMS has not invoiced waits for it.
         revenueDeferredDate: null,
-        // The invoice is what put this order's revenue in Sales, and what makes the order undeletable under a
-        // journal (see Group A1). A shipment of an order IMS has not invoiced waits for the invoice.
         accountingInvoiceId: { not: null },
       },
     },
