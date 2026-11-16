@@ -34,13 +34,21 @@ mock.module('@/lib/db', {
 
 const allocateCalls: Array<[string, unknown]> = []
 const statusCalls: Array<[string, string]> = []
+const liveStatus: Record<string, string> = {}
 let allocateImpl: (id: string) => Promise<Record<string, unknown>> = async () => ({ success: true, syncProductIds: ['p1'], unallocatedQty: 0 })
 let statusImpl: (id: string, target: string) => Promise<{ success: boolean; error?: string }> = async () => ({ success: true })
 mock.module('@/app/actions/allocation', {
   namedExports: { autoAllocateOrder: async (id: string, opts: unknown) => { allocateCalls.push([id, opts]); return allocateImpl(id) } },
 })
 mock.module('@/app/actions/sales', {
-  namedExports: { updateSalesOrderStatus: async (id: string, target: string) => { statusCalls.push([id, target]); return statusImpl(id, target) } },
+  namedExports: {
+    applySalesOrderStatusTransition: async (id: string, target: string, _extra: unknown, opts: { guardUnderLock?: (c: string) => string | null }) => {
+      statusCalls.push([id, target])
+      const refusal = opts.guardUnderLock?.(liveStatus[id] ?? orders.find((o) => o.id === id)?.status ?? '')
+      if (refusal) return { success: false, permanent: true, error: `Refused: ${refusal}` }
+      return statusImpl(id, target)
+    },
+  },
 })
 
 const order = (id: string, status: string, extra: Partial<Order> = {}): Order => ({ id, orderNumber: `SO-${id}`, externalOrderNumber: null, status, archived: false, ...extra })
@@ -50,6 +58,7 @@ beforeEach(() => {
   orders = []
   trackingValue = null
   findManyCalls.length = 0
+  for (const k of Object.keys(liveStatus)) delete liveStatus[k]
   allocateCalls.length = 0
   statusCalls.length = 0
   allocateImpl = async () => ({ success: true, syncProductIds: ['p1'], unallocatedQty: 0 })
@@ -78,7 +87,7 @@ test('bulk allocate: mixed selection reports done, skipped and failed per row an
   assert.equal(by.ghost.outcome, 'failed')
   assert.deepEqual(res.counts, { done: 1, skipped: 2, failed: 3 })
   assert.deepEqual(allocateCalls.map((c) => c[0]), ['a', 'c', 'e'], 'only eligible orders reach the allocator, in order')
-  assert.equal(allocateCalls[0][1], undefined, 'called exactly as the order page calls it')
+  assert.deepEqual(allocateCalls[0][1], { requireStatusUnderLock: ['PROCESSING'] })
 })
 
 test('bulk allocate reports a short allocation on its row', async () => {
@@ -104,6 +113,34 @@ test('bulk advance: each status takes its one step through the same services as 
   assert.deepEqual(allocateCalls.map((c) => c[0]), ['p'], 'PROCESSING advances through the allocator, as the order page does')
   assert.match(res.results.find((r) => r.id === 'k')!.message, /Not in a state that can advance/)
   assert.match(res.results.find((r) => r.id === 'z')!.message, /Archived/)
+})
+
+test('race: an order put on hold after the bulk read is skipped by Advance, hold intact', async () => {
+  orders = [order('a', 'PENDING_PAYMENT'), order('b', 'SHIPPED')]
+  liveStatus.a = 'ON_HOLD'
+  liveStatus.b = 'SHIPPED'
+  const { bulkAdvanceSalesOrders } = await import('@/app/actions/sales-bulk')
+  const res = await bulkAdvanceSalesOrders(['a', 'b'])
+  assert.ok(res.ok)
+  assert.equal(res.results[0].outcome, 'skipped')
+  assert.match(res.results[0].message, /Status changed since the list was loaded/)
+  assert.equal(res.results[1].outcome, 'done')
+  assert.equal(liveStatus.a, 'ON_HOLD')
+})
+
+test('race: Allocate (and Advance from PROCESSING) require PROCESSING under the lock; a stale status is skipped and reserves nothing', async () => {
+  orders = [order('a', 'PROCESSING'), order('b', 'PROCESSING')]
+  // the allocator honours requireStatusUnderLock exactly as the real one: ON_HOLD now, so an explicit no-op
+  allocateImpl = async () => ({ success: false, skipped: true, committed: false })
+  const { bulkAllocateSalesOrders, bulkAdvanceSalesOrders } = await import('@/app/actions/sales-bulk')
+  for (const run of [bulkAllocateSalesOrders, bulkAdvanceSalesOrders]) {
+    allocateCalls.length = 0
+    const res = await run(['a', 'b'])
+    assert.ok(res.ok)
+    assert.deepEqual(res.results.map((r) => r.outcome), ['skipped', 'skipped'])
+    assert.match(res.results[0].message, /Status changed since the list was loaded/)
+    assert.deepEqual(allocateCalls.map((c) => c[1]), [{ requireStatusUnderLock: ['PROCESSING'] }, { requireStatusUnderLock: ['PROCESSING'] }])
+  }
 })
 
 test('bulk advance skips Delivered while delivery tracking is off', async () => {

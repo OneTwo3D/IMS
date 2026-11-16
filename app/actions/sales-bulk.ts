@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 import { autoAllocateOrder } from '@/app/actions/allocation'
-import { updateSalesOrderStatus } from '@/app/actions/sales'
+import { applySalesOrderStatusTransition } from '@/app/actions/sales'
 import {
   advancePlan,
   allocateSkipReason,
@@ -24,6 +24,8 @@ import {
  * Rows run strictly one after another (capped at 100): no burst on the database, and connector work is only what each service already queues.
  * One order failing is reported on its own row and the run carries on.
  */
+
+const STATUS_CHANGED_MESSAGE = 'Status changed since the list was loaded, so nothing was done. Open the order to check it.'
 
 type OrderRow = { id: string; orderNumber: string | null; externalOrderNumber: string | null; status: string; archived: boolean }
 
@@ -62,7 +64,8 @@ type AllocationAnswer = Awaited<ReturnType<typeof autoAllocateOrder>>
 
 /** The order page's allocation, called exactly as its button calls it (its own stock-sync enqueue included: no new producer here). */
 async function allocateOne(id: string): Promise<Omit<BulkRowResult, 'id' | 'orderNumber'>> {
-  const result: AllocationAnswer = await autoAllocateOrder(id)
+  // The status was read when the run began: re-checked under the order lock, so an order put on hold meanwhile is left alone.
+  const result: AllocationAnswer = await autoAllocateOrder(id, { requireStatusUnderLock: ['PROCESSING'] })
   if (result.success) {
     const short = result.unallocatedQty ?? 0
     return {
@@ -70,7 +73,7 @@ async function allocateOne(id: string): Promise<Omit<BulkRowResult, 'id' | 'orde
       message: short > 0 ? `Allocated, but ${short} unit(s) are short and wait on backorder.` : 'Allocated.',
     }
   }
-  if (result.skipped) return { outcome: 'skipped', message: 'The order changed status while the bulk action was running, so it was not allocated.' }
+  if (result.skipped) return { outcome: 'skipped', message: STATUS_CHANGED_MESSAGE }
   const partial = (result.allocationCount ?? 0) > 0 ? 'Partly allocated. ' : ''
   return { outcome: 'failed', message: `${partial}${operatorMessage(result.error, 'Stock could not be allocated.')}` }
 }
@@ -109,7 +112,13 @@ export async function bulkAdvanceSalesOrders(orderIds: string[]): Promise<BulkRu
       if ('skip' in plan) return { outcome: 'skipped', message: plan.skip }
       // Exactly the order page's workflow button: Allocate is the allocator, every other step is the status service.
       if (plan.action.target === 'ALLOCATED') return allocateOne(id)
-      const result = await updateSalesOrderStatus(id, plan.action.target)
+      // updateSalesOrderStatus's own call, plus a guard that REFUSES (never widens) unless the status under the order lock is still the one planned from.
+      const expected = o.status
+      const result = await applySalesOrderStatusTransition(id, plan.action.target, undefined, {
+        pushStatusToWooCommerce: true,
+        guardUnderLock: (current) => (current === expected ? null : STATUS_CHANGED_MESSAGE),
+      })
+      if (!result.success && result.error?.includes(STATUS_CHANGED_MESSAGE)) return { outcome: 'skipped', message: STATUS_CHANGED_MESSAGE }
       if (result.success) return { outcome: 'done', message: `Moved to ${plan.action.target.toLowerCase().replace('_', ' ')}.` }
       return { outcome: 'failed', message: operatorMessage(result.error, 'The status could not be changed.') }
     }))
