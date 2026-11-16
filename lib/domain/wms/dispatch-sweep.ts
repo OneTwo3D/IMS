@@ -33,6 +33,7 @@ import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 export { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 export type { WmsStatusBinding } from '@/lib/domain/wms/status-binding'
 import { unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
+import { isWmsTerminalNonDespatchStatus, WMS_TERMINAL_NON_DESPATCH_CATEGORY } from '@/lib/domain/wms/terminal-status'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
@@ -517,6 +518,13 @@ export type WmsDispatchSweepDeps = {
   // so only CONSECUTIVE failures accumulate.
   recordDispatchError(candidate: WmsDispatchCandidate, reason: string): Promise<{ deadLettered: boolean }>
   clearDispatchFailures(linkId: string): Promise<void>
+  /**
+   * The WMS shows a LIVE IMS order as cancelled / deleted / voided / rejected and not despatched. Record it as an exception for an operator
+   * (idempotent: one open row per order). It must never change the order, its stock, refunds or invoice, and never the link. Best effort:
+   * a failure is logged and the sweep goes on. `clearWmsTerminalNonDespatch` closes the exception when the order is later despatched.
+   */
+  recordWmsTerminalNonDespatch?(candidate: WmsDispatchCandidate, wmsStatus: string): Promise<void>
+  clearWmsTerminalNonDespatch?(orderId: string): Promise<void>
   /**
    * o3d-bjc.9: unresolved-record streak, kept SEPARATE from the transport
    * failure counter above. `recordUnresolvedRead` increments and returns the new
@@ -1189,6 +1197,14 @@ export type WmsDispatchOutcome = {
   action: 'dispatched' | 'pending' | 'error'
   reason: string
   unresolved?: boolean
+  /**
+   * The WMS reads this order as TERMINAL and not despatched (cancelled, deleted, voided, rejected) while IMS still treats it as live. It stays
+   * `pending` (nothing is applied and the link is left exactly as it is); the sweep reports it for an operator through
+   * `recordWmsTerminalNonDespatch`. The value is the status as the WMS shows it.
+   */
+  wmsTerminal?: string
+  /** A part of a split order is confirmed despatched: any "cancelled in the WMS" exception raised earlier is false and is closed. */
+  partDespatched?: boolean
 }
 
 /**
@@ -1283,6 +1299,25 @@ export async function reconcileOneOrder(
     }
   }
 
+  // A SPLIT order the WMS shows as cancelled / deleted / voided / rejected at ORDER level, with no part despatched, is reported like an ordinary one
+  // (the split branch below returns before the ordinary check). A part already despatched keeps the existing per-part handling. A connector that cannot
+  // read parts has its top-level status computed for the whole order, so that is read as it stands.
+  // An EMPTY part list is read as the order-level status stands (a cancelled order may list no parts). Any part despatched is remembered so the
+  // exception raised earlier is closed (below), even while the per-part reconciliation is still pending.
+  let partDespatched = Boolean(status.isSplit && status.dispatched)
+  if (status.isSplit && !status.dispatched && isWmsTerminalNonDespatchStatus(status)) {
+    const parts = deps.partsSupported ? await deps.fetchOrderParts(effectiveOrderNumber) : null
+    if (parts !== null && parts.some((part) => part.dispatched)) partDespatched = true
+    if (parts === null || !parts.some((part) => part.dispatched)) {
+      return {
+        action: 'pending',
+        reason: `Not dispatched: the WMS shows this split order as ${status.statusLabel || status.status}, which is final, and no part has been despatched — reported for an operator, nothing changed in IMS`,
+        unresolved: requireResolution && !dispatchStateEstablished(status),
+        wmsTerminal: status.statusLabel || status.status,
+      }
+    }
+  }
+
   // A split order's primary row can read dispatched while only some parts have shipped (or
   // the reverse), so handle split BEFORE the dispatched gate and reconcile per part.
   if (status.isSplit) {
@@ -1296,13 +1331,22 @@ export async function reconcileOneOrder(
       }
     }
     // A merged survivor's parts mix several original orders → reconcile atomically.
-    return reconcileSplitOrder(deps, candidate, effectiveOrderNumber, status.partCount, !status.isMerged, requireResolution)
+    const split = await reconcileSplitOrder(deps, candidate, effectiveOrderNumber, status.partCount, !status.isMerged, requireResolution)
+    return partDespatched ? { ...split, partDespatched: true } : split
   }
 
   if (!status.dispatched) {
     // A BLANK status is "we don't know", not "not shipped" (Codex round 8): the
     // forced per-order lookup on a merge/split supplement uses the lenient path, so
     // an unmapped OrderStatusId arrives here as status '' + dispatched false.
+    if (isWmsTerminalNonDespatchStatus(status)) {
+      return {
+        action: 'pending',
+        reason: `Not dispatched: the WMS shows this order as ${status.statusLabel || status.status}, which is final — reported for an operator, nothing changed in IMS`,
+        unresolved: requireResolution && !dispatchStateEstablished(status),
+        wmsTerminal: status.statusLabel || status.status,
+      }
+    }
     return {
       action: 'pending',
       reason: `Not dispatched (status ${status.status || 'Unknown'})`,
@@ -1639,6 +1683,15 @@ export async function runWmsDispatchSweepCore(
     // healthy, and clearing the streak on it would let a link alternate between a
     // real error and an unresolved read and never reach the exception inbox.
     let reason = outcome.reason
+    try {
+      if (outcome.wmsTerminal !== undefined) await deps.recordWmsTerminalNonDespatch?.(candidate, outcome.wmsTerminal)
+      else if (outcome.action === 'dispatched' || outcome.partDespatched) await deps.clearWmsTerminalNonDespatch?.(candidate.orderId)
+    } catch (terminalError) {
+      console.error('[wms-dispatch-sweep] could not record a WMS-terminal order for an operator:', terminalError)
+      // The operator-facing row did not commit, so this pass has not finished deciding the order: hold the watermark
+      // (as for a withdrawal park that did not commit) so the change cannot age out before the row is written.
+      passClean = false
+    }
     try {
       if (outcome.action === 'error') {
         if (thrownHold || isOutboundWriteHeldText(outcome.reason)) counters.outboundHeld = (counters.outboundHeld ?? 0) + 1
@@ -3053,6 +3106,38 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         select: { dispatchUnresolvedCount: true },
       })
       return { count: link.dispatchUnresolvedCount }
+    },
+    async recordWmsTerminalNonDespatch(candidate, wmsStatus) {
+      const order = await db.salesOrder.findUnique({ where: { id: candidate.orderId }, select: { status: true, refundStatus: true, orderNumber: true } })
+      // Only an order IMS still means to fulfil: a cancelled / on-hold / fully-refunded one is check C's (its WMS order OUGHT to be cancelled).
+      if (!order || ['CANCELLED', 'ON_HOLD', 'SHIPPED', 'COMPLETED', 'DELIVERED'].includes(order.status) || order.refundStatus === 'FULL') return
+      const shown = scrubWmsError(wmsStatus, 'unknown')
+      const detail = `The warehouse shows this order as "${shown}" and not despatched, but IMS still has it as ${order.status} with its stock reserved, so it will never be fulfilled. `
+        + 'IMS has made no cancellation, stock release, refund or credit note, and will not push this order to the warehouse a second time. Check with the warehouse, then cancel or refund the order in IMS, or have it reinstated.'
+      const where = { orderId: candidate.orderId, category: WMS_TERMINAL_NON_DESPATCH_CATEGORY, status: 'OPEN' }
+      const updated = await db.wmsOrderDiscrepancy.updateMany({ where, data: { detail, externalOrderNumber: candidate.externalOrderNumber, lastSeenAt: new Date() } })
+      if (updated.count > 0) return
+      try {
+        await db.wmsOrderDiscrepancy.create({ data: { connector: connectorId, orderId: candidate.orderId, category: WMS_TERMINAL_NON_DESPATCH_CATEGORY, detail, externalOrderNumber: candidate.externalOrderNumber } })
+      } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return
+        throw error
+      }
+      // First sight only: a known open row must not bell the admins every sweep.
+      const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+      await Promise.all(admins.map((admin) => notify({
+        userId: admin.id,
+        type: 'error',
+        title: 'Order cancelled in the warehouse',
+        message: `Order ${order.orderNumber ?? candidate.orderId} is ${shown} in the WMS but still live in IMS. Review it in the sync exception inbox.`,
+        actionUrl: '/sync/exceptions',
+      })))
+    },
+    async clearWmsTerminalNonDespatch(orderId) {
+      await db.wmsOrderDiscrepancy.updateMany({
+        where: { orderId, category: WMS_TERMINAL_NON_DESPATCH_CATEGORY, status: 'OPEN' },
+        data: { status: 'RESOLVED', resolvedAt: new Date() },
+      })
     },
     async clearUnresolvedReads(linkId) {
       // Only touch rows that actually carry streak state, so the happy path
