@@ -4059,6 +4059,8 @@ model WmsOrderPushLink {
   amendLeaseExpiresAt   DateTime? @map("amend_lease_expires_at")
   /// The shipping service of a courier-fallback operator task that is DUE and not yet recorded (cleared once recorded): a failed insert is retried by a later sweep.
   courierTaskService    String?   @map("courier_task_service")
+  /// The stable episode of that due task (written with the marker, before the warehouse call): every retry keys its task on it, so one fallback is one task.
+  courierTaskEpisode    DateTime? @map("courier_task_episode")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())

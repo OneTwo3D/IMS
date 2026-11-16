@@ -1,5 +1,6 @@
 'use client'
 
+import { PurchaseOrderEmailSetting } from '@/components/settings/purchase-order-email'
 import { useState, useTransition, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import {
@@ -39,6 +40,7 @@ type Props = {
   shoppingConnectors: ShoppingConnectorSummary[]
   currencies: CurrencyRow[]
   testEmailDefault: string
+  purchaseOrderEmailEnabled: boolean
 }
 
 const TABS = [
@@ -67,7 +69,7 @@ const SUPPORTED_TIMEZONES: string[] = _intl.supportedValuesOf
   ? _intl.supportedValuesOf('timeZone')
   : ['Europe/London', 'UTC']
 
-export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault }: Props) {
+export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault, purchaseOrderEmailEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [isEmailPending, startEmailTransition] = useTransition()
@@ -708,6 +710,13 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
           <p className="text-sm text-muted-foreground">
             Customise header notes, footer text, terms, and display options for each document type.
           </p>
+          <Card className="p-4">
+            <h3 className="text-sm font-semibold mb-1">Email purchase orders to suppliers</h3>
+            <p className="text-xs text-muted-foreground mb-3">
+              Whether Confirm &amp; Send PO and Email PO send the PO PDF to the supplier. Off by default.
+            </p>
+            <PurchaseOrderEmailSetting currentValue={purchaseOrderEmailEnabled ? 'true' : 'false'} />
+          </Card>
           {tpls.map((tpl) => {
             const isEditing = editingTpl === tpl.type
             return (
