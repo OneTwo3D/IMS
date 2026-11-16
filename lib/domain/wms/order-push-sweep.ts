@@ -1,3 +1,4 @@
+import { runMergeCandidateDetectionSafe } from '@/lib/domain/wms/merge-candidates'
 import { randomUUID } from 'node:crypto'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
@@ -4538,5 +4539,8 @@ export async function runWmsOrderPushSweep(
   const locked = await withOrderPushSweepLockOrSkip(connectorId, () =>
     runWmsOrderPushSweepCore(connector, connectorId, createPrismaWmsOrderPushPort(), options))
   if ('lockSkipped' in locked) return { ...empty, skipped: 'Another WMS order push sweep is already running' }
+  // Merge candidates (flag mode, default off): after IMS created warehouse orders, look for same-customer orders still NEW. Outside the sweep lock, database only,
+  // and it never throws: a detection failure cannot affect the push.
+  if (locked.created > 0) await runMergeCandidateDetectionSafe('the order push')
   return locked
 }

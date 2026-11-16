@@ -105,6 +105,23 @@ When Mintsoft merges several orders into one parcel and more than one of them ch
 
 Check the orders, refund the extra postage by hand if it is due, then press **Clear**. Clear needs the sync permission and a fresh sign-in, and the activity log records who cleared it and what the flag said. The flag is raised again only if Mintsoft merges the order into a further order and the rule applies again.
 
+### Merge candidates: same-customer orders still New in Mintsoft (off by default)
+
+When the same customer has two or more open orders for the same delivery address and Mintsoft still shows all of them as **New**, one parcel could ship instead of several. **IMS never merges orders**: Mintsoft has no merge function IMS can call, so merging stays a manual step in the Mintsoft screens. This feature only tells you which orders to look at.
+
+It is **off by default** and nothing described here happens until you switch it on in **Integrations > Mintsoft > Merge candidates** (setting `wms_merge_candidate_mode`: **Off** or **Flag**; any other value, including the reserved `hold`, counts as Off). A hold mode, which would hold the orders in Mintsoft until they are merged, is not built.
+
+With **Flag** on, IMS checks after it pushes orders and after every order-status refresh. Orders are grouped when they have the same billing email and the same delivery address (street lines, city, postcode and country; case, spacing and punctuation are ignored; the billing address is used when there is no shipping address), they are all still open in IMS, and the Mintsoft order of each is **New** according to the status IMS last read. IMS makes no extra call to Mintsoft to decide this. NI, JE, GG and IM count as the UK. Left out: orders with a backordered line, orders with a pending or approved withdrawal, held, shipped, cancelled or fully refunded orders, and orders Mintsoft already merged into one (they count once). Three or more orders form one group.
+
+What you see for a group:
+
+- a **Mergeable with ...** badge on each order, linking to the others;
+- an entry in each order's activity log;
+- the group in the list under **Integrations > Mintsoft > Merge candidates**;
+- ONE task for the group under **Integrations > Exceptions > Raise a warehouse query**: check these orders in Mintsoft and merge them there if appropriate. IMS writes no note on the Mintsoft or WooCommerce order for this, because the warehouse does not read notes. If the group stops qualifying (an order leaves New, ships, is cancelled or its address changes) IMS resolves the task itself. If you press **Done** first it stays done.
+
+Warnings are added to the task and the badge: an **EU destination** needs the customs declaration and IOSS number checked before merging, and a group that ships by **FedEx** needs its label created by hand. Switching the mode back to Off stops new flags but does not remove open tasks: mark them Done.
+
 ### Holds, cancels and merged orders
 
 - **A hold or cancel Mintsoft cannot honour.** If the order is already picking, packing or despatched, or Mintsoft merged it into another order, IMS cannot cancel it there. It stays live, shows under Exceptions as **Hold not honoured** or **Cancel not honoured**, and a **Raise a warehouse query** task is added for the warehouse (IMS writes no note on the Mintsoft order). A despatch after a hold is recorded as normal. A despatch after a cancel, or after a full refund while the order was still undespatched, is not recorded automatically: it appears as a stuck despatch for you to decide what happens to the goods.
