@@ -97,7 +97,7 @@ export async function loadInFlightDispatch(
     else if (snapshot.fetchedAt.getTime() < freshCutoff) reason = 'status_snapshot_stale'
     if (reason) {
       total = addMoney(total, row.qty)
-      holds.push({ orderId: row.order.id, orderNumber: row.order.orderNumber, qty: toDecimal(row.qty).toNumber(), reason })
+      holds.push({ orderId: row.order.id, orderNumber: row.order.orderNumber ?? row.order.id, qty: toDecimal(row.qty).toNumber(), reason })
     }
   }
   return { qty: total.toNumber(), holds }
