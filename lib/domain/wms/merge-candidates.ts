@@ -4,6 +4,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnectorDef, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { getSalesOrderBackorderReport } from '@/lib/domain/inventory/backorder-report'
+import { withMergeCandidateLockOrSkip } from './dispatch-sweep-lock'
 import { readWmsMergeCandidateMode, type WmsMergeCandidateMode } from './merge-candidate-mode'
 import {
   MERGE_OPEN_STATUSES,
@@ -53,6 +54,8 @@ export type MergeCandidatePort = {
   raiseGroupTask(connector: string, group: MergeGroup, queryText: string): Promise<MergeTaskOutcome>
   /** Resolve this connector's OPEN merge-candidate tasks whose group is not in `keepBases`. Returns how many. */
   resolveTasksNotIn(connector: string, keepBases: readonly string[]): Promise<number>
+  /** Run the whole compute, raise, resolve pass holding the connector's detection lock; `null` when another pass holds it. */
+  withLock<T>(connector: string, fn: () => Promise<T>): Promise<T | null>
   now(): Date
 }
 
@@ -91,16 +94,22 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
   if (mode === 'off') return { mode: 'off', groups: [] }
   const env = await port.environment()
   if ('skipped' in env) return { mode, skipped: env.skipped, groups: [] }
-  const groups = await computeGroups(port, env)
-  let created = 0
-  let reopened = 0
-  for (const group of groups) {
-    const outcome = await port.raiseGroupTask(env.connectorId, group, mergeGroupTaskText(group, env.connectorLabel))
-    if (outcome === 'created') created += 1
-    else if (outcome === 'reopened') reopened += 1
-  }
-  const resolved = await port.resolveTasksNotIn(env.connectorId, groups.map((group) => group.basis))
-  return { mode, groups, created, reopened, resolved }
+  // ONE pass at a time per connector: a pass resolves every open task its own groups do not include, so two overlapping passes that saw
+  // different groups would each resolve the task the other had just raised. A pass that cannot get the lock skips; the next sweep runs it again.
+  // (The alternative, re-checking membership per task under a lock, still needs a lock and still reads the groups twice.)
+  const pass = await port.withLock(env.connectorId, async (): Promise<MergeCandidateRun> => {
+    const groups = await computeGroups(port, env)
+    let created = 0
+    let reopened = 0
+    for (const group of groups) {
+      const outcome = await port.raiseGroupTask(env.connectorId, group, mergeGroupTaskText(group, env.connectorLabel))
+      if (outcome === 'created') created += 1
+      else if (outcome === 'reopened') reopened += 1
+    }
+    const resolved = await port.resolveTasksNotIn(env.connectorId, groups.map((group) => group.basis))
+    return { mode, groups, created, reopened, resolved }
+  })
+  return pass ?? { mode, skipped: 'Another merge-candidate pass is running', groups: [] }
 }
 
 /** For the sweeps: never throws. A failed detection is logged and must not affect the push or the status sweep. */
@@ -122,6 +131,10 @@ const memberLabel = (member: { orderNumber: string | null; orderId: string }) =>
 
 export const prismaMergeCandidatePort: MergeCandidatePort = {
   now: () => new Date(),
+  async withLock(connector, fn) {
+    const outcome = await withMergeCandidateLockOrSkip(connector, fn)
+    return outcome !== null && typeof outcome === 'object' && 'lockSkipped' in outcome ? null : outcome as Awaited<ReturnType<typeof fn>>
+  },
   readMode: () => readWmsMergeCandidateMode(),
 
   async environment() {

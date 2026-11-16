@@ -83,3 +83,45 @@ test('ten concurrent runs raise exactly one task', SKIP, async (t) => {
   await Promise.all(Array.from({ length: 10 }, () => w.mc.runMergeCandidateDetection(w.port)))
   assert.equal(await w.db.wmsOperatorTask.count({ where: { reason: 'MERGE_CANDIDATE', orderId: { in: [a, b] } } }), 1)
 })
+
+test('overlapping runs whose view of the groups differs: the second skips, and the final state is exactly the groups that qualify now', SKIP, async (t) => {
+  const w = await world()
+  const e1 = `mc-${randomUUID().slice(0, 8)}@example.test`
+  const e2 = `mc-${randomUUID().slice(0, 8)}@example.test`
+  const [a, b] = [await newOrder(w, e1, 'e'), await newOrder(w, e1, 'f')]
+  const [c, d] = [await newOrder(w, e2, 'g'), await newOrder(w, e2, 'h')]
+  const mine = new Set([a, b, c, d])
+  t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id: { in: [...mine] } } }) })
+  const scoped = { ...w.port, loadOrders: async () => (await w.port.loadOrders()).filter((o) => mine.has(o.orderId)) }
+  const open = () => w.db.wmsOperatorTask.findMany({ where: { reason: 'MERGE_CANDIDATE', status: 'OPEN', orderId: { in: [...mine] } }, select: { orderId: true } })
+
+  // Run A reads both groups, then stalls while holding the pass lock.
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let loaded!: () => void
+  const hasLoaded = new Promise<void>((resolve) => { loaded = resolve })
+  const slow = { ...scoped, loadOrders: async () => { const view = await scoped.loadOrders(); loaded(); await gate; return view } }
+  const runA = w.mc.runMergeCandidateDetection(slow)
+  await hasLoaded
+
+  // Membership changes while A is mid-pass: the second group stops qualifying.
+  await w.db.wmsOrderStatusSnapshot.update({ where: { orderId: d }, data: { status: 'PICKING' } })
+
+  // Run B overlaps A: it cannot take the lock, so it skips instead of resolving anything.
+  const runB = await w.mc.runMergeCandidateDetection(scoped)
+  assert.equal('skipped' in runB, true, 'the overlapping run skips')
+  assert.equal((await open()).length, 0, 'the skipped run wrote nothing')
+
+  release()
+  await runA // A acts on its (now stale) view: raises both groups.
+  assert.equal((await open()).length, 2)
+
+  // The next pass sees the current membership: only a+b qualifies, and c+d's task is resolved.
+  await w.mc.runMergeCandidateDetection(scoped)
+  const finalOpen = await open()
+  assert.equal(finalOpen.length, 1, 'exactly the groups that qualify now')
+  assert.ok([a, b].includes(finalOpen[0].orderId))
+  const cdTask = await w.db.wmsOperatorTask.findFirst({ where: { reason: 'MERGE_CANDIDATE', orderId: { in: [c, d] } } })
+  assert.equal(cdTask?.status, 'DONE')
+  assert.equal(cdTask?.doneBy, w.mc.MERGE_TASK_SYSTEM_ACTOR)
+})

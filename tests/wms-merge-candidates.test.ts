@@ -238,7 +238,7 @@ test('the mode: only `flag` is on; off, blank, unknown and the reserved `hold` a
 // ---------------------------------------------------------------------------------------------------------------------------------------
 
 type Task = { key: string; basis: string; status: 'OPEN' | 'DONE'; doneBy: string | null; queryText: string; orderId: string; externalOrderId: string }
-function fakePort(opts: { mode: 'off' | 'flag'; orders: MergeCandidateOrder[]; backordered?: string[]; tenantScoped?: boolean; environment?: { skipped: string } }) {
+function fakePort(opts: { mode: 'off' | 'flag'; orders: MergeCandidateOrder[]; backordered?: string[]; tenantScoped?: boolean; environment?: { skipped: string }; lockHeld?: boolean }) {
   const state = { mode: opts.mode, orders: opts.orders, backordered: new Set(opts.backordered ?? []), tenantScoped: opts.tenantScoped ?? true }
   const tasks: Task[] = []
   const log: string[] = []
@@ -246,6 +246,7 @@ function fakePort(opts: { mode: 'off' | 'flag'; orders: MergeCandidateOrder[]; b
   const reads: string[] = []
   const port: MergeCandidatePort = {
     now: () => NOW,
+    withLock: async (_connector, fn) => (opts.lockHeld ? null : fn()),
     readMode: async () => { reads.push('mode'); return state.mode },
     environment: async () => { reads.push('environment'); return opts.environment ?? { connectorId: 'mintsoft', connectorLabel: 'Mintsoft', tenantScoped: state.tenantScoped } },
     loadOrders: async () => { reads.push('orders'); return state.orders },
@@ -367,6 +368,14 @@ test('flag mode with no client scope or no connector writes nothing', async () =
   const skipped = await runMergeCandidateDetection(g.port)
   assert.equal('skipped' in skipped, true)
   assert.deepEqual(g.writes, [])
+})
+
+test('a pass that cannot get the connector lock skips and writes nothing', async () => {
+  const f = fakePort({ mode: 'flag', orders: [order({}), order({})], lockHeld: true })
+  const result = await runMergeCandidateDetection(f.port)
+  assert.equal('skipped' in result, true)
+  assert.deepEqual(f.writes, [])
+  assert.deepEqual(f.tasks, [])
 })
 
 test('a detection failure never throws out of the safe wrapper (it must not affect the push)', async () => {
