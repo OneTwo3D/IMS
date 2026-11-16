@@ -12,8 +12,7 @@ import type { BillData, CreditNoteData, InvoiceData } from '@/lib/connectors/typ
  * to the path each of them hands it, so the URL that would leave is asserted per document type. Nothing here touches the network.
  */
 
-// Loaded BEFORE the module mock so the fake transport can apply the real helper.
-const real = await import('@/lib/connectors/xero/api')
+import { xeroWritePath } from '@/lib/connectors/xero/write-path'
 
 const sent: Array<{ method: string; url: string; body: Record<string, unknown> }> = []
 const respond = {
@@ -26,10 +25,9 @@ const respond = {
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
-    ...real,
     xeroGet: async () => ({ ok: true, status: 200, data: { CreditNotes: [] } }),
-    xeroPost: async (path: string, body: Record<string, unknown>) => { sent.push({ method: 'POST', url: real.xeroWritePath('POST', path), body }); return respond },
-    xeroPut: async (path: string, body: Record<string, unknown>) => { sent.push({ method: 'PUT', url: real.xeroWritePath('PUT', path), body }); return respond },
+    xeroPost: async (path: string, body: Record<string, unknown>) => { sent.push({ method: 'POST', url: xeroWritePath('POST', path), body }); return respond },
+    xeroPut: async (path: string, body: Record<string, unknown>) => { sent.push({ method: 'PUT', url: xeroWritePath('PUT', path), body }); return respond },
   },
 })
 mock.module('@/lib/connectors/xero/contacts', { namedExports: { findOrCreateContact: async () => ({ success: true, contactId: 'contact-1' }) } })
@@ -40,10 +38,9 @@ test.beforeEach(() => { sent.length = 0 })
 const lines = [{ itemCode: 'SKU-1', description: 'Widget', quantity: 3, unitAmount: 33.3333, accountCode: '200', taxType: 'OUTPUT2' }]
 const invoice = { invoiceNumber: 'INV-1', contactName: 'C', date: '2026-08-20', currency: 'GBP', lines } as InvoiceData
 const bill = { invoiceNumber: 'B-1', contactName: 'S', date: '2026-08-20', currency: 'GBP', lines } as BillData
-const credit = { creditNoteNumber: 'CN-1', contactName: 'C', date: '2026-08-20', currency: 'GBP', lines } as CreditNoteData
+const credit = { creditNoteNumber: 'SCN-scn-2', contactName: 'C', date: '2026-08-20', currency: 'GBP', lines } as CreditNoteData
 
 test('xeroWritePath: every line-item write endpoint gets unitdp=4; reads and non-document writes are untouched', () => {
-  const { xeroWritePath } = real
   for (const path of ['Invoices', 'CreditNotes', 'PurchaseOrders', 'Invoices/abc-123', 'CreditNotes/abc-123', 'PurchaseOrders/abc-123']) {
     for (const method of ['POST', 'PUT'] as const) assert.equal(xeroWritePath(method, path), `${path}?unitdp=4`, `${method} ${path}`)
   }
@@ -64,9 +61,10 @@ test('each document poster sends unitdp=4: invoice, invoice update, bill, bill u
   assert.equal((await pushPurchaseBill(bill, 'AUTHORISED')).success, true)
   assert.equal((await updatePurchaseBill('bill-9', bill, 'AUTHORISED')).success, true)
   assert.equal((await pushCreditNote(credit, 'AUTHORISED')).success, true)
-  assert.equal((await pushPurchaseCreditNote(credit, 'AUTHORISED', {
+  const supplier = await pushPurchaseCreditNote(credit, 'AUTHORISED', {
     firstAttempt: true, creditNote: { referenceType: 'SupplierCreditNote', referenceId: 'scn-2' }, lookup: async () => ({ ok: true, claims: [] }),
-  })).success, true)
+  })
+  assert.equal(supplier.success, true, String(supplier.error))
   assert.deepEqual(sent.map((s) => `${s.method} ${s.url}`), [
     'POST Invoices?unitdp=4', 'POST Invoices/inv-9?unitdp=4', 'PUT Invoices?unitdp=4', 'POST Invoices/bill-9?unitdp=4',
     'POST CreditNotes?unitdp=4', 'POST CreditNotes?unitdp=4',
