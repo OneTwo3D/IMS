@@ -122,6 +122,22 @@ function parsePaymentMap(json: string): PaymentMapRow[] {
   } catch { return [] }
 }
 
+/**
+ * The books lock date as read from Xero, read-only (Xero is the source of truth; it is refreshed by the daily
+ * batch and by Sync Chart of Accounts). Exported for the test.
+ */
+export function describeBooksLockDate(
+  lockDate: string | undefined,
+  readAt: string | undefined,
+  formatDateTime: (value: Date | string) => string,
+): string {
+  if (!readAt) return 'Books lock date: not read from Xero yet. It is read at the start of each daily batch and when the chart of accounts is synced.'
+  const when = formatDateTime(readAt)
+  return lockDate
+    ? `Books locked up to ${lockDate} (read from Xero ${when}).`
+    : `No books lock date set in Xero (read from Xero ${when}).`
+}
+
 function serializePaymentMap(rows: PaymentMapRow[]): string {
   const map: Record<string, string> = {}
   for (const r of rows) {
@@ -650,6 +666,9 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 </Button>
               </div>
             </div>
+            <p className="text-xs text-muted-foreground" data-testid="xero-books-lock-date">
+              {describeBooksLockDate(s.xero_books_lock_date, s.xero_books_lock_date_read_at, formatDateTime)}
+            </p>
             {accountsMsg && (
               <p className={`text-xs ${accountsMsgLevel === 'error' ? 'text-destructive' : accountsMsgLevel === 'warning' ? 'text-amber-700 dark:text-amber-300' : 'text-muted-foreground'}`}>
                 {accountsMsg}

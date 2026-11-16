@@ -331,6 +331,7 @@ export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: WmsConnectorRegistrations<Wms
           createPurchaseOrderAsn: (poId, input) => m.createMintsoftPurchaseOrderAsn(poId, input),
           createTransferAsn: (transferId, input) => m.createMintsoftTransferAsn(transferId, input),
           recheckAsnBookedIn: (externalAsnId) => m.recheckMintsoftAsnBookedIn(externalAsnId),
+          closeAsnShort: (externalAsnId, reason) => m.closeMintsoftAsnShort(externalAsnId, reason),
         }
       },
       productSync: async () => {

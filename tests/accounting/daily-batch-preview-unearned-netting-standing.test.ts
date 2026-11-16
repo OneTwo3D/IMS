@@ -52,6 +52,10 @@ const SHIPMENT = {
   },
 }
 
+// ACC-H11: the batch imports the Xero books lock date at the start of a run; offline, and not what this file tests.
+mock.module('@/lib/connectors/xero/books-lock-date', {
+  namedExports: { refreshXeroBooksLockDate: async () => ({ lockDate: null, refreshed: false }) },
+})
 mock.module('@/lib/db', {
   namedExports: {
     db: {

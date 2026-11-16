@@ -371,6 +371,15 @@ export const INVOICE_DOCUMENT_RESET_TRANSACTION_LOCK_KEY = 1
 export const INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE = 411_220_880
 
 /**
+ * THE PURCHASE ORDER EMAIL SEND LOCK (two-int, key 0).
+ *
+ * The outbox drain takes it SHARED (transaction scope) from its final `purchase_order_email_enabled` check through the SMTP send of a
+ * PURCHASE_ORDER row; saving the setting takes it EXCLUSIVE. So switching the setting off waits for sends already past their check, and
+ * a send that starts after the save reads the committed value and is refused. Shared holders coexist, so sends do not serialise.
+ */
+export const PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE = 411_220_881
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -422,5 +431,6 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   INVOICE_DOCUMENT_RESET_LOCK_NAMESPACE,
   INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
+  PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

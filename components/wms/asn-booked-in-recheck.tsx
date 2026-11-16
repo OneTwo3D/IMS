@@ -4,7 +4,7 @@ import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
-import { recheckWmsAsnBookedIn } from '@/app/actions/wms-asn'
+import { closeWmsAsnShort, recheckWmsAsnBookedIn } from '@/app/actions/wms-asn'
 
 /**
  * Re-check an ASN's booked-in state directly with the warehouse.
@@ -29,11 +29,14 @@ export function AsnBookedInRecheck({
   lastCallbackAt,
   closed,
   connectorLabel,
+  canCloseShort = false,
 }: {
   externalAsnId: string
   lastCallbackAt: string | null
   closed: boolean
   connectorLabel: string
+  /** o3d-hqvrp.117: offer "Close short" (a partially booked-in purchase-order ASN that is still open). */
+  canCloseShort?: boolean
 }) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
@@ -62,6 +65,30 @@ export function AsnBookedInRecheck({
       >
         {isPending ? 'Re-checking…' : 'Re-check'}
       </Button>
+      {canCloseShort && !closed && (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={isPending}
+          title="The supplier will not deliver the rest on this ASN. Releases the undelivered quantity for manual receipt or a new ASN."
+          onClick={() => {
+            const reason = window.prompt('Close this ASN short? The undelivered quantity is released. Reason (required):')
+            if (!reason?.trim()) return
+            setMessage('')
+            setFailed(false)
+            startTransition(async () => {
+              const result = await closeWmsAsnShort(externalAsnId, reason)
+              setFailed(!result.success)
+              setMessage(result.success
+                ? (result.message ?? 'Closed short.')
+                : (result.error ?? `Could not close the ASN with ${connectorLabel}.`))
+              if (result.success) router.refresh()
+            })
+          }}
+        >
+          Close short
+        </Button>
+      )}
       <span className="text-xs text-muted-foreground">
         {message
           ? <span className={failed ? 'text-destructive' : undefined}>{message}</span>

@@ -3,11 +3,17 @@ import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
-import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, documentVatRows, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
-import { documentTotalsRows, salesOrderMoneyView } from '@/lib/domain/sales/sales-order-money-view'
+import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { orderDocumentMoney, drawTotalsRows } from '@/lib/pdf-order-money'
+import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { formatMoney } from '@/lib/utils'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
+
+function safeFilenamePart(value: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)
+  return safe.length > 0 ? safe : 'order'
+}
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireApiAuth()
@@ -36,7 +42,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     select: { headerNote: true, footerNote: true, termsText: true, customFooter: true, showPaymentTerms: true, paymentTermsText: true },
   })
   const tz = await getDisplayTimeZone()
-  const { doc } = createPdfDocument({ title: `Order ${so.externalOrderNumber}` })
+  const orderRef = getSalesOrderReference(so)
+  const { doc } = createPdfDocument({ title: `Order ${orderRef}` })
   const date = formatDateTime(so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   const shipAddr = so.shippingAddress as Record<string, string> | null
@@ -44,7 +51,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   await drawHeader(doc, branding, {
     title: 'Sales Order',
-    reference: so.externalOrderNumber ?? so.id.slice(0, 8),
+    reference: orderRef,
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -69,21 +76,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const symPos: 'PREFIX' | 'POSTFIX' = currencyRow?.symbolPosition ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
   // ONE basis for every figure on the document (lib/domain/sales/sales-order-money-view.ts), labelled, and reconciling with the stored total.
-  const view = salesOrderMoneyView({
-    pricesIncludeVat: so.pricesIncludeVat,
-    shoppingLinks: so.shoppingLinks,
-    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
-    subtotalForeign: Number(so.subtotalForeign),
-    discountAmount: Number(so.discountAmount),
-    shippingForeign: Number(so.shippingForeign),
-    taxForeign: Number(so.taxForeign),
-    totalForeign: Number(so.totalForeign),
-    storeCreditForeign: Number(so.storeCreditForeign ?? 0),
-    lines: so.lines.map((l) => ({
-      qty: Number(l.qty), unitPriceForeign: Number(l.unitPriceForeign), discountAmount: Number(l.discountAmount ?? 0),
-      totalForeign: Number(l.totalForeign), taxForeign: Number(l.taxForeign ?? 0),
-    })),
-  })
+  const { view, totalsRows } = orderDocumentMoney(so)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
@@ -104,24 +97,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   drawTable(doc, columns, rows, branding)
 
   // Totals
-  doc.y += 5
-  const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
-  const vW = columns[columns.length - 1].width
-  const lW = 80
-  const lX = tableRight - vW - lW
-  doc.font('Helvetica').fontSize(9).fillColor('#666')
-  const totalsRows = documentTotalsRows(view, documentVatRows({
-    taxRateName: so.taxRateName,
-    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
-    taxForeign: Number(so.taxForeign),
-    lines: so.lines.map((l) => ({ taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null, taxForeign: Number(l.taxForeign || 0) })),
-  }))
-  for (const row of totalsRows) {
-    if (row.strong) doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
-    else doc.font('Helvetica').fontSize(9).fillColor('#666')
-    doc.text(`${row.label}:`, lX - 40, doc.y + (row.strong ? 3 : 0), { width: lW + 40, align: 'right' })
-    doc.text(money(row.amount), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
+  drawTotalsRows(doc, totalsRows, money, columns)
 
   // Footer note from template
   if (tpl?.footerNote) {
@@ -151,6 +127,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   drawFooter(doc, 'Thank you for your order.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
   const buffer = await pdfToBuffer(doc)
   return new NextResponse(new Uint8Array(buffer), {
-    headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Order-${so.externalOrderNumber}.pdf"` },
+    headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Order-${safeFilenamePart(orderRef)}.pdf"` },
   })
 }

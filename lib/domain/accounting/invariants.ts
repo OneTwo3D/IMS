@@ -76,6 +76,13 @@ type SalesOrderAccountingRow = {
     chargeback?: boolean
     // scjz.71: durable — whether a COGS/unearned reversal was staged for this refund.
     reversalStaged?: boolean
+    // o3d-hqvrp.35: when the refund was entered, and what its totals mean. A refund entered BEFORE the
+    // order's A1 deferral is netted out of the deferral itself (see revenueDeferralAmount), so it does not
+    // need the refund-aware tie-out. Optional: absent (fixtures) reads as "not known to be pre-batch".
+    refundedAt?: Date | string | null
+    totalsBasis?: string | null
+    // The A1 adjustment journal that netted this refund; its log must still be live (see below).
+    deferralAdjustmentRef?: string | null
   }>
 }
 
@@ -427,6 +434,26 @@ function dailyBatchSyncEvidence(
   }
 }
 
+
+
+/**
+ * o3d-hqvrp.35: the lifecycle tie-out used to skip EVERY refunded order, because a refund's Unearned
+ * Revenue reversal adjusts the deferred base outside the recognised sum. A refund entered before the
+ * order's A1 deferral posts no reversal at all - its net value was taken out of the deferral itself - so
+ * for an order whose every refund is NET-basis and predates the deferral, recognised revenue must still
+ * equal the deferred amount, and a stranded Unearned balance (the 110 vs 70 case) is visible here.
+ * Any other refund (after the deferral, legacy gross totals, or an unknown time) keeps the old skip.
+ */
+function refundsAllNettedIntoDeferral(order: SalesOrderAccountingRow): boolean {
+  if (order.refunds.length === 0) return true
+  const deferredAt = order.revenueDeferredDate == null ? null : new Date(order.revenueDeferredDate).getTime()
+  if (deferredAt == null || Number.isNaN(deferredAt)) return false
+  return order.refunds.every((refund) => {
+    if (refund.totalsBasis !== 'NET' || refund.refundedAt == null) return false
+    const refundedAt = new Date(refund.refundedAt).getTime()
+    return !Number.isNaN(refundedAt) && refundedAt < deferredAt
+  })
+}
 export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): AccountingInvariantFinding[] {
   const findings: AccountingInvariantFinding[] = []
   const syncLogIndex = buildLiveSyncLogIndex(rows.syncLogs)
@@ -619,7 +646,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     if (
       hasA1 &&
       isFullyShippedTerminalStatus(order.status) &&
-      order.refunds.length === 0 &&
+      refundsAllNettedIntoDeferral(order) &&
       postedShipments.length > 0 &&
       order.shipments.every((shipment) => shipment.shipmentJournalDate != null || shipment.status !== 'SHIPPED')
     ) {
@@ -675,6 +702,23 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
           unearnedRevenueAmount: decimalToNumber(order.unearnedRevenueAmount),
         },
       })
+    }
+
+    // o3d-hqvrp.35: a refund the batch netted out of the deferral carries the adjustment journal that did it. A
+    // journal with no live sync row is a deferral adjustment that never reached (or left) the ledger, so
+    // Unearned Revenue is overstated by the refund until the recreate sweep rebuilds it.
+    for (const refund of order.refunds) {
+      const adjustmentRef = refund.deferralAdjustmentRef?.trim()
+      if (!adjustmentRef) continue
+      if (!hasLiveSyncLog(syncLogIndex.exact, 'DAILY_BATCH_REVENUE_DEFERRAL', adjustmentRef, 'DailyBatch')) {
+        findings.push({
+          severity: 'warning',
+          code: 'refund_deferral_adjustment_without_sync_evidence',
+          orderId: order.id,
+          message: `Sales order ${label} has a refund netted out of its revenue deferral by adjustment ${adjustmentRef}, but no live daily batch sync row carries it`,
+          details: { refundId: refund.id, expectedReferenceId: adjustmentRef, totalBase: decimalToNumber(refund.totalBase) },
+        })
+      }
     }
 
     if (hasA1) {
@@ -1123,6 +1167,9 @@ export async function collectAccountingInvariantRows(
             accountingRetrySyncs: true,
             chargeback: true,
             reversalStaged: true,
+            refundedAt: true,
+            totalsBasis: true,
+            deferralAdjustmentRef: true,
           },
         },
       },

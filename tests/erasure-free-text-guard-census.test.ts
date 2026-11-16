@@ -54,16 +54,18 @@ test('the migration installs a trigger for every guarded table and column, and t
 const WRITERS: Record<string, Record<string, number>> = {
   wmsOrderStatusSnapshot: { 'lib/domain/wms/order-status-sweep.ts': 3 },
   wmsOrderPushLink: {
-    'app/actions/sync-exceptions.ts': 7, 'app/actions/wms-order-push.ts': 2, 'lib/domain/outbound-shadow/retire-held-backlog.ts': 1,
-    'lib/domain/wms/dispatch-sweep.ts': 10, 'lib/domain/wms/operator-task-done.ts': 1, 'lib/domain/wms/order-push-sweep.ts': 19, 'lib/domain/wms/order-reconcile-sweep.ts': 1,
+    'app/actions/sync-exceptions.ts': 8, 'app/actions/wms-order-push.ts': 2, 'lib/domain/outbound-shadow/retire-held-backlog.ts': 1,
+    'lib/domain/wms/dispatch-sweep.ts': 10, 'lib/domain/wms/double-postage.ts': 1, 'lib/domain/wms/operator-task-done.ts': 1, 'lib/domain/wms/order-push-sweep.ts': 19, 'lib/domain/wms/order-reconcile-sweep.ts': 1,
   },
-  wmsOrderDiscrepancy: { 'app/actions/sync-exceptions.ts': 2, 'lib/domain/wms/order-reconcile-sweep.ts': 11 },
+  wmsOrderDiscrepancy: { 'app/actions/sync-exceptions.ts': 2, 'lib/domain/wms/dispatch-sweep.ts': 3, 'lib/domain/wms/order-reconcile-sweep.ts': 12 },
   wmsReturnsInbox: { 'app/actions/mintsoft-sync.ts': 2, 'lib/connectors/mintsoft/sync/returns-sync.ts': 1 },
   salesOrderRefund: {
     'app/actions/sales.ts': 2, 'lib/domain/accounting/back-reference.ts': 1, 'lib/domain/sales/refund-accounting-discharge.ts': 1,
     'lib/domain/sales/refund-basis-backfill.ts': 1, 'lib/domain/sales/refund-service.ts': 9,
     // Stamps `stockCorrectionQueuedAt`, a timestamp: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
     'lib/connectors/woocommerce/sync/refund-stock-correction.ts': 1,
+    // Stamps `deferralAdjustmentRef`, a daily-batch journal reference: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
+    'lib/connectors/xero/daily-sync.ts': 1,
   },
 }
 

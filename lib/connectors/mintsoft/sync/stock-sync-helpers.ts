@@ -337,6 +337,14 @@ export type MintsoftAlignDownInput = {
    */
   openAsnPendingQty: number
   /**
+   * Units the WMS has despatched (or may have: the despatch sweep gave up on the order, or the cached WMS
+   * status is missing or stale) that IMS has not yet recorded as SHIPPED: they still sit in IMS on-hand and reservedQty, while Mintsoft has already taken
+   * them off its balance. A positive value means a lower Mintsoft balance can be an unrecorded despatch, so
+   * writing it off here would be undone-and-doubled when the despatch lands and decrements stock again
+   * (o3d-hqvrp.118). The source is `loadInFlightDispatch` in in-flight-dispatch.ts.
+   */
+  inFlightDispatchQty: number
+  /**
    * The OPEN QTY_MISMATCH discrepancy recorded by a PREVIOUS run, read BEFORE this
    * run upserts it. Null when this is the first run that sees the mismatch.
    */
@@ -366,6 +374,12 @@ export type MintsoftAlignDownDecision =
  *  4. receipt timing       — open-ASN pending receipts can explain IMS holding
  *                            more than Mintsoft (booked-in not yet processed);
  *                            never write those off.
+ *  4b. in-flight despatch  — units the WMS has despatched and IMS has not yet
+ *                            recorded as shipped: the dispatch will decrement stock
+ *                            itself, so aligning down now counts those units twice.
+ *                            Unlike the persistence gate (5) this does not expire
+ *                            after one cycle: it holds for as long as the despatch
+ *                            is unrecorded.
  *  5. persistence          — the SAME delta must have been recorded by a previous
  *                            run (dispatch webhooks/sweeps get a full cycle to
  *                            land before we treat the delta as real shrinkage).
@@ -403,6 +417,13 @@ export function planMintsoftAlignDown(input: MintsoftAlignDownInput): MintsoftAl
     return {
       action: 'hold',
       reason: `Open ASN lines still expect ${input.openAsnPendingQty} inbound for this product — the lower Mintsoft balance may be receipt timing, not shrinkage.`,
+    }
+  }
+
+  if (input.inFlightDispatchQty > 0) {
+    return {
+      action: 'hold',
+      reason: `${input.inFlightDispatchQty} unit(s) of this product are despatched at the WMS but not yet recorded as shipped in IMS — the lower Mintsoft balance is that despatch, not shrinkage. Align-down resumes once the despatch is recorded.`,
     }
   }
 

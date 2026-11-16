@@ -56,7 +56,7 @@ Purchase orders use the canonical purchase workflow documented in `docs/workflow
 | **Draft** | The PO has been created but not yet sent. Everything can still be edited. |
 | **RFQ Sent** | A request for quotation has been sent to the supplier. |
 | **Quote Received** | A supplier quote has been received and can be converted to a purchase order. |
-| **PO Sent** | The purchase order has been confirmed and sent to the supplier. |
+| **PO Sent** | The purchase order has been confirmed. When emailing POs is switched on (off by default), **Confirm & Send PO** also queues an email with the PO PDF to the supplier's email address (see [PO PDF](#po-pdf)). |
 | **Shipped** | The supplier has shipped the goods. |
 | **Partially Received** | Some lines have been received but the PO is not yet complete. |
 | **Received** | Every line has landed in stock. A line counts as **landed** when its goods have arrived by any route: a manual receipt, a warehouse (WMS) book-in, or a warehouse stock-sync alignment that raised stock without a receipt on the line. An order the warehouse accounted for entirely therefore becomes Received without a manual receipt. |
@@ -99,7 +99,14 @@ Generate a request for quotation PDF to send to the supplier. The RFQ includes p
 
 ### PO PDF
 
-Generate a purchase order PDF to send to the supplier. The PO PDF includes product details, barcodes/EANs, **and prices**.
+The **PO PDF** button on any purchase order opens the priced purchase order: supplier and our reference, delivery address (the destination warehouse), expected delivery, currency, payment terms, every line with quantity, unit cost, discount and total, then the totals (subtotal after discounts, VAT, additional costs and the order total). It needs the Purchasing permission. Settings > Documents > Purchase Order previews the same layout with sample data.
+
+**Confirm & Send PO** confirms the order and then, **only if emailing POs is switched on**, queues an email to the supplier's address with this PDF attached. The switch is **Settings > Company > Documents > Email purchase orders to suppliers** (administrators only) and it is **off by default**: the feature is built but ships switched off, so a stage copy holding real SMTP credentials cannot mail a real supplier.
+
+- **Switched off (default):** the order is confirmed, nothing is queued and the page says "PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it to the supplier directly." The **Email PO** button is hidden. A PO email that was queued before the switch was turned off is not sent either: it ends **Failed** in the email queue with the reason "Not sent: emailing purchase orders to suppliers is switched off".
+- **Switched on:** the order is confirmed first. If the email cannot be queued, or the supplier has **no email address** (or an invalid one), the order stays confirmed and the page says nothing was sent. Add the address on the supplier and click **Email PO**, or download the PDF and send it to the supplier directly.
+- **Email PO** (on a confirmed order, switch on) queues the email again, for example after correcting the supplier's address. A second click while the first email is still waiting does not add a duplicate.
+- "Queued" means the email is on the outbox, not that the supplier has it. It goes out through the same email queue as order confirmations (see [Documents & Email](documents-email.md)), with your SMTP settings. The outcome is logged on the order's activity.
 
 
 ## Receiving a Purchase Order
@@ -107,6 +114,10 @@ Generate a purchase order PDF to send to the supplier. The PO PDF includes produ
 When goods arrive, open the PO and click **Receive Goods**. You can receive all lines at once or partially receive individual lines. You cannot receive more than the line's ordered quantity less what has already landed (including anything the warehouse has booked in or aligned).
 
 **Lines with an open warehouse ASN are booked in through the ASN, not by hand.** If a line's Mintsoft (warehouse) ASN is still open, partly booked in, or being created, **Receive Goods** refuses that line and names the SKU and the ASN. Use **Recheck booked-in** on the order once the warehouse has booked the goods, so the stock is added once. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received here.
+
+**The supplier will not send the rest of a part-delivered ASN.** In the order's warehouse ASN table, press **Close short** on the partly booked-in ASN and give a reason. Nothing is booked or written off; the units the warehouse already booked in stay received, and the undelivered quantity becomes outstanding again, so you can receive it by hand or create a new ASN. It is refused while the ASN has a booked-in update that has not been applied yet (use **Recheck booked-in** first). If goods for a closed ASN turn up later, put them on a new ASN.
+
+**Over-delivery.** If the warehouse books in more than the ASN expected, the update waits for an administrator to approve it. The review shows the quantity that will be booked. On approval all of it is received into stock at the order's unit cost and counted against the order line.
 
 When stock is received:
 
