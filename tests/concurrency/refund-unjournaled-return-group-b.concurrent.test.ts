@@ -248,3 +248,145 @@ test('o3d-hqvrp.32: 3 units shipped across 3 shipments journaled in SEPARATE run
     await rig.appDb.$disconnect()
   }
 })
+
+const accountingSettings = {
+  connector: 'xero', syncEnabled: true, salesAccount: '4000', shippingAccount: '4010', discountAccount: '', cogsAccount: '5000',
+  inventoryRevaluationAccount: '', inventoryAccount: '1200', allocatedInventoryAccount: '1210', unearnedRevenueAccount: '2100',
+  transitAccount: '', accountsReceivableAccount: '', accountsPayableAccount: '', realisedFxGainLossAccount: '',
+  unrealisedFxGainLossAccount: '', manufacturingOverheadAccount: '', euVatIossAccount: '', euVatDdpAccount: '', euFeeAccount: '',
+  roundingDifferenceAccount: '', paymentAccountMap: '{}', invoiceUrlTemplate: '', billUrlTemplate: '', reverseChargeSalesTaxType: '',
+} as never
+
+test('o3d-hqvrp.361: one line, two shipments (one journaled, one not), both units refunded and returned: each restocked once at its own cost, one reversal each, GL = cost layers, a rerun books nothing twice', { skip }, async () => {
+  const rig = await openRig()
+  const { Prisma, db } = rig
+  const D = (v: string) => new Prisma.Decimal(v)
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let orderId: string | undefined
+  let productId: string | undefined
+  const whs: string[] = []
+  try {
+    for (const [key, value] of [['xero_sync_enabled', 'true'], ['xero_cogs_account', '5000'], ['xero_inventory_account', '1200'], ['xero_allocated_inventory_account', '1210'], ['xero_unearned_revenue_account', '2100'], ['xero_sales_account', '4000']]) {
+      await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+    }
+    const product = await db.product.create({ data: { sku: `MX-${suffix}`, name: 'mx', type: 'SIMPLE' }, select: { id: true } })
+    productId = product.id
+    const main = await db.warehouse.create({ data: { code: `XM${suffix.slice(0, 8)}`, name: 'mx main' }, select: { id: true } })
+    const returns = await db.warehouse.create({ data: { code: `XR${suffix.slice(0, 8)}`, name: 'mx returns' }, select: { id: true } })
+    whs.push(main.id, returns.id)
+    const costs = ['40', '50']
+    const layers = [] as Array<{ id: string; unit: string }>
+    for (const unit of costs) {
+      const l = await db.costLayer.create({ data: { productId: product.id, warehouseId: main.id, receivedQty: D('1'), remainingQty: D('0'), unitCostBase: D(unit) }, select: { id: true } })
+      layers.push({ id: l.id, unit })
+    }
+    // Order total exceeds the two refunded units, so the refund is PARTIAL by amount and Group B still journals the rest.
+    const order = await db.salesOrder.create({
+      data: {
+        orderNumber: `MX-${suffix.slice(0, 8)}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: D('1'),
+        subtotalForeign: D('200'), totalForeign: D('300'), subtotalBase: D('200'), taxBase: D('0'), totalBase: D('300'),
+        paidAt: new Date(), revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: D('200'),
+        inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'), allocationBatchAmount: D('90'),
+        lines: { create: [{ productId: product.id, description: 'mx', qty: D('2'), unitPriceForeign: D('100'), unitPriceBase: D('100'), taxForeign: D('0'), taxBase: D('0'), totalForeign: D('200'), totalBase: D('200') }] },
+      },
+      select: { id: true, lines: { select: { id: true } } },
+    })
+    orderId = order.id
+    const lineId = order.lines[0].id
+    await db.orderAllocation.create({ data: { orderId: order.id, lineId, productId: product.id, warehouseId: main.id, qty: D('2'), allocationBatchAmount: D('90'), costLayerSnapshot: layers.map((l) => ({ costLayerId: l.id, qty: '1', unitCostBase: l.unit })) } })
+    const shipmentIds: string[] = []
+    for (const [i, l] of layers.entries()) {
+      const shipment = await db.shipment.create({
+        data: {
+          orderId: order.id, warehouseId: main.id, status: 'SHIPPED', shippedAt: new Date(), cogsBatchAmount: D(l.unit), createdAt: new Date(Date.now() - (10 - i) * 60_000),
+          // Shipment 0 (cost 40) is already journaled; shipment 1 (cost 50) is shipped but waits for Group B.
+          ...(i === 0 ? { shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'), revenueRecognizedAmount: D('100') } : {}),
+          lines: { create: [{ lineId, productId: product.id, qty: D('1'), costLayerSnapshot: [{ costLayerId: l.id, qty: '1', unitCostBase: l.unit }] }] },
+        },
+        select: { id: true },
+      })
+      shipmentIds.push(shipment.id)
+    }
+    await db.stockLevel.create({ data: { productId: product.id, warehouseId: main.id, quantity: D('0'), reservedQty: D('0') } })
+
+    // 1. Refund both units with a return.
+    const refund = await rig.createSalesOrderRefund(rig.db, {
+      orderId: order.id,
+      lines: [{ lineId, productId: product.id, description: 'mx', qty: 2, totalBase: 200 }],
+      reason: 'Customer return', returnWarehouseId: returns.id, creditNotePrefix: `MX${suffix.slice(0, 6)}-`, accountingSettings,
+    })
+    assert.equal(refund.success, true, `refund (${refund.success ? '' : refund.error})`)
+    if (!refund.success) return
+    const refundId = refund.createdRefund.id
+    const syncs = refund.accountingSyncs as unknown as Array<{ type: string; payload: { lines: Line[] } }>
+    const balanced = (lines: Line[]) => Math.round(lines.reduce((s, l) => s + (l.debit ?? 0), 0) * 100) === Math.round(lines.reduce((s, l) => s + (l.credit ?? 0), 0) * 100)
+    for (const s of syncs) assert.ok(balanced(s.payload.lines), `${s.type} balances`)
+
+    // Both units restocked, each at its own shipment's issued cost.
+    const returnedLayers = await db.costLayer.findMany({ where: { productId: product.id, warehouseId: returns.id }, select: { receivedQty: true, unitCostBase: true } })
+    assert.deepEqual(returnedLayers.map((l) => [Number(l.receivedQty), Number(l.unitCostBase)]).sort((a, b) => a[1] - b[1]), [[1, 40], [1, 50]], 'both units restocked, once each, at their issued costs')
+    assert.equal(Number((await db.stockLevel.findFirst({ where: { productId: product.id, warehouseId: returns.id } }))?.quantity), 2)
+    const returnedValue = returnedLayers.reduce((s, l) => s + Number(l.receivedQty) * Number(l.unitCostBase), 0)
+
+    // The staged reversal covers the journaled unit only.
+    const stagedInventoryDebit = syncs.filter((s) => s.type === 'COGS_REVERSAL').flatMap((s) => s.payload.lines).filter((l) => l.accountCode === '1200').reduce((s, l) => s + (l.debit ?? 0), 0)
+    assert.equal(stagedInventoryDebit, 40, 'the staged COGS reversal is the journaled unit (1 x 40)')
+    const refundRow = await db.salesOrderRefund.findUnique({ where: { id: refundId }, select: { returnCostSplit: true } })
+    assert.deepEqual(refundRow?.returnCostSplit, [{ shipmentId: shipmentIds[1], valueBase: '50.000000' }], 'only the unjournaled shipment still owes its share')
+
+    // 2. Group B journals the unjournaled shipment and books the unjournaled unit's credit.
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [], 'the batch ran clean')
+    assert.equal(run.groupB, 1)
+    const logs = await db.accountingSyncLog.findMany({ where: { type: 'DAILY_BATCH_GROUP_B' }, select: { payload: true } })
+    const mine = logs.map((l) => l.payload as { lines: Line[] }).filter((p) => p.lines.some((line) => line.accountCode === '1210' && (line.credit ?? 0) === 50))
+    assert.equal(mine.length, 1, 'one Group B journal, for the unjournaled shipment')
+    const lines = mine[0].lines
+    assert.ok(balanced(lines), 'the Group B journal balances')
+    const sum = (code: string, side: 'debit' | 'credit') => lines.filter((l) => l.accountCode === code).reduce((s, l) => s + (l[side] ?? 0), 0)
+    assert.equal(sum('1200', 'debit'), 50, 'the unjournaled unit credit is booked: Inventory debit 50')
+    assert.equal(sum('5000', 'debit') - sum('5000', 'credit'), 0, 'that shipment\'s COGS is fully reversed (shipped 50 - returned 50)')
+
+    // Final GL = cost layers: Inventory debits from the staged reversal + Group B equal the restocked layers.
+    assert.equal(stagedInventoryDebit + sum('1200', 'debit'), returnedValue, 'GL Inventory debits == the cost layers that came back')
+    const rows = await db.cogsSubledgerMovement.findMany({ where: { idempotencyKey: { startsWith: 'refund-unjournaled-return:' }, sourceRef: refundId } })
+    assert.equal(rows.length, 1)
+    assert.equal(Number(rows[0].baseDelta), -50)
+
+    // 3. A rerun books nothing twice and restocks nothing twice.
+    await db.shipment.updateMany({ where: { id: shipmentIds[1] }, data: { shipmentJournalDate: null } })
+    const again = await rig.runDailyBatchSync()
+    assert.deepEqual(again.errors, [])
+    assert.equal(await db.cogsSubledgerMovement.count({ where: { idempotencyKey: { startsWith: 'refund-unjournaled-return:' }, sourceRef: refundId } }), 1, 'the credit is recorded once')
+    const inventoryDebits = (await db.accountingSyncLog.findMany({ where: { type: 'DAILY_BATCH_GROUP_B' }, select: { payload: true } }))
+      .map((l) => l.payload as { lines: Line[] }).flatMap((p) => p.lines).filter((l) => l.accountCode === '1200' && (l.debit ?? 0) > 0)
+    assert.equal(inventoryDebits.length, 1, 'the unjournaled unit\'s credit is in exactly one journal')
+    assert.equal(await db.stockMovement.count({ where: { productId: product.id, type: 'RETURN_INBOUND' } }), 1, 'the return movement exists once')
+    assert.equal(await db.costLayer.count({ where: { productId: product.id, warehouseId: returns.id } }), 2, 'no layer was added by the rerun')
+  } finally {
+    const oid = orderId
+    if (oid) {
+      await db.accountingSyncLog.deleteMany({ where: { type: 'DAILY_BATCH_GROUP_B' } }).catch(() => {})
+      await db.cogsSubledgerMovement.deleteMany({ where: { OR: [{ idempotencyKey: { startsWith: 'refund-unjournaled-return:' } }, { idempotencyKey: { startsWith: 'dispatch:' } }] } }).catch(() => {})
+      await db.activityLog.deleteMany({ where: { entityId: oid } }).catch(() => {})
+      await db.integrationOutbox.deleteMany({ where: { operation: 'refund.reservation-release', payloadJson: { path: ['orderId'], equals: oid } } }).catch(() => {})
+      await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: oid } } }).catch(() => {})
+      await db.salesOrderRefund.deleteMany({ where: { orderId: oid } }).catch(() => {})
+      await db.shipmentLine.deleteMany({ where: { shipment: { orderId: oid } } }).catch(() => {})
+      await db.shipment.deleteMany({ where: { orderId: oid } }).catch(() => {})
+      await db.orderAllocation.deleteMany({ where: { orderId: oid } }).catch(() => {})
+      await db.salesOrderLine.deleteMany({ where: { orderId: oid } }).catch(() => {})
+      await db.salesOrder.delete({ where: { id: oid } }).catch(() => {})
+    }
+    if (productId) {
+      await db.stockMovement.deleteMany({ where: { productId } }).catch(() => {})
+      await db.costLayerSourceLine.deleteMany({ where: { costLayer: { productId } } }).catch(() => {})
+      await db.costLayer.deleteMany({ where: { productId } }).catch(() => {})
+      await db.stockLevel.deleteMany({ where: { productId } }).catch(() => {})
+    }
+    await db.warehouse.deleteMany({ where: { id: { in: whs } } }).catch(() => {})
+    if (productId) await db.product.delete({ where: { id: productId } }).catch(() => {})
+    await db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
