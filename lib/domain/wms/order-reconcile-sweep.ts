@@ -8,6 +8,7 @@ import { wmsCreateObligationFloor, wmsProducerHold } from '@/lib/connectors/wms/
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus } from '@/lib/connectors/wms/types'
 import { notify } from '@/lib/notifications'
 import { scrubWmsError } from './error-scrub'
+import { WMS_TERMINAL_NON_DESPATCH_CATEGORY } from './terminal-status'
 
 /**
  * Connector-agnostic scheduled ORDER-LEVEL reconciliation (q66in.4.4): compares
@@ -796,6 +797,21 @@ export async function runWmsOrderReconcileSweep(
       data: { status: 'RESOLVED', resolvedAt: now },
     })
 
+    // A WMS-terminal-not-despatched row (raised by the dispatch sweep for an order IMS still treats as live) is moot once the link has left
+    // SYNCED/MERGED or IMS itself has cancelled / held / shipped / fully refunded the order: the operator has acted, or check C now owns it.
+    await db.wmsOrderDiscrepancy.updateMany({
+      where: {
+        category: WMS_TERMINAL_NON_DESPATCH_CATEGORY,
+        status: 'OPEN',
+        OR: [
+          { order: { wmsOrderPush: { isNot: { state: { in: ['SYNCED', 'MERGED'] } } } } },
+          { order: { status: { in: ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED', 'ON_HOLD'] } } },
+          { order: { refundStatus: 'FULL' } },
+        ],
+      },
+      data: { status: 'RESOLVED', resolvedAt: now },
+    })
+
     // Resolve NOT_PUSHED rows whose drift predicate no longer holds — the order
     // gained a live link, or stopped being eligible. Re-evaluated per open row
     // (bounded set), never by absence from a capped scan.
@@ -806,7 +822,7 @@ export async function runWmsOrderReconcileSweep(
     for (let lastId = ''; ;) {
       const openRows = await db.wmsOrderDiscrepancy.findMany({
         where: {
-          category: { in: ['MISSING_IN_WMS', 'ACTIVE_AFTER_CANCEL'] },
+          category: { in: ['MISSING_IN_WMS', 'ACTIVE_AFTER_CANCEL', WMS_TERMINAL_NON_DESPATCH_CATEGORY] },
           status: 'OPEN',
           externalOrderNumber: { not: null },
           ...(lastId ? { id: { gt: lastId } } : {}),

@@ -114,6 +114,21 @@ export function refundNoteQuery(wmsOrder: string, imsOrder: string, creditNote: 
     : `Warehouse order ${wmsOrder} (IMS order ${imsOrder}) was partly refunded in IMS${cn} and its line quantities were reduced. If the order can no longer be amended automatically, please remove the refunded items from it.`
 }
 
+/**
+ * The query for a hold or cancel whose warehouse order could not be PROVED to be this order (its number did not match, could not be read, or
+ * the order was not found and no merge could be proven). IMS sent nothing. An operator investigates and acts; nothing here tells them to cancel
+ * an order that may not be this one.
+ */
+export function identityCheckQuery(intent: 'HOLD' | 'CANCEL', wmsOrder: string, imsOrder: string): string {
+  const what = intent === 'HOLD' ? 'placed ON HOLD in IMS' : 'CANCELLED / fully refunded in IMS'
+  const act = intent === 'HOLD' ? 'pause' : 'cancel'
+  return `IMS order ${imsOrder} was ${what}, but IMS could not confirm that warehouse order ${wmsOrder} is this order (its number or id does not match what IMS sent, or it could not be found), so IMS sent nothing to the warehouse. `
+    + `Please look the order up in the warehouse and act: if it is this order and has not been despatched, ${act} it; if it was merged or renamed, deal with the order it became; do not change an order that is not this one.`
+}
+
+/** The lastError of a notice whose task is an investigation: the retry pass reads it to raise the same kind of task. */
+export const INVESTIGATE_NOTICE_PREFIX = 'Check needed: '
+
 export function noticeQuery(intent: 'HOLD' | 'CANCEL', merged: boolean, wmsOrder: string, imsOrder: string): string {
   if (intent === 'HOLD') {
     return merged

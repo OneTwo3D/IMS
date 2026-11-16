@@ -239,7 +239,7 @@ test('H2: a 404 on cancel is NOT a successful cancel: the link is not CANCELLED,
   const r = await quiet(() => runWmsOrderPushSweepCore(wms.connector, 'mintsoft', port, { now: NOW }))
   assert.equal(r.cancelled, 0)
   assert.equal(r.operatorNotices, 1)
-  assert.equal(updates.length, 1)
+  assert.equal(updates.length, 2, 'the notice, then the stamp once its investigative task is recorded')
   assert.notEqual(updates[0].data.state, 'CANCELLED')
   assert.ok(updates[0].data.cancelNoticeAt)
   assert.match(String(updates[0].data.lastError), /was not found[\s\S]*merged[\s\S]*NOT recorded it as cancelled/)
@@ -466,14 +466,16 @@ test('R2-2: an operator task that could NOT be recorded leaves the notice in pla
   assert.equal(updates[0].data.holdNoticeCommentAt, null)
 })
 
-test('R2-2: a notice whose task was recorded is stamped; a 404 notice (no task) is settled by definition', async () => {
+test('R2-2: a notice whose task was recorded is stamped; a 404 notice is stamped only once its investigative task is recorded (o3d-hqvrp.351)', async () => {
   const delivered = makePort({ holdable: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3' }] })
   await quiet(() => runWmsOrderPushSweepCore(connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) }).connector, 'mintsoft', delivered.port, { now: NOW }))
   assert.equal(delivered.updates.length, 2)
   assert.ok(delivered.updates[1].data.holdNoticeCommentAt, 'stamped after the task was recorded')
   const notFound = makePort({ holdable: [{ id: 'link-1', orderId: 'so-3', externalOrderId: 'wms-3' }] })
   await quiet(() => runWmsOrderPushSweepCore(connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }) }).connector, 'mintsoft', notFound.port, { now: NOW }))
-  assert.ok(notFound.updates[0].data.holdNoticeCommentAt)
+  assert.equal(notFound.updates[0].data.holdNoticeCommentAt, null, 'not settled at the write')
+  assert.equal(notFound.tasks.length, 1)
+  assert.ok(notFound.updates[1].data.holdNoticeCommentAt, 'stamped after the task was recorded')
 })
 
 test('R2-2: a notice with no task yet (a failed raise, or a notice from before operator tasks) gets its task on a later sweep, and is stamped', async () => {
@@ -561,7 +563,8 @@ test('merge: the same for a cancel; and with no survivor (a deletion) the plain 
   const gone = makePort({ cancellable: [{ id: 'link-1', orderId: 'so-2', externalOrderId: 'old-1', externalOrderNumber: 'ORD-B' }] })
   const g = connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_FOUND' }), findMergedSurvivor: async () => ({ kind: 'ABSENT' as const }) })
   await quiet(() => runWmsOrderPushSweepCore(g.connector, 'mintsoft', gone.port, { now: NOW }))
-  assert.equal(gone.updates.length, 1)
+  assert.equal(gone.updates.length, 2, 'the notice, then the stamp once its task is recorded')
+  assert.equal(gone.tasks.length, 1)
   assert.equal(gone.updates[0].data.state, undefined)
   assert.match(String(gone.updates[0].data.lastError), /was not found/)
 })
@@ -742,7 +745,9 @@ test('R17: B 404s, a survivor "A+B+C" (an unrelated merge that merely lists B) i
     assert.equal(updates.some((u) => u.data.state === 'MERGED' || u.data.externalOrderId === 'surv-abc'), false, `${intent}: the link was NOT re-pointed`)
     assert.equal(result.operatorNotices, 1)
     assert.match(String(updates.find((u) => typeof u.data.lastError === 'string')!.data.lastError), /possible merge into WMS order surv-abc could not be proven.*does not hold this order's recorded lines.*check it in the WMS/)
-    assert.deepEqual(tasks, [], 'no task is raised about the unproven survivor')
+    assert.equal(tasks.length, 1, 'one investigative task is raised, and it names no unproven survivor')
+    assert.match(tasks[0].queryText, /could not confirm that warehouse order .* is this order/)
+    assert.doesNotMatch(tasks[0].queryText, /surv-abc/)
   }
 })
 
