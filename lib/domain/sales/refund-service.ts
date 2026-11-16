@@ -6083,7 +6083,21 @@ export async function retrySalesOrderRefundAccounting(
       // o3d-2sm1: THE ORDER'S DEFERRAL BEING GONE IS NOT PROOF THAT NOTHING WAS OWED — it is
       // equally what a full refund's OWN un-stage leaves behind. Which of the two this row is, is
       // decided by `reversalRecordVerdict`, never by the missing date on its own.
-      if (!refund.order.revenueDeferredDate) {
+      // ACC-H12: A COSTED-ON-SHIPMENT REFUND WHOSE STAGING NEVER COMMITTED IS RE-STAGED, NOT DISMISSED.
+      //
+      // Such a refund owes its accounting (the flag is set at creation) while the order has no deferral stamp, so the
+      // branch below would read "no deferral" as "nothing owed" and return success with no syncs, and the caller would
+      // clear the flag over a COGS reversal that was never queued. The row's own witness tells the two apart exactly:
+      // `NOT_STAGED` is written at INSERT and the staging transaction flips it to `STAGED` in the same commit that records
+      // the syncs, so NOT_STAGED with no recorded syncs means staging demonstrably never committed; and an order with
+      // no deferral stamp that still has a costed shipment can only have armed the flag for that reason (a full
+      // refund's own un-stage writes STAGED). The reversal of a costed shipment is derived from the shipment's own
+      // snapshots, which a deferral stamp is not needed for, so it is re-derived here, once, in this transaction.
+      const costedOnlyRestage = !refund.order.revenueDeferredDate
+        && refund.accountingRetrySyncs == null
+        && refund.reversalStagingState === REVERSAL_STAGING_NOT_STAGED
+        && (await tx.shipment.count({ where: { orderId: refund.orderId, shipmentJournalDate: { not: null }, cogsRelievedFromInventoryAt: { not: null } } })) > 0
+      if (!refund.order.revenueDeferredDate && !costedOnlyRestage) {
         // Re-staging is not the alternative on either branch below, and the omission is worth
         // stating: every reversal amount is derived from the stamps the un-stage removed. A re-stage
         // here would take no residue and record no refusal — a fabricated figure in place of a
@@ -6177,6 +6191,7 @@ export async function retrySalesOrderRefundAccounting(
         newStatus,
         chargeback: refund.chargeback,
         activeConnector: input.activeAccountingConnector,
+        ...(costedOnlyRestage ? { costedShipmentsOnly: true } : {}),
       })
 
       let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []

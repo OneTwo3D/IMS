@@ -26,7 +26,7 @@ import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import {
   StaleDailyBatchDeferralError,
   assertRevenueDeferralsUnchanged,
-  preBatchRefundAdjustments,
+  preBatchRefundDeferredParts,
   preBatchRefundsNettedIntoStoredDeferral,
   revenueDeferralGrossAmount,
   logStaleDailyBatchDeferral,
@@ -981,9 +981,18 @@ export async function recreateMissingDailyBatchLogs(
       unearnedRevenueAmount: true,
       // ACC-H13: the paid-day journal carries the GROSS deferral; pre-batch refunds are separate adjustment
       // journals. The stored amount is net, so the refunds that were netted are added back here.
-      refunds: { select: { totalBase: true, totalsBasis: true, deferralAdjustmentRef: true } },
-      // ACC-H12: the revenue shipments recognised before the deferral, which the paid-day journal leaves out.
+      refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true, deferralAdjustmentRef: true } },
+      // ACC-H12: the revenue shipments recognised before the deferral, which the paid-day journal leaves out. Such an
+      // order is rebuilt from its gross figure (see below), so the inputs of that figure ride along.
       shipments: { where: { cogsRelievedFromInventoryAt: { not: null } }, select: { revenueRecognizedAmount: true } },
+      subtotalBase: true,
+      shippingBase: true,
+      discountAmount: true,
+      pricesIncludeVat: true,
+      taxRatePercent: true,
+      fxRateToBase: true,
+      shoppingLinks: { select: { connector: true } },
+      lines: { select: { totalBase: true, taxRate: { select: { rate: true } } } },
     },
   })
   const orphanA2Orders = await db.salesOrder.findMany({
@@ -1021,6 +1030,11 @@ export async function recreateMissingDailyBatchLogs(
   // from the same orders (same retention window and cut-off) as the paid-day batches, so a lost adjustment is
   // rebuilt exactly once.
   for (const order of orphanA1Orders) {
+    // ACC-H12: with revenue shipped before payment only the deferred part of a refund was adjusted against Unearned.
+    const shippedBeforeDeferral = (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
+    const deferredPartByRefundId = shippedBeforeDeferral > 0
+      ? new Map(preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount({ id: '', ...order }), shippedBeforeDeferral).map((part) => [part.refundId, part.deferredPart]))
+      : null
     for (const refund of order.refunds ?? []) {
       if (!refund.deferralAdjustmentRef) continue
       const summary = foldDailyBatchRow(
@@ -1031,7 +1045,7 @@ export async function recreateMissingDailyBatchLogs(
       )
       if (!summary) continue
       summary.refundCount += 1
-      summary.total += Number(refund.totalBase ?? 0)
+      summary.total += deferredPartByRefundId ? (deferredPartByRefundId.get(refund.id) ?? 0) : Number(refund.totalBase ?? 0)
     }
   }
 
@@ -1047,7 +1061,11 @@ export async function recreateMissingDailyBatchLogs(
     summary.orderCount += 1
     const nettedBack = preBatchRefundsNettedIntoStoredDeferral(order)
     const shippedBeforeDeferral = (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
-    summary.total += Math.max(0, Number(order.unearnedRevenueAmount ?? 0) + nettedBack - shippedBeforeDeferral)
+    // ACC-H12: the paid-day journal of an order with revenue shipped before payment is its gross deferral less that
+    // revenue, whatever refunds were netted or not (the stored figure then also carries refunds of shipped goods).
+    summary.total += shippedBeforeDeferral > 0
+      ? Math.max(0, revenueDeferralGrossAmount({ id: '', ...order }) - shippedBeforeDeferral)
+      : Number(order.unearnedRevenueAmount ?? 0) + nettedBack
   }
 
   // o3d-i0o6 r5 (Codex round 4, HIGH 1) — THE LEDGER THIS SWEEP WOULD POST INTO, NAMED ONCE.
@@ -1627,14 +1645,26 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // disagreement can only mean the ORDER moved — never that the two sides do different sums.
       // `amount` is the NETTED figure (what the order stores and the fence re-derives); `grossAmount` is what the
       // paid-day journal moves, so a refund entered in a LATER period never changes an earlier period's journal.
-      const orderDeferrals = orders.map((order) => ({
-        orderId: order.id,
-        amount: revenueDeferralAmount(order),
-        // ACC-H12: only the part not yet shipped moves from Sales to Unearned Revenue. `amount` (what the order
-        // stores and the fence re-derives) keeps the full figure, so Group B's true-up and the refund service's
-        // open balance still see the whole deferral less what shipments recognised.
-        grossAmount: Math.max(0, round2(revenueDeferralGrossAmount(order) - (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0))),
-      }))
+      const shippedRevenueOf = (order: (typeof orders)[number]): number => (
+        (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
+      )
+      const orderDeferrals = orders.map((order) => {
+        const amount = revenueDeferralAmount(order)
+        const shippedRevenue = shippedRevenueOf(order)
+        // ACC-H12: refunds of goods that shipped before payment never took value out of the deferral (their revenue is
+        // still in Sales and the credit note reverses it), so the order stores the net figure PLUS that part. Group B's
+        // true-up and the refund service then see exactly what the ledger holds in Unearned Revenue. The fence still
+        // compares `amount`, the net figure.
+        const parts = preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenue)
+        const undeferredRefunds = parts.reduce((sum, part) => sum + part.amount - part.deferredPart, 0)
+        return {
+          orderId: order.id,
+          amount,
+          storedAmount: round2(amount + undeferredRefunds),
+          // Only the part not yet shipped moves from Sales to Unearned Revenue.
+          grossAmount: Math.max(0, round2(revenueDeferralGrossAmount(order) - shippedRevenue)),
+        }
+      })
       // ACC-H11: one journal per EVENT date (the day the order was paid), each with its own reference. The
       // fence below still covers EVERY order of the run in one lock, once.
       const orderById = new Map(orders.map((order) => [order.id, order]))
@@ -1675,11 +1705,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const adjustmentRows: RefundAdjustmentRow[] = []
       for (const order of orders) {
         const paidDay = utcDay(order.paidAt)
-        for (const adjustment of preBatchRefundAdjustments(order.refunds)) {
+        for (const adjustment of preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenueOf(order))) {
+          // ACC-H12: only the part of a refund that came out of deferred revenue is adjusted against Unearned.
+          if (!(adjustment.deferredPart > 0)) continue
           adjustmentRows.push({
             orderId: order.id,
             refundId: adjustment.refundId,
-            amount: adjustment.amount,
+            amount: adjustment.deferredPart,
             day: laterDay(utcDay(adjustment.refundedAt), paidDay),
           })
         }
@@ -1755,7 +1787,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             })
           }
 
-          const deferralByOrderId = new Map(group.rows.map((order) => [order.orderId, order.amount]))
+          const deferralByOrderId = new Map(group.rows.map((order) => [order.orderId, order.storedAmount]))
           for (const deferral of group.rows) {
             await tx.salesOrder.update({
               where: { id: deferral.orderId },

@@ -22,7 +22,7 @@ const skip = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
 async function openRig() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
-  const [{ Prisma, PrismaClient }, { PrismaPg }, { createSalesOrderRefund }, { runDailyBatchSync }, { db: appDb }] = await Promise.all([
+  const [{ Prisma, PrismaClient }, { PrismaPg }, { createSalesOrderRefund, retrySalesOrderRefundAccounting }, { runDailyBatchSync }, { db: appDb }] = await Promise.all([
     import('@/app/generated/prisma/client'),
     import('@prisma/adapter-pg'),
     import('@/lib/domain/sales/refund-service'),
@@ -30,7 +30,7 @@ async function openRig() {
     import('@/lib/db'),
   ])
   const db = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL!, max: 4 }) })
-  return { Prisma, db, appDb, createSalesOrderRefund, runDailyBatchSync }
+  return { Prisma, db, appDb, createSalesOrderRefund, retrySalesOrderRefundAccounting, runDailyBatchSync }
 }
 type Rig = Awaited<ReturnType<typeof openRig>>
 
@@ -447,6 +447,98 @@ test('ACC-H12: a lost costed-on-shipment journal is rebuilt DR COGS / CR Invento
     const again = await rig.runDailyBatchSync()
     assert.deepEqual(again.errors, [])
     assert.equal((await journals(rig)).length, rebuilt.length, 'rebuilt once')
+  } finally {
+    await clean(rig, fx)
+    await close(rig)
+  }
+})
+
+test('ACC-H12: a failed costed-on-shipment refund staging is RE-STAGED by the retry, once, and the flag stays until the caller clears it', { skip }, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Fixture | undefined
+  try {
+    await clean(rig, undefined)
+    await setup(rig)
+    fx = await seed(rig, suffix, { paid: false, shipUnits: 2, qty: 2 })
+    await fx.ship(2)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const refund = await rig.createSalesOrderRefund(rig.db, {
+      orderId: fx.orderId,
+      lines: [{ lineId: fx.lineId, productId: fx.productId, description: 'cs', qty: 1, totalBase: 100 }],
+      reason: 'Customer return', returnWarehouseId: fx.returnsId, creditNotePrefix: `CS${suffix.slice(0, 6)}-`,
+      accountingSettings, activeAccountingConnector: 'xero',
+    })
+    assert.equal(refund.success, true, `refund (${refund.success ? '' : refund.error})`)
+    if (!refund.success) return
+    // The state a FAILED staging leaves behind: the transaction rolled back, so no recorded syncs and the witness
+    // still says the staging never committed, while the obligation flag stands.
+    await rig.db.salesOrderRefund.update({
+      where: { id: refund.createdRefund.id },
+      data: { accountingRetrySyncs: rig.Prisma.DbNull, reversalStagingState: 'NOT_STAGED', accountingRetryRequired: true, allocatedReliefAmount: null },
+    })
+    const retried = await rig.retrySalesOrderRefundAccounting(rig.db, { refundId: refund.createdRefund.id, accountingSettings, activeAccountingConnector: 'xero' })
+    assert.equal(retried.success, true, `retry (${retried.success ? '' : retried.error})`)
+    if (!retried.success) return
+    const cogs = (retried.accountingSyncs as unknown as Array<{ type: string; payload: { lines: Line[] } }>).filter((sync) => sync.type === 'COGS_REVERSAL')
+    assert.equal(cogs.length, 1, 'the retry re-stages the COGS reversal instead of returning success with nothing')
+    const journal: Journal = { type: 'COGS_REVERSAL', lines: cogs[0].payload.lines }
+    assertBalanced([journal], 'retried reversal')
+    assert.equal(net([journal], '1200'), 10, 'DR Inventory')
+    assert.equal(net([journal], '5000'), -10, 'CR COGS')
+    assert.equal(net([journal], '1210'), 0)
+    const row = await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refund.createdRefund.id } })
+    assert.equal(row.accountingRetryRequired, true, 'the flag is cleared by the caller after queueing, never by the retry itself')
+    assert.equal(row.reversalStagingState, 'STAGED')
+    assert.ok(row.accountingRetrySyncs, 'the staged syncs are recorded for the caller to queue')
+    // A second retry replays the recorded syncs: still exactly one reversal.
+    const again = await rig.retrySalesOrderRefundAccounting(rig.db, { refundId: refund.createdRefund.id, accountingSettings, activeAccountingConnector: 'xero' })
+    assert.equal(again.success, true)
+    if (!again.success) return
+    assert.equal((again.accountingSyncs as unknown as Array<{ type: string }>).filter((sync) => sync.type === 'COGS_REVERSAL').length, 1, 'staged exactly once')
+  } finally {
+    await clean(rig, fx)
+    await close(rig)
+  }
+})
+
+test('ACC-H12: a partial refund of SHIPPED units before payment adjusts Unearned only for the part A1 deferred: Unearned nets to zero, Sales = gross - credit note', { skip }, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Fixture | undefined
+  try {
+    await clean(rig, undefined)
+    await setup(rig)
+    fx = await seed(rig, suffix, { paid: false, shipUnits: 2 })
+    await fx.ship(2)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    // 3 of the 4 units refunded: the 2 unshipped ones first, then 1 shipped one (money only; no stock comes back here).
+    const refund = await rig.createSalesOrderRefund(rig.db, {
+      orderId: fx.orderId,
+      lines: [{ lineId: fx.lineId, productId: fx.productId, description: 'cs', qty: 3, totalBase: 300 }],
+      reason: 'Customer refund', creditNotePrefix: `CS${suffix.slice(0, 6)}-`,
+    })
+    assert.equal(refund.success, true, `refund (${refund.success ? '' : refund.error})`)
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { paidAt: new Date() } })
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [])
+    const all = await journals(rig)
+    assertBalanced(all, 'refund before payment')
+    const a1 = all.filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
+    assert.equal(a1.length, 2, 'the paid-day deferral and the refund adjustment')
+    assert.equal(net(a1, '2100'), 0, 'Unearned nets to zero: 200 deferred (400 gross less 200 shipped), 200 adjusted (the refund part that came out of it)')
+    assert.equal(net(a1, '4000'), 0, 'the batch moves nothing net in Sales: gross 400 less the 300 credit note = 100 stays')
+    const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(Number(order.unearnedRevenueAmount), 200, 'stored = net 100 + the 100 refunded from shipped goods, which never left Sales')
+    const again = await rig.runDailyBatchSync()
+    assert.deepEqual(again.errors, [])
+    assert.equal((await journals(rig)).length, all.length, 'rerun posts nothing')
+    // A lost deferral and adjustment are rebuilt at the same figures.
+    await rig.db.accountingSyncLog.deleteMany({ where: { type: 'DAILY_BATCH_REVENUE_DEFERRAL' } })
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const rebuilt = (await journals(rig)).filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
+    assertBalanced(rebuilt, 'rebuilt')
+    assert.equal(net(rebuilt, '2100'), 0, 'the rebuild nets the same')
   } finally {
     await clean(rig, fx)
     await close(rig)
