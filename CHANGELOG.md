@@ -13,6 +13,7 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 ### Xero documents are sent with `unitdp=4`; the REST API connector card is removed (backend / sync / UI)
 
 - Every Xero invoice, bill, credit note, supplier credit and purchase order write now carries `unitdp=4`, so Xero keeps the 4 decimal places IMS sends for a unit amount instead of rounding to 2. Without it a 3-unit line at 33.3333 came out at 99.99 in Xero against 100.00 on the order, and the payment for the order total was refused.
+- IMS holds unit prices to 6 decimal places but Xero keeps 4 at `unitdp=4`, so a 300-unit line worth 100.00 (0.333333 each) would have totalled 99.99 in Xero. Where the 4dp unit price does not reproduce the line total to the penny, the line is sent as one unit at its own total with the quantity and unit price in the description; all other lines keep their quantity.
 - The Integrations page no longer shows a "REST API" card. It listed 10 `/api/v1` endpoints and told operators to generate an API key in User Management; neither exists.
 
 ### Mintsoft: IMS writes no order comments; it raises operator tasks instead (backend / sync / UI)

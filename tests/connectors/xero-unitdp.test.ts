@@ -88,3 +88,60 @@ test('a 3-unit line at 33.3333 is sent at 4dp and totals 100.00 at unitdp=4 (not
     assert.equal(line.Quantity * Math.round(line.UnitAmount * 100) / 100, 99.99, 'what a 2dp unit amount would have produced')
   }
 })
+
+// ---- six-decimal unit prices at a high quantity: unitdp=4 alone is not enough ---------------------------------------------------------
+
+import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { fitLineToXeroUnitDp } from '@/lib/connectors/xero/write-path'
+import { expectedLedgerTotal } from '@/lib/domain/sales/sales-invoice-reconciliation'
+
+/** Xero's line total at unitdp=4: Quantity x UnitAmount (kept to 4dp), rounded to 2dp. */
+const xeroLineTotal = (l: { Quantity: number; UnitAmount: number }) => roundQuantity(toDecimal(l.Quantity).mul(toDecimal(l.UnitAmount)), 2).toNumber()
+
+test('fitLineToXeroUnitDp: 100.00 over 300 units (0.333333) would total 99.99 at 4dp, so the line is sent as one unit of its own total', () => {
+  const naive = Math.round(300 * 0.3333 * 100) / 100
+  assert.equal(naive, 99.99, 'the penny the report is about')
+  const fit = fitLineToXeroUnitDp(300, 0.333333)
+  assert.deepEqual(fit, { Quantity: 1, UnitAmount: 100, collapsed: true })
+  assert.equal(xeroLineTotal(fit), 100)
+})
+
+test('fitLineToXeroUnitDp: a line the 4dp unit amount already reproduces is left alone (quantity kept)', () => {
+  assert.deepEqual(fitLineToXeroUnitDp(3, 33.3333), { Quantity: 3, UnitAmount: 33.3333, collapsed: false })
+  assert.deepEqual(fitLineToXeroUnitDp(3, 8.325), { Quantity: 3, UnitAmount: 8.325, collapsed: false })
+  const sixDp = fitLineToXeroUnitDp(2, 1.234567)
+  assert.deepEqual(sixDp, { Quantity: 2, UnitAmount: 1.2346, collapsed: false })
+  assert.equal(xeroLineTotal(sixDp), 2.47)
+})
+
+test('every fitted line totals, at Xero\'s precision, what the IMS line totals (6dp unit prices, quantities 1..400)', () => {
+  for (const unit of [0.333333, 0.666667, 1.234567, 9.990001, 0.014286, 33.333333, 0.166667]) {
+    for (let q = 1; q <= 400; q++) {
+      const fit = fitLineToXeroUnitDp(q, unit)
+      assert.equal(xeroLineTotal(fit), roundQuantity(toDecimal(q).mul(toDecimal(unit)), 2).toNumber(), `${q} x ${unit}`)
+    }
+  }
+})
+
+test('invoice, credit note and bill built from a 300 x 0.333333 line carry the exact total, and the reconciliation expects the same figure', async () => {
+  const { buildSalesInvoicePayload } = await import('@/lib/connectors/xero/invoices')
+  const { buildPurchaseBillPayload } = await import('@/lib/connectors/xero/bills')
+  const { buildXeroPurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  const high = [{ itemCode: 'SKU-1', description: 'Bulk', quantity: 300, unitAmount: 0.333333, accountCode: '200', taxType: 'OUTPUT2' }]
+  const payloads = [
+    buildSalesInvoicePayload({ ...invoice, lines: high } as InvoiceData, 'AUTHORISED', 'c1', new Set(), 'GBP'),
+    buildPurchaseBillPayload({ ...bill, lines: high } as BillData, 'AUTHORISED', 'c1', 'GBP'),
+    buildXeroPurchaseCreditNote({ ...credit, lines: high } as CreditNoteData, 'AUTHORISED', 'c1', 'GBP'),
+  ]
+  for (const p of payloads) {
+    const items = p.LineItems as Array<{ Description: string; Quantity: number; UnitAmount: number }>
+    assert.equal(items.length, 1)
+    assert.equal(xeroLineTotal(items[0]!), 100)
+    assert.match(items[0]!.Description, /Bulk \(300 x 0\.333333\)/)
+  }
+  const expected = expectedLedgerTotal({
+    lineAmountsIncludeTax: true, headerRate: 0.2,
+    lines: [{ quantity: 300, unitAmount: 0.333333, discountAmount: 0, rate: 0.2, storedTax: 0 }],
+  } as Parameters<typeof expectedLedgerTotal>[0])
+  assert.equal(Math.round(expected * 100) / 100, 100)
+})

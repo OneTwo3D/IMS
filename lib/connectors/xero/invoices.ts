@@ -3,6 +3,7 @@
  */
 
 import { xeroPost } from './api'
+import { xeroQuantityLine } from './write-path'
 import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
 import { xeroDocumentRevisionAt } from './document-revision'
@@ -145,9 +146,7 @@ export function buildSalesInvoicePayload(
   // knows about the target system's discount representation.
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
-      Description: line.description,
-      Quantity: line.quantity,
-      UnitAmount: line.unitAmount,
+      ...xeroQuantityLine(line.description, line.quantity, line.unitAmount),
       AccountCode: line.accountCode,
       TaxType: line.taxType,
     }

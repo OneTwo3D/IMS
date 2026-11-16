@@ -6,6 +6,7 @@ import { withSalesInvoiceAuthorization, type BeforeRemoteWrite, type ContactGate
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
 import { xeroGet, xeroPost, xeroPut } from './api'
+import { xeroQuantityLine } from './write-path'
 import { findOrCreateContact } from './contacts'
 import { foreignCurrencyRateProblem, xeroCurrencyRateOrRefuse } from './fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -112,9 +113,7 @@ export async function pushCreditNote(
   // Build line items
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
-      Description: line.description,
-      Quantity: line.quantity,
-      UnitAmount: line.unitAmount,
+      ...xeroQuantityLine(line.description, line.quantity, line.unitAmount),
       AccountCode: line.accountCode,
       TaxType: line.taxType,
     }
@@ -176,9 +175,7 @@ export function buildXeroPurchaseCreditNote(
     Date: data.date,
     LineItems: data.lines.map((line: InvoiceLine) => {
       const xeroLine: Record<string, unknown> = {
-        Description: line.description,
-        Quantity: line.quantity,
-        UnitAmount: line.unitAmount,
+        ...xeroQuantityLine(line.description, line.quantity, line.unitAmount),
         AccountCode: line.accountCode,
         TaxType: line.taxType,
       }

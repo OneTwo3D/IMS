@@ -3,6 +3,7 @@
  */
 
 import { xeroPost, xeroPut } from './api'
+import { xeroQuantityLine } from './write-path'
 import { findOrCreateContact } from './contacts'
 import { xeroDocumentRevisionAt } from './document-revision'
 import { foreignCurrencyRateProblem, isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
@@ -62,14 +63,11 @@ export function buildPurchaseBillPayload(
   const lineItems = data.lines.map((line: InvoiceLine) => {
     let effectiveUnitAmount = line.unitAmount
     if (line.discountAmount && line.discountAmount > 0 && line.quantity > 0) {
-      const perUnitDiscount = line.discountAmount / line.quantity
-      effectiveUnitAmount = Math.round((line.unitAmount - perUnitDiscount) * 10000) / 10000
-      if (effectiveUnitAmount < 0) effectiveUnitAmount = 0
+      // Exact per-unit figure: fitted to 4dp (or collapsed to the line total) below, so the discount is not rounded twice.
+      effectiveUnitAmount = Math.max(0, line.unitAmount - line.discountAmount / line.quantity)
     }
     const xeroLine: Record<string, unknown> = {
-      Description: line.description,
-      Quantity: line.quantity,
-      UnitAmount: effectiveUnitAmount,
+      ...xeroQuantityLine(line.description, line.quantity, effectiveUnitAmount),
       AccountCode: line.accountCode,
       TaxType: line.taxType,
     }
