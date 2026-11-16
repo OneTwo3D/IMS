@@ -317,6 +317,7 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
     shipmentLine: inertModel,
     shipment: inertModel,
     orderAllocation: inertModel,
+    wcStockDirtyOrder: inertModel,
     returnExpectationLine: inertModel,
     returnExpectation: inertModel,
     invoiceDocumentFetchState: inertModel,

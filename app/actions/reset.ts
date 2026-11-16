@@ -32,6 +32,11 @@ const WC_ORDER_SYNC_STATE_KEYS = [
   'last_wc_order_sync_at',
   'last_wc_order_reconcile_at',
   WC_COMPLETED_HISTORY_COVERED_KEY,
+  // The cancellation backstop's cursor and resumable backfill (WC_CANCELLATION_BACKSTOP_CURSOR_KEY / WC_CANCELLATION_BACKFILL_KEY in order-import.ts;
+  // literals here because order-import is not importable into this action, a test pins them equal). Left in place, the backstop would resume
+  // from its old cursor after a reset and never re-check cancellations of re-imported orders older than it.
+  'wc_cancellation_backstop_cursor',
+  'wc_cancellation_backstop_backfill',
   WC_ORDER_SWEEP_LAST_SUCCESS_SETTING,
   'wc_order_webhook_last_received_at',
   'wc_order_webhook_last_processed_at',
@@ -110,6 +115,8 @@ async function clearTransactionScope(guards: ResetGuards) {
     const resetAt = new Date().toISOString()
     await tx.setting.upsert({ where: { key: WC_ORDER_RESET_MARKER_KEY }, create: { key: WC_ORDER_RESET_MARKER_KEY, value: resetAt }, update: { value: resetAt } })
     await tx.setting.deleteMany({ where: { key: { in: [WC_COMPLETED_HISTORY_COVERED_KEY] } } })
+    // Released-order records point at orders this reset deletes (stock-dirty-orders.ts).
+    await tx.wcStockDirtyOrder.deleteMany({})
     await tx.shipmentLine.deleteMany({})
     await tx.shipment.deleteMany({})
     await tx.orderAllocation.deleteMany({})

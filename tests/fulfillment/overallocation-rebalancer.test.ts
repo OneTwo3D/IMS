@@ -327,6 +327,7 @@ const tx = {
       return {}
     },
   },
+  shoppingOrderLink: { findFirst: async () => null }, // a release looks up the WooCommerce link to record the order for the stock guard
   stockLevel: {
     findUnique: async ({ where }: { where: { productId_warehouseId: { productId: string; warehouseId: string } } }) => {
       const key = where.productId_warehouseId
