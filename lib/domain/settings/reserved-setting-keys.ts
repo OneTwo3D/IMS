@@ -67,13 +67,17 @@ const LEASE_SETTING_KEYS = ['mintsoft_auth_lock'] as const
  *     (`unresolvedDriftStateKey`, `lib/domain/wms/unresolved-drift.ts`). Its stored value is what the
  *     operator's isolate action compare-and-sets against, so a hand-written one either fabricates a
  *     cohort to isolate or invalidates the page of an operator about to act on a real one.
+ *   • `wms_systemic_failure:<connector>:<sweep>` — the systemic-failure circuit breaker's counter and open incident
+ *     (`systemicFailureStateKey`, `lib/domain/wms/systemic-failure-store.ts`). A hand-written one either fabricates an incident or
+ *     resets the counter that bounds the suppression of parking.
  *
- * Both are refused because they are not listed preferences. The prefixes are here so the refusal
+ * All are refused because they are not listed preferences. The prefixes are here so the refusal
  * names the family instead of ending at "unrecognised".
  */
 const RESERVED_SETTING_KEY_PREFIXES: readonly string[] = [
   'wms_dispatch_unresolved_drift:',
   'wms_dispatch_unresolved_streak:',
+  'wms_systemic_failure:',
 ]
 
 /**

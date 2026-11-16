@@ -99,6 +99,17 @@ An open task never turns the `wms-order-push` job red; the job's result reports 
 
 **Integrations > Exceptions** is the inbox for items the warehouse link could not finish. Sections include a maintenance window, blocked order pushes, dead inbound events, despatches that could not be reconciled, unreadable records, order-level drift and order-total mismatches. Each row has **Replay** (try again safely) and **Dismiss**, or **Mark as handled** once you have fixed it by hand. A despatch for an order under a withdrawal hold is held back again when replayed. Unreadable records can be isolated so that one bad record does not stop the rest.
 
+### When the warehouse connection fails for everything at once
+
+One order that keeps failing is a problem with that order, so after five failed attempts IMS parks it under **Integrations > Exceptions** for you to look at. When the **connection** is the problem (a change at Mintsoft, an expired key, an outage), every order fails at once, and parking them one by one would take the whole shop out of sync and leave you replaying each of them afterwards.
+
+So IMS looks at the pass as a whole. If at least three orders failed and at least half of the orders it tried failed, it treats it as a connection fault instead: it **parks nothing**, every order stays queued and is retried automatically, and you get **one** notification (and one **WMS connector-wide failure** row under Integrations > Exceptions) rather than one per order. Nothing needs replaying; the row clears by itself on the first pass that works, and the activity log records it.
+
+- This covers the order push (creating and verifying orders in Mintsoft) and the despatch sync. The scheduled job shows as failed while it lasts: that is deliberate, because it did fail.
+- It is bounded. If the fault is still there after five passes in a row, IMS goes back to parking the orders that have run out of retries one at a time, tells you so (a second notification, and the row reads "Isolating one by one again"), and those orders appear in the sections above for replay.
+- On a very small shop, where three failures can never happen, an outage in which every attempt fails for three passes in a row still raises the same notification.
+- Check Mintsoft (status page, API key, the connection test under Settings) and fix the cause. You do not need to do anything to the orders.
+
 ### Possible double postage on merged orders
 
 When Mintsoft merges several orders into one parcel and more than one of them charged the customer postage, the customer may have paid postage twice. IMS cannot decide that for you and **never refunds it automatically**. The absorbed order appears under **Integrations > Exceptions** in **Merged orders - possible double postage**, with the orders in the merge and the amount each charged. The flag is only raised when at least two live (not cancelled) orders of the merge charged postage above zero. It is for you, not the warehouse: IMS writes nothing to Mintsoft and adds no warehouse query task for it.
