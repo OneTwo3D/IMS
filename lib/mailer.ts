@@ -163,8 +163,9 @@ export async function sendEmailWithSmtpSettings(
     const fromName = sanitizeDisplayName(smtp.fromName)
 
     const deadlineMs = opts.deadlineMs
-    // singleSend: watch the transaction log for the DATA command (the first byte of the message). The log entry is read for that one
+    // singleSend: watch the transaction log for the server's 354 reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
     // fact and discarded; nothing it carries (addresses, credentials) is kept.
+    let awaitingDataReply = false
     let dataStarted = false
     if (opts.singleSend) {
       unknownOutcomeProbe = (e) => {
@@ -181,7 +182,14 @@ export async function sendEmailWithSmtpSettings(
         transactionLog: true,
         logger: {
           debug: (entry: { tnx?: string } | undefined, message?: unknown): void => {
-            if (entry?.tnx === 'client' && typeof message === 'string' && message.trim().toUpperCase() === 'DATA') dataStarted = true
+            if (typeof message !== 'string') return
+            if (entry?.tnx === 'client' && message.trim().toUpperCase() === 'DATA') awaitingDataReply = true
+            // The server's answer to DATA is logged ('server') just before nodemailer acts on it; a 354 (nodemailer also accepts 2xx) is what
+            // makes it stream the message. Only from that reply on has anything been handed over. Pinned by the nodemailer-version test.
+            else if (entry?.tnx === 'server' && awaitingDataReply) {
+              awaitingDataReply = false
+              if (/^[23]\d\d/.test(message.trim())) dataStarted = true
+            }
           },
           level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,
         },

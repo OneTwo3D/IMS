@@ -20,7 +20,12 @@ const SMTP = { host: 'smtp.invalid', port: 587, user: '', pass: '', secure: 'non
 const mail = { to: 'to@example.test', subject: 's', html: 'h' }
 const reject = (code: string, message: string, extra: Record<string, unknown> = {}) =>
   Object.assign(new Error(message), { code, command: 'CONN', ...extra })
-const sendCommand = (o: Options, command: string) => o.logger.debug({ tnx: 'client' }, command)
+const sendCommand = (o: Options, command: string) => {
+  o.logger.debug({ tnx: 'client' }, command)
+  // The server's reply to DATA (nodemailer logs it with tnx 'server' before acting on it): delivery has begun only from here.
+  if (command === 'DATA') o.logger.debug({ tnx: 'server' }, '354 End data with <CR><LF>.<CR><LF>')
+}
+const sendDataCommandOnly = (o: Options) => o.logger.debug({ tnx: 'client' }, 'DATA')
 
 test('mailer: a sendMail rejection exactly at the deadline, after DATA, is the same terminal unknown outcome as the deadline timer', async () => {
   const { sendEmailWithSmtpSettings, SEND_DEADLINE_UNKNOWN_OUTCOME } = await import('../../lib/mailer.ts')
@@ -42,6 +47,33 @@ test('mailer: a pre-delivery rejection just before the deadline (no DATA seen) s
     assert.equal(r.permanent, false)
     assert.equal(r.unknownOutcome, undefined)
   }
+})
+
+test('mailer: a disconnect after DATA is written but before the 354 reply is retryable; after the 354 it is terminal', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  behave = async (o) => { sendDataCommandOnly(o); throw reject('ECONNECTION', 'Connection closed unexpectedly') }
+  const early = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
+  assert.equal(early.permanent, false)
+  assert.equal(early.unknownOutcome, undefined)
+  // A refusal of DATA (4xx/5xx reply, logged as the server line) is not delivery either.
+  behave = async (o) => { sendDataCommandOnly(o); o.logger.debug({ tnx: 'server' }, '451 try later'); throw reject('ECONNECTION', 'Connection closed unexpectedly') }
+  assert.equal((await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })).permanent, false)
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('ECONNECTION', 'Connection closed unexpectedly') }
+  const late = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
+  assert.equal(late.permanent, true)
+  assert.equal(late.unknownOutcome, true)
+})
+
+test('mailer: the installed nodemailer logs the DATA command and the server reply the way the phase tracker reads them (version pin)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { createRequire } = await import('node:module')
+  const req = createRequire(import.meta.url)
+  const dir = req.resolve('nodemailer/package.json').replace(/package\.json$/, '')
+  const src = readFileSync(`${dir}lib/smtp-connection/index.js`, 'utf8')
+  assert.match(src, /this\._sendCommand\('DATA'\)/, 'nodemailer writes DATA itself')
+  assert.match(src, /tnx: 'client'/, "client commands are logged with tnx 'client' when transactionLog is on")
+  assert.match(src, /tnx: 'server'/, "server replies are logged with tnx 'server' before the response action runs")
+  assert.match(src, /_actionDATA\(str, callback\) \{\s*\n[^\n]*\n[^\n]*\n\s*if \(!\/\^\[23\]\/\.test\(str\)\)/, 'DATA accepts a 2xx/3xx reply, then streams')
 })
 
 test('mailer: a socket failure after DATA started is terminal, however early it comes', async () => {
