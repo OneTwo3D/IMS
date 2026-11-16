@@ -21,7 +21,7 @@ const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
-const DEFAULT_DEMAND_WINDOW_DAYS = 90
+export const DEFAULT_DEMAND_WINDOW_DAYS = 90
 const DEFAULT_LEAD_TIME_DAYS = 14
 
 // Median (rounded to whole days) of a set of observed lead times, or null when empty.
@@ -35,10 +35,10 @@ function medianLeadTimeDays(values: number[]): number | null {
 // Default replenishment cover: when a product drops to its reorder point, suggest
 // ordering back up to roughly this many weeks of forecast demand ON TOP of the
 // reorder point (an order-up-to level). Matches the retired forecast's 8-week lot.
-const DEFAULT_TARGET_COVER_WEEKS = 8
+export const DEFAULT_TARGET_COVER_WEEKS = 8
 // Upper bound (one year) so a crafted URL/CSV param can't request absurd order-up-to
 // levels and generate runaway suggested quantities.
-const MAX_TARGET_COVER_WEEKS = 52
+export const MAX_TARGET_COVER_WEEKS = 52
 const REPLENISHMENT_PRODUCT_TYPES: ProductType[] = [
   ProductType.SIMPLE,
   ProductType.VARIANT,
@@ -582,9 +582,10 @@ function availabilityBreakdownByProduct(stockLevels: StockLevelRow[]): Map<strin
   ]))
 }
 
-async function loadOpenPoLines(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<OpenPoLineRow[]> {
+async function loadOpenPoLines(client: ReplenishmentReportClient, filters: StockPositionFilters, productId?: string): Promise<OpenPoLineRow[]> {
   const lines = await client.purchaseOrderLine.findMany({
     where: {
+      ...(productId ? { productId } : {}),
       po: {
         status: { in: OPEN_PO_STATUSES },
         ...(filters.warehouseId ? { destinationWarehouseId: filters.warehouseId } : {}),
@@ -674,9 +675,10 @@ function demandWindow(now: Date, days: number): { dateFrom: Date; dateTo: Date; 
   return { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
 }
 
-async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<VelocitySaleInput[]> {
+async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }, productId?: string): Promise<VelocitySaleInput[]> {
   const movements = await client.stockMovement.findMany({
     where: {
+      ...(productId ? { productId } : {}),
       type: StockMovementType.SALE_DISPATCH,
       createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       product: productWhere(filters),
@@ -735,9 +737,10 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
   }))
 }
 
-async function loadStockLevels(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<StockLevelRow[]> {
+async function loadStockLevels(client: ReplenishmentReportClient, filters: StockPositionFilters, productId?: string): Promise<StockLevelRow[]> {
   const levels = await client.stockLevel.findMany({
     where: {
+      ...(productId ? { productId } : {}),
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
       product: productWhere(filters),
     },
@@ -752,6 +755,51 @@ async function loadStockLevels(client: ReplenishmentReportClient, filters: Stock
   }) as StockLevelRow[]
   assertSourceLimit(levels.length, SOURCE_ROW_LIMIT, 'Replenishment stock-level source rows')
   return levels
+}
+
+/**
+ * The single-product source rows behind the Reorder Planning demand chart (o3d-s8n.4): the SAME
+ * loaders the report uses, narrowed to one product so a drill-down does not scan the catalogue.
+ * `windowDays` is the sales-history window ending today (UTC); `arrivals` are the dated open PO
+ * quantities exactly as `getReorderReport` feeds them to the stock projection.
+ */
+export async function loadReorderChartSources(
+  filters: StockPositionFilters,
+  productId: string,
+  windowDays: number,
+  options: { deps?: ReplenishmentReportDeps } = {},
+): Promise<{
+  window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }
+  sales: VelocitySaleInput[]
+  availableQty: Prisma.Decimal
+  openPoLines: OpenPoLineRow[]
+  arrivals: InboundArrival[]
+  undatedInboundQty: Prisma.Decimal
+}> {
+  const client = clientFromDeps(options.deps)
+  const window = demandWindow(nowFromDeps(options.deps), windowDays)
+  const [sales, stockLevels, openPoLines] = await Promise.all([
+    loadVelocityRows(client, filters, window, productId),
+    loadStockLevels(client, filters, productId),
+    loadOpenPoLines(client, filters, productId),
+  ])
+  let availableQty = new Prisma.Decimal(0)
+  for (const level of stockLevels) {
+    availableQty = availableQty.add(toDecimal(level.quantity).sub(toDecimal(level.reservedQty)))
+  }
+  let undatedInboundQty = new Prisma.Decimal(0)
+  for (const line of openPoLines) {
+    const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
+    if (qty.gt(0) && !line.po.expectedDelivery) undatedInboundQty = undatedInboundQty.add(qty)
+  }
+  return {
+    window,
+    sales,
+    availableQty,
+    openPoLines,
+    arrivals: inboundArrivalsByProduct(openPoLines).get(productId) ?? [],
+    undatedInboundQty,
+  }
 }
 
 export async function getReorderReport(
