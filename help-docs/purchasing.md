@@ -118,6 +118,7 @@ The **PO PDF** button on any purchase order opens the priced purchase order: sup
 - **Switched on:** the order is confirmed first. If the email cannot be queued, or the supplier has **no email address** (or an invalid one), the order stays confirmed and the page says nothing was sent. Add the address on the supplier and click **Email PO**, or download the PDF and send it to the supplier directly.
 - **Email PO** (on a confirmed order, switch on) queues the email again, for example after correcting the supplier's address. A second click while the first email is still waiting does not add a duplicate.
 - "Queued" means the email is on the outbox, not that the supplier has it. It goes out through the same email queue as order confirmations (see [Documents & Email](documents-email.md)), with your SMTP settings. The outcome is logged on the order's activity.
+- **A PO email is never sent twice automatically.** If the mail server had already been handed the message when the connection dropped or the 60-second send limit ran out, nobody can tell whether the supplier received it. The email ends **Failed** in the email queue with "Outcome unknown", and the order's activity shows a warning. Nothing is retried: check with the supplier, then click **Email PO** to send it again if needed. A failure before the message was handed over (the mail server could not be reached, or login failed) is retried automatically as before.
 
 
 ## Receiving a Purchase Order
