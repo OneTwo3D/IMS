@@ -70,7 +70,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   // is held on the refund's CREDIT_NOTE sync row. A refund never staged (or whose row was refused, or whose payload retention has removed) is
   // recalculated and labelled Draft.
   const syncRow = await db.accountingSyncLog.findFirst({
-    where: { type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: refund.id, payload: { not: Prisma.DbNull } },
+    where: { type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: refund.id, status: { not: 'CANCELLED' }, payload: { not: Prisma.DbNull } },
     orderBy: { createdAt: 'desc' },
     select: { payload: true },
   })
