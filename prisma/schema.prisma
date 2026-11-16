@@ -2238,6 +2238,10 @@ model SalesOrderRefund {
   // fallback return rows: [{ shipmentId, valueBase }]. Group B books the COGS reversal for stock returned BEFORE its shipment
   // was journaled, one shipment at a time, from this. NULL: no such return.
   returnCostSplit Json?      @map("return_cost_split")
+  // Which source shipments the units this refund ACTUALLY returned to stock came from (staged and fallback rows alike):
+  // [{ shipmentId, productId, qty }]. Later refunds replay it so each one prices the units that are left from the right
+  // shipment, whichever of staging or the fallback chose it. NULL: nothing recorded (older refunds, nothing returned).
+  returnShipmentQty Json?    @map("return_shipment_qty")
   // scjz.71: whether this refund STAGED a COGS/unearned reversal (durable, set at
   // staging time). Distinguishes a fully-shipped chargeback (no reversal staged —
   // credit-note-only, exempt from reversal-evidence checks) from a partial/deferred

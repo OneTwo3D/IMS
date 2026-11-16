@@ -61,7 +61,7 @@ const WRITERS: Record<string, Record<string, number>> = {
   wmsReturnsInbox: { 'app/actions/mintsoft-sync.ts': 2, 'lib/connectors/mintsoft/sync/returns-sync.ts': 1 },
   salesOrderRefund: {
     'app/actions/sales.ts': 2, 'lib/domain/accounting/back-reference.ts': 1, 'lib/domain/sales/refund-accounting-discharge.ts': 1,
-    'lib/domain/sales/refund-basis-backfill.ts': 1, 'lib/domain/sales/refund-service.ts': 7,
+    'lib/domain/sales/refund-basis-backfill.ts': 1, 'lib/domain/sales/refund-service.ts': 9,
     // Stamps `stockCorrectionQueuedAt`, a timestamp: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
     'lib/connectors/woocommerce/sync/refund-stock-correction.ts': 1,
     // Stamps `deferralAdjustmentRef`, a daily-batch journal reference: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
