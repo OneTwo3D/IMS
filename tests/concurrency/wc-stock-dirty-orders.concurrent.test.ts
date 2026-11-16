@@ -225,3 +225,35 @@ test('a product-id cache reset re-binds the entries to the new generation with t
     await rig.pool.end()
   }
 })
+
+test('a save to ANOTHER store deletes the entries and an old-generation write is refused; a same-store key rotation re-binds them (the same refusal holds)', { skip }, async () => {
+  const rig = await openRig()
+  let fx: Awaited<ReturnType<typeof seed>> | undefined
+  try {
+    fx = await seed(rig, suffix(), true)
+    const seeded = fx
+    await withVersion(rig, '30', async () => {
+      await rig.db.$transaction(async (tx) => { await rig.markWcOrderDirtyForStockGuard(tx, seeded.orderId) })
+      const row = await rig.db.wcStockDirtyOrder.findUnique({ where: { wcOrderId: seeded.wcOrderId } })
+      const stale = { tokenOf: new Map([[seeded.wcOrderId, row!.token]]), settled: [seeded.wcOrderId], refreshed: [] as never[] }
+      const bump = (version: string, storeUrlChanging: boolean) => rig.db.$transaction(async (tx) => {
+        await tx.setting.update({ where: { key: 'wc_settings_version' }, data: { value: version } })
+        if (storeUrlChanging) await tx.wcStockDirtyOrder.deleteMany({})
+        else await tx.wcStockDirtyOrder.updateMany({ data: { syncVersion: version } })
+      })
+      // same store, keys rotated: kept and re-bound; the run that began under 30 is refused
+      await bump('31', false)
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '30', stale), false)
+      assert.equal((await rig.loadDirtyOrdersForGuard(rig.db as never, '31')).length, 1)
+      assert.equal((await rig.loadDirtyOrdersForGuard(rig.db as never, '30')).length, 0)
+      // another store: deleted; a run that began under 31 is refused
+      await bump('32', true)
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '31', stale), false)
+      assert.equal(await rig.db.wcStockDirtyOrder.count({ where: { wcOrderId: seeded.wcOrderId } }), 0)
+    })
+  } finally {
+    await cleanup(rig, fx)
+    await rig.db.$disconnect()
+    await rig.pool.end()
+  }
+})

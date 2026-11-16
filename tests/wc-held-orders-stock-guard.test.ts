@@ -516,12 +516,16 @@ test('a persistent set far above the fetch budget never blocks for ever: positiv
   }
 })
 
-test('a credential rebind (another store) deletes the dirty entries; a product-id cache reset (same store) re-binds them, in the bump transaction', async () => {
+test('a save to another store deletes the dirty entries; a same-store key rotation and a product-id cache reset re-bind them, in the bump transaction', async () => {
   const { readFile } = await import('node:fs/promises')
   const src = await readFile(new URL('../app/actions/wc-sync.ts', import.meta.url), 'utf8')
-  const bump = /create: \{ key: WC_SETTINGS_VERSION_KEY, value: nextVersion \},\n\s+update: \{ value: nextVersion \},\n\s+\}\)\n(?:\s+\/\/[^\n]*\n)+\s+await tx\.wcStockDirtyOrder\.(deleteMany\(\{\}\)|updateMany\(\{ data: \{ syncVersion: nextVersion \} \}\))/g
-  const found = [...src.matchAll(bump)].map((m) => m[1])
-  assert.deepEqual(found, ['deleteMany({})', 'updateMany({ data: { syncVersion: nextVersion } })'], 'saveWcCredentials deletes, resetWcProductIdCache re-binds')
+  const rebind = 'await tx.wcStockDirtyOrder.updateMany({ data: { syncVersion: nextVersion } })'
+  const save = src.slice(src.indexOf('export async function saveWcCredentials'), src.indexOf('export async function resetWcProductIdCache'))
+  assert.ok(save.includes(`if (storeUrlChanging) await tx.wcStockDirtyOrder.deleteMany({})\n    else ${rebind}`), 'saveWcCredentials: delete only when the store URL changed from a known one, else re-bind')
+  assert.ok(save.indexOf('wcStockDirtyOrder') > save.indexOf('WC_SETTINGS_VERSION_KEY, value: nextVersion'), 'after the bump, in its transaction')
+  assert.doesNotMatch(save, /last_wc_order_(sync|reconcile)_at/, 'the save does not reset the order cursors, which is why a same-store save must keep the entries')
+  const reset = src.slice(src.indexOf('export async function resetWcProductIdCache'))
+  assert.ok(reset.includes(rebind) && !reset.includes('wcStockDirtyOrder.deleteMany'))
   assert.equal([...src.matchAll(/WC_SETTINGS_VERSION_KEY, value: nextVersion/g)].length, 2, 'and there is no third bump this misses')
   assert.ok(src.indexOf('async function resetWcProductIdCache') < src.lastIndexOf('updateMany({ data: { syncVersion: nextVersion } })'))
 })

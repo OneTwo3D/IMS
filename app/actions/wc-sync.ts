@@ -523,9 +523,13 @@ export async function saveWcCredentials(url: string, key: string, secret: string
       create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
       update: { value: nextVersion },
     })
-    // The released-order records belong to the generation just left (their ids are the old store's): retired in this same transaction, which
-    // also holds the lock every guard write-back takes, so a run still on the old generation cannot write them back afterwards.
-    await tx.wcStockDirtyOrder.deleteMany({})
+    // The released-order records (stock-dirty-orders.ts) hold the order ids of the store being left. A DIFFERENT store (the normalised URL
+    // changed from a known one) has other ids, so they are deleted. The SAME store (keys rotated, or no previous URL to compare, where keeping
+    // can only over-charge) keeps its ids, and this save does not reset the order-sync cursors, so the rows move to the new generation with their
+    // snapshots instead of vanishing: otherwise an older released order would be read by neither path. Same transaction and lock as every guard
+    // write-back, so a run still on the old generation cannot write afterwards.
+    if (storeUrlChanging) await tx.wcStockDirtyOrder.deleteMany({})
+    else await tx.wcStockDirtyOrder.updateMany({ data: { syncVersion: nextVersion } })
 
     // Operator gift-card answers are bound to the store they were given for: those of any other store than the one now configured are deleted with the rebind (the activity log keeps who answered what).
     await tx.euVatGiftCardLineResolution.deleteMany({ where: { NOT: { storeIdentity: normaliseStoreIdentity(validatedUrl.normalizedUrl) ?? '' } } })
