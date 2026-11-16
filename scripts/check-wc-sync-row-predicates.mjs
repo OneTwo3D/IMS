@@ -161,6 +161,8 @@ const PREDICATE_OWNERS = [
   // The two families written BEFORE an IMS order exists, so they carry no entityId.
   'lib/connectors/woocommerce/sync/order-import.ts::pendingFxQueueWhere',
   'lib/connectors/woocommerce/sync/order-admission.ts::wcAdmissionRefusalQueueWhere',
+  // An OPEN refused WooCommerce completion (o3d-ymgc): names an IMS order but blocks nothing, so it is NOT in the union above.
+  'lib/domain/sales/wc-sync-row-families.ts::openWcCompletionRefusalWhere',
 ]
 
 /** The single SQL renderer of the union predicate. */
@@ -179,9 +181,11 @@ const SQL_ACCUSED_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::recoveryAcc
  * it). Rendered once here; tests/db/admission-refusal-retention.test.ts proves it against Postgres.
  */
 const SQL_PENDING_REFUSAL_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::pendingAdmissionRefusalRowSql'
+/** The fourth: an OPEN refused-completion row, which the retention sweep keeps (o3d-ymgc). Proven against Postgres by tests/db/wc-completion-refusal-row.test.ts. */
+const SQL_OPEN_COMPLETION_REFUSAL_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::openWcCompletionRefusalRowSql'
 /** The retention exemption for an open edit-drift row (o3d-hqvrp.84): its own family, rendered once, total. */
 const SQL_EDIT_DRIFT_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::openWcOrderEditDriftRowSql'
-const SQL_OWNERS = [SQL_OWNER, SQL_ACCUSED_OWNER, SQL_PENDING_REFUSAL_OWNER, SQL_EDIT_DRIFT_OWNER]
+const SQL_OWNERS = [SQL_OWNER, SQL_ACCUSED_OWNER, SQL_PENDING_REFUSAL_OWNER, SQL_EDIT_DRIFT_OWNER, SQL_OPEN_COMPLETION_REFUSAL_OWNER]
 
 /**
  * Tokens that make a raw SQL string a family predicate rather than an ordinary statement about this
@@ -266,6 +270,7 @@ const FAMILY_PREDICATE_FUNCTIONS = new Set([
   'heldSalesInvoiceQueueWhere',
   'pendingFxQueueWhere',
   'wcAdmissionRefusalQueueWhere',
+  'openWcCompletionRefusalWhere',
 ])
 
 /** Prisma's negation key. */

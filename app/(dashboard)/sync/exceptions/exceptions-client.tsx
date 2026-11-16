@@ -48,6 +48,7 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
+  clearDoublePostageFlag,
   dismissWithdrawnDispatch,
   acknowledgeWmsAmendNotice,
   claimAccountingPostingRefusalForHandPostingAction,
@@ -1470,6 +1471,84 @@ export function ExceptionsClient({ data }: Props) {
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[560px]" title={row.detail ?? ''}>{row.detail ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.foundAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.wcCompletionRefusals.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`WooCommerce orders — completed in the store but not fulfilled in IMS (${data.summary.wcCompletionRefusals})`}
+            detail="WooCommerce says these orders are completed, but IMS refused to turn that into shipments (for example the shipment lines do not cover what was ordered, net of refunds). The store's notification was acknowledged and will not be sent again, so nothing brings the order back on its own. Open the order, put the shortfall right (or fulfil it in IMS), and the row clears by itself once the order is shipped, completed or cancelled; there is nothing to acknowledge here."
+            shown={data.wcCompletionRefusals.length}
+            total={data.summary.wcCompletionRefusals}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead>Why IMS refused</TableHead>
+                <TableHead>Refused</TableHead>
+                <TableHead>Since</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.wcCompletionRefusals.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell>
+                    <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.externalOrderId}</Link>
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[520px]" title={row.detail}>{row.detail || row.refusal}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.occurrences}x</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.raisedAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.doublePostageFlags.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Merged orders — possible double postage (${data.summary.doublePostageFlags})`}
+            detail="The warehouse merged these orders into one parcel and more than one of the merged orders charged the customer postage. IMS never refunds automatically and the warehouse does not need to do anything. Check the orders, refund the extra postage by hand if it is due, then press Clear (it asks you to sign in again and records who cleared it)."
+            shown={data.doublePostageFlags.length}
+            total={data.summary.doublePostageFlags}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead>Merged into</TableHead>
+                <TableHead>What IMS found</TableHead>
+                <TableHead>Flagged</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.doublePostageFlags.map((row) => (
+                <TableRow key={row.orderId}>
+                  <TableCell>
+                    <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
+                  </TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[520px]" title={row.detail}>{row.detail}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.flaggedAt)}</TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => runAction(() => clearDoublePostageFlag(row.orderId), `Cleared the double-postage flag for ${row.orderNumber ?? row.orderId}.`)}
+                    >
+                      <CheckCircle2 className="h-3 w-3 mr-1" />Clear
+                    </Button>
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
