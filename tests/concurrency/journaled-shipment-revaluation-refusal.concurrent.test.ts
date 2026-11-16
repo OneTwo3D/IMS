@@ -326,6 +326,10 @@ test('o3d-c08y: a revaluation that would take a journaled shipment below zero is
       ['xero_sync_cogs_reversal', 'submitted'],
       ['xero_inventory_account', '630'],
       ['xero_cogs_account', '500'],
+      // Late landed cost on a sold unit is funded from Stock in Transit (#917): with no transit account the
+      // revaluation is not queued here at all. Set it explicitly so the arm does not depend on settings a
+      // previously run file left behind.
+      ['xero_transit_account', '631'],
     ]
     const previous = new Map<string, string | null>()
     for (const [key, value] of keys) {
