@@ -73,30 +73,37 @@ type TxClient = Prisma.TransactionClient
  * The stamp the two shapes are told apart by is only ever written by Group A1, which runs under the same
  * batch lock as this read, so an order cannot move between the shapes inside a run.
  */
-export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
-  OR: [
-    {
-      status: 'SHIPPED',
-      shipmentJournalDate: null,
-      order: {
-        refundStatus: { not: 'FULL' },
-        revenueDeferredDate: { not: null },
-        inventoryAllocatedDate: { not: null },
-      },
-    },
-    {
-      status: 'SHIPPED',
-      shipmentJournalDate: null,
-      order: {
-        refundStatus: { not: 'FULL' },
-        // The invoice (`accountingInvoiceId`) is what put this order's revenue in Sales, and what makes the order
-        // undeletable under a journal (see Group A1). A shipment of an order IMS has not invoiced waits for it.
-        revenueDeferredDate: null,
-        accountingInvoiceId: { not: null },
-      },
-    },
-  ],
+const GROUP_B_PAID_SHAPE = {
+  status: 'SHIPPED',
+  shipmentJournalDate: null,
+  order: {
+    refundStatus: { not: 'FULL' },
+    revenueDeferredDate: { not: null },
+    inventoryAllocatedDate: { not: null },
+  },
 } satisfies Prisma.ShipmentWhereInput
+
+const GROUP_B_DIRECT_SHAPE = {
+  status: 'SHIPPED',
+  shipmentJournalDate: null,
+  order: {
+    refundStatus: { not: 'FULL' },
+    // The invoice (`accountingInvoiceId`) is what put this order's revenue in Sales, and what makes the order
+    // undeletable under a journal (see Group A1). A shipment of an order IMS has not invoiced waits for it.
+    revenueDeferredDate: null,
+    accountingInvoiceId: { not: null },
+  },
+} satisfies Prisma.ShipmentWhereInput
+
+/** Both shapes (the probe's superset and the one the tests pin). */
+export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
+  OR: [GROUP_B_PAID_SHAPE, GROUP_B_DIRECT_SHAPE],
+} satisfies Prisma.ShipmentWhereInput
+
+/** One pass of Group B: `direct` runs before Group A1 and A2, `paid` after them (ACC-H12). */
+export function groupBShipmentWhere(mode: 'direct' | 'paid'): Prisma.ShipmentWhereInput {
+  return mode === 'direct' ? GROUP_B_DIRECT_SHAPE : GROUP_B_PAID_SHAPE
+}
 
 /**
  * Raised when the loaded data references a cost layer the lock did not cover.

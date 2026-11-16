@@ -75,10 +75,10 @@ async function seed(rig: Rig, suffix: string, opts: { paid: boolean; shipUnits: 
   await db.orderAllocation.create({ data: { orderId: order.id, lineId, productId: product.id, warehouseId: main.id, qty: D(opts.allocQty ?? qty) } })
   await db.stockLevel.create({ data: { productId: product.id, warehouseId: main.id, quantity: D('0'), reservedQty: D('0') } })
   const ids = { productId: product.id, mainId: main.id, returnsId: returns.id, orderId: order.id, lineId, layerId: layer.id, shipmentIds: [] as string[] }
-  const ship = async (units: number) => {
+  const ship = async (units: number, shippedAt: Date = new Date()) => {
     const shipment = await db.shipment.create({
       data: {
-        orderId: order.id, warehouseId: main.id, status: 'SHIPPED', shippedAt: new Date(), createdAt: new Date(Date.now() - 60_000 + ids.shipmentIds.length * 1000),
+        orderId: order.id, warehouseId: main.id, status: 'SHIPPED', shippedAt, createdAt: new Date(Date.now() - 60_000 + ids.shipmentIds.length * 1000),
         lines: { create: [{ lineId, productId: product.id, qty: D(units), costLayerSnapshot: [{ costLayerId: layer.id, qty: String(units), unitCostBase: '10' }] }] },
       },
       select: { id: true },
@@ -540,6 +540,86 @@ test('ACC-H12: a partial refund of SHIPPED units before payment adjusts Unearned
     assertBalanced(rebuilt, 'rebuilt')
     assert.equal(net(rebuilt, '2100'), 0, 'the rebuild nets the same')
   } finally {
+    await clean(rig, fx)
+    await close(rig)
+  }
+})
+
+test('ACC-H12: shipped unpaid in one period, paid in the next before any batch runs: COGS stays dated the ship day, once, no Allocated Inventory', { skip }, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Fixture | undefined
+  try {
+    await clean(rig, undefined)
+    await setup(rig)
+    fx = await seed(rig, suffix, { paid: false, shipUnits: 2, qty: 2 })
+    await fx.ship(2, new Date('2026-03-31T12:00:00.000Z'))
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED', paidAt: new Date('2026-04-02T12:00:00.000Z') } })
+    // No batch ran between the shipment and the payment: A1 and A2 are now due in the same run as the shipment's cost.
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [], 'the batch ran clean')
+    const all = await journals(rig)
+    assertBalanced(all, 'cross-period')
+    const groupB = await rig.db.accountingSyncLog.findMany({ where: { type: 'DAILY_BATCH_GROUP_B' }, select: { payload: true } })
+    assert.equal(groupB.length, 1)
+    const payload = groupB[0].payload as { date: string; lines: Line[] }
+    assert.equal(payload.date, '2026-03-31', 'COGS is dated the day the goods shipped, not the payment day')
+    assert.equal(net([{ type: 'x', lines: payload.lines }], '5000'), 20)
+    assert.equal(net([{ type: 'x', lines: payload.lines }], '1200'), -20, 'relieved from Inventory directly')
+    assert.equal(net(all, '5000'), 20, 'COGS once')
+    assert.equal(net(all, '1210'), 0, 'A2 reclassified nothing: Allocated Inventory is untouched')
+    assert.equal(all.filter((j) => j.type === 'DAILY_BATCH_INVENTORY_ALLOC').length, 0)
+    assert.equal(net(all, '2100'), 0, 'every pound had shipped before payment: nothing was deferred')
+    const stamped = await rig.db.shipment.findFirstOrThrow({ where: { orderId: fx.orderId } })
+    assert.ok(stamped.cogsRelievedFromInventoryAt)
+    const again = await rig.runDailyBatchSync()
+    assert.deepEqual(again.errors, [])
+    assert.equal((await journals(rig)).length, all.length, 'rerun posts nothing')
+  } finally {
+    await clean(rig, fx)
+    await close(rig)
+  }
+})
+
+test('ACC-H12: a lost direct-relief journal is rebuilt at the ORIGINAL amount after a landed-cost revaluation, which keeps its own correction', { skip }, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Fixture | undefined
+  const { INTEGRATION_PLUGIN_SETTING_KEYS } = await import('@/lib/integration-plugin-keys')
+  const keys: Array<[string, string]> = [['xero_sync_cogs_reversal', 'submitted'], [INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true']]
+  try {
+    await clean(rig, undefined)
+    await setup(rig)
+    for (const [key, value] of keys) await rig.db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+    fx = await seed(rig, suffix, { paid: false, shipUnits: 2, qty: 2 })
+    await fx.ship(2)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const original = await journals(rig)
+    assert.equal(net(original, '5000'), 20)
+    // Landed cost raises the layer from 10 to 14 a unit: the stored snapshot and cogsBatchAmount are rewritten in place.
+    const { updateSnapshotsForCostLayerChange, refreshShipmentCogsForCostLayerChange } = await import('@/lib/cost-layers')
+    await rig.db.$transaction(async (tx) => {
+      await tx.costLayer.update({ where: { id: fx!.layerId }, data: { unitCostBase: '14' } })
+      await updateSnapshotsForCostLayerChange(tx, fx!.layerId, '14')
+      await refreshShipmentCogsForCostLayerChange(tx, fx!.layerId, { accountingSettings: { connector: 'xero', inventoryAccount: '1200', cogsAccount: '5000' } })
+    })
+    const shipment = await rig.db.shipment.findFirstOrThrow({ where: { orderId: fx.orderId } })
+    assert.equal(Number(shipment.cogsBatchAmount), 28, 'the mutable amount carries the revaluation')
+    assert.equal(Number(shipment.cogsRelievedFromInventoryAmount), 20, 'the marker amount stays what the journal posted')
+    const corrections = await rig.db.accountingSyncLog.findMany({ where: { type: 'COGS_REVERSAL', referenceId: shipment.id }, select: { id: true } })
+    // The original journal is lost; the sweep rebuilds it.
+    await rig.db.accountingSyncLog.deleteMany({ where: { type: 'DAILY_BATCH_GROUP_B' } })
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const rebuilt = await journals(rig)
+    const groupB = rebuilt.filter((j) => j.type === 'DAILY_BATCH_GROUP_B')
+    assert.equal(groupB.length, 1)
+    assertBalanced(groupB, 'rebuilt')
+    assert.equal(net(groupB, '5000'), 20, 'rebuilt at the original 20, not the revalued 28')
+    assert.equal(net(groupB, '1200'), -20)
+    const after = await rig.db.accountingSyncLog.findMany({ where: { type: 'COGS_REVERSAL', referenceId: shipment.id }, select: { id: true } })
+    assert.equal(after.length, corrections.length, 'the correction is neither duplicated nor folded into the rebuild')
+  } finally {
+    await rig.db.setting.deleteMany({ where: { key: { in: keys.map(([key]) => key) } } }).catch(() => {})
     await clean(rig, fx)
     await close(rig)
   }

@@ -59,7 +59,7 @@ import {
 } from '@/lib/cost-layer-snapshots'
 import {
   assertGroupBSnapshotsWereLocked,
-  DAILY_BATCH_GROUP_B_SHIPMENT_WHERE,
+  groupBShipmentWhere,
   lockCostLayersForGroupBWindow,
 } from '@/lib/domain/accounting/daily-batch-group-b-lock'
 import { addMoney, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -1022,7 +1022,7 @@ export async function recreateMissingDailyBatchLogs(
   })
   const orphanBShipments = await db.shipment.findMany({
     where: { shipmentJournalDate: journaledDateFilter },
-    select: { id: true, shipmentJournalDate: true, shipmentJournalBatchRef: true, revenueRecognizedAmount: true, cogsBatchAmount: true, cogsRelievedFromInventoryAt: true },
+    select: { id: true, shipmentJournalDate: true, shipmentJournalBatchRef: true, revenueRecognizedAmount: true, cogsBatchAmount: true, cogsRelievedFromInventoryAt: true, cogsRelievedFromInventoryAmount: true },
   })
 
   const adjustmentBatches = new Map<string, DailyBatchRecreateBucket<{ refundCount: number; total: number }>>()
@@ -1106,7 +1106,12 @@ export async function recreateMissingDailyBatchLogs(
       () => ({ shipmentCount: 0, revenue: 0, cogs: 0, inventoryCogs: 0, shipments: [] }),
     )
     if (!summary) continue
-    const shipmentCogs = Number(shipment.cogsBatchAmount ?? 0)
+    // ACC-H12: a shipment costed straight out of Inventory is rebuilt at the amount that journal ORIGINALLY posted, which
+    // is recorded once and never revalued. `cogsBatchAmount` is rewritten in place by landed-cost revaluation, which
+    // posts its own correction separately, so using it here would count that correction twice.
+    const shipmentCogs = shipment.cogsRelievedFromInventoryAt && shipment.cogsRelievedFromInventoryAmount != null
+      ? Number(shipment.cogsRelievedFromInventoryAmount)
+      : Number(shipment.cogsBatchAmount ?? 0)
     summary.shipmentCount += 1
     // ACC-H12: a shipment costed straight out of Inventory recorded its revenue share but posted no revenue leg
     // (the invoice booked it), and its COGS credit went to Inventory rather than Allocated Inventory.
@@ -1586,754 +1591,23 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     // skipped silently — it is the one outcome where a human has to decide whether to re-post.
     result.errors.push(...await recreateMissingDailyBatchLogs(settings, baseCurrency, negativeBasisRefusals, lockDate))
 
-  // --- Group A1: Revenue Deferral ---
-  groupA1Skip: try {
-    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
-    // so from that moment another batch — or a refund, which shares this domain
-    // — can start while we are still writing. Stop instead.
-    batchLock.assertHeld('Group A1 (revenue deferral)')
-    if (lockBlocked) {
-      await reportLockBlocksRun('A1', lockDate)
-      break groupA1Skip
-    }
-    // DELIBERATELY NOT the shared invoiced-revenue basis (lib/domain/sales/invoiced-revenue-basis.ts).
-    // The reports count an order once it carries an invoice, paid or not, and accept a Xeroom-era
-    // invoice number. This batch decides what IMS itself must post, so it needs a PAID order whose
-    // invoice IMS posted (accountingInvoiceId). The two differ on purpose; do not unify them.
-    const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
-      where: {
-        paidAt: { not: null },
-        revenueDeferredDate: null,
-        accountingInvoiceId: { not: null },
-        status: { notIn: ['CANCELLED', 'DRAFT'] },
-        refundStatus: { not: 'FULL' },
-      },
-      select: {
-        id: true,
-        orderNumber: true,
-        externalOrderNumber: true,
-        fxRateToBase: true,
-        subtotalBase: true,
-        shippingBase: true,
-        discountAmount: true,
-        pricesIncludeVat: true,
-        taxRatePercent: true,
-        paidAt: true,
-        // o3d-hqvrp.35: refunds entered before this first run, netted out of the deferral.
-        refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
-        // ACC-H12: revenue already recorded by shipments whose COGS the batch posted before payment. The invoice
-        // put it in Sales and nothing moved it to Unearned Revenue, so the deferral below leaves it out.
-        shipments: { where: { cogsRelievedFromInventoryAt: { not: null } }, select: { revenueRecognizedAmount: true } },
-        shoppingLinks: {
-          select: { connector: true },
-        },
-        lines: {
-          select: {
-            totalBase: true,
-            taxRate: { select: { rate: true } },
-          },
-        },
-      },
-      orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
-      take: batchLimit + 1,
-    }), batchLimit)
-    const orders = orderWindow.rows
-    result.hasMore.groupA1 = orderWindow.hasMore
-
-    if (orders.length > 0) {
-      // o3d-y14: derived through the SAME function the in-transaction fence re-derives with, so a
-      // disagreement can only mean the ORDER moved — never that the two sides do different sums.
-      // `amount` is the NETTED figure (what the order stores and the fence re-derives); `grossAmount` is what the
-      // paid-day journal moves, so a refund entered in a LATER period never changes an earlier period's journal.
-      const shippedRevenueOf = (order: (typeof orders)[number]): number => (
-        (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
-      )
-      const orderDeferrals = orders.map((order) => {
-        const amount = revenueDeferralAmount(order)
-        const shippedRevenue = shippedRevenueOf(order)
-        // ACC-H12: refunds of goods that shipped before payment never took value out of the deferral (their revenue is
-        // still in Sales and the credit note reverses it), so the order stores the net figure PLUS that part. Group B's
-        // true-up and the refund service then see exactly what the ledger holds in Unearned Revenue. The fence still
-        // compares `amount`, the net figure.
-        const parts = preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenue)
-        const undeferredRefunds = parts.reduce((sum, part) => sum + part.amount - part.deferredPart, 0)
-        return {
-          orderId: order.id,
-          amount,
-          storedAmount: round2(amount + undeferredRefunds),
-          // Only the part not yet shipped moves from Sales to Unearned Revenue.
-          grossAmount: Math.max(0, round2(revenueDeferralGrossAmount(order) - shippedRevenue)),
-        }
-      })
-      // ACC-H11: one journal per EVENT date (the day the order was paid), each with its own reference. The
-      // fence below still covers EVERY order of the run in one lock, once.
-      const orderById = new Map(orders.map((order) => [order.id, order]))
-      const a1Dated = groupByPostingDate(
-        orderDeferrals,
-        (deferral) => utcDay(orderById.get(deferral.orderId)?.paidAt),
-        dateContext,
-      )
-      if (a1Dated.deferred.length > 0) throw new Error('A1: an order has no open posting day although the lock-blocks-run check passed')
-      const a1Plans = a1Dated.groups.map((group) => {
-        const totalRevenueDeferred = round2(group.rows.reduce((sum, order) => sum + order.grossAmount, 0))
-        const invariantTotal = round2(group.rows.reduce((sum, order) => sum + order.grossAmount, 0))
-        if (Math.abs(invariantTotal - totalRevenueDeferred) > 0.01) {
-          throw new Error(`A1 revenue deferral invariant failed: per-order ${invariantTotal.toFixed(2)} != journal ${totalRevenueDeferred.toFixed(2)}`)
-        }
-        const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
-        if (totalRevenueDeferred > 0) {
-          journalLines.push(
-            { accountCode: settings.xero_sales_account, description: `Daily revenue deferral — ${group.rows.length} order(s)`, debit: totalRevenueDeferred },
-            { accountCode: settings.xero_unearned_revenue_account, description: `Daily revenue deferral — ${group.rows.length} order(s)`, credit: totalRevenueDeferred },
-          )
-        }
-        // o3d-0qoo: computed ONCE, here, and stamped onto every member order inside the same
-        // transaction as the stage stamp. It is deliberately NOT re-derived per order from
-        // revenueDeferredDate: `today` is captured at run start while the stamps are written
-        // with later new Date() calls, so a run crossing UTC midnight makes the two disagree
-        // and every consumer that re-derives looks for a batch that does not exist.
-        // ACC-H11: the reference carries the JOURNAL's date (the event day), so the persisted reference
-        // stays the batch's identity and its date for every consumer.
-        const referenceId = buildDailyBatchReferenceId('A1', group.date, group.rows.map((row) => row.orderId))
-        return { group, totalRevenueDeferred, journalLines, referenceId }
-      })
-
-      // ACC-H13 + ACC-H11: each refund entered before this first run is a SEPARATE adjustment (DR Unearned
-      // Revenue / CR Sales, the same direction the refund service uses after a deferral), dated the day of the
-      // refund (never before the deferral it adjusts) and subject to the same lock rule. One journal per date.
-      type RefundAdjustmentRow = { orderId: string; refundId: string | null; amount: number; day: string | null }
-      const adjustmentRows: RefundAdjustmentRow[] = []
-      for (const order of orders) {
-        const paidDay = utcDay(order.paidAt)
-        for (const adjustment of preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenueOf(order))) {
-          // ACC-H12: only the part of a refund that came out of deferred revenue is adjusted against Unearned.
-          if (!(adjustment.deferredPart > 0)) continue
-          adjustmentRows.push({
-            orderId: order.id,
-            refundId: adjustment.refundId,
-            amount: adjustment.deferredPart,
-            day: laterDay(utcDay(adjustment.refundedAt), paidDay),
-          })
-        }
-      }
-      const adjustmentDated = groupByPostingDate(adjustmentRows, (row) => row.day, dateContext)
-      if (adjustmentDated.deferred.length > 0) throw new Error('A1: a refund adjustment has no open posting day although the lock-blocks-run check passed')
-      const adjustmentPlans = adjustmentDated.groups.map((group) => {
-        const total = round2(group.rows.reduce((sum, row) => sum + row.amount, 0))
-        // The identity digest is over a distinct namespace so it can never collide with the paid-day journal of the same date.
-        const referenceId = buildDailyBatchReferenceId('A1', group.date, group.rows.map((row) => `refund-adjustment:${row.refundId ?? row.orderId}`))
-        return { group, total, referenceId }
-      })
-
-      await db.$transaction(async (tx) => {
-        // o3d-y14: every figure below — the payload, the journal total and the per-order stamp —
-        // was derived from a read taken OUTSIDE this transaction and without a lock. Re-derive it
-        // now that the member rows are locked, and refuse the whole group rather than persist a
-        // deferral the order itself contradicts. See daily-batch-discount-fence.ts.
-        await assertRevenueDeferralsUnchanged(tx, orderDeferrals)
-
-        for (const plan of adjustmentPlans) {
-          if (plan.total <= 0) continue
-          await createPendingSyncLog(tx, {
-            type: 'DAILY_BATCH_REVENUE_DEFERRAL',
-            referenceId: plan.referenceId,
-            currency: baseCurrency,
-            payload: {
-              date: plan.group.date,
-              reference: `Revenue Deferral refund adjustment ${plan.group.date} ${plan.referenceId.slice(-8)}`,
-              narration: `Revenue deferral adjustment for refund(s) entered before the first batch run: ${plan.group.rows.length} refund(s), £${plan.total.toFixed(2)}${lockedPeriodNarration(plan.group.movedFromLockedDays, lockDate)}`,
-              lines: [
-                { accountCode: settings.xero_unearned_revenue_account, description: `Pre-batch refund adjustment — ${plan.group.rows.length} refund(s)`, debit: plan.total },
-                { accountCode: settings.xero_sales_account, description: `Pre-batch refund adjustment — ${plan.group.rows.length} refund(s)`, credit: plan.total },
-              ],
-              refundAdjustments: plan.group.rows,
-              batchReferenceId: plan.referenceId,
-              batchDate: plan.group.date,
-              batchGroup: 'A1',
-              batchEntityCount: plan.group.rows.length,
-              splitBatch: result.hasMore.groupA1,
-              _postingMode: 'submitted',
-            },
-          })
-          // The durable witness: each refund carries the adjustment journal that netted it, in the same
-          // transaction as the journal, so a lost log can be rebuilt (and rebuilt once) and the rebuilt paid-day
-          // journal knows which refunds to add back.
-          const stampedRefundIds = plan.group.rows.map((row) => row.refundId).filter((id): id is string => !!id)
-          if (stampedRefundIds.length > 0) {
-            await tx.salesOrderRefund.updateMany({ where: { id: { in: stampedRefundIds } }, data: { deferralAdjustmentRef: plan.referenceId } })
-          }
-        }
-
-        for (const plan of a1Plans) {
-          const { group, totalRevenueDeferred, journalLines, referenceId } = plan
-          if (journalLines.length > 0) {
-            await createPendingSyncLog(tx, {
-              type: 'DAILY_BATCH_REVENUE_DEFERRAL',
-              referenceId,
-              currency: baseCurrency,
-              payload: {
-                date: group.date,
-                reference: `Revenue Deferral ${group.date} ${referenceId.slice(-8)}`,
-                narration: `Daily revenue deferral: ${group.rows.length} order(s), £${totalRevenueDeferred.toFixed(2)}${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`,
-                lines: journalLines,
-                orderDeferrals: group.rows,
-                batchReferenceId: referenceId,
-                batchDate: group.date,
-                batchGroup: 'A1',
-                batchEntityCount: group.rows.length,
-                splitBatch: result.hasMore.groupA1,
-                _postingMode: 'submitted',
-              },
-            })
-          }
-
-          const deferralByOrderId = new Map(group.rows.map((order) => [order.orderId, order.storedAmount]))
-          for (const deferral of group.rows) {
-            await tx.salesOrder.update({
-              where: { id: deferral.orderId },
-              data: {
-                revenueDeferredDate: new Date(),
-                revenueDeferredBatchRef: referenceId,
-                unearnedRevenueAmount: deferralByOrderId.get(deferral.orderId) ?? 0,
-              },
-            })
-          }
-        }
-      })
-      for (const plan of a1Plans) await reportLockedPeriodMoves('A1', plan.group.date, plan.group.movedFromLockedDays, lockDate)
-      for (const plan of adjustmentPlans) await reportLockedPeriodMoves('A1', plan.group.date, plan.group.movedFromLockedDays, lockDate)
-
-      result.groupA1 = orders.length
-    }
-  } catch (e) {
-    // o3d-y14: the fence aborts the transaction, so nothing recorded the refusal. Log it here,
-    // OUTSIDE the rolled-back transaction, before it becomes one more line in result.errors.
-    if (e instanceof StaleDailyBatchDeferralError) await logStaleDailyBatchDeferral(XERO_CONNECTOR, e)
-    result.errors.push(`Group A1 error: ${String(e)}`)
-  }
-
-  // --- Group A2: Inventory Reclassification ---
-  groupA2Skip: try {
-    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
-    // so from that moment another batch — or a refund, which shares this domain
-    // — can start while we are still writing. Stop instead.
-    batchLock.assertHeld('Group A2 (inventory reclassification)')
-    if (lockBlocked) {
-      await reportLockBlocksRun('A2', lockDate)
-      break groupA2Skip
-    }
-    // o3d-0i5y r9 — THE PLAN AND THE STAMP NOW DESCRIBE THE SAME STATE OF THE ORDER.
-    //
-    // This selection used to run on `db`, OUTSIDE the transaction below and under no row lock. Every
-    // input A2 decides on — the allocation rows, their records, the dispatched lines — was therefore
-    // a snapshot of a moment that had already passed by the time the transaction opened, while the
-    // writes at the end of it (the row records, the stamp, the batch ref, the amount) landed
-    // unconditionally on the rows as they stood THEN. Between the two, the very paths that share
-    // this domain move exactly these rows: `allocateSalesOrder` rewrites the allocation set and
-    // carries the records between scopes, a refund un-stages and reverses, a dispatch writes
-    // shipment snapshots. The batch's session lock does not close this — it excludes another BATCH,
-    // not an operator re-allocating an order from the UI.
-    //
-    // Three concrete losses, all of them money:
-    //
-    //   * a re-allocation that lands in the gap has its NEW record overwritten by `next`, which was
-    //     computed from the OLD one — so units the rewrite carried to another warehouse are
-    //     re-presented as unaccounted and posted a second time, or a record is erased outright.
-    //   * an allocation row deleted in the gap makes the per-row `update` throw, aborting a
-    //     transaction that has already valued every other order in the window.
-    //   * quantity ADDED in the gap is stamped as accounted without ever being valued: the stamp is
-    //     order-level, so A2 never looks at the order again, and Group B still credits Allocated
-    //     Inventory for it when it ships.
-    //
-    // So the read moves inside the transaction that writes, and the orders are ROW-LOCKED before
-    // anything is read off them — the shape `e2mz`, `small2` and `settle` all closed tonight, and
-    // the shape `buildLayerSnapshot` just below already uses for cost layers: select the candidates,
-    // lock them, then re-read under the lock and re-apply the eligibility test, so an order that
-    // stopped qualifying while we waited for the lock is dropped rather than posted.
-    // o3d-sidy r2 (review MEDIUM) — REFUSED ORDERS MUST NOT STARVE THE WINDOW.
-    //
-    // A refused order keeps its place at the front of the window (it stays eligible, and the window
-    // is `revenueDeferredDate asc`), so a window filled with refused orders would reclassify nothing
-    // every night while healthy orders queued behind it. So a pass that refused anything and left
-    // candidates behind is followed by another pass that EXCLUDES every order refused so far, given
-    // only the slots this run has not yet spent on ACCEPTED orders — the run still reclassifies at
-    // most `batchLimit` orders. It terminates: every further pass either accepts nothing new and
-    // refuses nothing (stop), or refuses at least one more order, which the next pass excludes, so
-    // the candidate set shrinks strictly. Each pass is its own transaction and its own journal, the
-    // same shape a batch already takes when it is split across runs.
-    //
-    // o3d-sidy r2 (review LOW 2): a pass's refusals are PUBLISHED only once its transaction has
-    // committed. A pass that later aborts (a "Missing FIFO snapshot" on another order, say) rolls back
-    // as a whole and is reported as the group error it is; its refusals are not reported as if the
-    // rest of that pass had gone through.
-    const refusedA2OrderIds = new Set<string>()
-    let a2Accepted = 0
-    let a2HasMore = false
-    for (;;) {
-      const passLimit = batchLimit - a2Accepted
-      if (passLimit <= 0) break
-      const passRefusals: NegativeCostBasisRefusal[] = []
-      const groupA2 = await db.$transaction(async (tx) => {
-        const candidateWindow = takeDailyBatchWindow(await tx.salesOrder.findMany({
-          where: refusedA2OrderIds.size > 0
-            ? { ...A2_ELIGIBLE_ORDER, id: { notIn: [...refusedA2OrderIds] } }
-            : A2_ELIGIBLE_ORDER,
-          orderBy: A2_ORDER_SELECTION_ORDER,
-          select: { id: true },
-          take: passLimit + 1,
-        }), passLimit)
-        const candidateIds = candidateWindow.rows.map((row) => row.id)
-        if (candidateIds.length === 0) return { count: 0, hasMore: candidateWindow.hasMore, journals: [] as Array<{ date: string; movedFromLockedDays: string[] }> }
-        await lockSalesOrders(tx, candidateIds)
-
-        // Re-read UNDER THE LOCK, and re-apply the eligibility test as a WHERE rather than trusting
-        // the candidate list: the permission to post this order is evaluated in exactly one place,
-        // immediately before the act it authorises. An order that was stamped, fully refunded or
-        // cancelled while we blocked on its lock simply is not in this result.
-        const orders = await tx.salesOrder.findMany({
-          where: { id: { in: candidateIds }, ...A2_ELIGIBLE_ORDER },
-          orderBy: A2_ORDER_SELECTION_ORDER,
-          select: {
-            id: true,
-            orderNumber: true,
-            externalOrderNumber: true,
-            status: true,
-            // ACC-H11: the journal is dated by the event - paid, and stock allocated.
-            paidAt: true,
-            // o3d-0i5y r5 (rebase onto o3d-o97): what EARLIER A2 passes already recorded posting for
-            // this order. Since the residual rebuild hands a stamped order back for the INCREMENT,
-            // this pass is no longer necessarily the first, and the order-level record has to be the
-            // running total rather than the latest instalment. Read under the same lock as everything
-            // else A2 plans from.
-            allocationBatchAmount: true,
-            // o3d-i0o6 r3: and the pass history that figure is the sum of, read in the same statement
-            // so this pass appends to what it actually planned from.
-            allocationBatchPasses: true,
-            allocations: {
-              select: {
-                id: true,
-                lineId: true,
-                productId: true,
-                warehouseId: true,
-                qty: true,
-                createdAt: true,
-                // o3d-0i5y r5: what THIS row has already had reclassified. Without it A2 can only ask an
-                // order-level question, and the residual added to a part-journaled order is invisible.
-                costLayerSnapshot: true,
-              },
-            },
-            shipments: {
-              where: { status: 'SHIPPED' },
-              select: {
-                id: true,
-                status: true,
-                warehouseId: true,
-                // ACC-H12: shipments already costed straight out of Inventory are not A2's to value or record.
-                cogsRelievedFromInventoryAt: true,
-                // o3d-0i5y r7: the journal date is deliberately NOT read. What a pass owes is decided by
-                // the allocation row's own entries against the dispatched quantity — see
-                // `planA2Reclassification`. Selecting a shipment's journal date here only ever supported
-                // the whole-shipment valuation that re-posted the pinned part of a mixed shipment.
-                lines: {
-                  select: {
-                    id: true,
-                    lineId: true,
-                    productId: true,
-                    qty: true,
-                    costLayerSnapshot: true,
-                  },
-                },
-              },
-            },
-          },
-        })
-        if (orders.length === 0) return { count: 0, hasMore: candidateWindow.hasMore, journals: [] as Array<{ date: string; movedFromLockedDays: string[] }> }
-
-        const plans = new Map(orders.map((order) => [order.id, planA2Reclassification(order)]))
-
-        const snapshot = await buildLayerSnapshot(
-          tx,
-          orders.flatMap((order) => {
-            const plan = plans.get(order.id)!
-            return order.allocations
-              .filter((alloc) => plan.outstandingByAllocation.has(alloc.id))
-              .map((alloc) => ({
-                productId: alloc.productId,
-                warehouseId: alloc.warehouseId,
-              }))
-          }),
-        )
-        const orderValues = new Map<string, number>()
-        const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
-        /**
-         * o3d-0i5y r10: the entries THIS pass adds to a row, kept apart from the ones it merely read.
-         *
-         * A2 appends; it never authors what is already on the row. Holding the two halves separately
-         * is what lets the write rebase its append onto the record AS LOCKED instead of replaying the
-         * base it planned from — see `lockAllocationRecords`.
-         */
-        const allocationAppends = new Map<string, CostLayerSnapshotEntry[]>()
-        /** The quantity the planned-from base recorded, so a base that MOVED can be told from one that was revalued. */
-        const allocationBaseQty = new Map<string, Decimal>()
-
-        // o3d-sidy (review H1): orders refused for a negative basis. Everything this pass computed for
-        // them is withdrawn before any journal, stamp or record is written, so they are exactly as if
-        // this batch had never seen them — see the refusal below the allocation loop.
-        const refusedOrderIds = new Set<string>()
-
-        for (const order of orders) {
-          const plan = plans.get(order.id)!
-          // o3d-sidy: what this order took from the shared in-memory layer snapshot, so a refusal can
-          // hand it back and the orders after it value exactly as they would without this one.
-          const orderConsumption: Array<{ productId: string; warehouseId: string; consumed: CostLayerSnapshotEntry[] }> = []
-          const orderAppended: CostLayerSnapshotEntry[] = []
-          // o3d-0i5y r7: value is accumulated ROW BY ROW, from the entries this pass actually writes.
-          // r6 valued the whole unjournaled shipment here instead, which posts the WHOLE of a MIXED
-          // shipment — part of it already pinned and posted by an earlier pass. See the shipment-
-          // sourced term below.
-          let orderCostValue = toDecimal(0)
-
-          // Rows that have never been reclassified at all, owe nothing and have nothing to record are
-          // still STAMPED with an empty snapshot, exactly as before.
-          for (const allocationId of plan.stampEmptyAllocationIds) {
-            allocationSnapshots.set(allocationId, [])
-            allocationAppends.set(allocationId, [])
-            allocationBaseQty.set(allocationId, toDecimal(0))
-          }
-
-          for (const alloc of order.allocations) {
-            const outstanding = plan.outstandingByAllocation.get(alloc.id)
-            const shipmentAccounted = plan.shipmentAccountedByAllocation.get(alloc.id)
-            if (!outstanding && !shipmentAccounted) continue
-            // o3d-0i5y r8: the row's RECORD — what earlier passes already accounted and posted. It
-            // is both the base the new entries are appended to and the pool the shipment take is
-            // netted by, so a dispatched entry this row has already valued can never be valued again.
-            const alreadyRecorded = parseCostLayerSnapshot(alloc.costLayerSnapshot)
-            // o3d-0i5y r6: units this pass is accounting from the SHIPMENT snapshots, written onto the
-            // row so a later pass reads them as evidence instead of inferring them from an overlap.
-            // They add NO value here — the shipment value is posted once, above, and only while the
-            // shipment is unjournaled — this is a record of quantity already in the ledger.
-            const recorded = shipmentAccounted
-              ? takeShipmentAccountedEntries(
-                  alreadyRecorded,
-                  order.shipments
-                    .filter((shipment) => shipment.warehouseId === alloc.warehouseId && !shipment.cogsRelievedFromInventoryAt)
-                    .flatMap((shipment) => shipment.lines.filter((line) => (
-                      line.lineId === alloc.lineId && line.productId === alloc.productId
-                    ))),
-                  shipmentAccounted,
-                  alloc.id,
-                )
-              : []
-            // o3d-0i5y r7: THE RECORD IS ALSO THE VALUATION, and it must be, because the row is the
-            // only place that says which dispatched units A2 has already posted. `shipmentAccounted`
-            // is dispatched quantity NO entry on the row accounts for, so these entries are exactly
-            // the units whose cost has never reached Allocated Inventory — never the pinned part of
-            // the same shipment, which is what r6's whole-shipment sum re-posted every pass.
-            //
-            // A short take can only mean a dispatched line carries no snapshot to record. r6 let that
-            // stand as a silent under-account; it is now as loud as r5's whole-shipment guard was,
-            // and names the row and the quantity rather than the batch.
-            if (shipmentAccounted) {
-              const recordedQty = sumCostLayerSnapshotQty(recorded)
-              if (recordedQty.lt(shipmentAccounted)) {
-                throw new Error(
-                  `Missing FIFO snapshot on shipped line(s) for allocation ${alloc.id} on order ${order.id}: `
-                  + `${shipmentAccounted.toString()} dispatched unit(s) to account for, only ${recordedQty.toString()} recoverable`,
-                )
-              }
-            }
-            const consumed = outstanding
-              ? consumeSnapshotLayers(
-                  snapshot,
-                  alloc.productId,
-                  alloc.warehouseId,
-                  outstanding.toNumber(),
-                )
-              : []
-            orderConsumption.push({ productId: alloc.productId, warehouseId: alloc.warehouseId, consumed })
-            orderAppended.push(...recorded, ...consumed)
-            // APPENDED, not replaced, so `snapshotQty` keeps naming everything ever posted against
-            // this row — which is what makes the next pass's outstanding calculation right. The
-            // shipped record goes BEFORE the fresh pin, so the qty-based contra relief that Group B
-            // and the refund reversal run for each shipment line consumes exactly those units and
-            // leaves the unshipped pin standing.
-            //
-            // o3d-0i5y r9: the entries THIS pass values are stamped with WHAT IT VALUED THEM AT, in
-            // this same statement — and the journal for that amount is raised in this same
-            // transaction, a few lines below. `alreadyRecorded` is left exactly as it is: an earlier
-            // pass stamped it with the amount IT posted, and re-stamping at today's cost would turn
-            // a record of a historical posting into a revaluation of it. That is the whole point of
-            // the field — a landed-cost correction rewrites `unitCostBase` on these very rows
-            // without touching Allocated Inventory, so the pin stops being able to say what was
-            // debited the moment it is revalued.
-            //
-            // o3d-0i5y r10: the append is kept SEPARATE from `alreadyRecorded`, because the write is
-            // no longer allowed to replay the base it planned from — see `lockAllocationRecords` and
-            // the write loop below.
-            const appended = [
-              ...recorded.map(withPostedUnitCost),
-              ...consumed.map(withPostedUnitCost),
-            ]
-            allocationAppends.set(alloc.id, appended)
-            allocationBaseQty.set(alloc.id, sumCostLayerSnapshotQty(alreadyRecorded))
-            allocationSnapshots.set(alloc.id, [...alreadyRecorded, ...appended])
-            orderCostValue = addMoney(
-              orderCostValue,
-              addMoney(sumCostLayerSnapshot(recorded), sumCostLayerSnapshot(consumed)),
-            )
-          }
-          orderCostValue = roundQuantity(orderCostValue, 2)
-
-          // o3d-sidy (review H1) — A2 REFUSES A NEGATIVE BASIS PER ORDER, BEFORE ANYTHING IS WRITTEN.
-          //
-          // Both halves of what this pass values can carry one: `recorded` comes off the shipment
-          // snapshots, which a landed-cost revaluation rewrites in place (same-day allocate-and-ship is
-          // the ordinary case), and `consumed` off live layers whose unit cost the same revaluation
-          // changed. Unrefused, the negative was debited to Allocated Inventory short, stamped onto the
-          // order and pinned as `postedUnitCostBase`, and the correction that followed re-valued the
-          // layer and left the ledger short for good. PER ORDER, like Group B, rather than failing the
-          // whole transaction: A2 is ONE journal for every order in the window, and aborting it would
-          // hold back every other order's reclassification — and so every other order's Group B, which
-          // waits for this stamp — until one purchase order was corrected.
-          //
-          // o3d-sidy r2 (review MEDIUM) — WHAT "PER ORDER" MEANS FOR A NEGATIVE LIVE LAYER. The refused
-          // order hands its layers back, so the next order's FIFO take starts from the same place and
-          // reaches the same negative layer: ONE negative layer refuses EVERY order whose take reaches
-          // it (2 units at -6 ahead of 5 at 20, three 1-unit orders: all three refused), not just the
-          // negative quantity, until the basis is corrected. That is deliberate — it values each order
-          // exactly as if the refused ones were absent — and the window loop above keeps those refused
-          // orders from starving the orders behind them.
-          const negative = negativeBasisEntries(orderAppended)
-          if (negative.length > 0) {
-            for (const { productId, warehouseId, consumed } of orderConsumption) {
-              returnSnapshotLayers(snapshot, productId, warehouseId, consumed)
-            }
-            for (const alloc of order.allocations) {
-              allocationSnapshots.delete(alloc.id)
-              allocationAppends.delete(alloc.id)
-              allocationBaseQty.delete(alloc.id)
-            }
-            refusedOrderIds.add(order.id)
-            const orderRef = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
-            passRefusals.push(new NegativeCostBasisRefusal(
-              `Group A2 order ${orderRef}: negative cost basis — cost layer(s) ${describeNegativeEntries(negative)}; `
-              + `the reclassification would be ${orderCostValue.toFixed(2)}. Not reclassified, so its shipments `
-              + `wait too. ${NEGATIVE_BASIS_REMEDY}reclassifies it and posts its COGS (o3d-sidy).`,
-              {
-                group: 'A2', orderId: order.id, orderRef, shipmentId: null, batchRef: null,
-                negativeEntries: negativeEntryDetail(negative), value: orderCostValue.toFixed(2),
-              },
-            ))
-            continue
-          }
-
-          orderValues.set(order.id, orderCostValue.toNumber())
-        }
-
-        // o3d-sidy: the batch is built from the orders that were NOT refused, and only from them.
-        const accepted = orders.filter((order) => !refusedOrderIds.has(order.id))
-        if (accepted.length === 0) return { count: 0, hasMore: candidateWindow.hasMore, journals: [] as Array<{ date: string; movedFromLockedDays: string[] }> }
-        // ACC-H11: ONE JOURNAL PER EVENT DATE. An order's reclassification is dated the later of the day it
-        // was paid and the day its stock was allocated (the rows this pass actually touched), so a backorder
-        // allocated weeks after payment lands on the day the stock arrived. Each date is its own journal with
-        // its own reference; each order is stamped with the journal that carries ITS pounds.
-        const a2OrderDay = (order: (typeof accepted)[number]): string | null => laterDay(
-          utcDay(order.paidAt),
-          ...order.allocations
-            .filter((alloc) => allocationSnapshots.has(alloc.id))
-            .map((alloc) => utcDay(alloc.createdAt)),
-        )
-        const a2Dated = groupByPostingDate(accepted, a2OrderDay, dateContext)
-        if (a2Dated.deferred.length > 0) throw new Error('A2: an order has no open posting day although the lock-blocks-run check passed')
-        const a2Groups = a2Dated.groups
-        const a2JournalByOrderId = new Map<string, { referenceId: string; syncLogId: string | null }>()
-        const a2PostedGroups: Array<{ date: string; movedFromLockedDays: string[] }> = []
-        for (const group of a2Groups) {
-          // o3d-0qoo: batch identity, computed once from this journal's own date and order set, then
-          // persisted on every member row alongside its stage stamp. See the A1 note above for why
-          // deriving it back from inventoryAllocatedDate is not equivalent.
-          // o3d-0i5y r9: derived from the LOCKED set, so the ref names the orders the journal is
-          // actually built from rather than the ones a pre-transaction read happened to see.
-          // o3d-sidy: and from the ACCEPTED set, so a refused order is not named by a batch it is not in.
-          const referenceId = buildDailyBatchReferenceId('A2', group.date, group.rows.map((order) => order.id))
-          let groupValue = toDecimal(0)
-          for (const order of group.rows) groupValue = addMoney(groupValue, orderValues.get(order.id) ?? 0)
-          const groupValueNumber = round2Decimal(groupValue)
-          // o3d-o97 r3: null when NO journal was raised. The guard below is on the batch's ROUNDED
-          // total, so a window whose only member values at £0.004 stamps that order with an amount
-          // and creates no journal at all — which is exactly the inference ("an amount implies a
-          // pass that created a journal") the refund reversal used to rest on.
-          let groupSyncLogId: string | null = null
-          if (groupValueNumber > 0) {
-            groupSyncLogId = await createPendingSyncLog(tx, {
-              type: 'DAILY_BATCH_INVENTORY_ALLOC',
-              referenceId,
-              currency: baseCurrency,
-              payload: {
-                date: group.date,
-                reference: `Inventory Allocation ${group.date} ${referenceId.slice(-8)}`,
-                narration: `Daily inventory reclassification: ${group.rows.length} order(s), £${groupValueNumber.toFixed(2)}${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`,
-                lines: [
-                  { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${group.rows.length} order(s)`, debit: groupValueNumber },
-                  { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${group.rows.length} order(s)`, credit: groupValueNumber },
-                ],
-                batchReferenceId: referenceId,
-                batchDate: group.date,
-                batchGroup: 'A2',
-                batchEntityCount: group.rows.length,
-                splitBatch: result.hasMore.groupA2,
-                _postingMode: 'submitted',
-              },
-            })
-          }
-          for (const order of group.rows) a2JournalByOrderId.set(order.id, { referenceId, syncLogId: groupSyncLogId })
-          a2PostedGroups.push({ date: group.date, movedFromLockedDays: group.movedFromLockedDays })
-        }
-
-        // -----------------------------------------------------------------------------------
-        // o3d-0i5y r10 (Codex round 10, finding 4) — THE WRITE REBASES ONTO THE ROW AS LOCKED.
-        //
-        // r9 moved the PLAN inside the transaction and under the orders' row locks, which was the
-        // right half of the fix. This is the other half: the write the plan leads to. It rewrites the
-        // WHOLE `costLayerSnapshot` array, and the front of that array is `alreadyRecorded` — entries
-        // read at the top of this transaction and not touched by A2 since.
-        //
-        // One writer can change them in that window, and it is not covered by the sales-order lock:
-        // `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations`
-        // when a landed cost lands late. It takes no order lock (it selects by cost layer, across
-        // every table that carries a snapshot), so it commits freely between A2's read and A2's
-        // write — and then A2 writes the array it read and the correction is gone.
-        //
-        //   a layer bought at £4 is corrected to £5 while the batch runs. 10 recorded units on the
-        //   row are repriced £40 -> £50 and the revaluation posts that £10 to COGS/Inventory.
-        //   A2 then writes back its planned array, at £4. The row says £40 again while the ledger
-        //   says £50, and Group B relieves those units at £4 when they ship: £10 of real cost never
-        //   reaches COGS, permanently, and the refund reversal reverses the same £10 short.
-        //
-        // So the base is RE-READ under the row lock at the moment of writing, and this pass's own
-        // entries are appended to THAT. A2 appends; it does not author what it merely read. The
-        // append is unaffected — `recorded` and `consumed` are this pass's own valuations, stamped
-        // with `postedUnitCostBase` — and a correction that lands after the lock waits for it, then
-        // patches the array A2 committed.
-        //
-        // A base whose QUANTITY moved is a different matter and is refused: the revaluation cannot
-        // change quantities or entry counts (it maps each entry to itself), so a base that grew or
-        // shrank means a writer nothing here can account for, and the plan built on it — `outstanding`
-        // above all — is describing a row that no longer exists. It cannot be reached today, because
-        // every path that changes WHICH units are recorded takes the order lock this pass holds.
-        const lockedRecords = await lockAllocationRecords(
-          tx,
-          accepted.flatMap((order) => order.allocations
-            .filter((alloc) => allocationSnapshots.has(alloc.id))
-            .map((alloc) => alloc.id)),
-        )
-
-        for (const order of accepted) {
-          for (const alloc of order.allocations) {
-            const next = allocationSnapshots.get(alloc.id)
-            // `undefined` means "this row was already accounted and is not being changed". It is NOT
-            // the same as `[]`, which is a deliberate stamp; writing `?? []` here would erase the
-            // pinned layers of every row a previous pass posted (o3d-0i5y r5).
-            if (!next) continue
-            const lockedBase = parseCostLayerSnapshot(lockedRecords.get(alloc.id) ?? null)
-            const plannedBaseQty = allocationBaseQty.get(alloc.id) ?? toDecimal(0)
-            const lockedBaseQty = sumCostLayerSnapshotQty(lockedBase)
-            if (!lockedBaseQty.eq(plannedBaseQty)) {
-              throw new Error(
-                `Allocation ${alloc.id} on order ${order.id} recorded ${plannedBaseQty.toString()} unit(s) when this `
-                + `pass planned from it and ${lockedBaseQty.toString()} unit(s) under the write lock — the record moved `
-                + 'under Group A2 and the plan built on it cannot be trusted',
-              )
-            }
-            const written = [...lockedBase, ...(allocationAppends.get(alloc.id) ?? [])]
-            await tx.orderAllocation.update({
-              where: { id: alloc.id },
-              data: {
-                costLayerSnapshot: written as never,
-                // o3d-o97 r3: the pounds this row contributed to the DR above, pinned beside the
-                // layers it was pinned from. Revaluation rewrites those layers' unitCostBase in
-                // the snapshot; it never posts to Allocated Inventory, so this figure is what a
-                // refund of part of this row has to reverse at.
-                //
-                // o3d-0i5y r10 (rebase): read off the array actually WRITTEN — the record re-read
-                // under the write lock plus this pass's appends — never the array this pass planned
-                // from. A landed-cost correction landing mid-batch rewrites the former and not the
-                // latter, and writing the planned copy back is how £10 of real cost never reaches
-                // COGS. And the figure is the POSTED basis where the entries carry one, so an
-                // earlier pass's pounds are the pounds it debited rather than what its layers have
-                // been revalued to since; pre-r9 entries carry no posted basis, and for those the pin
-                // is the only evidence there is, exactly as before.
-                //
-                // Where THIS pass raised no journal an EARLIER pass's record is left alone rather
-                // than nulled: `undefined` is "do not update", while `null` would erase a debit that
-                // is still standing and is the evidence-deletion o3d-o97 r4 refused.
-                allocationBatchAmount: a2JournalByOrderId.get(order.id)?.syncLogId
-                  ? roundQuantity(recordedPostedBasis(written), 4).toNumber()
-                  : lockedBase.length > 0 ? undefined : null,
-              },
-            })
-          }
-          await tx.salesOrder.update({
-            where: { id: order.id },
-            data: {
-              inventoryAllocatedDate: new Date(),
-              inventoryAllocatedBatchRef: a2JournalByOrderId.get(order.id)?.referenceId,
-              // o3d-o97 r3 + o3d-0i5y r5: the pounds A2 has debited to Allocated Inventory for this
-              // order — ACCUMULATED, not replaced. o3d-o97 wrote this as one pass's figure because
-              // the stamp only ever came off an order A2 was about to re-value in full. It does not
-              // any more: `resetAllocationAccountingIfStaged` hands a stamped order back when the
-              // declared set leaves NEW quantity, and A2 then posts that increment alone. Replacing
-              // the figure would leave the order recording £20 of a £70 debit, and the refund's open
-              // balance would strand the other £50 permanently.
-              //
-              // o3d-i0o6 r3 — AND THE ATTRIBUTION IS ACCUMULATED WITH IT, BY THE SAME CALL. The amount
-              // was cumulative while the journal id, connector and account code beside it were
-              // REPLACED by this pass, so the row said "£55, carried by the £5 journal" and a proof
-              // read the second half as covering the first. `buildAllocationDebitOrderUpdate` produces
-              // the running total, the appended pass history and those three columns TOGETHER — there
-              // is no way to write the figure here without recording the pass that made it, which is
-              // what stops the next connector from reintroducing the same gap by omission.
-              ...buildAllocationDebitOrderUpdate({
-                existingAmount: order.allocationBatchAmount,
-                existingPasses: order.allocationBatchPasses,
-                passAmount: orderValues.get(order.id) ?? 0,
-                syncLogId: a2JournalByOrderId.get(order.id)?.syncLogId ?? null,
-                connector: XERO_CONNECTOR,
-                accountCode: settings.xero_allocated_inventory_account,
-                batchRef: a2JournalByOrderId.get(order.id)?.referenceId ?? '',
-                at: new Date(),
-              }),
-            },
-          })
-        }
-
-        return { count: accepted.length, hasMore: candidateWindow.hasMore, journals: a2PostedGroups }
-      })
-
-      for (const journal of groupA2.journals) await reportLockedPeriodMoves('A2', journal.date, journal.movedFromLockedDays, lockDate)
-      negativeBasisRefusals.push(...passRefusals)
-      for (const refusal of passRefusals) {
-        if (refusal.detail.orderId) refusedA2OrderIds.add(refusal.detail.orderId)
-      }
-      a2Accepted += groupA2.count
-      a2HasMore = groupA2.hasMore
-      result.groupA2 = a2Accepted
-      result.hasMore.groupA2 = a2HasMore
-      if (passRefusals.length === 0 || !groupA2.hasMore) break
-    }
-  } catch (e) {
-    result.errors.push(`Group A2 error: ${String(e)}`)
-  }
-
   // --- Group B: Shipment Revenue Recognition + COGS ---
+  //
+  // ACC-H12: RUN IN TWO PASSES, THE DIRECT ONE FIRST. A shipment that left while its order was not yet deferred is
+  // costed straight out of Inventory (DR COGS / CR Inventory) on the day it shipped. That decision must not depend on
+  // whether payment, Group A1 and Group A2 happened to run first: if A1 and A2 ran before it, the order would be
+  // stamped, the shipment would take the ordinary path, A2 would reclassify its units through Allocated Inventory and
+  // its COGS would be dated at the payment day. So the direct pass runs BEFORE A1 and A2, while the deferral stamp still
+  // says what the order's state was when the goods left. A2 and A1 then see the marker and skip or net the costed units,
+  // and Allocated Inventory nets to zero. The ordinary pass (paid, deferred, allocated) stays after A2 as before.
+  const runGroupB = async (mode: 'direct' | 'paid'): Promise<void> => {
   groupBSkip: try {
     // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
     // so from that moment another batch — or a refund, which shares this domain
     // — can start while we are still writing. Stop instead.
     batchLock.assertHeld('Group B (shipment revenue + COGS)')
     if (lockBlocked) {
-      await reportLockBlocksRun('B', lockDate)
+      if (mode === 'paid') await reportLockBlocksRun('B', lockDate)
       break groupBSkip
     }
     const bPostedGroups: Array<{ date: string; movedFromLockedDays: string[] }> = []
@@ -2345,18 +1619,18 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // lib/domain/accounting/daily-batch-group-b-lock.ts). The same read also REVALIDATES status: a
       // shipment that stopped qualifying while we waited for the lock is simply not returned.
       const candidateWindow = takeDailyBatchWindow(await tx.shipment.findMany({
-        where: DAILY_BATCH_GROUP_B_SHIPMENT_WHERE,
+        where: groupBShipmentWhere(mode),
         select: { id: true, orderId: true, lines: { select: { costLayerSnapshot: true } } },
         orderBy: { createdAt: 'asc' },
         take: batchLimit + 1,
       }), batchLimit)
-      result.hasMore.groupB = candidateWindow.hasMore
+      result.hasMore.groupB = result.hasMore.groupB || candidateWindow.hasMore
       if (candidateWindow.rows.length === 0) return 0
       const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
       const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates: candidateWindow.rows })
 
       const shipments = await tx.shipment.findMany({
-        where: { ...DAILY_BATCH_GROUP_B_SHIPMENT_WHERE, id: { in: candidateShipmentIds } },
+        where: { AND: [groupBShipmentWhere(mode), { id: { in: candidateShipmentIds } }] },
         select: {
           id: true,
           orderId: true,
@@ -3077,12 +2351,771 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       return processedShipmentCount
     })
     if (groupBCount > 0) {
-      result.groupB = groupBCount
+      result.groupB += groupBCount
     }
     for (const journal of bPostedGroups) await reportLockedPeriodMoves('B', journal.date, journal.movedFromLockedDays, lockDate)
   } catch (e) {
     result.errors.push(`Group B error: ${String(e)}`)
   }
+  }
+
+  await runGroupB('direct')
+
+  // --- Group A1: Revenue Deferral ---
+  groupA1Skip: try {
+    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
+    // so from that moment another batch — or a refund, which shares this domain
+    // — can start while we are still writing. Stop instead.
+    batchLock.assertHeld('Group A1 (revenue deferral)')
+    if (lockBlocked) {
+      await reportLockBlocksRun('A1', lockDate)
+      break groupA1Skip
+    }
+    // DELIBERATELY NOT the shared invoiced-revenue basis (lib/domain/sales/invoiced-revenue-basis.ts).
+    // The reports count an order once it carries an invoice, paid or not, and accept a Xeroom-era
+    // invoice number. This batch decides what IMS itself must post, so it needs a PAID order whose
+    // invoice IMS posted (accountingInvoiceId). The two differ on purpose; do not unify them.
+    const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
+      where: {
+        paidAt: { not: null },
+        revenueDeferredDate: null,
+        accountingInvoiceId: { not: null },
+        status: { notIn: ['CANCELLED', 'DRAFT'] },
+        refundStatus: { not: 'FULL' },
+      },
+      select: {
+        id: true,
+        orderNumber: true,
+        externalOrderNumber: true,
+        fxRateToBase: true,
+        subtotalBase: true,
+        shippingBase: true,
+        discountAmount: true,
+        pricesIncludeVat: true,
+        taxRatePercent: true,
+        paidAt: true,
+        // o3d-hqvrp.35: refunds entered before this first run, netted out of the deferral.
+        refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
+        // ACC-H12: revenue already recorded by shipments whose COGS the batch posted before payment. The invoice
+        // put it in Sales and nothing moved it to Unearned Revenue, so the deferral below leaves it out.
+        // It also names a shipment that left while the order was unpaid and that the direct pass of Group B has not
+        // costed yet (a backlog or a refusal): such an order is not deferred until that shipment is costed.
+        shipments: {
+          where: { OR: [{ cogsRelievedFromInventoryAt: { not: null } }, { status: 'SHIPPED', shipmentJournalDate: null }] },
+          select: { revenueRecognizedAmount: true, cogsRelievedFromInventoryAt: true, shipmentJournalDate: true, shippedAt: true, createdAt: true },
+        },
+        shoppingLinks: {
+          select: { connector: true },
+        },
+        lines: {
+          select: {
+            totalBase: true,
+            taxRate: { select: { rate: true } },
+          },
+        },
+      },
+      orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
+      take: batchLimit + 1,
+    }), batchLimit)
+    // ACC-H12: an order whose shipment left before it was paid and is still waiting for its direct cost is not
+    // deferred yet. Deferring it first would send the ship-date COGS down the ordinary path at the payment date.
+    const awaitingDirectCost = (order: (typeof orderWindow.rows)[number]): boolean => (order.shipments ?? []).some((shipment) => (
+      !shipment.cogsRelievedFromInventoryAt
+      && !shipment.shipmentJournalDate
+      && !!order.paidAt
+      && (shipment.shippedAt ?? shipment.createdAt) < order.paidAt
+    ))
+    const orders = orderWindow.rows.filter((order) => !awaitingDirectCost(order))
+    result.hasMore.groupA1 = orderWindow.hasMore
+
+    if (orders.length > 0) {
+      // o3d-y14: derived through the SAME function the in-transaction fence re-derives with, so a
+      // disagreement can only mean the ORDER moved — never that the two sides do different sums.
+      // `amount` is the NETTED figure (what the order stores and the fence re-derives); `grossAmount` is what the
+      // paid-day journal moves, so a refund entered in a LATER period never changes an earlier period's journal.
+      const shippedRevenueOf = (order: (typeof orders)[number]): number => (
+        (order.shipments ?? []).filter((shipment) => !!shipment.cogsRelievedFromInventoryAt).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
+      )
+      const orderDeferrals = orders.map((order) => {
+        const amount = revenueDeferralAmount(order)
+        const shippedRevenue = shippedRevenueOf(order)
+        // ACC-H12: refunds of goods that shipped before payment never took value out of the deferral (their revenue is
+        // still in Sales and the credit note reverses it), so the order stores the net figure PLUS that part. Group B's
+        // true-up and the refund service then see exactly what the ledger holds in Unearned Revenue. The fence still
+        // compares `amount`, the net figure.
+        const parts = preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenue)
+        const undeferredRefunds = parts.reduce((sum, part) => sum + part.amount - part.deferredPart, 0)
+        return {
+          orderId: order.id,
+          amount,
+          storedAmount: round2(amount + undeferredRefunds),
+          // Only the part not yet shipped moves from Sales to Unearned Revenue.
+          grossAmount: Math.max(0, round2(revenueDeferralGrossAmount(order) - shippedRevenue)),
+        }
+      })
+      // ACC-H11: one journal per EVENT date (the day the order was paid), each with its own reference. The
+      // fence below still covers EVERY order of the run in one lock, once.
+      const orderById = new Map(orders.map((order) => [order.id, order]))
+      const a1Dated = groupByPostingDate(
+        orderDeferrals,
+        (deferral) => utcDay(orderById.get(deferral.orderId)?.paidAt),
+        dateContext,
+      )
+      if (a1Dated.deferred.length > 0) throw new Error('A1: an order has no open posting day although the lock-blocks-run check passed')
+      const a1Plans = a1Dated.groups.map((group) => {
+        const totalRevenueDeferred = round2(group.rows.reduce((sum, order) => sum + order.grossAmount, 0))
+        const invariantTotal = round2(group.rows.reduce((sum, order) => sum + order.grossAmount, 0))
+        if (Math.abs(invariantTotal - totalRevenueDeferred) > 0.01) {
+          throw new Error(`A1 revenue deferral invariant failed: per-order ${invariantTotal.toFixed(2)} != journal ${totalRevenueDeferred.toFixed(2)}`)
+        }
+        const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
+        if (totalRevenueDeferred > 0) {
+          journalLines.push(
+            { accountCode: settings.xero_sales_account, description: `Daily revenue deferral — ${group.rows.length} order(s)`, debit: totalRevenueDeferred },
+            { accountCode: settings.xero_unearned_revenue_account, description: `Daily revenue deferral — ${group.rows.length} order(s)`, credit: totalRevenueDeferred },
+          )
+        }
+        // o3d-0qoo: computed ONCE, here, and stamped onto every member order inside the same
+        // transaction as the stage stamp. It is deliberately NOT re-derived per order from
+        // revenueDeferredDate: `today` is captured at run start while the stamps are written
+        // with later new Date() calls, so a run crossing UTC midnight makes the two disagree
+        // and every consumer that re-derives looks for a batch that does not exist.
+        // ACC-H11: the reference carries the JOURNAL's date (the event day), so the persisted reference
+        // stays the batch's identity and its date for every consumer.
+        const referenceId = buildDailyBatchReferenceId('A1', group.date, group.rows.map((row) => row.orderId))
+        return { group, totalRevenueDeferred, journalLines, referenceId }
+      })
+
+      // ACC-H13 + ACC-H11: each refund entered before this first run is a SEPARATE adjustment (DR Unearned
+      // Revenue / CR Sales, the same direction the refund service uses after a deferral), dated the day of the
+      // refund (never before the deferral it adjusts) and subject to the same lock rule. One journal per date.
+      type RefundAdjustmentRow = { orderId: string; refundId: string | null; amount: number; day: string | null }
+      const adjustmentRows: RefundAdjustmentRow[] = []
+      for (const order of orders) {
+        const paidDay = utcDay(order.paidAt)
+        for (const adjustment of preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenueOf(order))) {
+          // ACC-H12: only the part of a refund that came out of deferred revenue is adjusted against Unearned.
+          if (!(adjustment.deferredPart > 0)) continue
+          adjustmentRows.push({
+            orderId: order.id,
+            refundId: adjustment.refundId,
+            amount: adjustment.deferredPart,
+            day: laterDay(utcDay(adjustment.refundedAt), paidDay),
+          })
+        }
+      }
+      const adjustmentDated = groupByPostingDate(adjustmentRows, (row) => row.day, dateContext)
+      if (adjustmentDated.deferred.length > 0) throw new Error('A1: a refund adjustment has no open posting day although the lock-blocks-run check passed')
+      const adjustmentPlans = adjustmentDated.groups.map((group) => {
+        const total = round2(group.rows.reduce((sum, row) => sum + row.amount, 0))
+        // The identity digest is over a distinct namespace so it can never collide with the paid-day journal of the same date.
+        const referenceId = buildDailyBatchReferenceId('A1', group.date, group.rows.map((row) => `refund-adjustment:${row.refundId ?? row.orderId}`))
+        return { group, total, referenceId }
+      })
+
+      await db.$transaction(async (tx) => {
+        // o3d-y14: every figure below — the payload, the journal total and the per-order stamp —
+        // was derived from a read taken OUTSIDE this transaction and without a lock. Re-derive it
+        // now that the member rows are locked, and refuse the whole group rather than persist a
+        // deferral the order itself contradicts. See daily-batch-discount-fence.ts.
+        await assertRevenueDeferralsUnchanged(tx, orderDeferrals)
+
+        for (const plan of adjustmentPlans) {
+          if (plan.total <= 0) continue
+          await createPendingSyncLog(tx, {
+            type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+            referenceId: plan.referenceId,
+            currency: baseCurrency,
+            payload: {
+              date: plan.group.date,
+              reference: `Revenue Deferral refund adjustment ${plan.group.date} ${plan.referenceId.slice(-8)}`,
+              narration: `Revenue deferral adjustment for refund(s) entered before the first batch run: ${plan.group.rows.length} refund(s), £${plan.total.toFixed(2)}${lockedPeriodNarration(plan.group.movedFromLockedDays, lockDate)}`,
+              lines: [
+                { accountCode: settings.xero_unearned_revenue_account, description: `Pre-batch refund adjustment — ${plan.group.rows.length} refund(s)`, debit: plan.total },
+                { accountCode: settings.xero_sales_account, description: `Pre-batch refund adjustment — ${plan.group.rows.length} refund(s)`, credit: plan.total },
+              ],
+              refundAdjustments: plan.group.rows,
+              batchReferenceId: plan.referenceId,
+              batchDate: plan.group.date,
+              batchGroup: 'A1',
+              batchEntityCount: plan.group.rows.length,
+              splitBatch: result.hasMore.groupA1,
+              _postingMode: 'submitted',
+            },
+          })
+          // The durable witness: each refund carries the adjustment journal that netted it, in the same
+          // transaction as the journal, so a lost log can be rebuilt (and rebuilt once) and the rebuilt paid-day
+          // journal knows which refunds to add back.
+          const stampedRefundIds = plan.group.rows.map((row) => row.refundId).filter((id): id is string => !!id)
+          if (stampedRefundIds.length > 0) {
+            await tx.salesOrderRefund.updateMany({ where: { id: { in: stampedRefundIds } }, data: { deferralAdjustmentRef: plan.referenceId } })
+          }
+        }
+
+        for (const plan of a1Plans) {
+          const { group, totalRevenueDeferred, journalLines, referenceId } = plan
+          if (journalLines.length > 0) {
+            await createPendingSyncLog(tx, {
+              type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+              referenceId,
+              currency: baseCurrency,
+              payload: {
+                date: group.date,
+                reference: `Revenue Deferral ${group.date} ${referenceId.slice(-8)}`,
+                narration: `Daily revenue deferral: ${group.rows.length} order(s), £${totalRevenueDeferred.toFixed(2)}${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`,
+                lines: journalLines,
+                orderDeferrals: group.rows,
+                batchReferenceId: referenceId,
+                batchDate: group.date,
+                batchGroup: 'A1',
+                batchEntityCount: group.rows.length,
+                splitBatch: result.hasMore.groupA1,
+                _postingMode: 'submitted',
+              },
+            })
+          }
+
+          const deferralByOrderId = new Map(group.rows.map((order) => [order.orderId, order.storedAmount]))
+          for (const deferral of group.rows) {
+            await tx.salesOrder.update({
+              where: { id: deferral.orderId },
+              data: {
+                revenueDeferredDate: new Date(),
+                revenueDeferredBatchRef: referenceId,
+                unearnedRevenueAmount: deferralByOrderId.get(deferral.orderId) ?? 0,
+              },
+            })
+          }
+        }
+      })
+      for (const plan of a1Plans) await reportLockedPeriodMoves('A1', plan.group.date, plan.group.movedFromLockedDays, lockDate)
+      for (const plan of adjustmentPlans) await reportLockedPeriodMoves('A1', plan.group.date, plan.group.movedFromLockedDays, lockDate)
+
+      result.groupA1 = orders.length
+    }
+  } catch (e) {
+    // o3d-y14: the fence aborts the transaction, so nothing recorded the refusal. Log it here,
+    // OUTSIDE the rolled-back transaction, before it becomes one more line in result.errors.
+    if (e instanceof StaleDailyBatchDeferralError) await logStaleDailyBatchDeferral(XERO_CONNECTOR, e)
+    result.errors.push(`Group A1 error: ${String(e)}`)
+  }
+
+  // --- Group A2: Inventory Reclassification ---
+  groupA2Skip: try {
+    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
+    // so from that moment another batch — or a refund, which shares this domain
+    // — can start while we are still writing. Stop instead.
+    batchLock.assertHeld('Group A2 (inventory reclassification)')
+    if (lockBlocked) {
+      await reportLockBlocksRun('A2', lockDate)
+      break groupA2Skip
+    }
+    // o3d-0i5y r9 — THE PLAN AND THE STAMP NOW DESCRIBE THE SAME STATE OF THE ORDER.
+    //
+    // This selection used to run on `db`, OUTSIDE the transaction below and under no row lock. Every
+    // input A2 decides on — the allocation rows, their records, the dispatched lines — was therefore
+    // a snapshot of a moment that had already passed by the time the transaction opened, while the
+    // writes at the end of it (the row records, the stamp, the batch ref, the amount) landed
+    // unconditionally on the rows as they stood THEN. Between the two, the very paths that share
+    // this domain move exactly these rows: `allocateSalesOrder` rewrites the allocation set and
+    // carries the records between scopes, a refund un-stages and reverses, a dispatch writes
+    // shipment snapshots. The batch's session lock does not close this — it excludes another BATCH,
+    // not an operator re-allocating an order from the UI.
+    //
+    // Three concrete losses, all of them money:
+    //
+    //   * a re-allocation that lands in the gap has its NEW record overwritten by `next`, which was
+    //     computed from the OLD one — so units the rewrite carried to another warehouse are
+    //     re-presented as unaccounted and posted a second time, or a record is erased outright.
+    //   * an allocation row deleted in the gap makes the per-row `update` throw, aborting a
+    //     transaction that has already valued every other order in the window.
+    //   * quantity ADDED in the gap is stamped as accounted without ever being valued: the stamp is
+    //     order-level, so A2 never looks at the order again, and Group B still credits Allocated
+    //     Inventory for it when it ships.
+    //
+    // So the read moves inside the transaction that writes, and the orders are ROW-LOCKED before
+    // anything is read off them — the shape `e2mz`, `small2` and `settle` all closed tonight, and
+    // the shape `buildLayerSnapshot` just below already uses for cost layers: select the candidates,
+    // lock them, then re-read under the lock and re-apply the eligibility test, so an order that
+    // stopped qualifying while we waited for the lock is dropped rather than posted.
+    // o3d-sidy r2 (review MEDIUM) — REFUSED ORDERS MUST NOT STARVE THE WINDOW.
+    //
+    // A refused order keeps its place at the front of the window (it stays eligible, and the window
+    // is `revenueDeferredDate asc`), so a window filled with refused orders would reclassify nothing
+    // every night while healthy orders queued behind it. So a pass that refused anything and left
+    // candidates behind is followed by another pass that EXCLUDES every order refused so far, given
+    // only the slots this run has not yet spent on ACCEPTED orders — the run still reclassifies at
+    // most `batchLimit` orders. It terminates: every further pass either accepts nothing new and
+    // refuses nothing (stop), or refuses at least one more order, which the next pass excludes, so
+    // the candidate set shrinks strictly. Each pass is its own transaction and its own journal, the
+    // same shape a batch already takes when it is split across runs.
+    //
+    // o3d-sidy r2 (review LOW 2): a pass's refusals are PUBLISHED only once its transaction has
+    // committed. A pass that later aborts (a "Missing FIFO snapshot" on another order, say) rolls back
+    // as a whole and is reported as the group error it is; its refusals are not reported as if the
+    // rest of that pass had gone through.
+    const refusedA2OrderIds = new Set<string>()
+    let a2Accepted = 0
+    let a2HasMore = false
+    for (;;) {
+      const passLimit = batchLimit - a2Accepted
+      if (passLimit <= 0) break
+      const passRefusals: NegativeCostBasisRefusal[] = []
+      const groupA2 = await db.$transaction(async (tx) => {
+        const candidateWindow = takeDailyBatchWindow(await tx.salesOrder.findMany({
+          where: refusedA2OrderIds.size > 0
+            ? { ...A2_ELIGIBLE_ORDER, id: { notIn: [...refusedA2OrderIds] } }
+            : A2_ELIGIBLE_ORDER,
+          orderBy: A2_ORDER_SELECTION_ORDER,
+          select: { id: true },
+          take: passLimit + 1,
+        }), passLimit)
+        const candidateIds = candidateWindow.rows.map((row) => row.id)
+        if (candidateIds.length === 0) return { count: 0, hasMore: candidateWindow.hasMore, journals: [] as Array<{ date: string; movedFromLockedDays: string[] }> }
+        await lockSalesOrders(tx, candidateIds)
+
+        // Re-read UNDER THE LOCK, and re-apply the eligibility test as a WHERE rather than trusting
+        // the candidate list: the permission to post this order is evaluated in exactly one place,
+        // immediately before the act it authorises. An order that was stamped, fully refunded or
+        // cancelled while we blocked on its lock simply is not in this result.
+        const orders = await tx.salesOrder.findMany({
+          where: { id: { in: candidateIds }, ...A2_ELIGIBLE_ORDER },
+          orderBy: A2_ORDER_SELECTION_ORDER,
+          select: {
+            id: true,
+            orderNumber: true,
+            externalOrderNumber: true,
+            status: true,
+            // ACC-H11: the journal is dated by the event - paid, and stock allocated.
+            paidAt: true,
+            // o3d-0i5y r5 (rebase onto o3d-o97): what EARLIER A2 passes already recorded posting for
+            // this order. Since the residual rebuild hands a stamped order back for the INCREMENT,
+            // this pass is no longer necessarily the first, and the order-level record has to be the
+            // running total rather than the latest instalment. Read under the same lock as everything
+            // else A2 plans from.
+            allocationBatchAmount: true,
+            // o3d-i0o6 r3: and the pass history that figure is the sum of, read in the same statement
+            // so this pass appends to what it actually planned from.
+            allocationBatchPasses: true,
+            allocations: {
+              select: {
+                id: true,
+                lineId: true,
+                productId: true,
+                warehouseId: true,
+                qty: true,
+                createdAt: true,
+                // o3d-0i5y r5: what THIS row has already had reclassified. Without it A2 can only ask an
+                // order-level question, and the residual added to a part-journaled order is invisible.
+                costLayerSnapshot: true,
+              },
+            },
+            shipments: {
+              where: { status: 'SHIPPED' },
+              select: {
+                id: true,
+                status: true,
+                warehouseId: true,
+                // ACC-H12: shipments already costed straight out of Inventory are not A2's to value or record.
+                cogsRelievedFromInventoryAt: true,
+                // o3d-0i5y r7: the journal date is deliberately NOT read. What a pass owes is decided by
+                // the allocation row's own entries against the dispatched quantity — see
+                // `planA2Reclassification`. Selecting a shipment's journal date here only ever supported
+                // the whole-shipment valuation that re-posted the pinned part of a mixed shipment.
+                lines: {
+                  select: {
+                    id: true,
+                    lineId: true,
+                    productId: true,
+                    qty: true,
+                    costLayerSnapshot: true,
+                  },
+                },
+              },
+            },
+          },
+        })
+        if (orders.length === 0) return { count: 0, hasMore: candidateWindow.hasMore, journals: [] as Array<{ date: string; movedFromLockedDays: string[] }> }
+
+        const plans = new Map(orders.map((order) => [order.id, planA2Reclassification(order)]))
+
+        const snapshot = await buildLayerSnapshot(
+          tx,
+          orders.flatMap((order) => {
+            const plan = plans.get(order.id)!
+            return order.allocations
+              .filter((alloc) => plan.outstandingByAllocation.has(alloc.id))
+              .map((alloc) => ({
+                productId: alloc.productId,
+                warehouseId: alloc.warehouseId,
+              }))
+          }),
+        )
+        const orderValues = new Map<string, number>()
+        const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+        /**
+         * o3d-0i5y r10: the entries THIS pass adds to a row, kept apart from the ones it merely read.
+         *
+         * A2 appends; it never authors what is already on the row. Holding the two halves separately
+         * is what lets the write rebase its append onto the record AS LOCKED instead of replaying the
+         * base it planned from — see `lockAllocationRecords`.
+         */
+        const allocationAppends = new Map<string, CostLayerSnapshotEntry[]>()
+        /** The quantity the planned-from base recorded, so a base that MOVED can be told from one that was revalued. */
+        const allocationBaseQty = new Map<string, Decimal>()
+
+        // o3d-sidy (review H1): orders refused for a negative basis. Everything this pass computed for
+        // them is withdrawn before any journal, stamp or record is written, so they are exactly as if
+        // this batch had never seen them — see the refusal below the allocation loop.
+        const refusedOrderIds = new Set<string>()
+
+        for (const order of orders) {
+          const plan = plans.get(order.id)!
+          // o3d-sidy: what this order took from the shared in-memory layer snapshot, so a refusal can
+          // hand it back and the orders after it value exactly as they would without this one.
+          const orderConsumption: Array<{ productId: string; warehouseId: string; consumed: CostLayerSnapshotEntry[] }> = []
+          const orderAppended: CostLayerSnapshotEntry[] = []
+          // o3d-0i5y r7: value is accumulated ROW BY ROW, from the entries this pass actually writes.
+          // r6 valued the whole unjournaled shipment here instead, which posts the WHOLE of a MIXED
+          // shipment — part of it already pinned and posted by an earlier pass. See the shipment-
+          // sourced term below.
+          let orderCostValue = toDecimal(0)
+
+          // Rows that have never been reclassified at all, owe nothing and have nothing to record are
+          // still STAMPED with an empty snapshot, exactly as before.
+          for (const allocationId of plan.stampEmptyAllocationIds) {
+            allocationSnapshots.set(allocationId, [])
+            allocationAppends.set(allocationId, [])
+            allocationBaseQty.set(allocationId, toDecimal(0))
+          }
+
+          for (const alloc of order.allocations) {
+            const outstanding = plan.outstandingByAllocation.get(alloc.id)
+            const shipmentAccounted = plan.shipmentAccountedByAllocation.get(alloc.id)
+            if (!outstanding && !shipmentAccounted) continue
+            // o3d-0i5y r8: the row's RECORD — what earlier passes already accounted and posted. It
+            // is both the base the new entries are appended to and the pool the shipment take is
+            // netted by, so a dispatched entry this row has already valued can never be valued again.
+            const alreadyRecorded = parseCostLayerSnapshot(alloc.costLayerSnapshot)
+            // o3d-0i5y r6: units this pass is accounting from the SHIPMENT snapshots, written onto the
+            // row so a later pass reads them as evidence instead of inferring them from an overlap.
+            // They add NO value here — the shipment value is posted once, above, and only while the
+            // shipment is unjournaled — this is a record of quantity already in the ledger.
+            const recorded = shipmentAccounted
+              ? takeShipmentAccountedEntries(
+                  alreadyRecorded,
+                  order.shipments
+                    .filter((shipment) => shipment.warehouseId === alloc.warehouseId && !shipment.cogsRelievedFromInventoryAt)
+                    .flatMap((shipment) => shipment.lines.filter((line) => (
+                      line.lineId === alloc.lineId && line.productId === alloc.productId
+                    ))),
+                  shipmentAccounted,
+                  alloc.id,
+                )
+              : []
+            // o3d-0i5y r7: THE RECORD IS ALSO THE VALUATION, and it must be, because the row is the
+            // only place that says which dispatched units A2 has already posted. `shipmentAccounted`
+            // is dispatched quantity NO entry on the row accounts for, so these entries are exactly
+            // the units whose cost has never reached Allocated Inventory — never the pinned part of
+            // the same shipment, which is what r6's whole-shipment sum re-posted every pass.
+            //
+            // A short take can only mean a dispatched line carries no snapshot to record. r6 let that
+            // stand as a silent under-account; it is now as loud as r5's whole-shipment guard was,
+            // and names the row and the quantity rather than the batch.
+            if (shipmentAccounted) {
+              const recordedQty = sumCostLayerSnapshotQty(recorded)
+              if (recordedQty.lt(shipmentAccounted)) {
+                throw new Error(
+                  `Missing FIFO snapshot on shipped line(s) for allocation ${alloc.id} on order ${order.id}: `
+                  + `${shipmentAccounted.toString()} dispatched unit(s) to account for, only ${recordedQty.toString()} recoverable`,
+                )
+              }
+            }
+            const consumed = outstanding
+              ? consumeSnapshotLayers(
+                  snapshot,
+                  alloc.productId,
+                  alloc.warehouseId,
+                  outstanding.toNumber(),
+                )
+              : []
+            orderConsumption.push({ productId: alloc.productId, warehouseId: alloc.warehouseId, consumed })
+            orderAppended.push(...recorded, ...consumed)
+            // APPENDED, not replaced, so `snapshotQty` keeps naming everything ever posted against
+            // this row — which is what makes the next pass's outstanding calculation right. The
+            // shipped record goes BEFORE the fresh pin, so the qty-based contra relief that Group B
+            // and the refund reversal run for each shipment line consumes exactly those units and
+            // leaves the unshipped pin standing.
+            //
+            // o3d-0i5y r9: the entries THIS pass values are stamped with WHAT IT VALUED THEM AT, in
+            // this same statement — and the journal for that amount is raised in this same
+            // transaction, a few lines below. `alreadyRecorded` is left exactly as it is: an earlier
+            // pass stamped it with the amount IT posted, and re-stamping at today's cost would turn
+            // a record of a historical posting into a revaluation of it. That is the whole point of
+            // the field — a landed-cost correction rewrites `unitCostBase` on these very rows
+            // without touching Allocated Inventory, so the pin stops being able to say what was
+            // debited the moment it is revalued.
+            //
+            // o3d-0i5y r10: the append is kept SEPARATE from `alreadyRecorded`, because the write is
+            // no longer allowed to replay the base it planned from — see `lockAllocationRecords` and
+            // the write loop below.
+            const appended = [
+              ...recorded.map(withPostedUnitCost),
+              ...consumed.map(withPostedUnitCost),
+            ]
+            allocationAppends.set(alloc.id, appended)
+            allocationBaseQty.set(alloc.id, sumCostLayerSnapshotQty(alreadyRecorded))
+            allocationSnapshots.set(alloc.id, [...alreadyRecorded, ...appended])
+            orderCostValue = addMoney(
+              orderCostValue,
+              addMoney(sumCostLayerSnapshot(recorded), sumCostLayerSnapshot(consumed)),
+            )
+          }
+          orderCostValue = roundQuantity(orderCostValue, 2)
+
+          // o3d-sidy (review H1) — A2 REFUSES A NEGATIVE BASIS PER ORDER, BEFORE ANYTHING IS WRITTEN.
+          //
+          // Both halves of what this pass values can carry one: `recorded` comes off the shipment
+          // snapshots, which a landed-cost revaluation rewrites in place (same-day allocate-and-ship is
+          // the ordinary case), and `consumed` off live layers whose unit cost the same revaluation
+          // changed. Unrefused, the negative was debited to Allocated Inventory short, stamped onto the
+          // order and pinned as `postedUnitCostBase`, and the correction that followed re-valued the
+          // layer and left the ledger short for good. PER ORDER, like Group B, rather than failing the
+          // whole transaction: A2 is ONE journal for every order in the window, and aborting it would
+          // hold back every other order's reclassification — and so every other order's Group B, which
+          // waits for this stamp — until one purchase order was corrected.
+          //
+          // o3d-sidy r2 (review MEDIUM) — WHAT "PER ORDER" MEANS FOR A NEGATIVE LIVE LAYER. The refused
+          // order hands its layers back, so the next order's FIFO take starts from the same place and
+          // reaches the same negative layer: ONE negative layer refuses EVERY order whose take reaches
+          // it (2 units at -6 ahead of 5 at 20, three 1-unit orders: all three refused), not just the
+          // negative quantity, until the basis is corrected. That is deliberate — it values each order
+          // exactly as if the refused ones were absent — and the window loop above keeps those refused
+          // orders from starving the orders behind them.
+          const negative = negativeBasisEntries(orderAppended)
+          if (negative.length > 0) {
+            for (const { productId, warehouseId, consumed } of orderConsumption) {
+              returnSnapshotLayers(snapshot, productId, warehouseId, consumed)
+            }
+            for (const alloc of order.allocations) {
+              allocationSnapshots.delete(alloc.id)
+              allocationAppends.delete(alloc.id)
+              allocationBaseQty.delete(alloc.id)
+            }
+            refusedOrderIds.add(order.id)
+            const orderRef = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
+            passRefusals.push(new NegativeCostBasisRefusal(
+              `Group A2 order ${orderRef}: negative cost basis — cost layer(s) ${describeNegativeEntries(negative)}; `
+              + `the reclassification would be ${orderCostValue.toFixed(2)}. Not reclassified, so its shipments `
+              + `wait too. ${NEGATIVE_BASIS_REMEDY}reclassifies it and posts its COGS (o3d-sidy).`,
+              {
+                group: 'A2', orderId: order.id, orderRef, shipmentId: null, batchRef: null,
+                negativeEntries: negativeEntryDetail(negative), value: orderCostValue.toFixed(2),
+              },
+            ))
+            continue
+          }
+
+          orderValues.set(order.id, orderCostValue.toNumber())
+        }
+
+        // o3d-sidy: the batch is built from the orders that were NOT refused, and only from them.
+        const accepted = orders.filter((order) => !refusedOrderIds.has(order.id))
+        if (accepted.length === 0) return { count: 0, hasMore: candidateWindow.hasMore, journals: [] as Array<{ date: string; movedFromLockedDays: string[] }> }
+        // ACC-H11: ONE JOURNAL PER EVENT DATE. An order's reclassification is dated the later of the day it
+        // was paid and the day its stock was allocated (the rows this pass actually touched), so a backorder
+        // allocated weeks after payment lands on the day the stock arrived. Each date is its own journal with
+        // its own reference; each order is stamped with the journal that carries ITS pounds.
+        const a2OrderDay = (order: (typeof accepted)[number]): string | null => laterDay(
+          utcDay(order.paidAt),
+          ...order.allocations
+            .filter((alloc) => allocationSnapshots.has(alloc.id))
+            .map((alloc) => utcDay(alloc.createdAt)),
+        )
+        const a2Dated = groupByPostingDate(accepted, a2OrderDay, dateContext)
+        if (a2Dated.deferred.length > 0) throw new Error('A2: an order has no open posting day although the lock-blocks-run check passed')
+        const a2Groups = a2Dated.groups
+        const a2JournalByOrderId = new Map<string, { referenceId: string; syncLogId: string | null }>()
+        const a2PostedGroups: Array<{ date: string; movedFromLockedDays: string[] }> = []
+        for (const group of a2Groups) {
+          // o3d-0qoo: batch identity, computed once from this journal's own date and order set, then
+          // persisted on every member row alongside its stage stamp. See the A1 note above for why
+          // deriving it back from inventoryAllocatedDate is not equivalent.
+          // o3d-0i5y r9: derived from the LOCKED set, so the ref names the orders the journal is
+          // actually built from rather than the ones a pre-transaction read happened to see.
+          // o3d-sidy: and from the ACCEPTED set, so a refused order is not named by a batch it is not in.
+          const referenceId = buildDailyBatchReferenceId('A2', group.date, group.rows.map((order) => order.id))
+          let groupValue = toDecimal(0)
+          for (const order of group.rows) groupValue = addMoney(groupValue, orderValues.get(order.id) ?? 0)
+          const groupValueNumber = round2Decimal(groupValue)
+          // o3d-o97 r3: null when NO journal was raised. The guard below is on the batch's ROUNDED
+          // total, so a window whose only member values at £0.004 stamps that order with an amount
+          // and creates no journal at all — which is exactly the inference ("an amount implies a
+          // pass that created a journal") the refund reversal used to rest on.
+          let groupSyncLogId: string | null = null
+          if (groupValueNumber > 0) {
+            groupSyncLogId = await createPendingSyncLog(tx, {
+              type: 'DAILY_BATCH_INVENTORY_ALLOC',
+              referenceId,
+              currency: baseCurrency,
+              payload: {
+                date: group.date,
+                reference: `Inventory Allocation ${group.date} ${referenceId.slice(-8)}`,
+                narration: `Daily inventory reclassification: ${group.rows.length} order(s), £${groupValueNumber.toFixed(2)}${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`,
+                lines: [
+                  { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${group.rows.length} order(s)`, debit: groupValueNumber },
+                  { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${group.rows.length} order(s)`, credit: groupValueNumber },
+                ],
+                batchReferenceId: referenceId,
+                batchDate: group.date,
+                batchGroup: 'A2',
+                batchEntityCount: group.rows.length,
+                splitBatch: result.hasMore.groupA2,
+                _postingMode: 'submitted',
+              },
+            })
+          }
+          for (const order of group.rows) a2JournalByOrderId.set(order.id, { referenceId, syncLogId: groupSyncLogId })
+          a2PostedGroups.push({ date: group.date, movedFromLockedDays: group.movedFromLockedDays })
+        }
+
+        // -----------------------------------------------------------------------------------
+        // o3d-0i5y r10 (Codex round 10, finding 4) — THE WRITE REBASES ONTO THE ROW AS LOCKED.
+        //
+        // r9 moved the PLAN inside the transaction and under the orders' row locks, which was the
+        // right half of the fix. This is the other half: the write the plan leads to. It rewrites the
+        // WHOLE `costLayerSnapshot` array, and the front of that array is `alreadyRecorded` — entries
+        // read at the top of this transaction and not touched by A2 since.
+        //
+        // One writer can change them in that window, and it is not covered by the sales-order lock:
+        // `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations`
+        // when a landed cost lands late. It takes no order lock (it selects by cost layer, across
+        // every table that carries a snapshot), so it commits freely between A2's read and A2's
+        // write — and then A2 writes the array it read and the correction is gone.
+        //
+        //   a layer bought at £4 is corrected to £5 while the batch runs. 10 recorded units on the
+        //   row are repriced £40 -> £50 and the revaluation posts that £10 to COGS/Inventory.
+        //   A2 then writes back its planned array, at £4. The row says £40 again while the ledger
+        //   says £50, and Group B relieves those units at £4 when they ship: £10 of real cost never
+        //   reaches COGS, permanently, and the refund reversal reverses the same £10 short.
+        //
+        // So the base is RE-READ under the row lock at the moment of writing, and this pass's own
+        // entries are appended to THAT. A2 appends; it does not author what it merely read. The
+        // append is unaffected — `recorded` and `consumed` are this pass's own valuations, stamped
+        // with `postedUnitCostBase` — and a correction that lands after the lock waits for it, then
+        // patches the array A2 committed.
+        //
+        // A base whose QUANTITY moved is a different matter and is refused: the revaluation cannot
+        // change quantities or entry counts (it maps each entry to itself), so a base that grew or
+        // shrank means a writer nothing here can account for, and the plan built on it — `outstanding`
+        // above all — is describing a row that no longer exists. It cannot be reached today, because
+        // every path that changes WHICH units are recorded takes the order lock this pass holds.
+        const lockedRecords = await lockAllocationRecords(
+          tx,
+          accepted.flatMap((order) => order.allocations
+            .filter((alloc) => allocationSnapshots.has(alloc.id))
+            .map((alloc) => alloc.id)),
+        )
+
+        for (const order of accepted) {
+          for (const alloc of order.allocations) {
+            const next = allocationSnapshots.get(alloc.id)
+            // `undefined` means "this row was already accounted and is not being changed". It is NOT
+            // the same as `[]`, which is a deliberate stamp; writing `?? []` here would erase the
+            // pinned layers of every row a previous pass posted (o3d-0i5y r5).
+            if (!next) continue
+            const lockedBase = parseCostLayerSnapshot(lockedRecords.get(alloc.id) ?? null)
+            const plannedBaseQty = allocationBaseQty.get(alloc.id) ?? toDecimal(0)
+            const lockedBaseQty = sumCostLayerSnapshotQty(lockedBase)
+            if (!lockedBaseQty.eq(plannedBaseQty)) {
+              throw new Error(
+                `Allocation ${alloc.id} on order ${order.id} recorded ${plannedBaseQty.toString()} unit(s) when this `
+                + `pass planned from it and ${lockedBaseQty.toString()} unit(s) under the write lock — the record moved `
+                + 'under Group A2 and the plan built on it cannot be trusted',
+              )
+            }
+            const written = [...lockedBase, ...(allocationAppends.get(alloc.id) ?? [])]
+            await tx.orderAllocation.update({
+              where: { id: alloc.id },
+              data: {
+                costLayerSnapshot: written as never,
+                // o3d-o97 r3: the pounds this row contributed to the DR above, pinned beside the
+                // layers it was pinned from. Revaluation rewrites those layers' unitCostBase in
+                // the snapshot; it never posts to Allocated Inventory, so this figure is what a
+                // refund of part of this row has to reverse at.
+                //
+                // o3d-0i5y r10 (rebase): read off the array actually WRITTEN — the record re-read
+                // under the write lock plus this pass's appends — never the array this pass planned
+                // from. A landed-cost correction landing mid-batch rewrites the former and not the
+                // latter, and writing the planned copy back is how £10 of real cost never reaches
+                // COGS. And the figure is the POSTED basis where the entries carry one, so an
+                // earlier pass's pounds are the pounds it debited rather than what its layers have
+                // been revalued to since; pre-r9 entries carry no posted basis, and for those the pin
+                // is the only evidence there is, exactly as before.
+                //
+                // Where THIS pass raised no journal an EARLIER pass's record is left alone rather
+                // than nulled: `undefined` is "do not update", while `null` would erase a debit that
+                // is still standing and is the evidence-deletion o3d-o97 r4 refused.
+                allocationBatchAmount: a2JournalByOrderId.get(order.id)?.syncLogId
+                  ? roundQuantity(recordedPostedBasis(written), 4).toNumber()
+                  : lockedBase.length > 0 ? undefined : null,
+              },
+            })
+          }
+          await tx.salesOrder.update({
+            where: { id: order.id },
+            data: {
+              inventoryAllocatedDate: new Date(),
+              inventoryAllocatedBatchRef: a2JournalByOrderId.get(order.id)?.referenceId,
+              // o3d-o97 r3 + o3d-0i5y r5: the pounds A2 has debited to Allocated Inventory for this
+              // order — ACCUMULATED, not replaced. o3d-o97 wrote this as one pass's figure because
+              // the stamp only ever came off an order A2 was about to re-value in full. It does not
+              // any more: `resetAllocationAccountingIfStaged` hands a stamped order back when the
+              // declared set leaves NEW quantity, and A2 then posts that increment alone. Replacing
+              // the figure would leave the order recording £20 of a £70 debit, and the refund's open
+              // balance would strand the other £50 permanently.
+              //
+              // o3d-i0o6 r3 — AND THE ATTRIBUTION IS ACCUMULATED WITH IT, BY THE SAME CALL. The amount
+              // was cumulative while the journal id, connector and account code beside it were
+              // REPLACED by this pass, so the row said "£55, carried by the £5 journal" and a proof
+              // read the second half as covering the first. `buildAllocationDebitOrderUpdate` produces
+              // the running total, the appended pass history and those three columns TOGETHER — there
+              // is no way to write the figure here without recording the pass that made it, which is
+              // what stops the next connector from reintroducing the same gap by omission.
+              ...buildAllocationDebitOrderUpdate({
+                existingAmount: order.allocationBatchAmount,
+                existingPasses: order.allocationBatchPasses,
+                passAmount: orderValues.get(order.id) ?? 0,
+                syncLogId: a2JournalByOrderId.get(order.id)?.syncLogId ?? null,
+                connector: XERO_CONNECTOR,
+                accountCode: settings.xero_allocated_inventory_account,
+                batchRef: a2JournalByOrderId.get(order.id)?.referenceId ?? '',
+                at: new Date(),
+              }),
+            },
+          })
+        }
+
+        return { count: accepted.length, hasMore: candidateWindow.hasMore, journals: a2PostedGroups }
+      })
+
+      for (const journal of groupA2.journals) await reportLockedPeriodMoves('A2', journal.date, journal.movedFromLockedDays, lockDate)
+      negativeBasisRefusals.push(...passRefusals)
+      for (const refusal of passRefusals) {
+        if (refusal.detail.orderId) refusedA2OrderIds.add(refusal.detail.orderId)
+      }
+      a2Accepted += groupA2.count
+      a2HasMore = groupA2.hasMore
+      result.groupA2 = a2Accepted
+      result.hasMore.groupA2 = a2HasMore
+      if (passRefusals.length === 0 || !groupA2.hasMore) break
+    }
+  } catch (e) {
+    result.errors.push(`Group A2 error: ${String(e)}`)
+  }
+
+  await runGroupB('paid')
+
 
     // cogs-audit scjz.60.4: sweep the inventory subledger-vs-GL rounding residue to
     // the rounding-difference account. Runs after the batch postings so the GL/
