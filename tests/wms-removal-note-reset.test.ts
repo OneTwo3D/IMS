@@ -46,3 +46,15 @@ test('operator tasks cascade with their order (so the transaction reset and an o
   const schema = await readFile(new URL('../prisma/schema.prisma', import.meta.url), 'utf8')
   assert.match(schema.slice(schema.indexOf('model WmsOperatorTask {')), /order\s+SalesOrder\s+@relation\(fields: \[orderId\], references: \[id\], onDelete: Cascade\)/)
 })
+
+test('the transaction reset dates itself and drops the WooCommerce covered-history boundary INSIDE the order-deleting transaction, before the orders go', async () => {
+  const source = await readFile(new URL('../app/actions/reset.ts', import.meta.url), 'utf8')
+  const scope = source.slice(source.indexOf('async function clearTransactionScope'), source.indexOf('async function clearProductScope'))
+  const marker = scope.indexOf('WC_ORDER_RESET_MARKER_KEY')
+  const dropped = scope.indexOf('tx.setting.deleteMany({ where: { key: { in: [WC_COMPLETED_HISTORY_COVERED_KEY] } } })')
+  const orders = scope.indexOf('await tx.salesOrder.deleteMany({})')
+  const end = scope.indexOf('}, { timeout: 600_000')
+  assert.ok(marker !== -1 && dropped !== -1 && marker < orders && dropped < orders && orders < end, 'marker and boundary drop precede the order delete inside the transaction')
+  assert.match(source, /const WC_ORDER_SYNC_STATE_KEYS = \[[^\]]*WC_COMPLETED_HISTORY_COVERED_KEY/, 'and the boundary is in the intake-state keys cleared with the cursors')
+  assert.doesNotMatch(source.slice(source.indexOf('const WC_ORDER_SYNC_STATE_KEYS'), source.indexOf('] as const')), /WC_ORDER_RESET_MARKER_KEY/, 'the reset marker itself is never cleared')
+})

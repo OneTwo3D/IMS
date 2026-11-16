@@ -261,6 +261,9 @@ const defaultDeps: LandedCostServiceDeps = {
   warnWeightZeroLines,
 }
 
+/** ACC-H14: the production deps, for the manufacturing cost edit's propagation into downstream layers. */
+export const defaultLandedCostServiceDeps: LandedCostServiceDeps = defaultDeps
+
 const LANDED_COST_DELTA_EPSILON = new Prisma.Decimal('0.000001')
 const LANDED_COST_JOURNAL_EPSILON = new Prisma.Decimal('0.01')
 
@@ -514,10 +517,22 @@ export async function propagateLandedCostToOutputs(
   recalcRunId: string,
   revaluedAt: Date,
   revaluationContext?: ShipmentRevaluationContext,
+  /**
+   * ACC-H14 (Codex R2): THE CHART EVERY DOWNSTREAM SHIPMENT REFRESH IS ASKED OF. One chart for the whole walk, so
+   * the COGS_REVERSAL rows and the batch-ownership decisions are about the SAME connector as the caller's own
+   * journal even if the active connector changes mid-run. A caller that has one passes it (the manufacturing
+   * cost edit passes its reclass chart); otherwise it is resolved ONCE here and handed down the recursion,
+   * instead of once per shipment refresh.
+   */
+  accountingSettings?: AccountingSettings | null,
 ): Promise<void> {
   if (costDeltaPerUnit.abs().lte(LANDED_COST_DELTA_EPSILON)) return
   if (depth > MAX_LANDED_COST_PROPAGATION_DEPTH) return
   if (ancestors.has(sourceCostLayerId)) return // cycle on the current path
+  // Resolved LAZILY, at the first shipment refresh that needs it: this runs inside the caller's transaction,
+  // and a pooled read on a walk that never reaches a refresh is a second connection held for nothing (the
+  // revaluation pooled-client trap holds the freight transactions to tx only).
+  let chart = accountingSettings
   const nextAncestors = new Set(ancestors).add(sourceCostLayerId)
 
   const sourceLines = await deps.getDependentOutputSourceLines(tx, sourceCostLayerId)
@@ -590,12 +605,20 @@ export async function propagateLandedCostToOutputs(
     let outputShipmentRevalDelta = new Prisma.Decimal(0)
     if (outDeltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
       await deps.updateSnapshotsForCostLayerChange(tx, outputCostLayerId, newOutputUnitCost)
+      if (chart === undefined) chart = await getAccountingSettings().catch(() => null)
+      // A landed-cost revaluation books the sold units' share against TRANSIT (where the cost was capitalised).
+      // A manufacturing cost edit has no Transit leg: its own reclass credits the overhead and debits Inventory
+      // for the whole edit, so the downstream shipment's reversal must credit INVENTORY (the default offset).
+      // Offsetting it to Transit would credit an account the edit never debited, and with no Transit account
+      // configured the reversal would not post at all (ACC-H14).
+      const fundedFromTransit = revaluationContext?.operation !== 'recompute_production_order'
       const shipmentRefresh = await deps.refreshShipmentCogsForCostLayerChange(tx, outputCostLayerId, {
-        offsetCostDeltaToTransit: true,
+        ...(fundedFromTransit ? { offsetCostDeltaToTransit: true } : {}),
         recalcRunId,
         revaluationContext: revaluationContext
           ? { ...revaluationContext, source: 'landed_cost_output_propagation' }
           : undefined,
+        ...(chart ? { accountingSettings: chart } : {}),
       })
       outputShipmentRevalDelta = shipmentRefresh.cogsRevaluationDelta
       await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, outputCostLayerId)
@@ -616,7 +639,7 @@ export async function propagateLandedCostToOutputs(
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
-    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt, revaluationContext)
+    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt, revaluationContext, chart)
   }
 }
 
