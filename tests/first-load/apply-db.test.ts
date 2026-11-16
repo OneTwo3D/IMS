@@ -311,7 +311,7 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         }
         if (step === 'purchase-orders') {
           const lines = (JSON.parse(units[step][0]!.fingerprint) as { lines: string[] }).lines
-          assert.ok(lines.every((l) => l.split('|').length === 6), 'a line string carries sku, qty, amount, discount, discount text and tax')
+          assert.ok(lines.every((l) => l.split('|').length === 7), 'a line string carries sku, qty, amount, discount, discount text, line delivery date and tax')
           columns += (spec.lineLevel ?? []).length
         }
       }
