@@ -2509,6 +2509,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           lastCallbackAt={asn.lastCallbackAt}
                           closed={Boolean(asn.closedAt)}
                           connectorLabel={wmsAsnState.connectorLabel}
+                          canCloseShort={asn.status === 'PARTIALLY_BOOKED_IN'}
                         />
                       </TableCell>
                     )}

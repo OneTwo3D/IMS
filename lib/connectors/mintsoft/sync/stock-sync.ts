@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { loadInFlightDispatchQty } from '@/lib/connectors/mintsoft/sync/in-flight-dispatch'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { classifyUnresolvedWmsSku } from '@/lib/domain/wms/stock-sync-helpers'
 import { createCostLayer } from '@/lib/cost-layers'
@@ -2392,12 +2393,13 @@ async function applyMintsoftAlignDownForProduct(params: {
   stockEnqueue?: Exclude<StockEnqueueOutcome, 'ok'>
   reason: string
 }> {
-  const [priorDiscrepancy, openAsnPendingQty, stockLevel, alignDownReason] = await Promise.all([
+  const [priorDiscrepancy, openAsnPendingQty, inFlightDispatchQty, stockLevel, alignDownReason] = await Promise.all([
     db.wmsStockDiscrepancy.findFirst({
       where: buildDiscrepancyWhere(params.binding, 'QTY_MISMATCH', params.productId, params.sku),
       select: { delta: true, lastSeenAt: true },
     }),
     getOpenAsnPendingQty(params.binding, params.productId),
+    loadInFlightDispatchQty(db, { productId: params.productId, warehouseId: params.binding.warehouseId }),
     db.stockLevel.findUnique({
       where: {
         productId_warehouseId: {
@@ -2427,6 +2429,7 @@ async function applyMintsoftAlignDownForProduct(params: {
     reasonConfigured: Boolean(alignDownReason?.active && alignDownReason?.accountCode),
     thresholds: parseMintsoftThresholds(params.binding.discrepancyThresholds),
     openAsnPendingQty,
+    inFlightDispatchQty,
     priorDiscrepancy: priorDiscrepancy
       ? {
           delta: priorDiscrepancy.delta == null ? null : Number(priorDiscrepancy.delta),
