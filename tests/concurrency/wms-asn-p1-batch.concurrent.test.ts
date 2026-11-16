@@ -220,7 +220,7 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
   const runStartedAt = new Date(now.getTime() - 60_000)
   const minutesAgo = (m: number) => new Date(now.getTime() - m * 60_000)
 
-  async function order(suffix: string, qty: number, opts: { imsStatus?: 'PACKING' | 'SHIPPED'; wms?: { status: string; fetchedAt: Date; lastError?: string }; deadLettered?: boolean; pushState?: 'SYNCED' | 'CANCELLED' }) {
+  async function order(suffix: string, qty: number, opts: { imsStatus?: 'PACKING' | 'SHIPPED'; wms?: { status: string; fetchedAt: Date; lastError?: string; dispatched?: boolean | null }; deadLettered?: boolean; pushState?: 'SYNCED' | 'CANCELLED' }) {
     const id = `${tag}${suffix}`
     await db.salesOrder.create({
       data: {
@@ -237,7 +237,7 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
     })
     if (opts.wms) {
       await db.wmsOrderStatusSnapshot.create({
-        data: { orderId: id, connector: 'mintsoft', connectorLabel: 'Mintsoft', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}`, status: opts.wms.status, statusLabel: opts.wms.status, fetchedAt: opts.wms.fetchedAt, lastError: opts.wms.lastError ?? null },
+        data: { orderId: id, connector: 'mintsoft', connectorLabel: 'Mintsoft', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}`, status: opts.wms.status, statusLabel: opts.wms.status, fetchedAt: opts.wms.fetchedAt, lastError: opts.wms.lastError ?? null, dispatched: opts.wms.dispatched === undefined ? opts.wms.status === 'DESPATCHED' : opts.wms.dispatched },
       })
     }
   }
@@ -268,11 +268,24 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
   await order('g', 8, { pushState: 'CANCELLED' })
   assert.equal((await load()).qty, 19, 'shipped in IMS or link cancelled: not held')
   assert.equal((await loadInFlightDispatch(db, { productId: product.id, warehouseId: 'other-warehouse', now, runStartedAt })).qty, 0)
+  // The connector's persisted decision, not the name (o3d-hqvrp.368). Held qty so far is 19.
+  await order('i', 4, { wms: { status: 'SHIPPING_DONE', fetchedAt: minutesAgo(2), dispatched: true } })
+  const flagTrue = await load()
+  assert.equal(flagTrue.qty, 23, 'fresh snapshot, name outside the set but dispatched=true: held')
+  assert.ok(flagTrue.holds.some((h) => h.orderNumber.endsWith(`${tag}i`) && h.reason === 'despatched_at_wms'))
+  await order('j', 5, { wms: { status: 'NEW', fetchedAt: minutesAgo(2), dispatched: null } })
+  const flagNull = await load()
+  assert.equal(flagNull.qty, 28, 'fresh snapshot with dispatched null (pre-migration row): held')
+  assert.ok(flagNull.holds.some((h) => h.orderNumber.endsWith(`${tag}j`) && h.reason === 'status_dispatch_unknown'))
+  await order('k', 6, { wms: { status: 'NEW', fetchedAt: minutesAgo(2), dispatched: false } })
+  const flagFalse = await load()
+  assert.equal(flagFalse.qty, 28, 'fresh snapshot, explicit dispatched=false, no lastError: not held')
+  assert.equal(flagFalse.holds.some((h) => h.orderNumber.endsWith(`${tag}k`)), false)
   // newer than the stock reading counts as fresh even beyond the window
   const recentRun = new Date(now.getTime() - 4 * 3600_000)
   await db.wmsOrderStatusSnapshot.update({ where: { orderId: `${tag}b` }, data: { fetchedAt: new Date(now.getTime() - 3 * 3600_000) } })
   const viaRun = await loadInFlightDispatch(db, { productId: product.id, warehouseId: warehouse.id, now, runStartedAt: recentRun })
   assert.equal(viaRun.holds.some((h) => h.orderNumber.endsWith(`${tag}b`)), false, 'a snapshot newer than the stock reading is fresh')
   // and it runs on a transaction client, which is how the decision point re-checks it
-  assert.equal((await db.$transaction((tx) => load(tx as unknown as typeof db))).qty, 19)
+  assert.equal((await db.$transaction((tx) => load(tx as unknown as typeof db))).qty, 28)
 })

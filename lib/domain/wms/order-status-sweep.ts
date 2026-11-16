@@ -281,6 +281,9 @@ export async function runWmsOrderStatusSweep(
             deepLinkUrl: status.deepLinkUrl,
             trackingNumber: tracking?.trackingNumber ?? null,
             carrier: tracking?.carrier ?? null,
+            // The connector's own despatched decision, persisted so the in-flight gate does not have to re-derive
+            // it from the status name alone.
+            dispatched: status.dispatched,
             lastError: null,
           }
         : {
@@ -297,6 +300,7 @@ export async function runWmsOrderStatusSweep(
             deepLinkUrl: null,
             trackingNumber: null,
             carrier: null,
+            dispatched: null,
             lastError: notFoundReason,
           }
 

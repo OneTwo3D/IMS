@@ -27,7 +27,12 @@ import { MINTSOFT_DISPATCHED_STATUSES } from '@/lib/connectors/mintsoft/api/orde
  * `SNAPSHOT_FRESH_WINDOW_MINUTES` of the decision. The window is 45 minutes: the `wms-order-status` cron runs
  * every 15 minutes but only re-reads a snapshot older than the sweep's 30-minute stale threshold
  * (order-status-sweep.ts DEFAULT_STALE_MINUTES), so a healthy snapshot is at most 30 + 15 minutes old. No live
- * Mintsoft read is made here (reads are rate limited); a missing snapshot (cron off, order not yet swept)
+ * THE CONNECTOR'S DECISION, NOT THE NAME. The sweep persists the connector's `dispatched` decision (vendor status
+ * grouping or a despatch date, which a name set cannot see) with each successful snapshot. Release needs a fresh
+ * successful read with `dispatched === false`; true, null (absent or unresolved), a stale read and a failed read all
+ * hold. The planning check and the in-transaction re-check both go through this function.
+ *
+ * No live Mintsoft read is made here (reads are rate limited); a missing snapshot (cron off, order not yet swept)
  * holds. Hold-only: this can only ever delay an align-down, never apply one.
  */
 
@@ -45,7 +50,7 @@ export type InFlightDispatchHold = {
   orderId: string
   orderNumber: string
   qty: number
-  reason: 'despatched_at_wms' | 'despatch_state_unknown' | 'status_lookup_failed' | 'status_snapshot_missing' | 'status_snapshot_stale'
+  reason: 'despatched_at_wms' | 'despatch_state_unknown' | 'status_lookup_failed' | 'status_snapshot_missing' | 'status_snapshot_stale' | 'status_dispatch_unknown'
 }
 
 export async function loadInFlightDispatch(
@@ -74,7 +79,7 @@ export async function loadInFlightDispatch(
         select: {
           id: true,
           orderNumber: true,
-          wmsOrderStatus: { select: { status: true, fetchedAt: true, lastError: true } },
+          wmsOrderStatus: { select: { status: true, dispatched: true, fetchedAt: true, lastError: true } },
           wmsOrderPush: { select: { dispatchDeadLetteredAt: true, dispatchUnresolvedAt: true } },
         },
       },
@@ -91,7 +96,9 @@ export async function loadInFlightDispatch(
     const snapshot = row.order.wmsOrderStatus
     const cachedStatus = snapshot?.status?.trim().toUpperCase() ?? ''
     let reason: InFlightDispatchHold['reason'] | null = null
-    if (MINTSOFT_DISPATCHED_STATUSES.has(cachedStatus)) reason = 'despatched_at_wms'
+    // The connector's persisted decision outranks the name set (vendor grouping or a despatch date can say
+    // "despatched" for a name the set does not know). The name set stays as a second hold-only signal.
+    if (snapshot?.dispatched === true || MINTSOFT_DISPATCHED_STATUSES.has(cachedStatus)) reason = 'despatched_at_wms'
     else if (row.order.wmsOrderPush?.dispatchDeadLetteredAt != null || row.order.wmsOrderPush?.dispatchUnresolvedAt != null) reason = 'despatch_state_unknown'
     // A FAILED REFRESH IS NOT A FRESH READ (Codex R2 HIGH). When a lookup throws, or cannot resolve the
     // order, the status sweep writes `fetchedAt = now` and `lastError` but KEEPS the old `status`
@@ -102,6 +109,9 @@ export async function loadInFlightDispatch(
     else if (snapshot?.lastError != null) reason = 'status_lookup_failed'
     else if (!snapshot || cachedStatus === '') reason = 'status_snapshot_missing'
     else if (snapshot.fetchedAt.getTime() < freshCutoff) reason = 'status_snapshot_stale'
+    // An explicit `false` is the only release. Null is a row from before the column existed or a read that
+    // recorded no decision: the connector never said "not despatched", so it holds.
+    else if (snapshot.dispatched !== false) reason = 'status_dispatch_unknown'
     if (reason) {
       total = addMoney(total, row.qty)
       holds.push({ orderId: row.order.id, orderNumber: row.order.orderNumber ?? row.order.id, qty: toDecimal(row.qty).toNumber(), reason })
