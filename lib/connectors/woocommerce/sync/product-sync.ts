@@ -596,6 +596,22 @@ function parseNum(val: unknown): number | null {
   return Number.isNaN(n) ? null : n
 }
 
+/**
+ * The sale price WooCommerce reported, as an IMS update instruction.
+ *   undefined -> the payload did not carry the field (or it is unparseable): leave IMS alone.
+ *   null      -> WooCommerce reported an EMPTY sale price (sale removed, or ended by its
+ *                scheduled-sale cron): CLEAR salePriceBase, otherwise the next IMS save
+ *                pushes the stale discount back to the store.
+ *   number    -> the live sale price.
+ */
+export function resolveWcSalePriceUpdate(raw: unknown): number | null | undefined {
+  if (raw === undefined || raw === null) return undefined
+  const normalized = asTrimmedString(raw)
+  if (!normalized) return null
+  const n = parseFloat(normalized)
+  return Number.isNaN(n) ? undefined : n
+}
+
 function getFirstImageUrl(images: unknown): string | null {
   if (!Array.isArray(images)) return null
   for (const image of images) {
@@ -818,6 +834,7 @@ export async function syncWcProductToIms(
     const description = stripHtml(wcProduct.short_description || wcProduct.description || '')
     const salesPriceBase = parseNum(wcProduct.regular_price)
     const salePriceBase = parseNum(wcProduct.sale_price)
+    const salePriceUpdate = resolveWcSalePriceUpdate(wcProduct.sale_price)
     const weight = parseNum(wcProduct.weight)
     const depthCm = parseNum(wcProduct.dimensions?.length)   // WC "length" = depth
     const widthCm = parseNum(wcProduct.dimensions?.width)
@@ -1035,7 +1052,7 @@ export async function syncWcProductToIms(
             if (decision.wooShapeAgrees) {
               if (productType !== 'VARIABLE') {
                 if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-                if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+                if (salePriceUpdate !== undefined) updateData.salePriceBase = salePriceUpdate
               } else {
                 updateData.salesPriceBase = null
                 updateData.salePriceBase = null
@@ -1853,6 +1870,7 @@ async function applyVariations(
     const description = stripHtml(v.description || '')
     const salesPriceBase = parseNum(v.regular_price)
     const salePriceBase = parseNum(v.sale_price)
+    const salePriceUpdate = resolveWcSalePriceUpdate(v.sale_price)
     const weight = parseNum(v.weight)
     const depthCm = parseNum(v.dimensions?.length)
     const widthCm = parseNum(v.dimensions?.width)
@@ -1949,7 +1967,7 @@ async function applyVariations(
       }
       if (parentCategoryId != null) updateData.categoryId = parentCategoryId
       if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-      if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+      if (salePriceUpdate !== undefined) updateData.salePriceBase = salePriceUpdate
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
       // o3d-4kfh r7 (Codex finding 2): the VARIATION path writes a type too — `VARIANT`, over

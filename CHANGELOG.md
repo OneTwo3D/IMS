@@ -10,6 +10,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### WooCommerce sync: ended sales and unreserved on-hold orders (backend / sync, user-visible)
+
+- **Fixed: an ended WooCommerce sale was never cleared in IMS.** An empty `sale_price` from WooCommerce (sale removed, or ended by its scheduled-sale cron) now clears `salePriceBase` for products and variations; before, the old value stayed and the next IMS save of the product pushed the expired discount back to the store. A payload that omits the field, or sends an unreadable value, still leaves IMS untouched.
+- **Fixed: the absolute stock push erased WooCommerce's decrement for orders IMS had not reserved.** Before each push, IMS reads the store's `on-hold` and `processing` orders, ignores those IMS already holds, and subtracts the rest (kit lines expand to their components) from the stock it sends. If that read fails, is unreadable or exceeds 2,000 orders, the whole push is skipped and reported as an error rather than guessing (WooCommerce's figure is never made higher by IMS in that case). Costs one paged read of the store's on-hold/processing orders per push run. No schema change.
+
 ### Xero paid date and EU VAT update refusals (backend / sync)
 
 - **Fixed: the Xero date reader accepted days that do not exist.** `FullyPaidOnDate` and the other Xero dates read `2026-02-30` as 2 March (the platform parser rolls such days on). An ISO date whose written year, month and day are not a real calendar day (zoned or zone-less, or an hour of 24 that would roll the day on) is now unreadable, so the payment poller leaves the document pending and retries it instead of writing a wrong `paidAt`.

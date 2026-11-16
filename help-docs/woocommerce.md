@@ -114,6 +114,8 @@ With the initial import complete, new and updated WooCommerce orders are importe
 
 - **Enable/disable** order sync with the toggle
 - **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`). At least one status must be ticked: an empty selection is rejected when you save, because it is not a filter WooCommerce can be asked for. To stop importing orders altogether, turn **Enable order sync** off instead.
+- **Stock pushed to WooCommerce counts orders IMS has not imported.** WooCommerce lowers stock when an order goes `on-hold` (for example bank transfer) as well as `processing`. Before each stock push IMS reads the store's `on-hold` and `processing` orders; any that IMS has not imported yet are subtracted from the stock it sends, so ticking or unticking a status never gives sold units back to the store. If WooCommerce's orders cannot be read (an outage, an unreadable answer, or more than 2,000 such orders), the push is skipped for that run and shown as an error on the Sync page; WooCommerce's own figure is left untouched and the next run retries.
+- **Sale prices follow WooCommerce.** When a sale ends in WooCommerce (its sale price becomes empty) the next product import clears the sale price in IMS, so a later IMS save no longer pushes the expired discount back to the store.
 - **Polling cadence** — how often IMS sweeps WooCommerce is **not** set on this page. It is the
   **WooCommerce Reconcile** cron schedule (hourly unless you change it), edited in
   **Settings → System → Scheduler**. The sync page used to offer a "Polling interval (minutes)"
