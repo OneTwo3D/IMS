@@ -38,3 +38,10 @@ test('SKU comparison ignores case and padding, and a line with no SKU on either 
   assert.deepEqual(detectWcOrderEditDrift(wc([{ id: 11, quantity: 2, sku: ' red-m ' }]), stored), [])
   assert.deepEqual(detectWcOrderEditDrift(wc([{ id: 11, quantity: 2 }]), stored), [])
 })
+
+test('ignoreTotal drops only the total difference (a paid delivery whose total disagrees already has its own obligation row)', () => {
+  const d = detectWcOrderEditDrift(wc([{ id: 11, quantity: 3, sku: 'RED-M' }], '36.00'), stored, { ignoreTotal: true })
+  assert.equal(d.length, 1)
+  assert.match(d[0], /is x 3; IMS holds x 2/)
+  assert.deepEqual(detectWcOrderEditDrift(wc([{ id: 11, quantity: 2, sku: 'RED-M' }], '36.00'), stored, { ignoreTotal: true }), [])
+})

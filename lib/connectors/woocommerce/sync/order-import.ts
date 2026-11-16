@@ -1387,10 +1387,12 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   const transition = await planWcPaidTransition(orderId, wcOrder)
   await wcReceiptRegistrationSeams.afterPlan?.(orderId)
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
-  // The lines and total are never rewritten here; an edit in WooCommerce is surfaced instead (o3d-hqvrp.84).
-  await surfaceWcOrderEditDrift(orderId, wcOrder)
   let outcome: PaidBlockOutcome = { blocked: false }
   if (transition.kind === 'record') outcome = await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId, snapshotVersion)
+  // The lines and total are never rewritten here; an edit in WooCommerce is surfaced instead (o3d-hqvrp.84). AFTER the paid step, because a paid
+  // delivery whose total or currency disagrees with IMS already left its own durable obligation row (paid-block, retried until the two agree):
+  // the total is not surfaced a second time then, so one disagreement is one row.
+  await surfaceWcOrderEditDrift(orderId, wcOrder, { ignoreTotal: outcome.blocked })
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.

@@ -47,7 +47,7 @@ export type StoredOrderForDrift = {
  * Goods lines only (a line with a WooCommerce line id); fee lines carry none and are compared through the total.
  * A payload without a readable `line_items` array or `total` states nothing, so nothing is compared for it.
  */
-export function detectWcOrderEditDrift(wcOrder: Pick<WcFullOrder, 'line_items' | 'total'>, stored: StoredOrderForDrift): string[] {
+export function detectWcOrderEditDrift(wcOrder: Pick<WcFullOrder, 'line_items' | 'total'>, stored: StoredOrderForDrift, options: { ignoreTotal?: boolean } = {}): string[] {
   const differences: string[] = []
 
   if (Array.isArray(wcOrder.line_items)) {
@@ -80,7 +80,7 @@ export function detectWcOrderEditDrift(wcOrder: Pick<WcFullOrder, 'line_items' |
     }
   }
 
-  if (wcOrder.total !== undefined && wcOrder.total !== null && String(wcOrder.total).trim() !== '') {
+  if (!options.ignoreTotal && wcOrder.total !== undefined && wcOrder.total !== null && String(wcOrder.total).trim() !== '') {
     try {
       const dp = currencyMinorUnits(stored.currency)
       const wcTotal = toDecimal(wcOrder.total).toFixed(dp)
@@ -98,14 +98,15 @@ export function detectWcOrderEditDrift(wcOrder: Pick<WcFullOrder, 'line_items' |
  * expire a live exception) and writes nothing else; a changed difference replaces the row and notes it once; agreement clears it.
  * Best effort by design: a failure here is logged and never fails the delivery whose real work already committed.
  */
-export async function surfaceWcOrderEditDrift(orderId: string, wcOrder: WcFullOrder): Promise<void> {
+/** `ignoreTotal`: the total (and currency) disagreement of a paid delivery is already carried by the paid-block obligation row; lines are still compared. */
+export async function surfaceWcOrderEditDrift(orderId: string, wcOrder: WcFullOrder, options: { ignoreTotal?: boolean } = {}): Promise<void> {
   try {
     const stored = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: { currency: true, totalForeign: true, externalOrderNumber: true, lines: { select: { externalLineItemId: true, qty: true, sku: true } } },
     })
     if (!stored) return
-    const differences = detectWcOrderEditDrift(wcOrder, stored)
+    const differences = detectWcOrderEditDrift(wcOrder, stored, options)
     const rowWhere = { ...wcOrderEditDriftWhere(), entityId: orderId }
     if (differences.length === 0) {
       await db.shoppingSyncLog.deleteMany({ where: rowWhere })
