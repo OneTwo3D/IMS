@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { ensureCurrentReleaseNotification } from '@/lib/releases'
+import { hasPermission } from '@/lib/permissions'
+import { announceNeedsAttentionThrottled } from '@/lib/domain/needs-attention/loader'
 
 function jsonNoStore(body: unknown, init?: ResponseInit) {
   const headers = new Headers(init?.headers)
@@ -17,6 +19,10 @@ export async function GET() {
   const userId = session.user.id!
 
   await ensureCurrentReleaseNotification()
+
+  // Needs-attention bell: announces newly failed rows once each (deduped by a Setting claim) and is
+  // throttled to one pass per minute per process. Internal users only; never breaks this response.
+  if (hasPermission(session.user.role, 'internal')) await announceNeedsAttentionThrottled()
 
   // Load both user-owned and broadcast rows (latest 50).
   const rows = await db.notification.findMany({

@@ -424,7 +424,7 @@ export function ExceptionsClient({ data }: Props) {
       ) : null}
 
       {data.wmsPushDeadLetters.length > 0 ? (
-        <Card className="p-4 space-y-3">
+        <Card id="wms-push-blocked" className="p-4 space-y-3 scroll-mt-4">
           <SectionHeading
             title={`WMS order pushes — blocked (${data.summary.wmsPushDeadLetters})`}
             detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved. A payload-invalid row cannot be replayed — fix the order data and the sweep re-queues it by itself (o3d-92fu)."
@@ -597,7 +597,7 @@ export function ExceptionsClient({ data }: Props) {
       ) : null}
 
       {data.refundSyncParks.length > 0 ? (
-        <Card className="p-4 space-y-3">
+        <Card id="refund-parks" className="p-4 space-y-3 scroll-mt-4">
           <SectionHeading
             title={`WooCommerce refunds — parked (${data.summary.refundSyncParks})`}
             detail={withLedgerCheck("Refunds that could not be applied. The refund/restock/credit-note has NOT posted, but the money HAS left WooCommerce. Retry re-fetches the order's refunds fresh from WooCommerce — use it for an amount mismatch fixed at the store. A QUARANTINED row was refused deliberately (its VAT could not be determined) and retry cannot clear it: record it manually against the order lines it covers.")}
@@ -709,7 +709,7 @@ export function ExceptionsClient({ data }: Props) {
       ) : null}
 
       {data.stuckDispatches.length > 0 ? (
-        <Card className="p-4 space-y-3">
+        <Card id="dispatch-dead-letters" className="p-4 space-y-3 scroll-mt-4">
           <SectionHeading
             title={`Dispatch reconciliation — dead-lettered orders (${data.summary.stuckDispatches})`}
             detail={

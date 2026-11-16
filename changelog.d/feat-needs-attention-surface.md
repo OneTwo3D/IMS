@@ -1,0 +1,6 @@
+### One "Needs attention" view: dashboard card and bell
+
+- **Added: a dashboard "Needs attention" card.** One count per failure category with a total, each linking to the matching section of the sync exception inbox or to the existing Integrations page: blocked warehouse order pushes, dispatch dead-letters, parked WooCommerce refunds, warehouse queries to raise, other inbox exceptions, failed accounting sync rows, paused warehouse receipts and open stock discrepancies. Only categories the viewer's role may act on are shown. It is a view over the exception inbox, not a second inbox.
+- **Added: one shared, cached count loader** (60 s TTL, single-flight) so the dashboard and the bell do not each run the heavy count queries per page load.
+- **Added: bell notifications** for blocked order pushes, parked refunds, failed accounting rows, paused receipts and new stock discrepancies. Each item is announced once (one notification per category per pass, deduplicated with a Setting claim); a cleared item that fails again is announced again. Dispatch dead-letters are not re-announced: the dispatch sweep already notifies for them.
+- **Changed: the exception inbox sections** for blocked pushes, parked refunds, dispatch dead-letters and warehouse queries now carry anchors the card links to.
