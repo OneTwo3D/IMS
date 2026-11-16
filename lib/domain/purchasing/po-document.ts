@@ -123,6 +123,10 @@ export function poTaxLabel(name: string | null, ratePercent: number | null): str
 // Sending
 // ---------------------------------------------------------------------------
 
+export const PO_EMAIL_SETTING_KEY = 'purchase_order_email_enabled'
+export const PO_EMAIL_DISABLED_MESSAGE = 'PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it yourself.'
+export const PO_EMAIL_DISABLED_REASON = 'Not sent: emailing purchase orders to suppliers is switched off (Settings > Documents)'
+
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export type PoSendDecision =
@@ -137,10 +141,12 @@ export function decidePoSend(supplierEmail: string | null | undefined): PoSendDe
   return { action: 'queue', to }
 }
 
-export type PoSendStatus = 'queued' | 'already_queued' | 'no_supplier_email' | 'invalid_supplier_email' | 'failed'
+export type PoSendStatus = 'disabled' | 'queued' | 'already_queued' | 'no_supplier_email' | 'invalid_supplier_email' | 'failed'
 export type PoSendResult = { status: PoSendStatus; to?: string; message: string }
 
 export type PoSendDeps = {
+  /** Whether emailing POs to suppliers is switched on (setting `purchase_order_email_enabled`, default OFF). */
+  isEnabled: () => Promise<boolean>
   /** Enqueue the email on the outbox. Returns whether a new row was written (false = an undelivered one already exists). */
   queue: (to: string) => Promise<{ queued: boolean }>
 }
@@ -151,6 +157,9 @@ export type PoSendDeps = {
  * outbox drain, under the installation's own SMTP settings and suppression list, so it is not a claim that the supplier has it yet.
  */
 export async function runPoSend(supplierEmail: string | null | undefined, deps: PoSendDeps): Promise<PoSendResult> {
+  let enabled = false
+  try { enabled = await deps.isEnabled() } catch { enabled = false }
+  if (!enabled) return { status: 'disabled', message: PO_EMAIL_DISABLED_MESSAGE }
   const decision = decidePoSend(supplierEmail)
   if (decision.action === 'skip') {
     return decision.reason === 'no_supplier_email'

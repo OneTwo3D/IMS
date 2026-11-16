@@ -10,7 +10,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { queueEmail } from '@/lib/email-outbox'
-import { getPurchaseOrderQueueData, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
+import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
 import { requirePermission } from '@/lib/auth/server'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
@@ -2199,6 +2199,7 @@ export async function advancePoStatus(
  */
 async function queuePurchaseOrderEmail(id: string, reference: string, supplierEmail: string | null): Promise<PoSendResult> {
   const result = await runPoSend(supplierEmail, {
+    isEnabled: isPurchaseOrderEmailEnabled,
     queue: async (to) => {
       const queued = await getPurchaseOrderQueueData(id)
       return queueEmail({

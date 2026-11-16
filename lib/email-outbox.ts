@@ -135,6 +135,7 @@ import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { sendEmail } from '@/lib/mailer'
 import { writeInvalidRecipientOutcome, type InvalidRecipientWriter } from '@/lib/email-outbox-invalid-recipient'
 import { prepareQueuedEmail } from '@/lib/order-email'
+import { EmailKindDisabledError } from '@/lib/email-kind-disabled'
 import {
   EMAIL_RECIPIENT_ERASED_REASON,
   ERASED_RECIPIENT_PLACEHOLDER,
@@ -2508,6 +2509,17 @@ export async function processPendingEmailOutbox(
       } catch (prepareError) {
         if (prepareError instanceof EmailRecipientErasedError) {
           await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
+          continue
+        }
+        if (prepareError instanceof EmailKindDisabledError) {
+          // A kind switched off by a setting: nothing is sent, the row ends FAILED with the reason, the address is kept.
+          const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
+            status: 'FAILED',
+            lastError: prepareError.message,
+            processingStartedAt: null,
+          }))
+          if (settled) result.failed++
+          else await recordConflict(claim, 'a disabled-kind refusal', smtp)
           continue
         }
         throw prepareError

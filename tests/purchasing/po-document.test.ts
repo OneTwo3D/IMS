@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  PO_EMAIL_DISABLED_MESSAGE,
   decidePoSend,
   formatPoQty,
   poDocumentColumns,
@@ -76,14 +77,14 @@ test('decidePoSend needs a plausible supplier address', () => {
 
 test('runPoSend queues once through the injected outbox and reports it', async () => {
   const queued: string[] = []
-  const r = await runPoSend('orders@supplier.test', { queue: async (to) => { queued.push(to); return { queued: true } } })
+  const r = await runPoSend('orders@supplier.test', { isEnabled: async () => true, queue: async (to) => { queued.push(to); return { queued: true } } })
   assert.equal(r.status, 'queued')
   assert.deepEqual(queued, ['orders@supplier.test'])
   assert.match(r.message, /confirmed/)
 })
 
 test('runPoSend: an undelivered duplicate is reported, not claimed as a new send', async () => {
-  const r = await runPoSend('orders@supplier.test', { queue: async () => ({ queued: false }) })
+  const r = await runPoSend('orders@supplier.test', { isEnabled: async () => true, queue: async () => ({ queued: false }) })
   assert.equal(r.status, 'already_queued')
   assert.match(r.message, /already queued/)
 })
@@ -91,7 +92,7 @@ test('runPoSend: an undelivered duplicate is reported, not claimed as a new send
 test('runPoSend: no supplier address confirms without touching the outbox and says so', async () => {
   let calls = 0
   for (const email of [null, '', 'garbage']) {
-    const r = await runPoSend(email, { queue: async () => { calls++; return { queued: true } } })
+    const r = await runPoSend(email, { isEnabled: async () => true, queue: async () => { calls++; return { queued: true } } })
     assert.ok(r.status === 'no_supplier_email' || r.status === 'invalid_supplier_email')
     assert.match(r.message, /nothing was sent/)
   }
@@ -99,8 +100,24 @@ test('runPoSend: no supplier address confirms without touching the outbox and sa
 })
 
 test('runPoSend: a failing outbox never throws, so the confirmation stands', async () => {
-  const r = await runPoSend('orders@supplier.test', { queue: async () => { throw new Error('db down') } })
+  const r = await runPoSend('orders@supplier.test', { isEnabled: async () => true, queue: async () => { throw new Error('db down') } })
   assert.equal(r.status, 'failed')
   assert.match(r.message, /confirmed/)
   assert.match(r.message, /db down/)
+})
+
+test('runPoSend: flag OFF confirms with nothing queued and the exact switched-off notice', async () => {
+  let calls = 0
+  const r = await runPoSend('orders@supplier.test', { isEnabled: async () => false, queue: async () => { calls++; return { queued: true } } })
+  assert.equal(r.status, 'disabled')
+  assert.equal(r.message, PO_EMAIL_DISABLED_MESSAGE)
+  assert.equal(r.message, 'PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it yourself.')
+  assert.equal(calls, 0)
+})
+
+test('runPoSend: an unreadable flag counts as OFF', async () => {
+  let calls = 0
+  const r = await runPoSend('orders@supplier.test', { isEnabled: async () => { throw new Error('db') }, queue: async () => { calls++; return { queued: true } } })
+  assert.equal(r.status, 'disabled')
+  assert.equal(calls, 0)
 })
