@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createPdfDocument, pdfToBuffer, registerUnicodeFonts, sellerIdentityLines } from '../lib/pdf.ts'
 import { invoiceDocumentIdentity, orderDocumentMoney, type OrderDocumentMoneyInput } from '../lib/pdf-order-money.ts'
-import { creditNoteDocumentModel } from '../lib/domain/sales/credit-note-document.ts'
+import { draftCreditNoteModel, postedCreditNoteModel } from '../lib/domain/sales/credit-note-document.ts'
 import { getSalesOrderReference } from '../lib/sales-order-display.ts'
 
 // ---- the seller's legal identifiers --------------------------------------------------------------------------------------
@@ -82,8 +82,8 @@ test('a net (storefront) order adds the VAT before the Total and reconciles', ()
 
 // ---- credit note -----------------------------------------------------------------------------------------------------------
 
-test("credit note rows add up to the credit note total, at each line's own rate", () => {
-  const { rows, total } = creditNoteDocumentModel({
+test("a draft credit note's rows add up to its total, at each line's own rate", () => {
+  const { rows, rounding, total } = draftCreditNoteModel({
     orderTaxRatePercent: 0.2,
     orderLines: [{ id: 'l1', qty: 1, unitPriceForeign: 10, discountAmount: 0, totalForeign: 10, taxForeign: 2, taxRatePercent: 0.2 }],
     refundLines: [
@@ -93,7 +93,39 @@ test("credit note rows add up to the credit note total, at each line's own rate"
   })
   assert.deepEqual(rows.map((r) => [r.net, r.vat, r.gross]), [[10, 2, 12], [5.55, 0, 5.55]])
   assert.deepEqual(total, { net: 15.55, vat: 2, gross: 17.55 })
-  assert.equal(Math.round(rows.reduce((s, r) => s + r.gross, 0) * 100) / 100, total.gross)
+  assert.equal(rounding, null)
+})
+
+test('two 0.005 lines: the printed rows plus an explicit Rounding row sum to the printed total', () => {
+  const { rows, rounding, total } = postedCreditNoteModel({
+    payloadLines: [{ description: 'A', quantity: 1, unitAmount: 0.005 }, { description: 'B', quantity: 1, unitAmount: 0.005 }],
+    lineAmountsIncludeTax: false,
+    vatIsOwnLine: false,
+    rateOf: () => 0,
+  })
+  assert.deepEqual(rows.map((r) => r.gross), [0.01, 0.01])
+  assert.deepEqual(total, { net: 0.01, vat: 0, gross: 0.01 })
+  assert.deepEqual(rounding, { net: -0.01, vat: 0, gross: -0.01 })
+  const sum = (k: 'net' | 'vat' | 'gross') => Math.round((rows.reduce((s, r) => s + r[k], 0) + (rounding?.[k] ?? 0)) * 100) / 100
+  assert.deepEqual({ net: sum('net'), vat: sum('vat'), gross: sum('gross') }, total)
+})
+
+test('a posted credit note prints its payload lines as queued, whatever the current rates; a scheme credit note carries its VAT as its own line', () => {
+  const plain = postedCreditNoteModel({
+    payloadLines: [{ description: 'Widget', quantity: 2, unitAmount: 10 }],
+    lineAmountsIncludeTax: false,
+    vatIsOwnLine: false,
+    rateOf: () => 0.2, // the frozen rate, handed in by the route; no tax table is read here
+  })
+  assert.deepEqual(plain.total, { net: 20, vat: 4, gross: 24 })
+  const scheme = postedCreditNoteModel({
+    payloadLines: [{ description: 'Widget', quantity: 1, unitAmount: 10 }, { description: 'VAT', quantity: 1, unitAmount: 1.9 }],
+    lineAmountsIncludeTax: false,
+    vatIsOwnLine: true,
+    rateOf: () => 0.2,
+  })
+  assert.deepEqual(scheme.rows.map((r) => [r.net, r.vat, r.gross]), [[10, 0, 10], [1.9, 0, 1.9]])
+  assert.deepEqual(scheme.total, { net: 11.9, vat: 0, gross: 11.9 })
 })
 
 // ---- Unicode ---------------------------------------------------------------------------------------------------------------

@@ -416,7 +416,7 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, externalOrderNumber: true, customerEmail: true },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, customerEmail: true },
   })
   if (!so) throw new Error('Order not found')
   if (!so.customerEmail) throw new Error('No customer email address')
