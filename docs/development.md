@@ -36,7 +36,7 @@ Every stage or production deploy cuts a version. Before deploying, open a small 
 2. Adds a `RELEASES[0]` entry in `lib/releases.ts` (version, date, title, summary, `userMessage`, `userHighlights`, `technicalHighlights`), following the previous entry's shape. Say "built, switched off" for anything behind a flag. Keep customer names and other personal data out of the notes.
 3. Sets the same version in `package.json` and in both places in `package-lock.json` (the top-level `version` and `packages[""].version`), by hand rather than with `npm install`.
 
-Run `npx tsx --test tests/ops/releases.test.ts tests/ops/readiness-gate-docs.test.ts` with the usual gates, merge, then deploy that merged commit. System > Releases reads `RELEASES`, so the new version shows there after the deploy.
+Name the release branch `release/x.y.z`. Immediately before merging, merge `origin/development` into it again and collect any fragments that arrived meanwhile; `npm run check:changelog-fragments` (part of `check:all`) fails a `release/*` branch while any fragment remains in `changelog.d/`. Run `npx tsx --test tests/ops/releases.test.ts tests/ops/readiness-gate-docs.test.ts` with the usual gates, merge, then deploy that merged commit. System > Releases reads `RELEASES`, so the new version shows there after the deploy.
 
 ## Changelog entries
 
