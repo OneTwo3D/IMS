@@ -109,6 +109,33 @@ export const UNRESOLVED_SNAPSHOT_WHERE: Prisma.WmsOrderStatusSnapshotWhereInput 
   AND: [{ lastError: { not: null } }, { lastError: { notIn: [...WMS_RESOLVED_LOOKUP_ERRORS] } }],
 }
 
+
+/**
+ * The `dispatched` decision persisted with a snapshot (o3d-hqvrp.368).
+ *
+ * `fetchOrderStatus` deliberately reads Part 1 of a split order, so its own flag is Part 1's decision alone. The in-flight
+ * gate releases an allocation on an explicit `false`, and a split order whose Part 2 shipped first would read `false` there.
+ * So for a split order the stored decision is an AGGREGATE: true when any part is despatched; false only when every part
+ * declared was read and none is despatched; null (unknown, which holds) when the parts cannot be read in full. An unsplit
+ * order keeps the connector's own decision and costs no extra read.
+ */
+async function resolveSnapshotDispatched(
+  connector: Pick<ReturnType<typeof getWmsConnector>, 'fetchOrderParts'>,
+  reference: string,
+  status: { dispatched: boolean; isSplit: boolean; partCount: number | null },
+): Promise<boolean | null> {
+  if (status.dispatched) return true
+  if (!status.isSplit) return status.dispatched
+  if (!connector.fetchOrderParts) return null
+  try {
+    const parts = await connector.fetchOrderParts(reference)
+    if (parts.some((part) => part.dispatched)) return true
+    const declared = status.partCount ?? 0
+    return declared > 1 && parts.length >= declared ? false : null
+  } catch {
+    return null
+  }
+}
 export async function runWmsOrderStatusSweep(
   options?: { batchSize?: number; staleMinutes?: number },
 ): Promise<WmsOrderStatusSweepResult> {
@@ -283,7 +310,7 @@ export async function runWmsOrderStatusSweep(
             carrier: tracking?.carrier ?? null,
             // The connector's own despatched decision, persisted so the in-flight gate does not have to re-derive
             // it from the status name alone.
-            dispatched: status.dispatched,
+            dispatched: await resolveSnapshotDispatched(connector, reference, status),
             lastError: null,
           }
         : {

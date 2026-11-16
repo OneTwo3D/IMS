@@ -2390,6 +2390,8 @@ async function applyMintsoftAlignDownForProduct(params: {
   wmsQty: number
   dryRun: boolean
   runStartedAt: Date
+  /** When the Mintsoft stock figures this run acts on were read; a status snapshot must be newer to release. */
+  stockReadAt: Date
 }): Promise<{
   applied: boolean
   dryRun: boolean
@@ -2402,7 +2404,7 @@ async function applyMintsoftAlignDownForProduct(params: {
       select: { delta: true, lastSeenAt: true },
     }),
     getOpenAsnPendingQty(params.binding, params.productId),
-    loadInFlightDispatch(db, { productId: params.productId, warehouseId: params.binding.warehouseId, now: new Date(), runStartedAt: new Date(params.runStartedAt) }),
+    loadInFlightDispatch(db, { productId: params.productId, warehouseId: params.binding.warehouseId, stockReadAt: new Date(params.stockReadAt) }),
     db.stockLevel.findUnique({
       where: {
         productId_warehouseId: {
@@ -2482,8 +2484,7 @@ async function applyMintsoftAlignDownForProduct(params: {
     const inFlightNow = await loadInFlightDispatch(tx, {
       productId: params.productId,
       warehouseId: params.binding.warehouseId,
-      now: new Date(),
-      runStartedAt: new Date(params.runStartedAt),
+      stockReadAt: new Date(params.stockReadAt),
     })
     if (inFlightNow.qty > 0) {
       return {
@@ -2744,6 +2745,8 @@ export async function runStockSyncForBinding(
     // externalQty and every discrepancy figure below are on-hand figures. A response that cannot
     // supply on-hand for every row throws here and fails the run (see normalizeMintsoftStockLevels).
     const fetchedLines = await connector.fetchStockLevels(binding.externalWarehouseId)
+    // Taken AFTER the read returns, so a status snapshot newer than this is certainly newer than the stock figures.
+    const stockReadAt = new Date()
     await refreshLease(true)
     const stockLines = consolidateMintsoftStockLines(fetchedLines)
     const thresholds = parseMintsoftThresholds(binding.discrepancyThresholds)
@@ -2972,6 +2975,7 @@ export async function runStockSyncForBinding(
             wmsQty,
             dryRun: alignmentDryRun,
             runStartedAt,
+            stockReadAt,
           })
 
           if (alignDown.stockEnqueue === 'failed') stockEnqueueFailures += 1

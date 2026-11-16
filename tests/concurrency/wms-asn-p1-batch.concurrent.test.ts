@@ -209,7 +209,38 @@ test('o3d-hqvrp.117: close short refuses an OPEN ASN and an ASN with an unproces
   assert.equal(asn.closedAt, null)
 })
 
-test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot is FRESH and not despatched', SKIP, async () => {
+test('o3d-hqvrp.368: a not-despatched status read BEFORE the stock read never releases (despatch between the two)', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { loadInFlightDispatch } = await import('@/lib/connectors/mintsoft/sync/in-flight-dispatch')
+  const tag = uniqueTag('PRED')
+  const product = await db.product.create({ data: { sku: tag, name: tag, type: 'SIMPLE' }, select: { id: true } })
+  const warehouse = await db.warehouse.create({ data: { code: tag.slice(-10), name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
+  const now = new Date()
+  const minutesAgo = (m: number) => new Date(now.getTime() - m * 60_000)
+  const id = `${tag}a`
+  await db.salesOrder.create({
+    data: {
+      id, orderNumber: `IMSTEST-${id}`, status: 'PACKING', currency: 'GBP', subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10,
+      lines: { create: [{ id: `${id}L`, productId: product.id, sku: tag, description: tag, qty: 3, unitPriceForeign: 1, unitPriceBase: 1, totalForeign: 3, totalBase: 3, cogsBase: 0 }] },
+    },
+  })
+  await db.orderAllocation.create({ data: { orderId: id, lineId: `${id}L`, productId: product.id, warehouseId: warehouse.id, qty: '3' } })
+  await db.wmsOrderPushLink.create({ data: { orderId: id, connector: 'mintsoft', state: 'SYNCED', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}` } })
+  // status read (false) 8 minutes ago; the stock read that the align-down acts on is 2 minutes ago, so a despatch could sit between them
+  await db.wmsOrderStatusSnapshot.create({
+    data: { orderId: id, connector: 'mintsoft', connectorLabel: 'Mintsoft', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}`, status: 'NEW', statusLabel: 'NEW', fetchedAt: minutesAgo(8), lastError: null, dispatched: false },
+  })
+  const load = (stockReadAt: Date, client: typeof db = db) => loadInFlightDispatch(client, { productId: product.id, warehouseId: warehouse.id, stockReadAt })
+  const before = await load(minutesAgo(2))
+  assert.equal(before.qty, 3, 'the false read predates the stock read: held')
+  assert.deepEqual(before.holds.map((h) => h.reason), ['status_predates_stock_read'])
+  assert.equal((await db.$transaction((tx) => load(minutesAgo(2), tx as unknown as typeof db))).qty, 3, 'the in-transaction re-check holds too')
+  assert.equal((await load(minutesAgo(9))).qty, 0, 'a false read taken after the stock read releases')
+  assert.equal((await load(minutesAgo(8))).qty, 3, 'a read taken at the same instant cannot prove ordering: held')
+})
+
+test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot was read AFTER the stock read and is not despatched', SKIP, async () => {
   loadEnv()
   const { db } = await import('@/lib/db')
   const { loadInFlightDispatch } = await import('@/lib/connectors/mintsoft/sync/in-flight-dispatch')
@@ -217,8 +248,8 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
   const product = await db.product.create({ data: { sku: tag, name: tag, type: 'SIMPLE' }, select: { id: true } })
   const warehouse = await db.warehouse.create({ data: { code: tag.slice(-10), name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
   const now = new Date()
-  const runStartedAt = new Date(now.getTime() - 60_000)
   const minutesAgo = (m: number) => new Date(now.getTime() - m * 60_000)
+  const stockReadAt = minutesAgo(10)
 
   async function order(suffix: string, qty: number, opts: { imsStatus?: 'PACKING' | 'SHIPPED'; wms?: { status: string; fetchedAt: Date; lastError?: string; dispatched?: boolean | null }; deadLettered?: boolean; pushState?: 'SYNCED' | 'CANCELLED' }) {
     const id = `${tag}${suffix}`
@@ -241,7 +272,7 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
       })
     }
   }
-  const load = (client: typeof db = db) => loadInFlightDispatch(client, { productId: product.id, warehouseId: warehouse.id, now, runStartedAt })
+  const load = (client: typeof db = db) => loadInFlightDispatch(client, { productId: product.id, warehouseId: warehouse.id, stockReadAt })
 
   assert.equal((await load()).qty, 0, 'no allocation, nothing in flight')
   await order('a', 2, { wms: { status: 'NEW', fetchedAt: minutesAgo(5) } })
@@ -249,7 +280,7 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
   await order('b', 3, { wms: { status: 'NEW', fetchedAt: minutesAgo(180) } })
   const stale = await load()
   assert.equal(stale.qty, 3, 'STALE snapshot with a live allocation: held')
-  assert.deepEqual(stale.holds.map((h) => h.reason), ['status_snapshot_stale'])
+  assert.deepEqual(stale.holds.map((h) => h.reason), ['status_predates_stock_read'])
   assert.match(stale.holds[0]!.orderNumber, /IMSTEST-/, 'the order that made it hold is named')
   await order('c', 4, {})
   assert.equal((await load()).qty, 7, 'MISSING snapshot: held')
@@ -258,8 +289,8 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
   await order('e', 6, { deadLettered: true, wms: { status: 'NEW', fetchedAt: minutesAgo(1) } })
   assert.equal((await load()).qty, 18, 'dispatch given up on: held')
   // A cached PRE-DISPATCH status whose refresh then FAILED: the sweep keeps the status and stamps fetchedAt = now.
-  await order('h', 1, { wms: { status: 'NEW', fetchedAt: minutesAgo(40) } })
-  assert.equal((await load()).qty, 18, 'a fresh-by-time pre-dispatch status is not held')
+  await order('h', 1, { wms: { status: 'NEW', fetchedAt: minutesAgo(6) } })
+  assert.equal((await load()).qty, 18, 'a pre-dispatch status read after the stock read is not held')
   await db.wmsOrderStatusSnapshot.update({ where: { orderId: `${tag}h` }, data: { fetchedAt: new Date(), lastError: 'Mintsoft lookup timed out' } })
   const failed = await load()
   assert.equal(failed.qty, 19, 'the failed refresh must not read as fresh: it is held')
@@ -267,7 +298,7 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
   await order('f', 7, { imsStatus: 'SHIPPED', wms: { status: 'DESPATCHED', fetchedAt: minutesAgo(2) } })
   await order('g', 8, { pushState: 'CANCELLED' })
   assert.equal((await load()).qty, 19, 'shipped in IMS or link cancelled: not held')
-  assert.equal((await loadInFlightDispatch(db, { productId: product.id, warehouseId: 'other-warehouse', now, runStartedAt })).qty, 0)
+  assert.equal((await loadInFlightDispatch(db, { productId: product.id, warehouseId: 'other-warehouse', stockReadAt })).qty, 0)
   // The connector's persisted decision, not the name (o3d-hqvrp.368). Held qty so far is 19.
   await order('i', 4, { wms: { status: 'SHIPPING_DONE', fetchedAt: minutesAgo(2), dispatched: true } })
   const flagTrue = await load()
@@ -282,9 +313,9 @@ test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot i
   assert.equal(flagFalse.qty, 28, 'fresh snapshot, explicit dispatched=false, no lastError: not held')
   assert.equal(flagFalse.holds.some((h) => h.orderNumber.endsWith(`${tag}k`)), false)
   // newer than the stock reading counts as fresh even beyond the window
-  const recentRun = new Date(now.getTime() - 4 * 3600_000)
+  const earlierStockRead = new Date(now.getTime() - 4 * 3600_000)
   await db.wmsOrderStatusSnapshot.update({ where: { orderId: `${tag}b` }, data: { fetchedAt: new Date(now.getTime() - 3 * 3600_000) } })
-  const viaRun = await loadInFlightDispatch(db, { productId: product.id, warehouseId: warehouse.id, now, runStartedAt: recentRun })
+  const viaRun = await loadInFlightDispatch(db, { productId: product.id, warehouseId: warehouse.id, stockReadAt: earlierStockRead })
   assert.equal(viaRun.holds.some((h) => h.orderNumber.endsWith(`${tag}b`)), false, 'a snapshot newer than the stock reading is fresh')
   // and it runs on a transaction client, which is how the decision point re-checks it
   assert.equal((await db.$transaction((tx) => load(tx as unknown as typeof db))).qty, 28)
