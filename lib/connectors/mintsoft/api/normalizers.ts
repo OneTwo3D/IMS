@@ -3,6 +3,10 @@ import type { WmsAsnLineRef, WmsAsnRef, WmsBundleComponent, WmsBundleRef, WmsPro
 import { readMintsoftAsnItemExpectedQty, readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
+import { classifyIdentifierCodes, type IdentifierCodes } from '@/lib/domain/products/identifiers'
+
+/** The classifier under its connector name (`classifyMintsoftCodes` in the sync plugin). */
+export const classifyMintsoftCodes = classifyIdentifierCodes
 
 const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
 const ASN_ARRAY_PAYLOAD_KEYS = [...ARRAY_PAYLOAD_KEYS, 'lines', 'Lines', 'asnLines', 'AsnLines', 'orderItems', 'OrderItems'] as const
@@ -12,6 +16,10 @@ const STOCK_SKU_KEYS = ['sku', 'SKU', 'productSku', 'ProductSku', 'productCode',
 const PRODUCT_ID_KEYS = ['productId', 'ProductId', 'id', 'Id', 'ID']
 const PRODUCT_NAME_KEYS = ['name', 'Name', 'productName', 'ProductName', 'description', 'Description']
 const PRODUCT_BARCODE_KEYS = ['ean', 'EAN', 'barcode', 'Barcode', 'upc', 'UPC', 'eanCode', 'EANCode']
+// The EAN-side and UPC-side spellings Mintsoft's product JSON has been seen to use. The classifier offers the first
+// group the GTIN slot first and the second group the MPN slot first (EAN = GTIN, UPC = MPN is the owner's model).
+const PRODUCT_EAN_KEYS = ['ean', 'EAN', 'barcode', 'Barcode', 'eanCode', 'EANCode']
+const PRODUCT_UPC_KEYS = ['upc', 'UPC']
 const RETURN_REASON_KEYS = ['reason', 'Reason', 'returnReason', 'ReturnReason']
 const RETURN_QTY_KEYS = ['qty', 'Qty', 'quantity', 'Quantity', 'returnedQty', 'ReturnedQty', 'returnQty', 'ReturnQty', 'receivedQty', 'ReceivedQty']
 const RETURN_RECEIVED_AT_KEYS = ['receivedAt', 'ReceivedAt', 'createdAt', 'CreatedAt', 'updatedAt', 'UpdatedAt', 'returnDate', 'ReturnDate', 'date', 'Date']
@@ -214,6 +222,23 @@ export function normalizeMintsoftStockLevels(data: unknown): WmsStockLine[] {
     }
     seen.add(line.sku)
     return line
+  })
+}
+
+/**
+ * Sort a Mintsoft product record's EAN/UPC into (gtin, mpn, leftover) by shape, not by which field held what
+ * (lib/domain/products/identifiers.ts).
+ *
+ * This is a SEPARATE read from `WmsProductRef.barcode`, deliberately. `barcode` is still the legacy first-match value,
+ * because the product sync backfills it into Product.barcode and later pushes it back out: changing it would change
+ * what IMS writes to live systems. The sync consults this classification only when the product identifier split is on.
+ * `leftover` is a third distinct code neither slot could take; the caller must surface it, never drop it.
+ */
+export function classifyMintsoftProductRecord(record: Record<string, unknown> | null | undefined): IdentifierCodes {
+  if (!record) return { gtin: '', mpn: '', leftover: '' }
+  return classifyIdentifierCodes({
+    EAN: getFirstString(record, PRODUCT_EAN_KEYS),
+    UPC: getFirstString(record, PRODUCT_UPC_KEYS),
   })
 }
 

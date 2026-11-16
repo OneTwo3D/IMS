@@ -47,6 +47,9 @@ export const CURRENCY_RATE_TOLERANCE = 1e-6
 
 const IMS_NO_TAX_KIND_TO_LINE_KIND: Readonly<Record<string, ShadowLineKind>> = { 'eu-vat-recovery': 'vat', 'fee-no-tax': 'fee', 'rounding-difference': 'rounding' }
 
+/** The description the Xero connector gives the one untaxed line that makes a unitdp=4 document total what the order totals (write-path.ts `planXeroRoundingLine`). It is appended after the IMS lines, shipping and discount, so it is recognised by this. */
+export const ROUNDING_ADJUSTMENT_DESCRIPTION = 'Rounding adjustment'
+
 type XeroLineItem = { Quantity?: unknown; UnitAmount?: unknown; DiscountAmount?: unknown; AccountCode?: unknown; TaxType?: unknown; Description?: unknown }
 
 const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '')
@@ -95,6 +98,7 @@ export function comparableFromBuiltPayload(
     }
     let kind: ShadowLineKind | null
     if (i < imsLines.length) kind = IMS_NO_TAX_KIND_TO_LINE_KIND[text(imsLines[i]!.noTaxKind)] ?? 'goods'
+    else if (text(item.Description) === ROUNDING_ADJUSTMENT_DESCRIPTION) kind = 'rounding'
     else kind = text(item.Description) === 'Order discount' ? 'discount' : 'shipping'
     lines.push({ kind, accountCode: code(item.AccountCode), taxType, lineAmount: amount.toFixed(currencyMinorUnits(currency)), taxAmount: tax === null ? null : tax.toFixed(currencyMinorUnits(currency)) })
     total = total.plus(amount)

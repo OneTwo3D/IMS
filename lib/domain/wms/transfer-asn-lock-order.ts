@@ -442,8 +442,16 @@ export class LandedCostScopeRacedError extends Error {
 }
 
 export type LandedCostRevaluationScopeRequest =
-  | { freightPoId: string; primaryPoIds?: undefined }
-  | { primaryPoIds: ReadonlyArray<string>; freightPoId?: undefined }
+  | { freightPoId: string; primaryPoIds?: undefined; rootLayerIds?: undefined }
+  | { primaryPoIds: ReadonlyArray<string>; freightPoId?: undefined; rootLayerIds?: undefined }
+  /**
+   * ACC-H14: a manufacturing cost edit revalues the output layers of ONE production order and propagates
+   * into every layer hanging off them (transfer destinations, later production runs). No purchase order is
+   * involved: the roots are the layers themselves, and the scope is those layers, everything downstream, and
+   * the transfers whose snapshots name any of them. The caller holds the production order (taken first, and
+   * never taken by a revaluation, so no cycle).
+   */
+  | { rootLayerIds: ReadonlyArray<string>; freightPoId?: undefined; primaryPoIds?: undefined }
 
 export type LandedCostRevaluationScope = {
   /** The freight order (when the request named one) and every primary order, ascending. */
@@ -458,7 +466,9 @@ async function discoverLandedCostRevaluationScope(
   request: LandedCostRevaluationScopeRequest,
 ): Promise<LandedCostRevaluationScope> {
   let primaryPoIds: string[]
-  if (request.freightPoId !== undefined) {
+  if (request.rootLayerIds !== undefined) {
+    primaryPoIds = []
+  } else if (request.freightPoId !== undefined) {
     const links = await tx.$queryRaw<Array<{ primaryPoId: string }>>`
       SELECT "primaryPoId" FROM landed_cost_links WHERE "freightPoId" = ${request.freightPoId}`
     primaryPoIds = sortedUnique(links.map((link) => link.primaryPoId))
@@ -470,7 +480,9 @@ async function discoverLandedCostRevaluationScope(
     : primaryPoIds)
 
   const layerIds = new Set<string>()
-  if (primaryPoIds.length > 0) {
+  if (request.rootLayerIds !== undefined) {
+    for (const id of request.rootLayerIds) layerIds.add(id)
+  } else if (primaryPoIds.length > 0) {
     const roots = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT cl.id FROM cost_layers cl
       INNER JOIN purchase_order_lines pol ON pol.id = cl."poLineId"

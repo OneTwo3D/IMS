@@ -129,6 +129,12 @@ export type WmsProductDto = {
   name: string
   customsDescription: string | null
   barcode: string | null
+  /**
+   * The manufacturer part number, written to the WMS's UPC field (the GTIN in `barcode` goes to EAN). ABSENT, not null,
+   * unless the product identifier split is on (`product_identifier_split_enabled`): a key that is present changes the
+   * payload hash, so it must not appear while the split is off.
+   */
+  mpn?: string | null
   commodityCode: string | null
   countryOfManufacture: string | null
   weightKg: number | null
@@ -260,6 +266,8 @@ export type WmsAsnRef = {
 export type WmsUpsertProductOptions = {
   externalProductId?: string | null
   omitBarcode?: boolean
+  /** Leave the WMS's UPC (MPN) field out of the write. Only meaningful, and only sent, when the identifier split is on. */
+  omitMpn?: boolean
 }
 
 /**

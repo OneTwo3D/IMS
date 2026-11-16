@@ -88,7 +88,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'deferralAdjustmentRef'],
+    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
     },
@@ -135,7 +135,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   WmsOrderPushLink: {
     erased: ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'],
-    notPersonal: ['connector', 'courierForm', 'courierFormName', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService'],
+    // doublePostageDetail: order numbers, currency and amounts only (built by decideDoublePostage); no name, address or contact.
+    notPersonal: ['connector', 'courierForm', 'courierFormName', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService', 'doublePostageDetail'],
     retained: {
       externalOrderId: 'the warehouse order id reconciles the order with the warehouse',
       externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',

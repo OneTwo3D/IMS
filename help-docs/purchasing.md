@@ -25,6 +25,17 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 8. (Optional) Tick **"Skip preferred-supplier update"** on the PO header if you don't want this PO to overwrite the products' preferred suppliers — useful for emergency or one-off orders. See [Preferred supplier auto-update](#preferred-supplier-auto-update) below.
 9. Save the PO.
 
+### Line margin (internal)
+
+When you hold the **inventory.prices** permission (Admin, Manager, Finance), the PO create/edit form shows a **Margin (internal)** column and an **Order margin** summary under the lines. It is read-only: it shows you what the entered price would earn so you can reconsider the price or the sales price; it does not block, warn-and-stop or require approval, and it cannot change a sales price.
+
+- **Sales price used:** the product's default list price (not the sale price), ex-VAT, in the base currency. A price stored VAT-inclusive has VAT removed using the product's sales VAT rate for the company's home country. If none is configured the line shows "—" instead of guessing.
+- **Cost used:** the unit price you entered, ex-VAT, after the line discount, per stock unit (purchase units are converted), converted to the base currency at the order's exchange rate. It is the **plain unit price, not landed cost**: freight, duty and other additional costs are not included.
+- **Shown per line:** gross margin % = (price - cost) / price, the margin amount per unit, and the sales price. A margin below 0% is shown in red with a warning icon. For comparison the line also shows the product's **cost now** (average landed cost of the stock on hand) and this supplier's **last** purchase price when they exist.
+- **Lines without a number:** a line with no sales price, no quantity or price yet, or no exchange rate (it shows "Rate unavailable", never a rate of 1) shows "—" with the reason and is left out of the order total.
+- **Order margin:** the total margin % and amount over the lines that have a sales price, and how many lines were left out.
+- **Internal only:** the margin is never shown in the supplier portal, a quote request (RFQ) view, the PO PDF or a supplier email, and users without the permission do not see the column.
+
 ### FX rate
 
 **One rate means the table rate.** A foreign-currency PO is always raised at the exchange rate held in Settings > Accounting > FX Rates (the `fx_rates` table) for its currency: the latest rate on or before the moment the PO is saved. There is no rate field to type, no override band and no warning: the number the PO form shows is the rate the PO is stored at. The form reads the rate when you choose the currency and shows it with its source and date. A currency with no stored rate cannot be used: the form shows "No exchange rate for <currency> yet: rates come from the store (Aelia)", the base-currency total shows a dash, and **Create Purchase Order** stays disabled until an admin has synced the rates or pinned one on the FX Rates page and you pick the currency again. The rate is never shown or used as 1.
@@ -107,6 +118,7 @@ The **PO PDF** button on any purchase order opens the priced purchase order: sup
 - **Switched on:** the order is confirmed first. If the email cannot be queued, or the supplier has **no email address** (or an invalid one), the order stays confirmed and the page says nothing was sent. Add the address on the supplier and click **Email PO**, or download the PDF and send it to the supplier directly.
 - **Email PO** (on a confirmed order, switch on) queues the email again, for example after correcting the supplier's address. A second click while the first email is still waiting does not add a duplicate.
 - "Queued" means the email is on the outbox, not that the supplier has it. It goes out through the same email queue as order confirmations (see [Documents & Email](documents-email.md)), with your SMTP settings. The outcome is logged on the order's activity.
+- **A PO email is never sent twice automatically.** If the mail server had already been handed the message when the connection dropped or the 60-second send limit ran out, nobody can tell whether the supplier received it. The email ends **Failed** in the email queue with "Outcome unknown", and the order's activity shows a warning. Nothing is retried: check with the supplier, then click **Email PO** to send it again if needed. A failure before the message was handed over (the mail server could not be reached, or login failed) is retried automatically as before.
 
 
 ## Receiving a Purchase Order

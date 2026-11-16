@@ -356,6 +356,11 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
         staged[where.key] = data.value
         return { key: where.key, value: data.value }
       },
+      // The reset dates itself (wc_order_reset_at) before it deletes the orders.
+      upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => {
+        staged[where.key] = create.value
+        return { key: where.key, value: create.value }
+      },
       // The whole settings table, as the full reset deletes it.
       //
       // STAGED, so nothing outside this transaction sees the rows go until it commits — and scoped to

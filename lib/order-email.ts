@@ -29,7 +29,7 @@ export type SendGuardOutcome<T> = { refused: string; unknown?: undefined } | { u
  * boundary and held against a concurrent switch-off. A refusal means nothing was sent.
  */
 type SendGuard = <T>(send: () => Promise<T>) => Promise<SendGuardOutcome<T>>
-export type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[]; sendGuard?: SendGuard; sendDeadlineMs?: number }
+export type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[]; sendGuard?: SendGuard; sendDeadlineMs?: number; singleSend?: boolean }
 type QueueEmailData = { to: string; subject: string; reference: string }
 
 type SoForPdf = {

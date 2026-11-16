@@ -58,6 +58,8 @@ Effects you will notice in other screens:
 
 **Products.** Products are pushed to Mintsoft with their customs data. A commodity code that is not a valid 8-digit 2026 CN8 code is left out of the push (the rest of the product still syncs) and an **Open Discrepancy** names the product; it clears itself once the code is corrected. A blank country of origin is sent as China; an unrecognised one is also sent as China and flagged until you correct it. See [Inventory](inventory.md) for the HS Code Review queue.
 
+**Barcode, EAN and UPC (flag, default OFF).** By default IMS writes a product's barcode to Mintsoft's **EAN** field and nothing to **UPC**, and reads whichever of the two fields comes first. The **Split product identifiers (GTIN / MPN)** switch (Sync > Products; setting `product_identifier_split_enabled`) is **off** until an administrator turns it on, and while it is off none of the following applies. When on, IMS writes the GTIN to EAN and the manufacturer part number to UPC, and reads both Mintsoft fields by shape. A code that cannot be placed (two part numbers, two GTINs, or a disagreement with IMS) raises a barcode conflict in Open Discrepancies and IMS writes neither field until you resolve it. See [Barcode versus MPN](inventory.md#barcode-versus-mpn).
+
 **Bundles.** A KIT product becomes a Mintsoft bundle, and bundles are create-only: Mintsoft has no way to change one, so a recipe change after the first push shows as a **bundle derivation conflict** in Open Discrepancies that you resolve by hand. If a bundle create may have reached Mintsoft but the answer was lost, IMS will not send it again. It appears under **Bundles** as waiting. Look in Mintsoft first, then either link the bundle by its Mintsoft id, or confirm that none exists. The "none exists" option is refused until the first attempt can no longer be in flight and a fresh lookup finds nothing.
 
 
@@ -96,6 +98,12 @@ Each task shows the Mintsoft order number, a link to the IMS order, why it was r
 An open task never turns the `wms-order-push` job red; the job's result reports how many are open. A task that IMS could not save is retried on the next run, and the job reports that as a failure. Tasks are removed with their order by the transaction reset, and hold no personal data.
 
 **Integrations > Exceptions** is the inbox for items the warehouse link could not finish. Sections include a maintenance window, blocked order pushes, dead inbound events, despatches that could not be reconciled, unreadable records, order-level drift and order-total mismatches. Each row has **Replay** (try again safely) and **Dismiss**, or **Mark as handled** once you have fixed it by hand. A despatch for an order under a withdrawal hold is held back again when replayed. Unreadable records can be isolated so that one bad record does not stop the rest.
+
+### Possible double postage on merged orders
+
+When Mintsoft merges several orders into one parcel and more than one of them charged the customer postage, the customer may have paid postage twice. IMS cannot decide that for you and **never refunds it automatically**. The absorbed order appears under **Integrations > Exceptions** in **Merged orders - possible double postage**, with the orders in the merge and the amount each charged. The flag is only raised when at least two live (not cancelled) orders of the merge charged postage above zero. It is for you, not the warehouse: IMS writes nothing to Mintsoft and adds no warehouse query task for it.
+
+Check the orders, refund the extra postage by hand if it is due, then press **Clear**. Clear needs the sync permission and a fresh sign-in, and the activity log records who cleared it and what the flag said. The flag is raised again only if Mintsoft merges the order into a further order and the rule applies again.
 
 ### Holds, cancels and merged orders
 

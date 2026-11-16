@@ -3,7 +3,7 @@
  */
 
 import { xeroPost } from './api'
-import { assertXeroLineQuantitiesKept, xeroUnitDpFields, xeroUnitDpRoundingLine } from './write-path'
+import { assertXeroLineQuantitiesKept, planXeroRoundingLine, xeroUnitDpFields, type XeroRoundingPlanInput, type XeroTaxRateOf, type XeroTotalLine } from './write-path'
 import { resolveUnitDpRoundingAccount } from './unit-dp-rounding'
 import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
@@ -117,6 +117,14 @@ export function isXeroSalesDocumentTaxTypeError(error: unknown): error is XeroSa
 
 // Exported for unit tests: the payload shape is where coupon/discount arithmetic actually resolves, and it
 // is far cheaper to pin here than through a full-chain order (o3d-lgo.5.1).
+/** What the rounding plan needs of a sales invoice: its priced lines, and the shipping and order-discount lines the builder adds as they are. Shared by the builder and the pre-flight so both see the same document. */
+export function salesInvoiceRoundingInput(data: InvoiceData): Omit<XeroRoundingPlanInput, 'account' | 'rateOf' | 'what'> {
+  const extraLines: XeroTotalLine[] = []
+  if (connectorEmitsShipping(data)) extraLines.push({ quantity: 1, unitAmount: data.shippingAmount, taxType: data.shippingTaxType })
+  if (connectorEmitsDiscount(data)) extraLines.push({ quantity: 1, unitAmount: -data.discountAmount, taxType: data.discountTaxType })
+  return { lines: data.lines, extraLines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax) }
+}
+
 export function buildSalesInvoicePayload(
   data: InvoiceData,
   status: string,
@@ -126,6 +134,8 @@ export function buildSalesInvoicePayload(
   baseCurrency: string,
   /** The Rounding account the unitdp=4 penny posts to (setting `xero_rounding_difference_account`); required only when the lines need one. */
   roundingAccount?: string | null,
+  /** The effective rate of a Xero tax type, to predict the document's total with tax; needed only when the lines need a rounding adjustment. */
+  taxRateOf?: XeroTaxRateOf,
 ): Record<string, unknown> {
   // o3d-q0x56.3: decided FIRST, before any payload is built. A foreign invoice with no usable IMS rate THROWS, so Xero is never left to apply
   // its XE.com day rate. A base-currency invoice with no rate omits the field, unchanged.
@@ -194,8 +204,8 @@ export function buildSalesInvoicePayload(
     })
   }
 
-  // The penny a 4dp unit price loses at Xero, posted on its own line so every line keeps its real quantity (see write-path.ts). Throws with no account.
-  const roundingLine = xeroUnitDpRoundingLine(data.lines, roundingAccount, `Sales invoice ${data.invoiceNumber ?? '(no number)'}`)
+  // The difference a 4dp unit price makes to Xero's total WITH tax, posted on its own untaxed line so every line keeps its real quantity (see write-path.ts). Throws when it cannot be reconciled.
+  const roundingLine = planXeroRoundingLine({ ...salesInvoiceRoundingInput(data), account: roundingAccount, rateOf: taxRateOf, what: `Sales invoice ${data.invoiceNumber ?? '(no number)'}` })
   if (roundingLine) lineItems.push(roundingLine)
   assertXeroLineQuantitiesKept(data.lines, lineItems)
 
@@ -247,7 +257,7 @@ async function prepareSalesInvoicePayload(
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Sales invoice ${data.invoiceNumber ?? '(no number)'}`,
   })
   if (rateProblem) return { success: false, error: rateProblem }
-  const rounding = await resolveUnitDpRoundingAccount(data.lines, `Sales invoice ${data.invoiceNumber ?? '(no number)'}`)
+  const rounding = await resolveUnitDpRoundingAccount({ ...salesInvoiceRoundingInput(data), what: `Sales invoice ${data.invoiceNumber ?? '(no number)'}` })
   if (!rounding.ok) return { success: false, error: rounding.error }
 
   // Find or create the contact
@@ -296,7 +306,7 @@ async function prepareSalesInvoicePayload(
   try {
     return {
       success: true,
-      invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes, baseCurrency, rounding.account),
+      invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes, baseCurrency, rounding.account, rounding.rateOf),
     }
   } catch (error) {
     if (isXeroForeignCurrencyRateError(error) || isXeroSalesDocumentTaxTypeError(error)) return { success: false, error: error.message }

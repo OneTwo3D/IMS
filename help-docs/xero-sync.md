@@ -485,10 +485,12 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Unearned Revenue | Liability | Revenue deferred until goods ship |
 | Manufacturing Overhead | Profit and loss | Overhead absorbed into manufactured stock cost (optional) |
 | Inventory Revaluation | Profit and loss | Offset for retrospective cost corrections on goods already sold (optional) |
-| Rounding Difference | Profit and loss | Absorbs sub-penny rounding so the inventory sub-ledger ties to the ledger (optional) |
+| Rounding Difference | Profit and loss | Absorbs sub-penny rounding so the inventory sub-ledger ties to the ledger. Also receives the one untaxed "Rounding adjustment" line that makes an invoice, bill or credit note total exactly what IMS holds, when a unit price IMS keeps to six decimal places is kept to four by Xero (see below). Needed only for such documents |
 | Accounts Receivable / Accounts Payable | Your control accounts | Control accounts for the foreign-exchange journals |
 | Realised and Unrealised FX Gain/Loss | Profit and loss | Settlement-rate variances and period revaluation |
 | EU IOSS/VOEC VAT collected, EU DDP charges collected, EU landed-cost fees | See the EU sections below | Three roles for the EU VAT treatment. Configuration only and **not yet switched on**: leave them blank until told otherwise (see the EU sections below) |
+
+**Rounding adjustment on documents (invoices, bills, credit notes, supplier credits).** IMS keeps unit prices to six decimal places and Xero keeps four, so for a line such as 1,000 x 0.333333 Xero's own total, with its per-line tax, can differ from IMS's by a few pence, and a full payment would not settle the document. IMS predicts the whole total Xero will hold (each line rounded to the penny, tax worked out per line and rounded, for tax-exclusive and tax-inclusive documents), and when it differs adds one "Rounding adjustment" line (quantity 1, tax type No VAT) on the Rounding Difference account for exactly the difference. The document is then predicted again and must equal the IMS total. If it cannot be, nothing is sent and the sync row says why: no Rounding account is mapped, the tax rate of a line is not in the stored Xero tax-rate list (or the list is stale or the type has several components), or the difference is more than rounding can explain.
 
 ## How Sync Works — Flowchart
 
@@ -944,6 +946,8 @@ Paid** setting the flag and the payment actually posting, where "not listed yet"
 On the sales side a reversal established this way clears `paidAt` but raises **no** chargeback credit
 note: a chargeback unwinds the whole recognised revenue, and the invoice still carries a payment. The
 alert says so — unwind revenue by hand if that is what the removal means.
+
+**A payment removed to be re-applied does not raise a chargeback.** Removing a payment in Xero in order to re-match it (remove it, then apply it again against the right invoice or bank line) leaves the invoice unpaid for a few minutes. An invoice whose Xero revision is less than **30 minutes** old and that shows nothing paid is **withheld** (*"…was changed in the last 30 minutes. That is what removing a payment in order to re-apply it looks like…"*): `paidAt` stays set and no chargeback credit note is raised. IMS asks Xero again within the hour. If the payment is back, the warning closes by itself and nothing was raised. If the invoice is still unpaid, it is then treated as a genuine reversal, exactly as before. A **voided** invoice is not delayed.
 
 **And a ledger holding *nothing* is not proof either.** "Nothing paid against this bill" is what a
 removed payment looks like — and it is equally what a payment the IMS registered *seconds ago* looks

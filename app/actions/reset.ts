@@ -13,6 +13,7 @@ import {
   ACCOUNTING_BINDING_WITNESS_SETTING_KEYS,
   runOrderedAccountingBindingWrites,
 } from '@/lib/connectors/accounting-binding-lock-order'
+import { WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY } from '@/lib/connectors/woocommerce/sync/stock-held-orders'
 import { WC_ORDER_SWEEP_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { InvoiceDocumentsRetainedError, invoiceDocumentResetVerdict } from '@/lib/domain/invoice-documents/reset-guard'
@@ -30,6 +31,7 @@ const WC_ORDER_SYNC_STATE_KEYS = [
   'wc_initial_import_completed',
   'last_wc_order_sync_at',
   'last_wc_order_reconcile_at',
+  WC_COMPLETED_HISTORY_COVERED_KEY,
   WC_ORDER_SWEEP_LAST_SUCCESS_SETTING,
   'wc_order_webhook_last_received_at',
   'wc_order_webhook_last_processed_at',
@@ -102,6 +104,12 @@ async function clearTransactionScope(guards: ResetGuards) {
     await lockResetInTransaction(tx)
     const verdict = await invoiceDocumentResetVerdict(tx)
     if (!verdict.ok) throw new InvoiceDocumentsRetainedError(verdict.reason)
+    // The WooCommerce stock guard's covered-history boundary rests on these orders and allocations. Date the reset BEFORE they go (a stock run
+    // that began earlier can then never write a boundary back: its write is refused, and the read side distrusts any boundary older than this),
+    // and drop the boundary in the same transaction.
+    const resetAt = new Date().toISOString()
+    await tx.setting.upsert({ where: { key: WC_ORDER_RESET_MARKER_KEY }, create: { key: WC_ORDER_RESET_MARKER_KEY, value: resetAt }, update: { value: resetAt } })
+    await tx.setting.deleteMany({ where: { key: { in: [WC_COMPLETED_HISTORY_COVERED_KEY] } } })
     await tx.shipmentLine.deleteMany({})
     await tx.shipment.deleteMany({})
     await tx.orderAllocation.deleteMany({})

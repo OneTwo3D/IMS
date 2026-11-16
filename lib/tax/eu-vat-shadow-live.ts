@@ -18,6 +18,7 @@ import { isXeroForeignCurrencyRateError } from '@/lib/connectors/xero/fx'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { comparableFromBuiltPayload } from '@/lib/domain/accounting/eu-vat-shadow-compare'
 import { readStoredXeroList, type Client } from '@/lib/tax/purchase-tax-import'
+import { loadStoredXeroRateOf } from '@/lib/connectors/xero/tax-rate-lookup'
 import type { InvoiceData } from '@/lib/connectors/types'
 import { readShadowWcCredentials, readShadowXeroGrant, wcReadOnlyGetOrder, xeroReadOnlyGet } from '@/lib/tax/eu-vat-shadow-http'
 import type { ShadowImsBuild, ShadowOrderRef, ShadowPorts, ShadowSelection, ShadowXeroFetch } from '@/lib/tax/eu-vat-shadow-run'
@@ -37,8 +38,15 @@ async function loadRateTable(now: Date): Promise<(taxType: string) => number | n
   return (taxType) => rates.get(taxType) ?? null
 }
 
+/** The Rounding account the real poster would use for a unitdp=4 difference (setting `xero_rounding_difference_account`): a plain read of the one setting, so the builder here sees what the poster sees. */
+async function loadRoundingAccount(): Promise<string | null> {
+  const row = await db.setting.findUnique({ where: { key: 'xero_rounding_difference_account' }, select: { value: true } })
+  const account = row?.value?.trim() ?? ''
+  return account === '' ? null : account
+}
+
 export async function createLiveShadowPorts(now: Date = new Date()): Promise<ShadowPorts> {
-  const [rateOf, baseCurrency] = await Promise.all([loadRateTable(now), getBaseCurrencyCode()])
+  const [rateOf, baseCurrency, roundingAccount, builderRates] = await Promise.all([loadRateTable(now), getBaseCurrencyCode(), loadRoundingAccount(), loadStoredXeroRateOf(now)])
 
   return {
     async listOrders(selection: ShadowSelection, limit: number) {
@@ -84,7 +92,7 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
         // THE REAL BUILDER, the one every Xero sales invoice goes through. A contact id and a draft status stand in for the two things only a real post has; nothing is sent.
         // The builder never reads the contact (it takes a ContactID), and this report never holds one: the placeholder is a constant, not a customer's name.
         const contactName = 'shadow'
-        built = buildSalesInvoicePayload({ ...(payload as unknown as InvoiceData), invoiceNumber: wc.invoiceNumber ?? 'SHADOW', contactName }, 'DRAFT', 'shadow-contact', new Set<string>(), baseCurrency)
+        built = buildSalesInvoicePayload({ ...(payload as unknown as InvoiceData), invoiceNumber: wc.invoiceNumber ?? 'SHADOW', contactName }, 'DRAFT', 'shadow-contact', new Set<string>(), baseCurrency, roundingAccount, builderRates.ok ? builderRates.rateOf : undefined)
       } catch (error) {
         // The builder's message can quote a line description: only its kind is reported.
         if (isXeroSalesDocumentTaxTypeError(error)) return { kind: 'refused', code: 'tax_type_missing' }
