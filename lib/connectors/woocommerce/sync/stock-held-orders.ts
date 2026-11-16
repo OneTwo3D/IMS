@@ -9,11 +9,25 @@
  * the store has already taken the units off, IMS has not, and an absolute push puts them back:
  * the next customer can buy stock that does not exist.
  *
- * THE RULE (cannot oversell). Before a push, read the store's `on-hold` and `processing` orders,
- * drop the ones IMS already holds (a ShoppingOrderLink exists: they are reserved, allocated or
- * shipped, so IMS's own figures already count them), and treat the remaining line quantities as
- * extra reservations against the products they name (a KIT line is expanded into its components,
- * recursively, because a kit's WooCommerce stock is derived from them).
+ * THE RULE (cannot oversell). Before a push, read the store's `on-hold` and `processing` orders
+ * (walked to the end: a short page proves it) and, per order, work out what IMS does NOT hold:
+ *   - an order IMS has not imported: every line unit;
+ *   - an order IMS HAS imported (a ShoppingOrderLink exists): a link does not prove stock is
+ *     reserved, because the importer tolerates no or partial allocation. For each product the order
+ *     needs (a KIT line is expanded into its components, recursively, because a kit's WooCommerce
+ *     stock is derived from them), subtract what IMS holds against the order for that product
+ *     (the larger of its OrderAllocation rows, which are kept after dispatch, and its shipped
+ *     ShipmentLine quantity) and keep the unallocated remainder.
+ * The remainders are treated as extra reservations against those products.
+ *
+ * A line IMS cannot resolve (a variation id that matches no IMS product by variation id or SKU is
+ * NEVER charged to its parent: the parent is VARIABLE and not stocked) makes the variations of that
+ * parent `blocked`: they are not pushed this run, everything else is.
+ *
+ * TRUNCATION. The walk stops at WC_HELD_ORDERS_MAX_PAGES (10,000 orders: far above any real queue
+ * of open on-hold/processing orders). If that ceiling is hit the unread orders could name any
+ * product, so no quantity can be proven safe: `truncated` is set and the caller pushes only
+ * forced-zero products (0 can never oversell) and reports an error.
  *
  * WHEN THE ORDER DATA CANNOT BE TRUSTED (the read fails, an unreadable page, more pages than the
  * walk allows) the loader reports `ok: false` and the caller pushes NOTHING for the run. Skipping is
@@ -38,9 +52,9 @@ import type { WcFullOrder } from './types'
 /** The statuses in which WooCommerce core holds stock (wc_maybe_reduce_stock_levels). */
 export const WC_STOCK_HOLDING_ORDER_STATUSES = ['on-hold', 'processing'] as const
 
-/** `per_page` x this bounds the walk; more than this and the data is declared unusable. */
 export const WC_HELD_ORDERS_PAGE_SIZE = 100
-export const WC_HELD_ORDERS_MAX_PAGES = 20
+/** Safety ceiling only; the walk normally ends on a short page. */
+export const WC_HELD_ORDERS_MAX_PAGES = 100
 
 const KIT_EXPANSION_MAX_DEPTH = 8
 
@@ -55,16 +69,29 @@ export type HeldProductRef = {
 }
 
 export type WcHeldUnitsResult =
-  | { ok: true; heldByProduct: Map<string, number>; ordersConsidered: number }
+  | {
+      ok: true
+      heldByProduct: Map<string, number>
+      /** IMS products that must not be pushed this run (an order line naming them could not be resolved). */
+      blockedProductIds: Set<string>
+      /** The page ceiling was hit: only forced-zero pushes are safe. */
+      truncated: boolean
+      ordersConsidered: number
+    }
   | { ok: false; reason: string }
 
 export type WcHeldUnitsDeps = {
   /** One page of `/orders` for the given statuses. */
   fetchOrdersPage: (statuses: string, page: number) => Promise<{ data: unknown; error?: string }>
-  /** Which of these WooCommerce order ids IMS already holds (a ShoppingOrderLink exists). */
-  findImportedOrderIds: (externalOrderIds: string[]) => Promise<Set<string>>
+  /**
+   * For these WooCommerce order ids, the orders IMS holds: key present = imported; value = what IMS holds against
+   * the order per product (max of allocated and shipped quantity; empty when nothing is allocated).
+   */
+  findImportedOrders: (externalOrderIds: string[]) => Promise<Map<string, Map<string, number>>>
   /** The IMS products behind these WooCommerce ids (product or variation) or SKUs, PLUS every kit component they reach, nested kits included. */
   findProducts: (externalIds: number[], skus: string[]) => Promise<HeldProductRef[]>
+  /** IMS product ids of the variations (children) of these WooCommerce parent product ids. */
+  findVariationIdsByParentExternalId: (parentExternalIds: number[]) => Promise<string[]>
 }
 
 function toLines(order: WcFullOrder): HeldLine[] | null {
@@ -85,14 +112,17 @@ function toLines(order: WcFullOrder): HeldLine[] | null {
 }
 
 /**
- * Pure: turn the unimported orders' lines into per-IMS-product held units. KIT lines expand into
- * their components (nested kits included); a kit itself is never charged, its stock is derived.
- * Lines that match no IMS product are ignored (nothing of IMS's to over-push).
+ * Pure: turn order lines into per-IMS-product units. KIT lines expand into their components
+ * (nested kits included); a kit itself is never charged, its stock is derived.
+ *
+ * Matching: a line with a variation id matches the variation id, then the SKU, and NEVER falls
+ * back to its (VARIABLE) parent; no match makes the line `unresolved`. A plain line matches the
+ * product id, then the SKU; a plain line matching nothing is not an IMS product and is ignored.
  */
 export function aggregateHeldUnits(
   lines: HeldLine[],
   products: HeldProductRef[],
-): Map<string, number> {
+): { held: Map<string, number>; unresolvedLines: HeldLine[] } {
   const byId = new Map<string, HeldProductRef>(products.map((p) => [p.id, p]))
   const byExternal = new Map<number, HeldProductRef>()
   const bySku = new Map<string, HeldProductRef>()
@@ -101,6 +131,7 @@ export function aggregateHeldUnits(
     if (p.sku) bySku.set(p.sku, p)
   }
   const held = new Map<string, number>()
+  const unresolvedLines: HeldLine[] = []
   const charge = (product: HeldProductRef, qty: number, depth: number, trail: Set<string>): void => {
     if (product.type === 'KIT') {
       // A cycle or absurd nesting cannot be resolved here; availability flags it separately.
@@ -116,19 +147,43 @@ export function aggregateHeldUnits(
     held.set(product.id, (held.get(product.id) ?? 0) + qty)
   }
   for (const line of lines) {
-    const product =
-      (line.variationId ? byExternal.get(line.variationId) : undefined)
-      ?? (line.productId ? byExternal.get(line.productId) : undefined)
-      ?? (line.sku ? bySku.get(line.sku) : undefined)
-    if (product) charge(product, line.quantity, 0, new Set())
+    let product: HeldProductRef | undefined
+    if (line.variationId) {
+      product = byExternal.get(line.variationId) ?? (line.sku ? bySku.get(line.sku) : undefined)
+      if (!product || product.type === 'VARIABLE') {
+        unresolvedLines.push(line)
+        continue
+      }
+    } else {
+      product = (line.productId ? byExternal.get(line.productId) : undefined) ?? (line.sku ? bySku.get(line.sku) : undefined)
+      if (!product) continue
+      if (product.type === 'VARIABLE') {
+        unresolvedLines.push(line)
+        continue
+      }
+    }
+    charge(product, line.quantity, 0, new Set())
   }
-  return held
+  return { held, unresolvedLines }
+}
+
+/** Pure: what is left of `demand` once what IMS holds against the order is taken off, per product. */
+export function unallocatedRemainder(
+  demand: ReadonlyMap<string, number>,
+  coverage: ReadonlyMap<string, number> | undefined,
+): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const [productId, qty] of demand) {
+    const rest = qty - (coverage?.get(productId) ?? 0)
+    if (rest > 1e-9) out.set(productId, rest)
+  }
+  return out
 }
 
 export async function loadWcHeldUnitsByProduct(deps: WcHeldUnitsDeps): Promise<WcHeldUnitsResult> {
   const statuses = WC_STOCK_HOLDING_ORDER_STATUSES.join(',')
   const orders: WcFullOrder[] = []
-  let complete = false
+  let truncated = true
   for (let page = 1; page <= WC_HELD_ORDERS_MAX_PAGES; page++) {
     let response: { data: unknown; error?: string }
     try {
@@ -140,31 +195,41 @@ export async function loadWcHeldUnitsByProduct(deps: WcHeldUnitsDeps): Promise<W
     if (!Array.isArray(response.data)) return { ok: false, reason: 'WooCommerce orders answer was not a list' }
     orders.push(...(response.data as WcFullOrder[]))
     if (response.data.length < WC_HELD_ORDERS_PAGE_SIZE) {
-      complete = true
+      truncated = false
       break
     }
   }
-  if (!complete) {
-    return { ok: false, reason: `more than ${WC_HELD_ORDERS_MAX_PAGES * WC_HELD_ORDERS_PAGE_SIZE} on-hold/processing orders in WooCommerce` }
-  }
 
-  const ids = orders.map((o) => String(o?.id ?? '')).filter((id) => id !== '')
-  const imported = await deps.findImportedOrderIds(ids)
-  const lines: HeldLine[] = []
-  let considered = 0
+  const ids = orders.map((o) => String(o?.id ?? ''))
+  if (ids.some((id) => id === '')) return { ok: false, reason: 'a WooCommerce order had no id' }
+  const imported = await deps.findImportedOrders(ids)
+  const perOrderLines: { id: string; lines: HeldLine[] }[] = []
   for (const order of orders) {
-    const id = String(order?.id ?? '')
-    if (!id) return { ok: false, reason: 'a WooCommerce order had no id' }
-    if (imported.has(id)) continue
-    const orderLines = toLines(order)
-    if (orderLines === null) return { ok: false, reason: `WooCommerce order ${id} had unreadable line items` }
-    considered++
-    lines.push(...orderLines)
+    const id = String(order.id)
+    const lines = toLines(order)
+    if (lines === null) return { ok: false, reason: `WooCommerce order ${id} had unreadable line items` }
+    perOrderLines.push({ id, lines })
   }
-  if (lines.length === 0) return { ok: true, heldByProduct: new Map(), ordersConsidered: considered }
+  const allLines = perOrderLines.flatMap((o) => o.lines)
+  const heldByProduct = new Map<string, number>()
+  const blockedProductIds = new Set<string>()
+  if (allLines.length === 0) return { ok: true, heldByProduct, blockedProductIds, truncated, ordersConsidered: 0 }
 
-  const externalIds = [...new Set(lines.flatMap((l) => [l.variationId, l.productId]).filter((n) => n > 0))]
-  const skus = [...new Set(lines.map((l) => l.sku).filter((s) => s !== ''))]
+  const externalIds = [...new Set(allLines.flatMap((l) => [l.variationId, l.productId]).filter((n) => n > 0))]
+  const skus = [...new Set(allLines.map((l) => l.sku).filter((s) => s !== ''))]
   const products = await deps.findProducts(externalIds, skus)
-  return { ok: true, heldByProduct: aggregateHeldUnits(lines, products), ordersConsidered: considered }
+
+  const unresolvedParents = new Set<number>()
+  let considered = 0
+  for (const { id, lines } of perOrderLines) {
+    const { held, unresolvedLines } = aggregateHeldUnits(lines, products)
+    for (const l of unresolvedLines) if (l.productId > 0) unresolvedParents.add(l.productId)
+    const remainder = imported.has(id) ? unallocatedRemainder(held, imported.get(id)) : held
+    if (remainder.size > 0 || unresolvedLines.length > 0) considered++
+    for (const [productId, qty] of remainder) heldByProduct.set(productId, (heldByProduct.get(productId) ?? 0) + qty)
+  }
+  if (unresolvedParents.size > 0) {
+    for (const id of await deps.findVariationIdsByParentExternalId([...unresolvedParents])) blockedProductIds.add(id)
+  }
+  return { ok: true, heldByProduct, blockedProductIds, truncated, ordersConsidered: considered }
 }

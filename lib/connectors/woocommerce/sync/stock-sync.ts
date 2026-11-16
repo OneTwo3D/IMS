@@ -820,6 +820,9 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     return result
   }
   const heldByProduct = held.heldByProduct
+  // ACCEPTED RACE (inter-system, documented, not fixed): an order WooCommerce takes AFTER the read above and BEFORE this run's
+  // write has been decremented by the store but is in neither the read nor IMS, so that one write can still give its units
+  // back. The window is one push run; the next push (or the daily forceAll reconcile) sees the order and corrects it.
   const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps, heldByProduct)
 
   const result: StockSyncResult = {
@@ -1181,6 +1184,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     heldByProduct,
   )
 
+  if (held.truncated) {
+    result.errors.push('Stock push limited to forced-zero products: WooCommerce has more open on-hold/processing orders than the safety ceiling lets IMS read, so no other quantity can be proven safe.')
+  }
+  if (held.blockedProductIds.size > 0) {
+    result.errors.push(`Stock push skipped ${held.blockedProductIds.size} product(s): an on-hold/processing WooCommerce order names a variation IMS cannot resolve, so their stock cannot be proven safe.`)
+  }
+
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
   const variantPushEntries: VariantPushEntry[] = []
@@ -1188,6 +1198,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     const target = effectiveTargets.get(product.id)
     if (target == null) {
       if (!result.errors.some((m) => m.includes(product.id))) result.skipped++
+      continue
+    }
+    // Only a forced zero is safe when the held-order picture is incomplete (0 can never oversell).
+    if (
+      (held.truncated || held.blockedProductIds.has(product.id))
+      && !shouldForceWooZeroStock(product.lifecycleStatus)
+    ) {
+      result.skipped++
       continue
     }
     const stockQuantity = resolvePushStockQuantity(
@@ -1720,13 +1738,46 @@ function buildWcHeldUnitsDeps(creds: ConnectorCredentials): WcHeldUnitsDeps {
   return {
     fetchOrdersPage: (statuses, page) =>
       safeWcFetch('/orders', { status: statuses, per_page: '100', page: String(page), orderby: 'id', order: 'asc' }, creds),
-    findImportedOrderIds: async (externalOrderIds) => {
-      if (externalOrderIds.length === 0) return new Set<string>()
+    findImportedOrders: async (externalOrderIds) => {
+      const out = new Map<string, Map<string, number>>()
+      if (externalOrderIds.length === 0) return out
       const links = await db.shoppingOrderLink.findMany({
         where: { connector: 'woocommerce', externalOrderId: { in: externalOrderIds } },
-        select: { externalOrderId: true },
+        select: { externalOrderId: true, orderId: true },
       })
-      return new Set(links.map((l) => l.externalOrderId))
+      if (links.length === 0) return out
+      const orderIds = links.map((l) => l.orderId)
+      // What IMS holds against each order, per product: the allocation rows (kept after dispatch, so they already cover shipped
+      // units) or the shipped quantity if the rows are gone, whichever is larger.
+      const allocations = await db.orderAllocation.findMany({ where: { orderId: { in: orderIds } }, select: { orderId: true, productId: true, qty: true } })
+      const shipped = await db.shipmentLine.findMany({ where: { shipment: { orderId: { in: orderIds } } }, select: { productId: true, qty: true, shipment: { select: { orderId: true } } } })
+      const sum = (rows: { orderId: string; productId: string; qty: unknown }[]) => {
+        const m = new Map<string, Map<string, number>>()
+        for (const r of rows) {
+          const per = m.get(r.orderId) ?? new Map<string, number>()
+          per.set(r.productId, (per.get(r.productId) ?? 0) + Number(r.qty))
+          m.set(r.orderId, per)
+        }
+        return m
+      }
+      const allocated = sum(allocations)
+      const shippedBy = sum(shipped.map((r) => ({ orderId: r.shipment.orderId, productId: r.productId, qty: r.qty })))
+      for (const l of links) {
+        const per = new Map<string, number>()
+        for (const source of [allocated.get(l.orderId), shippedBy.get(l.orderId)]) {
+          for (const [productId, qty] of source ?? []) per.set(productId, Math.max(per.get(productId) ?? 0, qty))
+        }
+        out.set(l.externalOrderId, per)
+      }
+      return out
+    },
+    findVariationIdsByParentExternalId: async (parentExternalIds) => {
+      if (parentExternalIds.length === 0) return []
+      const rows = await db.product.findMany({
+        where: { parent: { externalProductId: { in: parentExternalIds.map((n) => BigInt(n)) } } },
+        select: { id: true },
+      })
+      return rows.map((r) => r.id)
     },
     findProducts: async (externalIds, skus) => {
       const select = {

@@ -335,3 +335,13 @@ test('WCO-H3: if the on-hold/processing orders cannot be read, NOTHING is pushed
   assert.equal(result.pushed, false)
   assert.ok(result.errors.some((e) => e.includes('Stock push skipped')))
 })
+
+test('WCO-H3: a multi-unit unimported order is subtracted in full (linked/partial cases are unit-tested in wc-held-orders-stock-guard)', async () => {
+  reset([product('a', 'S1', BigInt(1))]) // stock 5; allocation rows are not modelled by this mock, so coverage is empty
+  ordersImpl = () => ({ data: [{ id: 901, line_items: [{ product_id: 1, variation_id: 0, quantity: 4, sku: 'S1' }] }] })
+  fetchImpl = okPreflight
+  let pushed: Array<{ id: number; stock_quantity: number }> = []
+  postImpl = (_p, body) => { pushed = (body as { update: typeof pushed }).update; return okUpdate([1]) }
+  await run()
+  assert.equal(pushed[0].stock_quantity, 1)
+})
