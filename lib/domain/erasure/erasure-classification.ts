@@ -46,7 +46,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   Shipment: {
     erased: ['trackingNumber'],
-    notPersonal: ['id', 'orderId', 'warehouseId', 'shippingService', 'shipmentJournalBatchRef', 'allocatedReliefSyncLogId', 'allocatedReliefConnector', 'allocatedReliefAccountCode'],
+    notPersonal: ['id', 'orderId', 'warehouseId', 'shippingService', 'shipmentJournalBatchRef', 'allocatedReliefSyncLogId', 'allocatedReliefConnector', 'allocatedReliefAccountCode', 'cogsRelievedFromInventoryAt', 'cogsRelievedFromInventoryAmount', 'cogsRelievedFromInventorySyncLogId'],
     retained: {
     },
   },

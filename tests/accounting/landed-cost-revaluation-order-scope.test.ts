@@ -134,6 +134,13 @@ test('o3d-zpa7: the chain that makes the race unreachable is pinned in every reg
     'DAILY_BATCH_GROUP_B_SHIPMENT_WHERE must still require revenueDeferredDate — it is what ties a journaled '
     + 'shipment to Group A1 (o3d-zpa7)',
   )
+  // ACC-H12: the one other shape (COGS on shipment, before the order is deferred) is tied to the same
+  // chain by the invoice itself: it needs `accountingInvoiceId`, exactly what Group A1 needs, so a
+  // journaled shipment still always belongs to an invoiced, undeletable order.
+  assert.ok(
+    shared.includes("revenueDeferredDate: null, accountingInvoiceId: { not: null },"),
+    'the COGS-on-shipment shape of DAILY_BATCH_GROUP_B_SHIPMENT_WHERE must require accountingInvoiceId (ACC-H12 / o3d-zpa7)',
+  )
 
   // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was
   // checked against TWO independently-written implementations. It is now checked against one — and the

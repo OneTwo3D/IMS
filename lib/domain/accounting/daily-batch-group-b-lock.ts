@@ -59,16 +59,44 @@ type TxClient = Prisma.TransactionClient
  * A shipment that stopped qualifying between the two — journaled by something else, unshipped, or
  * whose order was fully refunded — is dropped by the real read for free, which is the "revalidate
  * shipment status after acquiring the locks" half of the fix.
+ *
+ * TWO SHAPES (ACC-H12), distinguished by the order's deferral stamp and by nothing else:
+ *
+ *  - the ordinary shipment of a PAID order that Group A1 has deferred and Group A2 has reclassified:
+ *    DR Unearned / CR Sales for its revenue and DR COGS / CR Allocated Inventory for its cost;
+ *  - the shipment of an order that has NOT been deferred (not paid, or paid and still waiting for
+ *    Group A1): COGS is posted when the goods leave whether or not the order is paid, and Group A2 has
+ *    not run, so Allocated Inventory holds no debit for the units. Its cost is relieved straight out of
+ *    Inventory (DR COGS / CR Inventory) and the shipment is marked (`cogsRelievedFromInventoryAt`) so the
+ *    payment-time steps skip it. It posts no revenue leg: the invoice already put the revenue in Sales.
+ *
+ * The stamp the two shapes are told apart by is only ever written by Group A1, which runs under the same
+ * batch lock as this read, so an order cannot move between the shapes inside a run.
  */
 export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
-  status: 'SHIPPED',
-  shipmentJournalDate: null,
-  order: {
-    refundStatus: { not: 'FULL' },
-    revenueDeferredDate: { not: null },
-    inventoryAllocatedDate: { not: null },
-  },
-} as const satisfies Prisma.ShipmentWhereInput
+  OR: [
+    {
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      order: {
+        refundStatus: { not: 'FULL' },
+        revenueDeferredDate: { not: null },
+        inventoryAllocatedDate: { not: null },
+      },
+    },
+    {
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      order: {
+        refundStatus: { not: 'FULL' },
+        revenueDeferredDate: null,
+        // The invoice is what put this order's revenue in Sales, and what makes the order undeletable under a
+        // journal (see Group A1). A shipment of an order IMS has not invoiced waits for the invoice.
+        accountingInvoiceId: { not: null },
+      },
+    },
+  ],
+} satisfies Prisma.ShipmentWhereInput
 
 /**
  * Raised when the loaded data references a cost layer the lock did not cover.

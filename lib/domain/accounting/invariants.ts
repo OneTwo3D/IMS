@@ -60,6 +60,9 @@ type SalesOrderAccountingRow = {
     shipmentJournalDate: Date | string | null
     revenueRecognizedAmount: DecimalLike
     cogsBatchAmount: DecimalLike
+    // ACC-H12: set on a shipment whose COGS the batch relieved straight from Inventory before the order was
+    // deferred. Optional so pure-evaluator fixtures that predate it type-check; absent means "costed the ordinary way".
+    cogsRelievedFromInventoryAt?: Date | string | null
   }>
   refunds: Array<{
     id: string
@@ -632,6 +635,10 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     const hasA1 = order.revenueDeferredDate != null
     const hasA2 = order.inventoryAllocatedDate != null
     const postedShipments = order.shipments.filter((shipment) => shipment.shipmentJournalDate != null)
+    // ACC-H12: a shipment costed on shipment legitimately precedes payment and Group A1/A2, so it is neither
+    // "revenue posted without payment" nor "posted without prior staging". It stays in `postedShipments` for the
+    // tie-out and refund checks, which apply to it as to any other.
+    const stagedPostedShipments = postedShipments.filter((shipment) => shipment.cogsRelievedFromInventoryAt == null)
 
     // Lifecycle tie-out (scjz.75): once an order has fully shipped and every
     // recognizable (SHIPPED) shipment has posted its Group-B revenue, the sum of
@@ -688,7 +695,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     // amount is unknown (<= 0) fall back to presence to avoid false positives.
     const fullyCompensated = creditNotes.length > 0
       && (postedRevenue <= 0 || creditedTotal + 0.01 >= postedRevenue)
-    if ((hasA1 || hasA2 || postedShipments.length > 0) && order.paidAt === null && !fullyCompensated) {
+    if ((hasA1 || hasA2 || stagedPostedShipments.length > 0) && order.paidAt === null && !fullyCompensated) {
       findings.push({
         severity: 'critical',
         code: 'revenue_posted_without_payment',
@@ -826,7 +833,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       })
     }
 
-    for (const shipment of postedShipments) {
+    for (const shipment of stagedPostedShipments) {
       if (!hasA1 || !hasA2) {
         findings.push({
           severity: 'critical',
@@ -1154,6 +1161,7 @@ export async function collectAccountingInvariantRows(
             shipmentJournalDate: true,
             revenueRecognizedAmount: true,
             cogsBatchAmount: true,
+            cogsRelievedFromInventoryAt: true,
           },
         },
         refunds: {
