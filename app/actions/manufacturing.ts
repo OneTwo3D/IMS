@@ -1830,6 +1830,8 @@ async function recalculateManufacturingCostLayers(
       recalcRunId,
       revaluedAt,
       { source: 'manufacturing_recompute', operation: 'recompute_production_order', productionOrderId },
+      // The reclass journal's own chart: every downstream COGS_REVERSAL and ownership decision is about it.
+      reclassChart,
     )
     await refreshSalesOrderLineCogsForCostLayerChange(tx, li.id)
   }

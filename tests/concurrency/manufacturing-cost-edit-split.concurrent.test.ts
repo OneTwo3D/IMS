@@ -195,7 +195,7 @@ async function runCase(label: string, sc: Scenario, extend?: (world: Awaited<Ret
   assert.ok(Math.abs(inventory - stillInInventory * unitDelta) < 0.011, `Inventory moved by ${inventory}; the ${stillInInventory} unit(s) on hand, on a transfer or returned are Inventory (${stillInInventory * unitDelta})`)
   assert.ok(Math.abs(overhead - (sc.newOverhead - sc.oldOverhead)) < 0.011, 'the overhead credit is the whole edit')
   assert.ok(Math.abs(cogs + inventory - overhead) < 0.011, 'and the debits equal it')
-  return { cogs, inventory }
+  return { cogs, inventory, productionId: world.productionId, shipmentIds }
 }
 
 test('ACC-H14: setup', { skip }, async () => {
@@ -287,4 +287,14 @@ test('ACC-H14: transferred and component-reused units SOLD before the edit: COGS
   // 4 sold units carry +1 each into COGS; the 6 held units carry +1 each into Inventory; nothing else.
   assert.ok(Math.abs(r.cogs - 4) < 0.011, `COGS for the sold units equals the new cost: ${r.cogs}`)
   assert.ok(Math.abs(r.inventory - 6) < 0.011, `Inventory equals the new cost for the units still held: ${r.inventory}`)
+
+  // ONE CHART PER EDIT (Codex R2): every journal this edit queued — the reclass and each downstream shipment's
+  // COGS_REVERSAL — is routed to the same connector. They are asked of the chart the reclass resolved, not of
+  // whichever connector is active when each downstream refresh runs.
+  const rows = await db.accountingSyncLog.findMany({
+    where: { OR: [{ type: 'MANUFACTURING_RECLASS', referenceId: r.productionId }, { type: 'COGS_REVERSAL', referenceId: { in: r.shipmentIds } }] },
+    select: { type: true, connector: true },
+  })
+  assert.ok(rows.some((row) => row.type === 'MANUFACTURING_RECLASS') && rows.filter((row) => row.type === 'COGS_REVERSAL').length >= 2, 'the edit queued the reclass and both downstream reversals')
+  assert.deepEqual([...new Set(rows.map((row) => row.connector))], ['xero'], 'every journal of the edit carries the one chart connector')
 })

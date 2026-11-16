@@ -514,10 +514,19 @@ export async function propagateLandedCostToOutputs(
   recalcRunId: string,
   revaluedAt: Date,
   revaluationContext?: ShipmentRevaluationContext,
+  /**
+   * ACC-H14 (Codex R2): THE CHART EVERY DOWNSTREAM SHIPMENT REFRESH IS ASKED OF. One chart for the whole walk, so
+   * the COGS_REVERSAL rows and the batch-ownership decisions are about the SAME connector as the caller's own
+   * journal even if the active connector changes mid-run. A caller that has one passes it (the manufacturing
+   * cost edit passes its reclass chart); otherwise it is resolved ONCE here and handed down the recursion,
+   * instead of once per shipment refresh.
+   */
+  accountingSettings?: AccountingSettings | null,
 ): Promise<void> {
   if (costDeltaPerUnit.abs().lte(LANDED_COST_DELTA_EPSILON)) return
   if (depth > MAX_LANDED_COST_PROPAGATION_DEPTH) return
   if (ancestors.has(sourceCostLayerId)) return // cycle on the current path
+  const chart = accountingSettings ?? await getAccountingSettings().catch(() => null)
   const nextAncestors = new Set(ancestors).add(sourceCostLayerId)
 
   const sourceLines = await deps.getDependentOutputSourceLines(tx, sourceCostLayerId)
@@ -595,6 +604,7 @@ export async function propagateLandedCostToOutputs(
         revaluationContext: revaluationContext
           ? { ...revaluationContext, source: 'landed_cost_output_propagation' }
           : undefined,
+        ...(chart ? { accountingSettings: chart } : {}),
       })
       outputShipmentRevalDelta = shipmentRefresh.cogsRevaluationDelta
       await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, outputCostLayerId)
@@ -615,7 +625,7 @@ export async function propagateLandedCostToOutputs(
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
-    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt, revaluationContext)
+    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt, revaluationContext, chart)
   }
 }
 
