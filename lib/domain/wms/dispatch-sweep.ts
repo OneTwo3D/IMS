@@ -33,6 +33,8 @@ import { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 export { bindWmsStatusToCandidate } from '@/lib/domain/wms/status-binding'
 export type { WmsStatusBinding } from '@/lib/domain/wms/status-binding'
 import { unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
+import { runSystemicPass, type SystemicFailureStore } from '@/lib/domain/wms/systemic-failure'
+import { createDbSystemicFailureStore } from '@/lib/domain/wms/systemic-failure-store'
 import { isWmsTerminalNonDespatchStatus, WMS_TERMINAL_NON_DESPATCH_CATEGORY } from '@/lib/domain/wms/terminal-status'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
@@ -517,7 +519,18 @@ export type WmsDispatchSweepDeps = {
   // failure count (dead-lettering at DISPATCH_MAX_CONSECUTIVE_FAILURES — the link then
   // leaves listCandidates); clearDispatchFailures resets it on a success/pending outcome
   // so only CONSECUTIVE failures accumulate.
-  recordDispatchError(candidate: WmsDispatchCandidate, reason: string): Promise<{ deadLettered: boolean }>
+  //
+  // With `deferDeadLetter` the error is still COUNTED but a link that reaches the bound is not parked: it answers `exhausted` and the
+  // sweep decides at the end of the pass, through deadLetterDispatch, whether the failures were record-local (park it) or one
+  // connector fault (park nothing). Only passed when the deps also carry the breaker and can park (deadLetterDispatch).
+  recordDispatchError(candidate: WmsDispatchCandidate, reason: string, options?: { deferDeadLetter?: boolean }): Promise<{ deadLettered: boolean; exhausted?: { failureCount: number } }>
+  /** Park a link whose failure count reached the bound (the deferred half of recordDispatchError). Compare-and-set; false when it had moved on. */
+  deadLetterDispatch?(candidate: WmsDispatchCandidate, reason: string, failureCount: number): Promise<{ deadLettered: boolean }>
+  /**
+   * The systemic-failure circuit breaker (lib/domain/wms/systemic-failure.ts). Absent: a link is dead-lettered the moment it reaches
+   * the bound, as it always was (test doubles).
+   */
+  systemicBreaker?: { store: SystemicFailureStore; connectorId: string }
   clearDispatchFailures(linkId: string): Promise<void>
   /**
    * The WMS shows a LIVE IMS order as cancelled / deleted / voided / rejected and not despatched. Record it as an exception for an operator
@@ -1403,6 +1416,8 @@ export async function runWmsDispatchSweepCore(
   unresolvedQuarantined: number
   /** o3d-bjc.9: the unresolved cohort was read as connector drift — nothing isolated. */
   unresolvedSystemic: boolean
+  /** Links that reached the failure bound in a pass the systemic-failure breaker read as a connector fault, so were NOT dead-lettered. */
+  systemicSuppressed: number
   /** The delta window was clamped and could not cover its held-back backlog. */
   deltaWindowTruncated: boolean
   /** True when the sweep pinned the watermark because it could not prove full coverage. */
@@ -1468,6 +1483,14 @@ export async function runWmsDispatchSweepCore(
   // for the drift ratio. counters.totalChecked is not it: it also counts links
   // the delta served without any outcome decision.
   let linksDecided = 0
+  // The systemic-failure breaker's evidence for this pass (see the verdict below). `dispatchAttempts` is the denominator: links the
+  // pass actually asked the warehouse about and got an outcome for. A write the outbound-write hold refused is neither an attempt nor
+  // a failure: nothing was asked.
+  let dispatchAttempts = 0
+  let dispatchFailures = 0
+  let dispatchLastError: string | null = null
+  const exhaustedDispatch: Array<{ candidate: WmsDispatchCandidate; reason: string; failureCount: number }> = []
+  let systemicSuppressed = 0
   let unresolvedQuarantined = 0
   let unresolvedSystemic = false
   const quarantinedNumbers = new Set<string>()
@@ -1695,10 +1718,22 @@ export async function runWmsDispatchSweepCore(
     }
     try {
       if (outcome.action === 'error') {
-        if (thrownHold || isOutboundWriteHeldText(outcome.reason)) counters.outboundHeld = (counters.outboundHeld ?? 0) + 1
-        const { deadLettered } = await deps.recordDispatchError(candidate, outcome.reason)
+        const heldWrite = thrownHold || isOutboundWriteHeldText(outcome.reason)
+        if (heldWrite) counters.outboundHeld = (counters.outboundHeld ?? 0) + 1
+        else {
+          dispatchAttempts += 1
+          dispatchFailures += 1
+          dispatchLastError = outcome.reason
+        }
+        const deferDeadLetter = Boolean(deps.systemicBreaker && deps.deadLetterDispatch)
+        const { deadLettered, exhausted } = await deps.recordDispatchError(candidate, outcome.reason, deferDeadLetter ? { deferDeadLetter: true } : undefined)
         if (deadLettered) reason = `${outcome.reason} — dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures`
+        else if (exhausted) {
+          exhaustedDispatch.push({ candidate, reason: outcome.reason, failureCount: exhausted.failureCount })
+          reason = `${outcome.reason} — ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures; parking decided at the end of the pass`
+        }
       } else if (!outcome.unresolved) {
+        dispatchAttempts += 1
         await deps.clearDispatchFailures(candidate.linkId)
       }
       // o3d-bjc.9: the unresolved streak is its own, and it advances HERE while
@@ -2124,6 +2159,43 @@ export async function runWmsDispatchSweepCore(
     }
   }
 
+  // --- THE SYSTEMIC VERDICT: park the exhausted links, or park nothing (lib/domain/wms/systemic-failure.ts) ---
+  //
+  // A link that reached DISPATCH_MAX_CONSECUTIVE_FAILURES was not parked where it failed: that decision is made here, once, because
+  // this is the only point where one stuck order and a broken connector look different. Most of what the pass tried failing at once
+  // is a connector fault: ONE incident, NOTHING parked, every link stays a candidate and recovers by itself. Otherwise (or once the
+  // suppression bound is spent) each is parked as before. Either way the pass FAILED, so the job's own error count stands.
+  if (deps.systemicBreaker) {
+    const verdict = await runSystemicPass(deps.systemicBreaker.store, {
+      sweep: 'dispatch',
+      connector: deps.systemicBreaker.connectorId,
+      outcomes: { attempted: dispatchAttempts, failed: dispatchFailures, exhausted: exhaustedDispatch.length },
+      now,
+      reason: dispatchLastError,
+      onDegraded: (message) => console.error(`[wms-dispatch-sweep] systemic-failure breaker: ${message}`),
+    })
+    if (verdict.suppress) {
+      systemicSuppressed = exhaustedDispatch.length
+      passClean = false
+      console.warn(
+        `[wms-dispatch-sweep] ${dispatchFailures}/${dispatchAttempts} links failed this pass — treated as a connector fault, ` +
+          `${exhaustedDispatch.length} exhausted link(s) NOT dead-lettered`,
+      )
+    } else if (deps.deadLetterDispatch) {
+      for (const entry of exhaustedDispatch) {
+        try {
+          const parked = await deps.deadLetterDispatch(entry.candidate, entry.reason, entry.failureCount)
+          // false: the compare-and-set found the link already moved on (a success reset its count, or it was parked by another run).
+          if (!parked.deadLettered) console.warn(`[wms-dispatch-sweep] link ${entry.candidate.linkId} was not dead-lettered: it had moved on`)
+        } catch (deadLetterError) {
+          // The count stays at the bound, so the next failure of this link reaches this decision again.
+          console.error('[wms-dispatch-sweep] dead-letter failed:', deadLetterError)
+          counters.errors += 1
+        }
+      }
+    }
+  }
+
   // --- Unresolved cohort: isolate the record, or name the drift (o3d-bjc.9) ---
   //
   // Decided ONCE, here, because this is the only point in the pass where the two
@@ -2354,6 +2426,7 @@ export async function runWmsDispatchSweepCore(
     unresolved: unresolvedCount,
     unresolvedQuarantined,
     unresolvedSystemic,
+    systemicSuppressed,
     // Surfaced so the wrapper can mark the job PARTIAL: a clamped window means the
     // delta is running degraded and cannot cover its own backlog.
     deltaWindowTruncated,
@@ -2378,6 +2451,8 @@ export type WmsDispatchSweepResult = {
   skippedReason?: string
   /** PRESENT ONLY WHEN NON-ZERO: errors that are writes the outbound-write hold refused (also counted in `errors`). */
   outboundHeld?: number
+  /** PRESENT ONLY WHEN NON-ZERO: links that ran out of retries in a pass read as a connector fault, and so were NOT dead-lettered (the pass also counts them in `errors`). */
+  systemicSuppressed?: number
 }
 
 /**
@@ -2679,8 +2754,57 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
   const deltaKeys = wmsDeltaCursorKeys(connectorId)
   const deltaScopeLock = getWmsConnectorHooks(connectorId).deltaScopeLock
     ?? defaultWmsDeltaScopeLock(wmsDeltaStateRowKeys(deltaKeys))
+  const deadLetterDispatch: NonNullable<WmsDispatchSweepDeps['deadLetterDispatch']> = async (candidate, reason, failureCount) => {
+    // Compare-and-set so a concurrent run (or replay) can't double dead-letter,
+    // AND (Codex) so an overlapping sweep's successful reconcile — which resets
+    // the count between our increment/read and this write — vetoes the
+    // dead-letter: the count must STILL be at the threshold when we commit.
+    const updated = await db.wmsOrderPushLink.updateMany({
+      where: {
+        id: candidate.linkId,
+        dispatchDeadLetteredAt: null,
+        dispatchFailureCount: { gte: DISPATCH_MAX_CONSECUTIVE_FAILURES },
+      },
+      data: { dispatchDeadLetteredAt: new Date() },
+    })
+    if (updated.count === 0) return { deadLettered: false }
+
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: candidate.orderId,
+      tag: 'sync',
+      action: 'wms_dispatch_dead_lettered',
+      description: `Dispatch reconciliation dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures (WMS order ${candidate.externalOrderNumber}): ${reason}`,
+      metadata: {
+        orderId: candidate.orderId,
+        externalOrderNumber: candidate.externalOrderNumber,
+        connector: connectorId,
+        failureCount,
+        lastError: reason,
+      },
+      level: 'WARNING',
+      resolveUser: false,
+    })
+
+    // Bell the admins individually — a broadcast (userId null) would expose
+    // order details to READONLY/SUPPLIER users.
+    const admins = await db.user.findMany({
+      where: { role: 'ADMIN', active: true },
+      select: { id: true },
+    })
+    await Promise.all(admins.map((admin) => notify({
+      userId: admin.id,
+      type: 'error',
+      title: 'WMS dispatch stuck',
+      message: `Order ${candidate.externalOrderNumber} despatched in the WMS but cannot reconcile into IMS (${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures). It needs attention in the sync exception inbox.`,
+      actionUrl: '/sync/exceptions',
+    })))
+
+    return { deadLettered: true }
+  }
   return {
     zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading?.(),
+    systemicBreaker: { store: createDbSystemicFailureStore(connectorId), connectorId },
     storefrontCutoff: () => storefrontCutoffWhileEnforced(),
     async despatchLowerBound(orderId) {
       // NOT pushedAt: every amendment attempt, even a rejected one, moves it. firstClaimedAt is stamped once, when the create is first
@@ -3030,7 +3154,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       }
       return { parked: true }
     },
-    async recordDispatchError(candidate, reason) {
+    async recordDispatchError(candidate, reason, options) {
       // A held write (outbound-write hold) is not a reconcile failure: nothing is wrong with the order,
       // this installation has not been granted the storefront. Record the reason, spend no failure, and
       // never dead-letter for it - however long the hold lasts.
@@ -3053,54 +3177,11 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       if (!shouldDeadLetterDispatch(link.dispatchFailureCount, link.dispatchDeadLetteredAt)) {
         return { deadLettered: false }
       }
-
-      // Compare-and-set so a concurrent run (or replay) can't double dead-letter,
-      // AND (Codex) so an overlapping sweep's successful reconcile — which resets
-      // the count between our increment/read and this write — vetoes the
-      // dead-letter: the count must STILL be at the threshold when we commit.
-      const updated = await db.wmsOrderPushLink.updateMany({
-        where: {
-          id: candidate.linkId,
-          dispatchDeadLetteredAt: null,
-          dispatchFailureCount: { gte: DISPATCH_MAX_CONSECUTIVE_FAILURES },
-        },
-        data: { dispatchDeadLetteredAt: new Date() },
-      })
-      if (updated.count === 0) return { deadLettered: false }
-
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: candidate.orderId,
-        tag: 'sync',
-        action: 'wms_dispatch_dead_lettered',
-        description: `Dispatch reconciliation dead-lettered after ${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures (WMS order ${candidate.externalOrderNumber}): ${reason}`,
-        metadata: {
-          orderId: candidate.orderId,
-          externalOrderNumber: candidate.externalOrderNumber,
-          connector: connectorId,
-          failureCount: link.dispatchFailureCount,
-          lastError: reason,
-        },
-        level: 'WARNING',
-        resolveUser: false,
-      })
-
-      // Bell the admins individually — a broadcast (userId null) would expose
-      // order details to READONLY/SUPPLIER users.
-      const admins = await db.user.findMany({
-        where: { role: 'ADMIN', active: true },
-        select: { id: true },
-      })
-      await Promise.all(admins.map((admin) => notify({
-        userId: admin.id,
-        type: 'error',
-        title: 'WMS dispatch stuck',
-        message: `Order ${candidate.externalOrderNumber} despatched in the WMS but cannot reconcile into IMS (${DISPATCH_MAX_CONSECUTIVE_FAILURES} consecutive failures). It needs attention in the sync exception inbox.`,
-        actionUrl: '/sync/exceptions',
-      })))
-
-      return { deadLettered: true }
+      // The park waits for the end of the pass (the systemic-failure verdict). The count is already at the bound, so it stays eligible.
+      if (options?.deferDeadLetter) return { deadLettered: false, exhausted: { failureCount: link.dispatchFailureCount } }
+      return deadLetterDispatch(candidate, reason, link.dispatchFailureCount)
     },
+    deadLetterDispatch,
     // --- o3d-bjc.9: unresolved-record streak + quarantine -------------------
     async recordUnresolvedRead(candidate, reason) {
       const link = await db.wmsOrderPushLink.update({
@@ -3482,7 +3563,7 @@ async function runWmsDispatchSweepLocked(
     const {
       logs, deltaError, unresolved, deltaWindowTruncated, deltaCoverageIncomplete,
       deltaPreloadServed, deltaAuthoritativeRereads, deltaRowCount,
-      unresolvedQuarantined, unresolvedSystemic, withdrawalScreenFailures,
+      unresolvedQuarantined, unresolvedSystemic, withdrawalScreenFailures, systemicSuppressed,
     } = core
 
     if (logs.length > 0) {
@@ -3624,6 +3705,22 @@ async function runWmsDispatchSweepLocked(
       })
     }
 
+    // The systemic-failure verdict, in the job's own log so it is queryable: "nothing was parked" must not look like a pass that had
+    // nothing to park.
+    if (systemicSuppressed > 0) {
+      await db.wmsSyncLog.create({
+        data: {
+          jobId: job.id,
+          sku: null,
+          productId: null,
+          action: 'error',
+          reason: `${systemicSuppressed} link(s) ran out of retries in a pass where most links failed at once — read as a connector-wide `
+            + 'fault, so NONE were dead-lettered and every link stays eligible to recover automatically',
+          payload: { systemicFailure: true, systemicSuppressed, connector: connectorId } as Prisma.InputJsonValue,
+        },
+      })
+    }
+
     const { status, effectiveErrors } = resolveDispatchJobOutcome(counters.errors, deltaError, {
       unresolved,
       deltaWindowTruncated,
@@ -3662,7 +3759,7 @@ async function runWmsDispatchSweepLocked(
       })
     }
 
-    return { jobId: job.id, status, totalChecked: counters.totalChecked, dispatched: counters.dispatched, pending: counters.pending, errors: effectiveErrors, ...(counters.outboundHeld ? { outboundHeld: counters.outboundHeld } : {}) }
+    return { jobId: job.id, status, totalChecked: counters.totalChecked, dispatched: counters.dispatched, pending: counters.pending, errors: effectiveErrors, ...(counters.outboundHeld ? { outboundHeld: counters.outboundHeld } : {}), ...(systemicSuppressed > 0 ? { systemicSuppressed } : {}) }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'WMS dispatch sync failed'
     await db.wmsSyncJob.update({ where: { id: job.id }, data: { status: 'FAILED', finishedAt: new Date() } })

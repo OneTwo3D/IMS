@@ -594,6 +594,43 @@ IMS pushes sales orders outbound to the WMS so the 3PL can fulfil them. The work
 - **Store credit is a payment, not a discount.** Store credit a customer redeemed (WooCommerce Smart Coupons) is kept out of the order's discount, so the order is pushed with the **full** goods value and `DiscountTotalExVat` carries only genuine coupons (customs and IOSS see the real value). Nothing for the credit is sent to Mintsoft: no payment or credit field exists on the push, which is the same as the existing woo-mintsoft sync plugin, which strips the credit coupon back out of `DiscountTotalExVat` and sends no payment. The credit is recorded on the IMS order (`storeCreditForeign`, gross). The push-time total check (`totalMismatchPence`) expects it: it compares the order total with goods + tax + shipping − discount **− store credit**, so an honest credit order is not flagged. An order with store credit that was not created by the credit-aware import (no provenance mark), or that is held for store-credit review, is **withheld from the push** and parked `VALIDATION_FAILED` with a reason, rather than telling the warehouse a reduced goods value.
 - **Couriers.** The order's shipping service is mapped to a Mintsoft `CourierServiceId` via the courier map; unmapped services fall back to the default courier id, or pass the name through for Mintsoft to resolve.
 
+## Systemic-Failure Circuit Breaker (order push and dispatch sweeps)
+
+Dead-lettering is isolation, and isolation only makes sense when the thing isolated is the exception. A Mintsoft schema change, a broken endpoint or an expired credential fails every order at once; parking them one at a time quarantines the whole tenant and demands a manual replay after the dependency has recovered. So the sweeps that park a record after exhausted retries decide that park **once, at the end of the pass**, where one broken record and a broken connector can be told apart. The rule is the one the woo-mintsoft sync plugin runs (`MINTSOFT_SYSTEMIC_*`), ported parameter for parameter. The decision is the pure function `decideSystemicFailure` in `lib/domain/wms/systemic-failure.ts`; the persistence and the incident are in `lib/domain/wms/systemic-failure-store.ts`.
+
+| Parameter | Value | Why it exists |
+|---|---|---|
+| Floor (`SYSTEMIC_FAILURE_MIN_RECORDS`) | 3 | The ratio alone misfires on a quiet tick: one failing order of one is not an outage. |
+| Ratio (`SYSTEMIC_FAILURE_RATIO`) | 0.5 | The floor alone misfires on a big store: three broken orders among two hundred are not an outage. Floor **and** ratio must hold. |
+| Bound (`SYSTEMIC_MAX_CONSECUTIVE`) | 5 | Suppression must be bounded. Three permanently broken records in a three-record cohort would otherwise read as systemic for ever and never be isolated. After five consecutive systemic passes the sixth parks per record anyway. |
+| Endpoint passes (`SYSTEMIC_ENDPOINT_FAILURE_PASSES`) | 3 | A one-record tenant can never meet the floor, so a total outage there would be silent for ever. Every attempt failing for three passes running raises the incident at any size. It reports; it never withholds a park by itself. |
+
+**What a pass counts.** `attempted` is the records the pass actually asked the warehouse about (a write the outbound-write hold refused is not an attempt); `failed` is every one that failed this pass, **not only those that ran out of retries** (retry clocks are staggered, so during an outage three old orders may exhaust while ninety-seven equally broken newer ones have not, and scoring only the exhausted subset would park the three mid-outage); `exhausted` is the subset that would be parked. Nothing is at stake unless `exhausted` is above zero.
+
+**What a systemic pass does.**
+
+1. Parks nothing. A record that has run out of retries is written as the retryable state it would be after any other failed attempt (`PENDING_CREATE` / `PENDING_VERIFY` with the attempt count at the bound, or the dispatch failure count at the bound with no dead-letter stamp), so every record stays eligible and recovers automatically once the connector answers.
+2. Raises **one** incident per sweep per connector: an activity row, an `error` notification to each active admin (individually, never a broadcast) linking to `/sync/exceptions`, and a read-only **WMS connector-wide failure** section on that page. A fault that lasts a hundred passes announces itself once.
+3. Increments a persisted consecutive counter in the settings row `wms_systemic_failure:<connector>:<sweep>` (reserved: it cannot be written from the settings UI). The row is the incident: it exists while the incident is open.
+4. After the bound, the sweep isolates per record as it always did, and **says so**: the incident is escalated (second notification, the page row reads "Isolating one by one again"). The counter stays saturated so the next pass of the same fault keeps isolating.
+5. A clean pass, or a per-record pass (attempts, but not mass failure), resets the counter and resolves the incident (an activity row records it). A pass that attempted nothing changes nothing. A mass-failure pass with nothing exhausted yet leaves the counter alone.
+
+**Fail toward the old behaviour.** Suppression is only safe while it is counted. If the state row cannot be read, or the suppressing verdict cannot be saved, the pass isolates per record instead and logs why: an uncounted suppression would be an unbounded one. The breaker never throws into the sweep it protects.
+
+**Covered sweeps.**
+
+| Sweep | What is deferred | Counter key |
+|---|---|---|
+| Order push, create pass (`wms-order-push`) | the DEAD_LETTER of an order whose create failed for the 5th time; parked at the end of the pass by compare-and-set on the claim stamp the pass wrote | `order-push` |
+| Order push, verification pass | the quarantine of a link still unverifiable after 5 attempts; compare-and-set on `PENDING_VERIFY` | `order-push-verify` |
+| Dispatch sweep (`mintsoft-dispatch-sync`) | the dead-letter of a link at 5 consecutive reconcile failures (`deadLetterDispatch`, the same compare-and-set as before) | `dispatch` |
+
+Not covered, because they have no retry-then-park mechanism: the stock sync, the order-status sweep and the order-reconcile sweep. The unresolved-record quarantine of the dispatch sweep (an unreadable record, not a failed call) keeps its own older breaker (see Dispatch Ingestion & Reconciliation). The other DEAD_LETTER writes in the push sweep (a hold with no confirmed remote cancellation, a link that belongs to another tenant) are decisions about one record's evidence, not exhausted retries, and are unchanged.
+
+**Exit status.** A systemic pass is a **failed** cron run (HTTP 500), not a quiet green one. Every attempt in it failed, the run-log and monitoring read the exit status, and handling an outage gracefully is not a reason to report success. Skipped and held keep their meaning (a deliberate no-op, and the outbound-write hold). The order-push result carries `systemicSuppressed`, which the cron mapping reads as a failure; the dispatch result carries the same field and its error count already fails the run. The verdict is also written as a `WmsSyncLog` error row on the dispatch job so it is queryable.
+
+No feature flag: behaviour changes only on a pass where records failed, and the breaker fails toward the previous behaviour.
+
 ## Producer-Side Hold For Mintsoft (before the grant, and after it)
 
 The outbound-write grant (`MINTSOFT_WRITE_ALLOWED`) is the transport's permission. A second, earlier check decides whether IMS should PRODUCE a Mintsoft write at all. It is off by default; when `PRODUCER_HOLD_ENFORCED_DESTINATIONS` names `mintsoft`, a write is produced only once both the grant and `MINTSOFT_WRITES_LIVE_FROM` are in force and the ownership map says IMS owns that operation (IMS owns `mintsoft.order.amend` from the live phase, judged on the time of the change being propagated, not on when the order was paid, so an order the bridge created is amended once it is changed after the live-from instant, while a change made before it stays a shadow; only an order create is limited to orders paid from the live-from instant; ASNs and order notes are done by hand in Mintsoft until then). See "Producer-side hold" in the installation guide for the variables. Until then every Mintsoft write IMS would have made is kept as a *shadow record* in `outbound_shadow_writes` (destination `mintsoft`, operation, the order or product, how many times it was produced) and nothing is claimed, queued or sent.

@@ -820,6 +820,54 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {data.systemicFailures.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`WMS connector-wide failure (${data.summary.systemicFailures})`}
+            detail={
+              'Most of what a sync pass tried failed at once, so the sweep read it as a CONNECTOR fault rather than '
+              + 'broken orders: it parked nothing and every order stays eligible to recover by itself once the fault '
+              + 'is fixed. Nothing here needs replaying. This row clears on the first pass that works. If it lasts '
+              + 'more than a few passes the sweep gives up and isolates the exhausted orders one by one as usual; '
+              + 'they then appear in the sections above.'
+            }
+            shown={data.systemicFailures.length}
+            total={data.summary.systemicFailures}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[820px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Sweep</TableHead>
+                <TableHead>Connector</TableHead>
+                <TableHead>Since</TableHead>
+                <TableHead>Failed in the last pass</TableHead>
+                <TableHead>Passes</TableHead>
+                <TableHead>State</TableHead>
+                <TableHead>What the WMS said</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.systemicFailures.map((row) => (
+                <TableRow key={`${row.connector}:${row.sweep}`}>
+                  <TableCell className="text-xs font-medium">{row.label}</TableCell>
+                  <TableCell className="text-xs">{row.connector}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.openedAt)}</TableCell>
+                  <TableCell className="text-xs">
+                    {row.failed} of {row.attempted}
+                    {row.exhausted > 0 ? <span className="text-muted-foreground"> ({row.exhausted} out of retries)</span> : null}
+                  </TableCell>
+                  <TableCell className="text-xs">{row.consecutive}</TableCell>
+                  <TableCell className="text-xs">{row.isolating ? 'Isolating one by one again' : 'Nothing parked'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>
+                    {row.reason ?? '—'}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
       {data.unresolvedDrift.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading

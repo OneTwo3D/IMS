@@ -71,6 +71,7 @@ test('the run-time-built families are prefixes something actually builds', () =>
   const builders: Record<string, string> = {
     'wms_dispatch_unresolved_drift:': 'lib/domain/wms/dispatch-sweep.ts',
     'wms_dispatch_unresolved_streak:': 'lib/domain/wms/unresolved-drift.ts',
+    'wms_systemic_failure:': 'lib/domain/wms/systemic-failure-store.ts',
   }
 
   assert.deepEqual([...RESERVED_SETTING_KEY_PREFIXES].sort(), Object.keys(builders).sort())
