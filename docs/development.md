@@ -32,11 +32,15 @@ Inventory and accounting behavior changes must include focused tests. Keep serve
 
 Every stage or production deploy cuts a version. Before deploying, open a small PR against `development` that:
 
-1. Turns the `## Unreleased` section of `CHANGELOG.md` into `## x.y.z - YYYY-MM-DD` and leaves a fresh empty `## Unreleased` above it. Choose the version by the scheme in the changelog header: `x` for a breaking change (anything an operator must act on), `y` for user-facing non-breaking changes, `z` for backend-only changes. For a breaking release, add a short `### Operator actions (breaking)` list directly under the heading.
+1. Moves every fragment in `changelog.d/` (one file per merged PR, see `changelog.d/README.md`) into the `## Unreleased` section of `CHANGELOG.md` in merge order and deletes the fragment files. It then turns that section into `## x.y.z - YYYY-MM-DD` and leaves a fresh empty `## Unreleased` above it. Choose the version by the scheme in the changelog header: `x` for a breaking change (anything an operator must act on), `y` for user-facing non-breaking changes, `z` for backend-only changes. For a breaking release, add a short `### Operator actions (breaking)` list directly under the heading.
 2. Adds a `RELEASES[0]` entry in `lib/releases.ts` (version, date, title, summary, `userMessage`, `userHighlights`, `technicalHighlights`), following the previous entry's shape. Say "built, switched off" for anything behind a flag. Keep customer names and other personal data out of the notes.
 3. Sets the same version in `package.json` and in both places in `package-lock.json` (the top-level `version` and `packages[""].version`), by hand rather than with `npm install`.
 
 Run `npx tsx --test tests/ops/releases.test.ts tests/ops/readiness-gate-docs.test.ts` with the usual gates, merge, then deploy that merged commit. System > Releases reads `RELEASES`, so the new version shows there after the deploy.
+
+## Changelog entries
+
+A PR records its changelog entry as a new file in `changelog.d/`, not as an edit to `CHANGELOG.md`. Open PRs then never conflict on the changelog. The release cut collects the fragments (see `changelog.d/README.md`).
 
 ## Documentation Updates
 
