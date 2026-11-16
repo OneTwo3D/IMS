@@ -188,6 +188,7 @@ Open it from the banner, or go to `/sync/exceptions` (**Integrations > Open the 
 - **Replay** re-attempts the original work with its original payload and idempotency keys preserved. A replay of an order that has a withdrawal standing against it runs the same check and holds it back again.
 - **Dismiss** clears an exception IMS cannot or should not retry (for example a cancelled order that was never dispatched). Read the row's hint first; anything already despatched is handled as a return.
 - Replay and similar actions may ask you to **Confirm it's you**.
+- A **WMS connector-wide failure** row is not an order to act on. It means most of a sync pass failed at once, so IMS parked nothing and is retrying everything; fix the connection (see [Warehouse (Mintsoft)](warehouse.md)) and it clears itself.
 - Items that stay in the inbox are real unfinished work. Do not clear them just to empty the list.
 
 ### Event Timeline
