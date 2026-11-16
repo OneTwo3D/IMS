@@ -41,33 +41,121 @@ export class XeroRoundingAccountMissingError extends Error {
   }
 }
 
-type PricedLine = { quantity: number; unitAmount: number }
+type PricedLine = { quantity: number; unitAmount: number; discountAmount?: number | null }
 
 /** The Quantity and 4dp UnitAmount a line is sent with. The quantity is the IMS quantity, untouched. */
 export function xeroUnitDpFields(quantity: number, unitAmount: number): { Quantity: number; UnitAmount: number } {
   return { Quantity: quantity, UnitAmount: roundQuantity(unitAmount, XERO_UNIT_DP).toNumber() }
 }
 
-/** What the IMS lines total, less what Xero will total them to at unitdp=4 (each line rounded to 2dp, as Xero does). Zero when 4dp reproduces every line. */
+/** A line's discount as the connector sends it (DiscountAmount, whole pennies). */
+const sentDiscount = (l: { discountAmount?: number | null }): Decimal =>
+  l.discountAmount && l.discountAmount > 0 ? toDecimal(Math.round(l.discountAmount * 100) / 100) : toDecimal(0)
+
+/** What the IMS lines total, less what Xero will total them to at unitdp=4 (each line rounded to 2dp, as Xero does). Zero when 4dp reproduces every line. The LINE AMOUNTS only: tax is `planXeroRoundingLine`'s business. */
 export function unitDpLineGap(lines: readonly PricedLine[]): Decimal {
   let gap = toDecimal(0)
   for (const l of lines) {
     const q = toDecimal(l.quantity)
-    const intended = roundQuantity(q.mul(toDecimal(l.unitAmount)), 2)
-    const asXeroSees = roundQuantity(q.mul(roundQuantity(l.unitAmount, XERO_UNIT_DP)), 2)
+    const d = sentDiscount(l)
+    const intended = roundQuantity(q.mul(toDecimal(l.unitAmount)).sub(d), 2)
+    const asXeroSees = roundQuantity(q.mul(roundQuantity(l.unitAmount, XERO_UNIT_DP)).sub(d), 2)
     gap = gap.add(intended.sub(asXeroSees))
   }
   return gap
 }
 
-/** The rounding line, or null when there is no gap. THROWS when there is a gap and no account: no document with a total that differs from the order. */
-export function xeroUnitDpRoundingLine(
-  lines: readonly PricedLine[], account: string | null | undefined, what: string,
-): Record<string, unknown> | null {
-  const gap = unitDpLineGap(lines)
-  if (gap.isZero()) return null
-  if (!account || !account.trim()) throw new XeroRoundingAccountMissingError(what, gap.toFixed(2))
-  return { Description: 'Rounding adjustment', Quantity: 1, UnitAmount: gap.toNumber(), AccountCode: account.trim(), TaxType: 'NONE' }
+/**
+ * THE XERO TAX MODEL USED TO PREDICT A DOCUMENT TOTAL. `rateOf` gives the effective percentage of a Xero tax type (null: not known).
+ * NONE is always 0. Everything else comes from the stored Xero tax-rate list (tax-rate-lookup.ts), never from a guess.
+ */
+export type XeroTaxRateOf = (taxType: string) => number | null
+
+/** One line as Xero sees it: Quantity x UnitAmount (less DiscountAmount), the TaxType it is taxed on. */
+export type XeroTotalLine = { quantity: number; unitAmount: number; taxType?: string | null; discountAmount?: number | null }
+
+/** Why a document's total cannot be predicted or reconciled. Operator-facing; nothing was sent. */
+export class XeroRoundingUnreconcilableError extends Error {
+  constructor(what: string, why: string) {
+    super(`${what} cannot be posted: ${why} Nothing was sent, because a document whose total differs from the order's cannot be settled by a full payment.`)
+    this.name = 'XeroRoundingUnreconcilableError'
+  }
+}
+
+type Predicted = { ok: true; total: Decimal } | { ok: false; why: string }
+
+/**
+ * THE TOTAL XERO WILL HOLD FOR A DOCUMENT, computed the way Xero computes it. Per line: LineAmount = round2(Quantity x UnitAmount - DiscountAmount).
+ * Tax is PER LINE and rounded to 2dp, for both line-amount types: Exclusive adds round2(LineAmount x rate) to the total; Inclusive carves
+ * round2(LineAmount - LineAmount / (1 + rate)) out of the LineAmount, so the total is the sum of the line amounts and no rate is needed.
+ * A rate that is not known (not in the stored list, or a multi-component type this model does not carry) makes an Exclusive total unpredictable.
+ */
+export function predictXeroDocumentTotal(lines: readonly XeroTotalLine[], inclusive: boolean, rateOf: XeroTaxRateOf | undefined): Predicted {
+  let total = toDecimal(0)
+  for (const l of lines) {
+    const amount = roundQuantity(toDecimal(l.quantity).mul(toDecimal(l.unitAmount)).sub(sentDiscount(l)), 2)
+    total = total.add(amount)
+    if (inclusive) continue
+    const type = (l.taxType ?? '').trim()
+    const rate = type === 'NONE' ? 0 : type === '' ? null : (rateOf?.(type) ?? null)
+    if (rate === null) return { ok: false, why: `the tax rate of ${type === '' ? 'a line with no tax type' : `tax type ${type}`} is not known (it is not in the stored Xero tax-rate list, or it has several components), so the tax Xero will compute cannot be predicted.` }
+    total = total.add(roundQuantity(amount.mul(toDecimal(rate)).div(100), 2))
+  }
+  return { ok: true, total }
+}
+
+export type XeroRoundingPlanInput = {
+  /** The IMS priced lines (full-precision unit amounts), in the order they are sent. */
+  lines: readonly (PricedLine & { taxType?: string | null })[]
+  /** The lines sent as they are on both sides (shipping, order discount): they carry no unit-price loss and change nothing. */
+  extraLines?: readonly XeroTotalLine[]
+  lineAmountsIncludeTax: boolean
+  rateOf?: XeroTaxRateOf
+  account: string | null | undefined
+  what: string
+}
+
+/** The most the adjustment can legitimately be: what 4dp can lose on each line (0.00005 per unit, with tax) plus two minor units of per-line rounding. Anything past it is not a rounding difference. */
+function adjustmentCap(input: XeroRoundingPlanInput): Decimal {
+  let cap = toDecimal(0)
+  for (const l of input.lines) {
+    const type = (l.taxType ?? '').trim()
+    const rate = input.lineAmountsIncludeTax || type === 'NONE' ? 0 : (input.rateOf?.(type) ?? 0)
+    cap = cap.add(toDecimal(Math.abs(l.quantity)).mul('0.00005').mul(toDecimal(1).add(toDecimal(rate).div(100)))).add('0.02')
+  }
+  return cap
+}
+
+/**
+ * THE ROUNDING ADJUSTMENT, sized from the whole document. The IMS total and Xero's predicted total are both worked out per line, with tax (see
+ * `predictXeroDocumentTotal`); the adjustment is the difference, posted on the Rounding account with tax type NONE so its own tax is zero. The document
+ * is then predicted AGAIN with the adjustment line in it, and must equal the IMS total exactly: if it does not, or if the figures cannot be
+ * predicted at all, or the adjustment is larger than 4dp can account for, this THROWS and nothing is posted.
+ * Returns null when Xero's total already equals the IMS total (no account is needed then).
+ */
+export function planXeroRoundingLine(input: XeroRoundingPlanInput): Record<string, unknown> | null {
+  const { lines, extraLines = [], lineAmountsIncludeTax: inclusive, rateOf, what } = input
+  if (unitDpLineGap(lines).isZero()) return null
+  const toTotalLine = (l: PricedLine & { taxType?: string | null }, unit: number): XeroTotalLine => ({ quantity: l.quantity, unitAmount: unit, taxType: l.taxType, discountAmount: l.discountAmount })
+  const imsSide = [...lines.map((l) => toTotalLine(l, l.unitAmount)), ...extraLines]
+  const xeroSide = [...lines.map((l) => toTotalLine(l, xeroUnitDpFields(l.quantity, l.unitAmount).UnitAmount)), ...extraLines]
+  const ims = predictXeroDocumentTotal(imsSide, inclusive, rateOf)
+  const xero = predictXeroDocumentTotal(xeroSide, inclusive, rateOf)
+  if (!ims.ok) throw new XeroRoundingUnreconcilableError(what, ims.why)
+  if (!xero.ok) throw new XeroRoundingUnreconcilableError(what, xero.why)
+  const adjustment = roundQuantity(ims.total.sub(xero.total), 2)
+  if (adjustment.isZero()) return null
+  if (adjustment.abs().gt(adjustmentCap(input))) {
+    throw new XeroRoundingUnreconcilableError(what, `Xero would total it ${xero.total.toFixed(2)} against the order's ${ims.total.toFixed(2)}, a difference of ${adjustment.toFixed(2)} that four-decimal unit prices and per-line tax rounding cannot explain.`)
+  }
+  const account = input.account?.trim() ?? ''
+  if (!account) throw new XeroRoundingAccountMissingError(what, adjustment.toFixed(2))
+  const line = { Description: 'Rounding adjustment', Quantity: 1, UnitAmount: adjustment.toNumber(), AccountCode: account, TaxType: 'NONE' }
+  const after = predictXeroDocumentTotal([...xeroSide, { quantity: 1, unitAmount: line.UnitAmount, taxType: 'NONE' }], inclusive, rateOf)
+  if (!after.ok || !after.total.eq(ims.total)) {
+    throw new XeroRoundingUnreconcilableError(what, `with a rounding adjustment of ${adjustment.toFixed(2)} Xero would still total it ${after.ok ? after.total.toFixed(2) : 'differently'} against the order's ${ims.total.toFixed(2)}.`)
+  }
+  return line
 }
 
 /**

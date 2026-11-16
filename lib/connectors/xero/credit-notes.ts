@@ -6,7 +6,7 @@ import { withSalesInvoiceAuthorization, type BeforeRemoteWrite, type ContactGate
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
 import { xeroGet, xeroPost, xeroPut } from './api'
-import { assertXeroLineQuantitiesKept, xeroUnitDpFields, xeroUnitDpRoundingLine } from './write-path'
+import { assertXeroLineQuantitiesKept, planXeroRoundingLine, xeroUnitDpFields, type XeroTaxRateOf } from './write-path'
 import { resolveUnitDpRoundingAccount } from './unit-dp-rounding'
 import { findOrCreateContact } from './contacts'
 import { foreignCurrencyRateProblem, xeroCurrencyRateOrRefuse } from './fx'
@@ -85,7 +85,7 @@ export async function pushCreditNote(
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}`,
   })
   if (rateProblem) return { success: false, error: rateProblem }
-  const rounding = await resolveUnitDpRoundingAccount(data.lines, `Credit note ${data.creditNoteNumber ?? '(no number)'}`)
+  const rounding = await resolveUnitDpRoundingAccount({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), what: `Credit note ${data.creditNoteNumber ?? '(no number)'}` })
   if (!rounding.ok) return { success: false, error: rounding.error }
 
   // Find or create the contact
@@ -124,7 +124,7 @@ export async function pushCreditNote(
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
     return xeroLine
   })
-  const roundingLine = xeroUnitDpRoundingLine(data.lines, rounding.account, `Credit note ${data.creditNoteNumber ?? '(no number)'}`)
+  const roundingLine = planXeroRoundingLine({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), account: rounding.account, rateOf: rounding.rateOf, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}` })
   if (roundingLine) lineItems.push(roundingLine)
   assertXeroLineQuantitiesKept(data.lines, lineItems)
 
@@ -169,6 +169,8 @@ export function buildXeroPurchaseCreditNote(
   baseCurrency: string,
   /** The Rounding account the unitdp=4 penny posts to; required only when the lines need one. */
   roundingAccount?: string | null,
+  /** The effective rate of a Xero tax type, to predict the document's total with tax; needed only when the lines need a rounding adjustment. */
+  taxRateOf?: XeroTaxRateOf,
 ): Record<string, unknown> {
   // No default tax type: a line with none is refused, an explicit NONE only where the line names why (lib/domain/accounting/purchase-document-tax-types.ts).
   const taxTypeRefusal = purchaseDocumentTaxTypeRefusal(`Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`, data)
@@ -187,7 +189,7 @@ export function buildXeroPurchaseCreditNote(
       if (line.itemCode) xeroLine.ItemCode = line.itemCode
       return xeroLine
   })
-  const roundingLine = xeroUnitDpRoundingLine(data.lines, roundingAccount, `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`)
+  const roundingLine = planXeroRoundingLine({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), account: roundingAccount, rateOf: taxRateOf, what: `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}` })
   if (roundingLine) lineItems.push(roundingLine)
   assertXeroLineQuantitiesKept(data.lines, lineItems)
   const creditNote: Record<string, unknown> = {
@@ -438,7 +440,7 @@ export async function pushPurchaseCreditNote(
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`,
   })
   if (rateProblem) return { success: false, error: rateProblem }
-  const rounding = await resolveUnitDpRoundingAccount(data.lines, `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}`)
+  const rounding = await resolveUnitDpRoundingAccount({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), what: `Supplier credit note ${data.creditNoteNumber ?? '(no number)'}` })
   if (!rounding.ok) return { success: false, error: rounding.error }
 
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, true, { supplierId: opts.supplierId })
@@ -467,7 +469,7 @@ export async function pushPurchaseCreditNote(
     return { success: true, creditNoteId: decision.creditNoteId, adopted: true, error: undefined }
   }
 
-  const creditNote = buildXeroPurchaseCreditNote(data, status, contactResult.contactId, baseCurrency, rounding.account)
+  const creditNote = buildXeroPurchaseCreditNote(data, status, contactResult.contactId, baseCurrency, rounding.account, rounding.rateOf)
   const res = await xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote, { idempotencyKey: opts.idempotencyKey })
   if (!res.ok || !res.data?.CreditNotes?.length) {
     return { success: false, error: res.error ?? 'Failed to create purchase credit note' }
