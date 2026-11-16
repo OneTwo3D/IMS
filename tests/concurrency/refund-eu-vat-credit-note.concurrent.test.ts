@@ -166,6 +166,11 @@ async function creditNoteRow(db: Db, orderId: string) {
 function normalise(payload: Record<string, unknown>, fx: Fixture): string {
   const { contactName: _c, contactEmail: _e, date: _d, creditNoteNumber: _n, reference: _r, _idempotencyKey: _k, ...rest } = payload
   void [_c, _e, _d, _n, _r, _k]
+  // refundLineId and taxRatePosted (o3d-hqvrp.374) are line facts IMS keeps for the customer PDF; the Xero
+  // mapper never sends them, so they are not part of the EU VAT byte-identity claim and are left out here.
+  if (Array.isArray(rest.lines)) {
+    rest.lines = (rest.lines as Record<string, unknown>[]).map(({ refundLineId: _l, taxRatePosted: _t, ...line }) => { void [_l, _t]; return line })
+  }
   return JSON.stringify(rest).split(fx.rate.id).join('RATE').replace(/DE_CHARGED_[0-9a-f]{8}/g, 'CHARGED')
 }
 

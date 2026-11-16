@@ -84,6 +84,7 @@ test('a net (storefront) order adds the VAT before the Total and reconciles', ()
 
 test("a draft credit note's rows add up to its total, at each line's own rate", () => {
   const { rows, rounding, total } = draftCreditNoteModel({
+    currency: 'GBP',
     orderTaxRatePercent: 0.2,
     orderLines: [{ id: 'l1', qty: 1, unitPriceForeign: 10, discountAmount: 0, totalForeign: 10, taxForeign: 2, taxRatePercent: 0.2 }],
     refundLines: [
@@ -96,22 +97,24 @@ test("a draft credit note's rows add up to its total, at each line's own rate", 
   assert.equal(rounding, null)
 })
 
-test('two 0.005 lines: the printed rows plus an explicit Rounding row sum to the printed total', () => {
+test('two 0.005 lines: each posts as 0.01 (Xero rounds the line amount), so the rows sum to the total with no Rounding row', () => {
   const { rows, rounding, total } = postedCreditNoteModel({
+    currency: 'GBP',
     payloadLines: [{ description: 'A', quantity: 1, unitAmount: 0.005 }, { description: 'B', quantity: 1, unitAmount: 0.005 }],
     lineAmountsIncludeTax: false,
     vatIsOwnLine: false,
     rateOf: () => 0,
   })
   assert.deepEqual(rows.map((r) => r.gross), [0.01, 0.01])
-  assert.deepEqual(total, { net: 0.01, vat: 0, gross: 0.01 })
-  assert.deepEqual(rounding, { net: -0.01, vat: 0, gross: -0.01 })
+  assert.deepEqual(total, { net: 0.02, vat: 0, gross: 0.02 })
+  assert.equal(rounding, null)
   const sum = (k: 'net' | 'vat' | 'gross') => Math.round((rows.reduce((s, r) => s + r[k], 0) + (rounding?.[k] ?? 0)) * 100) / 100
   assert.deepEqual({ net: sum('net'), vat: sum('vat'), gross: sum('gross') }, total)
 })
 
 test('a posted credit note prints its payload lines as queued, whatever the current rates; a scheme credit note carries its VAT as its own line', () => {
   const plain = postedCreditNoteModel({
+    currency: 'GBP',
     payloadLines: [{ description: 'Widget', quantity: 2, unitAmount: 10 }],
     lineAmountsIncludeTax: false,
     vatIsOwnLine: false,
@@ -119,6 +122,7 @@ test('a posted credit note prints its payload lines as queued, whatever the curr
   })
   assert.deepEqual(plain.total, { net: 20, vat: 4, gross: 24 })
   const scheme = postedCreditNoteModel({
+    currency: 'GBP',
     payloadLines: [{ description: 'Widget', quantity: 1, unitAmount: 10 }, { description: 'VAT', quantity: 1, unitAmount: 1.9, noTaxKind: 'eu-vat-recovery' }],
     lineAmountsIncludeTax: false,
     vatIsOwnLine: true,
@@ -129,6 +133,7 @@ test('a posted credit note prints its payload lines as queued, whatever the curr
   assert.equal(scheme.rounding, null)
   // a fee on NONE and a rounding-difference line stay net lines of their own kind
   const kinds = postedCreditNoteModel({
+    currency: 'GBP',
     payloadLines: [{ description: 'Fee', quantity: 1, unitAmount: 2, noTaxKind: 'fee-no-tax' }, { description: 'Rounding', quantity: 1, unitAmount: 0.01, noTaxKind: 'rounding-difference' }],
     lineAmountsIncludeTax: false,
     vatIsOwnLine: true,

@@ -7,6 +7,7 @@ import {
   getReorderReport,
   type ReplenishmentReportClient,
 } from '@/lib/domain/inventory/replenishment-reports'
+import { selectReorderPoCandidates } from '@/lib/domain/purchasing/reorder-po-planning'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 function decimal(value: string | number): Prisma.Decimal {
@@ -110,6 +111,150 @@ test('reorder report nets available and inbound open PO against lead-time demand
   assert.equal(report.rows[0]?.suggestedReorderQty, '62')
   assert.equal(report.rows[0]?.leadTimeDays, 10)
   assert.equal(report.rows[0]?.urgency, 'reorder')
+  // Opening 3 is at or below safety stock 5, so receipt was already required today and the PO is overdue.
+  assert.equal(report.rows[0]?.timingBasis, 'already_below')
+  assert.equal(report.rows[0]?.requiredReceiptDate, '2026-06-01')
+  assert.equal(report.rows[0]?.latestPoDate, '2026-05-22')
+  assert.equal(report.rows[0]?.latestPoOverdue, true)
+})
+
+test('reorder timing steps dated open POs in, excludes undated ones and says so (o3d-s8n.2)', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('10'), leadTimeDays: 10,
+        category, preferredSupplier: null,
+        supplierProducts: [{ supplierId: 'supplier-1', supplierSku: 'S1', lastUnitCost: decimal('2'), leadTimeDays: 10, supplier }],
+      }, {
+        id: 'product-2', sku: 'SKU-2', name: 'Idle', type: ProductType.SIMPLE, stockUnit: 'pcs',
+        reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('0'), leadTimeDays: 10,
+        category, preferredSupplier: null, supplierProducts: [],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('100'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+        { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('5'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+      ],
+    },
+    stockMovement: {
+      findMany: async () => [{
+        productId: 'product-1', qty: decimal('90'), totalValueBase: decimal('180'), createdAt: new Date('2026-05-20T12:00:00.000Z'),
+        product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
+      }],
+    },
+    purchaseOrderLine: {
+      findMany: async () => [
+        { productId: 'product-1', qty: decimal('50'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), po: { supplierId: 'supplier-1', expectedDelivery: new Date('2026-06-21T00:00:00.000Z'), destinationWarehouseId: 'warehouse-1', supplier } },
+        { productId: 'product-1', qty: decimal('30'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), po: { supplierId: 'supplier-1', expectedDelivery: null, destinationWarehouseId: 'warehouse-1', supplier } },
+      ],
+    },
+  }
+
+  const report = await getReorderReport(
+    { thresholdDays: 90, includeZero: true },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+  const widget = report.rows.find((row) => row.sku === 'SKU-1')
+  // Demand 1/day, opening 100, +50 on day 20 (dated), +30 undated is NOT counted: 150 - k <= 10 at k = 140.
+  assert.equal(widget?.inboundOpenPoQty, '80')
+  assert.equal(widget?.timingBasis, 'projected')
+  assert.equal(widget?.requiredReceiptDate, '2026-10-19')
+  assert.equal(widget?.latestPoDate, '2026-10-09')
+  assert.equal(widget?.latestPoOverdue, false)
+  assert.equal(widget?.firstShortageDate, '2026-10-29')
+  // No demand keeps the row visible with null dates.
+  const idle = report.rows.find((row) => row.sku === 'SKU-2')
+  assert.equal(idle?.timingBasis, 'no_demand')
+  assert.equal(idle?.latestPoDate, null)
+  assert.equal(idle?.requiredReceiptDate, null)
+  assert.ok(report.notices.some((notice) => /1 row\(s\) have open PO quantity with no expected delivery date/.test(notice)))
+})
+
+test('reorder timing: a late PO is not assured stock, a PO due today is (o3d-s8n.2 review)', async () => {
+  const mk = (id: string, sku: string) => ({
+    id, sku, name: sku, type: ProductType.SIMPLE, stockUnit: 'pcs',
+    reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('20'), leadTimeDays: 5,
+    category, preferredSupplier: null,
+    supplierProducts: [{ supplierId: 'supplier-1', supplierSku: sku, lastUnitCost: decimal('2'), leadTimeDays: 5, supplier }],
+  })
+  const level = (productId: string) => ({ productId, warehouseId: 'warehouse-1', quantity: decimal('15'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } })
+  const sale = (productId: string, sku: string) => ({
+    productId, qty: decimal('900'), totalValueBase: decimal('1800'), createdAt: new Date('2026-05-20T12:00:00.000Z'),
+    product: { sku, name: sku, category, supplierProducts: [{ supplier }] },
+  })
+  const poLine = (productId: string, expected: string) => ({
+    productId, qty: decimal('500'), qtyReceived: decimal('0'), qtyReturned: decimal('0'),
+    po: { supplierId: 'supplier-1', expectedDelivery: new Date(expected), destinationWarehouseId: 'warehouse-1', supplier },
+  })
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: { findMany: async () => [mk('late', 'LATE'), mk('today', 'TODAY')] },
+    stockLevel: { findMany: async () => [level('late'), level('today')] },
+    stockMovement: { findMany: async () => [sale('late', 'LATE'), sale('today', 'TODAY')] },
+    purchaseOrderLine: { findMany: async () => [poLine('late', '2026-05-25T00:00:00.000Z'), poLine('today', '2026-06-01T00:00:00.000Z')] },
+  }
+  const report = await getReorderReport(
+    { thresholdDays: 90, includeZero: true },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+  const late = report.rows.find((row) => row.sku === 'LATE')
+  // Opening 15 <= safety 20; the 500 PO is a week overdue and not assured: stays overdue.
+  assert.equal(late?.timingBasis, 'already_below')
+  assert.equal(late?.latestPoOverdue, true)
+  assert.equal(late?.lateInboundQty, '500')
+  assert.equal(late?.lateInboundDueDate, '2026-05-25')
+  const today = report.rows.find((row) => row.sku === 'TODAY')
+  // 515 on day 0 clears safety stock: projected, not overdue, nothing late.
+  assert.equal(today?.timingBasis, 'projected')
+  assert.equal(today?.latestPoOverdue, false)
+  assert.equal(today?.lateInboundQty, '0')
+  assert.ok(report.notices.some((notice) => /1 row\(s\) have open PO quantity past its expected delivery date/.test(notice)))
+})
+
+test('default report keeps an overdue row covered only by a late PO: quantity 0, flagged, urgent, never drafted', async () => {
+  const product = (id: string, sku: string) => ({
+    id, sku, name: sku, type: ProductType.SIMPLE, stockUnit: 'pcs',
+    reorderPoint: null, reorderQty: decimal('12'), safetyStockQty: decimal('20'), leadTimeDays: 5,
+    category, preferredSupplier: null,
+    supplierProducts: [{ supplierId: 'supplier-1', supplierSku: sku, lastUnitCost: decimal('2'), leadTimeDays: 5, supplier }],
+  })
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: { findMany: async () => [product('late', 'LATE'), product('fine', 'FINE')] },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'late', warehouseId: 'warehouse-1', quantity: decimal('15'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+        { productId: 'fine', warehouseId: 'warehouse-1', quantity: decimal('5000'), reservedQty: decimal('0'), warehouse: { code: 'WH1', name: 'Main' } },
+      ],
+    },
+    stockMovement: {
+      findMany: async () => ['late', 'fine'].map((productId) => ({
+        productId, qty: decimal('900'), totalValueBase: decimal('1800'), createdAt: new Date('2026-05-20T12:00:00.000Z'),
+        product: { sku: productId, name: productId, category, supplierProducts: [{ supplier }] },
+      })),
+    },
+    purchaseOrderLine: {
+      findMany: async () => [{
+        productId: 'late', qty: decimal('500'), qtyReceived: decimal('0'), qtyReturned: decimal('0'),
+        po: { supplierId: 'supplier-1', expectedDelivery: new Date('2026-05-25T00:00:00.000Z'), destinationWarehouseId: 'warehouse-1', supplier },
+      }],
+    },
+  }
+  // No includeZero: the default view.
+  const report = await getReorderReport({ thresholdDays: 90 }, { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } })
+  assert.deepEqual(report.rows.map((row) => row.sku), ['LATE']) // FINE (healthy, nothing late) stays hidden
+  const row = report.rows[0]
+  assert.equal(row.suggestedReorderQty, '0') // on order, only late: not re-ordered
+  assert.equal(row.latestPoOverdue, true)
+  assert.equal(row.lateInboundQty, '500')
+  assert.equal(row.urgency, 'reorder') // overdue is urgent even at quantity 0
+  assert.match(row.reorderNote ?? '', /late PO/i)
+  const { bySupplier, skipped } = selectReorderPoCandidates(report.rows, ['late'])
+  assert.equal(bySupplier.size, 0)
+  assert.deepEqual(skipped.map((entry) => entry.reason), ['no_positive_qty'])
 })
 
 test('reorder demand is scoped to the filtered warehouse, like the stock it is compared against (o3d-s8n.1)', async () => {

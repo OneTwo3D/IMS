@@ -19,6 +19,7 @@ import { getForecastSettings } from '@/app/actions/forecasting'
 import { HistoricalImportTrigger } from './historical-import-trigger'
 import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-context'
 import { parseSelectedParam } from '@/lib/analytics/reorder-selection'
+import { ReorderCoverageProvider, ReorderCoverageWeeksCell, ReorderOrderQtyCell } from './reorder-coverage-cells'
 import { ReorderSelectAllCheckbox, ReorderRowCheckbox } from './reorder-selection-checkboxes'
 import {
   StockPositionReportPage,
@@ -74,6 +75,48 @@ const ABC_BADGE: Record<ReorderReportRow['abcClass'], string> = {
   C: 'bg-gray-100 text-gray-600 border-gray-200',
 }
 
+const MUTED_DASH = '\u2014'
+
+/** Latest PO date with a red Overdue badge, or an em dash and a muted reason when no date exists. */
+function LatePoBadge({ row }: { row: ReorderReportRow }) {
+  if (Number(row.lateInboundQty) <= 0) return null
+  return (
+    <span className="mt-0.5 block w-fit rounded border border-amber-200 bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800" title="Open PO quantity past its expected delivery date. Not counted in the dates here until it is received or re-dated.">
+      Late PO: {row.lateInboundQty} due {row.lateInboundDueDate}
+    </span>
+  )
+}
+
+function LatestPoDateCell({ row }: { row: ReorderReportRow }) {
+  return (
+    <div>
+      <LatestPoDateText row={row} />
+      <LatePoBadge row={row} />
+      {row.reorderNote ? <span className="mt-0.5 block max-w-[16rem] text-[11px] text-amber-800">{row.reorderNote}</span> : null}
+    </div>
+  )
+}
+
+function LatestPoDateText({ row }: { row: ReorderReportRow }) {
+  if (row.latestPoDate == null) {
+    return (
+      <span className="text-muted-foreground" title={row.timingBasis === 'no_demand' ? 'No sales demand, so no run-out date' : `No depletion within ${PROJECTION_HORIZON_LABEL}`}>
+        {MUTED_DASH} <span className="text-[10px]">{row.timingBasis === 'no_demand' ? 'no demand' : 'beyond horizon'}</span>
+      </span>
+    )
+  }
+  return (
+    <span className={row.latestPoOverdue ? 'font-medium text-red-700' : undefined}>
+      {row.latestPoDate}
+      {row.latestPoOverdue ? (
+        <span className="ml-1.5 inline-flex items-center rounded border border-red-200 bg-red-100 px-1.5 py-0.5 text-[10px] font-bold text-red-800">Overdue</span>
+      ) : null}
+    </span>
+  )
+}
+
+const PROJECTION_HORIZON_LABEL = '365 days'
+
 function urgencyLabel(urgency: ReorderReportRow['urgency']): string {
   return urgency === 'critical' ? 'Critical' : urgency === 'reorder' ? 'Reorder' : 'Watch'
 }
@@ -115,7 +158,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       render: (row) => <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />,
       footer: 'Totals',
     },
-    { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName ?? 'Unassigned' },
+    { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName ?? <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800" title="No supplier is set, so a draft PO cannot be raised for this row">Unassigned</span> },
     { key: 'neededFor', label: 'Needed for', render: (row) => row.neededFor.join(', ') },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'abcClass', label: 'ABC', render: (row) => <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-bold ${ABC_BADGE[row.abcClass]}`}>{row.abcClass}</span> },
@@ -124,8 +167,22 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'inbound', label: 'Inbound PO', align: 'right', render: (row) => row.inboundOpenPoQty, footer: report.totals.inboundOpenPoQty },
     { key: 'demand', label: 'Daily demand', align: 'right', render: (row) => row.averageDailyDemand },
     { key: 'leadTime', label: 'Lead time', align: 'right', render: (row) => `${row.leadTimeDays} days` },
+    { key: 'latestPoDate', label: 'Latest PO date', render: (row) => <LatestPoDateCell row={row} /> },
+    { key: 'requiredReceipt', label: 'Required receipt', render: (row) => row.requiredReceiptDate ?? MUTED_DASH },
     { key: 'reorderPoint', label: 'Reorder point', align: 'right', render: (row) => row.reorderPoint },
     { key: 'suggested', label: 'Suggested qty', align: 'right', render: (row) => row.suggestedReorderQty, footer: report.totals.suggestedReorderQty },
+    {
+      key: 'orderQty',
+      label: 'Order qty',
+      align: 'right',
+      render: (row) => <ReorderOrderQtyCell productId={row.productId} suggestedQty={row.suggestedReorderQty} averageDailyDemand={row.averageDailyDemand} label={row.sku} />,
+    },
+    {
+      key: 'coverageWeeks',
+      label: 'Coverage weeks',
+      align: 'right',
+      render: (row) => <ReorderCoverageWeeksCell productId={row.productId} suggestedQty={row.suggestedReorderQty} averageDailyDemand={row.averageDailyDemand} label={row.sku} />,
+    },
     { key: 'urgency', label: 'Status', render: (row) => urgencyLabel(row.urgency) },
   ]
 
@@ -155,6 +212,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
   return (
     <div className="space-y-3">
       <ReorderSelectionProvider visibleIds={visibleProductIds} initialSelected={initialSelected}>
+      <ReorderCoverageProvider>
       <ReorderActionsToolbar rows={toolbarRows} filters={actionFilters} />
     <StockPositionReportPage
       title="Reorder Planning"
@@ -221,6 +279,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
         cell: (row) => <ReorderRowCheckbox productId={row.productId} label={row.sku} />,
       }}
     />
+      </ReorderCoverageProvider>
       </ReorderSelectionProvider>
     </div>
   )
