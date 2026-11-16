@@ -69,6 +69,8 @@ mock.module('@/lib/db', {
 })
 
 const part = (partNumber: number, dispatched: boolean): Part => ({ externalId: `p${partNumber}`, partNumber, status: dispatched ? 'DESPATCHED' : 'NEW', dispatched, tracking: [] })
+/** What fetchMintsoftOrderParts returns for an unresolvable OrderStatusId: a blank status and dispatched=false. */
+const unknownPart = (partNumber: number): Part => ({ externalId: `p${partNumber}`, partNumber, status: '', dispatched: false, tracking: [] })
 
 async function snapshotFor(): Promise<Snapshot | undefined> {
   upserts.length = 0
@@ -170,4 +172,23 @@ test('the stored read time is when the status request BEGAN, not when the snapsh
   const { written } = await refreshOnce()
   assert.ok(written[0]?.fetchedAt instanceof Date)
   assert.ok(written[0].fetchedAt.getTime() < getResolvedAt, 'the gate refresh stamps request start too')
+})
+
+test('Part 1 pending and Part 2 with an unresolved (blank) status: null, never false', async () => {
+  statusOverrides = {}; hasParts = true
+  parts = [part(1, false), unknownPart(2)]
+  assert.equal((await snapshotFor())?.dispatched, null)
+  assert.equal((await refreshOnce()).written[0]?.dispatched, null, 'the gate refresh takes the same rule')
+})
+
+test('every part resolved and pending: false (an unknown part is the only thing that withholds it)', async () => {
+  statusOverrides = {}; hasParts = true
+  parts = [part(1, false), part(2, false)]
+  assert.equal((await snapshotFor())?.dispatched, false)
+})
+
+test('an unresolved part does not hide a despatched one: still true', async () => {
+  statusOverrides = {}; hasParts = true
+  parts = [unknownPart(1), part(2, true)]
+  assert.equal((await snapshotFor())?.dispatched, true)
 })

@@ -116,7 +116,7 @@ export const UNRESOLVED_SNAPSHOT_WHERE: Prisma.WmsOrderStatusSnapshotWhereInput 
  * `fetchOrderStatus` deliberately reads Part 1 of a split order, so its own flag is Part 1's decision alone. The in-flight
  * gate releases an allocation on an explicit `false`, and a split order whose Part 2 shipped first would read `false` there.
  * So for a split order the stored decision is an AGGREGATE: true when any part is despatched; false only when every part
- * declared was read and none is despatched; null (unknown, which holds) when the parts cannot be read in full. An unsplit
+ * declared was read, each with a resolved status, and none is despatched; null (unknown, which holds) when the parts cannot be read in full. An unsplit
  * order keeps the connector's own decision and costs no extra read.
  */
 async function resolveSnapshotDispatched(
@@ -131,7 +131,11 @@ async function resolveSnapshotDispatched(
     const parts = await connector.fetchOrderParts(reference)
     if (parts.some((part) => part.dispatched)) return true
     const declared = status.partCount ?? 0
-    return declared > 1 && parts.length >= declared ? false : null
+    // `false` needs every declared part read AND each part's status RESOLVED. The connector turns an unresolvable
+    // OrderStatusId into a blank status with dispatched=false, which is "unknown", not "not despatched": a part whose
+    // state could not be determined may already have shipped. Blank therefore yields null (held as status_dispatch_unknown).
+    const allResolved = parts.every((part) => (part.status ?? '').trim() !== '')
+    return declared > 1 && parts.length >= declared && allResolved ? false : null
   } catch {
     return null
   }
