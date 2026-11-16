@@ -23,6 +23,9 @@ import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
 import { formatMoney } from '@/lib/utils'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
+import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
+import { fxBlocksSubmit, usableRate, type FormFxRate } from '@/lib/currencies/form-fx-rate'
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 
@@ -248,7 +251,12 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const [supplierId, setSupplierId] = useState(existingPo?.supplierId ?? '')
   const [currency, setCurrency] = useState(existingPo?.currency ?? baseCurrency.code)
   // Display only: the server stores the rate it reads from fx_rates, never this number.
-  const [fxRate, setFxRate] = useState(existingPo?.fxRateToBase ?? 1)
+  // Never an invented 1: a new order has the base-currency state until a foreign currency is chosen and its table rate is read.
+  const initialFx: FormFxRate = !existingPo || existingPo.currency === baseCurrency.code
+    ? { state: 'base' }
+    : { state: 'ok', rate: existingPo.fxRateToBase, fetchedAt: '', source: 'order', manualOverride: false }
+  const { fx, load: loadFxRate } = useFormFxRate(initialFx)
+  const fxRate = fx ? usableRate(fx) : null
   const [destinationWarehouseId, setDestinationWarehouseId] = useState(existingPo?.destinationWarehouseId ?? '')
   const [supplierRef, setSupplierRef] = useState(existingPo?.supplierRef ?? '')
   const [skipPreferredSupplierUpdate, setSkipPreferredSupplierUpdate] = useState(existingPo?.skipPreferredSupplierUpdate ?? false)
@@ -424,16 +432,9 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const symPos = positionMap[currency] ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
 
-  // Build rate lookup
-  const rateMap: Record<string, number> = { [baseCurrency.code]: 1 }
-  for (const c of currencies) {
-    if (c.latestRate != null) rateMap[c.code] = c.latestRate
-  }
-
   function setCurrencyAndRate(code: string) {
     setCurrency(code)
-    if (code === baseCurrency.code) setFxRate(1)
-    else if (rateMap[code]) setFxRate(rateMap[code])
+    loadFxRate(code, code === baseCurrency.code)
   }
 
   async function handleSupplierChange(id: string) {
@@ -656,7 +657,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const additionalCostVat = additionalCosts.reduce((sum, ac) => ac.vatable && vatRate > 0 ? sum + ac.amountForeign * vatRate : sum, 0)
   const additionalCostTotal = additionalCostNet + additionalCostVat
   const grandTotalForeign = lineSubtotalForeign + taxTotalForeign + additionalCostTotal
-  const grandTotalBase = grandTotalForeign / fxRate
+  const grandTotalBase = fxRate === null ? null : grandTotalForeign / fxRate
 
   const filteredProducts = products.filter((p) => {
     if (!productSearch) return true
@@ -668,6 +669,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     setError('')
     if (!supplierId) { setError('Please select a supplier'); return }
     if (!lines.length) { setError('Add at least one product line'); return }
+    if (fxBlocksSubmit(fx)) { setError(fx?.state === 'missing' ? fx.message : 'The exchange rate is still loading'); return }
 
     const payload = {
       supplierId,
@@ -832,17 +834,10 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               <div className="flex-1 relative">
                 <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 {baseCurrency.code} =</span>
                 {/* Read-only: an order's rate is always the Settings -> Accounting -> FX Rates table rate (a manual override there is pinned by an admin), re-read when the order is saved with a new currency. */}
-                <Input
-                  type="number"
-                  value={fxRate}
-                  readOnly
-                  aria-label="Exchange rate (from the FX Rates table)"
-                  title="Set by the FX Rates table (Settings, Accounting). It cannot be typed here."
-                  className="pl-16 h-9 font-mono text-sm"
-                  disabled={currency === baseCurrency.code}
-                />
+                <FxRateInput fx={fx} className="pl-16 h-9 font-mono text-sm" disabled={currency === baseCurrency.code} />
               </div>
             </div>
+            <FxRateNotice fx={fx} />
           </div>
 
           <div className="space-y-1.5">
@@ -1238,7 +1233,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 <span className="font-mono">
                   {money(grandTotalForeign)}
                   {currency !== baseCurrency.code && (
-                    <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotalBase, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>
+                    <span className="text-muted-foreground font-normal ml-2">({grandTotalBase === null ? '—' : formatMoney(grandTotalBase, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>
                   )}
                 </span>
               </div>
@@ -1251,7 +1246,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     </div>
     <DialogFooter>
       <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-      <Button onClick={handleSubmit} disabled={isPending}>
+      <Button onClick={handleSubmit} disabled={isPending || fxBlocksSubmit(fx)}>
         {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
         {isEditMode ? 'Save Changes' : 'Create Purchase Order'}
       </Button>

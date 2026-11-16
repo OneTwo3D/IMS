@@ -8,6 +8,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta, resolveBaseCurrencyCode } from '@/lib/base-currency'
+import { getFxRateToBase } from '@/lib/currencies/fx-lookup'
+import { formFxRateFromError, type FormFxRate } from '@/lib/currencies/form-fx-rate'
 import { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 import { appendFxSourceSwitch, FxSourceHistoryUnreadableError, FxSwitchClockNotPastError, switchInstantAfterLast } from '@/lib/currencies/fx-source-regime'
 import { FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCES, getFxRateSource, getFxRateSourceInTx, type FxRateSource } from '@/lib/currencies/fx-source'
@@ -69,6 +71,23 @@ export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
     })
   }
   return mapped
+}
+
+/**
+ * The rate a PO / sales-order form shows for a chosen currency: the central lookup over fx_rates (Aelia is the master),
+ * as of now. A missing rate comes back as `{ state: 'missing' }`, never as 1.
+ */
+export async function getFormFxRate(currency: string): Promise<FormFxRate> {
+  await requireInternalUser()
+  const baseCurrency = await getBaseCurrencyCode()
+  const code = String(currency ?? '').trim().toUpperCase()
+  if (code === baseCurrency) return { state: 'base' }
+  try {
+    const r = await getFxRateToBase(db, { currency: code, asOf: new Date(), baseCurrency })
+    return { state: 'ok', rate: r.rate.toNumber(), fetchedAt: r.fetchedAt.toISOString(), source: r.source, manualOverride: r.manualOverride }
+  } catch (error) {
+    return formFxRateFromError(code, error)
+  }
 }
 
 /** Returns map: { BASE: 1, EUR: 1.17, USD: 1.27, ... } */

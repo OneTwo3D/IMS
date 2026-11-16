@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useRef, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { Search, X, Plus, Loader2, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -21,6 +21,9 @@ import { formatMoney } from '@/lib/utils'
 import { INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE, inclusivePricesWithoutOrderRate } from '@/lib/domain/sales/sales-order-vat-basis'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
+import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
+import { fxBlocksSubmit, repriceUnitPrice, usableRate } from '@/lib/currencies/form-fx-rate'
 
 type Warehouse = { id: string; code: string; name: string; isDefault?: boolean }
 
@@ -158,7 +161,11 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
   // Order
   const [currency, setCurrency] = useState(baseCurrency.code)
-  const [fxRate, setFxRate] = useState(1)
+  // The rate comes from the fx_rates table through a server action; a missing rate blocks submit and is never replaced by 1.
+  const { fx, load: loadFxRate } = useFormFxRate({ state: 'base' })
+  const fxRate = fx ? usableRate(fx) : null // null while loading or when the currency has no rate: base-currency figures show a dash
+  // The rate the line prices are currently expressed at (1 while in the base currency), so a currency change can re-price them.
+  const pricedAtRate = useRef(1)
   // Pre-select the default warehouse (falls back to the first one).
   const [warehouseId, setWarehouseId] = useState(
     warehouses.find((w) => w.isDefault)?.id ?? warehouses[0]?.id ?? '',
@@ -215,13 +222,17 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const symPos = positionMap[currency] ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
 
-  const rateMap: Record<string, number> = { [baseCurrency.code]: 1 }
-  for (const c of currencies) if (c.latestRate != null) rateMap[c.code] = c.latestRate
-
   function setCurrencyAndRate(code: string) {
     setCurrency(code)
-    if (code === baseCurrency.code) setFxRate(1)
-    else if (rateMap[code]) setFxRate(rateMap[code])
+    loadFxRate(code, code === baseCurrency.code, (r) => {
+      const next = usableRate(r)
+      // No rate: the lines keep the prices they have (still in the previous currency) and submit is blocked until a currency with a rate is chosen.
+      if (next === null) return
+      const from = pricedAtRate.current
+      pricedAtRate.current = next
+      if (from === next) return
+      setLines((prev) => prev.map((l) => ({ ...l, unitPrice: repriceUnitPrice(l.unitPrice, from, next) ?? l.unitPrice })))
+    })
   }
 
   function handleCustomerChange(id: string) {
@@ -286,7 +297,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     const dbIsGross = !!p.salesPriceTaxInclusive && lineRate > 0
     const net = dbIsGross ? dbPrice / (1 + lineRate) : dbPrice
     const display = pricesIncludeVat && lineRate > 0 ? net * (1 + lineRate) : net
-    const priceInCurrency = display * (currency === baseCurrency.code ? 1 : fxRate)
+    const priceInCurrency = display * (currency === baseCurrency.code ? 1 : pricedAtRate.current)
     setLines((prev) => [
       ...prev,
       {
@@ -479,6 +490,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     setError('')
     if (!customerId && !customerName.trim()) { setError('Select or enter a customer'); return }
     if (!lines.length) { setError('Add at least one product'); return }
+    if (fxBlocksSubmit(fx)) { setError(fx?.state === 'missing' ? fx.message : 'The exchange rate is still loading'); return }
     // The server refuses this too; saying so here saves the round trip (see lib/domain/sales/sales-order-vat-basis.ts).
     if (inclusivePricesWithoutOrderRate({ pricesIncludeVat, orderRate: vatRate, anyLineCarriesVat: lines.some((l) => l.taxRateValue > 0) })) {
       setError(INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE)
@@ -578,9 +590,10 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     {currencies.filter((c) => c.code !== baseCurrency.code).map((c) => (<option key={c.code} value={c.code}>{c.code} {c.symbol}</option>))}
                   </select>
                   {currency !== baseCurrency.code && (
-                    <Input type="number" value={fxRate} readOnly aria-label="Exchange rate (from the FX Rates table)" title="Set by the FX Rates table (Settings, Accounting). It cannot be typed here." className="flex-1 min-w-0 h-9 font-mono text-sm" />
+                    <FxRateInput fx={fx} className="flex-1 min-w-0 h-9 font-mono text-sm" />
                   )}
                 </div>
+                <FxRateNotice fx={fx} />
               </div>
               <div className="space-y-1.5">
                 <Label>Ship From Warehouse</Label>
@@ -868,7 +881,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     <span>Total</span>
                     <span className="font-mono">
                       {money(grandTotal)}
-                      {currency !== baseCurrency.code && <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotal / fxRate, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>}
+                      {currency !== baseCurrency.code && <span className="text-muted-foreground font-normal ml-2">({fxRate === null ? '—' : formatMoney(grandTotal / fxRate, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>}
                     </span>
                   </div>
                   <div className="flex justify-between text-muted-foreground border-t pt-1">
@@ -877,7 +890,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                   </div>
                   <div className="flex justify-between text-muted-foreground">
                     <span>Est. Margin</span>
-                    <span className="font-mono">{formatMoney((lineSubtotal / fxRate) - totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
+                    <span className="font-mono">{fxRate === null ? '—' : formatMoney((lineSubtotal / fxRate) - totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
                   </div>
                 </div>
               </div>
@@ -889,11 +902,11 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button variant="outline" onClick={() => handleSubmit(true)} disabled={isPending}>
+          <Button variant="outline" onClick={() => handleSubmit(true)} disabled={isPending || fxBlocksSubmit(fx)}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Save as Draft
           </Button>
-          <Button onClick={() => handleSubmit(false)} disabled={isPending}>
+          <Button onClick={() => handleSubmit(false)} disabled={isPending || fxBlocksSubmit(fx)}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Create Order
           </Button>
