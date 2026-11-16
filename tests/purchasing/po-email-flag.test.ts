@@ -45,3 +45,39 @@ test('with the flag ON the drain goes on to read the order (the refusal is gone)
   await assert.rejects(() => prepareQueuedEmail('PURCHASE_ORDER', 'PurchaseOrder', 'po-1'), /must not be read|PO not found/)
   assert.ok(orderReads > 0)
 })
+
+function lockClient(flag: () => string | null, log: string[]) {
+  return {
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
+      $executeRaw: async (q: TemplateStringsArray) => { log.push(`lock:${q.join('').includes('_shared') ? 'shared' : 'other'}`) },
+      setting: { findUnique: async () => { log.push('flag-read'); const v = flag(); return v === null ? null : { value: v } } },
+    }),
+  }
+}
+
+test('delivery boundary: the shared lock is taken, then the flag re-read, then the send', async () => {
+  const { runUnderPoEmailSendLock } = await import('../../lib/purchase-order-email.ts')
+  const log: string[] = []
+  const out = await runUnderPoEmailSendLock(lockClient(() => 'true', log), async () => { log.push('send'); return 'sent' })
+  assert.deepEqual(out, { value: 'sent' })
+  assert.deepEqual(log, ['lock:shared', 'flag-read', 'send'])
+})
+
+test('delivery boundary: flag turned OFF between preparation and send sends nothing', async () => {
+  const { runUnderPoEmailSendLock, buildPurchaseOrderEmail } = await import('../../lib/purchase-order-email.ts')
+  const { PO_EMAIL_DISABLED_REASON } = await import('../../lib/domain/purchasing/po-document.ts')
+  void buildPurchaseOrderEmail
+  // Preparation saw ON (it ran earlier); by the time the send is reached the committed value is OFF.
+  let flag: string | null = 'true'
+  const log: string[] = []
+  flag = 'false' // the operator's save commits after preparation
+  let sends = 0
+  const out = await runUnderPoEmailSendLock(lockClient(() => flag, log), async () => { sends++; return 'sent' })
+  assert.deepEqual(out, { refused: PO_EMAIL_DISABLED_REASON })
+  assert.equal(sends, 0)
+  assert.deepEqual(log, ['lock:shared', 'flag-read'])
+  // An absent row is OFF too.
+  flag = null
+  assert.deepEqual(await runUnderPoEmailSendLock(lockClient(() => flag, []), async () => { sends++ }), { refused: PO_EMAIL_DISABLED_REASON })
+  assert.equal(sends, 0)
+})

@@ -115,7 +115,6 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
     'shipping_carriers',
   ],
   'components/settings/dispatch-email.tsx': ['dispatch_email_enabled'],
-  'components/settings/purchase-order-email.tsx': ['purchase_order_email_enabled'],
   'components/settings/financial-year-start.tsx': ['financial_year_start'],
   'components/settings/invoice-trigger.tsx': ['invoice_trigger'],
   'components/settings/landed-cost-method.tsx': ['default_landed_cost_method'],

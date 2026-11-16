@@ -4,6 +4,7 @@
  * `buildPurchaseOrderEmail`, so the address and the document are those of the order AT SEND TIME.
  */
 import { db } from '@/lib/db'
+import { PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { EmailKindDisabledError } from '@/lib/email-kind-disabled'
 import { PO_EMAIL_DISABLED_REASON, PO_EMAIL_SETTING_KEY } from '@/lib/domain/purchasing/po-document'
 import { renderEmailHtml } from '@/lib/email-template'
@@ -54,5 +55,40 @@ export async function buildPurchaseOrderEmail(id: string) {
       'Please confirm receipt and your expected delivery date at your earliest convenience, and quote the PO reference on all delivery notes and invoices.',
     ],
   }, 'purchase_order')
-  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }] }
+  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }], sendGuard: purchaseOrderSendGuard }
+}
+
+/**
+ * THE DELIVERY-BOUNDARY CHECK. Runs the send inside a transaction that holds the PO email send lock SHARED and has just re-read the flag,
+ * so: a switch-off committed before this point refuses the send; a switch-off that starts after it waits (exclusive lock) until the send
+ * has returned. The row's settlement happens after, outside the lock. Nothing is sent on a refusal.
+ */
+export async function purchaseOrderSendGuard<T>(send: () => Promise<T>): Promise<{ refused: string } | { refused?: undefined; value: T }> {
+  return runUnderPoEmailSendLock(db, send)
+}
+
+type LockableClient = {
+  $transaction: <R>(fn: (tx: { $executeRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown>; setting: { findUnique: typeof db.setting.findUnique } }) => Promise<R>, options?: { timeout?: number; maxWait?: number }) => Promise<R>
+}
+
+/** @internal exported for tests, which pass a double client. */
+export async function runUnderPoEmailSendLock<T>(
+  client: unknown,
+  send: () => Promise<T>,
+): Promise<{ refused: string } | { refused?: undefined; value: T }> {
+  return (client as LockableClient).$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE}::int4, 0::int4)`
+    const row = await tx.setting.findUnique({ where: { key: PO_EMAIL_SETTING_KEY }, select: { value: true } })
+    if (row?.value !== 'true') return { refused: PO_EMAIL_DISABLED_REASON }
+    return { value: await send() }
+  }, { timeout: 180_000, maxWait: 30_000 })
+}
+
+/** Save the switch. Takes the send lock EXCLUSIVE, so it waits for sends already past their check; sends after it see the new value. */
+export async function savePurchaseOrderEmailEnabled(enabled: boolean): Promise<void> {
+  await db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE}::int4, 0::int4)`
+    const value = enabled ? 'true' : 'false'
+    await tx.setting.upsert({ where: { key: PO_EMAIL_SETTING_KEY }, create: { key: PO_EMAIL_SETTING_KEY, value }, update: { value } })
+  }, { timeout: 180_000, maxWait: 30_000 })
 }

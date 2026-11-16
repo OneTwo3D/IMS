@@ -10,7 +10,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { queueEmail } from '@/lib/email-outbox'
-import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
+import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
 import { requirePermission } from '@/lib/auth/server'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
@@ -2257,6 +2257,23 @@ export async function sendPurchaseOrderEmail(id: string): Promise<{ success: boo
     }
     const send = await queuePurchaseOrderEmail(id, po.reference, po.supplierEmail)
     return { success: send.status === 'queued' || send.status === 'already_queued', ...(send.status === 'queued' || send.status === 'already_queued' ? {} : { error: send.message }), send }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/** The Settings > Documents switch for emailing POs to suppliers (admin only). Coordinates with sends in flight: see the send lock. */
+export async function setPurchaseOrderEmailEnabled(enabled: boolean): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('settings.company')
+    await savePurchaseOrderEmailEnabled(enabled === true)
+    await logActivity({
+      entityType: 'SETTING', entityId: 'purchase_order_email_enabled', action: 'setting_changed', tag: 'settings', level: 'INFO',
+      description: `Emailing purchase orders to suppliers switched ${enabled ? 'ON' : 'OFF'}`,
+    })
+    revalidatePath('/settings/company')
+    revalidatePath('/purchase-orders')
+    return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
   }

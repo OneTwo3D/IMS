@@ -19,7 +19,7 @@ export type PoDocumentLine = {
   purchaseUnitQty: number | null
   purchaseUnitAbbreviation: string | null
   stockUnitName: string | null
-  /** Net cost per STOCK unit, after the line discount. */
+  /** Net cost per STOCK unit, ALREADY after the line discount, so qty x unitCost = total. The discount is never shown beside it (that read as taken twice); it is in the totals block. */
   unitCost: number
   /** The line discount, in the order currency (0 when none). */
   discountAmount: number
@@ -48,7 +48,7 @@ export type PoTotalsRow = { label: string; amount: string; strong?: boolean; mut
 const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100
 
 /** Page content width is 495pt (A4 less 50pt margins); the columns below add up to it. */
-export function poDocumentColumns(symbol: string, opts: { showSupplierSku: boolean; showDiscount: boolean; showPurchaseUnits: boolean }): PoColumn[] {
+export function poDocumentColumns(symbol: string, opts: { showSupplierSku: boolean; showPurchaseUnits: boolean }): PoColumn[] {
   const cols: PoColumn[] = [
     { label: '#', width: 22, align: 'right' },
     { label: 'SKU', width: 62 },
@@ -58,7 +58,6 @@ export function poDocumentColumns(symbol: string, opts: { showSupplierSku: boole
   cols.push({ label: 'Barcode / EAN', width: 66 })
   cols.push({ label: 'Qty', width: opts.showPurchaseUnits ? 64 : 40, align: 'right' })
   cols.push({ label: opts.showPurchaseUnits ? `Cost/unit (${symbol})` : `Unit cost (${symbol})`, width: 56, align: 'right' })
-  if (opts.showDiscount) cols.push({ label: 'Discount', width: 44, align: 'right' })
   cols.push({ label: `Total (${symbol})`, width: 56, align: 'right' })
   const fixed = cols.reduce((s, c) => s + c.width, 0)
   const product = cols.find((c) => c.label === 'Product')!
@@ -76,22 +75,20 @@ export function formatPoQty(line: Pick<PoDocumentLine, 'qty' | 'purchaseUnitQty'
 
 export function poDocumentRows(
   lines: readonly PoDocumentLine[],
-  opts: { showSupplierSku: boolean; showDiscount: boolean },
+  opts: { showSupplierSku: boolean },
 ): string[][] {
   return lines.map((l, i) => {
     const row = [String(i + 1), l.sku]
     if (opts.showSupplierSku) row.push(l.supplierSku ?? '—')
     row.push(l.name, l.barcode ?? '—', formatPoQty(l), l.unitCost.toFixed(2))
-    if (opts.showDiscount) row.push(l.discountAmount > 0 ? `-${l.discountAmount.toFixed(2)}` : '')
     row.push(l.total.toFixed(2))
     return row
   })
 }
 
-export function poLayoutFlags(lines: readonly PoDocumentLine[]): { showSupplierSku: boolean; showDiscount: boolean; showPurchaseUnits: boolean } {
+export function poLayoutFlags(lines: readonly PoDocumentLine[]): { showSupplierSku: boolean; showPurchaseUnits: boolean } {
   return {
     showSupplierSku: lines.some((l) => l.supplierSku),
-    showDiscount: lines.some((l) => l.discountAmount > 0),
     showPurchaseUnits: lines.some((l) => l.purchaseUnitQty != null && l.purchaseUnitAbbreviation),
   }
 }

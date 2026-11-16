@@ -2544,12 +2544,24 @@ export async function processPendingEmailOutbox(
         continue
       }
 
-      const sendResult = await smtp.send({
+      const outgoing = {
         to: prepared?.to ?? email.toEmail,
         subject: prepared?.subject ?? email.subject,
         html: prepared?.html ?? email.html,
         attachments,
-      })
+      }
+      let sendResult: Awaited<ReturnType<typeof smtp.send>>
+      if (prepared?.sendGuard) {
+        // The kind's own delivery-boundary check, held across the send (see PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE). A refusal sent nothing.
+        const guarded = await prepared.sendGuard(() => smtp.send(outgoing))
+        if (guarded.refused !== undefined) {
+          await refuseRecipient(guarded.refused, { keepAddress: true })
+          continue
+        }
+        sendResult = guarded.value
+      } else {
+        sendResult = await smtp.send(outgoing)
+      }
 
       // THE SENDER'S ANSWER WAS READ ONCE, INSIDE `smtp.send`, for the same reason the harness is
       // snapshotted above (r7 HIGH 2). `sendResult` is that wrapper's FROZEN snapshot rather than the

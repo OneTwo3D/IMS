@@ -22,25 +22,25 @@ const line = (over: Partial<PoDocumentLine> = {}): PoDocumentLine => ({
 const money = (n: number) => `£${n.toFixed(2)}`
 
 test('columns always fill the 495pt content width, whatever optional columns are on', () => {
-  for (const showSupplierSku of [false, true]) for (const showDiscount of [false, true]) for (const showPurchaseUnits of [false, true]) {
-    const cols = poDocumentColumns('£', { showSupplierSku, showDiscount, showPurchaseUnits })
+  for (const showSupplierSku of [false, true]) for (const showPurchaseUnits of [false, true]) {
+    const cols = poDocumentColumns('£', { showSupplierSku, showPurchaseUnits })
     assert.equal(cols.reduce((s, c) => s + c.width, 0), 495)
     assert.ok(cols.every((c) => c.width > 0))
   }
 })
 
 test('row cell count matches the column count and optional columns follow the flags', () => {
-  const lines = [line({ supplierSku: 'S-1', discountAmount: 1.5, total: 23.5 }), line({ sku: 'SKU-2' })]
+  const lines = [line({ supplierSku: 'S-1', discountAmount: 1.5, total: 23.5, unitCost: 2.35 }), line({ sku: 'SKU-2' })]
   const flags = poLayoutFlags(lines)
-  assert.deepEqual(flags, { showSupplierSku: true, showDiscount: true, showPurchaseUnits: false })
+  assert.deepEqual(flags, { showSupplierSku: true, showPurchaseUnits: false })
   const cols = poDocumentColumns('£', flags)
   const rows = poDocumentRows(lines, flags)
   assert.ok(rows.every((r) => r.length === cols.length))
-  assert.deepEqual(rows[0], ['1', 'SKU-1', 'S-1', 'Widget', '—', '10', '2.50', '-1.50', '23.50'])
-  assert.deepEqual(rows[1], ['2', 'SKU-2', '—', 'Widget', '—', '10', '2.50', '', '25.00'])
+  assert.deepEqual(rows[0], ['1', 'SKU-1', 'S-1', 'Widget', '—', '10', '2.35', '23.50'])
+  assert.deepEqual(rows[1], ['2', 'SKU-2', '—', 'Widget', '—', '10', '2.50', '25.00'])
 
   const plain = poLayoutFlags([line()])
-  assert.deepEqual(plain, { showSupplierSku: false, showDiscount: false, showPurchaseUnits: false })
+  assert.deepEqual(plain, { showSupplierSku: false, showPurchaseUnits: false })
   assert.equal(poDocumentRows([line()], plain)[0].length, poDocumentColumns('£', plain).length)
 })
 
@@ -120,4 +120,18 @@ test('runPoSend: an unreadable flag counts as OFF', async () => {
   const r = await runPoSend('orders@supplier.test', { isEnabled: async () => { throw new Error('db') }, queue: async () => { calls++; return { queued: true } } })
   assert.equal(r.status, 'disabled')
   assert.equal(calls, 0)
+})
+
+test('a discounted line does not read as discounted twice: 10 x 10 with a 10 discount shows net unit 9, total 90, no discount cell', () => {
+  const l = line({ qty: 10, unitCost: 9, discountAmount: 10, total: 90 })
+  const flags = poLayoutFlags([l])
+  const cols = poDocumentColumns('£', flags)
+  const [row] = poDocumentRows([l], flags)
+  assert.ok(!cols.some((c) => /discount/i.test(c.label)))
+  assert.equal(row.length, cols.length)
+  assert.equal(Number(row[row.length - 2]) * Number(row[row.length - 3]), Number(row[row.length - 1]), 'qty x unit cost = total')
+  assert.deepEqual(row.slice(-3), ['10', '9.00', '90.00'])
+  // The discount is still stated, once, in the totals block.
+  const totals = poTotalsRows({ subtotal: 90, lineDiscounts: 10, orderDiscount: 0, tax: 0, taxLabel: 'VAT', additionalCosts: 0, total: 90 }, money)
+  assert.ok(totals.some((r) => /Discounts included above \(lines £10\.00\)/.test(r.label)))
 })

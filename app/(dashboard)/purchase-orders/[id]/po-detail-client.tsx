@@ -2079,7 +2079,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const canRfq = po.status === 'DRAFT' || po.status === 'RFQ_SENT'
   const canAdvanceToQuoteReceived = po.status === 'RFQ_SENT'
   const canAdvanceToOrdered = po.status === 'DRAFT' || po.status === 'QUOTE_RECEIVED'
-  const canEmailPo = poEmailEnabled && po.status === 'PO_SENT' || po.status === 'SHIPPED' || po.status === 'PARTIALLY_RECEIVED'
+  const canEmailPo = poEmailEnabled && (po.status === 'PO_SENT' || po.status === 'SHIPPED' || po.status === 'PARTIALLY_RECEIVED')
   const canShip = po.status === 'PO_SENT'
   const canReceive = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)
   const canReturn = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED'].includes(po.status)

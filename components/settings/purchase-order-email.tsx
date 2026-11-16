@@ -4,7 +4,7 @@ import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { setSetting } from '@/app/actions/settings'
+import { setPurchaseOrderEmailEnabled } from '@/app/actions/purchase-orders'
 
 const OPTIONS = [
   { value: 'false', label: 'Off (default)', description: 'Confirm & Send PO confirms the order only. Download the PO PDF and send it to the supplier yourself.' },
@@ -22,7 +22,7 @@ export function PurchaseOrderEmailSetting({ currentValue }: Props) {
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
-      await setSetting('purchase_order_email_enabled', value)
+      await setPurchaseOrderEmailEnabled(value === 'true')
       router.refresh()
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)

@@ -21,7 +21,13 @@ import { getTrackingUrl } from '@/lib/tracking'
 import { buildPurchaseOrderEmail, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 
 type EmailAttachment = { filename: string; content: Buffer; contentType?: string }
-type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[] }
+export type SendGuardOutcome<T> = { refused: string } | { refused?: undefined; value: T }
+/**
+ * Optional hook on a prepared email: the drain runs its send INSIDE this, so a kind switched off by a setting can be re-checked at the delivery
+ * boundary and held against a concurrent switch-off. A refusal means nothing was sent.
+ */
+type SendGuard = <T>(send: () => Promise<T>) => Promise<SendGuardOutcome<T>>
+export type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[]; sendGuard?: SendGuard }
 type QueueEmailData = { to: string; subject: string; reference: string }
 
 type SoForPdf = {
