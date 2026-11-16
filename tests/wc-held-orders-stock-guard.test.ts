@@ -9,6 +9,7 @@ import {
   encodeCoveredHistoryBoundary,
   trustedCoveredHistoryBoundary,
   WC_ORDER_RESET_MARKER_KEY,
+  WC_BOUNDARY_GENERATION_KEY,
   WC_COMPLETED_HISTORY_COVERED_KEY,
   WC_HELD_ORDERS_MAX_PAGES,
   WC_HELD_ORDERS_PAGE_SIZE,
@@ -365,4 +366,69 @@ test('a stale in-flight boundary write is refused after a reset or a rebind; a f
   assert.equal(await persistCoveredHistoryBoundary(fresh as never, T0, '1'), true)
   assert.equal(trustedCoveredHistoryBoundary(fresh.rows[WC_COMPLETED_HISTORY_COVERED_KEY], '1', fresh.rows[WC_ORDER_RESET_MARKER_KEY]), new Date(T0).toISOString())
   assert.equal(await persistCoveredHistoryBoundary(fresh as never, T0 - 5000, '1'), false, 'never moves backwards')
+})
+
+// --- o3d-hqvrp.385: deleting an order / releasing its allocation must void the covered-history boundary ---
+
+function fakeSettingsTx(rows: Record<string, string>) {
+  return {
+    setting: { upsert: async ({ where, create, update }: { where: { key: string }; create: { value: string }; update: { value: string } }) => { rows[where.key] = where.key in rows ? update.value : create.value; return {} } },
+    stockLevel: { updateMany: async () => ({ count: 1 }) },
+  }
+}
+
+test('releasing an allocation replaces the boundary generation; the next guard reads completed history exhaustively', async () => {
+  const { applyAllocationReservationDelta } = await import('@/lib/domain/sales/allocation-service')
+  const rows: Record<string, string> = {}
+  const stored = encodeCoveredHistoryBoundary(T0, '1', rows[WC_BOUNDARY_GENERATION_KEY] ?? '0')
+  assert.ok(completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', null, rows[WC_BOUNDARY_GENERATION_KEY])) !== null, 'bounded before the delete')
+  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 3 }], 'release')
+  assert.ok(rows[WC_BOUNDARY_GENERATION_KEY], 'generation written in the releasing transaction')
+  assert.equal(trustedCoveredHistoryBoundary(stored, '1', null, rows[WC_BOUNDARY_GENERATION_KEY]), null)
+  assert.equal(completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', null, rows[WC_BOUNDARY_GENERATION_KEY])), null, 'unbounded: exhaustive read')
+  const before = rows[WC_BOUNDARY_GENERATION_KEY]
+  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 1 }], 'release')
+  assert.notEqual(rows[WC_BOUNDARY_GENERATION_KEY], before, 'every release replaces it')
+})
+
+test('the old completed order is charged again after its allocation was released (exhaustive read finds it)', async () => {
+  const d = deps({ completedPages: [[order(9, [11, 0, 3])]] })
+  const asked: Array<Record<string, string>> = []
+  const inner = d.fetchOrdersPage
+  d.fetchOrdersPage = async (p) => { if (p.status === 'completed' && p.orderby !== 'modified') asked.push(p); return inner(p) }
+  const stored = encodeCoveredHistoryBoundary(T0, '1', 'g1')
+  const r = await load(d, completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', null, 'g2')))
+  assert.ok(r.ok)
+  assert.ok(asked.length > 0 && asked.every((p) => !('modified_after' in p)))
+  assert.equal(r.heldByProduct.get('p1'), 3)
+})
+
+test('a reservation (or a shipment, which never goes through the release helper) does not invalidate', async () => {
+  const { applyAllocationReservationDelta } = await import('@/lib/domain/sales/allocation-service')
+  const rows: Record<string, string> = {}
+  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 3 }], 'reserve')
+  assert.equal(WC_BOUNDARY_GENERATION_KEY in rows, false)
+  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 0 }], 'release')
+  assert.equal(WC_BOUNDARY_GENERATION_KEY in rows, false, 'nothing released')
+  const { readFile } = await import('node:fs/promises')
+  const shipment = await readFile(new URL('../lib/domain/sales/shipment-service.ts', import.meta.url), 'utf8')
+  assert.doesNotMatch(shipment, /invalidateWcCoveredHistoryBoundary|applyAllocationReservationDelta\([^)]*'release'/, 'dispatch consumes the reservation through the shipment, it does not release')
+})
+
+test('deleteSalesOrder invalidates in the order-deleting transaction, before it returns', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const src = await readFile(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
+  const del = src.indexOf('await tx.salesOrder.delete({ where: { id } })')
+  const inv = src.indexOf('await invalidateWcCoveredHistoryBoundary(tx)', del)
+  const ret = src.indexOf('return { so, released }', del)
+  assert.ok(del !== -1 && inv > del && inv < ret)
+})
+
+test('a stale in-flight boundary write is refused after an order delete / allocation release replaced the generation', async () => {
+  const released = boundaryDb({ wc_settings_version: '1', [WC_BOUNDARY_GENERATION_KEY]: 'after-delete' })
+  assert.equal(await persistCoveredHistoryBoundary(released as never, T0, '1', 'before-delete'), false, 'the walk read the generation before the delete committed')
+  assert.equal(WC_COMPLETED_HISTORY_COVERED_KEY in released.rows, false)
+  assert.equal(await persistCoveredHistoryBoundary(released as never, T0, '1', 'after-delete'), true, 'a walk that began after it is accepted')
+  assert.equal(trustedCoveredHistoryBoundary(released.rows[WC_COMPLETED_HISTORY_COVERED_KEY], '1', null, 'after-delete'), new Date(T0).toISOString())
+  assert.equal(trustedCoveredHistoryBoundary(released.rows[WC_COMPLETED_HISTORY_COVERED_KEY], '1', null, 'another'), null, 'and a later release voids it again')
 })

@@ -327,6 +327,7 @@ const tx = {
       return {}
     },
   },
+  setting: { upsert: async () => ({}) }, // the covered-history boundary invalidation on every release
   stockLevel: {
     findUnique: async ({ where }: { where: { productId_warehouseId: { productId: string; warehouseId: string } } }) => {
       const key = where.productId_warehouseId

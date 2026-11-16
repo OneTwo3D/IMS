@@ -490,6 +490,7 @@ const tx = {
         shipment: { warehouseId: line.warehouseId, status: line.status },
       })),
   },
+  setting: { upsert: async () => ({}) }, // the covered-history boundary invalidation on every release
   stockLevel: {
     // TWO real shapes: `updateAllocation` filters one product across warehouses
     // (`productId: string`), `addAllocation` filters every expanded leaf

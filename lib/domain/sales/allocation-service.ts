@@ -1,3 +1,4 @@
+import { invalidateWcCoveredHistoryBoundary } from '@/lib/connectors/woocommerce/sync/stock-boundary-invalidation'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { randomUUID } from 'node:crypto'
 
@@ -2353,6 +2354,7 @@ export async function applyAllocationReservationDelta(
   rows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
   direction: 'reserve' | 'release',
 ) {
+  let releasedAny = false
   for (const row of rows) {
     const qty = toDecimal(row.qty)
     if (qty.lte(0)) continue
@@ -2396,7 +2398,13 @@ export async function applyAllocationReservationDelta(
         + 'zero the reservations of other orders sharing this product/warehouse (o3d-4kfh).',
       )
     }
+    releasedAny = true
   }
+  // Every IMS release of a reservation (order delete, deallocation, cancel, refund trim, manual reduce/move, re-allocation rewrite) goes through
+  // here and enqueues a stock push. Invalidate the WooCommerce covered-history boundary in the SAME transaction, AFTER the stock rows are
+  // locked and decremented (so every releaser takes stock rows first, then the setting row: one lock order). Dispatch does not come through
+  // here (it consumes the reservation via the shipment), so a normal shipment invalidates nothing.
+  if (releasedAny) await invalidateWcCoveredHistoryBoundary(tx)
 }
 
 type ReservationScope = { productId: string; warehouseId: string }

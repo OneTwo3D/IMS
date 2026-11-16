@@ -84,6 +84,16 @@ export const WC_COMPLETED_HISTORY_COVERED_KEY = 'wc_completed_history_covered_at
  */
 export const WC_ORDER_RESET_MARKER_KEY = 'wc_order_reset_at'
 
+/**
+ * Setting key: the covered-history boundary GENERATION (an opaque token, replaced with a fresh value). Any IMS transaction that deletes an
+ * order or releases/reduces its allocation replaces it in the same transaction (see stock-boundary-invalidation.ts), because that release
+ * enqueues a stock push and the boundary may be what lets a later guard omit that very order if it is still completed in WooCommerce. A
+ * boundary is trusted only when the token it was proven under is still current, and a stale in-flight write is refused by comparing the
+ * token read before its walk. It is a counter-free token (never compared for order, only for equality), absent reads as '0', and unlike
+ * `wc_settings_version` it carries no connection-generation meaning.
+ */
+export const WC_BOUNDARY_GENERATION_KEY = 'wc_completed_history_boundary_generation'
+
 export const WC_HELD_ORDERS_PAGE_SIZE = 100
 /** Safety ceiling only; the walk normally ends on a short page. */
 export const WC_HELD_ORDERS_MAX_PAGES = 100
@@ -122,8 +132,8 @@ export function completedOrdersModifiedAfter(
 }
 
 /** The stored form of the boundary: the instant, bound to the connection generation (`wc_settings_version`) it was proven under. */
-export function encodeCoveredHistoryBoundary(atMs: number, settingsVersion: string): string {
-  return JSON.stringify({ at: new Date(atMs).toISOString(), v: settingsVersion })
+export function encodeCoveredHistoryBoundary(atMs: number, settingsVersion: string, boundaryGeneration: string = '0'): string {
+  return JSON.stringify({ at: new Date(atMs).toISOString(), v: settingsVersion, g: boundaryGeneration })
 }
 
 /**
@@ -134,12 +144,15 @@ export function trustedCoveredHistoryBoundary(
   raw: string | null | undefined,
   currentSettingsVersion: string,
   resetMarker: string | null | undefined,
+  /** The CURRENT boundary generation (`WC_BOUNDARY_GENERATION_KEY`); absent reads as '0'. A boundary proven under another one is void. */
+  currentBoundaryGeneration: string | null | undefined = null,
 ): string | null {
   if (!raw) return null
   let at: string
   try {
-    const v = JSON.parse(raw) as { at?: unknown; v?: unknown }
+    const v = JSON.parse(raw) as { at?: unknown; v?: unknown; g?: unknown }
     if (typeof v.at !== 'string' || typeof v.v !== 'string' || v.v !== currentSettingsVersion) return null
+    if ((typeof v.g === 'string' ? v.g : '0') !== (currentBoundaryGeneration ?? '0')) return null
     at = v.at
   } catch {
     return null

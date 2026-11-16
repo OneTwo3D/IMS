@@ -1,5 +1,6 @@
 'use server'
 
+import { invalidateWcCoveredHistoryBoundary } from '@/lib/connectors/woocommerce/sync/stock-boundary-invalidation'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -3727,6 +3728,9 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       })
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
       await tx.salesOrder.delete({ where: { id } })
+      // The release above invalidates the WooCommerce covered-history boundary only when it freed a reservation. The delete itself removes the
+      // order the boundary may rest on (an ALLOCATED order with a fully dispatched row releases nothing), so invalidate unconditionally here.
+      await invalidateWcCoveredHistoryBoundary(tx)
       return { so, released }
     }, { maxWait: 5000, timeout: 20000 })
 

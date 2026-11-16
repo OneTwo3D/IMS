@@ -53,7 +53,7 @@ import {
   WOO_STOCK_SYNC_PRODUCT_STATUSES,
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
-import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
+import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_BOUNDARY_GENERATION_KEY, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -152,19 +152,28 @@ type BoundaryDb = Pick<typeof db, '$transaction'>
 
 /**
  * Compare-and-set of the covered-history boundary (see stock-held-orders.ts). Returns true when written. Refused (false) when the connection
- * generation moved since the run began, or when a transaction reset began after the proving walk did.
+ * generation moved since the run began, when a transaction reset began after the proving walk did, or when an order delete / allocation
+ * release replaced the boundary generation after the walk's generation read (the walk's picture may include the order it released).
  */
-export async function persistCoveredHistoryBoundary(database: BoundaryDb, coveredAtMs: number, syncVersion: string): Promise<boolean> {
+export async function persistCoveredHistoryBoundary(
+  database: BoundaryDb,
+  coveredAtMs: number,
+  syncVersion: string,
+  /** The boundary generation read BEFORE the proving walk began; refused when an order delete/allocation release replaced it since. */
+  boundaryGeneration: string = '0',
+): Promise<boolean> {
   return database.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
-    const rows = await tx.setting.findMany({ where: { key: { in: [WC_SETTINGS_VERSION_KEY, WC_ORDER_RESET_MARKER_KEY, WC_COMPLETED_HISTORY_COVERED_KEY] } } })
+    const rows = await tx.setting.findMany({ where: { key: { in: [WC_SETTINGS_VERSION_KEY, WC_ORDER_RESET_MARKER_KEY, WC_COMPLETED_HISTORY_COVERED_KEY, WC_BOUNDARY_GENERATION_KEY] } } })
     const get = (key: string) => rows.find((r) => r.key === key)?.value ?? null
     if ((get(WC_SETTINGS_VERSION_KEY) ?? '0') !== syncVersion) return false
+    const currentGeneration = get(WC_BOUNDARY_GENERATION_KEY) ?? '0'
+    if (currentGeneration !== boundaryGeneration) return false
     const reset = get(WC_ORDER_RESET_MARKER_KEY)
     if (reset && (Number.isNaN(Date.parse(reset)) || coveredAtMs < Date.parse(reset))) return false
-    const existing = trustedCoveredHistoryBoundary(get(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, reset)
+    const existing = trustedCoveredHistoryBoundary(get(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, reset, currentGeneration)
     if (existing !== null && Date.parse(existing) >= coveredAtMs) return false
-    const value = encodeCoveredHistoryBoundary(coveredAtMs, syncVersion)
+    const value = encodeCoveredHistoryBoundary(coveredAtMs, syncVersion, currentGeneration)
     await tx.setting.upsert({ where: { key: WC_COMPLETED_HISTORY_COVERED_KEY }, create: { key: WC_COMPLETED_HISTORY_COVERED_KEY, value }, update: { value } })
     return true
   })
@@ -827,18 +836,21 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // THE UNRESERVED-ORDER GUARD (WCO-H3). The push below is absolute, so it must not give back units
   // WooCommerce already took off for orders IMS has not reserved. Read them now; if they cannot be read,
   // push nothing (see stock-held-orders.ts for why that is the only safe answer).
-  const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at', WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY] } } })
+  const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at', WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, WC_BOUNDARY_GENERATION_KEY] } } })
   const cursorValue = (key: string) => cursorRows.find((r) => r.key === key)?.value ?? null
   const held = await loadWcHeldUnitsByProduct(
     buildWcHeldUnitsDeps(creds),
-    completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at'), trustedCoveredHistoryBoundary(cursorValue(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, cursorValue(WC_ORDER_RESET_MARKER_KEY))),
+    completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at'), trustedCoveredHistoryBoundary(cursorValue(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, cursorValue(WC_ORDER_RESET_MARKER_KEY), cursorValue(WC_BOUNDARY_GENERATION_KEY))),
   )
+  // Read in the SAME statement as the cursors, i.e. BEFORE the walk reads any order: a release committed after this read replaces the token,
+  // so the write below is refused; one committed before it is already reflected in what the walk reads.
+  const boundaryGenerationAtStart = cursorValue(WC_BOUNDARY_GENERATION_KEY) ?? '0'
   if (held.ok && held.completedHistoryCoveredAtMs !== null) {
     // Proven: completed history older than this walk is settled, so later runs (poll mode has no reconcile cursor) read only what changed since.
     // The write is a compare-and-set under the credential-mutation lock: it is refused when the connection generation moved since this run
     // began, or when a transaction reset began after the walk did (the reset deleted the orders the proof relied on). The read side checks
     // both again, so even a write that slipped past would not be trusted.
-    await persistCoveredHistoryBoundary(db, held.completedHistoryCoveredAtMs, syncVersion).catch(() => undefined)
+    await persistCoveredHistoryBoundary(db, held.completedHistoryCoveredAtMs, syncVersion, boundaryGenerationAtStart).catch(() => undefined)
   }
   if (!held.ok) {
     const result: StockSyncResult = {

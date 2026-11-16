@@ -522,6 +522,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
           })),
         })),
     },
+    setting: { upsert: async () => ({}) }, // the covered-history boundary invalidation on every release
     stockLevel: {
       findMany: async ({ where }: { where: { OR?: Array<{ productId: string; warehouseId: string }>; productId?: { in: string[] }; warehouseId?: { in: string[] } } }) => {
         if (where.OR) {
