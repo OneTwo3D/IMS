@@ -54,7 +54,7 @@ import {
   computeLandedCostForPendingLines,
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
 } from '@/lib/domain/purchasing/landed-cost-service'
-import { unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -928,6 +928,7 @@ export async function processBookedInEvent(
             reference: true,
             status: true,
             destinationWarehouseId: true,
+            subtotalBase: true,
             lines: {
               select: {
                 id: true,
@@ -1020,6 +1021,7 @@ export async function processBookedInEvent(
         // "not allocated yet". The remaining `?? ` copy of this bug is in the WMS stock-sync align-up
         // path, lib/connectors/mintsoft/sync/stock-sync.ts:1375; it is a different path in a different
         // transaction and is recorded on o3d-6nd55, which fixes that path next.)
+        const headerDiscountFactor = headerDiscountFactorForPo(po)
         const landedAllocation = computeLandedCostForPendingLines({
           lines: po.lines.map((line) => ({
             id: line.id,
@@ -1028,6 +1030,7 @@ export async function processBookedInEvent(
             totalBase: line.totalBase,
             landedUnitCostBase: line.landedUnitCostBase,
             weight: line.product?.weight ?? null,
+            headerDiscountFactor,
           })),
           directCostLines: po.freightCostLines.map((costLine) => ({
             id: costLine.id,
