@@ -2493,10 +2493,10 @@ export async function processPendingEmailOutbox(
       // the preparer refuses because the order or customer was erased; the address the order now carries is not the one
       // queued; or the erasure replaced the stored address while this row was claimed (the confirm below). Each is a
       // FENCED terminal write that also erases the address from the row, so the refusal itself keeps nothing.
-      const refuseRecipient = async (reason: string): Promise<void> => {
+      const refuseRecipient = async (reason: string, options: { keepAddress?: boolean } = {}): Promise<void> => {
         const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
           status: 'FAILED',
-          toEmail: ERASED_RECIPIENT_PLACEHOLDER,
+          ...(options.keepAddress ? {} : { toEmail: ERASED_RECIPIENT_PLACEHOLDER }),
           lastError: reason,
           processingStartedAt: null,
         }))
@@ -2512,14 +2512,8 @@ export async function processPendingEmailOutbox(
           continue
         }
         if (prepareError instanceof EmailKindDisabledError) {
-          // A kind switched off by a setting: nothing is sent, the row ends FAILED with the reason, the address is kept.
-          const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
-            status: 'FAILED',
-            lastError: prepareError.message,
-            processingStartedAt: null,
-          }))
-          if (settled) result.failed++
-          else await recordConflict(claim, 'a disabled-kind refusal', smtp)
+          // A kind switched off by a setting: nothing is sent and the row ends FAILED with the reason; the address is kept.
+          await refuseRecipient(prepareError.message, { keepAddress: true })
           continue
         }
         throw prepareError
