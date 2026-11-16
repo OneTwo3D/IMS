@@ -16,6 +16,10 @@ const state = {
   asked: [] as Array<Record<string, string>>,
   activity: [] as Row[],
   settings: new Map<string, string>(),
+  // A live store for the keyset backfill: status -> orders. `onFetch` runs after every read (to mutate the store between reads).
+  store: {} as Record<string, Array<{ id: number; status: string; date_created_gmt: string }>>,
+  onFetch: null as null | ((n: number) => void),
+  fetches: 0,
 }
 
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async (e: Row) => { state.activity.push(e) } } })
@@ -42,6 +46,18 @@ mock.module('@/lib/connectors/woocommerce/api', {
     wcFetch: async (_p: string, params: Record<string, string>) => {
       state.asked.push(params)
       if (state.fetchError[params.status]) return { data: null, error: state.fetchError[params.status] }
+      if (state.store[params.status] && params.orderby === 'date' && !params.modified_after) {
+        const after = params.after ? Date.parse(params.after) : -Infinity
+        const rows = state.store[params.status]
+          .filter((o) => Date.parse(`${o.date_created_gmt}Z`) > after)
+          .sort((a, b) => Date.parse(`${a.date_created_gmt}Z`) - Date.parse(`${b.date_created_gmt}Z`) || a.id - b.id)
+        const per = Number(params.per_page)
+        const out = rows.slice((Number(params.page) - 1) * per, Number(params.page) * per)
+        state.fetches++
+        const hook = state.onFetch
+        if (hook) hook(state.fetches)
+        return { data: out, error: null }
+      }
       return { data: state.pages[params.status]?.[Number(params.page) - 1] ?? [], error: null }
     },
     wcPut: async () => ({ data: null }),
@@ -52,7 +68,7 @@ mock.module('@/lib/connectors/woocommerce/sync/order-status', {
 })
 
 function reset() {
-  state.pages = {}; state.fetchError = {}; state.linked = {}; state.applied = []; state.syncResult = { success: true }; state.asked = []; state.activity = []; state.settings = new Map()
+  state.pages = {}; state.fetchError = {}; state.linked = {}; state.applied = []; state.syncResult = { success: true }; state.asked = []; state.activity = []; state.settings = new Map(); state.store = {}; state.onFetch = null; state.fetches = 0
 }
 async function run() {
   const { sweepWcCancellations } = await import('@/lib/connectors/woocommerce/sync/order-import')
@@ -139,10 +155,11 @@ test('a walk that never reaches an empty page is escalated, not trusted', async 
 })
 
 const CURSOR = 'wc_cancellation_backstop_cursor'
-async function job() {
+async function job(limits?: { maxPages: number; budgetMs: number }) {
   const { runWcCancellationBackstop } = await import('@/lib/connectors/woocommerce/sync/order-import')
-  return runWcCancellationBackstop()
+  return runWcCancellationBackstop(limits)
 }
+const BACKFILL = 'wc_cancellation_backstop_backfill'
 
 test('backstop job: does nothing before the initial import is complete (no read, no cursor)', async () => {
   reset()
@@ -187,4 +204,119 @@ test('the order sweep cursors are never read or written by the backstop job', as
   await job()
   assert.equal(state.settings.get('last_wc_order_reconcile_at'), '2026-11-01T00:00:00.000Z')
   assert.equal(state.settings.get('last_wc_order_sync_at'), '2026-11-02T00:00:00.000Z')
+})
+
+const SLICE = { maxPages: 2, budgetMs: 60_000 }
+// Orders created one minute apart, ids ascending with age.
+function stored(ids: number[], status = 'cancelled') {
+  return ids.map((id) => ({ id, status, date_created_gmt: new Date(Date.UTC(2026, 0, 1, 0, id)).toISOString().slice(0, 19) }))
+}
+const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i)
+const appliedIds = () => [...new Set(state.applied.map((a) => Number(a.id)))].sort((a, b) => a - b)
+
+test('backfill: bounded per run, resumes from the saved keyset position, and only the run that covers both statuses sets the cursor', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.store.cancelled = stored(range(1, 250))
+  state.store.trash = stored([251], 'trash')
+  state.linked = Object.fromEntries(range(1, 251).map((i) => [String(i), 'ALLOCATED']))
+  assert.deepEqual((await job(SLICE)).errors, [])
+  assert.equal(state.asked.length, 2, 'at most maxPages reads per run')
+  assert.equal(state.asked.every((p) => p.page === '1'), true, 'always page 1 (a keyset, not an offset)')
+  assert.equal(state.settings.has(CURSOR), false, 'not complete yet: no cursor')
+  const saved = JSON.parse(state.settings.get(BACKFILL)!)
+  assert.equal(saved.status, 'cancelled')
+  assert.ok(saved.after, 'a keyset position is saved')
+  const startedAt = saved.startedAt
+  await job(SLICE) // the short third page ends cancelled; trash is read
+  state.asked = []
+  const last = await job(SLICE)
+  assert.deepEqual(last.errors, [])
+  assert.ok(Number.isFinite(Date.parse(state.settings.get(CURSOR) ?? '')), 'cursor set once both statuses are covered')
+  assert.ok(Date.parse(state.settings.get(CURSOR)!) <= Date.parse(startedAt), 'cursor is taken from when the backfill began')
+  assert.deepEqual(appliedIds(), range(1, 251))
+  state.asked = []
+  await job(SLICE)
+  assert.ok(state.asked.every((p) => 'modified_after' in p), 'later runs are in cursor mode with the window')
+})
+
+test('backfill: an order leaving the status between reads does not hide the order behind it (the page-shift skip)', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.store.cancelled = stored(range(1, 150))
+  state.linked = Object.fromEntries(range(1, 150).map((i) => [String(i), 'ALLOCATED']))
+  // After page 1 is read, order 1 (already read) leaves `cancelled`. With page numbers, order 101 would slide onto page 1 and never be read.
+  state.onFetch = (n) => { if (n === 1) state.store.cancelled = state.store.cancelled.filter((o) => o.id !== 1) }
+  assert.deepEqual((await job({ maxPages: 50, budgetMs: 60_000 })).errors, [])
+  assert.deepEqual(appliedIds(), range(1, 150), 'order 101 was applied')
+  assert.ok(state.settings.has(CURSOR))
+})
+
+test('backfill: a full page that cannot advance the keyset (100 orders in one second) is an error, never a skip', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.store.cancelled = range(1, 120).map((id) => ({ id, status: 'cancelled', date_created_gmt: '2026-01-01T00:00:00' }))
+  const r = await job({ maxPages: 50, budgetMs: 60_000 })
+  assert.equal(r.errors.length, 1)
+  assert.match(r.errors[0], /did not advance/)
+  assert.equal(state.settings.has(CURSOR), false)
+})
+
+test('backfill: a full page without creation times cannot advance and is an error', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.store.cancelled = range(1, 120).map((id) => ({ id, status: 'cancelled', date_created_gmt: '' }))
+  state.store.cancelled = state.store.cancelled.map((o, i) => ({ ...o, date_created_gmt: i === 0 ? '' : '2026-01-01T00:00:00' }))
+  const r = await job({ maxPages: 50, budgetMs: 60_000 })
+  assert.equal(r.errors.length >= 1, true)
+  assert.equal(state.settings.has(CURSOR), false)
+})
+
+test('backfill: a failed read holds the position (never skipped) and sets no cursor; the next run retries the same read', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.store.cancelled = stored(range(1, 250))
+  await job({ maxPages: 1, budgetMs: 60_000 })
+  const held = JSON.parse(state.settings.get(BACKFILL)!)
+  assert.ok(held.after)
+  state.fetchError.cancelled = 'WC API error: 503 down'
+  const failed = await job(SLICE)
+  assert.equal(failed.errors.length, 1)
+  assert.deepEqual(JSON.parse(state.settings.get(BACKFILL)!), held, 'position unchanged by the failure')
+  assert.equal(state.settings.has(CURSOR), false)
+  state.fetchError = {}
+  state.asked = []
+  assert.deepEqual((await job(SLICE)).errors, [])
+  assert.equal(state.asked[0].after, held.after, 'resumes from the held position')
+})
+
+test('backfill: a page whose cancellation fails to apply is not passed', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.store.cancelled = stored(range(1, 150))
+  state.linked = { '1': 'ALLOCATED' }
+  state.syncResult = { success: false, error: 'transient' }
+  const r = await job(SLICE)
+  assert.equal(r.errors.length, 1)
+  assert.equal(JSON.parse(state.settings.get(BACKFILL)!).after, null, 'stays on the failed page')
+  assert.equal(state.settings.has(CURSOR), false)
+})
+
+test('backfill: a position saved by the old page-numbered walk restarts that status from its beginning', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.settings.set(BACKFILL, JSON.stringify({ startedAt: '2026-11-01T00:00:00.000Z', status: 'cancelled', nextPage: 7 }))
+  state.store.cancelled = stored([1])
+  await job(SLICE)
+  assert.equal(state.asked[0].after, undefined)
+})
+
+test('backfill: the time budget also ends a run, without an error', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.store.cancelled = stored([1, 2])
+  const r = await job({ maxPages: 50, budgetMs: 0 })
+  assert.deepEqual(r.errors, [])
+  assert.equal(state.asked.length, 0)
+  assert.equal(state.settings.has(CURSOR), false)
 })
