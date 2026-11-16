@@ -10,6 +10,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Refunds: no COGS reversal without a stock return; returned stock always carries a cost (backend / accounting)
+
+- **Fixed: a refund of shipped units marked "No stock return" posted a COGS reversal that debited Inventory.** With no return warehouse nothing comes back, so there is no stock or cost layer for the debit: the Inventory GL sat above the stock ledger by the shipped cost and margin was overstated. COGS is the cost of goods that left, so a refund that returns no stock now posts no COGS reversal (the cost stays expensed, as for a chargeback) and does not consume the shipped cost, leaving it available to a later refund that does return the units. Unshipped allocation is still released. A refund that returns stock reverses COGS as before.
+- **Fixed: returns of shipments not yet journaled, unpaid orders or orders with accounting off restocked stock with no cost layer.** The fallback return rows now carry the shipment's issued cost (the dispatch snapshot, or its dispatch cost records, at the originally posted unit cost, in dispatch order after earlier returns), so every restocked unit gets a cost layer. Where the issued cost is not on record, a return recorded by hand is refused with a message naming why, and a storefront refund (already issued, so it cannot be refused) is recorded without a return warehouse, restocks nothing and raises a WARNING on the order. No schema change and no backfill.
+
 ### Xero paid date and EU VAT update refusals (backend / sync)
 
 - **Fixed: the Xero date reader accepted days that do not exist.** `FullyPaidOnDate` and the other Xero dates read `2026-02-30` as 2 March (the platform parser rolls such days on). An ISO date whose written year, month and day are not a real calendar day (zoned or zone-less, or an hour of 24 that would roll the day on) is now unreadable, so the payment poller leaves the document pending and retries it instead of writing a wrong `paidAt`.

@@ -712,7 +712,16 @@ async function buildRefundFallbackReturnRows(
   orderId: string,
   lines: Array<RefundRequestLine | CreatedRefundLine>,
   excludeRefundId?: string,
-  options: { skipUnshipped?: boolean } = {},
+  options: {
+    skipUnshipped?: boolean
+    /**
+     * Receives every part of a row that was NOT returned because the cost of the shipped units is unknown
+     * (o3d-hqvrp.32). Only a storefront refund (`skipUnshipped`) parks: it is already issued in the
+     * storefront, so it cannot be refused. The caller records the parked units visibly. An operator-recorded
+     * refund never parks, it is refused.
+     */
+    parked?: Array<{ productId: string; qty: number; refundLineId: string | null }>
+  } = {},
 ): Promise<RefundReturnRow[]> {
   const order = await client.salesOrder.findUnique({
     where: { id: orderId },
@@ -738,9 +747,11 @@ async function buildRefundFallbackReturnRows(
         select: {
           lines: {
             select: {
+              id: true,
               lineId: true,
               productId: true,
               qty: true,
+              costLayerSnapshot: true,
             },
           },
         },
@@ -917,7 +928,21 @@ async function buildRefundFallbackReturnRows(
     }
   }
 
-  return lines.flatMap((line) => {
+  // o3d-hqvrp.32: THE COST OF A RETURNED UNIT. A restocked unit must carry a cost layer, so each row below is
+  // priced from the ISSUED cost of the units that shipped on its own order line: the dispatch snapshot (or, for
+  // an older line, its dispatch CogsEntry rows) valued at the originally posted unit cost, in dispatch order,
+  // after the units earlier refunds already took back. This does not depend on the shipment having been
+  // journaled, the order being paid or accounting being on, which is what the staged snapshot does depend on.
+  const costPool = await loadReturnCostPool(client, order.shipments)
+  const consumedBeforeThisBuild = new Map<string, number>()
+  for (const [lineId, rows] of sourceRowsByLine) {
+    for (const [productId, dispatched] of rows) {
+      const key = lineProductKey(lineId, productId)
+      consumedBeforeThisBuild.set(key, Math.max(0, dispatched - (remainingByLineProduct.get(key) ?? 0)))
+    }
+  }
+
+  const builtRows = lines.flatMap((line): Array<RefundReturnRow & { sourceLineId: string }> => {
     // Only a SALE line returns stock (a shipping or discount row is money only).
     if (!line.productId || line.qty <= 0 || (line.lineKind ?? 'sale') !== 'sale') return []
     const refundLineId = 'id' in line ? line.id : null
@@ -947,7 +972,7 @@ async function buildRefundFallbackReturnRows(
     // (released, not returned) before the walk moves on to the next line.
     if (options.skipUnshipped) {
       const walk = sortedLines.includes(sourceLine) ? sortedLines : [sourceLine, ...sortedLines]
-      const rows: RefundReturnRow[] = []
+      const rows: Array<RefundReturnRow & { sourceLineId: string }> = []
       for (const { line: allocated, take } of allocateRefundQtyAcrossLines(walk, line.qty, lineUnitsLeft)) {
         const allocatedRows = sourceRowsByLine.get(allocated.id)
         const allocatedQty = refundBoundaryNumber(allocated.qty)
@@ -970,7 +995,7 @@ async function buildRefundFallbackReturnRows(
           if (cappedQty <= 0) continue
           remainingReturnable.set(productId, available - cappedQty)
           remainingByLineProduct.set(lineKey, lineAvailable - cappedQty)
-          rows.push({ productId, qty: cappedQty, refundLineId })
+          rows.push({ productId, qty: cappedQty, refundLineId, sourceLineId: allocated.id })
         }
       }
       return rows
@@ -996,9 +1021,106 @@ async function buildRefundFallbackReturnRows(
       remainingByLineProduct.set(lineKey, lineAvailable - cappedQty)
 
       if (cappedQty <= 0) return []
-      return [{ productId, qty: cappedQty, refundLineId }]
+      return [{ productId, qty: cappedQty, refundLineId, sourceLineId: sourceLine.id }]
     })
   })
+
+  // Price the rows. The pool of each (line, component) is consumed once across this build, so two refund
+  // lines on one order line never price the same issued unit twice.
+  const cursorByKey = new Map<string, { index: number; usedInEntry: number }>()
+  const pricedRows: RefundReturnRow[] = []
+  for (const row of builtRows) {
+    const key = lineProductKey(row.sourceLineId, row.productId)
+    const pool = costPool.get(key) ?? []
+    let cursor = cursorByKey.get(key)
+    if (!cursor) {
+      // Skip the units earlier refunds already took back: they came out of the pool first.
+      cursor = { index: 0, usedInEntry: 0 }
+      let skip = consumedBeforeThisBuild.get(key) ?? 0
+      while (skip > 0.0000001 && cursor.index < pool.length) {
+        const step = Math.min(skip, pool[cursor.index].qty - cursor.usedInEntry)
+        cursor.usedInEntry += step
+        skip -= step
+        if (pool[cursor.index].qty - cursor.usedInEntry <= 0.0000001) cursor = { index: cursor.index + 1, usedInEntry: 0 }
+      }
+      cursorByKey.set(key, cursor)
+    }
+    let remaining = row.qty
+    while (remaining > 0.0000001 && cursor.index < pool.length) {
+      const entry = pool[cursor.index]
+      const step = Math.min(remaining, entry.qty - cursor.usedInEntry)
+      pricedRows.push({
+        productId: row.productId,
+        qty: step,
+        refundLineId: row.refundLineId,
+        unitCostBase: entry.unitCostBase,
+        poLineId: entry.poLineId,
+        sourceCostLayerId: entry.costLayerId,
+      })
+      remaining -= step
+      cursor.usedInEntry += step
+      if (entry.qty - cursor.usedInEntry <= 0.0000001) {
+        cursor.index += 1
+        cursor.usedInEntry = 0
+      }
+    }
+    if (remaining > 0.0000001) {
+      // The issued cost of these units is not on record (a dispatch with neither a snapshot nor CogsEntry rows).
+      // A costless unit must never enter stock, so the rest of the row is refused or parked, never restocked.
+      if (!options.skipUnshipped) {
+        throw new RefundReturnSourceError(
+          `Cannot restock product ${row.productId} for refund: the cost of the shipped units is not on record, and returned stock must carry a cost. Process as cash-only, or fix the shipment's cost snapshot first.`,
+        )
+      }
+      options.parked?.push({ productId: row.productId, qty: remaining, refundLineId: row.refundLineId ?? null })
+    }
+  }
+  return pricedRows
+}
+
+type ReturnCostPoolEntry = { costLayerId: string; qty: number; unitCostBase: number; poLineId: string | null }
+
+/**
+ * The issued cost of every shipped unit, per (order line, component product): the dispatch snapshot of each
+ * shipment line (falling back to its dispatch CogsEntry rows), valued at the originally posted unit cost.
+ */
+async function loadReturnCostPool(
+  client: RefundServiceClient,
+  shipments: ReadonlyArray<{ lines: ReadonlyArray<{ id: string; lineId: string; productId: string; costLayerSnapshot: Prisma.JsonValue | null }> }>,
+): Promise<Map<string, ReturnCostPoolEntry[]>> {
+  const tx = client as Prisma.TransactionClient
+  const shipmentLines = shipments.flatMap((shipment) => shipment.lines)
+  const pool = new Map<string, ReturnCostPoolEntry[]>()
+  if (shipmentLines.length === 0) return pool
+  const posted = await loadPostedShipmentUnitCosts(tx, shipmentLines.map((line) => line.id))
+  const snapshots = new Map<string, CostLayerSnapshotEntry[]>()
+  for (const line of shipmentLines) {
+    snapshots.set(line.id, applyPostedShipmentUnitCosts(
+      (await getShipmentLineCostSnapshot(tx, line)).map((entry) => ({ ...entry, shipmentLineId: line.id })),
+      posted,
+    ))
+  }
+  const layerIds = [...new Set([...snapshots.values()].flatMap((entries) => entries.map((entry) => entry.costLayerId)))]
+  const layers = layerIds.length === 0
+    ? []
+    : await tx.costLayer.findMany({ where: { id: { in: layerIds } }, select: { id: true, poLineId: true } })
+  const poLineByLayer = new Map(layers.map((layer) => [layer.id, layer.poLineId]))
+  for (const line of shipmentLines) {
+    const key = `${line.lineId}|${line.productId}`
+    const entries = pool.get(key) ?? []
+    for (const entry of snapshots.get(line.id) ?? []) {
+      const qty = refundBoundaryNumber(entry.qty)
+      if (qty <= 0) continue
+      entries.push({
+        costLayerId: entry.costLayerId,
+        qty,
+        unitCostBase: refundBoundaryNumber(entry.unitCostBase),
+        poLineId: poLineByLayer.get(entry.costLayerId) ?? null,
+      })
+    }
+    pool.set(key, entries)
+  }
+  return pool
 }
 
 /**
@@ -2589,6 +2711,12 @@ async function stageRefundAccountingReversals(
       return consumed
     }
 
+    // o3d-hqvrp.26: a refund that returns no stock reverses NO shipped COGS. COGS is the cost of goods that
+    // left; if the goods do not come back (no return warehouse), that cost stays expensed, exactly as for a
+    // chargeback. A reversal would debit Inventory (or Stock in Transit) for units no cost layer backs. The
+    // shipped cost is therefore not consumed either, so a later refund that does return those units still has
+    // it. Unshipped allocation is still released below: those units never left stock.
+    const stockReturned = Boolean(params.returnWarehouseId)
     for (const refundLine of params.refundLines) {
       const refundLineNet = toNetRevenue(refundLine.totalBase)
       if (!refundLine.productId || refundLine.qty <= 0) {
@@ -2614,7 +2742,7 @@ async function stageRefundAccountingReversals(
         // qty is still in stock — not a loss — so its allocated-inventory contra MUST
         // still be reversed, or the A2 allocation journal stays unreversed while a
         // full refund clears inventoryAllocatedDate (Codex).
-        if (lineAllocation.shippedQty > 0 && !params.chargeback) {
+        if (lineAllocation.shippedQty > 0 && !params.chargeback && stockReturned) {
           costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
         }
         if (lineAllocation.unshippedQty > 0) {
@@ -3186,7 +3314,8 @@ async function stageRefundAccountingReversals(
     const cogsReversalJournalDate = new Date().toISOString().slice(0, 10)
     // Goods in transit are not in Inventory: the debit goes to Stock in Transit until they arrive (the inventory
     // sub-ledger is cost layers, and none exists for units that are not back). Only a refund that actually
-    // returns stock is in transit (`returnWarehouseId`), so a refund with nothing to return keeps its debit.
+    // returns stock is in transit (`returnWarehouseId`). A refund with nothing to return has no shipped cost
+    // consumed above (o3d-hqvrp.26), so it reaches here with a zero reversal and posts no journal.
     const returnsInTransit = params.returnInTransit === true && Boolean(params.returnWarehouseId)
     const cogsReversalDebitAccount = returnsInTransit ? settings.transitAccount?.trim() : settings.inventoryAccount
     // Fail closed: no Stock in Transit account configured means the journal cannot be coded. Falling back to
@@ -4315,8 +4444,11 @@ export async function createSalesOrderRefund(
     // shipped quantity is left to restock, no return warehouse is recorded at all, so nothing downstream
     // (staging, inbound stock, the accounting retry) can restock what never shipped.
     let restockWarehouseId = effectiveReturnWarehouseId
+    // o3d-hqvrp.32: shipped units whose issued cost is not on record are NOT restocked (a costless unit must
+    // never enter stock) and are not silently dropped either: they are listed in a WARNING on the order below.
+    const parkedForUnknownCost: Array<{ productId: string; qty: number; refundLineId: string | null }> = []
     if (storefrontRefund && effectiveReturnWarehouseId) {
-      const restockable = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true })
+      const restockable = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true, parked: parkedForUnknownCost })
       if (restockable.length === 0) restockWarehouseId = undefined
     }
 
@@ -5053,6 +5185,19 @@ export async function createSalesOrderRefund(
     // fresher cost-layer snapshot; if that later step fails, the persisted
     // refund is retained and marked for accounting retry like other post-refund
     // side-effect failures.
+    if (parkedForUnknownCost.length > 0) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: input.orderId,
+          action: 'refund_return_parked_unknown_cost',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Refund ${createdRefund.id} did not restock ${parkedForUnknownCost.map((p) => `${p.qty} x product ${p.productId}`).join(', ')}: the issued cost of those shipped units is not on record, and returned stock must carry a cost. Restock them by hand once the cost is known.`,
+          metadata: { orderId: input.orderId, refundId: createdRefund.id, parked: parkedForUnknownCost },
+        },
+      })
+    }
     const fallbackReturnRows = restockWarehouseId
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
       : []

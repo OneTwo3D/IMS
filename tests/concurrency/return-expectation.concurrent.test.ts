@@ -87,7 +87,7 @@ async function seed(rig: Rig, suffix: string) {
       warehouseId: main.id,
       status: 'SHIPPED',
       shippedAt: new Date(),
-      lines: { create: [{ lineId, productId: product.id, qty: new Prisma.Decimal('2') }] },
+      lines: { create: [{ lineId, productId: product.id, qty: new Prisma.Decimal('2'), costLayerSnapshot: [{ costLayerId: 'retexp-issued-layer', qty: '2', unitCostBase: '40' }] }] },
     },
   })
   return { productId: product.id, mainId: main.id, returnsId: returns.id, orderId: order.id, lineId }
