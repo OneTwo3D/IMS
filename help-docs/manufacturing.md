@@ -214,7 +214,7 @@ Cost lines can be added, edited, or removed **after the order is completed**. Wh
    - `DR COGS` (or CR if delta is negative) for the units that were **sold** only. Units moved to another warehouse, returned by a customer or used as a component of a later production order are **not** COGS.
    - `DR Inventory` for everything else: units on hand, on a transfer, returned or re-used, plus the part of the sold units' change that the shipment's own COGS revaluation credits to Inventory when it posts.
    - `CR Manufacturing Overhead` for the **total** delta (matches the original journal direction)
-   The two debit legs always add up to the overhead credit. The unit cost of a destination layer already created by a transfer receipt is not changed by this edit.
+   The two debit legs always add up to the overhead credit. The edit also revalues the layers that hang off the output (a transfer's destination layer, a later production run that used the units as a component), including the COGS of any of those units already sold.
 3. Downstream snapshots on sales-order-line `cogsBase` and shipment-line `costLayerSnapshot` are refreshed.
 
 This means you can record actuals against estimates retroactively (e.g. final labour timesheet, monthly utility bill apportionment) without re-running the order or breaking accounting integrity. The journal is **idempotent** — keyed on `MFG_RECLASS:<orderId>:<oldTotal>:<newTotal>`, so saving the same edit twice posts only once.

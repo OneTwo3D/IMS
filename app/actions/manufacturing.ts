@@ -42,6 +42,8 @@ import {
   type ProductionOrderComponentSnapshot,
 } from '@/lib/domain/manufacturing/component-consumption'
 import { splitManufacturingRevaluation } from '@/lib/domain/manufacturing/cost-edit-split'
+import { lockLandedCostRevaluationScope } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { defaultLandedCostServiceDeps, propagateLandedCostToOutputs } from '@/lib/domain/purchasing/landed-cost-service'
 import { resolveAssemblyOutputQty } from '@/lib/domain/manufacturing/production-completion'
 import {
   evaluateProductionOrderCompletion,
@@ -1719,6 +1721,14 @@ async function recalculateManufacturingCostLayers(
   // -> cost_layers (these) -> snapshot child rows. A production order is not a row the revaluation takes, and
   // this transaction takes no transfer or purchase order, so it cannot be a link in a cycle with
   // 2a -> 2b-2d -> 6 (see lib/domain/wms/transfer-asn-lock-order.ts). Everything is READ after this line.
+  // ACC-H14: the edit now propagates into every layer hanging off the output layers (transfer destinations,
+  // later production runs), exactly as a landed-cost revaluation does, so it takes the SAME scope lock in the
+  // same order (transfers, then the layers of the closure, ascending). The production order is held by the
+  // caller and no revaluation takes one, so there is no cycle. The statement below then re-locks what is held.
+  const outputLayerRows = await tx.costLayer.findMany({ where: { productionOrderId }, select: { id: true } })
+  if (outputLayerRows.length > 0) {
+    await lockLandedCostRevaluationScope(tx, { rootLayerIds: outputLayerRows.map((row) => row.id) })
+  }
   await tx.$queryRaw`SELECT id FROM cost_layers WHERE production_order_id = ${productionOrderId} ORDER BY id FOR NO KEY UPDATE`
 
   const layers = await tx.costLayer.findMany({
@@ -1802,13 +1812,31 @@ async function recalculateManufacturingCostLayers(
       shipmentOwnedDelta: toDecimal(shipmentRefresh.cogsRevaluationDelta),
     })
     netCogsDeltaBase = addMoney(netCogsDeltaBase, split.cogsDelta)
-    netInventoryDeltaBase = addMoney(netInventoryDeltaBase, split.inventoryDelta)
+    // Whole edit on this layer; Inventory is taken as this less the COGS leg once the downstream legs are in.
+    netInventoryDeltaBase = addMoney(netInventoryDeltaBase, split.cogsDelta.add(split.inventoryDelta))
+    // ACC-H14: the units this edit moved on (transferred, re-used as a component) are carried by LAYERS that hang
+    // off this one. Their cost, their snapshots and the COGS of any of them already sold follow the same path a
+    // landed-cost revaluation takes. Each downstream layer reports the COGS it still owes net of what its own
+    // shipments post; that joins the COGS leg here, and Inventory stays the balance of the whole edit, so the
+    // journal equals the overhead credit however deep the chain goes.
+    await propagateLandedCostToOutputs(
+      tx,
+      defaultLandedCostServiceDeps,
+      li.id,
+      unitDelta,
+      (downstreamCogsDelta) => { netCogsDeltaBase = addMoney(netCogsDeltaBase, downstreamCogsDelta) },
+      new Set<string>(),
+      0,
+      recalcRunId,
+      revaluedAt,
+      { source: 'manufacturing_recompute', operation: 'recompute_production_order', productionOrderId },
+    )
     await refreshSalesOrderLineCogsForCostLayerChange(tx, li.id)
   }
 
   return {
     cogsDeltaBase: roundQuantity(netCogsDeltaBase, 6).toNumber(),
-    inventoryDeltaBase: roundQuantity(netInventoryDeltaBase, 6).toNumber(),
+    inventoryDeltaBase: roundQuantity(subtractMoney(netInventoryDeltaBase, netCogsDeltaBase), 6).toNumber(),
   }
 }
 

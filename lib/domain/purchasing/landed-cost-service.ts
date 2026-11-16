@@ -258,6 +258,9 @@ const defaultDeps: LandedCostServiceDeps = {
   warnWeightZeroLines,
 }
 
+/** ACC-H14: the production deps, for the manufacturing cost edit's propagation into downstream layers. */
+export const defaultLandedCostServiceDeps: LandedCostServiceDeps = defaultDeps
+
 const LANDED_COST_DELTA_EPSILON = new Prisma.Decimal('0.000001')
 const LANDED_COST_JOURNAL_EPSILON = new Prisma.Decimal('0.01')
 
