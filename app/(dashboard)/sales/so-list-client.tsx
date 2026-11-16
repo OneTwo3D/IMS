@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter, usePathname, useSearchParams } from 'next/navigation'
+import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
 import type { SoListResult, SoRow, SoStatus } from '@/app/actions/sales'
 import { PaginationBar } from '@/components/ui/pagination-bar'
 import { ArchivedBadge, OrderListSummary } from '@/components/lists/order-list-summary'
@@ -128,6 +129,16 @@ function loadCols(): ColKey[] {
 // ---------------------------------------------------------------------------
 // Derivations
 // ---------------------------------------------------------------------------
+
+function FulfilmentChip({ so }: { so: SoRow }) {
+  const f = summariseFulfilment(so.status, so.shipmentStatuses, so.shipmentOutstandingQty)
+  if (!f) return null
+  return (
+    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${FULFILMENT_TONE_CLASS[f.tone]}`}>
+      {f.label}
+    </span>
+  )
+}
 
 function invoiceStatus(so: SoRow): { label: string; cls: string } {
   // Refund state is orthogonal to the lifecycle status now — read refundStatus.
@@ -285,10 +296,11 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
         )
       case 'status':
         return (
-          <TableCell key={key}>
+          <TableCell key={key} className="space-x-1">
             <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
               {STATUS_LABELS[so.status]}
             </span>
+            <FulfilmentChip so={so} />
           </TableCell>
         )
       case 'total':
@@ -478,6 +490,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
                         <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
                           {STATUS_LABELS[so.status]}
                         </span>
+                        <FulfilmentChip so={so} />
                         <span className="text-sm font-semibold tabular-nums">
                           {fmtForeign(so.totalForeign, so.currency)}
                         </span>

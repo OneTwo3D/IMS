@@ -38,6 +38,8 @@ const pushCalls: PushArgs[] = []
 let script: Array<Record<string, unknown>> = []
 
 const activities: string[] = []
+let backstopCalls = 0
+let backstopResult: { synced: number; skipped: number; errors: string[] } = { synced: 0, skipped: 0, errors: [] }
 mock.module('@/lib/db', { namedExports: { db: fakeDb } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async (e: { level?: string; action?: string }) => { activities.push(`${e.level}:${e.action}`) }, logActivityPersisted: async () => true } })
 mock.module('@/lib/connectors/woocommerce/sync/order-import', {
@@ -45,6 +47,7 @@ mock.module('@/lib/connectors/woocommerce/sync/order-import', {
     isWcOrderWebhookPrimaryActive: async () => true,
     retryHeldWcSalesInvoiceReleases: async () => ({}),
     syncNewWcOrders: async () => ({}),
+    runWcCancellationBackstop: async () => { backstopCalls += 1; return backstopResult },
   },
 })
 mock.module('@/lib/connectors/woocommerce/sync/product-sync', {
@@ -71,6 +74,8 @@ function reset(script_: Array<Record<string, unknown>>) {
   pushCalls.length = 0
   activities.length = 0
   script = script_
+  backstopCalls = 0
+  backstopResult = { synced: 0, skipped: 0, errors: [] }
   settings.set('wc_stock_sync_enabled', 'true')
   settings.set('last_wc_order_reconcile_at', new Date().toISOString())
 }
@@ -257,4 +262,18 @@ test('the cursor clear and the stamp are written inside one transaction, not aro
   }
   assert.deepEqual(order.slice(order.indexOf('tx-begin')), ['tx-begin', 'tx:delete:cursor', 'tx:upsert:stamp', 'tx-end'])
   assert.ok(!order.some((entry) => entry.startsWith('db:') && (entry.endsWith(':stamp') || entry.endsWith(':cursor'))), 'nothing outside the transaction touches the stamp or the cursor')
+})
+
+test('the cancellation backstop runs on every pass, even in webhook-primary mode with the daily order reconcile not due, and its errors are reported', async () => {
+  const { runWcReconcile } = await import('@/lib/connectors/woocommerce/sync/reconcile')
+  reset([])
+  settings.delete('wc_stock_sync_enabled')
+  const quiet = await runWcReconcile()
+  assert.equal(backstopCalls, 1, 'ran although the order reconcile was skipped (webhook_primary_active)')
+  assert.equal((quiet.orders as { skipped?: boolean }).skipped, true)
+  assert.equal(quiet.cancellations, undefined, 'nothing to report when clean')
+  backstopResult = { synced: 0, skipped: 0, errors: ['WooCommerce cancelled orders could not be read'] }
+  const failed = await runWcReconcile()
+  assert.equal(backstopCalls, 2)
+  assert.deepEqual(failed.cancellations, { errors: ['WooCommerce cancelled orders could not be read'] })
 })

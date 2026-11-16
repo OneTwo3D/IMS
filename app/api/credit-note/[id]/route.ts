@@ -75,7 +75,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     select: { payload: true },
   })
   const payload = syncRow?.payload && typeof syncRow.payload === 'object' && !Array.isArray(syncRow.payload) ? (syncRow.payload as Record<string, unknown>) : null
-  const payloadLines = payload && Array.isArray(payload.lines) ? (payload.lines as Array<{ description?: unknown; quantity?: unknown; unitAmount?: unknown }>) : []
+  const payloadLines = payload && Array.isArray(payload.lines) ? (payload.lines as Array<{ description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }>) : []
   const posted = payload !== null && payloadLines.length > 0 && refusedCreditNoteError(payload) === null
 
   const orderRate = so.taxRatePercent != null ? Number(so.taxRatePercent) : null

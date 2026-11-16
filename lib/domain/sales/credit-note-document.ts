@@ -53,7 +53,7 @@ export function draftCreditNoteModel(input: {
   }))
 }
 
-export type PostedPayloadLine = { description?: unknown; quantity?: unknown; unitAmount?: unknown }
+export type PostedPayloadLine = { description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }
 
 /**
  * A refund whose credit note was staged: its payload lines as posted. `rateOf(i)` is the FROZEN rate for payload line i (0 for a line
@@ -68,8 +68,11 @@ export function postedCreditNoteModel(input: {
   return finishCreditNoteRows(input.payloadLines.map((l, i) => {
     const qty = Number(l.quantity ?? 1)
     const amount = qty * Number(l.unitAmount ?? 0)
-    const rate = input.vatIsOwnLine ? 0 : input.rateOf(i)
     const description = typeof l.description === 'string' ? l.description : 'Refund line'
+    // The scheme credit note's ONE VAT line (noTaxKind 'eu-vat-recovery') IS the VAT: it prints as VAT, not as net. Fee and rounding lines stay
+    // net lines of their own kind (a fee on NONE carries no VAT of its own; the rounding line is the rounding the credit note itself posts).
+    if (l.noTaxKind === 'eu-vat-recovery') return { description, qty, net: 0, vat: amount }
+    const rate = input.vatIsOwnLine ? 0 : input.rateOf(i)
     if (input.lineAmountsIncludeTax && rate > 0) {
       const net = amount / (1 + rate)
       return { description, qty, net, vat: amount - net }

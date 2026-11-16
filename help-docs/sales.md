@@ -62,6 +62,8 @@ Sales orders use the canonical sales order workflow documented in `docs/workflow
 | **On Hold** | Order paused, awaiting further action |
 | **Processing** | Order confirmed and being prepared |
 | **Allocated** | Stock has been allocated from warehouses |
+
+While an order is Allocated, Picking or Packing and has shipments, a second chip beside the status shows fulfilment progress derived from those shipments: **Ready to pick**, **Picking (1 of 2 parcels)**, **Packed 1 of 2 parcels**, **Packed — ready to ship**, **Partially shipped 1/3** or **Dispatched 2/2 parcels**. It appears on the order page and in the sales list; it is not a separate status and nothing is stored for it.
 | **Picking** | Items are being picked from the warehouse |
 | **Packing** | Items picked, being packed for dispatch |
 | **Shipped** | Order has been dispatched to the customer |
@@ -313,6 +315,12 @@ When a refund processes returned stock, the system uses the **current** cost-lay
 
 This keeps the returned-stock balance sheet entry aligned with the live cost layers. Note that the COGS reversal amount may differ from the originally-posted COGS amount by the revaluation delta — this is the expected behaviour for single-snapshot accounting.
 
+### Refunds that return no stock, and returns whose cost is unknown
+
+A refund with **No stock return** (no return warehouse) refunds the customer's money only. The goods are not back, so IMS posts **no COGS reversal** for it: the cost of the shipped units stays in COGS, exactly as for a chargeback, and Inventory is not debited for stock that no cost layer backs. The shipped cost is also left unconsumed, so a later refund that does return those units still has it.
+
+Every unit that is restocked carries a cost layer at the **issued cost** of the shipment it came from, in dispatch order, whether or not that shipment was ever journaled to the accounting system, and whether or not the order is paid or accounting is on. If the issued cost of the shipped units is not on record, a refund you record by hand with a return warehouse is **refused** with *"the cost of the shipped units is not on record"*; refund it as cash-only (no return warehouse) or fix the shipment's cost first. A WooCommerce refund is already issued in the shop, so it cannot be refused: it is recorded without a return warehouse, nothing is restocked, and a warning on the order (*refund_return_parked_unknown_cost*) names the units to restock by hand once the cost is known.
+
 ### Refunds without a shipment source
 
 If a sales order line was allocated but never shipped, the refund rejects with a clear message: *"Cannot return refunded stock for product X: no shipped stock source exists"*. The system refuses to silently restock from an allocation-only source — there's no actual stock movement to reverse.
@@ -464,7 +472,7 @@ Sales orders can be in any configured currency. The system handles the conversio
 
 When you create an order:
 
-- The current stored exchange rate is fetched from the FX rate table (Settings > Accounting > FX Rates). **There is no rate to type**: the form shows it read-only, and a rate sent any other way is ignored. A currency with no stored rate cannot be used: the order is refused with "Missing ... FX rate" and is never booked 1:1. An admin who needs a different rate pins a manual override on the FX Rates page.
+- The current stored exchange rate is fetched from the FX rate table (Settings > Accounting > FX Rates). **There is no rate to type**: the form shows it read-only, and a rate sent any other way is ignored. The rate is read when you choose the currency and shown with its source and date, and the lines already on the order are re-priced to the new currency at that rate (through the base currency). A currency with no stored rate cannot be used: the form shows "No exchange rate for <currency> yet: rates come from the store (Aelia)", the base-currency figures show a dash, the lines are left as they were, and **Save as Draft** and **Create Order** stay disabled until the rate exists. The server also refuses it, and an order is never booked 1:1. An admin who needs a different rate pins a manual override on the FX Rates page.
 - The rate is stamped on the order as `fxRateToBase`.
 - **CSV import:** `fxRateToBase` is optional. Leave it blank. A value that is not exactly the table rate is refused for that order (`FX_RATE_NOT_TABLE_RATE`), a zero, negative or unreadable value is `FX_RATE_INVALID` (never read as 1), and a currency with no rate is `FX_RATE_MISSING`.
 - All base-currency totals on the order use this stamped rate.
@@ -511,7 +519,7 @@ Three PDF documents are available for each sales order:
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically
-- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
+- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu for every order that is not a Draft or Cancelled, and from a **Packing slip** button on each shipment card (from Pending onwards, so it can be printed to pick from). The shipment button prints only that parcel. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
 

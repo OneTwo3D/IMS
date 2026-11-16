@@ -119,13 +119,22 @@ test('a posted credit note prints its payload lines as queued, whatever the curr
   })
   assert.deepEqual(plain.total, { net: 20, vat: 4, gross: 24 })
   const scheme = postedCreditNoteModel({
-    payloadLines: [{ description: 'Widget', quantity: 1, unitAmount: 10 }, { description: 'VAT', quantity: 1, unitAmount: 1.9 }],
+    payloadLines: [{ description: 'Widget', quantity: 1, unitAmount: 10 }, { description: 'VAT', quantity: 1, unitAmount: 1.9, noTaxKind: 'eu-vat-recovery' }],
     lineAmountsIncludeTax: false,
     vatIsOwnLine: true,
     rateOf: () => 0.2,
   })
-  assert.deepEqual(scheme.rows.map((r) => [r.net, r.vat, r.gross]), [[10, 0, 10], [1.9, 0, 1.9]])
-  assert.deepEqual(scheme.total, { net: 11.9, vat: 0, gross: 11.9 })
+  assert.deepEqual(scheme.rows.map((r) => [r.net, r.vat, r.gross]), [[10, 0, 10], [0, 1.9, 1.9]])
+  assert.deepEqual(scheme.total, { net: 10, vat: 1.9, gross: 11.9 })
+  assert.equal(scheme.rounding, null)
+  // a fee on NONE and a rounding-difference line stay net lines of their own kind
+  const kinds = postedCreditNoteModel({
+    payloadLines: [{ description: 'Fee', quantity: 1, unitAmount: 2, noTaxKind: 'fee-no-tax' }, { description: 'Rounding', quantity: 1, unitAmount: 0.01, noTaxKind: 'rounding-difference' }],
+    lineAmountsIncludeTax: false,
+    vatIsOwnLine: true,
+    rateOf: () => 0.2,
+  })
+  assert.deepEqual(kinds.total, { net: 2.01, vat: 0, gross: 2.01 })
 })
 
 // ---- Unicode ---------------------------------------------------------------------------------------------------------------

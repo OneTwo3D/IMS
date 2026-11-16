@@ -8,6 +8,7 @@ import { db } from '@/lib/db'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
+import { findOrderShipmentShortfall } from '@/lib/domain/sales/shipment-service'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { freshAuthFailureResult, requireFreshPermission, requireInternalUser, requirePermission } from '@/lib/auth/server'
@@ -285,6 +286,10 @@ export type SoRow = {
   wmsStatus: WmsOrderStatusView | null
   /** Outbound WMS dispatch-push state (sales-list chip); null when never pushed. */
   wmsPush: { state: string; lastError: string | null } | null
+  /** Statuses of the order's shipments, oldest first (drives the fulfilment summary on the status badge). */
+  shipmentStatuses: string[]
+  /** Units still owed (ordered - refunded - shipped); computed only when every parcel is SHIPPED on an order still in ALLOCATED/PICKING/PACKING, else null. */
+  shipmentOutstandingQty: number | null
 }
 
 export type SoDetail = SoRow & {
@@ -555,6 +560,8 @@ const SO_SELECT = {
     },
   },
   wmsOrderPush: { select: { state: true, lastError: true, connector: true, attempts: true, externalOrderId: true } },
+  // Fulfilment summary (status badge): statuses only, no new state.
+  shipments: { select: { status: true }, orderBy: { createdAt: 'asc' } },
   _count: { select: { lines: true } },
   lines: { select: { cogsBase: true } },
 } as const
@@ -619,6 +626,7 @@ function mapSoRow(so: {
     carrier: string | null
   } | null
   wmsOrderPush: { state: string; lastError: string | null; connector?: string; attempts?: number; externalOrderId?: string | null } | null
+  shipments?: { status: string }[]
 }): SoRow {
   const totalBase = Number(so.totalBase)
   const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
@@ -632,6 +640,8 @@ function mapSoRow(so: {
   const wms = so.wmsOrderStatus
   return {
     id: so.id,
+    shipmentStatuses: (so.shipments ?? []).map((sh) => sh.status),
+    shipmentOutstandingQty: null,
     wmsPush: so.wmsOrderPush
       ? (so.wmsOrderPush.connector !== undefined && wmsPushIsPreCutover(
         { state: so.wmsOrderPush.state, attempts: so.wmsOrderPush.attempts ?? 0, externalOrderId: so.wmsOrderPush.externalOrderId ?? null },
@@ -785,6 +795,14 @@ export type SoListResult = ListPage & {
  * A search covers order number, external order number, customer name and email, tracking number
  * and line SKU, and always includes completed and archived orders.
  */
+/** The fulfilment chip needs the order's remaining quantity only when every parcel has left yet the order has not advanced. */
+async function attachShipmentOutstanding(row: SoRow): Promise<void> {
+  if (!['ALLOCATED', 'PICKING', 'PACKING'].includes(row.status)) return
+  if (row.shipmentStatuses.length === 0 || row.shipmentStatuses.some((st) => st !== 'SHIPPED')) return
+  const shortfall = await findOrderShipmentShortfall(db, row.id)
+  row.shipmentOutstandingQty = (shortfall ?? []).reduce((sum, l) => sum + l.outstandingQty, 0)
+}
+
 export async function getSalesOrders(params: SoListParams = {}): Promise<SoListResult> {
   await requireInternalUser()
   const filter: SoListFilter = {
@@ -831,6 +849,7 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     }
     return row
   })
+  await Promise.all(rows.map(attachShipmentOutstanding))
   return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
@@ -978,8 +997,11 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     refundLines: r.lines,
   })]))
 
+  const detailRow = mapSoRow(so)
+  await attachShipmentOutstanding(detailRow)
+
   return {
-    ...mapSoRow(so),
+    ...detailRow,
     settlement,
     billingAddress: so.billingAddress,
     shippingAddress: so.shippingAddress,
@@ -1784,7 +1806,9 @@ export async function applySalesOrderStatusTransition(
   // transition, including CANCELLED from PROCESSING/ALLOCATED/PICKING/PACKING,
   // which releases reservations and deletes pending shipments. Symbols cannot
   // be serialized, so the capability tokens are not forgeable. (o3d-43oz)
-  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol },
+  // `guardUnderLock` (a function, so it cannot cross the RPC boundary either) can only REFUSE a move: it is asked the
+  // CURRENT status under the order lock and a non-null answer fails the transition (see updateSalesOrderStatusUnderLock).
+  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; guardUnderLock?: (currentStatus: string) => string | null },
   // `permanent: true` marks a failure a stable business rule refused, so a caller driving this from a
   // retrying transport (the Woo webhook inbox) can acknowledge it instead of retrying forever (o3d-bx9).
 ): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
@@ -2011,6 +2035,7 @@ export async function applySalesOrderStatusTransition(
           targetStatus,
           data,
           bypass: bypassPermission,
+          guardUnderLock: options?.guardUnderLock,
           beforeUpdate: async ({ tx: lockedTx }) => {
             // o3d-e1yb [wdraw]: enforce the terminal-approval fact HERE, under
             // the row lock, immediately before the write. The pre-flight check

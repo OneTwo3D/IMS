@@ -460,3 +460,20 @@ export const UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS: Record<UnresolvedWcOrderRowFa
     countNoun: 'sales invoice(s) held for a missing invoice number',
   },
 }
+
+/**
+ * THE ROW OF AN ORDER EDITED IN WOOCOMMERCE AFTER IMPORT (o3d-hqvrp.84). An open one is an operator's exception
+ * under Sync > Exceptions, and nothing re-reads an order whose content has not changed since it was last read, so
+ * nothing would refresh it: retention must NEVER age it out while it is open. It is deleted when the orders agree again.
+ */
+export const WC_ORDER_EDIT_DRIFT_RECORD_KIND = 'wc_order_edit_drift'
+export const WC_ORDER_EDIT_DRIFT_ENTITY_TYPE = 'SalesOrderEdit'
+
+/** TRUE for an open edit-drift row. Total (COALESCE), so `NOT (...)` in the retention DELETE is its exact complement. */
+export function openWcOrderEditDriftRowSql(): Prisma.Sql {
+  return Prisma.sql`COALESCE((
+        "shopping_sync_logs"."entityType" = ${WC_ORDER_EDIT_DRIFT_ENTITY_TYPE}
+    AND "shopping_sync_logs"."recordKind" = ${WC_ORDER_EDIT_DRIFT_RECORD_KIND}
+    AND "shopping_sync_logs".status = 'QUARANTINED'::"ShoppingSyncStatus"
+  ), FALSE)`
+}
