@@ -55,7 +55,7 @@ export const NEEDS_ATTENTION_CATEGORIES: readonly NeedsAttentionCategory[] = [
   {
     key: 'operatorTasks',
     label: 'Warehouse queries to raise',
-    detail: 'Open tasks a person must raise by hand in the warehouse system.',
+    detail: 'Open warehouse queries waiting for an operator.',
     href: '/sync/exceptions#wms-operator-tasks',
     permission: 'sync',
   },
