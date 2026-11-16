@@ -939,6 +939,8 @@ On the sales side a reversal established this way clears `paidAt` but raises **n
 note: a chargeback unwinds the whole recognised revenue, and the invoice still carries a payment. The
 alert says so — unwind revenue by hand if that is what the removal means.
 
+**A payment removed to be re-applied does not raise a chargeback.** Removing a payment in Xero in order to re-match it (remove it, then apply it again against the right invoice or bank line) leaves the invoice unpaid for a few minutes. An invoice whose Xero revision is less than **30 minutes** old and that shows nothing paid is **withheld** (*"…was changed in the last 30 minutes. That is what removing a payment in order to re-apply it looks like…"*): `paidAt` stays set and no chargeback credit note is raised. IMS asks Xero again within the hour. If the payment is back, the warning closes by itself and nothing was raised. If the invoice is still unpaid, it is then treated as a genuine reversal, exactly as before. A **voided** invoice is not delayed.
+
 **And a ledger holding *nothing* is not proof either.** "Nothing paid against this bill" is what a
 removed payment looks like — and it is equally what a payment the IMS registered *seconds ago* looks
 like, because **Mark Paid** sets `paidAt` at once and the worker posts the payment to Xero afterwards.
