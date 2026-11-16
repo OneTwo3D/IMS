@@ -146,13 +146,22 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
   return pass
 }
 
+/** What a sweep records of a detection pass: only a failure or a skip is worth a field. Off, or a pass that ran, is nothing. */
+export type MergeCandidateNote = { detection: 'did-not-complete' | 'skipped'; reason: string }
+
+export function mergeCandidateNote(run: MergeCandidateRun | { error: string }): MergeCandidateNote | undefined {
+  if ('error' in run) return { detection: 'did-not-complete', reason: run.error }
+  if ('skipped' in run) return { detection: 'skipped', reason: run.skipped }
+  return undefined
+}
+
 /** For the sweeps: never throws. A failed detection is logged and must not affect the push or the status sweep. */
 export async function runMergeCandidateDetectionSafe(trigger: string, port?: MergeCandidatePort): Promise<MergeCandidateRun | { error: string }> {
   try {
     return await runMergeCandidateDetection(port)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    console.error(`[wms-merge-candidates] detection after ${trigger} failed: ${message}`)
+    console.warn(`[wms-merge-candidates] detection after ${trigger} failed: ${message}`)
     return { error: message }
   }
 }

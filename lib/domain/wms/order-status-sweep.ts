@@ -8,7 +8,7 @@ import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/regist
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 import { shoppingOrderLookupSkipReason } from '@/lib/fulfillment/shopping-order-lookup'
 import { WMS_ORDER_STATUS_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
-import { runMergeCandidateDetectionSafe } from '@/lib/domain/wms/merge-candidates'
+import { mergeCandidateNote, runMergeCandidateDetectionSafe, type MergeCandidateNote } from '@/lib/domain/wms/merge-candidates'
 
 /**
  * Connector-agnostic WMS order-status sweep. Refreshes the cached snapshot for
@@ -39,6 +39,8 @@ export type WmsOrderStatusSweepResult = {
   pushHeld?: number
   /** Orders whose null fetch could not be settled because the presence probe THREW: a failed read, apart from the expected unresolved states (no probe, order present without a status) that only withhold the stamp. */
   probeFailures?: number
+  /** PRESENT ONLY WHEN the merge-candidate pass (flag mode) failed or skipped: best-effort, never changes this sweep's outcome. */
+  mergeCandidateDetection?: MergeCandidateNote
 }
 
 /**
@@ -421,7 +423,7 @@ export async function runWmsOrderStatusSweep(
   }
 
   // Merge candidates (flag mode, default off): the snapshots just refreshed are what prove an order is still NEW. Database only; never throws, never affects this sweep.
-  await runMergeCandidateDetectionSafe('the status sweep')
+  const mergeCandidateDetection = mergeCandidateNote(await runMergeCandidateDetectionSafe('the status sweep'))
 
-  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, PUSH_ERRORS_DISPLAY_CAP) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}), ...(pushFailures > 0 ? { pushFailures } : {}), ...(pushHeld > 0 ? { pushHeld } : {}), ...(probeFailures > 0 ? { probeFailures } : {}) }
+  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, PUSH_ERRORS_DISPLAY_CAP) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}), ...(pushFailures > 0 ? { pushFailures } : {}), ...(pushHeld > 0 ? { pushHeld } : {}), ...(probeFailures > 0 ? { probeFailures } : {}), ...(mergeCandidateDetection ? { mergeCandidateDetection } : {}) }
 }
