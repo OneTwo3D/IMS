@@ -1814,6 +1814,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                invoice is still outstanding — that gap is exactly what this line names. */
             <p className="px-4 pt-2 text-[11px] text-red-700 dark:text-red-300">{settlement.detail}</p>
           )}
+          {so.paymentRemovedForeign != null && so.paymentRemovedForeign > 0 && (
+            <p className="px-4 pt-2 text-[11px] text-amber-800 dark:text-amber-300" data-testid="payment-removed-notice">
+              The accounting ledger no longer holds {money(so.paymentRemovedForeign)} of this order&apos;s payment, so it is not fully paid. Revenue was not unwound: whether to credit the amount or write it off is decided by the order owner.
+            </p>
+          )}
           <div className="px-4 py-3 text-sm grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <span className="text-muted-foreground text-xs">Invoice Date</span>
@@ -1826,13 +1831,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             <div>
               <span className="text-muted-foreground text-xs">Paid</span>
               <p className="font-medium font-mono">
-                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0); return money(paid) })()}
+                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); return money(Math.max(0, paid)) })()}
               </p>
             </div>
             <div>
               <span className="text-muted-foreground text-xs">Balance</span>
-              <p className={`font-medium font-mono ${(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); return so.totalForeign - paid > 0.01 ? 'text-destructive' : 'text-green-600' })()}`}>
-                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${money(bal)} due` : 'Settled' })()}
+              <p className={`font-medium font-mono ${(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); return so.totalForeign - paid > 0.01 ? 'text-destructive' : 'text-green-600' })()}`}>
+                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${money(bal)} due` : 'Settled' })()}
               </p>
             </div>
           </div>

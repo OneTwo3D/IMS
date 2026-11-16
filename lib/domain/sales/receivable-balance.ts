@@ -31,6 +31,9 @@ import { refundCreditsAsGross, type TurnoverBound, type TurnoverRefund } from '@
  *    LEDGER receipt is registered), so the uncovered remainder is treated as received off-ledger at
  *    `paidAt`: receipts = max(customer receipts in base, invoiceGross). Cash paid out is then
  *    subtracted as usual, and an over-payment stays an over-payment.
+ *  - A PART REMOVED FROM THE LEDGER (o3d-cdhl): when the accounting ledger no longer holds part of the payment, that
+ *    part (`paymentRemovedForeign`, order currency, at the booked rate) comes off the receipts, so the balance owed
+ *    includes it from the moment it was recorded.
  *
  * `balance > 0.01` is a receivable, `balance < -0.01` a customer credit balance, otherwise settled.
  * A payment, refund or credit with no date counts as already happened (real rows always have one).
@@ -48,6 +51,9 @@ export type ReceivableOrder = {
   totalForeign?: unknown
   currency?: string | null
   paidAt?: Date | null
+  /** o3d-cdhl: the part of the paid amount the ledger no longer holds (order currency) and since when. NULL/absent = none. */
+  paymentRemovedForeign?: unknown
+  paymentRemovedAt?: Date | null
   payments: ReceivablePayment[]
   refunds?: Array<TurnoverRefund & { refundedAt?: Date | null }>
 }
@@ -94,6 +100,12 @@ export function receivableBalance(order: ReceivableOrder, asOf: Date): Receivabl
 
   let receipts = customerPayments.reduce((sum, p) => sum + toBase(p), 0)
   if (order.paidAt != null && onOrBefore(order.paidAt)) receipts = Math.max(receipts, invoiceGross)
+  // o3d-cdhl: the ledger no longer holds PART of what is held as paid (it came off the receipts at the booked rate, as every own-currency
+  // movement does). Without this the order's rows and its paid flag still say settled and the missing part would be owed by nobody.
+  const removedForeign = order.paymentRemovedForeign == null ? 0 : Number(order.paymentRemovedForeign)
+  if (order.paidAt != null && onOrBefore(order.paidAt) && removedForeign > 0 && onOrBefore(order.paymentRemovedAt)) {
+    receipts -= removedForeign * bookedRate
+  }
   receipts -= cashOut.reduce((sum, p) => sum + Math.abs(toBase(p)), 0)
 
   const balance = round2(invoiceGross - creditResult.credit - receipts)

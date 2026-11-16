@@ -11,6 +11,7 @@ import { INVOICED_ORDER_WHERE, invoicedInPeriodWhere, invoicedPeriodDate, invoic
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import { marginFigureBound, netLinearFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, unplacedCreditBoundFromParts, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
+import { isFullyPaid } from '@/lib/domain/sales/paid-state'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -463,7 +464,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
     where: Object.keys(dateFilter).length ? invoicedInPeriodWhere(dateFilter as { gte?: Date; lte?: Date }) : INVOICED_ORDER_WHERE,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, accountingInvoiceId: true, customerName: true, salesRep: true,
-      invoicedAt: true, createdAt: true, status: true, totalBase: true, totalForeign: true, currency: true, paidAt: true,
+      invoicedAt: true, createdAt: true, status: true, totalBase: true, totalForeign: true, currency: true, paidAt: true, paymentRemovedForeign: true, paymentRemovedAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true } },
       payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
       refunds: { select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
@@ -484,7 +485,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
         productName: l.description, customerName: o.customerName ?? '—', salesRep: o.salesRep,
         invoicedAt: invoicedPeriodDate(o).toISOString(), invoicedAtApproximate: invoicedPeriodDateIsApproximate(o), status: o.status,
         qty: Number(l.qty), totalBase: Number(l.totalBase),
-        paidAt: o.paidAt?.toISOString() ?? null, balance, balanceBound,
+        paidAt: isFullyPaid(o) ? (o.paidAt?.toISOString() ?? null) : null, balance, balanceBound,
       })
     }
   }
@@ -620,7 +621,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
     where: INVOICED_ORDER_WHERE,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
-      currency: true, totalBase: true, totalForeign: true, taxBase: true, invoicedAt: true, paidAt: true, createdAt: true,
+      currency: true, totalBase: true, totalForeign: true, taxBase: true, invoicedAt: true, paidAt: true, paymentRemovedForeign: true, paymentRemovedAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
       payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
       // o3d-iigc: the basis was not fetched before, so the report could not have respected it.
