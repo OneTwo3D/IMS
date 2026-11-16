@@ -2432,6 +2432,9 @@ export async function processPendingEmailOutbox(
   }
 
   for (const email of pending) {
+    // Set the moment a send is known to have an UNKNOWN outcome, before any settlement write. If that write throws, the catch below must
+    // settle terminal FAILED with this reason, never PENDING: the message may already have been accepted.
+    let unknownOutcomeReason: string | null = null
     const claimedAt = now()
     const token = randomUUID()
     const verdict = await claimEmailRow(client, email.id, { claimedAt, staleCutoff, token })
@@ -2587,6 +2590,7 @@ export async function processPendingEmailOutbox(
         }
         if (guarded.unknown !== undefined) {
           // The send may have been accepted but its outcome is unknown: terminal FAILED, never retried; a person re-queues it.
+          unknownOutcomeReason = guarded.unknown
           await refuseRecipient(guarded.unknown, { keepAddress: true })
           await recordUnknownOutcomeOnReference(email, guarded.unknown)
           continue
@@ -2601,6 +2605,7 @@ export async function processPendingEmailOutbox(
       // object the CALLER'S sender built, so these four reads cannot disagree with each other or with
       // the `delivered` the progress record holds — `error` in particular used to be read three
       // times, in three writes that must agree about what went wrong.
+      if (sendResult.unknownOutcome) unknownOutcomeReason = sendResult.error ?? 'Outcome unknown'
       const delivered = sendResult.success
       const reportedPermanent = sendResult.permanent
       const invalidRecipient = sendResult.invalidRecipient
@@ -2664,11 +2669,11 @@ export async function processPendingEmailOutbox(
       if (sendResult.unknownOutcome) await recordUnknownOutcomeOnReference(email, sendError ?? 'Outcome unknown')
     } catch (error) {
       const attempts = email.attempts + 1
-      const permanentFailure = attempts >= EMAIL_MAX_ATTEMPTS
+      const permanentFailure = attempts >= EMAIL_MAX_ATTEMPTS || unknownOutcomeReason !== null
       const settled = await settleClaimedEmail(client, claim, {
         status: permanentFailure ? 'FAILED' : 'PENDING',
         attempts,
-        lastError: String(error),
+        lastError: unknownOutcomeReason ?? String(error),
         availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
         processingStartedAt: null,
       })
@@ -2680,6 +2685,7 @@ export async function processPendingEmailOutbox(
       // "a thrown send" or "a throw before the send", so a database failure on a settled row was
       // reported as a mail-transport failure. `thrownPhase` names each of them; see its enumeration.
       else await recordConflict(claim, smtp.thrownPhase, smtp)
+      if (unknownOutcomeReason !== null) await recordUnknownOutcomeOnReference(email, unknownOutcomeReason)
     }
   }
 

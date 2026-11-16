@@ -38,7 +38,7 @@ type EmailOptions = {
   deadlineMs?: number
   /**
    * The message must reach the recipient AT MOST ONCE (a purchase order). Once delivery has begun (the DATA command was issued on an
-   * established connection), any failure that is not a definite server answer, and any failure at or after `deadlineMs`, is the terminal
+   * established connection), any failure that is not a definite server answer, and the deadline timer firing, is the terminal
    * "outcome unknown" result (`permanent` + `unknownOutcome`): the server may have accepted the message with the final response lost, so
    * it is never requeued. Failures before delivery began (DNS, refused, auth, a server answer) keep their ordinary classification.
    */
@@ -54,8 +54,6 @@ type SendEmailResult = {
   unknownOutcome?: boolean
 }
 
-/** A failure at or within this much of the deadline is the deadline firing, whichever of our timer and the transport's socket timer got there first. */
-const DEADLINE_TOLERANCE_MS = 1_000
 
 /** Reason on a send that hit its deadline: the message may or may not have been accepted, so it is never retried automatically. */
 export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending (Email PO).'
@@ -168,13 +166,13 @@ export async function sendEmailWithSmtpSettings(
     // singleSend: watch the transaction log for the DATA command (the first byte of the message). The log entry is read for that one
     // fact and discarded; nothing it carries (addresses, credentials) is kept.
     let dataStarted = false
-    const startedAt = Date.now()
     if (opts.singleSend) {
       unknownOutcomeProbe = (e) => {
         const responseCode = (e as { responseCode?: unknown } | null)?.responseCode
         if (typeof responseCode === 'number') return false // a definite answer from the server: the ordinary classification applies
-        const atDeadline = deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs - DEADLINE_TOLERANCE_MS
-        return dataStarted || atDeadline
+        // Classified by the OBSERVED phase: no DATA seen means nothing was handed over, so a rejection is retryable however late it comes.
+        // (The deadline TIMER below stays terminal: it leaves the send in flight, so its phase cannot be known.)
+        return dataStarted
       }
     }
     const noop = () => undefined

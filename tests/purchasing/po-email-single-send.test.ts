@@ -22,16 +22,26 @@ const reject = (code: string, message: string, extra: Record<string, unknown> = 
   Object.assign(new Error(message), { code, command: 'CONN', ...extra })
 const sendCommand = (o: Options, command: string) => o.logger.debug({ tnx: 'client' }, command)
 
-test('mailer: a sendMail rejection exactly at the deadline is the same terminal unknown outcome as the deadline timer', async () => {
+test('mailer: a sendMail rejection exactly at the deadline, after DATA, is the same terminal unknown outcome as the deadline timer', async () => {
   const { sendEmailWithSmtpSettings, SEND_DEADLINE_UNKNOWN_OUTCOME } = await import('../../lib/mailer.ts')
   // The transport's own socket timeout fires on the same tick as our timer and rejects first.
-  behave = () => new Promise((_, rej) => setTimeout(() => rej(reject('ETIMEDOUT', 'Timeout')), 20))
+  behave = (o) => { sendCommand(o, 'DATA'); return new Promise((_, rej) => setTimeout(() => rej(reject('ETIMEDOUT', 'Timeout')), 20)) }
   const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
   assert.deepEqual(r, { success: false, permanent: true, unknownOutcome: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME })
   // ... and the timer winning gives the identical answer.
   behave = () => new Promise<never>(() => undefined)
   const t = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
   assert.deepEqual(t, r)
+})
+
+test('mailer: a pre-delivery rejection just before the deadline (no DATA seen) stays retryable', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  for (const failure of [reject('EDNS', 'getaddrinfo ENOTFOUND smtp.invalid'), reject('ECONNECTION', 'connect ECONNREFUSED 127.0.0.1:587')]) {
+    behave = () => new Promise((_, rej) => setTimeout(() => rej(failure), 480))
+    const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 500, singleSend: true })
+    assert.equal(r.permanent, false)
+    assert.equal(r.unknownOutcome, undefined)
+  }
 })
 
 test('mailer: a socket failure after DATA started is terminal, however early it comes', async () => {
@@ -150,7 +160,8 @@ function matchesWhere(row: StoredRow, where: Where): boolean {
 }
 
 
-async function makeClient(rows: EmailOutboxRow[]) {
+async function makeClient(rows: EmailOutboxRow[], failFirstSettlement = false) {
+  let settlementFailed = false
   const { EMAIL_OUTBOX_IN_MEMORY_ROWS, createEmailOutboxHarnessClient } = await import('@/lib/email-outbox')
   const store: StoredRow[] = rows.map((row) => ({ ...row }))
   const suppressionStore: Record<string, unknown>[] = []
@@ -164,6 +175,10 @@ async function makeClient(rows: EmailOutboxRow[]) {
       },
       async updateMany(args: unknown) {
         const { where, data } = args as { where: Where; data: Record<string, unknown> }
+        if (failFirstSettlement && !settlementFailed && (data.status === 'FAILED' || data.status === 'PENDING')) {
+          settlementFailed = true
+          throw new Error('the settlement write did not commit')
+        }
         let count = 0
         for (const row of store) {
           if (!matchesWhere(row, where)) continue
@@ -198,10 +213,10 @@ function makeRow(overrides: Partial<EmailOutboxRow>): EmailOutboxRow {
 
 const T0 = new Date('2026-09-10T10:00:00.000Z')
 
-async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> | null) {
+async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> | null, failFirstSettlement = false) {
   const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
-  const { client, rows } = await makeClient([row])
+  const { client, rows } = await makeClient([row], failFirstSettlement)
   const logs: { entityType: string; entityId: string; action: string; level: string }[] = []
   const result = await processPendingEmailOutbox({
     harness: {
@@ -217,7 +232,7 @@ async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> 
 
 test('outbox: a PO send rejected exactly at the deadline ends FAILED, is not requeued, and is logged on the PO at WARNING', async () => {
   sendMailCalls = 0
-  behave = () => new Promise((_, rej) => setTimeout(() => rej(reject('ETIMEDOUT', 'Timeout')), 20))
+  behave = (o) => { sendCommand(o, 'DATA'); return new Promise((_, rej) => setTimeout(() => rej(reject('ETIMEDOUT', 'Timeout')), 20)) }
   const { result, row, logs } = await drainWith(makeRow({}), { sendDeadlineMs: 20, singleSend: true })
   assert.equal(result.failed, 1)
   assert.equal(row.status, 'FAILED')
@@ -260,4 +275,20 @@ test('outbox: another kind with the same socket failure after DATA is unchanged 
   assert.equal(row.status, 'PENDING')
   assert.equal(row.attempts, 1)
   assert.equal(logs.length, 0)
+})
+
+test('outbox: a settlement write that fails after an unknown outcome still ends FAILED, and nothing is sent on the next tick', async () => {
+  sendMailCalls = 0
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('ESOCKET', 'read ECONNRESET') }
+  const first = await drainWith(makeRow({}), { sendDeadlineMs: 60_000, singleSend: true }, true)
+  assert.equal(first.row.status, 'FAILED', 'the catch settles terminal, never PENDING')
+  assert.match(String(first.row.lastError ?? ''), /Outcome unknown/)
+  assert.equal(first.logs.length, 1)
+  const again = await drainWith(first.row, { sendDeadlineMs: 60_000, singleSend: true })
+  assert.equal(again.result.processed, 0)
+  assert.equal(sendMailCalls, 1)
+
+  // The guard's unknown-outcome branch has the same protection.
+  const guarded = await drainWith(makeRow({}), { sendGuard: async () => ({ unknown: 'Outcome unknown: guard backstop.' }), singleSend: true }, true)
+  assert.equal(guarded.row.status, 'FAILED')
 })
