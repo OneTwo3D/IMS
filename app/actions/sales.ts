@@ -285,6 +285,8 @@ export type SoRow = {
   wmsStatus: WmsOrderStatusView | null
   /** Outbound WMS dispatch-push state (sales-list chip); null when never pushed. */
   wmsPush: { state: string; lastError: string | null } | null
+  /** Statuses of the order's shipments, oldest first (drives the fulfilment summary on the status badge). */
+  shipmentStatuses: string[]
 }
 
 export type SoDetail = SoRow & {
@@ -555,6 +557,8 @@ const SO_SELECT = {
     },
   },
   wmsOrderPush: { select: { state: true, lastError: true, connector: true, attempts: true, externalOrderId: true } },
+  // Fulfilment summary (status badge): statuses only, no new state.
+  shipments: { select: { status: true }, orderBy: { createdAt: 'asc' } },
   _count: { select: { lines: true } },
   lines: { select: { cogsBase: true } },
 } as const
@@ -619,6 +623,7 @@ function mapSoRow(so: {
     carrier: string | null
   } | null
   wmsOrderPush: { state: string; lastError: string | null; connector?: string; attempts?: number; externalOrderId?: string | null } | null
+  shipments?: { status: string }[]
 }): SoRow {
   const totalBase = Number(so.totalBase)
   const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
@@ -632,6 +637,7 @@ function mapSoRow(so: {
   const wms = so.wmsOrderStatus
   return {
     id: so.id,
+    shipmentStatuses: (so.shipments ?? []).map((sh) => sh.status),
     wmsPush: so.wmsOrderPush
       ? (so.wmsOrderPush.connector !== undefined && wmsPushIsPreCutover(
         { state: so.wmsOrderPush.state, attempts: so.wmsOrderPush.attempts ?? 0, externalOrderId: so.wmsOrderPush.externalOrderId ?? null },

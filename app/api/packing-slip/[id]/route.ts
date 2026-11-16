@@ -17,8 +17,9 @@ import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
+import { selectShipmentsForSlip } from '@/lib/domain/sales/packing-slip-scope'
 
-export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireApiAuth()
   if (session instanceof NextResponse) return session
   if (!hasPermission(session.user.role, 'sales')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
@@ -51,7 +52,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   })
   if (!so) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-  const shipments = await db.shipment.findMany({
+  // ?shipment=<id> narrows the slip to one parcel (available from PENDING, so it can be printed to pick from).
+  const requestedShipmentId = new URL(req.url).searchParams.get('shipment')
+  const allShipments = await db.shipment.findMany({
     where: { orderId: id },
     include: {
       warehouse: { select: { name: true } },
@@ -63,6 +66,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     },
     orderBy: { createdAt: 'asc' },
   })
+  const shipments = selectShipmentsForSlip(allShipments, requestedShipmentId)
+  if (!shipments) return NextResponse.json({ error: 'Shipment not found on this order' }, { status: 404 })
 
   const [branding, tpl] = await Promise.all([
     getBranding(),
