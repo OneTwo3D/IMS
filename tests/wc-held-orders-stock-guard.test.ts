@@ -516,10 +516,12 @@ test('a persistent set far above the fetch budget never blocks for ever: positiv
   }
 })
 
-test('both paths that bump the connection generation retire the dirty entries in the same transaction', async () => {
+test('a credential rebind (another store) deletes the dirty entries; a product-id cache reset (same store) re-binds them, in the bump transaction', async () => {
   const { readFile } = await import('node:fs/promises')
   const src = await readFile(new URL('../app/actions/wc-sync.ts', import.meta.url), 'utf8')
-  const bumps = [...src.matchAll(/create: \{ key: WC_SETTINGS_VERSION_KEY, value: nextVersion \},\n\s+update: \{ value: nextVersion \},\n\s+\}\)\n\s+\/\/[^\n]*\n\s+\/\/[^\n]*\n\s+await tx\.wcStockDirtyOrder\.deleteMany\(\{\}\)/g)]
-  assert.equal(bumps.length, 2, 'saveWcCredentials (rebind) and resetWcProductIdCache each delete the rows right after the bump, inside their transaction')
+  const bump = /create: \{ key: WC_SETTINGS_VERSION_KEY, value: nextVersion \},\n\s+update: \{ value: nextVersion \},\n\s+\}\)\n(?:\s+\/\/[^\n]*\n)+\s+await tx\.wcStockDirtyOrder\.(deleteMany\(\{\}\)|updateMany\(\{ data: \{ syncVersion: nextVersion \} \}\))/g
+  const found = [...src.matchAll(bump)].map((m) => m[1])
+  assert.deepEqual(found, ['deleteMany({})', 'updateMany({ data: { syncVersion: nextVersion } })'], 'saveWcCredentials deletes, resetWcProductIdCache re-binds')
   assert.equal([...src.matchAll(/WC_SETTINGS_VERSION_KEY, value: nextVersion/g)].length, 2, 'and there is no third bump this misses')
+  assert.ok(src.indexOf('async function resetWcProductIdCache') < src.lastIndexOf('updateMany({ data: { syncVersion: nextVersion } })'))
 })

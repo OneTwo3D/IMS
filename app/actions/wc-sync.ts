@@ -624,9 +624,10 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
       create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
       update: { value: nextVersion },
     })
-    // The released-order records belong to the generation just left (their ids are the old store's): retired in this same transaction, which
-    // also holds the lock every guard write-back takes, so a run still on the old generation cannot write them back afterwards.
-    await tx.wcStockDirtyOrder.deleteMany({})
+    // A product-id cache reset is the SAME store: its released-order records keep their order ids and snapshots and move to the new generation
+    // (the order-sync cursors stay valid and the guard prefers them, so deleting the records would leave an older released order read by neither
+    // path). Same transaction, same lock as every guard write-back, so a run still on the old generation cannot write afterwards.
+    await tx.wcStockDirtyOrder.updateMany({ data: { syncVersion: nextVersion } })
     const cleared = await tx.product.updateMany({
       where: { externalProductId: { not: null } },
       data: { externalProductId: null },

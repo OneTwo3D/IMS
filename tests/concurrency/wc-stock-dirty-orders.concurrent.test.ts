@@ -194,3 +194,34 @@ test('entries are bound to the connection generation: a rebind retires the old r
     await rig.pool.end()
   }
 })
+
+test('a product-id cache reset re-binds the entries to the new generation with their snapshots; an in-flight write from before it is refused', { skip }, async () => {
+  const rig = await openRig()
+  let fx: Awaited<ReturnType<typeof seed>> | undefined
+  try {
+    fx = await seed(rig, suffix(), true)
+    const seeded = fx
+    await withVersion(rig, '20', async () => {
+      await rig.db.$transaction(async (tx) => { await rig.markWcOrderDirtyForStockGuard(tx, seeded.orderId) })
+      const row = await rig.db.wcStockDirtyOrder.findUnique({ where: { wcOrderId: seeded.wcOrderId } })
+      const snap = [{ wcOrderId: seeded.wcOrderId, status: 'completed', lines: [{ productId: 1, variationId: 0, sku: 'X', quantity: 2 }] }]
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '20', { tokenOf: new Map([[seeded.wcOrderId, row!.token]]), settled: [], refreshed: snap }), true)
+      // the reset transaction, as resetWcProductIdCache runs it: bump under the lock, re-bind the entries
+      await rig.db.$transaction(async (tx) => {
+        await tx.setting.update({ where: { key: 'wc_settings_version' }, data: { value: '21' } })
+        await tx.wcStockDirtyOrder.updateMany({ data: { syncVersion: '21' } })
+      })
+      // a run that began under generation 20 writes nothing afterwards
+      assert.equal(await rig.commitDirtyOrderOutcome(rig.db as never, '20', { tokenOf: new Map([[seeded.wcOrderId, row!.token]]), settled: [seeded.wcOrderId], refreshed: [] }), false)
+      assert.deepEqual(await rig.loadDirtyOrdersForGuard(rig.db as never, '20'), [])
+      // the guard on the new generation still has the order, with its snapshot: it is charged although the order-sync cursors are intact
+      const [kept] = await rig.loadDirtyOrdersForGuard(rig.db as never, '21')
+      assert.equal(kept?.wcOrderId, seeded.wcOrderId)
+      assert.deepEqual(rig.parseDirtySnapshot(kept!.lines, kept!.lineStatus)?.lines, snap[0]!.lines)
+    })
+  } finally {
+    await cleanup(rig, fx)
+    await rig.db.$disconnect()
+    await rig.pool.end()
+  }
+})
