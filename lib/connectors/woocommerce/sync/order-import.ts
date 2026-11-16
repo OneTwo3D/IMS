@@ -3,7 +3,7 @@
  */
 
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
-import { advancePullCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
+import { advancePullCursor, laterCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
@@ -32,6 +32,7 @@ import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
+import { surfaceWcOrderEditDrift } from './order-edit-drift'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
@@ -1388,6 +1389,10 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   await updateExistingWcOrderCore(orderId, wcOrder, transition.kind !== 'none')
   let outcome: PaidBlockOutcome = { blocked: false }
   if (transition.kind === 'record') outcome = await recordWcPaidTransition(orderId, wcOrder, transition.settlementRate, retryLogId, snapshotVersion)
+  // The lines and total are never rewritten here; an edit in WooCommerce is surfaced instead (o3d-hqvrp.84). AFTER the paid step, because a paid
+  // delivery whose total or currency disagrees with IMS already left its own durable obligation row (paid-block, retried until the two agree):
+  // the total is not surfaced a second time then, so one disagreement is one row.
+  await surfaceWcOrderEditDrift(orderId, wcOrder, { ignoreTotal: outcome.blocked })
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
@@ -4558,6 +4563,108 @@ export async function noteWcOrderAdmissionRefusal(modifiedAtIso: string | null |
     })
   } catch (e) {
     console.error('o3d-tj6v r4: failed to record an admission-refusal watermark', e)
+  }
+}
+
+/**
+ * THE CANCELLATION BACKSTOP (o3d-hqvrp.82). A cancellation (or a trash) in WooCommerce reaches IMS through
+ * one `order.updated` delivery, and the sweeps ask WooCommerce only for the operator's selected statuses
+ * (plus completed and the withdrawal statuses), so an order that moved to `cancelled` never comes back:
+ * a lost delivery meant the order stayed allocated and went on to the warehouse.
+ *
+ * This reads the orders WooCommerce holds as `cancelled` (and `trash`) modified since the
+ * sweep's window, and applies the cancellation to the ones IMS ALREADY HOLDS, through `syncWcOrderStatus`
+ * (state machine, withdrawal rules and the WMS cancel pass included). It never imports an order IMS has not
+ * seen, so the operator's status selection is unaffected. It does not touch the cursor: a failure of the
+ * required `cancelled` read, or a cancellation that fails to apply, is an ERROR on the run, which holds the
+ * cursor exactly as a failed import does. The same holds for `trash`, with ONE exception: a store that
+ * confirms it does not accept the status (4xx naming `status` as invalid) is asked once, logged, and not asked again.
+ * A transient failure (5xx, timeout, network) is never an exception: skipping it would let the cursor pass an order
+ * trashed in that window.
+ */
+const WC_TRASH_READ_UNSUPPORTED_KEY = 'wc_order_trash_read_unsupported'
+
+/** A 4xx from WooCommerce that names the `status` parameter as invalid: the store does not accept this status. */
+export function isWcUnsupportedStatusRefusal(error: unknown): boolean {
+  const text = String(error ?? '')
+  return /^WC API error: 4\d\d\b/.test(text) && /\bstatus\b/i.test(text) && /invalid|rest_invalid_param/i.test(text)
+}
+
+export const WC_CANCELLATION_BACKSTOP_CURSOR_KEY = 'wc_cancellation_backstop_cursor'
+
+/**
+ * THE CANCELLATION BACKSTOP AS ITS OWN JOB (o3d-hqvrp.82). It runs on the frequent wc-reconcile cron on every run, whatever mode the
+ * order sweep is in (in webhook-primary mode the order reconciliation is daily, which would leave a lost cancellation live for a day),
+ * and has its OWN cursor: it neither reads nor moves the order sweep's cursors.
+ *
+ * The window is `modified_after` the last COMPLETED backstop run (taken at read start, with the same overlap the order cursors use). The FIRST run
+ * has no cursor and reads `cancelled` and `trash` with no bound at all, so a cancellation made before the backstop existed is not skipped; it
+ * still applies only to orders IMS already holds. The cursor advances only after every read ended on an empty page and every apply succeeded.
+ * Needs the initial import to be complete (before it, IMS holds nothing to cancel and the full read would be wasted).
+ */
+export async function runWcCancellationBackstop(): Promise<SyncResult> {
+  const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
+  const initial = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
+  if (initial?.value !== 'true') return result
+  const readStartedAtMs = Date.now()
+  const stored = await db.setting.findUnique({ where: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY } })
+  const cursor = stored?.value && Number.isFinite(Date.parse(stored.value)) ? stored.value : null
+  await sweepWcCancellations(cursor, result, 'cancellation backstop')
+  if (result.errors.length === 0) {
+    const candidate = wcPullCursorCandidate(readStartedAtMs)
+    const value = laterCursor(cursor, candidate)
+    await db.setting.upsert({ where: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY }, create: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY, value }, update: { value } })
+  }
+  return result
+}
+
+export async function sweepWcCancellations(modifiedAfter: string | null, result: SyncResult, mode: string): Promise<void> {
+  const trashUnsupported = (await db.setting.findUnique({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY } }).catch(() => null)) !== null
+  for (const slug of ['cancelled', 'trash'] as const) {
+    if (slug === 'trash' && trashUnsupported) continue
+    // `cancelled` is a core status every store has; `trash` may be refused by a store, in which case it is optional (see below).
+    const required = slug === 'cancelled'
+    let page = 1
+    let endedOnEmptyPage = false
+    let unsupported = false
+    while (page <= MAX_WC_PAGE_WALK_PAGES) {
+      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', ...(modifiedAfter ? { modified_after: modifiedAfter } : {}) })
+      if (error || !Array.isArray(data)) {
+        const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
+        if (!required && isWcUnsupportedStatusRefusal(error)) {
+          // A CONFIRMED refusal of the status itself (4xx naming `status` as invalid): this store cannot be asked for trash.
+          // Logged once and remembered, so later sweeps stop asking. Anything else (5xx, timeout, network, an unreadable body) is
+          // transient and falls through to the error below: skipping the read would let the cursor pass an order trashed meanwhile.
+          await db.setting.upsert({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY }, create: { key: WC_TRASH_READ_UNSUPPORTED_KEY, value: new Date().toISOString() }, update: {} })
+          await logActivity({ entityType: 'SYNC', action: 'wc_order_trash_read_unsupported', tag: 'sync', level: 'WARNING', description: `${message}. The store does not accept the trash status, so the sweep will not ask for it again; a trashed order is then seen only through its webhook.`, metadata: { mode }, resolveUser: false }).catch(() => undefined)
+          unsupported = true
+          break
+        }
+        result.errors.push(message)
+        break
+      }
+      const orders = data as WcFullOrder[]
+      if (orders.length === 0) { endedOnEmptyPage = true; break }
+      for (const order of orders) {
+        try {
+          const link = await db.shoppingOrderLink.findUnique({
+            where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(order.id) } },
+            select: { order: { select: { status: true } } },
+          })
+          if (!link?.order || link.order.status === 'CANCELLED') continue
+          const { syncWcOrderStatus } = await import('./order-status')
+          // A trashed order is a cancellation as far as IMS is concerned.
+          const outcome = await syncWcOrderStatus(slug === 'trash' ? { ...order, status: 'cancelled' } : order)
+          if (!outcome.success && !outcome.permanent) result.errors.push(`cancellation backstop #${order.id}: ${outcome.error ?? 'unknown error'}`)
+        } catch (e) {
+          result.errors.push(`cancellation backstop #${order.id}: ${String(e)}`)
+        }
+      }
+      page++
+    }
+    if (!unsupported && !endedOnEmptyPage && result.errors.length === 0) {
+      result.errors.push(describeWcPageWalkCeilingStall('order', `${mode} cancellation backstop`))
+    }
   }
 }
 

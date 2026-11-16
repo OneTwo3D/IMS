@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  headerDiscountAmendRefusal,
+  PO_HEADER_DISCOUNT_PART_RECEIVED_MESSAGE,
   isPurchaseOrderEditableStatus,
   lineIsTouched,
   lineQtyFloor,
@@ -198,4 +200,13 @@ test('a line discount scales with the quantity: a percentage stays a percentage,
   assert.deepEqual(scaleLineDiscountForQty({ qty: 100, discountAmount: 50, discountStr: null }, 60), { discountAmount: 30, discountStr: null })
   assert.deepEqual(scaleLineDiscountForQty({ qty: 100, discountAmount: 0, discountStr: null }, 60), { discountAmount: 0, discountStr: null })
   assert.deepEqual(scaleLineDiscountForQty({ qty: 3, discountAmount: 1, discountStr: '1' }, 4), { discountAmount: 1.3333, discountStr: '1.3333' })
+})
+
+test('header discount: a line-value change is refused once stock has landed, and only then', () => {
+  const base = { anyLanded: true, headerDiscountForeign: 100, lineMoneyChanged: true }
+  assert.equal(headerDiscountAmendRefusal(base), PO_HEADER_DISCOUNT_PART_RECEIVED_MESSAGE)
+  assert.match(PO_HEADER_DISCOUNT_PART_RECEIVED_MESSAGE, /discount spread on received units/)
+  assert.equal(headerDiscountAmendRefusal({ ...base, anyLanded: false }), null)
+  assert.equal(headerDiscountAmendRefusal({ ...base, headerDiscountForeign: 0 }), null)
+  assert.equal(headerDiscountAmendRefusal({ ...base, lineMoneyChanged: false }), null)
 })

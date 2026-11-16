@@ -91,6 +91,40 @@ export type LandedAllocationLine = {
   unitCostBase: DecimalInput
   totalBase: DecimalInput
   weight?: DecimalInput | null
+  /**
+   * The surviving fraction of the line's goods cost after the order's HEADER discount (see
+   * `headerDiscountFactorForPo`). Absent = 1. `unitCostBase` on a PO line is the line-discounted,
+   * VAT-extracted price BEFORE the header discount, so a layer valued at it alone is worth more than the
+   * bill that pays for it and the difference is stranded in Stock in Transit.
+   */
+  headerDiscountFactor?: DecimalInput | null
+}
+
+/**
+ * The fraction of every line's goods cost that survives the order's header discount, READ BACK from the
+ * stored totals: `subtotalBase / SUM(line.totalBase)`. applyHeaderOrderDiscount reduces the net subtotal by
+ * one amount and never revisits the lines, so every line keeps the same fraction of its cost (the same basis
+ * return-credit-basis.ts uses for the credit on a return). 1 when there is nothing to take a proportion of,
+ * when the stored subtotal is missing, when it is not below the line sum (a discount can only reduce it), or
+ * when the gap is under half a pip (rounding, not a discount) so an undiscounted order is untouched.
+ */
+export function headerDiscountFactorForPo(po: {
+  subtotalBase: DecimalInput | null | undefined
+  lines: { totalBase: DecimalInput | null | undefined }[]
+}): Prisma.Decimal {
+  const one = new Prisma.Decimal(1)
+  if (po.subtotalBase == null) return one
+  const lineSum = po.lines.reduce((sum, l) => sum.add(decimal(l.totalBase)), new Prisma.Decimal(0))
+  if (!lineSum.gt(0)) return one
+  const subtotal = decimal(po.subtotalBase)
+  if (subtotal.gte(lineSum) || lineSum.sub(subtotal).lt(new Prisma.Decimal('0.0001'))) return one
+  if (subtotal.lt(0)) return new Prisma.Decimal(0)
+  return subtotal.div(lineSum)
+}
+
+function effectiveGoodsUnitCost(line: LandedAllocationLine): Prisma.Decimal {
+  const unit = decimal(line.unitCostBase)
+  return line.headerDiscountFactor == null ? unit : unit.mul(decimal(line.headerDiscountFactor))
 }
 
 /** 0 = the order's own (direct) cost lines; 1 = the cost lines of the freight orders linked to it. */
@@ -215,10 +249,10 @@ export function allocateLandedCost(
   for (const line of orderedLines) {
     const qty = decimal(line.qty)
     if (qty.lte(0)) {
-      grossUnitCostBaseByLine.set(line.id, decimal(line.unitCostBase))
+      grossUnitCostBaseByLine.set(line.id, effectiveGoodsUnitCost(line))
       continue
     }
-    const rounded = decimal(line.unitCostBase)
+    const rounded = effectiveGoodsUnitCost(line)
       .add(decimal(landedByLine.get(line.id)).div(qty))
       .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
     if (rounded.lt(0)) {

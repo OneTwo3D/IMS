@@ -5,7 +5,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
-import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { isPermanentStatusTransitionError, STATUS_GUARD_REFUSAL_PREFIX } from '@/lib/domain/sales/status-transition-errors'
 import type { ExternalFulfillmentRefusal } from '@/lib/fulfillment/external-fulfillment'
 import { wcFetch, wcPut } from '../api'
 import { assertWcAttemptMayWrite } from '../attempt-fence'
@@ -13,12 +13,38 @@ import type { WcFullOrder } from './types'
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
 import type { WcStatusPushTarget } from './completion-eligibility'
 import { normaliseWcOrderStatus } from '../order-status-filter'
+import { canTransitionSalesOrder, SALES_ORDER_TRANSITIONS } from '@/lib/domain/workflows/sales-order-state'
+import type { SalesOrderStatus as WorkflowSalesOrderStatus } from '@/lib/domain/workflows/status-types'
 
 type SalesOrderStatus = string
 
 // ---------------------------------------------------------------------------
 // WC → IMS status sync
 // ---------------------------------------------------------------------------
+
+/** Statuses IMS owns once fulfilment has begun: WooCommerce's `processing` is not news about an order in them. */
+const IMS_FULFILMENT_IN_PROGRESS: ReadonlySet<string> = new Set(['ALLOCATED', 'PICKING', 'PACKING'])
+
+/**
+ * Whether a WooCommerce-reported status may be applied to an order IMS holds in `from` (null = yes).
+ *
+ * The apply below runs through the full transition bypass, which skips the state machine. So the machine is
+ * asked HERE, and a move it does not allow is refused: a SHIPPED / COMPLETED / DELIVERED order never goes
+ * backwards because a stale retry, an unrelated plugin save or an admin edit carries `processing`.
+ * IMS never pushes `processing` to WooCommerce, so an order allocation moved to ALLOCATED / PICKING / PACKING
+ * still reads `processing` there: that status is not a request to undo the fulfilment progress.
+ */
+export function wcStatusSyncRefusal(from: string, to: string): string | null {
+  if (from === to) return null
+  if (!(from in SALES_ORDER_TRANSITIONS) || !(to in SALES_ORDER_TRANSITIONS)) return null // a status the machine does not know: not ours to judge
+  if (!canTransitionSalesOrder(from as WorkflowSalesOrderStatus, to as WorkflowSalesOrderStatus)) {
+    return `IMS does not allow ${from} -> ${to}`
+  }
+  if (IMS_FULFILMENT_IN_PROGRESS.has(from) && to === 'PROCESSING') {
+    return `${from} is further along than WooCommerce's processing; IMS never pushes processing`
+  }
+  return null
+}
 
 /**
  * `permanent: true` means a stable business rule refused the transition, so re-delivering the identical
@@ -113,12 +139,35 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
     // Special case: WC refunded → handled by refund sync, not status sync
     if (isWcStatus(wcOrder.status, 'refunded')) return { success: true }
 
+    // Forward-only: the bypass below skips the state machine, so ask it here (o3d-hqvrp.81).
+    const refusal = wcStatusSyncRefusal(so.status, targetStatus)
+    if (refusal) {
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_skipped_backwards', tag: 'sync', level: 'INFO',
+        description: `Left order #${so.externalOrderNumber} at ${so.status}: WooCommerce reported ${wcOrder.status} (${targetStatus}), which would move it backwards (${refusal})`,
+        resolveUser: false,
+      })
+      return { success: true }
+    }
+
     // Standard status update
     const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
     const result = await applySalesOrderStatusTransition(so.id, targetStatus as never, undefined, {
       pushStatusToWooCommerce: false,
       internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
+      // The refusal above read the status BEFORE this write, and the write skips the state machine: a dispatch that
+      // committed in between would be overwritten. Asked again against the current status under the order lock.
+      guardUnderLock: (current) => wcStatusSyncRefusal(current, targetStatus),
     })
+
+    if (!result.success && result.permanent && String(result.error ?? '').startsWith(STATUS_GUARD_REFUSAL_PREFIX)) {
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_skipped_backwards', tag: 'sync', level: 'INFO',
+        description: `Left order #${so.externalOrderNumber} as it is: it moved on while WooCommerce's ${wcOrder.status} (${targetStatus}) was being applied (${String(result.error).slice(STATUS_GUARD_REFUSAL_PREFIX.length)})`,
+        resolveUser: false,
+      })
+      return { success: true }
+    }
 
     if (!result.success) {
       await logActivity({

@@ -2271,7 +2271,8 @@ function recalcPoFor(fixture: RecalcFixture, mode: 'direct' | 'linked') {
     id: 'po-1',
     reference: 'PO-1',
     status: 'RECEIVED',
-    subtotalBase: '1',
+    // The stored subtotal equals the line sum (no header discount): a stale '1' here now reads as a 95%+ discount.
+    subtotalBase: fixture.lines.reduce((sum, l) => sum + Number(l.totalBase), 0).toString(),
     directFreightBase: '0',
     lines: lineRows,
     freightCostLines: fixture.direct,

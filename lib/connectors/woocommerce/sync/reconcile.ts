@@ -1,7 +1,7 @@
 import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
-import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, syncNewWcOrders } from './order-import'
+import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, runWcCancellationBackstop, syncNewWcOrders } from './order-import'
 import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
 import { processQueuedWcStockSyncJobs } from './stock-sync-jobs'
 import { queueRefundStockCorrections } from './refund-stock-correction'
@@ -37,6 +37,8 @@ type WcReconcileSkipped = { skipped: true; reason: string; reconciliationDue: bo
 /** What the reconcile reports, section by section. Written out so tests/ops/cron-outcome-fields.test.ts sees every failure field. */
 export type WcReconcileResult = {
   orders?: Awaited<ReturnType<typeof syncNewWcOrders>> | WcReconcileSkipped
+  /** The cancellation backstop (its own cursor; runs on every pass). */
+  cancellations?: { errors: string[] }
   heldSalesInvoices?: Awaited<ReturnType<typeof retryHeldWcSalesInvoiceReleases>>
   products?: Awaited<ReturnType<typeof syncAllWcProducts>> | WcReconcileSkipped
   refundStockCorrections?: { error: string }
@@ -76,6 +78,16 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
           reconciliationDue: false,
           lastReconciledAt: lastReconcile?.value ?? null,
         }
+  }
+
+  // o3d-hqvrp.82: a cancellation or trash WooCommerce holds but no delivery brought. Every pass, independent of the order sweep's mode and
+  // cursors (webhook-primary mode only reconciles orders daily).
+  try {
+    const cancellations = await runWcCancellationBackstop()
+    if (cancellations.errors.length > 0) results.cancellations = { errors: cancellations.errors }
+  } catch (error) {
+    console.error('[wc-reconcile] cancellation backstop failed', error)
+    results.cancellations = { errors: [`cancellation backstop: ${error instanceof Error ? error.message : String(error)}`] }
   }
 
   // o3d-k26m.6 round 4: THE DRIVER for a sales invoice held back for its number and not released.

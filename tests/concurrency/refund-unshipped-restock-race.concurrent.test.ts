@@ -116,7 +116,7 @@ async function seed(rig: Rig, suffix: string) {
       orderId: order.id,
       warehouseId: main.id,
       status: 'PACKED',
-      lines: { create: [{ lineId, productId: product.id, qty: new Prisma.Decimal('1') }] },
+      lines: { create: [{ lineId, productId: product.id, qty: new Prisma.Decimal('1'), costLayerSnapshot: [{ costLayerId: 'zvec21-issued-layer', qty: '1', unitCostBase: '40' }] }] },
     },
     select: { id: true },
   })

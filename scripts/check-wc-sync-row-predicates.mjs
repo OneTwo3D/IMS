@@ -179,7 +179,9 @@ const SQL_ACCUSED_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::recoveryAcc
  * it). Rendered once here; tests/db/admission-refusal-retention.test.ts proves it against Postgres.
  */
 const SQL_PENDING_REFUSAL_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::pendingAdmissionRefusalRowSql'
-const SQL_OWNERS = [SQL_OWNER, SQL_ACCUSED_OWNER, SQL_PENDING_REFUSAL_OWNER]
+/** The retention exemption for an open edit-drift row (o3d-hqvrp.84): its own family, rendered once, total. */
+const SQL_EDIT_DRIFT_OWNER = 'lib/domain/sales/wc-sync-row-families.ts::openWcOrderEditDriftRowSql'
+const SQL_OWNERS = [SQL_OWNER, SQL_ACCUSED_OWNER, SQL_PENDING_REFUSAL_OWNER, SQL_EDIT_DRIFT_OWNER]
 
 /**
  * Tokens that make a raw SQL string a family predicate rather than an ordinary statement about this

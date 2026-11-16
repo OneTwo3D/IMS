@@ -67,6 +67,8 @@ mock.module('@/lib/connectors/woocommerce/api', {
     describeUnendedWcPageWalk: (what: string) => `${what} never reached an empty page`,
     describeUnreadWcPage: (what: string, page: number, error: string) => `${what}: page ${page} unreadable: ${error}`,
     wcFetch: async (path: string, params?: Record<string, string>) => {
+      // The cancellation backstop (o3d-hqvrp.82) reads cancelled/trash orders; it has its own test, so these sweep tests see no extra read.
+      if (path === '/orders' && (params?.status === 'cancelled' || params?.status === 'trash')) return { data: [], totalPages: 1, totalItems: 0 }
       if (path === '/orders') {
         const rows = Number(params?.page ?? '1') === 1 ? store.listed : []
         return { data: rows, totalPages: 1, totalItems: store.listed.length, error: null }

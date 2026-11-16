@@ -19,6 +19,8 @@ const FAILURE_LIKE = /fail|error|dead|conflict|park|unresolved|reject|quarantin|
 
 /** "<file>::<innermost named function>" -> how many flagged catch clauses it holds and why each is safe. */
 const JUSTIFIED: Record<string, { count: number; reason: string }> = {
+  "lib/connectors/woocommerce/sync/order-edit-drift.ts::surfaceWcOrderEditDrift": { count: 1, reason: "the exception row for an order edited in WooCommerce is advisory and is re-derived from the payload on every later delivery of that order; a failed write is logged and must not fail a delivery whose real work (the import) already committed" },
+  "lib/connectors/woocommerce/sync/order-edit-drift.ts::detectWcOrderEditDrift": { count: 1, reason: "an unreadable order total in the payload is no evidence of an edit: the comparison simply reports nothing for the total" },
   "lib/connectors/woocommerce/sync/order-import.ts::importWcOrderOnce": { count: 1, reason: "the park of the invoice whose enqueue failed: its failure is carried (`held` stays false and the failure is thrown next; the order keeps its `salesInvoiceOwedAt` mark, so a redelivery fails until an invoice stands for it)" },
   "lib/connectors/mintsoft/sync/stock-sync.ts::enqueueAlignmentStockSync": { count: 1, reason: "the WARNING activity write after a failed stock enqueue: the enqueue failure itself is counted (`stockEnqueueFailures`), this only logs it" },
   "lib/accounting.ts::logUnknownAccountingConnector": { count: 1, reason: "best-effort logging or notice: a warning or audit write that failed must not decide the run; the state it describes is recorded elsewhere" },

@@ -44,6 +44,8 @@ mock.module('@/lib/settings-store', {
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
     wcFetch: async (path: string, params: Record<string, string> = {}) => {
+      // The cancellation backstop (o3d-hqvrp.82) reads cancelled/trash orders; it has its own test, so these sweep tests see no extra read.
+      if (path === '/orders' && (params?.status === 'cancelled' || params?.status === 'trash')) return { data: [], totalPages: 1, totalItems: 0 }
       if (path === '/orders') {
         state.modifiedAfter.push(params.modified_after)
         state.statusParams.push(params.status)

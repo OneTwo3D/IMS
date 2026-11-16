@@ -29,6 +29,7 @@ import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconcilia
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 import {
   allocateLandedCost,
+  headerDiscountFactorForPo,
   unabsorbedBaseForQty,
   type LandedAllocation,
   type LandedAllocationCostLine,
@@ -52,6 +53,8 @@ export type PendingGrossCostLine = {
   totalBase: Prisma.Decimal | number | string
   landedUnitCostBase?: Prisma.Decimal | number | string | null
   weight?: Prisma.Decimal | number | string | null
+  /** See LandedAllocationLine.headerDiscountFactor; every caller sets it from headerDiscountFactorForPo. */
+  headerDiscountFactor?: Prisma.Decimal | number | string | null
 }
 
 export type PendingGrossCostLineSource = {
@@ -600,6 +603,7 @@ export async function propagateLandedCostToOutputs(
     if (outDeltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
       await deps.updateSnapshotsForCostLayerChange(tx, outputCostLayerId, newOutputUnitCost)
       const shipmentRefresh = await deps.refreshShipmentCogsForCostLayerChange(tx, outputCostLayerId, {
+        offsetCostDeltaToTransit: true,
         recalcRunId,
         revaluationContext: revaluationContext
           ? { ...revaluationContext, source: 'landed_cost_output_propagation' }
@@ -978,6 +982,7 @@ export function computeLandedCostForPendingLines(params: {
       unitCostBase: line.unitCostBase,
       totalBase: line.totalBase,
       weight: line.weight ?? null,
+      headerDiscountFactor: line.headerDiscountFactor ?? null,
     })),
     [...toCostLines(params.directCostLines, 0), ...toCostLines(params.linkedCostLines, 1)],
   )
@@ -1362,6 +1367,7 @@ export async function recalculateLandedCosts(
     // book-in and the align-up call, so a layer laid at receipt and the same layer revalued here cannot
     // differ for the same cost lines. Source rank 0 = this PO's own lines, 1 = the linked freight POs'.
     const runWarnings: LandedCostRevaluationWarning[] = []
+    const headerDiscountFactor = headerDiscountFactorForPo(primaryPo)
     const allocation = allocateLandedCost(
       primaryPo.lines.map((line) => ({
         id: line.id,
@@ -1369,6 +1375,7 @@ export async function recalculateLandedCosts(
         unitCostBase: line.unitCostBase,
         totalBase: line.totalBase,
         weight: line.product?.weight ?? null,
+        headerDiscountFactor,
       })),
       [
         ...primaryPo.freightCostLines.map((costLine) => ({ ...costLine, sourceRank: 0 as const })),
@@ -1394,7 +1401,7 @@ export async function recalculateLandedCosts(
       const lineQty = decimal(line.qty)
       if (lineQty.lte(0)) continue
 
-      const baseUnitCostBase = decimal(line.unitCostBase)
+      const baseUnitCostBase = decimal(line.unitCostBase).mul(headerDiscountFactor)
       const landedForLine = decimal(allocation.landedAmountByLine.get(line.id))
       const grossUnitCostBase = allocation.grossUnitCostBaseByLine.get(line.id)!
       const floor = floorByLine.get(line.id)
@@ -1472,7 +1479,7 @@ export async function recalculateLandedCosts(
         let affectedSalesOrderLines = 0
         if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
           affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext })
+          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true })
           affectedShipments = shipmentRefresh.shipmentsUpdated
           // audit-3aph: the shipment path now owns the COGS revaluation for sold
           // goods (COGS_REVERSAL now / daily batch later), so remove it from the
@@ -1698,11 +1705,12 @@ export async function recalculateDirectLandedCosts(
   // THE ONE ALLOCATION (landed-cost-allocation.ts), shared with recalculateLandedCosts and every
   // receipt-side writer. Source rank 0 = this PO's own cost lines, 1 = its linked freight POs'.
   const runWarnings: LandedCostRevaluationWarning[] = []
+  const headerDiscountFactor = headerDiscountFactorForPo(po)
   const allocation = allocateLandedCost(
     po.lines.map((line) => {
       const basis = options.landedQtyBasis
       if (!basis) {
-        return { id: line.id, qty: line.qty, unitCostBase: line.unitCostBase, totalBase: line.totalBase, weight: line.product?.weight ?? null }
+        return { id: line.id, qty: line.qty, unitCostBase: line.unitCostBase, totalBase: line.totalBase, weight: line.product?.weight ?? null, headerDiscountFactor }
       }
       const landed = decimal(basis.get(line.id) ?? 0)
       const ordered = decimal(line.qty)
@@ -1712,6 +1720,7 @@ export async function recalculateDirectLandedCosts(
         unitCostBase: line.unitCostBase,
         totalBase: ordered.gt(0) ? decimal(line.totalBase).mul(landed).div(ordered) : new Prisma.Decimal(0),
         weight: line.product?.weight ?? null,
+        headerDiscountFactor,
       }
     }),
     [
@@ -1738,7 +1747,7 @@ export async function recalculateDirectLandedCosts(
     const lineQty = decimal(line.qty)
     if (lineQty.lte(0)) continue
 
-    const baseUnitCostBase = decimal(line.unitCostBase)
+    const baseUnitCostBase = decimal(line.unitCostBase).mul(headerDiscountFactor)
     const landedForLine = decimal(allocation.landedAmountByLine.get(line.id))
     const grossUnitCostBase = allocation.grossUnitCostBaseByLine.get(line.id)!
     const floor = floorByLine.get(line.id)
@@ -1816,7 +1825,7 @@ export async function recalculateDirectLandedCosts(
       let affectedSalesOrderLines = 0
       if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
         affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext })
+        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true })
         affectedShipments = shipmentRefresh.shipmentsUpdated
         // audit-3aph: shipment path owns the sold-goods COGS revaluation — remove
         // it from the COGS_JOURNAL to avoid double-posting COGS for sold units.
