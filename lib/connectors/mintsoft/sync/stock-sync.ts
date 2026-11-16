@@ -74,7 +74,7 @@ import {
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
   computeLandedCostForPendingLines,
 } from '@/lib/domain/purchasing/landed-cost-service'
-import { unabsorbedBaseForQty, type LandedAllocationFloor } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { headerDiscountFactorForPo, unabsorbedBaseForQty, type LandedAllocationFloor } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
@@ -1400,6 +1400,7 @@ async function loadAlignmentPurchaseLineCost(
         select: {
           id: true,
           reference: true,
+          subtotalBase: true,
           lines: {
             select: {
               id: true,
@@ -1443,6 +1444,7 @@ async function loadAlignmentPurchaseLineCost(
     throw new Error(`Purchase order line ${poLineId} is missing for alignment.`)
   }
 
+  const headerDiscountFactor = headerDiscountFactorForPo(poLine.po)
   const landedAllocation = computeLandedCostForPendingLines({
     lines: poLine.po.lines.map((line) => ({
       id: line.id,
@@ -1451,6 +1453,7 @@ async function loadAlignmentPurchaseLineCost(
       totalBase: line.totalBase,
       landedUnitCostBase: line.landedUnitCostBase,
       weight: line.product?.weight ?? null,
+      headerDiscountFactor,
     })),
     directCostLines: poLine.po.freightCostLines.map((costLine) => ({
       id: costLine.id,
