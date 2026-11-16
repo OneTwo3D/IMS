@@ -313,6 +313,12 @@ When a refund processes returned stock, the system uses the **current** cost-lay
 
 This keeps the returned-stock balance sheet entry aligned with the live cost layers. Note that the COGS reversal amount may differ from the originally-posted COGS amount by the revaluation delta — this is the expected behaviour for single-snapshot accounting.
 
+### Refunds that return no stock, and returns whose cost is unknown
+
+A refund with **No stock return** (no return warehouse) refunds the customer's money only. The goods are not back, so IMS posts **no COGS reversal** for it: the cost of the shipped units stays in COGS, exactly as for a chargeback, and Inventory is not debited for stock that no cost layer backs. The shipped cost is also left unconsumed, so a later refund that does return those units still has it.
+
+Every unit that is restocked carries a cost layer at the **issued cost** of the shipment it came from, in dispatch order, whether or not that shipment was ever journaled to the accounting system, and whether or not the order is paid or accounting is on. If the issued cost of the shipped units is not on record, a refund you record by hand with a return warehouse is **refused** with *"the cost of the shipped units is not on record"*; refund it as cash-only (no return warehouse) or fix the shipment's cost first. A WooCommerce refund is already issued in the shop, so it cannot be refused: it is recorded without a return warehouse, nothing is restocked, and a warning on the order (*refund_return_parked_unknown_cost*) names the units to restock by hand once the cost is known.
+
 ### Refunds without a shipment source
 
 If a sales order line was allocated but never shipped, the refund rejects with a clear message: *"Cannot return refunded stock for product X: no shipped stock source exists"*. The system refuses to silently restock from an allocation-only source — there's no actual stock movement to reverse.
