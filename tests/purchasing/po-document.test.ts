@@ -133,5 +133,5 @@ test('a discounted line does not read as discounted twice: 10 x 10 with a 10 dis
   assert.deepEqual(row.slice(-3), ['10', '9.00', '90.00'])
   // The discount is still stated, once, in the totals block.
   const totals = poTotalsRows({ subtotal: 90, lineDiscounts: 10, orderDiscount: 0, tax: 0, taxLabel: 'VAT', additionalCosts: 0, total: 90 }, money)
-  assert.ok(totals.some((r) => /Discounts included above \(lines £10\.00\)/.test(r.label)))
+  assert.ok(totals.some((r) => r.label === 'Discounts included above (lines)' && r.amount === '£10.00'))
 })
