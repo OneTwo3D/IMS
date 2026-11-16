@@ -18,6 +18,7 @@ import {
 } from '@/lib/domain/inventory/movement-cogs-relevance'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import {
   addMoney,
   multiplyMoney,
@@ -33,6 +34,8 @@ type ShipmentCogsRevaluationSyncOptions = {
   accountingSettings?: {
     inventoryAccount?: string | null
     cogsAccount?: string | null
+    /** Needed only with `offsetCostDeltaToTransit`. */
+    transitAccount?: string | null
     /**
      * o3d-j625 r2 (Codex HIGH 1) — WHOSE CHART THE TWO ACCOUNTS ABOVE ARE, and REQUIRED even though
      * they are not.
@@ -47,6 +50,14 @@ type ShipmentCogsRevaluationSyncOptions = {
     connector: AccountingConnectorId | null
   }
   queueAccountingSync?: typeof queueAccountingSyncTx
+  /**
+   * LATE LANDED COST ONLY. The cost change on units ALREADY SOLD is funded from Stock in Transit (the freight
+   * bill's debit), exactly as the consumed-qty COGS journal does (scjz.34): DR COGS / CR Transit. Without
+   * this the reverse-and-repost credits INVENTORY for the delta, which the on-hand reclass has already
+   * debited only for the units still on hand, so Inventory ends short and Transit keeps a debit. Left off,
+   * the journal is the plain reverse-old / post-new against Inventory (a revaluation of the goods themselves).
+   */
+  offsetCostDeltaToTransit?: boolean
   /**
    * Whether the COGS_REVERSAL posting type is actually enabled (injectable for
    * tests). Determines whether this revaluation will reach the ledger — used by
@@ -251,6 +262,8 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
   cogsAccount: string
   oldCogsBase: DecimalInput
   newCogsBase: DecimalInput
+  /** When set, only the CHANGE posts, against this account instead of Inventory (see offsetCostDeltaToTransit). */
+  costDeltaOffsetAccount?: string
 }): Record<string, unknown> | null {
   const oldCogs = roundQuantity(input.oldCogsBase, 2)
   const newCogs = roundQuantity(input.newCogsBase, 2)
@@ -270,6 +283,26 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
     )
   }
   if (oldCogs.sub(newCogs).abs().lt(0.01)) return null
+
+  if (input.costDeltaOffsetAccount) {
+    // Inventory carried the OLD cost out when the units shipped and is not touched again: the whole change is
+    // DR COGS / CR offset (increase) or DR offset / CR COGS (decrease).
+    const delta = newCogs.sub(oldCogs)
+    const abs = delta.abs().toNumber()
+    const increase = delta.gt(0)
+    return {
+      date: new Date().toISOString().slice(0, 10),
+      reference: `Shipment COGS revaluation: ${input.shipmentId}`,
+      narration: `Late landed cost on shipped units: shipment ${input.shipmentId} COGS ${oldCogs.toFixed(2)} to ${newCogs.toFixed(2)}, funded from the in-transit account`,
+      lines: [
+        { accountCode: increase ? input.cogsAccount : input.costDeltaOffsetAccount, description: `Shipment COGS revaluation ${input.shipmentId}`, debit: abs },
+        { accountCode: increase ? input.costDeltaOffsetAccount : input.cogsAccount, description: `Shipment COGS revaluation ${input.shipmentId}`, credit: abs },
+      ],
+      sourceCostLayerId: input.costLayerId,
+      oldCogsBase: oldCogs.toNumber(),
+      newCogsBase: newCogs.toNumber(),
+    }
+  }
 
   // Use a 4-line reverse + repost journal rather than a 2-line delta so the
   // accounting audit trail shows both the old and recomputed shipment COGS.
@@ -315,10 +348,14 @@ async function queueShipmentCogsRevaluationSync(
 ): Promise<boolean> {
   const settings = options.accountingSettings ?? await getAccountingSettings().catch(() => null)
   if (!settings?.inventoryAccount || !settings.cogsAccount) return false
+  // No transit account configured: cannot post the offset, so say "not posted here" and the caller keeps the
+  // delta in its own COGS journal (which offsets the same transit account) rather than losing it.
+  if (options.offsetCostDeltaToTransit && !settings.transitAccount) return false
   const payload = buildShipmentCogsRevaluationSyncPayload({
     ...input,
     inventoryAccount: settings.inventoryAccount,
     cogsAccount: settings.cogsAccount,
+    ...(options.offsetCostDeltaToTransit ? { costDeltaOffsetAccount: settings.transitAccount! } : {}),
   })
   if (!payload) return false
   // audit-3aph: only treat this revaluation as posted (so the caller drops it
@@ -445,6 +482,16 @@ async function queueShipmentCogsRevaluationSync(
     baseDelta: toDecimal(payload.newCogsBase as number).sub(payload.oldCogsBase as number),
     journalDate: payload.date as string,
   })
+  if (options.offsetCostDeltaToTransit) {
+    // The same journal moves TRANSIT (CR on an increase, DR on a decrease), as the consumed-qty COGS offset does.
+    await recordTransitSubledgerMovement(tx, {
+      sourceType: 'LANDED_COST_CONSUMED_OFFSET',
+      sourceRef: input.shipmentId,
+      idempotencyKey: revaluationIdempotencyKey,
+      baseDelta: toDecimal(payload.oldCogsBase as number).sub(payload.newCogsBase as number),
+      journalDate: payload.date as string,
+    })
+  }
   return true
 }
 
@@ -539,6 +586,15 @@ export type CostLayerSourceLineInput = {
   totalCostBase?: DecimalInput
 }
 
+export type ConsumeFifoOptions = {
+  /**
+   * A SUPPLIER RETURN names the PO line it sends back: that line's own layers (what the returned goods
+   * actually cost, and what the supplier's credit note is for) are consumed before any other layer of the
+   * warehouse. Only the ORDER changes; the quantity, locking and shortfall rules are the plain FIFO ones.
+   */
+  preferPoLineId?: string
+}
+
 type LockedFifoCostLayerRow = {
   id: string
   remainingQty: DecimalInput
@@ -568,6 +624,7 @@ export async function consumeFifoLayers(
   productId: string,
   warehouseId: string,
   qty: number,
+  options: ConsumeFifoOptions = {},
 ): Promise<{ consumed: ConsumedLayer[]; totalCost: Decimal; remainingQty: Decimal }> {
   let remaining = toDecimal(qty)
   let totalCost = toDecimal(0)
@@ -578,7 +635,19 @@ export async function consumeFifoLayers(
   // Select and lock in one statement. A pre-lock Prisma findMany can materialize
   // a stale FIFO snapshot under concurrency; FOR UPDATE makes the oldest
   // candidate rows wait and re-check before this transaction can consume them.
-  const layers = await tx.$queryRaw<LockedFifoCostLayerRow[]>`
+  // `preferPoLineId`: the layers received against that PO line go first (FIFO among themselves), then the rest
+  // of the warehouse's layers in FIFO order. Without it the order is plain FIFO, unchanged.
+  const layers = options.preferPoLineId
+    ? await tx.$queryRaw<LockedFifoCostLayerRow[]>`
+      SELECT id, "remainingQty", "unitCostBase"
+      FROM "cost_layers"
+      WHERE "productId" = ${productId}
+        AND "warehouseId" = ${warehouseId}
+        AND "remainingQty" > 0
+      ORDER BY CASE WHEN "poLineId" = ${options.preferPoLineId} THEN 0 ELSE 1 END ASC, "receivedAt" ASC, id ASC
+      FOR UPDATE
+    `
+    : await tx.$queryRaw<LockedFifoCostLayerRow[]>`
     SELECT id, "remainingQty", "unitCostBase"
     FROM "cost_layers"
     WHERE "productId" = ${productId}
@@ -623,10 +692,11 @@ export async function consumeFifoLayersStrict(
   productId: string,
   warehouseId: string,
   qty: number,
+  options: ConsumeFifoOptions = {},
 ): Promise<{ consumed: ConsumedLayer[]; totalCost: Decimal }> {
   let result
   try {
-    result = await consumeFifoLayers(tx, productId, warehouseId, qty)
+    result = await consumeFifoLayers(tx, productId, warehouseId, qty, options)
   } catch (error) {
     const message = getInventoryConstraintMessage(error)
     if (message) throw new Error(message)

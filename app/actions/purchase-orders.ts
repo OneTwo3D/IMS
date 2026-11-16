@@ -105,7 +105,7 @@ import {
   queueLandedCostAdjustmentJournals,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
-import { unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import {
   assertFreightTotalNotNegative,
   buildFreightCostLineRows,
@@ -925,6 +925,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   // THE ONE ALLOCATION, the same one receipt and recalculation use. `freightLinks` is read unfiltered
   // because it also LISTS cancelled freight for the operator, so the COST inputs are filtered here: a
   // cancelled freight PO's lines count toward neither receipt nor recalculation.
+  const headerDiscountFactor = headerDiscountFactorForPo(po)
   const landedAllocation = computeLandedCostForPendingLines({
     lines: po.lines.map((line) => ({
       id: line.id,
@@ -933,6 +934,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       totalBase: line.totalBase,
       landedUnitCostBase: line.landedUnitCostBase,
       weight: line.product?.weight ?? null,
+      headerDiscountFactor,
     })),
     directCostLines: po.freightCostLines.map((costLine) => ({
       id: costLine.id,
@@ -2386,6 +2388,7 @@ export async function receivePurchaseOrder(
         select: {
           reference: true,
           status: true,
+          subtotalBase: true,
           lines: {
             select: {
               id: true,
@@ -2438,6 +2441,7 @@ export async function receivePurchaseOrder(
       // THE ONE ALLOCATION (landed-cost-allocation.ts): the same cost recalculation will compute for these
       // units, so a receipt followed by a recalculation with unchanged cost lines posts nothing. A negative
       // landed cost is applied, and the zero floor's footprint comes back in `floors`.
+      const headerDiscountFactor = headerDiscountFactorForPo(currentPo)
       const landedAllocation = computeLandedCostForPendingLines({
         lines: currentPo.lines.map((line) => ({
           id: line.id,
@@ -2446,6 +2450,7 @@ export async function receivePurchaseOrder(
           totalBase: line.totalBase,
           landedUnitCostBase: line.landedUnitCostBase,
           weight: line.product?.weight ?? null,
+          headerDiscountFactor,
         })),
         directCostLines: currentPo.freightCostLines.map((costLine) => ({
           id: costLine.id,
@@ -3122,7 +3127,9 @@ export async function returnPurchaseOrder(
             referenceId: purchaseReturn.id,
           },
         })
-        const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
+        // The returned PO line's own layers first (not the warehouse's oldest): the units going back cost what THIS
+        // order paid, and that is the value the supplier credit note and the transit reversal are for.
+        const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned, { preferPoLineId: rl.poLineId })
         await tx.stockMovement.update({
           where: { id: movement.id },
           data: buildStockMovementValueFieldsFromConsumed(consumed, rl.qtyReturned),

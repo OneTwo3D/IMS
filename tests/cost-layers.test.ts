@@ -1049,3 +1049,37 @@ test('recordCostLayerRevaluation drops a coalesced net no-op (5->6->5)', async (
   assert.equal(logged, true)
   assert.deepEqual(deleted, [{ where: { id: 'rev-1' } }])
 })
+
+test('late landed cost on shipped units: the change posts DR COGS / CR transit and never touches inventory', () => {
+  const up = buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    costDeltaOffsetAccount: '815',
+    oldCogsBase: '30.00',
+    newCogsBase: '33.00',
+  })
+  assert.deepEqual((up!.lines as Array<Record<string, unknown>>).map((l) => [l.accountCode, l.debit ?? null, l.credit ?? null]), [
+    ['500', 3, null],
+    ['815', null, 3],
+  ])
+  const down = buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    costDeltaOffsetAccount: '815',
+    oldCogsBase: '33.00',
+    newCogsBase: '30.00',
+  })
+  assert.deepEqual((down!.lines as Array<Record<string, unknown>>).map((l) => [l.accountCode, l.debit ?? null, l.credit ?? null]), [
+    ['815', 3, null],
+    ['500', null, 3],
+  ])
+  assert.equal(down!.oldCogsBase, 33)
+  assert.equal(down!.newCogsBase, 30)
+  assert.equal(buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 's', costLayerId: 'l', inventoryAccount: '120', cogsAccount: '500', costDeltaOffsetAccount: '815', oldCogsBase: 5, newCogsBase: 5,
+  }), null)
+})

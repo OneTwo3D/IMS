@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Inventory costing: order discount, late landed cost on sold units, supplier-return layers (accounting)
+
+- **Fixed: an order-level purchase discount never reached the cost layer.** The unit cost laid at receipt (manual receipt, WMS book-in, WMS align-up, the order preview) and the one a landed-cost recalculation writes ignored the order's header discount, so 10 x 100 with 10% off laid a layer of 1,000 against a bill of 900 and left 100 in Stock in Transit. The discounted fraction (`subtotalBase / SUM(line totals)`, the basis the return credit already used) now scales every line's goods cost in the one allocation; landed cost is added on top of it. No schema change; an order with no header discount is byte-for-byte unchanged.
+- **Fixed: late landed cost on units already sold credited Inventory instead of Stock in Transit.** The reverse-and-repost COGS_REVERSAL for an already-journaled shipment credited Inventory for the whole change, while the on-hand reclass had debited Inventory only for the units still on hand (10 @ 10, 3 sold, +10 freight: Inventory +4 against layers +7, Transit left holding 3). Rule, as for the consumed-quantity COGS journal: cost on units already sold goes to COGS and is funded from Stock in Transit. Landed-cost revaluations now post that change as DR COGS / CR Transit (reversed on a decrease), with the matching transit subledger row; other revaluations (manufacturing) are unchanged. Shipments not yet journaled are posted by the daily batch from the revised shipment cost and are not changed here.
+- **Fixed: supplier returns consumed the warehouse's oldest layers, not the returned order's.** A return now consumes the layers received against the returned PO line first (FIFO among them) and only then falls back to the warehouse's other layers, so the inventory/transit reversal equals the cost of the goods returned and the credit note. No data correction is made to existing records.
+
 ### Xero paid date and EU VAT update refusals (backend / sync)
 
 - **Fixed: the Xero date reader accepted days that do not exist.** `FullyPaidOnDate` and the other Xero dates read `2026-02-30` as 2 March (the platform parser rolls such days on). An ISO date whose written year, month and day are not a real calendar day (zoned or zone-less, or an hour of 24 that would roll the day on) is now unreadable, so the payment poller leaves the document pending and retries it instead of writing a wrong `paidAt`.

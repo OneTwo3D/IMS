@@ -163,6 +163,8 @@ The system refuses to cancel a PO that has had nothing received but already has 
 
 If goods need to be sent back to the supplier, create a purchase return against the original PO. The return reduces stock at the relevant warehouse and records the adjustment.
 
+A supplier return takes stock out at the cost of the **purchase order being returned**, not the warehouse's oldest stock: the cost layers received against that order's line go first, so the amount reversed out of inventory matches the supplier credit note for the same goods. Only if that order's own stock has already gone (for example it was sold) does the return fall back to the warehouse's other layers, oldest first.
+
 A return does not strand the rest of the order. While quantity is still due on any line, the order stays **Partially Received** after a return: you can still receive the balance, edit, close or cancel it, and the balance stays in the incoming figures. The order moves to **Partially Returned** or **Returned** only when nothing is left to receive.
 
 
@@ -252,6 +254,8 @@ If a freight PO is added or updated after goods have already been received, the 
 
 - Existing FIFO cost layers from the affected receipts are revalued with the new unit costs.
 - If any of those layers have already been consumed by sales shipments, a COGS revaluation journal is queued for Xero — it reverses the old COGS amount and posts the new one.
+  The extra cost on units already sold is charged to COGS and cleared from **Stock in Transit** (debit COGS, credit Stock in Transit), not taken out of Inventory, so the freight bill's transit debit drains in full and Inventory ends at the cost of the units still on hand.
+- **An order-level discount reduces the unit cost.** A header discount on a purchase order (for example 10% off the whole order) is spread over its lines, so the cost laid at receipt, shown on the order and used for returns is the discounted cost and the stock value equals the bill.
 - All cost-layer snapshot changes are recorded in the activity log so finance can trace what changed and why.
 - **A credit or zero cost line is applied the same way at receipt and at recalculation.** A cost line with a
   negative amount (a discount or credit from the supplier) reduces the cost spread over the goods it is allocated to,
