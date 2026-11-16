@@ -436,6 +436,17 @@ test('create: a courier task that cannot be recorded stays DUE on the link (writ
   assert.deepEqual(cleared, ['so-1:Royal Mail'])
 })
 
+test('create: the courier marker and task name the service of the RELOADED order, not the candidate list\'s earlier read', async () => {
+  const fallbackPush = connector({ pushOrder: async () => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW', courierFallback: true }) })
+  const h = makePort({ createCandidates: [candidate({ shippingService: 'Royal Mail' })] })
+  h.port.reloadOrderForPush = async () => ({ shippingService: 'DPD Next Day', erasedAt: null })
+  const r = await runWmsOrderPushSweepCore(fallbackPush, 'mintsoft', h.port, { now: NOW })
+  assert.equal(r.created, 1)
+  assert.equal(h.upserts[0].create.courierTaskService, 'DPD Next Day')
+  assert.match(h.tasks[0].queryText, /'DPD Next Day'/)
+  assert.equal(h.tasks[0].dedupeBasis, 'courier-fallback:DPD Next Day')
+})
+
 test('courier tasks are keyed to the service: a fallback for another service is a different task with its own text', async () => {
   const a = makePort({})
   const b = makePort({})

@@ -936,6 +936,8 @@ export type WmsPushVerifyLink = WmsPushLinkRef & {
   /** A courier-fallback note held back until the id is proven ours. */
   courierPending: boolean
   shippingService: string | null
+  /** A courier-fallback task already due for this link (written at create, for the service applied then). */
+  courierTaskService?: string | null
 }
 
 /**
@@ -1330,8 +1332,8 @@ export async function runWmsOrderPushSweepCore(
   }
 
   /** The link write that promotes a verified link to SYNCED carries the courier due-marker whenever the link is courier-pending. */
-  const courierDueOnPromotion = (link: { courierPending: boolean; shippingService: string | null }): { courierTaskService?: string } =>
-    link.courierPending ? { courierTaskService: link.shippingService ?? '—' } : {}
+  const courierDueOnPromotion = (link: { courierPending: boolean; shippingService: string | null; courierTaskService?: string | null }): { courierTaskService?: string } =>
+    link.courierPending ? { courierTaskService: link.courierTaskService ?? link.shippingService ?? '—' } : {}
 
   /**
    * A PARTIAL removal (only some of the recorded lines are gone), or one whose lines could not be read, keeps the link OPEN: the obligation
@@ -2604,6 +2606,8 @@ export async function runWmsOrderPushSweepCore(
       // not sent (the claim is given back and the next pass records the refusal), an order that cannot be read is not sent, and
       // otherwise `input` is rebuilt from the current fields. The gap between this read and the HTTP call is an inter-system race
       // that cannot be closed from inside IMS.
+      // The shipping service the payload is built from: the RELOADED order's, not the candidate list's earlier read (the courier task names the service applied).
+      let pushService: string | null = order.shippingService
       if (port.reloadOrderForPush) {
         let current: Partial<OrderForPush> | null = null
         let readFailed = false
@@ -2618,6 +2622,7 @@ export async function runWmsOrderPushSweepCore(
         }
         try {
           input = buildPushInput({ ...order, ...current } as typeof order, externalWarehouseId)
+          if (current.shippingService !== undefined) pushService = current.shippingService
         } catch {
           await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
             state: 'PENDING_CREATE', attempts: order.pushAttempts,
@@ -2690,14 +2695,14 @@ export async function runWmsOrderPushSweepCore(
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: components=${componentPence ?? 'ok'} payload=${payloadPence ?? 'ok'} (recording ${totalMismatchPence}; pushed, flagged for review)`)
         }
-        const createLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (order.shippingService ?? '—') : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
+        const createLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-        const updateLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (order.shippingService ?? '—') : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
+        const updateLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
             // A (re-)created warehouse order starts with no amendment in flight and no stale mark, written atomically with the state it is
             // SYNCED under (and with its snapshot, see upsertCreatedLinkWithItems).
             lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }
@@ -2865,7 +2870,7 @@ export async function runWmsOrderPushSweepCore(
           // The due-marker was written WITH the link (above), so if recording the task fails the courier pass of a later sweep records it.
           await raiseCourierTask({
             orderId: order.id, externalOrderId: push.externalOrderId, warehouseRef: warehouseOrderRef(push.externalOrderNumber, push.externalOrderId),
-            orderRef: order.orderNumber ?? order.id, orderNumber: order.orderNumber ?? null, service: order.shippingService,
+            orderRef: order.orderNumber ?? order.id, orderNumber: order.orderNumber ?? null, service: pushService,
           })
         }
       } catch (error) {
@@ -3098,7 +3103,7 @@ export async function runWmsOrderPushSweepCore(
         if (link.courierPending) {
           await raiseCourierTask({
             orderId: link.orderId, externalOrderId: link.externalOrderId, warehouseRef: link.externalOrderId,
-            orderRef: link.orderNumber ?? link.orderId, orderNumber: link.orderNumber ?? null, service: link.shippingService,
+            orderRef: link.orderNumber ?? link.orderId, orderNumber: link.orderNumber ?? null, service: (link.courierTaskService ?? link.shippingService ?? '—') === '—' ? null : (link.courierTaskService ?? link.shippingService),
           })
         }
         await audit({
@@ -3177,8 +3182,9 @@ export async function runWmsOrderPushSweepCore(
       applied: { courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'; courierFormName?: string | null; courierFallback?: boolean },
       markerSetHere = false,
       earlierRecorded = false,
+      amendedService?: string | null,
     ) => {
-      const service = link.order.shippingService
+      const service = amendedService !== undefined ? amendedService : link.order.shippingService
       const raised = applied.courierFallback
         ? await raiseCourierTask({
           orderId: link.order.id, externalOrderId: link.externalOrderId!, warehouseRef: link.externalOrderId!,
@@ -3206,6 +3212,8 @@ export async function runWmsOrderPushSweepCore(
       let lineToken: string | undefined
       let courierMarkerSetHere = false
       let earlierCourierTaskRecorded = false
+      // The service the amendment is built from: the RELOADED order's (set below), used for the marker, the task and the cleanup.
+      let amendService: string | null = link.order.shippingService
       try {
         // An erased order is not amended: the pass settles it locally (no remote call, no retry loop) instead of
         // building a payload from placeholders. Propagating an erasure to the warehouse is separate work.
@@ -3250,6 +3258,7 @@ export async function runWmsOrderPushSweepCore(
           }
           amendOrder = { ...link.order, ...current } as typeof link.order
         }
+        amendService = amendOrder.shippingService
         const input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
         // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
         // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
@@ -3273,8 +3282,15 @@ export async function runWmsOrderPushSweepCore(
         // THE COURIER TASK IS DUE BEFORE THE CALL: the marker (the service being applied) is persisted first, so a fallback the amendment applies can never
         // be lost to a failed task insert followed by a failed link write. It is cleared once the task is recorded, or in the normal write when no fallback
         // was applied. If it cannot be written nothing is sent. (An existing marker is left as it is.)
-        if ((link.courierTaskService == null || earlierCourierTaskRecorded) && port.setCourierTaskDue) courierMarkerSetHere = await port.setCourierTaskDue(link.order.id, link.order.shippingService ?? '—')
+        if ((link.courierTaskService == null || earlierCourierTaskRecorded) && port.setCourierTaskDue) courierMarkerSetHere = await port.setCourierTaskDue(link.order.id, amendService ?? '—')
         update = await connector.updateOrder(link.externalOrderId, input, amendSeam.clearance)
+        // A RESULT THAT PROVES NO COURIER POST HAPPENED clears the marker this attempt set: `updated: false` is the connector's answer that nothing was amended
+        // (Mintsoft: NOT_FOUND, NOT_NEW, MERGED_SURVIVOR, ORDER_NUMBER_MISMATCH, ORDER_UNVERIFIABLE all return before any write). Only an applied or partially
+        // applied (WmsOrderUpdatePartialError) or ambiguous (any other throw) outcome keeps it.
+        if (!update.updated && courierMarkerSetHere) {
+          await port.clearCourierTaskDue?.(link.order.id, amendService ?? '—').catch((e) => console.error('[wms-order-push] could not clear the courier task marker', e))
+          courierMarkerSetHere = false
+        }
         // Nothing was written by THIS attempt. The mark is cleared only if this acquisition set it; a mark that was already set (an earlier
         // amendment was interrupted after changing lines but before its snapshot) stays until a verified replacement or a deletion of the ids.
         if (!update.updated && lineToken) {
@@ -3333,7 +3349,7 @@ export async function runWmsOrderPushSweepCore(
         }
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
         // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
-        const settled = await settleAmendedCourier(link, update.updated ? update : {}, courierMarkerSetHere, earlierCourierTaskRecorded)
+        const settled = await settleAmendedCourier(link, update.updated ? update : {}, courierMarkerSetHere, earlierCourierTaskRecorded, amendService)
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
         await port.updateLink(link.id, {
@@ -3366,8 +3382,8 @@ export async function runWmsOrderPushSweepCore(
         if (error instanceof WmsOrderUpdatePartialError && lineToken) await port.replaceOrderItems?.(link.order.id, link.externalOrderId as string, [], lineToken).catch(() => {})
         // A refusal that provably sent nothing (the outbound-write hold) applied no fallback: the marker this attempt set is withdrawn. Any other failure
         // may have been accepted, so the marker stays and the courier pass records the task.
-        if (courierMarkerSetHere && !(error instanceof WmsOrderUpdatePartialError) && isOutboundWriteHeldError(error) && error.nothingSent) await port.clearCourierTaskDue?.(link.order.id, link.order.shippingService ?? '—').catch(() => {})
-        const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied, courierMarkerSetHere, earlierCourierTaskRecorded).catch(() => null) : null
+        if (courierMarkerSetHere && !(error instanceof WmsOrderUpdatePartialError) && isOutboundWriteHeldError(error) && error.nothingSent) await port.clearCourierTaskDue?.(link.order.id, amendService ?? '—').catch(() => {})
+        const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied, courierMarkerSetHere, earlierCourierTaskRecorded, amendService).catch(() => null) : null
         await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
           action: 'order_update', outcome: update?.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
@@ -4036,7 +4052,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       const rows = await db.wmsOrderPushLink.findMany({
         where: { connector, state: 'PENDING_VERIFY', externalOrderId: { not: null } },
         select: {
-          id: true, orderId: true, externalOrderId: true, attempts: true, courierPending: true,
+          id: true, orderId: true, externalOrderId: true, attempts: true, courierPending: true, courierTaskService: true,
           order: { select: { orderNumber: true, externalOrderNumber: true, shippingService: true } },
         },
         take: limit,
@@ -4057,6 +4073,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         externalReference: row.orderId,
         verifyAttempts: row.attempts,
         courierPending: row.courierPending,
+        courierTaskService: row.courierTaskService,
         shippingService: row.order?.shippingService ?? null,
       }))
     },

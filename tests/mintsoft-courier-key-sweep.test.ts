@@ -32,11 +32,12 @@ function updateLinkFor(over: Partial<WmsPushUpdateLink>): WmsPushUpdateLink {
   }
 }
 
-async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Error, opts: { taskFails?: boolean; withMarker?: boolean; linkWriteFails?: boolean } = {}) {
+async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Error, opts: { taskFails?: boolean; withMarker?: boolean; linkWriteFails?: boolean; reloadService?: string } = {}) {
   const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
   const linkWrites: Array<Record<string, unknown>> = []
   const events: string[] = []
   const markers: string[] = []
+  const cleared: string[] = []
   const inputs: WmsOrderPushInput[] = []
   const taskPort = recordingTaskPort({ failWith: () => (opts.taskFails ? new Error('database unavailable') : null) })
   const port = {
@@ -50,7 +51,8 @@ async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Err
     cancellableLinks: async () => [],
     updatableLinks: async () => [link],
     updateLink: async (_id: string, data: Record<string, unknown>) => { if (opts.linkWriteFails) throw new Error('link write failed'); linkWrites.push(data) },
-    ...(opts.withMarker ? { setCourierTaskDue: async (_o: string, service: string) => { events.push('marker'); markers.push(service); return true }, clearCourierTaskDue: async () => undefined } : {}),
+    ...(opts.withMarker ? { setCourierTaskDue: async (_o: string, service: string) => { events.push('marker'); markers.push(service); return true }, clearCourierTaskDue: async (_o: string, service: string) => { cleared.push(service) } } : {}),
+    ...(opts.reloadService ? { reloadOrderForPush: async () => ({ ...link.order, shippingService: opts.reloadService, erasedAt: null }) } : {}),
     updateLinkByOrder: async () => undefined,
     updateLinkIfState: async () => true,
     upsertByOrder: async () => undefined,
@@ -64,7 +66,7 @@ async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Err
     updateOrder: async (_id: string, input: WmsOrderPushInput) => { events.push('updateOrder'); inputs.push(input); if (result instanceof Error) throw result; return result },
   }
   await runWmsOrderPushSweepCore(connector as never, 'mintsoft', port, { now: NOW })
-  return { linkWrites, inputs, tasks: taskPort.tasks, events, markers }
+  return { linkWrites, inputs, tasks: taskPort.tasks, events, markers, cleared }
 }
 
 test('a link with no recorded form, amended down to the placeholder, ends with courierPending true and the form recorded', async () => {
@@ -194,4 +196,26 @@ test('belt and braces: a failed task for B never overwrites a different pending 
   void runWmsOrderPushSweepCore
   const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { taskFails: true, withMarker: true })
   assert.equal(run.linkWrites[0]!.courierTaskService, 'RM Tracked', 'with no other pending service the marker is B')
+})
+
+test('a REFUSED amendment (nothing posted) clears the marker it set and raises no task; a later real fallback for the same service gives one task', async () => {
+  for (const status of ['ORDER_NUMBER_MISMATCH', 'ORDER_UNVERIFIABLE', 'MERGED_SURVIVOR', 'NOT_FOUND', 'NOT_NEW']) {
+    const refused = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), { updated: false, status }, { withMarker: true })
+    assert.deepEqual(refused.markers, ['RM Tracked'], status)
+    assert.ok(refused.cleared.includes('RM Tracked'), `${status}: the marker is cleared`)
+    assert.deepEqual(refused.tasks, [], `${status}: no task`)
+  }
+  const later = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { withMarker: true })
+  assert.equal(later.tasks.length, 1, 'the later successful fallback is the one open task (nothing earlier could have been done and deduped it away)')
+})
+
+test('the courier marker, task and cleanup name the service of the RELOADED order, not the batch read', async () => {
+  const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { withMarker: true, reloadService: 'DPD Next Day' })
+  assert.deepEqual(run.markers, ['DPD Next Day'])
+  assert.equal(run.tasks.length, 1)
+  assert.match(run.tasks[0]!.queryText, /'DPD Next Day'/)
+  assert.doesNotMatch(run.tasks[0]!.queryText, /RM Tracked/)
+  assert.equal(run.tasks[0]!.dedupeBasis, 'courier-fallback:DPD Next Day')
+  const failed = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { withMarker: true, reloadService: 'DPD Next Day', taskFails: true })
+  assert.equal(failed.linkWrites[0]!.courierTaskService, 'DPD Next Day', 'a failed task leaves the NEW service due')
 })
