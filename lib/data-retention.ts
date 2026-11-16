@@ -10,7 +10,7 @@ import {
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { WC_REFUND_PARK_RECOVERED_ACTION, WC_REFUND_PARK_VERIFICATION_MIGRATION } from '@/lib/domain/sales/refund-park-recovery'
-import { openWcOrderEditDriftRowSql, pendingAdmissionRefusalRowSql, recoveryAccusedRowSql, unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
+import { openWcCompletionRefusalRowSql, openWcOrderEditDriftRowSql, pendingAdmissionRefusalRowSql, recoveryAccusedRowSql, unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
@@ -264,6 +264,8 @@ export async function purgeExpiredData(): Promise<{
              -- created it), and the drain that keeps it young only runs while sync is on. Never
              -- deleted by age while PENDING; a resolved one (SYNCED) expires like any other row.
              AND NOT (${pendingAdmissionRefusalRowSql()})
+             -- An OPEN (QUARANTINED) refused WooCommerce completion is the order's only record (the delivery was acknowledged); kept while open.
+             AND NOT (${openWcCompletionRefusalRowSql()})
              -- An open "order edited in WooCommerce after import" row is an operator's exception that nothing re-reads
              -- until the order changes again, so it is kept until it is resolved (the row is then deleted, not aged).
              AND NOT (${openWcOrderEditDriftRowSql()})

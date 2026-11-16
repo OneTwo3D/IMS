@@ -387,6 +387,10 @@ export const apiRouteAuthPolicy = {
     access: 'admin-fresh',
     reason: 'Database reset code issuance is restricted through requireApiFreshAdmin.',
   },
+  '/api/purchase-order/[id]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with purchasing permission; supplier-portal users are refused.',
+  },
   '/api/rfq/[id]': {
     access: 'supplier',
     reason: 'Allows supplier users only for their own RFQs; non-suppliers require purchasing permission.',

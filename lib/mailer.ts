@@ -29,6 +29,12 @@ type EmailOptions = {
   subject: string
   html: string
   attachments?: { filename: string; content: Buffer; contentType?: string }[]
+  /**
+   * An explicit overall deadline for THIS send. Sets the transport's connection, greeting and socket timeouts and races the whole
+   * send; at the deadline the transport is closed (its sockets destroyed) and the answer is a PERMANENT "outcome unknown" failure, because
+   * the message may already have been accepted. Unset: no deadline, as before.
+   */
+  deadlineMs?: number
 }
 
 type SendEmailResult = {
@@ -37,6 +43,9 @@ type SendEmailResult = {
   permanent?: boolean
   invalidRecipient?: boolean
 }
+
+/** Reason on a send that hit its deadline: the message may or may not have been accepted, so it is never retried automatically. */
+export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending (Email PO).'
 
 const emailSchema = z.email()
 const RESERVED_EXAMPLE_DOMAIN_PATTERN = /\bexample\.(com|org|net)\b/i
@@ -122,7 +131,9 @@ export async function sendEmailWithSmtpSettings(
     const replyToEmail = smtp.replyTo ? validateEmailAddress(smtp.replyTo, 'reply-to') : undefined
     const fromName = sanitizeDisplayName(smtp.fromName)
 
+    const deadlineMs = opts.deadlineMs
     const transport = nodemailer.createTransport({
+      ...(deadlineMs ? { connectionTimeout: deadlineMs, greetingTimeout: deadlineMs, socketTimeout: deadlineMs } : {}),
       host: smtp.host,
       port: smtp.port,
       secure: smtp.secure === 'ssl',
@@ -130,7 +141,7 @@ export async function sendEmailWithSmtpSettings(
       tls: smtp.secure === 'tls' ? { rejectUnauthorized: true } : undefined,
     })
 
-    await transport.sendMail({
+    const sending = transport.sendMail({
       from: fromName ? { name: fromName, address: fromEmail } : fromEmail,
       replyTo: replyToEmail,
       to: toEmail,
@@ -142,6 +153,20 @@ export async function sendEmailWithSmtpSettings(
         contentType: a.contentType ?? 'application/pdf',
       })),
     })
+    if (deadlineMs) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const outcome = await Promise.race([
+        sending.then(() => 'sent' as const),
+        new Promise<'deadline'>((resolve) => { timer = setTimeout(() => resolve('deadline'), deadlineMs) }),
+      ]).finally(() => { if (timer) clearTimeout(timer) })
+      if (outcome === 'deadline') {
+        sending.catch(() => undefined)
+        transport.close()
+        return { success: false, permanent: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME }
+      }
+    } else {
+      await sending
+    }
 
     return { success: true }
   } catch (e) {

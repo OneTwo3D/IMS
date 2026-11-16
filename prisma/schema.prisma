@@ -4046,6 +4046,12 @@ model WmsOrderPushLink {
   /// consolidate the other order's lines): the change has to be applied there by hand. Live link, listed in the exception inbox until
   /// an operator acknowledges it (which clears this).
   amendNoticeAt         DateTime? @map("amend_notice_at")
+  /// Double postage (o3d-zvec.14): set when this order was absorbed into a Mintsoft merged order and MORE THAN ONE order in the merged group
+  /// charged the customer shipping, so the customer may have paid postage twice. IMS never refunds automatically: this flag is listed on
+  /// Sync > Exceptions for an IMS operator (the warehouse is not involved, so there is no warehouse task) until an operator clears it
+  /// (sets both columns back to null; the clear is audited). `doublePostageDetail` is the sentence the operator reads: order numbers and amounts only.
+  doublePostageAt       DateTime? @map("double_postage_at")
+  doublePostageDetail   String?   @map("double_postage_detail")
   /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
   /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
   lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
@@ -4059,6 +4065,8 @@ model WmsOrderPushLink {
   amendLeaseExpiresAt   DateTime? @map("amend_lease_expires_at")
   /// The shipping service of a courier-fallback operator task that is DUE and not yet recorded (cleared once recorded): a failed insert is retried by a later sweep.
   courierTaskService    String?   @map("courier_task_service")
+  /// The stable episode of that due task (written with the marker, before the warehouse call): every retry keys its task on it, so one fallback is one task.
+  courierTaskEpisode    DateTime? @map("courier_task_episode")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())
