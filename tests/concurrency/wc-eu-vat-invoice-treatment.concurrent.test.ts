@@ -1486,7 +1486,11 @@ test('[eu vat] the poster refuses a treated payload whose recorded regime policy
   // The cut-in is changed while the row waits.
   await db.setting.upsert({ where: { key: 'eu_vat_gift_card_flag_cut_in' }, create: { key: 'eu_vat_gift_card_flag_cut_in', value: '2026-12-01' }, update: { value: '2026-12-01' } })
   const refused = (await euSchemePostingRefusal(treated())) ?? ''
-  assert.match(refused, /^NOTHING WAS SENT\. Sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\); re-import the order\./)
+  assert.match(refused, /NOTHING WAS SENT\. Sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\)\.[\s\S]*re-importing the order will not rebuild it[\s\S]*post the invoice by hand in Xero and record it on this row with the settle action/)
+  assert.doesNotMatch(refused, /; re-import the order/, 'the dead remedy is not named')
+  const refusedUpdate = (await euSchemePostingRefusal(treated(), new Date(), 'update')) ?? ''
+  assert.match(refusedUpdate, /NOTHING WAS SENT\. The update of sales invoice INV-P was refused: the EU VAT regime settings changed since it was prepared \(cutIn\)\.[\s\S]*Check Xero for invoice INV-P first[\s\S]*retry this row on \/sync[\s\S]*settle action/)
+  assert.doesNotMatch(refusedUpdate, /then re-import|; re-import the order/)
   // Also a route-none treated payload, and one with no recorded policy.
   assert.match((await euSchemePostingRefusal({ invoiceNumber: 'INV-N', _euVatTreatment: { applied: true, route: 'none', regimePolicy: policy } })) ?? '', /settings changed since it was prepared/)
   assert.match((await euSchemePostingRefusal(treated({ regimePolicy: undefined }))) ?? '', /before the regime settings it was decided under were recorded/)
@@ -1498,7 +1502,8 @@ test('[eu vat] the poster refuses a treated payload whose recorded regime policy
 
 test('[eu vat] BOTH sales-invoice posting cases call the poster gate before anything is sent', () => {
   const src = readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
-  assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>\)/g) ?? []).length, 2, 'SALES_INVOICE and SALES_INVOICE_UPDATE')
+  assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>(, new Date\(\), 'update')?\)/g) ?? []).length, 2, 'SALES_INVOICE and SALES_INVOICE_UPDATE')
+  assert.equal((src.match(/await euSchemePostingRefusal\(payload as Record<string, unknown>, new Date\(\), 'update'\)/g) ?? []).length, 1, 'the UPDATE case says it is an update, so its refusal names the remedy for an invoice already in Xero')
   const hold = src.indexOf('await holdInvoiceOnRegimePolicyChange({ attempt, held: lease')
   assert.ok(hold > 0 && hold < src.indexOf('await euSchemePostingRefusal(payload as Record<string, unknown>)'), 'the SALES_INVOICE create supersedes a policy-changed invoice into a held invoice before the refusal gate')
 })
@@ -1659,8 +1664,10 @@ for (const kind of ['create', 'update'] as const) {
       assert.match(error, change === 'policy'
         ? /the EU VAT regime settings changed since it was prepared \(cutIn\)/
         : /20.*% in Xero, not zero-rated/)
-      assert.match(error, /^NOTHING WAS SENT\./)
-      assert.match(error, /check Xero for invoice INV-L first/i)
+      // The refusals go through withLedgerCheck, which prefixes the ledger-check preamble when the wording carries an instruction.
+      assert.match(error, /^(BEFORE acting on this: check whether the current version is already in the accounting system, and act only if it is absent\. )?NOTHING WAS SENT\./)
+      assert.match(error, /check Xero for (invoice INV-L|the current version of invoice INV-L) first/i)
+      if (kind === 'update') assert.doesNotMatch(error, /then re-import|; re-import the order/, 'an update never names a re-import as the fix')
       assert.deepEqual(await composeFinalBeforePost(null, { invoiceNumber: 'INV-U' }, kind)(request), { ok: true }, 'an untreated payload is not checked')
     })
   }
