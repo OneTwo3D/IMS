@@ -70,6 +70,8 @@ type Props = {
   purchaseUnits: PurchaseUnitRow[]
   carriers: string[]
   companyHomeCountry?: string | null
+  /** Internal margin column in the edit dialog; true only for a user holding `inventory.prices`. */
+  showMargin?: boolean
   accountingAvailable: boolean
   accountingBillUrlTemplate: string
   wmsAsnState: WmsPurchaseOrderAsnState
@@ -2034,7 +2036,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2484,6 +2486,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
           taxRates={taxRates}
           purchaseUnits={purchaseUnits}
           companyHomeCountry={companyHomeCountry}
+          showMargin={showMargin}
           existingPo={po}
           onClose={() => { setEditing(false); router.refresh() }}
         />

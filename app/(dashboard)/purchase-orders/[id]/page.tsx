@@ -16,6 +16,8 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { computePurchaseOrderOverBilling } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import { computePrepaidReconciliation } from '@/lib/domain/purchasing/prepaid-reconciliation'
+import { getSession } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
 import { PoDetailClient } from './po-detail-client'
 
@@ -25,6 +27,8 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function PurchaseOrderDetailPage({ params }: Props) {
   const { id } = await params
+  const session = await getSession()
+  const showMargin = !!session && hasPermission(session.user.role, 'inventory.prices')
   const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson, accountingSettings, accountingAvailable, wmsAsnState, poEmailEnabled] = await Promise.all([
     getPurchaseOrder(id),
     getSuppliers(),
@@ -82,7 +86,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} />
     </div>
   )
 }

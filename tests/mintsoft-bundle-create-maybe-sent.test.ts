@@ -20,6 +20,11 @@ import { setOutboundRefusalSink } from '../lib/security/outbound-write-refusal-l
  * in-memory double of exactly the delegates the sync touches. No vendor host is ever contacted.
  */
 
+// The outbound-write hold's reference is an HMAC keyed by SETTINGS_ENCRYPTION_KEY, and with no key NOTHING is
+// recognised as a hold (fail-safe, lib/security/outbound-write-hold-constants.ts). CI exports a key; a clean
+// checkout without .env.local has none, so these assertions need their own. Read lazily, so setting it here is enough.
+process.env.SETTINGS_ENCRYPTION_KEY = 'a1'.repeat(32)
+
 setOutboundRefusalSink(async () => undefined)
 
 type LinkRow = { id: string; connector: string; productId: string; externalBundleId: string; checksum: string | null; lastSyncedAt: Date | null; updatedAt: Date; sku?: string }

@@ -1,16 +1,29 @@
 import { getXeroSettings } from './settings'
-import { unitDpLineGap, XeroRoundingAccountMissingError } from './write-path'
+import { loadStoredXeroRateOf } from './tax-rate-lookup'
+import { planXeroRoundingLine, unitDpChangesAnyLine, type XeroRoundingPlanInput, type XeroTaxRateOf } from './write-path'
+
+export type UnitDpRoundingResolution = { ok: true; account: string | null; rateOf: XeroTaxRateOf | undefined } | { ok: false; error: string }
 
 /**
- * Asked BEFORE any contact or item round trip: is there a unitdp=4 penny to post, and if so is there a Rounding account to post it to?
- * Settings are read only when there is a gap, so a document whose prices Xero keeps exactly never touches them.
+ * Asked BEFORE any contact or item round trip: is there a unitdp=4 difference to post, and can the document be made to total what the order totals?
+ * The plan (write-path.ts `planXeroRoundingLine`) is run here on the real tax rates and Rounding account, so a document that cannot be reconciled (no
+ * Rounding account, a tax rate Xero's list does not carry, a difference rounding cannot explain) is refused with nothing created in Xero. The same plan
+ * runs again in the builder with the `account` and `rateOf` returned. Settings and the tax-rate list are read only when 4dp changes the amount of at least one line,
+ * so a document whose prices Xero keeps exactly never touches them.
  */
-export async function resolveUnitDpRoundingAccount(
-  lines: ReadonlyArray<{ quantity: number; unitAmount: number }>, what: string,
-): Promise<{ ok: true; account: string | null } | { ok: false; error: string }> {
-  const gap = unitDpLineGap(lines)
-  if (gap.isZero()) return { ok: true, account: null }
+export async function resolveUnitDpRoundingAccount(input: Omit<XeroRoundingPlanInput, 'account' | 'rateOf'>): Promise<UnitDpRoundingResolution> {
+  if (!unitDpChangesAnyLine(input.lines)) return { ok: true, account: null, rateOf: undefined }
+  let rateOf: XeroTaxRateOf | undefined
+  if (!input.lineAmountsIncludeTax) {
+    const rates = await loadStoredXeroRateOf()
+    if (!rates.ok) return { ok: false, error: `${input.what} cannot be posted: ${rates.error} Nothing was sent.` }
+    rateOf = rates.rateOf
+  }
   const account = (await getXeroSettings()).xero_rounding_difference_account?.trim() ?? ''
-  if (!account) return { ok: false, error: new XeroRoundingAccountMissingError(what, gap.toFixed(2)).message }
-  return { ok: true, account }
+  try {
+    planXeroRoundingLine({ ...input, account, rateOf })
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+  return { ok: true, account: account || null, rateOf }
 }

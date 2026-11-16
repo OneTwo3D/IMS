@@ -7,6 +7,8 @@ import { getCurrencies } from '@/app/actions/currencies'
 import { getTaxRates, getPurchaseUnits } from '@/app/actions/settings'
 import { getGoodsPosForLinking } from '@/app/actions/purchase-orders'
 import { getOrganisation } from '@/app/actions/company'
+import { getSession } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import { PurchaseOrdersClient } from './po-page-client'
 
 export const metadata: Metadata = { title: 'Purchase Orders' }
@@ -15,6 +17,8 @@ type SearchParams = { q?: string; status?: string; page?: string; invoiced?: str
 
 export default async function PurchaseOrdersPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const sp = await searchParams
+  const session = await getSession()
+  const showMargin = !!session && hasPermission(session.user.role, 'inventory.prices')
   const [list, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, goodsPos, organisation] = await Promise.all([
     getPurchaseOrders({ q: sp.q, status: sp.status, page: sp.page, invoiced: sp.invoiced === '1', returned: sp.returned === '1', includeArchived: sp.archived === '1' }),
     getSuppliers(),
@@ -42,6 +46,7 @@ export default async function PurchaseOrdersPage({ searchParams }: { searchParam
       purchaseUnits={purchaseUnits}
       goodsPos={goodsPos}
       companyHomeCountry={organisation?.country ?? null}
+      showMargin={showMargin}
     />
   )
 }
