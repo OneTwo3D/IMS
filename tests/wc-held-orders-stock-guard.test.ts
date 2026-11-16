@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   aggregateHeldUnits,
+  completedOrdersModifiedAfter,
   unallocatedRemainder,
   loadWcHeldUnitsByProduct,
   WC_HELD_ORDERS_MAX_PAGES,
@@ -18,10 +19,21 @@ const order = (id: number, ...lines: [number, number, number][]) => ({
   line_items: lines.map(([product_id, variation_id, quantity]) => ({ product_id, variation_id, quantity, sku: '' })),
 })
 
-function deps(over: Partial<WcHeldUnitsDeps> & { pages?: unknown[][] }): WcHeldUnitsDeps {
+const CURSOR = '2026-11-14T00:00:00.000Z'
+const load = (d: WcHeldUnitsDeps, cursor: string | null = CURSOR) => loadWcHeldUnitsByProduct(d, cursor)
+
+// Pages are served for the open (on-hold,processing) walk; `completed` is empty unless `completedPages` is given.
+function deps(over: Partial<WcHeldUnitsDeps> & { pages?: unknown[][]; completedPages?: unknown[][]; totalOverride?: (call: number) => number | null }): WcHeldUnitsDeps {
   const pages = over.pages ?? [[]]
+  const completedPages = over.completedPages ?? [[]]
+  let counts = 0
   return {
-    fetchOrdersPage: over.fetchOrdersPage ?? (async (_s, page) => ({ data: pages[page - 1] ?? [] })),
+    fetchOrdersPage: over.fetchOrdersPage ?? (async (params) => {
+      const list = params.status === 'completed' ? completedPages : pages
+      const total = list.reduce((n, p) => n + p.length, 0)
+      if (params.per_page === '1') { counts++; return { data: [], totalItems: over.totalOverride ? over.totalOverride(counts) : total } }
+      return { data: list[Number(params.page) - 1] ?? [], totalItems: total }
+    }),
     findImportedOrders: over.findImportedOrders ?? (async () => new Map<string, Map<string, number>>()),
     findProducts: over.findProducts ?? (async () => [simple('p1', 11)]),
     findVariationIdsByParentExternalId: over.findVariationIdsByParentExternalId ?? (async () => []),
@@ -29,7 +41,7 @@ function deps(over: Partial<WcHeldUnitsDeps> & { pages?: unknown[][] }): WcHeldU
 }
 
 test('BACS on-hold order IMS never imported is held against the product (the audit scenario)', async () => {
-  const r = await loadWcHeldUnitsByProduct(deps({ pages: [[order(1, [11, 0, 1])]] }))
+  const r = await load(deps({ pages: [[order(1, [11, 0, 1])]] }))
   assert.ok(r.ok)
   assert.equal(r.heldByProduct.get('p1'), 1)
   // 1 unit in stock, nothing reserved: the absolute push must be 0, not 1.
@@ -38,7 +50,7 @@ test('BACS on-hold order IMS never imported is held against the product (the aud
 })
 
 test('a linked, FULLY allocated order is not charged', async () => {
-  const r = await loadWcHeldUnitsByProduct(deps({
+  const r = await load(deps({
     pages: [[order(1, [11, 0, 2]), order(2, [11, 0, 3])]],
     findImportedOrders: async () => new Map([['1', new Map([['p1', 2]])]]),
   }))
@@ -48,7 +60,7 @@ test('a linked, FULLY allocated order is not charged', async () => {
 })
 
 test('a linked, PARTIALLY allocated order is charged its unallocated remainder; an unallocated one in full', async () => {
-  const r = await loadWcHeldUnitsByProduct(deps({
+  const r = await load(deps({
     pages: [[order(1, [11, 0, 5]), order(2, [11, 0, 4])]],
     findImportedOrders: async () => new Map([['1', new Map([['p1', 2]])], ['2', new Map<string, number>()]]),
   }))
@@ -105,7 +117,7 @@ test('held units come out of warehouse rows in turn and never below zero', () =>
 })
 
 test('fails closed when the order read errors, throws, is not a list, or is truncated', async () => {
-  const bad = async (d: Partial<WcHeldUnitsDeps> & { pages?: unknown[][] }) => (await loadWcHeldUnitsByProduct(deps(d))).ok
+  const bad = async (d: Partial<WcHeldUnitsDeps> & { pages?: unknown[][] }) => (await load(deps(d))).ok
   assert.equal(await bad({ fetchOrdersPage: async () => ({ data: null, error: 'WC API error: 500' }) }), false)
   assert.equal(await bad({ fetchOrdersPage: async () => { throw new Error('boom') } }), false)
   assert.equal(await bad({ fetchOrdersPage: async () => ({ data: { not: 'a list' } }) }), false)
@@ -114,14 +126,14 @@ test('fails closed when the order read errors, throws, is not a list, or is trun
 
 test('walks multiple pages until a short one', async () => {
   const p1 = Array.from({ length: WC_HELD_ORDERS_PAGE_SIZE }, (_, i) => order(i + 1, [11, 0, 1]))
-  const r = await loadWcHeldUnitsByProduct(deps({ pages: [p1, [order(999, [11, 0, 2])]] }))
+  const r = await load(deps({ pages: [p1, [order(999, [11, 0, 2])]] }))
   assert.ok(r.ok)
   assert.equal(r.heldByProduct.get('p1'), WC_HELD_ORDERS_PAGE_SIZE + 2)
 })
 
 test('an unmapped variation is NEVER charged to its VARIABLE parent: its variations are blocked instead', async () => {
   const parent: HeldProductRef = { id: 'parent', sku: 'P', type: 'VARIABLE', externalProductId: 10, components: [] }
-  const r = await loadWcHeldUnitsByProduct(deps({
+  const r = await load(deps({
     pages: [[order(1, [10, 555, 2])]],
     findProducts: async () => [parent],
     findVariationIdsByParentExternalId: async (ids) => (ids.includes(10) ? ['var-a', 'var-b'] : []),
@@ -141,17 +153,56 @@ test('a variation matches by its id, then by SKU', () => {
 
 test('a huge queue is walked to its end (no 2,000-order freeze) and a short page ends it', async () => {
   const full = Array.from({ length: WC_HELD_ORDERS_PAGE_SIZE }, (_, i) => order(i + 1, [11, 0, 1]))
-  const pages = [...Array.from({ length: 30 }, () => full), [order(9999, [11, 0, 1])]]
-  const r = await loadWcHeldUnitsByProduct(deps({ pages }))
+  let seq = 0
+  const pages = [...Array.from({ length: 30 }, () => full.map((o) => ({ ...o, id: ++seq }))), [order(++seq, [11, 0, 1])]]
+  const r = await load(deps({ pages }))
   assert.ok(r.ok)
-  assert.equal(r.truncated, false)
+  assert.equal(r.incomplete, false)
   assert.equal(r.heldByProduct.get('p1'), 30 * WC_HELD_ORDERS_PAGE_SIZE + 1)
 })
 
 test('hitting the safety ceiling reports truncated (the caller then pushes only forced zeros)', async () => {
   const full = Array.from({ length: WC_HELD_ORDERS_PAGE_SIZE }, (_, i) => order(i + 1))
-  const r = await loadWcHeldUnitsByProduct(deps({ fetchOrdersPage: async () => ({ data: full }) }))
+  const r = await load(deps({ fetchOrdersPage: async () => ({ data: full, totalItems: 99999 }) }))
   assert.ok(r.ok)
-  assert.equal(r.truncated, true)
+  assert.equal(r.incomplete, true)
   assert.ok(WC_HELD_ORDERS_MAX_PAGES >= 100)
+})
+
+test('an unimported completed order inside the window is charged like any other', async () => {
+  let asked = ''
+  const d = deps({ completedPages: [[order(70, [11, 0, 2])]] })
+  const inner = d.fetchOrdersPage
+  d.fetchOrdersPage = async (p) => { if (p.status === 'completed') asked = p.modified_after ?? ''; return inner(p) }
+  const r = await load(d)
+  assert.ok(r.ok)
+  assert.equal(r.heldByProduct.get('p1'), 2)
+  assert.equal(asked, CURSOR)
+})
+
+test('completed window: cursor minus overlap; the older cursor wins; none = unbounded', () => {
+  assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', null), '2026-11-14T00:00:00.000Z')
+  assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', '2026-11-10T00:00:00.000Z'), '2026-11-09T00:00:00.000Z')
+  assert.equal(completedOrdersModifiedAfter(null, '2026-11-10T00:00:00.000Z'), null)
+  assert.equal(completedOrdersModifiedAfter('garbage', null), null)
+})
+
+test('no cursor: the picture is incomplete', async () => {
+  const r = await load(deps({ pages: [[order(1, [11, 0, 1])]] }), null)
+  assert.ok(r.ok)
+  assert.equal(r.incomplete, true)
+  assert.equal(r.heldByProduct.get('p1'), 1) // what was read is still charged
+})
+
+test('completeness proof: a changed total, a shifted (repeated) id, a missing header or a short count each mark it incomplete', async () => {
+  const changed = await load(deps({ pages: [[order(1, [11, 0, 1])]], totalOverride: () => 2 }))
+  assert.ok(changed.ok && changed.incomplete)
+  const repeated = await load(deps({ pages: [[order(1, [11, 0, 1]), order(1, [11, 0, 1])]] }))
+  assert.ok(repeated.ok && repeated.incomplete)
+  const noHeader = await load(deps({ fetchOrdersPage: async () => ({ data: [order(1)], totalItems: null }) }))
+  assert.ok(noHeader.ok && noHeader.incomplete)
+  const short = await load(deps({ fetchOrdersPage: async (p) => (p.per_page === '1' ? { data: [], totalItems: 3 } : { data: [order(1)], totalItems: 3 }) }))
+  assert.ok(short.ok && short.incomplete)
+  const clean = await load(deps({ pages: [[order(1), order(2)]] }))
+  assert.ok(clean.ok && !clean.incomplete)
 })

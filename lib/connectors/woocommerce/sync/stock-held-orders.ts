@@ -24,10 +24,22 @@
  * NEVER charged to its parent: the parent is VARIABLE and not stocked) makes the variations of that
  * parent `blocked`: they are not pushed this run, everything else is.
  *
- * TRUNCATION. The walk stops at WC_HELD_ORDERS_MAX_PAGES (10,000 orders: far above any real queue
- * of open on-hold/processing orders). If that ceiling is hit the unread orders could name any
- * product, so no quantity can be proven safe: `truncated` is set and the caller pushes only
- * forced-zero products (0 can never oversell) and reports an error.
+ * COMPLETED ORDERS. WooCommerce also reduces stock for `completed` orders, and the default import
+ * filter is `processing` only, so an unimported completed order would be given back too. Completed
+ * orders are read as well, bounded by a window: modified since the order-sweep cursor
+ * (the older of last_wc_order_sync_at / last_wc_order_reconcile_at) minus WC_COMPLETED_OVERLAP_MS.
+ * Older completed orders have been imported or are covered by the reconcile. The same rule applies
+ * (unimported: in full; imported: unallocated remainder). No cursor means the window cannot be
+ * bounded, so the set is not proven complete.
+ *
+ * COMPLETENESS. A numbered-page walk over a live result can leave holes (an order changing status
+ * mid-walk shifts every later page). The WooCommerce REST orders endpoint has no id cursor, so each
+ * walk is ordered by id ascending and PROVEN: ids must be strictly ascending, the collected count
+ * must equal the `X-WP-Total` read with page 1, and a count read AFTER the walk must still match.
+ * Anything else (a missing header, a changed total, a repeated or out-of-order id, or the page
+ * ceiling WC_HELD_ORDERS_MAX_PAGES = 10,000 orders) marks the picture `incomplete`: unread orders
+ * could name any product, so no positive quantity can be proven safe. The caller then pushes only
+ * forced-zero products (0 can never oversell) and reports it; the next run retries.
  *
  * WHEN THE ORDER DATA CANNOT BE TRUSTED (the read fails, an unreadable page, more pages than the
  * walk allows) the loader reports `ok: false` and the caller pushes NOTHING for the run. Skipping is
@@ -56,7 +68,27 @@ export const WC_HELD_ORDERS_PAGE_SIZE = 100
 /** Safety ceiling only; the walk normally ends on a short page. */
 export const WC_HELD_ORDERS_MAX_PAGES = 100
 
+/** A completed order modified this long before the sweep cursor is still read (the sweep overlaps its own cursor). */
+export const WC_COMPLETED_OVERLAP_MS = 24 * 60 * 60 * 1000
+
 const KIT_EXPANSION_MAX_DEPTH = 8
+
+/**
+ * The `modified_after` for the completed-order read, from the two sweep cursors, or null when it cannot be bounded.
+ * The OLDER cursor is used: completed orders are only proven imported by the sweep that includes them (the reconcile).
+ */
+export function completedOrdersModifiedAfter(syncCursor: string | null | undefined, reconcileCursor: string | null | undefined): string | null {
+  const parse = (v: string | null | undefined): number | null => {
+    if (!v) return null
+    const t = Date.parse(v)
+    return Number.isNaN(t) ? null : t
+  }
+  const sync = parse(syncCursor)
+  if (sync === null) return null
+  const reconcile = parse(reconcileCursor)
+  const oldest = reconcile === null ? sync : Math.min(sync, reconcile)
+  return new Date(oldest - WC_COMPLETED_OVERLAP_MS).toISOString()
+}
 
 export type HeldLine = { productId: number; variationId: number; sku: string; quantity: number }
 
@@ -74,15 +106,16 @@ export type WcHeldUnitsResult =
       heldByProduct: Map<string, number>
       /** IMS products that must not be pushed this run (an order line naming them could not be resolved). */
       blockedProductIds: Set<string>
-      /** The page ceiling was hit: only forced-zero pushes are safe. */
-      truncated: boolean
+      /** The picture is not proven complete (see COMPLETENESS): only forced-zero pushes are safe. */
+      incomplete: boolean
+      incompleteReasons: string[]
       ordersConsidered: number
     }
   | { ok: false; reason: string }
 
 export type WcHeldUnitsDeps = {
-  /** One page of `/orders` for the given statuses. */
-  fetchOrdersPage: (statuses: string, page: number) => Promise<{ data: unknown; error?: string }>
+  /** One page of `/orders` with these query params; `totalItems` is the X-WP-Total header, null when absent. */
+  fetchOrdersPage: (params: Record<string, string>) => Promise<{ data: unknown; error?: string; totalItems?: number | null }>
   /**
    * For these WooCommerce order ids, the orders IMS holds: key present = imported; value = what IMS holds against
    * the order per product (max of allocated and shipped quantity; empty when nothing is allocated).
@@ -180,27 +213,80 @@ export function unallocatedRemainder(
   return out
 }
 
-export async function loadWcHeldUnitsByProduct(deps: WcHeldUnitsDeps): Promise<WcHeldUnitsResult> {
-  const statuses = WC_STOCK_HOLDING_ORDER_STATUSES.join(',')
+type WalkResult = { orders: WcFullOrder[]; fatal?: string; incompleteReasons: string[] }
+
+/** Walk one filtered, id-ascending result to its end and PROVE it complete (see COMPLETENESS). */
+async function walkOrders(deps: WcHeldUnitsDeps, label: string, filter: Record<string, string>): Promise<WalkResult> {
   const orders: WcFullOrder[] = []
-  let truncated = true
+  const reasons: string[] = []
+  const base = { ...filter, orderby: 'id', order: 'asc' }
+  let firstTotal: number | null | undefined
+  let ended = false
   for (let page = 1; page <= WC_HELD_ORDERS_MAX_PAGES; page++) {
-    let response: { data: unknown; error?: string }
+    let response: { data: unknown; error?: string; totalItems?: number | null }
     try {
-      response = await deps.fetchOrdersPage(statuses, page)
+      response = await deps.fetchOrdersPage({ ...base, per_page: String(WC_HELD_ORDERS_PAGE_SIZE), page: String(page) })
     } catch (e) {
-      return { ok: false, reason: `reading WooCommerce ${statuses} orders threw: ${e instanceof Error ? e.message : String(e)}` }
+      return { orders, incompleteReasons: reasons, fatal: `reading WooCommerce ${label} orders threw: ${e instanceof Error ? e.message : String(e)}` }
     }
-    if (response.error) return { ok: false, reason: `reading WooCommerce ${statuses} orders failed: ${response.error}` }
-    if (!Array.isArray(response.data)) return { ok: false, reason: 'WooCommerce orders answer was not a list' }
+    if (response.error) return { orders, incompleteReasons: reasons, fatal: `reading WooCommerce ${label} orders failed: ${response.error}` }
+    if (!Array.isArray(response.data)) return { orders, incompleteReasons: reasons, fatal: `WooCommerce ${label} orders answer was not a list` }
+    if (page === 1) firstTotal = response.totalItems
     orders.push(...(response.data as WcFullOrder[]))
     if (response.data.length < WC_HELD_ORDERS_PAGE_SIZE) {
-      truncated = false
+      ended = true
       break
     }
   }
+  if (!ended) reasons.push(`${label}: more than ${WC_HELD_ORDERS_MAX_PAGES * WC_HELD_ORDERS_PAGE_SIZE} orders (page ceiling)`)
 
-  const ids = orders.map((o) => String(o?.id ?? ''))
+  // Strictly ascending ids: a repeat or a step back means pages overlapped or shifted under the walk.
+  let last = -Infinity
+  for (const o of orders) {
+    const id = Number(o?.id)
+    if (!Number.isFinite(id) || id <= last) {
+      reasons.push(`${label}: order ids were not strictly ascending (pages shifted during the walk)`)
+      break
+    }
+    last = id
+  }
+  if (ended) {
+    if (firstTotal == null) reasons.push(`${label}: WooCommerce sent no X-WP-Total, so completeness cannot be proven`)
+    else {
+      if (orders.length !== firstTotal) reasons.push(`${label}: read ${orders.length} orders but WooCommerce reported ${firstTotal}`)
+      try {
+        const after = await deps.fetchOrdersPage({ ...base, per_page: '1', page: '1' })
+        if (after.error || after.totalItems == null) reasons.push(`${label}: the closing count read failed`)
+        else if (after.totalItems !== firstTotal) reasons.push(`${label}: the total changed during the walk (${firstTotal} to ${after.totalItems})`)
+      } catch {
+        reasons.push(`${label}: the closing count read threw`)
+      }
+    }
+  }
+  return { orders, incompleteReasons: reasons }
+}
+
+export async function loadWcHeldUnitsByProduct(
+  deps: WcHeldUnitsDeps,
+  /** `modified_after` for the completed-order read (see completedOrdersModifiedAfter); null = no cursor, cannot be bounded. */
+  completedModifiedAfter: string | null,
+): Promise<WcHeldUnitsResult> {
+  const statuses = WC_STOCK_HOLDING_ORDER_STATUSES.join(',')
+  const open = await walkOrders(deps, statuses, { status: statuses })
+  if (open.fatal) return { ok: false, reason: open.fatal }
+  const incompleteReasons = [...open.incompleteReasons]
+  const orders: WcFullOrder[] = [...open.orders]
+  if (completedModifiedAfter === null) {
+    incompleteReasons.push('completed: the order sweep cursor is missing, so unimported completed orders cannot be bounded')
+  } else {
+    const completed = await walkOrders(deps, 'completed', { status: 'completed', modified_after: completedModifiedAfter })
+    if (completed.fatal) return { ok: false, reason: completed.fatal }
+    incompleteReasons.push(...completed.incompleteReasons)
+    orders.push(...completed.orders)
+  }
+  const truncated = incompleteReasons.length > 0
+
+  const ids = [...new Set(orders.map((o) => String(o?.id ?? '')))]
   if (ids.some((id) => id === '')) return { ok: false, reason: 'a WooCommerce order had no id' }
   const imported = await deps.findImportedOrders(ids)
   const perOrderLines: { id: string; lines: HeldLine[] }[] = []
@@ -213,7 +299,7 @@ export async function loadWcHeldUnitsByProduct(deps: WcHeldUnitsDeps): Promise<W
   const allLines = perOrderLines.flatMap((o) => o.lines)
   const heldByProduct = new Map<string, number>()
   const blockedProductIds = new Set<string>()
-  if (allLines.length === 0) return { ok: true, heldByProduct, blockedProductIds, truncated, ordersConsidered: 0 }
+  if (allLines.length === 0) return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: 0 }
 
   const externalIds = [...new Set(allLines.flatMap((l) => [l.variationId, l.productId]).filter((n) => n > 0))]
   const skus = [...new Set(allLines.map((l) => l.sku).filter((s) => s !== ''))]
@@ -231,5 +317,5 @@ export async function loadWcHeldUnitsByProduct(deps: WcHeldUnitsDeps): Promise<W
   if (unresolvedParents.size > 0) {
     for (const id of await deps.findVariationIdsByParentExternalId([...unresolvedParents])) blockedProductIds.add(id)
   }
-  return { ok: true, heldByProduct, blockedProductIds, truncated, ordersConsidered: considered }
+  return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: considered }
 }

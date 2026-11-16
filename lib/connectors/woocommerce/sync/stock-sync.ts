@@ -53,7 +53,7 @@ import {
   WOO_STOCK_SYNC_PRODUCT_STATUSES,
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
-import { loadWcHeldUnitsByProduct, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
+import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -805,7 +805,12 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // THE UNRESERVED-ORDER GUARD (WCO-H3). The push below is absolute, so it must not give back units
   // WooCommerce already took off for orders IMS has not reserved. Read them now; if they cannot be read,
   // push nothing (see stock-held-orders.ts for why that is the only safe answer).
-  const held = await loadWcHeldUnitsByProduct(buildWcHeldUnitsDeps(creds))
+  const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at'] } } })
+  const cursorValue = (key: string) => cursorRows.find((r) => r.key === key)?.value ?? null
+  const held = await loadWcHeldUnitsByProduct(
+    buildWcHeldUnitsDeps(creds),
+    completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at')),
+  )
   if (!held.ok) {
     const result: StockSyncResult = {
       synced: 0, skipped: 0, errors: [`Stock push skipped: ${held.reason}. WooCommerce stock was left as it is, because an absolute push could erase the decrement of an order IMS cannot see.`],
@@ -1184,8 +1189,8 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     heldByProduct,
   )
 
-  if (held.truncated) {
-    result.errors.push('Stock push limited to forced-zero products: WooCommerce has more open on-hold/processing orders than the safety ceiling lets IMS read, so no other quantity can be proven safe.')
+  if (held.incomplete) {
+    result.errors.push(`Stock push limited to forced-zero products: the WooCommerce orders that hold stock could not be proven fully read (${held.incompleteReasons.join('; ')}), so no other quantity can be proven safe. The next run retries.`)
   }
   if (held.blockedProductIds.size > 0) {
     result.errors.push(`Stock push skipped ${held.blockedProductIds.size} product(s): an on-hold/processing WooCommerce order names a variation IMS cannot resolve, so their stock cannot be proven safe.`)
@@ -1202,7 +1207,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     }
     // Only a forced zero is safe when the held-order picture is incomplete (0 can never oversell).
     if (
-      (held.truncated || held.blockedProductIds.has(product.id))
+      (held.incomplete || held.blockedProductIds.has(product.id))
       && !shouldForceWooZeroStock(product.lifecycleStatus)
     ) {
       result.skipped++
@@ -1736,8 +1741,14 @@ export function resolvePushStockQuantity(
 /** The real I/O behind the unreserved-order guard. Read-only: one paged GET per call, two DB reads. */
 function buildWcHeldUnitsDeps(creds: ConnectorCredentials): WcHeldUnitsDeps {
   return {
-    fetchOrdersPage: (statuses, page) =>
-      safeWcFetch('/orders', { status: statuses, per_page: '100', page: String(page), orderby: 'id', order: 'asc' }, creds),
+    fetchOrdersPage: async (params) => {
+      try {
+        const { data, error, totalItems, totalItemsPresent } = await wcFetch('/orders', params, creds)
+        return { data, error, totalItems: totalItemsPresent ? totalItems : null }
+      } catch (e) {
+        return { data: null, error: `WC fetch threw: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}` }
+      }
+    },
     findImportedOrders: async (externalOrderIds) => {
       const out = new Map<string, Map<string, number>>()
       if (externalOrderIds.length === 0) return out
