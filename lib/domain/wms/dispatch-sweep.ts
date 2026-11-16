@@ -1688,6 +1688,9 @@ export async function runWmsDispatchSweepCore(
       else if (outcome.action === 'dispatched' || outcome.partDespatched) await deps.clearWmsTerminalNonDespatch?.(candidate.orderId)
     } catch (terminalError) {
       console.error('[wms-dispatch-sweep] could not record a WMS-terminal order for an operator:', terminalError)
+      // The operator-facing row did not commit, so this pass has not finished deciding the order: hold the watermark
+      // (as for a withdrawal park that did not commit) so the change cannot age out before the row is written.
+      passClean = false
     }
     try {
       if (outcome.action === 'error') {
@@ -3110,7 +3113,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       if (!order || ['CANCELLED', 'ON_HOLD', 'SHIPPED', 'COMPLETED', 'DELIVERED'].includes(order.status) || order.refundStatus === 'FULL') return
       const shown = scrubWmsError(wmsStatus, 'unknown')
       const detail = `The warehouse shows this order as "${shown}" and not despatched, but IMS still has it as ${order.status} with its stock reserved, so it will never be fulfilled. `
-        + 'IMS has changed nothing (no cancellation, stock release, refund or credit note) and will not push it again. Check with the warehouse, then cancel or refund the order in IMS, or have it reinstated.'
+        + 'IMS has made no cancellation, stock release, refund or credit note, and will not push this order to the warehouse a second time. Check with the warehouse, then cancel or refund the order in IMS, or have it reinstated.'
       const where = { orderId: candidate.orderId, category: WMS_TERMINAL_NON_DESPATCH_CATEGORY, status: 'OPEN' }
       const updated = await db.wmsOrderDiscrepancy.updateMany({ where, data: { detail, externalOrderNumber: candidate.externalOrderNumber, lastSeenAt: new Date() } })
       if (updated.count > 0) return
