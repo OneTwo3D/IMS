@@ -77,6 +77,30 @@ export type ReplenishmentReportClient = {
   shipmentLine: FindManyDelegate
   productionOrder: FindManyDelegate
   bomItem: FindManyDelegate
+  /** Per-warehouse threshold overrides. Optional so a client without the table reads as "no overrides". */
+  reorderThresholdOverride?: FindManyDelegate
+}
+
+type ThresholdOverrideRow = {
+  productId: string
+  warehouseId: string
+  reorderPoint: DecimalInput | null
+  safetyStockQty: DecimalInput | null
+  reorderQty: DecimalInput | null
+}
+
+async function loadThresholdOverrides(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<ThresholdOverrideRow[]> {
+  if (!client.reorderThresholdOverride) return []
+  const rows = await client.reorderThresholdOverride.findMany({
+    where: {
+      ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
+      product: productWhere(filters),
+    },
+    select: { productId: true, warehouseId: true, reorderPoint: true, safetyStockQty: true, reorderQty: true },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as ThresholdOverrideRow[]
+  assertSourceLimit(rows.length, SOURCE_ROW_LIMIT, 'Replenishment threshold override source rows')
+  return rows
 }
 
 export type ReplenishmentReportDeps = {
@@ -114,9 +138,6 @@ type StockLevelRow = {
   warehouseId: string
   quantity: DecimalInput
   reservedQty: DecimalInput
-  reorderPointOverride?: DecimalInput | null
-  safetyStockQtyOverride?: DecimalInput | null
-  reorderQtyOverride?: DecimalInput | null
   warehouse?: { code: string; name: string } | null
 }
 
@@ -766,9 +787,6 @@ async function loadStockLevels(client: ReplenishmentReportClient, filters: Stock
       warehouseId: true,
       quantity: true,
       reservedQty: true,
-      reorderPointOverride: true,
-      safetyStockQtyOverride: true,
-      reorderQtyOverride: true,
       warehouse: { select: { code: true, name: true } },
     },
     take: SOURCE_ROW_LIMIT + 1,
@@ -838,7 +856,7 @@ export async function getReorderReport(
   // including those with a zero suggested quantity.
   const includeAll = filters.includeZero === true
   const window = demandWindow(generatedAt, demandDays)
-  const [products, stockLevels, velocityInputs, openPoLines, latestMoRows, bomItemRows] = await Promise.all([
+  const [products, stockLevels, velocityInputs, openPoLines, latestMoRows, bomItemRows, thresholdOverrides] = await Promise.all([
     client.product.findMany({
       where: productWhere(filters),
       select: {
@@ -916,6 +934,7 @@ export async function getReorderReport(
       qty: DecimalInput
       bom: { productId: string | null }
     }>>,
+    loadThresholdOverrides(client, filters),
   ])
   assertSourceLimit(products.length, SOURCE_ROW_LIMIT, 'Replenishment product source rows')
 
@@ -1013,17 +1032,17 @@ export async function getReorderReport(
   // Per-warehouse thresholds apply when the report is scoped to ONE warehouse: that warehouse's StockLevel
   // override, else the Product value. The unscoped report is a consolidated, product-level view (stock is summed
   // over every warehouse), so it keeps the Product thresholds. Overrides it does not apply are counted in a notice.
-  const overrideByProduct = new Map<string, StockLevelRow>()
+  const overrideByProduct = new Map<string, ThresholdOverrideRow>()
   let productsWithUnappliedOverrides = 0
   if (filters.warehouseId) {
-    for (const level of stockLevels) {
-      if (level.warehouseId === filters.warehouseId) overrideByProduct.set(level.productId, level)
+    for (const row of thresholdOverrides) {
+      if (row.warehouseId === filters.warehouseId) overrideByProduct.set(row.productId, row)
     }
   } else {
     productsWithUnappliedOverrides = new Set(
-      stockLevels
-        .filter((l) => l.reorderPointOverride != null || l.safetyStockQtyOverride != null || l.reorderQtyOverride != null)
-        .map((l) => l.productId),
+      thresholdOverrides
+        .filter((o) => o.reorderPoint != null || o.safetyStockQty != null || o.reorderQty != null)
+        .map((o) => o.productId),
     ).size
   }
   const candidatesByProductId = new Map<string, Candidate>()

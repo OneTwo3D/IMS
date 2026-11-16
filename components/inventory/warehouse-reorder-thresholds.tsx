@@ -35,10 +35,17 @@ export function WarehouseReorderThresholds({ data, canEdit }: { data: WarehouseR
     startTransition(async () => {
       const result = await saveWarehouseReorderThresholds(
         data.productId,
-        data.warehouses.map((w) => ({ warehouseId: w.warehouseId, ...values[w.warehouseId] })),
+        data.warehouses.map((w) => ({
+          warehouseId: w.warehouseId,
+          ...values[w.warehouseId],
+          expected: { reorderPoint: w.reorderPoint, safetyStockQty: w.safetyStockQty, reorderQty: w.reorderQty },
+        })),
       )
       if (result.success) {
-        setMessage({ tone: 'ok', text: result.changed === 0 ? 'No changes to save.' : `Saved ${result.changed} change${result.changed === 1 ? '' : 's'}.` })
+        const saved = result.changed === 0 ? 'No changes to save.' : `Saved ${result.changed} change${result.changed === 1 ? '' : 's'}.`
+        setMessage(result.conflictMessage
+          ? { tone: 'error', text: `${saved} ${result.conflictMessage}` }
+          : { tone: 'ok', text: saved })
         router.refresh()
       } else {
         setFieldErrors(result.fieldErrors ?? {})

@@ -14,10 +14,11 @@ export type ReorderThresholdFields = {
   reorderQty: DecimalInput | null
 }
 
+/** One row of the reorder_threshold_overrides table (product x warehouse). Null/undefined fields inherit. */
 export type ReorderThresholdOverrides = {
-  reorderPointOverride?: DecimalInput | null
-  safetyStockQtyOverride?: DecimalInput | null
-  reorderQtyOverride?: DecimalInput | null
+  reorderPoint?: DecimalInput | null
+  safetyStockQty?: DecimalInput | null
+  reorderQty?: DecimalInput | null
 }
 
 export type ReorderThresholdField = keyof ReorderThresholdFields
@@ -30,12 +31,6 @@ export type ResolvedReorderThresholds = {
   overridden: ReorderThresholdField[]
 }
 
-const OVERRIDE_KEY: Record<ReorderThresholdField, keyof ReorderThresholdOverrides> = {
-  reorderPoint: 'reorderPointOverride',
-  safetyStockQty: 'safetyStockQtyOverride',
-  reorderQty: 'reorderQtyOverride',
-}
-
 export const REORDER_THRESHOLD_FIELDS: readonly ReorderThresholdField[] = ['reorderPoint', 'safetyStockQty', 'reorderQty']
 
 export function resolveReorderThresholds(
@@ -45,7 +40,7 @@ export function resolveReorderThresholds(
   const overridden: ReorderThresholdField[] = []
   const resolved = {} as Record<ReorderThresholdField, Prisma.Decimal | null>
   for (const field of REORDER_THRESHOLD_FIELDS) {
-    const own = override?.[OVERRIDE_KEY[field]]
+    const own = override?.[field]
     if (own != null) {
       resolved[field] = toDecimal(own)
       overridden.push(field)

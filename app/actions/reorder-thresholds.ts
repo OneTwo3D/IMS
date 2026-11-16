@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
-import { applyWarehouseReorderOverrides, type OverrideRowInput } from '@/lib/domain/inventory/reorder-threshold-overrides'
+import { applyWarehouseReorderOverrides, describeOverrideConflict, type OverrideConflict, type OverrideRowInput } from '@/lib/domain/inventory/reorder-threshold-overrides'
 
 export type WarehouseReorderThresholdRow = {
   warehouseId: string
@@ -38,9 +38,9 @@ export async function getWarehouseReorderThresholds(productId: string): Promise<
       select: { id: true, code: true, name: true, wmsBindings: { where: { active: true }, select: { id: true }, take: 1 } },
       orderBy: { code: 'asc' },
     }),
-    db.stockLevel.findMany({
+    db.reorderThresholdOverride.findMany({
       where: { productId },
-      select: { warehouseId: true, reorderPointOverride: true, safetyStockQtyOverride: true, reorderQtyOverride: true },
+      select: { warehouseId: true, reorderPoint: true, safetyStockQty: true, reorderQty: true },
     }),
   ])
   if (!product) return null
@@ -60,16 +60,16 @@ export async function getWarehouseReorderThresholds(productId: string): Promise<
         warehouseCode: w.code,
         warehouseName: w.name,
         wmsBound: w.wmsBindings.length > 0,
-        reorderPoint: text(level?.reorderPointOverride ?? null),
-        safetyStockQty: text(level?.safetyStockQtyOverride ?? null),
-        reorderQty: text(level?.reorderQtyOverride ?? null),
+        reorderPoint: text(level?.reorderPoint ?? null),
+        safetyStockQty: text(level?.safetyStockQty ?? null),
+        reorderQty: text(level?.reorderQty ?? null),
       }
     }),
   }
 }
 
 export type SaveWarehouseReorderThresholdsResult =
-  | { success: true; changed: number }
+  | { success: true; changed: number; conflicts: OverrideConflict[]; conflictMessage: string | null }
   | { success: false; error: string; fieldErrors?: Record<string, string> }
 
 export async function saveWarehouseReorderThresholds(
@@ -86,5 +86,10 @@ export async function saveWarehouseReorderThresholds(
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/analytics/reorder')
   }
-  return { success: true, changed: result.changes.length }
+  return {
+    success: true,
+    changed: result.changes.length,
+    conflicts: result.conflicts,
+    conflictMessage: result.conflicts.length > 0 ? describeOverrideConflict(result.conflicts) : null,
+  }
 }

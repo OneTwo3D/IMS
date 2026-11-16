@@ -405,7 +405,8 @@ A product's **reorder point**, **safety stock** and **reorder quantity** are set
 - **Blank means inherit.** Leave a cell empty and that warehouse uses the product's value, which is shown in grey as the placeholder (a dash means the product has none set, so Reorder Planning works the reorder point out from demand and lead time). Typing a value overrides that one field for that one warehouse; the other two fields are unaffected. **0** is a real override (for example a reorder quantity of 0 opts that warehouse out), not the same as blank.
 - **Numbers only.** Zero or more, up to four decimal places. Clear a cell and save to go back to inheriting.
 - **Who can change it.** Needs inventory edit permission; other users see the values but cannot edit. Every change is written to the **Activity Log** (who, when, the old value and the new value, per field and warehouse).
-- **A warehouse with no stock yet** can still be given thresholds; saving creates an empty (zero) stock row for it.
+- **A warehouse with no stock yet** can still be given thresholds. Saving never creates or changes a stock record, so it cannot affect stock sync or availability.
+- **Two people editing.** Each cell remembers the value it had when the page loaded. If someone else changed a cell you edited in the meantime, that cell is not saved and a message names it (reload to see the current value); your other edits are saved, and cells you did not touch are never overwritten.
 - **Warehouses connected to a warehouse system (WMS, such as Mintsoft)** can be given overrides too. These thresholds are planning figures used only by IMS Reorder Planning. They are never sent to the warehouse system or to the store, and an override does not change what is synced.
 - **Where it is used.** Reorder Planning, when filtered to a warehouse (see Analytics > Replenishment). Kit and variable parents and non-inventory products have no per-warehouse table.
 

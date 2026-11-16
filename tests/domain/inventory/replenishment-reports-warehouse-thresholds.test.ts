@@ -15,16 +15,26 @@ const product = {
   category, preferredSupplier: null, supplierProducts: [],
 }
 
-type Level = { productId: string; warehouseId: string; quantity: Prisma.Decimal; reservedQty: Prisma.Decimal; reorderPointOverride?: Prisma.Decimal | null; safetyStockQtyOverride?: Prisma.Decimal | null; reorderQtyOverride?: Prisma.Decimal | null; warehouse: { code: string; name: string } }
-const level = (warehouseId: string, qty: number, over: Partial<Level> = {}): Level => ({
-  productId: 'p1', warehouseId, quantity: d(qty), reservedQty: d(0), warehouse: { code: warehouseId, name: warehouseId }, ...over,
+type Level = { productId: string; warehouseId: string; quantity: Prisma.Decimal; reservedQty: Prisma.Decimal; warehouse: { code: string; name: string } }
+type Ovr = { productId: string; warehouseId: string; reorderPoint: Prisma.Decimal | null; safetyStockQty: Prisma.Decimal | null; reorderQty: Prisma.Decimal | null }
+const level = (warehouseId: string, qty: number): Level => ({
+  productId: 'p1', warehouseId, quantity: d(qty), reservedQty: d(0), warehouse: { code: warehouseId, name: warehouseId },
+})
+const ovr = (warehouseId: string, over: Partial<Ovr> = {}): Ovr => ({
+  productId: 'p1', warehouseId, reorderPoint: null, safetyStockQty: null, reorderQty: null, ...over,
 })
 
-function client(levels: Level[]): ReplenishmentReportClient {
+function client(levels: Level[], overrides: Ovr[] = []): ReplenishmentReportClient {
   return {
     stockMovement: empty, purchaseOrderLine: empty, purchaseReceipt: empty,
     salesOrderLine: empty, orderAllocation: empty, shipmentLine: empty, productionOrder: empty, bomItem: empty,
     product: { findMany: async () => [product] },
+    reorderThresholdOverride: {
+      findMany: async (args?: unknown) => {
+        const warehouseId = (args as { where?: { warehouseId?: string } })?.where?.warehouseId
+        return warehouseId ? overrides.filter((o) => o.warehouseId === warehouseId) : overrides
+      },
+    },
     // Honour the report's own warehouse filter, as the database would.
     stockLevel: {
       findMany: async (args?: unknown) => {
@@ -35,14 +45,13 @@ function client(levels: Level[]): ReplenishmentReportClient {
   }
 }
 
-const LEVELS = [
-  level('MAIN', 90),                                                // inherits: 90 <= 100 -> reorder
-  level('SAT', 90, { reorderPointOverride: d(40), safetyStockQtyOverride: d(5), reorderQtyOverride: d(7) }), // override: 90 > 40
-]
+const LEVELS = [level('MAIN', 90), level('SAT', 90)]
+// MAIN inherits (90 <= 100 -> reorder); SAT overrides (90 > 40).
+const OVERRIDES = [ovr('SAT', { reorderPoint: d(40), safetyStockQty: d(5), reorderQty: d(7) })]
 
 test('each warehouse is planned against its own thresholds', async () => {
-  const main = await getReorderReport({ warehouseId: 'MAIN', includeZero: true }, { deps: { client: client(LEVELS), now: NOW } })
-  const sat = await getReorderReport({ warehouseId: 'SAT', includeZero: true }, { deps: { client: client(LEVELS), now: NOW } })
+  const main = await getReorderReport({ warehouseId: 'MAIN', includeZero: true }, { deps: { client: client(LEVELS, OVERRIDES), now: NOW } })
+  const sat = await getReorderReport({ warehouseId: 'SAT', includeZero: true }, { deps: { client: client(LEVELS, OVERRIDES), now: NOW } })
 
   assert.equal(main.rows[0]?.reorderPoint, '100')
   assert.equal(main.rows[0]?.safetyStockQty, '20')
@@ -58,15 +67,14 @@ test('each warehouse is planned against its own thresholds', async () => {
 })
 
 test('the satellite stops appearing in the default view once its own threshold is lower', async () => {
-  const main = await getReorderReport({ warehouseId: 'MAIN' }, { deps: { client: client(LEVELS), now: NOW } })
-  const sat = await getReorderReport({ warehouseId: 'SAT' }, { deps: { client: client(LEVELS), now: NOW } })
+  const main = await getReorderReport({ warehouseId: 'MAIN' }, { deps: { client: client(LEVELS, OVERRIDES), now: NOW } })
+  const sat = await getReorderReport({ warehouseId: 'SAT' }, { deps: { client: client(LEVELS, OVERRIDES), now: NOW } })
   assert.equal(main.rows.length, 1)
   assert.equal(sat.rows.length, 0)
 })
 
 test('a partial override only replaces the fields it sets', async () => {
-  const partial = [level('SAT', 90, { reorderPointOverride: d(95) })]
-  const report = await getReorderReport({ warehouseId: 'SAT', includeZero: true }, { deps: { client: client(partial), now: NOW } })
+  const report = await getReorderReport({ warehouseId: 'SAT', includeZero: true }, { deps: { client: client([level('SAT', 90)], [ovr('SAT', { reorderPoint: d(95) })]), now: NOW } })
   assert.equal(report.rows[0]?.reorderPoint, '95')
   assert.equal(report.rows[0]?.safetyStockQty, '20')
   assert.equal(report.rows[0]?.configuredReorderQty, '30')
@@ -74,7 +82,7 @@ test('a partial override only replaces the fields it sets', async () => {
 })
 
 test('the all-warehouses view is consolidated: Product values, with a notice that overrides were not applied', async () => {
-  const report = await getReorderReport({ includeZero: true }, { deps: { client: client(LEVELS), now: NOW } })
+  const report = await getReorderReport({ includeZero: true }, { deps: { client: client(LEVELS, OVERRIDES), now: NOW } })
   assert.equal(report.rows[0]?.reorderPoint, '100')
   assert.equal(report.rows[0]?.safetyStockQty, '20')
   assert.deepEqual(report.rows[0]?.thresholdOverrides, [])
@@ -93,11 +101,9 @@ test('safety stock override drives the reorder timing dates', async () => {
       product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [] },
     }],
   }
-  const withDemand = (levels: Level[]): ReplenishmentReportClient => ({ ...client(levels), stockMovement: demand })
-  const levels = [
-    level('MAIN', 100),
-    level('SAT', 100, { safetyStockQtyOverride: d(60) }),
-  ]
+  const withDemand = (levels: Level[]): ReplenishmentReportClient => ({ ...client(levels, overrides), stockMovement: demand })
+  const levels = [level('MAIN', 100), level('SAT', 100)]
+  const overrides = [ovr('SAT', { safetyStockQty: d(60) })]
   const main = await getReorderReport({ warehouseId: 'MAIN', includeZero: true, thresholdDays: 90 }, { deps: { client: withDemand(levels), now: NOW } })
   const sat = await getReorderReport({ warehouseId: 'SAT', includeZero: true, thresholdDays: 90 }, { deps: { client: withDemand(levels), now: NOW } })
   // 1/day demand: stock 100 reaches safety 20 on day 80 (MAIN) but safety 60 on day 40 (SAT).

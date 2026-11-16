@@ -482,7 +482,7 @@ export default async function ProductDetailPage({
           )}
 
           {reorderThresholds && (
-            <WarehouseReorderThresholds data={reorderThresholds} canEdit={canEditInventory} />
+            <WarehouseReorderThresholds key={JSON.stringify(reorderThresholds.warehouses)} data={reorderThresholds} canEdit={canEditInventory} />
           )}
 
           {/* FIFO cost layers */}

@@ -14,7 +14,7 @@ test('no override row: every field inherits the Product value', () => {
 })
 
 test('null overrides inherit; a set override wins per field, independently', () => {
-  const r = resolveReorderThresholds(PRODUCT, { reorderPointOverride: '8', safetyStockQtyOverride: null, reorderQtyOverride: undefined })
+  const r = resolveReorderThresholds(PRODUCT, { reorderPoint: '8', safetyStockQty: null, reorderQty: undefined })
   assert.equal(r.reorderPoint?.toString(), '8')
   assert.equal(r.safetyStockQty?.toString(), '10')
   assert.equal(r.reorderQty?.toString(), '25')
@@ -22,14 +22,14 @@ test('null overrides inherit; a set override wins per field, independently', () 
 })
 
 test('an override of zero is an override, not "unset"', () => {
-  const r = resolveReorderThresholds(PRODUCT, { reorderQtyOverride: new Prisma.Decimal(0), safetyStockQtyOverride: 0 })
+  const r = resolveReorderThresholds(PRODUCT, { reorderQty: new Prisma.Decimal(0), safetyStockQty: 0 })
   assert.equal(r.reorderQty?.toString(), '0')
   assert.equal(r.safetyStockQty?.toString(), '0')
   assert.deepEqual(r.overridden, ['safetyStockQty', 'reorderQty'])
 })
 
 test('unset on both sides resolves to null, not zero', () => {
-  const r = resolveReorderThresholds({ reorderPoint: null, safetyStockQty: null, reorderQty: null }, { reorderPointOverride: null })
+  const r = resolveReorderThresholds({ reorderPoint: null, safetyStockQty: null, reorderQty: null }, { reorderPoint: null })
   assert.equal(r.reorderPoint, null)
   assert.equal(r.safetyStockQty, null)
   assert.equal(r.reorderQty, null)
@@ -37,7 +37,7 @@ test('unset on both sides resolves to null, not zero', () => {
 })
 
 test('an override applies even when the Product value is unset', () => {
-  const r = resolveReorderThresholds({ reorderPoint: null, safetyStockQty: null, reorderQty: null }, { safetyStockQtyOverride: '3.5' })
+  const r = resolveReorderThresholds({ reorderPoint: null, safetyStockQty: null, reorderQty: null }, { safetyStockQty: '3.5' })
   assert.equal(r.safetyStockQty?.toString(), '3.5')
   assert.deepEqual(r.overridden, ['safetyStockQty'])
 })
