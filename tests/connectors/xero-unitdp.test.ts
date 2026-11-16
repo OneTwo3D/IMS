@@ -36,6 +36,9 @@ const trackedItemCodes = new Set<string>()
 let settingsRounding = '860'
 mock.module('@/lib/connectors/xero/items', { namedExports: { findOrCreateItem: async (code: string) => ({ success: true, itemId: `item-${code}`, isTracked: trackedItemCodes.has(code) }) } })
 mock.module('@/lib/connectors/xero/settings', { namedExports: { getXeroSettings: async () => ({ xero_rounding_difference_account: settingsRounding }) } })
+// The stored Xero tax-rate list, as the posters read it to predict the document's total with tax. No database.
+const rateOf = (taxType: string): number | null => ({ OUTPUT2: 20, INPUT2: 20, ZERORATEDOUTPUT: 0 } as Record<string, number>)[taxType] ?? null
+mock.module('@/lib/connectors/xero/tax-rate-lookup', { namedExports: { loadStoredXeroRateOf: async () => ({ ok: true, rateOf }) } })
 
 test.beforeEach(() => { sent.length = 0; trackedItemCodes.clear(); settingsRounding = '860' })
 
@@ -109,9 +112,9 @@ test('an ItemCode line at 300 x 0.333333 keeps quantity 300 and gets a separate 
   const { buildPurchaseBillPayload } = await import('@/lib/connectors/xero/bills')
   const { buildXeroPurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
   const payloads = [
-    buildSalesInvoicePayload({ ...invoice, lines: high } as InvoiceData, 'AUTHORISED', 'c1', new Set(), 'GBP', '860'),
-    buildPurchaseBillPayload({ ...bill, lines: high } as BillData, 'AUTHORISED', 'c1', 'GBP', '860'),
-    buildXeroPurchaseCreditNote({ ...credit, lines: high } as CreditNoteData, 'AUTHORISED', 'c1', 'GBP', '860'),
+    buildSalesInvoicePayload({ ...invoice, lines: high } as InvoiceData, 'AUTHORISED', 'c1', new Set(), 'GBP', '860', rateOf),
+    buildPurchaseBillPayload({ ...bill, lines: high } as BillData, 'AUTHORISED', 'c1', 'GBP', '860', rateOf),
+    buildXeroPurchaseCreditNote({ ...credit, lines: high } as CreditNoteData, 'AUTHORISED', 'c1', 'GBP', '860', rateOf),
   ]
   for (const p of payloads) {
     const items = p.LineItems as Wire[]
@@ -132,9 +135,9 @@ test('no Rounding account mapped: the builders throw and every poster refuses be
   const { buildPurchaseBillPayload } = await import('@/lib/connectors/xero/bills')
   const { buildXeroPurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
   for (const account of [undefined, null, '', '  ']) {
-    assert.throws(() => buildSalesInvoicePayload({ ...invoice, lines: high } as InvoiceData, 'AUTHORISED', 'c1', new Set(), 'GBP', account), XeroRoundingAccountMissingError)
-    assert.throws(() => buildPurchaseBillPayload({ ...bill, lines: high } as BillData, 'AUTHORISED', 'c1', 'GBP', account), /Map a Rounding account/)
-    assert.throws(() => buildXeroPurchaseCreditNote({ ...credit, lines: high } as CreditNoteData, 'AUTHORISED', 'c1', 'GBP', account), /Map a Rounding account/)
+    assert.throws(() => buildSalesInvoicePayload({ ...invoice, lines: high } as InvoiceData, 'AUTHORISED', 'c1', new Set(), 'GBP', account, rateOf), XeroRoundingAccountMissingError)
+    assert.throws(() => buildPurchaseBillPayload({ ...bill, lines: high } as BillData, 'AUTHORISED', 'c1', 'GBP', account, rateOf), /Map a Rounding account/)
+    assert.throws(() => buildXeroPurchaseCreditNote({ ...credit, lines: high } as CreditNoteData, 'AUTHORISED', 'c1', 'GBP', account, rateOf), /Map a Rounding account/)
   }
   settingsRounding = ''
   const refused = await pushSalesInvoice({ ...invoice, lines: high } as InvoiceData, 'AUTHORISED')
