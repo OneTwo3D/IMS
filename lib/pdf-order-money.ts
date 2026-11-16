@@ -8,11 +8,11 @@ import { documentVatRows } from '@/lib/pdf'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { documentTotalsRows, salesOrderMoneyView, type SalesOrderMoneyView, type TotalsRow } from '@/lib/domain/sales/sales-order-money-view'
 
-type NumLike = number | string | { toString(): string }
+type NumLike = unknown // a Prisma Decimal, a number or a numeric string
 const n = (v: NumLike | null | undefined): number => Number(v ?? 0)
 
 export type OrderDocumentMoneyInput = {
-  pricesIncludeVat: boolean | null | undefined
+  pricesIncludeVat?: boolean | null
   shoppingLinks?: ReadonlyArray<{ connector: string }> | null
   taxRateName: string | null
   taxRatePercent: NumLike | null
