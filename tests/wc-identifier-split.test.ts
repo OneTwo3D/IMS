@@ -21,6 +21,8 @@ const state = {
   logs: [] as Array<Record<string, unknown>>,
   /** What a PUT answers with; null echoes the request's meta_data back (a WooCommerce that stores it). */
   putResponse: null as Record<string, unknown> | null,
+  /** When non-empty, successive GETs answer with these in order (the last repeats). */
+  getSequence: [] as Array<Record<string, unknown>>,
 }
 
 const dbMock = {
@@ -47,6 +49,7 @@ mock.module('@/lib/security/connector-fetch', {
       const body = String(init?.body ?? '')
       state.wireCalls.push({ url: String(url), method, body })
       let payload: Record<string, unknown> = state.wcObject
+      if (method === 'GET' && state.getSequence.length > 0) payload = state.getSequence.length > 1 ? state.getSequence.shift()! : state.getSequence[0]!
       if (method === 'PUT') {
         payload = state.putResponse ?? { ...state.wcObject, meta_data: (JSON.parse(body) as { meta_data?: unknown }).meta_data ?? state.wcObject.meta_data }
       }
@@ -64,7 +67,7 @@ const BASE: Row[] = [
   { key: 'wc_sync_product_direction', value: 'to_wc' },
 ]
 
-async function push(over: { flag?: string; product?: Record<string, unknown>; meta?: unknown[]; variation?: boolean }) {
+async function push(over: { flag?: string; product?: Record<string, unknown>; meta?: unknown[]; variation?: boolean; guid?: string; putResponse?: Record<string, unknown>; sequence?: Array<Record<string, unknown>> }) {
   state.settings = [...BASE, ...(over.flag === undefined ? [] : [{ key: 'product_identifier_split_enabled', value: over.flag }])]
   state.product = {
     id: 'ims-1', sku: 'SKU-1', name: 'Widget', salesPriceBase: null, salePriceBase: null, barcode: null, mpn: null,
@@ -72,10 +75,11 @@ async function push(over: { flag?: string; product?: Record<string, unknown>; me
     parent: over.variation ? { sku: 'PARENT', externalProductId: BigInt(99) } : null,
     ...over.product,
   }
-  state.wcObject = { id: 4242, sku: 'SKU-1', meta_data: over.meta ?? [] }
+  state.wcObject = { id: 4242, sku: 'SKU-1', meta_data: over.meta ?? [], ...(over.guid !== undefined ? { global_unique_id: over.guid } : {}) }
   state.wireCalls.length = 0
   state.logs.length = 0
-  state.putResponse = null
+  state.putResponse = over.putResponse ?? null
+  state.getSequence = over.sequence ? [...over.sequence] : []
   const { pushImsProductToWc } = await import('@/lib/connectors/woocommerce/sync/product-sync')
   const result = await pushImsProductToWc('ims-1')
   const put = state.wireCalls.find((call) => call.method === 'PUT')
@@ -171,4 +175,55 @@ test('planWcIdentifierWrite: Yoast empty placeholders are safe to create over, o
   }
   const none = planWcIdentifierWrite({ barcode: null, mpn: null, currentMeta: undefined, isVariation: false })
   assert.deepEqual(none, { payload: {} })
+})
+
+test('flag ON: a stale all-digits counter that IMS pushed earlier is cleared, and the clear is verified', async () => {
+  const { result, body } = await push({ flag: 'true', product: { barcode: '00000287', mpn: null }, guid: '00000287', putResponse: { id: 4242, sku: 'SKU-1', global_unique_id: '', meta_data: [{ key: 'wpseo_global_identifier_values', value: { gtin8: '', gtin12: '', gtin13: '', gtin14: '', isbn: '', mpn: '00000287' } }] } })
+  assert.equal(result.success, true)
+  assert.equal(body!.global_unique_id, '')
+})
+
+test('flag ON: a stale GTIN WooCommerce did not get from this barcode is left alone and surfaced', async () => {
+  const { result, body } = await push({ flag: 'true', product: { barcode: 'LN1', mpn: null }, guid: '12345' })
+  assert.equal(result.success, true)
+  assert.equal('global_unique_id' in body!, false)
+  assert.match(String(result.warning), /12345.*left untouched for review/)
+  assert.match(String(state.logs[0]?.errorMessage), /12345/)
+})
+
+test('flag ON: a valid GTIN already in WooCommerce is never cleared', async () => {
+  const { body } = await push({ flag: 'true', product: { barcode: null, mpn: 'LN1' }, guid: GTIN })
+  assert.equal('global_unique_id' in body!, false)
+})
+
+test('flag ON: a clear that WooCommerce does not honour is a failed push', async () => {
+  const { result } = await push({ flag: 'true', product: { barcode: '00000287', mpn: null }, guid: '00000287', putResponse: { id: 4242, sku: 'SKU-1', global_unique_id: '00000287', meta_data: [{ key: 'wpseo_global_identifier_values', value: { mpn: '00000287' } }] } })
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /did not clear/)
+})
+
+test('flag OFF: the same stale counter is not touched (byte-identical legacy body)', async () => {
+  const { put } = await push({ product: { barcode: 'LN1', mpn: null }, guid: '00000287' })
+  assert.equal(put?.body, '{"name":"Widget","status":"publish","sale_price":""}')
+})
+
+test('flag ON: identifiers changed by another writer between the read and the write: re-planned once from the fresh read, other sub-keys kept', async () => {
+  const key = 'wpseo_global_identifier_values'
+  const first = { id: 4242, sku: 'SKU-1', meta_data: [{ key, value: { gtin13: '', mpn: '' } }] }
+  const changed = { id: 4242, sku: 'SKU-1', meta_data: [{ key, value: { gtin13: '9999999999994', mpn: '' } }] }
+  // GET 1 (product fetch) = first; GET 2 (re-read) = changed; GET 3 (re-read after re-plan) = changed (settled)
+  const { result, body } = await push({ flag: 'true', product: { barcode: null, mpn: 'LN1' }, meta: first.meta_data, sequence: [first, changed, changed] })
+  assert.equal(result.success, true)
+  const value = (body!.meta_data as Array<{ value: Record<string, string> }>)[0]!.value
+  assert.equal(value.gtin13, '9999999999994', 'the concurrent change is not overwritten')
+  assert.equal(value.mpn, 'LN1')
+})
+
+test('flag ON: identifiers that keep changing: the push is skipped, nothing is written', async () => {
+  const key = 'wpseo_global_identifier_values'
+  const v = (n: string) => ({ id: 4242, sku: 'SKU-1', meta_data: [{ key, value: { gtin13: n, mpn: '' } }] })
+  const { result, put } = await push({ flag: 'true', product: { barcode: null, mpn: 'LN1' }, meta: v('1').meta_data, sequence: [v('1'), v('2'), v('3')] })
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /changed twice/)
+  assert.equal(put, undefined)
 })

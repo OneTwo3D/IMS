@@ -1,4 +1,4 @@
-import { classifyIdentifierCodes, isGtin } from '@/lib/domain/products/identifiers'
+import { classifyIdentifierCodes, isGtin, stripLikeWooCommerce } from '@/lib/domain/products/identifiers'
 
 /**
  * Where IMS writes a product's GTIN and MPN on WooCommerce, when the product identifier split is on
@@ -71,11 +71,28 @@ export function planWcIdentifierWrite(params: {
   mpn: string | null | undefined
   currentMeta: unknown
   isVariation: boolean
+  /** `global_unique_id` of the WooCommerce object as just fetched. */
+  currentGlobalUniqueId?: unknown
 }): WcIdentifierPlan {
   const codes = classifyIdentifierCodes({ EAN: params.barcode, UPC: params.mpn })
   const plan: WcIdentifierPlan = { payload: {} }
 
-  if (codes.gtin && isGtin(codes.gtin)) plan.payload.global_unique_id = codes.gtin
+  if (codes.gtin && isGtin(codes.gtin)) {
+    plan.payload.global_unique_id = codes.gtin
+  } else {
+    // Omitting the field does not clear what an earlier push (all-digits barcode, split off) already stored. A stored
+    // non-GTIN that is exactly what the old rule would have derived from this product's barcode came from IMS: clear it.
+    // Any other non-GTIN has no provable origin: leave it and say so.
+    const stored = typeof params.currentGlobalUniqueId === 'string' ? params.currentGlobalUniqueId.trim() : ''
+    if (stored && !isGtin(stored)) {
+      const fromImsBarcode = stripLikeWooCommerce(params.barcode)
+      if (fromImsBarcode && stored === fromImsBarcode) {
+        plan.payload.global_unique_id = ''
+      } else {
+        plan.warning = `WooCommerce's GTIN field holds ${stored}, which is not a valid GTIN and does not match this product's barcode; it was left untouched for review`
+      }
+    }
+  }
   if (codes.leftover) plan.leftover = codes.leftover
   if (!codes.mpn) return plan
 
@@ -90,7 +107,7 @@ export function planWcIdentifierWrite(params: {
     if (!object) {
       // PRESENT in a shape we do not understand (a legacy serialised string, a list, something a future Yoast writes).
       // Replacing it with our six-key object could destroy a GTIN or ISBN it encodes.
-      plan.warning = `MPN ${codes.mpn} was not written: ${key} holds a value in an unrecognised shape and was left untouched`
+      plan.warning = (plan.warning ? `${plan.warning}; ` : '') + `MPN ${codes.mpn} was not written: ${key} holds a value in an unrecognised shape and was left untouched`
       return plan
     }
     store = object
@@ -112,4 +129,9 @@ export function wcResponseConfirmsMpn(response: unknown, key: string, mpn: strin
   if (!Array.isArray(meta)) return null
   const store = asPlainObject(getMeta(meta, key))
   return store ? mpnOf(store) === mpn : false
+}
+
+/** What the identifier plan read: the Yoast store for this object's key and the GTIN field. Equal snapshots = nothing changed. */
+export function wcIdentifierSnapshot(meta: unknown, globalUniqueId: unknown, isVariation: boolean): string {
+  return JSON.stringify({ store: getMeta(meta, yoastIdentifierKey(isVariation)) ?? null, guid: typeof globalUniqueId === 'string' ? globalUniqueId.trim() : null })
 }

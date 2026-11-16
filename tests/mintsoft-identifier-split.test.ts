@@ -191,11 +191,11 @@ test('flag ON: a zero-padded counter in barcode is an MPN and never reaches EAN'
   assert.equal(options.omitMpn, false)
 })
 
-test('flag ON: bead example SKU 74928122361-04 (EAN=LN00000059, UPC=LN00000282) backfills the UPC as the MPN and reports the EAN, never dropping it', async () => {
+test('flag ON: bead example SKU 74928122361-04 (EAN=LN00000059, UPC=LN00000282) classifies the UPC as the MPN, reports the EAN as a leftover, and backfills nothing while it is open', async () => {
   reset({ flag: 'true', product: {}, wms: { ProductId: 168, SKU: 'SKU-1', EAN: 'LN00000059', UPC: 'LN00000282' } })
   await run()
 
-  assert.deepEqual(state.productUpdates, [{ mpn: 'LN00000282' }])
+  assert.deepEqual(state.productUpdates, [], 'no backfill while a leftover is open')
   const conflict = state.discrepancyCreates.find((row) => row.category === 'BARCODE_CONFLICT')
   assert.ok(conflict, 'the leftover is raised through the BARCODE_CONFLICT discrepancy')
   assert.match(String(conflict.message), /unplaced LN00000059/)
@@ -255,4 +255,23 @@ test('resolveMintsoftIdentifierPlan: per-slot state machine, GTIN-13/14 as one c
   assert.equal(mixed.kind, 'fill_wms_barcode')
   assert.equal(mixed.omitBarcode, false)
   assert.equal(mixed.omitMpn, false)
+})
+
+test('flag ON: part number A in barcode, Mintsoft EAN a GTIN and UPC a different part number B: nothing is backfilled, A survives', async () => {
+  reset({ flag: 'true', product: { barcode: 'LN00000059', mpn: null }, wms: { ProductId: 168, SKU: 'SKU-1', EAN: GTIN, UPC: 'LN00000282' } })
+  await run()
+  assert.deepEqual(state.productUpdates, [], 'no backfill while the plan conflicts')
+  assert.ok(state.discrepancyCreates.some((row) => row.category === 'BARCODE_CONFLICT'))
+  const { options } = state.upserts[0]!
+  assert.equal(options.omitBarcode, true)
+  assert.equal(options.omitMpn, true)
+})
+
+test('flag ON: a GTIN backfill over a part number in Product.barcode moves that part number to mpn in the same update', async () => {
+  reset({ flag: 'true', product: { barcode: 'LN00000059', mpn: null }, wms: { ProductId: 168, SKU: 'SKU-1', EAN: GTIN } })
+  await run()
+  assert.deepEqual(state.productUpdates, [{ barcode: GTIN, mpn: 'LN00000059' }])
+  const { dto } = state.upserts[0]!
+  assert.equal(dto.barcode, GTIN)
+  assert.equal(dto.mpn, 'LN00000059')
 })

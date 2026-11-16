@@ -632,7 +632,7 @@ async function fetchAuthoritativeMintsoftProduct(context: ProductSyncContext): P
   }
 }
 
-async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode: string): Promise<{
+async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode: string, alsoSet: { mpn?: string } = {}): Promise<{
   ok: true
 } | {
   ok: false
@@ -641,7 +641,7 @@ async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode:
   try {
     await db.product.update({
       where: { id: context.product.id },
-      data: { barcode },
+      data: { barcode, ...alsoSet },
     })
 
     await createBarcodeBackfillAudit({
@@ -791,13 +791,20 @@ async function syncOneMintsoftProduct(
   }
 
   if (identifierPlan && wmsCodes) {
-    // Backfills are local (Mintsoft -> IMS) and safe even while the plan is a conflict; only the WRITE to Mintsoft is held.
-    if (identifierPlan.gtin.kind === 'backfill' && wmsCodes.gtin) {
-      const backfill = await backfillBarcodeFromMintsoft(context, wmsCodes.gtin)
+    // NO backfill while the two-slot plan has any conflict or leftover: replacing Product.barcode in that state can erase an
+    // IMS part number the conflict is about (barcode = part number A, Mintsoft EAN = a GTIN, Mintsoft UPC = a different part
+    // number B). The conflict is reported below and a human decides.
+    const mayBackfill = identifierPlan.kind !== 'conflict'
+    if (mayBackfill && identifierPlan.gtin.kind === 'backfill' && wmsCodes.gtin) {
+      // A part number sitting in Product.barcode is moved to Product.mpn in the SAME update, before barcode is replaced.
+      const movedPartNumber = context.product.barcode?.trim() && !context.product.mpn?.trim() && imsCodes?.mpn
+        ? { mpn: imsCodes.mpn }
+        : {}
+      const backfill = await backfillBarcodeFromMintsoft(context, wmsCodes.gtin, movedPartNumber)
       if (!backfill.ok) return failedBackfillResult(backfill.message, wmsCodes.gtin)
       dto = { ...dto, barcode: wmsCodes.gtin }
     }
-    if (identifierPlan.mpn.kind === 'backfill' && wmsCodes.mpn) {
+    if (mayBackfill && identifierPlan.mpn.kind === 'backfill' && wmsCodes.mpn) {
       await backfillMpnFromMintsoft(context, wmsCodes.mpn)
       dto = { ...dto, mpn: wmsCodes.mpn }
     }
