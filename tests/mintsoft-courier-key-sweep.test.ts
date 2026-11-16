@@ -32,9 +32,11 @@ function updateLinkFor(over: Partial<WmsPushUpdateLink>): WmsPushUpdateLink {
   }
 }
 
-async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Error, opts: { taskFails?: boolean } = {}) {
+async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Error, opts: { taskFails?: boolean; withMarker?: boolean; linkWriteFails?: boolean } = {}) {
   const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
   const linkWrites: Array<Record<string, unknown>> = []
+  const events: string[] = []
+  const markers: string[] = []
   const inputs: WmsOrderPushInput[] = []
   const taskPort = recordingTaskPort({ failWith: () => (opts.taskFails ? new Error('database unavailable') : null) })
   const port = {
@@ -47,7 +49,8 @@ async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Err
     holdableLinks: async () => [],
     cancellableLinks: async () => [],
     updatableLinks: async () => [link],
-    updateLink: async (_id: string, data: Record<string, unknown>) => { linkWrites.push(data) },
+    updateLink: async (_id: string, data: Record<string, unknown>) => { if (opts.linkWriteFails) throw new Error('link write failed'); linkWrites.push(data) },
+    ...(opts.withMarker ? { setCourierTaskDue: async (_o: string, service: string) => { events.push('marker'); markers.push(service); return true }, clearCourierTaskDue: async () => undefined } : {}),
     updateLinkByOrder: async () => undefined,
     updateLinkIfState: async () => true,
     upsertByOrder: async () => undefined,
@@ -58,10 +61,10 @@ async function sweep(link: WmsPushUpdateLink, result: WmsOrderUpdateResult | Err
   } as unknown as WmsOrderPushPort
   const connector = {
     pushOrder: async () => { throw new Error('unexpected create') },
-    updateOrder: async (_id: string, input: WmsOrderPushInput) => { inputs.push(input); if (result instanceof Error) throw result; return result },
+    updateOrder: async (_id: string, input: WmsOrderPushInput) => { events.push('updateOrder'); inputs.push(input); if (result instanceof Error) throw result; return result },
   }
   await runWmsOrderPushSweepCore(connector as never, 'mintsoft', port, { now: NOW })
-  return { linkWrites, inputs, tasks: taskPort.tasks }
+  return { linkWrites, inputs, tasks: taskPort.tasks, events, markers }
 }
 
 test('a link with no recorded form, amended down to the placeholder, ends with courierPending true and the form recorded', async () => {
@@ -140,4 +143,31 @@ test('an item failure after an accepted fallback whose task could not be recorde
   assert.equal('courierForm' in run.linkWrites[0]!, false)
   assert.equal(run.linkWrites[0]!.courierPending, true)
   assert.equal('pushedAt' in run.linkWrites[0]!, false)
+})
+
+test('the courier due-marker is persisted BEFORE the amendment call; if the amendment applies the fallback, the task insert fails and the link write fails, the marker is what remains and a later sweep records exactly one task', async () => {
+  const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { taskFails: true, withMarker: true, linkWriteFails: true })
+  assert.deepEqual(run.events, ['marker', 'updateOrder'], 'the marker is written first')
+  assert.deepEqual(run.markers, ['RM Tracked'])
+  assert.equal(run.tasks.length, 0)
+  assert.deepEqual(run.linkWrites, [], 'and nothing else was saved: only the earlier marker is durable')
+  // The next sweep: the marker (a real port's courierTasksDue) yields the task, with no amendment at all.
+  const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+  const taskPort = recordingTaskPort()
+  const port = {
+    activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: '301' }], releasableHeldOrders: async () => [], createCandidates: async () => [],
+    revalidatableLinks: async () => ({ links: [], total: 0 }), ambiguousCreateLinks: async () => ({ links: [], total: 0 }), verifiableLinks: async () => [],
+    holdableLinks: async () => [], cancellableLinks: async () => [], updatableLinks: async () => [],
+    courierTasksDue: async () => [{ orderId: 'so-u', externalOrderId: 'wms-u', externalOrderNumber: null, orderNumber: 'SO-U', service: 'RM Tracked' }],
+    clearCourierTaskDue: async () => undefined, raiseOperatorTask: taskPort.raiseOperatorTask, recordEvent: async () => undefined,
+    updateLink: async () => undefined, updateLinkIfState: async () => true, upsertByOrder: async () => undefined, screenLiveWithdrawals: async () => new Set<string>(), verifyWithdrawalFence: async () => true,
+  } as unknown as WmsOrderPushPort
+  await runWmsOrderPushSweepCore({ pushOrder: async () => { throw new Error('x') }, cancelOrder: async () => ({ cancelled: true, status: 'CANCELLED' }) } as never, 'mintsoft', port, { now: NOW })
+  assert.equal(taskPort.tasks.length, 1)
+  assert.match(taskPort.tasks[0]!.queryText, /RM Tracked/)
+})
+
+test('an amendment that applies NO fallback clears the marker it set, in its normal write', async () => {
+  const run = await sweep(updateLinkFor({ courierForm: 'NAME', courierFormName: KEY }), { updated: true, status: 'NEW' }, { withMarker: true })
+  assert.equal(run.linkWrites[0]!.courierTaskService, null)
 })

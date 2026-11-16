@@ -717,6 +717,32 @@ test('R3 RACE: the link is re-pointed after the deletion is verified and before 
   })
 })
 
+test('A PARTIAL REFUSED REMOVAL records its line detail BEFORE the obligation and the line ids are forgotten: if the task cannot be recorded they stay, and the next sweep records ONE task naming removed and remaining', async () => {
+  await withEnv(OFF, async () => {
+    seedMerged()
+    const h = makePort({ cancellable: [mergedLinkRef()], items: storedD })
+    const refused = { removeOrderItems: async () => ({ kind: 'REFUSED' as const, reason: 'deleting line 3603107 failed (boom)', removed: [storedD[0]], remaining: [storedD[1]] }) }
+    const raise = h.port.raiseOperatorTask!
+    let failing = true
+    h.port.raiseOperatorTask = async (task) => { if (failing) throw new Error('database unavailable'); return raise(task) }
+    await sweep(h.port, refused)
+    assert.equal(h.tasks.length, 0)
+    assert.equal(h.removalNotes.size, 1, 'the obligation is NOT cleared while its task is unrecorded')
+    assert.deepEqual(h.dropped, [], 'and the recorded line ids are not dropped')
+    failing = false
+    await sweep(h.port, refused)
+    assert.equal(h.tasks.length, 1, 'exactly one task')
+    assert.equal(h.tasks[0].reason, 'CANCEL_NOTICE')
+    assert.match(h.tasks[0].queryText, /REMOVED so far: 2 x 243632999 \(line 3603106\)/)
+    assert.match(h.tasks[0].queryText, /STILL ON THE MERGED ORDER[^]*1 x 923663020 \(line 3603107\)/)
+    assert.doesNotMatch(h.tasks[0].queryText, /boom/)
+    assert.equal(h.removalNotes.size, 0, 'cleared only after the task is recorded')
+    assert.deepEqual(h.dropped, [['3603106']])
+    // the notice's own retry (same episode) adds no generic duplicate
+    assert.equal(fake.comments.length, 0)
+  })
+})
+
 test('A LINK THAT MOVED ON BETWEEN THE READ AND THE CLOSE: the conditional update writes nothing, so the link is not counted closed or audited', async () => {
   await withEnv(OFF, async () => {
     seedMerged()
