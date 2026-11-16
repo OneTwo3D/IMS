@@ -281,6 +281,6 @@ export function creditNoteAmounts(
   // many tiny lines do not drift by a rounding error each.
   const perLine = refund.lines.map((rl) => creditAmounts(roundTo(rl.postedNet, digits), rateOf(rl), digits))
   const rawNet = refund.lines.reduce((s, rl) => s + rl.postedNet, 0)
-  const rawVat = refund.lines.reduce((s, rl) => s + rl.postedNet * rateOf(rl), 0)
+  const rawVat = perLine.reduce((s, l) => s + l.vat, 0)
   return { perLine, total: { net: roundTo(rawNet, digits), vat: roundTo(rawVat, digits), gross: roundTo(rawNet + rawVat, digits) } }
 }

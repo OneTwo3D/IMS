@@ -45,12 +45,19 @@ export function finishCreditNoteRows(lines: ReadonlyArray<RawCreditNoteLine>, cu
   return { rows, rounding, total, digits }
 }
 
+/** Round to a currency's minor units (display/posting arithmetic; nothing is written back). */
+// decimal-boundary-ok: display-only rounding of figures already stored/posted
+export function roundMinor(n: number, currency: string | null | undefined): number {
+  const f = 10 ** currencyMinorUnits(currency)
+  return Math.round((n + Number.EPSILON) * f) / f
+}
+
 /** A posted credit note line whose VAT rate cannot be proven from anything frozen at posting. The PDF is refused rather than printed with a guessed rate. */
 export class CreditNoteRateUnprovableError extends Error {
   constructor(readonly lineNumbers: number[]) {
     super(
       `This credit note's VAT cannot be printed: line${lineNumbers.length === 1 ? '' : 's'} ${lineNumbers.join(', ')} of the posted credit note `
-      + 'cannot be matched to a refund line with a recorded VAT rate (the credit note was posted before IMS recorded which refund line each posted line belongs to). '
+      + 'has no recorded VAT rate for its tax code (the credit note was posted before IMS recorded it, or its tax code maps to no single rate). '
       + 'IMS will not guess a rate. Use the credit note in your accounting system as the document of record.',
     )
     this.name = 'CreditNoteRateUnprovableError'
@@ -67,11 +74,12 @@ export function draftCreditNoteModel(input: {
   return finishCreditNoteRows(input.refundLines.map((rl) => {
     const orderLine = rl.salesOrderLineId ? input.orderLines.find((l) => l.id === rl.salesOrderLineId) : undefined
     const rate = rl.vatRate ?? (orderLine ? lineVatRate(orderLine, input.orderTaxRatePercent) : Number(input.orderTaxRatePercent ?? 0))
-    return { description: rl.description, qty: rl.qty, net: rl.postedNet, vat: rl.postedNet * rate }
+    // VAT per line on the line's rounded net, rounded to the minor unit: how the ledger computes it.
+    return { description: rl.description, qty: rl.qty, net: rl.postedNet, vat: roundMinor(roundMinor(rl.postedNet, input.currency) * rate, input.currency) }
   }), input.currency)
 }
 
-export type PostedPayloadLine = { refundLineId?: unknown; description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }
+export type PostedPayloadLine = { refundLineId?: unknown; taxRatePosted?: unknown; description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }
 
 /**
  * A refund whose credit note was staged: its payload lines as posted. `rateOf(i)` is the FROZEN rate for payload line i, or null when it
@@ -96,45 +104,26 @@ export function postedCreditNoteModel(input: {
     const proven = input.vatIsOwnLine ? 0 : input.rateOf(i)
     if (proven === null) unprovable.push(i + 1)
     const rate = proven ?? 0
+    // Per-line VAT rounded to the currency's minor unit, as the ledger does (exclusive: on the line amount; inclusive: the tax part of it).
     if (input.lineAmountsIncludeTax && rate > 0) {
-      const net = amount / (1 + rate)
-      return { description, qty, net, vat: amount - net }
+      const vat = roundMinor(amount - amount / (1 + rate), input.currency)
+      return { description, qty, net: amount - vat, vat }
     }
-    return { description, qty, net: amount, vat: amount * rate }
+    return { description, qty, net: amount, vat: roundMinor(roundMinor(amount, input.currency) * rate, input.currency) }
   }), input.currency)
   if (unprovable.length > 0) throw new CreditNoteRateUnprovableError(unprovable)
   return model
 }
 
-export type PostedRateRefundLine = { id: string; salesOrderLineId: string | null; totalForeign: unknown; schemeTaxRateValue: unknown; chargedTaxForeign: unknown }
-export type PostedRateOrderLine = { id: string; totalForeign: unknown; taxForeign: unknown }
-
 /**
- * The FROZEN VAT rate (a fraction) of one posted payload line, or null when it cannot be proven.
+ * The VAT rate (a fraction) the tax code posted on a payload line carries, or null when it cannot be proven.
  *
- * The line is tied to its refund line by the `refundLineId` the credit-note payload carries, never by its description (an empty description
- * posts as "Refund line", and two lines can share one). A payload without that id (posted before it was recorded) proves nothing: null.
- * Then, in order: the refund line's own frozen rate; the VAT the source stated over the line's net; the linked order line's stored VAT over its
- * stored net; for a line that links to no order line (shipping), the order's own rate, but only when the line posted under the order's default
- * tax code. Anything else is null.
+ * `taxRatePosted` is written onto the payload line when the credit note is queued: the rate of the line's posted tax code (its `taxType`) priced
+ * against the sales tax table at that moment (null/absent when the code maps to no rate or to two). It is frozen with the payload, so the PDF is
+ * stable if rates change later, and it is the rate the ledger applies. The rounded VAT the source stated is NOT used: it can differ by a minor
+ * unit from what the code calculates. A payload without it (queued before it was recorded, or an unpriceable code) is unprovable: null.
  */
-export function postedLineVatRate(input: {
-  payloadLine: { refundLineId?: unknown; taxType?: unknown } | undefined
-  refundLines: ReadonlyArray<PostedRateRefundLine>
-  orderLines: ReadonlyArray<PostedRateOrderLine>
-  orderRate: number | null
-  orderDefaultTaxType: string | null
-}): number | null {
-  const id = input.payloadLine?.refundLineId
-  if (typeof id !== 'string' || id === '') return null
-  const rl = input.refundLines.find((l) => l.id === id)
-  if (!rl) return null
-  if (rl.schemeTaxRateValue != null) return Number(rl.schemeTaxRateValue)
-  const net = Number(rl.totalForeign)
-  if (rl.chargedTaxForeign != null && net > 0) return Number(rl.chargedTaxForeign) / net
-  const ol = rl.salesOrderLineId ? input.orderLines.find((l) => l.id === rl.salesOrderLineId) : undefined
-  if (ol && Number(ol.totalForeign) > 0) return Number(ol.taxForeign ?? 0) / Number(ol.totalForeign)
-  const code = input.payloadLine?.taxType
-  if (!ol && input.orderRate !== null && input.orderDefaultTaxType && typeof code === 'string' && code === input.orderDefaultTaxType) return input.orderRate
-  return null
+export function postedLineVatRate(payloadLine: { taxRatePosted?: unknown } | undefined): number | null {
+  const r = payloadLine?.taxRatePosted
+  return typeof r === 'number' && Number.isFinite(r) && r >= 0 ? r : null
 }

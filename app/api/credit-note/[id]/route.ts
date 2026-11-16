@@ -75,20 +75,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     select: { payload: true },
   })
   const payload = syncRow?.payload && typeof syncRow.payload === 'object' && !Array.isArray(syncRow.payload) ? (syncRow.payload as Record<string, unknown>) : null
-  const payloadLines = payload && Array.isArray(payload.lines) ? (payload.lines as Array<{ refundLineId?: unknown; taxType?: unknown; description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }>) : []
+  const payloadLines = payload && Array.isArray(payload.lines) ? (payload.lines as Array<{ refundLineId?: unknown; taxRatePosted?: unknown; taxType?: unknown; description?: unknown; quantity?: unknown; unitAmount?: unknown; noTaxKind?: unknown }>) : []
   const posted = payload !== null && payloadLines.length > 0 && refusedCreditNoteError(payload) === null
 
   const orderRate = so.taxRatePercent != null ? Number(so.taxRatePercent) : null
   let model: CreditNoteDocumentModel
   if (posted) {
-    // Frozen rates only, each from the refund line the payload line names (refundLineId), never a description match: see postedLineVatRate.
-    const rateOf = (index: number): number | null => postedLineVatRate({
-      payloadLine: payloadLines[index],
-      refundLines: refund.lines,
-      orderLines: so.lines,
-      orderRate,
-      orderDefaultTaxType: orderDefaultRate?.accountingTaxType ?? null,
-    })
+    // Frozen rates only: each line's own posted-code rate recorded on the payload line (taxRatePosted), never a description match or the source's rounded VAT: see postedLineVatRate.
+    const rateOf = (index: number): number | null => postedLineVatRate(payloadLines[index])
     try {
     model = postedCreditNoteModel({
       currency: so.currency,
