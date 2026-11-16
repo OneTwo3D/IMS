@@ -6,12 +6,16 @@ import {
   completedOrdersModifiedAfter,
   unallocatedRemainder,
   loadWcHeldUnitsByProduct,
+  encodeCoveredHistoryBoundary,
+  trustedCoveredHistoryBoundary,
+  WC_ORDER_RESET_MARKER_KEY,
+  WC_COMPLETED_HISTORY_COVERED_KEY,
   WC_HELD_ORDERS_MAX_PAGES,
   WC_HELD_ORDERS_PAGE_SIZE,
   type HeldProductRef,
   type WcHeldUnitsDeps,
 } from '@/lib/connectors/woocommerce/sync/stock-held-orders'
-import { buildStockMaps } from '@/lib/connectors/woocommerce/sync/stock-sync'
+import { buildStockMaps, persistCoveredHistoryBoundary } from '@/lib/connectors/woocommerce/sync/stock-sync'
 
 const simple = (id: string, ext: number, sku = id): HeldProductRef => ({ id, sku, type: 'SIMPLE', externalProductId: ext, components: [] })
 const order = (id: number, ...lines: [number, number, number][]) => ({
@@ -304,4 +308,61 @@ test('completedOrdersModifiedAfter uses the covered-history boundary only when a
   assert.equal(completedOrdersModifiedAfter(null, null, 'garbage'), null)
   assert.equal(completedOrdersModifiedAfter(null, null, null), null)
   assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', '2026-11-10T00:00:00.000Z', '2026-01-01T00:00:00.000Z'), '2026-11-09T00:00:00.000Z', 'both cursors present: they win')
+})
+
+// --- review round 2: a transaction reset (or a connection change) must void the covered-history boundary ---
+
+function boundaryDb(rows: Record<string, string>) {
+  return {
+    rows,
+    $transaction: async (fn: (tx: unknown) => Promise<boolean>) => fn({
+      $executeRaw: async () => 0,
+      setting: {
+        findMany: async ({ where }: { where: { key: { in: string[] } } }) => where.key.in.filter((k) => k in rows).map((key) => ({ key, value: rows[key] })),
+        upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => { rows[where.key] = update.value; return {} },
+      },
+    }),
+  }
+}
+const T0 = Date.parse('2026-11-10T00:00:00.000Z')
+
+test('boundary trust: a reset after the boundary, a different connection generation, or garbage all distrust it', () => {
+  const stored = encodeCoveredHistoryBoundary(T0, '3')
+  assert.equal(trustedCoveredHistoryBoundary(stored, '3', null), new Date(T0).toISOString())
+  assert.equal(trustedCoveredHistoryBoundary(stored, '3', new Date(T0 - 1000).toISOString()), new Date(T0).toISOString(), 'a reset BEFORE the proving walk is fine')
+  assert.equal(trustedCoveredHistoryBoundary(stored, '3', new Date(T0 + 1000).toISOString()), null, 'a reset after it voids it')
+  assert.equal(trustedCoveredHistoryBoundary(stored, '4', null), null, 'a rebind bumped the generation')
+  assert.equal(trustedCoveredHistoryBoundary(stored, '3', 'garbage'), null)
+  assert.equal(trustedCoveredHistoryBoundary('2026-11-10T00:00:00.000Z', '3', null), null, 'the old bare-timestamp form is not trusted')
+  assert.equal(trustedCoveredHistoryBoundary(null, '3', null), null)
+})
+
+test('after a reset the next guard reads completed history EXHAUSTIVELY (the boundary no longer bounds the read)', async () => {
+  const stored = encodeCoveredHistoryBoundary(T0, '1')
+  const before = completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', null))
+  assert.ok(before !== null, 'bounded before the reset')
+  const afterReset = completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', new Date(T0 + 5000).toISOString()))
+  assert.equal(afterReset, null)
+  const asked: Array<Record<string, string>> = []
+  const d = deps({ completedPages: [[order(9, [11, 0, 3])]] })
+  const inner = d.fetchOrdersPage
+  d.fetchOrdersPage = async (p) => { if (p.status === 'completed' && p.orderby !== 'modified') asked.push(p); return inner(p) }
+  const r = await load(d, afterReset)
+  assert.ok(r.ok)
+  assert.ok(asked.length > 0 && asked.every((p) => !('modified_after' in p)))
+  assert.equal(r.heldByProduct.get('p1'), 3, 'the old completed order, whose IMS allocation the reset deleted, is charged again')
+})
+
+test('a stale in-flight boundary write is refused after a reset or a rebind; a fresh one is accepted', async () => {
+  const resetAt = new Date(T0 + 60_000).toISOString()
+  const afterReset = boundaryDb({ wc_settings_version: '1', [WC_ORDER_RESET_MARKER_KEY]: resetAt })
+  assert.equal(await persistCoveredHistoryBoundary(afterReset as never, T0, '1'), false, 'the walk began before the reset')
+  assert.equal(WC_COMPLETED_HISTORY_COVERED_KEY in afterReset.rows, false)
+  const rebound = boundaryDb({ wc_settings_version: '2' })
+  assert.equal(await persistCoveredHistoryBoundary(rebound as never, T0, '1'), false, 'the connection changed since the run began')
+  assert.equal(WC_COMPLETED_HISTORY_COVERED_KEY in rebound.rows, false)
+  const fresh = boundaryDb({ wc_settings_version: '1', [WC_ORDER_RESET_MARKER_KEY]: new Date(T0 - 1000).toISOString() })
+  assert.equal(await persistCoveredHistoryBoundary(fresh as never, T0, '1'), true)
+  assert.equal(trustedCoveredHistoryBoundary(fresh.rows[WC_COMPLETED_HISTORY_COVERED_KEY], '1', fresh.rows[WC_ORDER_RESET_MARKER_KEY]), new Date(T0).toISOString())
+  assert.equal(await persistCoveredHistoryBoundary(fresh as never, T0 - 5000, '1'), false, 'never moves backwards')
 })

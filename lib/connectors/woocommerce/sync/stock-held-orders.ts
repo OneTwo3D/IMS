@@ -78,6 +78,12 @@ export const WC_STOCK_HOLDING_ORDER_STATUSES = ['on-hold', 'processing'] as cons
 /** Setting key: the persisted covered-history boundary (ISO instant), see THE COVERED-HISTORY BOUNDARY. */
 export const WC_COMPLETED_HISTORY_COVERED_KEY = 'wc_completed_history_covered_at'
 
+/**
+ * Setting key: when the last transaction reset began (ISO). The reset deletes the IMS orders and allocations that justified any
+ * covered-history boundary, so a boundary whose walk started before it is void; the reset sets this BEFORE it deletes and never clears it.
+ */
+export const WC_ORDER_RESET_MARKER_KEY = 'wc_order_reset_at'
+
 export const WC_HELD_ORDERS_PAGE_SIZE = 100
 /** Safety ceiling only; the walk normally ends on a short page. */
 export const WC_HELD_ORDERS_MAX_PAGES = 100
@@ -113,6 +119,39 @@ export function completedOrdersModifiedAfter(
   }
   const oldest = Math.min(sync, reconcile)
   return new Date(oldest - WC_COMPLETED_OVERLAP_MS).toISOString()
+}
+
+/** The stored form of the boundary: the instant, bound to the connection generation (`wc_settings_version`) it was proven under. */
+export function encodeCoveredHistoryBoundary(atMs: number, settingsVersion: string): string {
+  return JSON.stringify({ at: new Date(atMs).toISOString(), v: settingsVersion })
+}
+
+/**
+ * The boundary to TRUST, or null: it must parse, carry the CURRENT connection generation (a rebind or cache reset bumps it), and its
+ * walk must have started no earlier than the last transaction reset (which deleted the orders it relied on). Anything else is exhaustive.
+ */
+export function trustedCoveredHistoryBoundary(
+  raw: string | null | undefined,
+  currentSettingsVersion: string,
+  resetMarker: string | null | undefined,
+): string | null {
+  if (!raw) return null
+  let at: string
+  try {
+    const v = JSON.parse(raw) as { at?: unknown; v?: unknown }
+    if (typeof v.at !== 'string' || typeof v.v !== 'string' || v.v !== currentSettingsVersion) return null
+    at = v.at
+  } catch {
+    return null
+  }
+  const atMs = Date.parse(at)
+  if (Number.isNaN(atMs)) return null
+  if (resetMarker) {
+    const resetMs = Date.parse(resetMarker)
+    // An unreadable marker means a reset happened that cannot be dated: trust nothing.
+    if (Number.isNaN(resetMs) || atMs < resetMs) return null
+  }
+  return at
 }
 
 export type HeldLine = { productId: number; variationId: number; sku: string; quantity: number }
