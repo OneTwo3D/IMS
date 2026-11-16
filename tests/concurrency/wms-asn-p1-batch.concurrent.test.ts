@@ -310,7 +310,7 @@ test('o3d-hqvrp.368: a read that STARTED before the stock read holds even if wri
   loadEnv()
   const { db } = await import('@/lib/db')
   const { loadInFlightDispatch } = await import('@/lib/connectors/mintsoft/sync/in-flight-dispatch')
-  const { persistSnapshot } = await import('@/lib/domain/wms/order-status-sweep')
+  const { persistSnapshot, persistSnapshotFailure } = await import('@/lib/domain/wms/order-status-sweep')
   const tag = uniqueTag('MONO')
   const product = await db.product.create({ data: { sku: tag, name: tag, type: 'SIMPLE' }, select: { id: true } })
   const warehouse = await db.warehouse.create({ data: { code: tag.slice(-10), name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
@@ -347,6 +347,15 @@ test('o3d-hqvrp.368: a read that STARTED before the stock read holds even if wri
   assert.equal(stored.status, 'DESPATCHED')
   assert.equal(stored.fetchedAt.getTime(), at(30).getTime())
   assert.equal((await gate()).holds[0]?.reason, 'despatched_at_wms')
+
+  // A tie on the read time: the older-or-equal FAILURE record never blocks a successful read, and an equal-time read that does not say
+  // despatched never replaces a successful despatched=true.
+  const tie = at(10)
+  assert.equal((await persistSnapshotFailure(id, { connector: 'mintsoft', connectorLabel: 'Mintsoft', externalOrderId: '', externalOrderNumber: `MS-${id}`, status: '', statusLabel: 'Unknown', lastError: 'Mintsoft HTTP 503' }, tie)).valueOf(), true)
+  assert.equal((await persistSnapshot(id, fields('DESPATCHED', true), tie)).written, true, 'a success at the same read time as a failure record is written')
+  assert.equal((await db.wmsOrderStatusSnapshot.findUniqueOrThrow({ where: { orderId: id } })).lastError, null)
+  assert.equal((await persistSnapshot(id, fields('NEW', false), tie)).written, false, 'an equal-time false does not replace a successful true')
+  assert.equal((await persistSnapshotFailure(id, { connector: 'mintsoft', connectorLabel: 'Mintsoft', externalOrderId: '', externalOrderNumber: `MS-${id}`, status: '', statusLabel: 'Unknown', lastError: 'older failure' }, at(20))).valueOf(), false, 'a delayed older failure record is dropped too')
 })
 
 test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot was read AFTER the stock read and is not despatched', SKIP, async () => {

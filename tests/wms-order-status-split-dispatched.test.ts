@@ -126,7 +126,7 @@ test('an unsplit order keeps the connector decision and makes no part read', asy
 })
 
 // The align-down gate's own refresh (o3d-hqvrp.368) goes through the same aggregate and writes only a successful read.
-async function refreshOnce(): Promise<{ result: { attempted: number; refreshed: number }; written: Snapshot[] }> {
+async function refreshOnce(): Promise<{ result: { attempted: number; refreshed: number; failed: number }; written: Snapshot[] }> {
   upserts.length = 0
   partsCalls = 0
   const { refreshWmsOrderStatusSnapshots } = await import('@/lib/domain/wms/order-status-sweep')
@@ -138,7 +138,7 @@ test('gate refresh of a split order persists the aggregate over every part (Part
   statusOverrides = {}; hasParts = true
   parts = [part(1, false), part(2, true)]
   const { result, written } = await refreshOnce()
-  assert.deepEqual(result, { attempted: 1, refreshed: 1 })
+  assert.deepEqual(result, { attempted: 1, refreshed: 1, failed: 0 })
   assert.equal(written[0]?.dispatched, true)
 })
 
@@ -158,7 +158,7 @@ test('gate refresh whose status read throws writes nothing and does not throw', 
   statusOverrides = { __throw: true }; hasParts = true
   parts = []
   const { result, written } = await refreshOnce()
-  assert.deepEqual(result, { attempted: 1, refreshed: 0 })
+  assert.deepEqual(result, { attempted: 1, refreshed: 0, failed: 1 })
   assert.equal(written.length, 0)
   statusOverrides = {}
 })

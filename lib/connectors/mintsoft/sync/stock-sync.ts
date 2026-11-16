@@ -2409,7 +2409,12 @@ async function applyMintsoftAlignDownForProduct(params: {
     loadInFlightDispatchRefreshing(
       db,
       { productId: params.productId, warehouseId: params.binding.warehouseId, stockReadAt: new Date(params.stockReadAt) },
-      async (orderIds) => (await import('@/lib/domain/wms/order-status-sweep')).refreshWmsOrderStatusSnapshots(orderIds),
+      async (orderIds) => {
+        const refreshed = await (await import('@/lib/domain/wms/order-status-sweep')).refreshWmsOrderStatusSnapshots(orderIds)
+        // Orders whose re-read failed stay held; say so, so a Mintsoft status outage is visible in the run log.
+        if (refreshed.failed > 0) console.warn(`[mintsoft-stock-sync] align-down status refresh: ${refreshed.failed} of ${orderIds.length} order(s) could not be re-read and stay held`)
+        return refreshed
+      },
       params.statusRefreshBudget,
     ),
     db.stockLevel.findUnique({
