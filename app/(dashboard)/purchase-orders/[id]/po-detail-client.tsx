@@ -20,6 +20,8 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   advancePoStatus,
+  confirmAndSendPurchaseOrder,
+  sendPurchaseOrderEmail,
   updatePoTracking,
   cancelPurchaseOrder,
   receivePurchaseOrder,
@@ -2075,6 +2077,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const canRfq = po.status === 'DRAFT' || po.status === 'RFQ_SENT'
   const canAdvanceToQuoteReceived = po.status === 'RFQ_SENT'
   const canAdvanceToOrdered = po.status === 'DRAFT' || po.status === 'QUOTE_RECEIVED'
+  const canEmailPo = po.status === 'PO_SENT' || po.status === 'SHIPPED' || po.status === 'PARTIALLY_RECEIVED'
   const canShip = po.status === 'PO_SENT'
   const canReceive = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)
   const canReturn = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED'].includes(po.status)
@@ -2092,10 +2095,26 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
   function handleAdvanceToOrdered() {
     setError('')
+    setNotice('')
     startTransition(async () => {
-      const result = await advancePoStatus(po.id, 'PO_SENT')
-      if (result.success) router.refresh()
-      else setError(result.error ?? 'Failed')
+      // Confirms the order first, then queues the PO PDF email; a missing supplier address or a failed enqueue leaves the order confirmed.
+      const result = await confirmAndSendPurchaseOrder(po.id)
+      if (result.success) {
+        setNotice(result.send?.message ?? 'The order is confirmed.')
+        router.refresh()
+      } else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleEmailPo() {
+    setError('')
+    setNotice('')
+    startTransition(async () => {
+      const result = await sendPurchaseOrderEmail(po.id)
+      if (result.success) {
+        setNotice(result.send?.message ?? 'The PO email is queued.')
+        router.refresh()
+      } else setError(result.error ?? 'Failed')
     })
   }
 
@@ -2186,6 +2205,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 </Button>
               )}
             </>
+          )}
+          {!editing && (
+            <Button variant="outline" size="sm" onClick={() => window.open(`/api/purchase-order/${po.id}`, '_blank')}>
+              <FileText className="h-4 w-4 mr-1" />PO PDF
+            </Button>
+          )}
+          {canEmailPo && !editing && (
+            <Button variant="outline" size="sm" onClick={handleEmailPo} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email PO
+            </Button>
           )}
           {canAdvanceToQuoteReceived && !editing && (
             <Button variant="secondary" size="sm" onClick={handleAdvanceToQuoteReceived} disabled={isPending}>

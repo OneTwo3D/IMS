@@ -18,6 +18,7 @@ import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { getTrackingUrl } from '@/lib/tracking'
+import { buildPurchaseOrderEmail, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 
 type EmailAttachment = { filename: string; content: Buffer; contentType?: string }
 type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[] }
@@ -472,6 +473,7 @@ export async function getAccountingInvoiceQueueData(orderId: string): Promise<Qu
 }
 
 export async function prepareQueuedEmail(kind: string, referenceType: string | null, referenceId: string | null): Promise<PreparedEmail | null> {
+  if (referenceType === PURCHASE_ORDER_EMAIL_REFERENCE_TYPE && kind === PURCHASE_ORDER_EMAIL_KIND && referenceId) return buildPurchaseOrderEmail(referenceId)
   if (referenceType !== 'SalesOrder' || !referenceId) return null
   // ERASURE GATE, before the kind is even looked at: a kind this function does not prepare returns null and the drain
   // then sends to the STORED address, so the refusal cannot live inside the per-kind builders.

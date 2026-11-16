@@ -71,7 +71,7 @@ No IMS login is required for the customer — authorisation comes from the WC se
 | Invoice | Customer invoice with auto-generated number |
 | Packing Slip | Picking/packing checklist with SKU, product name, location, quantity, and a tick box per line. Available from the sales order detail page. Groups items by shipment when an order has multiple shipments from different warehouses. If shipments have not yet been created, it falls back to the sales order lines. |
 | Credit Note | Generated from refunds |
-| Purchase Order | Includes product barcode/EAN column |
+| Purchase Order | Priced order for the supplier: lines with barcode/EAN and supplier SKU, delivery address, currency, discounts, VAT and total. Available from the purchase order page (**PO PDF**) and emailed by **Confirm & Send PO** / **Email PO** |
 | RFQ (Request for Quotation) | Purchase order without prices; includes barcode/EAN |
 | Manufacturing Order | Production order sent to third-party manufacturers; includes component barcode/EAN |
 
