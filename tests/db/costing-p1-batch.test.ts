@@ -68,31 +68,48 @@ async function cleanup(db: Ctx['db'], s: Awaited<ReturnType<typeof seedBase>>) {
   await db.warehouse.deleteMany({ where: { id: s.warehouseId } })
 }
 
-test('supplier return consumes the returned PO line layers, not the warehouse oldest', { skip }, async () => {
+test('supplier return consumes only the returned PO line layers and refuses a quantity beyond them', { skip }, async () => {
   const { db, layers } = await load()
   const s = await seedBase(db)
   try {
     // Older stock from another source: 10 @ 5. Then the PO's layer: 10 @ 8.
-    await db.costLayer.create({ data: { productId: s.productId, warehouseId: s.warehouseId, receivedQty: D(10), remainingQty: D(10), unitCostBase: D(5), receivedAt: new Date('2026-01-01T00:00:00Z'), isOpeningStock: true } })
+    const other = await db.costLayer.create({ data: { productId: s.productId, warehouseId: s.warehouseId, receivedQty: D(10), remainingQty: D(10), unitCostBase: D(5), receivedAt: new Date('2026-01-01T00:00:00Z'), isOpeningStock: true }, select: { id: true } })
     const poLayer = await db.costLayer.create({ data: { productId: s.productId, warehouseId: s.warehouseId, receivedQty: D(10), remainingQty: D(10), unitCostBase: D(8), receivedAt: new Date('2026-02-01T00:00:00Z'), poLineId: s.poLineId }, select: { id: true } })
 
-    const out = await db.$transaction(async (tx) => layers.consumeFifoLayersStrict(tx, s.productId, s.warehouseId, 2, { preferPoLineId: s.poLineId }))
+    assert.equal((await db.$transaction((tx) => layers.getPoLineAttributableLayerQty(tx, s.productId, s.warehouseId, s.poLineId))).toString(), '10')
+
+    const out = await db.$transaction(async (tx) => layers.consumeFifoLayersStrict(tx, s.productId, s.warehouseId, 2, { onlyPoLineId: s.poLineId }))
     assert.equal(out.consumed.length, 1)
     assert.equal(out.consumed[0].costLayerId, poLayer.id)
     assert.equal(out.totalCost.toString(), '16')
 
-    // Plain FIFO (no preference) is unchanged: the oldest layer goes first.
+    // Plain FIFO (no option) is unchanged: the oldest layer goes first.
     const plain = await db.$transaction(async (tx) => layers.consumeFifoLayersStrict(tx, s.productId, s.warehouseId, 2))
     assert.equal(plain.totalCost.toString(), '10')
 
-    // PO layer holds 8 now; a return of 10 takes its 8 first, then the remaining 2 from the oldest layer (FIFO fallback).
-    const spill = await db.$transaction(async (tx) => layers.consumeFifoLayersStrict(tx, s.productId, s.warehouseId, 10, { preferPoLineId: s.poLineId }))
-    assert.deepEqual(spill.consumed.map((c) => [c.costLayerId === poLayer.id, c.qty.toString()]), [[true, '8'], [false, '2']])
-    assert.equal(spill.totalCost.toString(), '74')
+    // More than the PO line's 8 remaining: refused, and the other order's layer is NOT touched.
+    assert.equal((await db.$transaction((tx) => layers.getPoLineAttributableLayerQty(tx, s.productId, s.warehouseId, s.poLineId))).toString(), '8')
+    await assert.rejects(
+      db.$transaction(async (tx) => layers.consumeFifoLayersStrict(tx, s.productId, s.warehouseId, 9, { onlyPoLineId: s.poLineId })),
+      /Insufficient FIFO layers/,
+    )
+    const rows = await db.costLayer.findMany({ where: { productId: s.productId }, select: { id: true, remainingQty: true } })
+    assert.equal(rows.find((r) => r.id === other.id)!.remainingQty.toString(), '8')
+    assert.equal(rows.find((r) => r.id === poLayer.id)!.remainingQty.toString(), '8')
 
-    // Layer remaining quantities are consistent with the stock consumed (FIFO invariant: no layer negative).
-    const rows = await db.costLayer.findMany({ where: { productId: s.productId }, select: { remainingQty: true } })
-    assert.equal(rows.reduce((a, r) => a.add(r.remainingQty), D(0)).toString(), String(20 - 2 - 2 - 10))
+    // A layer a transfer recreated from the PO layer (no poLineId, one source-line hop) is attributable too.
+    const wh2 = await db.warehouse.create({ data: { name: `cp1b ${s.suffix}`, code: `CP1B${s.suffix}` }, select: { id: true } })
+    try {
+      const moved = await db.costLayer.create({ data: { productId: s.productId, warehouseId: wh2.id, receivedQty: D(3), remainingQty: D(3), unitCostBase: D(8) }, select: { id: true } })
+      await db.costLayerSourceLine.create({ data: { costLayerId: moved.id, sourceProductId: s.productId, sourceCostLayerId: poLayer.id, qty: D(3), unitCostBase: D(8), totalCostBase: D(24) } })
+      assert.equal((await db.$transaction((tx) => layers.getPoLineAttributableLayerQty(tx, s.productId, wh2.id, s.poLineId))).toString(), '3')
+      const back = await db.$transaction(async (tx) => layers.consumeFifoLayersStrict(tx, s.productId, wh2.id, 3, { onlyPoLineId: s.poLineId }))
+      assert.equal(back.totalCost.toString(), '24')
+    } finally {
+      await db.cogsEntry.deleteMany({ where: { costLayer: { warehouseId: wh2.id } } })
+      await db.costLayer.deleteMany({ where: { warehouseId: wh2.id } })
+      await db.warehouse.deleteMany({ where: { id: wh2.id } })
+    }
   } finally {
     await cleanup(db, s)
     await db.$disconnect()

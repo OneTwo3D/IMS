@@ -8,7 +8,7 @@
  */
 
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
-import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
+import { Prisma, type StockMovementType } from '@/app/generated/prisma/client'
 import { accountingPostingVerdictForChart, getAccountingSettings, isDailyBatchPostingEnabledForChart, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { isClientInsideTransaction, openSavepointDepth } from '@/lib/db/savepoint'
@@ -588,11 +588,38 @@ export type CostLayerSourceLineInput = {
 
 export type ConsumeFifoOptions = {
   /**
-   * A SUPPLIER RETURN names the PO line it sends back: that line's own layers (what the returned goods
-   * actually cost, and what the supplier's credit note is for) are consumed before any other layer of the
-   * warehouse. Only the ORDER changes; the quantity, locking and shortfall rules are the plain FIFO ones.
+   * A SUPPLIER RETURN names the PO line it sends back and consumes ONLY the layers attributable to it (what the
+   * returned goods actually cost, and what the supplier credit note is for), FIFO among themselves. Other orders'
+   * layers are never taken, so the reversal and the credit note value the same goods. If they hold less than `qty`
+   * the consume comes up short and the strict variant refuses; callers check `getPoLineAttributableLayerQty` first
+   * to say how much IS available. Attributable = layers received against the line, plus layers a stock transfer
+   * recreated from them (same product, one source-line hop), so stock moved to another warehouse can still go back.
    */
-  preferPoLineId?: string
+  onlyPoLineId?: string
+}
+
+/** SQL predicate shared by the consume and the availability read, so they cannot disagree. */
+function attributableLayerFilter(poLineId: string) {
+  return Prisma.sql`("poLineId" = ${poLineId} OR id IN (
+    SELECT sl."costLayerId" FROM "cost_layer_source_lines" sl
+    WHERE sl."sourceCostLayerId" IN (SELECT pl.id FROM "cost_layers" pl WHERE pl."poLineId" = ${poLineId})
+  ))`
+}
+
+/** Remaining quantity in `warehouseId` attributable to `poLineId` (see ConsumeFifoOptions.onlyPoLineId). */
+export async function getPoLineAttributableLayerQty(
+  tx: TxClient,
+  productId: string,
+  warehouseId: string,
+  poLineId: string,
+): Promise<Decimal> {
+  const rows = await tx.$queryRaw<Array<{ qty: DecimalInput | null }>>`
+    SELECT COALESCE(SUM("remainingQty"), 0) AS qty
+    FROM "cost_layers"
+    WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId} AND "remainingQty" > 0
+      AND ${attributableLayerFilter(poLineId)}
+  `
+  return toDecimal(rows[0]?.qty ?? 0)
 }
 
 type LockedFifoCostLayerRow = {
@@ -635,16 +662,17 @@ export async function consumeFifoLayers(
   // Select and lock in one statement. A pre-lock Prisma findMany can materialize
   // a stale FIFO snapshot under concurrency; FOR UPDATE makes the oldest
   // candidate rows wait and re-check before this transaction can consume them.
-  // `preferPoLineId`: the layers received against that PO line go first (FIFO among themselves), then the rest
-  // of the warehouse's layers in FIFO order. Without it the order is plain FIFO, unchanged.
-  const layers = options.preferPoLineId
+  // `onlyPoLineId`: a supplier return consumes only the layers attributable to the returned PO line. Without it the
+  // order is plain FIFO over the warehouse, unchanged.
+  const layers = options.onlyPoLineId
     ? await tx.$queryRaw<LockedFifoCostLayerRow[]>`
       SELECT id, "remainingQty", "unitCostBase"
       FROM "cost_layers"
       WHERE "productId" = ${productId}
         AND "warehouseId" = ${warehouseId}
         AND "remainingQty" > 0
-      ORDER BY CASE WHEN "poLineId" = ${options.preferPoLineId} THEN 0 ELSE 1 END ASC, "receivedAt" ASC, id ASC
+        AND ${attributableLayerFilter(options.onlyPoLineId)}
+      ORDER BY "receivedAt" ASC, id ASC
       FOR UPDATE
     `
     : await tx.$queryRaw<LockedFifoCostLayerRow[]>`
