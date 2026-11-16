@@ -2080,6 +2080,7 @@ model SalesOrder {
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
   wmsOrderStatus    WmsOrderStatusSnapshot?
   wmsOrderPush      WmsOrderPushLink?
+  wmsOperatorTasks  WmsOperatorTask[]
   wmsOrderDiscrepancies WmsOrderDiscrepancy[]
 
   @@index([status])
@@ -4033,7 +4034,8 @@ model WmsOrderPushLink {
   /// the link is pointed at a new warehouse order.
   holdNoticeAt        DateTime? @map("hold_notice_at")
   cancelNoticeAt      DateTime? @map("cancel_notice_at")
-  /// When the warehouse-visible note for that notice was actually posted. Null while undelivered: the push sweep retries it.
+  /// When the operator task ("raise a Mintsoft query") for that notice was recorded. Null until then: the push sweep raises it. (IMS writes no
+  /// comment to the warehouse; the column predates operator tasks, when it recorded the posted note, and keeps its name.)
   /// IMS changed an order the warehouse had already merged into another order and did NOT amend the merged order (that would delete or
   /// consolidate the other order's lines): the change has to be applied there by hand. Live link, listed in the exception inbox until
   /// an operator acknowledges it (which clears this).
@@ -4049,6 +4051,8 @@ model WmsOrderPushLink {
   /// same generation token as above.
   amendLeaseOwner       String?   @map("amend_lease_owner")
   amendLeaseExpiresAt   DateTime? @map("amend_lease_expires_at")
+  /// The shipping service of a courier-fallback operator task that is DUE and not yet recorded (cleared once recorded): a failed insert is retried by a later sweep.
+  courierTaskService    String?   @map("courier_task_service")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())
@@ -4084,6 +4088,53 @@ model WmsOrderPushItem {
   @@unique([linkId, externalItemId])
   @@index([linkId])
   @@map("wms_order_push_items")
+}
+
+// ---------------------------------------------------------------------------
+// WMS OPERATOR QUERY TASKS
+// ---------------------------------------------------------------------------
+// External warehouse staff do not read order comments; only a query raised in the warehouse's own system reaches them, and the API cannot
+// raise one. Where IMS used to post a comment on a warehouse order it now records one of these: a person raises the query by hand from the
+// copy-ready text and marks the task done. Holds no personal data: warehouse and IMS order numbers, SKUs and quantities only.
+
+enum WmsOperatorTaskReason {
+  MERGED_LINES_REMOVED
+  PARTIAL_REMOVAL_CHECK
+  COURIER_FALLBACK
+  PUSH_CONFLICT
+  CANCEL_NOTICE
+  REFUND_NOTE
+}
+
+enum WmsOperatorTaskStatus {
+  OPEN
+  DONE
+}
+
+model WmsOperatorTask {
+  id              String                @id @default(cuid())
+  connector       String
+  orderId         String                @map("order_id")
+  /// The warehouse order the query is about.
+  externalOrderId String                @map("external_order_id")
+  reason          WmsOperatorTaskReason
+  /// Copy-ready query text. Order numbers, SKUs and quantities only.
+  queryText       String                @map("query_text")
+  /// Machine-readable context the Done action needs (the link and the recorded lines of a partial-removal check). Never personal data.
+  payload         Json?
+  /// Hash of the content (and, for a notice, the episode it belongs to): the same fact raised twice is one task.
+  contentHash     String                @map("content_hash")
+  status          WmsOperatorTaskStatus @default(OPEN)
+  createdAt       DateTime              @default(now()) @map("created_at")
+  doneAt          DateTime?             @map("done_at")
+  doneBy          String?               @map("done_by")
+
+  order           SalesOrder            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, orderId, externalOrderId, reason, contentHash], map: "wms_operator_tasks_dedupe_key")
+  @@index([status, createdAt, id], map: "wms_operator_tasks_status_created_idx")
+  @@index([orderId], map: "wms_operator_tasks_order_idx")
+  @@map("wms_operator_tasks")
 }
 
 // ---------------------------------------------------------------------------

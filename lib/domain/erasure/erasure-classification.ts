@@ -135,7 +135,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   WmsOrderPushLink: {
     erased: ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'],
-    notPersonal: ['connector', 'courierForm', 'courierFormName', 'lineSnapshotToken', 'amendLeaseOwner'],
+    notPersonal: ['connector', 'courierForm', 'courierFormName', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService'],
     retained: {
       externalOrderId: 'the warehouse order id reconciles the order with the warehouse',
       externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',
@@ -145,6 +145,13 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     // The warehouse's own line ids with the SKU and quantity of each line: no person is named. Deleted with its link (cascade).
     erased: [],
     notPersonal: ['linkId', 'externalOrderId', 'externalItemId', 'sku'],
+    retained: {},
+  },
+  WmsOperatorTask: {
+    // Operator query tasks: the warehouse and IMS order numbers, SKUs, quantities and line ids, in fixed wording built by IMS. No person is named
+    // and no free text from the customer or the warehouse is stored (the connector's error text is not copied in). Deleted with its order (cascade).
+    erased: [],
+    notPersonal: ['id', 'connector', 'orderId', 'externalOrderId', 'queryText', 'payload', 'contentHash', 'doneBy'],
     retained: {},
   },
   WmsReturnsInbox: {

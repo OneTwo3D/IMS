@@ -162,7 +162,9 @@ test('no destination free-text writer anywhere under lib/ or app/ is given text 
   }
   console.log(`precondition (text census): ${files.length} files under lib/ and app/, ${callSites} writer call sites and ${properties} free-text payload properties examined`)
   assert.ok(files.length > 800, 'the census must be scanning the whole code base, not a list')
-  assert.ok(callSites >= 7, `the known writer call sites must be found (found ${callSites})`)
+  // The WMS comment writers (postConflictComment / addOrderComment) are gone from lib/ and app/ on purpose: IMS raises operator tasks instead
+  // (tests/wms-no-order-comment-writes.test.ts pins that). What remains are the WooCommerce order-note writers, so the floor is their count.
+  assert.ok(callSites >= 2, `the known writer call sites must be found (found ${callSites})`)
   assert.ok(properties >= 5, `the payload free-text properties must be found (found ${properties})`)
 
   const unexplained = findings.filter((f) => !(f.id in ALLOWED))
