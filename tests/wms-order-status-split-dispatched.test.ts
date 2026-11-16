@@ -7,7 +7,9 @@ import test, { mock } from 'node:test'
 // part is despatched, false only when every part was read and none is despatched, otherwise null (unknown).
 // All HTTP is mocked: the connector below is a stub and nothing reaches Mintsoft.
 
-type Snapshot = { orderId: string; dispatched: boolean | null; lastError: string | null }
+type Snapshot = { orderId: string; dispatched: boolean | null; lastError: string | null; fetchedAt?: Date }
+/** When the mocked status GET resolved: the stored read time must not be later than this (o3d-hqvrp.368 R2). */
+let getResolvedAt = 0
 type Part = { externalId: string; partNumber: number; status: string; dispatched: boolean; tracking: never[] }
 
 const upserts: Snapshot[] = []
@@ -26,6 +28,8 @@ mock.module('@/lib/connectors/wms/registry', {
     getWmsConnectorDef: () => ({ label: 'Mintsoft' }),
     getWmsConnector: () => ({
       fetchOrderStatus: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        getResolvedAt = Date.now()
         if (statusOverrides.__throw) throw new Error('Mintsoft 503')
         return {
         externalOrderId: 'ext-1', externalOrderNumber: 'SO-1', status: 'NEW', statusLabel: 'NEW',
@@ -155,4 +159,15 @@ test('gate refresh whose status read throws writes nothing and does not throw', 
   assert.deepEqual(result, { attempted: 1, refreshed: 0 })
   assert.equal(written.length, 0)
   statusOverrides = {}
+})
+
+test('the stored read time is when the status request BEGAN, not when the snapshot was written (sweep and gate refresh)', async () => {
+  statusOverrides = {}; hasParts = true
+  parts = [part(1, false), part(2, false)]
+  const swept = await snapshotFor()
+  assert.ok(swept?.fetchedAt instanceof Date, 'the sweep persists an explicit read time')
+  assert.ok(swept.fetchedAt.getTime() < getResolvedAt, 'read time precedes the end of the status GET')
+  const { written } = await refreshOnce()
+  assert.ok(written[0]?.fetchedAt instanceof Date)
+  assert.ok(written[0].fetchedAt.getTime() < getResolvedAt, 'the gate refresh stamps request start too')
 })

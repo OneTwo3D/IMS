@@ -165,23 +165,33 @@ function snapshotFieldsFromStatus(connectorId: string, connectorLabel: string, s
 
 /**
  * Writes a snapshot under the order lock, reading the erasure marker in the same transaction (an erased order keeps its status
- * but never its tracking number, carrier or deep link). Returns whether the order is erased.
+ * but never its tracking number, carrier or deep link).
+ *
+ * `readStartedAt` is when the status request BEGAN, taken before the GET. It is stored as `fetchedAt` in place of the time of
+ * this write: the write can land long after the read, and a "not despatched" answer read before a despatch must never look
+ * newer than a stock read that came after the despatch (o3d-hqvrp.368). The write is MONOTONIC: under the order lock a
+ * snapshot whose stored read time is the same or newer is left alone, so a delayed older read (a slow sweep, or a concurrent
+ * gate refresh) cannot overwrite a newer answer such as a despatched one. Returns whether the order is erased and whether this
+ * read was stored.
  */
-async function persistSnapshot(
+export async function persistSnapshot(
   orderId: string,
-  fields: Omit<Prisma.WmsOrderStatusSnapshotUncheckedCreateInput, 'orderId'>,
-): Promise<boolean> {
+  fields: Omit<Prisma.WmsOrderStatusSnapshotUncheckedCreateInput, 'orderId' | 'fetchedAt'>,
+  readStartedAt: Date,
+): Promise<{ erased: boolean; written: boolean }> {
   return db.$transaction(async (tx) => {
     await lockSalesOrder(tx, orderId)
     const current = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true } })
     const erased = current?.erasedAt != null
+    const stored = await tx.wmsOrderStatusSnapshot.findUnique({ where: { orderId }, select: { fetchedAt: true } })
+    if (stored && stored.fetchedAt.getTime() >= readStartedAt.getTime()) return { erased, written: false }
     const storedFields = erased ? { ...fields, trackingNumber: null, carrier: null, deepLinkUrl: null } : fields
     await tx.wmsOrderStatusSnapshot.upsert({
       where: { orderId },
-      create: { orderId, ...storedFields },
-      update: { ...storedFields, fetchedAt: new Date() },
+      create: { orderId, ...storedFields, fetchedAt: readStartedAt },
+      update: { ...storedFields, fetchedAt: readStartedAt },
     })
-    return erased
+    return { erased, written: true }
   })
 }
 
@@ -213,10 +223,12 @@ export async function refreshWmsOrderStatusSnapshots(orderIds: readonly string[]
       if (!reference) continue
       result.attempted += 1
       try {
+        // Taken BEFORE the request: this, not the write time, is the snapshot's read time (see persistSnapshot).
+        const readStartedAt = new Date()
         const status = await connector.fetchOrderStatus(reference)
         if (!status) continue
-        await persistSnapshot(order.id, snapshotFieldsFromStatus(connectorId, connectorLabel, status, await resolveSnapshotDispatched(connector, reference, status)))
-        result.refreshed += 1
+        const persisted = await persistSnapshot(order.id, snapshotFieldsFromStatus(connectorId, connectorLabel, status, await resolveSnapshotDispatched(connector, reference, status)), readStartedAt)
+        if (persisted.written) result.refreshed += 1
       } catch (error) {
         console.warn(`[wms-order-status-sweep] gate refresh failed for order ${order.id}: ${error instanceof Error ? error.message : String(error)}`)
       }
@@ -327,6 +339,8 @@ export async function runWmsOrderStatusSweep(
     }
 
     try {
+      // Taken BEFORE the request: this, not the write time, is the snapshot's read time (see persistSnapshot).
+      const readStartedAt = new Date()
       const status = await connector.fetchOrderStatus(reference)
       const tracking = status?.tracking.find((entry) => entry.trackingNumber || entry.carrier)
 
@@ -410,7 +424,11 @@ export async function runWmsOrderStatusSweep(
       // call that can take seconds; `order.erasedAt` was read before it and an erasure can commit in between. The erasure
       // takes the same lock, so this write is either wholly before it (and is then scrubbed by it) or wholly after it
       // (and sees the marker).
-      const erasedNow = await persistSnapshot(order.id, fields)
+      const persisted = await persistSnapshot(order.id, fields, readStartedAt)
+      // A newer snapshot is already stored (a concurrent read finished first): this older read is dropped, and so is everything
+      // that would act on it, the storefront push included.
+      if (!persisted.written) continue
+      const erasedNow = persisted.erased
       if (status) updated += 1
 
       // G6: clear the courier-pending review flag once the order is actually despatched

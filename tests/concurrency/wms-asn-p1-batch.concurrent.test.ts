@@ -306,6 +306,49 @@ test('o3d-hqvrp.368: a predating status is re-read once, released only on a fres
   assert.equal(spent.qty, 2, 'an exhausted budget refreshes nothing more')
 })
 
+test('o3d-hqvrp.368: a read that STARTED before the stock read holds even if written after it; a delayed older read never overwrites a newer one', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { loadInFlightDispatch } = await import('@/lib/connectors/mintsoft/sync/in-flight-dispatch')
+  const { persistSnapshot } = await import('@/lib/domain/wms/order-status-sweep')
+  const tag = uniqueTag('MONO')
+  const product = await db.product.create({ data: { sku: tag, name: tag, type: 'SIMPLE' }, select: { id: true } })
+  const warehouse = await db.warehouse.create({ data: { code: tag.slice(-10), name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
+  const id = `${tag}a`
+  await db.salesOrder.create({
+    data: {
+      id, orderNumber: `IMSTEST-${id}`, status: 'PACKING', currency: 'GBP', subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10,
+      lines: { create: [{ id: `${id}L`, productId: product.id, sku: tag, description: tag, qty: 3, unitPriceForeign: 1, unitPriceBase: 1, totalForeign: 3, totalBase: 3, cogsBase: 0 }] },
+    },
+  })
+  await db.orderAllocation.create({ data: { orderId: id, lineId: `${id}L`, productId: product.id, warehouseId: warehouse.id, qty: '3' } })
+  await db.wmsOrderPushLink.create({ data: { orderId: id, connector: 'mintsoft', state: 'SYNCED', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}` } })
+  const now = Date.now()
+  const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000)
+  const fields = (status: string, dispatched: boolean) => ({
+    connector: 'mintsoft', connectorLabel: 'Mintsoft', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}`, status, statusLabel: status, dispatched, lastError: null,
+  })
+  const stockReadAt = at(60)
+  const gate = () => loadInFlightDispatch(db, { productId: product.id, warehouseId: warehouse.id, stockReadAt })
+
+  // The read began 120 s ago (before the stock read 60 s ago) and is WRITTEN now, after the stock read.
+  const first = await persistSnapshot(id, fields('NEW', false), at(120))
+  assert.equal(first.written, true)
+  const held = await gate()
+  assert.equal(held.qty, 3, 'the stored read time is the request start, so the late write does not read as fresh')
+  assert.deepEqual(held.holds.map((h) => h.reason), ['status_predates_stock_read'])
+
+  // A newer true lands (read began 30 s ago), then a delayed OLDER false (began 50 s ago) is written afterwards.
+  assert.equal((await persistSnapshot(id, fields('DESPATCHED', true), at(30))).written, true)
+  const late = await persistSnapshot(id, fields('NEW', false), at(50))
+  assert.equal(late.written, false, 'a delayed older read is rejected')
+  const stored = await db.wmsOrderStatusSnapshot.findUniqueOrThrow({ where: { orderId: id } })
+  assert.equal(stored.dispatched, true)
+  assert.equal(stored.status, 'DESPATCHED')
+  assert.equal(stored.fetchedAt.getTime(), at(30).getTime())
+  assert.equal((await gate()).holds[0]?.reason, 'despatched_at_wms')
+})
+
 test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot was read AFTER the stock read and is not despatched', SKIP, async () => {
   loadEnv()
   const { db } = await import('@/lib/db')
