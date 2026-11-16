@@ -29,11 +29,48 @@ type Rows = {
   discrepancies: string[]
 }
 
+type Notif = { userId: string; title: string; message: string; actionUrl: string }
+
 function makeDb(rows: Rows, settings = new Map<string, string>(), calls = { counts: 0 }) {
-  const list = (ids: string[]) => async (args: { take: number }) => ids.slice(0, args.take).map((id) => ({ id }))
+  const notifications: Notif[] = []
+  let lock: Promise<void> = Promise.resolve()
+  const failures = { notificationInsert: 0 }
+  // The fake does not evaluate the real WHERE; it honours only the id filters the announcer adds.
+  const list = (ids: string[]) => async (args: { where?: { AND?: Array<{ id?: { in?: string[]; notIn?: string[] } }> }; take?: number }) => {
+    const idFilter = args.where?.AND?.[1]?.id
+    let out = ids
+    if (idFilter?.in) out = out.filter((id) => idFilter.in!.includes(id))
+    if (idFilter?.notIn) out = out.filter((id) => !idFilter.notIn!.includes(id))
+    return (args.take === undefined ? out : out.slice(0, args.take)).map((id) => ({ id }))
+  }
   const count = (ids: string[]) => async () => { calls.counts += 1; return ids.length }
+  const settingApi = (store: Map<string, string>) => ({
+    async findUnique({ where }: { where: { key: string } }) {
+      const value = store.get(where.key)
+      return value === undefined ? null : { value }
+    },
+    async createMany({ data }: { data: Array<{ key: string; value: string }> }) {
+      let n = 0
+      for (const row of data) if (!store.has(row.key)) { store.set(row.key, row.value); n += 1 }
+      return { count: n }
+    },
+    async updateMany({ where, data }: { where: { key: string; value: string }; data: { value: string } }) {
+      if (store.get(where.key) !== where.value) return { count: 0 }
+      store.set(where.key, data.value)
+      return { count: 1 }
+    },
+  })
+  const users = [
+    { id: 'admin', role: 'ADMIN' },
+    { id: 'manager', role: 'MANAGER' },
+    { id: 'wh', role: 'WAREHOUSE' },
+    { id: 'ro', role: 'READONLY' },
+    { id: 'sup', role: 'SUPPLIER' },
+  ]
   return {
     settings,
+    notifications,
+    failures,
     calls,
     db: {
       wmsOrderPushLink: { count: count(rows.push), findMany: list(rows.push) },
@@ -41,34 +78,37 @@ function makeDb(rows: Rows, settings = new Map<string, string>(), calls = { coun
       accountingSyncLog: { count: count(rows.failed), findMany: list(rows.failed) },
       wmsInboundReceiptEvent: { count: count(rows.reviews), findMany: list(rows.reviews) },
       wmsStockDiscrepancy: { count: count(rows.discrepancies), findMany: list(rows.discrepancies) },
-      setting: {
-        async findUnique({ where }: { where: { key: string } }) {
-          const value = settings.get(where.key)
-          return value === undefined ? null : { value }
-        },
-        async createMany({ data }: { data: Array<{ key: string; value: string }> }) {
-          let count = 0
-          for (const row of data) if (!settings.has(row.key)) { settings.set(row.key, row.value); count += 1 }
-          return { count }
-        },
-        async updateMany({ where, data }: { where: { key: string; value: string }; data: { value: string } }) {
-          if (settings.get(where.key) !== where.value) return { count: 0 }
-          settings.set(where.key, data.value)
-          return { count: 1 }
-        },
-      },
-      user: {
-        async findMany() {
-          return [
-            { id: 'admin', role: 'ADMIN' },
-            { id: 'manager', role: 'MANAGER' },
-            { id: 'wh', role: 'WAREHOUSE' },
-            { id: 'ro', role: 'READONLY' },
-            { id: 'sup', role: 'SUPPLIER' },
-          ]
-        },
+      setting: settingApi(settings),
+      // Interactive transaction with rollback semantics (writes land only if the callback resolves),
+      // serialised, modelling the row lock a real compare-and-set takes.
+      async $transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
+        const turn = lock
+        let release!: () => void
+        lock = new Promise<void>((resolve) => { release = resolve })
+        await turn
+        try { return await run(fn) } finally { release() }
       },
     },
+  }
+  async function run<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
+    const stagedSettings = new Map(settings)
+    const stagedNotifications: Notif[] = []
+    const tx = {
+      setting: settingApi(stagedSettings),
+      user: { async findMany() { return users } },
+      notification: {
+        async createMany({ data }: { data: Notif[] }) {
+          if (failures.notificationInsert > 0) { failures.notificationInsert -= 1; throw new Error('insert failed') }
+          stagedNotifications.push(...data)
+          return { count: data.length }
+        },
+      },
+    }
+    const result = await fn(tx)
+    settings.clear()
+    for (const [k, v] of stagedSettings) settings.set(k, v)
+    notifications.push(...stagedNotifications)
+    return result
   }
 }
 
@@ -76,14 +116,12 @@ const emptyRows = (): Rows => ({ push: [], parks: [], failed: [], reviews: [], d
 
 function announceHarness(rows: Rows, connector: string | null = 'xero') {
   const fake = makeDb(rows)
-  const sent: Array<{ userId: string; title: string; message: string; actionUrl: string }> = []
   const deps = {
     db: fake.db,
     activeAccountingConnector: async () => connector,
     activeWmsConnector: async () => 'wms-a',
-    notify: async (params) => { sent.push(params); return true },
-  } as AnnounceDeps
-  return { deps, sent, settings: fake.settings }
+  } as unknown as AnnounceDeps
+  return { deps, sent: fake.notifications, settings: fake.settings, fake }
 }
 
 // ---- count loader ------------------------------------------------------------------------------
@@ -214,10 +252,8 @@ test('announce: first sight notifies once per category; an unchanged set notifie
   const { deps, sent } = announceHarness({ ...emptyRows(), push: ['p1', 'p2'], parks: ['k1'] })
   const first = await announceNeedsAttention(deps)
   assert.deepEqual(first.announced.sort(), ['refundParks', 'wmsPushBlocked'])
-  const titles = new Set(sent.map((n) => n.title))
-  assert.equal(titles.size, 2)
-  const pushToAdmin = sent.filter((n) => n.userId === 'admin' && n.title === 'Warehouse order push blocked')
-  assert.equal(pushToAdmin.length, 1, 'one notification for two new rows, not two')
+  assert.equal(new Set(sent.map((n) => n.title)).size, 2)
+  assert.equal(sent.filter((n) => n.userId === 'admin' && n.title === 'Warehouse order push blocked').length, 1, 'one notification for two new rows')
 
   const before = sent.length
   const second = await announceNeedsAttention(deps)
@@ -236,7 +272,6 @@ test('announce: a NEW item notifies, naming only the new one; old items stay qui
   const adminMsg = sent.filter((n) => n.userId === 'admin')
   assert.equal(adminMsg.length, 1)
   assert.match(adminMsg[0].message, /^1 accounting sync row failed/)
-  assert.match(adminMsg[0].message, /2 open/)
 })
 
 test('announce: a cleared item is forgotten, so the same item failing again is announced again', async () => {
@@ -255,42 +290,73 @@ test('announce: a cleared item is forgotten, so the same item failing again is a
 test('announce: recipients are limited to roles holding the category permission', async () => {
   const { deps, sent } = announceHarness({ ...emptyRows(), reviews: ['e1'], push: ['p1'] })
   await announceNeedsAttention(deps)
-  const reviewRecipients = sent.filter((n) => n.title === 'Warehouse receipt paused for review').map((n) => n.userId)
-  assert.deepEqual(reviewRecipients, ['admin'])
-  const pushRecipients = sent.filter((n) => n.title === 'Warehouse order push blocked').map((n) => n.userId).sort()
-  assert.deepEqual(pushRecipients, ['admin', 'manager'])
+  assert.deepEqual(sent.filter((n) => n.title === 'Warehouse receipt paused for review').map((n) => n.userId), ['admin'])
+  assert.deepEqual(sent.filter((n) => n.title === 'Warehouse order push blocked').map((n) => n.userId).sort(), ['admin', 'manager'])
 })
 
-test('announce: two concurrent passes cannot both announce the same rows', async () => {
-  const { deps, sent } = announceHarness({ ...emptyRows(), discrepancies: ['d1'] })
-  await Promise.all([announceNeedsAttention(deps), announceNeedsAttention(deps)])
-  const forAdmin = sent.filter((n) => n.userId === 'admin' && n.title === 'Stock discrepancy opened')
-  assert.equal(forAdmin.length, 1)
+test('announce: no storm under concurrent passes', async () => {
+  const { deps, sent } = announceHarness({ ...emptyRows(), discrepancies: ['d1'], push: ['p1'] })
+  await Promise.all([announceNeedsAttention(deps), announceNeedsAttention(deps), announceNeedsAttention(deps)])
+  assert.equal(sent.filter((n) => n.userId === 'admin' && n.title === 'Stock discrepancy opened').length, 1)
+  assert.equal(sent.filter((n) => n.userId === 'admin' && n.title === 'Warehouse order push blocked').length, 1)
 })
 
-test('announce: when nobody could be told, the claim is released and the next run retries', async () => {
-  const rows = { ...emptyRows(), push: ['p1'] }
-  const fake = makeDb(rows)
-  let deliver = false
-  const sent: string[] = []
-  const deps = {
-    db: fake.db,
-    activeAccountingConnector: async () => 'xero',
-    activeWmsConnector: async () => 'wms-a',
-    notify: async (p: { userId: string }) => { if (deliver) sent.push(p.userId); return deliver },
-  } as unknown as AnnounceDeps
+test('announce: a failure after the claim rolls the claim back and the next pass retries', async () => {
+  const { deps, sent, settings, fake } = announceHarness({ ...emptyRows(), push: ['p1'] })
+  fake.failures.notificationInsert = 1
   const first = await announceNeedsAttention(deps)
-  assert.deepEqual(first.announced, [])
-  deliver = true
+  assert.deepEqual(first.failed, ['wmsPushBlocked'])
+  assert.equal(sent.length, 0)
+  assert.equal(settings.has(`${ANNOUNCED_KEY_PREFIX}wmsPushBlocked`), false, 'nothing was claimed')
   const second = await announceNeedsAttention(deps)
   assert.deepEqual(second.announced, ['wmsPushBlocked'])
-  assert.ok(sent.length > 0)
+  assert.deepEqual(sent.map((n) => n.userId).sort(), ['admin', 'manager'])
+})
+
+test('announce: a partial insert failure writes no recipient and the retry reaches every recipient', async () => {
+  const { deps, sent, fake } = announceHarness({ ...emptyRows(), parks: ['k1'] })
+  fake.failures.notificationInsert = 1
+  await announceNeedsAttention(deps)
+  assert.equal(sent.length, 0, 'no recipient is marked notified by a failed attempt')
+  await announceNeedsAttention(deps)
+  assert.deepEqual(sent.map((n) => n.userId).sort(), ['admin', 'manager'])
+})
+
+test('announce: with no eligible recipient nothing is claimed, so rows are announced once someone exists', async () => {
+  const rows = { ...emptyRows(), reviews: ['e1'] }
+  const { deps, sent, settings, fake } = announceHarness(rows)
+  const realDb = fake.db as unknown as { $transaction: (fn: (tx: { user: unknown }) => Promise<unknown>) => Promise<unknown> }
+  const original = realDb.$transaction.bind(realDb)
+  let empty = true
+  realDb.$transaction = (fn) => original((tx) => fn(empty ? { ...(tx as object), user: { findMany: async () => [] } } as { user: unknown } : tx))
+  await announceNeedsAttention(deps)
+  assert.equal(settings.has(`${ANNOUNCED_KEY_PREFIX}receiptReviews`), false)
+  empty = false
+  const result = await announceNeedsAttention(deps)
+  assert.deepEqual(result.announced, ['receiptReviews'])
+  assert.deepEqual(sent.map((n) => n.userId), ['admin'])
+})
+
+test('announce: 250 open items plus a new one - every row is announced over successive passes, the new one included', async () => {
+  const ids = Array.from({ length: 250 }, (_, i) => `a${String(i).padStart(4, '0')}`)
+  const rows = { ...emptyRows(), failed: [...ids] }
+  const { deps, sent } = announceHarness(rows)
+  await announceNeedsAttention(deps) // first batch: 200
+  assert.match(sent.find((n) => n.userId === 'admin')!.message, /^200\+ accounting sync rows failed/)
+  rows.failed.push('zzzz-new') // sorts after every existing id, beyond any earlier batch
+  sent.length = 0
+  await announceNeedsAttention(deps) // remaining 50 + the new one
+  const second = sent.filter((n) => n.userId === 'admin')
+  assert.equal(second.length, 1)
+  assert.match(second[0].message, /^51 accounting sync rows failed/)
+  sent.length = 0
+  await announceNeedsAttention(deps)
+  assert.equal(sent.length, 0, 'nothing left unannounced')
 })
 
 test('announce: dispatch dead-letters are not re-announced (the sweep already bells them)', () => {
   assert.equal(ANNOUNCE_SPECS.some((s) => (s.key as string) === 'dispatchDeadLetters'), false)
   assert.deepEqual(ANNOUNCE_SPECS.map((s) => s.key).sort(), ['failedAccounting', 'receiptReviews', 'refundParks', 'stockDiscrepancies', 'wmsPushBlocked'])
-  assert.ok(ANNOUNCED_KEY_PREFIX.length > 0)
 })
 
 // ---- links -------------------------------------------------------------------------------------

@@ -1,7 +1,6 @@
 import { db } from '@/lib/db'
 import { getActiveAccountingConnectorId } from '@/lib/accounting'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
-import { notifyPersisted } from '@/lib/notifications'
 import { announceNeedsAttention, type AnnounceDeps } from './announce'
 import type { NeedsAttentionView } from './categories'
 import { createNeedsAttentionLoader, type InboxSummarySlice } from './counts'
@@ -35,7 +34,6 @@ const announceDeps: AnnounceDeps = {
   db: db as unknown as AnnounceDeps['db'],
   activeAccountingConnector: getActiveAccountingConnectorId,
   activeWmsConnector: getEnabledWmsConnectorId,
-  notify: (params) => notifyPersisted(params),
 }
 
 const announceCache = createTtlCache(() => announceNeedsAttention(announceDeps), NEEDS_ATTENTION_TTL_MS)

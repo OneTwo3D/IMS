@@ -20,8 +20,8 @@ export const receiptReviewWhere = (connector: string) => ({
 
 export const stockDiscrepancyWhere = (connector: string) => ({ connector, status: 'OPEN' as const })
 
-/** Upper bound on how many ids one category samples for the bell: a storm of 5,000 rows is one alert, not 5,000 reads. */
-export const ANNOUNCE_SAMPLE_LIMIT = 200
+/** How many unannounced rows one pass announces (one notification covers them all); the rest follow on the next pass. */
+export const ANNOUNCE_BATCH_LIMIT = 200
 
 type IdRow = { id: string }
 
@@ -29,22 +29,22 @@ type IdRow = { id: string }
 export type NeedsAttentionDb = {
   wmsOrderPushLink: {
     count(args: { where: unknown }): Promise<number>
-    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take: number }): Promise<IdRow[]>
+    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take?: number }): Promise<IdRow[]>
   }
   shoppingSyncLog: {
-    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take: number }): Promise<IdRow[]>
+    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take?: number }): Promise<IdRow[]>
   }
   accountingSyncLog: {
     count(args: { where: unknown }): Promise<number>
-    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take: number }): Promise<IdRow[]>
+    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take?: number }): Promise<IdRow[]>
   }
   wmsInboundReceiptEvent: {
     count(args: { where: unknown }): Promise<number>
-    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take: number }): Promise<IdRow[]>
+    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take?: number }): Promise<IdRow[]>
   }
   wmsStockDiscrepancy: {
     count(args: { where: unknown }): Promise<number>
-    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take: number }): Promise<IdRow[]>
+    findMany(args: { where: unknown; select: { id: true }; orderBy: { id: 'asc' }; take?: number }): Promise<IdRow[]>
   }
 }
 
@@ -73,39 +73,62 @@ export async function countNonInboxCategories(deps: SourceDeps): Promise<{
 
 export type AnnouncedCategoryKey = 'wmsPushBlocked' | 'refundParks' | 'failedAccounting' | 'receiptReviews' | 'stockDiscrepancies'
 
-/** Stable ids of the rows currently open in a category (oldest id first, capped). */
-export async function sampleOpenIds(
-  deps: SourceDeps,
-  key: AnnouncedCategoryKey,
-  limit = ANNOUNCE_SAMPLE_LIMIT,
-): Promise<string[]> {
+type IdQuery = { where: object; run: (extra: object, take?: number) => Promise<IdRow[]> } | null
+
+/** The "open" predicate and reader for one category, or null when the category has no open set right now. */
+async function openQuery(deps: SourceDeps, key: AnnouncedCategoryKey): Promise<IdQuery> {
   const select = { id: true } as const
   const orderBy = { id: 'asc' } as const
-  let rows: IdRow[]
+  const make = (
+    where: object,
+    read: (args: { where: unknown; select: typeof select; orderBy: typeof orderBy; take?: number }) => Promise<IdRow[]>,
+  ): IdQuery => ({
+    where,
+    run: (extra, take) => read({ where: { AND: [where, extra] }, select, orderBy, ...(take === undefined ? {} : { take }) }),
+  })
   switch (key) {
     case 'wmsPushBlocked':
-      rows = await deps.db.wmsOrderPushLink.findMany({ where: WMS_PUSH_INBOX_WHERE, select, orderBy, take: limit })
-      break
+      return make(WMS_PUSH_INBOX_WHERE, (a) => deps.db.wmsOrderPushLink.findMany(a))
     case 'refundParks':
-      rows = await deps.db.shoppingSyncLog.findMany({ where: activeRefundParkWhere(), select, orderBy, take: limit })
-      break
+      return make(activeRefundParkWhere(), (a) => deps.db.shoppingSyncLog.findMany(a))
     case 'failedAccounting': {
       const connector = await deps.activeAccountingConnector()
-      rows = connector
-        ? await deps.db.accountingSyncLog.findMany({ where: { connector, status: 'FAILED' }, select, orderBy, take: limit })
-        : []
-      break
+      return connector ? make({ connector, status: 'FAILED' }, (a) => deps.db.accountingSyncLog.findMany(a)) : null
     }
     case 'receiptReviews': {
       const wms = await deps.activeWmsConnector()
-      rows = wms ? await deps.db.wmsInboundReceiptEvent.findMany({ where: receiptReviewWhere(wms), select, orderBy, take: limit }) : []
-      break
+      return wms ? make(receiptReviewWhere(wms), (a) => deps.db.wmsInboundReceiptEvent.findMany(a)) : null
     }
     case 'stockDiscrepancies': {
       const wms = await deps.activeWmsConnector()
-      rows = wms ? await deps.db.wmsStockDiscrepancy.findMany({ where: stockDiscrepancyWhere(wms), select, orderBy, take: limit }) : []
-      break
+      return wms ? make(stockDiscrepancyWhere(wms), (a) => deps.db.wmsStockDiscrepancy.findMany(a)) : null
     }
   }
-  return rows.map((row) => row.id)
+}
+
+/**
+ * Which of the already-announced ids are STILL open. Everything announced that is not in this list
+ * has cleared, so a later recurrence of the same row is a new transition.
+ */
+export async function stillOpenAmong(deps: SourceDeps, key: AnnouncedCategoryKey, announced: string[]): Promise<string[]> {
+  if (announced.length === 0) return []
+  const query = await openQuery(deps, key)
+  if (!query) return []
+  return (await query.run({ id: { in: announced } })).map((row) => row.id)
+}
+
+/**
+ * Open rows that have NOT been announced, oldest id first, at most `limit`. The exclusion is done in
+ * the database, so rows beyond any earlier batch are reached on the next pass rather than never.
+ */
+export async function nextUnannounced(
+  deps: SourceDeps,
+  key: AnnouncedCategoryKey,
+  announced: string[],
+  limit = ANNOUNCE_BATCH_LIMIT,
+): Promise<string[]> {
+  const query = await openQuery(deps, key)
+  if (!query) return []
+  const extra = announced.length > 0 ? { id: { notIn: announced } } : {}
+  return (await query.run(extra, limit)).map((row) => row.id)
 }

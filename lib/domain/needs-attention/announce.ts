@@ -1,88 +1,108 @@
-import { hasPermission, type Permission, ROLES } from '@/lib/permissions'
+import { hasPermission, type Permission } from '@/lib/permissions'
 import { NEEDS_ATTENTION_CATEGORIES } from './categories'
-import { sampleOpenIds, type AnnouncedCategoryKey, type SourceDeps } from './sources'
+import {
+  ANNOUNCE_BATCH_LIMIT,
+  nextUnannounced,
+  stillOpenAmong,
+  type AnnouncedCategoryKey,
+  type SourceDeps,
+} from './sources'
 
 /**
- * Bell notifications for the failure categories that did not notify before. The rule is ONE
- * notification per category per run, and only when a row appears that has not been announced:
+ * Bell notifications for the failure categories that did not notify before. One notification per
+ * category per pass, only for rows that have not been announced.
  *
- *   - the announced ids for a category live in one Setting row (`needs_attention_announced:<key>`),
- *     the same Setting-claim convention the dispatch sweep uses for its per-day drift incident;
- *   - a row that stays open is never announced twice (it is in the stored set);
- *   - a row that clears drops out of the stored set, so the SAME row failing again later is a new
- *     transition and is announced again;
- *   - the claim is a compare-and-set on the stored value, so two concurrent runs (two bell polls,
- *     two app instances) cannot both announce the same rows.
+ * STATE. One Setting row per category (`needs_attention_announced:<key>`, the Setting-claim
+ * convention the dispatch sweep uses) holds the ids already announced. It is a SET rather than a
+ * high-water mark because no source here has a monotonic "became failed" timestamp: a FAILED
+ * accounting row, a blocked push link or a paused receipt is an EXISTING row that changes state, so
+ * its id or createdAt is never newer than a mark when it fails again. The set handles that directly:
+ * an id that is no longer open is dropped from it, so the same row failing again is announced again.
  *
- * NOT covered here, deliberately, because they already bell at the moment of the transition:
- * dispatch-sweep dead letters / quarantines / withdrawal holds (lib/domain/wms/dispatch-sweep.ts)
- * and the order-reconcile and watchdog sweeps. Re-announcing them would double-notify.
+ * COVERAGE. Unannounced rows are found by excluding the set IN THE DATABASE (`id NOT IN announced`),
+ * a batch at a time, so rows beyond one batch are announced on the following passes rather than never.
+ * The set is capped; at the cap no further rows are recorded (logged), which bounds the stored value.
+ *
+ * ATOMICITY. The claim (compare-and-set of the set) and the notification rows are written in ONE
+ * transaction, with the recipients read inside it. Any failure rolls the claim back, so nothing is
+ * marked announced unless EVERY recipient's row was written, and the next pass retries all of them.
+ * Two concurrent passes cannot both win the compare-and-set.
+ *
+ * NOT covered here, deliberately, because they already bell at the transition: dispatch-sweep dead
+ * letters / quarantines / withdrawal holds, the order-reconcile and watchdog sweeps, and the systemic
+ * failure incidents.
  */
 export const ANNOUNCED_KEY_PREFIX = 'needs_attention_announced:'
-/** The stored set can never grow past this: it holds only ids currently open, and sampling is capped below it. */
-export const ANNOUNCED_SET_CAP = 400
+/** Upper bound on the stored set (about 125 KB of cuids). */
+export const ANNOUNCED_SET_CAP = 5000
 
 type AnnounceSpec = {
   key: AnnouncedCategoryKey
   title: string
-  message: (fresh: number, open: number) => string
+  /** `count` is the number of newly seen rows; `atLeast` is true when the batch limit hid more. */
+  message: (count: string) => string
   actionUrl: string
 }
 
-const plural = (n: number, one: string, many: string) => (n === 1 ? one : many)
+const n = (count: string, one: string, many: string) => (count === '1' ? one : many)
 
 export const ANNOUNCE_SPECS: readonly AnnounceSpec[] = [
   {
     key: 'wmsPushBlocked',
     title: 'Warehouse order push blocked',
-    message: (fresh, open) => `${fresh} ${plural(fresh, 'order has', 'orders have')} not reached the warehouse and will not fulfil until resolved (${open} open).`,
+    message: (c) => `${c} ${n(c, 'order has', 'orders have')} not reached the warehouse and will not fulfil until resolved.`,
     actionUrl: '/sync/exceptions#wms-push-blocked',
   },
   {
     key: 'refundParks',
     title: 'WooCommerce refund parked',
-    message: (fresh, open) => `${fresh} ${plural(fresh, 'refund was', 'refunds were')} parked because IMS could not apply ${plural(fresh, 'it', 'them')} (${open} open).`,
+    message: (c) => `${c} ${n(c, 'refund was', 'refunds were')} parked because IMS could not apply ${n(c, 'it', 'them')}.`,
     actionUrl: '/sync/exceptions#refund-parks',
   },
   {
     key: 'failedAccounting',
     title: 'Accounting sync failed',
-    message: (fresh, open) => `${fresh} accounting sync ${plural(fresh, 'row', 'rows')} failed after retries (${open} open). Nothing re-drives them on its own.`,
+    message: (c) => `${c} accounting sync ${n(c, 'row', 'rows')} failed after retries. Nothing re-drives them on its own.`,
     actionUrl: '/sync',
   },
   {
     key: 'receiptReviews',
     title: 'Warehouse receipt paused for review',
-    message: (fresh, open) => `${fresh} booked-in ${plural(fresh, 'callback is', 'callbacks are')} paused before stock updates (${open} open).`,
+    message: (c) => `${c} booked-in ${n(c, 'callback is', 'callbacks are')} paused before stock updates.`,
     actionUrl: '/sync',
   },
   {
     key: 'stockDiscrepancies',
     title: 'Stock discrepancy opened',
-    message: (fresh, open) => `${fresh} new warehouse stock ${plural(fresh, 'discrepancy', 'discrepancies')} (${open} open).`,
+    message: (c) => `${c} new warehouse stock ${n(c, 'discrepancy', 'discrepancies')}.`,
     actionUrl: '/sync',
   },
 ]
 
-type SettingRow = { value: string }
-
-/** The slice of the Prisma client the announcer uses. */
-export type AnnounceDb = {
+/** What one announcement transaction can do; the Prisma transaction client satisfies it. */
+export type AnnounceTx = {
   setting: {
-    findUnique(args: { where: { key: string } }): Promise<SettingRow | null>
     createMany(args: { data: Array<{ key: string; value: string }>; skipDuplicates: true }): Promise<{ count: number }>
     updateMany(args: { where: { key: string; value: string }; data: { value: string } }): Promise<{ count: number }>
   }
   user: {
     findMany(args: { where: { active: true }; select: { id: true; role: true } }): Promise<Array<{ id: string; role: string }>>
   }
+  notification: {
+    createMany(args: {
+      data: Array<{ userId: string; type: 'warning'; title: string; message: string; actionUrl: string }>
+    }): Promise<{ count: number }>
+  }
 }
 
-export type AnnounceDeps = SourceDeps & {
-  db: SourceDeps['db'] & AnnounceDb
-  /** Returns whether the notification actually reached the database. */
-  notify: (params: { userId: string; type: 'warning'; title: string; message: string; actionUrl: string }) => Promise<boolean>
+export type AnnounceDb = {
+  setting: AnnounceTx['setting'] & {
+    findUnique(args: { where: { key: string } }): Promise<{ value: string } | null>
+  }
+  $transaction<T>(fn: (tx: AnnounceTx) => Promise<T>): Promise<T>
 }
+
+export type AnnounceDeps = SourceDeps & { db: SourceDeps['db'] & AnnounceDb }
 
 function parseAnnounced(raw: string | null | undefined): string[] {
   if (!raw) return []
@@ -103,7 +123,7 @@ function permissionFor(key: AnnouncedCategoryKey): Permission {
 export type AnnounceResult = {
   /** Categories that produced a notification this run. */
   announced: AnnouncedCategoryKey[]
-  /** Categories whose read or write failed; they are retried next run (nothing was claimed). */
+  /** Categories whose read or write failed; nothing was claimed, so they are retried next run. */
   failed: AnnouncedCategoryKey[]
 }
 
@@ -121,18 +141,17 @@ export async function announceNeedsAttention(deps: AnnounceDeps): Promise<Announ
 }
 
 async function announceOne(deps: AnnounceDeps, spec: AnnounceSpec): Promise<boolean> {
-  const ids = await sampleOpenIds(deps, spec.key)
   const settingKey = `${ANNOUNCED_KEY_PREFIX}${spec.key}`
   const row = await deps.db.setting.findUnique({ where: { key: settingKey } })
   const previousRaw = row?.value ?? null
   const announced = parseAnnounced(previousRaw)
-  const open = new Set(ids)
-  const announcedSet = new Set(announced)
-  const fresh = ids.filter((id) => !announcedSet.has(id))
-  // Rows that cleared are forgotten, so a recurrence is a new transition.
-  const kept = announced.filter((id) => open.has(id))
 
-  const nextRaw = JSON.stringify([...kept, ...fresh].slice(-ANNOUNCED_SET_CAP))
+  // Rows that cleared are forgotten, so a recurrence is a new transition.
+  const kept = await stillOpenAmong(deps, spec.key, announced)
+  const room = Math.max(0, ANNOUNCED_SET_CAP - kept.length)
+  if (room === 0 && kept.length > 0) console.error(`[needs-attention] ${spec.key}: announced set is at its cap (${ANNOUNCED_SET_CAP}); new rows are not recorded`)
+  const fresh = room > 0 ? await nextUnannounced(deps, spec.key, kept, Math.min(ANNOUNCE_BATCH_LIMIT, room)) : []
+  const nextRaw = JSON.stringify([...kept, ...fresh])
 
   if (fresh.length === 0) {
     // Housekeeping only: persist the pruned set. Losing this race is harmless.
@@ -142,26 +161,33 @@ async function announceOne(deps: AnnounceDeps, spec: AnnounceSpec): Promise<bool
     return false
   }
 
-  const won = previousRaw === null
-    ? (await deps.db.setting.createMany({ data: [{ key: settingKey, value: nextRaw }], skipDuplicates: true })).count === 1
-    : (await deps.db.setting.updateMany({ where: { key: settingKey, value: previousRaw }, data: { value: nextRaw } })).count === 1
-  if (!won) return false
-
-  // The claim is provisional until at least one recipient really has the notification.
   const permission = permissionFor(spec.key)
-  const users = await deps.db.user.findMany({ where: { active: true }, select: { id: true, role: true } })
-  const recipients = users.filter((u) => (ROLES as string[]).includes(u.role) && hasPermission(u.role, permission))
-  const message = spec.message(fresh.length, ids.length)
-  const delivered = await Promise.all(recipients.map((u) => deps.notify({
-    userId: u.id,
-    type: 'warning',
-    title: spec.title,
-    message,
-    actionUrl: spec.actionUrl,
-  })))
-  if (delivered.some(Boolean)) return true
+  const count = `${fresh.length}${fresh.length >= ANNOUNCE_BATCH_LIMIT ? '+' : ''}`
+  const message = spec.message(count)
 
-  // Nobody was told (no eligible recipient, or every insert failed): release the claim so the next run tries again.
-  await deps.db.setting.updateMany({ where: { key: settingKey, value: nextRaw }, data: { value: previousRaw ?? '[]' } })
-  return false
+  return deps.db.$transaction(async (tx) => {
+    // Recipients are read inside the transaction. None means nothing can be told: write nothing, so
+    // the rows stay unannounced until someone eligible exists.
+    const users = await tx.user.findMany({ where: { active: true }, select: { id: true, role: true } })
+    const recipients = users.filter((u) => hasPermission(u.role, permission))
+    if (recipients.length === 0) return false
+
+    const won = previousRaw === null
+      ? (await tx.setting.createMany({ data: [{ key: settingKey, value: nextRaw }], skipDuplicates: true })).count === 1
+      : (await tx.setting.updateMany({ where: { key: settingKey, value: previousRaw }, data: { value: nextRaw } })).count === 1
+    if (!won) return false
+
+    // One statement for every recipient, in the same transaction as the claim: if it throws, the
+    // claim is rolled back with it and the next pass retries all of them.
+    await tx.notification.createMany({
+      data: recipients.map((u) => ({
+        userId: u.id,
+        type: 'warning' as const,
+        title: spec.title,
+        message,
+        actionUrl: spec.actionUrl,
+      })),
+    })
+    return true
+  })
 }
