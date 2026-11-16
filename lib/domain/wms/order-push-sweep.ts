@@ -1327,6 +1327,10 @@ export async function runWmsOrderPushSweepCore(
     return ok
   }
 
+  /** The link write that promotes a verified link to SYNCED carries the courier due-marker whenever the link is courier-pending. */
+  const courierDueOnPromotion = (link: { courierPending: boolean; shippingService: string | null }): { courierTaskService?: string } =>
+    link.courierPending ? { courierTaskService: link.shippingService ?? '—' } : {}
+
   /**
    * A PARTIAL removal (only some of the recorded lines are gone), or one whose lines could not be read, keeps the link OPEN: the obligation
    * moves to needs_check (the cancel pass then neither closes the link nor retries the removal over it) and ONE operator task is raised,
@@ -3061,7 +3065,7 @@ export async function runWmsOrderPushSweepCore(
             ? (approved
               ? { state: 'CANCELLED', cancelledAt: new Date(), lastError: null, reconcileCheckedAt: null }
               : { state: 'HELD', cancelledAt: cancelConfirmed ? new Date() : null, lastError: null, reconcileCheckedAt: null })
-            : { state: 'SYNCED', lastError: 'Verified ours, but the customer has withdrawn this order and it could not be cancelled — cancel it in the WMS by hand' })
+            : { state: 'SYNCED', lastError: 'Verified ours, but the customer has withdrawn this order and it could not be cancelled — cancel it in the WMS by hand', ...courierDueOnPromotion(link) })
           if (pulled) { if (approved) result.cancelled += 1; else result.held += 1 } else result.failed += 1
           await audit({
             action: approved ? 'order_cancel' : 'order_hold', outcome: pulled ? 'SUCCEEDED' : 'FAILED',
@@ -3073,7 +3077,9 @@ export async function runWmsOrderPushSweepCore(
           })
           continue
         }
-        await port.updateLink(link.id, { state: 'SYNCED', lastError: null })
+        // The courier task is DUE from the moment the link is SYNCED: the marker is written in the SAME write as the promotion, so a failed insert below
+        // is retried by the courier pass of a later sweep (the same rule as create).
+        await port.updateLink(link.id, { state: 'SYNCED', lastError: null, ...courierDueOnPromotion(link) })
         result.verified += 1
         // The courier-pending task was held back until the id was proven.
         if (link.courierPending) {

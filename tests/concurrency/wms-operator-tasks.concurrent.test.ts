@@ -314,3 +314,26 @@ test('a refund of a pushed order records its task INSIDE the refund transaction:
   assert.equal(await w.db.wmsOperatorTask.count({ where: { orderId: so.id } }), 1)
   assert.equal(await w.db.salesOrderRefund.count({ where: { orderId: so.id } }), 1)
 })
+
+test('a courier-pending link still PENDING_VERIFY (from before this change) whose task insert fails on promotion keeps the task DUE; a later sweep records exactly one', SKIP, async (t) => {
+  const w = await world()
+  const sweep = await import('@/lib/domain/wms/order-push-sweep')
+  const id = await order(w, 'pv')
+  await w.db.salesOrder.update({ where: { id }, data: { status: 'PROCESSING', shippingService: 'Royal Mail' } })
+  t.after(async () => { await w.db.salesOrder.deleteMany({ where: { id } }) })
+  const link = await w.db.wmsOrderPushLink.create({ data: { orderId: id, connector: 'mintsoft', state: 'PENDING_VERIFY', externalOrderId: 'wms-v', externalOrderNumber: 'MS-V', courierPending: true, pushedAt: new Date() } })
+  const connector = { ...sweepConnector(), verifyPushedOrder: async () => 'ours' as const }
+  const failing = sweep.createPrismaWmsOrderPushPort()
+  failing.raiseOperatorTask = async () => { throw new Error('database unavailable') }
+  const first = await quiet(() => sweep.runWmsOrderPushSweepCore(connector as never, 'mintsoft', failing, { batchSize: 50 }))
+  assert.equal(first.verified, 1)
+  const promoted = await w.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })
+  assert.equal(promoted.state, 'SYNCED')
+  assert.equal(promoted.courierTaskService, 'Royal Mail', 'the due-marker was written in the SAME write as the promotion')
+  assert.equal(await w.db.wmsOperatorTask.count({ where: { orderId: id } }), 0)
+  await quiet(() => sweep.runWmsOrderPushSweepCore(connector as never, 'mintsoft', sweep.createPrismaWmsOrderPushPort(), { batchSize: 50 }))
+  await quiet(() => sweep.runWmsOrderPushSweepCore(connector as never, 'mintsoft', sweep.createPrismaWmsOrderPushPort(), { batchSize: 50 }))
+  const tasks = await w.db.wmsOperatorTask.findMany({ where: { orderId: id } })
+  assert.deepEqual(tasks.map((x) => x.reason), ['COURIER_FALLBACK'])
+  assert.equal((await w.db.wmsOrderPushLink.findUniqueOrThrow({ where: { id: link.id } })).courierTaskService, null)
+})

@@ -32,12 +32,13 @@ ALTER TABLE "wms_operator_tasks" ADD CONSTRAINT "wms_operator_tasks_order_id_fke
 -- fallback (so a failed task insert is retried by a later sweep whether or not the order is amended), cleared once the task is recorded. Nullable column: additive.
 ALTER TABLE "wms_order_push_links" ADD COLUMN "courier_task_service" TEXT;
 
--- Backfill (idempotent: it only sets a marker, and a task is deduplicated): every live link still flagged courierPending is an outstanding courier
--- fallback whose old warehouse note was never read. The first sweep turns each into one task.
+-- Backfill (idempotent: it only sets a marker, and a task is deduplicated): every link still flagged courierPending is an outstanding courier
+-- fallback whose old warehouse note was never read (a PENDING_VERIFY one too: it is raised once the link is promoted, and the promotion writes the marker
+-- itself). The courier pass turns each live one into one task.
 UPDATE "wms_order_push_links" AS l
 SET "courier_task_service" = COALESCE(o."shippingService", '—')
 FROM "sales_orders" AS o
-WHERE o."id" = l."orderId" AND l."state" = 'SYNCED' AND l."courierPending" = true AND l."courier_task_service" IS NULL;
+WHERE o."id" = l."orderId" AND l."state" IN ('SYNCED', 'PENDING_VERIFY') AND l."courierPending" = true AND l."courier_task_service" IS NULL;
 
 -- Backfill: an OUTSTANDING hold or cancel notice is one on a live link (SYNCED or MERGED) that is still set (the sweep clears a notice once the order leaves
 -- the held or cancelled state, and only still-applicable notices are selected). Its "comment delivered" stamp recorded an old comment the warehouse never read,

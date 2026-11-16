@@ -1647,6 +1647,7 @@ test('[o3d-bjc.8] the courier-fallback task waits until the id is proven ours', 
     'mintsoft', promoted.port, { now: NOW },
   )
   const afterVerify = promoted.tasks
+  assert.equal(promoted.updates.find((u) => u.data.state === 'SYNCED')?.data.courierTaskService, 'Royal Mail', 'the due-marker is written in the promotion write itself')
   assert.equal(afterVerify.length, 1)
   const note = afterVerify[0]!
   assert.equal(note.reason, 'COURIER_FALLBACK')
