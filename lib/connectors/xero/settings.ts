@@ -43,6 +43,13 @@ export type XeroSettings = {
   xero_manufacturing_overhead_account: string
   xero_daily_batch_enabled: string
   xero_payment_polling_enabled: string
+  /**
+   * Last LOCKED day in Xero (`YYYY-MM-DD`), IMPORTED from the Organisation endpoint (books-lock-date.ts); empty = none
+   * read or none set. Read-only: deliberately not in XERO_SETTING_KEYS, so the settings save cannot write it.
+   */
+  xero_books_lock_date: string
+  /** ISO instant the lock date was last read from Xero; empty = never read. */
+  xero_books_lock_date_read_at: string
 }
 
 export const XERO_SETTING_KEYS = [
@@ -66,6 +73,9 @@ export const XERO_SETTING_KEYS = [
   'xero_manufacturing_overhead_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
 ]
+
+/** Imported from Xero, never saved from the settings form: read by getXeroSettings, absent from the save allowlist above. */
+export const XERO_IMPORTED_SETTING_KEYS = ['xero_books_lock_date', 'xero_books_lock_date_read_at'] as const
 
 const XERO_DEFAULTS: XeroSettings = {
   xero_client_id: '',
@@ -105,10 +115,12 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_manufacturing_overhead_account: '',
   xero_daily_batch_enabled: 'false',
   xero_payment_polling_enabled: 'false',
+  xero_books_lock_date: '',
+  xero_books_lock_date_read_at: '',
 }
 
 export async function getXeroSettings(): Promise<XeroSettings> {
-  const map = await getSettingValues(XERO_SETTING_KEYS)
+  const map = await getSettingValues([...XERO_SETTING_KEYS, ...XERO_IMPORTED_SETTING_KEYS])
   const result = { ...XERO_DEFAULTS }
   for (const k of Object.keys(result) as (keyof XeroSettings)[]) {
     const v = map.get(k)
