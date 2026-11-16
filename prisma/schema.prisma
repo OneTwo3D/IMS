@@ -3928,6 +3928,10 @@ model WmsOrderStatusSnapshot {
   carrier             String?
   fetchedAt           DateTime @default(now())
   lastError           String?
+  /// The connector's own "the goods have left the warehouse" decision for the status read that wrote this row
+  /// (vendor status grouping or a despatch date, not just the status name). Null = not recorded (rows from before
+  /// the column existed, or a read that did not resolve). Consumers must treat null as "unknown", never as false.
+  dispatched          Boolean?
   // Last WMS status successfully pushed to the storefront (G4). Decoupled from `status`
   // so a failed storefront push isn't masked by the cached-status change gate — it retries.
   wcPushedStatus      String?

@@ -21,20 +21,25 @@ import { MINTSOFT_DISPATCHED_STATUSES } from '@/lib/connectors/mintsoft/api/orde
  * Orders the warehouse has not despatched are NOT counted: their units are still on Mintsoft's shelves, so a
  * lower Mintsoft balance is not explained by them and the other gates still apply.
  *
- * STALE OR MISSING MEANS HOLD (Codex R1 HIGH). The cached status only proves "not despatched" while it is
- * FRESH. A live allocation on a pushed, unshipped order is therefore held for unless its snapshot is fresh and
- * not despatched. Fresh = fetched at or after the stock reading being acted on (`runStartedAt`), or within
- * `SNAPSHOT_FRESH_WINDOW_MINUTES` of the decision. The window is 45 minutes: the `wms-order-status` cron runs
- * every 15 minutes but only re-reads a snapshot older than the sweep's 30-minute stale threshold
- * (order-status-sweep.ts DEFAULT_STALE_MINUTES), so a healthy snapshot is at most 30 + 15 minutes old. No live
- * Mintsoft read is made here (reads are rate limited); a missing snapshot (cron off, order not yet swept)
+ * A STATUS READ MUST POST-DATE THE STOCK READ (o3d-hqvrp.368, Codex R3 HIGH). A "not despatched" status proves nothing about
+ * a stock figure read AFTER it: the order can despatch in between (false at 10:00, despatch 10:05, stock read 10:06), and
+ * then the lower Mintsoft balance IS the despatched units. So an allocation is released only when its snapshot was fetched
+ * strictly after `stockReadAt`, the moment the Mintsoft stock being aligned was read; an older (or equal) read holds as
+ * `status_predates_stock_read`. Holding is the safe default: the next status-sweep cycle re-reads the order and a later
+ * align-down run re-evaluates. Both the planning check and the in-transaction re-check pass the same `stockReadAt`.
+ *
+ * A FAILED REFRESH IS NOT A READ. The status sweep stamps `fetchedAt = now` and `lastError` on a failed lookup but keeps
+ * the old `status`, so `lastError` set means `fetchedAt` is a failure time and the cached status is held against.
+ *
+ * THE CONNECTOR'S DECISION, NOT THE NAME. The sweep persists the connector's `dispatched` decision (vendor status
+ * grouping or a despatch date, which a name set cannot see; for a split order an aggregate over every part) with each
+ * successful snapshot. Release needs a successful read, after the stock read, with `dispatched === false`; true, null
+ * (absent or unresolved), a predating read and a failed read all hold. The planning check and the in-transaction
+ * re-check both go through this function.
+ *
+ * No live Mintsoft read is made here (reads are rate limited); a missing snapshot (cron off, order not yet swept)
  * holds. Hold-only: this can only ever delay an align-down, never apply one.
  */
-
-/** DEFAULT_STALE_MINUTES (30) + the cron interval (15): the oldest a snapshot can be while the sweep is healthy. */
-export const SNAPSHOT_FRESH_WINDOW_MINUTES = 45
-
-
 
 /** IMS order statuses past which the shipment has been recorded (or the order is gone). */
 const RECORDED_ORDER_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
@@ -45,12 +50,12 @@ export type InFlightDispatchHold = {
   orderId: string
   orderNumber: string
   qty: number
-  reason: 'despatched_at_wms' | 'despatch_state_unknown' | 'status_lookup_failed' | 'status_snapshot_missing' | 'status_snapshot_stale'
+  reason: 'despatched_at_wms' | 'despatch_state_unknown' | 'status_lookup_failed' | 'status_snapshot_missing' | 'status_predates_stock_read' | 'status_dispatch_unknown'
 }
 
 export async function loadInFlightDispatch(
   client: InFlightClient,
-  input: { productId: string; warehouseId: string; connector?: string; now: Date; runStartedAt: Date },
+  input: { productId: string; warehouseId: string; connector?: string; stockReadAt: Date },
 ): Promise<{ qty: number; holds: InFlightDispatchHold[] }> {
   const connector = input.connector ?? 'mintsoft'
   const rows = await client.orderAllocation.findMany({
@@ -74,24 +79,22 @@ export async function loadInFlightDispatch(
         select: {
           id: true,
           orderNumber: true,
-          wmsOrderStatus: { select: { status: true, fetchedAt: true, lastError: true } },
+          wmsOrderStatus: { select: { status: true, dispatched: true, fetchedAt: true, lastError: true } },
           wmsOrderPush: { select: { dispatchDeadLetteredAt: true, dispatchUnresolvedAt: true } },
         },
       },
     },
   })
 
-  const freshCutoff = Math.min(
-    input.runStartedAt.getTime(),
-    input.now.getTime() - SNAPSHOT_FRESH_WINDOW_MINUTES * 60_000,
-  )
   let total = toDecimal(0)
   const holds: InFlightDispatchHold[] = []
   for (const row of rows) {
     const snapshot = row.order.wmsOrderStatus
     const cachedStatus = snapshot?.status?.trim().toUpperCase() ?? ''
     let reason: InFlightDispatchHold['reason'] | null = null
-    if (MINTSOFT_DISPATCHED_STATUSES.has(cachedStatus)) reason = 'despatched_at_wms'
+    // The connector's persisted decision outranks the name set (vendor grouping or a despatch date can say
+    // "despatched" for a name the set does not know). The name set stays as a second hold-only signal.
+    if (snapshot?.dispatched === true || MINTSOFT_DISPATCHED_STATUSES.has(cachedStatus)) reason = 'despatched_at_wms'
     else if (row.order.wmsOrderPush?.dispatchDeadLetteredAt != null || row.order.wmsOrderPush?.dispatchUnresolvedAt != null) reason = 'despatch_state_unknown'
     // A FAILED REFRESH IS NOT A FRESH READ (Codex R2 HIGH). When a lookup throws, or cannot resolve the
     // order, the status sweep writes `fetchedAt = now` and `lastError` but KEEPS the old `status`
@@ -101,13 +104,47 @@ export async function loadInFlightDispatch(
     // against, however recent that stamp is. When `lastError` is null `fetchedAt` is the successful read.
     else if (snapshot?.lastError != null) reason = 'status_lookup_failed'
     else if (!snapshot || cachedStatus === '') reason = 'status_snapshot_missing'
-    else if (snapshot.fetchedAt.getTime() < freshCutoff) reason = 'status_snapshot_stale'
+    else if (snapshot.fetchedAt.getTime() <= input.stockReadAt.getTime()) reason = 'status_predates_stock_read'
+    // An explicit `false` is the only release. Null is a row from before the column existed or a read that
+    // recorded no decision: the connector never said "not despatched", so it holds.
+    else if (snapshot.dispatched !== false) reason = 'status_dispatch_unknown'
     if (reason) {
       total = addMoney(total, row.qty)
       holds.push({ orderId: row.order.id, orderNumber: row.order.orderNumber ?? row.order.id, qty: toDecimal(row.qty).toNumber(), reason })
     }
   }
   return { qty: total.toNumber(), holds }
+}
+
+/** Orders whose status the align-down path may re-read per stock-sync run. Beyond it they stay held; a later run picks them up. */
+export const IN_FLIGHT_STATUS_REFRESH_CAP_PER_RUN = 25
+
+/**
+ * `loadInFlightDispatch`, but an allocation held only because its status read predates the stock read gets ONE fresh
+ * status read first (o3d-hqvrp.368). The status sweep refreshes a snapshot only when it is 30+ minutes old, so without this
+ * a snapshot is almost never newer than the current run's stock read and align-down would never release for a product with a
+ * live allocation. `refresh` re-reads and persists the snapshots (read-only against the WMS); the gate then runs again, and a
+ * refreshed snapshot, being fetched after `stockReadAt`, releases only on a genuine explicit `false`. `budget.remaining` is
+ * shared across the run and capped; an order beyond it, a refresh that fails or throws, or one that reads despatched or
+ * unknown all leave the hold in place. Only the planning check refreshes: the in-transaction re-check stays a pure read.
+ */
+export async function loadInFlightDispatchRefreshing(
+  client: InFlightClient,
+  input: Parameters<typeof loadInFlightDispatch>[1],
+  refresh: (orderIds: string[]) => Promise<unknown>,
+  budget: { remaining: number },
+): Promise<Awaited<ReturnType<typeof loadInFlightDispatch>>> {
+  const first = await loadInFlightDispatch(client, input)
+  const stale = [...new Set(first.holds.filter((h) => h.reason === 'status_predates_stock_read').map((h) => h.orderId))]
+  const batch = stale.slice(0, Math.max(0, budget.remaining))
+  if (batch.length === 0) return first
+  budget.remaining -= batch.length
+  try {
+    await refresh(batch)
+  } catch {
+    return first
+  }
+  return loadInFlightDispatch(client, input)
 }
 
 export function describeInFlightHolds(holds: readonly InFlightDispatchHold[]): string {
