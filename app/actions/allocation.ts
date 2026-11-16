@@ -694,7 +694,7 @@ export async function updateAllocation(
         productId: locked.productId,
         warehouseId: locked.warehouseId,
         qty: releaseQty,
-      }], 'release')
+      }], 'release', locked.orderId)
 
       // -------------------------------------------------------------------------------------
       // o3d-0i5y r11 (Codex round 11, finding 1) — WHERE GROUP A2'S POSTED RECORD STANDS, READ

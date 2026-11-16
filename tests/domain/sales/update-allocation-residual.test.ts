@@ -490,7 +490,7 @@ const tx = {
         shipment: { warehouseId: line.warehouseId, status: line.status },
       })),
   },
-  setting: { upsert: async () => ({}) }, // the covered-history boundary invalidation on every release
+  shoppingOrderLink: { findFirst: async () => null }, // a release looks up the WooCommerce link to record the order for the stock guard
   stockLevel: {
     // TWO real shapes: `updateAllocation` filters one product across warehouses
     // (`productId: string`), `addAllocation` filters every expanded leaf

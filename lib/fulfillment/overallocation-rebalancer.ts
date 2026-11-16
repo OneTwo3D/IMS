@@ -1,4 +1,4 @@
-import { invalidateWcCoveredHistoryBoundary } from '@/lib/connectors/woocommerce/sync/stock-boundary-invalidation'
+import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -295,9 +295,8 @@ export async function releaseOverallocations(
             where: { productId: item.productId, warehouseId: item.warehouseId },
             data: { reservedQty: { decrement: release } },
           })
-          // An allocation reduced is a release the WooCommerce covered-history boundary may rest on: invalidate it in this transaction, after the
-          // stock row is locked (same lock order as applyAllocationReservationDelta).
-          await invalidateWcCoveredHistoryBoundary(tx)
+          // An allocation reduced is a release the WooCommerce stock guard must re-check this order for (same transaction).
+          await markWcOrderDirtyForStockGuard(tx, alloc.orderId)
 
           const remainingForOrder = await tx.orderAllocation.count({ where: { orderId: alloc.orderId } })
           if (remainingForOrder === 0 && alloc.order.status === 'ALLOCATED') {

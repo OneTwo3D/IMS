@@ -522,7 +522,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
           })),
         })),
     },
-    setting: { upsert: async () => ({}) }, // the covered-history boundary invalidation on every release
+    shoppingOrderLink: { findFirst: async () => null }, // a release looks up the WooCommerce link to record the order for the stock guard
     stockLevel: {
       findMany: async ({ where }: { where: { OR?: Array<{ productId: string; warehouseId: string }>; productId?: { in: string[] }; warehouseId?: { in: string[] } } }) => {
         if (where.OR) {

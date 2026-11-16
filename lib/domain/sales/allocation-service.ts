@@ -1,4 +1,4 @@
-import { invalidateWcCoveredHistoryBoundary } from '@/lib/connectors/woocommerce/sync/stock-boundary-invalidation'
+import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { randomUUID } from 'node:crypto'
 
@@ -1994,7 +1994,7 @@ export async function releaseOrderAllocationsInTx(
       select: { productId: true, warehouseId: true, reservedQty: true },
     })
     : []
-  await applyAllocationReservationDelta(tx, releasedRows, 'release')
+  await applyAllocationReservationDelta(tx, releasedRows, 'release', orderId)
   const clampedReservations = await tx.stockLevel.updateMany({
     where: { reservedQty: { lt: 0 } },
     data: { reservedQty: 0 },
@@ -2336,7 +2336,7 @@ export async function trimUnshippedAllocationsForRefundTx(
     } else {
       await tx.orderAllocation.update({ where: { id: row.id }, data: { qty: remaining.toFixed(4) } })
     }
-    await applyAllocationReservationDelta(tx, [{ productId: step.productId, warehouseId: step.warehouseId, qty: step.qty }], 'release')
+    await applyAllocationReservationDelta(tx, [{ productId: step.productId, warehouseId: step.warehouseId, qty: step.qty }], 'release', params.orderId)
   }
   const reconciliation = await reconcilePendingShipments(tx, params.orderId, {
     cause: 'a refund releasing the unshipped reservation of its units',
@@ -2352,8 +2352,21 @@ export async function trimUnshippedAllocationsForRefundTx(
 export async function applyAllocationReservationDelta(
   tx: Prisma.TransactionClient,
   rows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
+  direction: 'reserve',
+): Promise<void>
+/** A release names the ORDER it frees, so the WooCommerce stock guard can re-check that order (see markWcOrderDirtyForStockGuard). */
+export async function applyAllocationReservationDelta(
+  tx: Prisma.TransactionClient,
+  rows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
+  direction: 'release',
+  orderId: string,
+): Promise<void>
+export async function applyAllocationReservationDelta(
+  tx: Prisma.TransactionClient,
+  rows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
   direction: 'reserve' | 'release',
-) {
+  orderId?: string,
+): Promise<void> {
   let releasedAny = false
   for (const row of rows) {
     const qty = toDecimal(row.qty)
@@ -2401,10 +2414,9 @@ export async function applyAllocationReservationDelta(
     releasedAny = true
   }
   // Every IMS release of a reservation (order delete, deallocation, cancel, refund trim, manual reduce/move, re-allocation rewrite) goes through
-  // here and enqueues a stock push. Invalidate the WooCommerce covered-history boundary in the SAME transaction, AFTER the stock rows are
-  // locked and decremented (so every releaser takes stock rows first, then the setting row: one lock order). Dispatch does not come through
-  // here (it consumes the reservation via the shipment), so a normal shipment invalidates nothing.
-  if (releasedAny) await invalidateWcCoveredHistoryBoundary(tx)
+  // here and enqueues a stock push: record the order for the WooCommerce stock guard in the SAME transaction. Dispatch does not come through
+  // here (it consumes the reservation via the shipment), so a normal shipment records nothing.
+  if (releasedAny && orderId) await markWcOrderDirtyForStockGuard(tx, orderId)
 }
 
 type ReservationScope = { productId: string; warehouseId: string }
@@ -2582,7 +2594,7 @@ export async function cancelSalesOrderFulfillmentState(
   // Keep the before/after reads bracketing the release: the extra locked-row
   // read is small, and it verifies the actual database delta rather than only
   // trusting the requested decrement shape.
-  await applyAllocationReservationDelta(tx, currentAllocs, 'release')
+  await applyAllocationReservationDelta(tx, currentAllocs, 'release', input.orderId)
   // o3d-0i5y r11: written BEFORE the delete, from the rows as they still stand, so a failure to
   // record the evidence cannot leave the rows gone and the debit undescribed.
   await recordStandingAllocationDebitOnCancel(
@@ -3890,6 +3902,7 @@ export async function allocateSalesOrder(
         tx,
         residualAllocationRows(existingAllocs, dispatchedAllocationLines),
         'release',
+        orderId,
       )
       // o3d-0i5y r4 — THE REWRITE KEEPS THE ROWS IT IS KEEPING.
       //

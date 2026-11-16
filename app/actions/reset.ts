@@ -115,6 +115,8 @@ async function clearTransactionScope(guards: ResetGuards) {
     const resetAt = new Date().toISOString()
     await tx.setting.upsert({ where: { key: WC_ORDER_RESET_MARKER_KEY }, create: { key: WC_ORDER_RESET_MARKER_KEY, value: resetAt }, update: { value: resetAt } })
     await tx.setting.deleteMany({ where: { key: { in: [WC_COMPLETED_HISTORY_COVERED_KEY] } } })
+    // Released-order records point at orders this reset deletes (stock-dirty-orders.ts).
+    await tx.wcStockDirtyOrder.deleteMany({})
     await tx.shipmentLine.deleteMany({})
     await tx.shipment.deleteMany({})
     await tx.orderAllocation.deleteMany({})

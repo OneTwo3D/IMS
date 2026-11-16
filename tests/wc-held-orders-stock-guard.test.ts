@@ -9,8 +9,8 @@ import {
   encodeCoveredHistoryBoundary,
   trustedCoveredHistoryBoundary,
   WC_ORDER_RESET_MARKER_KEY,
-  WC_BOUNDARY_GENERATION_KEY,
   WC_COMPLETED_HISTORY_COVERED_KEY,
+  WC_DIRTY_MAX_PER_RUN,
   WC_HELD_ORDERS_MAX_PAGES,
   WC_HELD_ORDERS_PAGE_SIZE,
   type HeldProductRef,
@@ -368,67 +368,102 @@ test('a stale in-flight boundary write is refused after a reset or a rebind; a f
   assert.equal(await persistCoveredHistoryBoundary(fresh as never, T0 - 5000, '1'), false, 'never moves backwards')
 })
 
-// --- o3d-hqvrp.385: deleting an order / releasing its allocation must void the covered-history boundary ---
+// --- o3d-hqvrp.385: an order whose allocation was released or deleted is re-checked by id; the boundary stays ---
 
-function fakeSettingsTx(rows: Record<string, string>) {
-  return {
-    setting: { upsert: async ({ where, create, update }: { where: { key: string }; create: { value: string }; update: { value: string } }) => { rows[where.key] = where.key in rows ? update.value : create.value; return {} } },
-    stockLevel: { updateMany: async () => ({ count: 1 }) },
-  }
+const heldOrder = (id: number, status: string, ...lines: [number, number, number][]) => ({ ...order(id, ...lines), status })
+
+/** Serves the bounded/unbounded completed walks and `include=` fetches; records what was asked. */
+function dirtyDeps(opts: { dirty?: Record<string, unknown>; includeError?: string; completedBounded?: unknown[]; imported?: Map<string, Map<string, number>>; ceiling?: boolean }) {
+  const asked: Array<Record<string, string>> = []
+  const d = deps({
+    findImportedOrders: async (ids) => new Map([...(opts.imported ?? new Map())].filter(([k]) => ids.includes(k))),
+    fetchOrdersPage: async (params) => {
+      asked.push(params)
+      if ('include' in params) {
+        if (opts.includeError) return { data: null, error: opts.includeError }
+        return { data: params.include.split(',').map((id) => opts.dirty?.[id]).filter(Boolean), totalItems: null }
+      }
+      if (params.orderby === 'modified') return { data: [], totalItems: 0 }
+      if (params.status === 'completed') {
+        if (!('modified_after' in params) && opts.ceiling) {
+          // an unbounded walk over a >10,000-order store: full pages for ever (the ceiling is reached, the picture is incomplete)
+          return { data: Array.from({ length: WC_HELD_ORDERS_PAGE_SIZE }, (_, i) => order(1_000_000 + (Number(params.page) - 1) * 1000 + i, [11, 0, 1])), totalItems: 20_000 }
+        }
+        const list = opts.completedBounded ?? []
+        if (params.per_page === '1') return { data: [], totalItems: list.length }
+        return { data: Number(params.page) === 1 ? list : [], totalItems: list.length }
+      }
+      return { data: [], totalItems: 0 }
+    },
+  })
+  return { d, asked }
 }
+const BOUND = completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(encodeCoveredHistoryBoundary(T0, '1'), '1', null))
 
-test('releasing an allocation replaces the boundary generation; the next guard reads completed history exhaustively', async () => {
-  const { applyAllocationReservationDelta } = await import('@/lib/domain/sales/allocation-service')
-  const rows: Record<string, string> = {}
-  const stored = encodeCoveredHistoryBoundary(T0, '1', rows[WC_BOUNDARY_GENERATION_KEY] ?? '0')
-  assert.ok(completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', null, rows[WC_BOUNDARY_GENERATION_KEY])) !== null, 'bounded before the delete')
-  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 3 }], 'release')
-  assert.ok(rows[WC_BOUNDARY_GENERATION_KEY], 'generation written in the releasing transaction')
-  assert.equal(trustedCoveredHistoryBoundary(stored, '1', null, rows[WC_BOUNDARY_GENERATION_KEY]), null)
-  assert.equal(completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', null, rows[WC_BOUNDARY_GENERATION_KEY])), null, 'unbounded: exhaustive read')
-  const before = rows[WC_BOUNDARY_GENERATION_KEY]
-  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 1 }], 'release')
-  assert.notEqual(rows[WC_BOUNDARY_GENERATION_KEY], before, 'every release replaces it')
+test('after a release the guard still uses the boundary AND fetches the released order by id; positives are not held and the order is charged', async () => {
+  assert.ok(BOUND !== null)
+  const { d, asked } = dirtyDeps({ dirty: { '9': heldOrder(9, 'completed', [11, 0, 3]) } })
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['9'])
+  assert.ok(r.ok)
+  assert.equal(r.incomplete, false, 'positive pushes stay enabled')
+  assert.equal(r.heldByProduct.get('p1'), 3, 'the released, still-completed order is charged like an unimported completed order')
+  assert.ok(asked.some((p) => p.include === '9'), 'fetched by id')
+  assert.ok(asked.filter((p) => p.status === 'completed' && p.orderby !== 'modified').every((p) => p.modified_after === BOUND), 'the bulk completed read stays bounded by the boundary')
+  assert.deepEqual(r.settledDirtyWcOrderIds, [], 'still held and uncovered: the entry stays, so it is charged on every run')
 })
 
-test('the old completed order is charged again after its allocation was released (exhaustive read finds it)', async () => {
-  const d = deps({ completedPages: [[order(9, [11, 0, 3])]] })
-  const asked: Array<Record<string, string>> = []
-  const inner = d.fetchOrdersPage
-  d.fetchOrdersPage = async (p) => { if (p.status === 'completed' && p.orderby !== 'modified') asked.push(p); return inner(p) }
-  const stored = encodeCoveredHistoryBoundary(T0, '1', 'g1')
-  const r = await load(d, completedOrdersModifiedAfter(null, null, trustedCoveredHistoryBoundary(stored, '1', null, 'g2')))
+test('a released order IMS accounts for again, or one WooCommerce no longer holds, is settled; a charged one is not', async () => {
+  const dirty = { '1': heldOrder(1, 'completed', [11, 0, 2]), '2': heldOrder(2, 'cancelled', [11, 0, 2]), '3': heldOrder(3, 'refunded', [11, 0, 2]), '4': heldOrder(4, 'processing', [11, 0, 5]) }
+  const { d } = dirtyDeps({ dirty, imported: new Map([['1', new Map([['p1', 2]])]]) })
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['1', '2', '3', '4'])
   assert.ok(r.ok)
-  assert.ok(asked.length > 0 && asked.every((p) => !('modified_after' in p)))
+  assert.deepEqual([...r.settledDirtyWcOrderIds].sort(), ['1', '2', '3'])
+  assert.equal(r.heldByProduct.get('p1'), 5, 'only order 4 is charged')
+})
+
+test('a dirty order the bulk walk already read is charged once, not twice', async () => {
+  const o = heldOrder(9, 'completed', [11, 0, 3])
+  const { d } = dirtyDeps({ dirty: { '9': o }, completedBounded: [o] })
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['9'])
+  assert.ok(r.ok)
   assert.equal(r.heldByProduct.get('p1'), 3)
 })
 
-test('a reservation (or a shipment, which never goes through the release helper) does not invalidate', async () => {
-  const { applyAllocationReservationDelta } = await import('@/lib/domain/sales/allocation-service')
-  const rows: Record<string, string> = {}
-  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 3 }], 'reserve')
-  assert.equal(WC_BOUNDARY_GENERATION_KEY in rows, false)
-  await applyAllocationReservationDelta(fakeSettingsTx(rows) as never, [{ productId: 'p1', warehouseId: 'w1', qty: 0 }], 'release')
-  assert.equal(WC_BOUNDARY_GENERATION_KEY in rows, false, 'nothing released')
-  const { readFile } = await import('node:fs/promises')
-  const shipment = await readFile(new URL('../lib/domain/sales/shipment-service.ts', import.meta.url), 'utf8')
-  assert.doesNotMatch(shipment, /invalidateWcCoveredHistoryBoundary|applyAllocationReservationDelta\([^)]*'release'/, 'dispatch consumes the reservation through the shipment, it does not release')
+test('a failed fetch of a dirty order holds positives (incomplete) and settles nothing, so the entry is kept', async () => {
+  const failed = await loadWcHeldUnitsByProduct(dirtyDeps({ includeError: 'WC API error: 503' }).d, BOUND, ['9'])
+  assert.ok(failed.ok)
+  assert.equal(failed.incomplete, true)
+  assert.match(failed.incompleteReasons.join(';'), /dirty orders: re-check read failed/)
+  assert.deepEqual(failed.settledDirtyWcOrderIds, [])
+  assert.equal(failed.completedHistoryCoveredAtMs, null)
+  const missing = await loadWcHeldUnitsByProduct(dirtyDeps({ dirty: {} }).d, BOUND, ['9'])
+  assert.ok(missing.ok)
+  assert.equal(missing.incomplete, true, 'WooCommerce did not return it: not provable, never dropped')
+  assert.deepEqual(missing.settledDirtyWcOrderIds, [])
 })
 
-test('deleteSalesOrder invalidates in the order-deleting transaction, before it returns', async () => {
-  const { readFile } = await import('node:fs/promises')
-  const src = await readFile(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
-  const del = src.indexOf('await tx.salesOrder.delete({ where: { id } })')
-  const inv = src.indexOf('await invalidateWcCoveredHistoryBoundary(tx)', del)
-  const ret = src.indexOf('return { so, released }', del)
-  assert.ok(del !== -1 && inv > del && inv < ret)
+test('a store past the 10,000-order walk ceiling keeps pushing positives after a release (the boundary still bounds the read)', async () => {
+  const { d, asked } = dirtyDeps({ ceiling: true, dirty: { '9': heldOrder(9, 'completed', [11, 0, 3]) } })
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, ['9'])
+  assert.ok(r.ok)
+  assert.equal(r.incomplete, false)
+  assert.equal(r.heldByProduct.get('p1'), 3)
+  assert.ok(asked.filter((p) => p.status === 'completed' && p.orderby !== 'modified').every((p) => 'modified_after' in p), 'never an exhaustive completed read')
+  // the contrast: with no boundary the same store cannot be proven (the ceiling), which is what rotating the boundary would have caused
+  const exhaustive = await loadWcHeldUnitsByProduct(dirtyDeps({ ceiling: true }).d, null, [])
+  assert.ok(exhaustive.ok)
+  assert.equal(exhaustive.incomplete, true)
 })
 
-test('a stale in-flight boundary write is refused after an order delete / allocation release replaced the generation', async () => {
-  const released = boundaryDb({ wc_settings_version: '1', [WC_BOUNDARY_GENERATION_KEY]: 'after-delete' })
-  assert.equal(await persistCoveredHistoryBoundary(released as never, T0, '1', 'before-delete'), false, 'the walk read the generation before the delete committed')
-  assert.equal(WC_COMPLETED_HISTORY_COVERED_KEY in released.rows, false)
-  assert.equal(await persistCoveredHistoryBoundary(released as never, T0, '1', 'after-delete'), true, 'a walk that began after it is accepted')
-  assert.equal(trustedCoveredHistoryBoundary(released.rows[WC_COMPLETED_HISTORY_COVERED_KEY], '1', null, 'after-delete'), new Date(T0).toISOString())
-  assert.equal(trustedCoveredHistoryBoundary(released.rows[WC_COMPLETED_HISTORY_COVERED_KEY], '1', null, 'another'), null, 'and a later release voids it again')
+test('dirty orders are fetched in batches of 100 by id and more than one run reads are reported incomplete', async () => {
+  const ids = Array.from({ length: 250 }, (_, i) => String(5000 + i))
+  const { d, asked } = dirtyDeps({ dirty: Object.fromEntries(ids.map((id) => [id, heldOrder(Number(id), 'cancelled', [11, 0, 1])])) })
+  const r = await loadWcHeldUnitsByProduct(d, BOUND, ids)
+  assert.ok(r.ok)
+  assert.equal(asked.filter((p) => 'include' in p).length, 3)
+  assert.equal(r.settledDirtyWcOrderIds.length, 250)
+  const many = Array.from({ length: WC_DIRTY_MAX_PER_RUN + 1 }, (_, i) => String(9000 + i))
+  const over = await loadWcHeldUnitsByProduct(dirtyDeps({ dirty: Object.fromEntries(many.map((id) => [id, heldOrder(Number(id), 'cancelled', [11, 0, 1])])) }).d, BOUND, many)
+  assert.ok(over.ok)
+  assert.equal(over.incomplete, true)
 })
