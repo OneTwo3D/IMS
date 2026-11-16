@@ -45,7 +45,11 @@ Each adjustment reason can be mapped to a Xero account. When adjustments are syn
 
 ## Stock Counts (Stocktakes)
 
-**Stock Control > Stock Counts** is a guided stocktake. A stock count snapshots the book quantity of each product in a warehouse, you enter what you physically counted, and posting books the differences as stock adjustments. Anyone who can make stock adjustments can run counts.
+**Stock Control > Stock Counts** is a guided stocktake. A stock count snapshots the book quantity of each product in a location (a warehouse), you enter what you physically counted, and posting books the differences as stock adjustments. Anyone who can make stock adjustments can run counts. You can count the whole location, or **prepare** a count by choosing exactly which products go on it (see [Prepared counts](#prepared-counts-choose-the-products-first)).
+
+### The count list
+
+The list shows every count with its **Date** (when it was created), **Reference**, **Location**, **Type** (Whole location or Prepared), **Status**, number of **Lines** and a **Counted / lines** tally. Use the status filter at the top right to show only Draft, In progress, Completed or Cancelled counts.
 
 ### Running a count
 
@@ -55,6 +59,18 @@ Each adjustment reason can be mapped to a Xero account. When adjustments are syn
 4. Click **Reconcile** (once reconciled, the button reads **Refresh reconciliation**). Nothing is booked yet; see below.
 5. Optionally pick a **Variance reason** (from your adjustment reasons) and click **Authorise and post variances**. You are asked to confirm, because posting books stock adjustments that consume or create FIFO layers and cannot be undone. At least one line must be counted.
 6. **Cancel count** abandons the count without posting anything.
+
+### Prepared counts: choose the products first
+
+Use a prepared count when you only want to count some products, for example one shelf or one supplier's range.
+
+1. Click **New count**, pick the **Location**, choose **Prepared (choose products)** and click **Choose products...**.
+2. In the selection window, search by product name or SKU, and narrow the list by **Product type** (simple, variant, manufactured), by state (active, archived, or both) and by category. Tick the products you want. Your ticks are kept while you change the search or the filters, and the footer shows how many you have selected. **Select all shown** ticks every product on screen that can be added. Parent products of variants, kits and non-inventory items are not offered because they have no stock of their own. Archived products only appear when you ask for them.
+3. Click **Create count**. The count is created as a Draft holding exactly the products you picked, each at its current book quantity (0 for a product with no stock in that location).
+
+The list stays editable until the count is posted or cancelled. Open the count and click **Add products** to open the same selection window; a product already on the count is marked **Already on this count** and cannot be ticked, and the server refuses a duplicate even if one is submitted. To take lines off, tick the box at the start of each line and click **Remove selected**. A line can only be removed while it is not yet counted and not reconciled; a line with a counted quantity has no tick box. If you need to remove one, clear its counted quantity and click **Save counts** (that also drops its reconciliation), then remove it. If a request includes a line that can no longer be removed, nothing is removed and the message names each such product. A count always keeps at least one line: to drop them all, cancel the count instead.
+
+Adding products and removing lines also work on a whole-location count that is still open. Products you add are uncounted and are not posted until you enter a quantity for them.
 
 ### How posting is protected
 

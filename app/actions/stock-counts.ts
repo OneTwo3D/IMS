@@ -12,6 +12,19 @@ import { classifyStockCountWmsPolicy, computeStockCountPostings, describeStockCo
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorIds } from '@/lib/connectors/wms/enabled-connector'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
+import {
+  STOCK_COUNTABLE_PRODUCT_TYPES,
+  checkLineAddition,
+  checkLineRemoval,
+  describeAlreadyInCount,
+  describeNotCountable,
+  describePlanLocked,
+  describeUnremovableLines,
+  isStockCountPlanEditable,
+  isStockCountableProductType,
+  lineRemovability,
+  normaliseProductSearchFilters,
+} from '@/lib/domain/inventory/stock-count-plan'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 30000 }
 
@@ -25,6 +38,8 @@ export type StockCountLineRow = {
   /** On-hand this line was reconciled against; null = not reconciled (or the count changed since). */
   reconciledQty: number | null
   notes: string | null
+  /** Neither counted nor reconciled, on a count whose product list can still change: the line can be taken off the count. */
+  removable: boolean
 }
 
 export type StockCountRow = {
@@ -34,6 +49,8 @@ export type StockCountRow = {
   warehouseCode: string
   warehouseName: string
   status: 'DRAFT' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED'
+  /** The product list was chosen up front (prepared stocktake) rather than snapshotting the whole warehouse. */
+  prepared: boolean
   notes: string | null
   startedAt: string | null
   completedAt: string | null
@@ -60,6 +77,7 @@ const COUNT_SELECT = {
   reference: true,
   warehouseId: true,
   status: true,
+  prepared: true,
   notes: true,
   startedAt: true,
   completedAt: true,
@@ -73,6 +91,7 @@ const COUNT_SELECT = {
 } as const
 
 function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }>): StockCountRow {
+  const planEditable = isStockCountPlanEditable(c.status)
   const lines: StockCountLineRow[] = c.lines.map((l) => ({
     id: l.id,
     productId: l.productId,
@@ -82,6 +101,10 @@ function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }
     variance: l.variance == null ? null : Number(l.variance),
     reconciledQty: l.reconciledQty == null ? null : Number(l.reconciledQty),
     notes: l.notes,
+    removable: planEditable && lineRemovability({
+      countedQty: l.countedQty == null ? null : Number(l.countedQty),
+      reconciledQty: l.reconciledQty == null ? null : Number(l.reconciledQty),
+    }).removable,
   }))
   return {
     id: c.id,
@@ -90,6 +113,7 @@ function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }
     warehouseCode: c.warehouse.code,
     warehouseName: c.warehouse.name,
     status: c.status,
+    prepared: c.prepared,
     notes: c.notes,
     startedAt: c.startedAt?.toISOString() ?? null,
     completedAt: c.completedAt?.toISOString() ?? null,
@@ -529,5 +553,279 @@ export async function cancelStockCount(countId: string): Promise<StockCountResul
   } catch (e) {
     console.error(e)
     return { message: e instanceof Error ? e.message : 'Failed to cancel stock count.' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prepared stocktakes: choose the product list before counting, edit it while the count is open.
+// ---------------------------------------------------------------------------
+
+/** A refusal whose message is written for the operator and is shown as-is; anything else becomes a generic message. */
+class PlanRefusal extends Error {}
+
+function planFailure(e: unknown, fallback: string): StockCountResult {
+  if (e instanceof PlanRefusal) return { message: e.message }
+  console.error(e)
+  return { message: fallback }
+}
+
+const MAX_PLAN_PRODUCTS = 2000
+const productIdsSchema = z.array(z.string().min(1)).min(1, 'Pick at least one product.').max(MAX_PLAN_PRODUCTS, `Pick at most ${MAX_PLAN_PRODUCTS} products at a time.`)
+
+export type StockCountProductRow = {
+  id: string
+  sku: string
+  name: string
+  type: string
+  lifecycleStatus: string
+  categoryName: string | null
+  /** Book quantity in the count's warehouse (0 when the product has no stock row there). */
+  onHand: number
+  /** Already a line on the count being edited: shown ticked and cannot be added again. */
+  inCount: boolean
+}
+
+export type StockCountProductSearchResult = {
+  rows: StockCountProductRow[]
+  total: number
+  /** Only the first `limit` matches are returned; narrow the search to see the rest. */
+  truncated: boolean
+  message?: string
+}
+
+const searchSchema = z.object({
+  warehouseId: z.string().min(1, 'Choose a location first.'),
+  /** The count being edited; omitted for a count that does not exist yet. */
+  countId: z.string().min(1).optional(),
+  query: z.string().optional(),
+  types: z.array(z.string()).optional(),
+  state: z.string().optional(),
+  categoryId: z.string().nullable().optional(),
+  limit: z.number().int().min(1).max(200).optional(),
+})
+
+/**
+ * Search the products that can go on a count: by name or SKU, filtered by product type, state (operational / archived) and
+ * category. The Product model has no brand and no tag, so those filters do not exist.
+ */
+export async function searchStockCountProducts(input: unknown): Promise<StockCountProductSearchResult> {
+  await requirePermission('stock_control.adjust')
+  const parsed = searchSchema.safeParse(input)
+  if (!parsed.success) return { rows: [], total: 0, truncated: false, message: parsed.error.issues[0]?.message ?? 'Invalid search.' }
+  const { warehouseId, countId, limit = 50 } = parsed.data
+  const f = normaliseProductSearchFilters(parsed.data)
+
+  const where: Prisma.ProductWhereInput = {
+    type: { in: f.types.length > 0 ? f.types : [...STOCK_COUNTABLE_PRODUCT_TYPES] },
+    ...(f.state === 'OPERATIONAL' ? { lifecycleStatus: { not: 'ARCHIVED' as const } } : f.state === 'ARCHIVED' ? { lifecycleStatus: 'ARCHIVED' as const } : {}),
+    ...(f.categoryId ? { categoryId: f.categoryId } : {}),
+    ...(f.query ? { OR: [{ sku: { contains: f.query, mode: 'insensitive' as const } }, { name: { contains: f.query, mode: 'insensitive' as const } }] } : {}),
+  }
+  const [total, products, inCountRows] = await Promise.all([
+    db.product.count({ where }),
+    db.product.findMany({
+      where,
+      orderBy: { sku: 'asc' },
+      take: limit,
+      select: {
+        id: true, sku: true, name: true, type: true, lifecycleStatus: true,
+        category: { select: { name: true } },
+        stockLevels: { where: { warehouseId }, select: { quantity: true } },
+      },
+    }),
+    countId ? db.stockCountLine.findMany({ where: { countId }, select: { productId: true } }) : Promise.resolve([]),
+  ])
+  const inCount = new Set(inCountRows.map((l) => l.productId))
+  return {
+    rows: products.map((p) => ({
+      id: p.id, sku: p.sku, name: p.name, type: p.type, lifecycleStatus: p.lifecycleStatus,
+      categoryName: p.category?.name ?? null,
+      onHand: p.stockLevels[0] ? Number(p.stockLevels[0].quantity) : 0,
+      inCount: inCount.has(p.id),
+    })),
+    total,
+    truncated: total > products.length,
+  }
+}
+
+export async function getStockCountProductCategories(): Promise<Array<{ id: string; name: string }>> {
+  await requirePermission('stock_control.adjust')
+  return db.productCategory.findMany({ orderBy: { name: 'asc' }, select: { id: true, name: true } })
+}
+
+/** The products a plan may hold, read inside the transaction. Refuses (with the SKUs) any that are archived, uncountable or gone. */
+async function loadCountableProductsTx(tx: Prisma.TransactionClient, productIds: string[]) {
+  const products = await tx.product.findMany({ where: { id: { in: productIds } }, select: { id: true, sku: true, type: true, lifecycleStatus: true } })
+  const byId = new Map(products.map((p) => [p.id, p]))
+  const problems: Array<{ sku: string; why: 'ARCHIVED' | 'TYPE' | 'MISSING' }> = []
+  for (const id of productIds) {
+    const p = byId.get(id)
+    if (!p) problems.push({ sku: id, why: 'MISSING' })
+    else if (!isOperationalProductStatus(p.lifecycleStatus)) problems.push({ sku: p.sku, why: 'ARCHIVED' })
+    else if (!isStockCountableProductType(p.type)) problems.push({ sku: p.sku, why: 'TYPE' })
+  }
+  if (problems.length > 0) throw new PlanRefusal(describeNotCountable(problems))
+  return products
+}
+
+/** Lock the warehouse's stock rows for these products and return each one's book quantity (0 where there is no row). */
+async function snapshotBookQtyTx(tx: Prisma.TransactionClient, warehouseId: string, productIds: string[]): Promise<Map<string, Prisma.Decimal>> {
+  await tx.$queryRaw`SELECT id FROM stock_levels WHERE "warehouseId" = ${warehouseId} AND "productId" = ANY(${productIds}::text[]) FOR UPDATE`
+  const levels = await tx.stockLevel.findMany({ where: { warehouseId, productId: { in: productIds } }, select: { productId: true, quantity: true } })
+  return new Map(levels.map((l) => [l.productId, new Prisma.Decimal(l.quantity)]))
+}
+
+const createPreparedSchema = z.object({
+  warehouseId: z.string().min(1, 'Choose a location first.'),
+  productIds: productIdsSchema,
+  notes: z.string().optional(),
+})
+
+/**
+ * Create a DRAFT stock count from a product list the operator chose (a prepared stocktake). Unlike the whole-warehouse
+ * snapshot, a chosen product with no stock row in the warehouse is allowed: it goes on the count at 0 on hand.
+ */
+export async function createPreparedStockCount(input: unknown): Promise<StockCountResult> {
+  await requirePermission('stock_control.adjust')
+  const parsed = createPreparedSchema.safeParse(input)
+  if (!parsed.success) return { message: parsed.error.issues[0]?.message ?? 'Invalid stock count.' }
+  const { warehouseId, notes } = parsed.data
+  const productIds = [...new Set(parsed.data.productIds)]
+
+  try {
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        const created = await db.$transaction(async (tx) => {
+          const warehouse = await tx.warehouse.findUnique({ where: { id: warehouseId }, select: { id: true } })
+          if (!warehouse) throw new PlanRefusal('That location no longer exists. Choose another one.')
+          const products = await loadCountableProductsTx(tx, productIds)
+          const book = await snapshotBookQtyTx(tx, warehouseId, productIds)
+          return tx.stockCount.create({
+            data: {
+              reference: makeStockCountReference(new Date(), Math.random().toString(36).slice(2)),
+              warehouseId,
+              status: 'DRAFT',
+              prepared: true,
+              notes: notes || null,
+              lines: {
+                create: products
+                  .sort((a, b) => a.sku.localeCompare(b.sku))
+                  .map((p) => ({ productId: p.id, sku: p.sku, expectedQty: book.get(p.id) ?? new Prisma.Decimal(0) })),
+              },
+            },
+            select: COUNT_SELECT,
+          })
+        }, STOCK_TX_OPTIONS)
+
+        const mapped = mapCount(created)
+        revalidatePath('/stock-control/stock-counts')
+        await logActivity({
+          entityType: 'STOCK_COUNT', entityId: created.id, action: 'created', tag: 'stock',
+          description: `Created prepared stock count ${mapped.reference} for ${mapped.warehouseName} (${mapped.lineCount} chosen lines)`,
+        })
+        return { success: true, count: mapped }
+      } catch (e) {
+        if (attempt < 5 && (e as { code?: string } | null)?.code === 'P2002') continue
+        throw e
+      }
+    }
+    return { message: 'Failed to create the stock count.' }
+  } catch (e) {
+    return planFailure(e, 'The stock count could not be created. Try again.')
+  }
+}
+
+const addLinesSchema = z.object({ countId: z.string().min(1), productIds: productIdsSchema })
+
+/**
+ * Add products to an open count (DRAFT or IN_PROGRESS). A product already on the count is refused, not skipped, so the
+ * operator sees what was wrong; nothing is added when anything in the request is refused. New lines are uncounted, so the
+ * lines already counted or reconciled are untouched.
+ */
+export async function addStockCountLines(input: unknown): Promise<StockCountResult> {
+  await requirePermission('stock_control.adjust')
+  const parsed = addLinesSchema.safeParse(input)
+  if (!parsed.success) return { message: parsed.error.issues[0]?.message ?? 'Invalid request.' }
+  const { countId } = parsed.data
+  const requested = [...new Set(parsed.data.productIds)]
+
+  try {
+    const updated = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM stock_counts WHERE id = ${countId} FOR UPDATE`
+      const count = await tx.stockCount.findUnique({ where: { id: countId }, select: { status: true, warehouseId: true, lines: { select: { productId: true, sku: true } } } })
+      if (!count) throw new PlanRefusal('Stock count not found.')
+      const locked = describePlanLocked(count.status)
+      if (locked) throw new PlanRefusal(locked)
+
+      const check = checkLineAddition(requested, count.lines.map((l) => l.productId))
+      if (check.alreadyInCount.length > 0) {
+        const skuById = new Map(count.lines.map((l) => [l.productId, l.sku]))
+        throw new PlanRefusal(describeAlreadyInCount(check.alreadyInCount.map((id) => skuById.get(id) ?? id)))
+      }
+      const products = await loadCountableProductsTx(tx, check.toAdd)
+      const book = await snapshotBookQtyTx(tx, count.warehouseId, check.toAdd)
+      await tx.stockCountLine.createMany({
+        data: products.map((p) => ({ countId, productId: p.id, sku: p.sku, expectedQty: book.get(p.id) ?? new Prisma.Decimal(0) })),
+      })
+      return tx.stockCount.findUniqueOrThrow({ where: { id: countId }, select: COUNT_SELECT })
+    }, STOCK_TX_OPTIONS)
+
+    revalidatePath('/stock-control/stock-counts')
+    await logActivity({
+      entityType: 'STOCK_COUNT', entityId: countId, action: 'lines_added', tag: 'stock',
+      description: `Added ${requested.length} product(s) to stock count ${updated.reference}`,
+    })
+    return { success: true, count: mapCount(updated) }
+  } catch (e) {
+    return planFailure(e, 'The products could not be added. Try again.')
+  }
+}
+
+const removeLinesSchema = z.object({ countId: z.string().min(1), lineIds: z.array(z.string().min(1)).min(1, 'Choose at least one line to remove.') })
+
+/**
+ * Take lines off an open count. Only a line that is neither counted nor reconciled can go; if any requested line is not
+ * removable nothing is removed. A count keeps at least one line.
+ */
+export async function removeStockCountLines(input: unknown): Promise<StockCountResult> {
+  await requirePermission('stock_control.adjust')
+  const parsed = removeLinesSchema.safeParse(input)
+  if (!parsed.success) return { message: parsed.error.issues[0]?.message ?? 'Invalid request.' }
+  const { countId, lineIds } = parsed.data
+
+  try {
+    let removedCount = 0
+    const updated = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM stock_counts WHERE id = ${countId} FOR UPDATE`
+      const count = await tx.stockCount.findUnique({
+        where: { id: countId },
+        select: { status: true, lines: { select: { id: true, sku: true, countedQty: true, reconciledQty: true } } },
+      })
+      if (!count) throw new PlanRefusal('Stock count not found.')
+      const locked = describePlanLocked(count.status)
+      if (locked) throw new PlanRefusal(locked)
+
+      const check = checkLineRemoval(lineIds, count.lines.map((l) => ({
+        id: l.id, sku: l.sku,
+        countedQty: l.countedQty == null ? null : Number(l.countedQty),
+        reconciledQty: l.reconciledQty == null ? null : Number(l.reconciledQty),
+      })))
+      if (check.unknownIds.length > 0) throw new PlanRefusal('Some of those lines are not on this count any more. Refresh the page and try again.')
+      if (check.blocked.length > 0) throw new PlanRefusal(describeUnremovableLines(check.blocked))
+      if (check.removableIds.length >= count.lines.length) throw new PlanRefusal('A count needs at least one product. Cancel the count instead of removing every line.')
+
+      await tx.stockCountLine.deleteMany({ where: { countId, id: { in: check.removableIds } } })
+      removedCount = check.removableIds.length
+      return tx.stockCount.findUniqueOrThrow({ where: { id: countId }, select: COUNT_SELECT })
+    }, STOCK_TX_OPTIONS)
+
+    revalidatePath('/stock-control/stock-counts')
+    await logActivity({
+      entityType: 'STOCK_COUNT', entityId: countId, action: 'lines_removed', tag: 'stock',
+      description: `Removed ${removedCount} product(s) from stock count ${updated.reference}`,
+    })
+    return { success: true, count: mapCount(updated) }
+  } catch (e) {
+    return planFailure(e, 'The lines could not be removed. Try again.')
   }
 }
