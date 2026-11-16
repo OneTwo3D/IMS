@@ -77,7 +77,7 @@ export function detectWcOrderEditDrift(wcOrder: Pick<WcFullOrder, 'line_items' |
     try {
       const dp = currencyMinorUnits(stored.currency)
       const wcTotal = toDecimal(wcOrder.total).toFixed(dp)
-      const imsTotal = toDecimal(stored.totalForeign).toFixed(dp)
+      const imsTotal = toDecimal(stored.totalForeign as never).toFixed(dp)
       if (wcTotal !== imsTotal) differences.push(`WooCommerce total is ${wcTotal}; IMS holds ${imsTotal} (${stored.currency})`)
     } catch {
       // an unreadable total is no evidence of an edit
