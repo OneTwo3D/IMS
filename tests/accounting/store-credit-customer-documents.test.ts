@@ -38,7 +38,7 @@ test('CENSUS 1: every file that RENDERS a PDF document is classified', () => {
   const table: Record<string, Verdict> = {
     'lib/order-email.ts': GUARDED('assertNoStoreCreditInvoiceDocument(so)'),
     'app/api/invoice/[id]/route.ts': GUARDED('storeCreditInvoiceDocumentRefusal(creditBlock)'),
-    'app/api/sales-order/[id]/route.ts': GUARDED('storeCreditForeign: Number(so.storeCreditForeign ?? 0)'),
+    'app/api/sales-order/[id]/route.ts': GUARDED('orderDocumentMoney(so)'),
     'lib/pdf.ts': EXEMPT('the createPdfDocument definition; renders nothing itself'),
     'app/api/packing-slip/[id]/route.ts': EXEMPT('packing slip: lines and quantities, no money totals'),
     'app/api/preview/document/route.ts': EXEMPT('template preview with sample data, not an order'),
