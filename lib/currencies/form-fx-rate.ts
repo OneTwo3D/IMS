@@ -1,5 +1,3 @@
-import { isMissingFxRateError } from './fx-select'
-
 /**
  * What the PO and sales-order forms show for a foreign currency (pure; the server action in app/actions/currencies.ts
  * fills it from the one central lookup, lib/currencies/fx-lookup.ts, over `fx_rates`, which Aelia feeds).
@@ -35,12 +33,6 @@ export function fxBlocksSubmit(fx: FormFxRate | null): boolean {
   return fx === null || usableRate(fx) === null
 }
 
-/** Maps a lookup failure to the form state. Only a missing-rate refusal is a state; anything else is a real error and rethrown. */
-export function formFxRateFromError(currency: string, error: unknown): FormFxRate {
-  if (isMissingFxRateError(error)) return missingFormFxRate(currency)
-  throw error
-}
-
 export function describeFxSource(source: string, manualOverride: boolean): string {
   if (manualOverride) return 'manual override'
   if (source === 'aelia') return 'Aelia'
@@ -57,3 +49,23 @@ export function repriceUnitPrice(price: number, fromRate: number | null, toRate:
   if (!(fromRate > 0) || !(toRate > 0) || !Number.isFinite(price)) return null
   return Math.round((price / fromRate) * toRate * 100) / 100
 }
+
+/**
+ * A discount field ("10%" or "5"): a percentage is a ratio and stays as typed, an absolute amount is restated like a price,
+ * blank stays blank. An unreadable or unconvertible value is returned unchanged (the caller blocks submit separately).
+ */
+export function repriceDiscountStr(input: string, fromRate: number | null, toRate: number | null): string {
+  const s = input.trim()
+  if (!s || s.endsWith('%')) return input
+  const abs = parseFloat(s)
+  if (Number.isNaN(abs)) return input
+  const next = repriceUnitPrice(abs, fromRate, toRate)
+  return next === null ? input : String(next)
+}
+
+/** The FX_RATE_CHANGED refusal the create actions return when the table rate moved after the form read it. */
+export function isFxRateChangedError(error: string | undefined): boolean {
+  return !!error && error.startsWith('FX_RATE_CHANGED:')
+}
+
+export const FX_RATE_CHANGED_FORM_MESSAGE = 'The exchange rate changed while you were working. The rate and the amounts shown have been updated: check them, then submit again.'

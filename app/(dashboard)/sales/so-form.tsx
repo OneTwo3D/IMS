@@ -23,7 +23,7 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
 import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
-import { fxBlocksSubmit, repriceUnitPrice, usableRate } from '@/lib/currencies/form-fx-rate'
+import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, repriceDiscountStr, repriceUnitPrice, usableRate } from '@/lib/currencies/form-fx-rate'
 
 type Warehouse = { id: string; code: string; name: string; isDefault?: boolean }
 
@@ -231,7 +231,12 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
       const from = pricedAtRate.current
       pricedAtRate.current = next
       if (from === next) return
-      setLines((prev) => prev.map((l) => ({ ...l, unitPrice: repriceUnitPrice(l.unitPrice, from, next) ?? l.unitPrice })))
+      // Every absolute money amount is restated; percentage discounts stay percentages.
+      const conv = (n: number) => repriceUnitPrice(n, from, next) ?? n
+      setLines((prev) => prev.map((l) => ({ ...l, unitPrice: conv(l.unitPrice), discount: repriceDiscountStr(l.discount, from, next) })))
+      setOrderDiscount((prev) => repriceDiscountStr(prev, from, next))
+      setShippingAmount((prev) => conv(prev))
+      setFees((prev) => prev.map((f) => ({ ...f, amount: conv(f.amount) })))
     })
   }
 
@@ -506,6 +511,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         shippingAddress: shippingAddrObj ?? undefined,
         customerEmail: customerEmail || undefined,
         currency,
+        expectedFxRate: fxRate ?? undefined,
         shipFromWarehouseId: warehouseId || undefined,
         expectedDelivery: expectedDelivery || undefined,
         salesRep: salesRep || undefined,
@@ -540,6 +546,10 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         router.refresh()
         onClose()
         router.push(`/sales/${result.order.id}`)
+      } else if (isFxRateChangedError(result.error)) {
+        // The table rate moved after the form read it: read it again, re-price from the rate the lines are at, and say so.
+        setCurrencyAndRate(currency)
+        setError(FX_RATE_CHANGED_FORM_MESSAGE)
       } else {
         setError(result.error ?? 'Failed to create order')
       }

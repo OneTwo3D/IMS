@@ -25,7 +25,7 @@ import { formatMoney } from '@/lib/utils'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
 import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
-import { fxBlocksSubmit, usableRate, type FormFxRate } from '@/lib/currencies/form-fx-rate'
+import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, usableRate, type FormFxRate } from '@/lib/currencies/form-fx-rate'
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 
@@ -730,12 +730,15 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           setError(result.error ?? 'Failed to update PO')
         }
       } else {
-        const result = await createPurchaseOrder(payload)
+        const result = await createPurchaseOrder({ ...payload, expectedFxRate: fxRate ?? undefined })
         if (result.success && result.po) {
           if (result.postCommitWarnings?.length) window.alert(`The purchase order was created, but: ${result.postCommitWarnings.join('; ')}`)
           router.refresh()
           onClose()
           router.push(`/purchase-orders/${result.po.id}`)
+        } else if (isFxRateChangedError(result.error)) {
+          setCurrencyAndRate(currency)
+          setError(FX_RATE_CHANGED_FORM_MESSAGE)
         } else {
           setError(result.error ?? 'Failed to create PO')
         }

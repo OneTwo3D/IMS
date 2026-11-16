@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { formFxRateFromError } from '@/lib/currencies/form-fx-rate-server'
 import { MissingFxRateError } from '@/lib/currencies/fx-select'
 import {
-  describeFxSource, formFxRateFromError, fxBlocksSubmit, missingFormFxRate, missingFxRateMessage, repriceUnitPrice, usableRate,
+  describeFxSource, fxBlocksSubmit, isFxRateChangedError, repriceDiscountStr, missingFormFxRate, missingFxRateMessage, repriceUnitPrice, usableRate,
   type FormFxRate,
 } from '@/lib/currencies/form-fx-rate'
 
@@ -54,4 +55,19 @@ test('describeFxSource names the source', () => {
   assert.equal(describeFxSource('aelia', false), 'Aelia')
   assert.equal(describeFxSource('aelia', true), 'manual override')
   assert.equal(describeFxSource('frankfurter', false), 'ECB (frankfurter)')
+})
+
+test('discounts: a percentage stays, an absolute amount is restated, blank stays blank', () => {
+  assert.equal(repriceDiscountStr('10%', 1, 1.2), '10%')
+  assert.equal(repriceDiscountStr('', 1, 1.2), '')
+  assert.equal(repriceDiscountStr('5', 1, 1.2), '6')
+  assert.equal(repriceDiscountStr('6', 1.2, 1), '5')
+  assert.equal(repriceDiscountStr('abc', 1, 1.2), 'abc')
+  assert.equal(repriceDiscountStr('5', 1, null), '5')
+})
+
+test('the rate-changed refusal is recognised by its code', () => {
+  assert.equal(isFxRateChangedError('FX_RATE_CHANGED: the EUR table rate moved from 1.1 to 1.2 since it was checked; nothing was written'), true)
+  assert.equal(isFxRateChangedError('Missing GBP FX rate'), false)
+  assert.equal(isFxRateChangedError(undefined), false)
 })
