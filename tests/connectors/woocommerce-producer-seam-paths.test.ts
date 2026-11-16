@@ -280,6 +280,7 @@ test('STOCK, the daily reconcile: a push the hold shadowed does NOT stamp last_w
     namedExports: {
       isWcOrderWebhookPrimaryActive: async () => true,
       retryHeldWcSalesInvoiceReleases: async () => ({}),
+      runWcCancellationBackstop: async () => ({ synced: 0, skipped: 0, errors: [] }),
       syncNewWcOrders: async () => ({}),
     },
   })

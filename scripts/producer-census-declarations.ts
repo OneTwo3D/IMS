@@ -40,6 +40,7 @@ export const EXCLUDED_OPERATIONS: Readonly<Record<string, string>> = {
   'internal.landed-cost-adjustment-journal': 'Internal outbox accounting/landed-cost.adjustment-journal: its effect is a sync-log row, which meets the Xero seam.',
   'internal.refund-reservation-release': 'Internal outbox sales/refund.reservation-release: releases a stock reservation, no destination write.',
   'internal.refund-unmatched-warning': 'Internal outbox sales/refund.unmatched-warning: raises an operator warning, no destination write.',
+  'internal.supplier-purchase-order-email': 'Operator-triggered e-mail of the purchase order PDF to a SUPPLIER (not a customer e-mail, so not in the ownership map): it only inserts a row on the local e-mail outbox, delivered by the drain under the installation\'s SMTP settings and suppression list; no destination (WooCommerce, Mintsoft, Xero) is written.',
   'woocommerce.generic-write-reexport': 'Re-export of the raw WooCommerce write helpers: the operation is chosen at each caller of wcPost or wcPut, which are declared.',
 }
 
@@ -164,6 +165,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Queues SALES_INVOICE for an order inside the transaction that creates or finalises it (the same enqueue as the facade site above, committed with the order); xeroom owns this operation, so IMS shadows it in every phase.'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of the products a draft finalisation just allocated (after the finalisation commits).'),
+  d('app/actions/purchase-orders.ts::queuePurchaseOrderEmail::queueEmail#1', 'internal', 'supplier-purchase-order-email', 'operator-action', 'not-applicable',
+    'Operator button (Confirm & Send PO, Email PO): queues the purchase order PDF e-mail to the supplier on the local outbox.'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::queueDispatchEmailIfEligible#1', 'customer-email', 'despatch', 'queue-producer', 'not-applicable',
     'Queues the despatch e-mail on an order status transition (setting-gated).'),
   d('app/actions/sales.ts::queueRefundAccountingActions::queueAccountingSync#1', 'xero', 'sales.credit-note', 'queue-producer', 'required',

@@ -20,6 +20,8 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   advancePoStatus,
+  confirmAndSendPurchaseOrder,
+  sendPurchaseOrderEmail,
   updatePoTracking,
   cancelPurchaseOrder,
   receivePurchaseOrder,
@@ -74,6 +76,8 @@ type Props = {
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   overBilling: PurchaseOrderOverBillingSummary
   prepaidReconciliation: PrepaidReconciliationSummary
+  /** Setting `purchase_order_email_enabled` (default off): whether Confirm & Send PO and Email PO mail the supplier. */
+  poEmailEnabled: boolean
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -238,7 +242,7 @@ function ReceiveDialog({
     <Dialog open onOpenChange={() => {}}>
       <DialogContent
         showCloseButton={false}
-        className="flex max-h-[85vh] w-full max-w-4xl flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl"
+        className="flex max-h-[85vh] w-full max-w-4xl flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl max-sm:top-0 max-sm:left-0 max-sm:h-dvh max-sm:max-h-dvh max-sm:max-w-none max-sm:translate-x-0 max-sm:translate-y-0 max-sm:rounded-none"
       >
         <DialogHeader className="shrink-0 border-b px-5 py-4">
           <DialogTitle>Receive Goods — {po.reference}</DialogTitle>
@@ -252,8 +256,9 @@ function ReceiveDialog({
         {/* Only this middle region scrolls — the header and footer stay put. */}
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 space-y-4">
           <div className="rounded-md border">
-            <Table className="w-full table-fixed">
-              <TableHeader className="bg-muted/40">
+            {/* Phone: each line is a stacked card (the table elements are re-laid out with CSS, one DOM). */}
+            <Table className="w-full table-fixed max-sm:block">
+              <TableHeader className="bg-muted/40 max-sm:hidden">
                 <TableRow>
                   <TableHead className="px-3 text-xs">Product</TableHead>
                   <TableHead className="px-3 text-xs text-right w-16">Ordered</TableHead>
@@ -263,18 +268,18 @@ function ReceiveDialog({
                   <TableHead className="px-3 text-xs w-44">Warehouse</TableHead>
                 </TableRow>
               </TableHeader>
-              <TableBody>
+              <TableBody className="max-sm:block">
                 {receiptLines.map((l) => (
-                  <TableRow key={l.poLineId} className="align-top">
-                    <TableCell className="px-3 py-2">
+                  <TableRow key={l.poLineId} className="align-top max-sm:grid max-sm:grid-cols-3 max-sm:gap-x-3 max-sm:gap-y-2 max-sm:p-3">
+                    <TableCell className="px-3 py-2 max-sm:col-span-3 max-sm:block max-sm:p-0">
                       <div className="flex min-w-0">
                         <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
                       </div>
                     </TableCell>
-                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyOrdered}</TableCell>
-                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReceived}</TableCell>
-                    <TableCell className="px-3 py-2 text-right tabular-nums font-medium">{l.qtyRemaining}</TableCell>
-                    <TableCell className="px-3 py-2">
+                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)] max-sm:text-left" data-label="Ordered">{l.qtyOrdered}</TableCell>
+                    <TableCell className="px-3 py-2 text-right tabular-nums text-muted-foreground max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)] max-sm:text-left" data-label="Received">{l.qtyAlreadyReceived}</TableCell>
+                    <TableCell className="px-3 py-2 text-right tabular-nums font-medium max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)] max-sm:text-left" data-label="Remaining">{l.qtyRemaining}</TableCell>
+                    <TableCell className="px-3 py-2 max-sm:col-span-3 max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)]" data-label="Receive now">
                       <Input
                         type="number"
                         min={0}
@@ -282,14 +287,14 @@ function ReceiveDialog({
                         step={1}
                         value={l.qtyToReceive}
                         onChange={(e) => updateLine(l.poLineId, 'qtyToReceive', Number(e.target.value))}
-                        className="h-8 text-sm text-right w-full font-mono"
+                        className="h-8 text-sm text-right w-full font-mono max-sm:h-11 max-sm:text-base"
                       />
                     </TableCell>
-                    <TableCell className="px-3 py-2">
+                    <TableCell className="px-3 py-2 max-sm:col-span-3 max-sm:block max-sm:p-0 max-sm:before:mb-0.5 max-sm:before:block max-sm:before:text-[11px] max-sm:before:text-muted-foreground max-sm:before:content-[attr(data-label)]" data-label="Warehouse">
                       <select
                         value={l.warehouseId}
                         onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
-                        className={`h-8 w-full rounded-md border bg-background px-2 text-xs ${lineDiverges(l) ? 'border-amber-400 ring-1 ring-amber-300 dark:border-amber-600' : 'border-input'}`}
+                        className={`h-8 w-full rounded-md border bg-background px-2 text-xs max-sm:h-11 max-sm:text-base ${lineDiverges(l) ? 'border-amber-400 ring-1 ring-amber-300 dark:border-amber-600' : 'border-input'}`}
                       >
                         <option value="">Select…</option>
                         {warehouses.map((w) => (
@@ -2029,7 +2034,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2075,6 +2080,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const canRfq = po.status === 'DRAFT' || po.status === 'RFQ_SENT'
   const canAdvanceToQuoteReceived = po.status === 'RFQ_SENT'
   const canAdvanceToOrdered = po.status === 'DRAFT' || po.status === 'QUOTE_RECEIVED'
+  const canEmailPo = poEmailEnabled && (po.status === 'PO_SENT' || po.status === 'SHIPPED' || po.status === 'PARTIALLY_RECEIVED')
   const canShip = po.status === 'PO_SENT'
   const canReceive = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)
   const canReturn = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED'].includes(po.status)
@@ -2092,10 +2098,26 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
   function handleAdvanceToOrdered() {
     setError('')
+    setNotice('')
     startTransition(async () => {
-      const result = await advancePoStatus(po.id, 'PO_SENT')
-      if (result.success) router.refresh()
-      else setError(result.error ?? 'Failed')
+      // Confirms the order first, then queues the PO PDF email; a missing supplier address or a failed enqueue leaves the order confirmed.
+      const result = await confirmAndSendPurchaseOrder(po.id)
+      if (result.success) {
+        setNotice(result.send?.message ?? 'The order is confirmed.')
+        router.refresh()
+      } else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleEmailPo() {
+    setError('')
+    setNotice('')
+    startTransition(async () => {
+      const result = await sendPurchaseOrderEmail(po.id)
+      if (result.success) {
+        setNotice(result.send?.message ?? 'The PO email is queued.')
+        router.refresh()
+      } else setError(result.error ?? 'Failed')
     })
   }
 
@@ -2187,6 +2209,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               )}
             </>
           )}
+          {!editing && (
+            <Button variant="outline" size="sm" onClick={() => window.open(`/api/purchase-order/${po.id}`, '_blank')}>
+              <FileText className="h-4 w-4 mr-1" />PO PDF
+            </Button>
+          )}
+          {canEmailPo && !editing && (
+            <Button variant="outline" size="sm" onClick={handleEmailPo} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email PO
+            </Button>
+          )}
           {canAdvanceToQuoteReceived && !editing && (
             <Button variant="secondary" size="sm" onClick={handleAdvanceToQuoteReceived} disabled={isPending}>
               {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-1" />}
@@ -2194,7 +2226,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             </Button>
           )}
           {canAdvanceToOrdered && !editing && (
-            <Button size="sm" onClick={handleAdvanceToOrdered} disabled={isPending}>
+            <Button size="sm" onClick={handleAdvanceToOrdered} disabled={isPending} title={poEmailEnabled ? undefined : 'Emailing POs to suppliers is switched off (Settings > Documents): this confirms the PO only.'}>
               {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Truck className="h-4 w-4 mr-1" />}
               Confirm &amp; Send PO
             </Button>

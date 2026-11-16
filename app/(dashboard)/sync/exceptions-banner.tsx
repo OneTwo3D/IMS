@@ -27,6 +27,8 @@ export function ExceptionsBanner({ summary }: { summary: ExceptionInboxSummary }
     summary.stuckDispatches > 0 ? `${summary.stuckDispatches} stuck dispatch(es)` : null,
     summary.pennyMismatches > 0 ? `${summary.pennyMismatches} order-total mismatch(es)` : null,
     summary.blockedWcOrders > 0 ? `${summary.blockedWcOrders} blocked WooCommerce order(s)` : null,
+    summary.wcCompletionRefusals > 0 ? `${summary.wcCompletionRefusals} refused WooCommerce completion(s)` : null,
+    summary.doublePostageFlags > 0 ? `${summary.doublePostageFlags} possible double postage` : null,
     summary.wmsOperatorTasksOpen > 0 ? `${summary.wmsOperatorTasksOpen} warehouse query task(s) to raise` : null,
     summary.orderReconcileDrift > 0 ? `${summary.orderReconcileDrift} order reconcile drift(s)` : null,
   ].filter(Boolean)

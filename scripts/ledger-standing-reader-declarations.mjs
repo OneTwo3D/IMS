@@ -15,6 +15,10 @@
 // slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question.
 
 export const DECLARATIONS = [
+  { key: "app/api/credit-note/[id]/route.ts::GET::where-excludes-cancelled#1", class: "DISPLAY",
+    reason: "Chooses which credit-note sync row's PAYLOAD the credit-note PDF prints: the latest row that is not CANCELLED (a CANCELLED row, a shadow included, was never sent). It reads the payload as queued; it makes no claim about whether the ledger holds the document and sends nothing." },
+  { key: "app/api/credit-note/[id]/route.ts::GET::where-admits-synced#1", class: "DISPLAY",
+    reason: "Same filter as the where-excludes-cancelled site above (one `status: { not: CANCELLED }` clause is reported as both kinds): selects the row whose queued payload is printed; no ledger claim." },
   { key: "lib/domain/sales/refund-182-hold.ts::creditNoteRowsOf::cmp-cancelled#1", class: "GUARD",
     reason: "Refuses to apply the first-N hold of a rate-182 credit note when the refund already has a credit-note row that is not the refused marker row. A deliberately CANCELLED row is skipped because it can never be sent; every other status (pending, processing, failed, synced) is a row that may still go out or already did, so the hold is declared a conflict instead of stamping the refund held over it. It decides nothing about the ledger's standing." },
   { key: "app/(dashboard)/sync/xero-client.tsx::XeroClient::id-read#1", class: "DISPLAY",

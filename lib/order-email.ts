@@ -14,19 +14,30 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
+import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { orderDocumentMoney, drawTotalsRows, invoiceDocumentIdentity } from '@/lib/pdf-order-money'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { getTrackingUrl } from '@/lib/tracking'
+import { buildPurchaseOrderEmail, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 
 type EmailAttachment = { filename: string; content: Buffer; contentType?: string }
-type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[] }
+export type SendGuardOutcome<T> = { refused: string; unknown?: undefined } | { unknown: string; refused?: undefined } | { refused?: undefined; unknown?: undefined; value: T }
+/**
+ * Optional hook on a prepared email: the drain runs its send INSIDE this, so a kind switched off by a setting can be re-checked at the delivery
+ * boundary and held against a concurrent switch-off. A refusal means nothing was sent.
+ */
+type SendGuard = <T>(send: () => Promise<T>) => Promise<SendGuardOutcome<T>>
+export type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[]; sendGuard?: SendGuard; sendDeadlineMs?: number }
 type QueueEmailData = { to: string; subject: string; reference: string }
 
 type SoForPdf = {
   id: string
   externalOrderNumber: string | null
   orderNumber?: string | null
+  pricesIncludeVat?: boolean | null
+  shoppingLinks?: { connector: string }[] | null
   currency: string
   customerName: string | null
   customerEmail: string | null
@@ -60,6 +71,7 @@ type SoForPdf = {
     discountAmount: unknown
     totalForeign: unknown
     taxForeign?: unknown
+    taxRate?: { rate: unknown } | null
   }[]
 }
 
@@ -81,6 +93,7 @@ async function getSalesOrderEmailOrder(orderId: string): Promise<SoForPdf | null
   return db.salesOrder.findUnique({
     where: { id: orderId },
     include: {
+      shoppingLinks: { select: { connector: true } },
       lines: {
         select: {
           description: true,
@@ -90,6 +103,7 @@ async function getSalesOrderEmailOrder(orderId: string): Promise<SoForPdf | null
           discountAmount: true,
           totalForeign: true,
           taxForeign: true,
+          taxRate: { select: { rate: true } },
         },
       },
     },
@@ -99,14 +113,15 @@ async function getSalesOrderEmailOrder(orderId: string): Promise<SoForPdf | null
 async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
   const tpl = await getTemplate('sales_order')
   const tz = await getDisplayTimeZone()
-  const { doc } = createPdfDocument({ title: `Order ${so.externalOrderNumber}` })
+  const orderRef = getSalesOrderReference(so)
+  const { doc } = createPdfDocument({ title: `Order ${orderRef}` })
   const date = formatDateTime(so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
   const shipAddr = so.shippingAddress as Record<string, string> | null
   const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, formatCountryDisplay(shipAddr.country)].filter(Boolean).join('\n') : ''
 
   await drawHeader(doc, branding, {
     title: 'Sales Order',
-    reference: so.externalOrderNumber ?? so.id.slice(0, 8),
+    reference: orderRef,
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -126,14 +141,15 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
   }
 
   const { sym, symPos } = await getCurrencyFormat(so.currency)
+  const { view, totalsRows } = orderDocumentMoney(so)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
     { label: 'Description', width: 195, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
-    { label: `Price (${sym})`, width: 65, align: 'right' },
+    { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
     { label: 'Discount', width: 50, align: 'right' },
-    { label: `Total (${sym})`, width: 65, align: 'right' },
+    { label: `Total ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
   ]
   const rows = so.lines.map((l, i) => [
     String(i + 1),
@@ -142,10 +158,10 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
     String(Number(l.qty)),
     Number(l.unitPriceForeign).toFixed(2),
     Number(l.discountAmount) > 0 ? `-${Number(l.discountAmount).toFixed(2)}` : '',
-    Number(l.totalForeign).toFixed(2),
+    view.lines[i].total.toFixed(2),
   ])
   drawTable(doc, columns, rows, branding)
-  drawTotals(doc, so, sym, symPos, columns)
+  drawTotalsRows(doc, totalsRows, (v) => formatMoney(v, sym, symPos), columns)
 
   if (tpl?.footerNote) {
     doc.y += 10
@@ -173,16 +189,17 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
 async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
   const tpl = await getTemplate('invoice')
   const tz = await getDisplayTimeZone()
-  const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
-  const { doc } = createPdfDocument({ title: `Invoice ${invNum}` })
+  const identity = invoiceDocumentIdentity(so)
+  const invNum = identity.reference
+  const { doc } = createPdfDocument({ title: `${identity.title} ${invNum}` })
   const billAddr = so.billingAddress as Record<string, string> | null
   const recipientAddr = billAddr ? [billAddr.line1, billAddr.line2, billAddr.city, billAddr.postcode, formatCountryDisplay(billAddr.country)].filter(Boolean).join('\n') : ''
   const date = formatDateTime(so.invoicedAt ?? so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   await drawHeader(doc, branding, {
-    title: 'Invoice',
+    title: identity.title,
     reference: invNum,
-    ...(so.orderNumber ? { secondaryReference: { label: 'Order', value: so.orderNumber } } : {}),
+    ...(identity.orderReference ? { secondaryReference: { label: 'Order', value: identity.orderReference } } : {}),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -199,13 +216,14 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   }
 
   const { sym, symPos } = await getCurrencyFormat(so.currency)
+  const { view, totalsRows } = orderDocumentMoney(so)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'Description', width: 230, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
-    { label: `Price (${sym})`, width: 65, align: 'right' },
-    { label: `Tax (${sym})`, width: 55, align: 'right' },
-    { label: `Total (${sym})`, width: 75, align: 'right' },
+    { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
+    { label: `${view.vatIsAdditional ? 'VAT' : 'incl. VAT'} (${sym})`, width: 55, align: 'right' },
+    { label: `Total ${view.basisLabel} (${sym})`, width: 75, align: 'right' },
   ]
   const rows = so.lines.map((l, i) => [
     String(i + 1),
@@ -213,13 +231,13 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
     String(Number(l.qty)),
     Number(l.unitPriceForeign).toFixed(2),
     Number(l.taxForeign ?? 0).toFixed(2),
-    Number(l.totalForeign).toFixed(2),
+    view.lines[i].total.toFixed(2),
   ])
   drawTable(doc, columns, rows, branding)
   // A wrapped description column can leave the table ending near the page bottom;
   // keep the totals block together rather than splitting it across the page break.
   if (doc.y + 90 > 780) doc.addPage()
-  drawTotals(doc, so, sym, symPos, columns)
+  drawTotalsRows(doc, totalsRows, (v) => formatMoney(v, sym, symPos), columns)
 
   const base = await getBaseCurrencyDisplay()
   if (so.currency !== base.code) {
@@ -255,46 +273,13 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   return pdfToBuffer(doc)
 }
 
-function drawTotals(doc: PDFKit.PDFDocument, so: SoForPdf, sym: string, symPos: SymbolPos, columns: PdfTableColumn[]) {
-  const money = (n: number) => formatMoney(n, sym, symPos)
-  doc.y += 5
-  const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
-  const vW = columns[columns.length - 1].width
-  const lW = 80
-  const lX = tableRight - vW - lW
-  doc.font('Helvetica').fontSize(9).fillColor('#666')
-  doc.text('Subtotal:', lX, doc.y, { width: lW, align: 'right' })
-  doc.text(money(Number(so.subtotalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  if (Number(so.discountAmount) > 0) {
-    doc.text('Discount:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`-${money(Number(so.discountAmount))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
-  if (Number(so.shippingForeign) > 0) {
-    doc.text('Shipping:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(money(Number(so.shippingForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
-  if (Number(so.taxForeign) > 0) {
-    const taxLabel = (so.taxRateName ?? 'Tax') + (so.taxRatePercent != null ? ` (${(Number(so.taxRatePercent) * 100).toFixed(0)}%)` : '') + ':'
-    doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
-    doc.text(money(Number(so.taxForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
-  // Store credit is a payment: shown as its own line so the figures above add up to the Total below.
-  if (Number(so.storeCreditForeign ?? 0) > 0) {
-    doc.text('Store credit:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`-${money(Number(so.storeCreditForeign))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
-  doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
-  doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-}
-
 async function buildSalesOrderConfirmationEmail(orderId: string): Promise<PreparedEmail> {
   const so = await getSalesOrderEmailOrder(orderId)
   if (!so) throw new Error('Order not found')
   if (!so.customerEmail) throw new Error('No customer email address')
 
   const branding = await getBranding()
-  const ref = so.externalOrderNumber ?? so.id.slice(0, 8)
+  const ref = getSalesOrderReference(so)
   const { money } = await getCurrencyFormat(so.currency)
   const pdfBuffer = await generateSalesOrderPdf(so, branding)
   const tz = await getDisplayTimeZone()
@@ -438,11 +423,11 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, externalOrderNumber: true, customerEmail: true },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, customerEmail: true },
   })
   if (!so) throw new Error('Order not found')
   if (!so.customerEmail) throw new Error('No customer email address')
-  const ref = so.externalOrderNumber ?? so.id.slice(0, 8)
+  const ref = getSalesOrderReference(so)
   return { to: so.customerEmail, subject: `Order Confirmation ${ref}`, reference: ref }
 }
 
@@ -472,6 +457,7 @@ export async function getAccountingInvoiceQueueData(orderId: string): Promise<Qu
 }
 
 export async function prepareQueuedEmail(kind: string, referenceType: string | null, referenceId: string | null): Promise<PreparedEmail | null> {
+  if (referenceType === PURCHASE_ORDER_EMAIL_REFERENCE_TYPE && kind === PURCHASE_ORDER_EMAIL_KIND && referenceId) return buildPurchaseOrderEmail(referenceId)
   if (referenceType !== 'SalesOrder' || !referenceId) return null
   // ERASURE GATE, before the kind is even looked at: a kind this function does not prepare returns null and the drain
   // then sends to the STORED address, so the refusal cannot live inside the per-kind builders.

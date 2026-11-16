@@ -27,7 +27,7 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 
 ### FX rate
 
-**One rate means the table rate.** A foreign-currency PO is always raised at the exchange rate held in Settings > Accounting > FX Rates (the `fx_rates` table) for its currency: the latest rate on or before the moment the PO is saved. There is no rate field to type, no override band and no warning: the number the PO form shows is the rate the PO is stored at. A currency with no stored rate cannot be used; the PO is refused with "Missing ... FX rate".
+**One rate means the table rate.** A foreign-currency PO is always raised at the exchange rate held in Settings > Accounting > FX Rates (the `fx_rates` table) for its currency: the latest rate on or before the moment the PO is saved. There is no rate field to type, no override band and no warning: the number the PO form shows is the rate the PO is stored at. The form reads the rate when you choose the currency and shows it with its source and date. A currency with no stored rate cannot be used: the form shows "No exchange rate for <currency> yet: rates come from the store (Aelia)", the base-currency total shows a dash, and **Create Purchase Order** stays disabled until an admin has synced the rates or pinned one on the FX Rates page and you pick the currency again. The rate is never shown or used as 1.
 
 - **A different rate for a deliberate reason** (a forward contract, a supplier-specific rate): an admin pins a **manual override** on Settings > Accounting > FX Rates (the pencil icon). The override is a new row in the table and is the latest rate, so every PO saved after it uses it, and the daily fetch skips that currency until the override is cleared. It applies to all POs in that currency, not to one.
 - **Existing POs keep the rate they were stored with.** A stored rate is never rewritten when the table changes.
@@ -56,7 +56,7 @@ Purchase orders use the canonical purchase workflow documented in `docs/workflow
 | **Draft** | The PO has been created but not yet sent. Everything can still be edited. |
 | **RFQ Sent** | A request for quotation has been sent to the supplier. |
 | **Quote Received** | A supplier quote has been received and can be converted to a purchase order. |
-| **PO Sent** | The purchase order has been confirmed and sent to the supplier. |
+| **PO Sent** | The purchase order has been confirmed. When emailing POs is switched on (off by default), **Confirm & Send PO** also queues an email with the PO PDF to the supplier's email address (see [PO PDF](#po-pdf)). |
 | **Shipped** | The supplier has shipped the goods. |
 | **Partially Received** | Some lines have been received but the PO is not yet complete. |
 | **Received** | Every line has landed in stock. A line counts as **landed** when its goods have arrived by any route: a manual receipt, a warehouse (WMS) book-in, or a warehouse stock-sync alignment that raised stock without a receipt on the line. An order the warehouse accounted for entirely therefore becomes Received without a manual receipt. |
@@ -99,7 +99,14 @@ Generate a request for quotation PDF to send to the supplier. The RFQ includes p
 
 ### PO PDF
 
-Generate a purchase order PDF to send to the supplier. The PO PDF includes product details, barcodes/EANs, **and prices**.
+The **PO PDF** button on any purchase order opens the priced purchase order: supplier and our reference, delivery address (the destination warehouse), expected delivery, currency, payment terms, every line with quantity, unit cost, discount and total, then the totals (subtotal after discounts, VAT, additional costs and the order total). It needs the Purchasing permission. Settings > Documents > Purchase Order previews the same layout with sample data.
+
+**Confirm & Send PO** confirms the order and then, **only if emailing POs is switched on**, queues an email to the supplier's address with this PDF attached. The switch is **Settings > Company > Documents > Email purchase orders to suppliers** (administrators only) and it is **off by default**: the feature is built but ships switched off, so a stage copy holding real SMTP credentials cannot mail a real supplier.
+
+- **Switched off (default):** the order is confirmed, nothing is queued and the page says "PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it to the supplier directly." The **Email PO** button is hidden. A PO email that was queued before the switch was turned off is not sent either: it ends **Failed** in the email queue with the reason "Not sent: emailing purchase orders to suppliers is switched off".
+- **Switched on:** the order is confirmed first. If the email cannot be queued, or the supplier has **no email address** (or an invalid one), the order stays confirmed and the page says nothing was sent. Add the address on the supplier and click **Email PO**, or download the PDF and send it to the supplier directly.
+- **Email PO** (on a confirmed order, switch on) queues the email again, for example after correcting the supplier's address. A second click while the first email is still waiting does not add a duplicate.
+- "Queued" means the email is on the outbox, not that the supplier has it. It goes out through the same email queue as order confirmations (see [Documents & Email](documents-email.md)), with your SMTP settings. The outcome is logged on the order's activity.
 
 
 ## Receiving a Purchase Order

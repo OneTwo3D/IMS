@@ -3,6 +3,8 @@
  */
 
 import { xeroPost } from './api'
+import { assertXeroLineQuantitiesKept, xeroUnitDpFields, xeroUnitDpRoundingLine } from './write-path'
+import { resolveUnitDpRoundingAccount } from './unit-dp-rounding'
 import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
 import { xeroDocumentRevisionAt } from './document-revision'
@@ -122,6 +124,8 @@ export function buildSalesInvoicePayload(
   droppedItemCodes: Set<string>,
   /** The organisation's base currency. REQUIRED: whether a missing CurrencyRate is allowed depends on it (o3d-q0x56.3). */
   baseCurrency: string,
+  /** The Rounding account the unitdp=4 penny posts to (setting `xero_rounding_difference_account`); required only when the lines need one. */
+  roundingAccount?: string | null,
 ): Record<string, unknown> {
   // o3d-q0x56.3: decided FIRST, before any payload is built. A foreign invoice with no usable IMS rate THROWS, so Xero is never left to apply
   // its XE.com day rate. A base-currency invoice with no rate omits the field, unchanged.
@@ -146,8 +150,7 @@ export function buildSalesInvoicePayload(
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
       Description: line.description,
-      Quantity: line.quantity,
-      UnitAmount: line.unitAmount,
+      ...xeroUnitDpFields(line.quantity, line.unitAmount),
       AccountCode: line.accountCode,
       TaxType: line.taxType,
     }
@@ -190,6 +193,11 @@ export function buildSalesInvoicePayload(
       TaxType: data.discountTaxType,
     })
   }
+
+  // The penny a 4dp unit price loses at Xero, posted on its own line so every line keeps its real quantity (see write-path.ts). Throws with no account.
+  const roundingLine = xeroUnitDpRoundingLine(data.lines, roundingAccount, `Sales invoice ${data.invoiceNumber ?? '(no number)'}`)
+  if (roundingLine) lineItems.push(roundingLine)
+  assertXeroLineQuantitiesKept(data.lines, lineItems)
 
   // DueDate is mandatory for AUTHORISED invoices in Xero. Fall back to the
   // invoice date (same-day payment) if the caller didn't supply one.
@@ -239,6 +247,8 @@ async function prepareSalesInvoicePayload(
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Sales invoice ${data.invoiceNumber ?? '(no number)'}`,
   })
   if (rateProblem) return { success: false, error: rateProblem }
+  const rounding = await resolveUnitDpRoundingAccount(data.lines, `Sales invoice ${data.invoiceNumber ?? '(no number)'}`)
+  if (!rounding.ok) return { success: false, error: rounding.error }
 
   // Find or create the contact
   let contactName = data.contactName
@@ -286,7 +296,7 @@ async function prepareSalesInvoicePayload(
   try {
     return {
       success: true,
-      invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes, baseCurrency),
+      invoice: buildSalesInvoicePayload(data, status, contactResult.contactId, droppedItemCodes, baseCurrency, rounding.account),
     }
   } catch (error) {
     if (isXeroForeignCurrencyRateError(error) || isXeroSalesDocumentTaxTypeError(error)) return { success: false, error: error.message }

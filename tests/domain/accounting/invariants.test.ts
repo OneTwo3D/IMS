@@ -852,6 +852,52 @@ test('scjz.75: skips the tie-out for refunded orders (reversal adjusts deferral 
   assert.ok(!codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
 })
 
+test('o3d-hqvrp.35: a NET refund entered BEFORE the deferral is netted into it, so the tie-out still applies and flags stranded revenue', () => {
+  const rows = fullyShippedNoRefundRows()
+  rows.salesOrders[0].shipments[1].revenueRecognizedAmount = 30 // strands 10 against the 100 deferral
+  rows.salesOrders[0].refunds = [{
+    id: 'r1', creditNoteNumber: 'CN-9', accountingCreditNoteId: 'xc-9', totalBase: 10,
+    accountingRetryRequired: false, accountingWarning: null, accountingRetrySyncs: null,
+    totalsBasis: 'NET', refundedAt: new Date(new Date(rows.salesOrders[0].revenueDeferredDate as Date).getTime() - 60_000),
+  }]
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
+})
+
+test('o3d-hqvrp.35: a refund entered AFTER the deferral (or of unknown time or legacy gross basis) keeps the old skip', () => {
+  for (const extra of [
+    { totalsBasis: 'NET', refundedAt: new Date('2099-01-01T00:00:00.000Z') },
+    { totalsBasis: null, refundedAt: new Date('2000-01-01T00:00:00.000Z') },
+    { totalsBasis: 'NET', refundedAt: null },
+  ]) {
+    const rows = fullyShippedNoRefundRows()
+    rows.salesOrders[0].shipments[1].revenueRecognizedAmount = 30
+    rows.salesOrders[0].refunds = [{
+      id: 'r1', creditNoteNumber: 'CN-9', accountingCreditNoteId: 'xc-9', totalBase: 10,
+      accountingRetryRequired: false, accountingWarning: null, accountingRetrySyncs: null, ...extra,
+    }]
+    const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+    assert.ok(!codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
+  }
+})
+
+test('o3d-hqvrp.35: a refund netted by an adjustment journal with no live sync row is reported; with the row it is not', () => {
+  const rows = fullyShippedNoRefundRows()
+  rows.salesOrders[0].refunds = [{
+    id: 'r1', creditNoteNumber: 'CN-9', accountingCreditNoteId: 'xc-9', totalBase: 10,
+    accountingRetryRequired: false, accountingWarning: null, accountingRetrySyncs: null,
+    totalsBasis: 'NET', deferralAdjustmentRef: 'A1-2026-01-01-ffffffff',
+  }]
+  const missing = evaluateAccountingInvariantRows(rows).find((f) => f.code === 'refund_deferral_adjustment_without_sync_evidence')
+  assert.ok(missing, 'expected a finding for the lost adjustment')
+  rows.syncLogs.push({
+    id: 'adj', connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'SYNCED',
+    referenceType: 'DailyBatch', referenceId: 'A1-2026-01-01-ffffffff', externalTransactionId: 'j-adj',
+    payload: { date: '2026-01-01' }, errorMessage: null, retryCount: 0, createdAt: A1_DATE, syncedAt: A1_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
+  })
+  assert.ok(!evaluateAccountingInvariantRows(rows).some((f) => f.code === 'refund_deferral_adjustment_without_sync_evidence'))
+})
+
 test('scjz.75: does not flag a non-terminal (still-shipping) order even if sums differ', () => {
   const rows = fullyShippedNoRefundRows()
   rows.salesOrders[0].status = 'ALLOCATED' // not a fully-shipped terminal status

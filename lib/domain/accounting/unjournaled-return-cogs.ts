@@ -16,6 +16,10 @@ import { addMoney, multiplyMoney, roundQuantity, toDecimal, type Decimal } from 
  * whichever batch run journals it, and the rest is booked by the runs that journal the other shipments. Net:
  * COGS = shipped - returned, and the Inventory debit equals the returned cost layers.
  *
+ * A refund can span a journaled and an unjournaled shipment: staging then restocks the journaled units with their
+ * COGS reversal, the fallback rows restock the rest, and `returnCostSplit` is rewritten to the fallback-restocked
+ * shares only. Group B books each such share, less whatever a staged COGS reversal already covers for that shipment.
+ *
  * Exactly once per (refund, shipment): the booking is recorded as a COGS sub-ledger row keyed
  * `unjournaledReturnKey`, in the same transaction as the journal. A share is capped by the shipment's own COGS,
  * so the reversal can never make a shipment's COGS negative.
@@ -50,6 +54,8 @@ export async function loadUnjournaledReturnCredits(
       select: { idempotencyKey: true },
     }),
   ])
+  const shipmentLines = await tx.shipmentLine.findMany({ where: { shipmentId: { in: batchShipments.map((s) => s.shipmentId) } }, select: { id: true, shipmentId: true } })
+  const shipmentIdByLine = new Map(shipmentLines.map((line) => [line.id, line.shipmentId]))
   const done = new Set(recorded.map((row) => row.idempotencyKey))
   const returned = new Set(movements.map((movement) => movement.referenceId))
 
@@ -58,20 +64,22 @@ export async function loadUnjournaledReturnCredits(
   for (const refund of refunds) {
     // Only a return that was actually applied from the fallback rows (no staged shipment-source snapshot).
     if (!returned.has(refund.id)) continue
-    let staged = toDecimal(0)
+    // What a staged COGS reversal already covers, per source shipment: only that part of a share is skipped.
+    const stagedByShipment = new Map<string, Decimal>()
     for (const line of refund.lines) {
       for (const entry of parseCostLayerSnapshot(line.costLayerSnapshot)) {
-        if (entry.source === 'shipment') staged = addMoney(staged, multiplyMoney(entry.qty, entry.unitCostBase))
+        const shipmentId = entry.source === 'shipment' && entry.shipmentLineId ? shipmentIdByLine.get(entry.shipmentLineId) : undefined
+        if (shipmentId) stagedByShipment.set(shipmentId, addMoney(stagedByShipment.get(shipmentId) ?? toDecimal(0), multiplyMoney(entry.qty, entry.unitCostBase)))
       }
     }
-    if (staged.gt(0)) continue
     const split = Array.isArray(refund.returnCostSplit) ? refund.returnCostSplit as Array<{ shipmentId?: string; valueBase?: string }> : []
     for (const part of split) {
       const shipment = part.shipmentId ? shipmentById.get(part.shipmentId) : undefined
       if (!shipment || shipment.orderId !== refund.orderId || !part.valueBase) continue
       if (done.has(unjournaledReturnKey(refund.id, shipment.shipmentId))) continue
       const cap = remaining.get(shipment.shipmentId) ?? 0
-      const amount = roundQuantity(Math.min(toDecimal(part.valueBase).toNumber(), cap), 6)
+      const uncovered = toDecimal(part.valueBase).sub(stagedByShipment.get(shipment.shipmentId) ?? 0).toNumber()
+      const amount = roundQuantity(Math.min(uncovered, cap), 6)
       if (amount.lte(0.005)) continue
       remaining.set(shipment.shipmentId, cap - amount.toNumber())
       credits.push({ orderId: refund.orderId, refundId: refund.id, shipmentId: shipment.shipmentId, amount })

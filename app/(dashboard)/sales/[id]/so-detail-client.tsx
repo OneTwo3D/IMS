@@ -35,6 +35,8 @@ import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
+import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
+import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
 import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
 import { buildRefundRequest, creditNoteAmounts, salesOrderMoneyView, type MoneyViewOrder } from '@/lib/domain/sales/sales-order-money-view'
 import { ProductLink } from '@/components/inventory/product-link'
@@ -875,6 +877,16 @@ function ShipmentsPanel({
                 })()}
               </div>
               <div className="flex items-center gap-1.5">
+                {orderPackingSlipAvailable(orderStatus) && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => window.open(packingSlipUrl(orderId, s.id), '_blank')}
+                  >
+                    <Package className="h-3 w-3 mr-1" />Packing slip
+                  </Button>
+                )}
                 {nextAction && s.status !== 'SHIPPED' && (
                   <Button size="sm" className="h-7 text-xs" onClick={() => handleAdvance(s.id, nextAction.target)} disabled={isPending}>
                     {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
@@ -1262,6 +1274,17 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[so.status]}`}>
           {STATUS_LABELS[so.status]}
         </span>
+        {(() => {
+          const fulfilment = summariseFulfilment(so.status, shipments.map((sh) => sh.status), so.shipmentOutstandingQty)
+          return fulfilment ? (
+            <span
+              className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${FULFILMENT_TONE_CLASS[fulfilment.tone]}`}
+              title="Fulfilment progress, derived from this order's shipments"
+            >
+              {fulfilment.label}
+            </span>
+          ) : null
+        })()}
         {so.refundStatus !== 'NONE' && (
           <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${
             so.refundStatus === 'FULL'
@@ -1451,8 +1474,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <FileText className="h-4 w-4 mr-1.5" />Invoice PDF
                 </DropdownMenuItem>
               )}
-              {['PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && (
-                <DropdownMenuItem onClick={() => window.open(`/api/packing-slip/${so.id}`, '_blank')}>
+              {orderPackingSlipAvailable(so.status) && (
+                <DropdownMenuItem onClick={() => window.open(packingSlipUrl(so.id), '_blank')}>
                   <Package className="h-4 w-4 mr-1.5" />Packing Slip
                 </DropdownMenuItem>
               )}
@@ -1964,6 +1987,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 <div className="flex items-center gap-2">
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                   <span className="text-muted-foreground text-xs">{formatDateTime(r.refundedAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                  <a href={`/api/credit-note/${r.id}`} target="_blank" rel="noreferrer" className="text-xs text-primary underline">PDF</a>
                 </div>
                 <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>

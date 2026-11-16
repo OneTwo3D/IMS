@@ -37,6 +37,7 @@ import {
   describeFollowUpObligationBacklogRow,
   readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
+import { wcOrderEditDriftWhere } from '@/lib/connectors/woocommerce/sync/order-edit-drift'
 import { giftCardUnsettledHoldWhere } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
@@ -138,6 +139,7 @@ import {
   wmsResolutionSkipReason,
 } from '@/lib/connectors/wms/enabled-connector'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
+import { loadOpenWcCompletionRefusals } from '@/lib/connectors/woocommerce/sync/completion-refusal'
 import { isWcAdmissionRefusalPayload, wcBlockedOrderQueueWhere } from '@/lib/connectors/woocommerce/sync/order-admission'
 
 // q66in.4.2: the dead-letter / exception inbox. One aggregated read model over
@@ -505,6 +507,49 @@ export type BlockedWcOrderRow = {
   blockedAt: string
 }
 
+/**
+ * o3d-ymgc: a WooCommerce order the store marked completed that IMS PERMANENTLY refused to turn into shipments (a coverage shortfall).
+ * The delivery was acknowledged, so this row is the order's only durable record. It clears by itself once the order is fulfilled,
+ * completed or cancelled, so there is nothing to acknowledge.
+ */
+export type WcCompletionRefusalRow = {
+  id: string
+  orderId: string
+  orderNumber: string | null
+  externalOrderId: string
+  /** The refusal code (for example `coverage_shortfall`). */
+  refusal: string
+  /** The refusal's own sentence, naming what is short. */
+  detail: string
+  /** How many times the store's completion was refused for this order. */
+  occurrences: number
+  raisedAt: string
+}
+
+/**
+ * o3d-zvec.14: an order absorbed by a warehouse merge where more than one order of the merge charged the customer postage. Listed until an
+ * IMS operator clears it; IMS never refunds automatically and the warehouse is not involved.
+ */
+export type DoublePostageRow = {
+  orderId: string
+  orderNumber: string | null
+  connector: string
+  /** The warehouse order the orders were merged into. */
+  externalOrderNumber: string | null
+  detail: string
+  flaggedAt: string
+}
+
+export type WcOrderEditDriftRow = {
+  id: string
+  orderId: string | null
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  /** What differs between the WooCommerce order and the IMS order. */
+  detail: string | null
+  foundAt: string
+}
+
 export type ProductStructureConflictRow = {
   id: string
   /** The IMS product the WooCommerce object was paired with. */
@@ -764,8 +809,14 @@ export type ExceptionInboxSummary = {
   pennyMismatches: number
   orderReconcileDrift: number
   productStructureConflicts: number
+  /** WooCommerce orders whose lines or total were edited after import (IMS keeps the original content). */
+  wcOrderEdits: number
   /** WooCommerce orders a guard refused to import, recorded in the by-id queue. */
   blockedWcOrders: number
+  /** Permanently refused WooCommerce completions still open (counted in the total). */
+  wcCompletionRefusals: number
+  /** Merged orders that may have charged postage twice, awaiting an operator (counted in the total). */
+  doublePostageFlags: number
   /** Held invoices refused for a gift-card flag the store left unsettled: an operator answers per line (counted in the total). */
   giftCardLinesToResolve: number
   /** Open operator tasks ("raise a warehouse query"): IMS writes no warehouse comments, so each is a query a person raises by hand (counted in the total). */
@@ -814,7 +865,10 @@ export type ExceptionInboxData = {
   pennyMismatches: PennyMismatchRow[]
   orderReconcileDrift: OrderReconcileDriftRow[]
   productStructureConflicts: ProductStructureConflictRow[]
+  wcOrderEdits: WcOrderEditDriftRow[]
   blockedWcOrders: BlockedWcOrderRow[]
+  wcCompletionRefusals: WcCompletionRefusalRow[]
+  doublePostageFlags: DoublePostageRow[]
   unresolvedDrift: UnresolvedDriftRow[]
   accountingFollowUpObligations: AccountingFollowUpObligationRow[]
   accountingPostingRefusals: AccountingPostingRefusalRow[]
@@ -1012,6 +1066,82 @@ async function loadProductStructureConflicts(): Promise<ProductStructureConflict
   })
 }
 
+async function countWcCompletionRefusals(): Promise<number> {
+  return (await loadOpenWcCompletionRefusals()).length
+}
+
+async function loadWcCompletionRefusals(): Promise<WcCompletionRefusalRow[]> {
+  return (await loadOpenWcCompletionRefusals(SECTION_LIMIT)).map((row) => ({
+    id: row.id,
+    orderId: row.orderId,
+    orderNumber: row.orderNumber,
+    externalOrderId: row.externalOrderId,
+    refusal: row.refusal,
+    detail: row.error,
+    occurrences: row.occurrences,
+    raisedAt: row.raisedAt,
+  }))
+}
+
+const DOUBLE_POSTAGE_WHERE = { doublePostageAt: { not: null } } as const
+
+function countDoublePostageFlags(): Promise<number> {
+  return db.wmsOrderPushLink.count({ where: DOUBLE_POSTAGE_WHERE })
+}
+
+async function loadDoublePostageFlags(): Promise<DoublePostageRow[]> {
+  const links = await db.wmsOrderPushLink.findMany({
+    where: DOUBLE_POSTAGE_WHERE,
+    orderBy: { doublePostageAt: 'desc' },
+    take: SECTION_LIMIT,
+    select: {
+      orderId: true,
+      connector: true,
+      externalOrderNumber: true,
+      doublePostageAt: true,
+      doublePostageDetail: true,
+      order: { select: { orderNumber: true, externalOrderNumber: true } },
+    },
+  })
+  return links.map((link) => ({
+    orderId: link.orderId,
+    orderNumber: link.order.externalOrderNumber ?? link.order.orderNumber,
+    connector: link.connector,
+    externalOrderNumber: link.externalOrderNumber,
+    detail: link.doublePostageDetail ?? '',
+    flaggedAt: (link.doublePostageAt ?? new Date(0)).toISOString(),
+  }))
+}
+
+function countWcOrderEdits(): Promise<number> {
+  return db.shoppingSyncLog.count({ where: wcOrderEditDriftWhere() })
+}
+
+async function loadWcOrderEdits(): Promise<WcOrderEditDriftRow[]> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: wcOrderEditDriftWhere(),
+    orderBy: { createdAt: 'desc' },
+    take: SECTION_LIMIT,
+    select: { id: true, entityId: true, externalId: true, errorMessage: true, createdAt: true },
+  })
+  const orderIds = rows.map((row) => row.entityId).filter((id): id is string => Boolean(id))
+  const orders = orderIds.length > 0
+    ? await db.salesOrder.findMany({ where: { id: { in: orderIds } }, select: { id: true, orderNumber: true, externalOrderNumber: true } })
+    : []
+  const byId = new Map(orders.map((order) => [order.id, order]))
+  return rows.map((row) => {
+    const order = row.entityId ? byId.get(row.entityId) : undefined
+    return {
+      id: row.id,
+      orderId: row.entityId,
+      orderNumber: order?.orderNumber ?? null,
+      externalOrderNumber: order?.externalOrderNumber ?? row.externalId,
+      detail: row.errorMessage,
+      foundAt: row.createdAt.toISOString(),
+    }
+  })
+}
+
 function countBlockedWcOrders(): Promise<number> {
   return db.shoppingSyncLog.count({ where: wcBlockedOrderQueueWhere() })
 }
@@ -1104,7 +1234,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, deadShoppingWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, blockedWcOrders, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals, handPostClaims] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, deadShoppingWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, wcOrderEdits, blockedWcOrders, wcCompletionRefusals, doublePostageFlags, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals, handPostClaims] = await Promise.all([
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
@@ -1120,7 +1250,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     countStuckDispatches(),
     countOrderReconcileDrift(),
     countProductStructureConflicts(),
+    countWcOrderEdits(),
     countBlockedWcOrders(),
+    countWcCompletionRefusals(),
+    countDoublePostageFlags(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
@@ -1157,7 +1290,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     pennyMismatches,
     orderReconcileDrift,
     productStructureConflicts,
+    wcOrderEdits,
     blockedWcOrders,
+    wcCompletionRefusals,
+    doublePostageFlags,
     giftCardLinesToResolve,
     wmsOperatorTasksOpen,
     unresolvedDrift: driftIncidents.length,
@@ -1167,7 +1303,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + blockedWcOrders + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }
@@ -1243,7 +1379,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
   // apart cannot change which side of a five-minute grace a row falls on.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, deadShoppingWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, blockedWcOrderRows, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, deadShoppingWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, wcOrderEditRows, blockedWcOrderRows, wcCompletionRefusalRows, doublePostageRows, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: WMS_PUSH_INBOX_WHERE,
       orderBy: { lastAttemptAt: 'desc' },
@@ -1349,7 +1485,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     }),
     loadOrderReconcileDrift(),
     loadProductStructureConflicts(),
+    loadWcOrderEdits(),
     loadBlockedWcOrders(),
+    loadWcCompletionRefusals(),
+    loadDoublePostageFlags(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
@@ -1711,7 +1850,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     })),
     orderReconcileDrift,
     productStructureConflicts,
+    wcOrderEdits: wcOrderEditRows,
     blockedWcOrders: blockedWcOrderRows,
+    wcCompletionRefusals: wcCompletionRefusalRows,
+    doublePostageFlags: doublePostageRows,
     unresolvedDrift: driftIncidents.map((incident) => ({
       connector: incident.connector,
       version: incident.version,
@@ -4426,6 +4568,56 @@ export async function clearPennyMismatchFlag(orderId: string): Promise<{ success
   })
   revalidatePath('/sync/exceptions')
   return { success: true }
+}
+
+/**
+ * o3d-zvec.14: clear the double-postage flag on an order the warehouse merged. THE OPERATOR'S CALL: IMS never refunds postage on its own, so
+ * clearing only records that a person has looked (and refunded by hand if it was due). Sync permission AND a fresh sign-in, because it
+ * retires the only record of a possible over-charge; audited with who cleared it and what it said.
+ */
+export async function clearDoublePostageFlag(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const link = await db.wmsOrderPushLink.findUnique({
+      where: { orderId },
+      select: { doublePostageAt: true, doublePostageDetail: true, externalOrderNumber: true, connector: true },
+    })
+    if (!link || !link.doublePostageAt) return { success: false, error: 'The flag was already cleared.' }
+    // ONE transaction: the compare-and-set clear (on the very flag the operator saw, so two operators clearing at once audit one clear)
+    // and its audit row commit or roll back together. logActivityInTransaction does not catch, so an audit that cannot be written
+    // takes the clear with it.
+    const cleared = await db.$transaction(async (tx) => {
+      const updated = await tx.wmsOrderPushLink.updateMany({
+        where: { orderId, doublePostageAt: link.doublePostageAt },
+        data: { doublePostageAt: null, doublePostageDetail: null },
+      })
+      if (updated.count === 0) return false
+      await logActivityInTransaction(tx, {
+        userId: session.user.id,
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        tag: 'sync',
+        action: 'wms_double_postage_cleared',
+        description: 'Cleared the possible double-postage flag on a merged order via the exception inbox',
+        metadata: {
+          orderId,
+          userId: session.user.id,
+          connector: link.connector,
+          mergedInto: link.externalOrderNumber,
+          flaggedAt: link.doublePostageAt?.toISOString(),
+          detail: link.doublePostageDetail,
+        },
+      })
+      return true
+    })
+    if (!cleared) return { success: false, error: 'The flag was already cleared.' }
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
 }
 
 /**

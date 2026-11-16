@@ -86,6 +86,10 @@ const DEFERRAL_INPUT_SELECT = {
   taxRatePercent: true,
   shoppingLinks: { select: { connector: true } },
   lines: { select: { totalBase: true, taxRate: { select: { rate: true } } } },
+  // o3d-hqvrp.35 (ACC-H13): the refunds already on the order. Group A1 only ever selects an order that
+  // has NOT been deferred, so any refund it carries predates the deferral and took no Unearned
+  // Revenue reversal (the refund service stages those only once `revenueDeferredDate` is set).
+  refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
 } as const
 
 type DeferralInputs = {
@@ -98,6 +102,8 @@ type DeferralInputs = {
   taxRatePercent: Prisma.Decimal | number | null
   shoppingLinks: Array<{ connector: string }>
   lines: Array<{ totalBase: Prisma.Decimal | number | null; taxRate?: { rate: Prisma.Decimal | number | null } | null }>
+  /** Optional so fixtures that predate the netting still type-check; absent means "no refunds". */
+  refunds?: Array<{ id?: string; totalBase: Prisma.Decimal | number | null; totalsBasis: string | null; refundedAt?: Date | null }>
 }
 
 /**
@@ -127,9 +133,58 @@ export function chunkOrderIds(ids: readonly string[], size = DEFERRAL_ID_CHUNK_S
  * there, and misses drift that is.
  */
 export function revenueDeferralAmount(order: DeferralInputs): number {
+  return roundToGlPrecisionNumber(revenueDeferralGrossAmount(order) - preBatchRefundedNetBase(order.refunds))
+}
+
+/**
+ * The deferral BEFORE any refund is netted: subtotal + shipping - discount. This is what the order's invoice
+ * put in Sales, so it is what the paid-day journal moves to Unearned Revenue. Refunds are then adjusted
+ * separately, each on its own date (`preBatchRefundAdjustments`), so a refund entered in a later period never
+ * changes a journal dated in an earlier one.
+ */
+export function revenueDeferralGrossAmount(order: DeferralInputs): number {
   return roundToGlPrecisionNumber(
     Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - normalizeOrderDiscountBase(order, order.lines),
   )
+}
+
+export type PreBatchRefundAdjustment = { refundId: string | null; amount: number; refundedAt: Date | null }
+
+/** The NET refunds `preBatchRefundedNetBase` subtracts, one per refund, so each can be journalled on its own date. */
+export function preBatchRefundAdjustments(refunds: DeferralInputs['refunds']): PreBatchRefundAdjustment[] {
+  const adjustments: PreBatchRefundAdjustment[] = []
+  for (const refund of refunds ?? []) {
+    if (refund.totalsBasis !== 'NET') continue
+    const amount = roundToGlPrecisionNumber(Number(refund.totalBase ?? 0))
+    if (!(amount > 0)) continue
+    adjustments.push({ refundId: refund.id ?? null, amount, refundedAt: refund.refundedAt ?? null })
+  }
+  return adjustments
+}
+
+/**
+ * o3d-hqvrp.35 (ACC-H13) — REFUNDS ENTERED BEFORE THE FIRST BATCH RUN ARE NETTED OUT OF THE DEFERRAL.
+ *
+ * The invoice posts the order's revenue to Sales; a refund's credit note takes its (net) value back out
+ * of Sales. The deferral then pulls "what the invoice put in Sales" into Unearned Revenue. Before this,
+ * the deferral was subtotal + shipping - discount no matter what had been refunded, so an order with
+ * lines 60 + 40, shipping 10 and the 40 line refunded pre-batch deferred 110 although Sales held 70:
+ * Unearned kept a 44 credit for ever and Sales showed 16 instead of 60 at shipment. (A refund entered
+ * AFTER the deferral is handled by the refund service's own Unearned Revenue reversal, and is not in
+ * this sum because Group A1 never selects a deferred order.)
+ *
+ * ONLY NET REFUNDS COUNT. `totalsBasis` is 'NET' for every refund written since the net contract; a
+ * legacy row (NULL) stores GROSS totals, and subtracting a tax-inclusive figure from a tax-exclusive
+ * deferral would over-net. Those are left as they were - the order is still deferred at the unnetted
+ * figure, which the lifecycle tie-out then reports - rather than guessed at.
+ */
+export function preBatchRefundedNetBase(refunds: DeferralInputs['refunds']): number {
+  let total = 0
+  for (const refund of refunds ?? []) {
+    if (refund.totalsBasis !== 'NET') continue
+    total += Number(refund.totalBase ?? 0)
+  }
+  return roundToGlPrecisionNumber(total)
 }
 
 /**
@@ -273,4 +328,18 @@ export function liveDailyBatchDeferralWhere(batchRefs: readonly string[]): {
     type: 'DAILY_BATCH_REVENUE_DEFERRAL' as AccountingSyncType,
     status: { in: [...POSTABLE_ACCOUNTING_SYNC_STATUSES] as AccountingSyncStatus[] },
   }
+}
+
+/**
+ * The NET refunds that were netted out of an order's STORED deferral by the adjustment path, so a rebuilt
+ * paid-day journal can be raised at the gross figure it was originally posted at. A refund counts ONLY if the
+ * batch stamped it with its adjustment journal (`deferralAdjustmentRef`): a stamp written before that path
+ * existed stored the GROSS deferral, its refunds carry no ref, and it must be rebuilt at the stored amount.
+ */
+export function preBatchRefundsNettedIntoStoredDeferral(order: {
+  refunds?: Array<{ totalBase: Prisma.Decimal | number | null; totalsBasis: string | null; deferralAdjustmentRef?: string | null }>
+}): number {
+  return (order.refunds ?? [])
+    .filter((refund) => refund.totalsBasis === 'NET' && !!refund.deferralAdjustmentRef)
+    .reduce((sum, refund) => sum + Number(refund.totalBase ?? 0), 0)
 }

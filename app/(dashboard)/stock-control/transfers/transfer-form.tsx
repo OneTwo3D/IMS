@@ -37,11 +37,12 @@ type Line = {
   qty: number
 }
 
-function StockCell({ entry, dim }: { entry: StockLevelEntry; dim?: boolean }) {
+function StockCell({ entry, dim, label }: { entry: StockLevelEntry; dim?: boolean; label: string }) {
   const available = entry.available
   const total = entry.total
   return (
-    <span className={`font-mono text-xs text-right ${dim ? 'text-muted-foreground' : available <= 0 ? 'text-destructive' : 'text-foreground'}`}>
+    <span className={`font-mono text-xs text-right max-sm:text-left ${dim ? 'text-muted-foreground' : available <= 0 ? 'text-destructive' : 'text-foreground'}`}>
+      <span className="hidden font-sans text-[11px] text-muted-foreground max-sm:block">{label}</span>
       {total}
       {total !== available
         ? <span className="text-muted-foreground"> ({available})</span>
@@ -101,7 +102,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
+      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl max-sm:top-0 max-sm:left-0 max-sm:h-dvh max-sm:max-h-dvh max-sm:max-w-none max-sm:translate-x-0 max-sm:translate-y-0 max-sm:content-start max-sm:rounded-none">
         <DialogHeader>
           <DialogTitle>New Stock Transfer</DialogTitle>
         </DialogHeader>
@@ -111,7 +112,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-1.5">
               <Label className="text-sm">From Warehouse</Label>
-              <Select value={fromId} onChange={(e) => setFromId(e.target.value)} className="h-9">
+              <Select value={fromId} onChange={(e) => setFromId(e.target.value)} className="h-9 max-sm:h-11 max-sm:text-base">
                 {warehouses.map((w) => (
                   <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
                 ))}
@@ -119,7 +120,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
             </div>
             <div className="space-y-1.5">
               <Label className="text-sm">To Warehouse</Label>
-              <Select value={toId} onChange={(e) => setToId(e.target.value)} className="h-9">
+              <Select value={toId} onChange={(e) => setToId(e.target.value)} className="h-9 max-sm:h-11 max-sm:text-base">
                 {warehouses.map((w) => (
                   <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
                 ))}
@@ -130,7 +131,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
           {/* Notes */}
           <div className="space-y-1.5">
             <Label className="text-sm">Notes (optional)</Label>
-            <Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="e.g. monthly restock" className="h-9" />
+            <Input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="e.g. monthly restock" className="h-9 max-sm:h-11 max-sm:text-base" />
           </div>
 
           {/* Product search */}
@@ -139,6 +140,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
             <div className="relative">
               <Input
                 ref={searchRef}
+                className="max-sm:h-11 max-sm:text-base"
                 placeholder="Search by SKU or name…"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
@@ -179,8 +181,8 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
             </div>
           ) : (
             <div className="border border-border rounded-lg overflow-x-auto">
-              <div className="min-w-[500px]">
-              <div className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b border-border">
+              <div className="sm:min-w-[500px]">
+              <div className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2 bg-muted/50 max-sm:hidden text-xs font-medium text-muted-foreground border-b border-border">
                 <span>Product</span>
                 <span className="text-right">From {warehouses.find((w) => w.id === fromId)?.code ?? ''}</span>
                 <span className="text-right">To {warehouses.find((w) => w.id === toId)?.code ?? ''}</span>
@@ -191,20 +193,20 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
                 const from = stockAt(line.productId, fromId)
                 const to = stockAt(line.productId, toId)
                 return (
-                  <div key={line.key} className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2.5 items-center border-b border-border/50 last:border-0">
-                    <div className="min-w-0">
+                  <div key={line.key} className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2.5 items-center border-b border-border/50 last:border-0 max-sm:grid-cols-2 max-sm:gap-y-2">
+                    <div className="min-w-0 max-sm:col-start-1 max-sm:row-start-1">
                       <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
                     </div>
-                    <StockCell entry={from} />
-                    <StockCell entry={to} dim />
+                    <StockCell entry={from} label={`From ${warehouses.find((w) => w.id === fromId)?.code ?? ''}`} />
+                    <StockCell entry={to} dim label={`To ${warehouses.find((w) => w.id === toId)?.code ?? ''}`} />
                     <Input
                       type="number" min="1" step="1"
                       value={line.qty === 0 ? '' : line.qty}
                       onChange={(e) => setLines((prev) => prev.map((l) => l.key === line.key ? { ...l, qty: Number(e.target.value) || 0 } : l))}
                       placeholder="0"
-                      className={`h-8 w-24 text-right text-sm font-mono ${line.qty > from.available && from.available > 0 ? 'border-destructive text-destructive' : ''}`}
+                      className={`h-8 w-24 text-right text-sm font-mono max-sm:col-span-2 max-sm:h-11 max-sm:w-full max-sm:text-base ${line.qty > from.available && from.available > 0 ? 'border-destructive text-destructive' : ''}`}
                     />
-                    <Button type="button" variant="ghost" size="icon" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="h-8 w-8 text-muted-foreground hover:text-destructive">
+                    <Button type="button" variant="ghost" size="icon" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="h-8 w-8 text-muted-foreground hover:text-destructive max-sm:col-start-2 max-sm:row-start-1 max-sm:h-11 max-sm:w-11 max-sm:justify-self-end">
                       <X className="h-3.5 w-3.5" />
                     </Button>
                   </div>

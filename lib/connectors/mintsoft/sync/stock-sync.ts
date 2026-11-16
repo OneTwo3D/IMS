@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { describeInFlightHolds, loadInFlightDispatch } from '@/lib/connectors/mintsoft/sync/in-flight-dispatch'
+import { describeInFlightHolds, IN_FLIGHT_STATUS_REFRESH_CAP_PER_RUN, loadInFlightDispatch, loadInFlightDispatchRefreshing } from '@/lib/connectors/mintsoft/sync/in-flight-dispatch'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { classifyUnresolvedWmsSku } from '@/lib/domain/wms/stock-sync-helpers'
 import { createCostLayer } from '@/lib/cost-layers'
@@ -2390,6 +2390,10 @@ async function applyMintsoftAlignDownForProduct(params: {
   wmsQty: number
   dryRun: boolean
   runStartedAt: Date
+  /** When the Mintsoft stock figures this run acts on were read; a status snapshot must be newer to release. */
+  stockReadAt: Date
+  /** Per-run allowance of status re-reads for orders the gate holds on a predating snapshot. */
+  statusRefreshBudget: { remaining: number }
 }): Promise<{
   applied: boolean
   dryRun: boolean
@@ -2402,7 +2406,17 @@ async function applyMintsoftAlignDownForProduct(params: {
       select: { delta: true, lastSeenAt: true },
     }),
     getOpenAsnPendingQty(params.binding, params.productId),
-    loadInFlightDispatch(db, { productId: params.productId, warehouseId: params.binding.warehouseId, now: new Date(), runStartedAt: new Date(params.runStartedAt) }),
+    loadInFlightDispatchRefreshing(
+      db,
+      { productId: params.productId, warehouseId: params.binding.warehouseId, stockReadAt: new Date(params.stockReadAt) },
+      async (orderIds) => {
+        const refreshed = await (await import('@/lib/domain/wms/order-status-sweep')).refreshWmsOrderStatusSnapshots(orderIds)
+        // Orders whose re-read failed stay held; say so, so a Mintsoft status outage is visible in the run log.
+        if (refreshed.failed > 0) console.warn(`[mintsoft-stock-sync] align-down status refresh: ${refreshed.failed} of ${orderIds.length} order(s) could not be re-read and stay held`)
+        return refreshed
+      },
+      params.statusRefreshBudget,
+    ),
     db.stockLevel.findUnique({
       where: {
         productId_warehouseId: {
@@ -2482,8 +2496,7 @@ async function applyMintsoftAlignDownForProduct(params: {
     const inFlightNow = await loadInFlightDispatch(tx, {
       productId: params.productId,
       warehouseId: params.binding.warehouseId,
-      now: new Date(),
-      runStartedAt: new Date(params.runStartedAt),
+      stockReadAt: new Date(params.stockReadAt),
     })
     if (inFlightNow.qty > 0) {
       return {
@@ -2744,6 +2757,9 @@ export async function runStockSyncForBinding(
     // externalQty and every discrepancy figure below are on-hand figures. A response that cannot
     // supply on-hand for every row throws here and fails the run (see normalizeMintsoftStockLevels).
     const fetchedLines = await connector.fetchStockLevels(binding.externalWarehouseId)
+    // Taken AFTER the read returns, so a status snapshot newer than this is certainly newer than the stock figures.
+    const stockReadAt = new Date()
+    const statusRefreshBudget = { remaining: IN_FLIGHT_STATUS_REFRESH_CAP_PER_RUN }
     await refreshLease(true)
     const stockLines = consolidateMintsoftStockLines(fetchedLines)
     const thresholds = parseMintsoftThresholds(binding.discrepancyThresholds)
@@ -2972,6 +2988,8 @@ export async function runStockSyncForBinding(
             wmsQty,
             dryRun: alignmentDryRun,
             runStartedAt,
+            stockReadAt,
+            statusRefreshBudget,
           })
 
           if (alignDown.stockEnqueue === 'failed') stockEnqueueFailures += 1

@@ -5,8 +5,10 @@ import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 import { currentInvoiceIsWithdrawn, loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
-import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, documentVatRows, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
-import { documentTotalsRows, salesOrderMoneyView } from '@/lib/domain/sales/sales-order-money-view'
+import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { orderDocumentMoney, drawTotalsRows } from '@/lib/pdf-order-money'
+import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { invoiceDocumentIdentity } from '@/lib/pdf-order-money'
 import { formatMoney } from '@/lib/utils'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
@@ -43,7 +45,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     // Staff see a document the ledger withdrew (voided on a live order), labelled; no customer reader serves it.
     const pdfBuffer = await loadCurrentInvoicePdf(so.id, { includeWithdrawn: true })
     if (pdfBuffer) {
-      const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
+      const invNum = so.invoiceNumber ?? getSalesOrderReference(so)
       const withdrawn = await currentInvoiceIsWithdrawn(so.id)
       return new NextResponse(new Uint8Array(pdfBuffer), {
         headers: {
@@ -67,8 +69,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     where: { type: 'invoice' },
     select: { headerNote: true, footerNote: true, termsText: true, customFooter: true, showPaymentTerms: true, paymentTermsText: true },
   })
-  const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
-  const { doc } = createPdfDocument({ title: `Invoice ${invNum}` })
+  const identity = invoiceDocumentIdentity(so)
+  const invNum = identity.reference
+  const { doc } = createPdfDocument({ title: `${identity.title} ${invNum}` })
 
   const billAddr = so.billingAddress as Record<string, string> | null
   const recipientAddr = billAddr ? [billAddr.line1, billAddr.line2, billAddr.city, billAddr.postcode, formatCountryDisplay(billAddr.country)].filter(Boolean).join('\n') : ''
@@ -76,9 +79,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const date = formatDateTime(so.invoicedAt ?? so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
 
   await drawHeader(doc, branding, {
-    title: 'Invoice',
+    title: identity.title,
     reference: invNum,
-    ...(so.orderNumber ? { secondaryReference: { label: 'Order', value: so.orderNumber } } : {}),
+    ...(identity.orderReference ? { secondaryReference: { label: 'Order', value: identity.orderReference } } : {}),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -104,21 +107,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   // Show base-currency equivalents (VAT + total) when the order is in a foreign currency.
   const showBaseEquivalent = so.currency !== base.code
   // ONE basis for every figure on the document (lib/domain/sales/sales-order-money-view.ts), labelled, and reconciling with the stored total.
-  const view = salesOrderMoneyView({
-    pricesIncludeVat: so.pricesIncludeVat,
-    shoppingLinks: so.shoppingLinks,
-    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
-    subtotalForeign: Number(so.subtotalForeign),
-    discountAmount: Number(so.discountAmount),
-    shippingForeign: Number(so.shippingForeign),
-    taxForeign: Number(so.taxForeign),
-    totalForeign: Number(so.totalForeign),
-    storeCreditForeign: Number(so.storeCreditForeign ?? 0),
-    lines: so.lines.map((l) => ({
-      qty: Number(l.qty), unitPriceForeign: Number(l.unitPriceForeign), discountAmount: Number(l.discountAmount ?? 0),
-      totalForeign: Number(l.totalForeign), taxForeign: Number(l.taxForeign ?? 0),
-    })),
-  })
+  const { view, totalsRows } = orderDocumentMoney(so)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'Description', width: 230, wrap: true },
@@ -139,24 +128,11 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   // keep the totals block together rather than splitting it across the page break.
   if (doc.y + 90 > 780) doc.addPage()
   // Totals
-  doc.y += 5
+  drawTotalsRows(doc, totalsRows, money, columns)
   const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
   const vW = columns[columns.length - 1].width
   const lW = 80
   const lX = tableRight - vW - lW
-  doc.font('Helvetica').fontSize(9).fillColor('#666')
-  const totalsRows = documentTotalsRows(view, documentVatRows({
-    taxRateName: so.taxRateName,
-    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
-    taxForeign: Number(so.taxForeign),
-    lines: so.lines.map((l) => ({ taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null, taxForeign: Number(l.taxForeign || 0) })),
-  }))
-  for (const row of totalsRows) {
-    if (row.strong) doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
-    else doc.font('Helvetica').fontSize(9).fillColor('#666')
-    doc.text(`${row.label}:`, lX - 40, doc.y + (row.strong ? 3 : 0), { width: lW + 40, align: 'right' })
-    doc.text(money(row.amount), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
-  }
 
   if (showBaseEquivalent) {
     // Total + VAT in the base currency on one line, e.g. "(GBP equivalent £80.73, 20% VAT £13.46)".

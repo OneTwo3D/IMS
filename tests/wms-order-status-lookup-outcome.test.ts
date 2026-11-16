@@ -16,7 +16,7 @@ const upserts: Snapshot[] = []
 let presenceResult: 'FOUND' | 'MISSING' | 'AMBIGUOUS' = 'MISSING'
 let presenceThrows: Error | null = null
 let hasProbe = true
-let existingSnapshot: { externalOrderId: string; lastError: string | null } | null = null
+let existingSnapshot: { externalOrderId: string; lastError: string | null; fetchedAt: Date } | null = null
 /** Counts remote presence probes, so the no-reprobe test measures the thing it claims. */
 let probeCalls = 0
 
@@ -187,7 +187,7 @@ test('a LEGACY not-found row is not accepted as confirmed absence (o3d-eu0r)', a
   hasProbe = true
   presenceThrows = null
   presenceResult = 'MISSING'
-  existingSnapshot = { externalOrderId: '', lastError: WMS_LOOKUP_NOT_FOUND }
+  existingSnapshot = { externalOrderId: '', lastError: WMS_LOOKUP_NOT_FOUND, fetchedAt: new Date(0) }
 
   const snapshot = await runSweep()
   existingSnapshot = null
@@ -215,7 +215,7 @@ test('an already CONFIRMED-absent order is not re-probed every sweep (o3d-eu0r)'
   assert.equal(probeCalls, 1, 'precondition — an unknown order is probed')
 
   // Already confirmed absent and still absent: nothing new to learn, so no remote call.
-  existingSnapshot = { externalOrderId: '', lastError: WMS_LOOKUP_CONFIRMED_ABSENT }
+  existingSnapshot = { externalOrderId: '', lastError: WMS_LOOKUP_CONFIRMED_ABSENT, fetchedAt: new Date(0) }
   const snapshot = await runSweep()
   existingSnapshot = null
 

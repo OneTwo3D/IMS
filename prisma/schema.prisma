@@ -2216,6 +2216,12 @@ model SalesOrderRefund {
   // reporting the order — and this string says, on a row that outlives the order's stamps, which
   // record was missing and how many pounds are still sitting in Allocated Inventory.
   allocationBasisUnresolved String? @map("accounting_allocation_basis_unresolved")
+  // The Group A1 adjustment journal (DR Unearned Revenue / CR Sales, `A1-<date>-<digest>`) that netted THIS refund
+  // out of its order's revenue deferral, stamped in the same transaction as the journal. NULL for a refund the
+  // batch never netted: a refund recorded after the deferral (the refund service reverses those), and every row
+  // from before the column existed - which is also how the A1 recreate sweep tells a deferral stored net
+  // (adjusted separately) from one stored gross (the old convention). No backfill.
+  deferralAdjustmentRef String? @map("deferral_adjustment_ref")
   accountingRetrySyncs Json?  @map("accounting_retry_syncs")
   // scjz.70: revenue-only chargeback — credit note reverses recognised revenue
   // against AR, but COGS reversal + inventory restock are suppressed (cost kept as
@@ -2232,6 +2238,10 @@ model SalesOrderRefund {
   // fallback return rows: [{ shipmentId, valueBase }]. Group B books the COGS reversal for stock returned BEFORE its shipment
   // was journaled, one shipment at a time, from this. NULL: no such return.
   returnCostSplit Json?      @map("return_cost_split")
+  // Which source shipments the units this refund ACTUALLY returned to stock came from (staged and fallback rows alike):
+  // [{ shipmentId, productId, qty }]. Later refunds replay it so each one prices the units that are left from the right
+  // shipment, whichever of staging or the fallback chose it. NULL: nothing recorded (older refunds, nothing returned).
+  returnShipmentQty Json?    @map("return_shipment_qty")
   // scjz.71: whether this refund STAGED a COGS/unearned reversal (durable, set at
   // staging time). Distinguishes a fully-shipped chargeback (no reversal staged —
   // credit-note-only, exempt from reversal-evidence checks) from a partial/deferred
@@ -2601,6 +2611,8 @@ model StockCount {
   completedAt DateTime?
   /// When the counted lines were last reconciled against live on-hand (the instant each line's reconciledQty was stamped). Null = never.
   reconciledAt DateTime?
+  /// True when the operator chose the product list before counting started (a prepared stocktake); false = whole-warehouse snapshot.
+  prepared    Boolean          @default(false)
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
 
@@ -2625,6 +2637,7 @@ model StockCountLine {
 
   count           StockCount @relation(fields: [countId], references: [id])
 
+  @@unique([countId, productId])
   @@index([countId])
   @@index([productId])
   @@index([sku(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_count_lines_sku_trgm_idx")
@@ -3915,6 +3928,10 @@ model WmsOrderStatusSnapshot {
   carrier             String?
   fetchedAt           DateTime @default(now())
   lastError           String?
+  /// The connector's own "the goods have left the warehouse" decision for the status read that wrote this row
+  /// (vendor status grouping or a despatch date, not just the status name). Null = not recorded (rows from before
+  /// the column existed, or a read that did not resolve). Consumers must treat null as "unknown", never as false.
+  dispatched          Boolean?
   // Last WMS status successfully pushed to the storefront (G4). Decoupled from `status`
   // so a failed storefront push isn't masked by the cached-status change gate — it retries.
   wcPushedStatus      String?
@@ -4040,6 +4057,12 @@ model WmsOrderPushLink {
   /// consolidate the other order's lines): the change has to be applied there by hand. Live link, listed in the exception inbox until
   /// an operator acknowledges it (which clears this).
   amendNoticeAt         DateTime? @map("amend_notice_at")
+  /// Double postage (o3d-zvec.14): set when this order was absorbed into a Mintsoft merged order and MORE THAN ONE order in the merged group
+  /// charged the customer shipping, so the customer may have paid postage twice. IMS never refunds automatically: this flag is listed on
+  /// Sync > Exceptions for an IMS operator (the warehouse is not involved, so there is no warehouse task) until an operator clears it
+  /// (sets both columns back to null; the clear is audited). `doublePostageDetail` is the sentence the operator reads: order numbers and amounts only.
+  doublePostageAt       DateTime? @map("double_postage_at")
+  doublePostageDetail   String?   @map("double_postage_detail")
   /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
   /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
   lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
@@ -4053,6 +4076,8 @@ model WmsOrderPushLink {
   amendLeaseExpiresAt   DateTime? @map("amend_lease_expires_at")
   /// The shipping service of a courier-fallback operator task that is DUE and not yet recorded (cleared once recorded): a failed insert is retried by a later sweep.
   courierTaskService    String?   @map("courier_task_service")
+  /// The stable episode of that due task (written with the marker, before the warehouse call): every retry keys its task on it, so one fallback is one task.
+  courierTaskEpisode    DateTime? @map("courier_task_episode")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
   createdAt           DateTime          @default(now())

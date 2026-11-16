@@ -9,6 +9,10 @@ import test, { mock } from 'node:test'
 let lockHeldElsewhere = true
 let batchResult: unknown = null
 
+// ACC-H11: the batch imports the Xero books lock date at the start of a run; offline, and not what this file tests.
+mock.module('@/lib/connectors/xero/books-lock-date', {
+  namedExports: { refreshXeroBooksLockDate: async () => ({ lockDate: null, refreshed: false }) },
+})
 mock.module('@/lib/db/pinned-advisory-lock', { namedExports: { acquirePinnedAdvisoryLockOrNull: async () => (lockHeldElsewhere ? null : { release: async () => undefined }) } })
 mock.module('@/lib/cron-auth', { namedExports: { verifyCron: async () => null } })
 mock.module('@/lib/cron-rate-limit', { namedExports: { enforceCronRateLimit: async () => null } })
