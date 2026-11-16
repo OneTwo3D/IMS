@@ -62,6 +62,8 @@ Sales orders use the canonical sales order workflow documented in `docs/workflow
 | **On Hold** | Order paused, awaiting further action |
 | **Processing** | Order confirmed and being prepared |
 | **Allocated** | Stock has been allocated from warehouses |
+
+While an order is Allocated, Picking or Packing and has shipments, a second chip beside the status shows fulfilment progress derived from those shipments: **Ready to pick**, **Picking (1 of 2 parcels)**, **Packed 1 of 2 parcels**, **Packed — ready to ship**, **Partially shipped 1/3** or **Dispatched 2/2 parcels**. It appears on the order page and in the sales list; it is not a separate status and nothing is stored for it.
 | **Picking** | Items are being picked from the warehouse |
 | **Packing** | Items picked, being packed for dispatch |
 | **Shipped** | Order has been dispatched to the customer |
@@ -511,7 +513,7 @@ Three PDF documents are available for each sales order:
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically
-- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
+- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu for every order that is not a Draft or Cancelled, and from a **Packing slip** button on each shipment card (from Pending onwards, so it can be printed to pick from). The shipment button prints only that parcel. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
 

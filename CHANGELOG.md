@@ -10,6 +10,12 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Sales orders: fulfilment progress on the status badge; per-shipment packing slip (UI)
+
+- **Fixed: the order status badge hid picking, packing and partial dispatch.** An Allocated order whose parcels are being picked, packed or partly dispatched now shows a second chip (for example "Picking (1 of 2 parcels)", "Packed — ready to ship", "Partially shipped 1/3") on the order page and in the sales list. It is derived from the shipments; no new state is stored.
+- **Fixed: the packing slip could not be printed while picking.** Each shipment card now has a **Packing slip** button (from Pending onwards) that prints only that parcel (`/api/packing-slip/<order>?shipment=<id>`); the order-level slip in the ⋮ menu is offered for every non-draft, non-cancelled order.
+- Editing a sales order after creation (a separate audit item) is not part of this change.
+
 ### Mintsoft: IMS writes no order comments; it raises operator tasks instead (backend / sync / UI)
 
 - **Changed: IMS no longer writes any comment to a Mintsoft order.** The warehouse staff do not read order comments; only a Mintsoft query reaches them, and the API cannot raise one. Every place IMS used to post a note now records an **operator task** instead, listed on **Sync > Exceptions** under **Raise a warehouse query** (warehouse order number, link to the IMS order, reason, copy-ready query text with a Copy button, and a **Done** button needing the sync permission and a fresh sign-in, recorded with who and when). The sites are: the merged-line removal note (the earlier removal-note obligation), the courier-fallback note (on create, on verify and on amend), the hold / cancel notices (past NEW, merged, and a removal that could not finish), and the refund note on a pushed order. The open count is in the Exceptions banner total. The `wms-order-push` cron is NOT red for an open task (its result reports `operatorTasksOpen` and `operatorTasksRaised`); it is red only if a task could not be recorded (`operatorTaskErrors`, retried next run).
