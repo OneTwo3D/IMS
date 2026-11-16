@@ -110,6 +110,17 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
     if (!reading.imsStatus) return { success: true } // no reading = ignore this status
 
     const targetStatus = reading.imsStatus
+    // o3d-ymgc: a refused-completion row on Sync > Exceptions closes when the order has reached a settled status in IMS (the order's real
+    // state changed), or when the store sends a NON-completed status that is STRICTLY NEWER than the refusing event. An older event
+    // arriving late (a redelivered `processing`) settles nothing. Best effort; the inbox read settles any it misses.
+    {
+      const completion = await import('./completion-refusal')
+      if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(so.status)) {
+        await completion.resolveWcCompletionRefusal(so.id).catch(() => 0)
+      } else if (!isWcStatus(wcOrder.status, 'completed')) {
+        await completion.resolveWcCompletionRefusalIfNewer(so.id, completion.wcEventInstant(wcOrder)).catch(() => 0)
+      }
+    }
     if (targetStatus === so.status) return { success: true } // already in sync
 
     // Special case: WC completed → run completion flow

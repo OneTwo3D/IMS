@@ -14,6 +14,7 @@ import {
 } from '@/lib/fulfillment/external-fulfillment'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { recordWcCompletionRefusal, resolveWcCompletionRefusal, wcEventInstant } from './completion-refusal'
 
 /** Already dispatched: a completion here is real fulfilment evidence catching
  *  up, not something a withdrawal should block. */
@@ -100,7 +101,11 @@ export async function processWcCompletion(
       shippingService: row.carrier,
     })),
   })
-  if (applied.success) return { kind: 'fulfilled' }
+  if (applied.success) {
+    // o3d-ymgc: a shortfall that has since been put right (or never was one on this pass) closes its Exceptions row.
+    await resolveWcCompletionRefusal(orderId)
+    return { kind: 'fulfilled' }
+  }
 
   // The WooCommerce twin of the WMS dispatch sweep's failure counter. That path increments
   // WmsOrderPushLink.dispatchFailureCount, dead-letters at DISPATCH_MAX_CONSECUTIVE_FAILURES and
@@ -125,5 +130,27 @@ export async function processWcCompletion(
     resolveUser: false,
   })
 
-  return { kind: 'refused', error: applied.error, permanent: applied.permanent, refusal: applied.refusal }
+  // o3d-ymgc: a PERMANENT refusal is acknowledged, so the delivery is retired and nothing brings the order back. It gets a
+  // durable QUARANTINED row on Sync > Exceptions (cleared when the order is fulfilled or completed). A TRANSIENT refusal retries to the
+  // webhook inbox's dead-letter, which the inbox already surfaces, so it raises nothing here. A failed write must not change the verdict.
+  let permanent = applied.permanent
+  if (applied.permanent) {
+    try {
+      await recordWcCompletionRefusal({
+        orderId,
+        externalOrderId: wcOrder.id,
+        wcStatus: wcOrder.status,
+        refusal: applied.refusal,
+        error: applied.error,
+        eventAt: wcEventInstant(wcOrder),
+      })
+    } catch (error) {
+      // THE ROW IS THE ONLY RECORD of an acknowledged refusal. If it cannot be written, acknowledging the delivery would leave no row and
+      // no retry, so the refusal is reported TRANSIENT: the webhook answers 5xx, the delivery is redelivered, and the next one writes it.
+      console.error('[wc-completion] could not record the refused completion on Sync > Exceptions; reporting it as retryable', error)
+      permanent = false
+    }
+  }
+
+  return { kind: 'refused', error: applied.error, permanent, refusal: applied.refusal }
 }

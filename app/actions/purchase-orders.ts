@@ -9,6 +9,9 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { queueEmail } from '@/lib/email-outbox'
+import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
+import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
 import { requirePermission } from '@/lib/auth/server'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
 // order the WMS alignment relies on. See that module's census of every writer.
@@ -2202,6 +2205,93 @@ export async function advancePoStatus(
       description: `Failed to advance PO ${id} status: ${String(e)}`,
       metadata: null,
     })
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Queue the PO PDF email for the supplier on the email outbox and log the outcome on the PO. Never throws: the outcome is the result.
+ * Nothing is sent from here: the outbox drain delivers it under the installation's SMTP settings, suppression list and maintenance
+ * mode, exactly as order confirmations are, so a stage with no SMTP configured keeps it queued/failed rather than mailing anyone.
+ */
+async function queuePurchaseOrderEmail(id: string, reference: string, supplierEmail: string | null): Promise<PoSendResult> {
+  const result = await runPoSend(supplierEmail, {
+    isEnabled: isPurchaseOrderEmailEnabled,
+    queue: async (to) => {
+      const queued = await getPurchaseOrderQueueData(id)
+      return queueEmail({
+        kind: PURCHASE_ORDER_EMAIL_KIND,
+        to,
+        subject: queued.subject,
+        html: 'queued',
+        referenceType: PURCHASE_ORDER_EMAIL_REFERENCE_TYPE,
+        referenceId: id,
+      })
+    },
+  })
+  try {
+    await logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: result.status === 'queued' ? 'email_queued' : 'email_not_queued',
+      tag: 'purchase',
+      level: result.status === 'failed' ? 'WARNING' : 'INFO',
+      description: `PO ${reference}: ${result.message}`,
+      metadata: { reference, sendStatus: result.status },
+    })
+  } catch (logError) {
+    console.error('Failed to log PO email outcome:', logError)
+  }
+  return result
+}
+
+/**
+ * "Confirm & Send PO": confirm the order (PO_SENT) and then email the PO PDF to the supplier. The two steps are separate: the
+ * confirmation commits first, and a supplier with no address or a failed enqueue leaves the order confirmed and says so in `send`.
+ */
+export async function confirmAndSendPurchaseOrder(
+  id: string,
+): Promise<{ success: boolean; error?: string; warnings?: string[]; send?: PoSendResult }> {
+  const advanced = await advancePoStatus(id, 'PO_SENT')
+  if (!advanced.success) return { success: false, error: advanced.error }
+  let send: PoSendResult
+  try {
+    const po = await getPurchaseOrderQueueData(id)
+    send = await queuePurchaseOrderEmail(id, po.reference, po.supplierEmail)
+  } catch (e) {
+    send = { status: 'failed', message: `The order is confirmed, but the email could not be queued (${e instanceof Error ? e.message : String(e)}). Use "Email PO" to retry.` }
+  }
+  return { success: true, ...(advanced.warnings ? { warnings: advanced.warnings } : {}), send }
+}
+
+/** Email (or re-email) the PO PDF of an already confirmed order. */
+export async function sendPurchaseOrderEmail(id: string): Promise<{ success: boolean; error?: string; send?: PoSendResult }> {
+  try {
+    await requirePermission('purchasing.create')
+    const po = await getPurchaseOrderQueueData(id)
+    if (['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'CANCELLED'].includes(po.status)) {
+      return { success: false, error: 'Confirm the purchase order before emailing it to the supplier.' }
+    }
+    const send = await queuePurchaseOrderEmail(id, po.reference, po.supplierEmail)
+    return { success: send.status === 'queued' || send.status === 'already_queued', ...(send.status === 'queued' || send.status === 'already_queued' ? {} : { error: send.message }), send }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/** The Settings > Documents switch for emailing POs to suppliers (admin only). Coordinates with sends in flight: see the send lock. */
+export async function setPurchaseOrderEmailEnabled(enabled: boolean): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('settings.company')
+    await savePurchaseOrderEmailEnabled(enabled === true)
+    await logActivity({
+      entityType: 'SETTING', entityId: 'purchase_order_email_enabled', action: 'setting_changed', tag: 'settings', level: 'INFO',
+      description: `Emailing purchase orders to suppliers switched ${enabled ? 'ON' : 'OFF'}`,
+    })
+    revalidatePath('/settings/company')
+    revalidatePath('/purchase-orders')
+    return { success: true }
+  } catch (e) {
     return { success: false, error: String(e) }
   }
 }

@@ -18,6 +18,7 @@ import { computePurchaseOrderOverBilling } from '@/lib/domain/purchasing/purchas
 import { computePrepaidReconciliation } from '@/lib/domain/purchasing/prepaid-reconciliation'
 import { getSession } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
 import { PoDetailClient } from './po-detail-client'
 
 export const metadata: Metadata = { title: 'Purchase Order' }
@@ -28,7 +29,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   const { id } = await params
   const session = await getSession()
   const showMargin = !!session && hasPermission(session.user.role, 'inventory.prices')
-  const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson, accountingSettings, accountingAvailable, wmsAsnState] = await Promise.all([
+  const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson, accountingSettings, accountingAvailable, wmsAsnState, poEmailEnabled] = await Promise.all([
     getPurchaseOrder(id),
     getSuppliers(),
     listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
@@ -42,6 +43,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
     getAccountingSettings(),
     isIntegrationPluginEnabled('xero'),
     getWmsPurchaseOrderAsnState(id),
+    isPurchaseOrderEmailEnabled(),
   ])
 
   if (!po) notFound()
@@ -84,7 +86,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} />
     </div>
   )
 }

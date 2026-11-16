@@ -13,6 +13,7 @@ import {
   type PdfTableColumn,
   type Branding,
 } from '@/lib/pdf'
+import { renderPurchaseOrderPdf } from '@/lib/purchase-order-pdf'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
 
@@ -125,35 +126,39 @@ async function generateSalesOrderPreview(branding: Branding, today: string) {
   return pdfToBuffer(doc)
 }
 
-async function generatePurchaseOrderPreview(branding: Branding, today: string) {
+async function generatePurchaseOrderPreview(branding: Branding, _today: string) {
   const tpl = await getTemplate('purchase_order')
-  const { doc } = createPdfDocument({ title: 'Purchase Order Preview' })
-
-  await drawHeader(doc, branding, {
-    title: 'Purchase Order',
-    reference: 'PO-20260405-X7K2',
-    date: today,
-    recipient: { ...SAMPLE_RECIPIENT, name: 'Filament Supplies GmbH', address: 'Industriestr. 42\n10115 Berlin\nDE' },
-  })
-
-  drawTemplateNotes(doc, tpl, 'header')
-
-  const columns: PdfTableColumn[] = [
-    { label: '#', width: 25, align: 'right' },
-    { label: 'SKU', width: 65 },
-    { label: 'Product', width: 120, wrap: true },
-    { label: 'Barcode / EAN', width: 75 },
-    { label: 'MPN', width: 85 },
-    { label: 'Qty', width: 45, align: 'right' },
-    { label: 'Unit Price', width: 50, align: 'right' },
-    { label: 'Total', width: 50, align: 'right' },
-  ]
-  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, '501234567890' + i, `MPN-${l.sku}`, String(l.qty), `£${l.price.toFixed(2)}`, `£${(l.qty * l.price).toFixed(2)}`])
-  drawTable(doc, columns, rows, branding)
-
-  drawTemplateNotes(doc, tpl, 'footer')
-  drawFooter(doc, 'Please confirm receipt of this order.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.purchasesEmail })
-  return pdfToBuffer(doc)
+  const tz = await getDisplayTimeZone()
+  // The same renderer as the real /api/purchase-order/[id] PDF, fed sample data, so the preview is what a supplier receives.
+  const lines = SAMPLE_LINES.map((l) => ({
+    sku: l.sku, name: l.name, barcode: '501234567890', mpn: `MPN-${l.sku}`, supplierSku: `SUP-${l.sku}`,
+    qty: l.qty, purchaseUnitQty: null, purchaseUnitAbbreviation: null, stockUnitName: null,
+    unitCost: l.price, discountAmount: 0, total: Math.round(l.qty * l.price * 100) / 100,
+  }))
+  const subtotal = Math.round(lines.reduce((s, l) => s + l.total, 0) * 100) / 100
+  const tax = Math.round(subtotal * 0.2 * 100) / 100
+  return renderPurchaseOrderPdf(
+    {
+      reference: 'PO-20260405-X7K2',
+      currency: 'GBP',
+      currencySymbol: '£',
+      currencySymbolPosition: 'PREFIX',
+      createdAt: new Date(),
+      expectedDelivery: new Date(Date.now() + 14 * 86400000),
+      notes: null,
+      supplierRef: null,
+      supplier: {
+        name: 'Filament Supplies GmbH', contactName: SAMPLE_RECIPIENT.contact, email: SAMPLE_RECIPIENT.email,
+        address: 'Industriestr. 42\n10115 Berlin\nDE', accountNumber: 'ACC-1042', vatNumber: null, paymentTermsDays: 30,
+      },
+      shipTo: { name: 'Main Warehouse (MIL1)', address: '1 Warehouse Way\nMildenhall\nIP28 7AA\nGB' },
+      lines,
+      totals: { subtotal, lineDiscounts: 0, orderDiscount: 0, tax, taxLabel: 'UK Standard Rate (20%)', additionalCosts: 0, total: Math.round((subtotal + tax) * 100) / 100 },
+    },
+    branding,
+    tpl,
+    { timeZone: tz, title: 'Purchase Order Preview' },
+  )
 }
 
 async function generateRfqPreview(branding: Branding, today: string) {

@@ -103,13 +103,14 @@ test('an amendment that newly falls back to the default courier raises the same 
   assert.equal(run.linkWrites[0]!.courierForm, 'PLACEHOLDER')
 })
 
-test('a courier task that cannot be recorded keeps the link retryable: not marked pushed, form not recorded, flag still raised', async () => {
+test('a courier task that cannot be recorded does NOT make the accepted amendment repeat: pushed, form recorded, the task stays DUE with its episode (o3d-hqvrp.352)', async () => {
   const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { taskFails: true })
   assert.equal(run.tasks.length, 0)
-  assert.equal('pushedAt' in run.linkWrites[0]!, false, 'the order stays due, so the next pass amends and raises the task again (it is deduplicated)')
-  assert.equal('courierForm' in run.linkWrites[0]!, false, 'the next pass finds the fallback again')
+  assert.ok(run.linkWrites[0]!.pushedAt, 'the amendment was accepted by the warehouse: the order is not due again, so no second warehouse write')
+  assert.equal(run.linkWrites[0]!.courierForm, 'PLACEHOLDER')
   assert.equal(run.linkWrites[0]!.courierPending, true)
-  assert.equal(run.linkWrites[0]!.courierTaskService, 'RM Tracked', 'the task stays DUE on the link, so a later sweep records it even if the order is never amended again')
+  assert.equal(run.linkWrites[0]!.courierTaskService, 'RM Tracked', 'the task stays DUE on the link, so the courier pass of a later sweep records it')
+  assert.ok(run.linkWrites[0]!.courierTaskEpisode, 'with the stable episode the due pass will key it on')
   assert.match(String(run.linkWrites[0]!.lastError), /operator task not recorded/)
 })
 
@@ -139,11 +140,12 @@ test('the next pass after that does not raise the task again', async () => {
   assert.ok(next.linkWrites[0]!.pushedAt, 'and this time the amendment completes')
 })
 
-test('an item failure after an accepted fallback whose task could not be recorded keeps the retry rule: form not recorded', async () => {
+test('an item failure after an accepted fallback whose task could not be recorded: form recorded (the fallback was accepted), the link stays due for the items only', async () => {
   const run = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), ITEMS_DOWN(), { taskFails: true })
   assert.equal(run.tasks.length, 0)
-  assert.equal('courierForm' in run.linkWrites[0]!, false)
+  assert.equal(run.linkWrites[0]!.courierForm, 'PLACEHOLDER')
   assert.equal(run.linkWrites[0]!.courierPending, true)
+  assert.equal(run.linkWrites[0]!.courierTaskService, 'RM Tracked')
   assert.equal('pushedAt' in run.linkWrites[0]!, false)
 })
 
@@ -215,7 +217,7 @@ test('the courier marker, task and cleanup name the service of the RELOADED orde
   assert.equal(run.tasks.length, 1)
   assert.match(run.tasks[0]!.queryText, /'DPD Next Day'/)
   assert.doesNotMatch(run.tasks[0]!.queryText, /RM Tracked/)
-  assert.equal(run.tasks[0]!.dedupeBasis, 'courier-fallback:DPD Next Day')
+  assert.equal(run.tasks[0]!.dedupeBasis, 'courier-fallback:DPD Next Day@2026-06-26T00:00:00.000Z', 'the episode is the create time')
   const failed = await sweep(updateLinkFor({ courierForm: null, courierFormName: null }), PLACEHOLDER_RESULT, { withMarker: true, reloadService: 'DPD Next Day', taskFails: true })
   assert.equal(failed.linkWrites[0]!.courierTaskService, 'DPD Next Day', 'a failed task leaves the NEW service due')
 })

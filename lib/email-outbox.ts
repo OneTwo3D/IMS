@@ -135,6 +135,7 @@ import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { sendEmail } from '@/lib/mailer'
 import { writeInvalidRecipientOutcome, type InvalidRecipientWriter } from '@/lib/email-outbox-invalid-recipient'
 import { prepareQueuedEmail } from '@/lib/order-email'
+import { EmailKindDisabledError } from '@/lib/email-kind-disabled'
 import {
   EMAIL_RECIPIENT_ERASED_REASON,
   ERASED_RECIPIENT_PLACEHOLDER,
@@ -2492,10 +2493,10 @@ export async function processPendingEmailOutbox(
       // the preparer refuses because the order or customer was erased; the address the order now carries is not the one
       // queued; or the erasure replaced the stored address while this row was claimed (the confirm below). Each is a
       // FENCED terminal write that also erases the address from the row, so the refusal itself keeps nothing.
-      const refuseRecipient = async (reason: string): Promise<void> => {
+      const refuseRecipient = async (reason: string, options: { keepAddress?: boolean } = {}): Promise<void> => {
         const settled = await smtp.settlementWrite(() => settleClaimedEmail(client, claim, {
           status: 'FAILED',
-          toEmail: ERASED_RECIPIENT_PLACEHOLDER,
+          ...(options.keepAddress ? {} : { toEmail: ERASED_RECIPIENT_PLACEHOLDER }),
           lastError: reason,
           processingStartedAt: null,
         }))
@@ -2508,6 +2509,11 @@ export async function processPendingEmailOutbox(
       } catch (prepareError) {
         if (prepareError instanceof EmailRecipientErasedError) {
           await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
+          continue
+        }
+        if (prepareError instanceof EmailKindDisabledError) {
+          // A kind switched off by a setting: nothing is sent and the row ends FAILED with the reason; the address is kept.
+          await refuseRecipient(prepareError.message, { keepAddress: true })
           continue
         }
         throw prepareError
@@ -2538,12 +2544,30 @@ export async function processPendingEmailOutbox(
         continue
       }
 
-      const sendResult = await smtp.send({
+      const outgoing = {
         to: prepared?.to ?? email.toEmail,
         subject: prepared?.subject ?? email.subject,
         html: prepared?.html ?? email.html,
         attachments,
-      })
+        ...(prepared?.sendDeadlineMs ? { deadlineMs: prepared.sendDeadlineMs } : {}),
+      }
+      let sendResult: Awaited<ReturnType<typeof smtp.send>>
+      if (prepared?.sendGuard) {
+        // The kind's own delivery-boundary check, held across the send (see PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE). A refusal sent nothing.
+        const guarded = await prepared.sendGuard(() => smtp.send(outgoing))
+        if (guarded.refused !== undefined) {
+          await refuseRecipient(guarded.refused, { keepAddress: true })
+          continue
+        }
+        if (guarded.unknown !== undefined) {
+          // The send may have been accepted but its outcome is unknown: terminal FAILED, never retried; a person re-queues it.
+          await refuseRecipient(guarded.unknown, { keepAddress: true })
+          continue
+        }
+        sendResult = guarded.value
+      } else {
+        sendResult = await smtp.send(outgoing)
+      }
 
       // THE SENDER'S ANSWER WAS READ ONCE, INSIDE `smtp.send`, for the same reason the harness is
       // snapshotted above (r7 HIGH 2). `sendResult` is that wrapper's FROZEN snapshot rather than the
