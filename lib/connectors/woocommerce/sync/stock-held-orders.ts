@@ -29,8 +29,12 @@
  * orders are read as well, bounded by a window: modified since the order-sweep cursor
  * (the older of last_wc_order_sync_at / last_wc_order_reconcile_at) minus WC_COMPLETED_OVERLAP_MS.
  * Older completed orders have been imported or are covered by the reconcile. The same rule applies
- * (unimported: in full; imported: unallocated remainder). No cursor means the window cannot be
- * bounded, so the set is not proven complete.
+ * (unimported: in full; imported: unallocated remainder). If EITHER cursor is missing the window
+ * cannot be bounded, so completed orders are read EXHAUSTIVELY (no modified_after) under the same
+ * completeness proof. A store whose completed history exceeds the walk ceiling, or whose total cannot
+ * be proven, is then reported `incomplete` and only forced-zero pushes go out, which is the safe answer.
+ * This is deliberate: an install that never runs a reconcile sweep (poll mode) would otherwise either
+ * be blocked from positive pushes forever or push on an unproven picture.
  *
  * COMPLETENESS. A numbered-page walk over a live result can leave holes (an order changing status
  * mid-walk shifts every later page). The WooCommerce REST orders endpoint has no id cursor, so each
@@ -84,9 +88,12 @@ export function completedOrdersModifiedAfter(syncCursor: string | null | undefin
     return Number.isNaN(t) ? null : t
   }
   const sync = parse(syncCursor)
-  if (sync === null) return null
   const reconcile = parse(reconcileCursor)
-  const oldest = reconcile === null ? sync : Math.min(sync, reconcile)
+  // A MISSING reconcile cursor is NOT "no reconcile needed": completed orders are proven imported only by the reconcile sweep, so
+  // without it nothing says an older completed order was ever imported. Falling back to the poll cursor alone read just the last
+  // day yet reported a complete picture (o3d-hqvrp.362). It is unbounded instead; the caller reads completed orders exhaustively.
+  if (sync === null || reconcile === null) return null
+  const oldest = Math.min(sync, reconcile)
   return new Date(oldest - WC_COMPLETED_OVERLAP_MS).toISOString()
 }
 
@@ -268,7 +275,7 @@ async function walkOrders(deps: WcHeldUnitsDeps, label: string, filter: Record<s
 
 export async function loadWcHeldUnitsByProduct(
   deps: WcHeldUnitsDeps,
-  /** `modified_after` for the completed-order read (see completedOrdersModifiedAfter); null = no cursor, cannot be bounded. */
+  /** `modified_after` for the completed-order read (see completedOrdersModifiedAfter); null = cannot be bounded, so read them all. */
   completedModifiedAfter: string | null,
 ): Promise<WcHeldUnitsResult> {
   const statuses = WC_STOCK_HOLDING_ORDER_STATUSES.join(',')
@@ -276,14 +283,10 @@ export async function loadWcHeldUnitsByProduct(
   if (open.fatal) return { ok: false, reason: open.fatal }
   const incompleteReasons = [...open.incompleteReasons]
   const orders: WcFullOrder[] = [...open.orders]
-  if (completedModifiedAfter === null) {
-    incompleteReasons.push('completed: the order sweep cursor is missing, so unimported completed orders cannot be bounded')
-  } else {
-    const completed = await walkOrders(deps, 'completed', { status: 'completed', modified_after: completedModifiedAfter })
-    if (completed.fatal) return { ok: false, reason: completed.fatal }
-    incompleteReasons.push(...completed.incompleteReasons)
-    orders.push(...completed.orders)
-  }
+  const completed = await walkOrders(deps, 'completed', { status: 'completed', ...(completedModifiedAfter === null ? {} : { modified_after: completedModifiedAfter }) })
+  if (completed.fatal) return { ok: false, reason: completed.fatal }
+  incompleteReasons.push(...completed.incompleteReasons.map((r) => (completedModifiedAfter === null ? `${r} (a sweep cursor is missing, so ALL completed orders were read)` : r)))
+  orders.push(...completed.orders)
   const truncated = incompleteReasons.length > 0
 
   const ids = [...new Set(orders.map((o) => String(o?.id ?? '')))]

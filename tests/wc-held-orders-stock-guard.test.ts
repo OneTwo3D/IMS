@@ -181,17 +181,32 @@ test('an unimported completed order inside the window is charged like any other'
 })
 
 test('completed window: cursor minus overlap; the older cursor wins; none = unbounded', () => {
-  assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', null), '2026-11-14T00:00:00.000Z')
+  assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', null), null, 'a missing reconcile cursor cannot be bounded by the poll cursor')
   assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', '2026-11-10T00:00:00.000Z'), '2026-11-09T00:00:00.000Z')
   assert.equal(completedOrdersModifiedAfter(null, '2026-11-10T00:00:00.000Z'), null)
   assert.equal(completedOrdersModifiedAfter('garbage', null), null)
 })
 
-test('no cursor: the picture is incomplete', async () => {
-  const r = await load(deps({ pages: [[order(1, [11, 0, 1])]] }), null)
+test('no cursor: completed orders are read EXHAUSTIVELY (no modified_after); a provable read is complete and charged', async () => {
+  const asked: Array<Record<string, string>> = []
+  const d = deps({ pages: [[order(1, [11, 0, 1])]], completedPages: [[order(2, [11, 0, 1])]] })
+  const inner = d.fetchOrdersPage
+  d.fetchOrdersPage = async (p) => { if (p.status === 'completed') asked.push(p); return inner(p) }
+  const r = await load(d, null)
+  assert.ok(r.ok)
+  assert.ok(asked.length > 0 && asked.every((p) => !('modified_after' in p)), 'unbounded read of completed orders')
+  assert.equal(r.incomplete, false)
+  assert.equal(r.heldByProduct.get('p1'), 2, 'the completed order is charged as well as the open one')
+})
+
+test('no cursor and the exhaustive read cannot be proven: incomplete (forced-zero only) with a reason naming the missing cursor', async () => {
+  const d = deps({ pages: [[order(1, [11, 0, 1])]], completedPages: [[order(2, [11, 0, 1])]] })
+  const inner = d.fetchOrdersPage
+  d.fetchOrdersPage = async (p) => { const r = await inner(p); return p.status === 'completed' ? { ...r, totalItems: null } : r }
+  const r = await load(d, null)
   assert.ok(r.ok)
   assert.equal(r.incomplete, true)
-  assert.equal(r.heldByProduct.get('p1'), 1) // what was read is still charged
+  assert.ok(r.incompleteReasons.some((x) => /sweep cursor is missing/.test(x)))
 })
 
 test('completeness proof: a changed total, a shifted (repeated) id, a missing header or a short count each mark it incomplete', async () => {

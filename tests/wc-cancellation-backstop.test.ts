@@ -139,10 +139,11 @@ test('a walk that never reaches an empty page is escalated, not trusted', async 
 })
 
 const CURSOR = 'wc_cancellation_backstop_cursor'
-async function job() {
+async function job(limits?: { maxPages: number; budgetMs: number }) {
   const { runWcCancellationBackstop } = await import('@/lib/connectors/woocommerce/sync/order-import')
-  return runWcCancellationBackstop()
+  return runWcCancellationBackstop(limits)
 }
+const BACKFILL = 'wc_cancellation_backstop_backfill'
 
 test('backstop job: does nothing before the initial import is complete (no read, no cursor)', async () => {
   reset()
@@ -187,4 +188,85 @@ test('the order sweep cursors are never read or written by the backstop job', as
   await job()
   assert.equal(state.settings.get('last_wc_order_reconcile_at'), '2026-11-01T00:00:00.000Z')
   assert.equal(state.settings.get('last_wc_order_sync_at'), '2026-11-02T00:00:00.000Z')
+})
+
+const SLICE = { maxPages: 2, budgetMs: 60_000 }
+function order(id: number, status = 'cancelled') { return { id, status } }
+
+test('backfill: bounded per run, resumes from the saved position, and only the run that covers both statuses sets the cursor', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.pages.cancelled = [[order(1)], [order(2)], [order(3)], [order(4)]]
+  state.pages.trash = [[order(5, 'trash')]]
+  state.linked = { '1': 'ALLOCATED', '2': 'ALLOCATED', '3': 'ALLOCATED', '4': 'ALLOCATED', '5': 'ALLOCATED' }
+  assert.deepEqual((await job(SLICE)).errors, [])
+  assert.equal(state.asked.length, 2, 'at most maxPages reads per run')
+  assert.equal(state.settings.has(CURSOR), false, 'not complete yet: no cursor')
+  assert.deepEqual(JSON.parse(state.settings.get(BACKFILL)!), { startedAt: JSON.parse(state.settings.get(BACKFILL)!).startedAt, status: 'cancelled', nextPage: 3 })
+  const startedAt = JSON.parse(state.settings.get(BACKFILL)!).startedAt
+  // Resumes one page behind the saved position (page 2), reaches 3 and 4.
+  state.asked = []
+  await job(SLICE)
+  assert.deepEqual(state.asked.map((p) => `${p.status}:${p.page}`), ['cancelled:2', 'cancelled:3'])
+  assert.equal(state.settings.has(CURSOR), false)
+  // Next: 4, the empty page 5 ends cancelled; trash is reached on the following run.
+  state.asked = []
+  await job(SLICE)
+  assert.deepEqual(state.asked.map((p) => `${p.status}:${p.page}`), ['cancelled:3', 'cancelled:4'])
+  state.asked = []
+  await job(SLICE)
+  assert.equal(state.settings.has(CURSOR), false)
+  state.asked = []
+  const last = await job(SLICE)
+  assert.deepEqual(last.errors, [])
+  assert.ok(state.asked.every((p) => !('modified_after' in p)))
+  assert.ok(state.asked.some((p) => p.status === 'trash'))
+  assert.ok(Number.isFinite(Date.parse(state.settings.get(CURSOR) ?? '')), 'cursor set once both statuses are covered')
+  assert.ok(Date.parse(state.settings.get(CURSOR)!) <= Date.parse(startedAt), 'cursor is taken from when the backfill began')
+  assert.ok(state.applied.some((a) => a.id === 5), 'trash order applied')
+  assert.deepEqual([...new Set(state.applied.map((a) => a.id))].sort(), [1, 2, 3, 4, 5])
+  // Later runs are in cursor mode with the window.
+  state.asked = []
+  await job(SLICE)
+  assert.ok(state.asked.every((p) => 'modified_after' in p))
+})
+
+test('backfill: a failed read holds the position (never skipped) and sets no cursor; the next run retries the same page', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.pages.cancelled = [[order(1)], [order(2)], [order(3)]]
+  await job({ maxPages: 1, budgetMs: 60_000 })
+  const held = JSON.parse(state.settings.get(BACKFILL)!)
+  assert.equal(held.nextPage, 2)
+  state.fetchError.cancelled = 'WC API error: 503 down'
+  const failed = await job(SLICE)
+  assert.equal(failed.errors.length, 1)
+  assert.deepEqual(JSON.parse(state.settings.get(BACKFILL)!), held, 'position unchanged by the failure')
+  assert.equal(state.settings.has(CURSOR), false)
+  state.fetchError = {}
+  state.asked = []
+  assert.deepEqual((await job(SLICE)).errors, [])
+  assert.equal(state.asked[0].page, '1', 'resumes one page behind the held position')
+})
+
+test('backfill: a page whose cancellation fails to apply is not passed', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.pages.cancelled = [[order(1)], [order(2)]]
+  state.linked = { '1': 'ALLOCATED' }
+  state.syncResult = { success: false, error: 'transient' }
+  const r = await job(SLICE)
+  assert.equal(r.errors.length, 1)
+  assert.equal(JSON.parse(state.settings.get(BACKFILL)!).nextPage, 1, 'stays on the failed page')
+  assert.equal(state.settings.has(CURSOR), false)
+})
+
+test('backfill: the time budget also ends a run, without an error', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.pages.cancelled = [[order(1)], [order(2)]]
+  const r = await job({ maxPages: 50, budgetMs: 0 })
+  assert.deepEqual(r.errors, [])
+  assert.equal(state.asked.length, 0)
+  assert.equal(state.settings.has(CURSOR), false)
 })

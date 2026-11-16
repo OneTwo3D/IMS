@@ -4602,13 +4602,122 @@ export const WC_CANCELLATION_BACKSTOP_CURSOR_KEY = 'wc_cancellation_backstop_cur
  * still applies only to orders IMS already holds. The cursor advances only after every read ended on an empty page and every apply succeeded.
  * Needs the initial import to be complete (before it, IMS holds nothing to cancel and the full read would be wasted).
  */
-export async function runWcCancellationBackstop(): Promise<SyncResult> {
+/** Where the resumable first-run backfill stands: the status being walked, the next page, and when the backfill began. */
+export const WC_CANCELLATION_BACKFILL_KEY = 'wc_cancellation_backstop_backfill'
+/** Pages one run of the backfill may read (100 orders each). Bounded so a run ends well inside the ~60 s request budget. */
+export const WC_CANCELLATION_BACKFILL_MAX_PAGES = 8
+/** Wall-clock budget of one backfill run. */
+export const WC_CANCELLATION_BACKFILL_BUDGET_MS = 35_000
+
+type WcBackfillState = { startedAt: string; status: 'cancelled' | 'trash'; nextPage: number }
+
+function parseWcBackfillState(raw: string | null | undefined): WcBackfillState | null {
+  if (!raw) return null
+  try {
+    const v = JSON.parse(raw) as Partial<WcBackfillState>
+    if ((v.status !== 'cancelled' && v.status !== 'trash') || !Number.isInteger(v.nextPage) || (v.nextPage as number) < 1 || !Number.isFinite(Date.parse(String(v.startedAt)))) return null
+    return { startedAt: String(v.startedAt), status: v.status, nextPage: v.nextPage as number }
+  } catch {
+    return null
+  }
+}
+
+async function saveWcBackfillState(state: WcBackfillState): Promise<void> {
+  const value = JSON.stringify(state)
+  await db.setting.upsert({ where: { key: WC_CANCELLATION_BACKFILL_KEY }, create: { key: WC_CANCELLATION_BACKFILL_KEY, value }, update: { value } })
+}
+
+/** Applies a page of cancelled/trashed WooCommerce orders to the ones IMS already holds. Errors are pushed on the result. */
+async function applyWcCancellationPage(orders: WcFullOrder[], slug: 'cancelled' | 'trash', result: SyncResult): Promise<void> {
+  for (const order of orders) {
+    try {
+      const link = await db.shoppingOrderLink.findUnique({
+        where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: String(order.id) } },
+        select: { order: { select: { status: true } } },
+      })
+      if (!link?.order || link.order.status === 'CANCELLED') continue
+      const { syncWcOrderStatus } = await import('./order-status')
+      // A trashed order is a cancellation as far as IMS is concerned.
+      const outcome = await syncWcOrderStatus(slug === 'trash' ? { ...order, status: 'cancelled' } : order)
+      if (!outcome.success && !outcome.permanent) result.errors.push(`cancellation backstop #${order.id}: ${outcome.error ?? 'unknown error'}`)
+    } catch (e) {
+      result.errors.push(`cancellation backstop #${order.id}: ${String(e)}`)
+    }
+  }
+}
+
+/**
+ * ONE BOUNDED SLICE of the first-run backfill. Walks `cancelled` then `trash` (unbounded by date) from the persisted position, at most
+ * `maxPages` pages / `budgetMs` per run, saving the position after every page that was read AND applied cleanly. A failure stops the
+ * slice with the position held at that page (never skipped), and the next run resumes one page BEHIND the saved position, because the
+ * walk is by page number and an order removed from the list meanwhile shifts later orders one place earlier. Returns true only when
+ * both statuses were walked to an empty page; the caller then switches to cursor mode.
+ */
+async function runWcCancellationBackfillSlice(
+  result: SyncResult,
+  readStartedAtMs: number,
+  limits: { maxPages: number; budgetMs: number },
+): Promise<{ complete: boolean; startedAtMs: number }> {
+  const stored = parseWcBackfillState((await db.setting.findUnique({ where: { key: WC_CANCELLATION_BACKFILL_KEY } }))?.value)
+  const startedAtMs = stored ? Date.parse(stored.startedAt) : readStartedAtMs
+  const state: WcBackfillState = stored ?? { startedAt: new Date(readStartedAtMs).toISOString(), status: 'cancelled', nextPage: 1 }
+  if (!stored) await saveWcBackfillState(state)
+  const trashUnsupported = (await db.setting.findUnique({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY } }).catch(() => null)) !== null
+  const deadline = Date.now() + limits.budgetMs
+  let pagesRead = 0
+  const slugs = ['cancelled', 'trash'] as const
+  for (let i = slugs.indexOf(state.status); i < slugs.length; i++) {
+    const slug = slugs[i]
+    if (slug === 'trash' && trashUnsupported) continue
+    const required = slug === 'cancelled'
+    // Resume one page behind the saved position (a removed order shifts later ones earlier); the first page of a status starts at 1.
+    let page = slug === state.status ? Math.max(1, state.nextPage - 1) : 1
+    for (;;) {
+      if (pagesRead >= limits.maxPages || Date.now() >= deadline) return { complete: false, startedAtMs }
+      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc' })
+      pagesRead++
+      if (error || !Array.isArray(data)) {
+        const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
+        if (!required && isWcUnsupportedStatusRefusal(error)) {
+          await rememberWcTrashUnsupported(message, 'cancellation backstop backfill')
+          break
+        }
+        result.errors.push(message)
+        return { complete: false, startedAtMs }
+      }
+      const orders = data as WcFullOrder[]
+      if (orders.length === 0) break
+      const before = result.errors.length
+      await applyWcCancellationPage(orders, slug, result)
+      // A page with a failed apply is NOT passed: the position stays where it was, so the next run reads it again.
+      if (result.errors.length > before) return { complete: false, startedAtMs }
+      page++
+      await saveWcBackfillState({ startedAt: state.startedAt, status: slug, nextPage: page })
+    }
+    if (i + 1 < slugs.length) await saveWcBackfillState({ startedAt: state.startedAt, status: slugs[i + 1], nextPage: 1 })
+  }
+  return { complete: true, startedAtMs }
+}
+
+export async function runWcCancellationBackstop(
+  limits: { maxPages: number; budgetMs: number } = { maxPages: WC_CANCELLATION_BACKFILL_MAX_PAGES, budgetMs: WC_CANCELLATION_BACKFILL_BUDGET_MS },
+): Promise<SyncResult> {
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
   const initial = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
   if (initial?.value !== 'true') return result
   const readStartedAtMs = Date.now()
   const stored = await db.setting.findUnique({ where: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY } })
   const cursor = stored?.value && Number.isFinite(Date.parse(stored.value)) ? stored.value : null
+  if (cursor === null) {
+    // FIRST RUN: a resumable backfill. The cursor is set only once BOTH statuses are covered, and it is taken from when the
+    // backfill BEGAN (with the usual overlap), so anything cancelled while it was running is read by the first cursor-mode run.
+    const slice = await runWcCancellationBackfillSlice(result, readStartedAtMs, limits)
+    if (slice.complete && result.errors.length === 0) {
+      const value = wcPullCursorCandidate(slice.startedAtMs)
+      await db.setting.upsert({ where: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY }, create: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY, value }, update: { value } })
+    }
+    return result
+  }
   await sweepWcCancellations(cursor, result, 'cancellation backstop')
   if (result.errors.length === 0) {
     const candidate = wcPullCursorCandidate(readStartedAtMs)
@@ -4616,6 +4725,14 @@ export async function runWcCancellationBackstop(): Promise<SyncResult> {
     await db.setting.upsert({ where: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY }, create: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY, value }, update: { value } })
   }
   return result
+}
+
+async function rememberWcTrashUnsupported(message: string, mode: string): Promise<void> {
+  // A CONFIRMED refusal of the status itself (4xx naming `status` as invalid): this store cannot be asked for trash.
+  // Logged once and remembered, so later sweeps stop asking. Anything else (5xx, timeout, network, an unreadable body) is
+  // transient and is an error: skipping the read would let the cursor pass an order trashed meanwhile.
+  await db.setting.upsert({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY }, create: { key: WC_TRASH_READ_UNSUPPORTED_KEY, value: new Date().toISOString() }, update: {} })
+  await logActivity({ entityType: 'SYNC', action: 'wc_order_trash_read_unsupported', tag: 'sync', level: 'WARNING', description: `${message}. The store does not accept the trash status, so the sweep will not ask for it again; a trashed order is then seen only through its webhook.`, metadata: { mode }, resolveUser: false }).catch(() => undefined)
 }
 
 export async function sweepWcCancellations(modifiedAfter: string | null, result: SyncResult, mode: string): Promise<void> {
