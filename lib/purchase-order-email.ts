@@ -55,7 +55,7 @@ export async function buildPurchaseOrderEmail(id: string) {
       'Please confirm receipt and your expected delivery date at your earliest convenience, and quote the PO reference on all delivery notes and invoices.',
     ],
   }, 'purchase_order')
-  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }], sendGuard: purchaseOrderSendGuard, sendDeadlineMs: PO_SEND_DEADLINE_MS }
+  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }], sendGuard: purchaseOrderSendGuard, sendDeadlineMs: PO_SEND_DEADLINE_MS, singleSend: true }
 }
 
 /** The PO send's own deadline (the mailer closes the connection at it) and the guard's backstop race, both well below the transaction timeout. */

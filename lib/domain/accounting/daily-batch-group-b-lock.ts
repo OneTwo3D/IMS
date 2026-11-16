@@ -59,8 +59,21 @@ type TxClient = Prisma.TransactionClient
  * A shipment that stopped qualifying between the two — journaled by something else, unshipped, or
  * whose order was fully refunded — is dropped by the real read for free, which is the "revalidate
  * shipment status after acquiring the locks" half of the fix.
+ *
+ * TWO SHAPES (ACC-H12), distinguished by the order's deferral stamp and by nothing else:
+ *
+ *  - the ordinary shipment of a PAID order that Group A1 has deferred and Group A2 has reclassified:
+ *    DR Unearned / CR Sales for its revenue and DR COGS / CR Allocated Inventory for its cost;
+ *  - the shipment of an order that has NOT been deferred (not paid, or paid and still waiting for
+ *    Group A1): COGS is posted when the goods leave whether or not the order is paid, and Group A2 has
+ *    not run, so Allocated Inventory holds no debit for the units. Its cost is relieved straight out of
+ *    Inventory (DR COGS / CR Inventory) and the shipment is marked (`cogsRelievedFromInventoryAt`) so the
+ *    payment-time steps skip it. It posts no revenue leg: the invoice already put the revenue in Sales.
+ *
+ * The stamp the two shapes are told apart by is only ever written by Group A1, which runs under the same
+ * batch lock as this read, so an order cannot move between the shapes inside a run.
  */
-export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
+const GROUP_B_PAID_SHAPE = {
   status: 'SHIPPED',
   shipmentJournalDate: null,
   order: {
@@ -68,7 +81,67 @@ export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
     revenueDeferredDate: { not: null },
     inventoryAllocatedDate: { not: null },
   },
-} as const satisfies Prisma.ShipmentWhereInput
+} satisfies Prisma.ShipmentWhereInput
+
+const GROUP_B_DIRECT_SHAPE = {
+  status: 'SHIPPED',
+  shipmentJournalDate: null,
+  order: {
+    refundStatus: { not: 'FULL' },
+    // The invoice (`accountingInvoiceId`) is what put this order's revenue in Sales, and what makes the order
+    // undeletable under a journal (see Group A1). A shipment of an order IMS has not invoiced waits for it.
+    revenueDeferredDate: null,
+    accountingInvoiceId: { not: null },
+  },
+} satisfies Prisma.ShipmentWhereInput
+
+/** Both shapes (the probe's superset and the one the tests pin). */
+export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
+  OR: [GROUP_B_PAID_SHAPE, GROUP_B_DIRECT_SHAPE],
+} satisfies Prisma.ShipmentWhereInput
+
+/**
+ * The ONE time rule that decides whether a shipment left BEFORE its order was paid, and so is costed at shipment
+ * by the direct pass. It uses the same ship time the batch dates events with since #919 (`shippedAt`, falling
+ * back to `createdAt`) against the order's `paidAt`.
+ *
+ * TIE RULE: a shipment made at exactly `paidAt` counts as made AFTER payment (strictly earlier is required), so
+ * it takes the ordinary path (A1, A2, paid Group B). Group B's direct pass and Group A1's hold-back both call
+ * this function, so a shipment is never taken by both passes and never by neither.
+ */
+export function shippedBeforePayment(input: {
+  paidAt: Date | null | undefined
+  shippedAt: Date | null | undefined
+  createdAt: Date
+}): boolean {
+  if (!input.paidAt) return true
+  return (input.shippedAt ?? input.createdAt).getTime() < input.paidAt.getTime()
+}
+
+/**
+ * Whether a shipment read by the Group B probe or real read belongs to `mode`. The deferral stamp splits the
+ * passes as before; the direct pass additionally requires the shipment to pre-date payment, which a Prisma
+ * where-clause cannot express (it compares two different tables' columns).
+ */
+export function groupBShipmentBelongsToPass(
+  mode: 'direct' | 'paid',
+  shipment: {
+    shippedAt?: Date | null
+    createdAt: Date
+    order: { revenueDeferredDate: Date | null; paidAt: Date | null } | null | undefined
+  },
+): boolean {
+  const order = shipment.order
+  if (!order) return false
+  if (mode === 'paid') return order.revenueDeferredDate !== null
+  return order.revenueDeferredDate === null
+    && shippedBeforePayment({ paidAt: order.paidAt, shippedAt: shipment.shippedAt, createdAt: shipment.createdAt })
+}
+
+/** One pass of Group B: `direct` runs before Group A1 and A2, `paid` after them (ACC-H12). */
+export function groupBShipmentWhere(mode: 'direct' | 'paid'): Prisma.ShipmentWhereInput {
+  return mode === 'direct' ? GROUP_B_DIRECT_SHAPE : GROUP_B_PAID_SHAPE
+}
 
 /**
  * Raised when the loaded data references a cost layer the lock did not cover.

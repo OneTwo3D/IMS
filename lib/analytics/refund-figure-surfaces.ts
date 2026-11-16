@@ -486,7 +486,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/connectors/xero/daily-sync.ts',
-    figures: ['proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account'],
+    figures: ['shippedRevenue', 'shippedRevenueOf', 'proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',
     reason:
       'Revenue deferral/recognition journal amounts. Ledger postings (per event date).',
@@ -507,7 +507,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/accounting/daily-batch-discount-fence.ts',
-    figures: ['assertRevenueDeferralsUnchanged', 'revenueDeferralAmount', 'revenueDeferralGrossAmount', 'revenueDeferredBatchRef', 'unearnedRevenueAmount'],
+    figures: ['shippedRevenue', 'assertRevenueDeferralsUnchanged', 'revenueDeferralAmount', 'revenueDeferralGrossAmount', 'revenueDeferredBatchRef', 'unearnedRevenueAmount'],
     treatment: 'not-refund-sensitive',
     reason:
       'o3d-y14 Group A1 fence. It re-derives each order’s deferral under the batch’s own row locks purely to COMPARE it with the figure the unlocked read produced, and refuses the group on a disagreement — the amount is never published, and the only thing it can cause is that no journal is staged at all. The deferral figure it re-derives is the ledger posting already declared under xero/daily-sync.ts. revenueDeferralGrossAmount is the same arithmetic before refunds: the paid-day journal amount, deliberately refund-blind because each pre-batch refund is posted as its own dated adjustment.',
@@ -707,6 +707,55 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     treatment: 'not-refund-sensitive',
     reason:
       'Test fixture seeding ledger fields.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/[id]/page.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/[id]/po-detail-client.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/page.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/po-form.tsx',
+    figures: ['marginAmount', 'marginByKey', 'marginPct', 'marginRequestKey', 'showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Renders the PO margin column and order margin box. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/(dashboard)/purchase-orders/po-page-client.tsx',
+    figures: ['showMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'app/actions/purchase-order-margin.ts',
+    figures: ['previewPoLineMargins'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Server action computing the PO margin preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/line-margin.ts',
+    figures: ['computeLineMargin', 'computePoMarginTotal', 'margin', 'marginAmount', 'marginPct'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Pure margin computation for the PO preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
   },
 ]
 

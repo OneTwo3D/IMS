@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer'
+import type SMTPTransport from 'nodemailer/lib/smtp-transport'
 import { z } from 'zod'
 import { getSettingValues } from '@/lib/settings-store'
 
@@ -35,6 +36,13 @@ type EmailOptions = {
    * the message may already have been accepted. Unset: no deadline, as before.
    */
   deadlineMs?: number
+  /**
+   * The message must reach the recipient AT MOST ONCE (a purchase order). Once delivery has begun (the DATA command was issued on an
+   * established connection), any failure that is not a definite server answer, and the deadline timer firing, is the terminal
+   * "outcome unknown" result (`permanent` + `unknownOutcome`): the server may have accepted the message with the final response lost, so
+   * it is never requeued. Failures before delivery began (DNS, refused, auth, a server answer) keep their ordinary classification.
+   */
+  singleSend?: boolean
 }
 
 type SendEmailResult = {
@@ -42,7 +50,10 @@ type SendEmailResult = {
   error?: string
   permanent?: boolean
   invalidRecipient?: boolean
+  /** The message may or may not have been delivered; the failure is terminal and an operator must check before re-sending. */
+  unknownOutcome?: boolean
 }
+
 
 /** Reason on a send that hit its deadline: the message may or may not have been accepted, so it is never retried automatically. */
 export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending (Email PO).'
@@ -116,10 +127,30 @@ async function getSmtpSettings(): Promise<SmtpSettingsInput> {
   }
 }
 
+function classifySendFailure(e: unknown, unknownOutcome: boolean): SendEmailResult {
+  if (unknownOutcome) return { success: false, permanent: true, unknownOutcome: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME }
+  const error = e as { code?: string; responseCode?: number }
+  const message = normalizeMailError(String(e))
+  const responseCode = typeof error.responseCode === 'number' ? error.responseCode : null
+  const code = error.code ?? ''
+  const invalidRecipient =
+    responseCode === 550
+    || responseCode === 551
+    || responseCode === 553
+    || responseCode === 554
+    || code === 'EENVELOPE'
+    || /recipient|mailbox unavailable|user unknown|no such user|invalid recipient/i.test(message)
+  const permanent =
+    invalidRecipient
+    || (responseCode !== null && responseCode >= 500 && responseCode < 600)
+  return { success: false, error: message, permanent, invalidRecipient }
+}
+
 export async function sendEmailWithSmtpSettings(
   smtpInput: SmtpSettingsInput,
   opts: EmailOptions,
 ): Promise<SendEmailResult> {
+  let unknownOutcomeProbe: ((e: unknown) => boolean) | undefined
   try {
     const smtp = normalizeSmtpSettings(smtpInput)
     if (!smtp.fromEmail) {
@@ -132,14 +163,47 @@ export async function sendEmailWithSmtpSettings(
     const fromName = sanitizeDisplayName(smtp.fromName)
 
     const deadlineMs = opts.deadlineMs
-    const transport = nodemailer.createTransport({
+    // singleSend: watch the transaction log for the server's 354 reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
+    // fact and discarded; nothing it carries (addresses, credentials) is kept.
+    let awaitingDataReply = false
+    let dataStarted = false
+    if (opts.singleSend) {
+      unknownOutcomeProbe = (e) => {
+        const responseCode = (e as { responseCode?: unknown } | null)?.responseCode
+        // Only an explicit 4xx/5xx is a definite failure answer (ordinary classification). A 2xx/3xx code on a transport error is a PARTIAL final
+        // reply (nodemailer attaches the half-read response to 'Connection closed unexpectedly'): the server may have accepted the message.
+        if (typeof responseCode === 'number' && responseCode >= 400 && responseCode < 600) return false
+        // Classified by the OBSERVED phase: no DATA seen means nothing was handed over, so a rejection is retryable however late it comes.
+        // (The deadline TIMER below stays terminal: it leaves the send in flight, so its phase cannot be known.)
+        return dataStarted
+      }
+    }
+    const noop = () => undefined
+    const transportOptions: SMTPTransport.Options = {
+      ...(opts.singleSend ? {
+        transactionLog: true,
+        logger: {
+          debug: (entry: { tnx?: string } | undefined, message?: unknown): void => {
+            if (typeof message !== 'string') return
+            if (entry?.tnx === 'client' && message.trim().toUpperCase() === 'DATA') awaitingDataReply = true
+            // The server's answer to DATA is logged ('server') just before nodemailer acts on it; a 354 (nodemailer also accepts 2xx) is what
+            // makes it stream the message. Only from that reply on has anything been handed over. Pinned by the nodemailer-version test.
+            else if (entry?.tnx === 'server' && awaitingDataReply) {
+              awaitingDataReply = false
+              if (/^[23]\d\d/.test(message.trim())) dataStarted = true
+            }
+          },
+          level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,
+        },
+      } : {}),
       ...(deadlineMs ? { connectionTimeout: deadlineMs, greetingTimeout: deadlineMs, socketTimeout: deadlineMs } : {}),
       host: smtp.host,
       port: smtp.port,
       secure: smtp.secure === 'ssl',
       auth: smtp.user ? { user: smtp.user, pass: smtp.pass } : undefined,
       tls: smtp.secure === 'tls' ? { rejectUnauthorized: true } : undefined,
-    })
+    }
+    const transport = nodemailer.createTransport(transportOptions)
 
     const sending = transport.sendMail({
       from: fromName ? { name: fromName, address: fromEmail } : fromEmail,
@@ -162,7 +226,7 @@ export async function sendEmailWithSmtpSettings(
       if (outcome === 'deadline') {
         sending.catch(() => undefined)
         transport.close()
-        return { success: false, permanent: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME }
+        return classifySendFailure(null, true)
       }
     } else {
       await sending
@@ -170,26 +234,7 @@ export async function sendEmailWithSmtpSettings(
 
     return { success: true }
   } catch (e) {
-    const error = e as {
-      code?: string
-      responseCode?: number
-      command?: string
-      message?: string
-    }
-    const message = normalizeMailError(String(e))
-    const responseCode = typeof error.responseCode === 'number' ? error.responseCode : null
-    const code = error.code ?? ''
-    const invalidRecipient =
-      responseCode === 550
-      || responseCode === 551
-      || responseCode === 553
-      || responseCode === 554
-      || code === 'EENVELOPE'
-      || /recipient|mailbox unavailable|user unknown|no such user|invalid recipient/i.test(message)
-    const permanent =
-      invalidRecipient
-      || (responseCode !== null && responseCode >= 500 && responseCode < 600)
-    return { success: false, error: message, permanent, invalidRecipient }
+    return classifySendFailure(e, unknownOutcomeProbe?.(e) ?? false)
   }
 }
 
@@ -201,25 +246,6 @@ export async function sendEmail(opts: EmailOptions): Promise<SendEmailResult> {
     }
     return await sendEmailWithSmtpSettings(smtp, opts)
   } catch (e) {
-    const error = e as {
-      code?: string
-      responseCode?: number
-      command?: string
-      message?: string
-    }
-    const message = normalizeMailError(String(e))
-    const responseCode = typeof error.responseCode === 'number' ? error.responseCode : null
-    const code = error.code ?? ''
-    const invalidRecipient =
-      responseCode === 550
-      || responseCode === 551
-      || responseCode === 553
-      || responseCode === 554
-      || code === 'EENVELOPE'
-      || /recipient|mailbox unavailable|user unknown|no such user|invalid recipient/i.test(message)
-    const permanent =
-      invalidRecipient
-      || (responseCode !== null && responseCode >= 500 && responseCode < 600)
-    return { success: false, error: message, permanent, invalidRecipient }
+    return classifySendFailure(e, false)
   }
 }
