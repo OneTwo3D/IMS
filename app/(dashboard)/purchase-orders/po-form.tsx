@@ -55,6 +55,28 @@ type Props = {
   existingPo?: PoDetail | null
 }
 
+/**
+ * Optional per-line delivery date. Blank means "inherit the order's date", shown as the placeholder; a native date
+ * input cannot show a placeholder, so a blank, unfocused field renders as text and switches to a date picker on focus.
+ */
+function LineEtaInput({ value, headerDate, onChange }: { value: string; headerDate: string; onChange: (v: string) => void }) {
+  const [focused, setFocused] = useState(false)
+  const asDate = focused || value !== ''
+  return (
+    <Input
+      type={asDate ? 'date' : 'text'}
+      value={value}
+      placeholder={headerDate || 'Order date'}
+      title="Blank = follows the order's Expected Delivery"
+      aria-label="Line expected delivery"
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      onChange={(e) => onChange(e.target.value)}
+      className="h-7 text-xs w-32 mx-auto"
+    />
+  )
+}
+
 type LineItem = {
   key: string
   /** The order line this row edits (omitted for a line added in this session). */
@@ -70,6 +92,8 @@ type LineItem = {
   purchaseUnitId: string // '' = stock units
   unitCostForeign: number // cost per purchase unit
   discount: string // user-entered discount, e.g. "5%" or "2.50"
+  /** Optional per-line delivery date (YYYY-MM-DD). '' = inherit the order's Expected Delivery. */
+  expectedDelivery: string
   productCategory: TaxCategory
   // Per-line tax rate. When `taxRateAutoResolved` is true, the line follows
   // the order/supplier rate; when false the user has manually overridden it.
@@ -356,6 +380,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         purchaseUnitId,
         unitCostForeign: Math.round(displayUnitCost * 10000) / 10000,
         discount: l.discountStr ?? '',
+        expectedDelivery: l.expectedDelivery ? l.expectedDelivery.slice(0, 10) : '',
         productCategory: (product?.taxCategory ?? 'STANDARD') as TaxCategory,
         // Re-derive line VAT from the order/supplier default on load (auto), so
         // it always tracks the supplier's Default VAT Rate. The net unit cost is
@@ -481,6 +506,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       key: makeKey(), productId: p.id, sku: p.sku, productName: p.name,
       qty: 1, purchaseUnitId: '', unitCostForeign: Math.round(displayCost * 10000) / 10000,
       discount: '',
+      expectedDelivery: '',
       productCategory,
       taxRateId: resolved.taxRateId,
       taxRateValue: resolved.taxRateValue,
@@ -754,6 +780,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
             : l.unitCostForeign,
           sortOrder: i,
           discountStr: l.discount || undefined,
+          expectedDelivery: l.expectedDelivery || null,
           discountAmount: discAmount > 0 ? discAmount : undefined,
           // Only send the id when the user has manually overridden this line.
           // Auto lines pass null so the server applies the order/supplier rate.
@@ -1002,6 +1029,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                   {pricesIncludeVat ? ' incl.' : ''}
                 </TableHead>
                 <TableHead className="text-xs text-center w-24">Discount</TableHead>
+                <TableHead className="text-xs text-center w-32" title="Optional. Blank means the line follows the order's Expected Delivery.">Expected</TableHead>
                 <TableHead className="text-xs text-center w-32">VAT</TableHead>
                 <TableHead className="text-xs text-right w-28">Line Total ({sym})</TableHead>
                 {showMargin && (
@@ -1067,6 +1095,13 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                         onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, discount: e.target.value } : l))}
                         placeholder={`${sym} or %`}
                         className={`h-7 text-sm text-right w-24 ml-auto font-mono ${parseDiscount(line.discount, line.qty * line.unitCostForeign) > 0 ? 'text-destructive' : ''}`}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <LineEtaInput
+                        value={line.expectedDelivery}
+                        headerDate={expectedDelivery}
+                        onChange={(v) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, expectedDelivery: v } : l))}
                       />
                     </TableCell>
                     <TableCell>

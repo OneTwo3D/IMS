@@ -32,7 +32,7 @@ test('columns always fill the 495pt content width, whatever optional columns are
 test('row cell count matches the column count and optional columns follow the flags', () => {
   const lines = [line({ supplierSku: 'S-1', discountAmount: 1.5, total: 23.5, unitCost: 2.35 }), line({ sku: 'SKU-2' })]
   const flags = poLayoutFlags(lines)
-  assert.deepEqual(flags, { showSupplierSku: true, showPurchaseUnits: false })
+  assert.deepEqual(flags, { showSupplierSku: true, showPurchaseUnits: false, showLineEta: false })
   const cols = poDocumentColumns('£', flags)
   const rows = poDocumentRows(lines, flags)
   assert.ok(rows.every((r) => r.length === cols.length))
@@ -40,7 +40,7 @@ test('row cell count matches the column count and optional columns follow the fl
   assert.deepEqual(rows[1], ['2', 'SKU-2', '—', 'Widget', '—', '10', '2.50', '25.00'])
 
   const plain = poLayoutFlags([line()])
-  assert.deepEqual(plain, { showSupplierSku: false, showPurchaseUnits: false })
+  assert.deepEqual(plain, { showSupplierSku: false, showPurchaseUnits: false, showLineEta: false })
   assert.equal(poDocumentRows([line()], plain)[0].length, poDocumentColumns('£', plain).length)
 })
 
@@ -134,4 +134,22 @@ test('a discounted line does not read as discounted twice: 10 x 10 with a 10 dis
   // The discount is still stated, once, in the totals block.
   const totals = poTotalsRows({ subtotal: 90, lineDiscounts: 10, orderDiscount: 0, tax: 0, taxLabel: 'VAT', additionalCosts: 0, total: 90 }, money)
   assert.ok(totals.some((r) => r.label === 'Discounts included above (lines)' && r.amount === '£10.00'))
+})
+
+test('the Delivery column appears only when a line has a date that differs from the order, and rows match the columns', () => {
+  const none = [line(), line({ sku: 'SKU-2' })]
+  const noneFlags = poLayoutFlags(none)
+  assert.equal(noneFlags.showLineEta, false)
+  assert.ok(!poDocumentColumns('£', noneFlags).some((c) => c.label === 'Delivery'))
+
+  const lines = [line({ deliveryDate: new Date('2026-12-15T00:00:00.000Z') }), line({ sku: 'SKU-2' })]
+  const flags = poLayoutFlags(lines)
+  assert.equal(flags.showLineEta, true)
+  const cols = poDocumentColumns('£', flags)
+  assert.equal(cols.reduce((s, c) => s + c.width, 0), 495)
+  const rows = poDocumentRows(lines, { ...flags, formatDate: (d) => `D:${d.toISOString().slice(0, 10)}` })
+  assert.ok(rows.every((r) => r.length === cols.length))
+  const at = cols.findIndex((c) => c.label === 'Delivery')
+  assert.equal(rows[0]![at], 'D:2026-12-15')
+  assert.equal(rows[1]![at], '—', 'a line that follows the order date shows a dash')
 })

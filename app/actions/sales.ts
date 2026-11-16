@@ -74,7 +74,7 @@ import {
 import { dischargeRefundAccountingObligation } from '@/lib/domain/sales/refund-accounting-discharge'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { rateBinding, resolveSalesLineTaxType, taxTypeForBasis } from '@/lib/accounting/reverse-charge'
-import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
+import { buildTaxTypeRateIndex, creditNoteLineTaxTypeResolver, priceSnapshottedTaxIdentity } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { refusedCreditNotePayload } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { recordCreditNoteTreatmentRefusal, treatCreditNotePayload } from '@/lib/domain/sales/eu-vat-credit-note-treatment'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
@@ -2285,7 +2285,7 @@ async function queueRefundAccountingActions(input: {
   accountingSyncs: RefundAccountingSyncRequest[]
   accountingSettings?: AccountingSettings
 }): Promise<RefundAccountingSettlement> {
-  const [settings, orderForCN, baseCurrency] = await Promise.all([
+  const [settings, orderForCN, baseCurrency, salesTaxRatesForCn] = await Promise.all([
     input.accountingSettings ? Promise.resolve(input.accountingSettings) : getAccountingSettings(),
     db.salesOrder.findUnique({
       where: { id: input.orderId },
@@ -2303,7 +2303,9 @@ async function queueRefundAccountingActions(input: {
       },
     }),
     getBaseCurrencyCode(),
+    db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }),
   ])
+  const salesRateByTaxType = buildTaxTypeRateIndex(salesTaxRatesForCn)
   const cnContactName = orderForCN?.customer
     ? `${orderForCN.customer.firstName} ${orderForCN.customer.lastName}`.trim()
     : 'Walk-in Customer'
@@ -2364,6 +2366,14 @@ async function queueRefundAccountingActions(input: {
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
     lines: input.lines.map((line) => ({
+      // Never sent: ties this posted line to its refund line so the credit-note PDF can read that line's frozen VAT rate (a description cannot: it may be blank or repeated).
+      refundLineId: line.id,
+      // Never sent: the rate of the tax code this line posts under (the ledger's own calculation), frozen here so the PDF prints exactly the VAT the posting produces. Absent when the code maps to no single rate: the PDF is then refused, not guessed.
+      ...((): { taxRatePosted?: number } => {
+        const code = creditNoteTaxTypeOf(line)
+        const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: salesRateByTaxType, label: 'credit note line' }) : null
+        return priced?.ok ? { taxRatePosted: priced.rate.toNumber() } : {}
+      })(),
       description: line.description || 'Refund line',
       quantity: line.qty > 0 ? line.qty : 1,
       unitAmount: orderForCN?.currency === baseCurrency

@@ -29,6 +29,11 @@ import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basi
 // decimal-boundary-ok: display-only (these are rendering figures, rounded to the minor unit; the stored Decimals are never written back from them)
 const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100
 const round4 = (n: number): number => Math.round((n + Number.EPSILON) * 10000) / 10000
+/** Round to `digits` decimal places (a currency's minor-unit precision). */
+const roundTo = (n: number, digits: number): number => {
+  const f = 10 ** digits
+  return Math.round((n + Number.EPSILON) * f) / f
+}
 
 /** Anything off by more than half a minor unit does not reconcile. */
 const RECONCILE_TOLERANCE = 0.005
@@ -174,9 +179,9 @@ export function refundLineAmounts(
 }
 
 /** Net money credited at a rate: VAT rounded per line as the ledger does. */
-export function creditAmounts(net: number, rate: number): RefundAmounts {
-  const vat = round2(net * rate)
-  return { net, vat, gross: round2(net + vat) }
+export function creditAmounts(net: number, rate: number, digits: number = 2): RefundAmounts {
+  const vat = roundTo(net * rate, digits)
+  return { net, vat, gross: roundTo(net + vat, digits) }
 }
 
 export function sumRefundAmounts(parts: ReadonlyArray<RefundAmounts>): RefundAmounts {
@@ -265,6 +270,8 @@ export type CreditNoteLineFacts = { salesOrderLineId: string | null; postedNet: 
 export function creditNoteAmounts(
   order: { taxRatePercent: number | null; lines: ReadonlyArray<MoneyViewLine & { id: string }> },
   refund: { lines: ReadonlyArray<CreditNoteLineFacts> },
+  /** The currency's minor-unit digits (default 2); a 3- or 4-decimal currency must pass its own or its figures round to the penny. */
+  digits: number = 2,
 ): { perLine: RefundAmounts[]; total: RefundAmounts } {
   const rateOf = (rl: CreditNoteLineFacts): number => {
     const orderLine = rl.salesOrderLineId ? order.lines.find((l) => l.id === rl.salesOrderLineId) : undefined
@@ -272,8 +279,8 @@ export function creditNoteAmounts(
   }
   // Per-line figures are for display (each rounded to the minor unit); the TOTAL is summed from the unrounded 4 dp amounts and rounded once, so
   // many tiny lines do not drift by a rounding error each.
-  const perLine = refund.lines.map((rl) => creditAmounts(round2(rl.postedNet), rateOf(rl)))
+  const perLine = refund.lines.map((rl) => creditAmounts(roundTo(rl.postedNet, digits), rateOf(rl), digits))
   const rawNet = refund.lines.reduce((s, rl) => s + rl.postedNet, 0)
-  const rawVat = refund.lines.reduce((s, rl) => s + rl.postedNet * rateOf(rl), 0)
-  return { perLine, total: { net: round2(rawNet), vat: round2(rawVat), gross: round2(rawNet + rawVat) } }
+  const rawVat = perLine.reduce((s, l) => s + l.vat, 0)
+  return { perLine, total: { net: roundTo(rawNet, digits), vat: roundTo(rawVat, digits), gross: roundTo(rawNet + rawVat, digits) } }
 }

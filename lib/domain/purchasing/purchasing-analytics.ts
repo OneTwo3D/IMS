@@ -1,3 +1,4 @@
+import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
 import { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
@@ -156,6 +157,7 @@ type OpenPoRow = {
     qtyReturned: DecimalInput
     unitCostBase: DecimalInput
     landedUnitCostBase?: DecimalInput
+    expectedDelivery?: Date | null
   }>
 }
 
@@ -396,6 +398,7 @@ export async function getOpenPurchaseOrdersReport(
           qtyReturned: true,
           unitCostBase: true,
           landedUnitCostBase: true,
+          expectedDelivery: true,
         },
       },
     },
@@ -407,9 +410,15 @@ export async function getOpenPurchaseOrdersReport(
   const rows = orders.map<OpenPurchaseOrderReportRow>((order) => {
     let outstandingQty = new Prisma.Decimal(0)
     let outstandingValueBase = new Prisma.Decimal(0)
+    // The order's date is the earliest effective date (line's own, else the header's) among lines still to come.
+    let earliestEta: Date | null = null
     for (const line of order.lines) {
       const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned)))
       outstandingQty = outstandingQty.add(outstanding)
+      if (outstanding.gt(0)) {
+        const eta = effectiveLineEta(line.expectedDelivery, order.expectedDelivery)
+        if (eta && (!earliestEta || eta.getTime() < earliestEta.getTime())) earliestEta = eta
+      }
       const unitCost = line.landedUnitCostBase != null && toDecimal(line.landedUnitCostBase).gt(0)
         ? line.landedUnitCostBase
         : line.unitCostBase
@@ -423,8 +432,8 @@ export async function getOpenPurchaseOrdersReport(
       supplierName: order.supplier.name,
       status: order.status,
       poSentAt: order.poSentAt ? dateOnly(order.poSentAt) : null,
-      expectedDelivery: order.expectedDelivery ? dateOnly(order.expectedDelivery) : null,
-      overdue: Boolean(order.expectedDelivery && order.expectedDelivery.getTime() < startOfUtcDay(generatedAt).getTime() && outstandingQty.gt(0)),
+      expectedDelivery: earliestEta ? dateOnly(earliestEta) : null,
+      overdue: Boolean(earliestEta && (earliestEta as Date).getTime() < startOfUtcDay(generatedAt).getTime() && outstandingQty.gt(0)),
       daysSinceSent: daysString(daysBetween(sentAt, generatedAt)),
       outstandingQty: qtyString(outstandingQty),
       outstandingValueBase: moneyString(outstandingValueBase, baseCurrency),

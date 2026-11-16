@@ -233,7 +233,7 @@ async function observePurchaseOrders(prepared: PreparedRun): Promise<StepObserva
       supplier: { select: { name: true, currency: true } }, destinationWarehouse: { select: { code: true } },
       lines: {
         orderBy: { sortOrder: 'asc' },
-        select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true,
+        select: { qty: true, totalForeign: true, taxForeign: true, discountAmount: true, discountStr: true, expectedDelivery: true,
           productId: true, sortOrder: true, unitCostForeign: true, unitCostBase: true, totalBase: true, taxBase: true, description: true, purchaseUnitId: true, purchaseUnitQty: true, qtyReceived: true, qtyReturned: true, landedUnitCostBase: true, reorderEvidence: true, product: { select: { sku: true } }, taxRate: { select: { name: true, rate: true, usedFor: true, active: true, accountingTaxType: true, isCompound: true, reverseCharge: true, reportingCategory: true, components: TAX_RATE_SELECT.components } } },
       },
     },
