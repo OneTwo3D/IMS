@@ -136,6 +136,96 @@ async function resolveSnapshotDispatched(
     return null
   }
 }
+
+type WmsStatusForSnapshot = NonNullable<Awaited<ReturnType<NonNullable<ReturnType<typeof getWmsConnector>['fetchOrderStatus']>>>>
+
+/** The snapshot columns for a successful status read. Shared by the sweep and the align-down gate refresh. */
+function snapshotFieldsFromStatus(connectorId: string, connectorLabel: string, status: WmsStatusForSnapshot, dispatched: boolean | null) {
+  const tracking = status.tracking.find((entry) => entry.trackingNumber || entry.carrier)
+  return {
+    connector: connectorId,
+    connectorLabel,
+    externalOrderId: status.externalOrderId,
+    externalOrderNumber: status.externalOrderNumber,
+    status: status.status,
+    statusLabel: status.statusLabel,
+    isSplit: status.isSplit,
+    partCount: status.partCount,
+    isMerged: status.isMerged,
+    mergedOrderNumbers: status.mergedOrderNumbers,
+    deepLinkUrl: status.deepLinkUrl,
+    trackingNumber: tracking?.trackingNumber ?? null,
+    carrier: tracking?.carrier ?? null,
+    // The connector's own despatched decision (an aggregate over every part for a split order), persisted so the in-flight
+    // gate does not have to re-derive it from the status name alone.
+    dispatched,
+    lastError: null,
+  }
+}
+
+/**
+ * Writes a snapshot under the order lock, reading the erasure marker in the same transaction (an erased order keeps its status
+ * but never its tracking number, carrier or deep link). Returns whether the order is erased.
+ */
+async function persistSnapshot(
+  orderId: string,
+  fields: Omit<Prisma.WmsOrderStatusSnapshotUncheckedCreateInput, 'orderId'>,
+): Promise<boolean> {
+  return db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const current = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true } })
+    const erased = current?.erasedAt != null
+    const storedFields = erased ? { ...fields, trackingNumber: null, carrier: null, deepLinkUrl: null } : fields
+    await tx.wmsOrderStatusSnapshot.upsert({
+      where: { orderId },
+      create: { orderId, ...storedFields },
+      update: { ...storedFields, fetchedAt: new Date() },
+    })
+    return erased
+  })
+}
+
+/**
+ * Re-reads the WMS status of specific orders and persists the snapshots, for the Mintsoft align-down in-flight gate
+ * (o3d-hqvrp.368): a stock figure was just read, and a status decision taken AFTER it is what lets the gate release.
+ * Read-only against the WMS (the same lookups as the sweep, split orders through the same aggregate). Writes only a
+ * SUCCESSFUL read; a missing order, an unreadable one or any error leaves the old snapshot in place, which the gate
+ * keeps holding on. Never throws.
+ */
+export async function refreshWmsOrderStatusSnapshots(orderIds: readonly string[]): Promise<{ attempted: number; refreshed: number }> {
+  const result = { attempted: 0, refreshed: 0 }
+  if (orderIds.length === 0) return result
+  try {
+    const resolution = resolveEnabledWmsConnector(await getIntegrationPluginState())
+    if (resolution.kind !== 'one') return result
+    const connectorId = resolution.id
+    const connector = getWmsConnector(connectorId)
+    if (!connector.fetchOrderStatus) return result
+    const lookupResolution = await resolveWmsOrderLookupConnector(connectorId)
+    if (lookupResolution.kind !== 'one') return result
+    const connectorLabel = getWmsConnectorDef(connectorId).label
+    const orders = await db.salesOrder.findMany({
+      where: { id: { in: [...orderIds] }, shoppingLinks: { some: { connector: lookupResolution.connector, externalOrderNumber: { not: null } } } },
+      select: { id: true, shoppingLinks: { where: { connector: lookupResolution.connector }, select: { externalOrderNumber: true }, take: 1 } },
+    })
+    for (const order of orders) {
+      const reference = order.shoppingLinks[0]?.externalOrderNumber?.trim()
+      if (!reference) continue
+      result.attempted += 1
+      try {
+        const status = await connector.fetchOrderStatus(reference)
+        if (!status) continue
+        await persistSnapshot(order.id, snapshotFieldsFromStatus(connectorId, connectorLabel, status, await resolveSnapshotDispatched(connector, reference, status)))
+        result.refreshed += 1
+      } catch (error) {
+        console.warn(`[wms-order-status-sweep] gate refresh failed for order ${order.id}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  } catch (error) {
+    console.warn(`[wms-order-status-sweep] gate refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return result
+}
 export async function runWmsOrderStatusSweep(
   options?: { batchSize?: number; staleMinutes?: number },
 ): Promise<WmsOrderStatusSweepResult> {
@@ -294,25 +384,7 @@ export async function runWmsOrderStatusSweep(
       }
 
       const fields = status
-        ? {
-            connector: connectorId,
-            connectorLabel,
-            externalOrderId: status.externalOrderId,
-            externalOrderNumber: status.externalOrderNumber,
-            status: status.status,
-            statusLabel: status.statusLabel,
-            isSplit: status.isSplit,
-            partCount: status.partCount,
-            isMerged: status.isMerged,
-            mergedOrderNumbers: status.mergedOrderNumbers,
-            deepLinkUrl: status.deepLinkUrl,
-            trackingNumber: tracking?.trackingNumber ?? null,
-            carrier: tracking?.carrier ?? null,
-            // The connector's own despatched decision, persisted so the in-flight gate does not have to re-derive
-            // it from the status name alone.
-            dispatched: await resolveSnapshotDispatched(connector, reference, status),
-            lastError: null,
-          }
+        ? snapshotFieldsFromStatus(connectorId, connectorLabel, status, await resolveSnapshotDispatched(connector, reference, status))
         : {
             connector: connectorId,
             connectorLabel,
@@ -338,18 +410,7 @@ export async function runWmsOrderStatusSweep(
       // call that can take seconds; `order.erasedAt` was read before it and an erasure can commit in between. The erasure
       // takes the same lock, so this write is either wholly before it (and is then scrubbed by it) or wholly after it
       // (and sees the marker).
-      const erasedNow = await db.$transaction(async (tx) => {
-        await lockSalesOrder(tx, order.id)
-        const current = await tx.salesOrder.findUnique({ where: { id: order.id }, select: { erasedAt: true } })
-        const erased = current?.erasedAt != null
-        const storedFields = erased ? { ...fields, trackingNumber: null, carrier: null, deepLinkUrl: null } : fields
-        await tx.wmsOrderStatusSnapshot.upsert({
-          where: { orderId: order.id },
-          create: { orderId: order.id, ...storedFields },
-          update: { ...storedFields, fetchedAt: new Date() },
-        })
-        return erased
-      })
+      const erasedNow = await persistSnapshot(order.id, fields)
       if (status) updated += 1
 
       // G6: clear the courier-pending review flag once the order is actually despatched

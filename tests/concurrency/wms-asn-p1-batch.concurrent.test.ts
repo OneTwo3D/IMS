@@ -240,6 +240,72 @@ test('o3d-hqvrp.368: a not-despatched status read BEFORE the stock read never re
   assert.equal((await load(minutesAgo(8))).qty, 3, 'a read taken at the same instant cannot prove ordering: held')
 })
 
+test('o3d-hqvrp.368: a predating status is re-read once, released only on a fresh not-despatched answer, bounded per run', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { loadInFlightDispatchRefreshing } = await import('@/lib/connectors/mintsoft/sync/in-flight-dispatch')
+  const tag = uniqueTag('REFR')
+  const product = await db.product.create({ data: { sku: tag, name: tag, type: 'SIMPLE' }, select: { id: true } })
+  const warehouse = await db.warehouse.create({ data: { code: tag.slice(-10), name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
+  const stockReadAt = new Date(Date.now() - 60_000)
+  const old = new Date(Date.now() - 20 * 60_000)
+  const ids: string[] = []
+  for (const suffix of ['a', 'b', 'c']) {
+    const id = `${tag}${suffix}`
+    ids.push(id)
+    await db.salesOrder.create({
+      data: {
+        id, orderNumber: `IMSTEST-${id}`, status: 'PACKING', currency: 'GBP', subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10,
+        lines: { create: [{ id: `${id}L`, productId: product.id, sku: tag, description: tag, qty: 2, unitPriceForeign: 1, unitPriceBase: 1, totalForeign: 2, totalBase: 2, cogsBase: 0 }] },
+      },
+    })
+    await db.orderAllocation.create({ data: { orderId: id, lineId: `${id}L`, productId: product.id, warehouseId: warehouse.id, qty: '2' } })
+    await db.wmsOrderPushLink.create({ data: { orderId: id, connector: 'mintsoft', state: 'SYNCED', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}` } })
+    await db.wmsOrderStatusSnapshot.create({
+      data: { orderId: id, connector: 'mintsoft', connectorLabel: 'Mintsoft', externalOrderId: `ext-${id}`, externalOrderNumber: `MS-${id}`, status: 'NEW', statusLabel: 'NEW', fetchedAt: old, lastError: null, dispatched: false },
+    })
+  }
+  // A mocked refresh: no network. It stamps a fresh snapshot with the given decision, as the real one does after a successful read.
+  const stamp = (dispatched: boolean | null) => async (orderIds: string[]) => {
+    for (const orderId of orderIds) {
+      await db.wmsOrderStatusSnapshot.update({ where: { orderId }, data: { fetchedAt: new Date(), dispatched, status: dispatched ? 'DESPATCHED' : 'NEW' } })
+    }
+  }
+  const run = (refresh: (orderIds: string[]) => Promise<unknown>, budget: { remaining: number }) =>
+    loadInFlightDispatchRefreshing(db, { productId: product.id, warehouseId: warehouse.id, stockReadAt }, refresh, budget)
+
+  const reset = () => db.wmsOrderStatusSnapshot.updateMany({ where: { orderId: { in: ids } }, data: { fetchedAt: old, dispatched: false, status: 'NEW' } })
+
+  // refresh says not despatched: all released
+  const released = await run(stamp(false), { remaining: 25 })
+  assert.equal(released.qty, 0, 'a fresh explicit not-despatched read releases')
+  // refresh says despatched: held with the despatch reason
+  await reset()
+  const despatched = await run(stamp(true), { remaining: 25 })
+  assert.equal(despatched.qty, 6)
+  assert.ok(despatched.holds.every((h) => h.reason === 'despatched_at_wms'))
+  // refresh throws: the original holds stand
+  await reset()
+  const thrown = await run(async () => { throw new Error('Mintsoft down') }, { remaining: 25 })
+  assert.equal(thrown.qty, 6)
+  assert.ok(thrown.holds.every((h) => h.reason === 'status_predates_stock_read'))
+  // refresh reads but cannot decide (null): held
+  await reset()
+  assert.equal((await run(stamp(null), { remaining: 25 })).qty, 6)
+  // a refresh that did nothing (error swallowed inside it): still held
+  await reset()
+  assert.equal((await run(async () => ({ attempted: 3, refreshed: 0 }), { remaining: 25 })).qty, 6)
+  // cap: only 2 of 3 orders are re-read, the third stays held, and the budget is spent for the rest of the run
+  await reset()
+  const budget = { remaining: 2 }
+  const capped = await run(stamp(false), budget)
+  assert.equal(capped.qty, 2, 'the order beyond the cap stays held')
+  assert.deepEqual(capped.holds.map((h) => h.reason), ['status_predates_stock_read'])
+  assert.equal(budget.remaining, 0)
+  const spent = await run(stamp(false), budget)
+  assert.equal(spent.qty, 2, 'an exhausted budget refreshes nothing more')
+})
+
 test('o3d-hqvrp.118: a live allocation is in flight unless its status snapshot was read AFTER the stock read and is not despatched', SKIP, async () => {
   loadEnv()
   const { db } = await import('@/lib/db')

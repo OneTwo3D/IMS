@@ -25,11 +25,14 @@ mock.module('@/lib/connectors/wms/registry', {
   namedExports: {
     getWmsConnectorDef: () => ({ label: 'Mintsoft' }),
     getWmsConnector: () => ({
-      fetchOrderStatus: async () => ({
+      fetchOrderStatus: async () => {
+        if (statusOverrides.__throw) throw new Error('Mintsoft 503')
+        return {
         externalOrderId: 'ext-1', externalOrderNumber: 'SO-1', status: 'NEW', statusLabel: 'NEW',
         isSplit: true, partCount: 2, isMerged: false, mergedOrderNumbers: [], deepLinkUrl: null,
         tracking: [], dispatched: false, raw: {}, ...statusOverrides,
-      }),
+        }
+      },
       ...(hasParts
         ? {
           fetchOrderParts: async () => {
@@ -114,4 +117,42 @@ test('an unsplit order keeps the connector decision and makes no part read', asy
   parts = []
   assert.equal((await snapshotFor())?.dispatched, false)
   assert.equal(partsCalls, 0)
+})
+
+// The align-down gate's own refresh (o3d-hqvrp.368) goes through the same aggregate and writes only a successful read.
+async function refreshOnce(): Promise<{ result: { attempted: number; refreshed: number }; written: Snapshot[] }> {
+  upserts.length = 0
+  partsCalls = 0
+  const { refreshWmsOrderStatusSnapshots } = await import('@/lib/domain/wms/order-status-sweep')
+  const result = await refreshWmsOrderStatusSnapshots(['order-1'])
+  return { result, written: [...upserts] }
+}
+
+test('gate refresh of a split order persists the aggregate over every part (Part 2 despatched => true)', async () => {
+  statusOverrides = {}; hasParts = true
+  parts = [part(1, false), part(2, true)]
+  const { result, written } = await refreshOnce()
+  assert.deepEqual(result, { attempted: 1, refreshed: 1 })
+  assert.equal(written[0]?.dispatched, true)
+})
+
+test('gate refresh of a split order with every part not despatched persists false', async () => {
+  statusOverrides = {}; hasParts = true
+  parts = [part(1, false), part(2, false)]
+  assert.equal((await refreshOnce()).written[0]?.dispatched, false)
+})
+
+test('gate refresh whose part read fails persists null, never false', async () => {
+  statusOverrides = {}; hasParts = true
+  parts = new Error('Mintsoft 500')
+  assert.equal((await refreshOnce()).written[0]?.dispatched, null)
+})
+
+test('gate refresh whose status read throws writes nothing and does not throw', async () => {
+  statusOverrides = { __throw: true }; hasParts = true
+  parts = []
+  const { result, written } = await refreshOnce()
+  assert.deepEqual(result, { attempted: 1, refreshed: 0 })
+  assert.equal(written.length, 0)
+  statusOverrides = {}
 })

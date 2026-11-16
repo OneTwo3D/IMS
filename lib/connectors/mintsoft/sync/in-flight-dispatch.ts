@@ -116,6 +116,37 @@ export async function loadInFlightDispatch(
   return { qty: total.toNumber(), holds }
 }
 
+/** Orders whose status the align-down path may re-read per stock-sync run. Beyond it they stay held; a later run picks them up. */
+export const IN_FLIGHT_STATUS_REFRESH_CAP_PER_RUN = 25
+
+/**
+ * `loadInFlightDispatch`, but an allocation held only because its status read predates the stock read gets ONE fresh
+ * status read first (o3d-hqvrp.368). The status sweep refreshes a snapshot only when it is 30+ minutes old, so without this
+ * a snapshot is almost never newer than the current run's stock read and align-down would never release for a product with a
+ * live allocation. `refresh` re-reads and persists the snapshots (read-only against the WMS); the gate then runs again, and a
+ * refreshed snapshot, being fetched after `stockReadAt`, releases only on a genuine explicit `false`. `budget.remaining` is
+ * shared across the run and capped; an order beyond it, a refresh that fails or throws, or one that reads despatched or
+ * unknown all leave the hold in place. Only the planning check refreshes: the in-transaction re-check stays a pure read.
+ */
+export async function loadInFlightDispatchRefreshing(
+  client: InFlightClient,
+  input: Parameters<typeof loadInFlightDispatch>[1],
+  refresh: (orderIds: string[]) => Promise<unknown>,
+  budget: { remaining: number },
+): Promise<Awaited<ReturnType<typeof loadInFlightDispatch>>> {
+  const first = await loadInFlightDispatch(client, input)
+  const stale = [...new Set(first.holds.filter((h) => h.reason === 'status_predates_stock_read').map((h) => h.orderId))]
+  const batch = stale.slice(0, Math.max(0, budget.remaining))
+  if (batch.length === 0) return first
+  budget.remaining -= batch.length
+  try {
+    await refresh(batch)
+  } catch {
+    return first
+  }
+  return loadInFlightDispatch(client, input)
+}
+
 export function describeInFlightHolds(holds: readonly InFlightDispatchHold[]): string {
   return holds.slice(0, 10).map((hold) => `${hold.orderNumber} (${hold.qty}, ${hold.reason})`).join('; ')
     + (holds.length > 10 ? `; and ${holds.length - 10} more` : '')

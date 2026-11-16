@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { describeInFlightHolds, loadInFlightDispatch } from '@/lib/connectors/mintsoft/sync/in-flight-dispatch'
+import { describeInFlightHolds, IN_FLIGHT_STATUS_REFRESH_CAP_PER_RUN, loadInFlightDispatch, loadInFlightDispatchRefreshing } from '@/lib/connectors/mintsoft/sync/in-flight-dispatch'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { classifyUnresolvedWmsSku } from '@/lib/domain/wms/stock-sync-helpers'
 import { createCostLayer } from '@/lib/cost-layers'
@@ -2392,6 +2392,8 @@ async function applyMintsoftAlignDownForProduct(params: {
   runStartedAt: Date
   /** When the Mintsoft stock figures this run acts on were read; a status snapshot must be newer to release. */
   stockReadAt: Date
+  /** Per-run allowance of status re-reads for orders the gate holds on a predating snapshot. */
+  statusRefreshBudget: { remaining: number }
 }): Promise<{
   applied: boolean
   dryRun: boolean
@@ -2404,7 +2406,12 @@ async function applyMintsoftAlignDownForProduct(params: {
       select: { delta: true, lastSeenAt: true },
     }),
     getOpenAsnPendingQty(params.binding, params.productId),
-    loadInFlightDispatch(db, { productId: params.productId, warehouseId: params.binding.warehouseId, stockReadAt: new Date(params.stockReadAt) }),
+    loadInFlightDispatchRefreshing(
+      db,
+      { productId: params.productId, warehouseId: params.binding.warehouseId, stockReadAt: new Date(params.stockReadAt) },
+      async (orderIds) => (await import('@/lib/domain/wms/order-status-sweep')).refreshWmsOrderStatusSnapshots(orderIds),
+      params.statusRefreshBudget,
+    ),
     db.stockLevel.findUnique({
       where: {
         productId_warehouseId: {
@@ -2747,6 +2754,7 @@ export async function runStockSyncForBinding(
     const fetchedLines = await connector.fetchStockLevels(binding.externalWarehouseId)
     // Taken AFTER the read returns, so a status snapshot newer than this is certainly newer than the stock figures.
     const stockReadAt = new Date()
+    const statusRefreshBudget = { remaining: IN_FLIGHT_STATUS_REFRESH_CAP_PER_RUN }
     await refreshLease(true)
     const stockLines = consolidateMintsoftStockLines(fetchedLines)
     const thresholds = parseMintsoftThresholds(binding.discrepancyThresholds)
@@ -2976,6 +2984,7 @@ export async function runStockSyncForBinding(
             dryRun: alignmentDryRun,
             runStartedAt,
             stockReadAt,
+            statusRefreshBudget,
           })
 
           if (alignDown.stockEnqueue === 'failed') stockEnqueueFailures += 1
