@@ -25,6 +25,8 @@ import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRem
 import { scrubWmsError } from './error-scrub'
 import { courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
+import { runSystemicPass, type SystemicFailureStore } from './systemic-failure'
+import { createDbSystemicFailureStore } from './systemic-failure-store'
 import { flagDoublePostageForMergedLink } from './double-postage'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 import {
@@ -301,6 +303,14 @@ export function provesNoRemoteWmsCall(
   // picking up "…and none may have been dispatched" (o3d-2k5r r3).
   return !wmsCreateOutcomeIsAmbiguous(link)
 }
+/**
+ * Did this create DEFINITELY not reach the warehouse? Only a connector that says so counts: an error carrying `nothingSent: true` (the
+ * outbound-write hold's own class, and any connector error that adopts the flag). Every other failure of a create (a timeout, a 5xx, a
+ * refusal that came back from the far side) may have been honoured, so its outcome is ambiguous and is never retried blind.
+ */
+export function isDefiniteCreateRefusal(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { nothingSent?: unknown }).nothingSent === true
+}
 const DEFAULT_BATCH_SIZE = 25
 /** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
 const EMPTY_ORDER_ID_SET: ReadonlySet<string> = new Set<string>()
@@ -327,6 +337,8 @@ export type WmsOrderPushSweepResult = {
   released: number
   failed: number
   deadLettered: number
+  /** PRESENT ONLY WHEN NON-ZERO: orders and links that ran out of retries in a pass the systemic-failure breaker read as a connector fault, and so were NOT parked (they stay eligible). A failed run. */
+  systemicSuppressed?: number
   /**
    * o3d-92fu: orders parked VALIDATION_FAILED this sweep — the payload could not be
    * BUILT from local data, so no remote call was made. Deliberately NOT folded into
@@ -1220,6 +1232,14 @@ export interface WmsOrderPushPort {
    * read, and refuses an erased order. Absent: the caller uses its snapshot (test doubles). A rejection fails closed.
    */
   reloadOrderForPush?(orderId: string): Promise<Partial<OrderForPush> | null>
+  /**
+   * The systemic-failure circuit breaker's state and incident (lib/domain/wms/systemic-failure.ts). Optional: a port without one
+   * keeps the legacy behaviour (a record is parked the moment its retries run out), which is what test doubles get.
+   *
+   * With it, exhausted creates and verifications are not parked inline: the park is DECIDED once, at the end of the pass, because
+   * that is the only point where one broken record and a broken connector can be told apart.
+   */
+  systemicBreaker?: SystemicFailureStore
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
   recordEvent(event: WmsMutationEventInput): Promise<void>
 }
@@ -1288,6 +1308,15 @@ export async function runWmsOrderPushSweepCore(
   // attempt, no failure. Unenforced (the default) every answer is `proceed` and nothing below differs from before.
   let shadowedCount = 0
   let shadowUnrecordedCount = 0
+  // THE SYSTEMIC-FAILURE BREAKER (lib/domain/wms/systemic-failure.ts). A create or verification that has run out of retries is NOT
+  // parked where it fails: it is collected here and the park is decided once, at the end of the pass, when one broken order and a
+  // broken connector can be told apart. Without a breaker on the port, exhaustion parks inline exactly as it always did.
+  const breaker = port.systemicBreaker
+  const createPass = { attempted: 0, failed: 0, lastError: null as string | null }
+  const exhaustedCreates: Array<{ orderId: string; orderNumber: string | null; attempts: number; message: string; stamp: Date; definite: boolean }> = []
+  const verifyPass = { attempted: 0, failed: 0, lastError: null as string | null }
+  let systemicSuppressed = 0
+  const exhaustedVerifies: Array<{ linkId: string; orderId: string; externalOrderId: string; attempts: number; message: string; stamp: Date }> = []
   let recoveryRefusedCount = 0
   /** THE SINGLE FLOOR of this sweep: the create query and every re-queue into PENDING_CREATE read it, so they cannot disagree. Null: not enforced, or not live. */
   const createFloor = wmsCreateObligationFloor(connectorId, producerContext)
@@ -2669,6 +2698,7 @@ export async function runWmsOrderPushSweepCore(
       let push: Awaited<ReturnType<NonNullable<PushConnector['pushOrder']>>> | null = null
       try {
         push = await connector.pushOrder!(input, createSeam.clearance)
+        createPass.attempted += 1
         const courierPending = push.courierFallback ?? false
         // o3d-bjc.8: an id the connector MINTED but has not proved is ours is
         // not SYNCED. It is also emphatically not PENDING_CREATE — the order
@@ -2907,10 +2937,22 @@ export async function runWmsOrderPushSweepCore(
         const attempts = heldByOutboundHold ? order.pushAttempts : order.pushAttempts + 1
         const dead = !heldByOutboundHold && attempts >= MAX_ATTEMPTS
         const message = scrubWmsError(error, 'WMS order push failed')
-        if (dead) result.deadLettered += 1
+        // The park of a create that failed with NO order minted waits for the end of the pass (see `breaker`). The link is written as the
+        // PENDING_CREATE it would be on any other failed attempt, with its attempts already at the bound, so a crash before the decision
+        // leaves it exactly where an ordinary failure would: eligible, and exhausted again on its next failure.
+        const deferPark = dead && push === null && breaker !== undefined
+        const heldNothingSent = heldByOutboundHold || (isOutboundWriteHeldError(error) && error.nothingSent)
+        if (dead && !deferPark) result.deadLettered += 1
         else result.failed += 1
-        if (heldByOutboundHold || (isOutboundWriteHeldError(error) && error.nothingSent)) result.outboundHeld = (result.outboundHeld ?? 0) + 1
-        const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
+        if (heldNothingSent) result.outboundHeld = (result.outboundHeld ?? 0) + 1
+        if (push === null && !heldNothingSent) {
+          // A held write is not a failed attempt: nothing was asked of the warehouse.
+          createPass.attempted += 1
+          createPass.failed += 1
+          createPass.lastError = message
+        }
+        if (deferPark) exhaustedCreates.push({ orderId: order.id, orderNumber: order.orderNumber ?? null, attempts, message, stamp: ts, definite: isDefiniteCreateRefusal(error) })
+        const state: PushState = dead && !deferPark ? 'DEAD_LETTER' : 'PENDING_CREATE'
         // `lastAttemptAt` IS the create dispatch stamp (decideCreateClaim): a stamped PENDING_CREATE link is
         // skipped until its lease expires and then parked AMBIGUOUS_CREATE ("a create may have left"). A
         // PROVEN pre-send hold sent nothing in THIS WHOLE PUSH (the connector converts a hold that follows an
@@ -2937,8 +2979,11 @@ export async function runWmsOrderPushSweepCore(
               )
               .catch(() => {})
           } else {
+            // A create the connector PROVED was not sent leaves no dispatch stamp (so the order is offered again next sweep instead of
+            // lapsing into AMBIGUOUS_CREATE); a parked or about-to-be-decided one keeps it for the compare-and-set.
+            const stamp = isDefiniteCreateRefusal(error) && !dead ? null : ts
             await port
-              .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: ts }, { state, attempts, lastError: message, lastAttemptAt: ts })
+              .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: stamp }, { state, attempts, lastError: message, lastAttemptAt: stamp })
               .catch(() => {})
           }
         }
@@ -2946,7 +2991,7 @@ export async function runWmsOrderPushSweepCore(
           action: 'order_create', outcome: push ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push?.externalOrderId ?? null,
           summary: push
             ? `Order ${order.orderNumber ?? order.id} created in WMS as ${push.externalOrderNumber ?? push.externalOrderId}, but recording the link failed`
-            : `WMS create failed for order ${order.orderNumber ?? order.id}${dead ? ' — dead-lettered' : ''}`,
+            : `WMS create failed for order ${order.orderNumber ?? order.id}${deferPark ? ' — retries exhausted, parking decided at the end of the pass' : dead ? ' — dead-lettered' : ''}`,
           before: beforeCreate,
           after: push
             ? { state: 'SYNCED', externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, linkPersistFailed: true, intent: pushIntentSummary(input) }
@@ -3065,6 +3110,11 @@ export async function runWmsOrderPushSweepCore(
         }
       }
 
+      verifyPass.attempted += 1
+      if (verdict === 'unknown') {
+        verifyPass.failed += 1
+        verifyPass.lastError = verifyError
+      }
       if (verdict === 'ours') {
         if (heldNow) {
           const approved = heldApproved
@@ -3164,7 +3214,19 @@ export async function runWmsOrderPushSweepCore(
         // permanently-unknown head every sweep and newer links never get a turn.
         const attempts = link.verifyAttempts + 1
         const exhausted = attempts >= MAX_ATTEMPTS
-        if (exhausted) {
+        if (exhausted && breaker) {
+          // Out of retries, but whether to quarantine is decided at the end of the pass (see `breaker`). Until then the link is
+          // written exactly as an unresolved attempt is, so it stays PENDING_VERIFY and keeps being verified.
+          const message = `WMS order ${link.externalOrderId} could not be verified after ${attempts} attempts`
+            + `${verifyError ? ` (${verifyError})` : ''} — quarantined for manual check, NOT re-pushed`
+          exhaustedVerifies.push({ linkId: link.id, orderId: link.orderId, externalOrderId: link.externalOrderId, attempts, message, stamp: verifyTs })
+          await port.updateLink(link.id, {
+            attempts,
+            lastAttemptAt: verifyTs,
+            lastError: verifyError ?? `WMS order ${link.externalOrderId} not yet verified as ours`,
+          })
+          result.verifyUnresolved += 1
+        } else if (exhausted) {
           // Still no answer after the bound. An order nobody can resolve is an
           // operator's decision, not a reason to keep quietly retrying while its
           // WMS order sits outside every other pass. Escalated, never re-pushed.
@@ -3750,6 +3812,109 @@ export async function runWmsOrderPushSweepCore(
       }
     }
   }
+
+  // --- THE SYSTEMIC VERDICT (lib/domain/wms/systemic-failure.ts) ---
+  //
+  // Parking is isolation, and isolation only means anything when the thing isolated is the exception. Decided ONCE here, because this
+  // is the only point in the pass where one broken order and a broken connector look different:
+  //   - most of what the pass tried failed at once  => a connector fault: ONE incident, NOTHING parked, every link stays eligible
+  //     and recovers on its own when the dependency does;
+  //   - otherwise (or once the suppression bound is spent) => the exhausted records are parked, as they always were.
+  // A pass that is systemic is a FAILED run (the cron reads `systemicSuppressed`), never a quiet green one.
+  if (breaker) {
+    const create = await runSystemicPass(breaker, {
+      sweep: 'order-push',
+      connector: connectorId,
+      outcomes: { attempted: createPass.attempted, failed: createPass.failed, exhausted: exhaustedCreates.length },
+      now: now(),
+      reason: createPass.lastError,
+      onDegraded: (message) => console.error(`[wms-order-push] systemic-failure breaker (create): ${message}`),
+    })
+    if (create.suppress) {
+      systemicSuppressed += exhaustedCreates.length
+      console.warn(`[wms-order-push] ${createPass.failed}/${createPass.attempted} creates failed this pass — treated as a connector fault, ${exhaustedCreates.length} exhausted order(s) NOT parked`)
+      // A suppressed order must be able to RECOVER. A link left PENDING_CREATE with its dispatch stamp is skipped until the lease
+      // lapses and is then parked AMBIGUOUS_CREATE: never created again. So where the connector PROVED the create was not sent
+      // (nothingSent), the claim is released here (stamp cleared, compare-and-set on the stamp this pass wrote) and the order is offered
+      // for a fresh create next pass, as a held create is. An AMBIGUOUS failure keeps its stamp and its AMBIGUOUS_CREATE path untouched:
+      // a create that may have landed is never retried blind, breaker or not.
+      for (const exhaustedCreate of exhaustedCreates) {
+        if (!exhaustedCreate.definite) continue
+        try {
+          await port.updateLinkIfCreateClaimOwned?.(exhaustedCreate.orderId, exhaustedCreate.stamp, { state: 'PENDING_CREATE', attempts: exhaustedCreate.attempts, lastError: exhaustedCreate.message, lastAttemptAt: null })
+        } catch (error) {
+          console.error('[wms-order-push] failed to release the create claim of a suppressed order', exhaustedCreate.orderId, error)
+          result.linkWriteErrors += 1
+        }
+      }
+    } else {
+      for (const exhaustedCreate of exhaustedCreates) {
+        const parkData = { state: 'DEAD_LETTER' as const, attempts: exhaustedCreate.attempts, lastError: exhaustedCreate.message, lastAttemptAt: exhaustedCreate.stamp }
+        let parked = false
+        try {
+          // Compare-and-set on the stamp this pass wrote, so an operator's replay or another worker's claim in between is never overwritten.
+          if (port.updateLinkIfCreateClaimOwned) parked = await port.updateLinkIfCreateClaimOwned(exhaustedCreate.orderId, exhaustedCreate.stamp, parkData)
+          else {
+            await port.upsertByOrder(exhaustedCreate.orderId, { connector: connectorId, ...parkData }, parkData)
+            parked = true
+          }
+        } catch (error) {
+          console.error('[wms-order-push] failed to park an order whose create retries are exhausted', exhaustedCreate.orderId, error)
+          result.linkWriteErrors += 1
+          continue
+        }
+        if (!parked) continue
+        result.failed -= 1
+        result.deadLettered += 1
+        await audit({
+          action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: exhaustedCreate.orderId, externalId: null,
+          summary: `WMS create failed for order ${exhaustedCreate.orderNumber ?? exhaustedCreate.orderId} — dead-lettered`,
+          before: { state: 'PENDING_CREATE', attempts: exhaustedCreate.attempts },
+          after: { state: 'DEAD_LETTER', attempts: exhaustedCreate.attempts },
+          error: exhaustedCreate.message,
+        })
+      }
+    }
+
+    const verify = await runSystemicPass(breaker, {
+      sweep: 'order-push-verify',
+      connector: connectorId,
+      outcomes: { attempted: verifyPass.attempted, failed: verifyPass.failed, exhausted: exhaustedVerifies.length },
+      now: now(),
+      reason: verifyPass.lastError,
+      onDegraded: (message) => console.error(`[wms-order-push] systemic-failure breaker (verify): ${message}`),
+    })
+    if (verify.suppress) {
+      systemicSuppressed += exhaustedVerifies.length
+      console.warn(`[wms-order-push] ${verifyPass.failed}/${verifyPass.attempted} verifications unresolved this pass — treated as a connector fault, ${exhaustedVerifies.length} exhausted link(s) NOT quarantined`)
+    } else {
+      for (const exhaustedVerify of exhaustedVerifies) {
+        let quarantined = false
+        try {
+          quarantined = await port.updateLinkIfState(exhaustedVerify.linkId, 'PENDING_VERIFY', {
+            state: 'DEAD_LETTER', attempts: exhaustedVerify.attempts, lastError: exhaustedVerify.message, lastAttemptAt: exhaustedVerify.stamp,
+          })
+        } catch (error) {
+          console.error('[wms-order-push] failed to quarantine a link whose verification retries are exhausted', exhaustedVerify.linkId, error)
+          result.linkWriteErrors += 1
+          continue
+        }
+        if (!quarantined) continue
+        result.verifyUnresolved -= 1
+        result.verifyQuarantined += 1
+        result.deadLettered += 1
+        await audit({
+          action: 'order_create', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: exhaustedVerify.orderId,
+          externalId: exhaustedVerify.externalOrderId,
+          summary: exhaustedVerify.message,
+          before: { state: 'PENDING_VERIFY', externalOrderId: exhaustedVerify.externalOrderId, attempts: exhaustedVerify.attempts },
+          after: { state: 'DEAD_LETTER', attempts: exhaustedVerify.attempts },
+          error: exhaustedVerify.message,
+        })
+      }
+    }
+  }
+  if (systemicSuppressed > 0) result.systemicSuppressed = systemicSuppressed
 
   if (ambiguousCreateAdopted > 0) result.ambiguousCreateAdopted = ambiguousCreateAdopted
   if (operatorNoticeCount > 0) result.operatorNotices = operatorNoticeCount
@@ -4537,7 +4702,7 @@ export async function runWmsOrderPushSweep(
   // One push sweep per connector at a time (o3d-hqvrp.339): creates, holds, releases, cancels and note retries all act on the same
   // links, and the per-link amend lease covers only the amendment path. Skip rather than queue: the holder is doing this work now.
   const locked = await withOrderPushSweepLockOrSkip(connectorId, () =>
-    runWmsOrderPushSweepCore(connector, connectorId, createPrismaWmsOrderPushPort(), options))
+    runWmsOrderPushSweepCore(connector, connectorId, { ...createPrismaWmsOrderPushPort(), systemicBreaker: createDbSystemicFailureStore(connectorId) }, options))
   if ('lockSkipped' in locked) return { ...empty, skipped: 'Another WMS order push sweep is already running' }
   // Merge candidates (flag mode, default off): after IMS created warehouse orders, look for same-customer orders still NEW. Outside the sweep lock, database only,
   // and it never throws: a detection failure cannot affect the push.

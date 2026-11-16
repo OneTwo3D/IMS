@@ -1,3 +1,4 @@
+import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
 import { Prisma, ProductType, SalesOrderStatus, StockMovementType } from '@/app/generated/prisma/client'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { db } from '@/lib/db'
@@ -21,7 +22,7 @@ const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
-const DEFAULT_DEMAND_WINDOW_DAYS = 90
+export const DEFAULT_DEMAND_WINDOW_DAYS = 90
 const DEFAULT_LEAD_TIME_DAYS = 14
 
 // Median (rounded to whole days) of a set of observed lead times, or null when empty.
@@ -35,10 +36,10 @@ function medianLeadTimeDays(values: number[]): number | null {
 // Default replenishment cover: when a product drops to its reorder point, suggest
 // ordering back up to roughly this many weeks of forecast demand ON TOP of the
 // reorder point (an order-up-to level). Matches the retired forecast's 8-week lot.
-const DEFAULT_TARGET_COVER_WEEKS = 8
+export const DEFAULT_TARGET_COVER_WEEKS = 8
 // Upper bound (one year) so a crafted URL/CSV param can't request absurd order-up-to
 // levels and generate runaway suggested quantities.
-const MAX_TARGET_COVER_WEEKS = 52
+export const MAX_TARGET_COVER_WEEKS = 52
 const REPLENISHMENT_PRODUCT_TYPES: ProductType[] = [
   ProductType.SIMPLE,
   ProductType.VARIANT,
@@ -134,6 +135,8 @@ type OpenPoLineRow = {
   qty: DecimalInput
   qtyReceived: DecimalInput
   qtyReturned: DecimalInput
+  /** The line's own estimated delivery; null = it follows `po.expectedDelivery` (effectiveLineEta). */
+  expectedDelivery?: Date | null
   po: {
     supplierId: string
     expectedDelivery: Date | null
@@ -582,9 +585,10 @@ function availabilityBreakdownByProduct(stockLevels: StockLevelRow[]): Map<strin
   ]))
 }
 
-async function loadOpenPoLines(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<OpenPoLineRow[]> {
+async function loadOpenPoLines(client: ReplenishmentReportClient, filters: StockPositionFilters, productId?: string): Promise<OpenPoLineRow[]> {
   const lines = await client.purchaseOrderLine.findMany({
     where: {
+      ...(productId ? { productId } : {}),
       po: {
         status: { in: OPEN_PO_STATUSES },
         ...(filters.warehouseId ? { destinationWarehouseId: filters.warehouseId } : {}),
@@ -596,6 +600,7 @@ async function loadOpenPoLines(client: ReplenishmentReportClient, filters: Stock
       qty: true,
       qtyReceived: true,
       qtyReturned: true,
+      expectedDelivery: true,
       po: {
         select: {
           supplierId: true,
@@ -629,13 +634,15 @@ function inboundOpenPoByStock(lines: OpenPoLineRow[]): Map<string, Prisma.Decima
   return inbound
 }
 
-function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, string> {
+export function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, string> {
   const dates = new Map<string, Date>()
   for (const line of lines) {
     const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
-    if (qty.lte(0) || !line.po.expectedDelivery) continue
+    // The line's own date wins, else the order's (lib/domain/purchasing/line-eta.ts).
+    const eta = effectiveLineEta(line.expectedDelivery, line.po.expectedDelivery)
+    if (qty.lte(0) || !eta) continue
     const existing = dates.get(line.productId)
-    if (!existing || line.po.expectedDelivery.getTime() < existing.getTime()) dates.set(line.productId, line.po.expectedDelivery)
+    if (!existing || eta.getTime() < existing.getTime()) dates.set(line.productId, eta)
   }
   return new Map([...dates.entries()].map(([key, value]) => [key, dateOnly(value)]))
 }
@@ -645,13 +652,15 @@ function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, strin
  * expectedDelivery are EXCLUDED (an unknown arrival cannot rescue a run-out date), so
  * sum(arrivals) <= inboundOpenPoQty; undatedInboundProductIds reports the gap.
  */
-function inboundArrivalsByProduct(lines: OpenPoLineRow[]): Map<string, InboundArrival[]> {
+export function inboundArrivalsByProduct(lines: OpenPoLineRow[]): Map<string, InboundArrival[]> {
   const byProductDate = new Map<string, Map<string, Prisma.Decimal>>()
   for (const line of lines) {
     const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
-    if (qty.lte(0) || !line.po.expectedDelivery) continue
+    // The line's own date wins, else the order's (lib/domain/purchasing/line-eta.ts); the late-PO logic reads these same dates.
+    const eta = effectiveLineEta(line.expectedDelivery, line.po.expectedDelivery)
+    if (qty.lte(0) || !eta) continue
     const dates = byProductDate.get(line.productId) ?? new Map<string, Prisma.Decimal>()
-    addToMap(dates, dateOnly(line.po.expectedDelivery), qty)
+    addToMap(dates, dateOnly(eta), qty)
     byProductDate.set(line.productId, dates)
   }
   return new Map([...byProductDate].map(([productId, dates]) => [
@@ -660,11 +669,11 @@ function inboundArrivalsByProduct(lines: OpenPoLineRow[]): Map<string, InboundAr
   ]))
 }
 
-function undatedInboundProductIds(lines: OpenPoLineRow[]): Set<string> {
+export function undatedInboundProductIds(lines: OpenPoLineRow[]): Set<string> {
   const ids = new Set<string>()
   for (const line of lines) {
     const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
-    if (qty.gt(0) && !line.po.expectedDelivery) ids.add(line.productId)
+    if (qty.gt(0) && !effectiveLineEta(line.expectedDelivery, line.po.expectedDelivery)) ids.add(line.productId)
   }
   return ids
 }
@@ -674,9 +683,10 @@ function demandWindow(now: Date, days: number): { dateFrom: Date; dateTo: Date; 
   return { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
 }
 
-async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<VelocitySaleInput[]> {
+async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }, productId?: string): Promise<VelocitySaleInput[]> {
   const movements = await client.stockMovement.findMany({
     where: {
+      ...(productId ? { productId } : {}),
       type: StockMovementType.SALE_DISPATCH,
       createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       product: productWhere(filters),
@@ -735,9 +745,10 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
   }))
 }
 
-async function loadStockLevels(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<StockLevelRow[]> {
+async function loadStockLevels(client: ReplenishmentReportClient, filters: StockPositionFilters, productId?: string): Promise<StockLevelRow[]> {
   const levels = await client.stockLevel.findMany({
     where: {
+      ...(productId ? { productId } : {}),
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
       product: productWhere(filters),
     },
@@ -752,6 +763,51 @@ async function loadStockLevels(client: ReplenishmentReportClient, filters: Stock
   }) as StockLevelRow[]
   assertSourceLimit(levels.length, SOURCE_ROW_LIMIT, 'Replenishment stock-level source rows')
   return levels
+}
+
+/**
+ * The single-product source rows behind the Reorder Planning demand chart (o3d-s8n.4): the SAME
+ * loaders the report uses, narrowed to one product so a drill-down does not scan the catalogue.
+ * `windowDays` is the sales-history window ending today (UTC); `arrivals` are the dated open PO
+ * quantities exactly as `getReorderReport` feeds them to the stock projection.
+ */
+export async function loadReorderChartSources(
+  filters: StockPositionFilters,
+  productId: string,
+  windowDays: number,
+  options: { deps?: ReplenishmentReportDeps } = {},
+): Promise<{
+  window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }
+  sales: VelocitySaleInput[]
+  availableQty: Prisma.Decimal
+  openPoLines: OpenPoLineRow[]
+  arrivals: InboundArrival[]
+  undatedInboundQty: Prisma.Decimal
+}> {
+  const client = clientFromDeps(options.deps)
+  const window = demandWindow(nowFromDeps(options.deps), windowDays)
+  const [sales, stockLevels, openPoLines] = await Promise.all([
+    loadVelocityRows(client, filters, window, productId),
+    loadStockLevels(client, filters, productId),
+    loadOpenPoLines(client, filters, productId),
+  ])
+  let availableQty = new Prisma.Decimal(0)
+  for (const level of stockLevels) {
+    availableQty = availableQty.add(toDecimal(level.quantity).sub(toDecimal(level.reservedQty)))
+  }
+  let undatedInboundQty = new Prisma.Decimal(0)
+  for (const line of openPoLines) {
+    const qty = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
+    if (qty.gt(0) && !line.po.expectedDelivery) undatedInboundQty = undatedInboundQty.add(qty)
+  }
+  return {
+    window,
+    sales,
+    availableQty,
+    openPoLines,
+    arrivals: inboundArrivalsByProduct(openPoLines).get(productId) ?? [],
+    undatedInboundQty,
+  }
 }
 
 export async function getReorderReport(
