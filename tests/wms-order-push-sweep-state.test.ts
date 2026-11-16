@@ -444,7 +444,7 @@ test('create: the courier marker and task name the service of the RELOADED order
   assert.equal(r.created, 1)
   assert.equal(h.upserts[0].create.courierTaskService, 'DPD Next Day')
   assert.match(h.tasks[0].queryText, /'DPD Next Day'/)
-  assert.equal(h.tasks[0].dedupeBasis, 'courier-fallback:DPD Next Day')
+  assert.equal(h.tasks[0].dedupeBasis, 'courier-fallback:DPD Next Day@2026-06-26T00:00:00.000Z', 'the episode is the create time')
 })
 
 test('courier tasks are keyed to the service: a fallback for another service is a different task with its own text', async () => {
