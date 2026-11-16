@@ -24,7 +24,7 @@ mock.module('@/lib/db', {
     db: {
       setting: {
         findUnique: async ({ where }: { where: { key: string } }) => (state.settings.has(where.key) ? { key: where.key, value: state.settings.get(where.key) } : null),
-        upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { if (!state.settings.has(where.key)) state.settings.set(where.key, create.value); return {} },
+        upsert: async ({ where, create, update }: { where: { key: string }; create: { value: string }; update: { value?: string } }) => { state.settings.set(where.key, state.settings.has(where.key) && update.value !== undefined ? update.value : (state.settings.get(where.key) ?? create.value)); return {} },
       },
       shoppingOrderLink: {
         findUnique: async ({ where }: { where: { connector_externalOrderId: { externalOrderId: string } } }) => {
@@ -136,4 +136,55 @@ test('a walk that never reaches an empty page is escalated, not trusted', async 
   const result = await run()
   assert.equal(result.errors.length, 1)
   assert.match(result.errors[0], /ceiling/)
+})
+
+const CURSOR = 'wc_cancellation_backstop_cursor'
+async function job() {
+  const { runWcCancellationBackstop } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  return runWcCancellationBackstop()
+}
+
+test('backstop job: does nothing before the initial import is complete (no read, no cursor)', async () => {
+  reset()
+  const result = await job()
+  assert.deepEqual(result.errors, [])
+  assert.equal(state.asked.length, 0)
+  assert.equal(state.settings.has(CURSOR), false)
+})
+
+test('backstop job, FIRST run (no cursor): reads cancelled and trash with NO modified_after, applies only to orders IMS holds, then sets its own cursor', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.pages.cancelled = [[{ id: 1, status: 'cancelled' }, { id: 2, status: 'cancelled' }]]
+  state.linked = { '1': 'ALLOCATED' }
+  const result = await job()
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(state.applied, [{ id: 1, status: 'cancelled' }], 'an order IMS never imported is left alone')
+  assert.ok(state.asked.length >= 2 && state.asked.every((p) => !('modified_after' in p)), 'an unbounded read of both statuses')
+  assert.ok(Number.isFinite(Date.parse(state.settings.get(CURSOR) ?? '')), 'its own cursor is set')
+})
+
+test('backstop job, later run: bounded by its own cursor; a failed read holds the cursor', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.settings.set(CURSOR, '2026-11-10T00:00:00.000Z')
+  state.fetchError.cancelled = 'WC API error: 503 down'
+  const result = await job()
+  assert.equal(result.errors.length, 1)
+  assert.ok(state.asked.every((p) => p.modified_after === '2026-11-10T00:00:00.000Z'))
+  assert.equal(state.settings.get(CURSOR), '2026-11-10T00:00:00.000Z', 'held')
+  state.fetchError = {}
+  state.asked = []
+  assert.deepEqual((await job()).errors, [])
+  assert.ok(Date.parse(state.settings.get(CURSOR)!) > Date.parse('2026-11-10T00:00:00.000Z'), 'advanced after a clean run')
+})
+
+test('the order sweep cursors are never read or written by the backstop job', async () => {
+  reset()
+  state.settings.set('wc_initial_import_completed', 'true')
+  state.settings.set('last_wc_order_reconcile_at', '2026-11-01T00:00:00.000Z')
+  state.settings.set('last_wc_order_sync_at', '2026-11-02T00:00:00.000Z')
+  await job()
+  assert.equal(state.settings.get('last_wc_order_reconcile_at'), '2026-11-01T00:00:00.000Z')
+  assert.equal(state.settings.get('last_wc_order_sync_at'), '2026-11-02T00:00:00.000Z')
 })

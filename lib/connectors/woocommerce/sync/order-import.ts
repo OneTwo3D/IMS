@@ -3,7 +3,7 @@
  */
 
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
-import { advancePullCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
+import { advancePullCursor, laterCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
 import { orderIsErasedInTx, scrubContactInAccountingPayload } from '@/lib/domain/erasure/erase-personal-data'
 import { WC_RECEIPT_NOTE_IMPORTED_PAID, WC_RECEIPT_NOTE_PAID_LATER, WC_RECEIPT_NOTE_PAID_LATER_PARTIAL } from '@/lib/domain/erasure/order-state'
@@ -4588,7 +4588,35 @@ export function isWcUnsupportedStatusRefusal(error: unknown): boolean {
   return /^WC API error: 4\d\d\b/.test(text) && /\bstatus\b/i.test(text) && /invalid|rest_invalid_param/i.test(text)
 }
 
-export async function sweepWcCancellations(modifiedAfter: string, result: SyncResult, mode: string): Promise<void> {
+export const WC_CANCELLATION_BACKSTOP_CURSOR_KEY = 'wc_cancellation_backstop_cursor'
+
+/**
+ * THE CANCELLATION BACKSTOP AS ITS OWN JOB (o3d-hqvrp.82). It runs on the frequent wc-reconcile cron on every run, whatever mode the
+ * order sweep is in (in webhook-primary mode the order reconciliation is daily, which would leave a lost cancellation live for a day),
+ * and has its OWN cursor: it neither reads nor moves the order sweep's cursors.
+ *
+ * The window is `modified_after` the last COMPLETED backstop run (taken at read start, with the same overlap the order cursors use). The FIRST run
+ * has no cursor and reads `cancelled` and `trash` with no bound at all, so a cancellation made before the backstop existed is not skipped; it
+ * still applies only to orders IMS already holds. The cursor advances only after every read ended on an empty page and every apply succeeded.
+ * Needs the initial import to be complete (before it, IMS holds nothing to cancel and the full read would be wasted).
+ */
+export async function runWcCancellationBackstop(): Promise<SyncResult> {
+  const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
+  const initial = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
+  if (initial?.value !== 'true') return result
+  const readStartedAtMs = Date.now()
+  const stored = await db.setting.findUnique({ where: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY } })
+  const cursor = stored?.value && Number.isFinite(Date.parse(stored.value)) ? stored.value : null
+  await sweepWcCancellations(cursor, result, 'cancellation backstop')
+  if (result.errors.length === 0) {
+    const candidate = wcPullCursorCandidate(readStartedAtMs)
+    const value = laterCursor(cursor, candidate)
+    await db.setting.upsert({ where: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY }, create: { key: WC_CANCELLATION_BACKSTOP_CURSOR_KEY, value }, update: { value } })
+  }
+  return result
+}
+
+export async function sweepWcCancellations(modifiedAfter: string | null, result: SyncResult, mode: string): Promise<void> {
   const trashUnsupported = (await db.setting.findUnique({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY } }).catch(() => null)) !== null
   for (const slug of ['cancelled', 'trash'] as const) {
     if (slug === 'trash' && trashUnsupported) continue
@@ -4598,7 +4626,7 @@ export async function sweepWcCancellations(modifiedAfter: string, result: SyncRe
     let endedOnEmptyPage = false
     let unsupported = false
     while (page <= MAX_WC_PAGE_WALK_PAGES) {
-      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', modified_after: modifiedAfter })
+      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', ...(modifiedAfter ? { modified_after: modifiedAfter } : {}) })
       if (error || !Array.isArray(data)) {
         const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
         if (!required && isWcUnsupportedStatusRefusal(error)) {
@@ -4964,12 +4992,6 @@ export async function syncNewWcOrders(
     ? await walkOrders(statuses, lastSync)
     : { endedOnEmptyPage: false, page: 1 }
   const { endedOnEmptyPage, page } = walked
-
-  // A cancellation WooCommerce holds but no delivery brought (see sweepWcCancellations). Only after a clean
-  // main walk, and only with a window to read from: the first sweep has nothing to back-stop.
-  if (endedOnEmptyPage && result.errors.length === 0 && lastSync) {
-    await sweepWcCancellations(lastSync, result, mode)
-  }
 
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a
