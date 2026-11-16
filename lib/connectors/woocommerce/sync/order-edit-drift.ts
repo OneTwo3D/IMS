@@ -20,9 +20,9 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, toDecimal } from '@/lib/domain/math/decimal'
 import type { WcFullOrder } from './types'
+import { WC_ORDER_EDIT_DRIFT_ENTITY_TYPE, WC_ORDER_EDIT_DRIFT_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 
-export const WC_ORDER_EDIT_DRIFT_RECORD_KIND = 'wc_order_edit_drift'
-export const WC_ORDER_EDIT_DRIFT_ENTITY_TYPE = 'SalesOrderEdit'
+export { WC_ORDER_EDIT_DRIFT_RECORD_KIND, WC_ORDER_EDIT_DRIFT_ENTITY_TYPE }
 export const WC_ORDER_EDIT_DRIFT_ACTION = 'wc_order_edited_after_import'
 
 /** Selects the open edit-drift rows. The ONLY place this family is selected. */
@@ -66,7 +66,14 @@ export function detectWcOrderEditDrift(wcOrder: Pick<WcFullOrder, 'line_items' |
     for (const [id, line] of [...wc].sort((a, b) => a[0] - b[0])) {
       const held = ims.get(id)
       if (!held) differences.push(`WooCommerce line ${id}${line.sku ? ` (${line.sku})` : ''} x ${line.qty} is not on the IMS order`)
-      else if (held.qty !== line.qty) differences.push(`WooCommerce line ${id}${line.sku ? ` (${line.sku})` : ''} is x ${line.qty}; IMS holds x ${held.qty}`)
+      else {
+        if (held.sku.trim() !== '' && line.sku.trim() !== '' && held.sku.trim().toLowerCase() !== line.sku.trim().toLowerCase()) {
+        // The same WooCommerce line id, a different product or variation (quantity and total may be unchanged). The SKU is the
+        // identity IMS stores for the line; the product and variation ids are not stored, so they cannot be compared.
+        differences.push(`WooCommerce line ${id} is now ${line.sku}; IMS holds ${held.sku}`)
+        }
+        if (held.qty !== line.qty) differences.push(`WooCommerce line ${id}${line.sku ? ` (${line.sku})` : ''} is x ${line.qty}; IMS holds x ${held.qty}`)
+      }
     }
     for (const [id, line] of [...ims].sort((a, b) => a[0] - b[0])) {
       if (!wc.has(id)) differences.push(`IMS line ${id}${line.sku ? ` (${line.sku})` : ''} x ${line.qty} is no longer on the WooCommerce order`)

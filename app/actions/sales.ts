@@ -1788,7 +1788,9 @@ export async function applySalesOrderStatusTransition(
   // transition, including CANCELLED from PROCESSING/ALLOCATED/PICKING/PACKING,
   // which releases reservations and deletes pending shipments. Symbols cannot
   // be serialized, so the capability tokens are not forgeable. (o3d-43oz)
-  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol },
+  // `guardUnderLock` (a function, so it cannot cross the RPC boundary either) can only REFUSE a move: it is asked the
+  // CURRENT status under the order lock and a non-null answer fails the transition (see updateSalesOrderStatusUnderLock).
+  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; guardUnderLock?: (currentStatus: string) => string | null },
   // `permanent: true` marks a failure a stable business rule refused, so a caller driving this from a
   // retrying transport (the Woo webhook inbox) can acknowledge it instead of retrying forever (o3d-bx9).
 ): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
@@ -2015,6 +2017,7 @@ export async function applySalesOrderStatusTransition(
           targetStatus,
           data,
           bypass: bypassPermission,
+          guardUnderLock: options?.guardUnderLock,
           beforeUpdate: async ({ tx: lockedTx }) => {
             // o3d-e1yb [wdraw]: enforce the terminal-approval fact HERE, under
             // the row lock, immediately before the write. The pre-flight check

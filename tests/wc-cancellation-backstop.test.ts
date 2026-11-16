@@ -15,12 +15,17 @@ const state = {
   syncResult: { success: true } as { success: boolean; error?: string; permanent?: boolean },
   asked: [] as Array<Record<string, string>>,
   activity: [] as Row[],
+  settings: new Map<string, string>(),
 }
 
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async (e: Row) => { state.activity.push(e) } } })
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      setting: {
+        findUnique: async ({ where }: { where: { key: string } }) => (state.settings.has(where.key) ? { key: where.key, value: state.settings.get(where.key) } : null),
+        upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { if (!state.settings.has(where.key)) state.settings.set(where.key, create.value); return {} },
+      },
       shoppingOrderLink: {
         findUnique: async ({ where }: { where: { connector_externalOrderId: { externalOrderId: string } } }) => {
           const status = state.linked[where.connector_externalOrderId.externalOrderId]
@@ -47,7 +52,7 @@ mock.module('@/lib/connectors/woocommerce/sync/order-status', {
 })
 
 function reset() {
-  state.pages = {}; state.fetchError = {}; state.linked = {}; state.applied = []; state.syncResult = { success: true }; state.asked = []; state.activity = []
+  state.pages = {}; state.fetchError = {}; state.linked = {}; state.applied = []; state.syncResult = { success: true }; state.asked = []; state.activity = []; state.settings = new Map()
 }
 async function run() {
   const { sweepWcCancellations } = await import('@/lib/connectors/woocommerce/sync/order-import')
@@ -74,15 +79,44 @@ test('a trashed order is applied as a cancellation', async () => {
   assert.deepEqual(state.applied, [{ id: 9, status: 'cancelled' }])
 })
 
-test('a failed cancelled read is an error (the cursor is held); a failed trash read is only a warning', async () => {
+test('a failed cancelled read is an error (the cursor is held)', async () => {
   reset()
-  state.fetchError.cancelled = 'boom'
+  state.fetchError.cancelled = 'WC API error: 500 boom'
   assert.equal((await run()).errors.length, 1)
+})
+
+test('a TRANSIENT trash read failure (5xx, timeout, network, 429) also holds the cursor and is not remembered', async () => {
+  for (const error of ['WC API error: 503 Service Unavailable', 'WC API error: 429 Too Many Requests', 'fetch failed: network timeout', 'WC API returned non-JSON response (text/html). The server may have timed out.']) {
+    reset()
+    state.fetchError.trash = error
+    const result = await run()
+    assert.equal(result.errors.length, 1, error)
+    assert.equal(state.settings.size, 0, 'nothing is remembered')
+  }
+})
+
+test('a CONFIRMED unsupported-status refusal of trash is logged once, remembered, and not asked again', async () => {
   reset()
-  state.fetchError.trash = 'invalid status'
-  const result = await run()
-  assert.deepEqual(result.errors, [])
-  assert.equal(state.activity.filter((a) => a.action === 'wc_order_trash_read_failed').length, 1)
+  state.fetchError.trash = 'WC API error: 400 {"code":"rest_invalid_param","message":"Invalid parameter(s): status"}'
+  const first = await run()
+  assert.deepEqual(first.errors, [], 'the cursor is not held for it')
+  assert.equal(state.activity.filter((a) => a.action === 'wc_order_trash_read_unsupported').length, 1)
+  const askedFirst = state.asked.filter((p) => p.status === 'trash').length
+  assert.equal(askedFirst, 1)
+  state.asked = []
+  state.activity = []
+  const second = await run()
+  assert.deepEqual(second.errors, [])
+  assert.equal(state.asked.filter((p) => p.status === 'trash').length, 0, 'later sweeps do not ask for trash')
+  assert.equal(state.activity.filter((a) => a.action === 'wc_order_trash_read_unsupported').length, 0, 'and do not log it again')
+})
+
+test('isWcUnsupportedStatusRefusal: only a 4xx that names status as invalid', async () => {
+  const { isWcUnsupportedStatusRefusal } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  assert.equal(isWcUnsupportedStatusRefusal('WC API error: 400 Invalid parameter(s): status'), true)
+  assert.equal(isWcUnsupportedStatusRefusal('WC API error: 401 Invalid signature'), false)
+  assert.equal(isWcUnsupportedStatusRefusal('WC API error: 500 Invalid parameter(s): status'), false)
+  assert.equal(isWcUnsupportedStatusRefusal('network timeout'), false)
 })
 
 test('a cancellation that fails to apply holds the cursor; a permanent refusal does not', async () => {

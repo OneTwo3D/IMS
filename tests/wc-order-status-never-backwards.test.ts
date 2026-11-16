@@ -8,7 +8,11 @@ import test, { mock } from 'node:test'
  * PACKING) is not undone by an unchanged `processing`. These drive the REAL `syncWcOrderStatus`.
  */
 type Row = Record<string, unknown>
-const state = { imsStatus: 'SHIPPED', transitions: [] as Array<{ orderId: string; status: string }>, activity: [] as Row[] }
+const state = {
+  imsStatus: 'SHIPPED', transitions: [] as Array<{ orderId: string; status: string }>, activity: [] as Row[],
+  guards: [] as Array<((current: string) => string | null) | undefined>,
+  applyResult: { success: true } as { success: boolean; error?: string; permanent?: boolean },
+}
 
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async (e: Row) => { state.activity.push(e) } } })
 mock.module('@/lib/db', {
@@ -22,13 +26,15 @@ mock.module('@/lib/db', {
 mock.module('@/lib/connectors/woocommerce/sync/withdrawal', { namedExports: { handleWcWithdrawalStatus: async () => ({ kind: 'not-a-withdrawal' as const }) } })
 mock.module('@/lib/connectors/woocommerce/sync/completion-flow', { namedExports: { processWcCompletion: async () => ({ kind: 'fulfilled' as const }) } })
 mock.module('@/app/actions/sales', {
-  namedExports: { applySalesOrderStatusTransition: async (orderId: string, status: string) => { state.transitions.push({ orderId, status }); return { success: true } } },
+  namedExports: { applySalesOrderStatusTransition: async (orderId: string, status: string, _x: unknown, options?: { guardUnderLock?: (c: string) => string | null }) => { state.transitions.push({ orderId, status }); state.guards.push(options?.guardUnderLock); return state.applyResult } },
 })
 
 async function sync(ims: string, wc: string) {
   state.imsStatus = ims
   state.transitions = []
   state.activity = []
+  state.guards = []
+  state.applyResult = { success: true }
   const { syncWcOrderStatus } = await import('@/lib/connectors/woocommerce/sync/order-status')
   return syncWcOrderStatus({ id: 5001, number: '5001', status: wc } as never)
 }
@@ -73,4 +79,24 @@ test('wcStatusSyncRefusal: the machine decides', async () => {
   assert.match(String(wcStatusSyncRefusal('DELIVERED', 'PROCESSING')), /does not allow/)
   assert.match(String(wcStatusSyncRefusal('PACKING', 'PROCESSING')), /does not allow|further along/)
   assert.equal(wcStatusSyncRefusal('PROCESSING', 'PROCESSING'), null)
+})
+
+test('the write carries a guard that re-asks the machine against the CURRENT status under the order lock', async () => {
+  await sync('PROCESSING', 'on-hold')
+  const guard = state.guards[0]
+  assert.equal(typeof guard, 'function')
+  assert.equal(guard!('PROCESSING'), null, 'still legal from the status that was read')
+  assert.match(String(guard!('SHIPPED')), /does not allow/, 'refused once a dispatch has committed')
+})
+
+test('a refusal made under the lock is a skip (acknowledged, recorded), not a failure', async () => {
+  const { STATUS_GUARD_REFUSAL_PREFIX } = await import('@/lib/domain/sales/status-transition-errors')
+  state.imsStatus = 'PROCESSING'
+  state.activity = []
+  state.applyResult = { success: false, permanent: true, error: `${STATUS_GUARD_REFUSAL_PREFIX}IMS does not allow SHIPPED -> ON_HOLD` }
+  const { syncWcOrderStatus } = await import('@/lib/connectors/woocommerce/sync/order-status')
+  const result = await syncWcOrderStatus({ id: 5001, number: '5001', status: 'on-hold' } as never)
+  assert.equal(result.success, true)
+  assert.equal(state.activity.filter((a) => a.action === 'status_sync_skipped_backwards').length, 1)
+  assert.equal(state.activity.filter((a) => a.action === 'status_sync_failed').length, 0)
 })

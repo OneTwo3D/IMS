@@ -4570,25 +4570,47 @@ export async function noteWcOrderAdmissionRefusal(modifiedAtIso: string | null |
  * (plus completed and the withdrawal statuses), so an order that moved to `cancelled` never comes back:
  * a lost delivery meant the order stayed allocated and went on to the warehouse.
  *
- * This reads the orders WooCommerce holds as `cancelled` (and, best effort, `trash`) modified since the
+ * This reads the orders WooCommerce holds as `cancelled` (and `trash`) modified since the
  * sweep's window, and applies the cancellation to the ones IMS ALREADY HOLDS, through `syncWcOrderStatus`
  * (state machine, withdrawal rules and the WMS cancel pass included). It never imports an order IMS has not
  * seen, so the operator's status selection is unaffected. It does not touch the cursor: a failure of the
  * required `cancelled` read, or a cancellation that fails to apply, is an ERROR on the run, which holds the
- * cursor exactly as a failed import does. The `trash` read is best effort (a store that rejects the status
- * must not stall the sweep): its failure is logged and the `cancelled` read still stands.
+ * cursor exactly as a failed import does. The same holds for `trash`, with ONE exception: a store that
+ * confirms it does not accept the status (4xx naming `status` as invalid) is asked once, logged, and not asked again.
+ * A transient failure (5xx, timeout, network) is never an exception: skipping it would let the cursor pass an order
+ * trashed in that window.
  */
+const WC_TRASH_READ_UNSUPPORTED_KEY = 'wc_order_trash_read_unsupported'
+
+/** A 4xx from WooCommerce that names the `status` parameter as invalid: the store does not accept this status. */
+export function isWcUnsupportedStatusRefusal(error: unknown): boolean {
+  const text = String(error ?? '')
+  return /^WC API error: 4\d\d\b/.test(text) && /\bstatus\b/i.test(text) && /invalid|rest_invalid_param/i.test(text)
+}
+
 export async function sweepWcCancellations(modifiedAfter: string, result: SyncResult, mode: string): Promise<void> {
+  const trashUnsupported = (await db.setting.findUnique({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY } }).catch(() => null)) !== null
   for (const slug of ['cancelled', 'trash'] as const) {
+    if (slug === 'trash' && trashUnsupported) continue
+    // `cancelled` is a core status every store has; `trash` may be refused by a store, in which case it is optional (see below).
     const required = slug === 'cancelled'
     let page = 1
     let endedOnEmptyPage = false
+    let unsupported = false
     while (page <= MAX_WC_PAGE_WALK_PAGES) {
       const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', modified_after: modifiedAfter })
       if (error || !Array.isArray(data)) {
         const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
-        if (required) result.errors.push(message)
-        else await logActivity({ entityType: 'SYNC', action: 'wc_order_trash_read_failed', tag: 'sync', level: 'WARNING', description: message, metadata: { mode }, resolveUser: false }).catch(() => undefined)
+        if (!required && isWcUnsupportedStatusRefusal(error)) {
+          // A CONFIRMED refusal of the status itself (4xx naming `status` as invalid): this store cannot be asked for trash.
+          // Logged once and remembered, so later sweeps stop asking. Anything else (5xx, timeout, network, an unreadable body) is
+          // transient and falls through to the error below: skipping the read would let the cursor pass an order trashed meanwhile.
+          await db.setting.upsert({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY }, create: { key: WC_TRASH_READ_UNSUPPORTED_KEY, value: new Date().toISOString() }, update: {} })
+          await logActivity({ entityType: 'SYNC', action: 'wc_order_trash_read_unsupported', tag: 'sync', level: 'WARNING', description: `${message}. The store does not accept the trash status, so the sweep will not ask for it again; a trashed order is then seen only through its webhook.`, metadata: { mode }, resolveUser: false }).catch(() => undefined)
+          unsupported = true
+          break
+        }
+        result.errors.push(message)
         break
       }
       const orders = data as WcFullOrder[]
@@ -4610,7 +4632,7 @@ export async function sweepWcCancellations(modifiedAfter: string, result: SyncRe
       }
       page++
     }
-    if (required && !endedOnEmptyPage && result.errors.length === 0) {
+    if (!unsupported && !endedOnEmptyPage && result.errors.length === 0) {
       result.errors.push(describeWcPageWalkCeilingStall('order', `${mode} cancellation backstop`))
     }
   }

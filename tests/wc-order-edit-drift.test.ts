@@ -28,3 +28,13 @@ test('a total that differs only below the minor unit is not an edit', () => {
 test('a payload that states no lines or total is compared on nothing', () => {
   assert.deepEqual(detectWcOrderEditDrift({} as never, stored), [])
 })
+
+test('the same WooCommerce line id with a different SKU is an edit even when quantity and total are unchanged', () => {
+  const d = detectWcOrderEditDrift(wc([{ id: 11, quantity: 2, sku: 'RED-L' }]), stored)
+  assert.equal(d.length, 1)
+  assert.match(d[0], /line 11 is now RED-L; IMS holds RED-M/)
+})
+test('SKU comparison ignores case and padding, and a line with no SKU on either side is not compared on it', () => {
+  assert.deepEqual(detectWcOrderEditDrift(wc([{ id: 11, quantity: 2, sku: ' red-m ' }]), stored), [])
+  assert.deepEqual(detectWcOrderEditDrift(wc([{ id: 11, quantity: 2 }]), stored), [])
+})

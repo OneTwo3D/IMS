@@ -5,7 +5,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
-import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { isPermanentStatusTransitionError, STATUS_GUARD_REFUSAL_PREFIX } from '@/lib/domain/sales/status-transition-errors'
 import type { ExternalFulfillmentRefusal } from '@/lib/fulfillment/external-fulfillment'
 import { wcFetch, wcPut } from '../api'
 import { assertWcAttemptMayWrite } from '../attempt-fence'
@@ -155,7 +155,19 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
     const result = await applySalesOrderStatusTransition(so.id, targetStatus as never, undefined, {
       pushStatusToWooCommerce: false,
       internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
+      // The refusal above read the status BEFORE this write, and the write skips the state machine: a dispatch that
+      // committed in between would be overwritten. Asked again against the current status under the order lock.
+      guardUnderLock: (current) => wcStatusSyncRefusal(current, targetStatus),
     })
+
+    if (!result.success && result.permanent && String(result.error ?? '').startsWith(STATUS_GUARD_REFUSAL_PREFIX)) {
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_skipped_backwards', tag: 'sync', level: 'INFO',
+        description: `Left order #${so.externalOrderNumber} as it is: it moved on while WooCommerce's ${wcOrder.status} (${targetStatus}) was being applied (${String(result.error).slice(STATUS_GUARD_REFUSAL_PREFIX.length)})`,
+        resolveUser: false,
+      })
+      return { success: true }
+    }
 
     if (!result.success) {
       await logActivity({
