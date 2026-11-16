@@ -76,3 +76,11 @@ test('every landed-cost shipment revaluation funds the change from transit', () 
   assert.equal(idx.length, 3)
   for (const i of idx) assert.ok(src.slice(i, i + 260).includes('offsetCostDeltaToTransit: true'), 'a landed-cost revaluation must set offsetCostDeltaToTransit')
 })
+
+test('the only landed-cost revaluation not funded from transit is a manufacturing cost edit (ACC-H14)', () => {
+  const src = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
+  // Exactly one conditional site, and its condition is the production-order operation and nothing else.
+  assert.equal(src.match(/fundedFromTransit/g)?.length, 2)
+  assert.ok(src.includes("const fundedFromTransit = revaluationContext?.operation !== 'recompute_production_order'"))
+  assert.ok(src.includes('...(fundedFromTransit ? { offsetCostDeltaToTransit: true } : {})'))
+})

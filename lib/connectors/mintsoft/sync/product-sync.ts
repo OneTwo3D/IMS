@@ -11,6 +11,9 @@ import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-cons
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { mintsoftProducerSeam } from '../producer-seam'
 import { snapshotFromRow } from '@/lib/domain/product-content/store'
+import { classifyIdentifierCodes, sameCode, type IdentifierCodes } from '@/lib/domain/products/identifiers'
+import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
+import { classifyMintsoftProductRecord } from '../api/normalizers'
 import { describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
 const ELIGIBLE_PRODUCT_TYPES = [
@@ -31,6 +34,7 @@ const PRODUCT_SYNC_CANDIDATE_SELECT = {
   sku: true,
   name: true,
   barcode: true,
+  mpn: true,
   hsCode: true,
   countryOfOrigin: true,
   customsDescription: true,
@@ -67,6 +71,8 @@ type ProductSyncCandidate = {
   sku: string
   name: string
   barcode: string | null
+  /** Only read when the product identifier split is on. */
+  mpn?: string | null
   hsCode: string | null
   countryOfOrigin: string | null
   customsDescription: string | null
@@ -262,6 +268,65 @@ export function resolveMintsoftBarcodePlan(imsBarcode: string | null, wmsBarcode
   if (!imsBarcode && wmsBarcode) return { kind: 'backfill', omitBarcode: true }
   if (imsBarcode === wmsBarcode) return { kind: 'match', omitBarcode: false }
   return { kind: 'conflict', omitBarcode: true }
+}
+
+export type MintsoftIdentifierPlan = {
+  /** The aggregate across both slots, in the single-slot plan's vocabulary. `conflict` also covers a leftover code. */
+  kind: BarcodePlan['kind']
+  gtin: BarcodePlan
+  mpn: BarcodePlan
+  omitBarcode: boolean
+  omitMpn: boolean
+  /** A third distinct code neither slot could take, on either side. Never dropped: it is what makes this a conflict. */
+  leftover: { ims: string; wms: string }
+}
+
+/**
+ * The two-slot form of `resolveMintsoftBarcodePlan`, used only when the product identifier split is on.
+ *
+ * Each slot (GTIN -> Mintsoft EAN, MPN -> Mintsoft UPC) runs the single-slot state machine on its own values. A
+ * GTIN-13 on one side and the same trade item as a GTIN-14 on the other is the same code (`sameCode`), not a conflict.
+ *
+ * ANY conflict, in either slot, or any leftover on either side, writes NOTHING to either Mintsoft field. A leftover is
+ * a code the warehouse may hold stock under that IMS cannot place, and writing the other slot could overwrite exactly
+ * that field (for instance a GTIN held in UPC), which is the decision a sync must not make. A human resolves the
+ * BARCODE_CONFLICT discrepancy.
+ *
+ * Without a conflict a slot is written whenever IMS, or the WMS value about to be backfilled into IMS, has a value, so
+ * the code lands in its canonical field (GTIN in EAN, MPN in UPC) even when Mintsoft had it in the other one.
+ */
+export function resolveMintsoftIdentifierPlan(ims: IdentifierCodes, wms: IdentifierCodes): MintsoftIdentifierPlan {
+  const slot = (imsValue: string, wmsValue: string): BarcodePlan => {
+    const wmsComparable = imsValue && wmsValue && sameCode(imsValue, wmsValue) ? imsValue : wmsValue
+    return resolveMintsoftBarcodePlan(imsValue || null, wmsComparable || null)
+  }
+  const gtin = slot(ims.gtin, wms.gtin)
+  const mpn = slot(ims.mpn, wms.mpn)
+  const leftover = { ims: ims.leftover, wms: wms.leftover }
+  const conflict = gtin.kind === 'conflict' || mpn.kind === 'conflict' || Boolean(leftover.ims || leftover.wms)
+
+  const kinds = [gtin.kind, mpn.kind]
+  let kind: BarcodePlan['kind']
+  if (conflict) kind = 'conflict'
+  else if (kinds.includes('fill_wms_barcode')) kind = 'fill_wms_barcode'
+  else if (kinds.includes('backfill')) kind = 'backfill'
+  else if (kinds.includes('match')) kind = 'match'
+  else kind = 'noop'
+
+  return {
+    kind,
+    gtin,
+    mpn,
+    omitBarcode: conflict || !(ims.gtin || wms.gtin),
+    omitMpn: conflict || !(ims.mpn || wms.mpn),
+    leftover,
+  }
+}
+
+function describeIdentifierSet(codes: IdentifierCodes): string {
+  const parts = [`GTIN ${codes.gtin || '(none)'}`, `MPN ${codes.mpn || '(none)'}`]
+  if (codes.leftover) parts.push(`unplaced ${codes.leftover}`)
+  return parts.join(', ')
 }
 
 export function resolveMintsoftExternalProductId(params: {
@@ -506,6 +571,8 @@ async function createBarcodeBackfillAudit(params: {
   productId: string
   sku: string
   barcode: string
+  /** What was backfilled; only the identifier split ever says anything but 'barcode'. */
+  label?: 'barcode' | 'MPN'
 }) {
   const now = new Date()
   if (params.scopes.length === 0) return
@@ -520,7 +587,7 @@ async function createBarcodeBackfillAudit(params: {
       status: 'RESOLVED',
       imsValue: null,
       wmsValue: params.barcode,
-      message: 'Mintsoft barcode was backfilled into IMS.',
+      message: params.label === 'MPN' ? 'Mintsoft MPN was backfilled into IMS.' : 'Mintsoft barcode was backfilled into IMS.',
       firstSeenAt: now,
       lastSeenAt: now,
       resolvedAt: now,
@@ -565,17 +632,53 @@ async function fetchAuthoritativeMintsoftProduct(context: ProductSyncContext): P
   }
 }
 
-async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode: string): Promise<{
+type PlannedIdentifiers = { barcode: string | null; mpn: string | null }
+
+/**
+ * Identifier split only: a backfill is a compare-and-set against the barcode and mpn the plan was built from, so an operator
+ * edit made after the product snapshot was read is never overwritten. Zero rows means the values moved: report it on the
+ * BARCODE_CONFLICT channel and write nothing (the next run re-plans from the fresh values).
+ */
+async function updateIdentifiersIfUnchanged(
+  context: ProductSyncContext,
+  expected: PlannedIdentifiers,
+  data: { barcode?: string; mpn?: string },
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const result = await db.product.updateMany({
+    where: { id: context.product.id, barcode: expected.barcode, mpn: expected.mpn },
+    data,
+  })
+  if (result.count > 0) return { ok: true }
+  const fresh = await db.product.findUnique({ where: { id: context.product.id }, select: { barcode: true, mpn: true } })
+  const message = `IMS barcode/MPN changed (now barcode ${fresh?.barcode ?? '(none)'}, MPN ${fresh?.mpn ?? '(none)'}) while the Mintsoft sync was running; nothing was backfilled from Mintsoft. It is re-planned on the next run.`
+  await upsertProductDiscrepancy({
+    scopes: context.scopes,
+    productId: context.product.id,
+    sku: context.product.sku,
+    category: 'BARCODE_CONFLICT',
+    imsValue: `barcode ${fresh?.barcode ?? '(none)'}, MPN ${fresh?.mpn ?? '(none)'}`,
+    wmsValue: [data.barcode && `GTIN ${data.barcode}`, data.mpn && `MPN ${data.mpn}`].filter(Boolean).join(', ') || null,
+    message,
+  })
+  return { ok: false, message }
+}
+
+async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode: string, alsoSet: { mpn?: string } = {}, expected?: PlannedIdentifiers): Promise<{
   ok: true
 } | {
   ok: false
   message: string
 }> {
   try {
-    await db.product.update({
-      where: { id: context.product.id },
-      data: { barcode },
-    })
+    if (expected) {
+      const guarded = await updateIdentifiersIfUnchanged(context, expected, { barcode, ...alsoSet })
+      if (!guarded.ok) return guarded
+    } else {
+      await db.product.update({
+        where: { id: context.product.id },
+        data: { barcode, ...alsoSet },
+      })
+    }
 
     await createBarcodeBackfillAudit({
       scopes: context.scopes,
@@ -607,6 +710,20 @@ async function backfillBarcodeFromMintsoft(context: ProductSyncContext, barcode:
   })
 
   return { ok: false, message }
+}
+
+/** Identifier split only: copy the MPN Mintsoft holds into an IMS product that has none. Product.mpn is not unique. */
+async function backfillMpnFromMintsoft(context: ProductSyncContext, mpn: string, expected: PlannedIdentifiers): Promise<{ ok: true } | { ok: false; message: string }> {
+  const guarded = await updateIdentifiersIfUnchanged(context, expected, { mpn })
+  if (!guarded.ok) return guarded
+  await createBarcodeBackfillAudit({
+    scopes: context.scopes,
+    productId: context.product.id,
+    sku: context.product.sku,
+    barcode: mpn,
+    label: 'MPN',
+  })
+  return { ok: true }
 }
 
 async function syncOneMintsoftProduct(
@@ -667,34 +784,77 @@ async function syncOneMintsoftProduct(
     await resolveProductDiscrepancy(context.scopes, context.product.id, 'INVALID_COUNTRY_OF_ORIGIN')
   }
 
+  // THE IDENTIFIER SPLIT (o3d-mu0a). Off (the default): everything below is the single-barcode behaviour, unchanged, and
+  // `dto` has no `mpn` key, so the payload hash and every outbound byte are what they always were. On: the GTIN goes to
+  // EAN and the MPN to UPC, classified by shape, with the two-slot plan below.
+  const splitEnabled = await readProductIdentifierSplitEnabled()
+  const imsCodes = splitEnabled
+    ? classifyIdentifierCodes({ EAN: context.product.barcode, UPC: context.product.mpn })
+    : null
+  if (imsCodes) dto = { ...dto, barcode: imsCodes.gtin || null, mpn: imsCodes.mpn || null }
+  const wmsCodes = splitEnabled && authoritative
+    ? classifyMintsoftProductRecord(authoritative.raw ?? { EAN: authoritative.barcode })
+    : null
+
   let payloadHash = hashMintsoftProductDto(dto)
   const wmsBarcode = trimToNull(authoritative?.barcode)
-  const barcodePlan = resolveMintsoftBarcodePlan(dto.barcode, wmsBarcode)
+  const identifierPlan = imsCodes
+    ? resolveMintsoftIdentifierPlan(imsCodes, wmsCodes ?? { gtin: '', mpn: '', leftover: '' })
+    : null
+  const barcodePlan: BarcodePlan = identifierPlan
+    ? { kind: identifierPlan.kind, omitBarcode: identifierPlan.omitBarcode } as BarcodePlan
+    : resolveMintsoftBarcodePlan(dto.barcode, wmsBarcode)
 
-  if (barcodePlan.kind === 'backfill' && wmsBarcode) {
-    const backfill = await backfillBarcodeFromMintsoft(context, wmsBarcode)
-    if (!backfill.ok) {
-      const knownExternalProductId = authoritative?.externalId ?? existingLink?.externalProductId
-      if (knownExternalProductId) {
-        await upsertMintsoftProductLink({
-          productId: context.product.id,
-          externalProductId: knownExternalProductId,
-          lastKnownBarcode: wmsBarcode,
-          metadata: toJsonPayload(authoritative?.raw),
-          lastError: backfill.message,
-        })
-      } else {
-        await recordMintsoftProductLinkError(context.product.id, backfill.message)
-      }
-      return {
-        sku: context.product.sku,
+  const failedBackfillResult = async (message: string, lastKnownBarcode: string | null): Promise<ProductSyncLineResult> => {
+    const knownExternalProductId = authoritative?.externalId ?? existingLink?.externalProductId
+    if (knownExternalProductId) {
+      await upsertMintsoftProductLink({
         productId: context.product.id,
-        action: 'conflict',
-        reason: backfill.message,
-        payload: toJsonPayload(authoritative?.raw),
-        remoteUpdated: false,
-      }
+        externalProductId: knownExternalProductId,
+        lastKnownBarcode,
+        metadata: toJsonPayload(authoritative?.raw),
+        lastError: message,
+      })
+    } else {
+      await recordMintsoftProductLinkError(context.product.id, message)
     }
+    return {
+      sku: context.product.sku,
+      productId: context.product.id,
+      action: 'conflict',
+      reason: message,
+      payload: toJsonPayload(authoritative?.raw),
+      remoteUpdated: false,
+    }
+  }
+
+  if (identifierPlan && wmsCodes) {
+    // NO backfill while the two-slot plan has any conflict or leftover: replacing Product.barcode in that state can erase an
+    // IMS part number the conflict is about (barcode = part number A, Mintsoft EAN = a GTIN, Mintsoft UPC = a different part
+    // number B). The conflict is reported below and a human decides.
+    const mayBackfill = identifierPlan.kind !== 'conflict'
+    // The values the plan was built from; each successful backfill advances it.
+    let planned: PlannedIdentifiers = { barcode: context.product.barcode, mpn: context.product.mpn ?? null }
+    if (mayBackfill && identifierPlan.gtin.kind === 'backfill' && wmsCodes.gtin) {
+      // A part number sitting in Product.barcode is moved to Product.mpn in the SAME update, before barcode is replaced.
+      const movedPartNumber = context.product.barcode?.trim() && !context.product.mpn?.trim() && imsCodes?.mpn
+        ? { mpn: imsCodes.mpn }
+        : {}
+      const backfill = await backfillBarcodeFromMintsoft(context, wmsCodes.gtin, movedPartNumber, planned)
+      if (!backfill.ok) return failedBackfillResult(backfill.message, wmsCodes.gtin)
+      planned = { barcode: wmsCodes.gtin, mpn: movedPartNumber.mpn ?? planned.mpn }
+      dto = { ...dto, barcode: wmsCodes.gtin }
+    }
+    if (mayBackfill && identifierPlan.mpn.kind === 'backfill' && wmsCodes.mpn) {
+      const mpnBackfill = await backfillMpnFromMintsoft(context, wmsCodes.mpn, planned)
+      if (!mpnBackfill.ok) return failedBackfillResult(mpnBackfill.message, wmsCodes.mpn)
+      planned = { ...planned, mpn: wmsCodes.mpn }
+      dto = { ...dto, mpn: wmsCodes.mpn }
+    }
+    payloadHash = hashMintsoftProductDto(dto)
+  } else if (barcodePlan.kind === 'backfill' && wmsBarcode) {
+    const backfill = await backfillBarcodeFromMintsoft(context, wmsBarcode)
+    if (!backfill.ok) return failedBackfillResult(backfill.message, wmsBarcode)
 
     dto = {
       ...dto,
@@ -703,7 +863,20 @@ async function syncOneMintsoftProduct(
     payloadHash = hashMintsoftProductDto(dto)
   }
 
-  if (barcodePlan.kind === 'conflict') {
+  if (barcodePlan.kind === 'conflict' && identifierPlan && imsCodes && wmsCodes) {
+    // The conflict branch is also where a leftover is reported: a code neither slot could take is never dropped. Both
+    // sides are shown in full so the operator sees exactly which code could not be placed.
+    await upsertProductDiscrepancy({
+      scopes: context.scopes,
+      productId: context.product.id,
+      sku: context.product.sku,
+      category: 'BARCODE_CONFLICT',
+      imsValue: describeIdentifierSet(imsCodes),
+      wmsValue: describeIdentifierSet(wmsCodes),
+      message: `IMS identifiers (${describeIdentifierSet(imsCodes)}) cannot be reconciled with Mintsoft EAN/UPC (${describeIdentifierSet(wmsCodes)}). `
+        + 'A code that neither the GTIN slot nor the MPN slot can take is never dropped or picked between automatically. Neither Mintsoft field was written.',
+    })
+  } else if (barcodePlan.kind === 'conflict') {
     await upsertProductDiscrepancy({
       scopes: context.scopes,
       productId: context.product.id,
@@ -788,7 +961,12 @@ async function syncOneMintsoftProduct(
     operation: 'product.upsert',
     subjectType: 'Product',
     subjectId: context.product.id,
-    payload: { product: dto, externalProductId: externalProductId ?? null, omitBarcode: barcodePlan.omitBarcode },
+    payload: {
+      product: dto,
+      externalProductId: externalProductId ?? null,
+      omitBarcode: barcodePlan.omitBarcode,
+      ...(identifierPlan ? { omitMpn: identifierPlan.omitMpn } : {}),
+    },
     summary: { sku: context.product.sku, creating: !externalProductId },
   })
   if (!upsertSeam.proceed) {
@@ -807,6 +985,7 @@ async function syncOneMintsoftProduct(
     synced = await context.connector.upsertProduct(dto, {
       externalProductId,
       omitBarcode: barcodePlan.omitBarcode,
+      ...(identifierPlan ? { omitMpn: identifierPlan.omitMpn } : {}),
     }, upsertSeam.clearance)
   } catch (error) {
     await recordWmsMutationEvent({
@@ -825,7 +1004,7 @@ async function syncOneMintsoftProduct(
       ? `Mintsoft product updated for ${context.product.sku}`
       : `Mintsoft product created for ${context.product.sku}`,
     before: { externalProductId: externalProductId ?? null, payloadHash: existingLink?.payloadHash ?? null },
-    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, payloadHash },
+    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, ...(identifierPlan ? { mpnOmitted: identifierPlan.omitMpn } : {}), payloadHash },
   } as const
 
   // The event records only AFTER the local link persisted (Codex r2) — a link

@@ -347,6 +347,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sync permission.',
   },
+  '/api/credit-note/[id]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with sales permission.',
+  },
   '/api/invoice/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission.',
@@ -382,6 +386,10 @@ export const apiRouteAuthPolicy = {
   '/api/reset/code': {
     access: 'admin-fresh',
     reason: 'Database reset code issuance is restricted through requireApiFreshAdmin.',
+  },
+  '/api/purchase-order/[id]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with purchasing permission; supplier-portal users are refused.',
   },
   '/api/rfq/[id]': {
     access: 'supplier',

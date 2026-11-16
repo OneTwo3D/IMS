@@ -53,6 +53,7 @@ import {
   WOO_STOCK_SYNC_PRODUCT_STATUSES,
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
+import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -144,6 +145,28 @@ async function snapshotSyncContext(): Promise<{
     // only the interpretation is shared with getWcCredentials.
     const creds: ConnectorCredentials | null = resolveWcCredentialsFromRows(rows)
     return { creds, syncVersion }
+  })
+}
+
+type BoundaryDb = Pick<typeof db, '$transaction'>
+
+/**
+ * Compare-and-set of the covered-history boundary (see stock-held-orders.ts). Returns true when written. Refused (false) when the connection
+ * generation moved since the run began, or when a transaction reset began after the proving walk did.
+ */
+export async function persistCoveredHistoryBoundary(database: BoundaryDb, coveredAtMs: number, syncVersion: string): Promise<boolean> {
+  return database.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+    const rows = await tx.setting.findMany({ where: { key: { in: [WC_SETTINGS_VERSION_KEY, WC_ORDER_RESET_MARKER_KEY, WC_COMPLETED_HISTORY_COVERED_KEY] } } })
+    const get = (key: string) => rows.find((r) => r.key === key)?.value ?? null
+    if ((get(WC_SETTINGS_VERSION_KEY) ?? '0') !== syncVersion) return false
+    const reset = get(WC_ORDER_RESET_MARKER_KEY)
+    if (reset && (Number.isNaN(Date.parse(reset)) || coveredAtMs < Date.parse(reset))) return false
+    const existing = trustedCoveredHistoryBoundary(get(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, reset)
+    if (existing !== null && Date.parse(existing) >= coveredAtMs) return false
+    const value = encodeCoveredHistoryBoundary(coveredAtMs, syncVersion)
+    await tx.setting.upsert({ where: { key: WC_COMPLETED_HISTORY_COVERED_KEY }, create: { key: WC_COMPLETED_HISTORY_COVERED_KEY, value }, update: { value } })
+    return true
   })
 }
 
@@ -801,7 +824,40 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       scopedStockIdsWithSiblings = [...scopedStockProductIds, ...missingComponentIds]
     }
   }
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps)
+  // THE UNRESERVED-ORDER GUARD (WCO-H3). The push below is absolute, so it must not give back units
+  // WooCommerce already took off for orders IMS has not reserved. Read them now; if they cannot be read,
+  // push nothing (see stock-held-orders.ts for why that is the only safe answer).
+  const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at', WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY] } } })
+  const cursorValue = (key: string) => cursorRows.find((r) => r.key === key)?.value ?? null
+  const held = await loadWcHeldUnitsByProduct(
+    buildWcHeldUnitsDeps(creds),
+    completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at'), trustedCoveredHistoryBoundary(cursorValue(WC_COMPLETED_HISTORY_COVERED_KEY), syncVersion, cursorValue(WC_ORDER_RESET_MARKER_KEY))),
+  )
+  if (held.ok && held.completedHistoryCoveredAtMs !== null) {
+    // Proven: completed history older than this walk is settled, so later runs (poll mode has no reconcile cursor) read only what changed since.
+    // The write is a compare-and-set under the credential-mutation lock: it is refused when the connection generation moved since this run
+    // began, or when a transaction reset began after the walk did (the reset deleted the orders the proof relied on). The read side checks
+    // both again, so even a write that slipped past would not be trusted.
+    await persistCoveredHistoryBoundary(db, held.completedHistoryCoveredAtMs, syncVersion).catch(() => undefined)
+  }
+  if (!held.ok) {
+    const result: StockSyncResult = {
+      synced: 0, skipped: 0, errors: [`Stock push skipped: ${held.reason}. WooCommerce stock was left as it is, because an absolute push could erase the decrement of an order IMS cannot see.`],
+      candidates: 0, matched: 0, unmatched: 0, pushed: false,
+      message: `Stock push skipped — ${held.reason}`, unmatchedSkuSample: [],
+    }
+    await recordAttempt()
+    await logActivity({
+      entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
+      description: `Stock sync skipped: could not verify WooCommerce orders that hold stock (${held.reason})`,
+    })
+    return result
+  }
+  const heldByProduct = held.heldByProduct
+  // ACCEPTED RACE (inter-system, documented, not fixed): an order WooCommerce takes AFTER the read above and BEFORE this run's
+  // write has been decremented by the store but is in neither the read nor IMS, so that one write can still give its units
+  // back. The window is one push run; the next push (or the daily forceAll reconcile) sees the order and corrects it.
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps, heldByProduct)
 
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
@@ -1159,7 +1215,15 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     // bghy: include KIT siblings so the fresh re-fetch has the same basis as the
     // snapshot — otherwise the min(snapshot, fresh) clamp re-zeros the KIT.
     scopedStockIdsWithSiblings,
+    heldByProduct,
   )
+
+  if (held.incomplete) {
+    result.errors.push(`Stock push limited to forced-zero products: the WooCommerce orders that hold stock could not be proven fully read (${held.incompleteReasons.join('; ')}), so no other quantity can be proven safe. The next run retries.`)
+  }
+  if (held.blockedProductIds.size > 0) {
+    result.errors.push(`Stock push skipped ${held.blockedProductIds.size} product(s): an on-hold/processing WooCommerce order names a variation IMS cannot resolve, so their stock cannot be proven safe.`)
+  }
 
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
@@ -1168,6 +1232,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     const target = effectiveTargets.get(product.id)
     if (target == null) {
       if (!result.errors.some((m) => m.includes(product.id))) result.skipped++
+      continue
+    }
+    // Only a forced zero is safe when the held-order picture is incomplete (0 can never oversell).
+    if (
+      (held.incomplete || held.blockedProductIds.has(product.id))
+      && !shouldForceWooZeroStock(product.lifecycleStatus)
+    ) {
+      result.skipped++
       continue
     }
     const stockQuantity = resolvePushStockQuantity(
@@ -1595,14 +1667,29 @@ export type StockLevelSnapshotRow = {
  * the exact same availability basis can be recomputed against a fresh re-read
  * immediately before pushing (the 1qsb stale-snapshot oversell guard).
  */
-export function buildStockMaps(stockLevels: StockLevelSnapshotRow[]): {
+export function buildStockMaps(
+  stockLevels: StockLevelSnapshotRow[],
+  /**
+   * Units WooCommerce already took off the store for orders IMS holds no reservation for (see
+   * stock-held-orders.ts). Treated as extra reservations: taken out of each product's warehouse
+   * rows in turn, never below 0.
+   */
+  heldUnits?: ReadonlyMap<string, number>,
+): {
   stockByProduct: Map<string, number>
   stockByProductWarehouse: Map<string, Map<string, number>>
 } {
   const stockByProduct = new Map<string, number>()
   const stockByProductWarehouse = new Map<string, Map<string, number>>()
+  const heldRemaining = new Map<string, number>(heldUnits ?? [])
   for (const sl of stockLevels) {
-    const available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
+    let available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
+    const held = heldRemaining.get(sl.productId) ?? 0
+    if (held > 0 && available > 0) {
+      const taken = Math.min(held, available)
+      available -= taken
+      heldRemaining.set(sl.productId, held - taken)
+    }
     stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
     const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
     byWarehouse.set(sl.warehouseId, available)
@@ -1680,11 +1767,95 @@ export function resolvePushStockQuantity(
   return Math.floor(Math.min(snapshotAvailable, freshAvailable))
 }
 
+/** The real I/O behind the unreserved-order guard. Read-only: one paged GET per call, two DB reads. */
+function buildWcHeldUnitsDeps(creds: ConnectorCredentials): WcHeldUnitsDeps {
+  return {
+    fetchOrdersPage: async (params) => {
+      try {
+        const { data, error, totalItems, totalItemsPresent } = await wcFetch('/orders', params, creds)
+        return { data, error, totalItems: totalItemsPresent ? totalItems : null }
+      } catch (e) {
+        return { data: null, error: `WC fetch threw: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}` }
+      }
+    },
+    findImportedOrders: async (externalOrderIds) => {
+      const out = new Map<string, Map<string, number>>()
+      if (externalOrderIds.length === 0) return out
+      const links = await db.shoppingOrderLink.findMany({
+        where: { connector: 'woocommerce', externalOrderId: { in: externalOrderIds } },
+        select: { externalOrderId: true, orderId: true },
+      })
+      if (links.length === 0) return out
+      const orderIds = links.map((l) => l.orderId)
+      // What IMS holds against each order, per product: the allocation rows (kept after dispatch, so they already cover shipped
+      // units) or the shipped quantity if the rows are gone, whichever is larger.
+      const allocations = await db.orderAllocation.findMany({ where: { orderId: { in: orderIds } }, select: { orderId: true, productId: true, qty: true } })
+      const shipped = await db.shipmentLine.findMany({ where: { shipment: { orderId: { in: orderIds } } }, select: { productId: true, qty: true, shipment: { select: { orderId: true } } } })
+      const sum = (rows: { orderId: string; productId: string; qty: unknown }[]) => {
+        const m = new Map<string, Map<string, number>>()
+        for (const r of rows) {
+          const per = m.get(r.orderId) ?? new Map<string, number>()
+          per.set(r.productId, (per.get(r.productId) ?? 0) + Number(r.qty))
+          m.set(r.orderId, per)
+        }
+        return m
+      }
+      const allocated = sum(allocations)
+      const shippedBy = sum(shipped.map((r) => ({ orderId: r.shipment.orderId, productId: r.productId, qty: r.qty })))
+      for (const l of links) {
+        const per = new Map<string, number>()
+        for (const source of [allocated.get(l.orderId), shippedBy.get(l.orderId)]) {
+          for (const [productId, qty] of source ?? []) per.set(productId, Math.max(per.get(productId) ?? 0, qty))
+        }
+        out.set(l.externalOrderId, per)
+      }
+      return out
+    },
+    findVariationIdsByParentExternalId: async (parentExternalIds) => {
+      if (parentExternalIds.length === 0) return []
+      const rows = await db.product.findMany({
+        where: { parent: { externalProductId: { in: parentExternalIds.map((n) => BigInt(n)) } } },
+        select: { id: true },
+      })
+      return rows.map((r) => r.id)
+    },
+    findProducts: async (externalIds, skus) => {
+      const select = {
+        id: true, sku: true, type: true, externalProductId: true,
+        productComponents: { select: { componentId: true, qty: true } },
+      } as const
+      const found = new Map<string, HeldProductRef>()
+      const add = (rows: { id: string; sku: string; type: string; externalProductId: bigint | number | null; productComponents: { componentId: string; qty: unknown }[] }[]) => {
+        for (const r of rows) {
+          found.set(r.id, {
+            id: r.id, sku: r.sku, type: r.type,
+            externalProductId: r.externalProductId == null ? null : Number(r.externalProductId),
+            components: r.productComponents.map((c) => ({ componentId: c.componentId, qty: Number(c.qty) })),
+          })
+        }
+      }
+      const or: Prisma.ProductWhereInput[] = []
+      if (externalIds.length) or.push({ externalProductId: { in: externalIds.map((n) => BigInt(n)) } })
+      if (skus.length) or.push({ sku: { in: skus } })
+      if (or.length === 0) return []
+      add(await db.product.findMany({ where: { OR: or }, select }))
+      // Reach every kit component, nested kits included (bounded: a cycle adds nothing new).
+      for (let depth = 0; depth < 8; depth++) {
+        const need = [...new Set([...found.values()].flatMap((p) => p.components.map((c) => c.componentId)))].filter((id) => !found.has(id))
+        if (need.length === 0) break
+        add(await db.product.findMany({ where: { id: { in: need } }, select }))
+      }
+      return [...found.values()]
+    },
+  }
+}
+
 async function computeFreshAvailableByProduct(
   products: CandidateProduct[],
   productById: Map<string, CandidateProduct>,
   whIds: string[],
   scopedStockProductIds: string[] | null,
+  heldUnits?: ReadonlyMap<string, number>,
 ): Promise<Map<string, number>> {
   const freshStockLevels = await db.stockLevel.findMany({
     where: {
@@ -1693,7 +1864,7 @@ async function computeFreshAvailableByProduct(
     },
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels)
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels, heldUnits)
   // Throwaway error sink: any kit-cycle diagnostics were already surfaced from the
   // snapshot pass; recomputing here must not double-report them.
   return computeAvailableByProduct(

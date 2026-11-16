@@ -363,6 +363,62 @@ export function unresolvedWcOrderRowSql(): Prisma.Sql {
 }
 
 /**
+ * WHAT A REFUSED WOOCOMMERCE COMPLETION SAYS IT IS (o3d-ymgc).
+ *
+ * A storefront order marked completed that IMS PERMANENTLY refused to turn into shipments (a coverage shortfall) is
+ * acknowledged to the webhook, so nothing will bring the order back: this row is its only durable record. It names an
+ * IMS order (`entityId`) and is QUARANTINED while open, SYNCED once the order is fulfilled, completed or cancelled.
+ *
+ * DELIBERATELY NOT in {@link UNRESOLVED_WC_ORDER_ROW_FAMILIES}. Those families BLOCK things (an order delete, a store
+ * rebind) because deleting the order would strand money; this row only needs to SURVIVE RETENTION and be LISTED. It is
+ * kept by its own predicate, {@link openWcCompletionRefusalRowSql}, exactly as the admission-refusal queue is.
+ */
+export const WC_COMPLETION_REFUSAL_RECORD_KIND = 'WC_COMPLETION_REFUSAL'
+
+/** The status an OPEN completion refusal carries. */
+export const WC_COMPLETION_REFUSAL_OPEN_STATUS = 'QUARANTINED' as const
+
+/** The order statuses in which a refused completion is moot: dispatched, or the order is gone from the pipeline. */
+export const WC_COMPLETION_REFUSAL_SETTLED_ORDER_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
+
+/**
+ * THE PREDICATE: an OPEN refused-completion row. Every clause is a positive assertion by the writer; callers narrow it
+ * (`entityId`) and must not negate it (use {@link openWcCompletionRefusalRowSql}, which is total, for a complement).
+ */
+export function openWcCompletionRefusalWhere(): {
+  connector: string
+  direction: 'FROM_CONNECTOR'
+  entityType: string
+  entityId: { not: null }
+  recordKind: string
+  status: typeof WC_COMPLETION_REFUSAL_OPEN_STATUS
+} {
+  return {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    entityId: { not: null },
+    recordKind: WC_COMPLETION_REFUSAL_RECORD_KIND,
+    status: WC_COMPLETION_REFUSAL_OPEN_STATUS,
+  }
+}
+
+/**
+ * The same predicate in SQL, for the retention sweep's `DELETE ... WHERE NOT (...)`. Rendered TOTAL
+ * (`COALESCE(..., FALSE)`) for the same reason as {@link unresolvedWcOrderRowSql}: the retention DELETE negates it.
+ * An OPEN row is never deleted by age; a resolved one (SYNCED) expires like any other.
+ */
+export function openWcCompletionRefusalRowSql(): Prisma.Sql {
+  return Prisma.sql`COALESCE((
+        "shopping_sync_logs".connector = 'woocommerce'
+    AND "shopping_sync_logs".direction = 'FROM_CONNECTOR'::"ShoppingSyncDirection"
+    AND "shopping_sync_logs"."entityType" = 'SalesOrder'
+    AND "shopping_sync_logs"."recordKind" = ${WC_COMPLETION_REFUSAL_RECORD_KIND}
+    AND "shopping_sync_logs".status = ${WC_COMPLETION_REFUSAL_OPEN_STATUS}::"ShoppingSyncStatus"
+  ), FALSE)`
+}
+
+/**
  * The payload discriminator of the by-id ADMISSION-REFUSAL QUEUE (`order-admission.ts` re-exports it as
  * `WC_ADMISSION_REFUSAL_QUEUE`). It lives here, in the pure module, so the retention sweep can render the
  * family without importing a module that holds a database handle.
@@ -459,4 +515,21 @@ export const UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS: Record<UnresolvedWcOrderRowFa
       + 'and the hold to release.',
     countNoun: 'sales invoice(s) held for a missing invoice number',
   },
+}
+
+/**
+ * THE ROW OF AN ORDER EDITED IN WOOCOMMERCE AFTER IMPORT (o3d-hqvrp.84). An open one is an operator's exception
+ * under Sync > Exceptions, and nothing re-reads an order whose content has not changed since it was last read, so
+ * nothing would refresh it: retention must NEVER age it out while it is open. It is deleted when the orders agree again.
+ */
+export const WC_ORDER_EDIT_DRIFT_RECORD_KIND = 'wc_order_edit_drift'
+export const WC_ORDER_EDIT_DRIFT_ENTITY_TYPE = 'SalesOrderEdit'
+
+/** TRUE for an open edit-drift row. Total (COALESCE), so `NOT (...)` in the retention DELETE is its exact complement. */
+export function openWcOrderEditDriftRowSql(): Prisma.Sql {
+  return Prisma.sql`COALESCE((
+        "shopping_sync_logs"."entityType" = ${WC_ORDER_EDIT_DRIFT_ENTITY_TYPE}
+    AND "shopping_sync_logs"."recordKind" = ${WC_ORDER_EDIT_DRIFT_RECORD_KIND}
+    AND "shopping_sync_logs".status = 'QUARANTINED'::"ShoppingSyncStatus"
+  ), FALSE)`
 }

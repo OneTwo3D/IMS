@@ -4,6 +4,8 @@
 
 import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
 import { readWcProductPushDecision } from './product-push-gate'
+import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
+import { planWcIdentifierWrite, wcIdentifierSnapshot, wcResponseConfirmsMpn } from './product-identifiers'
 import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
@@ -596,6 +598,22 @@ function parseNum(val: unknown): number | null {
   return Number.isNaN(n) ? null : n
 }
 
+/**
+ * The sale price WooCommerce reported, as an IMS update instruction.
+ *   undefined -> the payload did not carry the field (or it is unparseable): leave IMS alone.
+ *   null      -> WooCommerce reported an EMPTY sale price (sale removed, or ended by its
+ *                scheduled-sale cron): CLEAR salePriceBase, otherwise the next IMS save
+ *                pushes the stale discount back to the store.
+ *   number    -> the live sale price.
+ */
+export function resolveWcSalePriceUpdate(raw: unknown): number | null | undefined {
+  if (raw === undefined || raw === null) return undefined
+  const normalized = asTrimmedString(raw)
+  if (!normalized) return null
+  const n = parseFloat(normalized)
+  return Number.isNaN(n) ? undefined : n
+}
+
 function getFirstImageUrl(images: unknown): string | null {
   if (!Array.isArray(images)) return null
   for (const image of images) {
@@ -818,6 +836,7 @@ export async function syncWcProductToIms(
     const description = stripHtml(wcProduct.short_description || wcProduct.description || '')
     const salesPriceBase = parseNum(wcProduct.regular_price)
     const salePriceBase = parseNum(wcProduct.sale_price)
+    const salePriceUpdate = resolveWcSalePriceUpdate(wcProduct.sale_price)
     const weight = parseNum(wcProduct.weight)
     const depthCm = parseNum(wcProduct.dimensions?.length)   // WC "length" = depth
     const widthCm = parseNum(wcProduct.dimensions?.width)
@@ -1035,7 +1054,7 @@ export async function syncWcProductToIms(
             if (decision.wooShapeAgrees) {
               if (productType !== 'VARIABLE') {
                 if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-                if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+                if (salePriceUpdate !== undefined) updateData.salePriceBase = salePriceUpdate
               } else {
                 updateData.salesPriceBase = null
                 updateData.salePriceBase = null
@@ -1853,6 +1872,7 @@ async function applyVariations(
     const description = stripHtml(v.description || '')
     const salesPriceBase = parseNum(v.regular_price)
     const salePriceBase = parseNum(v.sale_price)
+    const salePriceUpdate = resolveWcSalePriceUpdate(v.sale_price)
     const weight = parseNum(v.weight)
     const depthCm = parseNum(v.dimensions?.length)
     const widthCm = parseNum(v.dimensions?.width)
@@ -1949,7 +1969,7 @@ async function applyVariations(
       }
       if (parentCategoryId != null) updateData.categoryId = parentCategoryId
       if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-      if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+      if (salePriceUpdate !== undefined) updateData.salePriceBase = salePriceUpdate
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
       // o3d-4kfh r7 (Codex finding 2): the VARIATION path writes a type too — `VARIANT`, over
@@ -2085,6 +2105,8 @@ export function buildImsToWcProductPayload(product: {
   salesPriceBase: Prisma.Decimal | number | null
   salePriceBase: Prisma.Decimal | number | null
   barcode: string | null
+  /** Ignored here: the MPN is written only by the identifier split, in pushImsProductToWc, behind its flag. */
+  mpn?: string | null
 }): Record<string, unknown> {
   const updateData: Record<string, unknown> = { name: product.name }
   updateData.status = deriveWooStatusFromLifecycleStatus(product.lifecycleStatus)
@@ -2100,7 +2122,7 @@ export function buildImsToWcProductPayload(product: {
 
 export async function pushImsProductToWc(
   productId: string,
-): Promise<{ success: boolean; error?: string; skipped?: boolean }> {
+): Promise<{ success: boolean; error?: string; skipped?: boolean; warning?: string }> {
   try {
     // The writer re-checks on its own, whatever the caller did: `wc_sync_product_enabled` and
     // `wc_sync_product_direction` decide whether IMS may write to the live product at all. A read
@@ -2120,6 +2142,7 @@ export async function pushImsProductToWc(
         salesPriceBase: true,
         salePriceBase: true,
         barcode: true,
+        mpn: true,
         type: true,
         externalProductId: true,
         lifecycleStatus: true,
@@ -2132,6 +2155,9 @@ export async function pushImsProductToWc(
 
     let externalProductId: number
     let putPath: string
+    // The meta_data of the WooCommerce object about to be written, as just fetched (the identifier split merges into it).
+    let currentWcMeta: unknown = undefined
+    let currentWcGuid: unknown = undefined
 
     if (product.parent?.sku) {
       const parentWcId = product.parent?.externalProductId != null ? Number(product.parent.externalProductId) : null
@@ -2140,6 +2166,8 @@ export async function pushImsProductToWc(
       }
 
       let variationId = product.externalProductId != null ? Number(product.externalProductId) : null
+      let fetchedVariationMeta: unknown = undefined
+      let fetchedVariationGuid: unknown = undefined
       if (!variationId) {
         const { data, error } = await wcFetch(
           `/products/${parentWcId}/variations`,
@@ -2153,6 +2181,8 @@ export async function pushImsProductToWc(
           return { success: false, error: `Expected exactly one WooCommerce variation for SKU ${product.sku} under ${product.parent.sku}` }
         }
         variationId = matches[0].id
+        fetchedVariationMeta = matches[0].meta_data
+        fetchedVariationGuid = matches[0].global_unique_id
         const persisted = await persistMappingIfVersionMatches(product.id, variationId, syncVersion)
         if (!persisted.ok) {
           return { success: false, error: describeMappingFailure(persisted, product.sku) }
@@ -2164,9 +2194,13 @@ export async function pushImsProductToWc(
         if (variation.sku !== product.sku) {
           return { success: false, error: `Cached WooCommerce variation ${variationId} no longer matches SKU ${product.sku}` }
         }
+        fetchedVariationMeta = variation.meta_data
+        fetchedVariationGuid = variation.global_unique_id
       }
 
       externalProductId = variationId
+      currentWcMeta = fetchedVariationMeta
+      currentWcGuid = fetchedVariationGuid
       putPath = `/products/${parentWcId}/variations/${variationId}`
     } else {
       let resolvedId = product.externalProductId != null ? Number(product.externalProductId) : null
@@ -2177,6 +2211,8 @@ export async function pushImsProductToWc(
         if (wcProduct.sku !== product.sku) {
           return { success: false, error: `Cached WooCommerce product ${resolvedId} no longer matches SKU ${product.sku}` }
         }
+        currentWcMeta = wcProduct.meta_data
+        currentWcGuid = wcProduct.global_unique_id
       } else {
         const { data, error } = await wcFetch('/products', { sku: product.sku, per_page: '2' }, creds)
         if (error) return { success: false, error }
@@ -2191,6 +2227,8 @@ export async function pushImsProductToWc(
           }
         }
         resolvedId = wcProducts[0].id
+        currentWcMeta = wcProducts[0].meta_data
+        currentWcGuid = wcProducts[0].global_unique_id
         const persisted = await persistMappingIfVersionMatches(product.id, resolvedId, syncVersion)
         if (!persisted.ok) {
           return { success: false, error: describeMappingFailure(persisted, product.sku) }
@@ -2216,8 +2254,61 @@ export async function pushImsProductToWc(
     const lastLook = await readWcProductPushDecision()
     if (!lastLook.allowed) return { success: true, skipped: true, error: lastLook.message }
 
-    const { error: putError } = await wcPut(putPath, updateData, creds)
+    // THE IDENTIFIER SPLIT (o3d-mu0a), behind `product_identifier_split_enabled` (default off). Off: `updateData` is
+    // exactly what buildImsToWcProductPayload built, so the PUT body is byte-identical to what IMS always sent. On: the
+    // all-digits `global_unique_id` is replaced by one gated on isGtin, and the MPN is written to Yoast's identifier
+    // store. Read here, after the settings recheck, so the decision is as fresh as the write.
+    let identifierWarning: string | undefined
+    let expectedMpn: { key: string; mpn: string } | null = null
+    let expectedGuidCleared = false
+    if (await readProductIdentifierSplitEnabled()) {
+      const isVariation = Boolean(product.parent?.sku)
+      const planFrom = (meta: unknown, guid: unknown) => planWcIdentifierWrite({ barcode: product.barcode, mpn: product.mpn, currentMeta: meta, isVariation, currentGlobalUniqueId: guid })
+      let plan = planFrom(currentWcMeta, currentWcGuid)
+      // The Yoast store is ONE serialised value and WooCommerce REST has no way to update a single sub-key, so the write is
+      // a read-modify-write. Narrow the race: re-read immediately before the PUT; if the identifiers moved since the plan's
+      // read, re-plan from the fresh read ONCE, and if they moved again skip the push (a later push retries).
+      if (plan.payload.meta_data || plan.payload.global_unique_id === '') {
+        let settled = false
+        for (let attempt = 0; attempt < 2 && !settled; attempt += 1) {
+          const { data: fresh, error: freshError } = await wcFetch(putPath, {}, creds)
+          if (freshError) return { success: false, error: freshError }
+          const freshObject = fresh as { meta_data?: unknown; global_unique_id?: unknown }
+          if (wcIdentifierSnapshot(freshObject.meta_data, freshObject.global_unique_id, isVariation) === wcIdentifierSnapshot(currentWcMeta, currentWcGuid, isVariation)) {
+            settled = true
+          } else {
+            currentWcMeta = freshObject.meta_data
+            currentWcGuid = freshObject.global_unique_id
+            plan = planFrom(currentWcMeta, currentWcGuid)
+          }
+        }
+        if (!settled) {
+          return { success: false, error: `WooCommerce identifiers for ${product.sku} changed twice while the push was being prepared; push skipped, it will be retried` }
+        }
+      }
+      delete updateData.global_unique_id
+      Object.assign(updateData, plan.payload)
+      const written = plan.payload.meta_data?.[0]
+      if (written) expectedMpn = { key: written.key, mpn: String(written.value.mpn) }
+      if (plan.payload.global_unique_id === '') expectedGuidCleared = true
+      identifierWarning = [
+        plan.warning,
+        plan.leftover ? `Identifier ${plan.leftover} could not be placed (the product holds two codes for one slot) and was not written` : undefined,
+      ].filter(Boolean).join('; ') || undefined
+    }
+
+    const { data: putData, error: putError } = await wcPut(putPath, updateData, creds)
     if (putError) return { success: false, error: putError }
+    if (expectedMpn && wcResponseConfirmsMpn(putData, expectedMpn.key, expectedMpn.mpn) === false) {
+      // A plugin filter can reject a meta write and still answer 200: do not call that a success.
+      return { success: false, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }
+    }
+    if (expectedGuidCleared) {
+      const stored = (putData as { global_unique_id?: unknown } | null)?.global_unique_id
+      if (typeof stored === 'string' && stored.trim() !== '') {
+        return { success: false, error: 'WooCommerce accepted the request but did not clear the stale GTIN field' }
+      }
+    }
 
     await db.shoppingSyncLog.create({
       data: {
@@ -2227,11 +2318,14 @@ export async function pushImsProductToWc(
         entityId: productId,
         externalId: String(externalProductId),
         payload: JSON.parse(JSON.stringify(updateData)),
+        // An identifier that could not be placed is recorded on the row for a human, never dropped silently. Only the
+        // identifier split ever sets it.
+        ...(identifierWarning ? { errorMessage: identifierWarning } : {}),
         syncedAt: new Date(),
       },
     })
 
-    return { success: true }
+    return identifierWarning ? { success: true, warning: identifierWarning } : { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
   }

@@ -546,6 +546,100 @@ function refundReturnAggregateKey(row: Pick<RefundReturnRow, 'productId' | 'refu
   return row.refundLineId ? `${row.productId}:${row.refundLineId}` : row.productId
 }
 
+/** Replaces the refund's return cost split (the per-shipment shares Group B still has to book). */
+async function persistReturnCostSplit(
+  tx: Prisma.TransactionClient,
+  refundId: string,
+  split: ReadonlyArray<{ shipmentId: string; valueBase: string }>,
+): Promise<void> {
+  await tx.salesOrderRefund.update({ where: { id: refundId }, data: { returnCostSplit: split as never } })
+}
+
+/**
+ * Records, on the refund, which shipments the units it actually returned to stock (or, in transit, the units its return
+ * expectation values) came from. Later refunds replay it (`buildRefundFallbackReturnRows`), so a unit staging took from
+ * one shipment is never priced again from that shipment.
+ *
+ * It records what was CLAIMED, not what is later received: an in-transit return that arrives short or long is cleared
+ * against the expectation by the receipt/write-off flow, and the per-line caps already count the refund's quantity, so
+ * the shipment record stays the refund's claim. Re-pricing it on receipt would move cost between refunds that have
+ * already been valued and journaled.
+ */
+async function persistReturnShipmentQty(
+  tx: Prisma.TransactionClient,
+  refundId: string,
+  rows: ReadonlyArray<RefundReturnRow>,
+): Promise<void> {
+  const byKey = new Map<string, { shipmentId: string; productId: string; qty: number }>()
+  for (const row of rows) {
+    if (!row.shipmentId || !(row.qty > 0)) continue
+    const key = `${row.shipmentId}|${row.productId}`
+    const entry = byKey.get(key) ?? { shipmentId: row.shipmentId, productId: row.productId, qty: 0 }
+    entry.qty += row.qty
+    byKey.set(key, entry)
+  }
+  await tx.salesOrderRefund.update({ where: { id: refundId }, data: { returnShipmentQty: [...byKey.values()] as never } })
+}
+
+/**
+ * Reconciles the STAGED return rows (the dispatch cost of JOURNALED shipments, from accounting staging) with the
+ * FALLBACK rows (every returned unit, from the issued cost of each shipment) per source shipment, so a refund that
+ * spans a journaled and a not-yet-journaled shipment restocks every unit once.
+ *
+ * Staged rows come first and carry their shipment's COGS reversal. For each (refund line, product) the fallback
+ * rows add only what staging did not cover: the units of shipments the staged rows do not cover, capped by what
+ * the fallback says was returned in total, so a unit is never restocked twice. Each fallback row keeps its own
+ * shipment's issued cost. `split` is the cost of exactly those fallback-restocked units per shipment: the
+ * shares Group B must still book, because no staged reversal covers them.
+ */
+export function reconcileStagedAndFallbackReturnRows(
+  stagedRows: ReadonlyArray<RefundReturnRow>,
+  fallbackRows: ReadonlyArray<RefundReturnRow>,
+): { rows: RefundReturnRow[]; split: Array<{ shipmentId: string; valueBase: string }> } {
+  const splitOf = (rows: ReadonlyArray<RefundReturnRow>) => {
+    const byShipment = new Map<string, Decimal>()
+    for (const row of rows) {
+      if (!row.shipmentId || row.unitCostBase == null) continue
+      byShipment.set(row.shipmentId, addMoney(byShipment.get(row.shipmentId) ?? toDecimal(0), multiplyMoney(row.qty, row.unitCostBase)))
+    }
+    return [...byShipment].map(([shipmentId, value]) => ({ shipmentId, valueBase: roundQuantity(value, 6).toFixed(6) }))
+  }
+  if (stagedRows.length === 0) return { rows: [...fallbackRows], split: splitOf(fallbackRows) }
+
+  const lineKey = (row: RefundReturnRow) => `${row.refundLineId ?? ''}|${row.productId}`
+  const stagedByLine = new Map<string, number>()
+  const covered = new Map<string, number>()
+  for (const row of stagedRows) {
+    stagedByLine.set(lineKey(row), (stagedByLine.get(lineKey(row)) ?? 0) + row.qty)
+    if (row.shipmentId) covered.set(`${lineKey(row)}|${row.shipmentId}`, (covered.get(`${lineKey(row)}|${row.shipmentId}`) ?? 0) + row.qty)
+  }
+  const fallbackByLine = new Map<string, number>()
+  for (const row of fallbackRows) fallbackByLine.set(lineKey(row), (fallbackByLine.get(lineKey(row)) ?? 0) + row.qty)
+  // What each line still owes after the staged units.
+  const owed = new Map<string, number>()
+  for (const [key, qty] of fallbackByLine) owed.set(key, Math.max(0, qty - (stagedByLine.get(key) ?? 0)))
+
+  const added: RefundReturnRow[] = []
+  for (const row of fallbackRows) {
+    const key = lineKey(row)
+    let take = row.qty
+    if (row.shipmentId) {
+      // Units of this shipment that staging already restocked are not restocked again (`owed` is already net of
+      // them, so they do not draw it down).
+      const shipmentKey = `${key}|${row.shipmentId}`
+      const alreadyCovered = covered.get(shipmentKey) ?? 0
+      const used = Math.min(alreadyCovered, take)
+      covered.set(shipmentKey, alreadyCovered - used)
+      take -= used
+    }
+    take = Math.min(take, owed.get(key) ?? 0)
+    if (take <= 0.0000001) continue
+    owed.set(key, (owed.get(key) ?? 0) - take)
+    added.push({ ...row, qty: take })
+  }
+  return { rows: [...stagedRows, ...added], split: splitOf(added) }
+}
+
 async function getExistingCreditNoteNumberMax(
   tx: Prisma.TransactionClient,
   prefix: string,
@@ -770,6 +864,7 @@ async function buildRefundFallbackReturnRows(
         select: {
           id: true,
           returnWarehouseId: true,
+          returnShipmentQty: true,
           lines: {
             select: { id: true, productId: true, description: true, qty: true, totalBase: true, unitPriceBase: true, salesOrderLineId: true },
           },
@@ -1031,29 +1126,49 @@ async function buildRefundFallbackReturnRows(
   })
 
   // Price the rows. The pool of each (line, component) is consumed once across this build, so two refund
-  // lines on one order line never price the same issued unit twice.
-  const cursorByKey = new Map<string, { index: number; usedInEntry: number }>()
+  // lines on one order line never price the same issued unit twice. Which units earlier refunds took back, per cost-pool entry. A refund that recorded the shipments it actually returned
+  // (`returnShipmentQty`) debits exactly those shipments' entries, whichever of staging or the fallback chose them; the
+  // rest of what a line gave back (older refunds, or units whose shipment was not recorded) comes off in dispatch order.
+  const recordedLeft = new Map<string, number>()
+  for (const refund of priorRefunds) {
+    if (!refund.returnWarehouseId || !Array.isArray(refund.returnShipmentQty)) continue
+    for (const entry of refund.returnShipmentQty as Array<{ shipmentId?: string; productId?: string; qty?: number }>) {
+      if (!entry?.shipmentId || !entry.productId || !(Number(entry.qty) > 0)) continue
+      const k = `${entry.shipmentId}|${entry.productId}`
+      recordedLeft.set(k, (recordedLeft.get(k) ?? 0) + Number(entry.qty))
+    }
+  }
+  const usedByKey = new Map<string, number[]>()
+  for (const [key, pool] of costPool) {
+    const productId = key.slice(key.indexOf('|') + 1)
+    const used = pool.map(() => 0)
+    let toSkip = consumedBeforeThisBuild.get(key) ?? 0
+    pool.forEach((entry, i) => {
+      const k = `${entry.shipmentId}|${productId}`
+      const take = Math.min(recordedLeft.get(k) ?? 0, entry.qty, toSkip)
+      if (take <= 0) return
+      used[i] += take
+      toSkip -= take
+      recordedLeft.set(k, (recordedLeft.get(k) ?? 0) - take)
+    })
+    pool.forEach((entry, i) => {
+      if (toSkip <= 0.0000001) return
+      const take = Math.min(toSkip, entry.qty - used[i])
+      used[i] += take
+      toSkip -= take
+    })
+    usedByKey.set(key, used)
+  }
   const pricedRows: RefundReturnRow[] = []
   for (const row of builtRows) {
     const key = lineProductKey(row.sourceLineId, row.productId)
     const pool = costPool.get(key) ?? []
-    let cursor = cursorByKey.get(key)
-    if (!cursor) {
-      // Skip the units earlier refunds already took back: they came out of the pool first.
-      cursor = { index: 0, usedInEntry: 0 }
-      let skip = consumedBeforeThisBuild.get(key) ?? 0
-      while (skip > 0.0000001 && cursor.index < pool.length) {
-        const step = Math.min(skip, pool[cursor.index].qty - cursor.usedInEntry)
-        cursor.usedInEntry += step
-        skip -= step
-        if (pool[cursor.index].qty - cursor.usedInEntry <= 0.0000001) cursor = { index: cursor.index + 1, usedInEntry: 0 }
-      }
-      cursorByKey.set(key, cursor)
-    }
+    const used = usedByKey.get(key) ?? []
     let remaining = row.qty
-    while (remaining > 0.0000001 && cursor.index < pool.length) {
-      const entry = pool[cursor.index]
-      const step = Math.min(remaining, entry.qty - cursor.usedInEntry)
+    for (let i = 0; i < pool.length && remaining > 0.0000001; i++) {
+      const entry = pool[i]
+      const step = Math.min(remaining, entry.qty - used[i])
+      if (step <= 0.0000001) continue
       pricedRows.push({
         productId: row.productId,
         qty: step,
@@ -1064,11 +1179,7 @@ async function buildRefundFallbackReturnRows(
         shipmentId: entry.shipmentId,
       })
       remaining -= step
-      cursor.usedInEntry += step
-      if (entry.qty - cursor.usedInEntry <= 0.0000001) {
-        cursor.index += 1
-        cursor.usedInEntry = 0
-      }
+      used[i] += step
     }
     if (remaining > 0.0000001) {
       // The issued cost of these units is not on record (a dispatch with neither a snapshot nor CogsEntry rows).
@@ -2777,6 +2888,12 @@ async function stageRefundAccountingReversals(
     }
 
     if (params.returnWarehouseId) {
+      // The shipment each staged unit came from (staging reads JOURNALED shipments only), so the return can be
+      // reconciled with the fallback rows per source shipment.
+      const shipmentIdByShipmentLineId = new Map<string, string>()
+      for (const shipment of orderAccounting?.shipments ?? []) {
+        for (const shipmentLine of shipment.lines) shipmentIdByShipmentLineId.set(shipmentLine.id, shipment.id)
+      }
       snapshotReturnRows = params.refundLines.flatMap((refundLine) => (
         (refundLayerSnapshots.get(refundLine.id) ?? []).flatMap((entry) => {
           if (entry.source !== 'shipment') return []
@@ -2789,6 +2906,7 @@ async function stageRefundAccountingReversals(
             unitCostBase: entry.unitCostBase,
             poLineId: poLineIdByCostLayerId.get(entry.costLayerId) ?? null,
             sourceCostLayerId: entry.costLayerId,
+            shipmentId: entry.shipmentLineId ? shipmentIdByShipmentLineId.get(entry.shipmentLineId) ?? null : null,
           }]
         })
       ))
@@ -5261,6 +5379,9 @@ export async function createSalesOrderRefund(
         rows: fallbackReturnRows,
         valued: !accountingStagingFollows,
       })
+      // The shipments the document expects, recorded in the same transaction so a later refund replays them. Staging may
+      // restate the document from its own rows (below), which re-records them.
+      await persistReturnShipmentQty(tx, createdRefund.id, fallbackReturnRows)
     }
 
     // o3d-67y: eligibility is derived from RESIDUAL reserved quantity under this order lock, not lifecycle
@@ -5423,6 +5544,7 @@ export async function createSalesOrderRefund(
             rows: stagedRows.length > 0 ? stagedRows : txResult.fallbackReturnRows,
             transit: returnExpectationTransitLinkFromSyncs(result.accountingSyncs),
           })
+          await persistReturnShipmentQty(tx, txResult.createdRefund.id, stagedRows.length > 0 ? stagedRows : txResult.fallbackReturnRows)
         }
         await tx.salesOrderRefund.update({
           where: { id: txResult.createdRefund.id },
@@ -5532,19 +5654,21 @@ export async function createSalesOrderRefund(
   // inbound return movement is skipped (the customer keeps the goods).
   if (txResult.restockWarehouseId && !accountingWarning && !txResult.returnInTransit) {
     const snapshotRows = snapshotReturnRows ?? []
-    const returnRows = snapshotRows.length > 0
-      ? snapshotRows
-      : txResult.fallbackReturnRows
 
-    returnedRows = await runInTransaction(client, (tx) => (
-      applyReturnInboundStockTx(tx, {
+    returnedRows = await runInTransaction(client, async (tx) => {
+      // Staged (journaled shipments) and fallback (the rest) rows are reconciled per source shipment, so a refund
+      // spanning both restocks every unit once; the Group B split keeps only the fallback-restocked shares.
+      const reconciled = reconcileStagedAndFallbackReturnRows(snapshotRows, txResult.fallbackReturnRows)
+      if (snapshotRows.length > 0) await persistReturnCostSplit(tx, txResult.createdRefund.id, reconciled.split)
+      await persistReturnShipmentQty(tx, txResult.createdRefund.id, reconciled.rows)
+      return applyReturnInboundStockTx(tx, {
         referenceType: 'SalesOrderRefund',
         referenceId: txResult.createdRefund.id,
         warehouseId: txResult.restockWarehouseId!,
-        rows: returnRows,
+        rows: reconciled.rows,
         note: 'Refund return',
       })
-    ))
+    })
   }
 
   return {
@@ -6145,13 +6269,27 @@ export async function retrySalesOrderRefundAccounting(
       let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
       if (refund.returnWarehouseId && !refund.chargeback) {
         const snapshotRows = staged.snapshotReturnRows ?? []
-        const returnRows = snapshotRows.length > 0
-          ? snapshotRows
-          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines, refund.id, {
+        let fallbackRows: RefundReturnRow[] = []
+        try {
+          fallbackRows = await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines, refund.id, {
             // o3d-zvec.21: the same rule the creation applied — a storefront refund never restocks (or
             // throws on) a line that did not ship. Its persisted external id is how creation chose it.
             skipUnshipped: refund.externalRefundId != null,
           })
+        } catch (error) {
+          // Staged rows alone restock exactly as before; only a refund with nothing staged needs the fallback.
+          if (snapshotRows.length === 0 || !isRefundReturnSourceError(error)) throw error
+        }
+        const reconciled = reconcileStagedAndFallbackReturnRows(snapshotRows, fallbackRows)
+        if (snapshotRows.length > 0 && fallbackRows.length > 0 && !refund.returnInTransit) {
+          await persistReturnCostSplit(tx, refund.id, reconciled.split)
+        }
+        // An in-transit refund values its document from the staged snapshot (or, with none, the fallback), as the
+        // Stock in Transit journal does; only a refund that restocks now reconciles the two.
+        const returnRows = refund.returnInTransit
+          ? (snapshotRows.length > 0 ? snapshotRows : fallbackRows)
+          : reconciled.rows
+        await persistReturnShipmentQty(tx, refund.id, returnRows)
         if (refund.returnInTransit) {
           // Value (or, for a refund this build created before the document moved into the refund transaction,
           // create) the document in THIS transaction, which also persists the re-staged syncs below. Idempotent

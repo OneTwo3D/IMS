@@ -185,7 +185,8 @@ Click **New Product** to open the product form. (On an existing product the **Sa
 | **Name** | The display name shown throughout the system. |
 | **Category** | Reporting category as a path with `>` as the nesting separator (e.g. `Apparel > T-Shirts`). Pick from the dropdown — it lists every known category as a full path — or type a new path and the system creates each missing segment on save. Two leaves with the same name under different parents (`Apparel > T-Shirts` vs `Promo > T-Shirts`) are distinct. Manage the full tree in **Settings > Inventory**. |
 | **Type** | The product type (see below). |
-| **Barcode** | An optional barcode or EAN for scanning. |
+| **Barcode** | An optional barcode or EAN for scanning. This is the **GTIN** slot: a GTIN is a digits-only global trade number (8, 12, 13 or 14 digits with a correct GS1 check digit) that scanners and Google Merchant Center read. |
+| **MPN** | The manufacturer part number, for example `LN00000287`. It can contain letters, which a GTIN cannot, so it lives in its own field. See [Barcode versus MPN](#barcode-versus-mpn). |
 | **HS Code** | The Harmonised System / EU Combined Nomenclature code for customs declarations. For a code that reaches the warehouse it must be a declarable 8-digit 2026 EU CN code (see [HS Code Review](#hs-code-review)). |
 | **Country of Origin** | Pick the country where the product is manufactured from the list. Left blank, it is **not** stored as blank downstream: customs and the warehouse are sent **China (CN)** as the default, and the field says so. Choose a country to declare the true origin. |
 | **Customs Description** | A short goods description for customs paperwork. The warehouse accepts at most 50 characters, so longer text is shortened at a word boundary when it is sent. Use a plain product phrase, not a brand name or a word such as "parts". |
@@ -340,6 +341,20 @@ Before a product is pushed to the warehouse (Mintsoft), its HS code is checked: 
 - the discrepancy clears itself the next time the product syncs with a valid code.
 
 Fix it by correcting the code on the product (or by approving a valid proposal, below). See [Warehouse (Mintsoft)](warehouse.md).
+
+### Barcode versus MPN
+
+A GTIN and a part number are different kinds of identifier, and one field cannot hold both: WooCommerce's GTIN field keeps only digits, so `LN00000287` would be stored as `00000287`, which does not scan. A value also is not a GTIN just because it is all digits. A zero-padded internal counter such as `00000287` is not one: a real GTIN has fewer than four leading zeros and a valid check digit.
+
+**This is off by default.** Until an administrator turns on **Split product identifiers (GTIN / MPN)** on the **Sync** page (Products tab; setting `product_identifier_split_enabled`), IMS sends the warehouse and the storefront exactly what it always has, and nothing described below happens. The split is not live.
+
+When it is switched on:
+
+- **WooCommerce.** Only a real GTIN is sent as the product's GTIN. The MPN is written to the product's Yoast **MPN** identifier (the same place the WooCommerce/Mintsoft sync plugin writes it), on the variation itself for a variation. The other Yoast identifiers are preserved. If Yoast already holds an identifier in a shape IMS does not recognise, IMS leaves it alone and records that on the product's sync log entry.
+- **Mintsoft.** The GTIN is written to Mintsoft's **EAN** field and the part number to **UPC**. IMS reads Mintsoft's two fields by shape, not by which field held what, so a GTIN that was typed into UPC is still recognised.
+- **A code that fits neither slot is never dropped and never chosen between.** If a product has two different part numbers, two different GTINs, or IMS and Mintsoft disagree, IMS raises a **barcode conflict** under Open Discrepancies (Integrations > Mintsoft) that names every code. While it is open IMS writes **neither** Mintsoft field. Correct the product, or the warehouse record, and the conflict clears itself on the next sync.
+
+A read-only report, `scripts/report-identifier-reclassification.ts`, lists which existing barcodes the split would move to MPN and which would land in conflict. It changes no data.
 
 ### HS Code Review
 
