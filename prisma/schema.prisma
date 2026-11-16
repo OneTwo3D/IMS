@@ -2227,6 +2227,10 @@ model SalesOrderRefund {
   // treatment: the COGS reversal debits Stock in Transit for exactly the refunds that carry true here. The
   // default is false, which is the behaviour of every build that predates the column.
   returnInTransit Boolean    @default(false) @map("return_in_transit")
+  // Which source shipments the returned units came from and their issued cost, written when the refund is created from the
+  // fallback return rows: [{ shipmentId, valueBase }]. Group B books the COGS reversal for stock returned BEFORE its shipment
+  // was journaled, one shipment at a time, from this. NULL: no such return.
+  returnCostSplit Json?      @map("return_cost_split")
   // scjz.71: whether this refund STAGED a COGS/unearned reversal (durable, set at
   // staging time). Distinguishes a fully-shipped chargeback (no reversal staged —
   // credit-note-only, exempt from reversal-evidence checks) from a partial/deferred

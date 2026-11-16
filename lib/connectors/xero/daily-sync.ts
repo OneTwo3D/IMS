@@ -2512,14 +2512,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       // o3d-hqvrp.32: stock that came back from these shipments before they were journaled has no COGS
       // reversal of its own (refund staging only reads journaled shipments), so it is booked here, in the
-      // same journal: DR Inventory / CR COGS. Capped per order by the COGS this batch journals for it.
-      const batchCogsByOrder = new Map<string, number>()
+      // same journal: DR Inventory / CR COGS. Booked per source shipment, capped by that shipment's COGS.
+      const batchShipmentCogs: Array<{ shipmentId: string; orderId: string; cogs: number }> = []
       for (const shipment of shipments) {
         const shipmentResult = shipmentResults.get(shipment.id)
-        if (!shipmentResult) continue
-        batchCogsByOrder.set(shipment.orderId, (batchCogsByOrder.get(shipment.orderId) ?? 0) + shipmentResult.cogs)
+        if (shipmentResult) batchShipmentCogs.push({ shipmentId: shipment.id, orderId: shipment.orderId, cogs: shipmentResult.cogs })
       }
-      const unjournaledReturnCredits = await loadUnjournaledReturnCredits(tx, batchCogsByOrder)
+      const unjournaledReturnCredits = await loadUnjournaledReturnCredits(tx, batchShipmentCogs)
       const unjournaledReturnTotal = round2Decimal(
         unjournaledReturnCredits.reduce((sum, credit) => addMoney(sum, credit.amount), toDecimal(0)),
       )
@@ -2648,7 +2647,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           await recordCogsSubledgerMovement(tx, {
             sourceType: 'REFUND_REVERSAL',
             sourceRef: credit.refundId,
-            idempotencyKey: unjournaledReturnKey(credit.refundId),
+            idempotencyKey: unjournaledReturnKey(credit.refundId, credit.shipmentId),
             baseDelta: credit.amount.negated(),
             journalDate: today,
           })

@@ -1,6 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { parseCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
-import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
 /**
  * Stock that came back BEFORE its shipment was journaled (o3d-hqvrp.32).
@@ -10,69 +10,72 @@ import { addMoney, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type 
  * reversal. Group B later journals the shipment's full COGS (DR COGS / CR Allocated Inventory) without knowing
  * the units came back, which would leave the returned layer with no Inventory debit and COGS overstated.
  *
- * So when Group B journals a shipment it also books the reversal those refunds never could, in the same journal:
- * DR Inventory / CR COGS for the value the refund returned to stock that no staged COGS reversal already
- * covered. Net: COGS = shipped - returned, and the Inventory debit equals the returned cost layers.
+ * So when Group B journals a shipment it also books, in the same journal, the reversal for the units of THAT
+ * shipment that came back: DR Inventory / CR COGS. The refund records which shipments its returned units came
+ * from and what they cost (`SalesOrderRefund.returnCostSplit`), so each shipment books only its own share, in
+ * whichever batch run journals it, and the rest is booked by the runs that journal the other shipments. Net:
+ * COGS = shipped - returned, and the Inventory debit equals the returned cost layers.
  *
- * Idempotent per refund through its subledger row (`unjournaledReturnKey`), recorded in the same transaction as
- * the journal. Capped, per order, by the COGS this batch journals for that order, so a reversal can never make
- * the order's COGS negative; a refund that does not fit waits for a later batch, whole.
+ * Exactly once per (refund, shipment): the booking is recorded as a COGS sub-ledger row keyed
+ * `unjournaledReturnKey`, in the same transaction as the journal. A share is capped by the shipment's own COGS,
+ * so the reversal can never make a shipment's COGS negative.
  */
-export function unjournaledReturnKey(refundId: string): string {
-  return `refund-unjournaled-return:${refundId}`
+export function unjournaledReturnKey(refundId: string, shipmentId: string): string {
+  return `refund-unjournaled-return:${refundId}:${shipmentId}`
 }
 
-export type UnjournaledReturnCredit = { orderId: string; refundId: string; amount: Decimal }
+export type UnjournaledReturnCredit = { orderId: string; refundId: string; shipmentId: string; amount: Decimal }
 
 export async function loadUnjournaledReturnCredits(
   tx: Prisma.TransactionClient,
-  batchCogsByOrder: ReadonlyMap<string, number>,
+  batchShipments: ReadonlyArray<{ shipmentId: string; orderId: string; cogs: number }>,
 ): Promise<UnjournaledReturnCredit[]> {
-  const orderIds = [...batchCogsByOrder.keys()]
-  if (orderIds.length === 0) return []
+  if (batchShipments.length === 0) return []
+  const shipmentById = new Map(batchShipments.map((s) => [s.shipmentId, s]))
+  const orderIds = [...new Set(batchShipments.map((s) => s.orderId))]
   const refunds = await tx.salesOrderRefund.findMany({
-    where: { orderId: { in: orderIds }, returnWarehouseId: { not: null }, chargeback: false, returnInTransit: false },
+    where: { orderId: { in: orderIds }, returnWarehouseId: { not: null }, chargeback: false, returnInTransit: false, returnCostSplit: { not: null as never } },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    select: { id: true, orderId: true, lines: { select: { costLayerSnapshot: true } } },
+    select: { id: true, orderId: true, returnCostSplit: true, lines: { select: { costLayerSnapshot: true } } },
   })
   if (refunds.length === 0) return []
   const refundIds = refunds.map((refund) => refund.id)
   const [movements, recorded] = await Promise.all([
     tx.stockMovement.findMany({
       where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: { in: refundIds } },
-      select: { referenceId: true, totalValueBase: true },
+      select: { referenceId: true },
     }),
     tx.cogsSubledgerMovement.findMany({
-      where: { idempotencyKey: { in: refundIds.map(unjournaledReturnKey) } },
+      where: { idempotencyKey: { startsWith: 'refund-unjournaled-return:' }, sourceRef: { in: refundIds } },
       select: { idempotencyKey: true },
     }),
   ])
   const done = new Set(recorded.map((row) => row.idempotencyKey))
-  const returnedByRefund = new Map<string, Decimal>()
-  for (const movement of movements) {
-    if (!movement.referenceId || movement.totalValueBase == null) continue
-    returnedByRefund.set(movement.referenceId, addMoney(returnedByRefund.get(movement.referenceId) ?? toDecimal(0), movement.totalValueBase))
-  }
+  const returned = new Set(movements.map((movement) => movement.referenceId))
 
-  const remainingCap = new Map(batchCogsByOrder)
+  const remaining = new Map(batchShipments.map((s) => [s.shipmentId, s.cogs]))
   const credits: UnjournaledReturnCredit[] = []
   for (const refund of refunds) {
-    if (done.has(unjournaledReturnKey(refund.id))) continue
-    const returned = returnedByRefund.get(refund.id)
-    if (!returned) continue
-    // What a staged COGS reversal already covered: the shipment-source entries on the refund's own lines.
+    // Only a return that was actually applied from the fallback rows (no staged shipment-source snapshot).
+    if (!returned.has(refund.id)) continue
     let staged = toDecimal(0)
     for (const line of refund.lines) {
       for (const entry of parseCostLayerSnapshot(line.costLayerSnapshot)) {
         if (entry.source === 'shipment') staged = addMoney(staged, multiplyMoney(entry.qty, entry.unitCostBase))
       }
     }
-    const amount = roundQuantity(subtractMoney(returned, staged), 6)
-    if (amount.lte(0.005)) continue
-    const cap = remainingCap.get(refund.orderId) ?? 0
-    if (amount.gt(cap)) continue
-    remainingCap.set(refund.orderId, cap - amount.toNumber())
-    credits.push({ orderId: refund.orderId, refundId: refund.id, amount })
+    if (staged.gt(0)) continue
+    const split = Array.isArray(refund.returnCostSplit) ? refund.returnCostSplit as Array<{ shipmentId?: string; valueBase?: string }> : []
+    for (const part of split) {
+      const shipment = part.shipmentId ? shipmentById.get(part.shipmentId) : undefined
+      if (!shipment || shipment.orderId !== refund.orderId || !part.valueBase) continue
+      if (done.has(unjournaledReturnKey(refund.id, shipment.shipmentId))) continue
+      const cap = remaining.get(shipment.shipmentId) ?? 0
+      const amount = roundQuantity(Math.min(toDecimal(part.valueBase).toNumber(), cap), 6)
+      if (amount.lte(0.005)) continue
+      remaining.set(shipment.shipmentId, cap - amount.toNumber())
+      credits.push({ orderId: refund.orderId, refundId: refund.id, shipmentId: shipment.shipmentId, amount })
+    }
   }
   return credits
 }

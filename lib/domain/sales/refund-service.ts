@@ -20,7 +20,7 @@ import {
 import { eas182RefundFigures } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { unstampedOrderIsScheme } from '@/lib/domain/sales/eu-vat-scheme-evidence'
 import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
-import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
@@ -154,6 +154,8 @@ export type RefundReturnRow = {
   unitCostBase?: DecimalInput
   poLineId?: string | null
   sourceCostLayerId?: string | null
+  /** The shipment the unit shipped on (set by the fallback builder), so its value can be booked per shipment. */
+  shipmentId?: string | null
 }
 
 export type RefundRequestLine = {
@@ -744,7 +746,9 @@ async function buildRefundFallbackReturnRows(
       },
       shipments: {
         where: { status: 'SHIPPED' },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         select: {
+          id: true,
           lines: {
             select: {
               id: true,
@@ -1056,6 +1060,7 @@ async function buildRefundFallbackReturnRows(
         unitCostBase: entry.unitCostBase,
         poLineId: entry.poLineId,
         sourceCostLayerId: entry.costLayerId,
+        shipmentId: entry.shipmentId,
       })
       remaining -= step
       cursor.usedInEntry += step
@@ -1078,7 +1083,7 @@ async function buildRefundFallbackReturnRows(
   return pricedRows
 }
 
-type ReturnCostPoolEntry = { costLayerId: string; qty: number; unitCostBase: number; poLineId: string | null }
+type ReturnCostPoolEntry = { shipmentId: string; costLayerId: string; qty: number; unitCostBase: number; poLineId: string | null }
 
 /**
  * The issued cost of every shipped unit, per (order line, component product): the dispatch snapshot of each
@@ -1086,10 +1091,10 @@ type ReturnCostPoolEntry = { costLayerId: string; qty: number; unitCostBase: num
  */
 async function loadReturnCostPool(
   client: RefundServiceClient,
-  shipments: ReadonlyArray<{ lines: ReadonlyArray<{ id: string; lineId: string; productId: string; costLayerSnapshot: Prisma.JsonValue | null }> }>,
+  shipments: ReadonlyArray<{ id: string; lines: ReadonlyArray<{ id: string; lineId: string; productId: string; costLayerSnapshot: Prisma.JsonValue | null }> }>,
 ): Promise<Map<string, ReturnCostPoolEntry[]>> {
   const tx = client as Prisma.TransactionClient
-  const shipmentLines = shipments.flatMap((shipment) => shipment.lines)
+  const shipmentLines = shipments.flatMap((shipment) => shipment.lines.map((line) => ({ ...line, shipmentId: shipment.id })))
   const pool = new Map<string, ReturnCostPoolEntry[]>()
   if (shipmentLines.length === 0) return pool
   const posted = await loadPostedShipmentUnitCosts(tx, shipmentLines.map((line) => line.id))
@@ -1112,6 +1117,7 @@ async function loadReturnCostPool(
       const qty = refundBoundaryNumber(entry.qty)
       if (qty <= 0) continue
       entries.push({
+        shipmentId: line.shipmentId,
         costLayerId: entry.costLayerId,
         qty,
         unitCostBase: refundBoundaryNumber(entry.unitCostBase),
@@ -5201,6 +5207,20 @@ export async function createSalesOrderRefund(
     const fallbackReturnRows = restockWarehouseId
       ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
       : []
+
+    // o3d-hqvrp.32: which shipments the returned units came from, and what they cost, so the daily batch can book
+    // the COGS reversal for stock returned before its shipment was journaled one shipment at a time.
+    const splitByShipment = new Map<string, Decimal>()
+    for (const row of fallbackReturnRows) {
+      if (!row.shipmentId || row.unitCostBase == null) continue
+      splitByShipment.set(row.shipmentId, addMoney(splitByShipment.get(row.shipmentId) ?? toDecimal(0), multiplyMoney(row.qty, row.unitCostBase)))
+    }
+    if (splitByShipment.size > 0) {
+      await tx.salesOrderRefund.update({
+        where: { id: createdRefund.id },
+        data: { returnCostSplit: [...splitByShipment].map(([shipmentId, value]) => ({ shipmentId, valueBase: roundQuantity(value, 6).toFixed(6) })) as never },
+      })
+    }
 
     // Returned units in transit: the DOCUMENT is written here, in the refund's own transaction, so a refund that
     // routes its goods in transit can never commit without it (a crash, a failed write or a replay cannot leave
