@@ -35,7 +35,7 @@ const D = (v: string | number) => new Prisma.Decimal(v)
 async function seedBase(db: Ctx['db']) {
   const suffix = randomUUID().slice(0, 8)
   const product = await db.product.create({ data: { sku: `CP1-${suffix}`, name: `cp1 ${suffix}`, type: 'SIMPLE' }, select: { id: true } })
-  const warehouse = await db.warehouse.create({ data: { name: `cp1 ${suffix}` }, select: { id: true } })
+  const warehouse = await db.warehouse.create({ data: { name: `cp1 ${suffix}`, code: `CP1${suffix}` }, select: { id: true } })
   const supplier = await db.supplier.create({ data: { name: `cp1 ${suffix}` }, select: { id: true } })
   const po = await db.purchaseOrder.create({
     data: {
@@ -154,6 +154,7 @@ test('late landed cost on shipped units posts DR COGS / CR transit and leaves in
       await db.cogsSubledgerMovement.deleteMany({ where: { sourceRef: extra.shipmentId } })
       await db.shipment.deleteMany({ where: { id: extra.shipmentId } })
     }
+    if (extra.orderId) await db.salesOrderLine.deleteMany({ where: { orderId: extra.orderId } })
     if (extra.orderId) await db.salesOrder.deleteMany({ where: { id: extra.orderId } })
     await cleanup(db, s)
     await db.$disconnect()
