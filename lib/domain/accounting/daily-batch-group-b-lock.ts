@@ -100,6 +100,44 @@ export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
   OR: [GROUP_B_PAID_SHAPE, GROUP_B_DIRECT_SHAPE],
 } satisfies Prisma.ShipmentWhereInput
 
+/**
+ * The ONE time rule that decides whether a shipment left BEFORE its order was paid, and so is costed at shipment
+ * by the direct pass. It uses the same ship time the batch dates events with since #919 (`shippedAt`, falling
+ * back to `createdAt`) against the order's `paidAt`.
+ *
+ * TIE RULE: a shipment made at exactly `paidAt` counts as made AFTER payment (strictly earlier is required), so
+ * it takes the ordinary path (A1, A2, paid Group B). Group B's direct pass and Group A1's hold-back both call
+ * this function, so a shipment is never taken by both passes and never by neither.
+ */
+export function shippedBeforePayment(input: {
+  paidAt: Date | null | undefined
+  shippedAt: Date | null | undefined
+  createdAt: Date
+}): boolean {
+  if (!input.paidAt) return true
+  return (input.shippedAt ?? input.createdAt).getTime() < input.paidAt.getTime()
+}
+
+/**
+ * Whether a shipment read by the Group B probe or real read belongs to `mode`. The deferral stamp splits the
+ * passes as before; the direct pass additionally requires the shipment to pre-date payment, which a Prisma
+ * where-clause cannot express (it compares two different tables' columns).
+ */
+export function groupBShipmentBelongsToPass(
+  mode: 'direct' | 'paid',
+  shipment: {
+    shippedAt?: Date | null
+    createdAt: Date
+    order: { revenueDeferredDate: Date | null; paidAt: Date | null } | null | undefined
+  },
+): boolean {
+  const order = shipment.order
+  if (!order) return false
+  if (mode === 'paid') return order.revenueDeferredDate !== null
+  return order.revenueDeferredDate === null
+    && shippedBeforePayment({ paidAt: order.paidAt, shippedAt: shipment.shippedAt, createdAt: shipment.createdAt })
+}
+
 /** One pass of Group B: `direct` runs before Group A1 and A2, `paid` after them (ACC-H12). */
 export function groupBShipmentWhere(mode: 'direct' | 'paid'): Prisma.ShipmentWhereInput {
   return mode === 'direct' ? GROUP_B_DIRECT_SHAPE : GROUP_B_PAID_SHAPE

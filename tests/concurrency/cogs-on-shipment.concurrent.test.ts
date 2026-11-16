@@ -624,3 +624,117 @@ test('ACC-H12: a lost direct-relief journal is rebuilt at the ORIGINAL amount af
     await close(rig)
   }
 })
+
+async function groupBPayloads(rig: Rig): Promise<Array<{ date: string; lines: Line[] }>> {
+  const rows = await rig.db.accountingSyncLog.findMany({ where: { type: 'DAILY_BATCH_GROUP_B' }, select: { payload: true }, orderBy: { createdAt: 'asc' } })
+  return rows.map((row) => row.payload as { date: string; lines: Line[] })
+}
+
+test('ACC-H12: paid on day 1, shipped on day 2, first batch after both: the ordinary A1/A2/Group B path, no direct journal, no marker', { skip }, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Fixture | undefined
+  try {
+    await clean(rig, undefined)
+    await setup(rig)
+    fx = await seed(rig, suffix, { paid: false, shipUnits: 2, qty: 2 })
+    const shipmentId = await fx.ship(2, new Date('2026-04-02T12:00:00.000Z'))
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED', paidAt: new Date('2026-04-01T09:00:00.000Z') } })
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [], 'the batch ran clean')
+    const all = await journals(rig)
+    assertBalanced(all, 'paid then shipped')
+    const shipment = await rig.db.shipment.findUniqueOrThrow({ where: { id: shipmentId } })
+    assert.equal(shipment.cogsRelievedFromInventoryAt, null, 'no direct marker on a shipment made after payment')
+    assert.equal(Number(shipment.allocatedReliefAmount), 20, 'relieved through Allocated Inventory')
+    assert.equal(all.filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL').length, 1, 'A1 deferred the whole order')
+    assert.equal(all.filter((j) => j.type === 'DAILY_BATCH_INVENTORY_ALLOC').length, 1, 'A2 reclassified the units')
+    assert.equal(net(all, '2100', 'DAILY_BATCH_REVENUE_DEFERRAL'), -200, 'the full 200 moved from Sales to Unearned Revenue')
+    const groupB = await groupBPayloads(rig)
+    assert.equal(groupB.length, 1)
+    assert.equal(groupB[0].date, '2026-04-02', 'COGS dated the later of ship day and paid day')
+    assert.equal(net([{ type: 'x', lines: groupB[0].lines }], '1210'), -20, 'Group B credits Allocated Inventory, not Inventory')
+    assert.equal(net([{ type: 'x', lines: groupB[0].lines }], '1200'), 0)
+    assert.equal(net(all, '5000'), 20, 'COGS once')
+    assert.equal(net(all, '1210'), 0)
+    assert.equal(net(all, '2100'), 0)
+    const again = await rig.runDailyBatchSync()
+    assert.deepEqual(again.errors, [])
+    assert.equal((await journals(rig)).length, all.length, 'rerun posts nothing')
+  } finally {
+    await clean(rig, fx)
+    await close(rig)
+  }
+})
+
+test('ACC-H12: an order with one shipment before payment and one after: each takes its own path, Allocated Inventory nets to zero, COGS is not doubled, rerun is idempotent', { skip }, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Fixture | undefined
+  try {
+    await clean(rig, undefined)
+    await setup(rig)
+    fx = await seed(rig, suffix, { paid: false, shipUnits: 4, qty: 4 })
+    const early = await fx.ship(2, new Date('2026-03-31T12:00:00.000Z'))
+    const late = await fx.ship(2, new Date('2026-04-03T12:00:00.000Z'))
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED', paidAt: new Date('2026-04-02T12:00:00.000Z') } })
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [], 'the batch ran clean')
+    const all = await journals(rig)
+    assertBalanced(all, 'mixed')
+    const earlyRow = await rig.db.shipment.findUniqueOrThrow({ where: { id: early } })
+    const lateRow = await rig.db.shipment.findUniqueOrThrow({ where: { id: late } })
+    assert.ok(earlyRow.cogsRelievedFromInventoryAt, 'the pre-payment shipment is costed directly')
+    assert.equal(lateRow.cogsRelievedFromInventoryAt, null, 'the post-payment shipment is not')
+    assert.equal(Number(lateRow.allocatedReliefAmount), 20, 'the post-payment shipment relieves Allocated Inventory')
+    const groupB = await groupBPayloads(rig)
+    assert.equal(groupB.length, 2)
+    const dates = groupB.map((p) => p.date).sort()
+    assert.deepEqual(dates, ['2026-03-31', '2026-04-03'])
+    const directPayload = groupB.find((p) => p.date === '2026-03-31')!
+    assert.equal(net([{ type: 'x', lines: directPayload.lines }], '1200'), -20)
+    assert.equal(net([{ type: 'x', lines: directPayload.lines }], '1210'), 0)
+    const paidPayload = groupB.find((p) => p.date === '2026-04-03')!
+    assert.equal(net([{ type: 'x', lines: paidPayload.lines }], '1210'), -20)
+    assert.equal(net([{ type: 'x', lines: paidPayload.lines }], '1200'), 0)
+    assert.equal(net(all, '5000'), 40, 'COGS once per shipment')
+    assert.equal(net(all, '1200'), -40, 'Inventory relieved once per unit')
+    assert.equal(net(all, '1210'), 0, 'Allocated Inventory nets to zero')
+    assert.equal(net(all, '2100', 'DAILY_BATCH_REVENUE_DEFERRAL'), -200, 'A1 defers only the part that had not shipped when the order was paid')
+    assert.equal(net(all, '2100'), 0, 'Unearned Revenue nets to zero')
+    const alloc = all.filter((j) => j.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+    assert.equal(net(alloc, '1210'), 20, 'A2 reclassifies only the units that had not shipped')
+    const again = await rig.runDailyBatchSync()
+    assert.deepEqual(again.errors, [])
+    assert.equal((await journals(rig)).length, all.length, 'rerun posts nothing')
+  } finally {
+    await clean(rig, fx)
+    await close(rig)
+  }
+})
+
+test('ACC-H12: a shipment made at exactly the payment time takes the ordinary path (tie rule), never both passes', { skip }, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Fixture | undefined
+  try {
+    await clean(rig, undefined)
+    await setup(rig)
+    fx = await seed(rig, suffix, { paid: false, shipUnits: 2, qty: 2 })
+    const at = new Date('2026-04-02T12:00:00.000Z')
+    const shipmentId = await fx.ship(2, at)
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED', paidAt: at } })
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [])
+    const all = await journals(rig)
+    assertBalanced(all, 'tie')
+    const shipment = await rig.db.shipment.findUniqueOrThrow({ where: { id: shipmentId } })
+    assert.equal(shipment.cogsRelievedFromInventoryAt, null)
+    assert.equal(Number(shipment.allocatedReliefAmount), 20)
+    assert.equal(net(all, '5000'), 20, 'COGS once')
+    assert.equal(net(all, '1210'), 0)
+  } finally {
+    await clean(rig, fx)
+    await close(rig)
+  }
+})

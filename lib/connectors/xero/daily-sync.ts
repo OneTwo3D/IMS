@@ -60,6 +60,8 @@ import {
 import {
   assertGroupBSnapshotsWereLocked,
   groupBShipmentWhere,
+  groupBShipmentBelongsToPass,
+  shippedBeforePayment,
   lockCostLayersForGroupBWindow,
 } from '@/lib/domain/accounting/daily-batch-group-b-lock'
 import { addMoney, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -1620,16 +1622,14 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // shipment that stopped qualifying while we waited for the lock is simply not returned.
       const candidateWindow = takeDailyBatchWindow(await tx.shipment.findMany({
         where: groupBShipmentWhere(mode),
-        select: { id: true, orderId: true, order: { select: { revenueDeferredDate: true } }, lines: { select: { costLayerSnapshot: true } } },
+        select: { id: true, orderId: true, createdAt: true, shippedAt: true, order: { select: { revenueDeferredDate: true, paidAt: true } }, lines: { select: { costLayerSnapshot: true } } },
         orderBy: { createdAt: 'asc' },
         take: batchLimit + 1,
       }), batchLimit)
       result.hasMore.groupB = result.hasMore.groupB || candidateWindow.hasMore
       // The where-clause already splits the passes by the order's deferral stamp; restating it on the probe rows means a pass
       // with nothing of its own takes no lock and reads nothing (the stamp is only written by Group A1, under this lock).
-      candidateWindow.rows = candidateWindow.rows.filter((row) => (
-        mode === 'direct' ? row.order?.revenueDeferredDate === null : row.order?.revenueDeferredDate !== null
-      ))
+      candidateWindow.rows = candidateWindow.rows.filter((row) => groupBShipmentBelongsToPass(mode, row))
       if (candidateWindow.rows.length === 0) return 0
       const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
       const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates: candidateWindow.rows })
@@ -1706,9 +1706,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       // The where-clause already splits the two passes by the order's deferral stamp; this restates it on the rows read,
       // so a pass can never process the other pass's shipment (the stamp is only ever written by Group A1, under this lock).
-      const shipments = shipmentRows.filter((shipment) => (
-        mode === 'direct' ? shipment.order.revenueDeferredDate === null : shipment.order.revenueDeferredDate !== null
-      ))
+      const shipments = shipmentRows.filter((shipment) => groupBShipmentBelongsToPass(mode, shipment))
 
       if (shipments.length === 0) {
         return 0
@@ -2434,7 +2432,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       !shipment.cogsRelievedFromInventoryAt
       && !shipment.shipmentJournalDate
       && !!order.paidAt
-      && (shipment.shippedAt ?? shipment.createdAt) < order.paidAt
+      && shippedBeforePayment({ paidAt: order.paidAt, shippedAt: shipment.shippedAt, createdAt: shipment.createdAt })
     ))
     const orders = orderWindow.rows.filter((order) => !awaitingDirectCost(order))
     result.hasMore.groupA1 = orderWindow.hasMore
