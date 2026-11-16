@@ -23,12 +23,13 @@ const CURSOR = '2026-11-14T00:00:00.000Z'
 const load = (d: WcHeldUnitsDeps, cursor: string | null = CURSOR) => loadWcHeldUnitsByProduct(d, cursor)
 
 // Pages are served for the open (on-hold,processing) walk; `completed` is empty unless `completedPages` is given.
-function deps(over: Partial<WcHeldUnitsDeps> & { pages?: unknown[][]; completedPages?: unknown[][]; totalOverride?: (call: number) => number | null }): WcHeldUnitsDeps {
+function deps(over: Partial<WcHeldUnitsDeps> & { pages?: unknown[][]; completedPages?: unknown[][]; totalOverride?: (call: number) => number | null; probeTotal?: number }): WcHeldUnitsDeps {
   const pages = over.pages ?? [[]]
   const completedPages = over.completedPages ?? [[]]
   let counts = 0
   return {
     fetchOrdersPage: over.fetchOrdersPage ?? (async (params) => {
+      if (params.orderby === 'modified') return { data: [], totalItems: over.probeTotal ?? 0 } // the changed-during-the-walk probe
       const list = params.status === 'completed' ? completedPages : pages
       const total = list.reduce((n, p) => n + p.length, 0)
       if (params.per_page === '1') { counts++; return { data: [], totalItems: over.totalOverride ? over.totalOverride(counts) : total } }
@@ -173,7 +174,7 @@ test('an unimported completed order inside the window is charged like any other'
   let asked = ''
   const d = deps({ completedPages: [[order(70, [11, 0, 2])]] })
   const inner = d.fetchOrdersPage
-  d.fetchOrdersPage = async (p) => { if (p.status === 'completed') asked = p.modified_after ?? ''; return inner(p) }
+  d.fetchOrdersPage = async (p) => { if (p.status === 'completed' && p.orderby !== 'modified') asked = p.modified_after ?? ''; return inner(p) }
   const r = await load(d)
   assert.ok(r.ok)
   assert.equal(r.heldByProduct.get('p1'), 2)
@@ -191,7 +192,7 @@ test('no cursor: completed orders are read EXHAUSTIVELY (no modified_after); a p
   const asked: Array<Record<string, string>> = []
   const d = deps({ pages: [[order(1, [11, 0, 1])]], completedPages: [[order(2, [11, 0, 1])]] })
   const inner = d.fetchOrdersPage
-  d.fetchOrdersPage = async (p) => { if (p.status === 'completed') asked.push(p); return inner(p) }
+  d.fetchOrdersPage = async (p) => { if (p.status === 'completed' && p.orderby !== 'modified') asked.push(p); return inner(p) }
   const r = await load(d, null)
   assert.ok(r.ok)
   assert.ok(asked.length > 0 && asked.every((p) => !('modified_after' in p)), 'unbounded read of completed orders')
@@ -220,4 +221,87 @@ test('completeness proof: a changed total, a shifted (repeated) id, a missing he
   assert.ok(short.ok && short.incomplete)
   const clean = await load(deps({ pages: [[order(1), order(2)]] }))
   assert.ok(clean.ok && !clean.incomplete)
+})
+
+// --- review findings: same-count churn, and the covered-history boundary for poll mode ---
+
+test('a completed order leaving while another enters (total unchanged) shifts a page: the walk is NOT proven complete', async () => {
+  // 101 completed orders. After page 1 is read, order 1 leaves `completed` and order 500 enters: the count stays 101, ids stay ascending,
+  // order 101 slides onto the page already read and is never seen. The entering order was modified just now, which the probe reports.
+  let ids = Array.from({ length: 101 }, (_, i) => i + 1)
+  let pageReads = 0
+  const d = deps({
+    probeTotal: 1,
+    fetchOrdersPage: async (params) => {
+      if (params.orderby === 'modified') return { data: [], totalItems: 1 }
+      if (params.status !== 'completed') return { data: [], totalItems: 0 }
+      if (params.per_page === '1') return { data: [], totalItems: ids.length }
+      const per = Number(params.per_page)
+      const out = ids.slice((Number(params.page) - 1) * per, Number(params.page) * per).map((id) => order(id, [11, 0, 1]))
+      if (++pageReads === 1) ids = [...ids.filter((id) => id !== 1), 500]
+      return { data: out, totalItems: 101 }
+    },
+    findImportedOrders: async (xs) => new Map(xs.map((x) => [x, new Map([['p1', 1]])])),
+  })
+  const r = await load(d, null)
+  assert.ok(r.ok)
+  assert.equal(r.incomplete, true)
+  assert.ok(r.incompleteReasons.some((x) => /changed while the walk was running/.test(x)))
+  assert.equal(r.completedHistoryCoveredAtMs, null)
+})
+
+test('the churn probe asks for completed orders modified since just before the walk began; a failed probe is incomplete', async () => {
+  const asked: Record<string, string>[] = []
+  const before = Date.now()
+  const d = deps({
+    fetchOrdersPage: async (params) => {
+      asked.push(params)
+      if (params.orderby === 'modified') return { data: [], error: 'boom' }
+      return { data: [], totalItems: 0 }
+    },
+  })
+  const r = await load(d)
+  assert.ok(r.ok)
+  assert.equal(r.incomplete, true)
+  const probe = asked.find((p) => p.orderby === 'modified')!
+  assert.equal(probe.status, 'completed')
+  assert.ok(Date.parse(probe.modified_after) <= before && Date.parse(probe.modified_after) >= before - 120_000)
+})
+
+test('a clean exhaustive read where every completed order is accounted for returns a covered-history boundary', async () => {
+  const before = Date.now()
+  const r = await load(deps({
+    completedPages: [[order(1, [11, 0, 2]), order(2, [11, 0, 1])]],
+    findImportedOrders: async (ids) => new Map(ids.map((id) => [id, new Map([['p1', 5]])])),
+  }), null)
+  assert.ok(r.ok)
+  assert.equal(r.incomplete, false)
+  assert.ok(r.completedHistoryCoveredAtMs !== null && r.completedHistoryCoveredAtMs >= before && r.completedHistoryCoveredAtMs <= Date.now())
+})
+
+test('no boundary when a completed order IMS does not hold, a bounded read, or an incomplete read', async () => {
+  const unimported = await load(deps({ completedPages: [[order(1, [11, 0, 2])]] }), null)
+  assert.ok(unimported.ok)
+  assert.equal(unimported.completedHistoryCoveredAtMs, null, 'an unimported completed order is not settled')
+  assert.equal(unimported.heldByProduct.get('p1'), 2)
+  const bounded = await load(deps({
+    completedPages: [[order(1, [11, 0, 2])]],
+    findImportedOrders: async (ids) => new Map(ids.map((id) => [id, new Map([['p1', 5]])])),
+  }), CURSOR)
+  assert.ok(bounded.ok)
+  assert.equal(bounded.completedHistoryCoveredAtMs, null, 'a bounded read proves nothing about older history')
+  const incomplete = await load(deps({
+    completedPages: [[order(1, [11, 0, 2])]], probeTotal: 3,
+    findImportedOrders: async (ids) => new Map(ids.map((id) => [id, new Map([['p1', 5]])])),
+  }), null)
+  assert.ok(incomplete.ok)
+  assert.equal(incomplete.completedHistoryCoveredAtMs, null)
+})
+
+test('completedOrdersModifiedAfter uses the covered-history boundary only when a sweep cursor is missing', () => {
+  assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', null, '2026-11-12T00:00:00.000Z'), '2026-11-11T00:00:00.000Z')
+  assert.equal(completedOrdersModifiedAfter(null, null, '2026-11-12T00:00:00.000Z'), '2026-11-11T00:00:00.000Z')
+  assert.equal(completedOrdersModifiedAfter(null, null, 'garbage'), null)
+  assert.equal(completedOrdersModifiedAfter(null, null, null), null)
+  assert.equal(completedOrdersModifiedAfter('2026-11-15T00:00:00.000Z', '2026-11-10T00:00:00.000Z', '2026-01-01T00:00:00.000Z'), '2026-11-09T00:00:00.000Z', 'both cursors present: they win')
 })

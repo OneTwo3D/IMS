@@ -53,7 +53,7 @@ import {
   WOO_STOCK_SYNC_PRODUCT_STATUSES,
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
-import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
+import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -805,12 +805,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // THE UNRESERVED-ORDER GUARD (WCO-H3). The push below is absolute, so it must not give back units
   // WooCommerce already took off for orders IMS has not reserved. Read them now; if they cannot be read,
   // push nothing (see stock-held-orders.ts for why that is the only safe answer).
-  const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at'] } } })
+  const cursorRows = await db.setting.findMany({ where: { key: { in: ['last_wc_order_sync_at', 'last_wc_order_reconcile_at', WC_COMPLETED_HISTORY_COVERED_KEY] } } })
   const cursorValue = (key: string) => cursorRows.find((r) => r.key === key)?.value ?? null
   const held = await loadWcHeldUnitsByProduct(
     buildWcHeldUnitsDeps(creds),
-    completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at')),
+    completedOrdersModifiedAfter(cursorValue('last_wc_order_sync_at'), cursorValue('last_wc_order_reconcile_at'), cursorValue(WC_COMPLETED_HISTORY_COVERED_KEY)),
   )
+  if (held.ok && held.completedHistoryCoveredAtMs !== null) {
+    // Proven: completed history older than this walk is settled, so later runs (poll mode has no reconcile cursor) read only what changed since.
+    const previous = Date.parse(cursorValue(WC_COMPLETED_HISTORY_COVERED_KEY) ?? '')
+    if (Number.isNaN(previous) || held.completedHistoryCoveredAtMs > previous) {
+      const value = new Date(held.completedHistoryCoveredAtMs).toISOString()
+      await db.setting.upsert({ where: { key: WC_COMPLETED_HISTORY_COVERED_KEY }, create: { key: WC_COMPLETED_HISTORY_COVERED_KEY, value }, update: { value } }).catch(() => undefined)
+    }
+  }
   if (!held.ok) {
     const result: StockSyncResult = {
       synced: 0, skipped: 0, errors: [`Stock push skipped: ${held.reason}. WooCommerce stock was left as it is, because an absolute push could erase the decrement of an order IMS cannot see.`],

@@ -36,6 +36,13 @@
  * This is deliberate: an install that never runs a reconcile sweep (poll mode) would otherwise either
  * be blocked from positive pushes forever or push on an unproven picture.
  *
+ * THE COVERED-HISTORY BOUNDARY (poll mode). An exhaustive completed read that is PROVEN complete AND finds every completed order
+ * fully accounted for (imported, nothing unallocated, no unresolved line) proves that all completed history older than the walk's
+ * start is settled. That instant is returned as `completedHistoryCoveredAtMs`; the caller persists it, and later runs bound the
+ * completed read by it (minus the overlap) when a sweep cursor is missing, instead of rereading the store's whole history on
+ * every push. A walk that is incomplete, or that found a completed order IMS does not hold, never sets it, so a boundary exists only
+ * once it is proven and positive pushes stay disabled until then.
+ *
  * COMPLETENESS. A numbered-page walk over a live result can leave holes (an order changing status
  * mid-walk shifts every later page). The WooCommerce REST orders endpoint has no id cursor, so each
  * walk is ordered by id ascending and PROVEN: ids must be strictly ascending, the collected count
@@ -68,6 +75,9 @@ import type { WcFullOrder } from './types'
 /** The statuses in which WooCommerce core holds stock (wc_maybe_reduce_stock_levels). */
 export const WC_STOCK_HOLDING_ORDER_STATUSES = ['on-hold', 'processing'] as const
 
+/** Setting key: the persisted covered-history boundary (ISO instant), see THE COVERED-HISTORY BOUNDARY. */
+export const WC_COMPLETED_HISTORY_COVERED_KEY = 'wc_completed_history_covered_at'
+
 export const WC_HELD_ORDERS_PAGE_SIZE = 100
 /** Safety ceiling only; the walk normally ends on a short page. */
 export const WC_HELD_ORDERS_MAX_PAGES = 100
@@ -81,7 +91,12 @@ const KIT_EXPANSION_MAX_DEPTH = 8
  * The `modified_after` for the completed-order read, from the two sweep cursors, or null when it cannot be bounded.
  * The OLDER cursor is used: completed orders are only proven imported by the sweep that includes them (the reconcile).
  */
-export function completedOrdersModifiedAfter(syncCursor: string | null | undefined, reconcileCursor: string | null | undefined): string | null {
+export function completedOrdersModifiedAfter(
+  syncCursor: string | null | undefined,
+  reconcileCursor: string | null | undefined,
+  /** The persisted covered-history boundary (see THE COVERED-HISTORY BOUNDARY); used only when the sweep cursors cannot bound the read. */
+  coveredHistoryAt?: string | null,
+): string | null {
   const parse = (v: string | null | undefined): number | null => {
     if (!v) return null
     const t = Date.parse(v)
@@ -92,7 +107,10 @@ export function completedOrdersModifiedAfter(syncCursor: string | null | undefin
   // A MISSING reconcile cursor is NOT "no reconcile needed": completed orders are proven imported only by the reconcile sweep, so
   // without it nothing says an older completed order was ever imported. Falling back to the poll cursor alone read just the last
   // day yet reported a complete picture (o3d-hqvrp.362). It is unbounded instead; the caller reads completed orders exhaustively.
-  if (sync === null || reconcile === null) return null
+  if (sync === null || reconcile === null) {
+    const covered = parse(coveredHistoryAt)
+    return covered === null ? null : new Date(covered - WC_COMPLETED_OVERLAP_MS).toISOString()
+  }
   const oldest = Math.min(sync, reconcile)
   return new Date(oldest - WC_COMPLETED_OVERLAP_MS).toISOString()
 }
@@ -117,6 +135,11 @@ export type WcHeldUnitsResult =
       incomplete: boolean
       incompleteReasons: string[]
       ordersConsidered: number
+      /**
+       * Set only when this run read ALL completed orders, proved that read complete, and found every one fully accounted for in IMS:
+       * completed history older than this instant (epoch ms, the walk's start) is settled and later runs may bound their read by it.
+       */
+      completedHistoryCoveredAtMs: number | null
     }
   | { ok: false; reason: string }
 
@@ -220,10 +243,14 @@ export function unallocatedRemainder(
   return out
 }
 
-type WalkResult = { orders: WcFullOrder[]; fatal?: string; incompleteReasons: string[] }
+type WalkResult = { orders: WcFullOrder[]; fatal?: string; incompleteReasons: string[]; startedAtMs: number }
+
+/** Clock-skew margin for the churn probe: orders modified this long before the walk began also count as changed. */
+export const WC_WALK_CHURN_MARGIN_MS = 60 * 1000
 
 /** Walk one filtered, id-ascending result to its end and PROVE it complete (see COMPLETENESS). */
-async function walkOrders(deps: WcHeldUnitsDeps, label: string, filter: Record<string, string>): Promise<WalkResult> {
+async function walkOrders(deps: WcHeldUnitsDeps, label: string, filter: Record<string, string>, opts: { churnProbe?: boolean } = {}): Promise<WalkResult> {
+  const startedAtMs = Date.now()
   const orders: WcFullOrder[] = []
   const reasons: string[] = []
   const base = { ...filter, orderby: 'id', order: 'asc' }
@@ -234,10 +261,10 @@ async function walkOrders(deps: WcHeldUnitsDeps, label: string, filter: Record<s
     try {
       response = await deps.fetchOrdersPage({ ...base, per_page: String(WC_HELD_ORDERS_PAGE_SIZE), page: String(page) })
     } catch (e) {
-      return { orders, incompleteReasons: reasons, fatal: `reading WooCommerce ${label} orders threw: ${e instanceof Error ? e.message : String(e)}` }
+      return { orders, incompleteReasons: reasons, startedAtMs, fatal: `reading WooCommerce ${label} orders threw: ${e instanceof Error ? e.message : String(e)}` }
     }
-    if (response.error) return { orders, incompleteReasons: reasons, fatal: `reading WooCommerce ${label} orders failed: ${response.error}` }
-    if (!Array.isArray(response.data)) return { orders, incompleteReasons: reasons, fatal: `WooCommerce ${label} orders answer was not a list` }
+    if (response.error) return { orders, incompleteReasons: reasons, startedAtMs, fatal: `reading WooCommerce ${label} orders failed: ${response.error}` }
+    if (!Array.isArray(response.data)) return { orders, incompleteReasons: reasons, startedAtMs, fatal: `WooCommerce ${label} orders answer was not a list` }
     if (page === 1) firstTotal = response.totalItems
     orders.push(...(response.data as WcFullOrder[]))
     if (response.data.length < WC_HELD_ORDERS_PAGE_SIZE) {
@@ -268,9 +295,22 @@ async function walkOrders(deps: WcHeldUnitsDeps, label: string, filter: Record<s
       } catch {
         reasons.push(`${label}: the closing count read threw`)
       }
+      if (opts.churnProbe) {
+        // An unchanged total does NOT prove an unchanged set: one order leaving the status while another enters it keeps the count and
+        // shifts every later order onto a page already read. Any order that ENTERED the status was modified at that moment, so a
+        // modified-since count over the walk's span must be 0; anything else means the walk may have a hole.
+        const since = new Date(startedAtMs - WC_WALK_CHURN_MARGIN_MS).toISOString()
+        try {
+          const probe = await deps.fetchOrdersPage({ ...filter, modified_after: since, orderby: 'modified', order: 'asc', per_page: '1', page: '1' })
+          if (probe.error || probe.totalItems == null) reasons.push(`${label}: the changed-during-the-walk check could not be read`)
+          else if (probe.totalItems > 0) reasons.push(`${label}: ${probe.totalItems} order(s) changed while the walk was running, so a shifted page cannot be ruled out`)
+        } catch {
+          reasons.push(`${label}: the changed-during-the-walk check threw`)
+        }
+      }
     }
   }
-  return { orders, incompleteReasons: reasons }
+  return { orders, incompleteReasons: reasons, startedAtMs }
 }
 
 export async function loadWcHeldUnitsByProduct(
@@ -283,11 +323,14 @@ export async function loadWcHeldUnitsByProduct(
   if (open.fatal) return { ok: false, reason: open.fatal }
   const incompleteReasons = [...open.incompleteReasons]
   const orders: WcFullOrder[] = [...open.orders]
-  const completed = await walkOrders(deps, 'completed', { status: 'completed', ...(completedModifiedAfter === null ? {} : { modified_after: completedModifiedAfter }) })
+  const completed = await walkOrders(deps, 'completed', { status: 'completed', ...(completedModifiedAfter === null ? {} : { modified_after: completedModifiedAfter }) }, { churnProbe: true })
   if (completed.fatal) return { ok: false, reason: completed.fatal }
   incompleteReasons.push(...completed.incompleteReasons.map((r) => (completedModifiedAfter === null ? `${r} (a sweep cursor is missing, so ALL completed orders were read)` : r)))
   orders.push(...completed.orders)
   const truncated = incompleteReasons.length > 0
+  const completedIds = new Set(completed.orders.map((o) => String(o?.id ?? '')))
+  let completedSettled = true
+  const coveredAtIfSettled = completedModifiedAfter === null && !truncated ? completed.startedAtMs : null
 
   const ids = [...new Set(orders.map((o) => String(o?.id ?? '')))]
   if (ids.some((id) => id === '')) return { ok: false, reason: 'a WooCommerce order had no id' }
@@ -302,7 +345,7 @@ export async function loadWcHeldUnitsByProduct(
   const allLines = perOrderLines.flatMap((o) => o.lines)
   const heldByProduct = new Map<string, number>()
   const blockedProductIds = new Set<string>()
-  if (allLines.length === 0) return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: 0 }
+  if (allLines.length === 0) return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: 0, completedHistoryCoveredAtMs: coveredAtIfSettled }
 
   const externalIds = [...new Set(allLines.flatMap((l) => [l.variationId, l.productId]).filter((n) => n > 0))]
   const skus = [...new Set(allLines.map((l) => l.sku).filter((s) => s !== ''))]
@@ -314,11 +357,12 @@ export async function loadWcHeldUnitsByProduct(
     const { held, unresolvedLines } = aggregateHeldUnits(lines, products)
     for (const l of unresolvedLines) if (l.productId > 0) unresolvedParents.add(l.productId)
     const remainder = imported.has(id) ? unallocatedRemainder(held, imported.get(id)) : held
+    if (completedIds.has(id) && (remainder.size > 0 || unresolvedLines.length > 0)) completedSettled = false
     if (remainder.size > 0 || unresolvedLines.length > 0) considered++
     for (const [productId, qty] of remainder) heldByProduct.set(productId, (heldByProduct.get(productId) ?? 0) + qty)
   }
   if (unresolvedParents.size > 0) {
     for (const id of await deps.findVariationIdsByParentExternalId([...unresolvedParents])) blockedProductIds.add(id)
   }
-  return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: considered }
+  return { ok: true, heldByProduct, blockedProductIds, incomplete: truncated, incompleteReasons, ordersConsidered: considered, completedHistoryCoveredAtMs: completedSettled ? coveredAtIfSettled : null }
 }

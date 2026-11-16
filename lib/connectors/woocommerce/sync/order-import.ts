@@ -4602,24 +4602,44 @@ export const WC_CANCELLATION_BACKSTOP_CURSOR_KEY = 'wc_cancellation_backstop_cur
  * still applies only to orders IMS already holds. The cursor advances only after every read ended on an empty page and every apply succeeded.
  * Needs the initial import to be complete (before it, IMS holds nothing to cancel and the full read would be wasted).
  */
-/** Where the resumable first-run backfill stands: the status being walked, the next page, and when the backfill began. */
+/** Where the resumable first-run backfill stands: the status being walked, the keyset position, and when the backfill began. */
 export const WC_CANCELLATION_BACKFILL_KEY = 'wc_cancellation_backstop_backfill'
 /** Pages one run of the backfill may read (100 orders each). Bounded so a run ends well inside the ~60 s request budget. */
 export const WC_CANCELLATION_BACKFILL_MAX_PAGES = 8
 /** Wall-clock budget of one backfill run. */
 export const WC_CANCELLATION_BACKFILL_BUDGET_MS = 35_000
 
-type WcBackfillState = { startedAt: string; status: 'cancelled' | 'trash'; nextPage: number }
+/**
+ * `after` is the keyset position: only orders created AFTER it (WooCommerce `after`, an ISO-8601 instant) are asked for, oldest first, always
+ * page 1. It is null at the start of a status. A keyset position cannot be shifted by an order leaving the status mid-walk, which a
+ * page number can (the order after a removed one slides onto the page already read and is never visited).
+ */
+type WcBackfillState = { startedAt: string; status: 'cancelled' | 'trash'; after: string | null }
+
+/** Orders per backfill read. */
+export const WC_CANCELLATION_BACKFILL_PAGE_SIZE = 100
+/** The next position steps back this far from the newest creation time read, so orders created in that same second are read again, not skipped. */
+const WC_BACKFILL_KEYSET_OVERLAP_MS = 1000
 
 function parseWcBackfillState(raw: string | null | undefined): WcBackfillState | null {
   if (!raw) return null
   try {
-    const v = JSON.parse(raw) as Partial<WcBackfillState>
-    if ((v.status !== 'cancelled' && v.status !== 'trash') || !Number.isInteger(v.nextPage) || (v.nextPage as number) < 1 || !Number.isFinite(Date.parse(String(v.startedAt)))) return null
-    return { startedAt: String(v.startedAt), status: v.status, nextPage: v.nextPage as number }
+    const v = JSON.parse(raw) as Partial<WcBackfillState> & { nextPage?: unknown }
+    if ((v.status !== 'cancelled' && v.status !== 'trash') || !Number.isFinite(Date.parse(String(v.startedAt)))) return null
+    // A position saved by the page-numbered walk is not trustworthy (it may already have skipped an order): that status restarts from its beginning.
+    const after = typeof v.after === 'string' && Number.isFinite(Date.parse(v.after)) ? v.after : null
+    return { startedAt: String(v.startedAt), status: v.status, after }
   } catch {
     return null
   }
+}
+
+/** The `date_created_gmt` of a WooCommerce order as epoch ms, or null when absent or unreadable. */
+function wcOrderCreatedGmtMs(order: WcFullOrder): number | null {
+  const raw = (order as { date_created_gmt?: unknown }).date_created_gmt
+  if (typeof raw !== 'string' || raw === '') return null
+  const t = Date.parse(/(?:Z|[+-]\d\d:?\d\d)$/i.test(raw) ? raw : `${raw}Z`)
+  return Number.isNaN(t) ? null : t
 }
 
 async function saveWcBackfillState(state: WcBackfillState): Promise<void> {
@@ -4647,11 +4667,11 @@ async function applyWcCancellationPage(orders: WcFullOrder[], slug: 'cancelled' 
 }
 
 /**
- * ONE BOUNDED SLICE of the first-run backfill. Walks `cancelled` then `trash` (unbounded by date) from the persisted position, at most
- * `maxPages` pages / `budgetMs` per run, saving the position after every page that was read AND applied cleanly. A failure stops the
- * slice with the position held at that page (never skipped), and the next run resumes one page BEHIND the saved position, because the
- * walk is by page number and an order removed from the list meanwhile shifts later orders one place earlier. Returns true only when
- * both statuses were walked to an empty page; the caller then switches to cursor mode.
+ * ONE BOUNDED SLICE of the first-run backfill. Walks `cancelled` then `trash` (unbounded by date) by a KEYSET on creation time (oldest first,
+ * `after` = newest creation time read, always page 1), at most `maxPages` reads / `budgetMs` per run, saving the position after every page that
+ * was read AND applied cleanly. A failure stops the slice with the position held (never skipped). A status ends on an empty or short page.
+ * A page that cannot advance the keyset (no creation time, or 100 orders in one second) is an error, never a skip. Returns true only when both
+ * statuses were walked to their end; the caller then switches to cursor mode.
  */
 async function runWcCancellationBackfillSlice(
   result: SyncResult,
@@ -4660,7 +4680,7 @@ async function runWcCancellationBackfillSlice(
 ): Promise<{ complete: boolean; startedAtMs: number }> {
   const stored = parseWcBackfillState((await db.setting.findUnique({ where: { key: WC_CANCELLATION_BACKFILL_KEY } }))?.value)
   const startedAtMs = stored ? Date.parse(stored.startedAt) : readStartedAtMs
-  const state: WcBackfillState = stored ?? { startedAt: new Date(readStartedAtMs).toISOString(), status: 'cancelled', nextPage: 1 }
+  const state: WcBackfillState = stored ?? { startedAt: new Date(readStartedAtMs).toISOString(), status: 'cancelled', after: null }
   if (!stored) await saveWcBackfillState(state)
   const trashUnsupported = (await db.setting.findUnique({ where: { key: WC_TRASH_READ_UNSUPPORTED_KEY } }).catch(() => null)) !== null
   const deadline = Date.now() + limits.budgetMs
@@ -4670,11 +4690,12 @@ async function runWcCancellationBackfillSlice(
     const slug = slugs[i]
     if (slug === 'trash' && trashUnsupported) continue
     const required = slug === 'cancelled'
-    // Resume one page behind the saved position (a removed order shifts later ones earlier); the first page of a status starts at 1.
-    let page = slug === state.status ? Math.max(1, state.nextPage - 1) : 1
+    let after: string | null = slug === state.status ? state.after : null
     for (;;) {
       if (pagesRead >= limits.maxPages || Date.now() >= deadline) return { complete: false, startedAtMs }
-      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc' })
+      const { data, error } = await wcFetch('/orders', {
+        status: slug, per_page: String(WC_CANCELLATION_BACKFILL_PAGE_SIZE), page: '1', orderby: 'date', order: 'asc', ...(after ? { after } : {}),
+      })
       pagesRead++
       if (error || !Array.isArray(data)) {
         const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
@@ -4691,10 +4712,21 @@ async function runWcCancellationBackfillSlice(
       await applyWcCancellationPage(orders, slug, result)
       // A page with a failed apply is NOT passed: the position stays where it was, so the next run reads it again.
       if (result.errors.length > before) return { complete: false, startedAtMs }
-      page++
-      await saveWcBackfillState({ startedAt: state.startedAt, status: slug, nextPage: page })
+      if (orders.length < WC_CANCELLATION_BACKFILL_PAGE_SIZE) break
+      const created = orders.map(wcOrderCreatedGmtMs)
+      if (created.some((t) => t === null)) {
+        result.errors.push(`WooCommerce ${slug} orders for the cancellation backstop carried no readable creation time, so the walk cannot advance safely`)
+        return { complete: false, startedAtMs }
+      }
+      const next = new Date(Math.max(...(created as number[])) - WC_BACKFILL_KEYSET_OVERLAP_MS).toISOString()
+      if (after !== null && Date.parse(next) <= Date.parse(after)) {
+        result.errors.push(`WooCommerce ${slug} orders for the cancellation backstop did not advance past ${after} (a full page created within one second), so the walk stopped rather than skip orders`)
+        return { complete: false, startedAtMs }
+      }
+      after = next
+      await saveWcBackfillState({ startedAt: state.startedAt, status: slug, after })
     }
-    if (i + 1 < slugs.length) await saveWcBackfillState({ startedAt: state.startedAt, status: slugs[i + 1], nextPage: 1 })
+    if (i + 1 < slugs.length) await saveWcBackfillState({ startedAt: state.startedAt, status: slugs[i + 1], after: null })
   }
   return { complete: true, startedAtMs }
 }
