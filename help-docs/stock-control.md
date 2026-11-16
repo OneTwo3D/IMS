@@ -70,7 +70,7 @@ Use a prepared count when you only want to count some products, for example one 
 
 The list stays editable until the count is posted or cancelled. Open the count and click **Add products** to open the same selection window; a product already on the count is marked **Already on this count** and cannot be ticked, and the server refuses a duplicate even if one is submitted. To take lines off, tick the box at the start of each line and click **Remove selected**. A line can only be removed while it is not yet counted and not reconciled; a line with a counted quantity has no tick box. If you need to remove one, clear its counted quantity and click **Save counts** (that also drops its reconciliation), then remove it. If a request includes a line that can no longer be removed, nothing is removed and the message names each such product. A count always keeps at least one line: to drop them all, cancel the count instead.
 
-Adding products and removing lines also work on a whole-location count that is still open. Products you add are uncounted and are not posted until you enter a quantity for them.
+You can also add products to a whole-location count that is still open, but lines can only be removed from a prepared count (a whole-location count covers every stocked product, so leave one uncounted instead). Products you add are uncounted and are not posted until you enter a quantity for them.
 
 ### How posting is protected
 

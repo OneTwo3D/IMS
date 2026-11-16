@@ -325,7 +325,7 @@ function StockCountRowView({
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-background">
                   <tr className="text-left text-xs text-muted-foreground">
-                    {editable && <th className="px-3 py-1.5 w-8"><span className="sr-only">Remove</span></th>}
+                    {editable && count.prepared && <th className="px-3 py-1.5 w-8"><span className="sr-only">Remove</span></th>}
                     <th className="px-3 py-1.5">SKU</th>
                     <th className="px-3 py-1.5 text-right">Book qty</th>
                     <th className="px-3 py-1.5 text-right">Counted</th>
@@ -338,7 +338,7 @@ function StockCountRowView({
                     const variance = raw === '' ? null : Number(raw) - l.expectedQty
                     return (
                       <tr key={l.id} className="border-t border-border/50">
-                        {editable && (
+                        {editable && count.prepared && (
                           <td className="px-3 py-1">
                             <input
                               type="checkbox"
@@ -377,7 +377,7 @@ function StockCountRowView({
             {editable && (
               <div className="flex flex-wrap items-center gap-2 mt-3">
                 <Button size="sm" variant="outline" disabled={pending} onClick={() => { setAddError(null); setAdding(true) }}>Add products</Button>
-                <Button size="sm" variant="outline" disabled={pending || removeIds.length === 0} onClick={handleRemove}>Remove selected ({removeIds.length})</Button>
+                {count.prepared && <Button size="sm" variant="outline" disabled={pending || removeIds.length === 0} onClick={handleRemove}>Remove selected ({removeIds.length})</Button>}
                 <Button size="sm" variant="outline" disabled={pending} onClick={() => run(() => saveStockCountCounts({ countId: count.id, counts: buildCounts() }), 'Counts saved.')}>
                   {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Save counts'}
                 </Button>

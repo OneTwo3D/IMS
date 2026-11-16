@@ -184,5 +184,11 @@ test('prepared stocktakes: choose, edit, refuse', { skip }, async (t) => {
     const added = await addStockCountLines({ countId: res.count!.id, productIds: [c.id] })
     assert.ok(added.success)
     assert.equal(added.count!.lines.length, 3)
+    // ...but its lines cannot be removed: a whole-warehouse count keeps covering every stocked product.
+    const removal = await removeStockCountLines({ countId: res.count!.id, lineIds: [added.count!.lines[0]!.id] })
+    assert.equal(removal.success, undefined)
+    assert.match(removal.message!, /only be removed from a prepared count/)
+    assert.equal(await lineCount(res.count!.id), 3)
+    assert.ok(added.count!.lines.every((l) => !l.removable), 'the UI is told no line is removable')
   })
 })

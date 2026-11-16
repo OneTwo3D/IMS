@@ -28,6 +28,16 @@ import {
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 30000 }
 
+/**
+ * Make sure a stock row exists for every product about to be read and posted against, so the FOR UPDATE that follows locks it.
+ * A prepared count may hold a product with no stock row; without a row to lock, a receipt could create it between the live
+ * read and the adjustment, and the adjustment would then add to the receipt instead of replacing the book figure.
+ * INSERT ... ON CONFLICT DO NOTHING (skipDuplicates): an existing row is left as it is.
+ */
+async function materialiseStockRowsTx(tx: Prisma.TransactionClient, warehouseId: string, productIds: string[]): Promise<void> {
+  await tx.stockLevel.createMany({ data: productIds.map((productId) => ({ productId, warehouseId, quantity: 0 })), skipDuplicates: true })
+}
+
 export type StockCountLineRow = {
   id: string
   productId: string
@@ -38,7 +48,7 @@ export type StockCountLineRow = {
   /** On-hand this line was reconciled against; null = not reconciled (or the count changed since). */
   reconciledQty: number | null
   notes: string | null
-  /** Neither counted nor reconciled, on a count whose product list can still change: the line can be taken off the count. */
+  /** Neither counted nor reconciled, on an open prepared count: the line can be taken off the count. */
   removable: boolean
 }
 
@@ -91,7 +101,7 @@ const COUNT_SELECT = {
 } as const
 
 function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }>): StockCountRow {
-  const planEditable = isStockCountPlanEditable(c.status)
+  const planEditable = isStockCountPlanEditable(c.status) && c.prepared
   const lines: StockCountLineRow[] = c.lines.map((l) => ({
     id: l.id,
     productId: l.productId,
@@ -339,6 +349,7 @@ export async function reconcileStockCount(input: unknown): Promise<StockCountRes
       if (counted.length === 0) throw new Error('Count at least one line before reconciling.')
 
       const productIds = counted.map((l) => l.productId)
+      await materialiseStockRowsTx(tx, count.warehouseId, productIds)
       await tx.$queryRaw`SELECT id FROM stock_levels WHERE "warehouseId" = ${count.warehouseId} AND "productId" = ANY(${productIds}::text[]) FOR UPDATE`
       const levels = await tx.stockLevel.findMany({ where: { warehouseId: count.warehouseId, productId: { in: productIds } }, select: { productId: true, quantity: true } })
       const liveBook = new Map(levels.map((l) => [l.productId, new Prisma.Decimal(l.quantity)]))
@@ -466,6 +477,7 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
       // Read the LIVE book per counted product under lock.
       const productIds = countedLines.map((l) => l.productId)
       if (productIds.length > 0) {
+        await materialiseStockRowsTx(tx, count.warehouseId, productIds)
         await tx.$queryRaw`SELECT id FROM stock_levels WHERE "warehouseId" = ${count.warehouseId} AND "productId" = ANY(${productIds}::text[]) FOR UPDATE`
       }
       const levels = productIds.length
@@ -799,11 +811,12 @@ export async function removeStockCountLines(input: unknown): Promise<StockCountR
       await tx.$queryRaw`SELECT id FROM stock_counts WHERE id = ${countId} FOR UPDATE`
       const count = await tx.stockCount.findUnique({
         where: { id: countId },
-        select: { status: true, lines: { select: { id: true, sku: true, countedQty: true, reconciledQty: true } } },
+        select: { status: true, prepared: true, lines: { select: { id: true, sku: true, countedQty: true, reconciledQty: true } } },
       })
       if (!count) throw new PlanRefusal('Stock count not found.')
       const locked = describePlanLocked(count.status)
       if (locked) throw new PlanRefusal(locked)
+      if (!count.prepared) throw new PlanRefusal('Lines can only be removed from a prepared count. This count covers the whole location, so leave a product uncounted instead of removing it.')
 
       const check = checkLineRemoval(lineIds, count.lines.map((l) => ({
         id: l.id, sku: l.sku,
