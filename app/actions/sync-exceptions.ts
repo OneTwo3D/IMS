@@ -21,6 +21,7 @@ import {
   WMS_BOOKED_IN_RECHECK_DUE_KEY,
 } from '@/lib/maintenance-mode'
 import { runPostMaintenanceRecheckForActiveConnector } from '@/lib/domain/wms/post-maintenance-recheck'
+import { loadSystemicFailureIncidents, type SystemicFailureIncidentRow } from '@/lib/domain/wms/systemic-failure-store'
 import { eligibleCohortDigest, isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import {
   buildBlockedWmsPushRow,
@@ -822,6 +823,8 @@ export type ExceptionInboxSummary = {
   /** Open operator tasks ("raise a warehouse query"): IMS writes no warehouse comments, so each is a query a person raises by hand (counted in the total). */
   wmsOperatorTasksOpen: number
   unresolvedDrift: number
+  /** Open systemic-failure incidents: a sweep read a pass as a connector-wide fault and parked nothing (counted in the total). */
+  systemicFailures: number
   /**
    * o3d-0bfh r6 (Codex HIGH): accounting sync rows that finished posting still owing follow-up work,
    * on a connector where NOTHING re-reads the marker. The row is the durable record of the debt; this
@@ -870,6 +873,8 @@ export type ExceptionInboxData = {
   wcCompletionRefusals: WcCompletionRefusalRow[]
   doublePostageFlags: DoublePostageRow[]
   unresolvedDrift: UnresolvedDriftRow[]
+  /** The open connector-wide failures the sweeps declined to isolate. Read-only: they clear themselves on the first healthy pass. */
+  systemicFailures: SystemicFailureIncidentRow[]
   accountingFollowUpObligations: AccountingFollowUpObligationRow[]
   accountingPostingRefusals: AccountingPostingRefusalRow[]
   accountingPostingRefusalsResolved: ResolvedAccountingPostingRefusalRow[]
@@ -1228,6 +1233,15 @@ async function loadMaintenanceRecoveryState(): Promise<MaintenanceRecoveryState>
   return buildMaintenanceRecoveryState(new Map(rows.map((row) => [row.key, row.value])))
 }
 
+/**
+ * The open systemic-failure incidents of the ACTIVE connector (a disabled connector's leftover row blocks nothing). Read-only on this
+ * page: the incident is the sweep's own state and ends on the first pass that works.
+ */
+async function loadActiveSystemicIncidents(): Promise<SystemicFailureIncidentRow[]> {
+  const connectorId = await getEnabledWmsConnectorId()
+  return connectorId ? loadSystemicFailureIncidents([connectorId]) : []
+}
+
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // o3d-0bfh r8 (Codex HIGH): the settling grace is aged against the DATABASE's clock, never this
@@ -1278,6 +1292,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
 
   const giftCardLinesToResolve = await db.shoppingSyncLog.count({ where: giftCardUnsettledHoldWhere() })
   const wmsOperatorTasksOpen = await db.wmsOperatorTask.count({ where: { status: 'OPEN' } })
+  const systemicFailures = (await loadActiveSystemicIncidents()).length
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
   const deadReceiptEvents = deadReceipts + deadWebhooks + deadShoppingWebhooks
   return {
@@ -1297,13 +1312,14 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     giftCardLinesToResolve,
     wmsOperatorTasksOpen,
     unresolvedDrift: driftIncidents.length,
+    systemicFailures,
     accountingFollowUpObligations,
     accountingPostingRefusals: outstandingPostingRefusals + unconfirmedPostingRefusals,
     accountingPostingRefusalsUnconfirmed: unconfirmedPostingRefusals,
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length + systemicFailures
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }
@@ -1854,6 +1870,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     blockedWcOrders: blockedWcOrderRows,
     wcCompletionRefusals: wcCompletionRefusalRows,
     doublePostageFlags: doublePostageRows,
+    systemicFailures: await loadActiveSystemicIncidents(),
     unresolvedDrift: driftIncidents.map((incident) => ({
       connector: incident.connector,
       version: incident.version,
