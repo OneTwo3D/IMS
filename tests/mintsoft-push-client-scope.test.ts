@@ -33,6 +33,11 @@ let emptyDetailIds = new Set<string>()
 let calls: string[] = []
 let writes: Array<{ path: string; method: string }> = []
 
+// The outbound-write hold's reference is an HMAC keyed by SETTINGS_ENCRYPTION_KEY, and with no key NOTHING is
+// recognised as a hold (fail-safe, lib/security/outbound-write-hold-constants.ts). CI exports a key; a clean
+// checkout without .env.local has none, so these assertions need their own. Read lazily, so setting it here is enough.
+process.env.SETTINGS_ENCRYPTION_KEY = 'a1'.repeat(32)
+
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
     getMintsoftSettings: async () => ({
