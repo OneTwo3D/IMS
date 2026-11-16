@@ -45,3 +45,17 @@ export function paidAmountForeign(order: PaidStateFields & { totalForeign: Decim
   const paid = subtractMoney(order.totalForeign, paymentRemovedAmount(order))
   return compareDecimal(paid, 0) < 0 ? toDecimal(0) : paid
 }
+
+/** The shortfall (order currency) standing as of a date: the sum of the signed history changes made on or before it. */
+export function shortfallAsOf(
+  history: ReadonlyArray<{ kind: string; amountForeign: unknown; createdAt: Date }>,
+  asOf: Date,
+): Decimal {
+  let sum = toDecimal(0)
+  for (const row of history) {
+    if (row.createdAt.getTime() > asOf.getTime()) continue
+    const amount = toDecimal(row.amountForeign as never)
+    sum = row.kind === 'REMOVED' ? sum.plus(amount) : sum.minus(amount)
+  }
+  return compareDecimal(sum, 0) < 0 ? toDecimal(0) : sum
+}

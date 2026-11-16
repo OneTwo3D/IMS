@@ -30,7 +30,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
-import { compareDecimal, toDecimal as toDecimalSafe } from '@/lib/domain/math/decimal'
+import { compareDecimal, ledgerAmountEpsilon, toDecimal as toDecimalSafe } from '@/lib/domain/math/decimal'
 import { xeroGet } from './api'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { notify, notifyPersisted } from '@/lib/notifications'
@@ -49,7 +49,7 @@ import {
   type PartialRemovalMeasurement,
   type RegisteredReceipt,
 } from '@/lib/domain/accounting/partial-payment-removal'
-import { recordPaymentRemoval } from '@/lib/domain/accounting/payment-removal-reconciliation'
+import { appendShortfallCleared, recordPaymentRemoval } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { loadInvoicePaymentSyncRows } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import {
@@ -885,9 +885,12 @@ export async function reconcilePartialRemovals(
 }
 
 /**
- * o3d-cdhl — A SHORTFALL THE LEDGER HAS MADE GOOD. An invoice that reads PAID again settles the whole balance, so any shortfall recorded
- * against its order is cleared. Whatever settled it (the payment re-applied, or a credit allocated) is in the ledger already; IMS only stops
- * saying part of the order is unpaid.
+ * o3d-cdhl — A SHORTFALL THE LEDGER HAS MADE GOOD, PROVED BY PAYMENT AND NOT BY STATUS.
+ *
+ * PAID is also what Xero shows when a CREDIT allocation settles the balance, with `AmountPaid` still below the total: that is the
+ * credit-note-or-bad-debt decision, not the payment coming back. So the shortfall is cleared or reduced only when the invoice's
+ * same-currency `AmountPaid` covers more of the order than is recorded as paid AND no credit is allocated. A credit-settled invoice
+ * keeps the shortfall and warns once (per removal) with the figures, leaving the ledger decision to the order owner.
  */
 export async function restorePaidAgainOrders(
   paidSalesInvoices: Map<string, XeroInvoice>,
@@ -896,27 +899,63 @@ export async function restorePaidAgainOrders(
   if (paidSalesInvoices.size === 0) return
   const orders = await db.salesOrder.findMany({
     where: { accountingInvoiceId: { in: [...paidSalesInvoices.keys()] }, paidAt: { not: null }, paymentRemovedForeign: { not: null } },
-    select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, currency: true, totalForeign: true, paymentRemovedForeign: true, unregisteredPaidAt: true },
+    select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, currency: true, totalForeign: true, paymentRemovedForeign: true, paymentRemovedAt: true, unregisteredPaidAt: true },
   })
   for (const order of orders) {
     if (!order.accountingInvoiceId || order.paymentRemovedForeign == null) continue
+    const invoice = paidSalesInvoices.get(order.accountingInvoiceId)
+    if (!invoice) continue
     const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
     try {
-      const restored = toDecimalSafe(order.paymentRemovedForeign)
+      const total = toDecimalSafe(order.totalForeign)
+      const shortfall = toDecimalSafe(order.paymentRemovedForeign)
+      const currency = xeroInvoiceCurrency(invoice)
+      const sameCurrency = currency !== null && currency.toUpperCase() === order.currency.toUpperCase()
+      const paid = sameCurrency ? parseLedgerAmount(invoice.AmountPaid, currency) : null
+      let credited = null as ReturnType<typeof toDecimalSafe> | null
+      try { credited = invoice.AmountCredited == null ? toDecimalSafe(0) : toDecimalSafe(invoice.AmountCredited) } catch { credited = null }
+      const epsilon = ledgerAmountEpsilon(order.currency)
+      const noCredit = credited !== null && compareDecimal(credited.abs(), epsilon) <= 0
+
+      if (paid === null || !Number.isFinite(paid) || paid < 0 || !noCredit) {
+        // Settled by something other than a proved payment (a credit, or figures not stated): keep the shortfall, say so once.
+        const seen = await db.activityLog.findFirst({
+          where: { entityId: order.id, action: 'payment_removal_credit_settled', ...(order.paymentRemovedAt ? { createdAt: { gte: order.paymentRemovedAt } } : {}) },
+          select: { id: true },
+        })
+        if (seen) continue
+        const description = withLedgerCheck(
+          `The invoice for order ${ref} reads paid in full in Xero, but Xero holds ${paid === null ? 'a paid amount IMS cannot read' : `${paid.toFixed(2)} ${order.currency} of payments`} `
+          + `against an order total of ${total.toFixed(2)} ${order.currency}${credited !== null && !noCredit ? ` and ${credited.toFixed(2)} ${order.currency} of allocated credit` : ''}. `
+          + `IMS keeps the ${shortfall.toFixed(2)} ${order.currency} recorded as not received, because a credit settling a removed payment is not the payment coming back, `
+          + `and no credit note or write-off was raised by IMS: whether the credit stands as the answer or the amount is written off is a decision for the order owner.`,
+        )
+        const logged = await logActivityPersisted({
+          entityType: 'SALES_ORDER', entityId: order.id, action: 'payment_removal_credit_settled', tag: 'sync', level: 'WARNING', description,
+          metadata: { connector: XERO_CONNECTOR, accountingInvoiceId: order.accountingInvoiceId, shortfall: shortfall.toString(), ledgerPaid: paid, ledgerCredited: credited?.toString() ?? null, documentTotal: total.toString() },
+          resolveUser: false,
+        })
+        const alerted = await alertAdmins({ title: 'Part of a removed payment is still unreceived', message: description, actionUrl: `/sales/${order.id}` })
+        if (!logged || !alerted) result.errors.push(`Credit-settled payment shortfall for order ${ref} left no durable signal; it is reported again on the next poll.`)
+        continue
+      }
+
+      // Same currency, a stated payment, no credit: what is paid is what the ledger says. The new shortfall is what that leaves of the total.
+      const ledgerPaid = toDecimalSafe(paid)
+      const target = compareDecimal(total.minus(ledgerPaid), epsilon) > 0 ? total.minus(ledgerPaid) : toDecimalSafe(0)
+      if (compareDecimal(target, shortfall) >= 0) continue
+      const restored = shortfall.minus(target)
       const recorded = await recordPaymentRemoval({
         orderId: order.id, connector: XERO_CONNECTOR, accountingInvoiceId: order.accountingInvoiceId,
         shortfallBefore: order.paymentRemovedForeign,
-        measurement: {
-          kind: 'RESTORED', restored, currency: order.currency,
-          recordedPaid: toDecimalSafe(order.totalForeign).minus(restored), ledgerPaid: toDecimalSafe(order.totalForeign), documentTotal: toDecimalSafe(order.totalForeign),
-        },
+        measurement: { kind: 'RESTORED', restored, currency: order.currency, recordedPaid: total.minus(shortfall), ledgerPaid, documentTotal: total },
         matchedPaymentIds: [],
       })
       if (recorded.outcome === 'recorded') {
         await logActivity({
           entityType: 'SALES_ORDER', entityId: order.id, action: 'payment_removal_restored', tag: 'sync', level: 'INFO',
-          description: `The invoice for order ${ref} is paid in full in Xero again, so the ${restored.toFixed(2)} ${order.currency} recorded as not received has been cleared and the order shows as fully paid.`,
-          metadata: { connector: XERO_CONNECTOR, accountingInvoiceId: order.accountingInvoiceId, restored: restored.toString() },
+          description: `Xero holds ${ledgerPaid.toFixed(2)} ${order.currency} of payments against the invoice for order ${ref}: ${restored.toFixed(2)} ${order.currency} of the missing payment is back, leaving ${recorded.shortfall.toFixed(2)} ${order.currency} recorded as not received.`,
+          metadata: { connector: XERO_CONNECTOR, accountingInvoiceId: order.accountingInvoiceId, restored: restored.toString(), shortfall: recorded.shortfall.toString() },
           resolveUser: false,
         })
       }
@@ -1408,9 +1447,12 @@ async function processDeltaChunk(
             // o3d-psrx r2: the provenance goes with the flag. Leaving it set on an order that is no
             // longer paid would withhold the NEXT reversal on a marker describing a flag that has
             // already been cleared once.
-            await db.salesOrder.update({
-              where: { id: orderId },
-              data: { paidAt: null, unregisteredPaidAt: null, paymentRemovedForeign: null, paymentRemovedAt: null },
+            await db.$transaction(async (tx) => {
+              await appendShortfallCleared(tx, orderId)
+              await tx.salesOrder.update({
+                where: { id: orderId },
+                data: { paidAt: null, unregisteredPaidAt: null, paymentRemovedForeign: null, paymentRemovedAt: null },
+              })
             })
           },
           notifyNeedsAttention: (o, { wcHandled, chargebackManualReason }) =>

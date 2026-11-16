@@ -1,5 +1,6 @@
 'use server'
 
+import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -3807,6 +3808,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
       const paidAt = markingAsPaid ? new Date() : null
+      await appendShortfallCleared(tx, id)
       await tx.salesOrder.update({
         where: { id },
         data: {
@@ -4548,6 +4550,7 @@ async function removePaymentAndSettlePaidAt(
   // Only a genuine paid → not-paid transition is a mismatch. An order that was never fully paid
   // (e.g. shipped on credit terms) isn't flagged just because a partial payment was removed.
   const becameUnpaid = input.paidAt !== null && !stillFullyPaid
+  if (!stillFullyPaid) await appendShortfallCleared(tx, input.orderId)
   await tx.salesOrder.update({
     where: { id: input.orderId },
     data: {

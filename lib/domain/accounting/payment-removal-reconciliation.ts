@@ -1,3 +1,4 @@
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { compareDecimal, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { shortfallAfter, type PartialRemovalMeasurement } from '@/lib/domain/accounting/partial-payment-removal'
@@ -81,5 +82,34 @@ export async function recordPaymentRemoval(params: {
       select: { id: true },
     })
     return { outcome: 'recorded', recordId: row.id, shortfall: after } as const
+  })
+}
+
+/**
+ * Append the history row for a shortfall that is being CLEARED outright by a write that clears or toggles `paidAt` (full reversal,
+ * delete-payment settle, Mark Paid toggle). The caller nulls the order's columns in the same transaction; this keeps the history
+ * complete, so the shortfall at any past date is the sum of the signed changes up to it (REMOVED +, RESTORED and CLEARED -).
+ */
+export async function appendShortfallCleared(
+  tx: Pick<Prisma.TransactionClient, 'salesOrder' | 'paymentRemovalReconciliation'>,
+  orderId: string,
+  now: Date = new Date(),
+): Promise<void> {
+  const order = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { paymentRemovedForeign: true, accountingInvoiceId: true, accountingInvoiceConnector: true, currency: true, totalForeign: true },
+  })
+  if (!order || order.paymentRemovedForeign == null) return
+  const shortfall = toDecimal(order.paymentRemovedForeign)
+  if (compareDecimal(shortfall, 0) <= 0) return
+  const total = toDecimal(order.totalForeign)
+  await tx.paymentRemovalReconciliation.create({
+    data: {
+      orderId, connector: order.accountingInvoiceConnector ?? 'unknown', accountingInvoiceId: order.accountingInvoiceId ?? '',
+      kind: 'CLEARED', amountForeign: shortfall.toString(), recordedPaidForeign: total.toString(),
+      ledgerPaidForeign: total.minus(shortfall).toString(), documentTotalForeign: total.toString(),
+      shortfallBeforeForeign: shortfall.toString(), shortfallAfterForeign: '0', currency: order.currency,
+      matchedPaymentIds: [], ledgerAction: 'NONE', createdAt: now,
+    },
   })
 }

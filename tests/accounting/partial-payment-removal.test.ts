@@ -109,3 +109,23 @@ test('refund open balance: the receivable includes the removed part from when it
 test('dispatch gate: the warehouse create fence excludes an order with a recorded removal', () => {
   assert.equal(WMS_CREATE_ELIGIBLE_ORDER_FENCES.paymentRemovedForeign, null)
 })
+
+test('AR as of a date comes from the history: a later restore or clear does not rewrite an earlier report', () => {
+  const paidAt = new Date('2026-08-01T00:00:00Z')
+  const d = (m: number) => new Date(Date.UTC(2026, m, 1))
+  const order = {
+    totalBase: 100, totalForeign: 100, currency: 'GBP', paidAt, payments: [{ amount: 100, currency: 'GBP', paidAt, refundId: null }],
+    // current columns say nothing is missing any more; the history knows better
+    paymentRemovedForeign: null, paymentRemovedAt: null,
+    paymentRemovals: [
+      { kind: 'REMOVED', amountForeign: '40', createdAt: d(8) },
+      { kind: 'RESTORED', amountForeign: '15', createdAt: d(9) },
+      { kind: 'CLEARED', amountForeign: '25', createdAt: d(10) },
+    ],
+  }
+  assert.equal(receivableBalance(order, d(7)).balance, 0, 'before it was recorded')
+  assert.equal(receivableBalance(order, new Date(d(8).getTime() + 1)).balance, 40, 'original shortfall')
+  assert.equal(receivableBalance(order, new Date(d(9).getTime() + 1)).balance, 25, 'after the partial restore')
+  assert.equal(receivableBalance(order, new Date(d(10).getTime() + 1)).balance, 0, 'after the full clear')
+  assert.equal(receivableBalance(order, new Date(d(8).getTime() + 5)).balance, 40, 'an earlier date still shows it after the clear')
+})

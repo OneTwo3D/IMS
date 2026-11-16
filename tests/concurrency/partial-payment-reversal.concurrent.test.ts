@@ -187,12 +187,52 @@ test('[o3d-cdhl] a further removal adds, a payment that comes back subtracts, a 
   assert.equal(await shortfall(), '20', 'a payment that came back subtracts')
 
   const result = pollResult()
+  // PAID because a CREDIT settled it (AmountPaid still 80): the shortfall stays and the operator is warned, once per removal.
+  await restorePaidAgainOrders(new Map([[invId, invoice(invId, { Status: 'PAID', AmountPaid: 80, AmountDue: 0, AmountCredited: 20 })]]) as never, result as never)
+  await restorePaidAgainOrders(new Map([[invId, invoice(invId, { Status: 'PAID', AmountPaid: 80, AmountDue: 0, AmountCredited: 20 })]]) as never, result as never)
+  assert.deepEqual(result.errors, [])
+  assert.equal(await shortfall(), '20', 'a credit settling the invoice is not the payment coming back')
+  const credited = await db.activityLog.findMany({ where: { entityId: id, action: 'payment_removal_credit_settled' } })
+  assert.equal(credited.length, 1, 'warned once')
+  assert.match(credited[0].description, /20\.00 GBP of allocated credit/)
+  assert.match(credited[0].description, /order owner/)
+  // PAID with the payments covering it clears.
   await restorePaidAgainOrders(new Map([[invId, invoice(invId, { Status: 'PAID', AmountPaid: 100, AmountDue: 0 })]]) as never, result as never)
   assert.deepEqual(result.errors, [])
   assert.equal(await shortfall(), null, 'a PAID invoice settles the whole balance')
-  const kinds = (await db.paymentRemovalReconciliation.findMany({ where: { orderId: id }, orderBy: { createdAt: 'asc' } })).map((r) => r.kind)
-  assert.deepEqual(kinds, ['REMOVED', 'REMOVED', 'RESTORED', 'RESTORED'])
+  const history = await db.paymentRemovalReconciliation.findMany({ where: { orderId: id }, orderBy: { createdAt: 'asc' } })
+  assert.deepEqual(history.map((r) => r.kind), ['REMOVED', 'REMOVED', 'RESTORED', 'RESTORED'])
+
+  // The history alone reproduces the shortfall at every past instant, so AR as of an earlier date does not move.
+  const { shortfallAsOf } = await import('@/lib/domain/sales/paid-state')
+  const at = (n: number) => new Date(history[n].createdAt.getTime())
+  assert.equal(shortfallAsOf(history, at(0)).toString(), '40')
+  assert.equal(shortfallAsOf(history, at(1)).toString(), '70')
+  assert.equal(shortfallAsOf(history, at(2)).toString(), '20')
+  assert.equal(shortfallAsOf(history, at(3)).toString(), '0')
+  assert.equal(shortfallAsOf(history, new Date(history[0].createdAt.getTime() - 1)).toString(), '0')
   await nothingPostedFor(db, id)
+})
+
+test('[o3d-cdhl] every writer that clears the shortfall appends a CLEARED history row', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+  const db = await loadDb()
+  const { reconcilePartialRemovals } = await import('@/lib/connectors/xero/payment-poller')
+  const { appendShortfallCleared } = await import('@/lib/domain/accounting/payment-removal-reconciliation')
+  const { shortfallAsOf } = await import('@/lib/domain/sales/paid-state')
+  const id = probeId()
+  const invId = `INV-${id}`
+  t.after(async () => { await db.activityLog.deleteMany({ where: { entityId: id } }); await db.salesOrder.deleteMany({ where: { id } }) })
+  await createPaidOrder(db, id, invId)
+  await reconcilePartialRemovals(await read(db, invoice(invId)) as never, pollResult() as never)
+  await new Promise((r) => setTimeout(r, 20))
+  await db.$transaction(async (tx) => {
+    await appendShortfallCleared(tx, id)
+    await tx.salesOrder.update({ where: { id }, data: { paidAt: null, unregisteredPaidAt: null, paymentRemovedForeign: null, paymentRemovedAt: null } })
+  })
+  const history = await db.paymentRemovalReconciliation.findMany({ where: { orderId: id }, orderBy: { createdAt: 'asc' } })
+  assert.deepEqual(history.map((r) => r.kind), ['REMOVED', 'CLEARED'])
+  assert.equal(shortfallAsOf(history, history[0].createdAt).toString(), '40', 'an earlier date still shows it after the clear')
+  assert.equal(shortfallAsOf(history, new Date()).toString(), '0')
 })
 
 test('[o3d-cdhl] a removed IMS-registered payment is named when it accounts for the removal', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {

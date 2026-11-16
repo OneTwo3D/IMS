@@ -225,8 +225,7 @@ type SalesOrderAgingRow = {
   invoicedAt: Date | null
   paymentDueAt: Date | null
   paidAt: Date | null
-  paymentRemovedForeign?: DecimalInput
-  paymentRemovedAt?: Date | null
+  paymentRemovals?: Array<{ kind: string; amountForeign: DecimalInput; createdAt: Date }>
   totalBase: DecimalInput
   totalForeign?: DecimalInput
   currency?: string | null
@@ -241,8 +240,7 @@ type SalesOrderCurrencyRow = {
   totalForeign: DecimalInput
   totalBase: DecimalInput
   paidAt: Date | null
-  paymentRemovedForeign?: DecimalInput
-  paymentRemovedAt?: Date | null
+  paymentRemovals?: Array<{ kind: string; amountForeign: DecimalInput; createdAt: Date }>
   payments: Array<{ amount: DecimalInput; currency: string; paidAt: Date; refundId: string | null; settlementRateToBase?: DecimalInput | null }>
   refunds?: Array<TurnoverRefund & { refundedAt?: Date | null }>
 }
@@ -718,8 +716,7 @@ export async function getArAgingReport(
       invoicedAt: true,
       paymentDueAt: true,
       paidAt: true,
-      paymentRemovedForeign: true,
-      paymentRemovedAt: true,
+      paymentRemovals: { select: { kind: true, amountForeign: true, createdAt: true } },
       totalBase: true,
       totalForeign: true,
       currency: true,
@@ -914,8 +911,7 @@ export async function getCurrencySummaryReport(
         totalBase: true,
         invoicedAt: true,
         paidAt: true,
-        paymentRemovedForeign: true,
-        paymentRemovedAt: true,
+        paymentRemovals: { select: { kind: true, amountForeign: true, createdAt: true } },
         payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
         refunds: { where: { refundedAt: { lt: window.dateToExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
       },
