@@ -10,6 +10,10 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Receiving and transfer dialogs usable on a phone (UI)
+
+- **Fixed: the Receive Goods dialog (purchase order) and the New Stock Transfer dialog no longer break at phone width (360-414 px).** Below the `sm` breakpoint both dialogs fill the screen and each line is a stacked card: product on top, then Ordered / Received / Remaining (receiving) or the From / To stock (transfer), then a full-width quantity input and, when receiving, the warehouse select, all tap-sized (44 px) with 16 px text so iOS does not zoom. The desktop tables are unchanged, and no behaviour or server action changed.
+
 ### Mintsoft: IMS writes no order comments; it raises operator tasks instead (backend / sync / UI)
 
 - **Changed: IMS no longer writes any comment to a Mintsoft order.** The warehouse staff do not read order comments; only a Mintsoft query reaches them, and the API cannot raise one. Every place IMS used to post a note now records an **operator task** instead, listed on **Sync > Exceptions** under **Raise a warehouse query** (warehouse order number, link to the IMS order, reason, copy-ready query text with a Copy button, and a **Done** button needing the sync permission and a fresh sign-in, recorded with who and when). The sites are: the merged-line removal note (the earlier removal-note obligation), the courier-fallback note (on create, on verify and on amend), the hold / cancel notices (past NEW, merged, and a removal that could not finish), and the refund note on a pushed order. The open count is in the Exceptions banner total. The `wms-order-push` cron is NOT red for an open task (its result reports `operatorTasksOpen` and `operatorTasksRaised`); it is red only if a task could not be recorded (`operatorTaskErrors`, retried next run).
