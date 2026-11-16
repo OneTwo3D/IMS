@@ -28,9 +28,11 @@ type Props = {
   purchaseUnits: PurchaseUnitRow[]
   goodsPos: GoodsPo[]
   companyHomeCountry?: string | null
+  /** Internal margin column; true only for a user holding `inventory.prices`. */
+  showMargin?: boolean
 }
 
-export function PurchaseOrdersClient({ list, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, goodsPos, companyHomeCountry }: Props) {
+export function PurchaseOrdersClient({ list, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, goodsPos, companyHomeCountry, showMargin }: Props) {
   const baseCurrency = useBaseCurrency()
   const [showCreate, setShowCreate] = useState(false)
   const [showFreight, setShowFreight] = useState(false)
@@ -65,6 +67,7 @@ export function PurchaseOrdersClient({ list, suppliers, products, warehouses, cu
           taxRates={taxRates}
           purchaseUnits={purchaseUnits}
           companyHomeCountry={companyHomeCountry}
+          showMargin={showMargin}
           onClose={() => setShowCreate(false)}
         />
       )}
