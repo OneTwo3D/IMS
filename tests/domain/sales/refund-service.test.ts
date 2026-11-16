@@ -520,6 +520,8 @@ function createClient(state: State): RefundServiceClient {
         },
       }),
     },
+    // The refund of an order pushed to a warehouse records its operator task in this transaction; these orders have no warehouse link.
+    wmsOrderPushLink: { findUnique: async () => null },
     integrationOutbox: {
       // o3d-67y: the durable reservation-release backstop is enqueued inside the refund tx when the order holds
       // allocations. These unit tests don't assert on the outbox, so this is a sink.
