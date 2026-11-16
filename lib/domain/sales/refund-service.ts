@@ -556,8 +556,14 @@ async function persistReturnCostSplit(
 }
 
 /**
- * Records, on the refund, which shipments the units it actually returned to stock came from. Later refunds replay it
- * (`buildRefundFallbackReturnRows`), so a unit staging took from one shipment is never priced again from that shipment.
+ * Records, on the refund, which shipments the units it actually returned to stock (or, in transit, the units its return
+ * expectation values) came from. Later refunds replay it (`buildRefundFallbackReturnRows`), so a unit staging took from
+ * one shipment is never priced again from that shipment.
+ *
+ * It records what was CLAIMED, not what is later received: an in-transit return that arrives short or long is cleared
+ * against the expectation by the receipt/write-off flow, and the per-line caps already count the refund's quantity, so
+ * the shipment record stays the refund's claim. Re-pricing it on receipt would move cost between refunds that have
+ * already been valued and journaled.
  */
 async function persistReturnShipmentQty(
   tx: Prisma.TransactionClient,
@@ -5373,6 +5379,9 @@ export async function createSalesOrderRefund(
         rows: fallbackReturnRows,
         valued: !accountingStagingFollows,
       })
+      // The shipments the document expects, recorded in the same transaction so a later refund replays them. Staging may
+      // restate the document from its own rows (below), which re-records them.
+      await persistReturnShipmentQty(tx, createdRefund.id, fallbackReturnRows)
     }
 
     // o3d-67y: eligibility is derived from RESIDUAL reserved quantity under this order lock, not lifecycle
@@ -5535,6 +5544,7 @@ export async function createSalesOrderRefund(
             rows: stagedRows.length > 0 ? stagedRows : txResult.fallbackReturnRows,
             transit: returnExpectationTransitLinkFromSyncs(result.accountingSyncs),
           })
+          await persistReturnShipmentQty(tx, txResult.createdRefund.id, stagedRows.length > 0 ? stagedRows : txResult.fallbackReturnRows)
         }
         await tx.salesOrderRefund.update({
           where: { id: txResult.createdRefund.id },
