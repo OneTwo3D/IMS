@@ -1590,6 +1590,14 @@ async function stageRefundAccountingReversals(
     /** scjz.70: revenue-only chargeback — suppress the COGS reversal (cost kept as a loss). */
     chargeback?: boolean
     /**
+     * ACC-H12: the order has NOT been deferred (not paid, or paid and waiting for Group A1) but shipments of it
+     * were costed straight out of Inventory when they shipped. The refund then owes the COGS reversal for the
+     * returned shipped units (DR Inventory / CR COGS, from the shipment snapshots) and nothing else: Group A2 never
+     * ran, so there is no Allocated Inventory pin to consume or reverse and no Unearned Revenue deferral to
+     * unwind. Unshipped quantity is left to the ordinary restock path.
+     */
+    costedShipmentsOnly?: boolean
+    /**
      * The refund's returned units are IN TRANSIT (a return expectation), not restocked: the COGS reversal then
      * debits Stock in Transit instead of Inventory. Read from the refund row (decided once at creation), never
      * from the live setting, so a retry stages the same treatment the first attempt did.
@@ -1657,8 +1665,12 @@ async function stageRefundAccountingReversals(
           where: { shipmentJournalDate: { not: null } },
           select: {
             id: true,
+            warehouseId: true,
             revenueRecognizedAmount: true,
             cogsBatchAmount: true,
+            // ACC-H12: shipments the batch costed straight out of Inventory. Their units never drew on an allocation
+            // pin, so they must not relieve one below, and their cost always reverses to Inventory.
+            cogsRelievedFromInventoryAt: true,
             // o3d-o97 r3: the CR Allocated Inventory Group B raised for this shipment, recorded by
             // Group B itself. The CogsEntry-derived fallback below it is HARD-DELETED by
             // `retention_stock_movements_months`.
@@ -1803,10 +1815,25 @@ async function stageRefundAccountingReversals(
     // nothing for this row — a KNOWN basis of zero — and it is mapped as such, so the row is not
     // pushed into the no-record branch below and counted as evidence of a missing basis.
     const postedAllocationUnitCostByAllocationId = new Map<string, number>()
+    // ACC-H12: units a shipment costed straight out of Inventory were never reclassified by Group A2, so the debit
+    // recorded on an allocation row covers only the rest of its quantity: dividing it by the whole row would price
+    // the units A2 DID debit at a fraction of their posted cost.
+    const costedShippedQtyByAllocationScope = new Map<string, number>()
+    for (const shipment of orderAccounting?.shipments ?? []) {
+      if (!shipment.cogsRelievedFromInventoryAt) continue
+      for (const line of shipment.lines) {
+        if (!line.productId) continue
+        const key = `${line.lineId}|${shipment.warehouseId}|${line.productId}`
+        costedShippedQtyByAllocationScope.set(key, (costedShippedQtyByAllocationScope.get(key) ?? 0) + refundBoundaryNumber(line.qty))
+      }
+    }
+    const aReclassifiedRowQty = (allocation: { lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal | number | string }): number => (
+      refundBoundaryNumber(allocation.qty) - (costedShippedQtyByAllocationScope.get(`${allocation.lineId}|${allocation.warehouseId}|${allocation.productId}`) ?? 0)
+    )
     for (const allocation of orderAccounting?.allocations ?? []) {
       if (allocation.allocationBatchAmount == null) continue
       const postedAmount = refundBoundaryNumber(allocation.allocationBatchAmount)
-      const allocatedQty = refundBoundaryNumber(allocation.qty)
+      const allocatedQty = aReclassifiedRowQty(allocation)
       if (allocatedQty <= 0) continue
       postedAllocationUnitCostByAllocationId.set(
         allocation.id,
@@ -1933,7 +1960,7 @@ async function stageRefundAccountingReversals(
     let unrecordedRowCount = 0
     const unrecordedRowProductIds = new Set<string>()
     for (const allocation of orderAccounting?.allocations ?? []) {
-      const rowQty = refundBoundaryNumber(allocation.qty)
+      const rowQty = Math.max(0, aReclassifiedRowQty(allocation))
       if (allocation.allocationBatchAmount != null) {
         recordedRowDebitTotal += Math.max(0, refundBoundaryNumber(allocation.allocationBatchAmount))
       } else if (rowQty > 0) {
@@ -2685,6 +2712,10 @@ async function stageRefundAccountingReversals(
     }
 
     for (const shipment of orderAccounting?.shipments ?? []) {
+      // ACC-H12: Group A2 pinned only the units still to ship when it ran for an order shipped before payment, so
+      // a costed shipment's units have nothing to relieve on the allocation row. Reducing the pin by them would
+      // consume units that are still allocated and strand their Allocated Inventory debit.
+      if (shipment.cogsRelievedFromInventoryAt) continue
       for (const shipmentLine of shipment.lines) {
         for (const entry of shipmentLineSnapshots.get(shipmentLine.id) ?? []) {
           if (!entry.orderAllocationId) continue
@@ -2863,7 +2894,7 @@ async function stageRefundAccountingReversals(
         if (lineAllocation.shippedQty > 0 && !params.chargeback && stockReturned) {
           costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
         }
-        if (lineAllocation.unshippedQty > 0) {
+        if (lineAllocation.unshippedQty > 0 && !params.costedShipmentsOnly) {
           costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
         }
       }
@@ -5115,7 +5146,11 @@ export async function createSalesOrderRefund(
         : 'MANUAL_UI'
     // Whether the accounting staging (and so the reversal journals) follows this transaction. ONE evaluation, used
     // both to arm the refund's accounting obligation and to decide whether its return document waits to be valued.
-    const accountingStagingFollows = Boolean(so.revenueDeferredDate && input.accountingSettings)
+    // ACC-H12: an order that is not deferred still owes a COGS reversal for stock that comes back from a shipment the
+    // batch costed on shipment, so staging follows for it too (the staging itself reverses only that cost).
+    const costedShipmentCount = so.revenueDeferredDate ? 0 : await tx.shipment.count({ where: { orderId: input.orderId, shipmentJournalDate: { not: null }, cogsRelievedFromInventoryAt: { not: null } } })
+    const costedShipmentsOnlyStaging = costedShipmentCount > 0
+    const accountingStagingFollows = Boolean((so.revenueDeferredDate || costedShipmentsOnlyStaging) && input.accountingSettings)
     // Under the order lock this transaction holds: the stamp it reads cannot change before the lines are written. Not read at all unless the caller says the switch is on.
     const schemeSnapshot = input.euVatSchemeSnapshot === true ? await resolveSchemePostingSnapshot(tx, input.orderId) : null
     // THE SCHEME DECISION, RECORDED EXPLICITLY: whenever the refund is created under the scheme path (the switch is on and the order is scheme-stamped, or it is unstamped and classified a scheme order on immutable evidence), regardless of whether any pricing field below could be filled, so a later switch-off
@@ -5439,6 +5474,7 @@ export async function createSalesOrderRefund(
       fallbackReturnRows,
       restockWarehouseId,
       returnInTransit,
+      costedShipmentsOnlyStaging,
     }
   }).catch((error) => {
     if (isRefundReturnSourceError(error)) {
@@ -5491,7 +5527,7 @@ export async function createSalesOrderRefund(
   let accountingSyncs: RefundAccountingSyncRequest[] = []
   let accountingWarning: string | undefined
   let snapshotReturnRows: RefundReturnRow[] | null = null
-  if (txResult.so.revenueDeferredDate && input.accountingSettings) {
+  if ((txResult.so.revenueDeferredDate || txResult.costedShipmentsOnlyStaging) && input.accountingSettings) {
     try {
       // ---------------------------------------------------------------------------------------
       // o3d-2sm1 — THE UN-STAGE AND THE RECORD OF WHAT IT STAGED ARE ONE COMMIT.
@@ -5527,6 +5563,7 @@ export async function createSalesOrderRefund(
           returnInTransit: txResult.returnInTransit,
           accountingSettings: input.accountingSettings!,
           so: txResult.so,
+          costedShipmentsOnly: !txResult.so.revenueDeferredDate && txResult.costedShipmentsOnlyStaging,
           newStatus: txResult.newStatus,
           chargeback: input.chargeback,
           activeConnector: input.activeAccountingConnector,
@@ -6170,7 +6207,21 @@ export async function retrySalesOrderRefundAccounting(
       // o3d-2sm1: THE ORDER'S DEFERRAL BEING GONE IS NOT PROOF THAT NOTHING WAS OWED — it is
       // equally what a full refund's OWN un-stage leaves behind. Which of the two this row is, is
       // decided by `reversalRecordVerdict`, never by the missing date on its own.
-      if (!refund.order.revenueDeferredDate) {
+      // ACC-H12: A COSTED-ON-SHIPMENT REFUND WHOSE STAGING NEVER COMMITTED IS RE-STAGED, NOT DISMISSED.
+      //
+      // Such a refund owes its accounting (the flag is set at creation) while the order has no deferral stamp, so the
+      // branch below would read "no deferral" as "nothing owed" and return success with no syncs, and the caller would
+      // clear the flag over a COGS reversal that was never queued. The row's own witness tells the two apart exactly:
+      // `NOT_STAGED` is written at INSERT and the staging transaction flips it to `STAGED` in the same commit that records
+      // the syncs, so NOT_STAGED with no recorded syncs means staging demonstrably never committed; and an order with
+      // no deferral stamp that still has a costed shipment can only have armed the flag for that reason (a full
+      // refund's own un-stage writes STAGED). The reversal of a costed shipment is derived from the shipment's own
+      // snapshots, which a deferral stamp is not needed for, so it is re-derived here, once, in this transaction.
+      const costedOnlyRestage = !refund.order.revenueDeferredDate
+        && refund.accountingRetrySyncs == null
+        && refund.reversalStagingState === REVERSAL_STAGING_NOT_STAGED
+        && (await tx.shipment.count({ where: { orderId: refund.orderId, shipmentJournalDate: { not: null }, cogsRelievedFromInventoryAt: { not: null } } })) > 0
+      if (!refund.order.revenueDeferredDate && !costedOnlyRestage) {
         // Re-staging is not the alternative on either branch below, and the omission is worth
         // stating: every reversal amount is derived from the stamps the un-stage removed. A re-stage
         // here would take no residue and record no refusal — a fabricated figure in place of a
@@ -6264,6 +6315,7 @@ export async function retrySalesOrderRefundAccounting(
         newStatus,
         chargeback: refund.chargeback,
         activeConnector: input.activeAccountingConnector,
+        ...(costedOnlyRestage ? { costedShipmentsOnly: true } : {}),
       })
 
       let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []

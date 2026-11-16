@@ -26,7 +26,7 @@ import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import {
   StaleDailyBatchDeferralError,
   assertRevenueDeferralsUnchanged,
-  preBatchRefundAdjustments,
+  preBatchRefundDeferredParts,
   preBatchRefundsNettedIntoStoredDeferral,
   revenueDeferralGrossAmount,
   logStaleDailyBatchDeferral,
@@ -59,7 +59,9 @@ import {
 } from '@/lib/cost-layer-snapshots'
 import {
   assertGroupBSnapshotsWereLocked,
-  DAILY_BATCH_GROUP_B_SHIPMENT_WHERE,
+  groupBShipmentWhere,
+  groupBShipmentBelongsToPass,
+  shippedBeforePayment,
   lockCostLayersForGroupBWindow,
 } from '@/lib/domain/accounting/daily-batch-group-b-lock'
 import { addMoney, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -221,6 +223,13 @@ export type A2AllocationRow = {
 export type A2ShipmentRow<TLine> = {
   warehouseId: string
   lines: TLine[]
+  /**
+   * ACC-H12: set when the daily batch already relieved this shipment's COGS straight out of Inventory
+   * (DR COGS / CR Inventory) because the order had not been deferred when the goods left. Its units are
+   * COSTED: Allocated Inventory never held a debit for them, so Group A2 neither values them from the
+   * shipment snapshots nor counts them against the allocation row's pin.
+   */
+  cogsRelievedFromInventoryAt?: Date | string | null
 }
 
 /**
@@ -283,11 +292,16 @@ export function planA2Reclassification<TLine extends { lineId: string; productId
 } {
   const scopeKey = (lineId: string, warehouseId: string, productId: string) => `${lineId}|${warehouseId}|${productId}`
   const shippedQtyByScope = new Map<string, Decimal>()
+  // ACC-H12: units a direct-to-Inventory shipment already costed. They are neither dispatched-and-unrecorded
+  // (A2 would value them from the shipment snapshots and debit Allocated Inventory for stock that was never
+  // allocated-and-pinned) nor part of what is still to be pinned, so they come off the row's allocated quantity.
+  const costedQtyByScope = new Map<string, Decimal>()
   for (const shipment of order.shipments) {
+    const target = shipment.cogsRelievedFromInventoryAt ? costedQtyByScope : shippedQtyByScope
     for (const line of shipment.lines) {
       if (!line.productId) continue
       const key = scopeKey(line.lineId, shipment.warehouseId, line.productId)
-      shippedQtyByScope.set(key, (shippedQtyByScope.get(key) ?? toDecimal(0)).add(toDecimal(line.qty)))
+      target.set(key, (target.get(key) ?? toDecimal(0)).add(toDecimal(line.qty)))
     }
   }
 
@@ -298,7 +312,12 @@ export function planA2Reclassification<TLine extends { lineId: string; productId
     const snapshot = parseCostLayerSnapshot(alloc.costLayerSnapshot)
     const shippedQty = shippedQtyByScope.get(scopeKey(alloc.lineId, alloc.warehouseId, alloc.productId)) ?? 0
     const { accounted, unrecordedShippedQty } = accountedAllocationQty({ snapshot, shippedQty })
-    const outstanding = unaccountedAllocationQty({ allocatedQty: alloc.qty, snapshot, shippedQty })
+    const costedQty = costedQtyByScope.get(scopeKey(alloc.lineId, alloc.warehouseId, alloc.productId))
+    const outstanding = unaccountedAllocationQty({
+      allocatedQty: costedQty ? toDecimal(alloc.qty).sub(costedQty) : alloc.qty,
+      snapshot,
+      shippedQty,
+    })
     if (outstanding.gt(0)) outstandingByAllocation.set(alloc.id, outstanding)
     // Recorded even when the row owes nothing else: the record is what stops the NEXT pass
     // re-deriving these units from an overlap it cannot resolve, which is the double post.
@@ -964,7 +983,18 @@ export async function recreateMissingDailyBatchLogs(
       unearnedRevenueAmount: true,
       // ACC-H13: the paid-day journal carries the GROSS deferral; pre-batch refunds are separate adjustment
       // journals. The stored amount is net, so the refunds that were netted are added back here.
-      refunds: { select: { totalBase: true, totalsBasis: true, deferralAdjustmentRef: true } },
+      refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true, deferralAdjustmentRef: true } },
+      // ACC-H12: the revenue shipments recognised before the deferral, which the paid-day journal leaves out. Such an
+      // order is rebuilt from its gross figure (see below), so the inputs of that figure ride along.
+      shipments: { where: { cogsRelievedFromInventoryAt: { not: null } }, select: { revenueRecognizedAmount: true } },
+      subtotalBase: true,
+      shippingBase: true,
+      discountAmount: true,
+      pricesIncludeVat: true,
+      taxRatePercent: true,
+      fxRateToBase: true,
+      shoppingLinks: { select: { connector: true } },
+      lines: { select: { totalBase: true, taxRate: { select: { rate: true } } } },
     },
   })
   const orphanA2Orders = await db.salesOrder.findMany({
@@ -994,7 +1024,7 @@ export async function recreateMissingDailyBatchLogs(
   })
   const orphanBShipments = await db.shipment.findMany({
     where: { shipmentJournalDate: journaledDateFilter },
-    select: { id: true, shipmentJournalDate: true, shipmentJournalBatchRef: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
+    select: { id: true, shipmentJournalDate: true, shipmentJournalBatchRef: true, revenueRecognizedAmount: true, cogsBatchAmount: true, cogsRelievedFromInventoryAt: true, cogsRelievedFromInventoryAmount: true },
   })
 
   const adjustmentBatches = new Map<string, DailyBatchRecreateBucket<{ refundCount: number; total: number }>>()
@@ -1002,6 +1032,11 @@ export async function recreateMissingDailyBatchLogs(
   // from the same orders (same retention window and cut-off) as the paid-day batches, so a lost adjustment is
   // rebuilt exactly once.
   for (const order of orphanA1Orders) {
+    // ACC-H12: with revenue shipped before payment only the deferred part of a refund was adjusted against Unearned.
+    const shippedBeforeDeferral = (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
+    const deferredPartByRefundId = shippedBeforeDeferral > 0
+      ? new Map(preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount({ id: '', ...order }), shippedBeforeDeferral).map((part) => [part.refundId, part.deferredPart]))
+      : null
     for (const refund of order.refunds ?? []) {
       if (!refund.deferralAdjustmentRef) continue
       const summary = foldDailyBatchRow(
@@ -1012,7 +1047,7 @@ export async function recreateMissingDailyBatchLogs(
       )
       if (!summary) continue
       summary.refundCount += 1
-      summary.total += Number(refund.totalBase ?? 0)
+      summary.total += deferredPartByRefundId ? (deferredPartByRefundId.get(refund.id) ?? 0) : Number(refund.totalBase ?? 0)
     }
   }
 
@@ -1027,7 +1062,12 @@ export async function recreateMissingDailyBatchLogs(
     if (!summary) continue
     summary.orderCount += 1
     const nettedBack = preBatchRefundsNettedIntoStoredDeferral(order)
-    summary.total += Number(order.unearnedRevenueAmount ?? 0) + nettedBack
+    const shippedBeforeDeferral = (order.shipments ?? []).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
+    // ACC-H12: the paid-day journal of an order with revenue shipped before payment is its gross deferral less that
+    // revenue, whatever refunds were netted or not (the stored figure then also carries refunds of shipped goods).
+    summary.total += shippedBeforeDeferral > 0
+      ? Math.max(0, revenueDeferralGrossAmount({ id: '', ...order }) - shippedBeforeDeferral)
+      : Number(order.unearnedRevenueAmount ?? 0) + nettedBack
   }
 
   // o3d-i0o6 r5 (Codex round 4, HIGH 1) — THE LEDGER THIS SWEEP WOULD POST INTO, NAMED ONCE.
@@ -1059,18 +1099,26 @@ export async function recreateMissingDailyBatchLogs(
     }
   }
 
-  const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number; shipments: Array<{ id: string; cogs: number }> }>>()
+  const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number; inventoryCogs: number; shipments: Array<{ id: string; cogs: number }> }>>()
   for (const shipment of orphanBShipments) {
     const summary = foldDailyBatchRow(
       bBatches,
       'B',
       { stagedAt: shipment.shipmentJournalDate, persistedRef: shipment.shipmentJournalBatchRef },
-      () => ({ shipmentCount: 0, revenue: 0, cogs: 0, shipments: [] }),
+      () => ({ shipmentCount: 0, revenue: 0, cogs: 0, inventoryCogs: 0, shipments: [] }),
     )
     if (!summary) continue
-    const shipmentCogs = Number(shipment.cogsBatchAmount ?? 0)
+    // ACC-H12: a shipment costed straight out of Inventory is rebuilt at the amount that journal ORIGINALLY posted, which
+    // is recorded once and never revalued. `cogsBatchAmount` is rewritten in place by landed-cost revaluation, which
+    // posts its own correction separately, so using it here would count that correction twice.
+    const shipmentCogs = shipment.cogsRelievedFromInventoryAt && shipment.cogsRelievedFromInventoryAmount != null
+      ? Number(shipment.cogsRelievedFromInventoryAmount)
+      : Number(shipment.cogsBatchAmount ?? 0)
     summary.shipmentCount += 1
-    summary.revenue += Number(shipment.revenueRecognizedAmount ?? 0)
+    // ACC-H12: a shipment costed straight out of Inventory recorded its revenue share but posted no revenue leg
+    // (the invoice booked it), and its COGS credit went to Inventory rather than Allocated Inventory.
+    if (shipment.cogsRelievedFromInventoryAt) summary.inventoryCogs += shipmentCogs
+    else summary.revenue += Number(shipment.revenueRecognizedAmount ?? 0)
     summary.cogs += shipmentCogs
     // bcz9.3: carry the per-shipment list so the recreate path can write the same
     // per-shipment DISPATCH ledger rows the live dispatch path writes.
@@ -1294,10 +1342,11 @@ export async function recreateMissingDailyBatchLogs(
       )
     }
     if (round2(summary.cogs) > 0) {
-      lines.push(
-        { accountCode: settings.xero_cogs_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, debit: round2(summary.cogs) },
-        { accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, credit: round2(summary.cogs) },
-      )
+      const inventoryCredit = Math.min(round2(summary.inventoryCogs), round2(summary.cogs))
+      const allocatedCredit = round2(round2(summary.cogs) - inventoryCredit)
+      lines.push({ accountCode: settings.xero_cogs_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, debit: round2(summary.cogs) })
+      if (allocatedCredit > 0) lines.push({ accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, credit: allocatedCredit })
+      if (inventoryCredit > 0) lines.push({ accountCode: settings.xero_inventory_account, description: `COGS shipped before payment — ${summary.shipmentCount} shipment(s)`, credit: inventoryCredit })
     }
     await db.$transaction(async (tx) => {
       await createPendingSyncLog(tx, {
@@ -1544,6 +1593,783 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     // skipped silently — it is the one outcome where a human has to decide whether to re-post.
     result.errors.push(...await recreateMissingDailyBatchLogs(settings, baseCurrency, negativeBasisRefusals, lockDate))
 
+  // --- Group B: Shipment Revenue Recognition + COGS ---
+  //
+  // ACC-H12: RUN IN TWO PASSES, THE DIRECT ONE FIRST. A shipment that left while its order was not yet deferred is
+  // costed straight out of Inventory (DR COGS / CR Inventory) on the day it shipped. That decision must not depend on
+  // whether payment, Group A1 and Group A2 happened to run first: if A1 and A2 ran before it, the order would be
+  // stamped, the shipment would take the ordinary path, A2 would reclassify its units through Allocated Inventory and
+  // its COGS would be dated at the payment day. So the direct pass runs BEFORE A1 and A2, while the deferral stamp still
+  // says what the order's state was when the goods left. A2 and A1 then see the marker and skip or net the costed units,
+  // and Allocated Inventory nets to zero. The ordinary pass (paid, deferred, allocated) stays after A2 as before.
+  const runGroupB = async (mode: 'direct' | 'paid'): Promise<void> => {
+  groupBSkip: try {
+    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
+    // so from that moment another batch — or a refund, which shares this domain
+    // — can start while we are still writing. Stop instead.
+    batchLock.assertHeld('Group B (shipment revenue + COGS)')
+    if (lockBlocked) {
+      if (mode === 'paid') await reportLockBlocksRun('B', lockDate)
+      break groupBSkip
+    }
+    const bPostedGroups: Array<{ date: string; movedFromLockedDays: string[] }> = []
+    const groupBCount = await db.$transaction(async (tx) => {
+      // o3d-c08y r2 (Codex HIGH): PROBE -> LOCK -> READ. This window's ids are read first, every cost
+      // layer their data references is locked, and only then is the data itself read — under those
+      // locks. Reading the snapshots first and locking afterwards let a landed-cost revaluation commit
+      // a negative basis in between and be posted from the stale positive copy (measured; see
+      // lib/domain/accounting/daily-batch-group-b-lock.ts). The same read also REVALIDATES status: a
+      // shipment that stopped qualifying while we waited for the lock is simply not returned.
+      const candidateWindow = takeDailyBatchWindow(await tx.shipment.findMany({
+        where: groupBShipmentWhere(mode),
+        select: { id: true, orderId: true, createdAt: true, shippedAt: true, order: { select: { revenueDeferredDate: true, paidAt: true } }, lines: { select: { costLayerSnapshot: true } } },
+        orderBy: { createdAt: 'asc' },
+        take: batchLimit + 1,
+      }), batchLimit)
+      result.hasMore.groupB = result.hasMore.groupB || candidateWindow.hasMore
+      // The where-clause already splits the passes by the order's deferral stamp; restating it on the probe rows means a pass
+      // with nothing of its own takes no lock and reads nothing (the stamp is only written by Group A1, under this lock).
+      candidateWindow.rows = candidateWindow.rows.filter((row) => groupBShipmentBelongsToPass(mode, row))
+      if (candidateWindow.rows.length === 0) return 0
+      const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
+      const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates: candidateWindow.rows })
+
+      const shipmentRows = await tx.shipment.findMany({
+        where: { ...groupBShipmentWhere(mode), id: { in: candidateShipmentIds } },
+        select: {
+          id: true,
+          orderId: true,
+          warehouseId: true,
+          createdAt: true,
+          // ACC-H11: the day the goods left, which dates the journal.
+          shippedAt: true,
+          cogsBatchAmount: true,
+          lines: {
+            select: {
+              id: true,
+              lineId: true,
+              productId: true,
+              qty: true,
+              costLayerSnapshot: true,
+              line: {
+                select: { id: true, productId: true, qty: true, totalBase: true },
+              },
+            },
+          },
+          order: {
+            select: {
+              orderNumber: true,
+              externalOrderNumber: true,
+              status: true,
+              refundStatus: true,
+              // ACC-H11: Group B never dates a journal before the payment that created the deferral it draws on.
+              paidAt: true,
+              totalBase: true,
+              unearnedRevenueAmount: true,
+              // ACC-H12: an order with no deferral stamp is on the COGS-on-shipment path, and the revenue share
+              // its shipments record is sized from the same figure Group A1 will later defer.
+              revenueDeferredDate: true,
+              fxRateToBase: true,
+              subtotalBase: true,
+              shippingBase: true,
+              discountAmount: true,
+              pricesIncludeVat: true,
+              taxRatePercent: true,
+              shoppingLinks: { select: { connector: true } },
+              refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
+              lines: {
+                select: {
+                  id: true,
+                  productId: true,
+                  qty: true,
+                  totalBase: true,
+                  taxRate: { select: { rate: true } },
+                  // o3d-kouj: the recipe this line was allocated from. Group B's per-line component
+                  // requirements decide which shipped component units belong to which sales line, and
+                  // the basis it relieves was recorded in exactly those units at dispatch.
+                  fulfillmentRequirements: true,
+                },
+              },
+              shipments: {
+                select: {
+                  id: true,
+                  status: true,
+                  shipmentJournalDate: true,
+                  revenueRecognizedAmount: true,
+                },
+              },
+            },
+          },
+        },
+        orderBy: { createdAt: 'asc' },
+      })
+
+      // The where-clause already splits the two passes by the order's deferral stamp; this restates it on the rows read,
+      // so a pass can never process the other pass's shipment (the stamp is only ever written by Group A1, under this lock).
+      const shipments = shipmentRows.filter((shipment) => groupBShipmentBelongsToPass(mode, shipment))
+
+      if (shipments.length === 0) {
+        return 0
+      }
+
+      const layerDecrements = new Map<string, number>()
+      const shipmentResults = new Map<string, { revenue: number; cogs: number }>()
+      const shipmentSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+      const shipmentsByOrder = new Map<string, typeof shipments>()
+      const orderIds = Array.from(new Set(shipments.map((shipment) => shipment.orderId)))
+
+      const [orderAllocations, priorShipmentLines, priorRefundLines] = await Promise.all([
+        tx.orderAllocation.findMany({
+          where: { orderId: { in: orderIds } },
+          select: {
+            id: true,
+            orderId: true,
+            lineId: true,
+            productId: true,
+            warehouseId: true,
+            costLayerSnapshot: true,
+          },
+        }),
+        tx.shipmentLine.findMany({
+          where: {
+            shipment: {
+              orderId: { in: orderIds },
+              shipmentJournalDate: { not: null },
+              // ACC-H12: units a direct-to-Inventory shipment costed never drew on an allocation pin (Group A2
+              // pins only what is still to ship), so they must not relieve one here.
+              cogsRelievedFromInventoryAt: null,
+            },
+          },
+          select: {
+            costLayerSnapshot: true,
+          },
+        }),
+        tx.salesOrderRefundLine.findMany({
+          where: {
+            refund: {
+              orderId: { in: orderIds },
+            },
+          },
+          select: {
+            costLayerSnapshot: true,
+          },
+        }),
+      ])
+
+      // o3d-c08y r2: the locks were taken above, BEFORE any of this was read. What is asserted here is
+      // the closure that makes that sound — everything just loaded stays inside the locked set, so no
+      // value below can still be changed by a concurrent revaluation. A miss skips the window with a
+      // named error rather than posting from a value that may already be stale.
+      assertGroupBSnapshotsWereLocked(lockedCostLayerIds, [
+        { what: 'the shipment lines it would post', rows: shipments.flatMap((shipment) => shipment.lines) },
+        { what: 'the order allocations it would consume from', rows: orderAllocations },
+        { what: 'the already-journaled shipment lines it nets against', rows: priorShipmentLines },
+        { what: 'the refund lines it nets against', rows: priorRefundLines },
+      ])
+      const graph = await loadFulfillmentProductGraph(
+        tx,
+        Array.from(new Set(
+          shipments.flatMap((shipment) => (
+            shipment.order.lines.map((line) => line.productId).filter((value): value is string => !!value)
+          )),
+        )),
+      )
+
+      // --- scjz.68: refund-reversal-aware deferred-revenue true-up inputs ---
+      // (1) posted UNEARNED_REV_REVERSAL per order — deferred revenue a refund credit
+      //     note already took out of the unearned account, which the true-up must not
+      //     recognize again; (2) for PARTIALLY_REFUNDED orders, the per-line coverage
+      //     used to decide whether the order is fully shipped net of refunds.
+      const allocationById = new Map(orderAllocations.map((allocation) => [allocation.id, allocation]))
+      const partialOrderIds = new Set(
+        shipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
+      )
+
+      const refunds = await tx.salesOrderRefund.findMany({
+        where: { orderId: { in: orderIds } },
+        select: { id: true, orderId: true },
+      })
+      const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
+      // o3d-3la07 (M5, D3: REPORT-ONLY). The netting below still sums exactly the PENDING / PROCESSING /
+      // SYNCED rows it always did (`countedUnearnedReversalRows`); the read is widened by the CANCELLED
+      // rows that may have reached the ledger so the per-order warning can name them. No arithmetic moves.
+      const reversalSyncs = await tx.accountingSyncLog.findMany({
+        where: {
+          AND: [
+            { connector: 'xero', type: 'UNEARNED_REV_REVERSAL' },
+            UNEARNED_REVERSAL_NETTING_WHERE,
+            {
+              OR: [
+                { referenceType: 'SalesOrder', referenceId: { in: orderIds } },
+                { referenceType: 'SalesOrderRefund', referenceId: { in: refunds.map((refund) => refund.id) } },
+              ],
+            },
+          ],
+        },
+        select: { id: true, referenceType: true, referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
+      })
+      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+      const reversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
+      for (const sync of reversalSyncs) {
+        const targetOrderId = sync.referenceType === 'SalesOrder'
+          ? sync.referenceId
+          : refundIdToOrderId.get(sync.referenceId)
+        if (!targetOrderId) continue
+        const allRows = reversalStandingRowsByOrder.get(targetOrderId) ?? []
+        allRows.push(sync)
+        reversalStandingRowsByOrder.set(targetOrderId, allRows)
+      }
+      for (const [targetOrderId, allRows] of reversalStandingRowsByOrder) {
+        reversalSyncsByOrder.set(
+          targetOrderId,
+          countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload })),
+        )
+      }
+
+      const shippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
+      const refundedUnshippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
+      if (partialOrderIds.size > 0) {
+        const dispatchedShipmentLines = await tx.shipmentLine.findMany({
+          where: { shipment: { orderId: { in: [...partialOrderIds] }, status: 'SHIPPED' } },
+          select: { lineId: true, productId: true, qty: true, shipment: { select: { orderId: true } } },
+        })
+        for (const line of dispatchedShipmentLines) {
+          if (!line.productId) continue
+          const rows = shippedRowsByOrder.get(line.shipment.orderId) ?? []
+          rows.push({ lineId: line.lineId, productId: line.productId, qty: Number(line.qty) })
+          shippedRowsByOrder.set(line.shipment.orderId, rows)
+        }
+        // Returns of shipped units (shipment-source) do not reduce the ship
+        // obligation, so only allocation-source (unshipped) refund qty counts.
+        for (const refundLine of priorRefundLines) {
+          for (const entry of parseCostLayerSnapshot(refundLine.costLayerSnapshot)) {
+            if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
+            const allocation = allocationById.get(entry.orderAllocationId)
+            if (!allocation?.productId || !partialOrderIds.has(allocation.orderId)) continue
+            const rows = refundedUnshippedRowsByOrder.get(allocation.orderId) ?? []
+            rows.push({ lineId: allocation.lineId, productId: allocation.productId, qty: toDecimal(entry.qty).toNumber() })
+            refundedUnshippedRowsByOrder.set(allocation.orderId, rows)
+          }
+        }
+      }
+
+      const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
+      for (const allocation of orderAllocations) {
+        allocationAvailability.set(
+          allocation.id,
+          parseCostLayerSnapshot(allocation.costLayerSnapshot),
+        )
+      }
+
+      for (const priorShipmentLine of priorShipmentLines) {
+        for (const entry of parseCostLayerSnapshot(priorShipmentLine.costLayerSnapshot)) {
+          if (!entry.orderAllocationId) continue
+          const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          // Relieve the allocation contra by QTY, not by exact costLayerId: a
+          // dispatch consumes FIFO-oldest layers that can differ from the layers
+          // the allocation pinned, so a costLayerId match would strand the
+          // Allocated-Inventory contra (cogs-audit scjz.21).
+          allocationAvailability.set(
+            entry.orderAllocationId,
+            reduceSnapshotByQty(available, entry.qty),
+          )
+        }
+      }
+
+      for (const priorRefundLine of priorRefundLines) {
+        for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
+          if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
+          const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          // Qty-based, matching the shipment relief above, so allocation availability
+          // tracking is consistent and order-independent in total relieved qty (scjz.21).
+          allocationAvailability.set(
+            entry.orderAllocationId,
+            reduceSnapshotByQty(available, entry.qty),
+          )
+        }
+      }
+
+      for (const shipment of shipments) {
+        const existing = shipmentsByOrder.get(shipment.orderId) ?? []
+        existing.push(shipment)
+        shipmentsByOrder.set(shipment.orderId, existing)
+      }
+
+      for (const [orderId, orderShipments] of shipmentsByOrder) {
+        const firstShipment = orderShipments[0]
+        // Wrap per-order processing so a single order with a COGS gap
+        // (e.g. cross-warehouse allocation mismatch, missing cost layers)
+        // is skipped with an error log instead of aborting the entire
+        // daily batch and rolling back every other order's revenue
+        // recognition and COGS posting.
+        try {
+        const orderLayerDecrements = new Map<string, number>()
+        const negativeBasisOrder = {
+          orderId,
+          orderRef: firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8),
+        }
+        // ACC-H12: an order Group A1 has not deferred yet is costed on shipment (DR COGS / CR Inventory). Its
+        // shipments still record their revenue share, sized from the figure A1 will store as the deferral, but
+        // post no revenue leg: the invoice already put the revenue in Sales.
+        const costedOnShipment = firstShipment.order.revenueDeferredDate === null
+        const deferredBase = costedOnShipment
+          ? revenueDeferralAmount({ id: orderId, ...firstShipment.order })
+          : Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
+        const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
+        const requirementsByLine = new Map(
+          firstShipment.order.lines
+            .filter((line) => !!line.productId)
+            .map((line) => [
+              line.id,
+              lineFulfillmentRequirements(line, graph).map((requirement) => ({
+                productId: requirement.productId,
+                factor: requirement.factor.toNumber(),
+              })),
+            ]),
+        )
+        const orderLineById = new Map(firstShipment.order.lines.map((line) => [line.id, line]))
+        const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
+          shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
+        ), 0)
+        // scjz.68: subtract deferred revenue a refund credit note already reversed
+        // out of the unearned account so the true-up never re-recognizes it.
+        const postedUnearnedReversal = sumPostedUnearnedReversal(
+          reversalSyncsByOrder.get(orderId) ?? [],
+          settings.xero_unearned_revenue_account,
+        )
+        // o3d-3la07 (M5, D3): say which rows the netting rests on that are not ledger facts.
+        const unearnedStanding = unearnedReversalStandingReport(reversalStandingRowsByOrder.get(orderId) ?? [])
+        const unearnedReport = describeUnearnedReversalReport(
+          firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8),
+          unearnedStanding,
+        )
+        if (unearnedReport) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: orderId,
+            action: 'daily_batch_unearned_reversal_netting_unproven',
+            tag: 'sync',
+            level: 'WARNING',
+            description: unearnedReport,
+            metadata: { orderId, ...unearnedStanding },
+            resolveUser: false,
+          }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
+        }
+        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
+        let runningRevenue = 0
+
+        // scjz.68: a fully-shipped terminal order trues up the remainder; a
+        // PARTIALLY_REFUNDED order may too, but only once every shippable line is
+        // shipped net of refunds. Either way hold the true-up until this batch holds
+        // the order's final dispatched-but-unjournaled shipment, so a batch-window
+        // split cannot recognize a later shipment's revenue early.
+        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status) && firstShipment.order.refundStatus !== 'PARTIAL'
+        if (!isTrueUpEligible && firstShipment.order.refundStatus === 'PARTIAL') {
+          const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
+            ...(shippedRowsByOrder.get(orderId) ?? []),
+            ...(refundedUnshippedRowsByOrder.get(orderId) ?? []),
+          ])
+          isTrueUpEligible = isFullyShippedNetOfRefunds(
+            firstShipment.order.lines
+              .filter((line) => !!line.productId)
+              .map((line) => ({
+                orderedQty: Number(line.qty),
+                coveredQty: combinedCoverageByLine.get(line.id) ?? 0,
+              })),
+          )
+        }
+        if (isTrueUpEligible) {
+          isTrueUpEligible = batchContainsFinalUnjournaledShipment(
+            firstShipment.order.shipments.filter((shipment) => shipment.status === 'SHIPPED'),
+            new Set(orderShipments.map((shipment) => shipment.id)),
+          )
+        }
+
+        for (let index = 0; index < orderShipments.length; index++) {
+          const shipment = orderShipments[index]
+          const shippedCoverageByLine = calculateCoverageByLine(
+            requirementsByLine,
+            shipment.lines.map((line) => ({
+              lineId: line.lineId,
+              productId: line.productId,
+              qty: Number(line.qty),
+            })),
+          )
+          const shipmentLineValue = [...shippedCoverageByLine.entries()].reduce((sum, [lineId, coveredQty]) => {
+            const line = orderLineById.get(lineId)
+            const lineQty = Number(line?.qty ?? 0)
+            if (!line || lineQty <= 0 || coveredQty <= 0) return sum
+            return sum + (Number(line.totalBase) * Math.min(coveredQty, lineQty)) / lineQty
+          }, 0)
+
+          const proportionalRevenue = orderLineTotal > 0
+            ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
+            : 0
+          const revenueProportion = recognizeShipmentRevenue({
+            proportionalRevenue,
+            remainingDeferred,
+            runningRevenue,
+            isFinalShipmentOfFullyShippedTerminalOrder:
+              isTrueUpEligible && index === orderShipments.length - 1,
+          })
+
+          // COGS: prefer immutable shipment-line snapshots when present.
+          // This ensures retrospective landed-cost updates flow through
+          // stored shipment COGS without re-consuming inventory.
+          const shipmentSnapshotsForLines = shipment.lines.map((line) => (
+            parseCostLayerSnapshot(line.costLayerSnapshot)
+          ))
+          const hasPrecomputedSnapshots = shipmentSnapshotsForLines.some((entries) => entries.length > 0)
+          const precomputedCogs = hasPrecomputedSnapshots
+            ? roundQuantity(
+                shipmentSnapshotsForLines.reduce(
+                  (sum, entries) => addMoney(sum, sumCostLayerSnapshot(entries)),
+                  toDecimal(0),
+                ),
+                2,
+              )
+            : toDecimal(shipment.cogsBatchAmount ?? 0)
+          const precomputedCogsNumber = precomputedCogs.toNumber()
+          // o3d-sidy: before anything is accumulated, so a refusal leaves nothing behind.
+          if (hasPrecomputedSnapshots) refuseNegativeBasisShipmentCogs(negativeBasisOrder, shipment.id, shipmentSnapshotsForLines.flat())
+          if (hasPrecomputedSnapshots) {
+            const missingSnapshotLines = shipment.lines.filter((line, lineIndex) => (
+              Number(line.qty) > 0 && shipmentSnapshotsForLines[lineIndex].length === 0
+            ))
+            if (missingSnapshotLines.length > 0) {
+              throw new Error(`Incomplete precomputed FIFO snapshots for shipment ${shipment.id}`)
+            }
+            const cogsBatchAmount = Number(shipment.cogsBatchAmount ?? 0)
+            if (cogsBatchAmount > 0 && Math.abs(round2(cogsBatchAmount) - precomputedCogsNumber) > 0.01) {
+              throw new Error(`Precomputed COGS mismatch for shipment ${shipment.id}: batch ${round2(cogsBatchAmount).toFixed(2)} != snapshots ${precomputedCogsNumber.toFixed(2)}`)
+            }
+          }
+
+          // If no pre-computed COGS and no snapshots, fall back to the
+          // legacy allocation-based consumption path for backward compat.
+          if (!hasPrecomputedSnapshots && precomputedCogs.lte(0)) {
+            const shipmentCostSnapshot: CostLayerSnapshotEntry[] = []
+            for (const sl of shipment.lines) {
+              let remainingQty = Number(sl.qty)
+              const matchingAllocations = orderAllocations.filter((allocation) => (
+                allocation.orderId === shipment.orderId
+                && allocation.lineId === sl.lineId
+                && allocation.productId === sl.productId
+                && allocation.warehouseId === shipment.warehouseId
+              ))
+
+              for (const allocation of matchingAllocations) {
+                if (remainingQty <= 0) break
+                const availableEntries = allocationAvailability.get(allocation.id) ?? []
+                const consumed = takeFromSnapshotEntries(availableEntries, remainingQty, {
+                  orderAllocationId: allocation.id,
+                  shipmentLineId: sl.id,
+                  source: 'shipment',
+                })
+                shipmentCostSnapshot.push(...consumed.taken)
+                remainingQty = consumed.remainingQty
+                allocationAvailability.set(
+                  allocation.id,
+                  reduceSnapshotByCostLayer(
+                    availableEntries,
+                    consumed.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+                  ),
+                )
+              }
+
+              if (remainingQty > 0.0000001) {
+                throw new Error(`Missing allocated cost layers for shipment line ${sl.id}`)
+              }
+            }
+
+            // o3d-sidy: the allocation snapshots are rewritten in place by the same revaluation.
+            refuseNegativeBasisShipmentCogs(negativeBasisOrder, shipment.id, shipmentCostSnapshot)
+
+            for (const entry of shipmentCostSnapshot) {
+              orderLayerDecrements.set(
+                entry.costLayerId,
+                (orderLayerDecrements.get(entry.costLayerId) ?? 0) + toDecimal(entry.qty).toNumber(),
+              )
+            }
+
+            const legacyCogs = roundQuantity(sumCostLayerSnapshot(shipmentCostSnapshot), 2)
+            const legacyCogsNumber = legacyCogs.toNumber()
+            runningRevenue += revenueProportion
+            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: legacyCogsNumber })
+            for (const sl of shipment.lines) {
+              shipmentSnapshots.set(
+                sl.id,
+                shipmentCostSnapshot.filter((entry) => entry.shipmentLineId === sl.id),
+              )
+            }
+          } else {
+            // Pre-computed path — snapshots already stored on shipment lines
+            runningRevenue += revenueProportion
+            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: precomputedCogsNumber })
+            // Snapshots are already on the shipment lines — no need to
+            // write them again or track layerDecrements (already consumed)
+          }
+        }
+        // Only publish legacy FIFO decrements after the whole order succeeds.
+        // Failed orders keep shipmentJournalDate null and must not mutate layer
+        // balances before their next retry.
+        for (const [layerId, decrement] of orderLayerDecrements) {
+          layerDecrements.set(layerId, (layerDecrements.get(layerId) ?? 0) + decrement)
+        }
+        } catch (orderError) {
+          // Per-order failure: skip this order, log the error, continue
+          // with remaining orders so the batch isn't blocked by one bad order.
+          const orderRef = firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)
+          // o3d-sidy: a negative-basis refusal is reported with the others at the end of the run —
+          // first in the errors and as an ERROR activity entry. See NegativeCostBasisRefusal.
+          if (orderError instanceof NegativeCostBasisRefusal) negativeBasisRefusals.push(orderError)
+          else result.errors.push(`Group B order ${orderRef}: ${String(orderError)}`)
+          // Remove any partially-accumulated results for this order's shipments
+          for (const s of orderShipments) {
+            const sr = shipmentResults.get(s.id)
+            if (sr) {
+              shipmentResults.delete(s.id)
+            }
+            for (const sl of s.lines) shipmentSnapshots.delete(sl.id)
+          }
+        }
+      }
+
+      const processedShipmentCount = shipmentResults.size
+
+      // ACC-H11: ONE JOURNAL PER EVENT DATE. A shipment is dated the later of the day it shipped and the
+      // day its order was paid (Group B waits for the deferral, and cannot recognise revenue before the
+      // payment that created the Unearned Revenue it draws on). Revenue and COGS of one shipment share
+      // that date. Each date is its own journal with its own reference, the identity the stamps carry.
+      const processedShipments = shipments.filter((shipment) => shipmentResults.has(shipment.id))
+      const groupBDay = (shipment: (typeof shipments)[number]): string | null => laterDay(
+        utcDay(shipment.shippedAt ?? shipment.createdAt),
+        utcDay(shipment.order.paidAt),
+      )
+      // ACC-H12: a shipment of an order that is not deferred yet is costed on its own journal, dated the day the
+      // goods left (there is no payment to wait for), so its group never mixes with the ordinary ones.
+      const isCostedOnShipment = (shipment: (typeof shipments)[number]): boolean => shipment.order.revenueDeferredDate === null
+      const bDated = groupByPostingDate(processedShipments.filter((shipment) => !isCostedOnShipment(shipment)), groupBDay, dateContext)
+      const bDatedDirect = groupByPostingDate(
+        processedShipments.filter(isCostedOnShipment),
+        (shipment) => utcDay(shipment.shippedAt ?? shipment.createdAt),
+        dateContext,
+      )
+      if (bDated.deferred.length > 0 || bDatedDirect.deferred.length > 0) throw new Error('Group B: a shipment has no open posting day although the lock-blocks-run check passed')
+      const bGroups = [
+        ...bDated.groups.map((group) => ({ ...group, costedOnShipment: false })),
+        ...bDatedDirect.groups.map((group) => ({ ...group, costedOnShipment: true })),
+      ]
+      // o3d-hqvrp.32: stock that came back from these shipments before they were journaled has no COGS
+      // reversal of its own (refund staging only reads journaled shipments), so it is booked here, in the
+      // same journal: DR Inventory / CR COGS. Booked per source shipment, capped by that shipment's COGS.
+      const batchShipmentCogs: Array<{ shipmentId: string; orderId: string; cogs: number }> = []
+      for (const shipment of shipments) {
+        const shipmentResult = shipmentResults.get(shipment.id)
+        if (shipmentResult) batchShipmentCogs.push({ shipmentId: shipment.id, orderId: shipment.orderId, cogs: shipmentResult.cogs })
+      }
+      const unjournaledReturnCredits = await loadUnjournaledReturnCredits(tx, batchShipmentCogs)
+
+      const returnCreditsToRecord: Array<{ credit: (typeof unjournaledReturnCredits)[number]; date: string }> = []
+      const bJournalByShipmentId = new Map<string, { referenceId: string; syncLogId: string | null; date: string; costedOnShipment: boolean }>()
+      for (const group of bGroups) {
+        let groupRevenueRaw = 0
+        let groupCogs = toDecimal(0)
+        for (const shipment of group.rows) {
+          const shipmentResult = shipmentResults.get(shipment.id)!
+          groupRevenueRaw += shipmentResult.revenue
+          groupCogs = addMoney(groupCogs, shipmentResult.cogs)
+        }
+        const groupRevenue = round2(groupRevenueRaw)
+        const groupCogsNumber = round2Decimal(groupCogs)
+        const groupCount = group.rows.length
+        const journalLines: JournalLinePayload[] = []
+
+        // Revenue: the ordinary group moves it from Unearned to Sales. A costed-on-shipment group posts none (the
+        // invoice already booked it to Sales); the share is still recorded on each shipment below.
+        if (groupRevenue > 0 && !group.costedOnShipment) {
+          journalLines.push(
+            { accountCode: settings.xero_unearned_revenue_account, description: `Revenue recognition — ${groupCount} shipment(s)`, debit: groupRevenue },
+            { accountCode: settings.xero_sales_account, description: `Revenue recognition — ${groupCount} shipment(s)`, credit: groupRevenue },
+          )
+        }
+
+        if (groupCogsNumber > 0) {
+          journalLines.push(
+            { accountCode: settings.xero_cogs_account, description: `COGS — ${groupCount} shipment(s)`, debit: groupCogsNumber },
+            // ACC-H12: units shipped before payment were never reclassified into Allocated Inventory, so there is
+            // no allocated debit to relieve: the cost leaves Inventory directly.
+            {
+              accountCode: group.costedOnShipment ? settings.xero_inventory_account : settings.xero_allocated_inventory_account,
+              description: `COGS — ${groupCount} shipment(s)`,
+              credit: groupCogsNumber,
+            },
+          )
+          // o3d-hqvrp.32: stock returned before these shipments were journaled is credited in the journal of the
+          // date its source shipment is journaled on, capped by that shipment's COGS (see unjournaled-return-cogs.ts).
+          const groupShipmentIds = new Set(group.rows.map((shipment) => shipment.id))
+          const groupReturnCredits = unjournaledReturnCredits.filter((credit) => groupShipmentIds.has(credit.shipmentId))
+          const groupReturnTotal = round2Decimal(groupReturnCredits.reduce((sum, credit) => addMoney(sum, credit.amount), toDecimal(0)))
+          if (groupReturnTotal > 0) {
+            journalLines.push(
+              { accountCode: settings.xero_inventory_account, description: `Returned before journaled — ${groupCount} shipment(s)`, debit: groupReturnTotal },
+              { accountCode: settings.xero_cogs_account, description: `Returned before journaled — ${groupCount} shipment(s)`, credit: groupReturnTotal },
+            )
+            for (const credit of groupReturnCredits) returnCreditsToRecord.push({ credit, date: group.date })
+          }
+        }
+
+        // o3d-0qoo: identity over the shipments that actually made it into this batch —
+        // shipmentResults has already had failed orders' shipments removed, and the stamping
+        // loop below skips exactly the same ones, so the digest input and the stamped set are
+        // the same set by construction. Persisted per shipment rather than re-derived from
+        // shipmentJournalDate, which is written later and can land on the next UTC day.
+        const referenceId = buildDailyBatchReferenceId('B', group.date, group.rows.map((shipment) => shipment.id))
+
+        // o3d-o97 r4: null unless a journal row was created AND it carried a CR Allocated Inventory
+        // line. Both halves matter, and they are not the same guard: the log is skipped entirely when
+        // the window produced no lines at all, and — separately — a window whose ROUNDED COGS total is
+        // zero still raises a revenue-only journal that credits Allocated Inventory NOTHING, while
+        // `allocatedReliefAmount` below is stamped on every member shipment regardless. Stamping the
+        // id off `journalLines.length` alone would attribute a credit to a journal that does not
+        // contain one, which is the same amount-implies-a-posting inference in a new place.
+        let groupBSyncLogId: string | null = null
+        if (journalLines.length > 0) {
+          const createdLogId = await createPendingSyncLog(tx, {
+            type: 'DAILY_BATCH_GROUP_B',
+            referenceId,
+            currency: baseCurrency,
+            payload: {
+              date: group.date,
+              reference: `Shipment COGS ${group.date} ${referenceId.slice(-8)}`,
+              narration: group.costedOnShipment
+                ? `Daily shipment batch, shipped before payment: ${groupCount} shipment(s), COGS £${groupCogsNumber.toFixed(2)} relieved from Inventory (revenue already booked by the invoice)${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`
+                : `Daily shipment batch: ${groupCount} shipment(s), revenue £${groupRevenue.toFixed(2)}, COGS £${groupCogsNumber.toFixed(2)}${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`,
+              lines: journalLines,
+              batchReferenceId: referenceId,
+              batchDate: group.date,
+              batchGroup: 'B',
+              batchEntityCount: groupCount,
+              splitBatch: result.hasMore.groupB,
+              _postingMode: 'submitted',
+            },
+          })
+          if (groupCogsNumber > 0) groupBSyncLogId = createdLogId
+        }
+        for (const shipment of group.rows) {
+          bJournalByShipmentId.set(shipment.id, { referenceId, syncLogId: groupBSyncLogId, date: group.date, costedOnShipment: group.costedOnShipment })
+        }
+        bPostedGroups.push({ date: group.date, movedFromLockedDays: group.movedFromLockedDays })
+      }
+
+      // Only mark shipments that were successfully processed. Failed
+      // orders had their results removed from shipmentResults by the
+      // per-order catch block — those shipments must remain untouched
+      // (shipmentJournalDate stays null) so the next batch run retries.
+      for (const shipment of shipments) {
+        const resultForShipment = shipmentResults.get(shipment.id)
+        if (!resultForShipment) continue // failed order — skip, leave retryable
+        const journalForShipment = bJournalByShipmentId.get(shipment.id)!
+        const referenceId = journalForShipment.referenceId
+        const groupBSyncLogId = journalForShipment.syncLogId
+        for (const line of shipment.lines) {
+          const lineSnapshot = shipmentSnapshots.get(line.id)
+          if (lineSnapshot) {
+            await tx.shipmentLine.update({
+              where: { id: line.id },
+              data: {
+                costLayerSnapshot: lineSnapshot as never,
+              },
+            })
+          }
+        }
+        const shipmentJournalDate = new Date()
+        const shipmentCostedOnShipment = journalForShipment.costedOnShipment
+        await tx.shipment.update({
+          where: { id: shipment.id },
+          data: {
+            shipmentJournalDate,
+            shipmentJournalBatchRef: referenceId,
+            cogsBatchAmount: resultForShipment.cogs,
+            revenueRecognizedAmount: resultForShipment.revenue,
+            // o3d-o97 r3: the CR Allocated Inventory this shipment's share of the journal above
+            // raised — the same figure as the COGS debit, recorded once and never revalued.
+            // `cogsBatchAmount` on the line above carries the same number TODAY and a different
+            // one after the next landed-cost correction rewrites it in place.
+            //
+            // ACC-H12: a shipment costed straight out of Inventory raised NO relief of the Allocated Inventory
+            // contra (A2 never debited it for these units), so it records £0 and names no journal. The refund
+            // service reads a recorded zero as "relieved nothing", which is exactly right.
+            allocatedReliefAmount: shipmentCostedOnShipment ? 0 : resultForShipment.cogs,
+            // o3d-o97 r4: and WHICH journal raised it, on WHICH ledger, against WHICH account —
+            // all null when no CR Allocated Inventory line was raised at all. The refund resolves
+            // the id back to the row to read its STATUS, so a Group B journal still queued, or one
+            // that ended CANCELLED, is never counted as relief the contra has already received.
+            allocatedReliefSyncLogId: shipmentCostedOnShipment ? null : groupBSyncLogId,
+            allocatedReliefConnector: !shipmentCostedOnShipment && groupBSyncLogId ? XERO_CONNECTOR : null,
+            allocatedReliefAccountCode: !shipmentCostedOnShipment && groupBSyncLogId ? settings.xero_allocated_inventory_account : null,
+            // ACC-H12: THE DURABLE MARKER, in the same statement as `shipmentJournalDate`. Group A2, Group B and the
+            // refund service read it to tell these units from the ones that went through Allocated Inventory.
+            ...(shipmentCostedOnShipment ? {
+              cogsRelievedFromInventoryAt: shipmentJournalDate,
+              cogsRelievedFromInventoryAmount: resultForShipment.cogs,
+              cogsRelievedFromInventorySyncLogId: groupBSyncLogId,
+            } : {}),
+          },
+        })
+        // khdw: record this shipment's dispatch COGS in the COGS subledger ledger as
+        // an immutable, correctly-dated row. The reconciliation reads the ledger (not
+        // the live, revaluation-mutated cogsBatchAmount), so a same-window dispatch +
+        // revaluation can't double-count. Idempotent per shipment.
+        //
+        // Dated on the JOURNAL's date (ACC-H11: the event day; before that, the run's date) — NOT on
+        // shipmentJournalDate (o3d-0qoo r1, found by Codex). The GL journal above is posted under that
+        // date, while the stamp is written with a later new Date(); on a midnight-crossing run the two
+        // differ, and the subledger row would land a day after the journal whose value it records.
+        // Reconciliation windows on journalDate, so that gap reads as a real one — and because this
+        // upsert is first-write-wins and keyed per shipment, a row written on the wrong day can never be
+        // corrected by a later run.
+        await recordCogsSubledgerMovement(tx, {
+          sourceType: 'DISPATCH',
+          sourceRef: shipment.id,
+          idempotencyKey: `dispatch:${shipment.id}`,
+          baseDelta: resultForShipment.cogs,
+          journalDate: journalForShipment.date,
+        })
+      }
+
+      // The reversal above is in a journal only when that journal's COGS is, and each refund is recorded once,
+      // under the same transaction as the journal, dated with it.
+      for (const { credit, date } of returnCreditsToRecord) {
+        await recordCogsSubledgerMovement(tx, {
+          sourceType: 'REFUND_REVERSAL',
+          sourceRef: credit.refundId,
+          idempotencyKey: unjournaledReturnKey(credit.refundId, credit.shipmentId),
+          baseDelta: credit.amount.negated(),
+          journalDate: date,
+        })
+      }
+
+      for (const [layerId, decrement] of layerDecrements) {
+        await tx.costLayer.update({
+          where: { id: layerId },
+          data: { remainingQty: { decrement } },
+        })
+      }
+
+      return processedShipmentCount
+    })
+    if (groupBCount > 0) {
+      result.groupB += groupBCount
+    }
+    for (const journal of bPostedGroups) await reportLockedPeriodMoves('B', journal.date, journal.movedFromLockedDays, lockDate)
+  } catch (e) {
+    result.errors.push(`Group B error: ${String(e)}`)
+  }
+  }
+
+  await runGroupB('direct')
+
   // --- Group A1: Revenue Deferral ---
   groupA1Skip: try {
     // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
@@ -1579,6 +2405,14 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         paidAt: true,
         // o3d-hqvrp.35: refunds entered before this first run, netted out of the deferral.
         refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
+        // ACC-H12: revenue already recorded by shipments whose COGS the batch posted before payment. The invoice
+        // put it in Sales and nothing moved it to Unearned Revenue, so the deferral below leaves it out.
+        // It also names a shipment that left while the order was unpaid and that the direct pass of Group B has not
+        // costed yet (a backlog or a refusal): such an order is not deferred until that shipment is costed.
+        shipments: {
+          where: { OR: [{ cogsRelievedFromInventoryAt: { not: null } }, { status: 'SHIPPED', shipmentJournalDate: null }] },
+          select: { revenueRecognizedAmount: true, cogsRelievedFromInventoryAt: true, shipmentJournalDate: true, shippedAt: true, createdAt: true },
+        },
         shoppingLinks: {
           select: { connector: true },
         },
@@ -1592,7 +2426,15 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
       take: batchLimit + 1,
     }), batchLimit)
-    const orders = orderWindow.rows
+    // ACC-H12: an order whose shipment left before it was paid and is still waiting for its direct cost is not
+    // deferred yet. Deferring it first would send the ship-date COGS down the ordinary path at the payment date.
+    const awaitingDirectCost = (order: (typeof orderWindow.rows)[number]): boolean => (order.shipments ?? []).some((shipment) => (
+      !shipment.cogsRelievedFromInventoryAt
+      && !shipment.shipmentJournalDate
+      && !!order.paidAt
+      && shippedBeforePayment({ paidAt: order.paidAt, shippedAt: shipment.shippedAt, createdAt: shipment.createdAt })
+    ))
+    const orders = orderWindow.rows.filter((order) => !awaitingDirectCost(order))
     result.hasMore.groupA1 = orderWindow.hasMore
 
     if (orders.length > 0) {
@@ -1600,11 +2442,26 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // disagreement can only mean the ORDER moved — never that the two sides do different sums.
       // `amount` is the NETTED figure (what the order stores and the fence re-derives); `grossAmount` is what the
       // paid-day journal moves, so a refund entered in a LATER period never changes an earlier period's journal.
-      const orderDeferrals = orders.map((order) => ({
-        orderId: order.id,
-        amount: revenueDeferralAmount(order),
-        grossAmount: revenueDeferralGrossAmount(order),
-      }))
+      const shippedRevenueOf = (order: (typeof orders)[number]): number => (
+        (order.shipments ?? []).filter((shipment) => !!shipment.cogsRelievedFromInventoryAt).reduce((sum, shipment) => sum + Number(shipment.revenueRecognizedAmount ?? 0), 0)
+      )
+      const orderDeferrals = orders.map((order) => {
+        const amount = revenueDeferralAmount(order)
+        const shippedRevenue = shippedRevenueOf(order)
+        // ACC-H12: refunds of goods that shipped before payment never took value out of the deferral (their revenue is
+        // still in Sales and the credit note reverses it), so the order stores the net figure PLUS that part. Group B's
+        // true-up and the refund service then see exactly what the ledger holds in Unearned Revenue. The fence still
+        // compares `amount`, the net figure.
+        const parts = preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenue)
+        const undeferredRefunds = parts.reduce((sum, part) => sum + part.amount - part.deferredPart, 0)
+        return {
+          orderId: order.id,
+          amount,
+          storedAmount: round2(amount + undeferredRefunds),
+          // Only the part not yet shipped moves from Sales to Unearned Revenue.
+          grossAmount: Math.max(0, round2(revenueDeferralGrossAmount(order) - shippedRevenue)),
+        }
+      })
       // ACC-H11: one journal per EVENT date (the day the order was paid), each with its own reference. The
       // fence below still covers EVERY order of the run in one lock, once.
       const orderById = new Map(orders.map((order) => [order.id, order]))
@@ -1645,11 +2502,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const adjustmentRows: RefundAdjustmentRow[] = []
       for (const order of orders) {
         const paidDay = utcDay(order.paidAt)
-        for (const adjustment of preBatchRefundAdjustments(order.refunds)) {
+        for (const adjustment of preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenueOf(order))) {
+          // ACC-H12: only the part of a refund that came out of deferred revenue is adjusted against Unearned.
+          if (!(adjustment.deferredPart > 0)) continue
           adjustmentRows.push({
             orderId: order.id,
             refundId: adjustment.refundId,
-            amount: adjustment.amount,
+            amount: adjustment.deferredPart,
             day: laterDay(utcDay(adjustment.refundedAt), paidDay),
           })
         }
@@ -1725,7 +2584,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             })
           }
 
-          const deferralByOrderId = new Map(group.rows.map((order) => [order.orderId, order.amount]))
+          const deferralByOrderId = new Map(group.rows.map((order) => [order.orderId, order.storedAmount]))
           for (const deferral of group.rows) {
             await tx.salesOrder.update({
               where: { id: deferral.orderId },
@@ -1866,6 +2725,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                 id: true,
                 status: true,
                 warehouseId: true,
+                // ACC-H12: shipments already costed straight out of Inventory are not A2's to value or record.
+                cogsRelievedFromInventoryAt: true,
                 // o3d-0i5y r7: the journal date is deliberately NOT read. What a pass owes is decided by
                 // the allocation row's own entries against the dispatched quantity — see
                 // `planA2Reclassification`. Selecting a shipment's journal date here only ever supported
@@ -1953,7 +2814,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               ? takeShipmentAccountedEntries(
                   alreadyRecorded,
                   order.shipments
-                    .filter((shipment) => shipment.warehouseId === alloc.warehouseId)
+                    .filter((shipment) => shipment.warehouseId === alloc.warehouseId && !shipment.cogsRelievedFromInventoryAt)
                     .flatMap((shipment) => shipment.lines.filter((line) => (
                       line.lineId === alloc.lineId && line.productId === alloc.productId
                     ))),
@@ -2262,709 +3123,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     result.errors.push(`Group A2 error: ${String(e)}`)
   }
 
-  // --- Group B: Shipment Revenue Recognition + COGS ---
-  groupBSkip: try {
-    // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
-    // so from that moment another batch — or a refund, which shares this domain
-    // — can start while we are still writing. Stop instead.
-    batchLock.assertHeld('Group B (shipment revenue + COGS)')
-    if (lockBlocked) {
-      await reportLockBlocksRun('B', lockDate)
-      break groupBSkip
-    }
-    const bPostedGroups: Array<{ date: string; movedFromLockedDays: string[] }> = []
-    const groupBCount = await db.$transaction(async (tx) => {
-      // o3d-c08y r2 (Codex HIGH): PROBE -> LOCK -> READ. This window's ids are read first, every cost
-      // layer their data references is locked, and only then is the data itself read — under those
-      // locks. Reading the snapshots first and locking afterwards let a landed-cost revaluation commit
-      // a negative basis in between and be posted from the stale positive copy (measured; see
-      // lib/domain/accounting/daily-batch-group-b-lock.ts). The same read also REVALIDATES status: a
-      // shipment that stopped qualifying while we waited for the lock is simply not returned.
-      const candidateWindow = takeDailyBatchWindow(await tx.shipment.findMany({
-        where: DAILY_BATCH_GROUP_B_SHIPMENT_WHERE,
-        select: { id: true, orderId: true, lines: { select: { costLayerSnapshot: true } } },
-        orderBy: { createdAt: 'asc' },
-        take: batchLimit + 1,
-      }), batchLimit)
-      result.hasMore.groupB = candidateWindow.hasMore
-      if (candidateWindow.rows.length === 0) return 0
-      const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
-      const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates: candidateWindow.rows })
+  await runGroupB('paid')
 
-      const shipments = await tx.shipment.findMany({
-        where: { ...DAILY_BATCH_GROUP_B_SHIPMENT_WHERE, id: { in: candidateShipmentIds } },
-        select: {
-          id: true,
-          orderId: true,
-          warehouseId: true,
-          createdAt: true,
-          // ACC-H11: the day the goods left, which dates the journal.
-          shippedAt: true,
-          cogsBatchAmount: true,
-          lines: {
-            select: {
-              id: true,
-              lineId: true,
-              productId: true,
-              qty: true,
-              costLayerSnapshot: true,
-              line: {
-                select: { id: true, productId: true, qty: true, totalBase: true },
-              },
-            },
-          },
-          order: {
-            select: {
-              orderNumber: true,
-              externalOrderNumber: true,
-              status: true,
-              refundStatus: true,
-              // ACC-H11: Group B never dates a journal before the payment that created the deferral it draws on.
-              paidAt: true,
-              totalBase: true,
-              unearnedRevenueAmount: true,
-              lines: {
-                select: {
-                  id: true,
-                  productId: true,
-                  qty: true,
-                  totalBase: true,
-                  // o3d-kouj: the recipe this line was allocated from. Group B's per-line component
-                  // requirements decide which shipped component units belong to which sales line, and
-                  // the basis it relieves was recorded in exactly those units at dispatch.
-                  fulfillmentRequirements: true,
-                },
-              },
-              shipments: {
-                select: {
-                  id: true,
-                  status: true,
-                  shipmentJournalDate: true,
-                  revenueRecognizedAmount: true,
-                },
-              },
-            },
-          },
-        },
-        orderBy: { createdAt: 'asc' },
-      })
-
-      if (shipments.length === 0) {
-        return 0
-      }
-
-      const layerDecrements = new Map<string, number>()
-      const shipmentResults = new Map<string, { revenue: number; cogs: number }>()
-      const shipmentSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
-      const shipmentsByOrder = new Map<string, typeof shipments>()
-      const orderIds = Array.from(new Set(shipments.map((shipment) => shipment.orderId)))
-
-      const [orderAllocations, priorShipmentLines, priorRefundLines] = await Promise.all([
-        tx.orderAllocation.findMany({
-          where: { orderId: { in: orderIds } },
-          select: {
-            id: true,
-            orderId: true,
-            lineId: true,
-            productId: true,
-            warehouseId: true,
-            costLayerSnapshot: true,
-          },
-        }),
-        tx.shipmentLine.findMany({
-          where: {
-            shipment: {
-              orderId: { in: orderIds },
-              shipmentJournalDate: { not: null },
-            },
-          },
-          select: {
-            costLayerSnapshot: true,
-          },
-        }),
-        tx.salesOrderRefundLine.findMany({
-          where: {
-            refund: {
-              orderId: { in: orderIds },
-            },
-          },
-          select: {
-            costLayerSnapshot: true,
-          },
-        }),
-      ])
-
-      // o3d-c08y r2: the locks were taken above, BEFORE any of this was read. What is asserted here is
-      // the closure that makes that sound — everything just loaded stays inside the locked set, so no
-      // value below can still be changed by a concurrent revaluation. A miss skips the window with a
-      // named error rather than posting from a value that may already be stale.
-      assertGroupBSnapshotsWereLocked(lockedCostLayerIds, [
-        { what: 'the shipment lines it would post', rows: shipments.flatMap((shipment) => shipment.lines) },
-        { what: 'the order allocations it would consume from', rows: orderAllocations },
-        { what: 'the already-journaled shipment lines it nets against', rows: priorShipmentLines },
-        { what: 'the refund lines it nets against', rows: priorRefundLines },
-      ])
-      const graph = await loadFulfillmentProductGraph(
-        tx,
-        Array.from(new Set(
-          shipments.flatMap((shipment) => (
-            shipment.order.lines.map((line) => line.productId).filter((value): value is string => !!value)
-          )),
-        )),
-      )
-
-      // --- scjz.68: refund-reversal-aware deferred-revenue true-up inputs ---
-      // (1) posted UNEARNED_REV_REVERSAL per order — deferred revenue a refund credit
-      //     note already took out of the unearned account, which the true-up must not
-      //     recognize again; (2) for PARTIALLY_REFUNDED orders, the per-line coverage
-      //     used to decide whether the order is fully shipped net of refunds.
-      const allocationById = new Map(orderAllocations.map((allocation) => [allocation.id, allocation]))
-      const partialOrderIds = new Set(
-        shipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
-      )
-
-      const refunds = await tx.salesOrderRefund.findMany({
-        where: { orderId: { in: orderIds } },
-        select: { id: true, orderId: true },
-      })
-      const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
-      // o3d-3la07 (M5, D3: REPORT-ONLY). The netting below still sums exactly the PENDING / PROCESSING /
-      // SYNCED rows it always did (`countedUnearnedReversalRows`); the read is widened by the CANCELLED
-      // rows that may have reached the ledger so the per-order warning can name them. No arithmetic moves.
-      const reversalSyncs = await tx.accountingSyncLog.findMany({
-        where: {
-          AND: [
-            { connector: 'xero', type: 'UNEARNED_REV_REVERSAL' },
-            UNEARNED_REVERSAL_NETTING_WHERE,
-            {
-              OR: [
-                { referenceType: 'SalesOrder', referenceId: { in: orderIds } },
-                { referenceType: 'SalesOrderRefund', referenceId: { in: refunds.map((refund) => refund.id) } },
-              ],
-            },
-          ],
-        },
-        select: { id: true, referenceType: true, referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
-      })
-      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
-      const reversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
-      for (const sync of reversalSyncs) {
-        const targetOrderId = sync.referenceType === 'SalesOrder'
-          ? sync.referenceId
-          : refundIdToOrderId.get(sync.referenceId)
-        if (!targetOrderId) continue
-        const allRows = reversalStandingRowsByOrder.get(targetOrderId) ?? []
-        allRows.push(sync)
-        reversalStandingRowsByOrder.set(targetOrderId, allRows)
-      }
-      for (const [targetOrderId, allRows] of reversalStandingRowsByOrder) {
-        reversalSyncsByOrder.set(
-          targetOrderId,
-          countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload })),
-        )
-      }
-
-      const shippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
-      const refundedUnshippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
-      if (partialOrderIds.size > 0) {
-        const dispatchedShipmentLines = await tx.shipmentLine.findMany({
-          where: { shipment: { orderId: { in: [...partialOrderIds] }, status: 'SHIPPED' } },
-          select: { lineId: true, productId: true, qty: true, shipment: { select: { orderId: true } } },
-        })
-        for (const line of dispatchedShipmentLines) {
-          if (!line.productId) continue
-          const rows = shippedRowsByOrder.get(line.shipment.orderId) ?? []
-          rows.push({ lineId: line.lineId, productId: line.productId, qty: Number(line.qty) })
-          shippedRowsByOrder.set(line.shipment.orderId, rows)
-        }
-        // Returns of shipped units (shipment-source) do not reduce the ship
-        // obligation, so only allocation-source (unshipped) refund qty counts.
-        for (const refundLine of priorRefundLines) {
-          for (const entry of parseCostLayerSnapshot(refundLine.costLayerSnapshot)) {
-            if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
-            const allocation = allocationById.get(entry.orderAllocationId)
-            if (!allocation?.productId || !partialOrderIds.has(allocation.orderId)) continue
-            const rows = refundedUnshippedRowsByOrder.get(allocation.orderId) ?? []
-            rows.push({ lineId: allocation.lineId, productId: allocation.productId, qty: toDecimal(entry.qty).toNumber() })
-            refundedUnshippedRowsByOrder.set(allocation.orderId, rows)
-          }
-        }
-      }
-
-      const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
-      for (const allocation of orderAllocations) {
-        allocationAvailability.set(
-          allocation.id,
-          parseCostLayerSnapshot(allocation.costLayerSnapshot),
-        )
-      }
-
-      for (const priorShipmentLine of priorShipmentLines) {
-        for (const entry of parseCostLayerSnapshot(priorShipmentLine.costLayerSnapshot)) {
-          if (!entry.orderAllocationId) continue
-          const available = allocationAvailability.get(entry.orderAllocationId) ?? []
-          // Relieve the allocation contra by QTY, not by exact costLayerId: a
-          // dispatch consumes FIFO-oldest layers that can differ from the layers
-          // the allocation pinned, so a costLayerId match would strand the
-          // Allocated-Inventory contra (cogs-audit scjz.21).
-          allocationAvailability.set(
-            entry.orderAllocationId,
-            reduceSnapshotByQty(available, entry.qty),
-          )
-        }
-      }
-
-      for (const priorRefundLine of priorRefundLines) {
-        for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
-          if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
-          const available = allocationAvailability.get(entry.orderAllocationId) ?? []
-          // Qty-based, matching the shipment relief above, so allocation availability
-          // tracking is consistent and order-independent in total relieved qty (scjz.21).
-          allocationAvailability.set(
-            entry.orderAllocationId,
-            reduceSnapshotByQty(available, entry.qty),
-          )
-        }
-      }
-
-      for (const shipment of shipments) {
-        const existing = shipmentsByOrder.get(shipment.orderId) ?? []
-        existing.push(shipment)
-        shipmentsByOrder.set(shipment.orderId, existing)
-      }
-
-      for (const [orderId, orderShipments] of shipmentsByOrder) {
-        const firstShipment = orderShipments[0]
-        // Wrap per-order processing so a single order with a COGS gap
-        // (e.g. cross-warehouse allocation mismatch, missing cost layers)
-        // is skipped with an error log instead of aborting the entire
-        // daily batch and rolling back every other order's revenue
-        // recognition and COGS posting.
-        try {
-        const orderLayerDecrements = new Map<string, number>()
-        const negativeBasisOrder = {
-          orderId,
-          orderRef: firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8),
-        }
-        const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
-        const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
-        const requirementsByLine = new Map(
-          firstShipment.order.lines
-            .filter((line) => !!line.productId)
-            .map((line) => [
-              line.id,
-              lineFulfillmentRequirements(line, graph).map((requirement) => ({
-                productId: requirement.productId,
-                factor: requirement.factor.toNumber(),
-              })),
-            ]),
-        )
-        const orderLineById = new Map(firstShipment.order.lines.map((line) => [line.id, line]))
-        const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
-          shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
-        ), 0)
-        // scjz.68: subtract deferred revenue a refund credit note already reversed
-        // out of the unearned account so the true-up never re-recognizes it.
-        const postedUnearnedReversal = sumPostedUnearnedReversal(
-          reversalSyncsByOrder.get(orderId) ?? [],
-          settings.xero_unearned_revenue_account,
-        )
-        // o3d-3la07 (M5, D3): say which rows the netting rests on that are not ledger facts.
-        const unearnedStanding = unearnedReversalStandingReport(reversalStandingRowsByOrder.get(orderId) ?? [])
-        const unearnedReport = describeUnearnedReversalReport(
-          firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8),
-          unearnedStanding,
-        )
-        if (unearnedReport) {
-          await logActivity({
-            entityType: 'SALES_ORDER',
-            entityId: orderId,
-            action: 'daily_batch_unearned_reversal_netting_unproven',
-            tag: 'sync',
-            level: 'WARNING',
-            description: unearnedReport,
-            metadata: { orderId, ...unearnedStanding },
-            resolveUser: false,
-          }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
-        }
-        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
-        let runningRevenue = 0
-
-        // scjz.68: a fully-shipped terminal order trues up the remainder; a
-        // PARTIALLY_REFUNDED order may too, but only once every shippable line is
-        // shipped net of refunds. Either way hold the true-up until this batch holds
-        // the order's final dispatched-but-unjournaled shipment, so a batch-window
-        // split cannot recognize a later shipment's revenue early.
-        let isTrueUpEligible = isFullyShippedTerminalStatus(firstShipment.order.status) && firstShipment.order.refundStatus !== 'PARTIAL'
-        if (!isTrueUpEligible && firstShipment.order.refundStatus === 'PARTIAL') {
-          const combinedCoverageByLine = calculateCoverageByLine(requirementsByLine, [
-            ...(shippedRowsByOrder.get(orderId) ?? []),
-            ...(refundedUnshippedRowsByOrder.get(orderId) ?? []),
-          ])
-          isTrueUpEligible = isFullyShippedNetOfRefunds(
-            firstShipment.order.lines
-              .filter((line) => !!line.productId)
-              .map((line) => ({
-                orderedQty: Number(line.qty),
-                coveredQty: combinedCoverageByLine.get(line.id) ?? 0,
-              })),
-          )
-        }
-        if (isTrueUpEligible) {
-          isTrueUpEligible = batchContainsFinalUnjournaledShipment(
-            firstShipment.order.shipments.filter((shipment) => shipment.status === 'SHIPPED'),
-            new Set(orderShipments.map((shipment) => shipment.id)),
-          )
-        }
-
-        for (let index = 0; index < orderShipments.length; index++) {
-          const shipment = orderShipments[index]
-          const shippedCoverageByLine = calculateCoverageByLine(
-            requirementsByLine,
-            shipment.lines.map((line) => ({
-              lineId: line.lineId,
-              productId: line.productId,
-              qty: Number(line.qty),
-            })),
-          )
-          const shipmentLineValue = [...shippedCoverageByLine.entries()].reduce((sum, [lineId, coveredQty]) => {
-            const line = orderLineById.get(lineId)
-            const lineQty = Number(line?.qty ?? 0)
-            if (!line || lineQty <= 0 || coveredQty <= 0) return sum
-            return sum + (Number(line.totalBase) * Math.min(coveredQty, lineQty)) / lineQty
-          }, 0)
-
-          const proportionalRevenue = orderLineTotal > 0
-            ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
-            : 0
-          const revenueProportion = recognizeShipmentRevenue({
-            proportionalRevenue,
-            remainingDeferred,
-            runningRevenue,
-            isFinalShipmentOfFullyShippedTerminalOrder:
-              isTrueUpEligible && index === orderShipments.length - 1,
-          })
-
-          // COGS: prefer immutable shipment-line snapshots when present.
-          // This ensures retrospective landed-cost updates flow through
-          // stored shipment COGS without re-consuming inventory.
-          const shipmentSnapshotsForLines = shipment.lines.map((line) => (
-            parseCostLayerSnapshot(line.costLayerSnapshot)
-          ))
-          const hasPrecomputedSnapshots = shipmentSnapshotsForLines.some((entries) => entries.length > 0)
-          const precomputedCogs = hasPrecomputedSnapshots
-            ? roundQuantity(
-                shipmentSnapshotsForLines.reduce(
-                  (sum, entries) => addMoney(sum, sumCostLayerSnapshot(entries)),
-                  toDecimal(0),
-                ),
-                2,
-              )
-            : toDecimal(shipment.cogsBatchAmount ?? 0)
-          const precomputedCogsNumber = precomputedCogs.toNumber()
-          // o3d-sidy: before anything is accumulated, so a refusal leaves nothing behind.
-          if (hasPrecomputedSnapshots) refuseNegativeBasisShipmentCogs(negativeBasisOrder, shipment.id, shipmentSnapshotsForLines.flat())
-          if (hasPrecomputedSnapshots) {
-            const missingSnapshotLines = shipment.lines.filter((line, lineIndex) => (
-              Number(line.qty) > 0 && shipmentSnapshotsForLines[lineIndex].length === 0
-            ))
-            if (missingSnapshotLines.length > 0) {
-              throw new Error(`Incomplete precomputed FIFO snapshots for shipment ${shipment.id}`)
-            }
-            const cogsBatchAmount = Number(shipment.cogsBatchAmount ?? 0)
-            if (cogsBatchAmount > 0 && Math.abs(round2(cogsBatchAmount) - precomputedCogsNumber) > 0.01) {
-              throw new Error(`Precomputed COGS mismatch for shipment ${shipment.id}: batch ${round2(cogsBatchAmount).toFixed(2)} != snapshots ${precomputedCogsNumber.toFixed(2)}`)
-            }
-          }
-
-          // If no pre-computed COGS and no snapshots, fall back to the
-          // legacy allocation-based consumption path for backward compat.
-          if (!hasPrecomputedSnapshots && precomputedCogs.lte(0)) {
-            const shipmentCostSnapshot: CostLayerSnapshotEntry[] = []
-            for (const sl of shipment.lines) {
-              let remainingQty = Number(sl.qty)
-              const matchingAllocations = orderAllocations.filter((allocation) => (
-                allocation.orderId === shipment.orderId
-                && allocation.lineId === sl.lineId
-                && allocation.productId === sl.productId
-                && allocation.warehouseId === shipment.warehouseId
-              ))
-
-              for (const allocation of matchingAllocations) {
-                if (remainingQty <= 0) break
-                const availableEntries = allocationAvailability.get(allocation.id) ?? []
-                const consumed = takeFromSnapshotEntries(availableEntries, remainingQty, {
-                  orderAllocationId: allocation.id,
-                  shipmentLineId: sl.id,
-                  source: 'shipment',
-                })
-                shipmentCostSnapshot.push(...consumed.taken)
-                remainingQty = consumed.remainingQty
-                allocationAvailability.set(
-                  allocation.id,
-                  reduceSnapshotByCostLayer(
-                    availableEntries,
-                    consumed.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
-                  ),
-                )
-              }
-
-              if (remainingQty > 0.0000001) {
-                throw new Error(`Missing allocated cost layers for shipment line ${sl.id}`)
-              }
-            }
-
-            // o3d-sidy: the allocation snapshots are rewritten in place by the same revaluation.
-            refuseNegativeBasisShipmentCogs(negativeBasisOrder, shipment.id, shipmentCostSnapshot)
-
-            for (const entry of shipmentCostSnapshot) {
-              orderLayerDecrements.set(
-                entry.costLayerId,
-                (orderLayerDecrements.get(entry.costLayerId) ?? 0) + toDecimal(entry.qty).toNumber(),
-              )
-            }
-
-            const legacyCogs = roundQuantity(sumCostLayerSnapshot(shipmentCostSnapshot), 2)
-            const legacyCogsNumber = legacyCogs.toNumber()
-            runningRevenue += revenueProportion
-            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: legacyCogsNumber })
-            for (const sl of shipment.lines) {
-              shipmentSnapshots.set(
-                sl.id,
-                shipmentCostSnapshot.filter((entry) => entry.shipmentLineId === sl.id),
-              )
-            }
-          } else {
-            // Pre-computed path — snapshots already stored on shipment lines
-            runningRevenue += revenueProportion
-            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: precomputedCogsNumber })
-            // Snapshots are already on the shipment lines — no need to
-            // write them again or track layerDecrements (already consumed)
-          }
-        }
-        // Only publish legacy FIFO decrements after the whole order succeeds.
-        // Failed orders keep shipmentJournalDate null and must not mutate layer
-        // balances before their next retry.
-        for (const [layerId, decrement] of orderLayerDecrements) {
-          layerDecrements.set(layerId, (layerDecrements.get(layerId) ?? 0) + decrement)
-        }
-        } catch (orderError) {
-          // Per-order failure: skip this order, log the error, continue
-          // with remaining orders so the batch isn't blocked by one bad order.
-          const orderRef = firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)
-          // o3d-sidy: a negative-basis refusal is reported with the others at the end of the run —
-          // first in the errors and as an ERROR activity entry. See NegativeCostBasisRefusal.
-          if (orderError instanceof NegativeCostBasisRefusal) negativeBasisRefusals.push(orderError)
-          else result.errors.push(`Group B order ${orderRef}: ${String(orderError)}`)
-          // Remove any partially-accumulated results for this order's shipments
-          for (const s of orderShipments) {
-            const sr = shipmentResults.get(s.id)
-            if (sr) {
-              shipmentResults.delete(s.id)
-            }
-            for (const sl of s.lines) shipmentSnapshots.delete(sl.id)
-          }
-        }
-      }
-
-      const processedShipmentCount = shipmentResults.size
-
-      // ACC-H11: ONE JOURNAL PER EVENT DATE. A shipment is dated the later of the day it shipped and the
-      // day its order was paid (Group B waits for the deferral, and cannot recognise revenue before the
-      // payment that created the Unearned Revenue it draws on). Revenue and COGS of one shipment share
-      // that date. Each date is its own journal with its own reference, the identity the stamps carry.
-      const processedShipments = shipments.filter((shipment) => shipmentResults.has(shipment.id))
-      const groupBDay = (shipment: (typeof shipments)[number]): string | null => laterDay(
-        utcDay(shipment.shippedAt ?? shipment.createdAt),
-        utcDay(shipment.order.paidAt),
-      )
-      const bDated = groupByPostingDate(processedShipments, groupBDay, dateContext)
-      if (bDated.deferred.length > 0) throw new Error('Group B: a shipment has no open posting day although the lock-blocks-run check passed')
-      const bGroups = bDated.groups
-      // o3d-hqvrp.32: stock that came back from these shipments before they were journaled has no COGS
-      // reversal of its own (refund staging only reads journaled shipments), so it is booked here, in the
-      // same journal: DR Inventory / CR COGS. Booked per source shipment, capped by that shipment's COGS.
-      const batchShipmentCogs: Array<{ shipmentId: string; orderId: string; cogs: number }> = []
-      for (const shipment of shipments) {
-        const shipmentResult = shipmentResults.get(shipment.id)
-        if (shipmentResult) batchShipmentCogs.push({ shipmentId: shipment.id, orderId: shipment.orderId, cogs: shipmentResult.cogs })
-      }
-      const unjournaledReturnCredits = await loadUnjournaledReturnCredits(tx, batchShipmentCogs)
-
-      const returnCreditsToRecord: Array<{ credit: (typeof unjournaledReturnCredits)[number]; date: string }> = []
-      const bJournalByShipmentId = new Map<string, { referenceId: string; syncLogId: string | null; date: string }>()
-      for (const group of bGroups) {
-        let groupRevenueRaw = 0
-        let groupCogs = toDecimal(0)
-        for (const shipment of group.rows) {
-          const shipmentResult = shipmentResults.get(shipment.id)!
-          groupRevenueRaw += shipmentResult.revenue
-          groupCogs = addMoney(groupCogs, shipmentResult.cogs)
-        }
-        const groupRevenue = round2(groupRevenueRaw)
-        const groupCogsNumber = round2Decimal(groupCogs)
-        const groupCount = group.rows.length
-        const journalLines: JournalLinePayload[] = []
-
-        if (groupRevenue > 0) {
-          journalLines.push(
-            { accountCode: settings.xero_unearned_revenue_account, description: `Revenue recognition — ${groupCount} shipment(s)`, debit: groupRevenue },
-            { accountCode: settings.xero_sales_account, description: `Revenue recognition — ${groupCount} shipment(s)`, credit: groupRevenue },
-          )
-        }
-
-        if (groupCogsNumber > 0) {
-          journalLines.push(
-            { accountCode: settings.xero_cogs_account, description: `COGS — ${groupCount} shipment(s)`, debit: groupCogsNumber },
-            { accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${groupCount} shipment(s)`, credit: groupCogsNumber },
-          )
-          // o3d-hqvrp.32: stock returned before these shipments were journaled is credited in the journal of the
-          // date its source shipment is journaled on, capped by that shipment's COGS (see unjournaled-return-cogs.ts).
-          const groupShipmentIds = new Set(group.rows.map((shipment) => shipment.id))
-          const groupReturnCredits = unjournaledReturnCredits.filter((credit) => groupShipmentIds.has(credit.shipmentId))
-          const groupReturnTotal = round2Decimal(groupReturnCredits.reduce((sum, credit) => addMoney(sum, credit.amount), toDecimal(0)))
-          if (groupReturnTotal > 0) {
-            journalLines.push(
-              { accountCode: settings.xero_inventory_account, description: `Returned before journaled — ${groupCount} shipment(s)`, debit: groupReturnTotal },
-              { accountCode: settings.xero_cogs_account, description: `Returned before journaled — ${groupCount} shipment(s)`, credit: groupReturnTotal },
-            )
-            for (const credit of groupReturnCredits) returnCreditsToRecord.push({ credit, date: group.date })
-          }
-        }
-
-        // o3d-0qoo: identity over the shipments that actually made it into this batch —
-        // shipmentResults has already had failed orders' shipments removed, and the stamping
-        // loop below skips exactly the same ones, so the digest input and the stamped set are
-        // the same set by construction. Persisted per shipment rather than re-derived from
-        // shipmentJournalDate, which is written later and can land on the next UTC day.
-        const referenceId = buildDailyBatchReferenceId('B', group.date, group.rows.map((shipment) => shipment.id))
-
-        // o3d-o97 r4: null unless a journal row was created AND it carried a CR Allocated Inventory
-        // line. Both halves matter, and they are not the same guard: the log is skipped entirely when
-        // the window produced no lines at all, and — separately — a window whose ROUNDED COGS total is
-        // zero still raises a revenue-only journal that credits Allocated Inventory NOTHING, while
-        // `allocatedReliefAmount` below is stamped on every member shipment regardless. Stamping the
-        // id off `journalLines.length` alone would attribute a credit to a journal that does not
-        // contain one, which is the same amount-implies-a-posting inference in a new place.
-        let groupBSyncLogId: string | null = null
-        if (journalLines.length > 0) {
-          const createdLogId = await createPendingSyncLog(tx, {
-            type: 'DAILY_BATCH_GROUP_B',
-            referenceId,
-            currency: baseCurrency,
-            payload: {
-              date: group.date,
-              reference: `Shipment COGS ${group.date} ${referenceId.slice(-8)}`,
-              narration: `Daily shipment batch: ${groupCount} shipment(s), revenue £${groupRevenue.toFixed(2)}, COGS £${groupCogsNumber.toFixed(2)}${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`,
-              lines: journalLines,
-              batchReferenceId: referenceId,
-              batchDate: group.date,
-              batchGroup: 'B',
-              batchEntityCount: groupCount,
-              splitBatch: result.hasMore.groupB,
-              _postingMode: 'submitted',
-            },
-          })
-          if (groupCogsNumber > 0) groupBSyncLogId = createdLogId
-        }
-        for (const shipment of group.rows) {
-          bJournalByShipmentId.set(shipment.id, { referenceId, syncLogId: groupBSyncLogId, date: group.date })
-        }
-        bPostedGroups.push({ date: group.date, movedFromLockedDays: group.movedFromLockedDays })
-      }
-
-      // Only mark shipments that were successfully processed. Failed
-      // orders had their results removed from shipmentResults by the
-      // per-order catch block — those shipments must remain untouched
-      // (shipmentJournalDate stays null) so the next batch run retries.
-      for (const shipment of shipments) {
-        const resultForShipment = shipmentResults.get(shipment.id)
-        if (!resultForShipment) continue // failed order — skip, leave retryable
-        const journalForShipment = bJournalByShipmentId.get(shipment.id)!
-        const referenceId = journalForShipment.referenceId
-        const groupBSyncLogId = journalForShipment.syncLogId
-        for (const line of shipment.lines) {
-          const lineSnapshot = shipmentSnapshots.get(line.id)
-          if (lineSnapshot) {
-            await tx.shipmentLine.update({
-              where: { id: line.id },
-              data: {
-                costLayerSnapshot: lineSnapshot as never,
-              },
-            })
-          }
-        }
-        const shipmentJournalDate = new Date()
-        await tx.shipment.update({
-          where: { id: shipment.id },
-          data: {
-            shipmentJournalDate,
-            shipmentJournalBatchRef: referenceId,
-            cogsBatchAmount: resultForShipment.cogs,
-            revenueRecognizedAmount: resultForShipment.revenue,
-            // o3d-o97 r3: the CR Allocated Inventory this shipment's share of the journal above
-            // raised — the same figure as the COGS debit, recorded once and never revalued.
-            // `cogsBatchAmount` on the line above carries the same number TODAY and a different
-            // one after the next landed-cost correction rewrites it in place.
-            allocatedReliefAmount: resultForShipment.cogs,
-            // o3d-o97 r4: and WHICH journal raised it, on WHICH ledger, against WHICH account —
-            // all null when no CR Allocated Inventory line was raised at all. The refund resolves
-            // the id back to the row to read its STATUS, so a Group B journal still queued, or one
-            // that ended CANCELLED, is never counted as relief the contra has already received.
-            allocatedReliefSyncLogId: groupBSyncLogId,
-            allocatedReliefConnector: groupBSyncLogId ? XERO_CONNECTOR : null,
-            allocatedReliefAccountCode: groupBSyncLogId ? settings.xero_allocated_inventory_account : null,
-          },
-        })
-        // khdw: record this shipment's dispatch COGS in the COGS subledger ledger as
-        // an immutable, correctly-dated row. The reconciliation reads the ledger (not
-        // the live, revaluation-mutated cogsBatchAmount), so a same-window dispatch +
-        // revaluation can't double-count. Idempotent per shipment.
-        //
-        // Dated on the JOURNAL's date (ACC-H11: the event day; before that, the run's date) — NOT on
-        // shipmentJournalDate (o3d-0qoo r1, found by Codex). The GL journal above is posted under that
-        // date, while the stamp is written with a later new Date(); on a midnight-crossing run the two
-        // differ, and the subledger row would land a day after the journal whose value it records.
-        // Reconciliation windows on journalDate, so that gap reads as a real one — and because this
-        // upsert is first-write-wins and keyed per shipment, a row written on the wrong day can never be
-        // corrected by a later run.
-        await recordCogsSubledgerMovement(tx, {
-          sourceType: 'DISPATCH',
-          sourceRef: shipment.id,
-          idempotencyKey: `dispatch:${shipment.id}`,
-          baseDelta: resultForShipment.cogs,
-          journalDate: journalForShipment.date,
-        })
-      }
-
-      // The reversal above is in a journal only when that journal's COGS is, and each refund is recorded once,
-      // under the same transaction as the journal, dated with it.
-      for (const { credit, date } of returnCreditsToRecord) {
-        await recordCogsSubledgerMovement(tx, {
-          sourceType: 'REFUND_REVERSAL',
-          sourceRef: credit.refundId,
-          idempotencyKey: unjournaledReturnKey(credit.refundId, credit.shipmentId),
-          baseDelta: credit.amount.negated(),
-          journalDate: date,
-        })
-      }
-
-      for (const [layerId, decrement] of layerDecrements) {
-        await tx.costLayer.update({
-          where: { id: layerId },
-          data: { remainingQty: { decrement } },
-        })
-      }
-
-      return processedShipmentCount
-    })
-    if (groupBCount > 0) {
-      result.groupB = groupBCount
-    }
-    for (const journal of bPostedGroups) await reportLockedPeriodMoves('B', journal.date, journal.movedFromLockedDays, lockDate)
-  } catch (e) {
-    result.errors.push(`Group B error: ${String(e)}`)
-  }
 
     // cogs-audit scjz.60.4: sweep the inventory subledger-vs-GL rounding residue to
     // the rounding-difference account. Runs after the batch postings so the GL/

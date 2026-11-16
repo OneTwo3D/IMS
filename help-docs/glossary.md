@@ -127,7 +127,7 @@ A separate ledger that feeds the main accounting system (Xero, in this case) in 
 Three daily batches the Xero sub-ledger posts each night:
 - **A1 — Revenue Deferral** — pulls back revenue that Xero auto-recognised when an invoice was paid, parking it in unearned revenue until goods actually ship.
 - **A2 — Inventory Reclassification** — moves the value of allocated stock from "Inventory Asset" to "Allocated Inventory" so the balance sheet reflects what's reserved vs available.
-- **B — Shipment Recognition** — at shipment, recognises the revenue (out of unearned) and books COGS (consuming FIFO cost layers).
+- **B — Shipment Recognition** — at shipment, recognises the revenue (out of unearned) and books COGS (consuming FIFO cost layers). A shipment that leaves before the order is paid books its COGS straight out of Inventory at shipment (revenue was already booked by the invoice), and A1/A2 skip what has already shipped when the order is paid.
 
 
 ## Integrations

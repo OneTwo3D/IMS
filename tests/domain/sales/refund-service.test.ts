@@ -520,6 +520,8 @@ function createClient(state: State): RefundServiceClient {
         },
       }),
     },
+    // ACC-H12: an order with no deferral stamp asks whether any of its shipments were costed straight out of Inventory; these have none.
+    shipment: { count: async () => 0 },
     // The refund of an order pushed to a warehouse records its operator task in this transaction; these orders have no warehouse link.
     wmsOrderPushLink: { findUnique: async () => null },
     integrationOutbox: {

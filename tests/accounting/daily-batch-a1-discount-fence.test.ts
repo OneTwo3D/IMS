@@ -275,7 +275,7 @@ for (const connector of CONNECTORS) {
 
     const journal = world.created.find((log) => log.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
     assert.ok(journal, 'the deferral journal is staged')
-    assert.deepEqual(journal.payload.orderDeferrals, [{ orderId: ORDER_ID, amount: 90, grossAmount: 90 }], '100 − 10')
+    assert.deepEqual(journal.payload.orderDeferrals, [{ orderId: ORDER_ID, amount: 90, storedAmount: 90, grossAmount: 90 }], '100 − 10')
     assert.equal(world.orderUpdates[0]?.data.unearnedRevenueAmount, 90, 'and the stamp agrees with it')
   })
 
