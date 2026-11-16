@@ -347,6 +347,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sync permission.',
   },
+  '/api/credit-note/[id]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with sales permission.',
+  },
   '/api/invoice/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission.',

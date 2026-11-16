@@ -214,7 +214,7 @@ async function generatePackingSlipPreview(branding: Branding, today: string) {
     { label: 'Qty', width: 60, align: 'right' },
     { label: 'Packed', width: 50, align: 'center' },
   ]
-  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, String(l.qty), '☐'])
+  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, String(l.qty), '[   ]'])
   drawTable(doc, columns, rows, branding)
 
   drawTemplateNotes(doc, tpl, 'footer')

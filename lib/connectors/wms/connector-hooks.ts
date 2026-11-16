@@ -41,6 +41,11 @@ export type WmsAsnActions = {
   createTransferAsn(transferId: unknown, input: unknown): Promise<WmsCreateAsnResult>
   /** Re-ask the warehouse whether an ASN booked in, for a callback that was refused or lost. */
   recheckAsnBookedIn(externalAsnId: unknown): Promise<{ success: boolean; error?: string; message?: string }>
+  /**
+   * Close a short-delivered purchase-order ASN so its remainder can be received by hand or put on a new ASN.
+   * Optional: a connector whose ASN has a terminal state of its own does not need it.
+   */
+  closeAsnShort?(externalAsnId: unknown, reason: unknown): Promise<{ success: boolean; error?: string; message?: string }>
 }
 
 /** What set a product/bundle sync running. Shared so the dispatcher and every connector agree. */

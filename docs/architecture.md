@@ -476,4 +476,3 @@ The `/sync` page provides a unified view of all connectors:
 
 - **WooCommerce** — connection settings, order/product/stock sync config, tax mapping, status mapping, sync log
 - **Xero** — OAuth connection, account mapping, transaction type toggles, sub-ledger settings, payment method mapping, sync log
-- **REST API** — tile with endpoint documentation
