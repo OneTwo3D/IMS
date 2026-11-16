@@ -1,0 +1,7 @@
+### Per-warehouse reorder points and safety stock (inventory / analytics)
+
+- **Added: a warehouse can have its own reorder point, safety stock and reorder quantity.** Three nullable columns on `stock_levels` (`reorderPointOverride`, `safetyStockQtyOverride`, `reorderQtyOverride`; additive migration `20261117030000_stock_level_reorder_overrides`, with `>= 0` checks) override the Product values for one product at one warehouse. NULL inherits the Product value, so every existing row behaves as before. One pure helper, `resolveReorderThresholds`, applies the rule everywhere.
+- **Reorder Planning uses them when filtered to a warehouse.** Each row is planned against that warehouse's resolved thresholds (reorder point, safety stock, reorder quantity), safety stock also moves Required receipt and Latest PO date, and a row using an override shows an **Override** tag. The unfiltered view stays consolidated at product level and says how many products have overrides it did not apply. The CSV exports keep their columns.
+- **Editor on the product page** (Inventory > product > Reorder thresholds by warehouse): blank inherits and shows the product value as the placeholder. Needs inventory edit permission; every change is audit-logged in the same transaction (who, when, old and new value).
+- **Warehouses bound to a WMS are allowed.** The thresholds are planning-only and are not sent to Mintsoft or WooCommerce.
+- Help documents: Inventory, Analytics.

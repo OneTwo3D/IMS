@@ -69,6 +69,8 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
   }
 }
 
+const THRESHOLD_FIELD_LABELS = { reorderPoint: 'reorder point', safetyStockQty: 'safety stock', reorderQty: 'reorder quantity' } as const
+
 const ABC_BADGE: Record<ReorderReportRow['abcClass'], string> = {
   A: 'bg-amber-100 text-amber-800 border-amber-200',
   B: 'bg-slate-100 text-slate-700 border-slate-200',
@@ -169,7 +171,19 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'leadTime', label: 'Lead time', align: 'right', render: (row) => `${row.leadTimeDays} days` },
     { key: 'latestPoDate', label: 'Latest PO date', render: (row) => <LatestPoDateCell row={row} /> },
     { key: 'requiredReceipt', label: 'Required receipt', render: (row) => row.requiredReceiptDate ?? MUTED_DASH },
-    { key: 'reorderPoint', label: 'Reorder point', align: 'right', render: (row) => row.reorderPoint },
+    {
+      key: 'reorderPoint',
+      label: 'Reorder point',
+      align: 'right',
+      render: (row) => row.thresholdOverrides.length > 0 ? (
+        <span
+          title={`This warehouse overrides the product value for: ${row.thresholdOverrides.map((f) => THRESHOLD_FIELD_LABELS[f]).join(', ')}. Safety stock ${row.safetyStockQty}, reorder quantity ${row.configuredReorderQty}.`}
+        >
+          {row.reorderPoint}
+          <span className="ml-1 rounded bg-sky-100 px-1 py-0.5 text-[10px] font-semibold text-sky-800">Override</span>
+        </span>
+      ) : row.reorderPoint,
+    },
     { key: 'suggested', label: 'Suggested qty', align: 'right', render: (row) => row.suggestedReorderQty, footer: report.totals.suggestedReorderQty },
     {
       key: 'orderQty',
