@@ -10,6 +10,11 @@ Every stage or production deploy cuts a version: see "Cut a release" in [docs/de
 
 ## Unreleased
 
+### Xero documents are sent with `unitdp=4`; the REST API connector card is removed (backend / sync / UI)
+
+- Every Xero invoice, bill, credit note, supplier credit and purchase order write now carries `unitdp=4`, so Xero keeps the 4 decimal places IMS sends for a unit amount instead of rounding to 2. Without it a 3-unit line at 33.3333 came out at 99.99 in Xero against 100.00 on the order, and the payment for the order total was refused.
+- The Integrations page no longer shows a "REST API" card. It listed 10 `/api/v1` endpoints and told operators to generate an API key in User Management; neither exists.
+
 ### Mintsoft: IMS writes no order comments; it raises operator tasks instead (backend / sync / UI)
 
 - **Changed: IMS no longer writes any comment to a Mintsoft order.** The warehouse staff do not read order comments; only a Mintsoft query reaches them, and the API cannot raise one. Every place IMS used to post a note now records an **operator task** instead, listed on **Sync > Exceptions** under **Raise a warehouse query** (warehouse order number, link to the IMS order, reason, copy-ready query text with a Copy button, and a **Done** button needing the sync permission and a fresh sign-in, recorded with who and when). The sites are: the merged-line removal note (the earlier removal-note obligation), the courier-fallback note (on create, on verify and on amend), the hold / cancel notices (past NEW, merged, and a removal that could not finish), and the refund note on a pushed order. The open count is in the Exceptions banner total. The `wms-order-push` cron is NOT red for an open task (its result reports `operatorTasksOpen` and `operatorTasksRaised`); it is red only if a task could not be recorded (`operatorTaskErrors`, retried next run).
