@@ -529,7 +529,10 @@ export async function propagateLandedCostToOutputs(
   if (costDeltaPerUnit.abs().lte(LANDED_COST_DELTA_EPSILON)) return
   if (depth > MAX_LANDED_COST_PROPAGATION_DEPTH) return
   if (ancestors.has(sourceCostLayerId)) return // cycle on the current path
-  const chart = accountingSettings ?? await getAccountingSettings().catch(() => null)
+  // Resolved LAZILY, at the first shipment refresh that needs it: this runs inside the caller's transaction,
+  // and a pooled read on a walk that never reaches a refresh is a second connection held for nothing (the
+  // revaluation pooled-client trap holds the freight transactions to tx only).
+  let chart = accountingSettings
   const nextAncestors = new Set(ancestors).add(sourceCostLayerId)
 
   const sourceLines = await deps.getDependentOutputSourceLines(tx, sourceCostLayerId)
@@ -602,8 +605,15 @@ export async function propagateLandedCostToOutputs(
     let outputShipmentRevalDelta = new Prisma.Decimal(0)
     if (outDeltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
       await deps.updateSnapshotsForCostLayerChange(tx, outputCostLayerId, newOutputUnitCost)
+      if (chart === undefined) chart = await getAccountingSettings().catch(() => null)
+      // A landed-cost revaluation books the sold units' share against TRANSIT (where the cost was capitalised).
+      // A manufacturing cost edit has no Transit leg: its own reclass credits the overhead and debits Inventory
+      // for the whole edit, so the downstream shipment's reversal must credit INVENTORY (the default offset).
+      // Offsetting it to Transit would credit an account the edit never debited, and with no Transit account
+      // configured the reversal would not post at all (ACC-H14).
+      const fundedFromTransit = revaluationContext?.operation !== 'recompute_production_order'
       const shipmentRefresh = await deps.refreshShipmentCogsForCostLayerChange(tx, outputCostLayerId, {
-        offsetCostDeltaToTransit: true,
+        ...(fundedFromTransit ? { offsetCostDeltaToTransit: true } : {}),
         recalcRunId,
         revaluationContext: revaluationContext
           ? { ...revaluationContext, source: 'landed_cost_output_propagation' }

@@ -298,3 +298,21 @@ test('ACC-H14: transferred and component-reused units SOLD before the edit: COGS
   assert.ok(rows.some((row) => row.type === 'MANUFACTURING_RECLASS') && rows.filter((row) => row.type === 'COGS_REVERSAL').length >= 2, 'the edit queued the reclass and both downstream reversals')
   assert.deepEqual([...new Set(rows.map((row) => row.connector))], ['xero'], 'every journal of the edit carries the one chart connector')
 })
+
+// The fixtures stamp a shipment batch ref on journaled shipments with no batch journal behind it. Left in the
+// shared scratch database, a later daily-batch run RECREATES a stage batch for them and books their COGS into
+// whatever journal that test is summing (refund-unjournaled-return-group-b saw 20 foreign shipments, COGS 688).
+// So the sales documents this file seeded are removed when it is done.
+test('ACC-H14: teardown removes the sales documents this file seeded', { skip }, async () => {
+  const { db } = await import('@/lib/db')
+  const where = { orderNumber: { startsWith: 'SO-ACCH14-' } }
+  const orders = await db.salesOrder.findMany({ where, select: { id: true } })
+  const orderIds = orders.map((o) => o.id)
+  await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: { in: orderIds } } } })
+  await db.salesOrderRefund.deleteMany({ where: { orderId: { in: orderIds } } })
+  await db.shipmentLine.deleteMany({ where: { shipment: { orderId: { in: orderIds } } } })
+  await db.shipment.deleteMany({ where: { orderId: { in: orderIds } } })
+  await db.salesOrderLine.deleteMany({ where: { orderId: { in: orderIds } } })
+  await db.salesOrder.deleteMany({ where: { id: { in: orderIds } } })
+  assert.equal(await db.shipment.count({ where: { orderId: { in: orderIds } } }), 0)
+})
