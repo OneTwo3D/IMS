@@ -1,20 +1,22 @@
 /**
- * THE MERGED-LINE REMOVAL NOTE, AS A DURABLE OBLIGATION.
+ * THE MERGED-LINE REMOVAL OBLIGATION.
  *
- * After IMS removes a cancelled order's lines from a merged warehouse order it owes the warehouse ONE note naming them. The link is closed
- * (CANCELLED) once the removal is verified and a CANCELLED link is never revisited, so the note cannot live on the link: it is a row in
- * `settings`, one per link, written BEFORE the first remote delete and driven through these states:
+ * After IMS removes a cancelled order's lines from a merged warehouse order the removal is recorded durably, because the link is closed
+ * (CANCELLED) once the removal is verified and a CANCELLED link is never revisited. It is a row in `settings`, one per link, written BEFORE
+ * the first remote delete and driven through these states:
  *
  *   intended    written before any delete; the lines named are the ones about to be removed. Not yet known to be removed.
- *   owed        the removal is verified (or the lines are confirmed absent): the note is to be posted.
- *   needs_check the note may or may not have reached the warehouse (an uncertain answer, a crash after a send, comments that cannot be
- *               read): NEVER re-posted blind; an operator looks at the warehouse order's comments (the sweep raises it once, see below).
+ *   owed        the removal is verified (or the lines are confirmed absent): the operator task "raise a query" is to be raised (and is
+ *               raised in the same step), and the link closed.
+ *   needs_check a PARTIAL removal (only some of the recorded lines are gone) or one that could not be read. It keeps the link OPEN and stops
+ *               the removal being retried over it, until an operator has the warehouse take the rest out and presses Done on its
+ *               partial-removal-check task (which re-reads the order, closes the link and deletes this row in one transaction).
+ *               `taskRaised` is set once that task exists. (A row left by the earlier posting design, with `verified`, is a verified removal
+ *               and is turned into a task and deleted; one without it is a partial removal and gets its task.)
  *
- * `attempted` is set (and persisted) BEFORE a send and cleared only by a definite "not sent" answer, so a crash or an uncertain answer
- * after a send leaves it set and the next sweep checks the order's comments for the marker instead of posting again.
+ * IMS writes no comment to the warehouse order any more (the warehouse does not read them), so nothing here tracks a post.
  *
- * NO PERSONAL DATA is kept: ids, SKUs and quantities only. The order number is read from the order at post time, and an erased order's
- * obligation is dropped, never posted.
+ * NO PERSONAL DATA is kept: ids, SKUs and quantities only. An erased order's obligation is dropped.
  */
 
 export const REMOVAL_NOTE_KEY_PREFIX = 'wms_order_push_removal_note:'
@@ -29,13 +31,13 @@ export type WmsRemovalNoteObligation = {
   /** The warehouse order the lines were on: the note is posted there and only there. */
   externalOrderId: string
   state: RemovalNoteState
-  /** A send may have gone out (see above). */
-  attempted: boolean
   /** True once the removal of these lines was VERIFIED on `externalOrderId` (set when it becomes owed). A needs_check row without it came from a PARTIAL interrupted removal and must never close a link. */
   verified?: boolean
   items: RemovalNoteItem[]
   /** Why it needs a check (no personal data). */
   detail?: string
+  /** The operator task for this row has been raised (set with needs_check); the sweep does not raise it again. */
+  taskRaised?: boolean
 }
 
 /**
@@ -45,11 +47,6 @@ export type WmsRemovalNoteObligation = {
  */
 export function removalNoteKey(connector: string, linkId: string, externalOrderId: string): string {
   return `${REMOVAL_NOTE_KEY_PREFIX}${connector}:${linkId}:${externalOrderId}`
-}
-
-/** The text a note carries so a re-read of the order's comments can prove it was posted. FIRST in the note: the connector truncates a long comment from the end. */
-export function removalNoteMarker(note: Pick<WmsRemovalNoteObligation, 'id' | 'linkId'>): string {
-  return `[IMS removal-note ${note.linkId}-${note.id}]`
 }
 
 export function serializeRemovalNote(note: WmsRemovalNoteObligation): string {
@@ -62,13 +59,13 @@ export function parseRemovalNote(value: string): WmsRemovalNoteObligation | null
     const p = JSON.parse(value) as Partial<WmsRemovalNoteObligation>
     const states: RemovalNoteState[] = ['intended', 'owed', 'needs_check']
     if (typeof p.id !== 'string' || typeof p.linkId !== 'string' || typeof p.orderId !== 'string' || typeof p.externalOrderId !== 'string') return null
-    if (!p.state || !states.includes(p.state) || typeof p.attempted !== 'boolean' || !Array.isArray(p.items)) return null
+    if (!p.state || !states.includes(p.state) || !Array.isArray(p.items)) return null
     const items: RemovalNoteItem[] = []
     for (const item of p.items) {
       if (!item || typeof item.externalItemId !== 'string' || typeof item.sku !== 'string' || typeof item.quantity !== 'number') return null
       items.push({ externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })
     }
-    return { id: p.id, linkId: p.linkId, orderId: p.orderId, externalOrderId: p.externalOrderId, state: p.state, attempted: p.attempted, items, ...(p.verified === true ? { verified: true } : {}), ...(typeof p.detail === 'string' ? { detail: p.detail } : {}) }
+    return { id: p.id, linkId: p.linkId, orderId: p.orderId, externalOrderId: p.externalOrderId, state: p.state, items, ...(p.verified === true ? { verified: true } : {}), ...(typeof p.detail === 'string' ? { detail: p.detail } : {}), ...(p.taskRaised === true ? { taskRaised: true } : {}) }
   } catch {
     return null
   }

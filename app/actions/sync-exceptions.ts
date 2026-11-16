@@ -781,6 +781,8 @@ export type ExceptionInboxSummary = {
   blockedWcOrders: number
   /** Held invoices refused for a gift-card flag the store left unsettled: an operator answers per line (counted in the total). */
   giftCardLinesToResolve: number
+  /** Open operator tasks ("raise a warehouse query"): IMS writes no warehouse comments, so each is a query a person raises by hand (counted in the total). */
+  wmsOperatorTasksOpen: number
   unresolvedDrift: number
   /**
    * o3d-0bfh r6 (Codex HIGH): accounting sync rows that finished posting still owing follow-up work,
@@ -1186,6 +1188,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   ])
 
   const giftCardLinesToResolve = await db.shoppingSyncLog.count({ where: giftCardUnsettledHoldWhere() })
+  const wmsOperatorTasksOpen = await db.wmsOperatorTask.count({ where: { status: 'OPEN' } })
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
   const deadReceiptEvents = deadReceipts + deadWebhooks + deadShoppingWebhooks
   return {
@@ -1201,6 +1204,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     wcOrderEdits,
     blockedWcOrders,
     giftCardLinesToResolve,
+    wmsOperatorTasksOpen,
     unresolvedDrift: driftIncidents.length,
     accountingFollowUpObligations,
     accountingPostingRefusals: outstandingPostingRefusals + unconfirmedPostingRefusals,
@@ -1208,7 +1212,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + giftCardLinesToResolve + driftIncidents.length
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }

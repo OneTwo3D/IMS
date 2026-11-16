@@ -87,6 +87,7 @@ export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
+import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -5046,6 +5047,29 @@ export async function createSalesOrderRefund(
       where: { id: input.orderId },
       data: { refundStatus: refundDispositionForStatus(newStatus) },
     })
+
+    // THE WAREHOUSE MUST ACT: a refund of an order already pushed to a warehouse is an operator task ("raise a query"; IMS writes no comment
+    // to the warehouse). It is recorded HERE, in the refund's own transaction, so the refund and its task commit together and a failure of
+    // either rolls back both: a committed refund can never be left without its task, and a replay (which finds the refund already there)
+    // needs none. An amount-only partial (shipping / discount / goodwill) leaves fulfilment unchanged and needs none. Deduplicated on the
+    // credit note.
+    const wmsLink = await tx.wmsOrderPushLink.findUnique({
+      where: { orderId: input.orderId },
+      select: { state: true, connector: true, externalOrderId: true, externalOrderNumber: true },
+    })
+    if (wmsLink?.state === 'SYNCED' && wmsLink.externalOrderId
+      && (newStatus === 'REFUNDED' || createdRefundLines.some((line) => line.lineKind === 'sale' && line.qty > 0))) {
+      const orderRef = so.orderNumber ?? input.orderId
+      await raiseWmsOperatorTask(tx, {
+        connector: wmsLink.connector,
+        orderId: input.orderId,
+        externalOrderId: wmsLink.externalOrderId,
+        reason: 'REFUND_NOTE',
+        queryText: refundNoteQuery(warehouseOrderRef(wmsLink.externalOrderNumber, wmsLink.externalOrderId), orderRef, creditNoteNumber, newStatus === 'REFUNDED'),
+        dedupeBasis: `refund:${creditNoteNumber || createdRefund.id}:${newStatus === 'REFUNDED' ? 'full' : 'partial'}`,
+        payload: { orderNumber: orderRef, externalOrderNumber: wmsLink.externalOrderNumber ?? null },
+      })
+    }
 
     // Build fallback rows inside the refund transaction so source-stock errors
     // roll back the refund and its lines. Stock application remains in the
