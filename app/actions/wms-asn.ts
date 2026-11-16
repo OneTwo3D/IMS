@@ -162,3 +162,19 @@ export async function recheckWmsAsnBookedIn(
   if (!resolved.actions) return asnUnavailable(resolved)
   return resolved.actions.recheckAsnBookedIn(externalAsnId)
 }
+
+/**
+ * o3d-hqvrp.117: close a short-delivered purchase-order ASN, releasing the undelivered remainder for manual
+ * receipt or a new ASN. The gate is the delegate's own (mintsoft-sync.ts:closeMintsoftAsnShort ->
+ * requirePermission('purchasing.receive')), repeated here for the reason the recheck above gives.
+ */
+export async function closeWmsAsnShort(
+  externalAsnId: unknown,
+  reason: unknown,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requirePermission('purchasing.receive')
+  const resolved = await resolveWmsAsn()
+  if (!resolved.actions) return asnUnavailable(resolved)
+  if (!resolved.actions.closeAsnShort) return { success: false, error: 'This warehouse connector does not support closing an ASN short.' }
+  return resolved.actions.closeAsnShort(externalAsnId, reason)
+}

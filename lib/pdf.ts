@@ -1,5 +1,6 @@
 import PDFDocument from 'pdfkit'
 import { readFile } from 'fs/promises'
+import { existsSync } from 'fs'
 import path from 'path'
 import sharp from 'sharp'
 import { filenameFromBrandingUploadUrl, resolveBrandingUploadFilePath } from '@/lib/upload-storage'
@@ -14,6 +15,8 @@ export type Branding = {
   companyName: string
   legalName: string
   vatNumber: string
+  /** Registry number (Organisation.companyNumber); empty when not set. */
+  companyNumber: string
   address: string
   phone: string
   email: string
@@ -45,6 +48,7 @@ export async function getBranding(): Promise<Branding> {
     companyName: org?.name ?? 'Our Company',
     legalName: org?.legalName ?? org?.name ?? 'Our Company',
     vatNumber: org?.vatNumber ?? '',
+    companyNumber: org?.companyNumber ?? '',
     address,
     phone: org?.phone ?? '',
     email: org?.email ?? '',
@@ -87,6 +91,37 @@ export type PdfTableRow = string[]
  * Creates a new PDFDocument with standard page setup, header, and returns it
  * along with helper functions for drawing tables, etc.
  */
+/**
+ * The built-in Helvetica is WinAnsi only: an em dash, "Ł", Cyrillic or Greek letters in a customer name or note are dropped or garbled.
+ * Every document text call names 'Helvetica' / 'Helvetica-Bold', so those two names are re-pointed at an embedded Unicode-capable face
+ * (Liberation Sans, metric-compatible with Helvetica, SIL OFL; public/fonts). It covers Latin, Latin Extended, Greek and Cyrillic; CJK
+ * and emoji are not in it. If the files cannot be found the standard fonts stay in place.
+ */
+export const PDF_FONT_FILES = {
+  regular: 'LiberationSans-Regular.ttf',
+  bold: 'LiberationSans-Bold.ttf',
+} as const
+
+export function pdfFontPath(file: string): string {
+  return path.resolve(process.cwd(), 'public', 'fonts', file)
+}
+
+export function registerUnicodeFonts(doc: PDFKit.PDFDocument): boolean {
+  const regular = pdfFontPath(PDF_FONT_FILES.regular)
+  const bold = pdfFontPath(PDF_FONT_FILES.bold)
+  if (!existsSync(regular) || !existsSync(bold)) return false
+  doc.registerFont('Helvetica', regular)
+  doc.registerFont('Helvetica-Bold', bold)
+  // PDFKit opens the built-in Helvetica in its constructor and caches it under that very name, and font() consults the cache before the
+  // registry: drop the two cached entries so the next font('Helvetica') resolves to the registered face (pinned pdfkit; the test asserts it).
+  const families = (doc as unknown as { _fontFamilies?: Record<string, unknown> })._fontFamilies
+  if (families) {
+    delete families['Helvetica']
+    delete families['Helvetica-Bold']
+  }
+  return true
+}
+
 export function createPdfDocument(options?: { title?: string }) {
   const doc = new PDFDocument({
     size: 'A4',
@@ -94,6 +129,7 @@ export function createPdfDocument(options?: { title?: string }) {
     info: { Title: options?.title ?? 'Document' },
     bufferPages: true,
   })
+  registerUnicodeFonts(doc)
 
   const pageWidth = 595.28 - 100 // A4 width minus margins
 
@@ -101,8 +137,18 @@ export function createPdfDocument(options?: { title?: string }) {
 }
 
 /**
- * Draw the document header with company info and recipient
+ * The seller's legal identifiers, printed under the FROM block of every document (a UK VAT invoice must carry the VAT registration
+ * number; a limited company's documents must show its registered number). Empty values are left out.
  */
+export function sellerIdentityLines(branding: Pick<Branding, 'vatNumber' | 'companyNumber'>): string[] {
+  const lines: string[] = []
+  const vat = branding.vatNumber?.trim()
+  const company = branding.companyNumber?.trim()
+  if (vat) lines.push(`VAT reg. no.: ${vat}`)
+  if (company) lines.push(`Company no.: ${company}`)
+  return lines
+}
+
 /**
  * Load a logo image from configured upload storage, or from public assets for
  * static bundled logos.
@@ -195,6 +241,7 @@ export async function drawHeader(
   }
   if (branding.email) { doc.fontSize(8).text(branding.email, 50, y); y = doc.y + 1 }
   if (branding.phone) { doc.fontSize(8).text(branding.phone, 50, y); y = doc.y + 1 }
+  for (const line of sellerIdentityLines(branding)) { doc.fontSize(8).text(line, 50, y); y = doc.y + 1 }
 
   // To
   if (opts.recipient) {

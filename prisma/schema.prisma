@@ -2216,6 +2216,12 @@ model SalesOrderRefund {
   // reporting the order — and this string says, on a row that outlives the order's stamps, which
   // record was missing and how many pounds are still sitting in Allocated Inventory.
   allocationBasisUnresolved String? @map("accounting_allocation_basis_unresolved")
+  // The Group A1 adjustment journal (DR Unearned Revenue / CR Sales, `A1-<date>-<digest>`) that netted THIS refund
+  // out of its order's revenue deferral, stamped in the same transaction as the journal. NULL for a refund the
+  // batch never netted: a refund recorded after the deferral (the refund service reverses those), and every row
+  // from before the column existed - which is also how the A1 recreate sweep tells a deferral stored net
+  // (adjusted separately) from one stored gross (the old convention). No backfill.
+  deferralAdjustmentRef String? @map("deferral_adjustment_ref")
   accountingRetrySyncs Json?  @map("accounting_retry_syncs")
   // scjz.70: revenue-only chargeback — credit note reverses recognised revenue
   // against AR, but COGS reversal + inventory restock are suppressed (cost kept as
