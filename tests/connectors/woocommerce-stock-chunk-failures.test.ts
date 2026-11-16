@@ -25,10 +25,13 @@ let fetchImpl: Fetch = () => ({ data: [] })
 let postImpl: Post = () => ({ data: { update: [] } })
 let ordersImpl: (params: Record<string, string>) => { data: unknown; error?: string } = () => ({ data: [] })
 // The guard's order read wants the X-WP-Total header; a count read (per_page=1) reports the whole list.
+let omitCompletedTotal = false
 function ordersAnswer(params: Record<string, string>) {
+  // The completed-order changed-during-the-walk probe (orderby=modified): nothing changed unless a test says so.
+  if (params.orderby === 'modified') return { data: [], totalItems: 0, totalItemsPresent: true }
   const r = ordersImpl(params)
   if (r.error || !Array.isArray(r.data)) return r
-  return { ...r, totalItems: r.data.length, totalItemsPresent: true, data: params.per_page === '1' ? r.data.slice(0, 1) : r.data }
+  return { ...r, totalItems: r.data.length, totalItemsPresent: !(omitCompletedTotal && params.status === 'completed'), data: params.per_page === '1' ? r.data.slice(0, 1) : r.data }
 }
 
 function modelProxy(name: string) {
@@ -82,6 +85,7 @@ const product = (id: string, sku: string, externalProductId: bigint | null) => (
 
 function reset(list: Array<Record<string, unknown>>) {
   settings.clear()
+  omitCompletedTotal = false
   for (const [key, value] of Object.entries({ wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_stock_sync_enabled: 'true', last_wc_order_sync_at: '2026-11-15T00:00:00.000Z' })) settings.set(key, value)
   candidates = list
   fetchImpl = () => ({ data: [] })
@@ -354,6 +358,7 @@ test('WCO-H3: a multi-unit unimported order is subtracted in full (linked/partia
 
 test('WCO-H3: an unimported COMPLETED order inside the cursor window is subtracted too', async () => {
   reset([product('a', 'S1', BigInt(1))])
+  settings.set('last_wc_order_reconcile_at', '2026-11-15T00:00:00.000Z') // both sweep cursors present: the read is bounded
   let completedAfter = ''
   ordersImpl = (params) => {
     if (params.status === 'completed') { completedAfter = params.modified_after ?? ''; return { data: [{ id: 950, line_items: [{ product_id: 1, variation_id: 0, quantity: 2, sku: 'S1' }] }] } }
@@ -367,13 +372,14 @@ test('WCO-H3: an unimported COMPLETED order inside the cursor window is subtract
   assert.equal(completedAfter, '2026-11-14T00:00:00.000Z') // cursor minus the one-day overlap
 })
 
-test('WCO-H3: with no order-sweep cursor, positive pushes are withheld', async () => {
+test('WCO-H3: with no order-sweep cursor, completed orders are read exhaustively; positive pushes are withheld only when that read cannot be proven', async () => {
   reset([product('a', 'S1', BigInt(1))])
   settings.delete('last_wc_order_sync_at')
+  omitCompletedTotal = true // WooCommerce sent no X-WP-Total for the unbounded read: completeness cannot be proven
   fetchImpl = okPreflight
   let posts = 0
   postImpl = () => { posts++; return okUpdate([1]) }
   const result = await run()
   assert.equal(posts, 0)
-  assert.ok(result.errors.some((e) => e.includes('cursor is missing')))
+  assert.ok(result.errors.some((e) => e.includes('sweep cursor is missing')))
 })
