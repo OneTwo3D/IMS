@@ -121,7 +121,7 @@ export function poTaxLabel(name: string | null, ratePercent: number | null): str
 // ---------------------------------------------------------------------------
 
 export const PO_EMAIL_SETTING_KEY = 'purchase_order_email_enabled'
-export const PO_EMAIL_DISABLED_MESSAGE = 'PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it yourself.'
+export const PO_EMAIL_DISABLED_MESSAGE = 'PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it to the supplier directly.'
 export const PO_EMAIL_DISABLED_REASON = 'Not sent: emailing purchase orders to suppliers is switched off (Settings > Documents)'
 
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -160,7 +160,7 @@ export async function runPoSend(supplierEmail: string | null | undefined, deps: 
   const decision = decidePoSend(supplierEmail)
   if (decision.action === 'skip') {
     return decision.reason === 'no_supplier_email'
-      ? { status: 'no_supplier_email', message: 'The order is confirmed, but the supplier has no email address, so nothing was sent. Add one on the supplier and use "Email PO", or download the PO PDF and send it yourself.' }
+      ? { status: 'no_supplier_email', message: 'The order is confirmed, but the supplier has no email address, so nothing was sent. Add one on the supplier and use "Email PO", or download the PO PDF and send it to the supplier directly.' }
       : { status: 'invalid_supplier_email', message: 'The order is confirmed, but the supplier\'s email address is not valid, so nothing was sent. Correct it on the supplier and use "Email PO".' }
   }
   try {

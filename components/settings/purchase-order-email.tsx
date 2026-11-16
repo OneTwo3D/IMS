@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { setPurchaseOrderEmailEnabled } from '@/app/actions/purchase-orders'
 
 const OPTIONS = [
-  { value: 'false', label: 'Off (default)', description: 'Confirm & Send PO confirms the order only. Download the PO PDF and send it to the supplier yourself.' },
+  { value: 'false', label: 'Off (default)', description: 'Confirm & Send PO confirms the order only. Download the PO PDF and send it to the supplier directly.' },
   { value: 'true', label: 'On', description: 'Confirm & Send PO (and Email PO) email the supplier a branded message with the PO PDF attached, through the email queue and your SMTP settings. Leave off on a stage copy that holds real SMTP credentials.' },
 ]
 

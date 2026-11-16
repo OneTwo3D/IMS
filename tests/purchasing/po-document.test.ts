@@ -111,7 +111,7 @@ test('runPoSend: flag OFF confirms with nothing queued and the exact switched-of
   const r = await runPoSend('orders@supplier.test', { isEnabled: async () => false, queue: async () => { calls++; return { queued: true } } })
   assert.equal(r.status, 'disabled')
   assert.equal(r.message, PO_EMAIL_DISABLED_MESSAGE)
-  assert.equal(r.message, 'PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it yourself.')
+  assert.equal(r.message, 'PO confirmed. Emailing POs to suppliers is switched off (Settings > Documents); download the PO PDF and send it to the supplier directly.')
   assert.equal(calls, 0)
 })
 
