@@ -28,6 +28,7 @@ const CENSUS: Record<string, Row> = {
   INVOICE_EMAIL: G("guardStoreCreditFollowUp(orderId, 'invoice email')", 'sendAccountingInvoiceEmailInternal(', 'if (emailCreditRefusal) return emailCreditRefusal'),
   WC_INVOICE_NOTE: G("guardStoreCreditFollowUp(orderId, 'WooCommerce invoice note')", 'pushInvoiceNoteToWc(', 'if (noteCreditRefusal) return noteCreditRefusal'),
   CREDIT_NOTE: G('guardStoreCreditCreditNote(', 'pushCreditNote({', 'if (storeCreditRefusal) return storeCreditRefusal'),
+  CREDIT_NOTE_VOID: E('voids a credit note that already stands: creates no document and moves no money, so the store-credit posting fence (which gates NEW documents) does not apply; a refund on a store-credit order is refused before the void is ever queued'),
   INVOICE_PDF: E('read-only: downloads a PDF Xero already holds; posts and sends nothing'),
   PURCHASE_INVOICE: PURCHASING,
   PURCHASE_INVOICE_UPDATE: PURCHASING,

@@ -96,9 +96,18 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       reason: 'owner decision: the refund reason text is kept',
     },
   },
+  // o3d-ngmt.22: the record that a refund recorded in error was deleted. Keyed to its order by id only (no foreign key, so it outlives a deleted order). Ids, a credit note number,
+  // amounts and a JSON of the reversed movements (ids and quantities); the one free-text column is the operator's delete reason, retained like the refund's own reason.
+  SalesOrderRefundDeletion: {
+    erased: [],
+    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId', 'reversal'],
+    retained: {
+      reason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
+    },
+  },
   // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
   CogsEntry: { erased: [], notPersonal: [], retained: {} },
-  CostLayer: { erased: [], notPersonal: [], retained: {} },
+  CostLayer: { erased: [], notPersonal: ['returnMovementId'], retained: {} },
   CostLayerRevaluation: { erased: [], notPersonal: ['reason'], retained: {} },
   CostLayerSourceLine: { erased: [], notPersonal: ['sourceCostLayerId'], retained: {} },
   OrderAllocation: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },

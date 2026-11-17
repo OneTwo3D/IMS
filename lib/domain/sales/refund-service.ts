@@ -1360,10 +1360,12 @@ async function createReturnInboundMovementAndCostLayersTx(
     idempotencyKey?: string
   },
 ): Promise<'created' | 'duplicate'> {
+  let createdMovement: { id: string } | undefined
   try {
     // o3d-slrn: returning 'duplicate' leaves the CALLER continuing on this same tx, so the
     // failing insert must be savepointed or everything after it hits a 25P02.
-    await withSavepoint(tx, () => tx.stockMovement.create({
+    createdMovement = await withSavepoint(tx, () => tx.stockMovement.create({
+      select: { id: true },
       data: {
         type: 'RETURN_INBOUND',
         productId: params.movementRow.productId,
@@ -1412,6 +1414,8 @@ async function createReturnInboundMovementAndCostLayersTx(
         remainingQty: row.qty,
         unitCostBase: unitCostBase.toFixed(6),
         poLineId: row.poLineId ?? null,
+        // o3d-ngmt.22: which movement created this layer, so deleting the refund removes exactly the layers its own return made.
+        returnMovementId: createdMovement?.id ?? null,
       },
       select: { id: true },
     })

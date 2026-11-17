@@ -381,6 +381,38 @@ When you record a refund in IMS on an order that came from WooCommerce, IMS book
 - **If the amount differs from every open IMS refund,** no Confirm button is offered: look at the refund in WooCommerce and, if it is a separate refund, use Record manually on that row. If it was meant to pay an IMS refund for a different amount, check the credit note and the refund first; recording it would credit the same money twice. If several IMS refunds have the same amount, each has its own Confirm button, so you name the one it settles.
 - A refund that **began in WooCommerce** is imported as it always was. A full or partial refund in IMS never changes the WooCommerce order status.
 
+### Deleting a refund recorded in error
+
+A refund an operator recorded in IMS by mistake can be deleted, and the delete undoes exactly what that refund did. **It is off by default**: an administrator switches it on with the `refund_delete_enabled` setting (the value `true`). While it is off the order page shows no delete control.
+
+**Where.** On the order page, open **Refunds**. Each refund shows **Delete refund** when it can be deleted, or a line beginning *Cannot be deleted* with the reason when it cannot. The action needs the same permission as recording a refund (`sales.refund`). A confirmation asks for an optional reason, which is kept in the audit record.
+
+**What it undoes, from the record of what the refund did (it never recalculates a cost):**
+
+- **Returned stock** goes back out: the refund's return movement and the cost layers that return created are removed and the stock level goes down by exactly the recorded quantity.
+- **The cost-of-sales (COGS) reversal** is reversed at the amount it carried. A reversal not yet sent to the accounting system is cancelled; one already posted is countered with a journal that swaps its debit and credit lines. The COGS sub-ledger gets the exact opposite movement, so it nets back to what it was before the refund. Because the delete reverses the amounts the refund actually posted, the result does not depend on how refund COGS reversal is valued (the open finance decision on refund cost basis).
+- **The credit note**: one never sent is cancelled and everything is undone at once. One already in the accounting system makes the delete **two steps**: confirming it only queues the *Credit note void* (see Xero sync) and changes nothing else, so the refund and its stock stay exactly as they were. Only when the accounting system confirms the void does IMS unwind the refund. If the accounting system refuses (for example the credit note was allocated or paid there), the refund stays as it is and the entry fails on the sync page with the reason. Nothing is sent when the delete is confirmed, and nothing leaves at all while outbound writes are held.
+- **A "Refund in WooCommerce" task** raised for the refund (on an order that came from WooCommerce) is marked done, so nobody is told to pay the customer back for a refund that no longer exists.
+- **Stock reservation**: the order is re-reserved for its remaining demand after the delete (best effort; if a shipment exists or stock is short, a warning says to allocate it from the order page).
+- **The order's refund status** is recalculated from the refunds that remain. Refund analytics and the Returns report no longer include the refund.
+
+A warehouse query the refund raised for an order already pushed to the warehouse is **not** withdrawn (IMS writes nothing to the warehouse): raise a follow-up query there if the warehouse acted on it.
+
+The refund row is removed; a record of the deletion (who, when, why, the credit note number and what was reversed) is kept, and the order's activity log shows *refund_deleted*.
+
+**When it is refused** (always with the reason in plain words, and nothing is changed):
+
+- The refund **came from WooCommerce** (it would be imported again) or was raised automatically, for example from a payment reversal. Delete or correct those in WooCommerce.
+- The credit note has **payments or allocations** recorded against it.
+- The credit note's date is **on or before the accounting lock date** IMS last read from Xero.
+- The stock the refund returned has **since been used, reserved or moved**, or the return predates IMS recording which cost layers it created.
+- The order carries **store credit**, or has been **erased**.
+- The refund's accounting is **being sent right now**, **still needs a retry**, or IMS **cannot prove** whether a queued entry reached the accounting system.
+- The refund routed goods **in transit**, or also moved unearned revenue, allocated inventory or a daily-batch adjustment, which a delete cannot unwind exactly. Correct those with a new entry.
+- The delete setting is off.
+
+The delete is idempotent: pressing it twice, or retrying after an interruption, reports success and does nothing a second time. If the accounting system cannot void the credit note (for example it was allocated there since), the queued entry fails with the reason and can be retried from the sync page after the allocation is removed in Xero.
+
 ## Payments
 
 You can record payments against a sales order:
