@@ -5,6 +5,8 @@ import {
   approvalSpendBase, approverIsRequester, assertPoApprovedForSend, editInvalidatesApproval, evaluatePoApproval, parseApprovalThreshold,
   PoApprovalRequiredError, validateApprovalThresholdInput, type PoApprovalFacts, type PoApprovalGateDb,
 } from '@/lib/domain/purchasing/po-approval'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { hasPermission, ROLES } from '@/lib/permissions'
 
 const D = (v: string) => new Prisma.Decimal(v)
@@ -90,4 +92,24 @@ test('the send gate: refuses an unapproved order at or above the threshold with 
 test('purchasing.approve is held by ADMIN and MANAGER only', () => {
   const holders = ROLES.filter((r) => hasPermission(r, 'purchasing.approve'))
   assert.deepEqual(holders.sort(), ['ADMIN', 'MANAGER'])
+})
+
+test('every user-invoked goods PO create path in app/ records the creator (self-approval depends on it)', () => {
+  const offenders: string[] = []
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir)) {
+      if (name === 'generated' || name === 'node_modules') continue
+      const path = join(dir, name)
+      if (statSync(path).isDirectory()) { walk(path); continue }
+      if (!/\.tsx?$/.test(name)) continue
+      const src = readFileSync(path, 'utf8')
+      for (const m of src.matchAll(/purchaseOrder\.create\(\{\s*data: \{([\s\S]{0,400})/g)) {
+        const head = m[1]!
+        if (/type: 'FREIGHT'/.test(head)) continue
+        if (!/createdById/.test(head)) offenders.push(path)
+      }
+    }
+  }
+  walk(join(process.cwd(), 'app'))
+  assert.deepEqual(offenders, [])
 })

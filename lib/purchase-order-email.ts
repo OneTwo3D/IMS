@@ -7,7 +7,7 @@ import { db } from '@/lib/db'
 import { PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { EmailKindDisabledError } from '@/lib/email-kind-disabled'
 import { PO_EMAIL_DISABLED_REASON, PO_EMAIL_SETTING_KEY } from '@/lib/domain/purchasing/po-document'
-import { assertPoApprovedForSend } from '@/lib/domain/purchasing/po-approval'
+import { assertPoApprovedForSend, PoApprovalRequiredError } from '@/lib/domain/purchasing/po-approval'
 import { renderEmailHtml } from '@/lib/email-template'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -58,7 +58,7 @@ export async function buildPurchaseOrderEmail(id: string) {
       'Please confirm receipt and your expected delivery date at your earliest convenience, and quote the PO reference on all delivery notes and invoices.',
     ],
   }, 'purchase_order')
-  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }], sendGuard: purchaseOrderSendGuard, sendDeadlineMs: PO_SEND_DEADLINE_MS, singleSend: true }
+  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }], sendGuard: purchaseOrderSendGuardFor(id), sendDeadlineMs: PO_SEND_DEADLINE_MS, singleSend: true }
 }
 
 /** The PO send's own deadline (the mailer closes the connection at it) and the guard's backstop race, both well below the transaction timeout. */
@@ -85,6 +85,30 @@ export async function purchaseOrderSendGuard<T>(send: () => Promise<T>): Promise
   return runUnderPoEmailSendLock(db, send)
 }
 
+/**
+ * The delivery guard for ONE order: the switch check above, plus the approval check made inside the same transaction under a SHARE lock on the
+ * order's row. An edit (which takes the row FOR UPDATE) that raises the total or moves the supplier or currency therefore either committed before
+ * this check (and the send is refused as unapproved) or waits until the send has returned. Without this, an edit could clear the approval between
+ * building the email and handing it to SMTP.
+ */
+export function purchaseOrderSendGuardFor(poId: string) {
+  return async function guard<T>(send: () => Promise<T>): Promise<GuardOutcome<T>> {
+    return runUnderPoEmailSendLock(db, send, {
+      approvalCheck: async (tx) => {
+        const t = tx as unknown as Parameters<typeof assertPoApprovedForSend>[0] & { $queryRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> }
+        await t.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR SHARE`
+        try {
+          await assertPoApprovedForSend(t, poId)
+        } catch (e) {
+          if (e instanceof PoApprovalRequiredError) return `Not sent: ${e.message}`
+          throw e
+        }
+        return null
+      },
+    })
+  }
+}
+
 type LockableClient = {
   $transaction: <R>(fn: (tx: { $executeRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown>; setting: { findUnique: typeof db.setting.findUnique } }) => Promise<R>, options?: { timeout?: number; maxWait?: number }) => Promise<R>
 }
@@ -93,7 +117,7 @@ type LockableClient = {
 export async function runUnderPoEmailSendLock<T>(
   client: unknown,
   send: () => Promise<T>,
-  options: { backstopMs?: number } = {},
+  options: { backstopMs?: number; approvalCheck?: (tx: unknown) => Promise<string | null> } = {},
 ): Promise<GuardOutcome<T>> {
   let answered: GuardOutcome<T> | null = null
   try {
@@ -101,6 +125,10 @@ export async function runUnderPoEmailSendLock<T>(
       await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE}::int4, 0::int4)`
       const row = await tx.setting.findUnique({ where: { key: PO_EMAIL_SETTING_KEY }, select: { value: true } })
       if (row?.value !== 'true') return { refused: PO_EMAIL_DISABLED_REASON } as GuardOutcome<T>
+      if (options.approvalCheck) {
+        const approvalRefusal = await options.approvalCheck(tx)
+        if (approvalRefusal) return { refused: approvalRefusal } as GuardOutcome<T>
+      }
       let timer: ReturnType<typeof setTimeout> | undefined
       const sending = send()
       const raced = await Promise.race([

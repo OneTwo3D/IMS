@@ -2479,7 +2479,9 @@ export async function approvePurchaseOrder(id: string): Promise<{ success: boole
       const state = evaluatePoApproval(po, threshold)
       if (!state.required) return { refused: 'This purchase order does not need approval.' }
       if (state.approved) return { alreadyApproved: true as const, reference: po.reference }
-      if (approverIsRequester(po.createdById, session.user.id)) return { refused: PO_APPROVAL_SELF_MESSAGE }
+      // An order with no stored creator (imported, or created before the column existed) is attributed from the activity log's create entry.
+      const creatorId = po.createdById ?? (await tx.activityLog.findFirst({ where: { entityType: 'PURCHASE_ORDER', entityId: id, action: 'created' }, orderBy: { createdAt: 'asc' }, select: { userId: true } }))?.userId ?? null
+      if (approverIsRequester(creatorId, session.user.id)) return { refused: PO_APPROVAL_SELF_MESSAGE }
       const approvedTotalBase = approvalSpendBase(po)
       await tx.purchaseOrder.update({
         where: { id },

@@ -276,6 +276,76 @@ test('concurrency: an approval racing an edit never leaves an approval that does
   void db
 })
 
+test('an order with no stored creator is attributed from the activity log: its creator cannot approve it, another approver can', SKIP, async () => {
+  const { approvePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  await setThreshold('100')
+  const po = await draft('ap-nullcreator', 30)
+  // The harness has no real session, so the create entry the action wrote carries no user: write the one a signed-in creation would have.
+  const creator = await db.user.create({ data: { email: `${fixtures.uid()}@example.invalid`, name: 'legacy creator', passwordHash: 'x', role: 'MANAGER' }, select: { id: true } })
+  await db.activityLog.deleteMany({ where: { entityType: 'PURCHASE_ORDER', entityId: po.poId, action: 'created' } })
+  await db.activityLog.create({ data: { userId: creator.id, entityType: 'PURCHASE_ORDER', entityId: po.poId, action: 'created', tag: 'purchase', description: 'Created PO (test)' } })
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { createdById: null } })
+  try {
+    as(creator.id, 'ADMIN')
+    const self = await approvePurchaseOrder(po.poId)
+    assert.equal(self.success, false)
+    assert.match(self.error ?? '', /you cannot approve it/)
+    as('approver-1', 'MANAGER')
+    assert.equal((await approvePurchaseOrder(po.poId)).success, true)
+  } finally {
+    // The scratch-database guard refuses a database holding users rows, so the fixture user and its log entry are removed.
+    await db.activityLog.deleteMany({ where: { userId: creator.id } })
+    await db.user.delete({ where: { id: creator.id } })
+  }
+})
+
+test('delivery guard: refuses a send whose approval no longer covers the order, and an approval-clearing edit waits for a send in flight', SKIP, async () => {
+  const { approvePurchaseOrder, updatePurchaseOrder } = await actions()
+  const { purchaseOrderSendGuardFor } = await import('@/lib/purchase-order-email')
+  const { db } = await import('@/lib/db')
+  await setThreshold('100')
+  await db.setting.upsert({ where: { key: 'purchase_order_email_enabled' }, create: { key: 'purchase_order_email_enabled', value: 'true' }, update: { value: 'true' } })
+  try {
+    const po = await draft('ap-guard', 30)
+    // Unapproved: refused, the send is never attempted.
+    let sends = 0
+    const refused = await purchaseOrderSendGuardFor(po.poId)(async () => { sends += 1; return 'sent' })
+    assert.ok('refused' in refused && /needs approval/.test(String(refused.refused)))
+    assert.equal(sends, 0)
+
+    as('approver-1', 'MANAGER')
+    assert.equal((await approvePurchaseOrder(po.poId)).success, true)
+    as('maker-1', 'MANAGER')
+    const ok = await purchaseOrderSendGuardFor(po.poId)(async () => { sends += 1; return 'sent' })
+    assert.ok('value' in ok && ok.value === 'sent')
+
+    // An edit that would clear the approval cannot slip in while the send is in flight: it queues behind the guard's share lock.
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let entered!: () => void
+    const inside = new Promise<void>((resolve) => { entered = resolve })
+    const guarded = purchaseOrderSendGuardFor(po.poId)(async () => { entered(); await gate; return 'sent-late' })
+    await inside
+    const probe = await rawSession()
+    try {
+      const edit = updatePurchaseOrder(po.poId, editQty(po, 40))
+      await waitForBlocked(probe, 1)
+      release()
+      const outcome = await guarded
+      assert.ok('value' in outcome && outcome.value === 'sent-late', 'the send that was past its check completes')
+      assert.equal((await edit).success, true)
+    } finally {
+      await probe.end()
+    }
+    assert.equal((await row(po.poId)).approvedAt, null, 'the edit then cleared the approval')
+    const after = await purchaseOrderSendGuardFor(po.poId)(async () => { sends += 1; return 'sent' })
+    assert.ok('refused' in after, 'the next delivery attempt is refused')
+  } finally {
+    await db.setting.deleteMany({ where: { key: 'purchase_order_email_enabled' } })
+  }
+})
+
 // ---- ordered race helpers (the same shape as tests/concurrency/po-lifecycle.concurrent.test.ts) ----
 
 type RawClient = {
