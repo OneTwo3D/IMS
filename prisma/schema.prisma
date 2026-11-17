@@ -4144,6 +4144,30 @@ enum WmsOperatorTaskStatus {
   DONE
 }
 
+/// Orders whose IMS allocation was released, reduced or deleted, which the WooCommerce stock guard must re-fetch by id on every run
+/// until Woo no longer holds the order or IMS accounts for it again. No foreign key to the order: the row must outlive a deleted order.
+/// `token` is replaced on every release so the guard's clear is a compare-and-set that cannot lose a release made during its run.
+model WcStockDirtyOrder {
+  id              String   @id @default(cuid())
+  /// The WooCommerce order id (captured from the order's link BEFORE a delete removes it).
+  wcOrderId       String   @unique @map("wc_order_id")
+  /// The connection generation (`wc_settings_version`) the order id belongs to. Another store's ids mean nothing here: rows of an older
+  /// generation are ignored by the guard and retired when the generation moves.
+  syncVersion     String   @map("sync_version")
+  /// The IMS order id, for the operator; may no longer exist.
+  orderId         String   @map("order_id")
+  token           String
+  releasedAt      DateTime @default(now()) @map("released_at")
+  /// What the last live read of the WooCommerce order showed while it was still held: status and line quantities. The guard charges the order
+  /// from this and refreshes a rotating slice each run, so a large persistent set never needs one fetch window. Null = never read live.
+  lines           Json?
+  lineStatus      String?  @map("line_status")
+  checkedAt       DateTime? @map("checked_at")
+
+  @@index([syncVersion, checkedAt, releasedAt, id], map: "wc_stock_dirty_orders_refresh_idx")
+  @@map("wc_stock_dirty_orders")
+}
+
 model WmsOperatorTask {
   id              String                @id @default(cuid())
   connector       String

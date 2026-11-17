@@ -1,6 +1,7 @@
 'use server'
 
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
+import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -3733,6 +3734,9 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       // which cannot resolve a session, so the acting user has to be handed down from the action
       // boundary. Without it, a draft shipment (and its tracking number) retired by an operator's
       // delete was attributed to nobody.
+      // Record the order for the WooCommerce stock guard BEFORE the delete removes its link (the WooCommerce order id is captured here). Done
+      // unconditionally: the delete removes the order even when the release frees nothing (a fully dispatched row).
+      await markWcOrderDirtyForStockGuard(tx, id)
       const released = await releaseOrderAllocationsInTx(tx, id, {
         cause: 'deleting the sales order',
         userId: session.user.id,

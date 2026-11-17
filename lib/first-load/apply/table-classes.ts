@@ -126,6 +126,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   users: { kind: 'CONFIG_ALLOWED', reason: 'operator accounts' },
   warehouses: { kind: 'CONFIG_ALLOWED', reason: 'the warehouses the load needs; configuration (their profile is checked by a rail)' },
   wc_withdrawal_suppressions: { kind: 'MUST_BE_EMPTY', reason: 'storefront withdrawal suppressions' },
+  wc_stock_dirty_orders: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs: orders whose allocation was released, for the stock guard; runtime state a first load starts empty' },
   wms_asn_line_maps: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_asn_maps: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_bundle_links: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
