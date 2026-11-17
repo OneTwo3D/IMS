@@ -79,6 +79,7 @@ async function buildWorld(rig: Rig, opts: { orderOver?: Record<string, unknown> 
       await db.integrationOutbox.deleteMany({ where: { OR: [{ payloadJson: { path: ['orderId'], equals: oid } }, { payloadJson: { path: ['accountingSyncLogId'], string_contains: '' } }] } }).catch(() => {})
       await db.cogsSubledgerMovement.deleteMany({ where: { sourceRef: { in: allRefundIds } } }).catch(() => {})
       await db.activityLog.deleteMany({ where: { entityId: oid } }).catch(() => {})
+      await db.wmsOperatorTask.deleteMany({ where: { orderId: oid } }).catch(() => {})
       await db.payment.deleteMany({ where: { orderId: oid } }).catch(() => {})
       await db.salesOrderRefundDeletion.deleteMany({ where: { orderId: oid } }).catch(() => {})
       await db.salesOrderInvoiceDocument.deleteMany({ where: { orderId: oid } }).catch(() => {})
@@ -156,6 +157,8 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     const cnSync = await seedPostedCreditNote(rig, refundId)
     const cogsSync = await seedCogsReversal(rig, refundId)
     assert.equal(await subledgerNet(rig, refundId), -45)
+    // The "Refund in WooCommerce" task an IMS refund on a storefront order raises (the person is told to pay the customer back in the shop).
+    const shopTask = await rig.db.wmsOperatorTask.create({ data: { connector: 'woocommerce', orderId: w.orderId, externalOrderId: refundId, reason: 'SHOP_REFUND_DUE', queryText: 'Please refund', contentHash: `h-${refundId}` }, select: { id: true } })
 
     const verdict = await rig.evaluateRefundDeletion(rig.db, refundId)
     assert.deepEqual(verdict.refusals, [], 'eligible')
@@ -194,6 +197,8 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     assert.equal(outbox[0].status, 'PENDING')
     // The posted credit note row itself is left as the record of what was posted (the void row undoes it in the ledger).
     assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: cnSync } })).status, 'SYNCED')
+    // The task that would have told someone to refund the customer in the shop for a refund that is gone is closed.
+    assert.equal((await rig.db.wmsOperatorTask.findUniqueOrThrow({ where: { id: shopTask.id } })).status, 'DONE')
     // The order's refund status is recomputed from what remains.
     assert.equal((await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId } })).refundStatus, 'NONE')
     // Audit and activity.

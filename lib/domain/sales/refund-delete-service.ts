@@ -481,6 +481,14 @@ export async function deleteSalesOrderRefund(
         data: { status: 'SUCCEEDED', lockedAt: null, lockedBy: null, nextAttemptAt: null },
       })
 
+      // A "Refund in WooCommerce" task raised for an IMS refund on a storefront order tells a person to pay the customer back in the shop. For a refund recorded in
+      // error that is the wrong instruction, so it is marked done (by the person deleting the refund, with the delete in the activity log) rather than left to be actioned.
+      const shopTasks = await tx.wmsOperatorTask.updateMany({
+        where: { connector: 'woocommerce', reason: 'SHOP_REFUND_DUE', externalOrderId: refund.id, status: 'OPEN' },
+        data: { status: 'DONE', doneAt: now, doneBy: input.actorUserId },
+      })
+      reversal.shopRefundTasksClosed = shopTasks.count
+
       // ---- 5. THE RECORD: PDF evidence is withdrawn (kept, detached), fetch state and lines go, then the refund ----
       await tx.salesOrderInvoiceDocument.updateMany({ where: { refundId: refund.id }, data: { refundId: null, withdrawnAt: now } })
       await tx.invoiceDocumentFetchState.deleteMany({ where: { refundId: refund.id } })
