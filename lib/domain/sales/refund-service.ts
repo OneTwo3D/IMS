@@ -2036,8 +2036,32 @@ async function stageRefundAccountingReversals(
 
     const priorUnearnedReversedRows = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+    // o3d-oyur (Codex r1 HIGH): a reversal whose lines are gone AND whose compaction summary is missing
+    // (a legacy compacted row, no backfill) moved an UNKNOWN amount, which is not a zero one. Counting it as
+    // zero raised the open unearned balance by whatever that reversal took and let this refund debit
+    // Unearned Revenue again. Unknown withholds this refund's unearned reversal altogether (the safe
+    // direction: it can only under-reverse, leaving a visible liability) and the refund says so.
+    const unreadableUnearnedReversalRows = priorUnearnedReversedRows
+      .filter((row) => journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') == null)
     const priorUnearnedReversed = priorUnearnedReversedRows
       .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
+    if (unreadableUnearnedReversalRows.length > 0) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.orderId,
+          action: 'refund_unearned_reversal_withheld_unreadable_prior',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `${unreadableUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order have no readable lines and no preserved account summary (compacted before summaries existed), so how much unearned revenue they already reversed cannot be established. This refund reversed NO unearned revenue rather than risk reversing it twice: check the unearned revenue account for this order and post the reversal by hand.`,
+          metadata: {
+            orderId: params.orderId,
+            refundId: params.refundId,
+            unreadableReversalCount: unreadableUnearnedReversalRows.length,
+          },
+        },
+      })
+    }
     // o3d-3la07 (M7, REPORT-ONLY - the arithmetic above is unchanged). An UNEARNED_REV_REVERSAL that an
     // operator settled as posted still reduces the unearned revenue this refund may reverse (the
     // reversal is claimed to exist, so counting it errs towards under-reversing), but its figure is the
@@ -2312,7 +2336,13 @@ async function stageRefundAccountingReversals(
         priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS did not verify it against the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
         continue
       }
-      priorRefundAllocationRelief += journalNetMovement(row, settings.allocatedInventoryAccount, 'credit') ?? 0
+      // o3d-oyur (Codex r1 HIGH): null is UNKNOWN (lines compacted away, no summary), never zero relief.
+      const orderLevelRelief = journalNetMovement(row, settings.allocatedInventoryAccount, 'credit')
+      if (orderLevelRelief == null) {
+        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal (${describeJournalRowState(row)}) has no readable lines and no preserved account summary, so how much it already credited Allocated Inventory cannot be established`
+        continue
+      }
+      priorRefundAllocationRelief += orderLevelRelief
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
       // (1) THE RECORD the refund wrote when it decided its own reversal — RESOLVED, not trusted.
@@ -2943,10 +2973,12 @@ async function stageRefundAccountingReversals(
       ))
     }
 
-    const remainingUnearned = Math.round(Math.max(
-      0,
-      refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
-    ) * 100) / 100
+    const remainingUnearned = unreadableUnearnedReversalRows.length > 0
+      ? 0
+      : Math.round(Math.max(
+        0,
+        refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
+      ) * 100) / 100
     // 6oyu.5: shipment-source entries are valued at the ORIGINALLY-POSTED COGS
     // (applyPostedShipmentUnitCosts), so both the COGS reversal below and the
     // returned-stock new inventory layer (snapshotReturnRows, shipment-source only)
