@@ -1,11 +1,10 @@
 /**
  * Re-derive SalesOrder.invoicingState for every order. Idempotent: run it twice and the second run changes nothing.
  *
- * WHY A SCRIPT AND NOT A MIGRATION BACKFILL. The derivation (lib/domain/sales/invoicing-state.ts) reads the accounting
- * sync-row standing rules and the stored invoice payloads, which are single-sourced in TypeScript. A SQL copy in a migration would be
- * a second definition that could drift from the first, and the migration would freeze today's reading forever. The write sites keep
- * the column right from the deploy onward; this makes the rows that existed before the deploy right (stage), and is the repair to run
- * after any data restore or after a write that bypassed the write sites.
+ * WHY THE MIGRATION DOES NOT DO ALL OF IT. The migration sets FULLY_INVOICED on every order with invoice evidence (a conservative
+ * SQL rule), so no stored value is wrong after an upgrade. It cannot detect a PARTIAL: that needs the stored invoice lines against the
+ * order's lines, and the standing rules, which are single-sourced in lib/domain/sales/invoicing-state.ts (a SQL copy would drift). This
+ * refines those, and is the repair to run after a data restore or after a write that bypassed the write sites.
  *
  * Usage:
  *   tsx scripts/recompute-invoicing-state.ts [--dry-run] [--batch N]

@@ -28,3 +28,15 @@ export async function invoicingOrderIdsForRows(client: unknown, where: Prisma.Ac
 export async function recomputeInvoicingStateForOrders(client: unknown, orderIds: readonly string[]) {
   return (await load()).recomputeInvoicingStateForOrders(client, orderIds)
 }
+export async function lockOrderFirst(client: unknown, orderId: string) {
+  return (await load()).lockOrderFirst(client, orderId)
+}
+export async function lockOrdersFirst(client: unknown, orderIds: readonly string[]) {
+  return (await load()).lockOrdersFirst(client, orderIds)
+}
+export async function lockOrderForRow(client: unknown, row: { type: string; referenceType: string; referenceId: string }) {
+  return (await load()).lockOrderForRow(client, row)
+}
+export async function lockOrdersOfInvoiceRows(client: unknown, where: Prisma.AccountingSyncLogWhereInput) {
+  return (await load()).lockOrdersOfInvoiceRows(client, where)
+}

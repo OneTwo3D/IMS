@@ -157,11 +157,9 @@ function canRecompute(client: InvoicingStateClient): boolean {
 
 async function recomputeWithin(client: InvoicingStateClient, orderId: string): Promise<{ state: InvoicingState | null; changed: boolean }> {
   if (!canRecompute(client)) return { state: null, changed: false }
-  // FOR NO KEY UPDATE, not FOR UPDATE: it conflicts with the order lock every other writer takes (so two recomputes, and a recompute and a
-  // cancellation, are serialised) but never blocks an insert that references the order, and a plain unit-test stub that models the order
-  // lock is not consumed by it. The row lock serialises two writers of the SAME order: the second one reads the first one's committed rows after it
-  // acquires the lock, so two invoices racing cannot leave the column at a value only one of them saw.
-  if (typeof client.$queryRaw === 'function') await client.$queryRaw(Prisma.sql`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR NO KEY UPDATE`)
+  // The order row lock, taken through the one lock helper (lockSalesOrder), and only if this transaction does not hold it already. It serialises two
+  // writers of the SAME order: the second reads the first one's committed rows after it acquires the lock, so two invoices racing cannot leave a stale value.
+  await lockOrderFirst(client, orderId)
   const evidence = await readEvidence(client, orderId)
   if (!evidence) return { state: null, changed: false }
   const state = deriveInvoicingState(evidence)
@@ -203,6 +201,36 @@ export async function recomputeInvoicingStateForRow(
   const c = client as Partial<InvoicingStateClient>
   if (!canRecompute(c as InvoicingStateClient)) return
   await recomputeSalesOrderInvoicingState(c as InvoicingStateClient, row.referenceId)
+}
+
+/**
+ * THE CANONICAL LOCK ORDER: THE ORDER ROW FIRST, THEN THE SYNC ROWS. Cancellation (`lockSalesOrder`, then the sync-row retirement) is the
+ * reference. A writer that moves a sales-invoice sync row inside a transaction must call this (or `lockOrderForRow`) BEFORE its first
+ * write to that row; taking the order lock after the row is the opposite order and can deadlock against a cancellation. A no-op outside a
+ * transaction, when the transaction already holds the lock, and for a client that cannot take one (a unit test's stand-in).
+ */
+export async function lockOrderFirst(client: unknown, orderId: string): Promise<void> {
+  const c = client as Partial<InvoicingStateClient> | null
+  if (!c || typeof c.$queryRaw !== 'function' || typeof c.$transaction === 'function') return
+  const { hasLockedSalesOrder, lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  if (hasLockedSalesOrder(c as never, orderId)) return
+  await lockSalesOrder(c as never, orderId)
+}
+
+/** Several orders, in id order, so two writers locking overlapping sets cannot take them in opposite orders. */
+export async function lockOrdersFirst(client: unknown, orderIds: readonly string[]): Promise<void> {
+  for (const id of [...new Set(orderIds)].sort()) await lockOrderFirst(client, id)
+}
+
+/** `lockOrderFirst` for the order a sync row belongs to; nothing for any row that is not a sales invoice. */
+export async function lockOrderForRow(client: unknown, row: { type: string; referenceType: string; referenceId: string }): Promise<void> {
+  if (row.referenceType !== 'SalesOrder' || !(INVOICING_SYNC_TYPES as readonly string[]).includes(row.type)) return
+  await lockOrderFirst(client, row.referenceId)
+}
+
+/** `lockOrdersFirst` for the orders of the sales-invoice rows matching `where` (read before the write that moves them). */
+export async function lockOrdersOfInvoiceRows(client: unknown, where: Prisma.AccountingSyncLogWhereInput): Promise<void> {
+  await lockOrdersFirst(client, await invoicingOrderIdsForRows(client, where))
 }
 
 /** The orders the sales-invoice rows matching `where` belong to. Read BEFORE a write that moves those rows out of `where`. */

@@ -2,7 +2,10 @@ import './scratch-database-setup' // FIRST: refuses to load unless the scratch D
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test, { type TestContext } from 'node:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { config } from 'dotenv'
+import { backendPid, waitUntilParkedBehind } from '../helpers/lock-wait-observer'
 
 /**
  * SalesOrder.invoicingState, against a real PostgreSQL: every place that creates, fails, retires, settles or links a sales
@@ -164,4 +167,83 @@ test('[invoicing state] the migration added the column with a NOT_INVOICED defau
   assert.equal(col.is_nullable, 'NO')
   const labels = await db.$queryRaw<{ enumlabel: string }[]>`SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'InvoicingState' ORDER BY enumsortorder`
   assert.deepEqual(labels.map((l) => l.enumlabel), ['NOT_INVOICED', 'PARTIALLY_INVOICED', 'FULLY_INVOICED'])
+})
+
+const FOR_UPDATE = /FOR UPDATE/i
+
+test('[invoicing state] LOCK ORDER: a decision on an invoice row takes the order lock BEFORE writing the row, so a cancellation holding the order lock cannot deadlock with it', { skip }, async (t) => {
+  const db = await loadDb()
+  const { applyFencedAttemptDecision } = await import('@/lib/domain/accounting/sync-log-attempt')
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const id = await makeOrder(db, t)
+  const row = await db.accountingSyncLog.create({ data: { connector: 'xero', type: 'SALES_INVOICE', status: 'FAILED', referenceType: 'SalesOrder', referenceId: id, payload: payload(3, randomUUID()), attemptRevision: 1 } })
+  let decision: Promise<{ ok: boolean }> | undefined
+  let parked: { observedAfterMs: number } | undefined
+  // The CANCELLATION holds the order lock, then writes the invoice row (the reference order). The retry's decision must queue behind the ORDER lock,
+  // not take the row first: taking the row first is the reverse order and a deadlock (Postgres would abort one of the two).
+  await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, id)
+    const holder = await backendPid(tx)
+    decision = db.$transaction((ctx) => applyFencedAttemptDecision(ctx as never, { id: row.id, expectedAttemptRevision: 1, expectedStatus: 'FAILED', data: { status: 'PENDING', retryCount: 0 } }))
+    parked = await waitUntilParkedBehind(db, { holderPid: holder, waitingOn: FOR_UPDATE, describe: 'retry decision behind the cancellation\'s order lock' })
+    await tx.accountingSyncLog.updateMany({ where: { id: row.id }, data: { status: 'CANCELLED', attemptRevision: { increment: 1 } } })
+    await tx.salesOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
+  })
+  const result = await decision!
+  assert.ok(parked, 'the decision parked behind the order lock before it wrote the row')
+  assert.equal(result.ok, false, 'it then found the row already retired by the cancellation and wrote nothing')
+  assert.equal((await db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id } })).status, 'CANCELLED')
+  assert.equal(await stateOf(db, id), 'NOT_INVOICED')
+})
+
+test('[invoicing state] LOCK ORDER: the bulk-retry helper locks the orders of the rows being revived, in id order, before it returns', { skip }, async (t) => {
+  const db = await loadDb()
+  const { lockOrdersOfInvoiceRows } = await import('@/lib/domain/sales/invoicing-state')
+  const { hasLockedSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const a = await makeOrder(db, t)
+  const b = await makeOrder(db, t)
+  const rows = await Promise.all([a, b].map((o) => db.accountingSyncLog.create({ data: { connector: 'xero', type: 'SALES_INVOICE', status: 'FAILED', referenceType: 'SalesOrder', referenceId: o, payload: payload(3, randomUUID()) } })))
+  await db.$transaction(async (tx) => {
+    await lockOrdersOfInvoiceRows(tx, { id: { in: rows.map((r) => r.id) } })
+    assert.equal(hasLockedSalesOrder(tx as never, a), true)
+    assert.equal(hasLockedSalesOrder(tx as never, b), true)
+  })
+})
+
+test('[invoicing state] MIGRATION BACKFILL: the migration\'s own UPDATE marks exactly the orders with invoice evidence FULLY_INVOICED and leaves the rest alone, and is idempotent', { skip }, async (t) => {
+  const db = await loadDb()
+  const sql = readFileSync(join(process.cwd(), 'prisma/migrations/20261117233000_sales_order_invoicing_state/migration.sql'), 'utf8')
+  const update = sql.slice(sql.indexOf('UPDATE "sales_orders"'))
+  const mk = async (over: Parameters<typeof makeOrder>[2] = {}) => makeOrder(db, t, over)
+  const none = await mk()
+  const linked = await mk()
+  await db.salesOrder.update({ where: { id: linked }, data: { accountingInvoiceId: `ext-${randomUUID()}` } })
+  const queued = await mk()
+  const synced = await mk()
+  const failedNoId = await mk()
+  const failedWithId = await mk()
+  const shadow = await mk()
+  const creditOnly = await mk()
+  const xeroom = await mk({ wooNumber: 'INWC-77' })
+  const row = (orderId: string, over: Record<string, unknown>) => db.accountingSyncLog.create({ data: { connector: 'xero', type: 'SALES_INVOICE', status: 'PENDING', referenceType: 'SalesOrder', referenceId: orderId, payload: payload(3, randomUUID()), ...over } as never })
+  await row(queued, {})
+  await row(synced, { status: 'SYNCED' })
+  await row(failedNoId, { status: 'FAILED' })
+  await row(failedWithId, { status: 'FAILED', externalTransactionId: 'doc-1' })
+  await row(shadow, { status: 'CANCELLED', settlementBasis: 'HELD_SHADOW' })
+  await row(creditOnly, { type: 'CREDIT_NOTE', status: 'SYNCED', externalTransactionId: 'cn-1' })
+  // The column is at its default everywhere (the rows above were written with no recompute), which is the state a migration meets.
+  const ids = [none, linked, queued, synced, failedNoId, failedWithId, shadow, creditOnly, xeroom]
+  await db.$executeRaw`UPDATE "sales_orders" SET "invoicing_state" = 'NOT_INVOICED' WHERE id = ANY(${ids})`
+  const run = async () => db.$executeRawUnsafe(update.replace('WHERE so."invoicing_state" = \'NOT_INVOICED\'', `WHERE so.id = ANY(ARRAY[${ids.map((i) => `'${i}'`).join(',')}]) AND so."invoicing_state" = 'NOT_INVOICED'`))
+  await run()
+  const states = Object.fromEntries(await Promise.all(Object.entries({ none, linked, queued, synced, failedNoId, failedWithId, shadow, creditOnly, xeroom }).map(async ([k, v]) => [k, await stateOf(db, v)])))
+  assert.deepEqual(states, {
+    none: 'NOT_INVOICED', linked: 'FULLY_INVOICED', queued: 'FULLY_INVOICED', synced: 'FULLY_INVOICED', failedNoId: 'NOT_INVOICED',
+    failedWithId: 'FULLY_INVOICED', shadow: 'NOT_INVOICED', creditOnly: 'NOT_INVOICED', xeroom: 'FULLY_INVOICED',
+  })
+  assert.equal(await run(), 0, 'a second run changes nothing')
+  // And the TypeScript derivation agrees with the SQL on every one of them (the repair finds nothing to change).
+  const { recomputeSalesOrderInvoicingState } = await import('@/lib/domain/sales/invoicing-state')
+  for (const id of ids) assert.equal((await recomputeSalesOrderInvoicingState(db as never, id)).changed, false, id)
 })

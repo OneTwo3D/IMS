@@ -1,5 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
+import { lockOrderForRow, recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { db } from '@/lib/db'
 import { HELD_SHADOW_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -485,6 +485,7 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
       summary: { type: row.type, connector: 'xero', retired: true },
       decision: retirementDecision(destination, operation, scope, now),
     })
+    await lockOrderForRow(tx, row)
     const updated = await tx.accountingSyncLog.updateMany({
       where: guard,
       data: {
@@ -507,6 +508,7 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
     }
     return { item, result: 'shadowed', detail: mirrorNote === null ? verdict.reason : `${verdict.reason}; ${mirrorNote}` }
   }
+  await lockOrderForRow(tx, row)
   const updated = await tx.accountingSyncLog.updateMany({
     where: guard,
     data: { status: 'FAILED', errorMessage: notice, attemptRevision: { increment: 1 } },

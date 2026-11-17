@@ -57,7 +57,7 @@ import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
+import { lockOrderForRow, recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
 import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
@@ -1120,6 +1120,8 @@ export async function applyMainSyncFailureRetry(
 ): Promise<{ finalFailure: boolean }> {
   const retryCount = entry.retryCount + 1
   const computedFinal = retryCount >= MAX_RETRIES
+  // Canonical lock order (order row, then sync row): a sales invoice's order is locked BEFORE its row is written. lib/domain/sales/invoicing-state.ts.
+  await lockOrderForRow(tx, entry)
   // o3d-e2mz: fenced on the claimed attempt as well as the observed retryCount. A
   // failure belongs to ONE attempt; without the revision this write reopens a row an
   // operator settled while this attempt was in flight, sending it round again as

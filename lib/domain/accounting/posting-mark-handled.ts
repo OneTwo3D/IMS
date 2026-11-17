@@ -1,5 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
+import { lockOrderForRow, recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import { accountingPostingKeyForRow, postingKeyIsReusedAcrossPostings } from '@/lib/accounting/posting-key'
 import {
@@ -327,6 +327,8 @@ async function cancelProvablyUnsentRows(
   // Only rows with the canonical never-attempted record reach here (`accountingSyncRowIsProvablyUnsent`); a queued row
   // without it is BLOCKING and is never cancelled, because cancelling it would let the operator hand-post an obligation
   // a worker may already have posted. The predicate is repeated so a row that lost the record in the window is a race.
+  // Canonical lock order: the order row before the rows this cancels.
+  await lockOrderForRow(tx, key)
   const stamped = await tx.accountingSyncLog.updateMany({
     where: {
       id: { in: ids }, status: 'PENDING', attemptRevision: UNCLAIMED_ATTEMPT_REVISION, externalTransactionId: null,

@@ -27,7 +27,7 @@
  * reasons are a single vocabulary rather than per-call-site prose.
  */
 
-import { recomputeInvoicingStateForSyncLogs } from '@/lib/domain/sales/invoicing-state-sites'
+import { lockOrdersOfInvoiceRows, recomputeInvoicingStateForSyncLogs } from '@/lib/domain/sales/invoicing-state-sites'
 import type { AccountingSyncStatus, Prisma } from '@/app/generated/prisma/client'
 
 /**
@@ -160,6 +160,8 @@ export async function applyFencedAttemptDecision(
   }
 
   const nextRevision = nextAttemptRevision(params.expectedAttemptRevision)
+  // Canonical lock order (order row, then sync row) for a decision on a sales invoice row; a no-op when the caller already holds the order lock.
+  await lockOrdersOfInvoiceRows(client, { id: params.id })
   const applied = await client.accountingSyncLog.updateMany({
     where: {
       id: params.id,

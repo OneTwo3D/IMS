@@ -103,7 +103,7 @@ What does **not** count: an invoice that failed without reaching the accounting 
 
 **Partially invoiced** means the invoice IMS holds covers fewer units than the order now holds. IMS invoices a whole order (there is no per-shipment invoice), so this is rare, for example units added to the order after its invoice was raised. An invoice IMS cannot read (one raised by Xeroom, or whose stored detail has been trimmed) reads **Fully invoiced**: IMS does not guess a shortfall it cannot measure.
 
-After an upgrade, existing orders read **Not invoiced** until an administrator runs `npm run sales:invoicing-state:recompute` once (add `-- --dry-run` to see how many orders it would change). It is safe to run again at any time: it only rewrites a state that is wrong.
+When IMS is upgraded to this version, existing orders that already have invoice evidence are set to **Fully invoiced** by the upgrade itself. An order IMS could now find to be only partly covered is corrected by running `npm run sales:invoicing-state:recompute` once (add `-- --dry-run` to see how many orders it would change). It is safe to run again at any time: it only rewrites a state that is wrong.
 
 The exact allowed transitions are kept in the canonical workflow reference so UI help does not drift from the enforced state-machine rules.
 

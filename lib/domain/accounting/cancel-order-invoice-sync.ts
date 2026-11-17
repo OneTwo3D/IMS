@@ -1,6 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
-import { recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
+import { lockOrderFirst, recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
 import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from './money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION, nextAttemptRevision, type AttemptRef } from './sync-log-attempt'
@@ -130,6 +130,8 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
   // cancellation simply proceeded and the invoice landed anyway. This is the invariant that stops it,
   // placed HERE so no caller of this module can skip it.
   await assertNoSalesInvoicePostingInFlight(tx, orderId, now)
+  // The cancellation's own order lock (the caller took it) is the canonical first lock; this holds it for a caller that did not.
+  await lockOrderFirst(tx, orderId)
 
   const staleProcessingCutoff = new Date(now.getTime() - STALE_PROCESSING_MS)
   const reason = 'Cancelled: sales order cancelled before the invoice posted (no revenue to recognise).'
@@ -311,6 +313,8 @@ export async function retireSalesInvoiceForCancelledOrder(
   /** The row is retired because THIS ATTEMPT is superseded, not because the sale is gone: its mirrored event is voided revivably, so the replacement attempt can take the document up. */
   attemptOnly = false,
 ): Promise<boolean> {
+  // Canonical lock order: the order row before the sync row this retires (a no-op when the guard that called this already holds it).
+  await lockOrderFirst(client, orderId)
   const fenced = attempt.attemptRevision !== UNCLAIMED_ATTEMPT_REVISION
   // BOTH claim identities in the predicate, and the retirement ADVANCES the one that is an identity.
   //
