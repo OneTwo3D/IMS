@@ -757,6 +757,48 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     reason:
       'Pure margin computation for the PO preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
   },
+  {
+    file: 'app/actions/purchase-orders.ts',
+    figures: ['netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`netTotal` is the net amount of a SUPPLIER credit note under the reverse-charge plan (the PO action converts it to base for the transit posting). It is a purchase-side ledger amount; customer refunds of past sales never enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/supplier-credit-note.ts',
+    figures: ['netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`netTotal` is the sum of the net lines of a supplier credit note split into reverse-charge net/VAT for the Xero posting. A purchase-side posting amount, not a sales revenue figure; no customer refund moves it.',
+  },
+  {
+    file: 'app/(dashboard)/analytics/reorder/page.tsx',
+    figures: ['forecastMargin', 'forecastMarginUnavailable', 'margin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      "Renders the two forecast columns (base-currency estimate, or the word unavailable with its reason where there is no cost history or usable price). Reorder Planning forecast sales and forecast margin: forward-looking ESTIMATES of what a product's forecast demand over the weeks of supply would earn at its list price ex-VAT less its current unit cost. They are not booked sales: no order, invoice or credit note is read, so a refund of a past sale cannot enter them. ",
+  },
+  {
+    file: 'app/api/export/replenishment/route.ts',
+    figures: ['forecastMargin'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      "CSV export of the forecast columns, appended last so the existing column contract is unchanged. Reorder Planning forecast sales and forecast margin: forward-looking ESTIMATES of what a product's forecast demand over the weeks of supply would earn at its list price ex-VAT less its current unit cost. They are not booked sales: no order, invoice or credit note is read, so a refund of a past sale cannot enter them. ",
+  },
+  {
+    file: 'lib/domain/inventory/reorder-forecast-money.ts',
+    figures: ['forecastMargin', 'forecastMarginUnavailable'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      "Pure Decimal computation of the estimates. Reorder Planning forecast sales and forecast margin: forward-looking ESTIMATES of what a product's forecast demand over the weeks of supply would earn at its list price ex-VAT less its current unit cost. They are not booked sales: no order, invoice or credit note is read, so a refund of a past sale cannot enter them. ",
+  },
+  {
+    file: 'lib/domain/inventory/replenishment-reports.ts',
+    figures: ['forecastMargin', 'forecastMarginUnavailable'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      "Attaches the estimates to the report rows, for the page and the CSV only. Reorder Planning forecast sales and forecast margin: forward-looking ESTIMATES of what a product's forecast demand over the weeks of supply would earn at its list price ex-VAT less its current unit cost. They are not booked sales: no order, invoice or credit note is read, so a refund of a past sale cannot enter them. ",
+  },
 ]
 
 /** Look a file up. Used by the coverage test and useful from a REPL when triaging a red run. */

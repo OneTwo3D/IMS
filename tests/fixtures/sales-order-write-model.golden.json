@@ -59,6 +59,8 @@
       "paymentDueAt": null,
       "accountingInvoiceId": null,
       "salesInvoiceOwedAt": null,
+      "editedInImsAt": null,
+      "wcLineBaseline": null,
       "accountingInvoiceConnector": null,
       "paidAt": null,
       "unregisteredPaidAt": null,
@@ -82,7 +84,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -204,6 +208,8 @@
       "paymentDueAt": null,
       "accountingInvoiceId": null,
       "salesInvoiceOwedAt": null,
+      "editedInImsAt": null,
+      "wcLineBaseline": null,
       "accountingInvoiceConnector": null,
       "paidAt": null,
       "unregisteredPaidAt": null,
@@ -227,7 +233,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -330,6 +338,8 @@
       "paymentDueAt": null,
       "accountingInvoiceId": null,
       "salesInvoiceOwedAt": null,
+      "editedInImsAt": null,
+      "wcLineBaseline": null,
       "accountingInvoiceConnector": null,
       "paidAt": null,
       "unregisteredPaidAt": null,
@@ -353,7 +363,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -456,6 +468,8 @@
       "paymentDueAt": null,
       "accountingInvoiceId": null,
       "salesInvoiceOwedAt": null,
+      "editedInImsAt": null,
+      "wcLineBaseline": null,
       "accountingInvoiceConnector": null,
       "paidAt": null,
       "unregisteredPaidAt": null,
@@ -479,7 +493,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -601,6 +617,8 @@
       "paymentDueAt": null,
       "accountingInvoiceId": null,
       "salesInvoiceOwedAt": null,
+      "editedInImsAt": null,
+      "wcLineBaseline": null,
       "accountingInvoiceConnector": null,
       "paidAt": null,
       "unregisteredPaidAt": null,
@@ -624,7 +642,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {

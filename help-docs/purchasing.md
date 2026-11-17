@@ -20,6 +20,7 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 3. Confirm the **currency** (defaults to the supplier's currency).
 4. The **FX rate to base currency** is shown read-only: it is the rate in Settings > Accounting > FX Rates for the order's currency, read when the order is saved. It cannot be typed here (see [FX rate](#fx-rate) below).
 5. Select the **destination warehouse** where the goods will be received.
+   Warehouses marked **Restricted** (Settings > Inventory > Warehouses, "Available in Purchase Orders" off) are not offered, and the server refuses them. An order saved earlier with a warehouse that was restricted afterwards keeps showing it, and you can leave it as it is.
 6. Add lines by searching for products. The system pre-fills the last purchase price for that supplier if one exists.
 7. Enter quantities and adjust prices as needed.
 8. (Optional) Tick **"Skip preferred-supplier update"** on the PO header if you don't want this PO to overwrite the products' preferred suppliers — useful for emergency or one-off orders. See [Preferred supplier auto-update](#preferred-supplier-auto-update) below.
@@ -87,8 +88,21 @@ An order has one **Expected Delivery** date, but a supplier sometimes ships one 
 - Receiving goods, in full or in part, never changes a line's date.
 - The **Reorder** report's inbound arrival date uses the effective date, so a product arriving in a later batch is no longer shown as arriving with the earliest line of the order. The **Open purchase orders** report shows the earliest effective date of the lines still to come.
 - The **PO PDF** (and so the emailed PO) adds a **Delivery** column when at least one line's date differs from the order's. Lines that follow the order's date show a dash there.
+- **Storefront back-in-stock date.** When the WooCommerce setting *Include estimated back-in-stock date* is on, an out-of-stock product's customer-facing date is the earliest of these dates over its sent, shipped or part-received orders, with an open warehouse ASN's expected arrival taking the place of the order date where it has one. A date that is already in the past is never shown to customers, so a supplier who has slipped makes the product show no date until the expected delivery (or the ASN eta) is updated to a future day: keep the Expected dates current. An order with no date shows none. See the WooCommerce help.
 - The purchase order CSV export and import have a **lineExpectedDelivery** column (YYYY-MM-DD, blank = follows the order's date), so a round trip keeps the line dates.
 - A line's date can be changed on any order that can still be edited, including one that has been part-received.
+
+## Notes on lines
+
+Each purchase order line can carry a short **internal note** (colourway, substitute accepted, chase this one). On the PO form click the notepad icon under the product to open a text field; the note is saved with the order. On the PO page the note shows under the product, and with the Purchasing permission the notepad opens the same field and **Save note** stores it, on any status, including a part-received order.
+
+- **Notes are internal: they are never printed on the PO PDF and never sent in the supplier email**, and they do not appear in the supplier portal. The order's own **Notes** field is the one that goes to the supplier. To tell the supplier something about one line, put it in the order Notes or in the line's **Description**, which does print on the PO.
+- A note is up to 2,000 characters. Clearing the text removes it.
+- Editing an order from an older screen that does not send notes keeps the stored notes.
+
+### Barcode and Supplier SKU on the order lines
+
+The **Order Lines** table on the PO page has **Barcode** and **Supplier SKU** columns after the product, so you can check goods against the order without opening the catalogue. Barcode is the product's barcode (empty when it has none). Supplier SKU is the supplier's own reference for the product from the supplier's product list (the same one the PO form uses); it is empty when none is recorded for this supplier. Use **Columns** above the table to hide either one; the choice is remembered in your browser only. The PO PDF sent to the supplier is unchanged.
 
 ## Editing a Purchase Order
 
@@ -136,6 +150,8 @@ The **PO PDF** button on any purchase order opens the priced purchase order: sup
 ## Receiving a Purchase Order
 
 When goods arrive, open the PO and click **Receive Goods**. You can receive all lines at once or partially receive individual lines. You cannot receive more than the line's ordered quantity less what has already landed (including anything the warehouse has booked in or aligned).
+
+The warehouse list in **Receive Goods** leaves out warehouses marked **Restricted** ("Available in Purchase Orders" off), and the server refuses them. The one exception is the order's own destination: an order that was placed before its warehouse was restricted can still be received into it, with a warning. Receipts booked in by the warehouse system (ASN book-in) are not affected by this setting.
 
 **Lines with an open warehouse ASN are booked in through the ASN, not by hand.** If a line's Mintsoft (warehouse) ASN is still open, partly booked in, or being created, **Receive Goods** refuses that line and names the SKU and the ASN. Use **Recheck booked-in** on the order once the warehouse has booked the goods, so the stock is added once. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received here.
 
@@ -265,6 +281,7 @@ The **Supplier credit notes** card at the bottom of a PO that has a bill lists e
 - **Automatic draft on a return.** Returning goods that were already billed (**Return Items**) raises a **DRAFT** supplier credit note for the over-billed value. Repeated returns top the credit up to the over-billed total; they never credit the same goods twice. A banner at the top of the PO says how many units are billed but were returned and reminds you to review the draft.
 - **Record one by hand.** Click **Record credit note** (shown once the order has a bill), enter the amount in the order's currency, optionally the supplier's credit note number and a reason, and click **Record (draft)**. The amount cannot exceed what is left to credit on the bill.
 - **Post it.** Click **Post** on a draft. When the accounting connector is Xero and syncing is on, the credit note is queued to Xero as a supplier credit note and allocated against the bill it offsets; it is converted to your base currency at the bill's exchange rate (see the credit-note conversion note under [Landed Cost Distribution](#landed-cost-distribution)). If the accounting connector has changed since the credit note was prepared, it stays a draft with an explanation and you post it again once the connector selection has settled. Posting needs the invoicing permission.
+- **Bills with reverse-charge lines.** A reverse-charge line is shown on the bill with the VAT the bill accounts for itself, so the bill total (for example 120 for a line of 100 at 20%) is more than you owe the supplier (100). A credit against such a bill is limited to what is owed to the supplier, counting credit notes already recorded against it; a larger amount is refused when you record it, or when you post an older draft, with the figure that is still creditable. Posting sends Xero one net line per bill line, each on the same VAT code the bill used (so Xero accounts for the VAT in the same way), allocates that same amount to the bill, and takes the same net out of the stock-in-transit clearing account. This also works for a bill that mixes reverse-charge and standard lines: the amount is shared across the lines in proportion to what each owes the supplier, and crediting the full amount reproduces every line of the bill. A bill that mixes other VAT treatments (for example taxable and exempt lines) is still refused for a single credit.
 - A posted credit note that fully offsets the bill is what lets you cancel an invoiced freight PO.
 
 A supplier return on a part-received order does not change the order's status while quantity is still due (see [Purchase Returns](#purchase-returns)).

@@ -199,7 +199,7 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
 // ---------------------------------------------------------------------------
 
 // Only push these IMS statuses to WC
-const IMS_TO_WC: Partial<Record<SalesOrderStatus, string>> = {
+export const IMS_TO_WC: Partial<Record<SalesOrderStatus, string>> = {
   SHIPPED: 'completed',
   CANCELLED: 'cancelled',
   ON_HOLD: 'on-hold',

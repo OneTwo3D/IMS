@@ -48,6 +48,7 @@ const EMPTY: WarehouseFormFields = {
   postcode: '',
   country: 'GB',
   availableForSale: true,
+  availableForPurchaseOrders: true,
   syncToStore: false,
   isDefault: false,
   defaultReturnWarehouse: false,
@@ -68,6 +69,7 @@ function toInput(w: WarehouseRow): WarehouseFormFields {
     postcode: w.postcode ?? '',
     country: w.country,
     availableForSale: w.availableForSale,
+    availableForPurchaseOrders: w.availableForPurchaseOrders,
     syncToStore: w.syncToStore,
     isDefault: w.isDefault,
     defaultReturnWarehouse: w.defaultReturnWarehouse,
@@ -219,6 +221,10 @@ function WarehouseDialog({
                 <input type="checkbox" checked={fields.availableForSale} onChange={(e) => set('availableForSale', e.target.checked)} className="rounded" />
                 Available for Sale
               </label>
+              <label className="flex items-center gap-2 text-sm" title="Off keeps this location out of the purchase-order destination and goods-receipt pickers (dropship, quarantine, virtual). Orders already pointing at it keep working. Warehouse-driven receipts are not affected.">
+                <input type="checkbox" checked={fields.availableForPurchaseOrders} onChange={(e) => set('availableForPurchaseOrders', e.target.checked)} className="rounded" />
+                Available in Purchase Orders
+              </label>
               {showStoreSync && (
                 <label className="flex items-center gap-2 text-sm">
                   <input type="checkbox" checked={fields.syncToStore} onChange={(e) => set('syncToStore', e.target.checked)} className="rounded" />
@@ -359,7 +365,14 @@ export function WarehousesTable({ warehouses: initial, showStoreSync = true, onC
           {warehouses.map((w) => (
             <TableRow key={w.id} className={!w.active ? 'opacity-50' : undefined}>
               <TableCell className="text-sm font-mono">{w.code}</TableCell>
-              <TableCell className="text-sm">{w.name}</TableCell>
+              <TableCell className="text-sm">
+                {w.name}
+                {!w.availableForPurchaseOrders && (
+                  <span className="ml-2 rounded border border-amber-400 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300" title="Not available in purchase orders: cannot be a PO destination or a goods-receipt location">
+                    Restricted
+                  </span>
+                )}
+              </TableCell>
               <TableCell className="text-sm text-muted-foreground">{w.type}</TableCell>
               <TableCell className="text-sm text-muted-foreground">{w.contactName || '—'}</TableCell>
               <TableCell className="text-sm text-muted-foreground">{w.city || '—'}</TableCell>

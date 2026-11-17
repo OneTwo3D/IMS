@@ -37,7 +37,8 @@ export type WmsOperatorTaskPage = { rows: WmsOperatorTaskRow[]; total: number; p
 export async function listWmsOperatorTasks(pageInput = 0): Promise<WmsOperatorTaskPage> {
   await requirePermission('sync')
   const page = Number.isInteger(pageInput) && pageInput > 0 ? pageInput : 0
-  const where = { status: 'OPEN' as const }
+  // A shop refund task is not a warehouse query: it has its own section (app/actions/shop-refund-tasks.ts).
+  const where = { status: 'OPEN' as const, reason: { not: 'SHOP_REFUND_DUE' as const } }
   const [total, tasks] = await Promise.all([
     db.wmsOperatorTask.count({ where }),
     db.wmsOperatorTask.findMany({

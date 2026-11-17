@@ -52,7 +52,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     ignored: { unresolvedWithoutSend: 'the quietest of the four claim-loss counts: nothing was delivered and nothing attributed, so there is no incident (see the field comment in lib/email-outbox.ts); a row left unresolved is reclaimed by the stale-claim pass, and one that keeps failing reaches `parked`, which is consumed' },
   },
   'fx-rates': {
-    consumed: ['failed', 'error', 'pendingWcOrderRetry.failed', 'pendingWcReceiptRetry.queue.failed', 'pendingWcReceiptRetry.queue.error', 'pendingWcReceiptRetry.orphans.failed', 'pendingWcReceiptRetry.orphans.error', 'stepFailures[].error', 'connectorPushFailures', 'pendingWcOrderRetryFailures'],
+    consumed: ['failed', 'error', 'pendingWcOrderRetry.failed', 'pendingWcReceiptRetry.queue.failed', 'pendingWcReceiptRetry.queue.error', 'pendingWcReceiptRetry.orphans.failed', 'pendingWcReceiptRetry.orphans.error', 'paymentMatching.failed', 'paymentMatching.error', 'stepFailures[].error', 'connectorPushFailures', 'pendingWcOrderRetryFailures'],
     breakdownOf: {},
     ignored: {
       'pendingWcReceiptRetry.orphans': 'the sweep result as a whole; its failure count is `pendingWcReceiptRetry.orphans.failed`, which is consumed',
@@ -137,6 +137,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     ignored: {
       deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads',
       staleBindingAlerts: 'the number of stale-sync alerts that WERE raised and delivered; an alert that could not be delivered is `deliveryFailures`, which decides `status`',
+      refusedActionAlerts: 'the number of refused-or-stalled-action alerts that WERE raised and delivered; one that could not be delivered is `deliveryFailures`, which decides `status`',
     },
   },
   'writers-check': {},

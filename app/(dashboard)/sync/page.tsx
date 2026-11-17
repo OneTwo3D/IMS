@@ -322,9 +322,14 @@ export default async function SyncPage() {
           </p>
         </div>
         {/* q66in.4.6: audit-grade before/after timeline of WMS connector mutations. */}
-        <Link href="/sync/events" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
-          <History className="h-4 w-4 mr-1" />Event Timeline
-        </Link>
+        <div className="flex flex-wrap gap-2">
+          <Link href="/sync/payment-matching" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
+            Payment matching
+          </Link>
+          <Link href="/sync/events" className={buttonVariants({ variant: 'outline', size: 'sm' })}>
+            <History className="h-4 w-4 mr-1" />Event Timeline
+          </Link>
+        </div>
       </div>
       {exceptionSummary && <ExceptionsBanner summary={exceptionSummary} />}
       {/* Unconditional: whether there is anything to show is resolveConnectorOrphanBannerState's

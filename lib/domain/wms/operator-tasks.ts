@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -27,6 +27,8 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   CANCEL_NOTICE: 'Cancel not honoured by the warehouse',
   REFUND_NOTE: 'Refund on an order the warehouse already holds',
   MERGE_CANDIDATE: 'Same-customer orders still NEW: check them in the warehouse system and merge there if appropriate',
+  SHOP_REFUND_DUE: 'Refund in WooCommerce: IMS recorded this refund, the shop still has to pay it back',
+  AMENDMENT_NOT_APPLIED: 'Order change not applied: the warehouse order is already past NEW',
 }
 
 export type WmsOperatorTaskInput = {
@@ -53,6 +55,18 @@ export type WmsOperatorTaskPayload = {
   items?: WmsOperatorTaskLine[]
   /** Merge candidate: the orders of the group (IMS and warehouse numbers only). */
   members?: Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>
+  /** Refund in WooCommerce (SHOP_REFUND_DUE): the IMS refund the task is about and the figures the operator refunds. IMS figures and ids only. */
+  shopRefund?: {
+    refundId: string
+    creditNoteNumber: string | null
+    currency: string
+    /** What the customer is to be paid back, tax included, in the order currency, to the currency's minor unit. Null when IMS could not price the refund's tax. */
+    grossForeign: string | null
+    /** The refund's net, in the order currency. */
+    netForeign: string
+    /** A fixed vocabulary, never the free-text reason typed on the refund. */
+    reasonKind: 'GOODS_RETURNED' | 'AMOUNT_ONLY'
+  }
 }
 
 export function wmsOperatorTaskHash(input: Pick<WmsOperatorTaskInput, 'reason' | 'queryText' | 'dedupeBasis'>): string {
@@ -118,6 +132,16 @@ export function mergeCandidateQuery(members: ReadonlyArray<{ orderNumber: string
   const list = members.map((member) => `${warehouseOrderRef(member.externalOrderNumber, member.externalOrderId)} (IMS order ${member.orderNumber ?? '—'})`).join(', ')
   const extra = warnings.length > 0 ? ` Warning: ${warnings.join(' ')}` : ''
   return `Please check these orders in ${warehouseLabel} and merge them there if appropriate: ${list}. They are for the same customer and delivery address and are all still NEW in ${warehouseLabel}. IMS does not merge orders and has changed nothing.${extra}`
+}
+
+/**
+ * The query for an amendment the warehouse order could not take because it was already past NEW (so IMS changed nothing there). It names the EXACT
+ * lines IMS wants the order to hold, so a person can apply them (or decide the warehouse should not) without opening IMS. SKUs and quantities only.
+ */
+export function amendmentNotAppliedQuery(wmsOrder: string, imsOrder: string, lines: ReadonlyArray<{ sku: string; quantity: number }>, wmsStatus: string): string {
+  const wanted = lines.length > 0 ? lines.map((line) => `${line.quantity} x ${line.sku}`).join(', ') : 'no lines'
+  return `IMS order ${imsOrder} was changed after warehouse order ${wmsOrder} left NEW (warehouse status ${wmsStatus}), so IMS could not amend it and has changed nothing there. `
+    + `IMS now holds this order as: ${wanted}. Please check the warehouse order against these lines and, if it is not yet despatched, make the change there.`
 }
 
 export function refundNoteQuery(wmsOrder: string, imsOrder: string, creditNote: string | null | undefined, full: boolean): string {

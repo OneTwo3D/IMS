@@ -492,6 +492,22 @@ model AdjustmentReason {
   @@map("adjustment_reasons")
 }
 
+/// Configurable reasons a customer return / refund happened (damaged, wrong item, changed mind ...). A configured list, not an enum, because the useful
+/// categories differ by business. Reason names are business configuration, not personal data. A refund points at one by id (`SalesOrderRefund.returnReasonId`);
+/// the free-text `SalesOrderRefund.reason` is a separate field and is untouched.
+model ReturnReason {
+  id        String   @id @default(cuid())
+  name      String
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refunds SalesOrderRefund[]
+
+  @@map("return_reasons")
+}
+
 // ---------------------------------------------------------------------------
 // CURRENCIES & FX
 // ---------------------------------------------------------------------------
@@ -621,6 +637,8 @@ model Warehouse {
   name                  String
   type                  WarehouseType @default(STANDARD)
   availableForSale      Boolean       @default(true)
+  // false = cannot be picked as a purchase-order destination or a goods-receipt location (dropship, quarantine, virtual). Existing POs already pointing here keep receiving; WMS-driven receipts are unaffected.
+  availableForPurchaseOrders Boolean  @default(true)
   syncToStore           Boolean       @default(false)
   contactName           String?
   email                 String?
@@ -1389,6 +1407,8 @@ model PurchaseOrderLine {
   reorderEvidence Json?
   /// Per-line estimated delivery. Null = inherit the order's expectedDelivery (lib/domain/purchasing/line-eta.ts). Receiving never writes it.
   expectedDelivery DateTime?
+  /// Internal remark on this line (colourway, substitute accepted, chase this one). Never printed on the supplier PO PDF or sent in the supplier email.
+  notes           String?
   qtyReceived     Decimal   @db.Decimal(12, 4) @default(0)
   qtyReturned     Decimal   @db.Decimal(12, 4) @default(0)
   sortOrder       Int       @default(0)
@@ -1911,6 +1931,12 @@ model SalesOrder {
   /// A value that is still set means an invoice obligation has not been recorded anywhere yet, so an existing-order import of it cannot succeed until a held invoice or a
   /// SALES_INVOICE row (any status) exists. NULL for every order imported before this column and for orders the import does not invoice.
   salesInvoiceOwedAt      DateTime?  @map("sales_invoice_owed_at")
+  /// Set when an operator edited this order in IMS after it was confirmed (lines, or addresses/notes after dispatch). While set, a later WooCommerce order.updated delivery does not write its addresses, notes, VAT number or shipping label back over the IMS edit,
+  /// and the "edited in WooCommerce after import" comparison is not raised (the order is deliberately desynced). Paid state and the order number still mirror. NULL on every order never edited this way.
+  editedInImsAt           DateTime?  @map("edited_in_ims_at")
+  /// The WooCommerce-facing state of this order's lines and total BEFORE the first IMS edit of its lines: { totalForeign, lines: [{ externalLineItemId, qty, sku }] }. Taken once, so the "edited in WooCommerce after import" comparison can keep running
+  /// after an IMS line edit, against what WooCommerce held (an IMS edit does not reach WooCommerce) instead of against the edited lines. NULL when the lines were never edited in IMS (an address or notes edit takes none), and the comparison is against the lines as usual.
+  wcLineBaseline          Json?      @map("wc_line_baseline")
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
@@ -1930,6 +1956,15 @@ model SalesOrder {
   /// can never be provenance-less, and cleared in the same statement when the claim is released.
   accountingInvoiceConnector String? @map("accounting_invoice_connector")
   paidAt            DateTime?
+  /// PART OF THE PAID AMOUNT THE LEDGER NO LONGER HOLDS, in the ORDER currency (o3d-cdhl). Set when the accounting
+  /// ledger shows less paid against the order's invoice than IMS recorded (a payment deleted there, or
+  /// part of it), and cleared when the ledger holds the full amount again. NULL (never 0) means no part of the payment is
+  /// missing. `paidAt` is deliberately LEFT SET while this is non-null: the order was paid and revenue was
+  /// recognised on that, and the unwind is the operator's decision; every reader that asks "is it fully paid?" asks
+  /// `paymentRemovedForeign` too (lib/domain/sales/paid-state.ts).
+  paymentRemovedForeign Decimal? @map("payment_removed_foreign") @db.Decimal(18, 4)
+  /// When `paymentRemovedForeign` last changed. NULL with it.
+  paymentRemovedAt  DateTime? @map("payment_removed_at")
   /// o3d-psrx r2 — THE PAID FLAG BESIDE IT WAS SET FROM EVIDENCE THE LEDGER WAS NEVER GIVEN.
   ///
   /// `paidAt` records THAT this order is held as paid. It does not record WHERE that belief came
@@ -2121,6 +2156,7 @@ model SalesOrder {
   invoiceDocumentFetches InvoiceDocumentFetchState[]
   invoiceStorePublication InvoiceStorePublication?
   payments          Payment[]
+  paymentRemovals   PaymentRemovalReconciliation[]
   allocations       OrderAllocation[]
   shipments         Shipment[]
   shoppingLinks     ShoppingOrderLink[]
@@ -2229,6 +2265,9 @@ model SalesOrderRefund {
   stockCorrectionQueuedAt DateTime? @map("stock_correction_queued_at")
   returnWarehouseId String?
   reason          String?
+  /// The structured reason (configured in Settings, one per refund). Optional; the free-text `reason` above is separate and unchanged. SetNull so removing a reason never touches a refund.
+  returnReasonId  String?    @map("return_reason_id")
+  returnReason    ReturnReason? @relation(fields: [returnReasonId], references: [id], onDelete: SetNull)
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
   // What the stored totals MEAN, and which trusted writer created the refund (o3d-n8p). Set by the
@@ -2344,6 +2383,7 @@ model SalesOrderRefund {
   @@unique([externalRefundId])
   @@index([orderId])
   @@index([stockCorrectionRequired, stockCorrectionQueuedAt])
+  @@index([returnReasonId])
   @@map("sales_order_refunds")
 }
 
@@ -3755,6 +3795,8 @@ model StockSyncState {
   lastPushedQty    Int?
   lastPushedAt     DateTime?
   lastPushedRemoteId String?
+  /// o3d-taro: the back-in-stock date last pushed as product meta ('' = cleared). Null until the feature has pushed once.
+  lastPushedEtaDate String?
   lastWebhookQty   Int?
   lastWebhookAt    DateTime?
   lastCorrectedAt  DateTime?
@@ -4175,6 +4217,10 @@ enum WmsOperatorTaskReason {
   REFUND_NOTE
   /// Same-customer orders that are all still NEW in the warehouse: a person checks them there and merges them (IMS never merges).
   MERGE_CANDIDATE
+  /// A refund IMS recorded that the shop still has to pay back to the customer in WooCommerce. Not a warehouse query: raised with connector 'woocommerce'.
+  SHOP_REFUND_DUE
+  /// An IMS amendment the warehouse order could not take because it was already past NEW: a person applies the change in the warehouse by hand.
+  AMENDMENT_NOT_APPLIED
 }
 
 enum WmsOperatorTaskStatus {
@@ -4230,6 +4276,119 @@ model WmsOperatorTask {
   @@index([status, createdAt, id], map: "wms_operator_tasks_status_created_idx")
   @@index([orderId], map: "wms_operator_tasks_order_idx")
   @@map("wms_operator_tasks")
+}
+
+// ---------------------------------------------------------------------------
+// REFUSED OR STALLED ACTIONS
+// ---------------------------------------------------------------------------
+// One durable record of "IMS wanted to do this, a gate refused it, and nothing else says so". A refusal used to be a string on a link or a
+// pending result that read as "come back later"; this row says what was asked, which gate refused it, whether it can ever succeed, and how long
+// it has been standing (firstSeenAt / lastSeenAt), so a condition that lasts a fortnight no longer looks like one that began a minute ago.
+// Keyed on (entity, action, gate): a repeat refusal bumps lastSeenAt and never makes a second row. Holds no personal data: order and warehouse
+// numbers, SKUs, quantities and amounts in fixed wording built by IMS. No foreign key: the row must outlive a deleted entity.
+
+enum RefusedActionPermanence {
+  /// The gate will not open on its own (the warehouse order is past NEW; a part was cancelled and will never despatch).
+  PERMANENT
+  /// The gate may open later; the action is retried.
+  RETRYABLE
+}
+
+/// Declared lowest first: the upsert keeps the GREATEST severity seen, which relies on this order.
+enum RefusedActionSeverity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model RefusedAction {
+  id          String                  @id @default(cuid())
+  /// What the action was about, e.g. SALES_ORDER.
+  entityType  String                  @map("entity_type")
+  entityId    String                  @map("entity_id")
+  /// What was requested, e.g. WMS_ORDER_AMEND.
+  action      String
+  /// The gate that refused it, e.g. WMS_ORDER_NOT_NEW.
+  gate        String
+  permanence  RefusedActionPermanence
+  severity    RefusedActionSeverity
+  /// The INTENT, without personal data (the warehouse push summary: order number, SKUs, quantities, amounts). Built by IMS, never copied from a remote error.
+  intent      Json?
+  /// One fixed-wording line an operator can read: what the gate saw (the warehouse status), never remote free text.
+  detail      String?
+  /// How many times the same refusal was seen in this episode.
+  attempts    Int                     @default(1)
+  firstSeenAt DateTime                @default(now()) @map("first_seen_at")
+  lastSeenAt  DateTime                @default(now()) @map("last_seen_at")
+  /// Set when the action later succeeded or the entity no longer needs it. A later refusal of the same action starts a new episode on the same row.
+  resolvedAt  DateTime?               @map("resolved_at")
+  resolution  String?
+  /// When the age-based alert was raised for this episode. Once per episode: cleared only when a new episode starts.
+  alertedAt   DateTime?               @map("alerted_at")
+  /// When a verification pass last tried to confirm this row against the warehouse (a read attempt, successful or not). The pass takes the
+  /// least recently tried rows first (never-tried first), so a persistent mismatch cannot starve newer rows.
+  lastVerifiedAt DateTime?            @map("last_verified_at")
+
+  @@unique([entityType, entityId, action, gate], map: "refused_actions_key")
+  @@index([resolvedAt, severity, firstSeenAt], map: "refused_actions_open_idx")
+  @@map("refused_actions")
+}
+
+// ---------------------------------------------------------------------------
+// XERO CUSTOMER-PAYMENT MATCHING
+// ---------------------------------------------------------------------------
+// One durable row per customer receipt (payments.id) that the matching pass has looked at: what it WOULD post (shadow), why it could not (unmatched: no
+// bank-account mapping, wrong currency; blocked: locked period, outbound hold, over the amount due), and in live mode the claim that makes a rerun or a
+// concurrent sweep post it once. The row is the claim: payment_id is unique, so two sweeps share one row and only one of them can move it to CLAIMED.
+// Holds no personal data: ids, a bank-account id, an amount and a reason code in fixed wording built by IMS. No foreign key: the row outlives a deleted receipt.
+
+enum XeroPaymentMatchStatus {
+  /// Shadow: the receipt would be registered against the open invoice. Nothing was written to Xero.
+  WOULD_POST
+  /// No safe match exists (no bank-account mapping for the payment system and currency, a currency other than the invoice's, no invoice).
+  UNMATCHED
+  /// A match exists but a rule stops it (locked Xero period, outbound write hold, over the amount due, an unresolved earlier attempt).
+  BLOCKED
+  /// Live: a sweep holds the claim and is registering the receipt through the existing path.
+  CLAIMED
+  /// Live: the registration is on record (queued for the Xero payment post by the existing path).
+  REGISTERED
+  /// Live: the registration threw or did not reach the record; retried by a later sweep up to a cap.
+  FAILED
+}
+
+model XeroPaymentMatch {
+  id                  String                 @id @default(cuid())
+  /// The local receipt. Unique: this IS the idempotency key.
+  paymentId           String                 @unique @map("payment_id")
+  orderId             String                 @map("order_id")
+  status              XeroPaymentMatchStatus
+  /// The mode of the sweep that last evaluated it (shadow or live).
+  mode                String
+  /// A fixed reason code (NO_BANK_ACCOUNT, LOCKED_PERIOD, OUTBOUND_HOLD, WOULD_OVERPAY, ...); null for WOULD_POST and REGISTERED.
+  reason              String?
+  /// One fixed-wording line an operator can read. Never remote free text.
+  detail              String?
+  /// The Xero bank account the payment map resolved, when one did.
+  bankAccountId       String?                @map("bank_account_id")
+  amount              Decimal                @db.Decimal(18, 4)
+  currency            String
+  /// What is left to pay on the invoice, in the invoice currency, when it could be measured.
+  amountDue           Decimal?               @db.Decimal(18, 4) @map("amount_due")
+  /// The open Xero invoice the receipt would settle.
+  accountingInvoiceId String?                @map("accounting_invoice_id")
+  /// The date the payment would carry in Xero (the receipt's own date; never moved).
+  paymentDate         DateTime?              @map("payment_date")
+  claimToken          String?                @map("claim_token")
+  claimedAt           DateTime?              @map("claimed_at")
+  registeredAt        DateTime?              @map("registered_at")
+  attempts            Int                    @default(0)
+  firstSeenAt         DateTime               @default(now()) @map("first_seen_at")
+  lastEvaluatedAt     DateTime               @default(now()) @map("last_evaluated_at")
+
+  @@index([status, lastEvaluatedAt], map: "xero_payment_matches_status_idx")
+  @@index([orderId], map: "xero_payment_matches_order_idx")
+  @@map("xero_payment_matches")
 }
 
 // ---------------------------------------------------------------------------
@@ -5386,4 +5545,41 @@ model StorefrontCustomerErasureTombstone {
 
   @@id([connector, customerKeyHash])
   @@map("storefront_customer_erasure_tombstones")
+}
+
+/// One reconciliation of a payment that the accounting ledger no longer holds, in whole or in part (o3d-cdhl). Written
+/// by the payment poller in the same transaction that moves `SalesOrder.paymentRemovedForeign`, so the order's figure
+/// and this history cannot disagree. It is the record that a given removal has already been reconciled: a recheck
+/// finds the order's figure already equal to what the ledger shows and writes nothing.
+///
+/// IMS posts nothing to the ledger for this row. `ledgerAction` says what is owed: the unwind of revenue (credit note
+/// or bad debt) is a policy decision left to an operator, and `OPERATOR_DECISION` stays until one is made.
+model PaymentRemovalReconciliation {
+  id                 String   @id @default(cuid())
+  orderId            String   @map("order_id")
+  /// Which accounting connector's document this describes (`xero`).
+  connector          String
+  accountingInvoiceId String  @map("accounting_invoice_id")
+  /// REMOVED: the ledger holds less than IMS recorded. RESTORED: it holds more than before (a payment was re-applied).
+  kind               String
+  /// The size of THIS change, in the order currency, always positive.
+  amountForeign      Decimal  @map("amount_foreign") @db.Decimal(18, 4)
+  /// What IMS had recorded as paid, what the ledger showed, and the document total, all in the order currency.
+  recordedPaidForeign Decimal @map("recorded_paid_foreign") @db.Decimal(18, 4)
+  ledgerPaidForeign  Decimal  @map("ledger_paid_foreign") @db.Decimal(18, 4)
+  documentTotalForeign Decimal @map("document_total_foreign") @db.Decimal(18, 4)
+  /// The order's `paymentRemovedForeign` before and after this change (0 for none).
+  shortfallBeforeForeign Decimal @map("shortfall_before_foreign") @db.Decimal(18, 4)
+  shortfallAfterForeign Decimal @map("shortfall_after_foreign") @db.Decimal(18, 4)
+  currency           String
+  /// The IMS payment registrations proved absent from the ledger's list, when they could be matched; empty otherwise.
+  matchedPaymentIds  Json     @default("[]") @map("matched_payment_ids")
+  /// OPERATOR_DECISION while the revenue unwind is owed; NONE for a restoration.
+  ledgerAction       String   @default("OPERATOR_DECISION") @map("ledger_action")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  order SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("payment_removal_reconciliations")
 }

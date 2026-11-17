@@ -11,6 +11,7 @@ import type { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
 import type { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 import type { retryPendingWcOrdersWaitingForFx } from '@/lib/connectors/woocommerce/sync/order-import'
 import type { sweepUnregisteredReceipts } from '@/lib/domain/accounting/receipt-registration-sweep'
+import type { runPaymentMatchingPass } from '@/lib/domain/accounting/payment-matching'
 import type { writeDailyInventorySnapshot } from '@/lib/domain/inventory/inventory-snapshot'
 import type { runInvoiceDocumentSweep } from '@/lib/domain/invoice-documents/sweep'
 import type { getInvoiceDocumentHealth } from '@/lib/domain/invoice-documents/health'
@@ -71,6 +72,7 @@ type FxRatesCronResult = (Ret<typeof fetchAllFxRatesInternal> | { error: string 
     queue: Ret<typeof retryPendingWcOrdersWaitingForFx> | { error: string }
     orphans: Ret<typeof sweepUnregisteredReceipts> | { error: string }
   }
+  paymentMatching: Ret<typeof runPaymentMatchingPass> | { error: string }
   stepFailures?: Array<{ step: string; error: string }>
 }
 type AccountingSyncCronResult = {
