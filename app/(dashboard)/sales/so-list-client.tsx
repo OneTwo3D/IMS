@@ -193,6 +193,8 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
     includeArchived: searchParams.get('archived') === '1',
     invoiced: false,
     returned: false,
+    customFieldKey: list.appliedCustomField?.key,
+    customFieldValue: list.appliedCustomField?.value,
   }
   const statusFilters = new Set(urlState.statuses as SoStatus[])
   const [search, setSearch] = useState(urlState.q)
@@ -458,6 +460,29 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
+        {list.customFieldFilters.length > 0 && (
+          <select
+            aria-label="Filter by custom field"
+            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+            value={list.appliedCustomField ? `${list.appliedCustomField.key}:${list.appliedCustomField.value}` : ''}
+            onChange={(e) => {
+              // The key is a slug (no colon), so the first colon separates it from the chosen value.
+              const at = e.target.value.indexOf(':')
+              const key = at > 0 ? e.target.value.slice(0, at) : ''
+              const value = at > 0 ? e.target.value.slice(at + 1) : ''
+              navigate(key && value ? { customFieldKey: key, customFieldValue: value } : { customFieldKey: undefined, customFieldValue: undefined })
+            }}
+          >
+            <option value="">Any custom field</option>
+            {list.customFieldFilters.map((field) => (
+              <optgroup key={field.key} label={field.label}>
+                {field.choices.map((choice) => (
+                  <option key={`${field.key}:${choice.value}`} value={`${field.key}:${choice.value}`}>{field.label}: {choice.label}</option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        )}
         <label
           className="flex items-center gap-1.5 text-xs"
           title={searching || statusFilters.size > 0 ? 'A search or status pick always includes completed orders' : undefined}

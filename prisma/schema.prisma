@@ -761,6 +761,7 @@ model Product {
   stockLevels     StockLevel[]
   locationStockBuffers LocationStockBuffer[]
   reorderThresholdOverrides ReorderThresholdOverride[]
+  customFieldValues CustomFieldValue[]
   costLayers      CostLayer[]
   inventorySnapshots InventorySnapshot[]
   inventoryReservationSnapshots InventoryReservationSnapshot[]
@@ -2125,6 +2126,7 @@ model SalesOrder {
   customer          Customer?        @relation(fields: [customerId], references: [id])
   shipFromWarehouse Warehouse?       @relation("ShipFromWarehouse", fields: [shipFromWarehouseId], references: [id])
   lines             SalesOrderLine[]
+  customFieldValues CustomFieldValue[]
   refunds           SalesOrderRefund[]
   returnExpectations ReturnExpectation[]
   invoiceDocuments  SalesOrderInvoiceDocument[]
@@ -5500,4 +5502,74 @@ model PaymentRemovalReconciliation {
 
   @@index([orderId])
   @@map("payment_removal_reconciliations")
+}
+
+/// Operator-defined fields for products (variants included: each variant is a Product row and carries its own values) and
+/// for sales orders. One definition model serves both entities. `key` is the immutable slug used in CSV columns
+/// (`cf:<key>`) and list filters; `namespace` groups fields on screen. `options` is a JSON array of allowed strings, used only
+/// by STRING fields (a dropdown). The type cannot change once any value exists (see lib/custom-fields/definitions.ts).
+enum CustomFieldEntity {
+  PRODUCT
+  SALES_ORDER
+}
+
+enum CustomFieldType {
+  STRING
+  NUMBER
+  DECIMAL
+  BOOLEAN
+  DATE
+  DATETIME
+  JSON
+  LINK
+}
+
+model CustomFieldDefinition {
+  id        String            @id @default(cuid())
+  entity    CustomFieldEntity
+  namespace String
+  key       String
+  label     String
+  type      CustomFieldType
+  options   Json?
+  required  Boolean           @default(false)
+  sortOrder Int               @default(0)
+  active    Boolean           @default(true)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  values CustomFieldValue[]
+
+  @@unique([entity, key])
+  @@index([entity, active, sortOrder])
+  @@map("custom_field_definitions")
+}
+
+/// One typed value of one definition on one product OR one sales order (a CHECK enforces exactly one of the two). Typed columns, one
+/// filled per row (a CHECK enforces that too, and the definition's type decides which): STRING and LINK use valueText, NUMBER and
+/// DECIMAL use valueDecimal, BOOLEAN valueBoolean, DATE valueDate, DATETIME valueDateTime, JSON valueJson. A blank value has no row.
+/// Sales-order values can hold personal data (free text), so they are erased with the order (lib/domain/erasure).
+model CustomFieldValue {
+  id            String    @id @default(cuid())
+  definitionId  String
+  productId     String?
+  salesOrderId  String?
+  valueText     String?
+  valueDecimal  Decimal?  @db.Decimal(28, 10)
+  valueBoolean  Boolean?
+  valueDate     DateTime? @db.Date
+  valueDateTime DateTime?
+  valueJson     Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  definition CustomFieldDefinition @relation(fields: [definitionId], references: [id], onDelete: Restrict)
+  product    Product?              @relation(fields: [productId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder?           @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([definitionId, productId])
+  @@unique([definitionId, salesOrderId])
+  @@index([productId])
+  @@index([salesOrderId])
+  @@map("custom_field_values")
 }

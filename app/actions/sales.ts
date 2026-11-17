@@ -181,6 +181,8 @@ import {
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
 import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
+import { filterableCustomFields, resolveCustomFieldListFilter, type FilterableCustomField } from '@/lib/custom-fields/filter'
+import { loadActiveDefinitions } from '@/lib/custom-fields/values-service'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -789,9 +791,15 @@ export type SoListParams = {
   showCompleted?: boolean
   /** Include archived orders in the default view. */
   includeArchived?: boolean
+  /** Filter by a custom field (a dropdown or yes / no field): its key and the chosen value. Unknown keys and values are ignored. */
+  customFieldKey?: string
+  customFieldValue?: string
 }
 
 export type SoListResult = ListPage & {
+  /** The custom fields the list can be filtered by (dropdown and yes / no fields), and the filter currently applied. */
+  customFieldFilters: FilterableCustomField[]
+  appliedCustomField: { key: string; value: string } | null
   rows: SoRow[]
   /** What the current view is hiding by default; search and explicit status picks lift it. */
   hides: SoListHidden
@@ -817,11 +825,14 @@ async function attachShipmentOutstanding(row: SoRow): Promise<void> {
 
 export async function getSalesOrders(params: SoListParams = {}): Promise<SoListResult> {
   await requireInternalUser()
+  const customFieldDefinitions = await loadActiveDefinitions(db, 'SALES_ORDER')
+  const customFieldFilter = resolveCustomFieldListFilter(customFieldDefinitions, params.customFieldKey, params.customFieldValue)
   const filter: SoListFilter = {
     q: normaliseListQuery(params.q),
     statuses: normaliseStatuses(params.status, SO_STATUSES),
     showCompleted: params.showCompleted === true,
     includeArchived: params.includeArchived === true,
+    ...(customFieldFilter ? { customField: customFieldFilter } : {}),
   }
   const where = buildSalesOrderListWhere(filter)
   const hides = soListHides(filter)
@@ -862,7 +873,11 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     return row
   })
   await Promise.all(rows.map(attachShipmentOutstanding))
-  return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
+  return {
+    ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q),
+    customFieldFilters: filterableCustomFields(customFieldDefinitions),
+    appliedCustomField: customFieldFilter ? { key: params.customFieldKey!, value: params.customFieldValue! } : null,
+  }
 }
 
 /**

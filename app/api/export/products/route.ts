@@ -3,6 +3,8 @@ import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { toIsoCountryCode } from '@/lib/countries'
+import { loadActiveDefinitions } from '@/lib/custom-fields/values-service'
+import { customFieldCsvHeader, formatCustomFieldValue } from '@/lib/custom-fields/values'
 
 const HEADERS = [
   'productId', 'parentProductId',
@@ -64,6 +66,24 @@ export async function GET(req: Request) {
     orderBy: { sku: 'asc' },
   })
 
+  // Active product custom fields, one `cf:<key>` column each, APPENDED LAST so every existing column keeps its place. Hidden fields are not exported.
+  const customFields = await loadActiveDefinitions(db, 'PRODUCT')
+  const customValues = new Map<string, Map<string, string>>()
+  if (customFields.length > 0) {
+    const typeById = new Map(customFields.map((f) => [f.id, f.type]))
+    const stored = await db.customFieldValue.findMany({
+      where: { definitionId: { in: customFields.map((f) => f.id) }, productId: { not: null } },
+      select: { definitionId: true, productId: true, valueText: true, valueDecimal: true, valueBoolean: true, valueDate: true, valueDateTime: true, valueJson: true },
+    })
+    for (const row of stored) {
+      const text = formatCustomFieldValue(typeById.get(row.definitionId)!, row)
+      if (text == null || !row.productId) continue
+      const forProduct = customValues.get(row.productId) ?? new Map<string, string>()
+      forProduct.set(row.definitionId, text)
+      customValues.set(row.productId, forProduct)
+    }
+  }
+
   const rows = products.map((p) => {
     // Format components as "SKU1:qty;SKU2:qty"
     const componentsStr = p.productComponents
@@ -104,9 +124,10 @@ export async function GET(req: Request) {
       inventoryValue: p.costLayers
         .reduce((s, c) => s + Number(c.remainingQty) * Number(c.unitCostBase), 0)
         .toFixed(2),
+      ...Object.fromEntries(customFields.map((f) => [customFieldCsvHeader(f.key), customValues.get(p.id)?.get(f.id) ?? ''])),
     }
   })
 
   const filename = `products-${new Date().toISOString().slice(0, 10)}.csv`
-  return csvResponse(toCsv(rows, HEADERS), filename)
+  return csvResponse(toCsv(rows, [...HEADERS, ...customFields.map((f) => customFieldCsvHeader(f.key))]), filename)
 }

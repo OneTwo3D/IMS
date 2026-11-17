@@ -47,6 +47,8 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
 
 The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list), **Import CSV** and **New Product**.
 
+If you have set up [custom fields](#custom-fields) for products, **Export CSV** adds one extra column for each field that is switched on, named `cf:` followed by the field's key (for example `cf:hazard_class`). They come after all the other columns, so existing columns keep their place. On **Import CSV**, a `cf:` column writes that field. As with every other column, **a blank cell means "leave this value as it is"**: it never clears a value (clear one on the product page). A value that does not suit the field's type, or is not one of a dropdown's choices, is reported against its row; the rest of that product's row still imports and the product keeps its other custom field values. A `cf:` column that does not match a field switched on for products is reported once and ignored. The **Template** file does not include `cf:` columns: add them yourself, or start from an export.
+
 
 ## CSV Templates & Import Rules
 
@@ -303,6 +305,16 @@ Click any product to open its detail page. From here you can:
 - **Stock Flow** -- The Stock Flow button beside the product name lists every stock movement for the product (date, type, warehouse, reference, note) with links back to the order, transfer or build order, and can be filtered.
 - **View in Store** -- Opens the product on the connected online store, when one is connected.
 - **Replenishment** -- Shows the lead time used for reorder planning, and whether it is set by hand, derived automatically from purchase order history, or the 14-day default. Set it with **Lead time (days)** in the product form; leave blank to use the automatic value.
+
+### Custom fields
+
+If your company has set up product fields in **Settings > Custom fields**, a **Custom fields** card appears on the product page (and on each variant's page), grouped by the field's group name. Each field has a type: text (free, or a dropdown of fixed choices), whole number, decimal number, yes / no, date, date and time (UTC), JSON or link. The value is checked on the server when you click **Save custom fields**: a number must be a number, a date a real date, a dropdown value one of the choices, and so on, and nothing is saved if any value is refused. A field marked **\*** is required: you cannot clear it once set.
+
+- **Variants keep their own values.** A variant does not inherit from its variable parent, and changing the parent never changes its variants.
+- **Who can change them.** Inventory edit permission. Everyone with inventory access can read them. Every change is written to the **Activity Log** with the old and new value.
+- **Internal only.** Custom fields are never sent to the online store, the warehouse system or the accounting system.
+- **New products.** The card appears once the product exists; the new-product form does not ask for custom fields. You can also fill them in with the CSV import (see [CSV Export](#csv-export)).
+- **Hidden fields.** When an administrator hides a field it disappears from the page and the CSV, but its values are kept and return if the field is shown again.
 
 ### Product Type Changes
 
