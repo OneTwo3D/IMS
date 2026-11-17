@@ -125,6 +125,8 @@ type LayerPlan = { id: string; productId: string; warehouseId: string; qty: Pris
 export type RefundDeletePlan = {
   refundId: string
   orderId: string
+  /** The CREDIT_NOTE_VOID row of a two-phase delete already queued for this refund, if any. */
+  voidRow: { id: string; status: string } | null
   creditNote: { row: SyncRow | null; disposition: SyncDisposition['kind']; ledgerId: string | null; connector: string | null; number: string | null }
   cogs: { row: SyncRow | null; disposition: SyncDisposition['kind'] }
   movements: MovementPlan[]
@@ -142,7 +144,7 @@ async function readLockDate(tx: Tx): Promise<string | null> {
  * EVERY REASON A REFUND CANNOT BE DELETED, from what is stored. Read only and race-free only under the order lock: the writer calls it
  * under that lock, the order page calls it without one just to say why a button is missing (the writer re-checks).
  */
-export async function evaluateRefundDeletion(client: RefundDeleteClient, refundId: string): Promise<RefundDeleteEvaluationResult> {
+export async function evaluateRefundDeletion(client: RefundDeleteClient, refundId: string, opts: { voidConfirmed?: boolean } = {}): Promise<RefundDeleteEvaluationResult> {
   const tx = client as Tx
   const refund = await tx.salesOrderRefund.findUnique({
     where: { id: refundId },
@@ -214,10 +216,14 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
   const syncs = (await tx.accountingSyncLog.findMany({ where: { referenceType: 'SalesOrderRefund', referenceId: refund.id }, select: SYNC_ROW_SELECT })) as SyncRow[]
   let creditNoteRow: SyncRow | null = null
   let cogsRow: SyncRow | null = null
+  let voidRow: { id: string; status: string } | null = null
   let creditDisposition: SyncDisposition['kind'] = 'ignore'
   let cogsDisposition: SyncDisposition['kind'] = 'ignore'
   for (const row of syncs) {
-    if (row.type === 'CREDIT_NOTE') {
+    if (row.type === 'CREDIT_NOTE_VOID') {
+      // The void of a two-phase delete: not an obstacle (the delete is waiting on it). A cancelled one never ran and is ignored.
+      if (mayHaveReachedLedger(row)) voidRow = { id: row.id, status: row.status }
+    } else if (row.type === 'CREDIT_NOTE') {
       const verdict = classifyRefundSyncRow(row, 'credit note')
       if (verdict.kind === 'refuse') refusals.push(verdict.refusal)
       else if (verdict.kind !== 'ignore') { creditNoteRow = row; creditDisposition = verdict.kind }
@@ -239,7 +245,7 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
 
   // ---- the lock date: the credit note's own day, and the journal's when one will be countered ----
   const lockDate = await readLockDate(tx)
-  if (creditDisposition === 'posted') {
+  if (creditDisposition === 'posted' && !opts.voidConfirmed) {
     const day = creditNoteDay(payloadRecord(creditNoteRow?.payload).date, refund.refundedAt)
     if (isOnOrBeforeLockDate(day, lockDate)) refusals.push(refundDeleteRefusals.booksLocked(day, lockDate as string))
   }
@@ -320,6 +326,7 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
     refusals: list,
     alreadyDeleted: false,
     plan: {
+      voidRow,
       refundId: refund.id,
       orderId: refund.orderId,
       creditNote: { row: creditNoteRow, disposition: creditDisposition, ledgerId, connector: refund.accountingCreditNoteConnector ?? creditNoteRow?.connector ?? null, number: refund.creditNoteNumber },
@@ -340,7 +347,7 @@ export class RefundDeleteRefused extends Error {
 }
 
 export type RefundDeleteResult =
-  | { success: true; alreadyDeleted: boolean; orderId: string | null; creditNoteNumber: string | null; productIds: string[]; voidQueued: boolean; counterJournalQueued: boolean }
+  | { success: true; pending?: boolean; alreadyDeleted: boolean; orderId: string | null; creditNoteNumber: string | null; productIds: string[]; voidQueued: boolean; counterJournalQueued: boolean }
   | { success: false; error: string; refusals: RefundDeleteRefusal[] }
 
 function swappedLines(payload: Record<string, unknown>): Array<Record<string, unknown>> | null {
@@ -376,7 +383,7 @@ const COGS_REVERSAL_KEY = (refundId: string): string => `sales-order-refund:${re
 
 export async function deleteSalesOrderRefund(
   client: RefundDeleteClient,
-  input: { refundId: string; actorUserId: string | null; reason: string | null; now?: Date },
+  input: { refundId: string; actorUserId: string | null; reason: string | null; now?: Date; /** Set by the void worker once the ledger has confirmed the void: the second phase of deleting a refund whose credit note was posted. */ voidConfirmed?: { syncLogId: string } },
 ): Promise<RefundDeleteResult> {
   const now = input.now ?? new Date()
   const today = now.toISOString().slice(0, 10)
@@ -390,7 +397,7 @@ export async function deleteSalesOrderRefund(
         return { success: false, error: 'This refund no longer exists.', refusals: [] }
       }
       await lockSalesOrder(tx, located.orderId)
-      const pre = await evaluateRefundDeletion(tx, input.refundId)
+      const pre = await evaluateRefundDeletion(tx, input.refundId, { voidConfirmed: input.voidConfirmed !== undefined })
       if (pre.alreadyDeleted) return { success: true, alreadyDeleted: true, orderId: located.orderId, creditNoteNumber: null, productIds: [], voidQueued: false, counterJournalQueued: false }
       if (!pre.plan) return { success: false, error: 'This refund no longer exists.', refusals: [] }
       // Stock rows are locked in the order every writer takes them (order, then stock levels), then the verdict is read again: what the
@@ -398,9 +405,39 @@ export async function deleteSalesOrderRefund(
       const productIds = [...new Set(pre.plan.movements.map((movement) => movement.productId))]
       const warehouseIds = [...new Set(pre.plan.movements.map((movement) => movement.warehouseId))]
       await lockStockLevels(tx, productIds, warehouseIds)
-      const verdict = productIds.length > 0 ? await evaluateRefundDeletion(tx, input.refundId) : pre
+      const verdict = productIds.length > 0 ? await evaluateRefundDeletion(tx, input.refundId, { voidConfirmed: input.voidConfirmed !== undefined }) : pre
       if (!verdict.eligible || !verdict.plan) return { success: false, error: verdict.refusals.map((refusal) => refusal.message).join(' '), refusals: verdict.refusals }
       const plan = verdict.plan
+
+      // A void row already SYNCED means the ledger confirmed it and only the second phase is missing: resume it.
+      const confirmed = input.voidConfirmed ?? (plan.voidRow?.status === 'SYNCED' ? { syncLogId: plan.voidRow.id } : undefined)
+
+      // ---- PHASE 1 (a credit note that was POSTED): queue the void and change NOTHING else. ----
+      // The ledger may refuse (allocated, paid), and IMS must not read it inside this transaction. So the refund, its stock and its journals stay exactly as they
+      // are until the void worker has had the ledger confirm the void; the worker then calls this function again with `voidConfirmed` (phase 2, below).
+      if (plan.creditNote.disposition === 'posted' && !confirmed) {
+        const connector = plan.creditNote.connector
+        if (!isRegisteredAccountingConnector(connector) || !plan.creditNote.ledgerId) throw new RefundDeleteRefused([refundDeleteRefusals.accountingUncertain('credit note')])
+        const outcome = await queueAccountingSyncTxWithOutcome(tx, {
+          type: 'CREDIT_NOTE_VOID',
+          referenceType: 'SalesOrderRefund',
+          referenceId: plan.refundId,
+          idempotencyKey: `refund-delete:${plan.refundId}:credit-note-void`,
+          chartConnector: connector,
+          documentConnector: connector,
+          connector,
+          payload: { creditNoteId: plan.creditNote.ledgerId, creditNoteNumber: plan.creditNote.number, date: today, _refundDelete: { actorUserId: input.actorUserId, reason: input.reason } },
+        })
+        if (!outcome.queued && outcome.reason !== 'already-queued') throw new RefundDeleteRefused([refundDeleteRefusals.accountingNotQueued('credit note void', outcome.reason)])
+        await tx.activityLog.create({
+          data: {
+            entityType: 'SALES_ORDER', entityId: plan.orderId, action: 'refund_delete_requested', tag: 'sales', level: 'INFO', userId: input.actorUserId,
+            description: `Requested deletion of refund ${plan.creditNote.number ?? plan.refundId}: its credit note change is queued. The refund and its stock stay as they are until the accounting system confirms it.`,
+            metadata: { refundId: plan.refundId },
+          },
+        })
+        return { success: true, pending: true, alreadyDeleted: false, orderId: plan.orderId, creditNoteNumber: plan.creditNote.number, productIds: [], voidQueued: true, counterJournalQueued: false }
+      }
 
       const refund = await tx.salesOrderRefund.findUniqueOrThrow({
         where: { id: plan.refundId },
@@ -457,7 +494,7 @@ export async function deleteSalesOrderRefund(
         ;(reversal.retired as unknown[]).push({ syncLogId: row.id, type: 'COGS_REVERSAL', how: plan.cogs.disposition })
       }
 
-      // ---- 3. THE CREDIT NOTE: retire, or queue the void ----
+      // ---- 3. THE CREDIT NOTE: retire an unsent one; a posted one was voided by phase 1's worker and is confirmed here ----
       let voidSyncLogId: string | null = null
       let voidQueued = false
       if (plan.creditNote.row || plan.creditNote.disposition === 'posted') {
@@ -465,26 +502,11 @@ export async function deleteSalesOrderRefund(
           await retireSyncRow(tx, plan.creditNote.row, 'Cancelled: the refund this credit note belonged to was deleted before it posted.')
           await voidMirroredAccountingEventsForOrder(tx, { types: ['CREDIT_NOTE'], referenceType: 'SalesOrderRefund', referenceId: refund.id, reason: 'refund deleted' })
           ;(reversal.retired as unknown[]).push({ syncLogId: plan.creditNote.row.id, type: 'CREDIT_NOTE', how: 'retire' })
-        } else if (plan.creditNote.disposition === 'posted') {
-          const connector = plan.creditNote.connector
-          if (!isRegisteredAccountingConnector(connector) || !plan.creditNote.ledgerId) throw new RefundDeleteRefused([refundDeleteRefusals.accountingUncertain('credit note')])
-          const key = `refund-delete:${refund.id}:credit-note-void`
-          const outcome = await queueAccountingSyncTxWithOutcome(tx, {
-            type: 'CREDIT_NOTE_VOID',
-            referenceType: 'SalesOrderRefundDeletion',
-            referenceId: refund.id,
-            idempotencyKey: key,
-            chartConnector: connector,
-            // The payload carries the ledger's own document id, so the connector that id belongs to is declared: the credit note's recorded provenance, never an inference.
-            documentConnector: connector,
-            connector,
-            payload: { creditNoteId: plan.creditNote.ledgerId, creditNoteNumber: plan.creditNote.number, date: today },
-          })
-          if (!outcome.queued && outcome.reason !== 'already-queued') throw new RefundDeleteRefused([refundDeleteRefusals.accountingNotQueued('credit note void', outcome.reason)])
+        } else if (plan.creditNote.disposition === 'posted' && confirmed) {
+          // Phase 2: the ledger has confirmed the void (the worker read the credit note and set it Voided).
+          voidSyncLogId = confirmed.syncLogId
           voidQueued = true
-          const queued = await tx.accountingSyncLog.findFirst({ where: { type: 'CREDIT_NOTE_VOID', referenceType: 'SalesOrderRefundDeletion', referenceId: refund.id }, orderBy: { createdAt: 'desc' }, select: { id: true } })
-          voidSyncLogId = queued?.id ?? null
-          ;(reversal.retired as unknown[]).push({ syncLogId: plan.creditNote.row?.id ?? null, type: 'CREDIT_NOTE', how: 'void-queued', voidSyncLogId })
+          ;(reversal.retired as unknown[]).push({ syncLogId: plan.creditNote.row?.id ?? null, type: 'CREDIT_NOTE', how: 'void-confirmed', voidSyncLogId })
         }
       }
 
@@ -540,7 +562,7 @@ export async function deleteSalesOrderRefund(
           tag: 'sales',
           level: 'WARNING',
           userId: input.actorUserId,
-          description: `Deleted refund ${refund.creditNoteNumber ?? refund.id} (recorded in error): ${plan.movements.length} stock movement(s) reversed, ${voidQueued ? 'credit note void queued' : plan.creditNote.row ? 'unsent credit note cancelled' : 'no credit note posted'}${plan.cogs.row ? (counterJournalQueued ? ', COGS reversal journal reversed' : ', unsent COGS reversal cancelled') : ''}.`,
+          description: `Deleted refund ${refund.creditNoteNumber ?? refund.id} (recorded in error): ${plan.movements.length} stock movement(s) reversed, ${voidQueued ? 'credit note closed in the accounting system' : plan.creditNote.row ? 'unsent credit note cancelled' : 'no credit note posted'}${plan.cogs.row ? (counterJournalQueued ? ', COGS reversal journal reversed' : ', unsent COGS reversal cancelled') : ''}.`,
           metadata: { refundId: refund.id, creditNoteNumber: refund.creditNoteNumber, totalBase: refund.totalBase.toString(), voidSyncLogId, counterJournalQueued, productIds },
         },
       })
@@ -562,4 +584,24 @@ async function retireSyncRow(tx: Tx, row: SyncRow, reason: string): Promise<void
   })
   // Lost the compare-and-swap: a worker claimed it between the read and here. Rolling back is the only safe answer.
   if (retired.count === 0) throw new RefundDeleteRefused([refundDeleteRefusals.accountingInFlight('accounting entry')])
+}
+
+/**
+ * PHASE 2 of deleting a refund whose credit note was posted, run by the void worker once the ledger has CONFIRMED the void. It unwinds the rest exactly as the
+ * one-step delete does. If it cannot (the stock moved meanwhile, a rule now refuses), it returns the refusal: the worker leaves the entry failed, the void is
+ * already done in the ledger, and a retry of the entry repeats the (idempotent) void read and then this step, so the delete resumes once the cause is cleared.
+ */
+export async function completeRefundDeletionAfterVoid(
+  client: RefundDeleteClient,
+  input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
+): Promise<{ ok: true; productIds: string[] } | { ok: false; error: string }> {
+  const result = await deleteSalesOrderRefund(client, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
+  if (!result.success) return { ok: false, error: `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${result.error}` }
+  if (result.productIds.length > 0) {
+    try {
+      const { enqueueStockSync } = await import('@/lib/shopping')
+      await enqueueStockSync(result.productIds, 'IMS_CHANGE')
+    } catch { /* the stock change goes with the next stock sync */ }
+  }
+  return { ok: true, productIds: result.productIds }
 }

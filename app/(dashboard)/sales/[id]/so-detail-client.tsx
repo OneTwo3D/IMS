@@ -323,6 +323,7 @@ function DeleteRefundDialog({ refund, onClose }: { refund: { id: string; creditN
     startTransition(async () => {
       const result = await deleteRefund(refund.id, reason)
       if (result.success) {
+        if (result.pending) alert('The credit note void has been queued. The refund and its stock stay as they are until the accounting system confirms the void; then the refund is removed. Check the sync page if it does not disappear.')
         if (result.warning) alert(result.warning)
         router.refresh()
         onClose()

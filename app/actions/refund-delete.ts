@@ -37,7 +37,7 @@ export async function getRefundDeleteEligibility(orderId: string): Promise<Refun
 export async function deleteRefund(
   refundId: string,
   reason?: string,
-): Promise<{ success: boolean; error?: string; refusals?: RefundDeleteRefusal[]; warning?: string }> {
+): Promise<{ success: boolean; pending?: boolean; error?: string; refusals?: RefundDeleteRefusal[]; warning?: string }> {
   const session = await requirePermission('sales.refund')
   const trimmed = (reason ?? '').trim().slice(0, 500)
   const result = await deleteSalesOrderRefund(db, { refundId, actorUserId: session.user.id ?? null, reason: trimmed || null })
@@ -45,6 +45,11 @@ export async function deleteRefund(
     return { success: false, error: result.error, refusals: result.refusals }
   }
   const orderId = result.orderId
+  // A refund whose credit note was posted is deleted in two steps: the void is queued now and the refund is removed once the accounting system confirms it.
+  if (result.pending) {
+    if (orderId) revalidatePath(`/sales/${orderId}`)
+    return { success: true, pending: true }
+  }
   if (result.alreadyDeleted) {
     if (orderId) revalidatePath(`/sales/${orderId}`)
     return { success: true }

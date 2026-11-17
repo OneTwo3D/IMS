@@ -30,7 +30,7 @@ async function openRig() {
     import('@/lib/domain/accounting/money-attempt-provenance'),
   ])
   const db = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL!, max: 6 }) })
-  return { Prisma, db, appDb, createSalesOrderRefund: refundService.createSalesOrderRefund, deleteSalesOrderRefund: deleteService.deleteSalesOrderRefund, evaluateRefundDeletion: deleteService.evaluateRefundDeletion, lockSalesOrder: alloc.lockSalesOrder, custody: custody.stampingCustodyOnCreate }
+  return { Prisma, db, appDb, createSalesOrderRefund: refundService.createSalesOrderRefund, deleteSalesOrderRefund: deleteService.deleteSalesOrderRefund, evaluateRefundDeletion: deleteService.evaluateRefundDeletion, completeAfterVoid: deleteService.completeRefundDeletionAfterVoid, lockSalesOrder: alloc.lockSalesOrder, custody: custody.stampingCustodyOnCreate }
 }
 type Rig = Awaited<ReturnType<typeof openRig>>
 
@@ -165,9 +165,23 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     const verdict = await rig.evaluateRefundDeletion(rig.db, refundId)
     assert.deepEqual(verdict.refusals, [], 'eligible')
 
-    const result = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'entered twice' })
-    assert.equal(result.success, true, result.success ? '' : result.error)
-    assert.ok(result.success && result.voidQueued)
+    // PHASE 1: a posted credit note only queues the void. Nothing else changes until the ledger confirms it.
+    const first = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'entered twice' })
+    assert.ok(first.success && first.pending && first.voidQueued)
+    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 1, 'the refund is untouched while the void is pending')
+    assert.equal(Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity), 1)
+    assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: cogsSync } })).status, 'PENDING')
+    assert.equal(await subledgerNet(rig, refundId), -45)
+    const voidRow = await rig.db.accountingSyncLog.findFirstOrThrow({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } })
+    // A second press while pending queues nothing more.
+    const again = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'entered twice' })
+    assert.ok(again.success && again.pending)
+    assert.equal(await rig.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } }), 1)
+    // PHASE 2: the worker has had the ledger confirm the void.
+    await rig.db.accountingSyncLog.update({ where: { id: voidRow.id }, data: { status: 'SYNCED' } })
+    const done = await rig.completeAfterVoid(rig.db, { refundId, voidSyncLogId: voidRow.id, actorUserId: null, reason: 'entered twice' })
+    assert.ok(done.ok, done.ok ? '' : done.error)
+    const result = { success: true as const, voidQueued: true }
 
     // The record is gone; the tombstone remembers it.
     assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 0)
@@ -190,8 +204,8 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     // The credit note void is queued through the outbox, PENDING: nothing was sent and nothing was claimed.
     const voidRows = await rig.db.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } })
     assert.equal(voidRows.length, 1)
-    assert.equal(voidRows[0].status, 'PENDING')
-    assert.equal(voidRows[0].referenceType, 'SalesOrderRefundDeletion')
+    assert.equal(voidRows[0].status, 'SYNCED', 'confirmed by the (simulated) worker')
+    assert.equal(voidRows[0].referenceType, 'SalesOrderRefund')
     assert.equal((voidRows[0].payload as Record<string, unknown>).creditNoteId, 'LEDGER-CN-1')
     assert.equal(tomb.voidSyncLogId, voidRows[0].id)
     const outbox = await rig.db.integrationOutbox.findMany({ where: { connector: 'xero', payloadJson: { path: ['accountingSyncLogId'], equals: voidRows[0].id } } })
@@ -339,34 +353,52 @@ for (const refusal of REFUSALS) {
   })
 }
 
-test('an idempotent retry reports success and does nothing twice; a crash before commit leaves nothing and the resume completes once', { skip }, async () => {
+test('a posted credit note the ledger refuses (allocated there) leaves IMS exactly as it was; once confirmed the delete resumes after a crash and runs once', { skip }, async () => {
   const rig = await openRig()
   const w = await buildWorld(rig)
   try {
     await enable(rig)
+    const { voidCreditNote } = await import('@/lib/connectors/xero/credit-notes')
     const refundId = await recordRefund(rig, w)
     await seedPostedCreditNote(rig, refundId)
     await seedCogsReversal(rig, refundId)
+    const stock = async () => Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity)
 
-    // A crash AFTER every write and BEFORE the commit: the whole delete rolls back.
+    // A crash before the commit of phase 1: nothing queued.
     const crashing = { $transaction: async (fn: (tx: never) => Promise<unknown>, opts?: unknown) => rig.db.$transaction(async (tx) => { await fn(tx as never); throw new Error('simulated crash before commit') }, opts as never) } as never
     await assert.rejects(() => rig.deleteSalesOrderRefund(crashing, { refundId, actorUserId: null, reason: null }), /simulated crash/)
-    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 1, 'the refund is still there')
-    assert.equal(await rig.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } }), 0, 'no void was queued')
-    assert.equal(await rig.db.salesOrderRefundDeletion.count({ where: { refundId } }), 0)
-    assert.equal(await subledgerNet(rig, refundId), -45, 'the sub-ledger is untouched')
-    assert.equal(Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity), 1)
+    assert.equal(await rig.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } }), 0)
 
-    // The resume.
-    const first = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: null })
-    assert.equal(first.success && !first.alreadyDeleted, true)
-    // The retry (a double click, a replay): success, and nothing is done a second time.
-    const again = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: null })
-    assert.equal(again.success && again.alreadyDeleted, true)
-    assert.equal(await rig.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } }), 1, 'one void')
+    const queued = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: null })
+    assert.ok(queued.success && queued.pending)
+    const voidRow = await rig.db.accountingSyncLog.findFirstOrThrow({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } })
+
+    // The ledger says the credit note is ALLOCATED (not represented by any IMS payment): the worker's void is refused and never reaches phase 2.
+    const allocated = await voidCreditNote({ creditNoteId: 'LEDGER-CN-1' }, undefined, {
+      get: async <T,>() => ({ ok: true, status: 200, data: { CreditNotes: [{ CreditNoteID: 'LEDGER-CN-1', Type: 'ACCRECCREDIT', Status: 'AUTHORISED', Allocations: [{ Amount: 5 }] }] } as T }),
+      post: async () => { throw new Error('must not write') },
+    })
+    assert.equal(allocated.success, false)
+    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 1, 'IMS is unchanged')
+    assert.equal(await stock(), 1)
+    assert.equal(await subledgerNet(rig, refundId), -45)
+    assert.equal(await rig.db.salesOrderRefundDeletion.count({ where: { refundId } }), 0)
+
+    // The ledger confirms (the allocation was removed there). Phase 2 crashes before commit once: nothing changes; the resume completes.
+    await rig.db.accountingSyncLog.update({ where: { id: voidRow.id }, data: { status: 'SYNCED' } })
+    await assert.rejects(() => rig.completeAfterVoid(crashing, { refundId, voidSyncLogId: voidRow.id, actorUserId: null, reason: null }), /simulated crash/)
+    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 1)
+    assert.equal(await stock(), 1)
+    const finished = await rig.completeAfterVoid(rig.db, { refundId, voidSyncLogId: voidRow.id, actorUserId: null, reason: null })
+    assert.ok(finished.ok, finished.ok ? '' : finished.error)
+    // A retry of the worker entry (or a double press) does nothing twice.
+    assert.ok((await rig.completeAfterVoid(rig.db, { refundId, voidSyncLogId: voidRow.id, actorUserId: null, reason: null })).ok)
+    const replay = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: null })
+    assert.ok(replay.success && replay.alreadyDeleted)
     assert.equal(await rig.db.salesOrderRefundDeletion.count({ where: { refundId } }), 1, 'one tombstone')
+    assert.equal(await rig.db.accountingSyncLog.count({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId } }), 1, 'one void')
+    assert.equal(await stock(), 0, 'stock went out once')
     assert.equal(await subledgerNet(rig, refundId), 0)
-    assert.equal(Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity), 0, 'stock went out once')
     assert.equal(await rig.db.activityLog.count({ where: { entityId: w.orderId, action: 'refund_deleted' } }), 1)
   } finally {
     await w.cleanup()

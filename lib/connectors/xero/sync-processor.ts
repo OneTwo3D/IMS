@@ -6783,7 +6783,15 @@ export async function processClaimedEntry(
         { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
       )
       // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
-      return { success: voided.success, externalId: voided.success ? voidCreditNoteId : undefined, error: voided.error }
+      if (!voided.success) return { success: false, error: voided.error }
+      // Phase 2 of a refund delete: the ledger has confirmed the void, so IMS now unwinds the refund (idempotent: an already deleted refund is a success).
+      if (referenceType === 'SalesOrderRefund') {
+        const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
+        const { completeRefundDeletionAfterVoid } = await import('@/lib/domain/sales/refund-delete-service')
+        const finished = await completeRefundDeletionAfterVoid(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null })
+        if (!finished.ok) return { success: false, error: finished.error }
+      }
+      return { success: true, externalId: voidCreditNoteId }
     }
 
     case 'PURCHASE_CREDIT_NOTE': {

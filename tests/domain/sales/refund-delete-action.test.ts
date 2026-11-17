@@ -104,6 +104,15 @@ test('a delete passes the actor and a trimmed reason, then re-reserves the order
   assert.deepEqual(state.stockSync, [['p1']])
 })
 
+test('a posted credit note is a two-step delete: the action reports pending and does no follow-up', async () => {
+  reset()
+  state.serviceResult = { success: true, pending: true, alreadyDeleted: false, orderId: 'o1', creditNoteNumber: 'CN-1', productIds: [], voidQueued: true, counterJournalQueued: false }
+  const { deleteRefund } = await actions()
+  assert.deepEqual(await deleteRefund('r1'), { success: true, pending: true })
+  assert.equal(state.allocate.length, 0)
+  assert.equal(state.stockSync.length, 0)
+})
+
 test('an order that is not being fulfilled is not re-reserved (a delete never promotes a draft or an unpaid order)', async () => {
   reset()
   state.orderStatus = 'PENDING_PAYMENT'
