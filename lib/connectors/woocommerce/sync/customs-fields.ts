@@ -49,21 +49,72 @@ function attributeValue(attrs: WcCustomsSource['attributes'], ...names: string[]
   return null
 }
 
-export function extractWcCustomsFields(source: WcCustomsSource): WcCustomsFields {
-  const hsCode =
-    trimmed(source.customs_commodity_code) ?? attributeValue(source.attributes, 'hs_code', 'hs code', 'hscode')
-  const origin =
-    trimmed(source.customs_country_of_origin) ??
-    attributeValue(source.attributes, 'country_of_origin', 'Country of Origin', 'coo')
+/** A customs value WooCommerce supplied that IMS cannot use (and therefore did not apply). */
+export type WcRejectedCustomsValue = { field: keyof WcCustomsFields; value: string }
+
+/**
+ * The commodity code IMS can push: digits only, exactly 8 (the warehouse CN8 rule). WooCommerce
+ * itself accepts 6-14 digits, so a shorter or longer native code is unusable here and must not
+ * displace a valid IMS value. Separators (spaces, dots, dashes) are stripped; any other character
+ * makes the value unusable.
+ */
+function normaliseCommodityCode(raw: string): string | null {
+  const compact = raw.replace(/[\s.\-]+/g, '')
+  return /^\d{8}$/.test(compact) ? compact : null
+}
+
+/**
+ * First candidate that normalises to a usable value. A candidate that is present but unusable is
+ * recorded as rejected and the next source is tried; when none is usable the field is null, i.e.
+ * ABSENT, so the caller preserves the existing IMS value.
+ */
+function firstUsable(
+  field: keyof WcCustomsFields,
+  candidates: (string | null)[],
+  normalise: (raw: string) => string | null,
+  rejected: WcRejectedCustomsValue[],
+): string | null {
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    const usable = normalise(candidate)
+    if (usable) return usable
+    rejected.push({ field, value: candidate })
+  }
+  return null
+}
+
+export function extractWcCustomsFields(source: WcCustomsSource): WcCustomsFields & { rejected: WcRejectedCustomsValue[] } {
+  const rejected: WcRejectedCustomsValue[] = []
+  const hsCode = firstUsable(
+    'hsCode',
+    [trimmed(source.customs_commodity_code), attributeValue(source.attributes, 'hs_code', 'hs code', 'hscode')],
+    normaliseCommodityCode,
+    rejected,
+  )
+  const countryOfOrigin = firstUsable(
+    'countryOfOrigin',
+    [
+      trimmed(source.customs_country_of_origin),
+      attributeValue(source.attributes, 'country_of_origin', 'Country of Origin', 'coo'),
+    ],
+    (raw) => toIsoCountryCode(raw),
+    rejected,
+  )
   const legacy = Array.isArray(source.meta_data)
     ? trimmed(source.meta_data.find((m) => m?.key === LEGACY_DESCRIPTION_META_KEY)?.value)
     : null
-  const descriptionRaw =
-    trimmed(source.customs_description) ??
-    attributeValue(source.attributes, 'customs_description', 'customs description', 'customsdescription') ??
-    legacy
-  // Clamped on the way in so the stored value is always one WooCommerce and the warehouse accept;
-  // null stays null so "WC omitted it" keeps its meaning.
-  const customsDescription = descriptionRaw ? clampCustomsDescription(descriptionRaw) : descriptionRaw
-  return { hsCode, countryOfOrigin: toIsoCountryCode(origin), customsDescription }
+  // Clamped on the way in so the stored value is always one WooCommerce and the warehouse accept
+  // (a value that clamps to nothing, e.g. only rejected symbols, is unusable); null stays null so
+  // "WC omitted it" keeps its meaning.
+  const customsDescription = firstUsable(
+    'customsDescription',
+    [
+      trimmed(source.customs_description),
+      attributeValue(source.attributes, 'customs_description', 'customs description', 'customsdescription'),
+      legacy,
+    ],
+    (raw) => clampCustomsDescription(raw) || null,
+    rejected,
+  )
+  return { hsCode, countryOfOrigin, customsDescription, rejected }
 }
