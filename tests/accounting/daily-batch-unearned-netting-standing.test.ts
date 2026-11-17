@@ -21,6 +21,8 @@ import { createSyncLogStore, matchesWhere, syncLogRow, type SyncLogRow } from '@
 
 const BATCH_DAY = '2026-07-20'
 
+/** Every `shipment.update` the run made: the journaled stamp (o3d-oyur retry test). */
+const shipmentUpdates: string[] = []
 const created: Array<{ type: string; referenceId: string; payload: Record<string, unknown> }> = []
 const activity: Array<Record<string, unknown>> = []
 let store = createSyncLogStore([])
@@ -56,7 +58,7 @@ const SHIPMENT = {
 }
 
 const tx = {
-  shipment: { findMany: async () => [SHIPMENT], update: async ({ where }: { where: { id: string } }) => ({ id: where.id }) },
+  shipment: { findMany: async () => [SHIPMENT], update: async ({ where }: { where: { id: string } }) => { shipmentUpdates.push(where.id); return { id: where.id } } },
   orderAllocation: { findMany: async () => [], update: async () => ({}) },
   shipmentLine: { findMany: async () => [], update: async () => ({}) },
   salesOrderRefundLine: { findMany: async () => [] },
@@ -272,16 +274,32 @@ test('[o3d-oyur] a SYNCED reversal compacted to its summary still nets: £100 - 
   assert.equal(unreadableReports().length, 0)
 })
 
-test('[o3d-oyur] a legacy compacted reversal (no lines, no summary) recognises NOTHING for the order and says so', async () => {
-  await runWith([reversalRow('rev-legacy', {
-    status: 'SYNCED',
-    externalTransactionId: 'JNL-8',
-    payload: {},
-    payloadAccountNets: null,
-  })])
-  assert.equal(recognisedRevenue(), 0, 'NOT 100 (zero reversal assumed) and no true-up: the amount reversed is unknown')
+test('[o3d-oyur] a legacy compacted reversal withholds the order: nothing journaled or stamped on run 1; once readable, run 2 recognises it exactly once', async () => {
+  const legacy = reversalRow('rev-legacy', { status: 'SYNCED', externalTransactionId: 'JNL-8', payload: {}, payloadAccountNets: null })
+  created.length = 0
+  activity.length = 0
+  shipmentUpdates.length = 0
+  store = createSyncLogStore([legacy])
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const run1 = await runDailyBatchSync()
+  assert.deepEqual(run1.errors, [])
+  assert.equal(run1.groupB, 0, 'run 1: the shipment is not processed')
+  assert.equal(created.filter((log) => log.type === 'DAILY_BATCH_GROUP_B').length, 0, 'run 1: no Group B journal (no revenue, no COGS)')
+  assert.equal(shipmentUpdates.length, 0, 'run 1: the shipment is NOT stamped journaled, so it stays retryable')
   const [report] = unreadableReports()
-  assert.ok(report, 'one warning')
+  assert.ok(report, 'run 1: one warning')
   assert.equal(report.entityId, 'order-1')
   assert.equal(report.level, 'WARNING')
+
+  // The reversal becomes readable (a summary is recorded for it); the same shipment is picked up again.
+  store = createSyncLogStore([{ ...legacy, payloadAccountNets: { version: 1, accounts: { '830': { credit: 0, debit: 30 } } } }])
+  created.length = 0
+  activity.length = 0
+  const run2 = await runDailyBatchSync()
+  assert.deepEqual(run2.errors, [])
+  assert.equal(run2.groupB, 1, 'run 2: the shipment is journaled')
+  assert.equal(created.filter((log) => log.type === 'DAILY_BATCH_GROUP_B').length, 1, 'exactly one Group B journal')
+  assert.equal(recognisedRevenue(), 70, 'run 2: £100 less the £30 the now-readable reversal took, recognised once')
+  assert.equal(shipmentUpdates.length, 1, 'and the shipment is stamped exactly once')
+  assert.equal(unreadableReports().length, 0)
 })

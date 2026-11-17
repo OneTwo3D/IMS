@@ -465,16 +465,13 @@ async function computePreview(): Promise<DailyBatchPreview> {
       unearnedReversalStandingReport(bReversalStandingRowsByOrder.get(orderId) ?? []),
     )
     if (unearnedReport) unearnedReversalWarnings.push(unearnedReport)
-    // o3d-oyur (Codex r2 HIGH): same withholding as the sync - an unreadable counted reversal means the true-up is not previewed either.
+    // o3d-oyur (Codex r2 HIGH): same as the sync - the order's shipments are not journaled while a counted reversal is unreadable, so none is previewed.
     const unreadableUnearnedReversals = unreadableUnearnedReversalRows(bReversalSyncsByOrder.get(orderId) ?? [])
     if (unreadableUnearnedReversals.length > 0) {
-      unearnedReversalWarnings.push(`Order ${getSalesOrderReference({ id: orderId, ...order })}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so no revenue is recognised for this order (true-up and proportional slice withheld).`)
+      unearnedReversalWarnings.push(`Order ${getSalesOrderReference({ id: orderId, ...order })}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so the run will not journal this order's shipments (they are retried once the reversal is readable).`)
+      continue
     }
-    // An unreadable counted reversal means the figure is unknown: recognise NOTHING for this order (the deferral stays visible in
-    // Unearned Revenue; the warning names the order) rather than let the proportional slice run uncapped against a reversal it cannot see.
-    const remainingDeferred = unreadableUnearnedReversals.length > 0
-      ? 0
-      : round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
+    const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
     let runningRevenue = 0
 
     let isTrueUpEligible = isFullyShippedTerminalStatus(order.status) && order.refundStatus !== 'PARTIAL'
@@ -498,7 +495,6 @@ async function computePreview(): Promise<DailyBatchPreview> {
         new Set(orderShipments.map((shipment) => shipment.id)),
       )
     }
-    if (unreadableUnearnedReversals.length > 0) isTrueUpEligible = false
 
     for (let index = 0; index < orderShipments.length; index++) {
       const shipment = orderShipments[index]

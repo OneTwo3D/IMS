@@ -1948,7 +1948,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             action: 'daily_batch_trueup_withheld_unreadable_unearned_reversal',
             tag: 'sync',
             level: 'WARNING',
-            description: `Order ${firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so how much unearned revenue a refund already reversed cannot be established. No revenue was recognised for this order this run (true-up and proportional slice withheld); check the unearned revenue account.`,
+            description: `Order ${firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so how much unearned revenue a refund already reversed cannot be established. Its shipments were NOT journaled this run (no revenue, no COGS, no stamp) and will be retried once the reversal is readable; check the unearned revenue account.`,
             metadata: { orderId, unreadableCount: unreadableUnearnedReversals.length },
             resolveUser: false,
           }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
@@ -1971,11 +1971,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             resolveUser: false,
           }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
         }
-        // An unreadable counted reversal means the figure is unknown: recognise NOTHING for this order (the deferral stays visible in
-        // Unearned Revenue; the warning names the order) rather than let the proportional slice run uncapped against a reversal it cannot see.
-        const remainingDeferred = unreadableUnearnedReversals.length > 0
-          ? 0
-          : round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
+        // o3d-oyur (Codex r3): an unreadable counted reversal means the figure is unknown, so this order's shipments are NOT processed at
+        // all this run: no revenue, no COGS, no stamp. Nothing is published for them (results, snapshots and layer decrements are only
+        // recorded further down), so shipmentJournalDate stays null and a later run picks them up once the reversal is readable, exactly
+        // once. Recognising 0 and stamping the shipment journaled would strand the deferral for good.
+        if (unreadableUnearnedReversals.length > 0) continue
+        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
         let runningRevenue = 0
 
         // scjz.68: a fully-shipped terminal order trues up the remainder; a
@@ -2004,7 +2005,6 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             new Set(orderShipments.map((shipment) => shipment.id)),
           )
         }
-        if (unreadableUnearnedReversals.length > 0) isTrueUpEligible = false
 
         for (let index = 0; index < orderShipments.length; index++) {
           const shipment = orderShipments[index]
