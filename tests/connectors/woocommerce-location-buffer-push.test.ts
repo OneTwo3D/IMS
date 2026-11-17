@@ -40,7 +40,7 @@ function modelProxy(name: string) {
       if (name === 'product' && method === 'findMany') {
         // Like the real query: an unscoped run only selects products that have a stock row (or KITs).
         const ids = (args as { where?: { OR?: Array<{ id?: { in?: string[] } }> } } | undefined)?.where?.OR?.[0]?.id?.in
-        return Array.isArray(ids) ? candidates.filter((c) => ids.includes(c.id as string)) : candidates
+        return Array.isArray(ids) ? candidates.filter((c) => c.type === 'KIT' || ids.includes(c.id as string)) : candidates
       }
       if (name === 'product' && method === 'updateMany') return { count: 1 }
       if (name === 'product' && method === 'findUnique') {
@@ -136,6 +136,41 @@ test('a buffer at a warehouse with NO stock row has no effect and does not make 
   const result = await run()
   assert.deepEqual(result.errors, [])
   assert.deepEqual(quantities(), { 1: 10 }, 'only the stocked product is pushed; the buffer-only product is not a candidate and a buffer at a stockless warehouse changes nothing')
+})
+
+test('FRACTIONAL: 2.3 on hand with a 0.3 buffer pushes 2 (binary floating point would push 1)', async () => {
+  assert.ok(2.3 - 0.3 < 2, 'precondition: the float subtraction really is 1.9999999999999998')
+  reset([L('a', 'w1', 2.3), L('b', 'w1', 5)], [B('a', 'w1', 0.3)])
+  await run()
+  assert.equal(quantities()['1'], 2)
+  assert.equal(quantities()['2'], 5)
+})
+
+test('FRACTIONAL buffers across two warehouses sum exactly before the single floor', async () => {
+  // w1: 2.3 - 0.3 = 2, w2: 1.3 - 0.3 = 1; floats give 1.9999999999999998 + 1 = 2.9999999999999996 -> 2
+  reset([L('a', 'w1', 2.3), L('a', 'w2', 1.3), L('b', 'w1', 4.35, 1), L('b', 'w2', 0.7)], [B('a', 'w1', 0.3), B('a', 'w2', 0.3), B('b', 'w1', 0.35), B('b', 'w2', 0.1)])
+  await run()
+  assert.equal(quantities()['1'], 3)
+  assert.equal(quantities()['2'], 3) // (4.35 - 1 - 0.35) + (0.7 - 0.1) = 3.6 -> 3
+})
+
+test('a KIT made of buffered components is valued exactly', async () => {
+  const kit = { ...product('k', 'S3', BigInt(3)), type: 'KIT', productComponents: [{ componentId: 'a', qty: 0.2, component: { type: 'SIMPLE', lifecycleStatus: 'ACTIVE' } }] }
+  reset([L('a', 'w1', 1.2)], [B('a', 'w1', 0.6)]) // 0.6 available to the store; 0.6 / 0.2 is 2.9999999999999996 in floats
+  assert.ok(Math.floor(0.6 / 0.2) === 2, 'precondition: the float division really loses a kit')
+  candidates = [product('a', 'S1', BigInt(1)), kit]
+  const result = await run()
+  assert.deepEqual(result.errors, [])
+  assert.equal(quantities()['3'], 3)
+  assert.equal(quantities()['1'], 0)
+})
+
+test('a KIT with no buffered component is valued exactly as before', async () => {
+  const kit = { ...product('k', 'S3', BigInt(3)), type: 'KIT', productComponents: [{ componentId: 'a', qty: 2, component: { type: 'SIMPLE', lifecycleStatus: 'ACTIVE' } }] }
+  reset([L('a', 'w1', 5), L('a', 'w2', 3)], [])
+  candidates = [product('a', 'S1', BigInt(1)), kit]
+  await run()
+  assert.equal(quantities()['3'], 3) // floor(5/2) + floor(3/2)
 })
 
 test('BYTE-IDENTITY: with no buffer rows, or only zero rows, the posted payloads are identical', async () => {
