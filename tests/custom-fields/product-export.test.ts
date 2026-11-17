@@ -9,20 +9,37 @@ import { parseCsv } from '../../lib/csv.ts'
 
 let definitions: Array<Record<string, unknown>> = []
 let values: Array<Record<string, unknown>> = []
+let catalogue: Array<ReturnType<typeof product>> = []
+const calls = { products: 0, definitions: 0, values: 0, valueIdBatchSizes: [] as number[], valueWhereUnbounded: 0 }
 
-const product = (id: string, sku: string) => ({
+function product(id: string, sku: string) { return {
   id, sku, name: `Name ${sku}`, description: null, type: 'SIMPLE', parentId: null, barcode: null, mpn: null, countryOfOrigin: null,
   preferredSupplierLocked: false, weight: null, widthCm: null, heightCm: null, depthCm: null, salesPriceBase: null, salePriceBase: null,
   salesPriceTaxInclusive: false, stockUnit: 'pcs', oversellAllowed: true, imageUrl: null, active: true, lifecycleStatus: 'ACTIVE',
   category: null, parent: null, preferredSupplier: null, stockLevels: [], costLayers: [], productComponents: [],
-})
+} }
 
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      product: { findMany: async () => [product('p1', 'AAA'), product('p2', 'BBB')] },
-      customFieldDefinition: { findMany: async (args: { where: { active: boolean } }) => definitions.filter((d) => d.active === args.where.active) },
-      customFieldValue: { findMany: async () => values },
+      product: {
+        findMany: async (args: { where?: { sku?: { gt: string } }; take?: number }) => {
+          calls.products += 1
+          const after = args.where?.sku?.gt
+          const rows = catalogue.filter((p) => after === undefined || p.sku > after).sort((a, b) => (a.sku < b.sku ? -1 : 1))
+          return rows.slice(0, args.take ?? rows.length)
+        },
+      },
+      customFieldDefinition: { findMany: async (args: { where: { active: boolean } }) => { calls.definitions += 1; return definitions.filter((d) => d.active === args.where.active) } },
+      customFieldValue: {
+        findMany: async (args: { where: { productId?: { in: string[] } } }) => {
+          calls.values += 1
+          const ids = args.where.productId?.in
+          if (!ids) { calls.valueWhereUnbounded += 1; return values }
+          calls.valueIdBatchSizes.push(ids.length)
+          return values.filter((v) => ids.includes(v.productId as string))
+        },
+      },
     },
   },
 })
@@ -41,7 +58,13 @@ const BASE_HEADERS = [
 
 const d = (over: Record<string, unknown>) => ({ entity: 'PRODUCT', namespace: 'logistics', options: null, required: false, sortOrder: 0, active: true, ...over })
 
+function reset() {
+  catalogue = [product('p1', 'AAA'), product('p2', 'BBB')]
+  calls.products = 0; calls.definitions = 0; calls.values = 0; calls.valueIdBatchSizes = []; calls.valueWhereUnbounded = 0
+}
+
 async function exportRows() {
+  reset()
   const response = await GET(new Request('http://localhost/api/export/products'))
   const text = await response.text()
   return { text, headers: text.split('\r\n')[0]!.split(','), rows: parseCsv(text) }
@@ -75,4 +98,23 @@ test('active fields are appended after `category`, in namespace then sort order;
   assert.equal(rows[0]!['cf:mass'], '')
   assert.equal(rows[1]!['cf:mass'], '12.5')
   assert.ok(!text.includes('hidden') && !text.includes('cf:old'), 'a switched-off field and its values are not exported')
+})
+
+test('MEMORY AND QUERIES ARE BOUNDED: a large catalogue is read in batches of 500, with the custom values of only that batch, two queries per batch', async () => {
+  definitions = [d({ id: 'dA', key: 'hazard', label: 'Hazard', type: 'STRING' }), d({ id: 'dB', key: 'zone', label: 'Zone', type: 'STRING' })]
+  values = []
+  reset()
+  catalogue = Array.from({ length: 1201 }, (_, i) => product(`p${i}`, `SKU${String(i).padStart(5, '0')}`))
+  for (const p of catalogue) values.push({ definitionId: 'dA', productId: p.id, valueText: `h-${p.sku}`, valueDecimal: null, valueBoolean: null, valueDate: null, valueDateTime: null, valueJson: null })
+  const response = await GET(new Request('http://localhost/api/export/products'))
+  const rows = parseCsv(await response.text())
+  assert.equal(rows.length, 1201, 'every product is exported exactly once, in sku order')
+  assert.deepEqual(rows.map((r) => r.sku), [...rows.map((r) => r.sku)].sort())
+  assert.equal(rows[1200]!['cf:hazard'], 'h-SKU01200')
+  assert.equal(rows[0]!['cf:zone'], '')
+  assert.equal(calls.products, 3, 'three product batches (500, 500, 201), not one per product')
+  assert.equal(calls.values, 3, 'one values query per batch')
+  assert.equal(calls.valueWhereUnbounded, 0, 'no values query is ever unbounded by product')
+  assert.deepEqual(calls.valueIdBatchSizes, [500, 500, 201])
+  assert.equal(calls.definitions, 1)
 })

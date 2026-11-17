@@ -28,6 +28,25 @@ const TEMPLATE_HEADERS = [
 ]
 const REQUIRED_HEADERS = ['sku', 'name']
 
+const EXPORT_BATCH_SIZE = 500
+
+const PRODUCT_INCLUDE = {
+  category: { select: { name: true } },
+  parent: { select: { sku: true } },
+  preferredSupplier: { select: { id: true, name: true } },
+  stockLevels: { select: { quantity: true } },
+  costLayers: {
+    where: { remainingQty: { gt: 0 } },
+    select: { remainingQty: true, unitCostBase: true },
+  },
+  productComponents: {
+    select: { qty: true, component: { select: { sku: true } } },
+    orderBy: { sortOrder: 'asc' },
+  },
+} as const
+
+type ProductBatch = Array<Awaited<ReturnType<typeof db.product.findMany<{ include: typeof PRODUCT_INCLUDE }>>>[number]>
+
 export async function GET(req: Request) {
   const session = await requireApiAuth()
   if (session instanceof Response) return session
@@ -48,43 +67,40 @@ export async function GET(req: Request) {
     ]), 'products-import-template.csv')
   }
 
-  const products = await db.product.findMany({
-    include: {
-      category: { select: { name: true } },
-      parent: { select: { sku: true } },
-      preferredSupplier: { select: { id: true, name: true } },
-      stockLevels: { select: { quantity: true } },
-      costLayers: {
-        where: { remainingQty: { gt: 0 } },
-        select: { remainingQty: true, unitCostBase: true },
-      },
-      productComponents: {
-        select: { qty: true, component: { select: { sku: true } } },
-        orderBy: { sortOrder: 'asc' },
-      },
-    },
-    orderBy: { sku: 'asc' },
-  })
-
   // Active product custom fields, one `cf:<key>` column each, APPENDED LAST so every existing column keeps its place. Hidden fields are not exported.
   const customFields = await loadActiveDefinitions(db, 'PRODUCT')
-  const customValues = new Map<string, Map<string, string>>()
-  if (customFields.length > 0) {
-    const typeById = new Map(customFields.map((f) => [f.id, f.type]))
-    const stored = await db.customFieldValue.findMany({
-      where: { definitionId: { in: customFields.map((f) => f.id) }, productId: { not: null } },
-      select: { definitionId: true, productId: true, valueText: true, valueDecimal: true, valueBoolean: true, valueDate: true, valueDateTime: true, valueJson: true },
+  const typeById = new Map(customFields.map((f) => [f.id, f.type]))
+  const headers = [...HEADERS, ...customFields.map((f) => customFieldCsvHeader(f.key))]
+
+  /**
+   * ONE BATCH of products plus the custom values of THOSE products only, so memory is bounded by the batch (not the catalogue) and the
+   * query count is two per batch (products, values) however many fields exist. Keyed by sku (unique) after the last one sent.
+   */
+  const loadBatch = async (afterSku: string | null) => {
+    const batch = await db.product.findMany({
+      where: afterSku === null ? {} : { sku: { gt: afterSku } },
+      include: PRODUCT_INCLUDE,
+      orderBy: { sku: 'asc' },
+      take: EXPORT_BATCH_SIZE,
     })
-    for (const row of stored) {
-      const text = formatCustomFieldValue(typeById.get(row.definitionId)!, row)
-      if (text == null || !row.productId) continue
-      const forProduct = customValues.get(row.productId) ?? new Map<string, string>()
-      forProduct.set(row.definitionId, text)
-      customValues.set(row.productId, forProduct)
+    const values = new Map<string, Map<string, string>>()
+    if (customFields.length > 0 && batch.length > 0) {
+      const stored = await db.customFieldValue.findMany({
+        where: { definitionId: { in: customFields.map((f) => f.id) }, productId: { in: batch.map((p) => p.id) } },
+        select: { definitionId: true, productId: true, valueText: true, valueDecimal: true, valueBoolean: true, valueDate: true, valueDateTime: true, valueJson: true },
+      })
+      for (const row of stored) {
+        const text = formatCustomFieldValue(typeById.get(row.definitionId)!, row)
+        if (text == null || !row.productId) continue
+        const forProduct = values.get(row.productId) ?? new Map<string, string>()
+        forProduct.set(row.definitionId, text)
+        values.set(row.productId, forProduct)
+      }
     }
+    return { batch, values }
   }
 
-  const rows = products.map((p) => {
+  const buildRows = (products: ProductBatch, customValues: Map<string, Map<string, string>>) => products.map((p) => {
     // Format components as "SKU1:qty;SKU2:qty"
     const componentsStr = p.productComponents
       .map((c) => `${c.component.sku}:${Number(c.qty)}`)
@@ -129,5 +145,27 @@ export async function GET(req: Request) {
   })
 
   const filename = `products-${new Date().toISOString().slice(0, 10)}.csv`
-  return csvResponse(toCsv(rows, [...HEADERS, ...customFields.map((f) => customFieldCsvHeader(f.key))]), filename)
+  const headerLine = toCsv([], headers)
+  const encoder = new TextEncoder()
+  let cursor: string | null = null
+  let started = false
+  let done = false
+  // Streamed: each pull reads one batch and emits its rows, so nothing holds the whole catalogue or every custom value at once.
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!started) {
+        started = true
+        controller.enqueue(encoder.encode(headerLine))
+        return
+      }
+      if (done) { controller.close(); return }
+      const { batch, values } = await loadBatch(cursor)
+      if (batch.length === 0) { done = true; controller.close(); return }
+      cursor = batch[batch.length - 1]!.sku
+      if (batch.length < EXPORT_BATCH_SIZE) done = true
+      const body = toCsv(buildRows(batch, values), headers).slice(headerLine.length)
+      controller.enqueue(encoder.encode(body))
+    },
+  })
+  return new Response(stream, { headers: csvResponse('', filename).headers })
 }
