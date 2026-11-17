@@ -64,6 +64,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   invoice_store_publications: { kind: 'MUST_BE_EMPTY', reason: 'what was written to the storefront about the customer invoice of existing orders' },
   landed_cost_links: { kind: 'MUST_BE_EMPTY', reason: 'landed-cost records' },
   landed_cost_revaluation_runs: { kind: 'MUST_BE_EMPTY', reason: 'landed-cost records' },
+  location_stock_buffers: { kind: 'CONFIG_ALLOWED', reason: 'operator-set channel hold-back quantities; availability configuration, not stock history, and no stock row is created by one' },
   manufacturing_cost_lines: { kind: 'MUST_BE_EMPTY', reason: 'manufacturing cost records' },
   notification_read_receipts: { kind: 'CONFIG_ALLOWED', reason: 'which operator read which notification' },
   needs_attention_announcements: { kind: 'CONFIG_ALLOWED', reason: 'which failing rows the bell has announced: operational state of the announcer, ids only, starts empty, no business data' },

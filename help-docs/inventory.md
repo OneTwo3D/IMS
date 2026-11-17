@@ -397,6 +397,17 @@ Each product displays four stock figures per warehouse:
   already arrived by any route (a manual receipt, a WMS book-in, or a WMS stock-sync alignment).
   Click the figure to see the source POs or transfers.
 
+### Channel buffer (hold stock back from the store)
+
+On a simple, variant or BOM product, the **Channel buffer by warehouse** card lets you hold a number of units back at a warehouse so they are never offered on connected sales channels (WooCommerce). The store is told **Available minus Buffer** for that warehouse, never below 0, before the warehouses are added together.
+
+- **It only changes what the store sees.** On Hand, Allocated and Available in IMS do not change, and the buffer does not stop IMS allocating the units to an IMS order (a buffer says what the store may sell, not what the warehouse may ship). The warehouse-system stock sync (Mintsoft) also keeps working on the real On Hand.
+- A buffer only has an effect at a warehouse marked **Sync to Store**; elsewhere the card shows "not synced".
+- Leave the box empty (or 0) for no buffer. Whole or decimal numbers of zero or more.
+- **A reason is required** whenever you change a buffer. Saving needs the **inventory edit** permission. Each change is recorded in the Activity Log (product entry) with who, when, the old value, the new value and the reason. Keep the reason about the stock, not about a customer.
+- Saving queues the normal stock push for that product, so the store figure updates within moments. If the push cannot be queued, the buffer is still saved, a warning is logged, and the next stock catch-up sends it.
+- Kit stock is worked out from its components, so set the buffer on the components.
+
 
 ### Reorder thresholds by warehouse
 
