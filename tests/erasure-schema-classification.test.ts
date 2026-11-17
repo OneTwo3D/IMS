@@ -118,6 +118,7 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   'Customer.accountingContactId': 'retained',
   'SalesOrder.accountingInvoiceId': 'retained',
   'SalesOrderRefund.accountingCreditNoteId': 'retained',
+  'PaymentRemovalReconciliation.accountingInvoiceId': 'retained',
   'SalesOrder.customerId': 'surrogate',
   'ShoppingCustomerLink.customerId': 'surrogate',
   // not customer data: suppliers, products, ledger accounts, staff users, purchasing documents
