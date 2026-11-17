@@ -254,3 +254,15 @@ test('chart demand: the toggle excludes stockout days, off is unchanged, and it 
   const report = await getReorderReport({ thresholdDays: 14, includeZero: true, ignoreStockouts: true }, { deps: { client, now: () => NOW, loadStockoutDayCounts: counts, loadSnapshotCoverage: coverage } })
   assert.equal(Number(report.rows[0]!.averageDailyDemand), on.averageDailyDemand)
 })
+
+test('chart demand stays unadjusted when the report refused the snapshot scan (it matches the report)', async () => {
+  const { deps, client } = build({ sales: SALES })
+  const loader = historyLoader(['2026-12-24', '2026-12-25', '2026-12-26', '2026-12-27', '2026-12-28', '2026-12-29', '2026-12-30'], {})
+  const { SourceScanTooLargeError } = await import('@/lib/security/source-scan-error')
+  const refusing: NonNullable<ReorderDemandChartDeps['loadStockoutDayCounts']> = async () => { throw new SourceScanTooLargeError('Stockout snapshot rows', 50000) }
+  const coverage: NonNullable<ReorderDemandChartDeps['loadSnapshotCoverage']> = async () => ({ firstCoveredDate: '2026-12-24', coveredDays: 7, windowDays: 14 })
+  const chart = await getReorderDemandChart({ productId: 'product-1', filters: { thresholdDays: 14, ignoreStockouts: true }, deps: { ...deps, loadStockoutHistory: loader, loadStockoutDayCounts: refusing, loadSnapshotCoverage: coverage } })
+  assert.equal(chart!.averageDailyDemand, 1.5)
+  const report = await getReorderReport({ thresholdDays: 14, includeZero: true, ignoreStockouts: true }, { deps: { client, now: () => NOW, loadStockoutDayCounts: refusing, loadSnapshotCoverage: coverage } })
+  assert.equal(Number(report.rows[0]!.averageDailyDemand), chart!.averageDailyDemand)
+})

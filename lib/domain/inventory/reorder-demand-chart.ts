@@ -217,7 +217,10 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
   // Demand rate: the exact figure getReorderReport used (same window, same rows), not its 4dp string.
   const velocityWindow = { dateFrom: demandFrom, dateTo: sources.window.dateTo }
   // Beyond MAX_STOCKOUT_WINDOW_DAYS the report refuses the adjustment, so the chart does too.
+  // It also refuses when the report's aggregate was refused (too many snapshot rows): the report row then
+  // carries no adjustment although the history shows stockout days.
   const adjustDemand = ignoreStockouts && demandDays <= MAX_STOCKOUT_WINDOW_DAYS
+    && (demandWindowStockoutDays === 0 || row.stockoutAdjustment != null)
   const velocity = adjustDemand
     ? calculateStockoutAdjustedVelocity(sources.sales, velocityWindow, new Map([[input.productId, demandWindowStockoutDays]]))
       .find((entry) => entry.productId === input.productId)

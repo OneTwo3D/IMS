@@ -2,7 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { UTC_DAY_MS } from '@/lib/domain/math/date-window'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { assertSourceLimit } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 /**
  * Stockout history from the daily InventorySnapshot / InventorySnapshotRun tables. No replay of
@@ -210,6 +210,22 @@ export async function getStockoutDayCounts(input: {
 
   const client = input.client ?? (db as unknown as StockoutCountsClient)
   const warehouseClause = input.warehouseId ? Prisma.sql`AND s."warehouseId" = ${input.warehouseId}` : Prisma.empty
+  // Bounded probe first (the repo's source-limit pattern): refuse before the aggregate when more snapshot
+  // rows than the limit would be read.
+  const probe = await client.$queryRaw<Array<{ n: number | bigint }>>(Prisma.sql`
+    SELECT COUNT(*)::int AS n FROM (
+      SELECT 1
+      FROM inventory_snapshots s
+      WHERE s."productId" = ANY(${productIds}::text[])
+        AND s."snapshotDate" BETWEEN ${input.dateFrom}::date AND ${input.dateTo}::date
+        ${warehouseClause}
+      LIMIT ${STOCKOUT_SOURCE_ROW_LIMIT + 1}
+    ) bounded
+  `)
+  const probed = Number(probe[0]?.n ?? 0)
+  if (probed > STOCKOUT_SOURCE_ROW_LIMIT) {
+    throw new SourceScanTooLargeError('Stockout snapshot rows', STOCKOUT_SOURCE_ROW_LIMIT, { rowCount: probed })
+  }
   const rows = await client.$queryRaw<CountRow[]>(Prisma.sql`
     WITH covered AS (
       SELECT COUNT(*)::int AS n

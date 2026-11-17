@@ -22,7 +22,7 @@ import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stoc
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { CLAIMED_BOM_SELECT, CLAIMED_BOM_WHERE, claimedBomItems } from '@/lib/products/claimed-bom'
 import { parseProductionOrderComponentSnapshot } from '@/lib/domain/manufacturing/component-consumption'
-import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, assertSourceLimit, isSourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
   type DecimalFulfillmentRequirement,
@@ -863,18 +863,31 @@ async function loadStockoutAdjustedVelocity(
 ): Promise<{
   rows: ReturnType<typeof calculateStockoutAdjustedVelocity>
   notices: string[]
+  refused?: boolean
 }> {
   const dateFrom = dateOnly(window.dateFrom)
   const dateTo = dateOnly(window.dateTo)
   const soldProductIds = [...new Set(velocityInputs.map((input) => input.productId))]
   const loadCounts = deps?.loadStockoutDayCounts ?? ((input) => getStockoutDayCounts(input))
   const loadCoverage = deps?.loadSnapshotCoverage ?? ((input) => getSnapshotCoverage(input))
-  const [counts, coverage] = await Promise.all([
+  let counts: Map<string, StockoutDayCount>
+  let coverage: SnapshotCoverage
+  try {
+    ;[counts, coverage] = await Promise.all([
     soldProductIds.length > 0
       ? loadCounts({ productIds: soldProductIds, warehouseId: filters.warehouseId, dateFrom, dateTo })
       : Promise.resolve(new Map<string, StockoutDayCount>()),
     loadCoverage({ dateFrom, dateTo }),
   ])
+  } catch (error) {
+    if (!isSourceScanTooLargeError(error)) throw error
+    // Too many snapshot rows to read: keep demand unadjusted and say so. The report itself still computes.
+    return {
+      rows: calculateDailyVelocity(velocityInputs, window).map((row) => ({ ...row, stockoutDays: 0, effectiveDays: 0, clamped: false })),
+      notices: ['Ignore stockouts is on but there are too many inventory snapshot rows to apply it for these filters, so demand is not adjusted. Narrow the filters (warehouse, category, supplier or a shorter demand window) and try again.'],
+      refused: true,
+    }
+  }
   const stockoutDaysByProduct = new Map([...counts].map(([productId, count]) => [productId, count.stockoutDays]))
   const rows = calculateStockoutAdjustedVelocity(velocityInputs, window, stockoutDaysByProduct)
 

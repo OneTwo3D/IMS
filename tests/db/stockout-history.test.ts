@@ -140,16 +140,34 @@ test('the batch query plan (EXPLAIN of the real statement) has no product x day 
       $queryRaw: async (query: Prisma.Sql) => {
         const plan = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF) ${query.text}`, ...query.values) as Array<Record<string, string>>
         plans.push(plan.map((row) => Object.values(row)[0]).join('\n'))
-        return []
+        return [{ n: 0 }]
       },
     }
     for (const warehouseId of [undefined, wa]) {
       await getStockoutDayCounts({ productIds: [p1, p2], warehouseId, dateFrom: FROM, dateTo: TO, client: explaining as never })
     }
-    assert.equal(plans.length, 2)
+    assert.equal(plans.length, 4) // probe + aggregate, with and without a warehouse
+    for (const text of plans.filter((_, index) => index % 2 === 0)) assert.match(text, /Limit/) // the probe is bounded
     for (const text of plans) {
       assert.match(text, /inventory_snapshots/)
       assert.doesNotMatch(text, /generate_series|unnest|Function Scan/i)
     }
+  })
+})
+
+test('the probe runs once against real rows and never reports more than the limit + 1', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const { p1, p2 } = await seed(tx)
+    const seen: number[] = []
+    const probing = {
+      $queryRaw: async (query: Prisma.Sql) => {
+        const rows = await tx.$queryRawUnsafe(query.text, ...query.values) as Array<{ n: number }>
+        if (/AS n FROM \(/.test(query.sql)) seen.push(Number(rows[0]!.n))
+        return rows
+      },
+    }
+    await getStockoutDayCounts({ productIds: [p1, p2], dateFrom: FROM, dateTo: TO, client: probing as never })
+    assert.equal(seen.length, 1)
+    assert.ok(seen[0]! > 0 && seen[0]! <= 50001)
   })
 })

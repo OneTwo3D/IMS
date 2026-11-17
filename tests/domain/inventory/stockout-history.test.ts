@@ -122,17 +122,19 @@ test('getStockoutDayCounts: one raw query, stockout = covered - positive days, z
   const client = {
     $queryRaw: async (query: Prisma.Sql) => {
       queries.push(query)
-      return [{ coveredDays: 10, productId: 'p1', positiveDays: 6 }]
+      return /COUNT\(\*\)::int AS n FROM \(/.test(query.sql) ? [{ n: 3 }] : [{ coveredDays: 10, productId: 'p1', positiveDays: 6 }]
     },
   }
   const counts = await getStockoutDayCounts({ productIds: ['p1', 'p2', 'p1'], dateFrom: '2027-01-01', dateTo: '2027-01-10', client: client as never })
-  assert.equal(queries.length, 1)
+  assert.equal(queries.length, 2) // the bounded probe, then the aggregate
+  assert.match(queries[0]!.sql, /LIMIT/)
+  assert.ok(queries[0]!.values.includes(50001))
   assert.deepEqual(counts.get('p1'), { stockoutDays: 4, coveredDays: 10 })
   assert.deepEqual(counts.get('p2'), { stockoutDays: 10, coveredDays: 10 }) // never positive on a covered day: all stockout
   assert.equal(counts.size, 2)
-  assert.match(queries[0]!.sql, /inventory_snapshot_runs/)
-  assert.doesNotMatch(queries[0]!.sql, /generate_series|CROSS JOIN|"warehouseId" = \?/)
-  assert.ok(queries[0]!.values.includes('2027-01-01'))
+  assert.match(queries[1]!.sql, /inventory_snapshot_runs/)
+  assert.doesNotMatch(queries[1]!.sql, /generate_series|CROSS JOIN|"warehouseId" = \?/)
+  assert.ok(queries[1]!.values.includes('2027-01-01'))
 })
 
 test('getStockoutDayCounts with no covered day in the range is { 0, 0 } for everyone', async () => {
@@ -145,10 +147,13 @@ test('getStockoutDayCounts adds the warehouse clause only when a warehouse is ch
   const queries: Prisma.Sql[] = []
   const client = { $queryRaw: async (query: Prisma.Sql) => { queries.push(query); return [] } }
   await getStockoutDayCounts({ productIds: ['p1'], warehouseId: 'w1', dateFrom: '2027-01-01', dateTo: '2027-01-10', client: client as never })
-  assert.match(queries[0]!.sql, /"warehouseId" = \?/)
-  assert.ok(queries[0]!.values.includes('w1'))
+  assert.equal(queries.length, 2)
+  for (const query of queries) {
+    assert.match(query.sql, /"warehouseId" = \?/)
+    assert.ok(query.values.includes('w1'))
+  }
   assert.equal((await getStockoutDayCounts({ productIds: [], dateFrom: '2027-01-01', dateTo: '2027-01-10', client: client as never })).size, 0)
-  assert.equal(queries.length, 1)
+  assert.equal(queries.length, 2)
 })
 
 test('getStockoutDayCounts refuses a range longer than the window cap, and accepts exactly the cap', async () => {
@@ -176,6 +181,19 @@ test('property: covered - positiveDays equals the per-day buildStockoutDays coun
     assert.equal(runs.length - positive, reference.stockoutDayCount, `round ${round}`)
     assert.equal(runs.length, reference.coveredDayCount)
   }
+})
+
+test('getStockoutDayCounts refuses over the snapshot-row limit before running the aggregate, and accepts exactly the limit', async () => {
+  const queries: string[] = []
+  const rowsFor = (n: number) => ({ $queryRaw: async (query: Prisma.Sql) => { queries.push(query.sql); return /AS n FROM \(/.test(query.sql) ? [{ n }] : [] } })
+  await assert.rejects(
+    getStockoutDayCounts({ productIds: ['p1'], dateFrom: '2027-01-01', dateTo: '2027-01-10', client: rowsFor(50001) as never }),
+    (error: unknown) => error instanceof SourceScanTooLargeError && /Stockout snapshot rows exceed 50,000/.test(error.message),
+  )
+  assert.equal(queries.length, 1) // the aggregate never ran
+  queries.length = 0
+  await getStockoutDayCounts({ productIds: ['p1'], dateFrom: '2027-01-01', dateTo: '2027-01-10', client: rowsFor(50000) as never })
+  assert.equal(queries.length, 2)
 })
 
 test('getStockoutDayCounts guards the product-id array with the source-row limit', async () => {

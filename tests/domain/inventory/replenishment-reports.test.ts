@@ -1871,3 +1871,19 @@ test('Ignore stockouts refuses a demand window over the cap: demand unadjusted, 
   assert.deepEqual(on.rows, off.rows)
   assert.ok(on.notices.some((notice) => notice.includes('longer than the 365 days')))
 })
+
+test('Ignore stockouts: a refused snapshot scan keeps demand unadjusted, says so, and does not fail the report', async () => {
+  const captured: { countArgs?: unknown } = {}
+  const base = stockoutFixture(captured)
+  const refusing = {
+    ...base,
+    loadStockoutDayCounts: async () => { throw new SourceScanTooLargeError('Stockout snapshot rows', 50000, { rowCount: 50001 }) },
+  }
+  const on = await getReorderReport({ thresholdDays: 90, includeZero: true, ignoreStockouts: true }, { deps: refusing })
+  const off = await getReorderReport({ thresholdDays: 90, includeZero: true }, { deps: base })
+  assert.deepEqual(on.rows, off.rows)
+  assert.ok(on.notices.some((notice) => notice.includes('too many inventory snapshot rows')))
+  // under the limit the adjustment still applies
+  const ok = await getReorderReport({ thresholdDays: 90, includeZero: true, ignoreStockouts: true }, { deps: base })
+  assert.equal(ok.rows.find((row) => row.productId === 'p-1')!.averageDailyDemand, '1.5')
+})
