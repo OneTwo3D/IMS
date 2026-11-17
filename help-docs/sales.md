@@ -11,6 +11,7 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Hide completed** (ticked by default) keeps finished work out of the everyday list, and the line above the table says how many Completed and Delivered orders that hides. Untick it to see them. Choosing **Completed** or **Delivered** in the status filter shows them too.
 - **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
+- **Quotes tab** — the **Quotes** button above the search shows only quotations (see [Quotations](#quotations)); **All orders** goes back. A quote carries a **Quote** badge, and an **Expired** badge once its validity date has passed.
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
 - **Refund state** — an order's refund state is separate from its stage (see [Order Statuses](#order-statuses)). On the list it shows in the **Invoice** column as **Part. Refunded** or **Refunded**.
@@ -58,6 +59,25 @@ When WooCommerce sync is configured, orders are imported automatically into the 
 WooCommerce orders always enter the IMS as **Processing**. When WooCommerce marks an order as **completed**, the IMS treats that as the external dispatch signal: it auto-allocates stock, creates shipment rows if needed, advances those shipments through the internal `PICKING -> PACKED -> SHIPPED` workflow, and stores any tracking information received from WooCommerce. See the **WooCommerce Integration** guide for details on sync configuration.
 
 **EU withdrawal requests.** If your store uses the EU order-withdrawal button plugin, a customer's request puts the order **On Hold** in IMS and shows a **Withdrawal hold** badge on the order. While it is held, IMS does not send the order to the warehouse. If the request is approved the order is cancelled. If it is rejected, the hold is deliberately **kept**, because a rejection only moves the storefront order back to its earlier status, and releasing it automatically would put goods back on the pick line. When you are satisfied, use **Release withdrawal hold** on the order (it asks you to confirm); the order stays On Hold, and moving it back to Processing then sends it to the warehouse again. Once an order has shipped, a withdrawal is a return, not a hold. See [WooCommerce](woocommerce.md#eu-withdrawal-requests).
+
+## Quotations
+
+A **quote** is an offer you send a customer before they order. In IMS a quote is a **Draft** order with a quote flag, a validity date and (once sent) the time it was queued for sending. It is not a new status, so every rule that applies to a Draft applies to it unchanged:
+
+- **It reserves no stock.** A quote is never allocated, exactly like a Draft. Stock you quote is still available to everyone else.
+- **It is not sent to the warehouse**, not invoiced, and not mirrored to WooCommerce.
+- **Prices are held on the quote only for show.** Nothing is recalculated when the quote is converted.
+- WooCommerce orders are never quotes.
+
+**Creating a quote.** On **New Sales Order**, fill in the order as usual, set **Quote valid until** (it starts 30 days ahead) and click **Save as quote** instead of Save as Draft. The date must be a real date that is not in the past. A quote can be changed with **Edit quote** (its date too); an order that is not a quote cannot be turned into one, and a quote cannot be saved as a live order.
+
+**The quote document.** The order's **Quote PDF** (the ⋮ menu) is the sales order document with a **QUOTE** heading and the line "Valid until ...". It prints no payment terms. Its wording comes from **Settings > Company > Documents > Quote**: until you save one it uses a built-in default that states this is a quotation, not an order or an invoice.
+
+**Sending a quote.** Download the PDF and send it yourself, or switch on **Settings > Company > Documents > Email quotes to customers** (off by default). With it on a quote shows **Send quote**, which puts a branded email with the quote PDF on the same email queue as order confirmations. It is **queued, not sent at that moment**: the queue delivers it under your SMTP settings and the suppression list, so an installation with no SMTP configured mails nobody. An expired quote cannot be sent (edit its date first). The detail page shows when the quote was queued. Switching the setting off also stops a quote already waiting in the queue: it ends Failed with the reason and nothing is sent.
+
+**Converting a quote to an order.** **Convert to order** clears the quote flag in one click. The order is then an ordinary **Draft** with the same lines and prices; you confirm it through the usual flow (**Process**), which allocates stock and queues the invoice. A quote cannot be processed, put on hold or invoiced before it is converted (it can be cancelled). If the validity date has passed, IMS asks for a note saying why the prices still stand; the note is added to the order's internal notes, and converting without one is refused.
+
+**Cloning** a quote makes an ordinary Draft, not a quote.
 
 ## Customer Turnover
 
@@ -543,7 +563,7 @@ This means the taxable base column in the report shows the net amount in both ca
 
 ## Documents
 
-Three PDF documents are available for each sales order:
+Three PDF documents are available for each sales order (a quote has its own, the **Quote PDF**, see [Quotations](#quotations)):
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically

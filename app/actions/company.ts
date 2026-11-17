@@ -11,6 +11,7 @@ import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/
 import { isKnownCurrency } from '@/lib/reconciliation-pack/constants'
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
+import { DEFAULT_QUOTE_TEMPLATE } from '@/lib/domain/sales/sales-quote'
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '@/lib/format-datetime'
 import { sendEmailWithSmtpSettings } from '@/lib/mailer'
 import {
@@ -519,7 +520,7 @@ export type DocumentTemplateData = {
   paymentTermsText: string
 }
 
-const TEMPLATE_TYPES = ['sales_order', 'purchase_order', 'invoice', 'packing_slip', 'credit_note', 'rfq', 'manufacturing_order']
+const TEMPLATE_TYPES = ['sales_order', 'quote', 'purchase_order', 'invoice', 'packing_slip', 'credit_note', 'rfq', 'manufacturing_order']
 
 export async function getDocumentTemplates(): Promise<DocumentTemplateData[]> {
   await requireInternalUser()
@@ -528,6 +529,8 @@ export async function getDocumentTemplates(): Promise<DocumentTemplateData[]> {
 
   return TEMPLATE_TYPES.map((type) => {
     const r = map.get(type)
+    // The Quote template has a built-in default until one is saved (what the quote PDF prints), so the editor starts from it.
+    if (!r && type === 'quote') return { type, ...DEFAULT_QUOTE_TEMPLATE }
     return {
       id: r?.id,
       type,

@@ -13,6 +13,7 @@ import { getOrganisation } from '@/app/actions/company'
 import { getOrderAllocations, getOrderFulfillmentRequirements, getOrderShipments } from '@/app/actions/allocation'
 import { getRejectedAccountingDocumentUpdateWarnings } from '@/app/actions/accounting-sync'
 import { getAccountingSettings } from '@/lib/accounting'
+import { isSalesQuoteEmailEnabled } from '@/lib/sales-quote-email'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { getSalesOrderAdminLinks } from '@/lib/shopping'
 import { getWmsOrderStatusForSalesOrder } from '@/app/actions/wms-order-status'
@@ -72,6 +73,8 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   })
 
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
+  // The Send quote button exists only while the Settings switch is on (default off).
+  const quoteEmailEnabled = so.isQuote ? await isSalesQuoteEmailEnabled() : false
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
 
   return (
@@ -104,6 +107,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         currentUserRole={session.user.role}
         rejectedAccountingSyncs={rejectedAccountingSyncs}
         paidWithoutInvoice={paidWithoutInvoice}
+        quoteEmailEnabled={quoteEmailEnabled}
         editForm={editForm}
       />
     </div>

@@ -76,6 +76,8 @@ export type SoListFilter = {
   showCompleted?: boolean
   /** Show archived orders in the default view. Search always includes them. */
   includeArchived?: boolean
+  /** The Quotes tab: only quotations (o3d-ngmt.16). Combines with search and the other filters. */
+  quotesOnly?: boolean
 }
 
 /** What the default view is hiding, so the page can say so. */
@@ -97,6 +99,7 @@ export function buildSalesOrderListWhere(filter: SoListFilter): Prisma.SalesOrde
   const and: Prisma.SalesOrderWhereInput[] = []
 
   if (hides.archived) and.push({ archived: { not: true } })
+  if (filter.quotesOnly) and.push({ isQuote: true })
   if (filter.statuses && filter.statuses.length > 0) and.push({ status: { in: filter.statuses } })
   else if (hides.completed) and.push({ status: { notIn: [...SO_COMPLETED_STATUSES] } })
 

@@ -1,6 +1,7 @@
 'use client'
 
 import { PurchaseOrderEmailSetting } from '@/components/settings/purchase-order-email'
+import { SalesQuoteEmailSetting } from '@/components/settings/sales-quote-email'
 import { useState, useTransition, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import {
@@ -41,6 +42,7 @@ type Props = {
   currencies: CurrencyRow[]
   testEmailDefault: string
   purchaseOrderEmailEnabled: boolean
+  salesQuoteEmailEnabled: boolean
 }
 
 const TABS = [
@@ -55,6 +57,7 @@ type Tab = (typeof TABS)[number]['key']
 
 const TEMPLATE_LABELS: Record<string, string> = {
   sales_order: 'Sales Order',
+  quote: 'Quote',
   purchase_order: 'Purchase Order',
   invoice: 'Invoice',
   packing_slip: 'Packing Slip',
@@ -69,7 +72,7 @@ const SUPPORTED_TIMEZONES: string[] = _intl.supportedValuesOf
   ? _intl.supportedValuesOf('timeZone')
   : ['Europe/London', 'UTC']
 
-export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault, purchaseOrderEmailEnabled }: Props) {
+export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault, purchaseOrderEmailEnabled, salesQuoteEmailEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [isEmailPending, startEmailTransition] = useTransition()
@@ -717,6 +720,13 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
             </p>
             <PurchaseOrderEmailSetting currentValue={purchaseOrderEmailEnabled ? 'true' : 'false'} />
           </Card>
+          <Card className="p-4">
+            <h3 className="text-sm font-semibold mb-1">Email quotes to customers</h3>
+            <p className="text-xs text-muted-foreground mb-3">
+              Whether Send quote emails the quote PDF to the customer. Off by default; with it off a quote can only be downloaded as a PDF.
+            </p>
+            <SalesQuoteEmailSetting currentValue={salesQuoteEmailEnabled ? 'true' : 'false'} />
+          </Card>
           {tpls.map((tpl) => {
             const isEditing = editingTpl === tpl.type
             return (
@@ -803,12 +813,14 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
                         <Switch checked={tpl.showVat} onCheckedChange={(v) => updateTpl(tpl.type, 'showVat', v)} />
                         Show VAT
                       </label>
-                      <label className="flex items-center gap-2 text-xs">
-                        <Switch checked={tpl.showPaymentTerms} onCheckedChange={(v) => updateTpl(tpl.type, 'showPaymentTerms', v)} />
-                        Show Payment Terms
-                      </label>
+                      {tpl.type !== 'quote' && (
+                        <label className="flex items-center gap-2 text-xs">
+                          <Switch checked={tpl.showPaymentTerms} onCheckedChange={(v) => updateTpl(tpl.type, 'showPaymentTerms', v)} />
+                          Show Payment Terms
+                        </label>
+                      )}
                     </div>
-                    {tpl.showPaymentTerms && (
+                    {tpl.type !== 'quote' && tpl.showPaymentTerms && (
                       <div className="space-y-1.5 max-w-xs">
                         <Label className="text-xs">Payment Terms Text</Label>
                         <Input
