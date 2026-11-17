@@ -146,7 +146,7 @@ export type CreateReplayPolicy =
   | 'not-a-create'
 
 export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy> = {
-  // The eighteen ManualJournal types. `POST /ManualJournals`, no natural key of any kind.
+  // The nineteen ManualJournal types. `POST /ManualJournals`, no natural key of any kind.
   COGS_JOURNAL: 'no-remedy',
   INVENTORY_ADJUSTMENT: 'no-remedy',
   STOCK_IN_TRANSIT: 'no-remedy',

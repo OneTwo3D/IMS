@@ -229,9 +229,14 @@ The Gross Margin and COGS reports use the same invoiced orders for revenue and c
 | **AR Aging** | Outstanding balances on invoiced sales orders (the same invoiced basis and invoice date as the revenue reports, so drafts, cancelled orders and orders with no invoice are not receivables) by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
 | **Currency Summary** | Sales, purchases, AR and AP grouped by document currency, with foreign and base-currency totals. |
+| **GR/IR** | The open goods accrual by supplier and purchase order, as of the end date: **received not billed**, **billed not received** (a prepaid supplier's bill ahead of the goods, or goods billed and then returned and not yet credited), the order's return credit notes, the net, the bills' price difference against the order, and the **age** in days of the oldest movement still open. See *GR/IR* below. |
 | **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
 
 Finance period-end reports are limited to finance and admin roles.
+
+### GR/IR report (goods received, not invoiced)
+
+**Analytics > GR/IR** lists, for each purchase order that still has a balance, what has been **received but not billed** and what has been **billed but not received**, in base currency, with the quantity, the date of the oldest movement still open and its age in days. A balance is cumulative: it is the position as of the end date you choose (the start date plays no part). Every figure is the **goods** value at the purchase order's own unit cost (after any order-level discount); freight and landed cost stay on the Stock in Transit path and are not in it. Received-not-billed and billed-not-received are added up per order line and never netted against each other, so one line's shortfall cannot hide another's. The **Price difference** column is what the supplier's bills charge over (or under) the order for the billed goods; it is shown beside the balance and is not part of it. The CSV export carries the same columns. The figures come from the GR/IR sub-ledger, which accrues with every receipt, bill, bill edit, supplier return and return credit note whether or not GR/IR posting to Xero is switched on.
 
 ### VAT report — reporting category dimension
 

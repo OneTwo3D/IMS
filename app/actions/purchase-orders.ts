@@ -5639,18 +5639,18 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       if (claimed.count === 0) return false
       // GR/IR accrual: a return-generated credit note is the supplier crediting back goods that were billed and then returned, which lifts the
       // debit the return left on GR/IR. Its NET is the figure its transit row carries. Recorded with the claim, whether or not the Xero posting is on.
+      // The credit's NET in base currency: ONE computation, the figure the transit row below carries as well as the GR/IR row.
+      const creditNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, cn.fxRateToBase).toNumber() : resolveSupplierCreditNoteTransitBase({
+        grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
+        billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
+        billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
+      })
       if (cn.isReturnGenerated) {
         await recordGrirReturnCreditNote(tx, {
           poId: cn.poId,
           supplierId: cn.supplierId,
           creditNoteId: cn.id,
-          netBase: reverseChargePlan
-            ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, cn.fxRateToBase).toNumber()
-            : resolveSupplierCreditNoteTransitBase({
-              grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
-              billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
-              billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
-            }),
+          netBase: creditNetBase,
           journalDate: creditNoteDate,
           at: new Date(),
         })
@@ -5684,11 +5684,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // keyed the same, only when actually queued (record on the queue's OWN
         // decision, bcz9.4). Net is derived from the offset bill's VAT ratio.
         if (queued) {
-          const transitNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, cn.fxRateToBase).toNumber() : resolveSupplierCreditNoteTransitBase({
-            grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
-            billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
-            billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
-          })
+          const transitNetBase = creditNetBase
           await recordTransitSubledgerMovement(tx, {
             sourceType: 'SUPPLIER_CREDIT_NOTE',
             sourceRef: cn.id,

@@ -439,14 +439,18 @@ function returnSnapshotLayers(
   }
 }
 
+type PendingSyncLogParams = {
+  type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION' | 'DAILY_BATCH_GRIR_RECLASS'
+  referenceId: string
+  payload: Record<string, unknown>
+  currency: string
+}
+
 async function createPendingSyncLog(
   tx: AccountingMirrorClient,
-  params: {
-    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION' | 'DAILY_BATCH_GRIR_RECLASS'
-    referenceId: string
-    payload: Record<string, unknown>
-    currency: string
-  },
+  params: PendingSyncLogParams,
+  /** Optional: set to whether the journal was QUEUED (false = the producer hold recorded a shadow and nothing was queued). */
+  outcome?: { queued: boolean },
 ): Promise<string> {
   // o3d-19gy: the connection this batch was composed against. A daily-batch journal carries no external
   // document id, but every account code and tax type in it was resolved from the chart of accounts of
@@ -497,7 +501,9 @@ async function createPendingSyncLog(
   // The producer-side hold said SHADOW: the journal is recorded as a shadow and NOTHING is queued - no outbox job and no
   // accounting event. The shadow row's own id is returned (status CANCELLED, never posted by IMS), so the batch stamps
   // the rows it was built from with an id whose status says what happened to it, exactly as for a queued journal.
+  if (outcome) outcome.queued = false
   if (created.shadowed) return created.shadowed.id
+  if (outcome) outcome.queued = true
   const log = created.row
   await scheduleXeroAccountingOutbox(tx, {
     accountingSyncLogId: log.id,
@@ -1603,7 +1609,8 @@ async function stageGrirReclassJournals(
           lockedPeriodNote: lockedPeriodNarration(group.movedFromLockedDays, context.lockDate),
         })
         if (journal) {
-          const logId = await createPendingSyncLog(tx, {
+          const staged = { queued: false }
+          await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_GRIR_RECLASS',
             referenceId,
             currency: baseCurrency,
@@ -1618,10 +1625,9 @@ async function stageGrirReclassJournals(
               batchEntityCount: group.rows.length,
               _postingMode: 'submitted',
             },
-          })
-          // A shadow row is CANCELLED and never posted by IMS: the ledger did not move, so the transit sub-ledger must not claim it did.
-          const staged = await tx.accountingSyncLog.findUnique({ where: { id: logId }, select: { status: true } })
-          if (staged?.status === 'PENDING') {
+          }, staged)
+          // A shadow is never posted by IMS: the ledger did not move, so the transit sub-ledger must not claim it did.
+          if (staged.queued) {
             await recordTransitSubledgerMovement(tx, {
               sourceType: 'GRIR_RECLASS',
               sourceRef: referenceId,
