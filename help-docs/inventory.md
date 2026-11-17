@@ -45,7 +45,7 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
 
 ### CSV Export
 
-The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list), **Import CSV** and **New Product**.
+The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list), **Import CSV** and **New Product**. To change many existing products through a spreadsheet, select them and use **Edit by CSV**; see [Products: Edit by CSV](products.md).
 
 
 ## CSV Templates & Import Rules

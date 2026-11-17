@@ -347,6 +347,14 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sync permission.',
   },
+  '/api/products/csv-edit/download': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with inventory.edit permission (price columns also need inventory.prices).',
+  },
+  '/api/products/csv-edit/upload': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with inventory.edit permission (price columns also need inventory.prices).',
+  },
   '/api/credit-note/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission.',

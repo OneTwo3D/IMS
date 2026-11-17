@@ -44,6 +44,18 @@ type CsvHeaderMetadata = CsvExportMetadata & {
 
 const ESSENTIAL_METADATA_KEYS = ['generatedAt', 'asOf', 'dateFrom', 'dateTo', 'source', 'groupBy', 'valueReplayReliable']
 
+/**
+ * The inverse of the formula guard `escapeField` applies on the way out: a cell the exporter wrote as `'=SUM(1)` (or
+ * `'-5% off`, `'+44...`, `'@home`) reads back as the text the product actually holds. Only a leading apostrophe that
+ * the guard itself would have added is removed, so a genuine leading apostrophe on ordinary text is kept. Round-trip
+ * importers use it so an unchanged cell is not read as an edit.
+ */
+export function stripCsvFormulaGuard(value: string): string {
+  if (!value.startsWith("'")) return value
+  const rest = value.slice(1)
+  return FORMULA_PREFIX.test(rest) && !NUMERIC_LITERAL.test(rest) ? rest : value
+}
+
 /** Escape a single value for CSV output */
 function escapeField(value: unknown): string {
   if (value === null || value === undefined) return ''
