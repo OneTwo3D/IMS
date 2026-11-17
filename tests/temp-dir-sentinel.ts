@@ -141,6 +141,8 @@ const own = mkdtempSync(join(tmpdir(), 'ims-unit-'))
  */
 setModeAt(own, 0o1777)
 
+// Remember where scratch material (throwaway clusters, trusted report dirs) must go: the private dir above is not a trusted ancestor. See tests/helpers/scratch-root.ts.
+process.env.IMS_TEST_ORIGINAL_TMPDIR = tmpdir()
 process.env.TMPDIR = own
 
 // ---------------------------------------------------------------------------
