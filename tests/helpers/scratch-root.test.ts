@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
 import { spawnSync } from 'node:child_process'
-import { MAX_SCRATCH_ROOT_LENGTH, ORIGINAL_TMPDIR_VAR, scratchRoot } from './scratch-root'
+import { MAX_SCRATCH_ROOT_LENGTH, ORIGINAL_TMPDIR_VAR, PRIVATE_TMPDIRS_VAR, scratchRoot } from './scratch-root'
 
-const VARS = ['IMS_SCRATCH_ROOT', ORIGINAL_TMPDIR_VAR, 'TMPDIR'] as const
+const VARS = ['IMS_SCRATCH_ROOT', ORIGINAL_TMPDIR_VAR, PRIVATE_TMPDIRS_VAR, 'TMPDIR'] as const
 let saved: Record<string, string | undefined>
 let dir: string
 let tmpRoot: string
@@ -125,4 +125,42 @@ test('the sentinel reports, removes and fails on a scratch directory a test left
   assert.notEqual(leaky.status, 0, 'a leaked scratch directory fails the process')
   assert.match(leaky.stderr, /temp-dir leak: 1 entry survived[\s\S]*ims-leaky-/)
   assert.deepEqual(readdirSync(dir).filter((e) => e.startsWith('ims-leaky-')), [], 'and the directory is removed')
+})
+
+test('a sentinel private directory is never a scratch root', () => {
+  const priv = mkdtempSync(path.join(tmpRoot, 'sr-'))
+  try {
+    process.env[PRIVATE_TMPDIRS_VAR] = priv
+    process.env.IMS_SCRATCH_ROOT = priv
+    process.env[ORIGINAL_TMPDIR_VAR] = priv
+    assert.equal(scratchRoot(), dir, 'falls through to TMPDIR')
+  } finally {
+    rmSync(priv, { recursive: true, force: true })
+  }
+})
+
+test('a worker-like child (TMPDIR already the parent sentinel private dir) picks the real original, not the private dir', () => {
+  const sentinel = path.resolve('tests/temp-dir-sentinel.ts')
+  const helper = path.resolve('tests/helpers/scratch-root.ts')
+  const probe = path.join(dir, 'worker.test.ts')
+  writeFileSync(probe, `import { scratchRoot } from ${JSON.stringify(helper)}\nprocess.stdout.write('ROOT=' + scratchRoot() + '\\n')\n`)
+  const outer: NodeJS.ProcessEnv = { ...process.env, TMPDIR: tmpRoot }
+  for (const v of ['IMS_SCRATCH_ROOT', ORIGINAL_TMPDIR_VAR, PRIVATE_TMPDIRS_VAR]) delete outer[v]
+  const spawn = (env: NodeJS.ProcessEnv, script: string) => spawnSync(process.execPath, ['--import', 'tsx', '--import', sentinel, script], { env, encoding: 'utf8' })
+  // Level 1: the outermost process records tmpRoot as the original.
+  const first = spawn(outer, probe)
+  assert.equal(first.status, 0, first.stderr)
+  assert.equal(first.stdout.trim(), `ROOT=${tmpRoot}`)
+  // Level 2: a child of a sentinel process inherits TMPDIR = a private dir and the recorded original.
+  const parentPrivate = mkdtempSync(path.join(tmpRoot, 'sr-'))
+  try {
+    const worker = spawn({ ...outer, TMPDIR: parentPrivate, [ORIGINAL_TMPDIR_VAR]: tmpRoot, [PRIVATE_TMPDIRS_VAR]: parentPrivate }, probe)
+    assert.equal(worker.status, 0, worker.stderr)
+    assert.equal(worker.stdout.trim(), `ROOT=${tmpRoot}`)
+    // Even with no recorded original, the inherited private dir is skipped rather than chosen.
+    const bare = spawn({ ...outer, TMPDIR: parentPrivate, [PRIVATE_TMPDIRS_VAR]: parentPrivate }, probe)
+    assert.notEqual(bare.status, 0, 'refuses rather than picking a private directory')
+  } finally {
+    rmSync(parentPrivate, { recursive: true, force: true })
+  }
 })
