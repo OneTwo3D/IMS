@@ -2,6 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
+import { readWcDutyTaxMirror, readWcLineCustomsUnitValue } from './duty-tax-mirror'
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
 import { advancePullCursor, laterCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
@@ -36,7 +37,7 @@ import { surfaceWcOrderEditDrift } from './order-edit-drift'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
-  readWcCustomerVat, readWcDutyTaxMirror, readWcLineCustomsUnitValue, resolveWcOrderLevelDiscount,
+  readWcCustomerVat, resolveWcOrderLevelDiscount,
   type MappedLine,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'

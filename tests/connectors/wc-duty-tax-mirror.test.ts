@@ -5,14 +5,14 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import * as fieldMappingNs from '../../lib/connectors/woocommerce/sync/field-mapping.ts'
 import * as orderImportNs from '../../lib/connectors/woocommerce/sync/order-import.ts'
+import * as dutyNs from '../../lib/connectors/woocommerce/sync/duty-tax-mirror.ts'
 import * as hsNs from '../../lib/connectors/woocommerce/sync/hs-code-mirror.ts'
 
 function unwrap<T extends object>(ns: T): T {
   return ('default' in ns ? (ns as { default: T }).default : ns) as T
 }
-const { readWcDutyTaxMirror, readWcLineCustomsUnitValue } = unwrap(fieldMappingNs)
+const { readWcDutyTaxMirror, readWcLineCustomsUnitValue } = unwrap(dutyNs)
 const { dutyTaxMirrorColumns, wclcComponentColumns } = unwrap(orderImportNs)
 const { readWcHsCodeMirror } = unwrap(hsNs)
 
