@@ -39,7 +39,7 @@ import {
   syncReadinessVerdict,
   type AccountMappingRebindTx,
 } from '@/lib/connectors/xero/account-mapping-rebind'
-import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt-decision'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
 import { isMaskedSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'

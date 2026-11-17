@@ -124,7 +124,7 @@ test('[invoicing state] an operator decision (settled NOT_POSTED) on the invoice
   const credit = await db.accountingSyncLog.create({ data: { connector: 'xero', type: 'CREDIT_NOTE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: id, payload: {}, externalTransactionId: 'cn-1' } })
   assert.ok(credit.id)
   assert.equal(await stateOf(db, id), 'FULLY_INVOICED')
-  const { applyFencedAttemptDecision } = await import('@/lib/domain/accounting/sync-log-attempt')
+  const { applyFencedAttemptDecision } = await import('@/lib/domain/accounting/sync-log-attempt-decision')
   const decided = await applyFencedAttemptDecision(db as never, { id: queued.row.id, expectedAttemptRevision: 0, expectedStatus: 'PENDING', adoptUnfencedAttempt: true, data: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' } })
   assert.equal(decided.ok, true)
   assert.equal(await stateOf(db, id), 'NOT_INVOICED', 'the credit note is not an invoice')
@@ -173,7 +173,7 @@ const FOR_UPDATE = /FOR UPDATE/i
 
 test('[invoicing state] LOCK ORDER: a decision on an invoice row takes the order lock BEFORE writing the row, so a cancellation holding the order lock cannot deadlock with it', { skip }, async (t) => {
   const db = await loadDb()
-  const { applyFencedAttemptDecision } = await import('@/lib/domain/accounting/sync-log-attempt')
+  const { applyFencedAttemptDecision } = await import('@/lib/domain/accounting/sync-log-attempt-decision')
   const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
   const id = await makeOrder(db, t)
   const row = await db.accountingSyncLog.create({ data: { connector: 'xero', type: 'SALES_INVOICE', status: 'FAILED', referenceType: 'SalesOrder', referenceId: id, payload: payload(3, randomUUID()), attemptRevision: 1 } })
