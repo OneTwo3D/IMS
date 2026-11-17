@@ -83,6 +83,12 @@ export type StockPositionFilters = {
   // o3d-s8n.3: reorder-report-only. Remove days with no on-hand stock (daily inventory snapshots) from the
   // demand denominator. Default off.
   ignoreStockouts?: boolean
+  // reorder-report-only. Growth percentage (-90..+500) scaling the calculated daily demand by
+  // 1 + growth/100 before everything is derived from it. Validated by resolveGrowthPercent; default 0 = no change.
+  growthPercent?: number
+  // reorder-report-only. Attach forecast quantity / sales / margin to the rows. Prices and cost,
+  // so callers set it only for roles holding inventory.prices.
+  includeForecastMoney?: boolean
   page?: number
   pageSize?: number
 }
