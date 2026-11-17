@@ -25,6 +25,15 @@ import { WC_ORDER_EDIT_DRIFT_ENTITY_TYPE, WC_ORDER_EDIT_DRIFT_RECORD_KIND } from
 export { WC_ORDER_EDIT_DRIFT_RECORD_KIND, WC_ORDER_EDIT_DRIFT_ENTITY_TYPE }
 export const WC_ORDER_EDIT_DRIFT_ACTION = 'wc_order_edited_after_import'
 
+export type WcLineBaseline = { totalForeign: number; lines: Array<{ externalLineItemId: number | null; qty: number; sku: string | null }> }
+
+/** The stored baseline, or null when absent or unreadable (an unreadable baseline compares against the lines, never silences). */
+export function parseWcLineBaseline(value: unknown): WcLineBaseline | null {
+  const v = value as { totalForeign?: unknown; lines?: unknown } | null
+  if (!v || typeof v.totalForeign !== 'number' || !Array.isArray(v.lines)) return null
+  return { totalForeign: v.totalForeign, lines: (v.lines as Array<{ externalLineItemId?: unknown; qty?: unknown; sku?: unknown }>).map((l) => ({ externalLineItemId: typeof l.externalLineItemId === 'number' ? l.externalLineItemId : null, qty: Number(l.qty), sku: typeof l.sku === 'string' ? l.sku : null })) }
+}
+
 /** Selects the open edit-drift rows. The ONLY place this family is selected. */
 export function wcOrderEditDriftWhere() {
   return {
@@ -103,11 +112,14 @@ export async function surfaceWcOrderEditDrift(orderId: string, wcOrder: WcFullOr
   try {
     const stored = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { currency: true, totalForeign: true, externalOrderNumber: true, lines: { select: { externalLineItemId: true, qty: true, sku: true } } },
+      select: { currency: true, totalForeign: true, externalOrderNumber: true, wcLineBaseline: true, lines: { select: { externalLineItemId: true, qty: true, sku: true } } },
     })
     if (!stored) return
-    const differences = detectWcOrderEditDrift(wcOrder, stored, options)
     const rowWhere = { ...wcOrderEditDriftWhere(), entityId: orderId }
+    // An order whose LINES an operator edited in IMS (owner-ruled desync) is expected to differ from WooCommerce's copy, so it is compared against the baseline taken at that edit (what the store held), not against the edited lines:
+    // the IMS edit raises nothing, and a later change made in WooCommerce still does. An order with no baseline (never line-edited, including an address or notes edit) is compared with its lines as before.
+    const baseline = parseWcLineBaseline(stored.wcLineBaseline)
+    const differences = detectWcOrderEditDrift(wcOrder, baseline ? { currency: stored.currency, totalForeign: baseline.totalForeign, lines: baseline.lines } : stored, options)
     if (differences.length === 0) {
       await db.shoppingSyncLog.deleteMany({ where: rowWhere })
       return

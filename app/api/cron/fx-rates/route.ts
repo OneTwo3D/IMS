@@ -42,7 +42,13 @@ export async function GET(request: Request) {
         const { sweepUnregisteredReceipts } = await import('@/lib/domain/accounting/receipt-registration-sweep')
         return sweepUnregisteredReceipts(50)
       })
-      return { ...refreshed, pendingWcReceiptRetry: { queue, orphans }, ...(stepFailures.length > 0 ? { stepFailures } : {}) }
+      // The customer-payment matching pass (Settings > Xero): matches receipts never registered in Xero to the open invoice by payment system and currency. A cron sweep, not an event. Default OFF; in shadow it only records
+      // what it would post, and in live it registers through the same path as the sweep above. Its own error boundary, like every step.
+      const paymentMatching = await runStep('payment-matching', async () => {
+        const { runPaymentMatchingPass } = await import('@/lib/domain/accounting/payment-matching')
+        return runPaymentMatchingPass({ limit: 50 })
+      })
+      return { ...refreshed, pendingWcReceiptRetry: { queue, orphans }, paymentMatching, ...(stepFailures.length > 0 ? { stepFailures } : {}) }
     },
     getOutcome: (result) => ({ result, ...(Array.isArray((result as { stepFailures?: unknown }).stepFailures) ? { responseStatus: 500 } : {}) }),
     outcomeOf: (result) => cronOutcome('fx-rates', result),

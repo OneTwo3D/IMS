@@ -52,6 +52,8 @@ async function seedWorld(): Promise<World> {
   loadEnv()
   const { db } = await import('@/lib/db')
   const tag = uid()
+  // The edit writes its audit entry in the order's transaction, attributed to the acting user, so the mocked session's user must be a real row.
+  await db.user.upsert({ where: { id: 'test-user' }, create: { id: 'test-user', email: 'test-user@example.invalid', name: 'test user', passwordHash: 'x' }, update: {} })
   // Rates are global (no country) so the resolver's global-by-category step answers deterministically: STANDARD 0.2, REDUCED 0.05.
   const std = await db.taxRate.create({ data: { name: `ZQWM Std 20 ${tag}`, rate: '0.2', usedFor: 'SALES', taxCategory: 'STANDARD', active: true }, select: { id: true } })
   const red = await db.taxRate.create({ data: { name: `ZQWM Red 5 ${tag}`, rate: '0.05', usedFor: 'SALES', taxCategory: 'REDUCED', active: true }, select: { id: true } })
@@ -73,6 +75,8 @@ async function seedWorld(): Promise<World> {
       await db.taxRate.deleteMany({ where: { id: { in: [std.id, red.id, zero.id] } } })
       await db.fxRate.deleteMany({ where: { id: { in: [fxEur.id, fxUsd.id] } } })
       await db.currency.deleteMany({ where: { code: { in: ['EUR', 'USD'].filter((c) => !existed.has(c)) } } })
+      // The guard refuses a database holding users, so the acting user the mocked session names is removed again.
+      await db.user.deleteMany({ where: { id: 'test-user' } })
     },
   }
   return world
@@ -266,11 +270,11 @@ test('refused edits write nothing: permission, the DRAFT-only rule and each bloc
   await db.salesOrder.update({ where: { id: idInvNo }, data: { invoiceNumber: `IN-${w.tag}` } })
   await refused(idInvNo, /invoice number or invoice document/, 'invoice number')
 
-  // every non-draft status
-  for (const status of ['PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'SHIPPED', 'CANCELLED'] as const) {
+  // the statuses whose lines are closed (a confirmed pre-dispatch order is editable: tests/concurrency/sales-order-edit-confirmed.concurrent.test.ts)
+  for (const [status, reason] of [['SHIPPED', /dispatched/], ['COMPLETED', /dispatched/], ['DELIVERED', /closed/], ['CANCELLED', /cancelled/]] as const) {
     const id = await fresh()
     await db.salesOrder.update({ where: { id }, data: { status } })
-    await refused(id, /Only draft orders can be edited/, `status ${status}`)
+    await refused(id, reason, `status ${status}`)
   }
 
   // blockers on an otherwise clean draft

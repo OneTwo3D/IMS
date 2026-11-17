@@ -104,6 +104,7 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'mintsoft.order.comment', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.product.upsert', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.product.content', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
+  { key: 'mintsoft.product.delete', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }, { settingTrue: 'mintsoft_parent_sku_delete_enabled', defaultValue: 'false' }] },
   { key: 'mintsoft.product.bundle', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.asn.create', trigger: 'operator', requires: [{ plugin: 'mintsoft' }] },
   { key: 'woocommerce.stock', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_stock_sync_enabled', defaultValue: 'false' }] },

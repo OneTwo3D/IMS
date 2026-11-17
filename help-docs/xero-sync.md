@@ -880,6 +880,24 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 
 **A stored receipt is never left unregistered.** A receipt (a payment recorded by hand with Add payment, a WooCommerce paid transition, an imported paid order) is committed before its INVOICE_PAYMENT is queued. If the invoice had not posted yet, the invoice post registers it. If the invoice had already posted and the queueing failed, nothing used to retry it; now the scheduled FX-rates cron run sweeps every non-refund receipt on a posted invoice that has no INVOICE_PAYMENT row and no refusal notice (receipts older than 5 minutes, up to 50 per run, oldest first, recently failed ones behind) and registers it. Registration is keyed per receipt and document, so the inline call and the sweep never register it twice. Nothing is swept when no accounting connector posts payments.
 
+### Payment matching (Sync > Payment matching)
+
+A customer receipt IMS holds but Xero does not (a manual payment recorded after the invoice posted, a receipt of a payment method that had no bank account mapped at the time, a foreign-currency receipt refused for a missing rate) used to stay unregistered until someone noticed the unsettled badge. The **payment matching pass** looks for these on every FX-rates cron run (up to 50 per run) and matches each one to the open Xero invoice of its order, **by payment method and currency**, using the same *Payment Account Mapping* as every other payment. It is a sweep, not an event, and it adds no second way of posting: a live registration goes through the same path as Add payment and the receipt sweep above.
+
+**The mode** is set on the Sync > Payment matching page (administrators only) and is **off by default**:
+
+| Mode | What happens |
+|---|---|
+| **Off** | The matching pass does nothing. It does not stop the scheduled receipt sweep described above, which registers receipts with no payment row and no refusal notice in every mode. |
+| **Shadow** | Every candidate receipt is evaluated and listed on the page: the payment, the invoice, the bank account, the amount, the amount still open on the invoice, and the reason when it cannot be matched. **The matching pass sends nothing to Xero** and queues no sync row. Only receipts the scheduled receipt sweep leaves alone (those that carry a refusal notice) are listed, because the sweep registers every other eligible receipt in every mode, so listing it as "would post" would report work already done. Use it to review what live would do. |
+| **Live** | A receipt the evaluation says would post is claimed (one durable row per receipt, so a rerun or two sweeps at once cannot register it twice) and registered through the existing path. |
+
+**What the pass never does.** It never guesses a bank account: no mapping for the payment method and currency means *Not matched*, and the page says which method and currency to map. A receipt in a different currency from its invoice is *Not matched*. It never pays more than the amount still open on the invoice, in the invoice's currency (a part payment within what is open is allowed, as for any receipt). It never moves a payment out of a locked period: a receipt dated on or before the books lock date IMS imported from Xero is *Held back* and keeps its own date. A foreign-currency receipt without its stored settlement rate is *Held back*. While the outbound write hold is on, every match is *Held back* and nothing is posted.
+
+**Reading the page.** *Would post* (shadow only) is what live would register. *Not matched* means there is no safe match until the mapping or the currency is fixed. *Held back* names the rule that stops it (locked period, outbound write hold, over the amount due, an earlier payment attempt on the invoice that must be checked in Xero first). *Failed, will retry* is a live registration that did not reach the record; it is retried each run up to five times, then left for a person. *Registered* rows leave the list; the registration then posts like any other and shows in the sync log.
+
+A receipt that already has a payment row in the sync log is never a candidate: its registration, in whatever state, belongs to the retry paths described below.
+
 **Manual overrides and push log.** Settings → Accounting → **FX Rates** shows the current rate per currency, with a source badge (`ECB (frankfurter)`, `Aelia (before markup)` or `Manual override`). Pin a manual rate via the pencil icon — the daily fetch will then skip that currency until the override is cleared (the undo icon re-fetches from frankfurter). The same panel includes a recent-pushes table (one row per fan-out attempt to a shopping connector) so you can see whether the latest push to WooCommerce succeeded.
 
 The full unified-FX rollout plan is tracked in `docs/todo/unified-fx-rates-plan.md`.
