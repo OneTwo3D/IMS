@@ -441,6 +441,10 @@ type OrderForPush = {
   storeCreditForeign?: unknown
   /** ASSESSED only from the credit-aware import's creating write; REVIEW_REQUIRED holds the push. */
   storeCreditAssessment?: unknown
+  /** Set when an operator edited the lines in IMS: the stored total is then no longer the storefront's figure. */
+  editedInImsAt?: Date | null
+  /** What discountAmount means (see OrderDiscountModel); null = not recorded. */
+  discountModel?: string | null
   totalForeign: unknown
   lines: CandidateLine[]
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
@@ -542,7 +546,20 @@ export function feeLinesNet(feeLines: Array<{ totalForeign: unknown }>) {
   return feeLines.reduce((sum, line) => sum.add(dec(line.totalForeign)), toDecimal(0))
 }
 
+/**
+ * Orders the total guard cannot judge exactly, so it stays silent rather than cry wolf: an order edited in IMS (its stored
+ * total is no longer the storefront's figure, so a difference is the edit, not a rounding fault) and an order whose
+ * discount is recorded under a model other than LINE_ALLOCATED (the reconstruction assumes line-allocated discounts).
+ * Returns the reason, or null when the order can be checked.
+ */
+export function totalGuardExclusion(order: { editedInImsAt?: Date | null; discountModel?: string | null }): 'EDITED_IN_IMS' | 'DISCOUNT_MODEL_NOT_LINE_ALLOCATED' | null {
+  if (order.editedInImsAt) return 'EDITED_IN_IMS'
+  if (order.discountModel && order.discountModel !== 'LINE_ALLOCATED') return 'DISCOUNT_MODEL_NOT_LINE_ALLOCATED'
+  return null
+}
+
 export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPushInput): number | null {
+  if (totalGuardExclusion(order)) return null
   try {
     const goodsLines = order.lines.filter((line) => !isMirroredFeeLine(line))
     const feeLines = order.lines.filter((line) => isMirroredFeeLine(line))
@@ -655,6 +672,8 @@ export const ORDER_PUSH_SELECT = {
   discountAmount: true,
   storeCreditForeign: true,
   storeCreditAssessment: true,
+  editedInImsAt: true,
+  discountModel: true,
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true, wclcFeeKind: true, productId: true, externalLineItemId: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
@@ -2798,7 +2817,7 @@ export async function runWmsOrderPushSweepCore(
         // exists. An unevaluable check reads as "no finding" and the SYNCED link write below still happens.
         let componentPence: number | null = null
         try {
-          const driftPence = orderTotalDriftPence(order, order.currency)
+          const driftPence = totalGuardExclusion(order) ? 0 : orderTotalDriftPence(order, order.currency)
           componentPence = driftPence > TOTAL_DRIFT_TOLERANCE_PENCE ? clampAdvisoryPence(driftPence) : null
         } catch (error) {
           console.error(`[wms-order-push] component total check could not run for ${order.orderNumber ?? order.id}: ${scrubWmsError(error, 'check failed')}`)
