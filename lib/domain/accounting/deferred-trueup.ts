@@ -32,6 +32,7 @@ import {
   workSlotStanding,
   type LedgerStandingRow,
 } from '@/lib/domain/accounting/ledger-standing'
+import { journalNetMovement, journalNetsReadable } from '@/lib/domain/accounting/journal-account-nets'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 function round2(value: number): number {
@@ -49,20 +50,26 @@ function round2(value: number): number {
  * the credit note actually took out of unearned revenue).
  */
 export function sumPostedUnearnedReversal(
-  reversalSyncs: Array<{ payload: unknown }>,
+  reversalSyncs: Array<{ payload: unknown; payloadAccountNets?: unknown }>,
   unearnedRevenueAccount: string,
 ): number {
   let total = 0
   for (const sync of reversalSyncs) {
-    const lines = (sync.payload as { lines?: Array<{ accountCode?: string; debit?: number }> } | null)?.lines
-    if (!Array.isArray(lines)) continue
-    for (const line of lines) {
-      if (line.accountCode === unearnedRevenueAccount) {
-        total += Number(line.debit ?? 0)
-      }
-    }
+    // o3d-oyur (Codex r2 HIGH): the lines, or once compaction dropped them the preserved per-account net. A row with neither is
+    // UNKNOWN, not zero: it adds nothing here and the caller MUST withhold the true-up (see `unreadableUnearnedReversalRows`).
+    const debit = journalNetMovement(sync, unearnedRevenueAccount, 'debit')
+    if (debit != null) total += debit
   }
   return round2(total)
+}
+
+/**
+ * The counted reversal rows whose unearned-revenue movement cannot be read (no `lines` and no valid compaction summary: a legacy
+ * compacted row). `sumPostedUnearnedReversal` cannot net them, so a true-up that recognises the remaining deferral must not run while
+ * any exist, or it debits Unearned Revenue for an amount a refund already reversed.
+ */
+export function unreadableUnearnedReversalRows<T extends { payload: unknown; payloadAccountNets?: unknown }>(reversalSyncs: T[]): T[] {
+  return reversalSyncs.filter((sync) => !journalNetsReadable(sync))
 }
 
 /**
@@ -146,6 +153,7 @@ export type UnearnedReversalSyncRow = LedgerStandingRow & {
   referenceType: string
   referenceId: string
   payload: unknown
+  payloadAccountNets?: unknown
 }
 
 /** The rows the netting COUNTS: exactly the PENDING / PROCESSING / SYNCED set it always summed. */

@@ -371,7 +371,9 @@ This means an admin viewing the activity log can see who did what but not see se
   On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
   write its external id onto the order or bill, because everything that write needs survives
   compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment
-  registration, bill attachment). If the sweep repairs one of these rows — or if you retry one by hand
+  registration, bill attachment). A compacted **journal** also keeps the per-account net the Allocated
+  Inventory reversal proof reads, so it stays provable (see *Xero Sync*); a journal whose payload cannot be
+  read is left uncompacted and reported. If the sweep repairs one of these rows — or if you retry one by hand
   from the Accounting Sync page, which settles it against the id it already has rather than
   re-sending it — a WARNING is written to the activity log
   (`xero_backreference_followups_discarded`) naming the document, so you can check whether its PDF or

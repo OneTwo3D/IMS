@@ -2399,6 +2399,8 @@ to erase, and the warning is raised only for what that record names. Two consequ
 - a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
   the intended outcome, not a missing alarm: there was nothing to lose.
 
+**A compacted journal keeps its per-account net.** Retention writes each reversal-proof journal's per-account totals (codes and two numbers, no names) onto the row as it clears the payload, and the proof reads them once the lines are gone; a journal that cannot be summarised is left uncompacted and reported. A journal compacted **before this shipped** has neither, stays unprovable, and the credit is posted by hand. The refund and the daily batch treat such an unearned-revenue reversal as an **unknown amount, never zero**: the refund reverses no unearned revenue and logs a warning, and the daily batch skips that order's shipments (warning logged, nothing journaled) until the reversal is readable.
+
 A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
 against — recorded in a column retention does not touch — so it can be posted. Before, it was queued
 carrying nothing and refused at the socket, which meant the PDF the table promised never actually
