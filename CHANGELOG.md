@@ -253,6 +253,14 @@ These are in the release but off by default; nothing changes until an administra
 - **New: supplier override per row.** The Supplier cell is a dropdown of the product's catalog suppliers; the draft line goes to the chosen supplier's draft, flagged in the evidence. A supplier outside the catalog is skipped ("supplier override not in catalog"), never replaced by the default. Overrides clear with the selection on filter or page change. The Reorder rows now expose `supplierOptions`.
 - **Fixed: duplicate-draft guard.** The 10-minute double-click guard now also matches on destination warehouse, so reorder runs for two warehouses for one supplier each create a draft. No migration.
 
+### Per-warehouse reorder points and safety stock (inventory / analytics)
+
+- **Added: a warehouse can have its own reorder point, safety stock and reorder quantity.** A new table `reorder_threshold_overrides` (one row per product and warehouse, three nullable Decimal(12,4) columns, `>= 0` checks; additive migration `20261117030000_stock_level_reorder_overrides`) overrides the Product values. It is separate from `stock_levels` on purpose: saving never creates or touches a stock row, so it cannot change stock sync or storefront availability. NULL inherits the Product value, so every existing product behaves as before. One pure helper, `resolveReorderThresholds`, applies the rule everywhere.
+- **Reorder Planning uses them when filtered to a warehouse.** Each row is planned against that warehouse's resolved thresholds (reorder point, safety stock, reorder quantity), safety stock also moves Required receipt and Latest PO date, and a row using an override shows an **Override** tag. The unfiltered view stays consolidated at product level and says how many products have overrides it did not apply. The CSV exports keep their columns.
+- **Editor on the product page** (Inventory > product > Reorder thresholds by warehouse): blank inherits and shows the product value as the placeholder. Needs inventory edit permission; every change is audit-logged in the same transaction (who, when, old and new value). Each cell is compare-and-set under a row lock against the value the page loaded: a cell someone else changed is refused with a reload message while the other cells still save.
+- **Warehouses bound to a WMS are allowed.** The thresholds are planning-only and are not sent to Mintsoft or WooCommerce.
+- Help documents: Inventory, Analytics.
+
 ## 4.4.1 - 2026-11-15
 
 ### WMS order-push sweep: single-flight, and the merged-line removal note is no longer lost (backend / sync)
