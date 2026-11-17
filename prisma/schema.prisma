@@ -112,6 +112,15 @@ enum RefundDisposition {
   FULL
 }
 
+// Invoicing state of a sales order, orthogonal to the fulfilment lifecycle status (and to RefundDisposition): an order can
+// be SHIPPED and NOT_INVOICED, or CANCELLED and FULLY_INVOICED. Derived from the order's invoice evidence, never set by hand:
+// lib/domain/sales/invoicing-state.ts (SalesOrder.invoicingState).
+enum InvoicingState {
+  NOT_INVOICED
+  PARTIALLY_INVOICED
+  FULLY_INVOICED
+}
+
 // o3d-9te: WHAT SalesOrder.discountAmount MEANS on this row, recorded by whoever wrote it.
 //
 // The o3d-y14 double-count existed because two different meanings shared one column and
@@ -210,6 +219,8 @@ enum AccountingSyncType {
   INVOICE_EMAIL
   WC_INVOICE_NOTE
   CREDIT_NOTE
+  // A refund recorded in error was deleted in IMS: void the sales credit note it posted (ACCRECCREDIT) in the ledger.
+  CREDIT_NOTE_VOID
   // audit-g5u2: supplier (purchase) credit note — Xero ACCPAYCREDIT.
   PURCHASE_CREDIT_NOTE
   // audit-v08m: follow-up that allocates the ACCPAYCREDIT to the bill it offsets.
@@ -952,6 +963,9 @@ model CostLayer {
   adjustmentMovementId String? @map("adjustment_movement_id")
   productionOrderId String?  @map("production_order_id")
   isOpeningStock  Boolean   @default(false)
+  /// The RETURN_INBOUND stock movement that created this layer (a refund that restocked its returned units). NULL for every other layer and for every layer written before the column existed.
+  /// Lets a deleted refund remove exactly the layers its own return created; a refund whose layers are not tagged cannot have its return reversed and is refused.
+  returnMovementId String?  @map("return_movement_id")
 
   product         Product   @relation(fields: [productId], references: [id])
   warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
@@ -966,6 +980,7 @@ model CostLayer {
   @@index([productId, warehouseId, receivedAt])
   @@index([adjustmentMovementId])
   @@index([productionOrderId])
+  @@index([returnMovementId])
   @@map("cost_layers")
 }
 
@@ -1787,6 +1802,8 @@ model SalesOrder {
   // by the refund service; the legacy PARTIALLY_REFUNDED/REFUNDED `status` values are
   // being retired in favour of this field (epic: orthogonal refund status).
   refundStatus      RefundDisposition @default(NONE)
+  /// Whether an invoice exists for the order, orthogonal to `status`. Derived and maintained by lib/domain/sales/invoicing-state.ts (the only writer); a cancelled order keeps it.
+  invoicingState    InvoicingState @default(NOT_INVOICED) @map("invoicing_state")
   /// o3d-e1yb [wdraw]: set when this order is ON_HOLD because the customer filed an EU
   /// right-of-withdrawal request in the storefront. It marks the hold as
   /// withdrawal-originated, which does two things nothing else does:
@@ -2391,6 +2408,32 @@ model SalesOrderRefund {
 /// It holds NO stock: nothing here is on hand, allocatable or pushed to a storefront. The value sits in the
 /// Stock in Transit account (the refund's COGS reversal debits it) until the units arrive or are written off.
 /// Lines carry the dispatch-cost snapshot the refund was valued at, so arrival can clear exactly that value.
+/// The record that a refund recorded in error was deleted (o3d-ngmt.22). The refund row and its lines are gone; this keeps the
+/// identity, the credit note number and the figures it carried, who deleted it and why, and what the delete reversed. It is also the
+/// idempotency anchor: one row per deleted refund id, so a retried delete finds it and reports done.
+/// Structural data only (ids, numbers, amounts, dates): no line text and no customer detail is copied in. `reason` is the operator's own text.
+model SalesOrderRefundDeletion {
+  id                      String   @id @default(cuid())
+  /// The deleted refund's own id. Unique: a delete happens once.
+  refundId                String   @unique @map("refund_id")
+  /// The order the refund belonged to. No foreign key: the record outlives a deleted order.
+  orderId                 String   @map("order_id")
+  creditNoteNumber        String?  @map("credit_note_number")
+  accountingCreditNoteId  String?  @map("accounting_credit_note_id")
+  totalBase               Decimal  @db.Decimal(18, 4) @map("total_base")
+  totalForeign            Decimal  @db.Decimal(18, 4) @map("total_foreign")
+  reason                  String?
+  deletedById             String?  @map("deleted_by_id")
+  deletedAt               DateTime @default(now()) @map("deleted_at")
+  /// The credit-note void sync row queued for the ledger (null when the credit note never reached it).
+  voidSyncLogId           String?  @map("void_sync_log_id")
+  /// What was reversed, from the recorded movements: stock out, layers removed, the COGS journal reversed, syncs retired. Amounts and ids only.
+  reversal                Json     @default("{}")
+
+  @@index([orderId])
+  @@map("sales_order_refund_deletions")
+}
+
 enum InvoiceDocumentKind {
   INVOICE
   CREDIT_NOTE
@@ -2493,6 +2536,9 @@ model InvoiceDocumentFetchState {
   leaseUntil    DateTime?                  @map("lease_until")
   /// Who holds the lease: a token unique to one fetch. Renewal, every state write, the promotion and the release all require it, so a holder whose lease was taken over cannot write or release the new holder's.
   leaseHolder   String?                    @map("lease_holder")
+  /// When a customer's click first QUEUED this document's fetch (an order the sweep never covered). Set once, never cleared: it is the
+  /// de-duplication key of the on-demand queue and the count behind its daily cap. NULL for a document nobody asked for.
+  customerRequestedAt DateTime?            @map("customer_requested_at")
   createdAt     DateTime                   @default(now()) @map("created_at")
   updatedAt     DateTime                   @updatedAt @map("updated_at")
 
@@ -2500,6 +2546,7 @@ model InvoiceDocumentFetchState {
   refund SalesOrderRefund? @relation(fields: [refundId], references: [id])
 
   @@index([status, nextAttemptAt])
+  @@index([customerRequestedAt])
   @@map("invoice_document_fetch_states")
 }
 
@@ -3309,6 +3356,23 @@ model AccountingSyncLog {
   /// table for those, which OVER-reports. That direction is deliberate and permanent: an over-broad
   /// warning is noise, an under-broad one loses a payment in silence.
   followUpObligations Json? @map("follow_up_obligations")
+
+  /// o3d-oyur — THE PER-ACCOUNT NET A JOURNAL MOVED, kept when retention drops its payload.
+  ///
+  /// The A2 posting proof asks ONE question of a journal: the NET movement of one account code in one
+  /// direction. Compaction empties `payload`, which used to leave an old journal permanently unprovable
+  /// (the proof fails closed). Compaction now writes this column in the SAME statement that empties the
+  /// payload, for the journal-carrying types only, and the proof reads it once the lines are gone:
+  /// `{ "version": 1, "accounts": { "<code>": { "credit": n, "debit": n } } }`, each figure the value
+  /// `extractPayloadNetMovement` returns for that account and direction. Account codes and two totals
+  /// each: no names, references, descriptions or addresses, so it is not personal data and may outlive
+  /// the payload.
+  ///
+  /// NULL is NO RECORD, not zero: every row compacted before this column existed (the payload it would
+  /// be derived from is gone, and there is no backfill), every row that was never compacted (its payload
+  /// is still the authority) and every non-journal type. A reader treats an absent or malformed value as
+  /// unreadable and the proof fails closed.
+  payloadAccountNets Json? @map("payload_account_nets")
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.

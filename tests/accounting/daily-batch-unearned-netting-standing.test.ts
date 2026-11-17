@@ -21,6 +21,8 @@ import { createSyncLogStore, matchesWhere, syncLogRow, type SyncLogRow } from '@
 
 const BATCH_DAY = '2026-07-20'
 
+/** Every `shipment.update` the run made: the journaled stamp (o3d-oyur retry test). */
+const shipmentUpdates: string[] = []
 const created: Array<{ type: string; referenceId: string; payload: Record<string, unknown> }> = []
 const activity: Array<Record<string, unknown>> = []
 let store = createSyncLogStore([])
@@ -56,7 +58,7 @@ const SHIPMENT = {
 }
 
 const tx = {
-  shipment: { findMany: async () => [SHIPMENT], update: async ({ where }: { where: { id: string } }) => ({ id: where.id }) },
+  shipment: { findMany: async () => [SHIPMENT], update: async ({ where }: { where: { id: string } }) => { shipmentUpdates.push(where.id); return { id: where.id } } },
   orderAllocation: { findMany: async () => [], update: async () => ({}) },
   shipmentLine: { findMany: async () => [], update: async () => ({}) },
   salesOrderRefundLine: { findMany: async () => [] },
@@ -252,4 +254,52 @@ test('[report names the right set] asserted-counted and may-have-posted-uncounte
   assert.doesNotMatch(text, /rev-confirmed/)
   assert.equal(recognisedRevenue(), 40, 'golden: both £30 counted rows (confirmed + asserted) net out of £100 -> 100 - 60')
   console.log('mixed case: 1 report naming 2 rows (confirmed not named); revenue 40')
+})
+
+// o3d-oyur (Codex r2 HIGH) - A COMPACTED REVERSAL IS READ FROM ITS PRESERVED NET, AND AN UNREADABLE ONE IS UNKNOWN, NEVER ZERO.
+// Retention compaction empties `payload` on a settled reversal. Before this the batch read only `payload`, so a compacted
+// £30 reversal counted as £0 and the final shipment recognised the whole £100 again.
+function unreadableReports(): Array<Record<string, unknown>> {
+  return activity.filter((entry) => entry.action === 'daily_batch_trueup_withheld_unreadable_unearned_reversal')
+}
+
+test('[o3d-oyur] a SYNCED reversal compacted to its summary still nets: £100 - £30 = £70, and nothing is withheld', async () => {
+  await runWith([reversalRow('rev-compacted', {
+    status: 'SYNCED',
+    externalTransactionId: 'JNL-9',
+    payload: {},
+    payloadAccountNets: { version: 1, accounts: { '830': { credit: 0, debit: 30 } } },
+  })])
+  assert.equal(recognisedRevenue(), 70, 'NOT 100: the compacted reversal still took £30 out of the deferral')
+  assert.equal(unreadableReports().length, 0)
+})
+
+test('[o3d-oyur] a legacy compacted reversal withholds the order: nothing journaled or stamped on run 1; once readable, run 2 recognises it exactly once', async () => {
+  const legacy = reversalRow('rev-legacy', { status: 'SYNCED', externalTransactionId: 'JNL-8', payload: {}, payloadAccountNets: null })
+  created.length = 0
+  activity.length = 0
+  shipmentUpdates.length = 0
+  store = createSyncLogStore([legacy])
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const run1 = await runDailyBatchSync()
+  assert.deepEqual(run1.errors, [])
+  assert.equal(run1.groupB, 0, 'run 1: the shipment is not processed')
+  assert.equal(created.filter((log) => log.type === 'DAILY_BATCH_GROUP_B').length, 0, 'run 1: no Group B journal (no revenue, no COGS)')
+  assert.equal(shipmentUpdates.length, 0, 'run 1: the shipment is NOT stamped journaled, so it stays retryable')
+  const [report] = unreadableReports()
+  assert.ok(report, 'run 1: one warning')
+  assert.equal(report.entityId, 'order-1')
+  assert.equal(report.level, 'WARNING')
+
+  // The reversal becomes readable (a summary is recorded for it); the same shipment is picked up again.
+  store = createSyncLogStore([{ ...legacy, payloadAccountNets: { version: 1, accounts: { '830': { credit: 0, debit: 30 } } } }])
+  created.length = 0
+  activity.length = 0
+  const run2 = await runDailyBatchSync()
+  assert.deepEqual(run2.errors, [])
+  assert.equal(run2.groupB, 1, 'run 2: the shipment is journaled')
+  assert.equal(created.filter((log) => log.type === 'DAILY_BATCH_GROUP_B').length, 1, 'exactly one Group B journal')
+  assert.equal(recognisedRevenue(), 70, 'run 2: £100 less the £30 the now-readable reversal took, recognised once')
+  assert.equal(shipmentUpdates.length, 1, 'and the shipment is stamped exactly once')
+  assert.equal(unreadableReports().length, 0)
 })

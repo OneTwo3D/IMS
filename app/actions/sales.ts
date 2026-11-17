@@ -1,5 +1,6 @@
 'use server'
 
+import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -177,7 +178,7 @@ import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-gua
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 import {
-  ORDER_LIST_PAGE_SIZE, isShortListQuery, SO_COMPLETED_STATUSES, SO_STATUSES, buildListPage, buildSalesOrderListWhere,
+  ORDER_LIST_PAGE_SIZE, isShortListQuery, SO_COMPLETED_STATUSES, SO_INVOICING_FILTERS, SO_STATUSES, buildListPage, buildSalesOrderListWhere,
   normaliseListQuery, normalisePage, normaliseStatuses, soListHides,
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
@@ -245,6 +246,8 @@ export type SoRow = {
   /// Hidden from the default operational list by data retention; still searchable and still counted by reports.
   archived: boolean
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
+  /// Whether an invoice exists for the order (orthogonal to `status`; a cancelled order keeps it). lib/domain/sales/invoicing-state.ts.
+  invoicingState: InvoicingState
   /// o3d-e1yb [wdraw]: set while an EU withdrawal request holds this order.
   withdrawalHoldAt: string | null
   /// o3d-rbyg r4: WHICH request the hold is — carried to the release so the button cannot clear a
@@ -528,6 +531,7 @@ const SO_SELECT = {
   orderNumber: true,
   status: true,
   refundStatus: true,
+  invoicingState: true,
   withdrawalHoldAt: true,
   withdrawalHoldGeneration: true,
   currency: true,
@@ -595,6 +599,7 @@ function mapSoRow(so: {
   orderNumber: string | null
   status: string
   refundStatus: string
+  invoicingState: string
   withdrawalHoldAt: Date | null
   withdrawalHoldGeneration: number
   currency: string
@@ -700,6 +705,7 @@ function mapSoRow(so: {
     status: so.status as SoStatus,
     archived: so.archived,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
+    invoicingState: so.invoicingState as InvoicingState,
     withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
     withdrawalHoldGeneration: so.withdrawalHoldGeneration,
     currency: so.currency,
@@ -795,6 +801,8 @@ export type SoListParams = {
   q?: string
   /** Comma-separated string (from the URL) or a list. Unknown values are ignored. */
   status?: string | string[]
+  /** Invoicing state picks, comma-separated or a list (NOT_INVOICED, PARTIALLY_INVOICED, FULLY_INVOICED). Unknown values are ignored. */
+  invoicing?: string | string[]
   page?: number | string
   /** Include COMPLETED / DELIVERED in the default view. */
   showCompleted?: boolean
@@ -831,6 +839,7 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
   const filter: SoListFilter = {
     q: normaliseListQuery(params.q),
     statuses: normaliseStatuses(params.status, SO_STATUSES),
+    invoicing: normaliseStatuses(params.invoicing, SO_INVOICING_FILTERS),
     showCompleted: params.showCompleted === true,
     includeArchived: params.includeArchived === true,
   }
