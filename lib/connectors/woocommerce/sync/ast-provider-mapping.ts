@@ -99,13 +99,33 @@ export function isClickDropForwardedOrder(meta: readonly WcMeta[] | null | undef
   return value === 1 || value === '1' || value === true
 }
 
-export function resolveAstProvider(input: { courier: string | null | undefined; orderMeta: readonly WcMeta[] | null | undefined }): AstProviderResolution {
-  if (isFedexLabelledOrder(input.orderMeta)) return { kind: 'fedex', slug: FEDEX_AST_PROVIDER }
-  if (isClickDropForwardedOrder(input.orderMeta)) return { kind: 'clickdrop', slug: CLICKDROP_AST_PROVIDER }
+/**
+ * `orderRowCount` and `trackingNumber` are the row's context. With ONE tracking row (or none given) the plugin's order-level
+ * rules apply unchanged. With SEVERAL rows the order-level label flags must not rebrand a shipment they do not identify:
+ *   - the FedEx label meta overrides a row only when `_fedex_tracking_number` is that row's own tracking number; when it names
+ *     another row the flag is skipped for this one, and when the order carries only a shipment id (no number to match) it applies
+ *     to rows with a courier the table does not know (the warehouse's generic "Local Collection"), never to a mapped courier;
+ *   - the Click & Drop flag likewise applies only to rows whose courier the table does not map.
+ * A row the flags skip falls through to its own courier lookup (a mapped carrier is preserved) or to unmapped.
+ */
+export function resolveAstProvider(input: {
+  courier: string | null | undefined
+  orderMeta: readonly WcMeta[] | null | undefined
+  orderRowCount?: number
+  trackingNumber?: string | null
+}): AstProviderResolution {
   const courier = (input.courier ?? '').trim()
-  if (courier && Object.prototype.hasOwnProperty.call(WMS_COURIER_TO_AST_PROVIDER, courier)) {
-    return { kind: 'courier', slug: WMS_COURIER_TO_AST_PROVIDER[courier] }
+  const mapped = Boolean(courier) && Object.prototype.hasOwnProperty.call(WMS_COURIER_TO_AST_PROVIDER, courier)
+  const multi = (input.orderRowCount ?? 1) > 1
+  if (isFedexLabelledOrder(input.orderMeta)) {
+    const labelled = metaValue(input.orderMeta, WC_FEDEX_TRACKING_META_KEYS[0])
+    const labelledNumber = labelled === undefined || labelled === null || labelled === false || labelled === 0 ? '' : String(labelled).trim()
+    const own = (input.trackingNumber ?? '').trim()
+    const applies = !multi || (labelledNumber ? labelledNumber === own : !mapped)
+    if (applies) return { kind: 'fedex', slug: FEDEX_AST_PROVIDER }
   }
+  if (isClickDropForwardedOrder(input.orderMeta) && (!multi || !mapped)) return { kind: 'clickdrop', slug: CLICKDROP_AST_PROVIDER }
+  if (mapped) return { kind: 'courier', slug: WMS_COURIER_TO_AST_PROVIDER[courier] }
   return { kind: 'unmapped', courier }
 }
 

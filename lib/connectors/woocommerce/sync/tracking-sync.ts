@@ -175,10 +175,29 @@ async function applyProviderMappingIfEnabled(
   outbound: { rows: TrackingSourceRow[]; items: WcTrackingItem[]; externalOrderId: number | null },
   orderMeta: WcMeta[],
 ): Promise<WcTrackingItem[]> {
-  if (!(await readAstProviderMappingEnabled())) return outbound.items
+  let enabled: boolean
+  try {
+    enabled = await readAstProviderMappingEnabled()
+  } catch (error) {
+    // An optional, default-off setting must never fail a tracking push (a failed push withholds the order's completion): an
+    // unreadable setting is OFF, which sends today's item. Recorded so the read failure is not silent.
+    try {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'wc_tracking_provider_setting_unreadable',
+        tag: 'sync',
+        level: 'WARNING',
+        description: 'The AST provider mapping setting could not be read; tracking was written without the mapping',
+        metadata: { externalOrderId: outbound.externalOrderId, error: error instanceof Error ? error.message : 'unknown error' },
+      })
+    } catch { /* the log write is best-effort too */ }
+    return outbound.items
+  }
+  if (!enabled) return outbound.items
   const unmapped: string[] = []
   const items = outbound.rows.map((row) => {
-    const resolution = resolveAstProvider({ courier: row.carrier, orderMeta })
+    const resolution = resolveAstProvider({ courier: row.carrier, orderMeta, orderRowCount: outbound.rows.length, trackingNumber: row.trackingNumber })
     if (resolution.kind === 'unmapped' && resolution.courier) unmapped.push(resolution.courier)
     return applyAstProvider(toWcTrackingItem(row), resolution)
   })

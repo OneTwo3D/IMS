@@ -356,8 +356,10 @@ Advanced Shipment Tracking (AST) builds the customer's tracking link and brandin
 Tick **Map couriers to tracking providers** under **Sync > WooCommerce > Order Sync** (setting `wc_ast_provider_mapping_enabled`) and the tracking item IMS writes carries the AST provider slug instead:
 
 - A courier in the warehouse courier table (Royal Mail, Parcelforce, Evri, DHL Express, UPS, Spring Global) is written with its slug. The name must match the table exactly, including capitals and brackets: there are no aliases and no partial matches.
-- An order the FedEx label plugin has labelled (it carries a `_fedex_tracking_number`) is written as **FedEx**, and an order forwarded to Click & Drop is written as **Royal Mail**, whatever courier name the warehouse reported. FedEx wins if an order has both.
+- An order the FedEx label plugin has labelled (it carries a `_fedex_tracking_number`) is written as **FedEx**, and an order forwarded to Click & Drop is written as **Royal Mail**, whatever courier name the warehouse reported. FedEx wins if an order has both. On an order with several shipments the label applies only to the shipment it identifies: the FedEx tracking number matches only that shipment's number, and a shipment with a table courier (for example UPS) keeps its own provider.
 - A courier that is not in the table (Palletline, Local Collection, anything new) is written exactly as before, and each one is counted in the activity log as `wc_tracking_provider_unmapped` with the courier name, so you can see what is missing. IMS never guesses a provider.
+
+If IMS cannot read the setting, it behaves as if it were unticked (the tracking is written as before and the failure is logged as `wc_tracking_provider_setting_unreadable`); tracking is never held up by it.
 
 With the box unticked (the default) nothing changes: the tracking written to WooCommerce is identical to what IMS wrote before this setting existed. Turning it on affects tracking written from then on; an order whose tracking was already written is rewritten with the slug the next time its tracking is pushed. Like every WooCommerce write, it goes through the outbox and is held while WooCommerce is shadowed.
 

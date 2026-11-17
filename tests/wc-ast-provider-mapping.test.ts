@@ -16,6 +16,7 @@ const state = {
   settingReads: 0,
   settingThrows: false,
   carrier: 'Royal Mail Tracked 24 [Parcel]',
+  extraShipments: [] as Array<{ trackingNumber: string; shippingService: string }>,
   wcMeta: [] as Array<{ id: number; key: string; value: unknown }>,
   puts: [] as Call[],
   logs: [] as Array<Record<string, unknown>>,
@@ -40,7 +41,7 @@ mock.module('@/lib/db', {
           shippingService: null,
           shippedAt: null,
           shoppingLinks: [{ externalOrderId: '501', externalOrderNumber: '501' }],
-          shipments: [{ trackingNumber: 'TN1', shippingService: state.carrier, shippedAt: SHIPPED_AT, createdAt: SHIPPED_AT }],
+          shipments: [{ trackingNumber: 'TN1', shippingService: state.carrier }, ...state.extraShipments].map((x) => ({ ...x, shippedAt: SHIPPED_AT, createdAt: SHIPPED_AT })),
         }),
       },
       shoppingSyncLog: { create: async ({ data }: { data: Record<string, unknown> }) => { state.syncLogs.push(data); return data } },
@@ -70,7 +71,7 @@ async function load() {
 }
 
 function reset(over: Partial<typeof state> = {}) {
-  Object.assign(state, { setting: undefined, settingReads: 0, settingThrows: false, carrier: 'Royal Mail Tracked 24 [Parcel]', wcMeta: [], puts: [], logs: [], syncLogs: [] }, over)
+  Object.assign(state, { setting: undefined, settingReads: 0, settingThrows: false, carrier: 'Royal Mail Tracked 24 [Parcel]', extraShipments: [], wcMeta: [], puts: [], logs: [], syncLogs: [] }, over)
 }
 const meta = (key: string, value: unknown) => ({ id: 1, key, value })
 const sentItems = () => ((state.puts[0].body as { meta_data: Array<{ value: unknown[] }> }).meta_data[0].value)
@@ -175,14 +176,44 @@ test('setting ON: an unknown courier keeps today\'s item and is counted in the a
   assert.equal((log!.metadata as Record<string, unknown>).unmappedCount, 1)
 })
 
-test('setting ON: an already-mapped item on the order is not rewritten (idempotent); an unreadable setting refuses the push', async () => {
+test('setting ON: an already-mapped item on the order is not rewritten (idempotent)', async () => {
   const { mapping, sync } = await load()
   void mapping; void sync
   reset({ setting: 'true', wcMeta: [meta('_wc_shipment_tracking_items', [{ tracking_provider: 'royal-mail', custom_tracking_provider: '', custom_tracking_link: '', tracking_number: 'TN1', date_shipped: TS }])] })
   assert.deepEqual(await sync.pushImsTrackingToWc('o1'), { success: true, skipped: true })
   assert.equal(state.puts.length, 0)
-  reset({ settingThrows: true })
-  const r = await sync.pushImsTrackingToWc('o1')
-  assert.equal(r.success, false)
-  assert.equal(state.puts.length, 0)
+})
+
+test('an unreadable mapping setting is OFF: the legacy item is pushed, the push succeeds, and the read failure is logged', async () => {
+  const { mapping, sync } = await load()
+  void mapping; void sync
+  reset({ settingThrows: true, wcMeta: [meta('_fedex_tracking_number', '77')] })
+  assert.deepEqual(await sync.pushImsTrackingToWc('o1'), { success: true })
+  assert.equal(state.puts.length, 1)
+  assert.equal(JSON.stringify(sentItems()), JSON.stringify([sync.toWcTrackingItem({ trackingNumber: 'TN1', carrier: 'Royal Mail Tracked 24 [Parcel]', shippedAt: SHIPPED_AT })]))
+  const log = state.logs.find((l) => l.action === 'wc_tracking_provider_setting_unreadable')
+  assert.ok(log)
+  assert.equal((log!.metadata as Record<string, unknown>).error, 'db down')
+})
+
+test('mixed-carrier order: a FedEx label identifies only its own tracking number; another shipment keeps its mapped carrier', async () => {
+  const { mapping, sync } = await load()
+  void mapping; void sync
+  const fedex = [meta('_fedex_tracking_number', '7777')]
+  const base = { orderMeta: fedex, orderRowCount: 2 }
+  assert.deepEqual(mapping.resolveAstProvider({ ...base, courier: 'Local Collection', trackingNumber: '7777' }), { kind: 'fedex', slug: 'fedex' })
+  assert.deepEqual(mapping.resolveAstProvider({ ...base, courier: 'UPS Standard', trackingNumber: '1Z999' }), { kind: 'courier', slug: 'ups' })
+  assert.deepEqual(mapping.resolveAstProvider({ ...base, courier: 'Local Collection', trackingNumber: 'OTHER' }), { kind: 'unmapped', courier: 'Local Collection' })
+  // a shipment id alone names no row: only a generic courier is branded, a mapped carrier is kept
+  const id = { orderMeta: [meta('_fedex_shipment_id', 'S1')], orderRowCount: 2 }
+  assert.equal(mapping.resolveAstProvider({ ...id, courier: 'Local Collection', trackingNumber: 'A' }).kind, 'fedex')
+  assert.equal(mapping.resolveAstProvider({ ...id, courier: 'UPS Standard', trackingNumber: 'B' }).kind, 'courier')
+  // Click & Drop: only rows whose courier the table does not map
+  const cd = { orderMeta: [meta('_clickdrop_label_pushed', '1')], orderRowCount: 2 }
+  assert.equal(mapping.resolveAstProvider({ ...cd, courier: 'Local Collection', trackingNumber: 'A' }).kind, 'clickdrop')
+  assert.deepEqual(mapping.resolveAstProvider({ ...cd, courier: 'UPS Standard', trackingNumber: 'B' }), { kind: 'courier', slug: 'ups' })
+  // end to end through the push
+  reset({ setting: 'true', carrier: 'Local Collection', extraShipments: [{ trackingNumber: '1Z999', shippingService: 'UPS Standard' }], wcMeta: [meta('_fedex_tracking_number', 'TN1')] })
+  assert.deepEqual(await sync.pushImsTrackingToWc('o1'), { success: true })
+  assert.deepEqual(sentItems().map((i) => (i as { tracking_provider: string }).tracking_provider), ['fedex', 'ups'])
 })
