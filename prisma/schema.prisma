@@ -4127,6 +4127,8 @@ enum WmsOperatorTaskReason {
   PUSH_CONFLICT
   CANCEL_NOTICE
   REFUND_NOTE
+  /// Same-customer orders that are all still NEW in the warehouse: a person checks them there and merges them (IMS never merges).
+  MERGE_CANDIDATE
 }
 
 enum WmsOperatorTaskStatus {
