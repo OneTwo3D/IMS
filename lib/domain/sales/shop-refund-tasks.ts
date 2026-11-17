@@ -10,23 +10,24 @@ import { raiseWmsOperatorTask, type WmsOperatorTaskPayload } from '@/lib/domain/
  * credit note and writes NOTHING to WooCommerce: no refund record, no status change, no order note, no money movement. The customer's money
  * is returned by a person in WooCommerce. IMS raises ONE operator task per IMS refund so that person is told.
  *
- * THE DUPLICATE CREDIT NOTE THIS PREVENTS. The WooCommerce refund import dedups on the storefront refund id alone. The person's later refund in
- * WooCommerce has a new id, so, left alone, the import would raise a SECOND credit note for money IMS already credited. So the import first asks
- * `matchWcRefundToOpenTask`: does this storefront refund settle an IMS refund that is waiting for it?
+ * THE DUPLICATE CREDIT NOTE THIS PREVENTS, AND WHY A PERSON DECIDES. The WooCommerce refund import dedups on the storefront refund id alone. The
+ * person's later refund in WooCommerce has a new id, so, left alone, the import would raise a SECOND credit note for money IMS already credited.
+ * But IMS writes no marker to WooCommerce, so an amount is NOT proof: a separate refund that began in WooCommerce can have the same amount as
+ * an open IMS refund. So IMS never links on its own. `findOpenShopRefunds` asks whether the order has an open task:
  *
  *   no task open on the order      nothing here applies: the import runs exactly as before (a refund that began in WooCommerce is untouched)
- *   exactly one task fits          the storefront refund id is set on the IMS refund, the task is resolved, and NO new credit note is raised
- *   anything else                  IMS does not guess: it records nothing and parks the refund with both sets of figures for a person
+ *   a task is open                 IMS records nothing and parks the storefront refund QUARANTINED, naming the IMS refunds still owed and the amounts
  *
- * "Fits" is: the same order, the same currency, the amount equal to the minor unit, an IMS refund with no storefront refund id, and an open task.
+ * The person then chooses, on that parked row:
+ *   "Confirm this WooCommerce refund settles IMS refund <credit note>"   `confirmShopRefundSettlement`: sets the storefront refund id on that IMS
+ *                                  refund and resolves the task and the park, with no credit note raised (only offered where the amount is equal)
+ *   the existing recording action on the row  it is a separate refund: a credit note is raised for it as for any WooCommerce refund
  *
  * The task holds no personal data: ids, the credit note number and money. The free-text reason typed on the IMS refund is NOT copied; the task
  * states a fixed kind instead, and the operator reads the typed reason on the order.
  */
 
 export const SHOP_REFUND_CONNECTOR = 'woocommerce'
-/** Recorded as `doneBy` when the import, not a person, resolved the task. */
-export const SHOP_REFUND_TASK_IMPORT_ACTOR = 'system:woocommerce-refund-import'
 
 type Money = Parameters<typeof toDecimal>[0]
 
@@ -59,7 +60,7 @@ export function shopRefundQuery(input: { orderNumber: string; creditNoteNumber: 
     ? `${input.grossForeign} ${input.currency} including tax`
     : `${input.netForeign} ${input.currency} before tax (IMS could not work out the tax-inclusive figure, so check it against the credit note)`
   return `Please refund ${amount} to the customer of IMS order ${input.orderNumber} in WooCommerce${cn}. IMS recorded this refund for ${what} and has written nothing to WooCommerce: no refund, no status change, no note. `
-    + 'The typed reason is on the IMS order. When the refund is made in WooCommerce and IMS imports it, IMS links it to this credit note, raises no second credit note and marks this task done. If you refund a different amount, IMS will not match it and will ask you to look at both.'
+    + 'The typed reason is on the IMS order. When IMS imports the refund you make in WooCommerce it does not link it on its own, because IMS cannot tell it from a separate refund. It lists it under parked refunds, where you confirm that it settles this credit note (no second credit note is raised and this task is marked done) or record it as a separate refund.'
 }
 
 /**
@@ -101,12 +102,9 @@ export async function raiseShopRefundTask(
   })
 }
 
-export type ShopRefundMatch =
-  | { kind: 'none' }
-  | { kind: 'matched'; taskId: string; refundId: string }
-  | { kind: 'ambiguous'; message: string }
+export type OpenShopRefund = { taskId: string; refundId: string; creditNoteNumber: string | null; currency: string | null; grossForeign: string | null }
 
-type MatchClient = Pick<Prisma.TransactionClient, 'wmsOperatorTask' | 'salesOrderRefund'>
+type OpenClient = Pick<Prisma.TransactionClient, 'wmsOperatorTask' | 'salesOrderRefund'>
 
 function shopRefundOf(payload: Prisma.JsonValue | null): NonNullable<WmsOperatorTaskPayload['shopRefund']> | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
@@ -114,75 +112,75 @@ function shopRefundOf(payload: Prisma.JsonValue | null): NonNullable<WmsOperator
   return value && typeof value === 'object' ? value : null
 }
 
-/**
- * Does this storefront refund settle an IMS refund that is waiting for it? Read-only.
- *
- * `amountForeign` is the storefront refund's stated amount (tax included) in the order currency, `orderCurrency` the order's. The figures in
- * the ambiguous answer are IMS's and the storefront's own: amounts, currency and credit note numbers; no person is named.
- */
-export async function matchWcRefundToOpenTask(
-  client: MatchClient,
-  input: { orderId: string; orderCurrency: string; wcRefundId: number; amountForeign: Decimal },
-): Promise<ShopRefundMatch> {
+/** The IMS refunds on this order that the shop still has to pay back: an OPEN task whose IMS refund has no storefront refund id yet. Read-only. */
+export async function findOpenShopRefunds(client: OpenClient, orderId: string): Promise<OpenShopRefund[]> {
   const open = await client.wmsOperatorTask.findMany({
-    where: { orderId: input.orderId, connector: SHOP_REFUND_CONNECTOR, reason: 'SHOP_REFUND_DUE', status: 'OPEN' },
+    where: { orderId, connector: SHOP_REFUND_CONNECTOR, reason: 'SHOP_REFUND_DUE', status: 'OPEN' },
     select: { id: true, externalOrderId: true, payload: true },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
-  if (open.length === 0) return { kind: 'none' }
-
-  const digits = currencyMinorUnits(input.orderCurrency)
-  const incoming = input.amountForeign.toDecimalPlaces(digits)
-  // Only a task whose IMS refund still has no storefront refund id can be settled by this one.
-  const refunds = await client.salesOrderRefund.findMany({
-    where: { id: { in: open.map((task) => task.externalOrderId) }, orderId: input.orderId, externalRefundId: null },
+  if (open.length === 0) return []
+  const waiting = new Set((await client.salesOrderRefund.findMany({
+    where: { id: { in: open.map((task) => task.externalOrderId) }, orderId, externalRefundId: null },
     select: { id: true },
-  })
-  const waiting = new Set(refunds.map((refund) => refund.id))
-  const candidates = open
+  })).map((refund) => refund.id))
+  return open
     .filter((task) => waiting.has(task.externalOrderId))
-    .map((task) => ({ task, facts: shopRefundOf(task.payload) }))
+    .map((task) => {
+      const facts = shopRefundOf(task.payload)
+      return { taskId: task.id, refundId: task.externalOrderId, creditNoteNumber: facts?.creditNoteNumber ?? null, currency: facts?.currency ?? null, grossForeign: facts?.grossForeign ?? null }
+    })
+}
 
-  const figures = candidates
-    .map(({ task, facts }) => `${facts?.creditNoteNumber ?? task.externalOrderId}: ${facts?.grossForeign ?? 'unknown'} ${facts?.currency ?? input.orderCurrency}`)
-    .join('; ')
-  const fits = candidates.filter(({ facts }) => facts !== null
-    && facts.currency === input.orderCurrency
-    && facts.grossForeign !== null
-    && toDecimal(facts.grossForeign).toDecimalPlaces(digits).equals(incoming))
-
-  if (fits.length === 1) return { kind: 'matched', taskId: fits[0].task.id, refundId: fits[0].task.externalOrderId }
-  const incomingText = `${incoming.toFixed(digits)} ${input.orderCurrency}`
-  if (fits.length > 1) {
-    return { kind: 'ambiguous', message: `WooCommerce refund ${input.wcRefundId} (${incomingText}) fits ${fits.length} open IMS refunds on this order equally (${figures}), so IMS cannot tell which one it settles.` }
-  }
-  return {
-    kind: 'ambiguous',
-    message: candidates.length === 0
-      ? `WooCommerce refund ${input.wcRefundId} (${incomingText}) arrived on an order whose open "Refund in WooCommerce" task no longer has an IMS refund waiting for a storefront refund, so IMS cannot tell what it settles.`
-      : `WooCommerce refund ${input.wcRefundId} (${incomingText}) does not equal the amount of any open IMS refund on this order (${figures}), so IMS cannot tell whether it settles one of them.`,
-  }
+/** Whether an open IMS refund is for exactly this storefront amount: the same currency and the tax-inclusive amount equal to the minor unit. An unpriced one never is. */
+export function shopRefundAmountEquals(open: OpenShopRefund, orderCurrency: string, amountForeign: Decimal): boolean {
+  if (open.currency !== orderCurrency || open.grossForeign === null) return false
+  const digits = currencyMinorUnits(orderCurrency)
+  return toDecimal(open.grossForeign).toDecimalPlaces(digits).equals(amountForeign.toDecimalPlaces(digits))
 }
 
 /**
- * Link the storefront refund to the IMS refund and resolve the task, in one transaction. The IMS refund is changed only while it still has no
- * storefront refund id, and the task only while it is still open, so two racing imports cannot both win.
- * Returns false when either compare-and-set lost (a person or another import got there first): nothing is then written.
+ * What the parked row says. The figures are IMS's and the storefront's own: amounts, currency and credit note numbers. It says plainly which of the
+ * two choices to make and why: IMS cannot tell, because it writes no marker to WooCommerce.
  */
-export async function settleShopRefundTask(
+export function shopRefundParkMessage(input: { wcRefundId: number; orderCurrency: string; amountForeign: Decimal; open: OpenShopRefund[] }): string {
+  const digits = currencyMinorUnits(input.orderCurrency)
+  const amount = `${input.amountForeign.toDecimalPlaces(digits).toFixed(digits)} ${input.orderCurrency}`
+  const owed = input.open.map((o) => `${o.creditNoteNumber ?? o.refundId}: ${o.grossForeign ?? 'tax-inclusive amount unknown'} ${o.currency ?? input.orderCurrency}`).join('; ')
+  const equal = input.open.filter((o) => shopRefundAmountEquals(o, input.orderCurrency, input.amountForeign))
+  const choice = equal.length > 0
+    ? 'IMS cannot tell whether this WooCommerce refund is the payment of one of those IMS refunds, because IMS writes no marker to WooCommerce and the amount alone is not proof. '
+      + 'Look at the refund in WooCommerce, then choose one. If it is the payment IMS asked for, choose "Confirm this WooCommerce refund settles IMS refund" and name the credit note: IMS links them, resolves the task and raises no second credit note. '
+      + 'If it is a separate refund, record it as a separate refund from this row (the usual recording action): a credit note is raised for it as for any WooCommerce refund and the IMS refund stays owed.'
+    : 'None of them has this amount, so IMS cannot link this refund to any of them. Look at the refund in WooCommerce. It is a separate refund, so record it as one from this row (the usual recording action): a credit note is raised for it as for any WooCommerce refund and the IMS refunds stay owed. '
+      + 'If it was meant to pay one of them for a different amount, check the credit note and the refund first.'
+  return `WooCommerce refund ${input.wcRefundId} (${amount}) was NOT recorded and nothing was linked. This order has IMS refund(s) the shop still has to pay back in WooCommerce (${owed}). ${choice}`
+}
+
+export type ConfirmShopRefundResult =
+  | { ok: true; taskId: string; creditNoteNumber: string | null }
+  | { ok: false; error: string }
+
+/**
+ * THE OPERATOR'S "CONFIRM": this storefront refund settles that IMS refund. The caller holds the per-refund advisory lock and the order lock and runs
+ * this inside the same transaction as the park resolution and the audit entry. It re-checks everything the person looked at: the IMS refund is the
+ * one named, is on this order, still has no storefront refund id, still has an open task, and is for exactly this amount and currency. Then it sets
+ * the storefront refund id (the unique key; a clash is a refusal) and resolves the task. No credit note is raised.
+ */
+export async function confirmShopRefundSettlement(
   tx: Pick<Prisma.TransactionClient, 'wmsOperatorTask' | 'salesOrderRefund'>,
-  input: { orderId: string; taskId: string; refundId: string; wcRefundId: number; now?: Date },
-): Promise<boolean> {
-  const at = input.now ?? new Date()
-  const linked = await tx.salesOrderRefund.updateMany({
-    where: { id: input.refundId, orderId: input.orderId, externalRefundId: null },
-    data: { externalRefundId: input.wcRefundId },
-  })
-  if (linked.count === 0) return false
-  const done = await tx.wmsOperatorTask.updateMany({
-    where: { id: input.taskId, status: 'OPEN' },
-    data: { status: 'DONE', doneAt: at, doneBy: SHOP_REFUND_TASK_IMPORT_ACTOR },
-  })
-  if (done.count === 0) throw new Error('The refund task was resolved by someone else while the storefront refund was being linked; nothing was changed.')
-  return true
+  input: { orderId: string; orderCurrency: string; imsRefundId: string; wcRefundId: number; amountForeign: Decimal; userId: string; now?: Date },
+): Promise<ConfirmShopRefundResult> {
+  const open = (await findOpenShopRefunds(tx, input.orderId)).find((o) => o.refundId === input.imsRefundId)
+  if (!open) return { ok: false, error: 'That IMS refund is no longer waiting for a WooCommerce refund (it was settled, or its task was marked done). Nothing was changed.' }
+  if (!shopRefundAmountEquals(open, input.orderCurrency, input.amountForeign)) {
+    return { ok: false, error: `That IMS refund (${open.creditNoteNumber ?? open.refundId}) is not for this WooCommerce refund's amount, so it cannot be confirmed as settled by it. Nothing was changed.` }
+  }
+  const taken = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: input.wcRefundId }, select: { id: true } })
+  if (taken) return { ok: false, error: `WooCommerce refund ${input.wcRefundId} is already recorded in IMS. Nothing was changed.` }
+  const linked = await tx.salesOrderRefund.updateMany({ where: { id: input.imsRefundId, orderId: input.orderId, externalRefundId: null }, data: { externalRefundId: input.wcRefundId } })
+  if (linked.count === 0) return { ok: false, error: 'That IMS refund changed while it was being linked. Nothing was changed.' }
+  const done = await tx.wmsOperatorTask.updateMany({ where: { id: open.taskId, status: 'OPEN' }, data: { status: 'DONE', doneAt: input.now ?? new Date(), doneBy: input.userId } })
+  if (done.count === 0) throw new Error('The refund task was resolved by someone else while the WooCommerce refund was being linked; nothing was changed.')
+  return { ok: true, taskId: open.taskId, creditNoteNumber: open.creditNoteNumber }
 }

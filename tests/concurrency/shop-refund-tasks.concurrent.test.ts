@@ -9,9 +9,10 @@ import { config } from 'dotenv'
  *
  *   arm 1  an IMS refund on a WooCommerce order raises ONE task (gross, currency, credit note), once however often the writer's path is
  *          re-entered; a refund WITH a storefront refund id (WOO_SYNC) raises none, and an order with no WooCommerce link raises none
- *   arm 2  the person's later WooCommerce refund of the same amount is LINKED: no second credit note, the task resolved; ten concurrent
- *          deliveries of it still link it once and raise nothing
- *   arm 3  a refund of a different amount is NOT guessed: no credit note, no link, a QUARANTINED park with the figures, the task still open
+ *   arm 2  an EQUAL-amount WooCommerce refund is PARKED, never linked on IMS's own say-so (it cannot tell it from a separate refund): no credit
+ *          note, no link, the task still open, one park however many deliveries
+ *   arm 3  the person's CONFIRM links it: no credit note, the task and the park resolved, audited; ten concurrent confirms apply once
+ *   arm 3b a different amount cannot be confirmed; "it is a separate refund" records its own credit note and the IMS refund stays owed
  *   arm 4  a refund that began in WooCommerce (no open task) is imported exactly as before: the writer is called once
  *
  * WooCommerce and Xero are never contacted: the sync's writer is an injected double, and nothing here reaches the network.
@@ -122,47 +123,76 @@ test('an IMS refund on a WooCommerce order raises ONE task; other refunds and no
   assert.equal(await w.db.wmsOperatorTask.count({ where: { orderId: plain.orderId } }), 0)
 })
 
-test('the matching WooCommerce refund is LINKED, once, with no second credit note; ten concurrent deliveries still link it once', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
-  const w = await world()
-  const seed = await seedOrder(w, { wc: true })
-  t.after(async () => { await cleanup(w, seed); await w.db.$disconnect() })
-  const made = await imsRefund(w, seed, seed.widget)
-  assert.equal(made.success, true)
-  const { deps, calls } = syncDeps(w)
-  const wcId = 770000 + Math.floor(Math.random() * 9000)
-  const results = await Promise.all(Array.from({ length: 10 }, () => w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '120.00'), deps)))
-  assert.equal(calls.createRefund, 0, 'NO second credit note is created (a late delivery is answered by the writer\'s replay of the linked refund)')
-  assert.ok(results.every((r) => r.outcome === 'already-applied' || r.outcome === 'retryable-failure'), JSON.stringify(results))
-  assert.ok(results.some((r) => r.outcome === 'already-applied'))
-  // a settled re-delivery is the plain already-applied
-  assert.equal((await w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '120.00'), deps)).outcome, 'already-applied')
-  const refunds = await w.db.salesOrderRefund.findMany({ where: { orderId: seed.orderId }, select: { externalRefundId: true, creditNoteNumber: true, source: true } })
-  assert.equal(refunds.length, 1, 'still the one credit note')
-  assert.equal(refunds[0].externalRefundId, wcId)
-  assert.equal(refunds[0].source, 'MANUAL_UI', 'the IMS refund is linked, not replaced')
-  const task = await w.db.wmsOperatorTask.findFirstOrThrow({ where: { orderId: seed.orderId } })
-  assert.equal(task.status, 'DONE')
-  assert.equal(task.doneBy, 'system:woocommerce-refund-import')
-})
-
-test('a different amount is NOT guessed: no credit note, no link, a QUARANTINED park with both figures, the task stays open', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+test('an EQUAL-amount WooCommerce refund is PARKED, not swallowed: nothing linked, no credit note, the task stays open; redeliveries change nothing', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
   const w = await world()
   const seed = await seedOrder(w, { wc: true })
   t.after(async () => { await cleanup(w, seed); await w.db.$disconnect() })
   assert.equal((await imsRefund(w, seed, seed.widget)).success, true)
   const { deps, calls } = syncDeps(w)
-  const wcId = 660000 + Math.floor(Math.random() * 9000)
-  assert.equal((await w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '100.00'), deps)).outcome, 'quarantined-refusal')
-  assert.equal(calls.createRefund, 0)
+  const wcId = 770000 + Math.floor(Math.random() * 9000)
+  const results = await Promise.all(Array.from({ length: 10 }, () => w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '120.00'), deps)))
+  assert.ok(results.every((r) => r.outcome === 'quarantined-refusal' || r.outcome === 'handled-unapplied-resolvable'), JSON.stringify(results))
+  assert.equal(calls.createRefund, 0, 'no credit note is raised for it')
   const refunds = await w.db.salesOrderRefund.findMany({ where: { orderId: seed.orderId }, select: { externalRefundId: true } })
-  assert.deepEqual(refunds.map((r) => r.externalRefundId), [null])
-  const park = await w.db.shoppingSyncLog.findFirstOrThrow({ where: { entityId: seed.orderId, externalId: String(wcId) } })
-  assert.equal(park.status, 'QUARANTINED')
-  assert.match(park.errorMessage ?? '', /100\.00 GBP/)
-  assert.match(park.errorMessage ?? '', /120\.00 GBP/)
+  assert.deepEqual(refunds.map((r) => r.externalRefundId), [null], 'IMS never links on its own')
   assert.equal((await w.db.wmsOperatorTask.findFirstOrThrow({ where: { orderId: seed.orderId } })).status, 'OPEN')
-  // the next delivery is the held park, not a second look: still nothing created
-  assert.equal((await w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '100.00'), deps)).outcome, 'handled-unapplied-resolvable')
+  const parks = await w.db.shoppingSyncLog.findMany({ where: { entityId: seed.orderId, externalId: String(wcId) } })
+  assert.equal(parks.length, 1, 'one parked row however many deliveries')
+  assert.equal(parks[0].status, 'QUARANTINED')
+  assert.match(parks[0].errorMessage ?? '', /Confirm this WooCommerce refund settles IMS refund/)
+  assert.match(parks[0].errorMessage ?? '', /120\.00 GBP/)
+})
+
+test('CONFIRM: links the IMS refund, raises no credit note, resolves the task and the park, audits it; ten concurrent confirms apply once', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+  const w = await world()
+  const confirm = (await import('@/lib/domain/sales/shop-refund-confirm')).confirmParkedRefundSettlement
+  const seed = await seedOrder(w, { wc: true })
+  const user = await w.db.user.create({ data: { email: `sr-${randomUUID().slice(0, 8)}@example.test`, name: 'Confirmer', role: 'ADMIN', active: true, passwordHash: 'x' }, select: { id: true } })
+  t.after(async () => { await w.db.activityLog.deleteMany({ where: { entityId: seed.orderId } }).catch(() => {}); await cleanup(w, seed); await w.db.user.deleteMany({ where: { id: user.id } }).catch(() => {}); await w.db.$disconnect() })
+  const made = await imsRefund(w, seed, seed.widget)
+  assert.equal(made.success, true)
+  const imsRefundId = made.success ? made.createdRefund.id : ''
+  const { deps, calls } = syncDeps(w)
+  const wcId = 660000 + Math.floor(Math.random() * 9000)
+  assert.equal((await w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '120.00'), deps)).outcome, 'quarantined-refusal')
+  const park = await w.db.shoppingSyncLog.findFirstOrThrow({ where: { entityId: seed.orderId, externalId: String(wcId) } })
+  const results = await Promise.all(Array.from({ length: 10 }, () => confirm(w.db, { parkId: park.id, imsRefundId, userId: user.id })))
+  assert.equal(results.filter((r) => r.success).length, 1, `exactly one confirm applies: ${JSON.stringify(results.map((r) => r.success ? 'ok' : r.error))}`)
+  const refunds = await w.db.salesOrderRefund.findMany({ where: { orderId: seed.orderId }, select: { externalRefundId: true, source: true } })
+  assert.equal(refunds.length, 1, 'no second credit note')
+  assert.equal(refunds[0].externalRefundId, wcId)
+  assert.equal(refunds[0].source, 'MANUAL_UI')
+  const task = await w.db.wmsOperatorTask.findFirstOrThrow({ where: { orderId: seed.orderId } })
+  assert.equal(task.status, 'DONE')
+  assert.equal(task.doneBy, user.id)
+  assert.equal((await w.db.shoppingSyncLog.findFirstOrThrow({ where: { id: park.id } })).status, 'SYNCED')
+  assert.equal(await w.db.activityLog.count({ where: { entityId: seed.orderId, action: 'wc_refund_confirmed_settles_ims_refund' } }), 1, 'one audit entry')
+  // the sweep delivering it again: already in IMS, nothing created
+  assert.equal((await w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '120.00'), deps)).outcome, 'already-applied')
+  assert.equal(calls.createRefund, 0)
+})
+
+test('CONFIRM refuses a different amount, and "it is a separate refund" records its own credit note while the IMS refund stays owed', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+  const w = await world()
+  const confirm = (await import('@/lib/domain/sales/shop-refund-confirm')).confirmParkedRefundSettlement
+  const seed = await seedOrder(w, { wc: true })
+  t.after(async () => { await cleanup(w, seed); await w.db.$disconnect() })
+  const made = await imsRefund(w, seed, seed.widget)
+  assert.equal(made.success, true)
+  const imsRefundId = made.success ? made.createdRefund.id : ''
+  const { deps, calls } = syncDeps(w)
+  const wcId = 550000 + Math.floor(Math.random() * 9000)
+  assert.equal((await w.syncWcRefund(seed.wcOrderId, wcRefund(wcId, '100.00'), deps)).outcome, 'quarantined-refusal')
+  const park = await w.db.shoppingSyncLog.findFirstOrThrow({ where: { entityId: seed.orderId, externalId: String(wcId) } })
+  assert.match(park.errorMessage ?? '', /None of them has this amount/)
+  const refused = await confirm(w.db, { parkId: park.id, imsRefundId, userId: 'nobody' })
+  assert.equal(refused.success, false)
+  assert.equal((await w.db.salesOrderRefund.findUniqueOrThrow({ where: { id: imsRefundId } })).externalRefundId, null)
+  // "It is a separate refund": the existing recording path (the writer with the storefront id) raises its own credit note
+  const separate = await imsRefund(w, seed, seed.gadget, wcId)
+  assert.equal(separate.success, true)
+  assert.equal(await w.db.salesOrderRefund.count({ where: { orderId: seed.orderId } }), 2, 'a credit note for the separate refund')
+  assert.equal((await w.db.wmsOperatorTask.findFirstOrThrow({ where: { orderId: seed.orderId } })).status, 'OPEN', 'the IMS refund is still owed')
   assert.equal(calls.createRefund, 0)
 })
 

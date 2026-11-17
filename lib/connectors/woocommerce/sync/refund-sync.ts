@@ -15,7 +15,7 @@ import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idem
 import { REFUND_TOTAL_EPSILON } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
-import { matchWcRefundToOpenTask, settleShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
+import { findOpenShopRefunds, shopRefundParkMessage } from '@/lib/domain/sales/shop-refund-tasks'
 import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
 import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
@@ -25,14 +25,6 @@ import type { WcRefund } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
 type CreateRefundAction = typeof createRefundAction
-
-/**
- * What an operator is told when IMS will not guess which IMS refund a storefront refund settles. Nothing was recorded, so if it IS the payment of an IMS
- * refund, recording it here would raise a second credit note for money already credited: check the order's credit notes and its "Refund in WooCommerce" task first.
- */
-const REFUND_PARK_AMBIGUOUS_HINT =
-  'Check the order\'s credit notes and its "Refund in WooCommerce" task on Sync > Exceptions first. If this storefront refund pays an IMS refund, do not record it again: a second credit note would credit the same money twice. '
-  + 'If it is a separate refund that began in WooCommerce, resolve this row with the manual recording action described under parked refunds in the WooCommerce help.'
 
 export type WcRefundSyncDependencies = {
   // o3d-w00 (Codex r7 #5): the identity an ITEMISED refund line will be re-grossed under is priced by
@@ -798,64 +790,39 @@ export async function syncWcRefund(
       return { outcome: 'handled-unapplied-resolvable', error: `WooCommerce refund ${wcRefund.id} is quarantined for this order and awaits manual resolution` }
     }
 
-    // DOES THIS STOREFRONT REFUND SETTLE AN IMS REFUND THAT IS WAITING FOR IT? (the "Refund in WooCommerce" task, lib/domain/sales/shop-refund-tasks.ts)
-    // IMS wrote no refund to WooCommerce for a refund recorded in IMS; a person made it there later, under a NEW storefront refund id. This import
-    // dedups on that id alone, so without this check it would raise a SECOND credit note for money IMS already credited. On an order with no open
-    // task nothing here applies and the refund is imported exactly as before. With one: an exact fit (same order, currency and amount, an IMS refund
-    // with no storefront refund id) is LINKED to it and raises nothing; anything else is NOT guessed at: nothing is recorded and the refund is
-    // parked, QUARANTINED, with both sets of figures for a person.
-    // The cheap, unlocked read decides whether this applies at all: with no open task the import carries on untouched (a storefront id an IMS refund
-    // already holds is answered by the refund writer's own replay, under its per-refund lock). Otherwise the decision is made AGAIN, under the
-    // per-refund lock the writer and the park write also take, so two deliveries of one storefront refund cannot both match, and a delivery that lost
-    // the race sees the winner's link and answers "already in IMS" instead of parking a refund that was just settled.
+    // IS AN IMS REFUND STILL WAITING FOR ITS WOOCOMMERCE REFUND? (the "Refund in WooCommerce" task, lib/domain/sales/shop-refund-tasks.ts)
+    // IMS wrote no refund to WooCommerce for a refund recorded in IMS; a person makes it there later, under a NEW storefront refund id, and this import
+    // dedups on that id alone. But IMS writes no marker to WooCommerce either, so it cannot tell that refund from a separate one that began in
+    // WooCommerce with the same amount: it NEVER links on its own and never raises a credit note for it. On an order with an open task the storefront
+    // refund is parked QUARANTINED, with the figures, and a person chooses on the parked row: confirm it settles a named IMS refund (a link, no
+    // second credit note), or record it as a separate refund (the usual route). An order with no open task is imported exactly as before.
+    // The cheap unlocked read decides whether this applies at all; the decision is made again under the per-refund lock the writer and the park
+    // write also take, so a delivery that lost a race to a confirmation answers "already in IMS" instead of parking a refund that was just settled.
     const wcAmount = parseDecimalAbs(wcRefund.amount)
-    const unlockedMatch = await matchWcRefundToOpenTask(client, { orderId: so.id, orderCurrency: so.currency, wcRefundId: wcRefund.id, amountForeign: wcAmount })
-    if (unlockedMatch.kind !== 'none') {
-      type Decision = { kind: 'landed-here' } | { kind: 'linked'; refundId: string; taskId: string } | { kind: 'lost' } | { kind: 'ambiguous'; message: string } | { kind: 'none' }
-      let decision: Decision
-      try {
-        decision = await client.$transaction(async (tx): Promise<Decision> => {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${wcRefund.id}`}))`
-          const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
-          if (landed) return landed.orderId === so.id ? { kind: 'landed-here' } : { kind: 'none' }
-          const match = await matchWcRefundToOpenTask(tx, { orderId: so.id, orderCurrency: so.currency, wcRefundId: wcRefund.id, amountForeign: wcAmount })
-          if (match.kind !== 'matched') return match
-          const linked = await settleShopRefundTask(tx, { orderId: so.id, taskId: match.taskId, refundId: match.refundId, wcRefundId: wcRefund.id })
-          return linked ? { kind: 'linked', refundId: match.refundId, taskId: match.taskId } : { kind: 'lost' }
-        })
-      } catch (error) {
-        if (!isExternalRefundIdUniqueConflict(error)) throw error
-        return { outcome: 'retryable-failure', error: `WooCommerce refund ${wcRefund.id} was recorded by a concurrent delivery while it was being linked; it will be re-checked.` }
-      }
+    if ((await findOpenShopRefunds(client, so.id)).length > 0) {
+      type Decision = { kind: 'landed-here' } | { kind: 'park'; message: string } | { kind: 'none' }
+      const decision = await client.$transaction(async (tx): Promise<Decision> => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${wcRefund.id}`}))`
+        const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
+        if (landed) return landed.orderId === so.id ? { kind: 'landed-here' } : { kind: 'none' }
+        const open = await findOpenShopRefunds(tx, so.id)
+        if (open.length === 0) return { kind: 'none' }
+        return { kind: 'park', message: shopRefundParkMessage({ wcRefundId: wcRefund.id, orderCurrency: so.currency, amountForeign: wcAmount, open }) }
+      })
       if (decision.kind === 'landed-here') return { outcome: 'already-applied' }
-      if (decision.kind === 'lost') return { outcome: 'retryable-failure', error: `The IMS refund that WooCommerce refund ${wcRefund.id} settles changed while it was being linked; it will be re-checked.` }
-      if (decision.kind === 'linked') {
+      if (decision.kind === 'park') {
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: decision.message, payload: wcRefund })
         await writeActivity({
           entityType: 'SALES_ORDER',
           entityId: so.id,
-          action: 'refund_sync_linked_to_ims_refund',
-          tag: 'sync',
-          level: 'INFO',
-          description: `WooCommerce refund ${wcRefund.id} settles an IMS refund that was waiting for it. It was linked to that credit note, no second credit note was raised, and the Refund in WooCommerce task was marked done.`,
-          metadata: { externalRefundId: wcRefund.id, imsRefundId: decision.refundId, taskId: decision.taskId },
-          resolveUser: false,
-        })
-        return { outcome: 'already-applied' }
-      }
-      if (decision.kind === 'ambiguous') {
-        const message = `WooCommerce refund ${wcRefund.id} was NOT recorded, so no second credit note was raised: ${decision.message} ${REFUND_PARK_AMBIGUOUS_HINT}`
-        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: message, payload: wcRefund })
-        await writeActivity({
-          entityType: 'SALES_ORDER',
-          entityId: so.id,
-          action: 'refund_sync_ambiguous_ims_refund_match',
+          action: 'refund_sync_awaits_ims_refund_confirmation',
           tag: 'sync',
           level: 'WARNING',
-          description: message,
+          description: decision.message,
           metadata: { externalRefundId: wcRefund.id },
           resolveUser: false,
         })
-        return { outcome: 'quarantined-refusal', error: message }
+        return { outcome: 'quarantined-refusal', error: decision.message }
       }
       // 'none': under the lock no task is open any more (a person resolved it): the import below runs as it always did.
     }

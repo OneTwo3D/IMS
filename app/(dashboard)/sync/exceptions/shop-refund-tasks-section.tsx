@@ -42,7 +42,7 @@ export function ShopRefundTasksSection({ data }: { data: ShopRefundTaskPage }) {
         <h2 className="text-sm font-semibold">{`Refund in WooCommerce (${total})`}</h2>
         <p className="text-xs text-muted-foreground">
           IMS recorded these refunds and credit notes and has written nothing to WooCommerce: no refund, no status change, no note. Refund the customer in WooCommerce for the amount shown.
-          When that refund is imported, IMS links it to the credit note (it raises no second credit note) and resolves the task. If the amount differs, IMS will not match it and will list it under parked refunds for you to look at.
+          When that refund is imported, IMS lists it under parked refunds: it cannot tell it from a separate refund, because it writes no marker to WooCommerce. There, confirm that it settles the credit note (IMS links it, raises no second credit note and resolves this task) or record it as a separate refund.
           Press Done only if no refund is to be made there. Your name and the time are recorded.
         </p>
       </div>

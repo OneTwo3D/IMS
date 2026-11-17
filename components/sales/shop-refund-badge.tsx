@@ -9,7 +9,7 @@ export function ShopRefundBadge({ view }: { view: ShopRefundBadgeView }) {
   return (
     <span
       className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-900 dark:text-amber-100"
-      title="IMS recorded a refund on this order and wrote nothing to WooCommerce. Refund the customer in WooCommerce; IMS matches that refund to its credit note when it is imported. See Sync > Exceptions."
+      title="IMS recorded a refund on this order and wrote nothing to WooCommerce. Refund the customer in WooCommerce; when IMS imports it, it is parked for you to confirm it settles the credit note. See Sync > Exceptions."
       data-shop-refund-due
     >
       {`Refund to make in WooCommerce${view.count > 1 ? ` x${view.count}` : ''}${amounts}`}
