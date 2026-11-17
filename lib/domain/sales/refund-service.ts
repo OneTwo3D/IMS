@@ -70,14 +70,13 @@ import {
   assertedJournalRemedy,
   cappedAllocationCredit,
   describeJournalRowState,
-  extractPayloadNetMovement,
   isAssertedJournalRefusal,
   journalRowProvesAmount,
-  payloadLinesLegible,
   proveAllocationDebitPosting,
   proveJournalPosting,
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
+import { journalNetMovement, journalNetsReadable } from '@/lib/domain/accounting/journal-account-nets'
 import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { findDurableShadowRecords, shadowRecordNamesSyncLog } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -1754,6 +1753,7 @@ async function stageRefundAccountingReversals(
         referenceType: true,
         referenceId: true,
         payload: true,
+        payloadAccountNets: true,
         ...LEDGER_STANDING_SELECT,
       },
     })
@@ -2037,7 +2037,7 @@ async function stageRefundAccountingReversals(
     const priorUnearnedReversedRows = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
     const priorUnearnedReversed = priorUnearnedReversedRows
-      .reduce((sum, row) => sum + extractPayloadNetMovement(row.payload, settings.unearnedRevenueAccount, 'debit'), 0)
+      .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
     // o3d-3la07 (M7, REPORT-ONLY - the arithmetic above is unchanged). An UNEARNED_REV_REVERSAL that an
     // operator settled as posted still reduces the unearned revenue this refund may reverse (the
     // reversal is claimed to exist, so counting it errs towards under-reversing), but its figure is the
@@ -2211,7 +2211,7 @@ async function stageRefundAccountingReversals(
       }
       const journal = await tx.accountingSyncLog.findUnique({
         where: { id: record.syncLogId },
-        select: { connector: true, payload: true, ...LEDGER_STANDING_SELECT },
+        select: { connector: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
       })
       // Deleted by retention once terminal: read as the recorded amount, the least destructive of
       // the two readings left — but ASSUMED, not proved (o3d-o97 r6). Retention deletes SYNCED and
@@ -2312,7 +2312,7 @@ async function stageRefundAccountingReversals(
         priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS did not verify it against the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
         continue
       }
-      priorRefundAllocationRelief += extractPayloadNetMovement(row.payload, settings.allocatedInventoryAccount, 'credit')
+      priorRefundAllocationRelief += journalNetMovement(row, settings.allocatedInventoryAccount, 'credit') ?? 0
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
       // (1) THE RECORD the refund wrote when it decided its own reversal — RESOLVED, not trusted.
@@ -2495,7 +2495,7 @@ async function stageRefundAccountingReversals(
       const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
       // Read only when `unsettled` is empty (below), i.e. when EVERY row proves an amount, so no further
       // settled-ness filter is needed (one would be unobservable, and a second spelling of the rule).
-      const legible = reversalRows.filter((row) => payloadLinesLegible(row.payload))
+      const legible = reversalRows.filter((row) => journalNetsReadable(row))
       if (unsettled.length > 0) {
         // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
         // in-flight or abandoned reversal is pounds that may or may not have moved, and either

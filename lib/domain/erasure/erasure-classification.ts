@@ -193,7 +193,7 @@ ERASURE_CLASSIFICATION.ShoppingSyncLog = {
 // The contact block of a payload is scrubbed by derived-copies.ts / erase-personal-data.ts (email always; name kept only where the copy may describe a posted, retained document).
 ERASURE_CLASSIFICATION.AccountingSyncLog = {
   erased: ['payload', 'errorMessage'],
-  notPersonal: ['connector', 'referenceType', 'referenceId', 'settlementBasis', 'connectionProvenance', 'createDispatchIdempotencyKey', 'followUpObligations'],
+  notPersonal: ['connector', 'referenceType', 'referenceId', 'settlementBasis', 'connectionProvenance', 'createDispatchIdempotencyKey', 'followUpObligations', 'payloadAccountNets'],
   retained: {
     externalTransactionId: 'the ledger document id reconciles the posted document',
     attemptedInvoiceNumber: 'the invoice number is part of the retained invoice record',

@@ -3268,6 +3268,23 @@ model AccountingSyncLog {
   /// warning is noise, an under-broad one loses a payment in silence.
   followUpObligations Json? @map("follow_up_obligations")
 
+  /// o3d-oyur — THE PER-ACCOUNT NET A JOURNAL MOVED, kept when retention drops its payload.
+  ///
+  /// The A2 posting proof asks ONE question of a journal: the NET movement of one account code in one
+  /// direction. Compaction empties `payload`, which used to leave an old journal permanently unprovable
+  /// (the proof fails closed). Compaction now writes this column in the SAME statement that empties the
+  /// payload, for the journal-carrying types only, and the proof reads it once the lines are gone:
+  /// `{ "version": 1, "accounts": { "<code>": { "credit": n, "debit": n } } }`, each figure the value
+  /// `extractPayloadNetMovement` returns for that account and direction. Account codes and two totals
+  /// each: no names, references, descriptions or addresses, so it is not personal data and may outlive
+  /// the payload.
+  ///
+  /// NULL is NO RECORD, not zero: every row compacted before this column existed (the payload it would
+  /// be derived from is gone, and there is no backfill), every row that was never compacted (its payload
+  /// is still the authority) and every non-journal type. A reader treats an absent or malformed value as
+  /// unreadable and the proof fails closed.
+  payloadAccountNets Json? @map("payload_account_nets")
+
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
 

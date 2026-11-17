@@ -2351,6 +2351,27 @@ to erase, and the warning is raised only for what that record names. Two consequ
 - a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
   the intended outcome, not a missing alarm: there was nothing to lose.
 
+**A compacted journal keeps the per-account net the reversal proof needs.** Before IMS reverses
+Allocated Inventory for a refund or a cancelled order it proves, from the journal's own lines, that the
+Group A2 debit really reached that account and that this order's share fits inside it. The only thing
+that proof asks of the lines is the **net movement of one account in one direction**. When retention
+compacts a daily-batch journal, a reversal journal or another journal row, it now writes that net, per
+account, onto the row in the same step that clears the payload (account codes and two totals each, no
+names or descriptions), and the proof reads it once the lines are gone. The result is the same figure the
+full payload would have given, so an old journal stays provable for ever and the reversal is raised
+automatically instead of waiting for you to post it by hand. Three things to know:
+
+- A journal whose payload **cannot be read** is not compacted at all. It keeps its payload, and the
+  retention run reports it in the Data retention activity entry ("left uncompacted because their payload
+  could not be summarised").
+- A journal compacted **before this shipped** has neither lines nor a net, and there is no way to give it
+  one (the payload it would be derived from is gone, and no backfill is run). It stays unprovable: the
+  automatic reversal or refund credit is refused with "its lines are no longer readable", and the credit
+  is posted by hand as before. The summary never lowers the bar: a share larger than the summarised debit,
+  a zero debit or a different account is refused exactly as it is for the full payload.
+- The summary is only used while the payload is gone. A row that still has its lines is always read from
+  them.
+
 A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
 against — recorded in a column retention does not touch — so it can be posted. Before, it was queued
 carrying nothing and refused at the socket, which meant the PDF the table promised never actually
