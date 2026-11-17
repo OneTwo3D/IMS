@@ -9,6 +9,7 @@ import { parseCsv } from '../../lib/csv.ts'
 
 let definitions: Array<Record<string, unknown>> = []
 let values: Array<Record<string, unknown>> = []
+let afterProductQuery: ((n: number) => void) | null = null
 let catalogue: Array<ReturnType<typeof product>> = []
 const calls = { products: 0, definitions: 0, values: 0, valueIdBatchSizes: [] as number[], valueWhereUnbounded: 0 }
 
@@ -23,11 +24,13 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       product: {
-        findMany: async (args: { where?: { sku?: { gt: string } }; take?: number }) => {
+        findMany: async (args: { where?: { id?: { gt: string } }; take?: number }) => {
           calls.products += 1
-          const after = args.where?.sku?.gt
-          const rows = catalogue.filter((p) => after === undefined || p.sku > after).sort((a, b) => (a.sku < b.sku ? -1 : 1))
-          return rows.slice(0, args.take ?? rows.length)
+          const after = args.where?.id?.gt
+          const rows = catalogue.filter((p) => after === undefined || p.id > after).sort((a, b) => (a.id < b.id ? -1 : 1))
+          const page = rows.slice(0, args.take ?? rows.length).map((p) => ({ ...p }))
+          afterProductQuery?.(calls.products)
+          return page
         },
       },
       customFieldDefinition: { findMany: async (args: { where: { active: boolean } }) => { calls.definitions += 1; return definitions.filter((d) => d.active === args.where.active) } },
@@ -60,6 +63,7 @@ const d = (over: Record<string, unknown>) => ({ entity: 'PRODUCT', namespace: 'l
 
 function reset() {
   catalogue = [product('p1', 'AAA'), product('p2', 'BBB')]
+  afterProductQuery = null
   calls.products = 0; calls.definitions = 0; calls.values = 0; calls.valueIdBatchSizes = []; calls.valueWhereUnbounded = 0
 }
 
@@ -104,17 +108,40 @@ test('MEMORY AND QUERIES ARE BOUNDED: a large catalogue is read in batches of 50
   definitions = [d({ id: 'dA', key: 'hazard', label: 'Hazard', type: 'STRING' }), d({ id: 'dB', key: 'zone', label: 'Zone', type: 'STRING' })]
   values = []
   reset()
-  catalogue = Array.from({ length: 1201 }, (_, i) => product(`p${i}`, `SKU${String(i).padStart(5, '0')}`))
+  catalogue = Array.from({ length: 1201 }, (_, i) => product(`p${String(i).padStart(5, '0')}`, `SKU${String(i).padStart(5, '0')}`))
   for (const p of catalogue) values.push({ definitionId: 'dA', productId: p.id, valueText: `h-${p.sku}`, valueDecimal: null, valueBoolean: null, valueDate: null, valueDateTime: null, valueJson: null })
   const response = await GET(new Request('http://localhost/api/export/products'))
   const rows = parseCsv(await response.text())
   assert.equal(rows.length, 1201, 'every product is exported exactly once, in sku order')
-  assert.deepEqual(rows.map((r) => r.sku), [...rows.map((r) => r.sku)].sort())
-  assert.equal(rows[1200]!['cf:hazard'], 'h-SKU01200')
-  assert.equal(rows[0]!['cf:zone'], '')
+  assert.equal(new Set(rows.map((r) => r.productId)).size, 1201)
+  assert.equal(rows.find((r) => r.sku === 'SKU01200')!['cf:hazard'], 'h-SKU01200')
+  assert.equal(rows.find((r) => r.sku === 'SKU00000')!['cf:zone'], '')
+  for (let from = 0; from < rows.length; from += 500) {
+    const skus = rows.slice(from, from + 500).map((r) => r.sku)
+    assert.deepEqual(skus, [...skus].sort(), 'sku order holds inside each batch')
+  }
   assert.equal(calls.products, 3, 'three product batches (500, 500, 201), not one per product')
   assert.equal(calls.values, 3, 'one values query per batch')
   assert.equal(calls.valueWhereUnbounded, 0, 'no values query is ever unbounded by product')
   assert.deepEqual(calls.valueIdBatchSizes, [500, 500, 201])
   assert.equal(calls.definitions, 1)
+})
+
+test('REGRESSION: a SKU edit between batches neither skips nor duplicates a product (paging is on the immutable id)', async () => {
+  definitions = []
+  values = []
+  reset()
+  catalogue = Array.from({ length: 1201 }, (_, i) => product(`p${String(i).padStart(5, '0')}`, `SKU${String(i).padStart(5, '0')}`))
+  // After the first batch is read: one already-exported product is renamed to sort LAST, and one not-yet-exported product is renamed to sort FIRST.
+  // A sku cursor would then repeat the first and skip the second.
+  afterProductQuery = (n) => {
+    if (n !== 1) return
+    catalogue.find((p) => p.id === 'p00000')!.sku = 'ZZZ-RENAMED-LATE'
+    catalogue.find((p) => p.id === 'p01200')!.sku = 'AAA-RENAMED-EARLY'
+  }
+  const rows = parseCsv(await (await GET(new Request('http://localhost/api/export/products'))).text())
+  const ids = rows.map((r) => r.productId)
+  assert.equal(rows.length, 1201)
+  assert.equal(new Set(ids).size, 1201, 'no product twice')
+  assert.deepEqual([...ids].sort(), catalogue.map((p) => p.id).sort(), 'no product missing')
 })
