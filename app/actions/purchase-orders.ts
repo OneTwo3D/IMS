@@ -1,6 +1,6 @@
 'use server'
 
-import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
+import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -2162,10 +2162,24 @@ export async function updatePurchaseOrder(
         await tx.purchaseOrder.update({ where: { id }, data: CLEARED_APPROVAL })
         approvalCleared = true
       }
+      // An order whose creator was never recorded takes the editor as its recorded maker, which is what lets approval proceed (by someone else).
+      await tx.purchaseOrder.updateMany({ where: { id, createdById: null }, data: { createdById: session.user.id } })
       return { po: approvalCleared ? { ...po, ...CLEARED_APPROVAL } : po, approvalCleared }
     }, STOCK_TX_OPTIONS)
     if ('refused' in edit) return { success: false, error: edit.refused }
     const po = edit.po
+    if (!['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED'].includes(existing.status)) {
+      // The supplier may already hold the earlier version (or an email for it may be in flight): say so on the order.
+      try {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER', entityId: id, action: 'edited_after_send', tag: 'purchase', level: 'WARNING',
+          description: `PO ${po.reference} was edited after it was sent to the supplier (status ${existing.status}): the supplier's copy may differ from this version`,
+          metadata: { reference: po.reference, status: existing.status },
+        })
+      } catch (logError) {
+        console.error('Failed to log PO edit after send:', logError)
+      }
+    }
     if (edit.approvalCleared) {
       try {
         await logActivity({
@@ -2479,8 +2493,10 @@ export async function approvePurchaseOrder(id: string): Promise<{ success: boole
       const state = evaluatePoApproval(po, threshold)
       if (!state.required) return { refused: 'This purchase order does not need approval.' }
       if (state.approved) return { alreadyApproved: true as const, reference: po.reference }
-      // An order with no stored creator (imported, or created before the column existed) is attributed from the activity log's create entry.
-      const creatorId = po.createdById ?? (await tx.activityLog.findFirst({ where: { entityType: 'PURCHASE_ORDER', entityId: id, action: 'created' }, orderBy: { createdAt: 'asc' }, select: { userId: true } }))?.userId ?? null
+      // An order with no stored creator (imported, or created before the column existed) is attributed from the activity log's create entry. If the
+      // creator still cannot be established, self-approval cannot be ruled out, so the order is refused until someone re-saves it (see below).
+      const creatorId = po.createdById ?? (await tx.activityLog.findFirst({ where: { entityType: 'PURCHASE_ORDER', entityId: id, action: 'created', userId: { not: null } }, orderBy: { createdAt: 'asc' }, select: { userId: true } }))?.userId ?? null
+      if (!creatorId) return { refused: PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE }
       if (approverIsRequester(creatorId, session.user.id)) return { refused: PO_APPROVAL_SELF_MESSAGE }
       const approvedTotalBase = approvalSpendBase(po)
       await tx.purchaseOrder.update({

@@ -276,6 +276,28 @@ test('concurrency: an approval racing an edit never leaves an approval that does
   void db
 })
 
+test('an order whose creator cannot be established is refused; once re-saved the editor is its maker and another approver can approve', SKIP, async () => {
+  const { approvePurchaseOrder, updatePurchaseOrder } = await actions()
+  const { db } = await import('@/lib/db')
+  await setThreshold('100')
+  const po = await draft('ap-unknowncreator', 30)
+  await db.activityLog.deleteMany({ where: { entityType: 'PURCHASE_ORDER', entityId: po.poId, action: 'created' } })
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { createdById: null } })
+  for (const [id, role] of [['approver-1', 'MANAGER'], ['maker-1', 'ADMIN']] as const) {
+    as(id, role)
+    const refused = await approvePurchaseOrder(po.poId)
+    assert.equal(refused.success, false, id)
+    assert.match(refused.error ?? '', /creator of this purchase order is not recorded/)
+  }
+  as('maker-1', 'MANAGER')
+  assert.equal((await updatePurchaseOrder(po.poId, editQty(po, 30))).success, true)
+  assert.equal((await row(po.poId)).createdById, 'maker-1', 'the re-save recorded the editor')
+  as('maker-1', 'ADMIN')
+  assert.match((await approvePurchaseOrder(po.poId)).error ?? '', /you cannot approve it/)
+  as('approver-1', 'MANAGER')
+  assert.equal((await approvePurchaseOrder(po.poId)).success, true)
+})
+
 test('an order with no stored creator is attributed from the activity log: its creator cannot approve it, another approver can', SKIP, async () => {
   const { approvePurchaseOrder } = await actions()
   const { db } = await import('@/lib/db')
@@ -300,7 +322,7 @@ test('an order with no stored creator is attributed from the activity log: its c
   }
 })
 
-test('delivery guard: refuses a send whose approval no longer covers the order, and an approval-clearing edit waits for a send in flight', SKIP, async () => {
+test('delivery guard: refuses a send whose approval no longer covers the order, and an edit during a send is not blocked but is flagged', SKIP, async () => {
   const { approvePurchaseOrder, updatePurchaseOrder } = await actions()
   const { purchaseOrderSendGuardFor } = await import('@/lib/purchase-order-email')
   const { db } = await import('@/lib/db')
@@ -320,24 +342,21 @@ test('delivery guard: refuses a send whose approval no longer covers the order, 
     const ok = await purchaseOrderSendGuardFor(po.poId)(async () => { sends += 1; return 'sent' })
     assert.ok('value' in ok && ok.value === 'sent')
 
-    // An edit that would clear the approval cannot slip in while the send is in flight: it queues behind the guard's share lock.
+    // The guard does not hold the order across the send: an approval-clearing edit is NOT blocked by a send in flight (a slow mail server must
+    // not make edits time out). The send already past its check completes; the edit is flagged "sent before change", and the next send is refused.
+    await db.purchaseOrder.update({ where: { id: po.poId }, data: { status: 'PO_SENT', poSentAt: new Date() } })
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
     let entered!: () => void
     const inside = new Promise<void>((resolve) => { entered = resolve })
     const guarded = purchaseOrderSendGuardFor(po.poId)(async () => { entered(); await gate; return 'sent-late' })
     await inside
-    const probe = await rawSession()
-    try {
-      const edit = updatePurchaseOrder(po.poId, editQty(po, 40))
-      await waitForBlocked(probe, 1)
-      release()
-      const outcome = await guarded
-      assert.ok('value' in outcome && outcome.value === 'sent-late', 'the send that was past its check completes')
-      assert.equal((await edit).success, true)
-    } finally {
-      await probe.end()
-    }
+    const edit = await updatePurchaseOrder(po.poId, editQty(po, 40))
+    assert.equal(edit.success, true, String(edit.error))
+    release()
+    const outcome = await guarded
+    assert.ok('value' in outcome && outcome.value === 'sent-late', 'the send that was past its check completes')
+    assert.ok(await db.activityLog.findFirst({ where: { entityType: 'PURCHASE_ORDER', entityId: po.poId, action: 'edited_after_send' } }), 'the edit is flagged as made after the send')
     assert.equal((await row(po.poId)).approvedAt, null, 'the edit then cleared the approval')
     const after = await purchaseOrderSendGuardFor(po.poId)(async () => { sends += 1; return 'sent' })
     assert.ok('refused' in after, 'the next delivery attempt is refused')

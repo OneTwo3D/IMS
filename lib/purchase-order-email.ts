@@ -86,26 +86,32 @@ export async function purchaseOrderSendGuard<T>(send: () => Promise<T>): Promise
 }
 
 /**
- * The delivery guard for ONE order: the switch check above, plus the approval check made inside the same transaction under a SHARE lock on the
- * order's row. An edit (which takes the row FOR UPDATE) that raises the total or moves the supplier or currency therefore either committed before
- * this check (and the send is refused as unapproved) or waits until the send has returned. Without this, an edit could clear the approval between
- * building the email and handing it to SMTP.
+ * The delivery guard for ONE order: the approval check, then the switch check and the send under the send lock.
+ *
+ * THE APPROVAL CHECK DOES NOT HOLD THE ORDER'S ROW ACROSS SMTP. A send can take up to the 60 s deadline, and holding a row lock that long would
+ * make every edit, receipt and status change on the order time out behind a slow mail server. So the check is its own SHORT transaction (a
+ * share lock on the row, released at commit, immediately before the send starts): it re-reads the order and compares it with the approval
+ * snapshot stored on the order itself (ex-VAT base total, supplier, currency, approvedAt), exactly as the send paths do.
+ *
+ * THE REMAINING WINDOW is the time between that commit and SMTP accepting the message (normally milliseconds). An edit that lands inside it
+ * clears the approval but cannot stop a message already being handed over. That is accepted and made visible instead: an edit to an order
+ * that has already been sent writes an `edited_after_send` warning to the order's activity ("sent before change"), and the next send of the
+ * order is refused until it is approved again.
  */
 export function purchaseOrderSendGuardFor(poId: string) {
   return async function guard<T>(send: () => Promise<T>): Promise<GuardOutcome<T>> {
-    return runUnderPoEmailSendLock(db, send, {
-      approvalCheck: async (tx) => {
-        const t = tx as unknown as Parameters<typeof assertPoApprovedForSend>[0] & { $queryRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown> }
-        await t.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR SHARE`
-        try {
-          await assertPoApprovedForSend(t, poId)
-        } catch (e) {
-          if (e instanceof PoApprovalRequiredError) return `Not sent: ${e.message}`
-          throw e
-        }
-        return null
-      },
-    })
+    const refusal = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR SHARE`
+      try {
+        await assertPoApprovedForSend(tx, poId)
+      } catch (e) {
+        if (e instanceof PoApprovalRequiredError) return `Not sent: ${e.message}`
+        throw e
+      }
+      return null
+    }, { timeout: 15_000, maxWait: 15_000 })
+    if (refusal) return { refused: refusal }
+    return runUnderPoEmailSendLock(db, send)
   }
 }
 
@@ -117,7 +123,7 @@ type LockableClient = {
 export async function runUnderPoEmailSendLock<T>(
   client: unknown,
   send: () => Promise<T>,
-  options: { backstopMs?: number; approvalCheck?: (tx: unknown) => Promise<string | null> } = {},
+  options: { backstopMs?: number } = {},
 ): Promise<GuardOutcome<T>> {
   let answered: GuardOutcome<T> | null = null
   try {
@@ -125,10 +131,6 @@ export async function runUnderPoEmailSendLock<T>(
       await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE}::int4, 0::int4)`
       const row = await tx.setting.findUnique({ where: { key: PO_EMAIL_SETTING_KEY }, select: { value: true } })
       if (row?.value !== 'true') return { refused: PO_EMAIL_DISABLED_REASON } as GuardOutcome<T>
-      if (options.approvalCheck) {
-        const approvalRefusal = await options.approvalCheck(tx)
-        if (approvalRefusal) return { refused: approvalRefusal } as GuardOutcome<T>
-      }
       let timer: ReturnType<typeof setTimeout> | undefined
       const sending = send()
       const raced = await Promise.race([

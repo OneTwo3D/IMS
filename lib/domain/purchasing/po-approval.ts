@@ -26,6 +26,9 @@ export const PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL: readonly string[] = ['DRAFT
 export const PO_APPROVAL_REQUIRED_MESSAGE =
   'This purchase order needs approval before it can be sent to the supplier. Ask a user with the purchase approval permission (not the order\'s creator) to approve it.'
 
+export const PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE =
+  'The creator of this purchase order is not recorded, so it cannot be approved yet. Open it, choose Edit and Save once to record who handled it; another approver can then approve it.'
+
 export const PO_APPROVAL_SELF_MESSAGE = 'You created this purchase order, so you cannot approve it. Ask another approver.'
 
 const MONEY_DP = 4
