@@ -12,7 +12,8 @@ import {
   type ReplenishmentReportDeps,
 } from '@/lib/domain/inventory/replenishment-reports'
 import { DEFAULT_PROJECTION_HORIZON_DAYS, projectStockPosition } from '@/lib/domain/inventory/reorder-timing'
-import { calculateDailyVelocity } from '@/lib/domain/inventory/velocity'
+import { calculateDailyVelocity, calculateStockoutAdjustedVelocity } from '@/lib/domain/inventory/velocity'
+import { MAX_STOCKOUT_WINDOW_DAYS, getStockoutHistory, type StockoutHistory } from '@/lib/domain/inventory/stockout-history'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 
 /**
@@ -21,8 +22,9 @@ import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position
  * contradict it), the history from the same SALE_DISPATCH loader, the curve from `projectStockPosition`
  * and the arrivals from the same dated open-PO lines.
  *
- * Not in this version (blocked on the stockout-aware demand work, o3d-s8n.3): the historical stock-position
- * line and the stockout / uncovered week shading. The chart says so rather than drawing a guess.
+ * History weeks also carry the daily-snapshot stock position and a three-state stockout verdict
+ * (o3d-s8n.3, getStockoutHistory): stockout, in stock, or UNKNOWN (no snapshot run that day). Unknown is
+ * its own state and is never drawn as in stock.
  */
 
 const MAX_FORECAST_WEEKS = 52
@@ -47,6 +49,21 @@ export type ReorderDemandChartWeek = {
   /** The suggested reorder quantity, plotted once at the required-receipt week. A series distinct from inboundQty. */
   requiredReceiptQty: number | null
   isFirstShortageWeek: boolean
+  /**
+   * History weeks only (null on forecast weeks): on-hand quantity at the end of the last snapshot-covered
+   * day of the week (daily inventory snapshots, summed over the scoped warehouses). Null when no day of
+   * the week is covered. A different measure from stockPositionQty, which is projected AVAILABLE stock.
+   */
+  historicalStockQty: number | null
+  /** History weeks only: days of the week (inside the history window, up to today) per state. */
+  stockoutDays: number | null
+  inStockDays: number | null
+  unknownDays: number | null
+  /**
+   * stockout: at least one covered day had no stock. unknown: no day was covered. partly_unknown: no
+   * stockout, but some days were not covered. in_stock: every day covered and in stock. Null on forecast weeks.
+   */
+  stockState: 'stockout' | 'unknown' | 'partly_unknown' | 'in_stock' | null
 }
 
 export type ReorderDemandChart = {
@@ -79,12 +96,26 @@ export type ReorderDemandChart = {
   openingQty: number
   /** False when there are no SALE_DISPATCH rows in the history window. */
   hasHistory: boolean
+  /** The Ignore stockouts toggle: averageDailyDemand excludes stockout days from the average. */
+  ignoreStockouts: boolean
+  /** Snapshot coverage over the history window (and the demand window when it reaches further back). */
+  stockout: {
+    firstCoveredDate: string | null
+    coveredDays: number
+    unknownDays: number
+    stockoutDays: number
+    /** Stockout days inside the demand window (what Ignore stockouts removes from the denominator). */
+    demandWindowStockoutDays: number
+    demandWindowDays: number
+    /** The 90% guard refused the adjustment. */
+    clamped: boolean
+  }
   notices: string[]
 }
 
 export type ReorderDemandChartFilters = Pick<
   StockPositionFilters,
-  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks'
+  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'ignoreStockouts'
 >
 
 type ChartClient = ReplenishmentReportClient & {
@@ -94,6 +125,10 @@ type ChartClient = ReplenishmentReportClient & {
 export type ReorderDemandChartDeps = {
   client?: ChartClient
   now?: () => Date
+  /** Defaults to the database (daily inventory snapshots). */
+  loadStockoutHistory?: (input: { productId: string; warehouseId?: string; dateFrom: string; dateTo: string }) => Promise<StockoutHistory>
+  loadStockoutDayCounts?: ReplenishmentReportDeps['loadStockoutDayCounts']
+  loadSnapshotCoverage?: ReplenishmentReportDeps['loadSnapshotCoverage']
 }
 
 export type GetReorderDemandChartInput = {
@@ -128,7 +163,13 @@ function num(value: Prisma.Decimal | string): number {
 export async function getReorderDemandChart(input: GetReorderDemandChartInput): Promise<ReorderDemandChart | null> {
   const filters = input.filters ?? {}
   const now = input.deps?.now?.() ?? new Date()
-  const reportDeps: ReplenishmentReportDeps = { client: input.deps?.client, now: () => now }
+  const reportDeps: ReplenishmentReportDeps = {
+    client: input.deps?.client,
+    now: () => now,
+    loadStockoutDayCounts: input.deps?.loadStockoutDayCounts,
+    loadSnapshotCoverage: input.deps?.loadSnapshotCoverage,
+  }
+  const ignoreStockouts = filters.ignoreStockouts === true
 
   const demandDays = positiveInt(filters.thresholdDays) ?? DEFAULT_DEMAND_WINDOW_DAYS
   const targetCoverWeeks = Math.min(MAX_TARGET_COVER_WEEKS, positiveInt(filters.targetCoverWeeks) ?? DEFAULT_TARGET_COVER_WEEKS)
@@ -142,6 +183,7 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     thresholdDays: demandDays,
     targetCoverWeeks,
     includeZero: true,
+    ...(ignoreStockouts ? { ignoreStockouts: true } : {}),
   }
   const report = await getReorderReport(planFilters, { paginate: false, deps: reportDeps })
   const row = report.rows.find((candidate) => candidate.productId === input.productId)
@@ -159,12 +201,34 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
   const todayStr = dateOnly(today)
   const historyFrom = addDays(today, -(historyDays - 1))
 
+  // Stockout history over whichever is longer, the chart's history or the demand window.
+  const demandFrom = addDays(today, -(demandDays - 1))
+  const stockoutFrom = demandFrom.getTime() < historyFrom.getTime() ? demandFrom : historyFrom
+  const loadStockoutHistory = input.deps?.loadStockoutHistory ?? ((args) => getStockoutHistory(args))
+  const stockoutHistory = await loadStockoutHistory({
+    productId: input.productId,
+    warehouseId: filters.warehouseId,
+    dateFrom: dateOnly(stockoutFrom),
+    dateTo: todayStr,
+  })
+  const demandFromStr = dateOnly(demandFrom)
+  const demandWindowStockoutDays = stockoutHistory.days.filter((day) => day.stockout && day.date >= demandFromStr).length
+
   // Demand rate: the exact figure getReorderReport used (same window, same rows), not its 4dp string.
-  const velocity = calculateDailyVelocity(sources.sales, {
-    dateFrom: addDays(today, -(demandDays - 1)),
-    dateTo: sources.window.dateTo,
-  }).find((entry) => entry.productId === input.productId)
+  const velocityWindow = { dateFrom: demandFrom, dateTo: sources.window.dateTo }
+  // Beyond MAX_STOCKOUT_WINDOW_DAYS the report refuses the adjustment, so the chart does too.
+  // It also refuses when the report's aggregate was refused (too many snapshot rows): the report row then
+  // carries no adjustment although the history shows stockout days.
+  const adjustDemand = ignoreStockouts && demandDays <= MAX_STOCKOUT_WINDOW_DAYS
+    && (demandWindowStockoutDays === 0 || row.stockoutAdjustment != null)
+  const velocity = adjustDemand
+    ? calculateStockoutAdjustedVelocity(sources.sales, velocityWindow, new Map([[input.productId, demandWindowStockoutDays]]))
+      .find((entry) => entry.productId === input.productId)
+    : calculateDailyVelocity(sources.sales, velocityWindow).find((entry) => entry.productId === input.productId)
   const averageDailyDemand = toDecimal(velocity?.dailyQtyVelocity ?? 0)
+  const demandClamped = adjustDemand && velocity != null && 'clamped' in velocity && velocity.clamped === true
+  const stockoutByDate = new Map(stockoutHistory.days.map((day) => [day.date, day]))
+  const historyFromStr = dateOnly(historyFrom)
 
   // History buckets: the Mondays covering the history window up to and including this week.
   const currentWeek = isoWeekStart(today)
@@ -219,6 +283,28 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     const isHistory = weekStart.getTime() <= currentWeek.getTime()
     const endQty = weekStart.getTime() >= currentWeek.getTime() ? qtyByDate.get(dateOnly(addDays(weekStart, 6))) : undefined
     const inbound = inboundByWeek.get(key)
+    let stockoutDays: number | null = null
+    let inStockDays: number | null = null
+    let unknownDays: number | null = null
+    let historicalStockQty: number | null = null
+    let stockState: ReorderDemandChartWeek['stockState'] = null
+    if (isHistory) {
+      stockoutDays = 0
+      inStockDays = 0
+      unknownDays = 0
+      for (let offset = 0; offset < 7; offset += 1) {
+        const date = dateOnly(addDays(weekStart, offset))
+        if (date < historyFromStr || date > todayStr) continue
+        const day = stockoutByDate.get(date)
+        if (!day || !day.covered) unknownDays += 1
+        else {
+          if (day.stockout) stockoutDays += 1
+          else inStockDays += 1
+          historicalStockQty = day.qty
+        }
+      }
+      stockState = stockoutDays > 0 ? 'stockout' : inStockDays === 0 ? 'unknown' : unknownDays > 0 ? 'partly_unknown' : 'in_stock'
+    }
     weeks.push({
       weekStart: key,
       kind: isHistory ? 'history' : 'forecast',
@@ -229,6 +315,11 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
       inboundQty: inbound ? num(inbound) : 0,
       requiredReceiptQty: requiredReceiptWeek === key ? num(row.suggestedReorderQty) : null,
       isFirstShortageWeek: firstShortageWeek === key,
+      historicalStockQty,
+      stockoutDays,
+      inStockDays,
+      unknownDays,
+      stockState,
     })
   }
 
@@ -236,8 +327,20 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     `History is SALE_DISPATCH units per week (Monday to Sunday, UTC) from ${dateOnly(historyFrom)} to ${todayStr}; the first and current weeks are partial. Returns are not netted.`,
     'Projected demand is a flat average (units sold in the demand window / window days), the same figure Reorder Planning uses. It has no trend or seasonality.',
     'Projected stock starts from current available quantity, subtracts the flat daily demand and adds each dated open PO on its expected delivery date. It matches the Required receipt and Latest PO date columns.',
-    'The historical stock-position line and stockout / uncovered shading are not shown yet: they need the stockout-aware demand history.',
+    'The grey-purple line in past weeks is on-hand stock from the daily inventory snapshots (end of the last covered day of the week). Red weeks had at least one day with no on-hand stock; grey weeks are UNKNOWN (no snapshot was taken), which is not the same as in stock.',
   ]
+  if (stockoutHistory.firstCoveredDate == null) {
+    notices.push(`No daily inventory snapshot exists between ${dateOnly(stockoutFrom)} and ${todayStr}, so stockouts cannot be shown for this range.`)
+  } else if (stockoutHistory.uncoveredDayCount > 0) {
+    notices.push(`Daily inventory snapshots cover ${stockoutHistory.coveredDayCount} of ${stockoutHistory.days.length} days from ${dateOnly(stockoutFrom)} (first covered day ${stockoutHistory.firstCoveredDate}). The other ${stockoutHistory.uncoveredDayCount} are unknown, not in stock. Today is unknown until tonight's snapshot.`)
+  }
+  if (ignoreStockouts && !adjustDemand) {
+    notices.push(`Ignore stockouts is on but the ${demandDays}-day demand window is longer than the ${MAX_STOCKOUT_WINDOW_DAYS} days it can check, so demand is not adjusted.`)
+  } else if (ignoreStockouts) {
+    notices.push(demandClamped
+      ? `Ignore stockouts is on, but ${demandWindowStockoutDays} of ${demandDays} demand-window days had no stock (90% or more), so the unadjusted demand rate is used.`
+      : `Ignore stockouts is on: ${demandWindowStockoutDays} stockout day(s) in the ${demandDays}-day demand window are excluded, so demand is units sold / ${demandDays - demandWindowStockoutDays} days.`)
+  }
   if (projection.lateInboundQty.gt(0)) {
     notices.push(`${roundQuantity(projection.lateInboundQty, 0).toString()} units on open POs are past their expected delivery date (earliest ${projection.lateInboundEarliestDate}). They are not in the projection until received or re-dated.`)
   }
@@ -288,6 +391,16 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     leadTimeDays: row.leadTimeDays,
     openingQty: num(sources.availableQty),
     hasHistory: historyRows > 0,
+    ignoreStockouts,
+    stockout: {
+      firstCoveredDate: stockoutHistory.firstCoveredDate,
+      coveredDays: stockoutHistory.coveredDayCount,
+      unknownDays: stockoutHistory.uncoveredDayCount,
+      stockoutDays: stockoutHistory.stockoutDayCount,
+      demandWindowStockoutDays,
+      demandWindowDays: demandDays,
+      clamped: demandClamped,
+    },
     notices,
   }
 }

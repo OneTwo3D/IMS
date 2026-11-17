@@ -65,6 +65,8 @@ function filtersFromRequest(req: NextRequest): StockPositionFilters {
     urgency: urgency(one(req, 'urgency')),
     search: one(req, 'search')?.trim().slice(0, 100) || undefined,
     targetCoverWeeks: positiveInteger(one(req, 'targetCoverWeeks')),
+    // o3d-s8n.3: the CSV must carry the same demand the page showed.
+    ...(one(req, 'ignoreStockouts') === '1' ? { ignoreStockouts: true } : {}),
   }
 }
 

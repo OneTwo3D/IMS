@@ -16,6 +16,11 @@ export function summarizeDemandChart(chart: ReorderDemandChart): string[] {
       ? `First shortage (projected stock at or below zero): ${chart.firstShortageDate}.`
       : 'No shortage projected in the horizon.',
   )
+  lines.push(
+    chart.stockout.firstCoveredDate == null
+      ? 'Stockouts cannot be shown: no daily inventory snapshot exists for this range.'
+      : `Stockouts: ${chart.stockout.stockoutDays} day(s) with no on-hand stock, ${chart.stockout.unknownDays} day(s) unknown (no snapshot), over the days shown (snapshots since ${chart.stockout.firstCoveredDate}).`,
+  )
   const arrivals = chart.weeks.filter((week) => week.inboundQty > 0)
   lines.push(
     arrivals.length > 0
