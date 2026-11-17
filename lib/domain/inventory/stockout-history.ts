@@ -177,13 +177,20 @@ export async function getStockoutHistory(input: {
   })
 }
 
-type CountRow = { productId: string; stockoutDays: number | bigint; coveredDays: number | bigint }
+type CountRow = { coveredDays: number | bigint; productId: string | null; positiveDays: number | bigint | null }
+
+/** Longest range getStockoutDayCounts accepts. The report refuses the adjustment beyond it (with a notice). */
+export const MAX_STOCKOUT_WINDOW_DAYS = 365
 
 /**
- * Batch form for the report: ONE raw SQL aggregate, one row per product (never products x days back to
- * the app). Covered days are the runs in the range; each product's day quantity is the sum of its
- * snapshot rows (all warehouses, or the chosen one) with an absent row counting as zero.
- * A product with no covered day in the range is returned with coveredDays 0 (and stockoutDays 0).
+ * Batch form for the report: ONE raw SQL, never a products x days expansion.
+ *   coveredDays        = runs in the range (one count).
+ *   positiveDays(p)    = covered days on which the product's summed on-hand is > 0, counted from the snapshot
+ *                        rows that exist (grouped by product and day, HAVING sum > 0), so the work is bounded by
+ *                        the real snapshot rows, not by products x days.
+ *   stockoutDays(p)    = coveredDays - positiveDays(p). This includes covered days with no row (a genuine zero)
+ *                        and days at or below zero; an uncovered day is in neither term.
+ * Every requested product gets an entry; with no covered day in the range it is { 0, 0 }.
  */
 export async function getStockoutDayCounts(input: {
   productIds: string[]
@@ -192,8 +199,10 @@ export async function getStockoutDayCounts(input: {
   dateTo: string
   client?: StockoutCountsClient
 }): Promise<Map<string, StockoutDayCount>> {
-  assertDateOnly(input.dateFrom, 'dateFrom')
-  assertDateOnly(input.dateTo, 'dateTo')
+  const rangeDays = enumerateDates(input.dateFrom, input.dateTo).length
+  if (rangeDays > MAX_STOCKOUT_WINDOW_DAYS) {
+    throw new Error(`Stockout day counts accept at most ${MAX_STOCKOUT_WINDOW_DAYS} days; got ${rangeDays}`)
+  }
   const productIds = [...new Set(input.productIds)]
   assertSourceLimit(productIds.length, STOCKOUT_SOURCE_ROW_LIMIT, 'Stockout day-count product ids')
   const counts = new Map<string, StockoutDayCount>(productIds.map((id) => [id, { stockoutDays: 0, coveredDays: 0 }]))
@@ -203,29 +212,33 @@ export async function getStockoutDayCounts(input: {
   const warehouseClause = input.warehouseId ? Prisma.sql`AND s."warehouseId" = ${input.warehouseId}` : Prisma.empty
   const rows = await client.$queryRaw<CountRow[]>(Prisma.sql`
     WITH covered AS (
-      SELECT r."snapshotDate" AS day
+      SELECT COUNT(*)::int AS n
       FROM inventory_snapshot_runs r
       WHERE r."snapshotDate" BETWEEN ${input.dateFrom}::date AND ${input.dateTo}::date
     ),
-    daily AS (
-      SELECT p.id AS "productId", c.day, COALESCE(SUM(s.qty), 0) AS qty
-      FROM unnest(${productIds}::text[]) AS p(id)
-      CROSS JOIN covered c
-      LEFT JOIN inventory_snapshots s
-        ON s."productId" = p.id
-        AND s."snapshotDate" = c.day
-        ${warehouseClause}
-      GROUP BY p.id, c.day
+    positive_days AS (
+      SELECT d."productId", COUNT(*)::int AS "positiveDays"
+      FROM (
+        SELECT s."productId", s."snapshotDate"
+        FROM inventory_snapshots s
+        JOIN inventory_snapshot_runs r ON r."snapshotDate" = s."snapshotDate"
+        WHERE s."productId" = ANY(${productIds}::text[])
+          AND s."snapshotDate" BETWEEN ${input.dateFrom}::date AND ${input.dateTo}::date
+          ${warehouseClause}
+        GROUP BY s."productId", s."snapshotDate"
+        HAVING SUM(s.qty) > 0
+      ) d
+      GROUP BY d."productId"
     )
-    SELECT
-      "productId",
-      (COUNT(*) FILTER (WHERE qty <= 0))::int AS "stockoutDays",
-      COUNT(*)::int AS "coveredDays"
-    FROM daily
-    GROUP BY "productId"
+    SELECT covered.n AS "coveredDays", p."productId", p."positiveDays"
+    FROM covered
+    LEFT JOIN positive_days p ON TRUE
   `)
-  for (const row of rows) {
-    counts.set(row.productId, { stockoutDays: Number(row.stockoutDays), coveredDays: Number(row.coveredDays) })
+  const coveredDays = rows.length > 0 ? Number(rows[0]!.coveredDays) : 0
+  const positiveByProduct = new Map<string, number>()
+  for (const row of rows) if (row.productId != null) positiveByProduct.set(row.productId, Number(row.positiveDays ?? 0))
+  for (const id of productIds) {
+    counts.set(id, { stockoutDays: Math.max(0, coveredDays - (positiveByProduct.get(id) ?? 0)), coveredDays })
   }
   return counts
 }

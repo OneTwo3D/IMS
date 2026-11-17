@@ -7,6 +7,7 @@ import {
   getSnapshotCoverage,
   getStockoutDayCounts,
   getStockoutHistory,
+  MAX_STOCKOUT_WINDOW_DAYS,
   type StockoutHistoryClient,
 } from '@/lib/domain/inventory/stockout-history'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
@@ -116,22 +117,28 @@ test('getStockoutHistory omits the warehouse clause when none is chosen', async 
   assert.equal('warehouseId' in where, false)
 })
 
-test('getStockoutDayCounts: one raw query, one entry per requested product (zeros for products the SQL did not return)', async () => {
+test('getStockoutDayCounts: one raw query, stockout = covered - positive days, zeros for products the SQL did not return', async () => {
   const queries: Prisma.Sql[] = []
   const client = {
     $queryRaw: async (query: Prisma.Sql) => {
       queries.push(query)
-      return [{ productId: 'p1', stockoutDays: 4, coveredDays: 10 }]
+      return [{ coveredDays: 10, productId: 'p1', positiveDays: 6 }]
     },
   }
   const counts = await getStockoutDayCounts({ productIds: ['p1', 'p2', 'p1'], dateFrom: '2027-01-01', dateTo: '2027-01-10', client: client as never })
   assert.equal(queries.length, 1)
   assert.deepEqual(counts.get('p1'), { stockoutDays: 4, coveredDays: 10 })
-  assert.deepEqual(counts.get('p2'), { stockoutDays: 0, coveredDays: 0 })
+  assert.deepEqual(counts.get('p2'), { stockoutDays: 10, coveredDays: 10 }) // never positive on a covered day: all stockout
   assert.equal(counts.size, 2)
   assert.match(queries[0]!.sql, /inventory_snapshot_runs/)
-  assert.doesNotMatch(queries[0]!.sql, /"warehouseId" = \?/)
+  assert.doesNotMatch(queries[0]!.sql, /generate_series|CROSS JOIN|"warehouseId" = \?/)
   assert.ok(queries[0]!.values.includes('2027-01-01'))
+})
+
+test('getStockoutDayCounts with no covered day in the range is { 0, 0 } for everyone', async () => {
+  const client = { $queryRaw: async () => [{ coveredDays: 0, productId: null, positiveDays: null }] }
+  const counts = await getStockoutDayCounts({ productIds: ['p1'], dateFrom: '2027-01-01', dateTo: '2027-01-10', client: client as never })
+  assert.deepEqual(counts.get('p1'), { stockoutDays: 0, coveredDays: 0 })
 })
 
 test('getStockoutDayCounts adds the warehouse clause only when a warehouse is chosen, and skips the query for no products', async () => {
@@ -142,6 +149,33 @@ test('getStockoutDayCounts adds the warehouse clause only when a warehouse is ch
   assert.ok(queries[0]!.values.includes('w1'))
   assert.equal((await getStockoutDayCounts({ productIds: [], dateFrom: '2027-01-01', dateTo: '2027-01-10', client: client as never })).size, 0)
   assert.equal(queries.length, 1)
+})
+
+test('getStockoutDayCounts refuses a range longer than the window cap, and accepts exactly the cap', async () => {
+  const client = { $queryRaw: async () => [] }
+  const ok = enumerateDates('2026-01-01', '2026-12-31') // 365 days
+  assert.equal(ok.length, MAX_STOCKOUT_WINDOW_DAYS)
+  await getStockoutDayCounts({ productIds: ['p1'], dateFrom: '2026-01-01', dateTo: '2026-12-31', client: client as never })
+  await assert.rejects(getStockoutDayCounts({ productIds: ['p1'], dateFrom: '2026-01-01', dateTo: '2027-01-01', client: client as never }), /at most 365/)
+})
+
+test('property: covered - positiveDays equals the per-day buildStockoutDays count on random fixtures', () => {
+  let seed = 12345
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff }
+  for (let round = 0; round < 200; round += 1) {
+    const dates = enumerateDates('2027-01-01', '2027-02-15')
+    const runs = dates.filter(() => rand() < 0.7)
+    const rows: Array<{ date: string; warehouseId: string; qty: number }> = []
+    for (const date of dates) for (const wh of ['a', 'b']) if (rand() < 0.6) rows.push({ date, warehouseId: wh, qty: rand() < 0.4 ? 0 : Math.floor(rand() * 5) })
+    const reference = buildStockoutDays({ dateFrom: '2027-01-01', dateTo: '2027-02-15', runDates: runs, rows })
+    // the SQL formula, evaluated in JS: positive days = covered days whose summed on-hand > 0
+    const runSet = new Set(runs)
+    const sums = new Map<string, number>()
+    for (const row of rows) sums.set(row.date, (sums.get(row.date) ?? 0) + row.qty)
+    const positive = [...sums].filter(([date, qty]) => runSet.has(date) && qty > 0).length
+    assert.equal(runs.length - positive, reference.stockoutDayCount, `round ${round}`)
+    assert.equal(runs.length, reference.coveredDayCount)
+  }
 })
 
 test('getStockoutDayCounts guards the product-id array with the source-row limit', async () => {

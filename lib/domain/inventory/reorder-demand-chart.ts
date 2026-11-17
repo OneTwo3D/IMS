@@ -13,7 +13,7 @@ import {
 } from '@/lib/domain/inventory/replenishment-reports'
 import { DEFAULT_PROJECTION_HORIZON_DAYS, projectStockPosition } from '@/lib/domain/inventory/reorder-timing'
 import { calculateDailyVelocity, calculateStockoutAdjustedVelocity } from '@/lib/domain/inventory/velocity'
-import { getStockoutHistory, type StockoutHistory } from '@/lib/domain/inventory/stockout-history'
+import { MAX_STOCKOUT_WINDOW_DAYS, getStockoutHistory, type StockoutHistory } from '@/lib/domain/inventory/stockout-history'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 
 /**
@@ -216,12 +216,14 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
 
   // Demand rate: the exact figure getReorderReport used (same window, same rows), not its 4dp string.
   const velocityWindow = { dateFrom: demandFrom, dateTo: sources.window.dateTo }
-  const velocity = ignoreStockouts
+  // Beyond MAX_STOCKOUT_WINDOW_DAYS the report refuses the adjustment, so the chart does too.
+  const adjustDemand = ignoreStockouts && demandDays <= MAX_STOCKOUT_WINDOW_DAYS
+  const velocity = adjustDemand
     ? calculateStockoutAdjustedVelocity(sources.sales, velocityWindow, new Map([[input.productId, demandWindowStockoutDays]]))
       .find((entry) => entry.productId === input.productId)
     : calculateDailyVelocity(sources.sales, velocityWindow).find((entry) => entry.productId === input.productId)
   const averageDailyDemand = toDecimal(velocity?.dailyQtyVelocity ?? 0)
-  const demandClamped = ignoreStockouts && velocity != null && 'clamped' in velocity && velocity.clamped === true
+  const demandClamped = adjustDemand && velocity != null && 'clamped' in velocity && velocity.clamped === true
   const stockoutByDate = new Map(stockoutHistory.days.map((day) => [day.date, day]))
   const historyFromStr = dateOnly(historyFrom)
 
@@ -329,7 +331,9 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
   } else if (stockoutHistory.uncoveredDayCount > 0) {
     notices.push(`Daily inventory snapshots cover ${stockoutHistory.coveredDayCount} of ${stockoutHistory.days.length} days from ${dateOnly(stockoutFrom)} (first covered day ${stockoutHistory.firstCoveredDate}). The other ${stockoutHistory.uncoveredDayCount} are unknown, not in stock. Today is unknown until tonight's snapshot.`)
   }
-  if (ignoreStockouts) {
+  if (ignoreStockouts && !adjustDemand) {
+    notices.push(`Ignore stockouts is on but the ${demandDays}-day demand window is longer than the ${MAX_STOCKOUT_WINDOW_DAYS} days it can check, so demand is not adjusted.`)
+  } else if (ignoreStockouts) {
     notices.push(demandClamped
       ? `Ignore stockouts is on, but ${demandWindowStockoutDays} of ${demandDays} demand-window days had no stock (90% or more), so the unadjusted demand rate is used.`
       : `Ignore stockouts is on: ${demandWindowStockoutDays} stockout day(s) in the ${demandDays}-day demand window are excluded, so demand is units sold / ${demandDays - demandWindowStockoutDays} days.`)

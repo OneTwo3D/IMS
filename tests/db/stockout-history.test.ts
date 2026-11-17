@@ -131,3 +131,25 @@ test('snapshot coverage: covered days inside the window and the earliest run on 
     assert.ok(coverage.firstCoveredDate != null && coverage.firstCoveredDate <= '2099-03-01')
   })
 })
+
+test('the batch query plan (EXPLAIN of the real statement) has no product x day expansion', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const { p1, p2, wa } = await seed(tx)
+    const plans: string[] = []
+    const explaining = {
+      $queryRaw: async (query: Prisma.Sql) => {
+        const plan = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF) ${query.text}`, ...query.values) as Array<Record<string, string>>
+        plans.push(plan.map((row) => Object.values(row)[0]).join('\n'))
+        return []
+      },
+    }
+    for (const warehouseId of [undefined, wa]) {
+      await getStockoutDayCounts({ productIds: [p1, p2], warehouseId, dateFrom: FROM, dateTo: TO, client: explaining as never })
+    }
+    assert.equal(plans.length, 2)
+    for (const text of plans) {
+      assert.match(text, /inventory_snapshots/)
+      assert.doesNotMatch(text, /generate_series|unnest|Function Scan/i)
+    }
+  })
+})

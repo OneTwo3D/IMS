@@ -1839,6 +1839,7 @@ test('Ignore stockouts on with no snapshot coverage at all: demand is unchanged 
   const off = await getReorderReport({ thresholdDays: 90, includeZero: true }, { deps })
   assert.deepEqual(on.rows, off.rows)
   assert.ok(on.notices.some((notice) => notice.includes('never run')))
+})
 
 test('a mixed-date draft PO gives every product its own date (an undated line cannot borrow the earliest line date)', () => {
   const po = { supplierId: 'supplier-1', expectedDelivery: new Date('2026-12-05T00:00:00.000Z'), destinationWarehouseId: null, supplier }
@@ -1859,4 +1860,14 @@ test('a mixed-date draft PO gives every product its own date (an undated line ca
   ]
   assert.equal(inboundArrivalsByProduct(undated).has('b'), false, 'no arrival date is invented for b')
   assert.deepEqual([...undatedInboundProductIds(undated)], ['b'])
+})
+
+test('Ignore stockouts refuses a demand window over the cap: demand unadjusted, no snapshot query, a notice says so', async () => {
+  const captured: { countArgs?: unknown } = {}
+  const deps = stockoutFixture(captured)
+  const on = await getReorderReport({ thresholdDays: 400, includeZero: true, ignoreStockouts: true }, { deps })
+  const off = await getReorderReport({ thresholdDays: 400, includeZero: true }, { deps })
+  assert.equal(captured.countArgs, undefined)
+  assert.deepEqual(on.rows, off.rows)
+  assert.ok(on.notices.some((notice) => notice.includes('longer than the 365 days')))
 })

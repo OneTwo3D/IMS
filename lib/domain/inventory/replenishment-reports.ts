@@ -14,6 +14,7 @@ import {
 import {
   getSnapshotCoverage,
   getStockoutDayCounts,
+  MAX_STOCKOUT_WINDOW_DAYS,
   type SnapshotCoverage,
   type StockoutDayCount,
 } from '@/lib/domain/inventory/stockout-history'
@@ -1007,7 +1008,12 @@ export async function getReorderReport(
   // days only) leave the demand denominator. Off by default; off runs calculateDailyVelocity untouched.
   let stockoutNotices: string[] = []
   let velocityRows: Array<ReturnType<typeof calculateDailyVelocity>[number] & { stockoutDays?: number; effectiveDays?: number; clamped?: boolean }>
-  if (filters.ignoreStockouts === true) {
+  if (filters.ignoreStockouts === true && demandDays > MAX_STOCKOUT_WINDOW_DAYS) {
+    // The day-count query is bounded by the snapshot rows in the window; refuse an unbounded window rather
+    // than scan years of snapshots. Demand stays unadjusted and the report says so.
+    velocityRows = calculateDailyVelocity(velocityInputs, window)
+    stockoutNotices = [`Ignore stockouts is on but the ${demandDays}-day demand window is longer than the ${MAX_STOCKOUT_WINDOW_DAYS} days it can check, so demand is not adjusted. Use a window of ${MAX_STOCKOUT_WINDOW_DAYS} days or fewer.`]
+  } else if (filters.ignoreStockouts === true) {
     const adjusted = await loadStockoutAdjustedVelocity(options.deps, filters, window, velocityInputs)
     velocityRows = adjusted.rows
     stockoutNotices = adjusted.notices
