@@ -317,39 +317,81 @@ const loosen = (at: string, mode: number, depth = 0): void => {
  * uid is allowed to, and then named and failed either way.
  */
 /**
- * Scratch directories made by `scratchRoot()` (tests/helpers/scratch-root.ts) live outside `own` (a throwaway cluster
- * parent must sit under a root-owned sticky ancestor), so the sweep below never sees them. The helper registers each
- * per-process directory it makes under a well-known global key; whatever is still in one at exit is a leak: named,
- * removed, and failed, exactly like a leak in `own`.
+ * Directories made OUTSIDE `own`: throwaway clusters and trusted report trees go under `scratchRoot()`
+ * (tests/helpers/scratch-root.ts), which must sit below a root-owned sticky ancestor, so they cannot live in `own` and the
+ * sweep below never saw them. Every `mkdtemp` this process makes is therefore recorded (see the patch below), and a path
+ * outside `own` that still exists at exit is a leak: named, removed, and failed, exactly like a leak in `own`.
  */
-const sweepScratch = (): void => {
-  const tracked = (globalThis as Record<symbol, unknown>)[Symbol.for('ims.test.scratchDirs')] as Set<string> | undefined
-  if (tracked === undefined) return
-  const subject = process.argv[1] ?? '<unknown entry point>'
-  for (const dir of tracked) {
-    let entries: string[]
-    try {
-      entries = readdirSync(dir)
-    } catch (error) {
-      if (isMissing(error)) continue
-      process.stderr.write(`temp-dir sentinel: could not enumerate scratch directory ${dir}: ${describe(error)}\n`)
-      if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
-      continue
+const createdOutside = new Set<string>()
+
+const noteCreated = (made: unknown): void => {
+  if (typeof made !== 'string') return
+  const resolved = resolve(made)
+  const inside = relative(own, resolved)
+  if (inside === '' || (!inside.startsWith('..') && !isAbsolute(inside))) return
+  createdOutside.add(resolved)
+}
+
+const realFs = createRequire(`${process.cwd()}/`)('node:fs') as Record<string, unknown> & { promises: Record<string, unknown> }
+const patchMkdtemp = (target: Record<string, unknown>, name: string, wrap: (original: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown): void => {
+  const original = target[name]
+  if (typeof original === 'function') target[name] = wrap(original as (...args: unknown[]) => unknown)
+}
+patchMkdtemp(realFs, 'mkdtempSync', (original) => function recordedMkdtempSync(this: unknown, ...args: unknown[]) {
+  const made = original.apply(this, args)
+  noteCreated(made)
+  return made
+})
+patchMkdtemp(realFs.promises, 'mkdtemp', (original) => async function recordedMkdtemp(this: unknown, ...args: unknown[]) {
+  const made = await original.apply(this, args)
+  noteCreated(made)
+  return made
+})
+patchMkdtemp(realFs, 'mkdtemp', (original) => function recordedMkdtempCallback(this: unknown, ...args: unknown[]) {
+  const last = args.length - 1
+  const callback = args[last]
+  if (typeof callback === 'function') {
+    args[last] = (error: unknown, made: unknown, ...rest: unknown[]) => {
+      if (!error) noteCreated(made)
+      return (callback as (...a: unknown[]) => unknown)(error, made, ...rest)
     }
-    try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch (error) {
-      process.stderr.write(`temp-dir sentinel: could not remove scratch directory ${dir}: ${describe(error)}\n`)
-      if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
-    }
-    if (entries.length === 0) continue
-    if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
-    process.stderr.write(
-      `temp-dir leak: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} survived ${subject} in the scratch directory ${dir}:\n` +
-        `${entries.slice().sort().map((entry) => `  ${entry}`).join('\n')}\n` +
-        'These came from tests/helpers/scratch-root.ts (throwaway clusters and trusted report trees); remove them where they are made.\n',
-    )
   }
+  return original.apply(this, args)
+})
+
+const sweepScratch = (): void => {
+  const subject = process.argv[1] ?? '<unknown entry point>'
+  const survivors: string[] = []
+  for (const dir of createdOutside) {
+    try {
+      lstatSync(dir)
+      survivors.push(dir)
+    } catch (error) {
+      if (!isMissing(error)) {
+        process.stderr.write(`temp-dir sentinel: could not examine ${dir}: ${describe(error)}\n`)
+        if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
+      }
+    }
+  }
+  for (const dir of survivors) {
+    for (let attempt = 0; attempt <= REPAIRS; attempt += 1) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+        break
+      } catch (error) {
+        if (attempt === REPAIRS) {
+          process.stderr.write(`temp-dir sentinel: could not remove ${dir}: ${describe(error)}\n`)
+        } else loosen(dir, 0o700)
+      }
+    }
+  }
+  if (survivors.length === 0) return
+  if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
+  process.stderr.write(
+    `temp-dir leak: ${survivors.length} entr${survivors.length === 1 ? 'y' : 'ies'} survived ${subject} outside the private TMPDIR (made with mkdtemp under the scratch root):\n` +
+      `${survivors.slice().sort().map((entry) => `  ${entry}`).join('\n')}\n` +
+      'Remove each where it is made.\n',
+  )
 }
 
 const settle = (): void => {
