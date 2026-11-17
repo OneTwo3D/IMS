@@ -152,6 +152,10 @@ When stock is received:
 The unit cost is validated as finite and non-negative before stock movements are written. A landed-cost recalculation that produces a NaN or infinite cost is rejected at the receipt boundary, before any stock or cost layer is created.
 
 
+### Sales orders pegged to this purchase order
+
+When a sales order line has been **pegged** to a line of this purchase order (from the sales order page, see **Pegging an order to a purchase order** in the Sales Orders guide), a **Pegged sales orders** panel on the purchase order lists each pegged order, its customer, the pegged quantity, and how much of it has been received and allocated so far. When stock is received on the line, by hand, by a warehouse ASN alignment or by a warehouse book-in, it is allocated to the pegged orders first (oldest peg first); any remainder is allocated to the oldest waiting order as usual. Receiving needs no extra step. Cancelling or closing the purchase order, or receiving the line without covering a peg, ends the peg and records why in the activity log; removing a line from an amended order records the same. Pegs are IMS-internal and send nothing anywhere.
+
 ## Closing and Cancelling a Purchase Order
 
 **Close PO** and **Cancel PO** are available at every stage from RFQ Sent to Partially Received (a Draft can only be cancelled; a fully **Received** or **Invoiced** order can only be closed; an order in **Partially Returned** can be closed or cancelled). On a part-received order the buttons read **Close short** and **Cancel balance**. A confirmation dialog states exactly what will happen, with the quantities. Which one you use depends on what you want the order to say, not on what happens to stock:

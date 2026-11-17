@@ -88,6 +88,14 @@ import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selecti
  * Best-effort post-commit: a failure is surfaced as a WARNING, never thrown.
  */
 async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string, sku: string): Promise<StockEnqueueOutcome> {
+  // SO-to-PO pegging: units the alignment just landed on a purchase-order line go to the order pegged to it first. Best-effort,
+  // IMS-internal; a no-op for a product nothing is pegged on.
+  try {
+    const { allocatePeggedOrdersForProducts } = await import('@/lib/fulfillment/peg-allocator')
+    await allocatePeggedOrdersForProducts([productId], { source: 'wms_alignment', referenceId: binding.id, referenceLabel: 'WMS stock alignment' })
+  } catch (error) {
+    console.error(error)
+  }
   try {
     await enqueueStockSync([productId], 'IMS_CHANGE')
     return 'ok'

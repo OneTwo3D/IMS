@@ -1865,6 +1865,14 @@ export async function processBookedInEvent(
 
     let stockEnqueue: 'failed' | 'held' | undefined
     if (processed.productIds.length > 0) {
+      // SO-to-PO pegging: units the book-in just landed on a purchase-order line go to the order pegged to it first.
+      // Best-effort and IMS-internal; a no-op for products nothing is pegged on. The oldest-first remainder is the sweep's, as before.
+      try {
+        const { allocatePeggedOrdersForProducts } = await import('@/lib/fulfillment/peg-allocator')
+        await allocatePeggedOrdersForProducts(processed.productIds, { source: 'wms_booked_in', referenceId: event.id, referenceLabel: `WMS booked-in ${event.externalAsnId}` })
+      } catch (error) {
+        console.error(error)
+      }
       try {
         await enqueueStockSync(processed.productIds, 'IMS_CHANGE')
       } catch (error) {

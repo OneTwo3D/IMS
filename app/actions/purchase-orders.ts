@@ -29,6 +29,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
+import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getPoLineAttributableLayerQty } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -1924,6 +1925,8 @@ export async function updatePurchaseOrder(
           if (discountRefusal) return { refused: discountRefusal }
           for (const index of plan.create) finalRows.push(lineData[index]!)
           if (plan.remove.length > 0) {
+            // SO-to-PO pegging: the pegs on a removed line go with it (FK cascade); record their end first.
+            await recordPegsRemovedWithLines(tx, { purchaseOrderLineIds: plan.remove.map((l) => l.id) }, session.user.id ?? null)
             await tx.purchaseOrderLine.deleteMany({ where: { poId: id, id: { in: plan.remove.map((l) => l.id) } } })
           }
           for (const u of lineUpdates) await tx.purchaseOrderLine.update({ where: { id: u.id }, data: u.data })

@@ -1399,6 +1399,7 @@ model PurchaseOrderLine {
   taxRate         TaxRate?         @relation(fields: [taxRateId], references: [id])
   receiptLines    PurchaseReceiptLine[]
   returnLines     PurchaseReturnLine[]
+  pegs            SalesOrderLinePeg[]
   invoiceLines    PurchaseInvoiceLine[]
   costLayers      CostLayer[]
 
@@ -2181,6 +2182,7 @@ model SalesOrderLine {
   product         Product?   @relation(fields: [productId], references: [id])
   taxRate         TaxRate?   @relation(fields: [taxRateId], references: [id])
   allocations     OrderAllocation[]
+  pegs            SalesOrderLinePeg[]
   shipmentLines   ShipmentLine[]
   refundLines     SalesOrderRefundLine[]
 
@@ -5127,6 +5129,50 @@ model OrderAllocation {
   @@index([productId, warehouseId])
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "order_allocations_costLayerSnapshot_gin_idx")
   @@map("order_allocations")
+}
+
+/// Why a sales-order-line peg stopped applying. A peg is never deleted by IMS: it ends, with a reason, and every end is
+/// also written to the activity log. (Deleting either line cascades the row away; those removals are logged first.)
+enum SalesOrderLinePegEndReason {
+  FULLY_ALLOCATED
+  SALES_ORDER_CANCELLED
+  SALES_LINE_REMOVED
+  SALES_ORDER_ADVANCED
+  PURCHASE_ORDER_CANCELLED
+  PURCHASE_LINE_RECEIVED_ELSEWHERE
+  REMOVED_BY_USER
+}
+
+/// Pegging: stock received on a purchase-order line is held for, and allocated to, one sales-order line first. IMS-internal
+/// allocation ordering only: nothing is sent to any connector. Many pegs may share a purchase-order line (one per
+/// customer order) and a sales-order line may be pegged to several purchase-order lines; one live peg per pair (partial
+/// unique index in the migration, not expressible here).
+/// `receivedQty` is the part of `qty` that has landed on the purchase-order line and been earmarked for this peg (oldest peg
+/// first); `allocatedQty` is the part of that the order has actually absorbed. `receivedQty - allocatedQty` is the hold
+/// other orders' allocation must leave alone. `seenLandedQty` is the line's landed quantity when `receivedQty` was last
+/// refreshed, so the refresh is idempotent whichever receipt path (manual, ASN alignment, WMS book-in) landed the units.
+model SalesOrderLinePeg {
+  id                  String    @id @default(cuid())
+  salesOrderLineId    String
+  purchaseOrderLineId String
+  qty                 Decimal   @db.Decimal(12, 4)
+  receivedQty         Decimal   @default(0) @db.Decimal(12, 4)
+  allocatedQty        Decimal   @default(0) @db.Decimal(12, 4)
+  /// The sales-order line's allocation when the peg was made: what the order already had from other stock.
+  baselineAllocatedQty Decimal  @default(0) @db.Decimal(12, 4)
+  seenLandedQty       Decimal   @default(0) @db.Decimal(12, 4)
+  createdAt           DateTime  @default(now())
+  createdById         String?
+  endedAt             DateTime?
+  endReason           SalesOrderLinePegEndReason?
+  endedById           String?
+
+  salesOrderLine      SalesOrderLine    @relation(fields: [salesOrderLineId], references: [id], onDelete: Cascade)
+  purchaseOrderLine   PurchaseOrderLine @relation(fields: [purchaseOrderLineId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderLineId])
+  @@index([salesOrderLineId])
+  @@map("sales_order_line_pegs")
 }
 
 /// A shipment groups allocated lines from one warehouse

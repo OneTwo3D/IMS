@@ -37,6 +37,17 @@ export async function allocateBackordersForProducts(
   const directIds = [...new Set(productIds.filter(Boolean))]
   if (directIds.length === 0) return result
 
+  // SO-to-PO pegging: stock that has just landed on a purchase-order line goes to the order pegged to it FIRST; the
+  // oldest-order-first pass below then hands out the remainder (and the pegged order is already covered, so it is skipped there).
+  if (context.source === 'purchase_receipt') {
+    try {
+      const { allocatePeggedOrdersForProducts } = await import('@/lib/fulfillment/peg-allocator')
+      await allocatePeggedOrdersForProducts(directIds, { source: 'purchase_receipt', referenceId: context.referenceId, referenceLabel: context.referenceLabel })
+    } catch (error) {
+      console.error(error)
+    }
+  }
+
   // Walk only through KIT parents to every depth. BOM parents are treated
   // as leaf stock by expandFulfillmentRequirementsDecimal — receiving a BOM's
   // component doesn't improve BOM-line coverage (BOM orders need the

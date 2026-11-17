@@ -11,6 +11,7 @@ import {
   refileAccountedRecordsForScope,
 } from '@/lib/domain/sales/allocation-service'
 import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
+import { loadPeggedOrderIds, sortReleaseCandidatesPeggedLast } from '@/lib/domain/sales/peg-service'
 import { reconcilePendingShipments } from '@/lib/domain/sales/pending-shipment-reconciliation'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -144,7 +145,7 @@ export async function releaseOverallocations(
         // new allocations (we don't hold sales_orders locks for them, so
         // can't safely touch) leaves their excess for the next rebalancer
         // call; unrelated release progress we CAN make is still applied.
-        const allocs = await tx.orderAllocation.findMany({
+        const allocsNewestFirst = await tx.orderAllocation.findMany({
           where: {
             productId: item.productId,
             warehouseId: item.warehouseId,
@@ -165,6 +166,8 @@ export async function releaseOverallocations(
           },
           orderBy: { order: { createdAt: 'desc' } },
         })
+        // SO-to-PO pegging: a pegged order is the one the operator promised stock to, so it gives way last.
+        const allocs = sortReleaseCandidatesPeggedLast(allocsNewestFirst, await loadPeggedOrderIds(tx, item.productId))
 
         const lockedOrderIdSet = new Set(candidateOrderIds)
         // o3d-4kfh r4: the orders this pass actually WROTE to, reconciled once each after the

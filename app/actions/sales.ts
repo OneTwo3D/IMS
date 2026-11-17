@@ -178,6 +178,7 @@ import {
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
+import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 
@@ -3816,6 +3817,8 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
         // orphaning the journal or stranding the debit — see releaseOrderAllocationsInTx.
         orderIsBeingDeleted: true,
       })
+      // SO-to-PO pegging: the order's pegs go with its lines (FK cascade); record their end first.
+      await recordPegsRemovedWithLines(tx, { salesOrderLineIds: (await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true } })).map((l) => l.id) }, session.user.id ?? null)
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
       await tx.salesOrder.delete({ where: { id } })
       return { so, released }

@@ -146,6 +146,18 @@ The panel is **refund-aware**: units that have been refunded are no longer outst
 
 The allocation panel reappears whenever there are unfulfilled order lines, even after some shipments have already been created or shipped. This enables the partial fulfillment workflow described below.
 
+### Pegging an order to a purchase order
+
+When stock is being bought for one particular customer order, **peg** the order line to the purchase order. Stock received on that purchase order is then allocated to the pegged order **first**, up to the pegged quantity; whatever is left over follows the normal rule, oldest order first. This replaces holding other orders back or deallocating them by hand and undoing that after the receipt.
+
+- **Peg to PO.** On the order page, the **Pegged to purchase orders** panel lists each line with a **Peg to PO** button (open orders only: Pending payment, On hold, Processing or Allocated). It opens a picker of the open purchase-order lines for that product that still have quantity that has not been received and is not already pegged to another order. Choose a line and a quantity. A line that has a peg shows a **Pegged** badge.
+- **What is refused.** A peg larger than the unreceived quantity of the purchase-order line (less what other orders have pegged to it), or larger than what the order line still lacks (ordered, less allocated, less other pegs), is refused with the figure. A kit line cannot be pegged. Only a purchase order that has been sent and is still expecting goods can be pegged to.
+- **How it behaves.** The stock that has landed for a peg is held for the pegged order: the reallocation sweep, the backorder allocation after any receipt and every other automatic allocation leave it alone, so an older order cannot be handed pegged stock, and automatic allocation never takes stock away from a pegged allocation to give it to another order. Receipts count however they arrive: receiving by hand, a warehouse ASN alignment, or a warehouse book-in. When stock is lost and reservations have to be released, a pegged order is released last. Stock is still shared between orders by quantity: pegging controls who is allocated first, it does not label individual units. Allocating by hand is unaffected.
+- **When a peg ends.** A peg ends by itself when the order line is fully allocated, when the order is cancelled or fully refunded, when the order moves on to picking or beyond, when the purchase order is cancelled or closed, or when the purchase-order line is received without covering the peg (for example it was edited down). The end and its reason are written to the activity log of both the order and the purchase order. Deleting either line removes its pegs and records that in the same way. You can also remove a peg yourself (**Remove**); the stock it held then goes to the oldest waiting order.
+- **Permission.** Creating or removing a peg needs **sales.process**, the same permission as allocating by hand (Admin, Manager and Warehouse). Everyone who can see the order sees the pegs.
+
+Pegging is entirely inside IMS: nothing is sent to WooCommerce, the warehouse or the accounting system.
+
 ### Shipment-Only Fulfillment
 
 The IMS no longer supports direct order-level dispatch. Orders must be fulfilled through shipment rows:

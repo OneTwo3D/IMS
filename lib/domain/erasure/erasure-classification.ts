@@ -99,6 +99,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   CostLayerRevaluation: { erased: [], notPersonal: ['reason'], retained: {} },
   CostLayerSourceLine: { erased: [], notPersonal: ['sourceCostLayerId'], retained: {} },
   OrderAllocation: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },
+  SalesOrderLinePeg: { erased: [], notPersonal: ['createdById', 'endedById'], retained: {} },
   Payment: {
     erased: ['notes'],
     notPersonal: ['currency', 'method'],

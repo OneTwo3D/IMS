@@ -3,6 +3,7 @@ import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { sweepUnallocatedProcessingOrders } from '@/lib/fulfillment/reallocation-sweep'
+import { sweepPegsAndRelease } from '@/lib/fulfillment/peg-allocator'
 import { sweepUnresolvedDirectCreateMarkers } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { cronResultResponse } from '@/lib/ops/cron-response'
 import { cronOutcome } from '@/lib/ops/cron-outcomes'
@@ -42,6 +43,17 @@ export async function GET(request: Request) {
   // when markers accumulate fastest. The endpoint still REPORTS the failure — a throw used to
   // surface as a 500, and turning that into a silent 200 would trade one regression for another —
   // it just no longer lets one pass cancel the other.
+  // SO-to-PO pegging: first end the pegs whose order or purchase order has gone (and hand what they held to the oldest waiting
+  // order), so the allocation pass below does not leave stock held for a peg that no longer applies. Independent of both passes.
+  let pegs: Awaited<ReturnType<typeof sweepPegsAndRelease>> | null = null
+  try {
+    pegs = await sweepPegsAndRelease()
+  } catch (error) {
+    failures.pegSweep = error instanceof Error ? error.message : String(error)
+    if (!(isOutboundWriteHeldError(error) && error.nothingSent === true)) genuineFailure = true
+    console.error('[reallocation-sweep] peg pass failed:', error)
+  }
+
   let result: Awaited<ReturnType<typeof sweepUnallocatedProcessingOrders>> | null = null
   try {
     result = await sweepUnallocatedProcessingOrders()
@@ -71,7 +83,7 @@ export async function GET(request: Request) {
 
   const failed = Object.keys(failures).length > 0
   // A pass that threw only because the outbound-write hold refused a write is held, not failed.
-  const body = { ...(result ?? {}), directCreateMarkers, ...(failed ? { ok: false, failures } : {}) }
+  const body = { ...(result ?? {}), directCreateMarkers, ...(pegs && pegs.ended > 0 ? { pegsEnded: pegs.ended } : {}), ...(failed ? { ok: false, failures } : {}) }
   const mapped = cronOutcome('reallocation-sweep', body)
   // Passes that failed only on a thrown hold are held; counted per-order errors in the passes that did run still make it failed.
   const withoutThrown = failed && !genuineFailure ? cronOutcome('reallocation-sweep', { ...body, ok: undefined }) : mapped
