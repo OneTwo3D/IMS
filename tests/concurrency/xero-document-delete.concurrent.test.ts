@@ -514,3 +514,47 @@ test('NEW ACTIVITY ON A BILL: a supplier credit note recorded after the request 
     await cleanBill(db, f)
   }
 })
+
+test('A REFUND THAT HOLDS THE ORDER LOCK WHEN COMPLETION ARRIVES: completion parks behind it, counts after it commits, and stops at NEEDS_REVIEW (sales invoice and bill)', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const { backendPid, waitUntilParkedBehind } = await import('@/tests/helpers/lock-wait-observer')
+  await applySettings()
+  const { requestAccountingDocumentDelete, completeAccountingDocumentDeletion } = await service()
+
+  const f = await seedSalesInvoice(db, 'race')
+  const b = await seedBill(db, 'brace')
+  try {
+    assert.ok((await requestAccountingDocumentDelete({ kind: 'SALES_INVOICE', documentId: f.orderId, requestedById: null }, deps(f))).ok)
+    assert.ok((await requestAccountingDocumentDelete({ kind: 'PURCHASE_BILL', documentId: b.billId, requestedById: null }, billDeps)).ok)
+    const supplierId = (await db.purchaseOrder.findUniqueOrThrow({ where: { id: b.poId }, select: { supplierId: true } })).supplierId
+
+    // The writer passed its pending-delete fence BEFORE the requests committed, then took the lock; completion arrives while it still holds it.
+    let completion: Promise<string> | null = null
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${f.orderId} FOR UPDATE`
+      const pid = await backendPid(tx)
+      completion = completeAccountingDocumentDeletion(f.xeroId)
+      await waitUntilParkedBehind(db, { holderPid: pid, waitingOn: /sales_orders/i, describe: 'sales completion behind the refund' })
+      await tx.salesOrderRefund.create({ data: { orderId: f.orderId, totalForeign: 10, totalBase: 10 } })
+    }, { timeout: 20_000, maxWait: 10_000 })
+    assert.equal(await completion, 'needs-review', 'the refund committed while completion waited, so it was counted')
+    const order = await db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId } })
+    assert.equal(order.invoiceNumber, f.number, 'not unwound over the refund')
+    assert.equal((await db.accountingDocumentDeletion.findUniqueOrThrow({ where: { externalDocumentId: f.xeroId } })).state, 'NEEDS_REVIEW')
+
+    let billCompletion: Promise<string> | null = null
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${b.billId} FOR UPDATE`
+      const pid = await backendPid(tx)
+      billCompletion = completeAccountingDocumentDeletion(b.xeroId)
+      await waitUntilParkedBehind(db, { holderPid: pid, waitingOn: /purchase_invoices/i, describe: 'bill completion behind the credit note' })
+      await tx.supplierCreditNote.create({ data: { poId: b.poId, purchaseInvoiceId: b.billId, supplierId, amountForeign: 5, amountBase: 5, currency: 'GBP', fxRateToBase: 1 } })
+    }, { timeout: 20_000, maxWait: 10_000 })
+    assert.equal(await billCompletion, 'needs-review')
+    assert.ok(await db.purchaseInvoice.findUnique({ where: { id: b.billId } }), 'the bill was not hard-deleted over the credit note')
+    assert.equal((await db.accountingDocumentDeletion.findUniqueOrThrow({ where: { externalDocumentId: b.xeroId } })).state, 'NEEDS_REVIEW')
+  } finally {
+    await cleanSales(db, f)
+    await cleanBill(db, b)
+  }
+})

@@ -406,7 +406,19 @@ export type DocumentDeleteCompletion = 'completed' | 'already-complete' | 'no-re
  */
 export async function completeAccountingDocumentDeletion(externalDocumentId: string): Promise<DocumentDeleteCompletion> {
   return db.$transaction(async (tx): Promise<DocumentDeleteCompletion> => {
-    const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT id FROM accounting_document_deletions WHERE external_document_id = ${externalDocumentId} FOR UPDATE`)
+    // LOCK ORDER IS THE ORDER-FIRST CONVENTION every refund, payment, credit-note and bill-edit path follows: the sales order (or the bill, then its
+    // purchase order) FIRST, the deletion row second. The late-activity count below is taken only once that lock is held, so an action that holds the
+    // lock when completion arrives commits before the count (and is seen), and one that arrives later waits behind the unwind.
+    const found = await tx.accountingDocumentDeletion.findUnique({ where: { externalDocumentId }, select: { id: true, kind: true, documentId: true, snapshot: true } })
+    if (!found) return 'no-record'
+    if (found.kind === 'SALES_INVOICE') {
+      await lockSalesOrder(tx, found.documentId)
+    } else {
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_invoices WHERE id = ${found.documentId} FOR UPDATE`)
+      const poId = (found.snapshot as { purchaseOrderId?: string } | null)?.purchaseOrderId
+      if (poId) await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`)
+    }
+    const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT id FROM accounting_document_deletions WHERE id = ${found.id} FOR UPDATE`)
     if (rows.length === 0) return 'no-record'
     const deletion = await tx.accountingDocumentDeletion.findUniqueOrThrow({ where: { id: rows[0].id } })
     if (deletion.state === 'COMPLETED') return 'already-complete'
