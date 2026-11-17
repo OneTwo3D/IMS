@@ -1758,3 +1758,85 @@ test('inbound arrivals and the late-PO logic use the effective line date (line d
   const lateLine = (await run(client(new Date('2026-05-28T00:00:00.000Z')))).rows[0]
   assert.equal(lateLine?.lateInboundDueDate, '2026-05-28', 'a past line date is the late due date')
 })
+
+// ---- o3d-s8n.3: the Ignore stockouts toggle ----
+
+function stockoutFixture(captured: { countArgs?: unknown }) {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [
+        { id: 'p-1', sku: 'SKU-1', name: 'Widget', type: ProductType.SIMPLE, stockUnit: 'pcs', reorderPoint: null, reorderQty: null, safetyStockQty: decimal('0'), leadTimeDays: 10, category, preferredSupplier: null, supplierProducts: [{ supplierId: 'supplier-1', supplierSku: null, lastUnitCost: decimal('1'), leadTimeDays: 10, supplier }] },
+        { id: 'p-2', sku: 'SKU-2', name: 'Gadget', type: ProductType.SIMPLE, stockUnit: 'pcs', reorderPoint: null, reorderQty: null, safetyStockQty: decimal('0'), leadTimeDays: 10, category, preferredSupplier: null, supplierProducts: [{ supplierId: 'supplier-1', supplierSku: null, lastUnitCost: decimal('1'), leadTimeDays: 10, supplier }] },
+      ],
+    },
+    stockLevel: { findMany: async () => [] },
+    stockMovement: {
+      findMany: async () => [
+        { productId: 'p-1', qty: decimal('90'), totalValueBase: decimal('0'), createdAt: new Date('2026-05-20T12:00:00.000Z'), product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] } },
+        { productId: 'p-2', qty: decimal('9'), totalValueBase: decimal('0'), createdAt: new Date('2026-05-20T12:00:00.000Z'), product: { sku: 'SKU-2', name: 'Gadget', category, supplierProducts: [{ supplier }] } },
+      ],
+    },
+    purchaseOrderLine: { findMany: async () => [] },
+  }
+  const deps = {
+    client,
+    now: () => new Date('2026-06-01T18:00:00.000Z'),
+    loadStockoutDayCounts: async (input: unknown) => {
+      captured.countArgs = input
+      return new Map([
+        ['p-1', { stockoutDays: 30, coveredDays: 60 }],
+        ['p-2', { stockoutDays: 85, coveredDays: 85 }], // 85 >= 90 * 0.9 = 81: clamped
+      ])
+    },
+    loadSnapshotCoverage: async () => ({ firstCoveredDate: '2026-04-10', coveredDays: 60, windowDays: 90 }),
+  }
+  return deps
+}
+
+test('Ignore stockouts off: demand, rows and notices are exactly the toggle-less report, and no snapshot query runs', async () => {
+  const captured: { countArgs?: unknown } = {}
+  const deps = stockoutFixture(captured)
+  const withoutFlag = await getReorderReport({ thresholdDays: 90, includeZero: true }, { deps })
+  const flagFalse = await getReorderReport({ thresholdDays: 90, includeZero: true, ignoreStockouts: false }, { deps })
+  assert.equal(JSON.stringify(flagFalse), JSON.stringify(withoutFlag))
+  assert.equal(captured.countArgs, undefined)
+  assert.equal(withoutFlag.rows.find((row) => row.productId === 'p-1')!.averageDailyDemand, '1')
+  assert.ok(withoutFlag.rows.every((row) => !('stockoutAdjustment' in row)))
+  assert.ok(withoutFlag.notices.every((notice) => !notice.includes('Ignore stockouts')))
+})
+
+test('Ignore stockouts on: stockout days leave the denominator, the 90% guard keeps the unadjusted rate, and the report says so', async () => {
+  const captured: { countArgs?: { productIds: string[]; warehouseId?: string; dateFrom: string; dateTo: string } } = {}
+  const deps = stockoutFixture(captured)
+  const report = await getReorderReport({ thresholdDays: 90, includeZero: true, ignoreStockouts: true, warehouseId: 'wh-1' }, { deps })
+  const p1 = report.rows.find((row) => row.productId === 'p-1')!
+  const p2 = report.rows.find((row) => row.productId === 'p-2')!
+  assert.equal(p1.averageDailyDemand, '1.5') // 90 / (90 - 30)
+  assert.deepEqual(p1.stockoutAdjustment, { stockoutDays: 30, effectiveDays: 60, clamped: false })
+  assert.equal(p2.averageDailyDemand, '0.1') // 9 / 90, NOT 9 / 5
+  assert.deepEqual(p2.stockoutAdjustment, { stockoutDays: 85, effectiveDays: 90, clamped: true })
+  // one batched call over the products that sold, scoped to the warehouse and the demand window
+  assert.deepEqual(captured.countArgs!.productIds.sort(), ['p-1', 'p-2'])
+  assert.equal(captured.countArgs!.warehouseId, 'wh-1')
+  assert.equal(captured.countArgs!.dateFrom, '2026-03-04')
+  assert.equal(captured.countArgs!.dateTo, '2026-06-01')
+  // reorder maths follow the adjusted rate
+  assert.equal(p1.reorderPoint, '15') // 1.5 * 10 lead time
+  assert.ok(report.notices.some((notice) => notice.includes('Ignore stockouts is on')))
+  assert.ok(report.notices.some((notice) => notice.includes('cover 60 of the 90') && notice.includes('2026-04-10')))
+  assert.ok(report.notices.some((notice) => notice.includes('90% or more') && notice.includes('SKU-2')))
+})
+
+test('Ignore stockouts on with no snapshot coverage at all: demand is unchanged and the notice says nothing could be checked', async () => {
+  const captured: { countArgs?: unknown } = {}
+  const deps = {
+    ...stockoutFixture(captured),
+    loadStockoutDayCounts: async (input: { productIds: string[] }) => new Map(input.productIds.map((id) => [id, { stockoutDays: 0, coveredDays: 0 }])),
+    loadSnapshotCoverage: async () => ({ firstCoveredDate: null, coveredDays: 0, windowDays: 90 }),
+  }
+  const on = await getReorderReport({ thresholdDays: 90, includeZero: true, ignoreStockouts: true }, { deps })
+  const off = await getReorderReport({ thresholdDays: 90, includeZero: true }, { deps })
+  assert.deepEqual(on.rows, off.rows)
+  assert.ok(on.notices.some((notice) => notice.includes('never run')))
+})

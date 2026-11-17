@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { getReorderReport, type ReplenishmentReportClient } from '@/lib/domain/inventory/replenishment-reports'
+import { buildStockoutDays } from '@/lib/domain/inventory/stockout-history'
 import { getReorderDemandChart, isoWeekStart, type ReorderDemandChartDeps } from '@/lib/domain/inventory/reorder-demand-chart'
 
 const d = (value: string | number) => new Prisma.Decimal(value)
@@ -9,6 +10,10 @@ const category = { id: 'category-1', name: 'Finished goods' }
 const supplier = { name: 'Supplier A' }
 // Wednesday. The Monday of this week is 2027-01-04; the history window crosses the year end.
 const NOW = new Date('2027-01-06T10:00:00.000Z')
+
+// No snapshot run on any day: every day is UNKNOWN. The loader the unit tests hand the chart instead of the database.
+const noStockoutHistory: NonNullable<ReorderDemandChartDeps['loadStockoutHistory']> = async ({ dateFrom, dateTo }) =>
+  buildStockoutDays({ dateFrom, dateTo, runDates: [], rows: [] })
 
 type Calls = { stockMovement: unknown[]; stockLevel: unknown[]; purchaseOrderLine: unknown[] }
 
@@ -37,7 +42,7 @@ function build(options: { sales?: unknown[]; po?: unknown[]; stock?: number } = 
     purchaseReceipt: empty, salesOrderLine: empty, orderAllocation: empty, shipmentLine: empty, productionOrder: empty, bomItem: empty,
     warehouse: { findUnique: async () => ({ name: 'Main Warehouse', code: 'W1' }) },
   } as unknown as ReplenishmentReportClient
-  return { deps: { client: client as ReorderDemandChartDeps['client'], now: () => NOW }, client, calls }
+  return { deps: { client: client as ReorderDemandChartDeps['client'], now: () => NOW, loadStockoutHistory: noStockoutHistory }, client, calls }
 }
 
 // 21 units in the 14-day window (2026-12-24 .. 2027-01-06) = 1.5/day. The Sun 12-20 sale is outside it.
@@ -178,4 +183,74 @@ test('chart: warehouse filter scopes stock, demand and POs to the planning locat
   const po = calls.purchaseOrderLine.at(-1) as { where: { productId?: string; po: { destinationWarehouseId?: string } } }
   assert.equal(po.where.po.destinationWarehouseId, 'wh-1')
   assert.equal(po.where.productId, 'product-1')
+})
+
+// ---- o3d-s8n.3: stockout shading, the historical stock line and the Ignore stockouts toggle ----
+
+/** Runs on `runDates`; `qty` by date (absent date with a run = genuine zero). */
+function historyLoader(runDates: string[], qtyByDate: Record<string, number>): NonNullable<ReorderDemandChartDeps['loadStockoutHistory']> {
+  return async ({ dateFrom, dateTo }) => buildStockoutDays({
+    dateFrom, dateTo, runDates,
+    rows: Object.entries(qtyByDate).map(([date, qty]) => ({ date, qty })),
+  })
+}
+
+test('chart weeks: three-state stock days, the historical stock line, and unknown is never in stock', async () => {
+  const { deps } = build({ sales: SALES })
+  // Runs 12-28 .. 01-02 and 01-05. 12-28/12-29 in stock; 12-30 .. 01-01 stocked out (zero / absent row);
+  // 01-02 in stock. Mon 12-21 .. Sun 12-27 and 01-03/01-04 have no run (unknown). 01-06 (today) unknown.
+  const runs = ['2026-12-28', '2026-12-29', '2026-12-30', '2026-12-31', '2027-01-01', '2027-01-02', '2027-01-05']
+  const chart = await getReorderDemandChart({
+    productId: 'product-1', filters: { thresholdDays: 14 },
+    deps: { ...deps, loadStockoutHistory: historyLoader(runs, { '2026-12-28': 9, '2026-12-29': 8, '2026-12-30': 0, '2027-01-02': 6, '2027-01-05': 5 }) },
+  })
+  assert.ok(chart)
+  const byWeek = new Map(chart.weeks.map((week) => [week.weekStart, week]))
+  const early = byWeek.get('2026-12-21')!
+  assert.equal(early.stockState, 'unknown')
+  assert.equal(early.stockoutDays, 0)
+  assert.equal(early.inStockDays, 0)
+  assert.equal(early.historicalStockQty, null)
+  const mid = byWeek.get('2026-12-28')!
+  assert.equal(mid.stockState, 'stockout')
+  assert.deepEqual([mid.stockoutDays, mid.inStockDays, mid.unknownDays], [3, 3, 1]) // out 12-30..01-01; in 12-28, 12-29, 01-02; unknown 01-03
+  assert.equal(mid.historicalStockQty, 6) // last covered day of the week is 01-02
+  const current = byWeek.get('2027-01-04')!
+  assert.equal(current.isCurrentWeek, true)
+  assert.deepEqual([current.stockoutDays, current.inStockDays, current.unknownDays], [0, 1, 2]) // 01-04 unknown, 01-05 in stock, 01-06 unknown
+  assert.equal(current.stockState, 'partly_unknown')
+  assert.equal(current.historicalStockQty, 5)
+  const forecast = chart.weeks.find((week) => week.kind === 'forecast')!
+  assert.deepEqual([forecast.stockState, forecast.stockoutDays, forecast.historicalStockQty], [null, null, null])
+  assert.equal(chart.stockout.stockoutDays, 3)
+  assert.equal(chart.stockout.firstCoveredDate, '2026-12-28')
+  assert.ok(chart.notices.some((notice) => notice.includes('UNKNOWN')))
+})
+
+test('chart with no snapshot runs at all: every history week is unknown and the notice says stockouts cannot be shown', async () => {
+  const { deps } = build({ sales: SALES })
+  const chart = await getReorderDemandChart({ productId: 'product-1', filters: { thresholdDays: 14 }, deps })
+  assert.ok(chart)
+  for (const week of chart.weeks.filter((w) => w.kind === 'history')) assert.equal(week.stockState, 'unknown')
+  assert.equal(chart.stockout.firstCoveredDate, null)
+  assert.equal(chart.stockout.stockoutDays, 0)
+  assert.ok(chart.notices.some((notice) => notice.includes('cannot be shown')))
+})
+
+test('chart demand: the toggle excludes stockout days, off is unchanged, and it matches getReorderReport', async () => {
+  const { deps, client } = build({ sales: SALES })
+  // 14-day window 12-24 .. 01-06. 7 covered stockout days inside it.
+  const runs = ['2026-12-24', '2026-12-25', '2026-12-26', '2026-12-27', '2026-12-28', '2026-12-29', '2026-12-30']
+  const loader = historyLoader(runs, {})
+  const counts: NonNullable<ReorderDemandChartDeps['loadStockoutDayCounts']> = async ({ productIds }) => new Map(productIds.map((id) => [id, { stockoutDays: 7, coveredDays: 7 }]))
+  const coverage: NonNullable<ReorderDemandChartDeps['loadSnapshotCoverage']> = async () => ({ firstCoveredDate: '2026-12-24', coveredDays: 7, windowDays: 14 })
+  const off = await getReorderDemandChart({ productId: 'product-1', filters: { thresholdDays: 14 }, deps: { ...deps, loadStockoutHistory: loader } })
+  const on = await getReorderDemandChart({ productId: 'product-1', filters: { thresholdDays: 14, ignoreStockouts: true }, deps: { ...deps, loadStockoutHistory: loader, loadStockoutDayCounts: counts, loadSnapshotCoverage: coverage } })
+  assert.ok(off && on)
+  assert.equal(off.averageDailyDemand, 1.5) // 21 / 14
+  assert.equal(on.averageDailyDemand, 3) // 21 / (14 - 7)
+  assert.equal(on.ignoreStockouts, true)
+  assert.equal(on.stockout.demandWindowStockoutDays, 7)
+  const report = await getReorderReport({ thresholdDays: 14, includeZero: true, ignoreStockouts: true }, { deps: { client, now: () => NOW, loadStockoutDayCounts: counts, loadSnapshotCoverage: coverage } })
+  assert.equal(Number(report.rows[0]!.averageDailyDemand), on.averageDailyDemand)
 })

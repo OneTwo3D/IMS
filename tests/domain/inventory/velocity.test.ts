@@ -7,6 +7,7 @@ import {
   calculateDailyVelocity,
   calculateDeadStock,
   calculateInventoryTurnover,
+  calculateStockoutAdjustedVelocity,
   classifyVelocityQuartiles,
   normalizeVelocityWindow,
   saleMovementCogsBase,
@@ -380,4 +381,52 @@ test('saleMovementCogsBase falls back to the movement value when there is no COG
   assert.equal(saleMovementCogsBase({ totalValueBase: '7.250000', cogsEntries: [] }).toFixed(6), '7.250000')
   assert.equal(saleMovementCogsBase({ totalValueBase: '7.250000' }).toFixed(6), '7.250000')
   assert.equal(saleMovementCogsBase({ totalValueBase: null }).toFixed(6), '0.000000')
+})
+
+// ---- o3d-s8n.3: stockout-adjusted velocity ----
+
+const SALE = (productId: string, qty: number) => ({ productId, sku: productId.toUpperCase(), productName: productId, qty, occurredAt: '2026-01-10T12:00:00.000Z' })
+const WINDOW_10 = { dateFrom: '2026-01-01', dateTo: '2026-01-10' }
+
+test('stockout-adjusted velocity shrinks the denominator only: units / (window - stockout days)', () => {
+  const sales = [SALE('p1', 30)]
+  const [plain] = calculateDailyVelocity(sales, WINDOW_10)
+  const [row] = calculateStockoutAdjustedVelocity(sales, WINDOW_10, new Map([['p1', 5]]))
+  assert.equal(plain!.dailyQtyVelocity, '3')
+  assert.equal(row!.dailyQtyVelocity, '6') // 30 / (10 - 5)
+  assert.equal(row!.stockoutDays, 5)
+  assert.equal(row!.effectiveDays, 5)
+  assert.equal(row!.clamped, false)
+  assert.equal(row!.qtySold, plain!.qtySold) // units sold are never altered
+})
+
+test('stockout-adjusted velocity: zero or missing stockout days is the unadjusted row', () => {
+  const sales = [SALE('p1', 7), SALE('p2', 3)]
+  const plain = calculateDailyVelocity(sales, WINDOW_10)
+  const adjusted = calculateStockoutAdjustedVelocity(sales, WINDOW_10, new Map([['p2', 0]]))
+  assert.deepEqual(adjusted.map((row) => ({ ...row, stockoutDays: undefined, effectiveDays: undefined, clamped: undefined })).map((row) => { const copy: Record<string, unknown> = { ...row }; delete copy.stockoutDays; delete copy.effectiveDays; delete copy.clamped; return copy }), plain)
+  assert.ok(adjusted.every((row) => row.stockoutDays === 0 && !row.clamped))
+})
+
+test('stockout-adjusted velocity clamps at 90% censored and keeps the unadjusted rate', () => {
+  const sales = [SALE('p1', 1), SALE('p2', 1), SALE('p3', 1)]
+  const rows = new Map(calculateStockoutAdjustedVelocity(sales, WINDOW_10, new Map([['p1', 8], ['p2', 9], ['p3', 10]])).map((row) => [row.productId, row]))
+  assert.equal(rows.get('p1')!.clamped, false) // 8 < 9
+  assert.equal(rows.get('p1')!.dailyQtyVelocity, '0.5') // 1 / 2
+  assert.equal(rows.get('p2')!.clamped, true) // 9 >= 10 * 0.9
+  assert.equal(rows.get('p2')!.dailyQtyVelocity, '0.1') // unadjusted, not 1/day
+  assert.equal(rows.get('p3')!.clamped, true)
+  assert.equal(rows.get('p3')!.dailyQtyVelocity, '0.1')
+  const tighter = calculateStockoutAdjustedVelocity(sales, WINDOW_10, new Map([['p1', 5]]), { maxCensoredFraction: 0.5 })
+  assert.equal(tighter.find((row) => row.productId === 'p1')!.clamped, true)
+  assert.throws(() => calculateStockoutAdjustedVelocity(sales, WINDOW_10, new Map(), { maxCensoredFraction: 0 }), /maxCensoredFraction/)
+})
+
+test('stockout-adjusted velocity is never below the unadjusted rate, for every stockout count', () => {
+  const sales = [SALE('p1', 7.3333)]
+  const [plain] = calculateDailyVelocity(sales, WINDOW_10)
+  for (let stockoutDays = -3; stockoutDays <= 14; stockoutDays += 1) {
+    const [row] = calculateStockoutAdjustedVelocity(sales, WINDOW_10, new Map([['p1', stockoutDays]]))
+    assert.ok(Number(row!.dailyQtyVelocity) >= Number(plain!.dailyQtyVelocity), `stockoutDays ${stockoutDays}`)
+  }
 })

@@ -18,7 +18,7 @@ import { ProductType } from '@/app/generated/prisma/client'
 // scope, ABC/urgency/search), instead of a separately-recomputed default.
 export type ReorderActionFilters = Pick<
   StockPositionFilters,
-  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'abcClass' | 'urgency' | 'search'
+  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'abcClass' | 'urgency' | 'search' | 'ignoreStockouts'
 >
 
 // Server actions can't trust their argument — the ReorderActionFilters type is only a
@@ -40,6 +40,9 @@ function sanitizeReorderActionFilters(filters?: ReorderActionFilters): ReorderAc
     abcClass: f.abcClass === 'A' || f.abcClass === 'B' || f.abcClass === 'C' ? f.abcClass : undefined,
     urgency: f.urgency === 'critical' || f.urgency === 'reorder' || f.urgency === 'watch' ? f.urgency : undefined,
     search: typeof f.search === 'string' ? f.search.trim().slice(0, 100) || undefined : undefined,
+    // o3d-s8n.3: only ever the literal `true`, and only added when set, so a call without the toggle
+    // produces exactly the object (and the persisted evidence) it always did.
+    ...(f.ignoreStockouts === true ? { ignoreStockouts: true } : {}),
   }
 }
 

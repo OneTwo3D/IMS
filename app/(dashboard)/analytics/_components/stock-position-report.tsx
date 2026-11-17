@@ -50,6 +50,8 @@ export type StockPositionFilterValues = {
   urgency?: string
   search?: string
   targetCoverWeeks?: string
+  // o3d-s8n.3: reorder-only. Remove stockout days from the demand average.
+  ignoreStockouts?: boolean
 }
 
 type StockPositionReportPageProps<Row> = {

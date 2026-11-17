@@ -80,6 +80,9 @@ export type StockPositionFilters = {
   // audit-32cl: target weeks of supply for the order-up-to suggested quantity
   // (reorder-report-only). Defaults to DEFAULT_TARGET_COVER_WEEKS when unset.
   targetCoverWeeks?: number
+  // o3d-s8n.3: reorder-report-only. Remove days with no on-hand stock (daily inventory snapshots) from the
+  // demand denominator. Default off.
+  ignoreStockouts?: boolean
   page?: number
   pageSize?: number
 }
