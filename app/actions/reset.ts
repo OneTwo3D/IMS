@@ -75,6 +75,8 @@ async function clearTransactionScope(guards: ResetGuards) {
   await db.emailOutbox.deleteMany({})
   await db.notificationReadReceipt.deleteMany({})
   await db.notification.deleteMany({})
+  // Otherwise a reset would leave every previously announced failure marked as already announced.
+  await db.needsAttentionAnnouncement.deleteMany({})
 
   // WMS operational state and history
   await db.wmsReturnsInbox.deleteMany({})

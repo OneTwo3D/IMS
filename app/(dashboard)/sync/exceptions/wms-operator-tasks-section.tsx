@@ -46,7 +46,7 @@ export function WmsOperatorTasksSection({ data }: { data: WmsOperatorTaskPage })
   }
 
   return (
-    <Card className="p-4 space-y-3">
+    <Card id="wms-operator-tasks" className="p-4 space-y-3 scroll-mt-4">
       <div>
         <h2 className="text-sm font-semibold">{`Raise a warehouse query (${total})`}</h2>
         <p className="text-xs text-muted-foreground">

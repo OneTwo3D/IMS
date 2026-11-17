@@ -236,6 +236,13 @@ type ProductionOrderRow = {
   warehouse: { code: string; name: string }
 }
 
+/** One supplier that carries the product in the catalog (SupplierProduct), cheapest first. */
+export type ReorderSupplierOption = {
+  supplierId: string
+  supplierName: string
+  supplierSku: string | null
+}
+
 export type ReorderReportRow = {
   productId: string
   sku: string
@@ -256,6 +263,12 @@ export type ReorderReportRow = {
    */
   supplierName: string | null
   supplierSku: string | null
+  /**
+   * Suppliers the operator may pick instead of the default for a draft PO: the product's catalog suppliers
+   * (cheapest first). Empty for BOM rows. Under a Supplier filter the report loads only that supplier's catalog
+   * entry, so this is limited to it then.
+   */
+  supplierOptions: ReorderSupplierOption[]
   stockUnit: string
   availableQty: string
   warehouseAvailabilityBreakdown: string
@@ -1327,6 +1340,13 @@ export async function getReorderReport(
       supplierId,
       supplierName,
       supplierSku,
+      supplierOptions: isBom
+        ? []
+        : candidate.product.supplierProducts.map((sp) => ({
+          supplierId: sp.supplierId,
+          supplierName: sp.supplier.name,
+          supplierSku: sp.supplierSku,
+        })),
       stockUnit: candidate.product.stockUnit,
       availableQty: integerQuantityString(candidate.availableQty),
       warehouseAvailabilityBreakdown: warehouseBreakdown.get(candidate.product.id) ?? '',

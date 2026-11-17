@@ -22,6 +22,7 @@ import { HistoricalImportTrigger } from './historical-import-trigger'
 import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-context'
 import { parseSelectedParam } from '@/lib/analytics/reorder-selection'
 import { ReorderCoverageProvider, ReorderCoverageWeeksCell, ReorderOrderQtyCell } from './reorder-coverage-cells'
+import { ReorderSupplierSelect } from './reorder-supplier-select'
 import { ReorderSelectAllCheckbox, ReorderRowCheckbox } from './reorder-selection-checkboxes'
 import { currentParams } from '../_components/report-utils'
 import {
@@ -192,7 +193,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       render: (row) => <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />,
       footer: 'Totals',
     },
-    { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName ?? <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800" title="No supplier is set, so a draft PO cannot be raised for this row">Unassigned</span> },
+    { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName == null ? <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800" title="No supplier is set, so a draft PO cannot be raised for this row">Unassigned</span> : row.productType === 'BOM' ? row.supplierName : <ReorderSupplierSelect productId={row.productId} sku={row.sku} defaultSupplierId={row.supplierId} defaultSupplierName={row.supplierName} options={row.supplierOptions} /> },
     { key: 'neededFor', label: 'Needed for', render: (row) => row.neededFor.join(', ') },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'abcClass', label: 'ABC', render: (row) => <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-bold ${ABC_BADGE[row.abcClass]}`}>{row.abcClass}</span> },
