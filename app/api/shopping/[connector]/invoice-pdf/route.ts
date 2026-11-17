@@ -1,17 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-import { logActivity } from '@/lib/activity-log'
-import { db } from '@/lib/db'
 import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
-import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { readLimitedRequestBody } from '@/lib/security/read-limited-request-body'
 import {
   getShoppingConnector,
-  SHOPPING_CONNECTORS,
   type ShoppingConnectorId,
 } from '@/lib/connectors/shopping-registry'
+import {
+  auditShoppingInvoicePdfAttempt,
+  consumeShoppingInvoicePdfNonce,
+  findShoppingInvoicePdfOrder,
+  isShoppingConnectorId,
+  isShoppingConnectorPluginEnabled,
+  NO_STORE_HEADERS,
+  preparingResponse,
+  shoppingOrderLinkHasExternalOrderKey,
+  type ShoppingDocumentAuditInput,
+  type ShoppingDocumentOrder,
+} from '@/lib/shopping-invoice-access'
+import type { OnDemandRequestOutcome } from '@/lib/domain/invoice-documents/on-demand'
 import {
   getShoppingInvoicePdfSecret,
   parseShoppingInvoicePdfRequest,
@@ -19,23 +28,15 @@ import {
   type ShoppingInvoicePdfRequest,
 } from '@/lib/shopping-invoice-pdf'
 
+export { auditShoppingInvoicePdfAttempt, shoppingOrderLinkHasExternalOrderKey }
+
 type ShoppingInvoicePdfRouteParams = {
   connector: string
 }
 
-type ShoppingInvoicePdfOrder = {
-  orderId: string
-  invoiceNumber: string | null
-  invoicePdfPath: string | null
-}
+type ShoppingInvoicePdfOrder = ShoppingDocumentOrder
 
-type ShoppingInvoicePdfAuditInput = {
-  connector: ShoppingConnectorId | string
-  externalOrderId?: string | null
-  orderId?: string | null
-  accepted: boolean
-  reason?: string | null
-}
+type ShoppingInvoicePdfAuditInput = ShoppingDocumentAuditInput
 
 type ShoppingInvoicePdfRouteDependencies = {
   getPluginEnabled: (connector: ShoppingConnectorId) => Promise<boolean>
@@ -46,11 +47,12 @@ type ShoppingInvoicePdfRouteDependencies = {
   auditAttempt: (input: ShoppingInvoicePdfAuditInput) => Promise<void>
   checkRateLimit?: (key: string, max: number, windowMs: number) => Promise<RateLimitResult>
   /**
-   * Fetch the invoice from the accounting ledger for an order IMS holds no PDF for yet (historic orders are
-   * fetched on first customer download). Called only AFTER the request is verified and the order is proved to be
-   * the caller's. True when a PDF is now stored. Absent in tests that do not exercise it.
+   * QUEUE the fetch of the invoice from the accounting ledger for an order IMS holds no PDF for yet (historic orders are fetched on
+   * the first customer click, in the background). Called only AFTER the request is verified, the order is proved to be the caller's and
+   * the request's one-time nonce is spent. Touches IMS's own tables and nothing else: the ledger is asked later, by the sweep.
+   * Absent in tests that do not exercise it.
    */
-  ensureInvoiceOnDemand?: (orderId: string) => Promise<boolean>
+  requestInvoiceOnDemand?: (orderId: string) => Promise<OnDemandRequestOutcome>
   /**
    * Look again at a PDF IMS already holds when its recheck is due (the ledger can amend an invoice). Never throws; whatever is
    * stored is served when the ledger cannot be asked.
@@ -58,10 +60,6 @@ type ShoppingInvoicePdfRouteDependencies = {
   refreshStaleInvoice?: (orderId: string) => Promise<void>
   now?: Date | number
 }
-
-const NO_STORE_HEADERS = {
-  'Cache-Control': 'private, no-store',
-} as const
 
 const SHOPPING_INVOICE_RATE_LIMIT_MAX = 60
 const SHOPPING_INVOICE_RATE_LIMIT_WINDOW_MS = 60_000
@@ -76,14 +74,8 @@ const defaultDependencies: ShoppingInvoicePdfRouteDependencies = {
   loadInvoicePdf: loadCurrentInvoicePdf,
   auditAttempt: auditShoppingInvoicePdfAttempt,
   checkRateLimit,
-  ensureInvoiceOnDemand: ensureShoppingInvoiceOnDemand,
+  requestInvoiceOnDemand: requestShoppingInvoiceOnDemand,
   refreshStaleInvoice: refreshShoppingInvoice,
-}
-
-// DERIVED FROM THE REGISTRY (o3d-remove-parked-connectors): a second id union here would mean this
-// ingress accepts only the connectors somebody remembered to spell in this file.
-function isShoppingConnectorId(value: string): value is ShoppingConnectorId {
-  return SHOPPING_CONNECTORS.some((connector) => connector.id === value)
 }
 
 function jsonNoStore(body: object, status: number): NextResponse {
@@ -95,17 +87,9 @@ function safeInvoiceFilename(value: string | null | undefined): string {
   return safe.length > 0 ? `invoice-${safe}.pdf` : 'invoice.pdf'
 }
 
-async function isShoppingConnectorPluginEnabled(connector: ShoppingConnectorId): Promise<boolean> {
-  const pluginState = await getIntegrationPluginState()
-  return pluginState[connector]
-}
-
-async function ensureShoppingInvoiceOnDemand(orderId: string): Promise<boolean> {
-  const [{ ensureInvoiceDocumentOnDemand }, { xeroInvoiceDocumentDeps }] = await Promise.all([
-    import('@/lib/domain/invoice-documents/sweep'),
-    import('@/lib/connectors/xero/invoice-document-deps'),
-  ])
-  return ensureInvoiceDocumentOnDemand(orderId, xeroInvoiceDocumentDeps())
+async function requestShoppingInvoiceOnDemand(orderId: string): Promise<OnDemandRequestOutcome> {
+  const { requestInvoiceDocumentOnDemand } = await import('@/lib/domain/invoice-documents/on-demand')
+  return requestInvoiceDocumentOnDemand({ orderId, kind: 'INVOICE' })
 }
 
 async function refreshShoppingInvoice(orderId: string): Promise<void> {
@@ -114,77 +98,6 @@ async function refreshShoppingInvoice(orderId: string): Promise<void> {
     import('@/lib/connectors/xero/invoice-document-deps'),
   ])
   await refreshStaleInvoiceDocument(orderId, xeroInvoiceDocumentDeps())
-}
-
-function isUniqueConstraintError(error: unknown): error is { code: string } {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'P2002'
-}
-
-/** @internal Test seam for guest-checkout ownership proof. */
-export function shoppingOrderLinkHasExternalOrderKey(metadata: unknown, externalOrderKey: string | undefined): boolean {
-  if (!externalOrderKey || !metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false
-  const value = (metadata as Record<string, unknown>).externalOrderKey
-  return typeof value === 'string' && value.length > 0 && value === externalOrderKey
-}
-
-async function consumeShoppingInvoicePdfNonce(request: ShoppingInvoicePdfRequest): Promise<boolean> {
-  const expiresAt = new Date(request.expiresAt * 1000)
-  try {
-    await db.oneTimeToken.create({
-      data: {
-        key: `shopping-invoice-pdf:${request.connector}:${request.nonce}`,
-        value: request.externalOrderId,
-        expiresAt,
-      },
-    })
-    return true
-  } catch (error) {
-    if (isUniqueConstraintError(error)) return false
-    throw error
-  }
-}
-
-async function findShoppingInvoicePdfOrder(request: ShoppingInvoicePdfRequest): Promise<ShoppingInvoicePdfOrder | null> {
-  const link = await db.shoppingOrderLink.findFirst({
-    where: {
-      connector: request.connector,
-      externalOrderId: request.externalOrderId,
-    },
-    select: {
-      metadata: true,
-      order: {
-        select: {
-          id: true,
-          customerId: true,
-          invoiceNumber: true,
-          invoicePdfPath: true,
-        },
-      },
-    },
-  })
-  const order = link?.order
-  if (!order) return null
-
-  if (request.externalCustomerId && request.externalCustomerId !== '0') {
-    if (!order.customerId) return null
-    const customerLink = await db.shoppingCustomerLink.findFirst({
-      where: {
-        connector: request.connector,
-        externalCustomerId: request.externalCustomerId,
-        customerId: order.customerId,
-      },
-      select: { id: true },
-    })
-    if (!customerLink) return null
-  } else if (!shoppingOrderLinkHasExternalOrderKey(link.metadata, request.externalOrderKey)) {
-    return null
-  }
-
-  return {
-    orderId: order.id,
-    invoiceNumber: order.invoiceNumber,
-    invoicePdfPath: order.invoicePdfPath,
-  }
 }
 
 async function auditAttemptSafely(
@@ -203,26 +116,6 @@ async function auditAttemptSafely(
       error: error instanceof Error ? error.message : String(error),
     })
   }
-}
-
-/** @internal Test seam for shopping invoice PDF route auditing. */
-export async function auditShoppingInvoicePdfAttempt(input: ShoppingInvoicePdfAuditInput): Promise<void> {
-  await logActivity({
-    entityType: input.orderId ? 'SALES_ORDER' : 'SYNC',
-    entityId: input.orderId ?? null,
-    tag: 'auth',
-    action: input.accepted ? 'shopping_invoice_pdf_request_verified' : 'shopping_invoice_pdf_request_rejected',
-    level: input.accepted ? 'INFO' : 'WARNING',
-    description: input.accepted
-      ? 'Shopping invoice PDF request accepted'
-      : `Shopping invoice PDF request rejected: ${input.reason ?? 'unknown'}`,
-    metadata: {
-      connector: input.connector,
-      externalOrderId: input.externalOrderId ?? null,
-      reason: input.reason ?? null,
-    },
-    resolveUser: false,
-  })
 }
 
 function reject(
@@ -307,15 +200,25 @@ export async function handleShoppingInvoicePdfRoute(
   if (!order) return reject(dependencies, auditWithOrder, 'order_not_found')
   let nonceConsumed = false
   if (!order.invoicePdfPath) {
-    // A historic order the sweep never covered: ask the ledger once (throttled per document, and only with the
-    // lazy-fetch setting on). The caller is already proved to own the order. The request's one-time nonce is spent
-    // BEFORE the ledger is asked, so a replayed request cannot be used to drive ledger calls. Any failure is the
-    // same 404 as before.
-    if (!dependencies.ensureInvoiceOnDemand) return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
+    // A historic order the sweep never covered. The caller is already proved to own the order. The request's one-time nonce is spent
+    // BEFORE anything is queued, so a replayed request cannot be used to drive the queue. The fetch is QUEUED, not run: the ledger is
+    // asked later by the sweep, under its own budget, so this answer is immediate and a customer cannot drive ledger traffic.
+    if (!dependencies.requestInvoiceOnDemand) return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
     if (!await dependencies.consumeNonce(parsed.request)) return reject(dependencies, auditWithOrder, 'nonce_replayed')
     nonceConsumed = true
-    const fetched = await dependencies.ensureInvoiceOnDemand(order.orderId).catch(() => false)
-    if (!fetched) return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
+    const outcome = await dependencies.requestInvoiceOnDemand(order.orderId).catch((): OnDemandRequestOutcome => ({ status: 'unavailable', reason: 'the request could not be queued' }))
+    if (outcome.status === 'preparing') {
+      await auditAttemptSafely(dependencies, { ...auditWithOrder, accepted: true, reason: 'invoice_pdf_preparing' })
+      return preparingResponse(outcome.retryAfterSeconds)
+    }
+    if (outcome.status === 'throttled') {
+      await auditAttemptSafely(dependencies, { ...auditWithOrder, accepted: false, reason: 'invoice_pdf_queue_full' })
+      return NextResponse.json(
+        { status: 'busy', error: 'Invoice PDF is not available right now' },
+        { status: 429, headers: { ...NO_STORE_HEADERS, 'Retry-After': String(outcome.retryAfterSeconds) } },
+      )
+    }
+    return reject(dependencies, auditWithOrder, 'invoice_pdf_missing', 404)
   }
   if (!nonceConsumed && !await dependencies.consumeNonce(parsed.request)) {
     return reject(dependencies, auditWithOrder, 'nonce_replayed')

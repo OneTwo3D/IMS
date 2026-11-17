@@ -2491,6 +2491,9 @@ model InvoiceDocumentFetchState {
   leaseUntil    DateTime?                  @map("lease_until")
   /// Who holds the lease: a token unique to one fetch. Renewal, every state write, the promotion and the release all require it, so a holder whose lease was taken over cannot write or release the new holder's.
   leaseHolder   String?                    @map("lease_holder")
+  /// When a customer's click first QUEUED this document's fetch (an order the sweep never covered). Set once, never cleared: it is the
+  /// de-duplication key of the on-demand queue and the count behind its daily cap. NULL for a document nobody asked for.
+  customerRequestedAt DateTime?            @map("customer_requested_at")
   createdAt     DateTime                   @default(now()) @map("created_at")
   updatedAt     DateTime                   @updatedAt @map("updated_at")
 
@@ -2498,6 +2501,7 @@ model InvoiceDocumentFetchState {
   refund SalesOrderRefund? @relation(fields: [refundId], references: [id])
 
   @@index([status, nextAttemptAt])
+  @@index([customerRequestedAt])
   @@map("invoice_document_fetch_states")
 }
 

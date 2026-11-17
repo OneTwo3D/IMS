@@ -424,6 +424,19 @@ function noteLimitHeaders(tenantId: string, res: { headers?: { get(name: string)
   }
 }
 
+/**
+ * The fewest calls left in the rolling day across the tenants this process knows about: the lower of Xero's own last answer and the local bucket (`XERO_DAY_LIMIT` minus calls in the last 24h). `null` when
+ * this process has made no Xero call yet (nothing is known). In-process, like the buckets themselves: a worker that has not talked to Xero cannot see another worker's spend.
+ */
+export function xeroDayCallsRemaining(): number | null {
+  const now = Date.now()
+  let lowest: number | null = null
+  const note = (value: number) => { lowest = lowest === null ? value : Math.min(lowest, value) }
+  for (const [, stamps] of dayBuckets) note(XERO_DAY_LIMIT - stamps.filter((ts) => ts >= now - 86_400_000).length)
+  for (const [, snapshot] of limitSnapshots) if (snapshot.dayRemaining != null && now - snapshot.at < 86_400_000) note(snapshot.dayRemaining)
+  return lowest
+}
+
 /** What Xero last told us was left for this tenant, or undefined if it has not answered yet. */
 export function xeroLimitSnapshot(tenantId: string): XeroLimitSnapshot | undefined {
   return limitSnapshots.get(tenantId)
