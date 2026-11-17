@@ -60,7 +60,7 @@ test('helper: a rate that is not above zero is refused, not turned into Infinity
 test('recordSupplierFreightCreditNote: base amount divides by the BILL rate, and the stored rate is that rate', async () => {
   poFixture = {
     id: 'po-1', reference: 'PO-1', currency: 'EUR', fxRateToBase: '1.25', supplierId: 's1',
-    invoices: [{ id: 'inv-1', fxRateToBase: '1.17', totalForeign: '500' }],
+    invoices: [{ id: 'inv-1', fxRateToBase: '1.17', totalForeign: '500', lines: [] }],
   }
   captured.created.length = 0
   const { recordSupplierFreightCreditNote } = await import('@/app/actions/purchase-orders')
@@ -78,7 +78,7 @@ test('[R3 HIGH] a selected bill whose own rate is unusable REFUSES before any wr
   for (const billRate of [null, '0', '-1']) {
     poFixture = {
       id: 'po-2', reference: 'PO-2', currency: 'EUR', fxRateToBase: '1.25', supplierId: 's1',
-      invoices: [{ id: 'inv-2', fxRateToBase: billRate, totalForeign: '500' }],
+      invoices: [{ id: 'inv-2', fxRateToBase: billRate, totalForeign: '500', lines: [] }],
     }
     captured.created.length = 0
     const result = await recordSupplierFreightCreditNote({ poId: 'po-2', amountForeign: 100 })
@@ -93,7 +93,7 @@ test('[q0x56.8] recordSupplierFreightCreditNote: a FOREIGN document with no usab
   for (const [billRate, poRate] of [['0', '0'], [null, '0'], [null, null], ['-1', '1.25']] as const) {
     poFixture = {
       id: 'po-3', reference: 'PO-3', currency: 'EUR', fxRateToBase: poRate, supplierId: 's1',
-      invoices: [{ id: 'inv-3', fxRateToBase: billRate, totalForeign: '500' }],
+      invoices: [{ id: 'inv-3', fxRateToBase: billRate, totalForeign: '500', lines: [] }],
     }
     captured.created.length = 0
     const result = await recordSupplierFreightCreditNote({ poId: 'po-3', amountForeign: 100, purchaseInvoiceId: 'inv-3' })
@@ -106,7 +106,7 @@ test('[q0x56.8] recordSupplierFreightCreditNote: a FOREIGN document with no usab
 test('[q0x56.8] recordSupplierFreightCreditNote: a BASE-currency document is 1 by currency, with no usable stored rate', async () => {
   poFixture = {
     id: 'po-4', reference: 'PO-4', currency: 'GBP', fxRateToBase: '0', supplierId: 's1',
-    invoices: [{ id: 'inv-4', fxRateToBase: '0', totalForeign: '500' }],
+    invoices: [{ id: 'inv-4', fxRateToBase: '0', totalForeign: '500', lines: [] }],
   }
   captured.created.length = 0
   const { recordSupplierFreightCreditNote } = await import('@/app/actions/purchase-orders')
@@ -121,6 +121,6 @@ test('posting path: the transit base of a credit note is computed with the helpe
   const multiplying = source.match(/Number\(cn\.amountForeign\)\s*\*\s*Number\(cn\.fxRateToBase\)|mul\(fxRateToBase\)/g) ?? []
   const viaHelper = source.match(/supplierCreditNoteAmountBase\(/g) ?? []
   console.log(`source PRECONDITION: multiplying sites=${multiplying.length}, helper call sites=${viaHelper.length}`)
-  assert.equal(viaHelper.length, 2, 'the record action and the posting transit base both use the helper')
+  assert.equal(viaHelper.length, 3, 'the record action and both posting transit bases (standard and reverse-charge) use the helper')
   assert.equal(multiplying.length, 0)
 })

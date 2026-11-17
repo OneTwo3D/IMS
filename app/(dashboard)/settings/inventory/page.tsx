@@ -1,9 +1,11 @@
 import { AccessDenied } from '@/components/auth/access-denied'
 import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
-import { SlidersHorizontal, FolderTree } from 'lucide-react'
+import { SlidersHorizontal, FolderTree, Undo2 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { getAdjustmentReasons, getWarehousesForSettings, getAccountCodes } from '@/app/actions/settings'
+import { getReturnReasons } from '@/app/actions/return-reasons'
+import { ReturnReasonsTable } from '@/components/settings/return-reasons-table'
 import { listCategoryTree } from '@/app/actions/categories'
 import { AdjustmentReasonsTable } from '@/components/settings/adjustment-reasons-table'
 import { WarehousesTable } from '@/components/settings/warehouses-table'
@@ -21,8 +23,9 @@ export default async function InventorySettingsPage() {
   if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
   const pluginState = await getIntegrationPluginState()
-  const [reasons, warehouses, accountCodes, categories] = await Promise.all([
+  const [reasons, returnReasons, warehouses, accountCodes, categories] = await Promise.all([
     getAdjustmentReasons(),
+    getReturnReasons(),
     getWarehousesForSettings(),
     pluginState.xero ? getAccountCodes() : Promise.resolve([]),
     listCategoryTree(),
@@ -32,7 +35,7 @@ export default async function InventorySettingsPage() {
     <div className="space-y-6 max-w-4xl">
       <div>
         <h1 className="text-2xl font-semibold">Inventory Settings</h1>
-        <p className="mt-1 text-sm text-muted-foreground">Warehouses, stock adjustment reasons, and inventory configuration.</p>
+        <p className="mt-1 text-sm text-muted-foreground">Warehouses, stock adjustment reasons, return reasons, and inventory configuration.</p>
       </div>
 
       <Card className="p-6">
@@ -65,6 +68,19 @@ export default async function InventorySettingsPage() {
           ) : null}
         </p>
         <AdjustmentReasonsTable reasons={reasons} accountCodes={accountCodes} showAccountCode={pluginState.xero} />
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Undo2 className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-base font-semibold">Return Reasons</h2>
+        </div>
+        <p className="text-sm text-muted-foreground mb-4">
+          Define the reasons an operator can pick when processing a refund. The returns report counts and values refunds by reason. A
+          WooCommerce refund whose reason text matches an active reason name (ignoring case) is mapped to it; any other text is left
+          unmapped, and reasons are never created automatically. Set a reason inactive to retire it; one that refunds use cannot be deleted.
+        </p>
+        <ReturnReasonsTable reasons={returnReasons} />
       </Card>
     </div>
   )

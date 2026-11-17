@@ -1,0 +1,5 @@
+### Estimated back-in-stock date pushed to WooCommerce for out-of-stock products (WooCommerce / purchasing)
+
+- **New (off by default): `wc_back_in_stock_date_enabled`.** Sync settings gain **Include estimated back-in-stock date**. When on, the stock push also writes the `_oti_eta_date` product meta (`YYYY-MM-DD`) for products pushed at zero stock: the earliest committed arrival from sent, shipped or part-received purchase orders (a line's own expected delivery, else the order's), with an open warehouse ASN's eta taking the place of the order date where it has one. A past-dated (late) or undated source never produces a date, and the meta is cleared when stock returns or the supply goes away. Bundles and kits never carry a date. The meta write goes through the `product.meta` producer seam and the outbound write hold. With the setting off the stock push is byte-identical to before.
+- Additive migration: nullable `stock_sync_states.lastPushedEtaDate`.
+- Display is a storefront job and is not part of this change: the meta key and display contract are in `docs/woocommerce-back-in-stock-date.md`. Help documents: WooCommerce, Purchasing.

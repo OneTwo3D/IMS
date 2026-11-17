@@ -10,6 +10,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { runPostCommit } from '@/lib/domain/post-commit'
 import { queueEmail } from '@/lib/email-outbox'
 import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
@@ -55,7 +56,7 @@ import {
 import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
@@ -189,6 +190,13 @@ const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
 export type PoStatus = 'DRAFT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'PO_SENT' | 'SHIPPED' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'CLOSED' | 'INVOICED' | 'PARTIALLY_RETURNED' | 'RETURNED' | 'CANCELLED'
 
+/** The internal remark on a PO line: trimmed, blank is none, capped at the length the form allows. Never sent to the supplier. */
+const PO_LINE_NOTES_MAX_LENGTH = 2000
+function normalizePoLineNotes(value: string | null | undefined): string | null {
+  const text = value?.trim()
+  return text ? text.slice(0, PO_LINE_NOTES_MAX_LENGTH) : null
+}
+
 export type PoLineRow = {
   id: string
   productId: string
@@ -198,6 +206,8 @@ export type PoLineRow = {
   /** Product.barcode; null when the variant has none (the page shows an empty cell). */
   barcode: string | null
   description: string | null
+  /** Internal per-line remark. Never printed on the supplier PO PDF or sent in the supplier email. */
+  notes: string | null
   qty: number
   unitCostForeign: number
   unitCostBase: number
@@ -355,6 +365,8 @@ export type PoLineInput = {
   sku: string
   productName: string
   description?: string
+  /** Internal remark on this line (never sent to the supplier). Omitted = keep the stored note on an existing line; blank clears it. */
+  notes?: string | null
   qty: number // stock units
   purchaseUnitId?: string
   purchaseUnitQty?: number // qty in purchase units
@@ -482,6 +494,7 @@ const PO_SELECT = {
       id: true,
       productId: true,
       description: true,
+      notes: true,
       qty: true,
       unitCostForeign: true,
       unitCostBase: true,
@@ -596,6 +609,7 @@ function mapLine(l: {
   id: string
   productId: string
   description: string | null
+  notes?: string | null
   qty: unknown
   unitCostForeign: unknown
   unitCostBase: unknown
@@ -625,6 +639,7 @@ function mapLine(l: {
     imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
     barcode: l.product.barcode ?? null,
     description: l.description,
+    notes: l.notes ?? null,
     qty,
     unitCostForeign: Number(l.unitCostForeign),
     unitCostBase: Number(l.unitCostBase),
@@ -1395,6 +1410,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       return {
         productId: l.productId,
         description: l.description || null,
+        notes: normalizePoLineNotes(l.notes),
         qty: l.qty,
         purchaseUnitId: l.purchaseUnitId || null,
         purchaseUnitQty: l.purchaseUnitQty ?? null,
@@ -1807,7 +1823,10 @@ export async function updatePurchaseOrder(
         const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
         const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx, priorLineRates)
         // A line whose `expectedDelivery` is ABSENT keeps its stored date (a caller that predates the field must not erase it); an explicit null or blank clears it.
-        const storedLineEta = new Map((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true } })).map((l) => [l.id, l.expectedDelivery]))
+        const storedLineRows = await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true, notes: true } })
+        const storedLineEta = new Map(storedLineRows.map((l) => [l.id, l.expectedDelivery]))
+        // Same rule for the internal note: an ABSENT `notes` keeps the stored one (a caller that predates the field must not erase it); an explicit null or blank clears it.
+        const storedLineNotes = new Map(storedLineRows.map((l) => [l.id, l.notes]))
 
         // FULL edit: delete existing lines and recreate. AMEND: lines are reconciled in place further down (ids are kept).
         if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
@@ -1847,6 +1866,9 @@ export async function updatePurchaseOrder(
             poId: id,
             productId: l.productId,
             description: l.description || null,
+            notes: l.notes === undefined
+              ? (l.poLineId ? storedLineNotes.get(l.poLineId) ?? null : null)
+              : normalizePoLineNotes(l.notes),
             qty: l.qty,
             purchaseUnitId: l.purchaseUnitId || null,
             purchaseUnitQty: l.purchaseUnitQty ?? null,
@@ -1897,6 +1919,7 @@ export async function updatePurchaseOrder(
                   ...scaled,
                   ...(k.qtyChanged ? { purchaseUnitQty: row.purchaseUnitQty, ...scaleLineDiscountForQty(k.fact, req.qty) } : {}),
                   description: row.description,
+                  notes: row.notes,
                   sortOrder: row.sortOrder,
                   expectedDelivery: row.expectedDelivery,
                 },
@@ -1913,7 +1936,7 @@ export async function updatePurchaseOrder(
                 // Unchanged: the stored figures stand. Recomputing under the request's VAT convention can differ by rounding (and
                 // the form sends net prices), and an unchanged save must not move a stored money field.
                 const stored = { totalForeign: k.fact.totalForeign, totalBase: k.fact.totalBase, taxForeign: k.fact.taxForeign, taxBase: k.fact.taxBase }
-                lineUpdates.push({ id: k.fact.id, data: { description: row.description, sortOrder: row.sortOrder, expectedDelivery: row.expectedDelivery } })
+                lineUpdates.push({ id: k.fact.id, data: { description: row.description, notes: row.notes, sortOrder: row.sortOrder, expectedDelivery: row.expectedDelivery } })
                 finalRows.push(stored)
               } else {
                 lineMoneyChanged = true
@@ -2353,6 +2376,39 @@ export async function updatePoTracking(
       metadata: { reference: existing.reference, ...payload },
     })
     return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Save the internal note on one PO line, on any order status (it is a remark, not a money or stock field, so it does not wait for a draft).
+ * The note is never printed on the supplier PO PDF or sent in the supplier email. Blank clears it.
+ */
+export async function updatePoLineNote(
+  poLineId: string,
+  notes: string | null,
+): Promise<{ success: boolean; notes?: string | null; error?: string }> {
+  try {
+    await requirePermission('purchasing.create')
+    const line = await db.purchaseOrderLine.findUnique({ where: { id: poLineId }, select: { id: true, poId: true, po: { select: { reference: true } } } })
+    if (!line) return { success: false, error: 'PO line not found' }
+    const saved = normalizePoLineNotes(notes)
+    await db.purchaseOrderLine.update({ where: { id: poLineId }, data: { notes: saved } })
+    const postCommit = await runPostCommit(async () => {
+      revalidatePath(`/purchase-orders/${line.poId}`)
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: line.poId,
+        action: 'line_note_updated',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `${saved ? 'Updated' : 'Cleared'} the internal note on a line of PO ${line.po.reference}`,
+        metadata: { reference: line.po.reference, poLineId },
+      })
+    }, 'Failed to record the line note change')
+    void postCommit // the note is saved either way; a failed audit entry must not report it as unsaved
+    return { success: true, notes: saved }
   } catch (e) {
     return { success: false, error: String(e) }
   }
@@ -5197,7 +5253,7 @@ export async function recordSupplierFreightCreditNote(input: {
         currency: true,
         fxRateToBase: true,
         supplierId: true,
-        invoices: { select: { id: true, fxRateToBase: true, totalForeign: true }, orderBy: { createdAt: 'desc' } },
+        invoices: { select: { id: true, fxRateToBase: true, totalForeign: true, lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } } }, orderBy: { createdAt: 'desc' } },
       },
     })
     if (!po) return { success: false, error: 'Purchase order not found' }
@@ -5214,7 +5270,13 @@ export async function recordSupplierFreightCreditNote(input: {
         where: { purchaseInvoiceId: selectedInvoice.id },
         _sum: { amountForeign: true },
       })
-      remainingCreditableForeign = Number(selectedInvoice.totalForeign) - Number(existing._sum.amountForeign ?? 0)
+      // A bill with reverse-charge lines stores a total that includes the VAT it accounts for itself, which is not owed to the supplier: its credits are capped at the NET PAYABLE
+      // (reverse-charge lines at their net, the rest at net plus VAT). Lines booked before the treatment was recorded carry no flag and count at the stored total.
+      const hasReverseChargeLine = selectedInvoice.lines.some((l) => l.taxReverseCharge === true)
+      const creditableCeiling = hasReverseChargeLine
+        ? billNetPayable(selectedInvoice.lines.map((l) => ({ taxType: undefined, rate: Number(l.taxRateValue ?? 0), reverseCharge: l.taxReverseCharge === true, net: Number(l.totalForeign) })), po.currency)
+        : Number(selectedInvoice.totalForeign)
+      remainingCreditableForeign = creditableCeiling - Number(existing._sum.amountForeign ?? 0)
     }
 
     const validationError = validateRecordSupplierCreditNote({
@@ -5289,7 +5351,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     const cn = await db.supplierCreditNote.findUnique({
       where: { id },
       select: {
-        id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true,
+        id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true, purchaseInvoiceId: true,
         amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
@@ -5413,9 +5475,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // poster for QuickBooks, so no posting is ever coming — so it is not an inbox row; it is a WARNING that
     // says plainly what the ledger will not receive.
     // One credit amount cannot mirror a bill that mixes VAT treatments: refused BEFORE anything is claimed (the credit stays a draft). Per-line credits are a follow-up.
-    // A Xero-bound credit against a bill with ANY reverse-charge line is refused before anything is claimed (its figures cannot agree yet); the credit stays a draft. Local-only credits are unaffected.
-    if (shouldQueueXero && billTreatments.some((t) => t.reverseCharge)) return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE }
-    if (shouldQueueXero && creditNoteTreatment.mixed) return { success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE }
+    // A bill with a reverse-charge line is credited by its own lines against its NET PAYABLE (below), so mixing reverse-charge with standard lines is supported there; any other mix is still refused.
+    const billHasReverseCharge = billTreatments.some((t) => t.reverseCharge)
+    if (shouldQueueXero && creditNoteTreatment.mixed && !billHasReverseCharge) return { success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE }
     // A credit that would be sent to the ledger is not priced on an inactive rate, and not on a treatment that cannot be told: refused before anything is claimed.
     if (shouldQueueXero) {
       if (legacyTreatmentsAmbiguous) return { success: false, error: LEGACY_BILL_TAX_AMBIGUOUS_MESSAGE }
@@ -5424,6 +5486,23 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       // The code the credit would post on is the bill's BOOKED code: it must still charge, in the ledger, the rate the line was booked at (the same agreement check as a bill's).
       const disagreement = await billTaxCodeRefusal(billTreatments.map((t, i) => ({ description: `bill line ${i + 1}`, taxType: t.taxType, rate: t.rate, checkable: !t.reverseCharge })), 'credit note')
       if (disagreement) return { success: false, error: disagreement }
+    }
+    // REVERSE-CHARGE BILL: the credit is an amount against the bill's NET PAYABLE (what is owed to the supplier, without the VAT the bill accounts for itself), capped there together with
+    // the credits already against the bill. That ONE amount is split across the bill's lines and is the Xero credit lines (exclusive net, each line's booked code, so Xero self-accounts the
+    // VAT the way the bill did), the allocation to the bill and the transit movement. Local-only credits are not Xero figures and are left alone.
+    let reverseChargePlan: Exclude<ReturnType<typeof planReverseChargeSupplierCredit>, string> | null = null
+    if (shouldQueueXero && billHasReverseCharge) {
+      const payableForeign = billNetPayable(billTreatments, cn.currency)
+      const others = cn.purchaseInvoiceId
+        ? await db.supplierCreditNote.aggregate({ where: { purchaseInvoiceId: cn.purchaseInvoiceId, id: { not: cn.id } }, _sum: { amountForeign: true } })
+        : null
+      const availableForeign = Math.max(0, payableForeign - Number(others?._sum.amountForeign ?? 0))
+      const creditForeign = Number(cn.amountForeign)
+      if (creditForeign > availableForeign + 0.0001) return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE(payableForeign.toFixed(2), availableForeign.toFixed(2)) }
+      const planned = planReverseChargeSupplierCredit({ amount: creditForeign, lines: billTreatments, currency: cn.currency })
+      if (planned === 'exceeds') return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE(payableForeign.toFixed(2), availableForeign.toFixed(2)) }
+      if (planned === 'inexact') return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE }
+      reverseChargePlan = planned
     }
     // The credit's payload is built BEFORE the claim so an undecided tax type is refused while the credit is still a DRAFT: claiming first would leave it POSTED, refused by the poster with
     // no Xero credit and no way back (posting requires DRAFT). A legacy bill line can reconstruct the right VAT and still have no mapped tax type.
@@ -5453,7 +5532,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       // audit-v08m: allocate the credit to the bill once both have posted to
       // Xero. Skipped when the bill has no external id yet (allocation needs it).
       allocateToInvoiceId: cn.purchaseInvoice?.accountingInvoiceId ?? null,
-      allocateAmount: Number(cn.amountForeign),
+      // The allocation is what Xero will hold the credit as, so it can never exceed the bill's outstanding amount.
+      allocateAmount: reverseChargePlan ? reverseChargePlan.xeroTotal : Number(cn.amountForeign),
+      reverseChargePlan: reverseChargePlan ?? undefined,
     }) : null
     if (shouldQueueXero && creditNotePayload) {
       const undecidedType = purchaseDocumentTaxTypeRefusal(`Supplier credit note ${cn.creditNoteNumber ?? cn.id}`, creditNotePayload as { lines?: ReadonlyArray<{ taxType?: unknown }> })
@@ -5525,7 +5606,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // keyed the same, only when actually queued (record on the queue's OWN
         // decision, bcz9.4). Net is derived from the offset bill's VAT ratio.
         if (queued) {
-          const transitNetBase = resolveSupplierCreditNoteTransitBase({
+          const transitNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, cn.fxRateToBase).toNumber() : resolveSupplierCreditNoteTransitBase({
             grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
             billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
             billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),

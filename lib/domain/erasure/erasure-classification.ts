@@ -34,9 +34,10 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       accountingContactProvenance: 'ledger contact provenance, part of the accounting record',
     },
   },
+  // wcLineBaseline (JSON): WooCommerce line item ids, quantities, SKUs and the order total taken at the first IMS line edit. Product and money figures only: no name, address, email or free text.
   SalesOrder: {
     erased: ['customerName', 'customerEmail', 'customerVatNumber', 'billingAddress', 'shippingAddress', 'notes', 'internalNotes', 'trackingNumber'],
-    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses'],
+    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
     retained: {
       invoiceNumber: 'issued invoice number, statutory record',
       accountingInvoiceId: 'ledger document id, statutory record',
@@ -90,7 +91,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
+    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
     },

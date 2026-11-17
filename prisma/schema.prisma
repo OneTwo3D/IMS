@@ -494,6 +494,22 @@ model AdjustmentReason {
   @@map("adjustment_reasons")
 }
 
+/// Configurable reasons a customer return / refund happened (damaged, wrong item, changed mind ...). A configured list, not an enum, because the useful
+/// categories differ by business. Reason names are business configuration, not personal data. A refund points at one by id (`SalesOrderRefund.returnReasonId`);
+/// the free-text `SalesOrderRefund.reason` is a separate field and is untouched.
+model ReturnReason {
+  id        String   @id @default(cuid())
+  name      String
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refunds SalesOrderRefund[]
+
+  @@map("return_reasons")
+}
+
 // ---------------------------------------------------------------------------
 // CURRENCIES & FX
 // ---------------------------------------------------------------------------
@@ -1397,6 +1413,8 @@ model PurchaseOrderLine {
   reorderEvidence Json?
   /// Per-line estimated delivery. Null = inherit the order's expectedDelivery (lib/domain/purchasing/line-eta.ts). Receiving never writes it.
   expectedDelivery DateTime?
+  /// Internal remark on this line (colourway, substitute accepted, chase this one). Never printed on the supplier PO PDF or sent in the supplier email.
+  notes           String?
   qtyReceived     Decimal   @db.Decimal(12, 4) @default(0)
   qtyReturned     Decimal   @db.Decimal(12, 4) @default(0)
   sortOrder       Int       @default(0)
@@ -1918,6 +1936,12 @@ model SalesOrder {
   /// A value that is still set means an invoice obligation has not been recorded anywhere yet, so an existing-order import of it cannot succeed until a held invoice or a
   /// SALES_INVOICE row (any status) exists. NULL for every order imported before this column and for orders the import does not invoice.
   salesInvoiceOwedAt      DateTime?  @map("sales_invoice_owed_at")
+  /// Set when an operator edited this order in IMS after it was confirmed (lines, or addresses/notes after dispatch). While set, a later WooCommerce order.updated delivery does not write its addresses, notes, VAT number or shipping label back over the IMS edit,
+  /// and the "edited in WooCommerce after import" comparison is not raised (the order is deliberately desynced). Paid state and the order number still mirror. NULL on every order never edited this way.
+  editedInImsAt           DateTime?  @map("edited_in_ims_at")
+  /// The WooCommerce-facing state of this order's lines and total BEFORE the first IMS edit of its lines: { totalForeign, lines: [{ externalLineItemId, qty, sku }] }. Taken once, so the "edited in WooCommerce after import" comparison can keep running
+  /// after an IMS line edit, against what WooCommerce held (an IMS edit does not reach WooCommerce) instead of against the edited lines. NULL when the lines were never edited in IMS (an address or notes edit takes none), and the comparison is against the lines as usual.
+  wcLineBaseline          Json?      @map("wc_line_baseline")
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
@@ -2245,6 +2269,9 @@ model SalesOrderRefund {
   stockCorrectionQueuedAt DateTime? @map("stock_correction_queued_at")
   returnWarehouseId String?
   reason          String?
+  /// The structured reason (configured in Settings, one per refund). Optional; the free-text `reason` above is separate and unchanged. SetNull so removing a reason never touches a refund.
+  returnReasonId  String?    @map("return_reason_id")
+  returnReason    ReturnReason? @relation(fields: [returnReasonId], references: [id], onDelete: SetNull)
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
   // What the stored totals MEAN, and which trusted writer created the refund (o3d-n8p). Set by the
@@ -2360,6 +2387,7 @@ model SalesOrderRefund {
   @@unique([externalRefundId])
   @@index([orderId])
   @@index([stockCorrectionRequired, stockCorrectionQueuedAt])
+  @@index([returnReasonId])
   @@map("sales_order_refunds")
 }
 
@@ -3797,6 +3825,8 @@ model StockSyncState {
   lastPushedQty    Int?
   lastPushedAt     DateTime?
   lastPushedRemoteId String?
+  /// o3d-taro: the back-in-stock date last pushed as product meta ('' = cleared). Null until the feature has pushed once.
+  lastPushedEtaDate String?
   lastWebhookQty   Int?
   lastWebhookAt    DateTime?
   lastCorrectedAt  DateTime?
