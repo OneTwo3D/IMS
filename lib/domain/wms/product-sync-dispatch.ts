@@ -92,3 +92,18 @@ export function scheduleWmsProductSync(productId: string): void {
   after(() => syncWmsBundleBestEffort(productId))
   after(() => syncWmsParentBundlesBestEffort(productId))
 }
+
+/**
+ * The same product, bundle and parent-KIT sync as {@link scheduleWmsProductSync}, run NOW and awaited (best-effort, never
+ * throws). For a paced drain (the product-sync-marks cron) that must bound how many warehouse calls it makes per run, which
+ * the fire-and-forget `after()` form cannot.
+ */
+export async function syncWmsProductNow(productId: string): Promise<void> {
+  // Unlike the fire-and-forget form, a failure THROWS, so the drain can keep the product's mark and retry it.
+  await runWmsProductSyncForProduct(productId, 'product_mutation')
+  await runWmsBundleSyncForProduct(productId, 'product_mutation')
+  const parents = await db.productComponent.findMany({ where: { componentId: productId }, select: { productId: true } })
+  for (const parentId of new Set(parents.map((parent) => parent.productId))) {
+    await runWmsBundleSyncForProduct(parentId, 'product_mutation')
+  }
+}

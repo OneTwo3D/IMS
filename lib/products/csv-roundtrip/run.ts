@@ -9,8 +9,8 @@ import {
   type RowOutcome,
 } from '@/lib/products/csv-roundtrip/plan'
 import type { ProductCsvColumn } from '@/lib/products/csv-roundtrip/columns'
+import { PRODUCT_SYNC_SWEEP_BATCH, PRODUCT_SYNC_SWEEP_MINUTES } from '@/lib/products/csv-roundtrip/sync-constants'
 import { writeBatchSizeFor, type PlannedUpdate, type ProductCsvStore } from '@/lib/products/csv-roundtrip/store'
-import type { ProductCsvSyncTarget } from '@/lib/products/csv-roundtrip/sync'
 
 /**
  * Preview or apply an edited product CSV. One function for both, so what the preview promises is computed by the very
@@ -56,6 +56,8 @@ export type ProductCsvEditResult = {
   /** Apply only. */
   written: number
   failedProducts: number
+  /** Apply only: products whose storefront (and warehouse) sync is now owed and will be drained by the sync cron. */
+  syncQueued: number
 }
 
 export type ProductCsvEditArgs = {
@@ -63,14 +65,16 @@ export type ProductCsvEditArgs = {
   text: string
   canUse: (permission: Permission) => boolean
   store: ProductCsvStore
+  /** Apply only: also owe the warehouse sync (the editor's rule: the user holds `sync`). */
+  markWarehouse?: boolean
   /** Apply only: called once per committed batch with what it wrote. */
-  onBatchWritten?: (batch: { updates: readonly PlannedUpdate[]; targets: ProductCsvSyncTarget[] }) => Promise<void> | void
+  onBatchWritten?: (batch: { updates: readonly PlannedUpdate[] }) => Promise<void> | void
 }
 
 function emptyResult(mode: 'preview' | 'apply'): ProductCsvEditResult {
   return {
     mode, totalRows: 0, changedProducts: 0, unchangedProducts: 0, errorRows: 0, errors: [], errorsTruncated: false,
-    warnings: [], columns: [], fieldChangeCounts: {}, diffs: [], diffsTruncated: false, written: 0, failedProducts: 0,
+    warnings: [], columns: [], fieldChangeCounts: {}, diffs: [], diffsTruncated: false, written: 0, failedProducts: 0, syncQueued: 0,
   }
 }
 
@@ -108,7 +112,6 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
   const barcodeHeader = headerByColumn.get('barcode')
   const batchSize = writeBatchSizeFor(columns, WRITE_BATCH)
   let pending: PlannedUpdate[] = []
-  let pendingTargets: ProductCsvSyncTarget[] = []
 
   const noteError = (message: string) => {
     result.errorRows++
@@ -119,11 +122,9 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
   async function flush() {
     if (pending.length === 0) return
     const updates = pending
-    const targets = pendingTargets
     pending = []
-    pendingTargets = []
     try {
-      const { written, staleIds } = await store.writeBatch(updates, columns)
+      const { written, staleIds } = await store.writeBatch(updates, columns, { markWarehouse: args.markWarehouse })
       const stale = new Set(staleIds)
       result.written += written
       result.changedProducts += written
@@ -131,7 +132,7 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
         if (stale.has(update.id)) noteError(`Row (${update.sku}): this product was changed in IMS while the import was running, so nothing was changed for it. Download the file again and re-apply your edits`)
       }
       const landed = updates.filter((update) => !stale.has(update.id))
-      if (landed.length > 0) await args.onBatchWritten?.({ updates: landed, targets: targets.filter((target) => !stale.has(target.id)) })
+      if (landed.length > 0) await args.onBatchWritten?.({ updates: landed })
     } catch (error) {
       result.failedProducts += updates.length
       const detail = error instanceof Error ? error.message : String(error)
@@ -179,16 +180,16 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
         continue
       }
       pending.push({ id: outcome.product.id, sku: outcome.sku, expectedUpdatedAt: outcome.product.updatedAt, changes: outcome.changes })
-      pendingTargets.push({
-        id: outcome.product.id,
-        lifecycleStatus: (outcome.changes.find((change) => change.column === 'lifecycleStatus')?.value as ProductCsvSyncTarget['lifecycleStatus'] | undefined)
-          ?? outcome.product.lifecycleStatus,
-        classificationChanged: outcome.changes.some((change) => change.column === 'name' || change.column === 'description' || change.column === 'category'),
-      })
       if (pending.length >= batchSize) await flush()
     }
   }
-  if (mode === 'apply') await flush()
+  if (mode === 'apply') {
+    await flush()
+    result.syncQueued = result.written
+    if (result.written > 0) {
+      result.warnings.push(`The ${result.written} change${result.written !== 1 ? 's' : ''} will reach the shop${args.markWarehouse ? ' and the warehouse' : ''} over the next sync runs (${PRODUCT_SYNC_SWEEP_BATCH} products every ${PRODUCT_SYNC_SWEEP_MINUTES} minutes), not immediately.${args.markWarehouse ? '' : ' Your role does not include the warehouse sync, so the warehouse picks these up on its own verify run.'}`)
+    }
+  }
   return result
 }
 

@@ -104,6 +104,16 @@ registerCronJobs([
     defaultEnabled: true,
   },
   {
+    slug: 'product-sync-marks',
+    settingKey: 'product_sync_marks',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Product Sync After Bulk Edit',
+    description: 'Hands products edited by CSV to the storefront and warehouse sync, 25 per run, so a large edit reaches the shop and the warehouse as a steady trickle instead of a burst.',
+    defaultSchedule: '*/5 * * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'product-lifecycle-archive',
     settingKey: 'product_lifecycle_archive',
     module: 'system',

@@ -10,10 +10,12 @@ import { handleProductCsvUpload, type ProductCsvUploadDeps } from '@/lib/product
 import { hasPermission, type Permission } from '@/lib/permissions'
 
 const state = { calls: [] as string[], inFlight: 0, peak: 0 }
+const failing = new Set<string>()
 mock.module('@/lib/shopping', {
   namedExports: {
     pushProductMetadata: async (id: string) => {
       state.calls.push(`push:${id}`)
+      if (failing.has(id)) throw new Error('storefront down')
       state.inFlight++
       state.peak = Math.max(state.peak, state.inFlight)
       await new Promise((resolve) => setImmediate(resolve))
@@ -28,7 +30,7 @@ mock.module('@/lib/shopping', {
 mock.module('@/lib/domain/wms/product-sync-dispatch', {
   namedExports: {
     isAnyWmsConnectorEnabled: async () => true,
-    scheduleWmsProductSync: (id: string) => { state.calls.push(`wms:${id}`) },
+    syncWmsProductNow: async (id: string) => { state.calls.push(`wms:${id}`) },
   },
 })
 mock.module('@/lib/trade/hs-classification-trigger', {
@@ -49,6 +51,7 @@ function makeClient(count: number) {
   }))
   const bySku = new Map(rows.map((r) => [r.sku as string, r]))
   const log: string[] = []
+  const marked: string[] = []
   const client = {
     supplier: { findMany: async () => { log.push('supplier.findMany'); return [] } },
     productCategory: { findMany: async () => { log.push('category.findMany'); return [] } },
@@ -60,10 +63,13 @@ function makeClient(count: number) {
     },
     $transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
       log.push('$transaction')
-      return cb({ $queryRaw: async (sql: { values: unknown[] }) => { log.push('$executeRaw'); return sql.values.filter((v) => typeof v === 'string' && String(v).startsWith('id-')).map((id) => ({ id })) } })
+      return cb({
+        $queryRaw: async (sql: { values: unknown[] }) => { log.push('$executeRaw'); return sql.values.filter((v) => typeof v === 'string' && String(v).startsWith('id-')).map((id) => ({ id })) },
+        $executeRaw: async (sql: { values: unknown[] }) => { log.push('marks'); marked.push(...(sql.values.find(Array.isArray) as string[])); return 0 },
+      })
     },
   }
-  return { client, log }
+  return { client, log, marked }
 }
 
 test('SCALE: thousands of rows cost a bounded number of queries, not one per row', async () => {
@@ -82,7 +88,8 @@ test('SCALE: thousands of rows cost a bounded number of queries, not one per row
   // 1000 rows per read chunk and at most 250 products per statement: 5 reads, 20 writes, 2 lookup reads.
   assert.equal(reads, Math.ceil(N / 1000))
   assert.equal(writes, Math.ceil(N / 250))
-  assert.ok(log.length <= 2 + 5 + 2 * 20, `${log.length} round trips for ${N} rows`)
+  assert.equal(log.filter((q) => q === 'marks').length, writes, 'one mark statement per batch, in its transaction')
+  assert.ok(log.length <= 2 + 5 + 3 * 20, `${log.length} round trips for ${N} rows`)
   assert.ok(log.length < N / 50, 'orders of magnitude below one query per row')
   console.log(`# scale: ${N} rows, ${log.length} client calls (${reads} reads, ${writes} statements), ${elapsed} ms`)
 })
@@ -98,32 +105,85 @@ test('SCALE: a 20,000-variant preview reads in bulk and keeps its report bounded
   assert.equal(log.filter((q) => q === 'product.findMany').length, 20)
 })
 
-// ------------------------------------------------------------------ the follow-up is the editor's follow-up
+// ------------------------------------------------------------------ the sweep: the editor's follow-up, paced
 
-test('apply hands edited products to the same sync the product editor uses', async () => {
-  const sync = await import('@/lib/products/csv-roundtrip/sync')
-  await sync.runProductCsvStorefrontSync([
-    { id: 'p1', lifecycleStatus: 'ACTIVE', classificationChanged: true },
-    { id: 'p2', lifecycleStatus: 'ARCHIVED', classificationChanged: false },
-  ])
-  const wms = await sync.scheduleProductCsvWmsSync([{ id: 'p1', lifecycleStatus: 'ACTIVE', classificationChanged: true }])
-  assert.deepEqual(wms, { scheduled: 1, deferred: 0 })
-  assert.deepEqual(state.calls.sort(), ['hs:p1', 'push:p1', 'push:p2', 'stock:p1:IMS_CHANGE:', 'stock:p2:IMS_CHANGE:force', 'wms:p1'].sort())
+type Mark = { productId: string; storefrontPending: boolean; warehousePending: boolean; updatedAt: Date }
+const sweepWorld = { marks: [] as Mark[], deleted: [] as string[], released: [] as string[], limitsSeen: [] as number[], lifecycle: new Map<string, string>() }
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      $queryRaw: async (sql: { sql: string; values: unknown[] }) => {
+        if (/UPDATE "product_sync_marks" SET "claimedAt" = now\(\)/.test(sql.sql)) {
+          const limit = sql.values.find((v) => typeof v === 'number' && v <= 1000 && v !== 5 && v !== 15) as number
+          sweepWorld.limitsSeen.push(limit)
+          return sweepWorld.marks.splice(0, limit)
+        }
+        return [{ remaining: sweepWorld.marks.length, parked: 0 }]
+      },
+      $executeRaw: async (sql: { sql: string; values: unknown[] }) => {
+        if (/^\s*DELETE/.test(sql.sql)) sweepWorld.deleted.push(sql.values[0] as string)
+        else sweepWorld.released.push(sql.values[1] as string)
+        return 1
+      },
+      product: { findMany: async (args: { where: { id: { in: string[] } } }) => args.where.id.in.map((id) => ({ id, lifecycleStatus: sweepWorld.lifecycle.get(id) ?? 'ACTIVE' })) },
+    },
+  },
+})
+const marksFor = (n: number, prefix = 'm'): Mark[] => Array.from({ length: n }, (_, i) => ({ productId: `${prefix}${i}`, storefrontPending: true, warehousePending: true, updatedAt: new Date(0) }))
 
-  // The editor's own tail, read from its source: the same four calls with the same arguments.
-  const editor = readFileSync(join(process.cwd(), 'app/actions/products.ts'), 'utf8')
-  const tail = editor.slice(editor.indexOf('export async function updateProduct'), editor.indexOf('export type ProductSupplierRow'))
-  assert.match(tail, /pushProductMetadata\(id\)/)
-  assert.match(tail, /enqueueStockSync\(\[id\], 'IMS_CHANGE', \{\s*force: data\.lifecycleStatus === 'ARCHIVED'/)
-  assert.match(tail, /isAnyWmsConnectorEnabled\(\)/)
-  assert.match(tail, /scheduleWmsProductSync\(id\)/)
-  assert.match(tail, /invalidateStaleHsProposal\(id\)/)
-  assert.match(tail, /hasPermission\(session\.user\.role, 'sync'\)/)
+test('SWEEP: each run takes at most the batch size, whatever is asked for or owed', async () => {
+  const { runProductSyncSweep } = await import('@/lib/products/csv-roundtrip/sync-sweep')
+  const { PRODUCT_SYNC_SWEEP_BATCH } = await import('@/lib/products/csv-roundtrip/sync-constants')
+  sweepWorld.marks = marksFor(60)
+  sweepWorld.deleted.length = 0; sweepWorld.limitsSeen.length = 0
+  const first = await runProductSyncSweep({ limit: 100_000 })
+  assert.equal(PRODUCT_SYNC_SWEEP_BATCH, 25)
+  assert.deepEqual(sweepWorld.limitsSeen, [25], 'a larger request is capped at the batch size')
+  assert.equal(first.claimed, 25)
+  assert.equal(first.remaining, 35)
+  assert.equal(state.calls.filter((c) => c.startsWith('push:')).length, 25)
+  assert.equal(state.calls.filter((c) => c.startsWith('wms:')).length, 25, 'warehouse sync once per owed product, awaited one by one')
+  assert.equal(state.calls.filter((c) => c.startsWith('stock:')).length, 1, 'one stock sync through the shopping queue for the batch')
+  assert.ok(state.peak <= 5)
+  assert.equal(sweepWorld.deleted.length, 25, 'handed-over marks are deleted')
+  const second = await runProductSyncSweep()
+  assert.equal(second.claimed, 25)
+  const third = await runProductSyncSweep()
+  assert.deepEqual([third.claimed, third.remaining], [10, 0])
 })
 
-test('the sync module writes to no vendor directly', () => {
-  const source = readFileSync(join(process.cwd(), 'lib/products/csv-roundtrip/sync.ts'), 'utf8')
-  assert.ok(!/wcPost|wcPut|pushImsProductToWc|upsertMintsoftProduct|fetch\(/.test(source.replace(/\/\*[\s\S]*?\*\//g, '')))
+test('SWEEP: archived products get a forced stock sync, a failed push keeps its mark, a warehouse-less mark makes no warehouse call', async () => {
+  const { runProductSyncSweep } = await import('@/lib/products/csv-roundtrip/sync-sweep')
+  sweepWorld.marks = [
+    { productId: 'live', storefrontPending: true, warehousePending: false, updatedAt: new Date(0) },
+    { productId: 'gone', storefrontPending: true, warehousePending: false, updatedAt: new Date(0) },
+  ]
+  sweepWorld.lifecycle.set('gone', 'ARCHIVED')
+  sweepWorld.deleted.length = 0; sweepWorld.released.length = 0
+  const result = await runProductSyncSweep()
+  sweepWorld.lifecycle.clear()
+  assert.deepEqual(state.calls.filter((c) => c.startsWith('stock:')).sort(), ['stock:gone:IMS_CHANGE:force', 'stock:live:IMS_CHANGE:'])
+  assert.deepEqual(state.calls.filter((c) => c.startsWith('wms:')), [])
+  assert.equal(result.failed, 0)
+})
+
+test('SWEEP: a product whose storefront push throws is released with its error, not deleted', async () => {
+  const { runProductSyncSweep } = await import('@/lib/products/csv-roundtrip/sync-sweep')
+  sweepWorld.marks = marksFor(2, 'f')
+  sweepWorld.deleted.length = 0; sweepWorld.released.length = 0
+  failing.add('f0')
+  const result = await runProductSyncSweep()
+  failing.clear()
+  assert.equal(result.failed, 1)
+  assert.deepEqual(sweepWorld.released, ['f0'])
+  assert.deepEqual(sweepWorld.deleted, ['f1'])
+})
+
+test('the sweep and the apply write to no vendor directly', () => {
+  for (const file of ['lib/products/csv-roundtrip/sync-sweep.ts', 'lib/products/csv-roundtrip/store.ts', 'lib/products/csv-roundtrip/upload-handler.ts']) {
+    const source = readFileSync(join(process.cwd(), file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+    assert.ok(!/wcPost|wcPut|pushImsProductToWc|upsertMintsoftProduct|fetch\(/.test(source), file)
+  }
 })
 
 // ------------------------------------------------------------------ the handlers: permissions and the apply wiring
@@ -136,9 +196,6 @@ function uploadDeps(role: string | null, client: unknown): ProductCsvUploadDeps 
     requireApiAuth: async () => (role ? session(role) : new Response('Unauthorized', { status: 401 })),
     client: client as never,
     logActivity: (async (entry: { action: string }) => { out.push(`log:${entry.action}`) }) as never,
-    scheduleWmsSync: async () => { out.push('wms') },
-    afterResponse: (task) => { out.push('after'); void task() },
-    storefrontSync: async (targets) => { out.push(`storefront:${targets.length}`) },
     revalidateInventory: () => { out.push('revalidate') },
   }
 }
@@ -169,26 +226,41 @@ test('upload: price columns are refused for an editor without inventory.prices, 
   assert.deepEqual(deps.out, [])
 })
 
-test('upload: preview writes and syncs nothing; apply writes, logs, revalidates and queues the sync after the response', async () => {
-  const { client, log } = makeClient(2)
+test('upload: preview writes nothing; apply writes, marks the sync owed, logs, and makes ZERO vendor calls inline', async () => {
+  const { client, log, marked } = makeClient(2)
   const previewDeps = uploadDeps('ADMIN', client)
   const dry = await (await handleProductCsvUpload(upload('sku,name\nV0,A\nV1,B', 'preview'), previewDeps)).json() as { changedProducts: number }
   assert.equal(dry.changedProducts, 2)
   assert.deepEqual(previewDeps.out, [])
-  assert.ok(!log.includes('$executeRaw'))
+  assert.ok(!log.includes('$executeRaw') && marked.length === 0)
 
   const deps = uploadDeps('ADMIN', client)
-  const done = await (await handleProductCsvUpload(upload('sku,name\nV0,A\nV1,B', 'apply'), deps)).json() as { written: number }
+  const done = await (await handleProductCsvUpload(upload('sku,name\nV0,A\nV1,B', 'apply'), deps)).json() as { written: number; syncQueued: number; warnings: string[] }
   assert.equal(done.written, 2)
-  assert.deepEqual(deps.out.filter((o) => o !== 'log:csv_edited'), ['log:imported', 'wms', 'after', 'storefront:2', 'revalidate'])
+  assert.equal(done.syncQueued, 2)
+  assert.deepEqual(marked.sort(), ['id-0', 'id-1'])
+  assert.deepEqual(deps.out.filter((o) => o !== 'log:csv_edited'), ['log:imported', 'revalidate'])
+  assert.deepEqual(state.calls, [], 'no storefront, stock or warehouse call was made')
+  assert.match(done.warnings.join(' '), /will reach the shop and the warehouse over the next sync runs \(25 products every 5 minutes\)/)
 })
 
-test('upload: a role without the sync permission gets no warehouse sync (the editor rule)', async () => {
+test('REGRESSION (bulk): applying thousands of products makes zero vendor calls inline and marks every one', async () => {
+  const N = 3000
+  const { client, marked } = makeClient(N)
+  const deps = uploadDeps('ADMIN', client)
+  const file = ['sku,name', ...Array.from({ length: N }, (_, i) => `V${i},Bulk ${i}`)].join('\n')
+  const done = await (await handleProductCsvUpload(upload(file, 'apply'), deps)).json() as { written: number }
+  assert.equal(done.written, N)
+  assert.equal(new Set(marked).size, N)
+  assert.deepEqual(state.calls, [])
+})
+
+test('upload: a role without the sync permission does not owe the warehouse sync (the editor rule), and is told', async () => {
   const { client } = makeClient(1)
   const deps = uploadDeps('WAREHOUSE', client)
-  await handleProductCsvUpload(upload('sku,name\nV0,A', 'apply'), deps)
-  assert.ok(!deps.out.includes('wms'))
-  assert.ok(deps.out.includes('after'))
+  const done = await (await handleProductCsvUpload(upload('sku,name\nV0,A', 'apply'), deps)).json() as { warnings: string[] }
+  assert.match(done.warnings.join(' '), /reach the shop over the next sync runs/)
+  assert.ok(!/and the warehouse over/.test(done.warnings.join(' ')))
 })
 
 test('download: price columns need inventory.prices, and the role needs inventory.edit', async () => {
@@ -200,29 +272,3 @@ test('download: price columns need inventory.prices, and the role needs inventor
   assert.equal((await handleProductCsvDownload(req(['bogus']), deps('ADMIN'))).status, 400)
 })
 
-test('REGRESSION (WMS fan-out): a bulk apply schedules NO per-product warehouse syncs and says so', async () => {
-  const sync = await import('@/lib/products/csv-roundtrip/sync')
-  const many = Array.from({ length: sync.PRODUCT_CSV_WMS_PER_PRODUCT_LIMIT + 1 }, (_, i) => ({ id: `b${i}`, lifecycleStatus: 'ACTIVE' as const, classificationChanged: false }))
-  const outcome = await sync.scheduleProductCsvWmsSync(many)
-  assert.deepEqual(outcome, { scheduled: 0, deferred: many.length })
-  assert.deepEqual(state.calls.filter((c) => c.startsWith('wms:')), [])
-  const atLimit = await sync.scheduleProductCsvWmsSync(many.slice(0, sync.PRODUCT_CSV_WMS_PER_PRODUCT_LIMIT))
-  assert.equal(atLimit.scheduled, sync.PRODUCT_CSV_WMS_PER_PRODUCT_LIMIT)
-
-  // Through the handler: the operator is told, and the storefront sync still runs once for the whole set.
-  const { client } = makeClient(30)
-  const deps = uploadDeps('ADMIN', client)
-  deps.scheduleWmsSync = sync.scheduleProductCsvWmsSync
-  const file = ['sku,name', ...Array.from({ length: 30 }, (_, i) => `V${i},E${i}`)].join('\n')
-  const body = await (await handleProductCsvUpload(upload(file, 'apply'), deps)).json() as { warnings: string[] }
-  assert.match(body.warnings.join(' '), /30 products were not queued for the warehouse/)
-})
-
-test('REGRESSION (storefront fan-out): pushes never exceed the concurrency ceiling, and stock sync is batched', async () => {
-  const sync = await import('@/lib/products/csv-roundtrip/sync')
-  const many = Array.from({ length: 200 }, (_, i) => ({ id: `s${i}`, lifecycleStatus: 'ACTIVE' as const, classificationChanged: false }))
-  await sync.runProductCsvStorefrontSync(many)
-  assert.equal(state.calls.filter((c) => c.startsWith('push:')).length, 200)
-  assert.equal(state.calls.filter((c) => c.startsWith('stock:')).length, 1, 'one batched stock sync for all live products')
-  assert.ok(state.peak <= sync.PRODUCT_CSV_SYNC_CONCURRENCY && state.peak > 1, `peak ${state.peak}`)
-})

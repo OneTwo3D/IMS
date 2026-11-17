@@ -117,6 +117,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   stock_levels: { kind: 'RUNNER_WRITES', reason: 'stock levels written with opening stock' },
   stock_movement_backfill_audit: { kind: 'MUST_BE_EMPTY', reason: 'stock-movement backfill audit' },
   stock_movements: { kind: 'RUNNER_WRITES', reason: 'opening-stock movements' },
+  product_sync_marks: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs' },
   stock_sync_jobs: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs' },
   stock_sync_states: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs' },
   stock_transfer_lines: { kind: 'MUST_BE_EMPTY', reason: 'stock transfers' },

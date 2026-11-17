@@ -812,6 +812,7 @@ model Product {
   shipmentLines    ShipmentLine[]
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
+  syncMark         ProductSyncMark?
   shoppingLinks    ShoppingProductLink[]
   wmsProductLinks  WmsProductLink[]
   wmsBundleLinks   WmsBundleLink[]
@@ -3805,6 +3806,25 @@ model StockSyncState {
 
   @@id([connector, productId])
   @@map("stock_sync_states")
+}
+
+/// Products edited in bulk (Edit by CSV) whose storefront and warehouse sync is still owed. Written in the SAME transaction as the
+/// edit, drained by the product-sync-marks cron in small batches, so a large edit never pushes to a vendor inside the request. A row
+/// is deleted once its sync has been handed over; a re-edit resets it. `claimedAt` is the drain's lease, `attempts` bounds retries.
+model ProductSyncMark {
+  productId         String    @id
+  storefrontPending Boolean   @default(true)
+  warehousePending  Boolean   @default(true)
+  attempts          Int       @default(0)
+  claimedAt         DateTime?
+  lastError         String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @default(now())
+
+  product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@map("product_sync_marks")
 }
 
 model StockSyncJob {

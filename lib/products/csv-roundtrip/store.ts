@@ -12,6 +12,9 @@ import type { FieldChange, PlanLookups, RoundTripProduct } from '@/lib/products/
  * READS ARE BULK. A chunk of rows costs one product query by SKU (and one barcode query when a barcode column is in
  * play), never one per row. The supplier and category tables are read once per file.
  *
+ * THE SYNC THE EDIT OWES IS RECORDED, NOT PERFORMED: each batch also inserts a product_sync_marks row per product in the same
+ * transaction (see sync-sweep.ts for the drain).
+ *
  * WRITES ARE BATCHED AND VERSIONED. {@link ProductCsvStore.writeBatch} applies a whole batch of products in ONE transaction and ONE
  * UPDATE ... FROM (VALUES ...) statement, so 20,000 edited variants are about eighty statements, not twenty thousand.
  * Only the columns the file carries are named in the statement, and each product only changes the fields its own row
@@ -38,7 +41,7 @@ export interface ProductCsvStore {
   /** barcode -> id of the product that holds it. */
   findBarcodeOwners(barcodes: readonly string[]): Promise<Map<string, string>>
   /** One transaction. Throws if the batch could not be written, in which case none of it was. */
-  writeBatch(updates: readonly PlannedUpdate[], columns: readonly ProductCsvColumn[]): Promise<{ written: number; staleIds: string[] }>
+  writeBatch(updates: readonly PlannedUpdate[], columns: readonly ProductCsvColumn[], options?: { markWarehouse?: boolean }): Promise<{ written: number; staleIds: string[] }>
 }
 
 export type ProductCsvDb = Pick<typeof appDb, 'product' | 'supplier' | 'productCategory' | '$transaction'>
@@ -146,6 +149,18 @@ export function buildBatchUpdateSql(updates: readonly PlannedUpdate[], columns: 
   `
 }
 
+/** Mark products as owing a sync (insert, or reset an existing mark so a re-edit is not lost to a drain already in flight). */
+export function buildSyncMarkSql(productIds: readonly string[], markWarehouse: boolean): Prisma.Sql {
+  return Prisma.sql`
+    INSERT INTO "product_sync_marks" ("productId", "storefrontPending", "warehousePending", "attempts", "claimedAt", "lastError", "createdAt", "updatedAt")
+    SELECT id, true, ${markWarehouse}::boolean, 0, NULL, NULL, now(), now() FROM unnest(${[...productIds]}::text[]) AS t(id)
+    ON CONFLICT ("productId") DO UPDATE SET
+      "storefrontPending" = true,
+      "warehousePending" = "product_sync_marks"."warehousePending" OR EXCLUDED."warehousePending",
+      "attempts" = 0, "claimedAt" = NULL, "lastError" = NULL, "updatedAt" = now()
+  `
+}
+
 export function createProductCsvStore(client: ProductCsvDb): ProductCsvStore {
   return {
     async loadLookupTables() {
@@ -174,10 +189,16 @@ export function createProductCsvStore(client: ProductCsvDb): ProductCsvStore {
       return new Map(rows.map((row) => [row.barcode as string, row.id]))
     },
 
-    async writeBatch(updates, columns) {
+    async writeBatch(updates, columns, options) {
       if (updates.length === 0) return { written: 0, staleIds: [] }
       const sql = buildBatchUpdateSql(updates, columns)
-      const returned = await client.$transaction(async (tx) => tx.$queryRaw<Array<{ id: string }>>(sql), { timeout: 60_000, maxWait: 10_000 })
+      const returned = await client.$transaction(async (tx) => {
+        const rows = await tx.$queryRaw<Array<{ id: string }>>(sql)
+        // The sync the edit owes, recorded in the SAME transaction: the edit and the obligation commit or roll back together,
+        // and nothing is pushed to a vendor from here. The product-sync-marks cron drains these in small batches.
+        if (rows.length > 0) await tx.$executeRaw(buildSyncMarkSql(rows.map((row) => row.id), options?.markWarehouse === true))
+        return rows
+      }, { timeout: 60_000, maxWait: 10_000 })
       const written = new Set(returned.map((row) => row.id))
       // A row the statement did not return was edited by someone else since the plan read it (or deleted): not written.
       return { written: written.size, staleIds: updates.filter((update) => !written.has(update.id)).map((update) => update.id) }

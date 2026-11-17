@@ -4,17 +4,11 @@ import type { logActivity as logActivityFn } from '@/lib/activity-log'
 import { hasPermission } from '@/lib/permissions'
 import { PRODUCT_CSV_IMPORT_MAX_BYTES, runProductCsvEdit } from '@/lib/products/csv-roundtrip/run'
 import { createProductCsvStore, type ProductCsvDb } from '@/lib/products/csv-roundtrip/store'
-import type { ProductCsvSyncTarget, ProductCsvWmsOutcome } from '@/lib/products/csv-roundtrip/sync'
 
 export type ProductCsvUploadDeps = {
   requireApiAuth: () => Promise<AuthSession | Response>
   client: ProductCsvDb
   logActivity: typeof logActivityFn
-  /** Warehouse sync; must be called while the request is in scope. */
-  scheduleWmsSync: (targets: readonly ProductCsvSyncTarget[]) => Promise<ProductCsvWmsOutcome | void>
-  /** Runs the storefront sync after the response is sent. */
-  afterResponse: (task: () => Promise<void>) => void
-  storefrontSync: (targets: readonly ProductCsvSyncTarget[]) => Promise<void>
   revalidateInventory: () => void
 }
 
@@ -23,7 +17,8 @@ export type ProductCsvUploadDeps = {
  *
  * An UPDATE-ONLY import. `preview` reads and validates the file and returns the per-product diff without writing
  * anything. `apply` plans the same file again against the products as they are now and writes in batches, each in its
- * own transaction, then hands every edited product to the same storefront and warehouse sync the product editor uses.
+ * own transaction that also records, per product, the storefront and warehouse sync the edit owes. Nothing is pushed to a
+ * vendor from the request: the product-sync-marks cron drains those marks in small batches (sync-sweep.ts).
  *
  * A route handler rather than a server action because a 20,000-variant file is several MB, past a server action's body
  * limit. Needs inventory.edit; price columns also need inventory.prices (checked against the file's own headers).
@@ -42,14 +37,14 @@ export async function handleProductCsvUpload(req: Request, deps: ProductCsvUploa
     return NextResponse.json({ error: `The file is larger than ${PRODUCT_CSV_IMPORT_MAX_BYTES / (1024 * 1024)} MB.` }, { status: 413 })
   }
 
-  const allTargets: ProductCsvSyncTarget[] = []
   const result = await runProductCsvEdit({
     mode,
     text: await file.text(),
     canUse: (permission) => hasPermission(role, permission),
     store: createProductCsvStore(deps.client),
-    onBatchWritten: async ({ updates, targets }) => {
-      allTargets.push(...targets)
+    // The editor's rule: the warehouse sync is owed only when the user holds `sync`.
+    markWarehouse: hasPermission(role, 'sync'),
+    onBatchWritten: async ({ updates }) => {
       await deps.logActivity({
         entityType: 'PRODUCT',
         entityId: null,
@@ -74,17 +69,7 @@ export async function handleProductCsvUpload(req: Request, deps: ProductCsvUploa
       description: `Edit by CSV: ${result.written} products updated, ${result.errorRows} row(s) with errors`,
       metadata: { columns: result.columns, written: result.written, failedProducts: result.failedProducts },
     })
-    if (allTargets.length > 0) {
-      // The warehouse sync registers its work with `after`, so it has to be scheduled while the request is in scope.
-      if (hasPermission(role, 'sync')) {
-        const wms = await deps.scheduleWmsSync(allTargets)
-        if (wms && wms.deferred > 0) {
-          result.warnings.push(`${wms.deferred} products were not queued for the warehouse one by one, because that many individual syncs would flood it. Run Product Verify on the Sync page, or wait for the scheduled warehouse product verify, to bring them up to date.`)
-        }
-      }
-      deps.afterResponse(() => deps.storefrontSync(allTargets))
-      deps.revalidateInventory()
-    }
+    if (result.written > 0) deps.revalidateInventory()
   }
 
   return NextResponse.json(result, { status: result.fatal ? 400 : 200 })

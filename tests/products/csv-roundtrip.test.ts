@@ -366,14 +366,13 @@ test('a barcode already held by another product, or given twice in the file, is 
   assert.match(done.errors[1], /Row 4 \(B\).*barcode "777" is also given to C/)
 })
 
-test('a lifecycle change is carried with the derived active flag and the sync target knows it', async () => {
+test('a lifecycle change is written with the derived active flag, and the warehouse mark follows the caller\'s sync permission', async () => {
   const store = new FakeStore([product('A')])
-  const seen: Array<{ lifecycle: string; classification: boolean }> = []
-  await runProductCsvEdit({
-    mode: 'apply', text: csv(['sku,lifecycleStatus,name', 'A,archived,Renamed']), canUse: canAll, store,
-    onBatchWritten: ({ targets }) => { for (const t of targets) seen.push({ lifecycle: t.lifecycleStatus, classification: t.classificationChanged }) },
-  })
-  assert.deepEqual(seen, [{ lifecycle: 'ARCHIVED', classification: true }])
+  const seen: boolean[] = []
+  const original = store.writeBatch.bind(store)
+  store.writeBatch = async (updates, ...rest: unknown[]) => { seen.push((rest[1] as { markWarehouse?: boolean } | undefined)?.markWarehouse === true); return original(updates) }
+  await runProductCsvEdit({ mode: 'apply', text: csv(['sku,lifecycleStatus,name', 'A,archived,Renamed']), canUse: canAll, store, markWarehouse: true })
+  assert.deepEqual(seen, [true])
   assert.equal(store.products.get('A')!.lifecycleStatus, 'ARCHIVED')
 })
 

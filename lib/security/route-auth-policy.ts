@@ -142,6 +142,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'o3d-d82p: durable drain of WooCommerce withdrawal suppressions; guarded by verifyCron.',
   },
+  '/api/cron/product-sync-marks': {
+    access: 'cron-secret',
+    reason: 'Paced drain of the storefront and warehouse sync owed by products edited by CSV; guarded by verifyCron.',
+  },
   '/api/cron/refund-reservation-release': {
     access: 'cron-secret',
     reason: 'o3d-67y: durable post-refund reservation-release drain; guarded by verifyCron.',

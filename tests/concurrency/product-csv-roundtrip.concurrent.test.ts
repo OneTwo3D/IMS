@@ -1,6 +1,6 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 
 /**
@@ -84,6 +84,62 @@ test(
       await db.product.deleteMany({ where: { sku: { startsWith: tag } } })
       await db.productCategory.deleteMany({ where: { id: cat.id } })
       await db.supplier.deleteMany({ where: { id: sup.id } })
+    }
+  },
+)
+
+test(
+  'product CSV round trip: the edit marks every product in its own transaction and the sweep drains 25 per run',
+  { skip: process.env.RUN_DB_CONCURRENCY_TESTS !== '1' },
+  async () => {
+    config({ path: '.env.local', quiet: true })
+    config({ quiet: true })
+    if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
+
+    const calls: string[] = []
+    mock.module('@/lib/shopping', { namedExports: {
+      pushProductMetadata: async (id: string) => { calls.push(`push:${id}`); return { success: true } },
+      enqueueStockSync: async (ids: string[]) => { calls.push(`stock:${ids.length}`) },
+    } })
+    mock.module('@/lib/domain/wms/product-sync-dispatch', { namedExports: {
+      isAnyWmsConnectorEnabled: async () => true,
+      syncWmsProductNow: async (id: string) => { calls.push(`wms:${id}`) },
+    } })
+
+    const { db } = await import('../../lib/db/index.ts')
+    const { runProductCsvEdit } = await import('../../lib/products/csv-roundtrip/run.ts')
+    const { createProductCsvStore } = await import('../../lib/products/csv-roundtrip/store.ts')
+    const { runProductSyncSweep } = await import('../../lib/products/csv-roundtrip/sync-sweep.ts')
+
+    const tag = `csvsw-${process.pid}-${Math.floor(performance.now())}`
+    const N = 60
+    await db.product.createMany({ data: Array.from({ length: N }, (_, i) => ({ sku: `${tag}-${i}`, name: `N${i}` })) })
+    const ids = (await db.product.findMany({ where: { sku: { startsWith: tag } }, select: { id: true } })).map((p) => p.id)
+    try {
+      const file = ['sku,name', ...Array.from({ length: N }, (_, i) => `${tag}-${i},Edited ${i}`)].join('\n')
+      const result = await runProductCsvEdit({ mode: 'apply', text: file, canUse: () => true, store: createProductCsvStore(db), markWarehouse: true })
+      assert.equal(result.written, N)
+      assert.equal(calls.length, 0, 'the apply made no vendor call')
+      assert.equal(await db.productSyncMark.count({ where: { productId: { in: ids } } }), N)
+
+      // Other marks may exist in a shared scratch DB; drain until ours are gone, counting only per-run size.
+      let perRunMax = 0
+      for (let run = 0; run < 20 && (await db.productSyncMark.count({ where: { productId: { in: ids } } })) > 0; run++) {
+        const out = await runProductSyncSweep()
+        perRunMax = Math.max(perRunMax, out.claimed)
+        assert.ok(out.claimed <= 25)
+      }
+      assert.equal(await db.productSyncMark.count({ where: { productId: { in: ids } } }), 0)
+      assert.equal(calls.filter((c) => c.startsWith('push:')).length, N)
+      assert.equal(calls.filter((c) => c.startsWith('wms:')).length, N)
+      assert.equal(perRunMax, 25)
+
+      // A re-edit resets a mark; a deleted product's mark goes with it.
+      await runProductCsvEdit({ mode: 'apply', text: `sku,name\n${tag}-0,Again`, canUse: () => true, store: createProductCsvStore(db) })
+      assert.equal(await db.productSyncMark.count({ where: { productId: { in: ids } } }), 1)
+      assert.equal(await db.productSyncMark.count({ where: { product: { sku: `${tag}-0` } } }), 1)
+    } finally {
+      await db.product.deleteMany({ where: { sku: { startsWith: tag } } })
     }
   },
 )
