@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import { recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
 import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from './money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION, nextAttemptRevision, type AttemptRef } from './sync-log-attempt'
@@ -269,6 +270,10 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
     reason,
   })
 
+  // The retired rows may have been the order's only invoice (a queued invoice whose order was cancelled before it posted is no invoice):
+  // the state is re-derived, and a row that DID post keeps it (the cancellation sweep never touches a row that names a document).
+  if (neverClaimed.count + retired.length > 0) await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, orderId)
+
   return neverClaimed.count + retired.length
 }
 
@@ -345,5 +350,6 @@ export async function retireSalesInvoiceForCancelledOrder(
     reason,
     ...(attemptOnly ? { attemptOnly: true } : {}),
   })
+  await recomputeSalesOrderInvoicingState(client as unknown as InvoicingStateClient, orderId)
   return true
 }

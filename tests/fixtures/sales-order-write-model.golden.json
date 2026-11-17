@@ -3,6 +3,7 @@
     "header": {
       "status": "DRAFT",
       "refundStatus": "NONE",
+      "invoicingState": "NOT_INVOICED",
       "withdrawalHoldAt": null,
       "withdrawalApprovedAt": null,
       "withdrawalHoldGeneration": 0,
@@ -150,6 +151,7 @@
     "header": {
       "status": "DRAFT",
       "refundStatus": "NONE",
+      "invoicingState": "NOT_INVOICED",
       "withdrawalHoldAt": null,
       "withdrawalApprovedAt": null,
       "withdrawalHoldGeneration": 0,
@@ -278,6 +280,7 @@
     "header": {
       "status": "DRAFT",
       "refundStatus": "NONE",
+      "invoicingState": "NOT_INVOICED",
       "withdrawalHoldAt": null,
       "withdrawalApprovedAt": null,
       "withdrawalHoldGeneration": 0,
@@ -406,6 +409,7 @@
     "header": {
       "status": "DRAFT",
       "refundStatus": "NONE",
+      "invoicingState": "NOT_INVOICED",
       "withdrawalHoldAt": null,
       "withdrawalApprovedAt": null,
       "withdrawalHoldGeneration": 0,
@@ -553,6 +557,7 @@
     "header": {
       "status": "DRAFT",
       "refundStatus": "NONE",
+      "invoicingState": "NOT_INVOICED",
       "withdrawalHoldAt": null,
       "withdrawalApprovedAt": null,
       "withdrawalHoldGeneration": 0,

@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { db } from '@/lib/db'
 import { HELD_SHADOW_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -495,6 +496,7 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
       },
     })
     if (updated.count === 0) throw new RetirementConflict('the row changed while it was being retired')
+    await recomputeInvoicingStateForRow(tx, row)
     await attachShadowSyncLog(tx, recorded.id, row.id)
     const mirrorNote = await mirrorBlockedBySibling(tx, row)
     if (mirrorNote === null) {
@@ -510,6 +512,7 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
     data: { status: 'FAILED', errorMessage: notice, attemptRevision: { increment: 1 } },
   })
   if (updated.count === 0) throw new RetirementConflict('the row changed while it was being parked')
+  await recomputeInvoicingStateForRow(tx, row)
   const parkMirrorNote = await mirrorBlockedBySibling(tx, row)
   if (parkMirrorNote === null) {
     await updateMirroredAccountingEventStatus(tx, {

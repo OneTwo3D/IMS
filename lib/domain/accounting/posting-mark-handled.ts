@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import { accountingPostingKeyForRow, postingKeyIsReusedAcrossPostings } from '@/lib/accounting/posting-key'
 import {
@@ -334,6 +335,8 @@ async function cancelProvablyUnsentRows(
     data: { status: 'CANCELLED', errorMessage: note, processingStartedAt: null, abandonedBeforeRemoteCall: true },
   })
   if (stamped.count !== ids.length) throw new MarkHandledRaceError()
+  // The cancelled rows were queued invoices if the key is a sales invoice's: the order's invoicing state follows them.
+  await recomputeInvoicingStateForRow(tx, key)
   for (const sync of rows) {
     const mirror = await updateMirroredAccountingEventStatus(tx as unknown as Prisma.TransactionClient, {
       connector: sync.connector,

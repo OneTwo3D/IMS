@@ -1,5 +1,6 @@
 'use client'
 
+import { INVOICING_STATE_LABELS, INVOICING_STATES, type InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter, usePathname, useSearchParams } from 'next/navigation'
@@ -50,6 +51,7 @@ const STATUS_CLASS: Record<SoStatus, string> = {
   CANCELLED: 'text-destructive border-destructive/30',
 }
 
+const INVOICING_FILTERS: readonly InvoicingState[] = INVOICING_STATES
 const FILTER_STATUSES: SoStatus[] = ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED']
 
 function timeAgo(iso: string): string {
@@ -188,6 +190,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
   const urlState: OrderListUrlState = {
     q: searchParams.get('q') ?? '',
     statuses: (searchParams.get('status') ?? '').split(',').filter(Boolean),
+    invoicing: (searchParams.get('invoicing') ?? '').split(',').filter(Boolean),
     page: list.page,
     showCompleted: searchParams.get('completed') === '1',
     includeArchived: searchParams.get('archived') === '1',
@@ -195,6 +198,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
     returned: false,
   }
   const statusFilters = new Set(urlState.statuses as SoStatus[])
+  const invoicingFilters = new Set((urlState.invoicing ?? []) as InvoicingState[])
   const [search, setSearch] = useState(urlState.q)
   const [lastPushedQ, setLastPushedQ] = useState(urlState.q)
   const [seenUrlQ, setSeenUrlQ] = useState(urlState.q)
@@ -260,6 +264,12 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
     const next = new Set(statusFilters)
     if (next.has(s)) next.delete(s); else next.add(s)
     navigate({ statuses: [...next] })
+  }
+
+  function toggleInvoicing(s: InvoicingState) {
+    const next = new Set(invoicingFilters)
+    if (next.has(s)) next.delete(s); else next.add(s)
+    navigate({ invoicing: [...next] })
   }
 
   const filtered = list.rows
@@ -458,15 +468,28 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="outline" size="sm" className="h-8 text-xs" aria-label="Filter by invoicing" />}>
+            <Filter className="h-3.5 w-3.5 mr-1.5" />
+            {invoicingFilters.size === 0 ? 'Invoicing: all' : invoicingFilters.size === 1 ? INVOICING_STATE_LABELS[[...invoicingFilters][0]] : `${invoicingFilters.size} invoicing states`}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start">
+            {INVOICING_FILTERS.map((s) => (
+              <DropdownMenuCheckboxItem key={s} checked={invoicingFilters.has(s)} onCheckedChange={() => toggleInvoicing(s)}>
+                {INVOICING_STATE_LABELS[s]}
+              </DropdownMenuCheckboxItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
         <label
           className="flex items-center gap-1.5 text-xs"
-          title={searching || statusFilters.size > 0 ? 'A search or status pick always includes completed orders' : undefined}
+          title={searching || statusFilters.size > 0 || invoicingFilters.size > 0 ? 'A search, a status pick or an invoicing pick always includes completed orders' : undefined}
         >
           <input
             type="checkbox"
             className="accent-primary h-3.5 w-3.5"
-            checked={!urlState.showCompleted && !searching && statusFilters.size === 0}
-            disabled={searching || statusFilters.size > 0}
+            checked={!urlState.showCompleted && !searching && statusFilters.size === 0 && invoicingFilters.size === 0}
+            disabled={searching || statusFilters.size > 0 || invoicingFilters.size > 0}
             onChange={(e) => navigate({ showCompleted: !e.target.checked })}
           />
           Hide completed

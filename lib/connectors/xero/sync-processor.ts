@@ -57,6 +57,7 @@ import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
 import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
@@ -1142,6 +1143,8 @@ export async function applyMainSyncFailureRetry(
   })
   if (updated.count > 0) {
     if (computedFinal) {
+      // A sales invoice that has failed for good (and names no document) is no longer queued or posted: the order's invoicing state follows it.
+      await recomputeInvoicingStateForRow(tx, entry)
       await updateMirroredEventForSyncLog(tx, {
         syncLogId: attempt.id,
         type: entry.type,

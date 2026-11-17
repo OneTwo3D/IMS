@@ -1,5 +1,6 @@
 'use client'
 
+import { INVOICING_STATE_CLASS, INVOICING_STATE_LABELS } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
@@ -1307,6 +1308,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             </span>
           ) : null
         })()}
+        <span
+          data-testid="invoicing-state-badge"
+          className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${INVOICING_STATE_CLASS[so.invoicingState]}`}
+          title="Whether an invoice exists for this order. Independent of the order status: a cancelled order keeps the state it had."
+        >
+          {INVOICING_STATE_LABELS[so.invoicingState]}
+        </span>
         {so.refundStatus !== 'NONE' && (
           <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${
             so.refundStatus === 'FULL'

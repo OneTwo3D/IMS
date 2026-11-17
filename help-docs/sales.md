@@ -11,6 +11,7 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Hide completed** (ticked by default) keeps finished work out of the everyday list, and the line above the table says how many Completed and Delivered orders that hides. Untick it to see them. Choosing **Completed** or **Delivered** in the status filter shows them too.
 - **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
+- **Filter by invoicing** — the **Invoicing** filter shows orders that are **Not invoiced**, **Partially invoiced** or **Fully invoiced** (pick one or several). It is separate from the status filter and combines with it. Picking an invoicing state includes Completed and Delivered orders, because a shipped order that was never invoiced is exactly what it is for; archived orders stay hidden unless you tick **Include archived**. See [Invoicing state](#invoicing-state).
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
 - **Refund state** — an order's refund state is separate from its stage (see [Order Statuses](#order-statuses)). On the list it shows in the **Invoice** column as **Part. Refunded** or **Refunded**.
@@ -84,6 +85,25 @@ While an order is Allocated, Picking or Packing and has shipments, a second chip
 | **Cancelled** | Order cancelled, stock reservations released |
 
 **Refund state is shown separately.** Refunds no longer change an order's stage. An order that has been refunded keeps its stage (for example **Delivered**) and carries a second badge beside it: **Partially refunded** (orange) or **Fully refunded** (red). So the order detail page can show two badges, the order status and the refund status. Orders that used to read "Partially Refunded" or "Refunded" now show their real stage plus the refund badge, and the stage filter on the list has no refund entries. A fully refunded order takes no further payments.
+
+
+### Invoicing state
+
+**Invoicing is shown separately from the stage**, like the refund state. The order detail page carries a badge beside the status: **Not invoiced**, **Partially invoiced** or **Fully invoiced**. An order can be Shipped and Not invoiced, or Cancelled and Fully invoiced: a cancelled order keeps the invoicing state it had, so its invoicing history stays visible. The sales order CSV export has the state as its last column (`invoicingState`).
+
+IMS works the state out itself from the order's invoices; you never set it. An order counts as **invoiced** when any of these holds:
+
+- IMS has **queued or posted** a sales invoice for it (the moment the invoice is queued, the order reads invoiced; a posted invoice stays counted);
+- the accounting invoice is **linked** to the order (it carries the accounting system's invoice id);
+- during the parallel phase, the invoicing incumbent (Xeroom) has **raised the invoice** and its number is on a WooCommerce order: IMS reads that number, so the order reads invoiced.
+
+What does **not** count: an invoice that failed without reaching the accounting system, one that was cancelled before it posted (for example, the order was cancelled first), and an invoice IMS only *recorded as a shadow* while writes to the accounting system are held. When the last invoice an order had is retired like that, the order goes back to **Not invoiced**.
+
+**Credit notes and refunds do not un-invoice an order.** A fully refunded order that was invoiced stays **Fully invoiced**; the refund state shows the credit.
+
+**Partially invoiced** means the invoice IMS holds covers fewer units than the order now holds. IMS invoices a whole order (there is no per-shipment invoice), so this is rare, for example units added to the order after its invoice was raised. An invoice IMS cannot read (one raised by Xeroom, or whose stored detail has been trimmed) reads **Fully invoiced**: IMS does not guess a shortfall it cannot measure.
+
+After an upgrade, existing orders read **Not invoiced** until an administrator runs `npm run sales:invoicing-state:recompute` once (add `-- --dry-run` to see how many orders it would change). It is safe to run again at any time: it only rewrites a state that is wrong.
 
 The exact allowed transitions are kept in the canonical workflow reference so UI help does not drift from the enforced state-machine rules.
 

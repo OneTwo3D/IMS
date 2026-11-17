@@ -1,6 +1,7 @@
 import { gateAccountingPayloadContact } from '@/lib/domain/erasure/contact-gate'
 import { reportUnrecordedShadow } from '@/lib/domain/outbound-shadow/unrecorded'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { RETIRED_TAX_CODE_REASON, RetiredTaxCodeInPayloadError, retiredTaxCodesInPayload } from '@/lib/tax/retired-tax-code-guard'
@@ -184,6 +185,8 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
     // A shadow discharges no refusal: it is not a posting, and an outstanding refusal still describes a debt IMS has not paid.
     return { row: null, suppressed: null, shadowed: row }
   }
+  // A queued sales invoice is an invoice: the order's invoicing state follows the row, in the same client (and so the same transaction).
+  await recomputeInvoicingStateForRow(client, { type: String(data.type), referenceType: String(data.referenceType), referenceId: String(data.referenceId) })
   await clearAccountingPostingRefusal(
     client as unknown as PostingRefusalClient,
     key,

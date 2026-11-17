@@ -27,6 +27,7 @@
  * reasons are a single vocabulary rather than per-call-site prose.
  */
 
+import { recomputeInvoicingStateForSyncLogs } from '@/lib/domain/sales/invoicing-state-sites'
 import type { AccountingSyncStatus, Prisma } from '@/app/generated/prisma/client'
 
 /**
@@ -167,7 +168,11 @@ export async function applyFencedAttemptDecision(
     },
     data: { ...params.data, attemptRevision: nextRevision },
   })
-  if (applied.count > 0) return { ok: true, attemptRevision: nextRevision }
+  if (applied.count > 0) {
+    // Every operator decision on a row lands here, and one of them can settle a sales invoice posted or not posted: the order follows it.
+    await recomputeInvoicingStateForSyncLogs(client, { id: params.id })
+    return { ok: true, attemptRevision: nextRevision }
+  }
 
   // Lost — read the row purely to say WHAT moved. The CAS above, not this read, decided the
   // outcome, so a further change between the two only makes the explanation slightly stale; it

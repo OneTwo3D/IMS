@@ -4,6 +4,7 @@ import { xeroBeforeCutoffRefusal, xeroProducerSeamVerdict, xeroResolveObligation
 import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
+import { recomputeInvoicingStateForSyncLogs } from '@/lib/domain/sales/invoicing-state-sites'
 import { db } from '@/lib/db'
 import { checkBulkRetryConfirmation, isUsableEntryId } from '@/lib/domain/accounting/bulk-retry-confirmation'
 import type { BulkRetryConfirmation } from '@/lib/typed-confirmation'
@@ -982,6 +983,8 @@ export async function retryFailedXeroSync(
             data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
           })
         }
+        // A revived FAILED sales invoice is queued again, so it counts as an invoice again.
+        if (result.count > 0) await recomputeInvoicingStateForSyncLogs(tx as never, { id: { in: allowedIds } })
         return { count: result.count, refused, siblingIds }
       })
 
