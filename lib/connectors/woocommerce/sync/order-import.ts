@@ -1516,7 +1516,10 @@ async function updateExistingWcOrderCore(
     // rest of the update (shipping, paid state, order number) proceeds exactly as before.
     await lockSalesOrder(tx, orderId)
     const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true } })
-    storedComponents = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
+    // The stored split is read only when this delivery carries one (an order without wclc components reads nothing extra).
+    if (Array.isArray(wcOrder.meta_data) && Object.values(wclcComponentColumns(wcOrder)).some((v) => v !== null)) {
+      storedComponents = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
+    }
     const erased = erasure?.erasedAt != null
     // EDITED IN IMS (owner-ruled desync, o3d-tgt2j policy): an operator edited this order here after confirming it, so WooCommerce's copy of the fields the edit can set (addresses, notes, shipping label / courier) is the
     // ORIGINAL and must not be written back over the edit. Paid state, the order number and the VAT number still mirror; the lines and total never did (see order-edit-drift.ts).
