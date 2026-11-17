@@ -1547,10 +1547,8 @@ async function updateExistingWcOrderCore(
         ...(!keepImsEdit && Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
           ? (({ shippingService, courierKey, shippingMethodId }) => ({ shippingService, courierKey, shippingMethodId }))(mapWcShipping(wcOrder))
           : {}),
-        // The wclc duty/tax/handling components FOLLOW WooCommerce on every delivery: these are
-        // WooCommerce's own results, stored as reported and never recomputed (owner decision D5). Nothing here is personal data, so an erased
-        // order keeps them, and an order edited in IMS keeps following them (the edit cannot set them). No line or invoice is rebuilt from them
-        // (an edit that moves the fee lines is surfaced by surfaceWcOrderEditDrift).
+        // The wclc components FOLLOW WooCommerce on every delivery (stored as reported, never recomputed, D5; not personal data, so erased and
+        // IMS-edited orders keep following them). No line or invoice is rebuilt from them (surfaceWcOrderEditDrift reports a moved split).
         ...(Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
         ...(erased || keepImsEdit
           ? {}
