@@ -15,6 +15,8 @@ import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { OnboardingBanner } from '@/components/layout/onboarding-banner'
+import { NeedsAttentionCard } from '@/components/dashboard/needs-attention-card'
+import type { NeedsAttentionView } from '@/lib/domain/needs-attention/categories'
 import { formatCompactMoney, formatMoney } from '@/lib/utils'
 
 type Props = {
@@ -22,6 +24,7 @@ type Props = {
   recentOrders: RecentOrder[]; incomingPOs: IncomingPO[]
   periodLabel: string; compLabel: string; initialPeriod: Period; initialCompare: CompareMode
   showOnboardingBanner?: boolean
+  needsAttention?: NeedsAttentionView | null
 }
 
 /**
@@ -257,7 +260,7 @@ function DesktopChartFrame({
   )
 }
 
-export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare, showOnboardingBanner }: Props) {
+export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare, showOnboardingBanner, needsAttention }: Props) {
   const formatDateTime = useFormatDateTime()
   const fmtDateShort = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short' })
   const baseCurrency = useBaseCurrency()
@@ -349,6 +352,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   return (
     <div className="space-y-4 md:space-y-5">
       {showOnboardingBanner && <OnboardingBanner />}
+      {needsAttention && <NeedsAttentionCard view={needsAttention} />}
       {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-2">

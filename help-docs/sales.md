@@ -16,6 +16,16 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Refund state** — an order's refund state is separate from its stage (see [Order Statuses](#order-statuses)). On the list it shows in the **Invoice** column as **Part. Refunded** or **Refunded**.
 - **WMS status** — when an order ships from a warehouse bound to a WMS (e.g. Mintsoft), a chip shows the WMS's fulfilment state (e.g. new, picking, dispatched, cancelled). The order detail page refreshes it live and deep-links to the order in the WMS admin; the list shows the most recent cached value. An order only pushes to the WMS once it is paid and ready to fulfil and dispatch push is enabled (see Settings → System → Scheduler). On an installation that is not yet allowed to write to the warehouse (the producer-side hold is switched on for it), nothing is pushed: the order stays as it is, the **Replay** and **Re-push** buttons say "Not sent by IMS: writes to Mintsoft are held on this installation" and change nothing, and IMS keeps only a record of what it would have sent. That record does not say whether the warehouse already holds the order (another system may have created it), so check the warehouse before acting. If you hold or cancel an order that Mintsoft has already started picking (or that Mintsoft has merged into another order), IMS cannot cancel it there: the order shows under **Sync → Exceptions** as "Hold not honoured" / "Cancel not honoured" and a **Raise a warehouse query** task is added under Exceptions for you to pass on to the warehouse (IMS writes no note on the Mintsoft order: the warehouse does not read them). IMS keeps watching the order, so if it ships after a hold the shipment is recorded as normal; if it ships after a cancel IMS does not record it for you and the order appears in the stuck-despatch list for you to decide what to do with the goods. An order whose creation timed out is linked to the order Mintsoft already holds for it once Mintsoft's own reference proves it is the same order; otherwise Replay on the "Create outcome unknown" row does the same check. The **WMS Dispatch** column shows whether IMS has sent the order to the warehouse (Queued, Pushed, Held, Cancelling, Cancelled, Failed or Payload invalid). See [Warehouse (Mintsoft)](warehouse.md) for how the warehouse connection works.
 
+### Bulk actions on the list
+
+Tick the box at the start of a row to select an order, or the box in the header to select every order on the page. A bar above the table shows how many orders are selected and offers three actions. Selection is per page: changing page or filter clears it.
+
+- **Allocate** runs the same auto-allocation as the **Allocate** button on the order page, for each selected order that is in **Processing**. An order that is already allocated (or picking or packing) is skipped as "Already allocated"; a draft, on-hold or waiting-for-payment order is skipped as not ready; a finished or cancelled order has nothing to allocate. If stock is short the row says how many units wait on backorder.
+- **Advance status** moves each selected order one step forward along the same flow as the order page's workflow button: Draft or Pending Payment to Processing, Processing to Allocated (the allocation above), Shipped to Completed, and Completed to Delivered (only when delivery tracking is on). It never ships, cancels or holds an order, and it queues nothing the single-order button would not queue. Orders in Allocated, Picking or Packing move on through their shipments, so they are skipped as "Not in a state that can advance"; so are archived orders and orders with no next step.
+- **Print packing slips** opens one combined PDF with a slip per selected order (each starting on a new page), drawn exactly as the order page's packing slip. Draft and cancelled orders get no slip; a closing "Not printed" page lists them.
+
+Each order runs on its own, one after another, using the same checks and permissions as its single-order button, so one order failing never stops the others and nothing is rolled back. When Allocate or Advance finishes, a result panel lists every selected order as **Done**, **Skipped** (with the reason) or **Failed** (with what to do), with totals at the top. You need the **sales.process** permission (Admin, Manager and Warehouse roles) to run Allocate and Advance; printing needs only sales access. At most 100 orders can be selected for one action; a page holds 50.
+
 ## Creating a Sales Order
 
 To create a new order manually:
@@ -26,6 +36,8 @@ To create a new order manually:
 4. Set quantities, prices, and any discounts
 5. Add notes if needed
 6. Save the order
+
+A Draft can be changed afterwards with **Edit order** (see *Editing an order* below).
 
 The **Ship From** warehouse is pre-selected with your default warehouse (the first warehouse if none is marked default); change it if the order ships from elsewhere. The stock figures beside each product are for the selected warehouse.
 
@@ -445,17 +457,19 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
 
-### Editing an order after it has been pushed to the accounting system
+### Editing an order
 
-Editing a sales order that already has an external accounting invoice (Xero) queues a
+**A Draft order can be edited.** Open the order and press **Edit order**: the same form you used to create it opens pre-filled, and you can change the customer, addresses, lines, quantities, prices, discounts, shipping, VAT basis, warehouse, delivery date and notes. **Save changes** re-prices the whole order exactly as creating it would (the same rounding, VAT and exchange-rate rules; a foreign-currency order is re-priced at today's table rate and refused if that rate is missing), replaces the lines, and keeps the order number, the status (still Draft) and the activity history, which records the edit with the old and new totals. An order that was saved with separate fee rows shows their sum as part of **Shipping** when you edit it. The order's external order number is not editable.
+
+**Edit order is disabled, with the reason shown when you hover it, when the order is not a Draft** (or is a draft that already has stock allocated, a shipment, a posted accounting invoice, a warehouse push, a payment recorded (or the order marked paid), store credit applied, an invoice number or document or accounting entry, a refund or return expectation, or a link to a WooCommerce order, or whose personal data has been erased). The server applies the same rule and refuses the edit if anything changed since the page was drawn; if someone else saved the order after you opened the form, your save is refused with a "changed by someone else, reload" message instead of overwriting their change. **Editing a confirmed order (Pending Payment onwards) is not available yet:** it would have to amend the queued or posted invoice, re-allocate stock and amend the order at the warehouse, and, for an order that came from WooCommerce, would desync it from the store. Until that is built, change a confirmed order's notes with **Notes**, or **Cancel** it and create a new one (**Clone** copies the lines and VAT basis). Editing never writes anything to the accounting system, the warehouse or the store.
+
+### Orders that already have an accounting invoice
+
+A sales order that already has an external accounting invoice (Xero) and is changed by a path that re-queues its invoice (for example a status change or a WooCommerce update) queues a
 `SALES_INVOICE_UPDATE` to push the changes through, instead of silently dropping them. The update
 payload is constructed by the same builder used for the original push, so what Xero sees matches a
 fresh post would have sent. A payload-derived idempotency key prevents duplicates if you re-save
-without any content change.
-
-If the active accounting connector is one that does not support this (Xero is the only one shipped today), IMS records a
-`sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
-behaviour is symmetric with the purchase bill edit path.
+without any content change. (This is not an operator Edit: see **Editing an order** above.)
 
 If the accounting connector rejects the update (e.g. the external invoice is locked, paid, or
 voided), an amber **rejected sync** alert appears at the top of the sales order detail page with

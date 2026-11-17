@@ -22,6 +22,7 @@ import { HistoricalImportTrigger } from './historical-import-trigger'
 import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-context'
 import { parseSelectedParam } from '@/lib/analytics/reorder-selection'
 import { ReorderCoverageProvider, ReorderCoverageWeeksCell, ReorderOrderQtyCell } from './reorder-coverage-cells'
+import { ReorderSupplierSelect } from './reorder-supplier-select'
 import { ReorderSelectAllCheckbox, ReorderRowCheckbox } from './reorder-selection-checkboxes'
 import { currentParams } from '../_components/report-utils'
 import {
@@ -71,6 +72,8 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
     pageSize: Number(one(searchParams.pageSize) ?? 100),
   }
 }
+
+const THRESHOLD_FIELD_LABELS = { reorderPoint: 'reorder point', safetyStockQty: 'safety stock', reorderQty: 'reorder quantity' } as const
 
 const ABC_BADGE: Record<ReorderReportRow['abcClass'], string> = {
   A: 'bg-amber-100 text-amber-800 border-amber-200',
@@ -170,7 +173,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       render: (row) => <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />,
       footer: 'Totals',
     },
-    { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName ?? <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800" title="No supplier is set, so a draft PO cannot be raised for this row">Unassigned</span> },
+    { key: 'supplier', label: 'Supplier / source', render: (row) => row.supplierName == null ? <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800" title="No supplier is set, so a draft PO cannot be raised for this row">Unassigned</span> : row.productType === 'BOM' ? row.supplierName : <ReorderSupplierSelect productId={row.productId} sku={row.sku} defaultSupplierId={row.supplierId} defaultSupplierName={row.supplierName} options={row.supplierOptions} /> },
     { key: 'neededFor', label: 'Needed for', render: (row) => row.neededFor.join(', ') },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'abcClass', label: 'ABC', render: (row) => <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-bold ${ABC_BADGE[row.abcClass]}`}>{row.abcClass}</span> },
@@ -181,7 +184,19 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'leadTime', label: 'Lead time', align: 'right', render: (row) => `${row.leadTimeDays} days` },
     { key: 'latestPoDate', label: 'Latest PO date', render: (row) => <LatestPoDateCell row={row} /> },
     { key: 'requiredReceipt', label: 'Required receipt', render: (row) => row.requiredReceiptDate ?? MUTED_DASH },
-    { key: 'reorderPoint', label: 'Reorder point', align: 'right', render: (row) => row.reorderPoint },
+    {
+      key: 'reorderPoint',
+      label: 'Reorder point',
+      align: 'right',
+      render: (row) => row.thresholdOverrides.length > 0 ? (
+        <span
+          title={`This warehouse overrides the product value for: ${row.thresholdOverrides.map((f) => THRESHOLD_FIELD_LABELS[f]).join(', ')}. Safety stock ${row.safetyStockQty}, reorder quantity ${row.configuredReorderQty}.`}
+        >
+          {row.reorderPoint}
+          <span className="ml-1 rounded bg-sky-100 px-1 py-0.5 text-[10px] font-semibold text-sky-800">Override</span>
+        </span>
+      ) : row.reorderPoint,
+    },
     { key: 'suggested', label: 'Suggested qty', align: 'right', render: (row) => row.suggestedReorderQty, footer: report.totals.suggestedReorderQty },
     {
       key: 'orderQty',

@@ -397,6 +397,29 @@ Each product displays four stock figures per warehouse:
   already arrived by any route (a manual receipt, a WMS book-in, or a WMS stock-sync alignment).
   Click the figure to see the source POs or transfers.
 
+### Channel buffer (hold stock back from the store)
+
+On a simple, variant or BOM product, the **Channel buffer by warehouse** card lets you hold a number of units back at a warehouse so they are never offered on connected sales channels (WooCommerce). The store is told **Available minus Buffer** for that warehouse, never below 0, before the warehouses are added together.
+
+- **It only changes what the store sees.** On Hand, Allocated and Available in IMS do not change, and the buffer does not stop IMS allocating the units to an IMS order (a buffer says what the store may sell, not what the warehouse may ship). The warehouse-system stock sync (Mintsoft) also keeps working on the real On Hand.
+- A buffer only has an effect at a warehouse marked **Sync to Store**; elsewhere the card shows "not synced".
+- Leave the box empty (or 0) for no buffer. Whole or decimal numbers of zero or more.
+- **A reason is required** whenever you change a buffer. Saving needs the **inventory edit** permission. Each change is recorded in the Activity Log (product entry) with who, when, the old value, the new value and the reason. Keep the reason about the stock, not about a customer.
+- Saving queues the normal stock push for that product, so the store figure updates within moments. If the push cannot be queued, the buffer is still saved, a warning is logged, and the next stock catch-up sends it.
+- Kit stock is worked out from its components, so set the buffer on the components.
+
+
+### Reorder thresholds by warehouse
+
+A product's **reorder point**, **safety stock** and **reorder quantity** are set once on the product and, until you say otherwise, every warehouse inherits them. On the product page, below **Stock Levels**, the **Reorder thresholds by warehouse** table lets you give one warehouse its own value, so a small satellite site is not held to the main site's alert level.
+
+- **Blank means inherit.** Leave a cell empty and that warehouse uses the product's value, which is shown in grey as the placeholder (a dash means the product has none set, so Reorder Planning works the reorder point out from demand and lead time). Typing a value overrides that one field for that one warehouse; the other two fields are unaffected. **0** is a real override (for example a reorder quantity of 0 opts that warehouse out), not the same as blank.
+- **Numbers only.** Zero or more, up to four decimal places. Clear a cell and save to go back to inheriting.
+- **Who can change it.** Needs inventory edit permission; other users see the values but cannot edit. Every change is written to the **Activity Log** (who, when, the old value and the new value, per field and warehouse).
+- **A warehouse with no stock yet** can still be given thresholds. Saving never creates or changes a stock record, so it cannot affect stock sync or availability.
+- **Two people editing.** Each cell remembers the value it had when the page loaded. If someone else changed a cell you edited in the meantime, that cell is not saved and a message names it (reload to see the current value); your other edits are saved, and cells you did not touch are never overwritten.
+- **Warehouses connected to a warehouse system (WMS, such as Mintsoft)** can be given overrides too. These thresholds are planning figures used only by IMS Reorder Planning. They are never sent to the warehouse system or to the store, and an override does not change what is synced.
+- **Where it is used.** Reorder Planning, when filtered to a warehouse (see Analytics > Replenishment). Kit and variable parents and non-inventory products have no per-warehouse table.
 
 ## FIFO Cost Layers
 
@@ -503,7 +526,7 @@ When the product appears in a reorder forecast (Analytics > Reorder), the foreca
 - Open PO incoming stock (the forecast subtracts inbound PO quantity from the suggested reorder)
 - Average daily demand from sales history (the "velocity")
 - Lead-time days from the preferred supplier's catalogue entry (or a system default if not set)
-- Safety stock and configured reorder thresholds
+- Safety stock and configured reorder thresholds (the warehouse's own override when the report is filtered to a warehouse; see [Reorder thresholds by warehouse](#reorder-thresholds-by-warehouse))
 
 ### Reorder Evidence
 

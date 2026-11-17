@@ -9,7 +9,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { createSalesOrder } from '@/app/actions/sales'
+import { createSalesOrder, updateSalesOrder, type SoDetail } from '@/app/actions/sales'
 import { createCustomer, type CustomerRow, type AddressData } from '@/app/actions/customers'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
@@ -38,6 +38,8 @@ type Props = {
   users: UserOption[]
   currentUserName: string
   companyHomeCountry?: string | null
+  /** Edit mode: the DRAFT order to pre-fill from; Save writes it through updateSalesOrder instead of creating a new order. */
+  order?: SoDetail
   onClose: () => void
 }
 
@@ -141,55 +143,100 @@ function formatAddr(a: AddressData | null): string {
   return [a.line1, a.line2, a.city, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ')
 }
 
-export function SoFormDialog({ products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry, onClose }: Props) {
+/** The form lines for a saved order. A line whose stored rate is not what the resolver would pick today is kept as a manual override; the rest re-resolve as the order is edited. */
+function editLinesFromOrder(order: SoDetail, products: ProductRow[], taxRates: TaxRateRow[], homeCountry: string | null): LineItem[] {
+  const selected = taxRates.find((t) => t.active && t.name === order.taxRateName)
+  const orderDefault = { id: selected?.id ?? null, name: selected?.name ?? null, rate: selected?.rate ?? 0 }
+  const country = (order.shippingAddress as { country?: string | null } | null)?.country
+    ?? (order.billingAddress as { country?: string | null } | null)?.country
+    ?? homeCountry
+  return order.lines.map((l) => {
+    const category: TaxCategory = products.find((p) => p.id === l.productId)?.taxCategory ?? 'STANDARD'
+    const resolved = resolveRateClientSide(category, country, taxRates, 'SALES', orderDefault)
+    const auto = resolved.taxRateId === l.taxRateId
+    return {
+      key: makeKey(),
+      productId: l.productId ?? '',
+      sku: l.sku,
+      name: l.description,
+      qty: l.qty,
+      unitPrice: l.unitPriceForeign,
+      discount: l.discountStr ?? (l.discountAmount > 0 ? String(l.discountAmount) : ''),
+      productCategory: category,
+      taxRateId: l.taxRateId,
+      taxRateValue: l.taxRatePercent ?? 0,
+      taxRateName: l.taxRateName,
+      taxRateWarning: auto ? resolved.warning : null,
+      taxRateAutoResolved: auto,
+    }
+  })
+}
+
+/** Shipping as the form shows it: the stored net figure, grossed up by the order's rate when prices include VAT. */
+function editShippingFromOrder(order: SoDetail): number {
+  const vat = order.taxRatePercent ?? 0
+  const gross = order.pricesIncludeVat && vat > 0 ? order.shippingForeign * (1 + vat) : order.shippingForeign
+  return Math.round(gross * 100) / 100
+}
+
+export function SoFormDialog({ products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry, order, onClose }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const baseCurrency = useBaseCurrency()
 
   // Customer
   const [allCustomers, setAllCustomers] = useState(customers)
-  const [customerId, setCustomerId] = useState('')
-  const [customerName, setCustomerName] = useState('')
-  const [customerEmail, setCustomerEmail] = useState('')
+  const editing = order !== undefined
+  const [customerId, setCustomerId] = useState(order?.customerId ?? '')
+  const [customerName, setCustomerName] = useState(order?.customerName ?? '')
+  const [customerEmail, setCustomerEmail] = useState(order?.customerEmail ?? '')
   const [showNewCustomer, setShowNewCustomer] = useState(false)
   const [newCustName, setNewCustName] = useState('')
   const [creatingCust, setCreatingCust] = useState(false)
-  const [billingAddr, setBillingAddr] = useState('')
-  const [shippingAddr, setShippingAddr] = useState('')
-  const [billingAddrObj, setBillingAddrObj] = useState<Record<string, string> | null>(null)
-  const [shippingAddrObj, setShippingAddrObj] = useState<Record<string, string> | null>(null)
+  const [billingAddr, setBillingAddr] = useState(order ? formatAddr((order.billingAddress ?? null) as AddressData | null) : '')
+  const [shippingAddr, setShippingAddr] = useState(order ? formatAddr((order.shippingAddress ?? null) as AddressData | null) : '')
+  const [billingAddrObj, setBillingAddrObj] = useState<Record<string, string> | null>((order?.billingAddress ?? null) as Record<string, string> | null)
+  const [shippingAddrObj, setShippingAddrObj] = useState<Record<string, string> | null>((order?.shippingAddress ?? null) as Record<string, string> | null)
 
   // Order
-  const [currency, setCurrency] = useState(baseCurrency.code)
+  const [currency, setCurrency] = useState(order?.currency ?? baseCurrency.code)
   // The rate comes from the fx_rates table through a server action; a missing rate blocks submit and is never replaced by 1.
-  const { fx, load: loadFxRate } = useFormFxRate({ state: 'base' })
+  // Editing a foreign-currency order reads today's table rate on open (below); submit stays blocked until it arrives.
+  const { fx, load: loadFxRate } = useFormFxRate(order && order.currency !== baseCurrency.code ? null : { state: 'base' })
   const fxRate = fx ? usableRate(fx) : null // null while loading or when the currency has no rate: base-currency figures show a dash
   // The rate the line prices are currently expressed at (1 while in the base currency), so a currency change can re-price them.
-  const pricedAtRate = useRef(1)
+  // An order being edited is priced at the rate it was saved at.
+  const pricedAtRate = useRef(order && order.currency !== baseCurrency.code ? order.fxRateToBase : 1)
   const moneyAnchors = useRef(new Map<string, MoneyAnchor>())
   const latest = useRef({ lines: [] as LineItem[], orderDiscount: '', shippingAmount: 0, fees: [] as FeeLine[] })
   // Pre-select the default warehouse (falls back to the first one).
   const [warehouseId, setWarehouseId] = useState(
-    warehouses.find((w) => w.isDefault)?.id ?? warehouses[0]?.id ?? '',
+    order ? (order.shipFromWarehouseId ?? '') : (warehouses.find((w) => w.isDefault)?.id ?? warehouses[0]?.id ?? ''),
   )
-  const [expectedDelivery, setExpectedDelivery] = useState('')
-  const [salesRep, setSalesRep] = useState(currentUserName)
-  const [notes, setNotes] = useState('')
-  const [internalNotes, setInternalNotes] = useState('')
-  const [taxRateId, setTaxRateId] = useState('')
-  const [pricesIncludeVat, setPricesIncludeVat] = useState(true)
+  const [expectedDelivery, setExpectedDelivery] = useState(order?.expectedDelivery ? order.expectedDelivery.slice(0, 10) : '')
+  const [salesRep, setSalesRep] = useState(order ? (order.salesRep ?? currentUserName) : currentUserName)
+  const [notes, setNotes] = useState(order?.notes ?? '')
+  const [internalNotes, setInternalNotes] = useState(order?.internalNotes ?? '')
+  const [taxRateId, setTaxRateId] = useState(order ? (taxRates.find((t) => t.active && t.name === order.taxRateName)?.id ?? '') : '')
+  const [pricesIncludeVat, setPricesIncludeVat] = useState(order ? order.pricesIncludeVat : true)
 
   // Lines
-  const [lines, setLines] = useState<LineItem[]>([])
+  const [lines, setLines] = useState<LineItem[]>(() => (order ? editLinesFromOrder(order, products, taxRates, companyHomeCountry ?? null) : []))
   const [productSearch, setProductSearch] = useState('')
   const [showSearch, setShowSearch] = useState(false)
 
   // Shipping, fees & discount
-  const [shippingAmount, setShippingAmount] = useState(0)
-  const [shippingService, setShippingService] = useState('')
+  // The order stores shipping (+ fees) NET and as one figure; the form shows it as entered (gross when prices include VAT) with no separate fee rows.
+  const [shippingAmount, setShippingAmount] = useState(() => (order ? editShippingFromOrder(order) : 0))
+  const [shippingService, setShippingService] = useState(order?.shippingService ?? '')
   const [fees, setFees] = useState<FeeLine[]>([])
-  const [orderDiscount, setOrderDiscount] = useState('')
+  const [orderDiscount, setOrderDiscount] = useState(order ? (order.discountStr ?? (order.discountAmount > 0 ? String(order.discountAmount) : '')) : '')
   useEffect(() => { latest.current = { lines, orderDiscount, shippingAmount, fees } }, [lines, orderDiscount, shippingAmount, fees])
+  // Editing: read the table rate of the order's foreign currency once. The lines stay as saved; the rate guards the write.
+  useEffect(() => {
+    if (order && order.currency !== baseCurrency.code) loadFxRate(order.currency, false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on open
+  }, [])
 
   const [error, setError] = useState('')
 
@@ -519,7 +566,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
     startTransition(async () => {
       const resolvedName = customerName || allCustomers.find((c) => c.id === customerId)?.fullName || ''
-      const result = await createSalesOrder({
+      const payload = {
         customerId: customerId || undefined,
         customerName: resolvedName,
         billingAddress: billingAddrObj ?? undefined,
@@ -555,7 +602,21 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
             taxRateId: l.taxRateAutoResolved ? null : l.taxRateId, // only send explicit overrides
           }
         }),
-      })
+      }
+      if (order) {
+        const edited = await updateSalesOrder(order.id, payload, order.updatedAt)
+        if (edited.success) {
+          router.refresh()
+          onClose()
+        } else if (isFxRateChangedError(edited.error)) {
+          setCurrencyAndRate(currency)
+          setError(FX_RATE_CHANGED_FORM_MESSAGE)
+        } else {
+          setError(edited.error ?? 'Failed to save the order')
+        }
+        return
+      }
+      const result = await createSalesOrder(payload)
       if (result.success && result.order) {
         if (result.postCommitWarnings?.length) window.alert(`The order was created, but: ${result.postCommitWarnings.join('; ')}`)
         router.refresh()
@@ -575,7 +636,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     <Dialog open onOpenChange={() => {}}>
       <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw]">
         <DialogHeader>
-          <DialogTitle>New Sales Order</DialogTitle>
+          <DialogTitle>{editing ? 'Edit Draft Order' : 'New Sales Order'}</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-6">
@@ -927,14 +988,23 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button variant="outline" onClick={() => handleSubmit(true)} disabled={isPending || fxBlocksSubmit(fx)}>
-            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-            Save as Draft
-          </Button>
-          <Button onClick={() => handleSubmit(false)} disabled={isPending || fxBlocksSubmit(fx)}>
-            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-            Create Order
-          </Button>
+          {editing ? (
+            <Button onClick={() => handleSubmit(true)} disabled={isPending || fxBlocksSubmit(fx)}>
+              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              Save changes
+            </Button>
+          ) : (
+            <>
+              <Button variant="outline" onClick={() => handleSubmit(true)} disabled={isPending || fxBlocksSubmit(fx)}>
+                {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                Save as Draft
+              </Button>
+              <Button onClick={() => handleSubmit(false)} disabled={isPending || fxBlocksSubmit(fx)}>
+                {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                Create Order
+              </Button>
+            </>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
