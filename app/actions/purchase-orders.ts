@@ -55,7 +55,7 @@ import {
 import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SupplierCreditNoteEnqueueDeclined, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
@@ -5417,7 +5417,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // REVERSE-CHARGE BILL: the credit is an amount against the bill's NET PAYABLE (what is owed to the supplier, without the VAT the bill accounts for itself), capped there together with
     // the credits already against the bill. That ONE amount is split across the bill's lines and is the Xero credit lines (exclusive net, each line's booked code, so Xero self-accounts the
     // VAT the way the bill did), the allocation to the bill and the transit movement. Local-only credits are not Xero figures and are left alone.
-    let reverseChargePlan: ReturnType<typeof planReverseChargeSupplierCredit> = null
+    let reverseChargePlan: Exclude<ReturnType<typeof planReverseChargeSupplierCredit>, string> | null = null
     if (shouldQueueXero && billHasReverseCharge) {
       const payableForeign = billNetPayable(billTreatments, cn.currency)
       const others = cn.purchaseInvoiceId
@@ -5425,8 +5425,11 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         : null
       const availableForeign = Math.max(0, payableForeign - Number(others?._sum.amountForeign ?? 0))
       const creditForeign = Number(cn.amountForeign)
-      reverseChargePlan = creditForeign > availableForeign + 0.0001 ? null : planReverseChargeSupplierCredit({ amount: creditForeign, lines: billTreatments, currency: cn.currency })
-      if (!reverseChargePlan) return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE(payableForeign.toFixed(2), availableForeign.toFixed(2)) }
+      if (creditForeign > availableForeign + 0.0001) return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE(payableForeign.toFixed(2), availableForeign.toFixed(2)) }
+      const planned = planReverseChargeSupplierCredit({ amount: creditForeign, lines: billTreatments, currency: cn.currency })
+      if (planned === 'exceeds') return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE(payableForeign.toFixed(2), availableForeign.toFixed(2)) }
+      if (planned === 'inexact') return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE }
+      reverseChargePlan = planned
     }
     // The credit's payload is built BEFORE the claim so an undecided tax type is refused while the credit is still a DRAFT: claiming first would leave it POSTED, refused by the poster with
     // no Xero credit and no way back (posting requires DRAFT). A legacy bill line can reconstruct the right VAT and still have no mapped tax type.

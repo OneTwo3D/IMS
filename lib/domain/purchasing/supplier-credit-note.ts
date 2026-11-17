@@ -118,32 +118,66 @@ export type ReverseChargeCreditPlan = {
  * A reverse-charge line's share is its net (Xero self-accounts the VAT under the reverse-charge code, as it did on the bill); a standard line's share is gross and is turned back
  * into net and VAT, so the credit mirrors the bill exactly: a full credit reproduces every bill line. Returns null when the credit exceeds the net payable.
  */
-export function planReverseChargeSupplierCredit(params: { amount: number; lines: ReadonlyArray<SupplierCreditBillLine>; currency: string }): ReverseChargeCreditPlan | null {
+export function planReverseChargeSupplierCredit(params: { amount: number; lines: ReadonlyArray<SupplierCreditBillLine>; currency: string }): ReverseChargeCreditPlan | 'exceeds' | 'inexact' {
   const { currency } = params
+  const places = roundMoney(1.23456789, currency).decimalPlaces()
+  const minor = toDecimal(1).div(toDecimal(10).pow(places))
   const payables = params.lines.map((l) => linePayable(l, currency))
   const total = payables.reduce((a, b) => addMoney(a, b), toDecimal(0))
   const amount = roundMoney(params.amount, currency)
-  if (!total.gt(0) || amount.gt(total)) return null
-  // Pro-rata shares rounded to the minor unit, the last carrying line taking the remainder so the shares add up to the credit exactly.
-  const shares = payables.map((p) => roundMoney(amount.mul(p).div(total), currency))
-  let lastWithPayable = -1
-  payables.forEach((p, i) => { if (p.gt(0)) lastWithPayable = i })
-  const drift = subtractMoney(amount, shares.reduce((a, b) => addMoney(a, b), toDecimal(0)))
-  if (lastWithPayable >= 0 && !drift.isZero()) shares[lastWithPayable] = addMoney(shares[lastWithPayable], drift)
+  if (!total.gt(0) || amount.gt(total)) return 'exceeds'
+  // LARGEST REMAINDER: each share is floored to the minor unit (never negative, never above the line's payable), then the leftover minor units go one at a time to the lines with the
+  // largest remainders. The shares add up to the credit exactly, and a credit smaller than the number of lines lands on as few lines as it needs (a zero share is omitted).
+  const exact = payables.map((p) => amount.mul(p).div(total))
+  const shares = exact.map((e) => e.toDecimalPlaces(places, 1 /* ROUND_DOWN */))
+  let leftover = amount.minus(shares.reduce((a, b) => addMoney(a, b), toDecimal(0))).div(minor).toNumber()
+  const order = exact.map((e, i) => ({ i, rem: e.minus(shares[i]) })).filter((r) => payables[r.i].gt(shares[r.i])).sort((x, y) => y.rem.comparedTo(x.rem) || x.i - y.i)
+  for (const r of order) { if (leftover <= 0) break; shares[r.i] = addMoney(shares[r.i], minor); leftover-- }
+  if (leftover > 0) return 'inexact'
+  // Each line's net from its share: a reverse-charge share is its net; a standard share is gross, turned back into net and VAT.
+  const lineGross = (l: SupplierCreditBillLine, net: ReturnType<typeof toDecimal>) => l.reverseCharge ? net : addMoney(net, roundMoney(multiplyMoney(net, l.rate), currency))
+  const maxNet = params.lines.map((l) => roundMoney(l.net, currency))
+  const nets = params.lines.map((l, i) => {
+    if (!shares[i].gt(0)) return toDecimal(0)
+    return l.reverseCharge ? shares[i] : roundMoney(shares[i].div(addMoney(1, l.rate)), currency)
+  })
+  // VERIFY what Xero will hold (the exclusive nets plus each standard line's VAT, rounded per line as the writer and its predictor do) against the credit. A standard line's gross takes only
+  // some values (VAT rounds per line), so any gap is closed by moving a net one minor unit at a time on lines where that gets closer, within the line's own net; if it cannot be closed
+  // exactly, nothing is planned.
+  const actual = () => nets.reduce((a, n, i) => addMoney(a, lineGross(params.lines[i], n)), toDecimal(0))
+  for (let guard = 0; guard < params.lines.length * 4 + 100; guard++) {
+    const diff = subtractMoney(amount, actual())
+    if (diff.isZero()) break
+    const dir = diff.gt(0) ? minor : minor.neg()
+    let moved = false
+    for (let i = 0; i < nets.length && !moved; i++) {
+      const next = addMoney(nets[i], dir)
+      if (next.lt(0) || next.gt(maxNet[i])) continue
+      const change = subtractMoney(lineGross(params.lines[i], next), lineGross(params.lines[i], nets[i]))
+      if (change.abs().gt(diff.abs()) || change.isZero() || change.gt(0) !== diff.gt(0)) continue
+      nets[i] = next
+      moved = true
+    }
+    if (!moved) return 'inexact'
+  }
+  if (!subtractMoney(amount, actual()).isZero()) return 'inexact'
   const lines: ReverseChargeCreditPlan['lines'] = []
   let netTotal = toDecimal(0)
-  let xeroTotal = toDecimal(0)
   params.lines.forEach((l, i) => {
-    const share = shares[i]
-    if (!share.gt(0)) return
-    const net = l.reverseCharge ? share : roundMoney(share.div(addMoney(1, l.rate)), currency)
+    const net = nets[i]
+    if (!net.gt(0)) return
     const vat = l.reverseCharge ? toDecimal(0) : roundMoney(multiplyMoney(net, l.rate), currency)
     netTotal = addMoney(netTotal, net)
-    xeroTotal = addMoney(xeroTotal, addMoney(net, vat))
     lines.push({ net: net.toNumber(), vat: vat.toNumber(), taxType: l.taxType, ...(l.taxRateId ? { taxRateId: l.taxRateId } : {}), reverseCharge: l.reverseCharge })
   })
-  return { lines, netTotal: netTotal.toNumber(), xeroTotal: (xeroTotal.gt(amount) ? amount : xeroTotal).toNumber() }
+  return { lines, netTotal: netTotal.toNumber(), xeroTotal: amount.toNumber() }
 }
+
+/** The credit cannot be split across the bill's lines into amounts Xero reproduces exactly: nothing is sent. */
+export const SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE = withLedgerCheck(
+  'This credit cannot be split across the lines of the reverse-charge bill into amounts that add up to exactly the credit once VAT is rounded line by line. '
+  + 'The credit note was not posted and is still a draft: record it again for a slightly different amount, such as the full remaining amount.',
+)
 
 /** Shown to the operator when a supplier credit note is raised against a bill whose lines carry more than one VAT treatment. */
 export const SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE = withLedgerCheck(
