@@ -102,6 +102,9 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   INVENTORY_ADJUSTMENT: { kind: 'payload', field: 'date' },
   SALES_INVOICE: { kind: 'payload', field: 'date' },
   SALES_INVOICE_UPDATE: { kind: 'payload', field: 'date' },
+  // The delete is dated by the document it removes: the producer writes the document's own date into `date`.
+  SALES_INVOICE_DELETE: { kind: 'payload', field: 'date' },
+  PURCHASE_INVOICE_DELETE: { kind: 'payload', field: 'date' },
   INVOICE_PAYMENT: { kind: 'payload', field: 'paymentDate' },
   // The bill attachment is raised from the posted purchase invoice row (enqueuePurchaseInvoiceFollowUps).
   BILL_ATTACHMENT: { kind: 'parent', via: [['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE']] },

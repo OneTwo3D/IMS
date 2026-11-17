@@ -520,7 +520,7 @@ export type SeamCounts = {
 export const CLAIM_BOUNDARY_FILE = 'lib/connectors/xero/sync-processor.ts'
 export const CLAIM_BOUNDARY_DECL = 'processClaimedEntry'
 export const CLAIM_BOUNDARY_HANDBACK = 'producer-held'
-const TRANSPORT_MODULE_RE = /^lib\/connectors\/xero\/(bills|contacts|credit-notes|invoices|items|journals|tax-rates)\.ts$/
+const TRANSPORT_MODULE_RE = /^lib\/connectors\/xero\/(bills|contacts|credit-notes|document-delete|invoices|items|journals|tax-rates)\.ts$/
 const EGRESS_DECLARED_EXCEPTIONS = [/^scripts\/provision-xero-demo\.ts$/, /^app\/actions\/settings\.ts$/, /^lib\/connectors\/accounting-registry\.ts$/]
 
 function calleeName(call: ts.CallExpression): string | null {

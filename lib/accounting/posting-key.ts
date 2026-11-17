@@ -130,6 +130,16 @@ const SCOPE_RULES: Record<AccountingSyncType, ScopeRule> = {
     const bill = payloadString(params, 'accountingInvoiceId')
     return bill ? `bill:${bill}` : ''
   },
+  // One delete per LEDGER document: the order (or bill) can later carry a replacement document, which has its own id and its own
+  // delete, so the document id in the payload is the discriminator. A retry of one delete carries the same id, so it cannot diverge.
+  SALES_INVOICE_DELETE: (params) => {
+    const document = payloadString(params, 'accountingInvoiceId')
+    return document ? `document:${document}` : ''
+  },
+  PURCHASE_INVOICE_DELETE: (params) => {
+    const document = payloadString(params, 'accountingInvoiceId')
+    return document ? `document:${document}` : ''
+  },
   // One refund per SalesOrderRefund / one supplier credit note per SupplierCreditNote.
   CREDIT_NOTE: DOCUMENT,
   PURCHASE_CREDIT_NOTE: DOCUMENT,

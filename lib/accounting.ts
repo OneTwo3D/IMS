@@ -123,6 +123,9 @@ const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   PURCHASE_CREDIT_NOTE: 'xero_sync_purchase_credit_note',
   PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
   PURCHASE_INVOICE_UPDATE: 'xero_sync_purchase_invoice',
+  // Deleting a document is gated by the same per-document switch as posting it: a ledger that is not sent invoices has none to delete.
+  SALES_INVOICE_DELETE: 'xero_sync_sales_invoice',
+  PURCHASE_INVOICE_DELETE: 'xero_sync_purchase_invoice',
   COGS_JOURNAL: 'xero_sync_cogs_journal',
   COGS_REVERSAL: 'xero_sync_cogs_reversal',
   STOCK_RECEIPT: 'xero_sync_stock_receipt',

@@ -79,9 +79,11 @@ export const WRITER_CRON_ROUTES: Readonly<Record<string, 'always-callable' | 'fl
 export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.sales.invoice', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
   { key: 'xero.sales.invoice-update', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
+  { key: 'xero.sales.invoice-delete', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }, { settingTrue: 'xero_document_delete_enabled', defaultValue: 'false' }] },
   { key: 'xero.sales.credit-note', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }] },
   { key: 'xero.sales.payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_invoice' }] },
+  { key: 'xero.purchase.bill-delete', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_invoice' }, { settingTrue: 'xero_document_delete_enabled', defaultValue: 'false' }] },
   { key: 'xero.purchase.bill-payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill-attachment', trigger: 'automatic', requires: [...XERO_MASTER, { settingTrue: 'xero_sync_attach_pdf', defaultValue: 'true' }] },
   { key: 'xero.purchase.supplier-credit', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_credit_note' }] },

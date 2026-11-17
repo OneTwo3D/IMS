@@ -19,6 +19,8 @@ import { getWmsOrderPushStateForSalesOrder } from '@/app/actions/wms-order-push'
 import { getMergeCandidateForSalesOrder } from '@/app/actions/wms-merge-candidates'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
+import { documentDeleteUiStates } from '@/lib/domain/accounting/document-delete-service'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { SoDetailClient } from './so-detail-client'
 
@@ -69,6 +71,8 @@ export default async function SalesOrderDetailPage({ params }: Props) {
 
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
+  // o3d-ngmt.21: the Delete control for a synced invoice — shown only for a user who may process sales, with the switch on, and for a document that reached Xero.
+  const invoiceDeleteState = (await documentDeleteUiStates('SALES_INVOICE', [so.id], hasPermission(session.user.role, 'sales.process')))[so.id]
 
   return (
     <div className="space-y-4">
@@ -99,6 +103,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         rejectedAccountingSyncs={rejectedAccountingSyncs}
         paidWithoutInvoice={paidWithoutInvoice}
         editForm={editForm}
+        invoiceDeleteState={invoiceDeleteState}
       />
     </div>
   )

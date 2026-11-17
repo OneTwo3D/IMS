@@ -140,6 +140,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   wms_order_discrepancies: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_push_items: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_push_links: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
+  accounting_document_deletions: { kind: 'MUST_BE_EMPTY', reason: 'record of synced invoices and bills an operator deleted in IMS and the ledger together: runtime accounting state this runner never writes' },
   payment_removal_reconciliations: { kind: 'MUST_BE_EMPTY', reason: 'dated history of partial payment removals the payment poll measured on posted invoices: runtime accounting state this runner never writes' },
   wms_operator_tasks: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_status_snapshots: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },

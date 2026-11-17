@@ -62,6 +62,8 @@ import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describe
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
+import { parseXeroDeleteTarget, runXeroDocumentDelete } from './document-delete'
+import { completeAccountingDocumentDeletion, pendingDocumentDeletionRefusal, recordDeletionTargetStatus } from '@/lib/domain/accounting/document-delete-service'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
@@ -3843,6 +3845,13 @@ const POST_EFFECT_DOCUMENT_UPDATE = {
     + 'Xero if the change should not stand; there is nothing to void or credit-note.',
 } as const
 
+const POST_EFFECT_DOCUMENT_DELETE = {
+  effect: 'RENUMBERED an existing Xero document and then DELETED or VOIDED it',
+  remedy: 'The document was renumbered (its original number is free again) and then removed from the ledger. If it should still exist, '
+    + 'raise a replacement; a voided or deleted document cannot be restored. If only the renumber landed, the document is still live '
+    + 'under its suffixed number: retry this row to finish the delete, or restore the number by hand.',
+} as const
+
 const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }> = {
   SALES_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
   PURCHASE_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
@@ -3850,6 +3859,8 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   PURCHASE_CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
   SALES_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
   PURCHASE_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  SALES_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
+  PURCHASE_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
   INVOICE_PAYMENT: POST_EFFECT_PAYMENT,
   BILL_PAYMENT: POST_EFFECT_PAYMENT,
   COGS_JOURNAL: POST_EFFECT_JOURNAL,
@@ -6290,6 +6301,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
       }
+      const salesDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (salesDeleting) return { success: false, error: salesDeleting }
       // Same cancelled-order backstop as the create: don't modify an external receivable for an order
       // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
@@ -6358,6 +6371,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for PURCHASE_INVOICE_UPDATE' }
       }
+      const billDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (billDeleting) return { success: false, error: billDeleting }
       const supplier = referenceType === 'PurchaseOrder'
         ? await db.purchaseOrder.findUnique({
             where: { id: referenceId },
@@ -6378,6 +6393,23 @@ export async function processClaimedEntry(
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
       return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
+    }
+
+    case 'SALES_INVOICE_DELETE':
+    case 'PURCHASE_INVOICE_DELETE': {
+      // o3d-ngmt.21: free the document's number, then DELETE or VOID it. Read first, so a retry after the number was already changed makes
+      // only the status write and never appends a second suffix; every write fences on the lease like every other remote mutation here.
+      const parsed = parseXeroDeleteTarget(type, payload as Record<string, unknown>)
+      if (!parsed.ok) return { success: false, error: parsed.error }
+      const deleteTarget = parsed.target
+      const run = await runXeroDocumentDelete(deleteTarget, {
+        fence: (step) => lease.fenceBeforeRemoteWrite(step),
+        idempotencyKey: (step) => buildXeroIdempotencyKey(entryId, step, payload),
+      })
+      if (run.kind === 'fenced') return run.result
+      if (run.kind === 'failed') return { success: false, error: run.error }
+      await recordDeletionTargetStatus(deleteTarget.invoiceId, run.status)
+      return { success: true, externalId: deleteTarget.invoiceId, externalRevisionAt: run.externalRevisionAt }
     }
 
     case 'INVOICE_PAYMENT': {
@@ -7071,6 +7103,12 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
+  // o3d-ngmt.21: a confirmed delete is not a back-reference at all — it UNWINDS the link. The unwind is idempotent and keyed on the ledger's
+  // document id, so a failure here is retried by the same follow-up path as a failed back-reference, from the id already stored on the row.
+  if (type === 'SALES_INVOICE_DELETE' || type === 'PURCHASE_INVOICE_DELETE') {
+    await completeAccountingDocumentDeletion(externalId)
+    return
+  }
   // audit-H3: do NOT swallow failures here. The external id is already persisted
   // on the sync row (externalTransactionId) before this runs, and the caller's
   // catch marks the row for retry so the next pass re-applies the back-reference

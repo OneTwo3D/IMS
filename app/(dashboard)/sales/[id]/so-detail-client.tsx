@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
+import { DeleteSyncedDocument } from '@/components/accounting/delete-synced-document'
+import type { DocumentDeleteUiState } from '@/lib/domain/accounting/document-delete-service'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
@@ -122,6 +124,8 @@ type Props = {
   paidWithoutInvoice: boolean
   /** The catalogue the Edit order dialog needs; loaded by the page only for a DRAFT (the only status that can be edited). */
   editForm?: Omit<ComponentProps<typeof SoFormDialog>, 'order' | 'onClose' | 'warehouses' | 'currencies'>
+  /** o3d-ngmt.21: whether to offer deleting the synced invoice, or why not. Undefined = nothing to show. */
+  invoiceDeleteState?: DocumentDeleteUiState
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -1003,7 +1007,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, invoiceDeleteState }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1846,6 +1850,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                figure below is IMS's own arithmetic and will happily read "Settled" while the accounting
                invoice is still outstanding — that gap is exactly what this line names. */
             <p className="px-4 pt-2 text-[11px] text-red-700 dark:text-red-300">{settlement.detail}</p>
+          )}
+          {invoiceDeleteState?.show && (
+            <div className="px-4 pt-2">
+              <DeleteSyncedDocument kind="SALES_INVOICE" documentId={so.id} state={invoiceDeleteState} />
+            </div>
           )}
           {so.paymentRemovedForeign != null && so.paymentRemovedForeign > 0 && (
             <p className="px-4 pt-2 text-[11px] text-amber-800 dark:text-amber-300" data-testid="payment-removed-notice">
