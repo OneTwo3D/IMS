@@ -141,8 +141,8 @@ test('journal types cover everything the refund relief arithmetic and the A2 pro
   for (const type of ['DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B', 'ALLOCATION_REVERSAL', 'COGS_REVERSAL', 'UNEARNED_REV_REVERSAL']) {
     assert.ok(isJournalPayloadSyncType(type), type)
   }
-  for (const type of ['SALES_INVOICE', 'PURCHASE_BILL', 'CREDIT_NOTE', 'INVOICE_PAYMENT']) {
-    assert.equal(isJournalPayloadSyncType(type), false, `${type} is not a journal`)
+  for (const type of ['SALES_INVOICE', 'PURCHASE_BILL', 'CREDIT_NOTE', 'INVOICE_PAYMENT', 'COGS_JOURNAL', 'DAILY_BATCH_REVENUE_DEFERRAL']) {
+    assert.equal(isJournalPayloadSyncType(type), false, `${type}: nothing reads its net, so it compacts as before`)
   }
   assert.equal(new Set(JOURNAL_PAYLOAD_SYNC_TYPES).size, JOURNAL_PAYLOAD_SYNC_TYPES.length, 'no duplicates')
 })

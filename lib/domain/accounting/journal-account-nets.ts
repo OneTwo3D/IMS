@@ -74,27 +74,22 @@ export type AccountNetSummary = {
 }
 
 /**
- * Sync-row types whose payload is a journal (`lines` carrying debit/credit) that a proof or relief
- * reader consumes. Compaction REQUIRES a summary for these before it drops the payload; every other
- * type (invoices, bills, credit notes ...) is compacted as before and has no summary.
+ * Sync-row types whose payload's per-account net is READ by a proof or by the refund relief arithmetic
+ * (`proveAllocationDebitPosting`, `proveJournalPosting`, `journalNetMovement` callers in refund-service).
+ * Compaction REQUIRES a summary for these before it drops the payload. Every other type (invoices,
+ * bills, credit notes, and journals nothing reads the net of, such as the revenue-deferral and
+ * reconciliation batches or COGS/FX journals) is compacted as before and has no summary: a reader that
+ * starts to need one adds its type here in the same change.
  *
- * The three reversals are read by the refund relief arithmetic; the DAILY_BATCH_* family are the
- * batch journals (A2 is DAILY_BATCH_INVENTORY_ALLOC); the *_JOURNAL types are per-document journals.
+ * DAILY_BATCH_INVENTORY_ALLOC is the A2 debit; DAILY_BATCH_GROUP_B the Group B relief; the three
+ * reversals are the order and refund relief journals.
  */
 export const JOURNAL_PAYLOAD_SYNC_TYPES: readonly string[] = [
   'DAILY_BATCH_INVENTORY_ALLOC',
   'DAILY_BATCH_GROUP_B',
-  'DAILY_BATCH_REVENUE_DEFERRAL',
-  'DAILY_BATCH_INVENTORY_RECONCILIATION',
-  'DAILY_BATCH_COGS_RECONCILIATION',
-  'DAILY_BATCH_TRANSIT_RECONCILIATION',
   'ALLOCATION_REVERSAL',
   'COGS_REVERSAL',
   'UNEARNED_REV_REVERSAL',
-  'COGS_JOURNAL',
-  'MANUFACTURING_JOURNAL',
-  'REALISED_FX_JOURNAL',
-  'UNREALISED_FX_JOURNAL',
 ]
 
 export function isJournalPayloadSyncType(type: string): boolean {

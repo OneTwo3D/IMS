@@ -2355,7 +2355,7 @@ to erase, and the warning is raised only for what that record names. Two consequ
 Allocated Inventory for a refund or a cancelled order it proves, from the journal's own lines, that the
 Group A2 debit really reached that account and that this order's share fits inside it. The only thing
 that proof asks of the lines is the **net movement of one account in one direction**. When retention
-compacts a daily-batch journal, a reversal journal or another journal row, it now writes that net, per
+compacts a journal the reversal proof reads (the A2 and Group B batch journals and the reversal journals), it now writes that net, per
 account, onto the row in the same step that clears the payload (account codes and two totals each, no
 names or descriptions), and the proof reads it once the lines are gone. The result is the same figure the
 full payload would have given, so an old journal stays provable for ever and the reversal is raised
