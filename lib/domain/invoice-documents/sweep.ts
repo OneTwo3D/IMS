@@ -3,9 +3,10 @@
  * plus the lazy entry point a customer's first download uses for an order the sweep never covered.
  *
  * OFF UNLESS CONFIGURED. The sweep only looks at orders created at or after the date in the setting
- * `invoice_documents_sweep_floor`; with no date it does nothing. Older (historic) orders are NOT bulk
- * fetched: they are fetched when their customer first asks (`invoice_documents_lazy_fetch_enabled`), which
- * spreads the ledger calls over time instead of spending the shared daily budget on ~14k orders at once.
+ * `invoice_documents_sweep_floor`; with no date it does nothing for them. Older (historic) orders are NOT bulk
+ * fetched: a customer's first click QUEUES the fetch (on-demand.ts, setting `invoice_documents_lazy_fetch_enabled`) and
+ * THIS run does it, a few per run and ahead of the floor work, so the ledger calls are spread over time instead of
+ * spending the shared daily budget on ~14k orders at once.
  *
  * BUDGET. Each order costs at most two ledger GETs (the number lookup and the PDF). A run handles at most
  * `limit` documents, and stops at once when the ledger says it is rate-limited or unreachable, and after
@@ -18,10 +19,10 @@ import { db } from '@/lib/db'
 import { loadInvoiceDocumentFile } from '@/lib/invoice-pdf'
 import { getSettingValue } from '@/lib/settings-store'
 import { ensureInvoiceDocument, type InvoiceDocumentDeps, type EnsureInvoiceDocumentOutcome } from './fetch-service'
+import { INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING, INVOICE_DOCUMENTS_LAZY_FETCH_SETTING, LAZY_REQUESTS_PER_RUN } from './on-demand'
 
+export { INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING, INVOICE_DOCUMENTS_LAZY_FETCH_SETTING }
 export const INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING = 'invoice_documents_sweep_floor'
-export const INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING = 'invoice_documents_credit_notes_enabled'
-export const INVOICE_DOCUMENTS_LAZY_FETCH_SETTING = 'invoice_documents_lazy_fetch_enabled'
 export const DEFAULT_SWEEP_LIMIT = 20
 export const INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING = 'invoice_documents_integrity_cursor'
 const INTEGRITY_SCAN_BATCH = 100
@@ -91,6 +92,26 @@ async function selectNewFetchCandidates(floor: Date, now: Date, take: number, in
     for (const refund of refunds) candidates.push({ orderId: refund.orderId, kind: 'CREDIT_NOTE', refundId: refund.id })
   }
   return candidates
+}
+
+/**
+ * DOCUMENTS A CUSTOMER ASKED FOR (on-demand.ts): historic orders, fetched whatever their date, oldest request first, a few per run so a flood
+ * of clicks cannot spend the ledger budget. A request waiting out its backoff, escalated to a person, or already stored is not due.
+ */
+async function selectCustomerRequested(now: Date, take: number, includeCreditNotes: boolean): Promise<Candidate[]> {
+  if (take <= 0) return []
+  const states = await db.invoiceDocumentFetchState.findMany({
+    where: {
+      customerRequestedAt: { not: null },
+      status: 'PENDING',
+      OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
+      ...(includeCreditNotes ? {} : { kind: 'INVOICE' as const }),
+    },
+    orderBy: { customerRequestedAt: 'asc' },
+    take,
+    select: { orderId: true, refundId: true, kind: true },
+  })
+  return states.map((state) => ({ orderId: state.orderId, kind: state.kind, ...(state.refundId ? { refundId: state.refundId } : {}) }))
 }
 
 /**
@@ -177,14 +198,24 @@ export async function runInvoiceDocumentSweep(
 ): Promise<InvoiceDocumentSweepResult> {
   const result: InvoiceDocumentSweepResult = { considered: 0, stored: 0, waiting: 0, needsAttention: 0, failed: 0, stoppedEarly: null }
   const floor = parseFloor(await getSettingValue(INVOICE_DOCUMENTS_SWEEP_FLOOR_SETTING))
-  if (floor === null) return { ...result, skipped: 'no-floor' }
-  if (floor === 'bad') return { ...result, skipped: 'bad-floor' }
+  const lazyOn = (await getSettingValue(INVOICE_DOCUMENTS_LAZY_FETCH_SETTING)) === 'true'
+  // With the on-demand switch off the run is exactly what it was: no floor, or a bad one, means nothing is done.
+  if (floor === null && !lazyOn) return { ...result, skipped: 'no-floor' }
+  if (floor === 'bad' && !lazyOn) return { ...result, skipped: 'bad-floor' }
   const includeCreditNotes = (await getSettingValue(INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING)) === 'true'
   const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_SWEEP_LIMIT, 200))
+  const now = deps.now()
 
-  // Verify stored files first, so a bad one is due for a re-fetch in this very run.
-  await markDocumentsWithBadFilesDue(deps.now()).catch(() => 0)
-  const candidates = await selectInvoiceDocumentCandidates(floor, deps.now(), limit, includeCreditNotes)
+  // A customer is waiting on these: they go first, capped per run.
+  const requested = lazyOn ? await selectCustomerRequested(now, Math.min(limit, LAZY_REQUESTS_PER_RUN), includeCreditNotes) : []
+  let candidates: Candidate[] = requested
+  if (floor instanceof Date) {
+    // Verify stored files first, so a bad one is due for a re-fetch in this very run.
+    await markDocumentsWithBadFilesDue(now).catch(() => 0)
+    const planned = await selectInvoiceDocumentCandidates(floor, now, limit - requested.length, includeCreditNotes)
+    const seen = new Set(requested.map((candidate) => `${candidate.orderId}:${candidate.kind}:${candidate.refundId ?? '-'}`))
+    candidates = [...requested, ...planned.filter((candidate) => !seen.has(`${candidate.orderId}:${candidate.kind}:${candidate.refundId ?? '-'}`))]
+  }
   let consecutiveFailures = 0
   for (const candidate of candidates) {
     result.considered++
@@ -208,22 +239,6 @@ export async function runInvoiceDocumentSweep(
     }
   }
   return result
-}
-
-/**
- * Lazy fetch for ONE order's invoice, called when a customer asks for the PDF. Off unless `invoice_documents_lazy_fetch_enabled`
- * is exactly 'true'. Honours the per-document backoff, so repeated clicks do not reach the ledger:
- *   - no PDF stored yet (a historic order): fetch it; returns whether a PDF is now stored;
- *   - a PDF stored and its recheck is due (the ledger may have amended it): look again, so the customer is served the current
- *     version. The old one is served if the ledger cannot be asked. Returns true whenever a PDF is stored.
- */
-export async function ensureInvoiceDocumentOnDemand(orderId: string, deps: InvoiceDocumentDeps): Promise<boolean> {
-  if ((await getSettingValue(INVOICE_DOCUMENTS_LAZY_FETCH_SETTING)) !== 'true') return false
-  const outcome = await ensureInvoiceDocument({ orderId, kind: 'INVOICE' }, deps)
-  if (outcome.status === 'stored') return true
-  // A recheck that did not come back with a new answer leaves the stored version in place.
-  const stored = await db.salesOrderInvoiceDocument.findFirst({ where: { orderId, kind: 'INVOICE', supersededAt: null, withdrawnAt: null }, select: { id: true } })
-  return stored !== null
 }
 
 /**

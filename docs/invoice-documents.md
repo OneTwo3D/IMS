@@ -1,4 +1,4 @@
-# Customer invoice documents (read side)
+# Customer invoice documents
 
 IMS keeps the customer-facing invoice (and credit note) PDF that the accounting ledger issued, so it can show it to the
 customer, attach it to e-mails and keep it as the statutory record. This page covers the read side: finding the document in
@@ -48,7 +48,7 @@ Each stored document carries a fingerprint (a hash) of what it was judged agains
 
 ## Amended documents: rechecks
 
-The ledger can amend or re-issue a document after IMS stored it, so a stored document is looked at again **1 day, then 7 days, then every 30 days** after the last look (the next time is on the document's fetch state). The sweep picks due rechecks up (they are not limited to the floor date, and a quarter of every run, at least one slot, is reserved for them so a backlog of new orders cannot starve them; unused slots roll over), and the customer download route looks again, on the first request after one falls due, before it serves (setting `invoice_documents_lazy_fetch_enabled`; the stored PDF is served if the ledger cannot be asked). A changed document (different hash) is promoted by the versioning rule above; a recheck that cannot get an answer leaves the stored version in place and never escalates a "missing" document.
+The ledger can amend or re-issue a document after IMS stored it, so a stored document is looked at again **1 day, then 7 days, then every 30 days** after the last look (the next time is on the document's fetch state). The sweep picks due rechecks up (they are not limited to the floor date, and a quarter of every run, at least one slot, is reserved for them so a backlog of new orders cannot starve them; unused slots roll over), and the customer download route looks again, on the first request after one falls due, before it serves (setting `invoice_documents_lazy_fetch_enabled`; the stored PDF is served if the ledger cannot be asked). This look-again is the one place a customer's click still reaches the ledger inline; it concerns a document IMS already holds. A changed document (different hash) is promoted by the versioning rule above; a recheck that cannot get an answer leaves the stored version in place and never escalates a "missing" document.
 
 ## The four order kinds
 
@@ -56,8 +56,8 @@ Paid orders, store-credit orders and cancelled orders are fetched the same way, 
 
 ## When it runs
 
-* **Sweep** (`invoice-documents`, off by default, every 15 minutes when on): fetches for WooCommerce-linked orders created at or after the date in setting `invoice_documents_sweep_floor`. **With no date it does nothing.** At most 20 documents per run; it stops at once when the ledger refuses or rate-limits, and after three failures in a row.
-* **Lazy fetch** for historic orders: when a customer asks for a PDF IMS does not hold (the signed customer download route, after the caller has proved they own the order and the request's one-time nonce is spent), and `invoice_documents_lazy_fetch_enabled` is `true`, IMS asks the ledger for that one order. Repeated clicks are throttled per document by the same backoff, so a customer cannot drive ledger traffic. There is no bulk backfill.
+* **Sweep** (`invoice-documents`, off by default, every 15 minutes when on): fetches for WooCommerce-linked orders created at or after the date in setting `invoice_documents_sweep_floor`. **With no date it fetches nothing for new orders** (customer-requested documents are still fetched while the on-demand setting is on). At most 20 documents per run; it stops at once when the ledger refuses or rate-limits, and after three failures in a row.
+* **On-demand fetch** for historic orders (`invoice_documents_lazy_fetch_enabled`, off by default; see *Historic orders: the on-demand queue* below): a customer's first click on an order IMS holds no PDF for QUEUES the fetch and is answered "preparing"; this sweep does it, a few per run and ahead of the floor work, whatever the order's date. There is no bulk backfill.
 
 ## Waiting, backoff, attention
 
@@ -66,6 +66,29 @@ A document the ledger does not hold yet is retried after 10 minutes, 30 minutes,
 ## Retention and backup
 
 A statutory record, kept six years. **Nothing in IMS deletes a document row or a stored file** (pinned by `tests/invoice-documents/retention.test.ts`); a retention job is an owner decision. The storage directory **must be in the backup set**, restored with the database (see installation.md). The tables are `MUST_BE_EMPTY` for a first load.
+
+## Historic orders: the on-demand queue
+
+About 14,000 historic orders have no stored document and are **not** fetched in advance: that would spend most of the shared 5,000-a-day ledger budget for days. Instead the first customer click queues one fetch.
+
+1. The helper plugin (or a signed request) asks for the order's PDF. After the usual checks (connector enabled, signature, fresh window, the one-time nonce spent, the caller proved to own the order) the route finds no stored PDF.
+2. With `invoice_documents_lazy_fetch_enabled` on, IMS **queues** the fetch: it marks the document's fetch state (`customerRequestedAt`) and answers **HTTP 202** `{ "status": "preparing", "retryAfterSeconds": 900 }` (also in `Retry-After`, with `X-IMS-Invoice-Status: preparing`). The click does not reach the ledger. With the setting off the answer is the 404 it always was.
+3. The `invoice-documents` cron takes queued requests first (at most 5 per run, oldest first), whatever the order's date and even with no sweep floor, runs the ordinary read-only fetch (lookup by the Xeroom number, download, re-read) and stores the document.
+4. A later click finds the stored PDF and is served it.
+
+* **De-duplicated.** One fetch state per document and a compare-and-set on `customerRequestedAt`: any number of clicks, concurrent or repeated, queue once and write one activity row (`invoice_document_requested`).
+* **Rate limited and bounded.** At most `invoice_documents_lazy_daily_cap` new requests per UTC day (default 200) and `invoice_documents_lazy_outstanding_cap` waiting at once (default 200); past either the route answers **429** with `Retry-After` and queues nothing. The caps are checked then written, so concurrent clicks can overshoot by the number in flight, which the route's per-address rate limit already bounds. Each document costs at most three ledger reads, so the default daily cap is at most 600. A request the ledger never answers follows the fetch backoff and needs a person after 14 days, after which a click is answered "not available".
+* **Nothing is queued** for an order with no invoice number, for a document already stored (a recheck is the sweep's job), or for one that needs a person.
+* **Flag-less historic orders.** IMS writes `_ims_invoice_pdf_available` only for an order that has a stored document and writes nothing to historic orders in bulk, so such an order has no helper-plugin button until the plugin shows one for orders carrying the old invoice number (`_wcpdf_invoice_number`, the number IMS reads). IMS answers those orders through the same endpoint now. The contract is pinned in `tests/fixtures/woo-helper-invoice-contract.json`.
+* **Invoice numbers.** During the parallel phase the numbers are the invoicing incumbent's, used verbatim; IMS mints nothing.
+
+## Credit note download (customer)
+
+`POST /api/shopping/[connector]/credit-note-pdf` is the invoice route's twin for a credit note, which is its **own document** (never the invoice). The request is the invoice request plus `externalRefundId` (the storefront's refund id), signed with the same secret and checked in the same order: connector enabled, bounded body, HMAC, fresh window, one-time nonce, and the proof that the caller owns the **order**. The refund is then looked up by its storefront id **inside the proved order**; a refund of anyone else's order is "not found" (404) and is never loaded, queued or served. The reader (`loadCurrentCreditNotePdf`) applies the invoice reader's refusals (withdrawn, order changed since the document was judged, number shared by another refund, bytes not matching the stored hash) and has no legacy fallback. A credit note not yet stored is queued exactly like an invoice (same caps) and needs `invoice_documents_credit_notes_enabled`. The number a credit note carries in the ledger is unverified (see above).
+
+## The invoice e-mail
+
+The `INVOICE` customer e-mail (manual **Email PDF** and the queued invoice mail; ownership row `customer-email.invoice`) attaches the invoice IMS renders itself **while `wc_invoice_document_enabled` is off**, as it always did. With it **on**, it attaches the stored ledger PDF, through the reader the customer download uses, so the customer is never mailed a different rendering of the number. If IMS holds a stored document it will not serve right now (withdrawn, order changed, number shared, file missing or altered), the mail is not sent with a rendering of its own: it fails and stays queued for the next attempt. An order with no stored document and no legacy file keeps IMS's own rendering. The `ACCOUNTING_INVOICE` kind (the invoice IMS posted itself) always attached the stored PDF and is unchanged.
 
 ## Publishing to the storefront (publish side)
 
@@ -81,5 +104,11 @@ Once IMS holds a document it can serve, the storefront's My Account still has to
 
 **The invoice note** (`woocommerce.order.invoice-note`) is a separate operation and writer. It still exists only for an invoice IMS posted itself and is not triggered for an invoice the incumbent posted. It is now written at most once per ledger invoice id (`InvoiceStorePublication.noteInvoiceId` / `noteWrittenAt`): before the marker, a failed or held meta write made the whole call fail and the queue retried it by posting the note again. It no longer writes the download flag; the note follow-up never writes the flag: only the guarded job does, and only for a stored document, so an invoice IMS posted itself (flat file, no document row) gets no flag from this change.
 
-**Not built here:** the runbook (order of operations at the switchover, duplicate-button overlap while the old plugin is still on, rollback), the e-mail hook-up and the credit note download route.
+## Switchover procedure
+
+The order of operations at the switchover (IMS live first, the old invoice plugin off right after, the duplicate-button overlap accepted), verification and rollback (flip `wc_invoice_document_enabled` to false and clear the meta) are in [ops/invoice-documents-switchover-runbook.md](ops/invoice-documents-switchover-runbook.md).
+
+## The helper-plugin contract
+
+What the helper plugin reads from an order and sends and expects from IMS is pinned from both sides by `tests/connectors/woo-helper-invoice-contract.test.ts` against `tests/fixtures/woo-helper-invoice-contract.json` and the plugin's source in this repository (the plugin itself is not changed by IMS work). Edit the plugin or IMS and the fixture together.
 

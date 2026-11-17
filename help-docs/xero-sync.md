@@ -1927,6 +1927,8 @@ When a sales invoice is synced to Xero and payment is registered:
 3. A signed download link is pushed to the WooCommerce order as a customer-visible note
 4. An admin-only note with a "View in Xero" link is added to the WC order
 
+For an invoice **Xeroom** (not IMS) posted, IMS finds it in Xero read-only by its number, fetches the PDF and keeps it as the customer's one invoice; see the **Customer invoice in My Account** runbook (`docs/ops/invoice-documents-switchover-runbook.md`). Orders from before this existed are fetched on the customer's first click (queued, then fetched in the background within the shared 5,000-a-day Xero allowance, with a per-day cap), never in bulk. Credit notes are separate documents. IMS only reads from Xero for all of this; it writes nothing to Xero.
+
 Invoice PDFs are accessible via a signed URL: `/api/invoices/[orderId]?token=<hmac>`. The token is generated using HMAC-SHA256 and verified with timing-safe comparison.
 
 ## Xero Deep Links
