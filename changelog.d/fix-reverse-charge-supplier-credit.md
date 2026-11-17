@@ -1,4 +1,0 @@
-### Supplier credits against reverse-charge bills (purchasing, Xero)
-
-- **Fixed: a supplier credit against a reverse-charge bill now carries the net payable end to end.** The credit is capped at what is owed to the supplier (the bill total without the VAT the bill accounts for itself, minus credits already recorded), and that one amount is the Xero credit note (exclusive net lines on the bill's own reverse-charge or standard codes), the allocation to the bill and the stock-in-transit movement. Previously the credit amount was the VAT-inclusive IMS total, so Xero, the allocation and transit disagreed and a full credit could exceed the Xero bill.
-- **Changed: the refusal of Xero-bound credits against reverse-charge bills is removed.** Credits against a bill that mixes reverse-charge and standard lines are supported too (shared across lines pro rata); other mixed-VAT bills are still refused. Credits against standard bills are unchanged.
