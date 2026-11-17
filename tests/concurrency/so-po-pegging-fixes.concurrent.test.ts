@@ -229,3 +229,34 @@ test('a landed-quantity correction does not earmark the same units twice', SKIP,
     await db.salesOrderLinePeg.deleteMany({ where: { purchaseOrderLineId: line.poLineId } })
   }
 })
+
+test('a pegged line is served from its receipt before an unpegged line for the same product on the same order', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const { allocateSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const po = await fixtures.seedPo('peg-twolines', [10])
+  const line = po.lines[0]!
+  const order = await db.salesOrder.create({
+    data: {
+      orderNumber: `PEGFIX-two-${randomUUID().slice(0, 8)}`, status: 'PROCESSING', currency: 'GBP', shipFromWarehouseId: po.warehouseId,
+      subtotalForeign: 60, totalForeign: 60, subtotalBase: 60, totalBase: 60,
+      lines: { create: [
+        { productId: line.productId, description: 'unpegged', sku: 'TWO-A', qty: 3, unitPriceForeign: 10, unitPriceBase: 10, totalForeign: 30, totalBase: 30 },
+        { productId: line.productId, description: 'pegged', sku: 'TWO-B', qty: 3, unitPriceForeign: 10, unitPriceBase: 10, totalForeign: 30, totalBase: 30 },
+      ] },
+    },
+    select: { id: true, lines: { select: { id: true, sku: true } } },
+  })
+  const unpeggedId = order.lines.find((l) => l.sku === 'TWO-A')!.id
+  const peggedId = order.lines.find((l) => l.sku === 'TWO-B')!.id
+  try {
+    await pegTo(db, line.poLineId, peggedId, 3)
+    const received = await fixtures.receive(po, line, 3)
+    assert.equal(received.success, true, String(received.error))
+    await allocateSalesOrder(db, { orderId: order.id, capPeggedLines: true })
+    const byLine = async (lineId: string) => Number((await db.orderAllocation.aggregate({ where: { lineId }, _sum: { qty: true } }))._sum.qty ?? 0)
+    assert.equal(await byLine(peggedId), 3, 'the pegged line gets the receipt')
+    assert.equal(await byLine(unpeggedId), 0, 'the unpegged line does not consume it')
+  } finally {
+    await db.salesOrderLinePeg.deleteMany({ where: { purchaseOrderLineId: line.poLineId } })
+  }
+})

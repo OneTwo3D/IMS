@@ -3655,6 +3655,13 @@ export async function allocateSalesOrder(
       }
     }
 
+    // SO-to-PO pegging: a pegged line is served before the order's other lines, so an unpegged line for the same product can not
+    // consume the stock that landed for the peg (stable: otherwise the order of the lines is unchanged).
+    if (pegContext && pegContext.own.length > 0) {
+      const peggedLineIds = new Set(pegContext.own.map((peg) => peg.salesOrderLineId))
+      lines.sort((a, b) => Number(peggedLineIds.has(b.id)) - Number(peggedLineIds.has(a.id)))
+    }
+
     // o3d-kouj: FEASIBILITY AND EXPANSION NOW COME FROM ONE SOURCE — the line's RESOLVED requirement
     // set, which is its pinned snapshot when it has one and the current graph when it does not.
     // Asking `getFulfillmentAvailableQtyDecimal` here would re-walk the CURRENT graph, so a line
