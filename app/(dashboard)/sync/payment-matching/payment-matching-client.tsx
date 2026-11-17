@@ -7,8 +7,8 @@ import { Button } from '@/components/ui/button'
 import { setPaymentMatchingMode, type PaymentMatchingOverview } from '@/app/actions/payment-matching'
 
 const MODES = [
-  { value: 'off', label: 'Off', help: 'Nothing is looked at or posted.' },
-  { value: 'shadow', label: 'Shadow', help: 'IMS works out what it would post and lists it here. Nothing is sent to Xero.' },
+  { value: 'off', label: 'Off', help: 'This matching step does nothing. The existing receipt sweep still registers receipts that were never queued.' },
+  { value: 'shadow', label: 'Shadow', help: 'IMS lists what this step would post for receipts the existing receipt sweep leaves alone. This step sends nothing to Xero, but the sweep still registers its own receipts.' },
   { value: 'live', label: 'Live', help: 'IMS registers each matched payment against its open Xero invoice.' },
 ] as const
 

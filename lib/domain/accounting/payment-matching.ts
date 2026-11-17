@@ -313,9 +313,10 @@ function isHeld(paidAt: Date): boolean {
 /**
  * The candidates: filtered in the query, BEFORE the limit, so a decided receipt can never take a slot from an undecided one. Excludes: refunds and non-positive amounts, a receipt with ANY
  * INVOICE_PAYMENT sync row (it has a Xero registration of its own, in whatever state, which the retry paths own), one this pass already registered or is registering, and an order whose current
- * invoice still owes its follow-ups (they register its receipts). Oldest evaluation first, never-evaluated first.
+ * invoice still owes its follow-ups (they register its receipts). Outside live mode (`onlyRefused`) only a receipt the scheduled receipt sweep does NOT pick up (one carrying a refusal notice) is listed: the sweep
+ * registers every other eligible receipt in any mode, so listing it as "would post" would report work the sweep has already done or is about to do. Oldest evaluation first, never-evaluated first.
  */
-async function selectCandidateIds(take: number, excludedOrders: string[]): Promise<Array<{ id: string }>> {
+async function selectCandidateIds(take: number, excludedOrders: string[], onlyRefused: boolean): Promise<Array<{ id: string }>> {
   const floor = new Date(Date.now() - RECEIPT_AGE_MINUTES * 60_000)
   const staleClaim = new Date(Date.now() - CLAIM_STALE_MINUTES * 60_000)
   return db.$queryRaw<Array<{ id: string }>>`
@@ -328,6 +329,7 @@ async function selectCandidateIds(take: number, excludedOrders: string[]): Promi
       AND (m.id IS NULL OR m.status NOT IN ('REGISTERED', 'CLAIMED') OR (m.status = 'CLAIMED' AND m.claimed_at < ${staleClaim}))
       AND (m.id IS NULL OR m.status <> 'FAILED' OR m.attempts < ${MAX_LIVE_ATTEMPTS})
       AND o.id <> ALL(${excludedOrders}::text[])
+      AND (NOT ${onlyRefused}::boolean OR EXISTS (SELECT 1 FROM "activity_logs" a WHERE a.action = 'invoice_payment_not_registered' AND a."entityType" = 'SALES_ORDER' AND a."entityId" = p."orderId" AND a.metadata->>'paymentId' = p.id))
     ORDER BY coalesce(m.last_evaluated_at, 'epoch'::timestamp) ASC, p."createdAt" ASC
     LIMIT ${take}`
 }
@@ -399,7 +401,7 @@ export async function runPaymentMatchingPass(options: { limit?: number } = {}): 
 
   const take = Math.min(Math.max(Math.trunc(options.limit ?? 50), 1), 250)
   const { ordersOwingCurrentInvoiceFollowUps } = await import('@/lib/domain/accounting/receipt-registration-sweep')
-  const candidates = await selectCandidateIds(take, await ordersOwingCurrentInvoiceFollowUps())
+  const candidates = await selectCandidateIds(take, await ordersOwingCurrentInvoiceFollowUps(), mode !== 'live')
   result.examined = candidates.length
   if (candidates.length === 0) return result
 
@@ -460,6 +462,9 @@ export async function runPaymentMatchingPass(options: { limit?: number } = {}): 
         await paymentMatchingSeams.afterClaim?.(p.id)
         const { registerReceiptAndProveObligation } = await import('@/lib/domain/accounting/receipt-registration-sweep')
         await registerReceiptAndProveObligation(p.orderId, getSalesOrderReference(p.order), p)
+        // A refusal notice from an earlier attempt also satisfies the obligation proof, so a failed enqueue would pass it. Success needs a CURRENT INVOICE_PAYMENT row of this receipt on this order's invoice.
+        const rowsNow = await loadInvoicePaymentSyncRows(p.orderId, 'xero', p.order.currency)
+        if (!rowsNow.some((row) => row.paymentId === p.id)) throw new Error('no INVOICE_PAYMENT row was queued for the receipt (only a refusal notice, if anything); it stays retryable')
         await db.xeroPaymentMatch.updateMany({ where: { paymentId: p.id, claimToken: token }, data: { status: 'REGISTERED', registeredAt: new Date(), reason: null, detail: null } })
         result.registered++
       } catch (error) {

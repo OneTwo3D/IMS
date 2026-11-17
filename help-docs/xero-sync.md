@@ -888,8 +888,8 @@ A customer receipt IMS holds but Xero does not (a manual payment recorded after 
 
 | Mode | What happens |
 |---|---|
-| **Off** | Nothing is looked at or recorded. |
-| **Shadow** | Every candidate receipt is evaluated and listed on the page: the payment, the invoice, the bank account, the amount, the amount still open on the invoice, and the reason when it cannot be matched. **Nothing is sent to Xero** and no sync row is queued. Use it to review what live would do. |
+| **Off** | The matching pass does nothing. It does not stop the scheduled receipt sweep described above, which registers receipts with no payment row and no refusal notice in every mode. |
+| **Shadow** | Every candidate receipt is evaluated and listed on the page: the payment, the invoice, the bank account, the amount, the amount still open on the invoice, and the reason when it cannot be matched. **The matching pass sends nothing to Xero** and queues no sync row. Only receipts the scheduled receipt sweep leaves alone (those that carry a refusal notice) are listed, because the sweep registers every other eligible receipt in every mode, so listing it as "would post" would report work already done. Use it to review what live would do. |
 | **Live** | A receipt the evaluation says would post is claimed (one durable row per receipt, so a rerun or two sweeps at once cannot register it twice) and registered through the existing path. |
 
 **What the pass never does.** It never guesses a bank account: no mapping for the payment method and currency means *Not matched*, and the page says which method and currency to map. A receipt in a different currency from its invoice is *Not matched*. It never pays more than the amount still open on the invoice, in the invoice's currency (a part payment within what is open is allowed, as for any receipt). It never moves a payment out of a locked period: a receipt dated on or before the books lock date IMS imported from Xero is *Held back* and keeps its own date. A foreign-currency receipt without its stored settlement rate is *Held back*. While the outbound write hold is on, every match is *Held back* and nothing is posted.

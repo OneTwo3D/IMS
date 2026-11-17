@@ -62,10 +62,18 @@ async function order(opts: { currency?: string; total?: string; connector?: stri
     select: { id: true, accountingInvoiceId: true },
   })
 }
-async function receipt(orderId: string, o: { amount: number; currency?: string; method?: string; paidAt?: Date; rate?: number | null }) {
+async function receipt(orderId: string, o: { amount: number; currency?: string; method?: string; paidAt?: Date; rate?: number | null; refused?: boolean }) {
   const p = await s.db.payment.create({ data: { orderId, amount: o.amount, currency: o.currency ?? 'GBP', method: o.method ?? 'Bank', paidAt: o.paidAt ?? new Date('2026-11-10T10:00:00Z'), settlementRateToBase: o.rate ?? null } })
   await s.sql(`update payments set "createdAt" = now() - interval '60 minutes' where id = $1`, [p.id])
+  // Outside live mode the pass lists only receipts the scheduled receipt sweep does not pick up (those with a refusal notice), so a receipt made under off or shadow carries one unless a test says otherwise.
+  const mode = (await s.db.setting.findUnique({ where: { key: pm.PAYMENT_MATCHING_MODE_KEY } }))?.value
+  if (o.refused ?? mode !== 'live') await refusalNotice(orderId, p.id)
   return p
+}
+
+/** The refusal notice the registration leaves when it is refused: the receipt the scheduled receipt sweep does NOT pick up, and so the only kind shadow lists. */
+async function refusalNotice(orderId: string, paymentId: string) {
+  await s.db.activityLog.create({ data: { entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_payment_not_registered', tag: 'sync', level: 'WARNING', description: 'refused', metadata: { paymentId } } })
 }
 
 let pm: typeof import('@/lib/domain/accounting/payment-matching')
@@ -78,6 +86,7 @@ beforeEach(async () => {
   await s.sql(`delete from xero_payment_matches`)
   await s.sql(`delete from accounting_sync_logs where type = 'INVOICE_PAYMENT'`)
   await s.sql(`delete from payments`)
+  await s.sql(`delete from activity_logs where action = 'invoice_payment_not_registered'`)
   delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
   await setSetting('accounting_payment_account_map', MAP)
   await setSetting('xero_books_lock_date', null)
@@ -326,6 +335,36 @@ test('only a non-refund receipt of a Xero-posted order with no INVOICE_PAYMENT r
   const young = await s.db.payment.create({ data: { orderId: (await order()).id, amount: 10, currency: 'GBP', method: 'Bank' } })
   await pm.runPaymentMatchingPass()
   for (const id of [registered.id, notXero.id, young.id]) assert.equal(await matchOf(id), null, id)
+})
+
+// [mutation: mark REGISTERED on the obligation proof alone (an earlier refusal notice satisfies it)]
+test('live: an old refusal notice does not make a failed enqueue look registered', async () => {
+  await setSetting(pm.PAYMENT_MATCHING_MODE_KEY, 'live')
+  const sweep = await import('@/lib/domain/accounting/receipt-registration-sweep')
+  // the real proof also accepts a refusal notice as "on record": model that, with the enqueue creating no row
+  sweep.receiptRegistrationSeams.obligationIsOnRecord = async () => true
+  recordMode = 'fail'
+  const p = await receipt((await order()).id, { amount: 40, refused: true })
+  const result = await pm.runPaymentMatchingPass()
+  assert.equal(result.registered, 0)
+  assert.equal(result.failed, 1)
+  const row = await matchOf(p.id)
+  assert.equal(row?.status, 'FAILED')
+  assert.equal(row?.reason, 'REGISTRATION_NOT_RECORDED')
+  recordMode = 'record'
+  assert.equal((await pm.runPaymentMatchingPass()).registered, 1, 'it stays retryable and registers once a row is queued')
+  assert.equal((await matchOf(p.id))?.status, 'REGISTERED')
+})
+
+// [mutation: list every eligible receipt in shadow, including the ones the scheduled receipt sweep registers regardless of mode]
+test('shadow lists only receipts the scheduled sweep leaves alone (those with a refusal notice)', async () => {
+  await setSetting(pm.PAYMENT_MATCHING_MODE_KEY, 'shadow')
+  const sweepOwned = await receipt((await order()).id, { amount: 10, refused: false })
+  const refused = await receipt((await order()).id, { amount: 10, refused: true })
+  const result = await pm.runPaymentMatchingPass()
+  assert.equal(result.examined, 1)
+  assert.equal(await matchOf(sweepOwned.id), null, 'the sweep registers it in any mode; shadow does not report it as "would post"')
+  assert.equal((await matchOf(refused.id))?.status, 'WOULD_POST')
 })
 
 test('the cron runs the pass every run, in its own error boundary', () => {
