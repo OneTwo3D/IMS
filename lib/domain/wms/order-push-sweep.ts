@@ -4704,21 +4704,27 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       await recordRefusedAction(db, input)
     },
     async openAmendmentRefusals(connector, limit) {
-      const refusals = await db.refusedAction.findMany({
-        where: { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, action: 'WMS_ORDER_AMEND', resolvedAt: null, severity: 'HIGH' },
-        orderBy: [{ firstSeenAt: 'asc' }, { id: 'asc' }], take: limit, select: { entityId: true, intent: true },
-      })
-      if (refusals.length === 0) return []
-      const links = await db.wmsOrderPushLink.findMany({
-        where: { connector, orderId: { in: refusals.map((row) => row.entityId) }, state: 'SYNCED', externalOrderId: { not: null } },
-        select: { orderId: true, externalOrderId: true },
-      })
-      const byOrder = new Map(links.map((link) => [link.orderId, link.externalOrderId as string]))
-      return refusals.flatMap((row) => {
-        const externalOrderId = byOrder.get(row.entityId)
+      // ROTATION: the eligible rows (this connector, a live SYNCED link with a warehouse order id) are filtered BEFORE the limit, the least recently tried
+      // come first (never tried first), and every row picked is stamped in the same statement, so a failed read or a persistent mismatch is retried in
+      // turn and can never starve a newer refusal.
+      const rows = await db.$queryRaw<Array<{ entity_id: string; intent: unknown; external_order_id: string }>>`
+        WITH picked AS (
+          SELECT r.id, l."externalOrderId" AS external_order_id
+            FROM refused_actions r
+            JOIN wms_order_push_links l ON l."orderId" = r.entity_id AND l.connector = ${connector} AND l.state::text = 'SYNCED' AND l."externalOrderId" IS NOT NULL
+           WHERE r.entity_type = ${REFUSED_ACTION_ENTITY_SALES_ORDER} AND r.action = 'WMS_ORDER_AMEND' AND r.resolved_at IS NULL AND r.severity = 'HIGH'
+           ORDER BY r.last_verified_at ASC NULLS FIRST, r.id ASC
+           LIMIT ${limit}
+             FOR UPDATE OF r SKIP LOCKED
+        )
+        UPDATE refused_actions r SET last_verified_at = (now() AT TIME ZONE 'UTC')
+          FROM picked p WHERE r.id = p.id
+        RETURNING r.entity_id, r.intent, p.external_order_id
+      `
+      return rows.flatMap((row) => {
         const intent = row.intent && typeof row.intent === 'object' && !Array.isArray(row.intent) ? (row.intent as { lines?: unknown }) : {}
         const lines = Array.isArray(intent.lines) ? intent.lines.flatMap((line) => (line && typeof (line as { sku?: unknown }).sku === 'string' ? [{ sku: (line as { sku: string }).sku, quantity: Number((line as { quantity?: unknown }).quantity) }] : [])) : []
-        return externalOrderId && lines.length > 0 ? [{ orderId: row.entityId, externalOrderId, lines }] : []
+        return lines.length > 0 ? [{ orderId: row.entity_id, externalOrderId: row.external_order_id, lines }] : []
       })
     },
     async resolveRefusedActions(orderId, action) {

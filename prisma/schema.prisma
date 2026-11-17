@@ -4257,6 +4257,9 @@ model RefusedAction {
   resolution  String?
   /// When the age-based alert was raised for this episode. Once per episode: cleared only when a new episode starts.
   alertedAt   DateTime?               @map("alerted_at")
+  /// When a verification pass last tried to confirm this row against the warehouse (a read attempt, successful or not). The pass takes the
+  /// least recently tried rows first (never-tried first), so a persistent mismatch cannot starve newer rows.
+  lastVerifiedAt DateTime?            @map("last_verified_at")
 
   @@unique([entityType, entityId, action, gate], map: "refused_actions_key")
   @@index([resolvedAt, severity, firstSeenAt], map: "refused_actions_open_idx")

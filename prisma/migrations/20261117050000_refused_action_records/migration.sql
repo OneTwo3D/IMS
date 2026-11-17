@@ -19,6 +19,7 @@ CREATE TABLE "refused_actions" (
     "resolved_at" TIMESTAMP(3),
     "resolution" TEXT,
     "alerted_at" TIMESTAMP(3),
+    "last_verified_at" TIMESTAMP(3),
 
     CONSTRAINT "refused_actions_pkey" PRIMARY KEY ("id")
 );

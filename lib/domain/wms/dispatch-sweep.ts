@@ -1806,8 +1806,13 @@ export async function runWmsDispatchSweepCore(
         // budget would isolate the stragglers the moment a connector outage
         // partially recovers — records that would have recovered by themselves.
         unresolvedLinks.push({ candidate, reason: outcome.reason, count: 0 })
+      } else if (outcome.refusal && outcome.refusal.permanence !== 'PERMANENT') {
+        // A cancelled part with other parts STILL TO DESPATCH: those parts can still ship, so the link stays an ordinary, fully-polled candidate (nothing
+        // is counted, nothing is isolated, an earlier streak is cleared). Isolating it would stop their despatches being recorded.
+        await deps.clearUnresolvedReads?.(candidate.linkId)
       } else if (outcome.refusal) {
-        // A known stall: counted per link, outside the drift cohort. Isolated after N consecutive reads so it stops being polled; the watermark is not held.
+        // A PERMANENT stall: every part is despatched (and was recorded this pass) or cancelled, so nothing is left to observe. Counted per link, outside the
+        // drift cohort, and isolated after N consecutive reads so it stops being polled; the watermark is not held.
         const { count } = (await deps.recordUnresolvedRead?.(candidate, outcome.reason)) ?? { count: 0 }
         if (count >= DISPATCH_MAX_CONSECUTIVE_STALLED_READS) {
           const isolated = await deps.quarantineUnresolved?.(candidate, outcome.reason, count, 'STALLED')

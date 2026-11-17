@@ -365,6 +365,35 @@ test('SEVERAL cancelled splits with no dispatched control: no drift incident, th
   assert.ok((quarantined as Array<{ count: number; kind?: string }>).every((q) => q.count === 5 && q.kind === 'STALLED'))
 })
 
+test('a cancelled part with another part STILL PENDING is never isolated: after more than 5 reads the later despatch of that part is still recorded', async () => {
+  const reads = new Map<string, number>()
+  const quarantined: number[] = []
+  const pushed: number[] = []
+  const recorded: string[] = []
+  let part1Despatched = false
+  const run = () => runWmsDispatchSweepCore(dispatchDeps({
+    listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+    fetchOrderStatus: async () => status({ status: 'PROCESSING', isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'P-1', partNumber: 1, status: part1Despatched ? 'DESPATCHED' : 'ONBACKORDER', dispatched: part1Despatched, tracking: part1Despatched ? [tracking({ trackingNumber: 'TN-1' })] : [] }),
+      part({ externalId: 'P-2', partNumber: 2, status: 'CANCELLED' }),
+    ],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    pushPartialShipment: async (_orderId, input) => { pushed.push(input.part); return { ok: true } },
+    recordRefusedAction: async (_c, refusal) => { recorded.push(refusal.permanence) },
+    recordUnresolvedRead: async (c) => { const n = (reads.get(c.linkId) ?? 0) + 1; reads.set(c.linkId, n); return { count: n } },
+    quarantineUnresolved: async (_c, _r, count) => { quarantined.push(count); return { quarantined: true } },
+    clearUnresolvedReads: async (linkId) => { reads.delete(linkId) },
+  }), { now: SWEEP_NOW })
+  for (let i = 0; i < 8; i += 1) await run()
+  assert.deepEqual(quarantined, [], 'never isolated while a part can still despatch')
+  assert.ok(recorded.length === 8 && recorded.every((p) => p === 'RETRYABLE'))
+  part1Despatched = true
+  await run()
+  assert.deepEqual(pushed, [1], 'the later despatch of part 1 was recorded (partial shipment pushed)')
+  assert.equal(recorded[recorded.length - 1], 'PERMANENT', 'now every part is accounted for')
+})
+
 test('a record that cannot be written holds the watermark (the trace is not yet durable) (the change must stay in the next window)', async () => {
   const saved: Array<{ watermark?: string }> = []
   await runWmsDispatchSweepCore(dispatchDeps({

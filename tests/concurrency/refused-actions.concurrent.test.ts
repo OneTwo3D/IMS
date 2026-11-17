@@ -162,3 +162,39 @@ test('marking the AMENDMENT_NOT_APPLIED task Done leaves the refusal OPEN; a ter
   await w.ra.resolveObsoleteRefusedActions(w.db)
   assert.equal(await open(), 0, 'a terminal order closes it')
 })
+
+test('verification rotation: 25 open serious refusals over sweeps of 10 are ALL tried within 3 sweeps, and a new refusal within 3 more', SKIP, async (t) => {
+  const w = await world()
+  const sweep = await import('@/lib/domain/wms/order-push-sweep')
+  const port = sweep.createPrismaWmsOrderPushPort()
+  const connector = `rot${randomUUID().slice(0, 6)}`
+  const ids: string[] = []
+  const mk = async (n: number) => {
+    const id = `rot-${randomUUID()}`
+    ids.push(id)
+    await w.db.salesOrder.create({
+      data: { id, orderNumber: `IMSTEST-${id}`, status: 'PROCESSING', currency: 'GBP', subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1, customerEmail: 'x@example.test', billingAddress: {}, shippingAddress: {},
+        wmsOrderPush: { create: { connector, state: 'SYNCED', externalOrderId: `w-${id}`, externalOrderNumber: `W-${id}` } } },
+    })
+    await w.ra.recordRefusedAction(w.db, base(id, { intent: { orderNumber: `SO-${n}`, lines: [{ sku: 'A', quantity: 3 }] }, now: new Date(Date.UTC(2026, 10, 1, 0, n)) }))
+    return id
+  }
+  t.after(async () => {
+    await w.db.refusedAction.deleteMany({ where: { entityId: { in: ids } } })
+    await w.db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+  })
+  for (let n = 0; n < 25; n += 1) await mk(n)
+  const seen = new Set<string>()
+  // Every one of these stays open (a persistent mismatch): they are never resolved here.
+  for (let sweepNo = 1; sweepNo <= 3; sweepNo += 1) {
+    const batch = await port.openAmendmentRefusals!(connector, 10)
+    assert.ok(batch.length <= 10)
+    for (const row of batch) seen.add(row.orderId)
+    if (sweepNo === 1) assert.equal(batch.length, 10)
+  }
+  assert.equal(seen.size, 25, 'every open row was tried within 3 sweeps of 10')
+  // A NEW refusal, arriving after the old rows were tried, is picked first (never tried) rather than starved behind them.
+  const fresh = await mk(99)
+  const next = await port.openAmendmentRefusals!(connector, 10)
+  assert.ok(next.some((row) => row.orderId === fresh), 'the new refusal is checked in the very next sweep')
+})
