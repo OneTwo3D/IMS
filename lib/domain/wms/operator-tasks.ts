@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -26,6 +26,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   PUSH_CONFLICT: 'Hold not honoured by the warehouse',
   CANCEL_NOTICE: 'Cancel not honoured by the warehouse',
   REFUND_NOTE: 'Refund on an order the warehouse already holds',
+  MERGE_CANDIDATE: 'Same-customer orders still NEW: check them in the warehouse system and merge there if appropriate',
 }
 
 export type WmsOperatorTaskInput = {
@@ -50,6 +51,8 @@ export type WmsOperatorTaskPayload = {
   /** Partial-removal check: the link to settle and the lines that must all be gone first. */
   linkId?: string
   items?: WmsOperatorTaskLine[]
+  /** Merge candidate: the orders of the group (IMS and warehouse numbers only). */
+  members?: Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>
 }
 
 export function wmsOperatorTaskHash(input: Pick<WmsOperatorTaskInput, 'reason' | 'queryText' | 'dedupeBasis'>): string {
@@ -105,6 +108,16 @@ export function partialRemovalCheckQuery(wmsOrder: string, imsOrder: string, rec
 
 export function courierFallbackQuery(wmsOrder: string, imsOrder: string, shippingService: string | null | undefined): string {
   return `Please verify the courier on warehouse order ${wmsOrder} (IMS order ${imsOrder}) before despatch. IMS shipping method '${shippingService ?? '—'}' did not map to a warehouse courier, so a default courier was used.`
+}
+
+/**
+ * The query for a group of same-customer orders that are all still NEW in the warehouse. IMS never merges (the warehouse has no merge API):
+ * a person checks the orders in Mintsoft and merges them there if that is right. Order numbers only.
+ */
+export function mergeCandidateQuery(members: ReadonlyArray<{ orderNumber: string | null; externalOrderId: string; externalOrderNumber: string }>, warnings: ReadonlyArray<string>, warehouseLabel: string): string {
+  const list = members.map((member) => `${warehouseOrderRef(member.externalOrderNumber, member.externalOrderId)} (IMS order ${member.orderNumber ?? '—'})`).join(', ')
+  const extra = warnings.length > 0 ? ` Warning: ${warnings.join(' ')}` : ''
+  return `Please check these orders in ${warehouseLabel} and merge them there if appropriate: ${list}. They are for the same customer and delivery address and are all still NEW in ${warehouseLabel}. IMS does not merge orders and has changed nothing.${extra}`
 }
 
 export function refundNoteQuery(wmsOrder: string, imsOrder: string, creditNote: string | null | undefined, full: boolean): string {

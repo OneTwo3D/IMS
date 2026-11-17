@@ -409,6 +409,18 @@ On a simple, variant or BOM product, the **Channel buffer by warehouse** card le
 - Kit stock is worked out from its components, so set the buffer on the components.
 
 
+### Reorder thresholds by warehouse
+
+A product's **reorder point**, **safety stock** and **reorder quantity** are set once on the product and, until you say otherwise, every warehouse inherits them. On the product page, below **Stock Levels**, the **Reorder thresholds by warehouse** table lets you give one warehouse its own value, so a small satellite site is not held to the main site's alert level.
+
+- **Blank means inherit.** Leave a cell empty and that warehouse uses the product's value, which is shown in grey as the placeholder (a dash means the product has none set, so Reorder Planning works the reorder point out from demand and lead time). Typing a value overrides that one field for that one warehouse; the other two fields are unaffected. **0** is a real override (for example a reorder quantity of 0 opts that warehouse out), not the same as blank.
+- **Numbers only.** Zero or more, up to four decimal places. Clear a cell and save to go back to inheriting.
+- **Who can change it.** Needs inventory edit permission; other users see the values but cannot edit. Every change is written to the **Activity Log** (who, when, the old value and the new value, per field and warehouse).
+- **A warehouse with no stock yet** can still be given thresholds. Saving never creates or changes a stock record, so it cannot affect stock sync or availability.
+- **Two people editing.** Each cell remembers the value it had when the page loaded. If someone else changed a cell you edited in the meantime, that cell is not saved and a message names it (reload to see the current value); your other edits are saved, and cells you did not touch are never overwritten.
+- **Warehouses connected to a warehouse system (WMS, such as Mintsoft)** can be given overrides too. These thresholds are planning figures used only by IMS Reorder Planning. They are never sent to the warehouse system or to the store, and an override does not change what is synced.
+- **Where it is used.** Reorder Planning, when filtered to a warehouse (see Analytics > Replenishment). Kit and variable parents and non-inventory products have no per-warehouse table.
+
 ## FIFO Cost Layers
 
 Every time stock is received (from a purchase order or build order), a new FIFO cost layer is created recording the quantity and unit cost. When stock is sold or consumed, the oldest layers are used first. This ensures your cost of goods sold accurately reflects purchase prices over time.
@@ -514,7 +526,7 @@ When the product appears in a reorder forecast (Analytics > Reorder), the foreca
 - Open PO incoming stock (the forecast subtracts inbound PO quantity from the suggested reorder)
 - Average daily demand from sales history (the "velocity")
 - Lead-time days from the preferred supplier's catalogue entry (or a system default if not set)
-- Safety stock and configured reorder thresholds
+- Safety stock and configured reorder thresholds (the warehouse's own override when the report is filtered to a warehouse; see [Reorder thresholds by warehouse](#reorder-thresholds-by-warehouse))
 
 ### Reorder Evidence
 

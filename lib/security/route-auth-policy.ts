@@ -375,6 +375,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission.',
   },
+  '/api/packing-slips': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with sales permission; prints only the orders named in the request (capped).',
+  },
   '/api/preview/document': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with settings permission.',

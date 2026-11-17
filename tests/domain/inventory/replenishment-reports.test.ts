@@ -1758,3 +1758,24 @@ test('inbound arrivals and the late-PO logic use the effective line date (line d
   const lateLine = (await run(client(new Date('2026-05-28T00:00:00.000Z')))).rows[0]
   assert.equal(lateLine?.lateInboundDueDate, '2026-05-28', 'a past line date is the late due date')
 })
+
+test('a mixed-date draft PO gives every product its own date (an undated line cannot borrow the earliest line date)', () => {
+  const po = { supplierId: 'supplier-1', expectedDelivery: new Date('2026-12-05T00:00:00.000Z'), destinationWarehouseId: null, supplier }
+  const base = { qty: decimal('10'), qtyReceived: decimal('0'), qtyReturned: decimal('0') }
+  // As generated: every line dated (floor for the undated row), header = earliest line date.
+  const dated = [
+    { ...base, productId: 'a', expectedDelivery: new Date('2026-12-05T00:00:00.000Z'), po },
+    { ...base, productId: 'b', expectedDelivery: new Date('2026-12-20T00:00:00.000Z'), po },
+  ]
+  const arrivals = inboundArrivalsByProduct(dated)
+  assert.deepEqual(arrivals.get('a')?.map((x) => x.date), ['2026-12-05'])
+  assert.deepEqual(arrivals.get('b')?.map((x) => x.date), ['2026-12-20'], 'b keeps its own later date')
+  // Unusable lead time: the header is null too, so the undated line stays undated (no borrowed date).
+  const nullHeader = { ...po, expectedDelivery: null }
+  const undated = [
+    { ...base, productId: 'a', expectedDelivery: new Date('2026-12-05T00:00:00.000Z'), po: nullHeader },
+    { ...base, productId: 'b', expectedDelivery: null, po: nullHeader },
+  ]
+  assert.equal(inboundArrivalsByProduct(undated).has('b'), false, 'no arrival date is invented for b')
+  assert.deepEqual([...undatedInboundProductIds(undated)], ['b'])
+})

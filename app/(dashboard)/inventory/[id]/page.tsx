@@ -19,6 +19,8 @@ import { Card } from '@/components/ui/card'
 import { StockDetailPopup } from '@/components/inventory/stock-detail-popups'
 import { LocationBuffer } from '@/components/inventory/location-buffer'
 import { getLocationBuffers } from '@/app/actions/location-buffer'
+import { WarehouseReorderThresholds } from '@/components/inventory/warehouse-reorder-thresholds'
+import { getWarehouseReorderThresholds } from '@/app/actions/reorder-thresholds'
 import { getSession } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
@@ -85,6 +87,7 @@ export default async function ProductDetailPage({
   const session = await getSession()
   const canEditInventory = session ? hasPermission(session.user.role, 'inventory.edit') : false
   const locationBuffers = holdsOwnStock ? await getLocationBuffers(id) : null
+  const reorderThresholds = holdsOwnStock ? await getWarehouseReorderThresholds(id) : null
 
   const [productOptions, suppliers, productComponents, kitStock, hsProposal] = await Promise.all([
     product.type === 'VARIABLE' ? getProductOptions(id) : Promise.resolve([]),
@@ -483,6 +486,10 @@ export default async function ProductDetailPage({
 
           {locationBuffers && (
             <LocationBuffer data={locationBuffers} canEdit={canEditInventory} />
+          )}
+
+          {reorderThresholds && (
+            <WarehouseReorderThresholds key={JSON.stringify(reorderThresholds.warehouses)} data={reorderThresholds} canEdit={canEditInventory} />
           )}
 
           {/* FIFO cost layers */}

@@ -4,6 +4,7 @@ import { redirect } from 'next/navigation'
 import { auth } from '@/lib/auth'
 import { SUPPLIER_HOME_PATH } from '@/lib/auth/role-home'
 import { shouldShowOnboardingBanner } from '@/app/actions/onboarding'
+import { getNeedsAttentionView } from '@/app/actions/needs-attention'
 import { DashboardClient } from './dashboard-client'
 
 export const metadata: Metadata = { title: 'Dashboard' }
@@ -27,6 +28,12 @@ export default async function Page() {
     showOnboardingBanner = await shouldShowOnboardingBanner()
   }
 
+  // A failed count read must not take the dashboard down: the card is an aid, the KPIs are the page.
+  const needsAttention = await getNeedsAttentionView().catch((error) => {
+    console.error('[dashboard] needs-attention counts unavailable:', error)
+    return null
+  })
+
   return (
     <DashboardClient
       kpi={kpi}
@@ -39,6 +46,7 @@ export default async function Page() {
       initialPeriod={initialPeriod}
       initialCompare={initialCompare}
       showOnboardingBanner={showOnboardingBanner}
+      needsAttention={needsAttention}
     />
   )
 }

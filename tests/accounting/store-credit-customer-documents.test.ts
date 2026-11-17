@@ -41,6 +41,7 @@ test('CENSUS 1: every file that RENDERS a PDF document is classified', () => {
     'app/api/sales-order/[id]/route.ts': GUARDED('orderDocumentMoney(so)'),
     'lib/pdf.ts': EXEMPT('the createPdfDocument definition; renders nothing itself'),
     'app/api/packing-slip/[id]/route.ts': EXEMPT('packing slip: lines and quantities, no money totals'),
+    'app/api/packing-slips/route.ts': EXEMPT('batch packing slips (several orders in one PDF, same renderer): lines and quantities, no money totals'),
     'app/api/preview/document/route.ts': EXEMPT('template preview with sample data, not an order'),
     'app/api/manufacturing-order/[id]/route.ts': EXEMPT('manufacturing order: no customer, no sales order'),
     'app/api/credit-note/[id]/route.ts': EXEMPT('credit note for a recorded refund: prints the refund lines and its credit, not an order total'),
