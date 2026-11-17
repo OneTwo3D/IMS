@@ -66,6 +66,8 @@ const WRITERS: Record<string, Record<string, number>> = {
     'lib/connectors/woocommerce/sync/refund-stock-correction.ts': 1,
     // Stamps `deferralAdjustmentRef`, a daily-batch journal reference: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
     'lib/connectors/xero/daily-sync.ts': 1,
+    // Sets `externalRefundId` (a WooCommerce refund id) when a person confirms a storefront refund settles an IMS refund: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
+    'lib/domain/sales/shop-refund-tasks.ts': 1,
   },
 }
 

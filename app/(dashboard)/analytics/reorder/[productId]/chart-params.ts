@@ -1,4 +1,5 @@
 import type { ProductType } from '@/app/generated/prisma/client'
+import { growthForCarry } from '@/lib/domain/inventory/forecast-growth'
 import type { ReorderDemandChartFilters } from '@/lib/domain/inventory/reorder-demand-chart'
 
 export type ChartSearchParams = Record<string, string | string[] | undefined>
@@ -21,6 +22,8 @@ export function chartFiltersFromSearch(searchParams: ChartSearchParams): Reorder
     productType: (one(searchParams.productType) || undefined) as ProductType | undefined,
     thresholdDays: positiveInteger(one(searchParams.thresholdDays)),
     targetCoverWeeks: positiveInteger(one(searchParams.targetCoverWeeks)),
+    ...(one(searchParams.ignoreStockouts) === '1' ? { ignoreStockouts: true } : {}),
+    ...(growthForCarry(one(searchParams.growthPercent)) !== undefined ? { growthPercent: growthForCarry(one(searchParams.growthPercent)) } : {}),
   }
 }
 

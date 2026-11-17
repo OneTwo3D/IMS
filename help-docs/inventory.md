@@ -376,10 +376,11 @@ The queue lists pending proposals, least confident first:
 | **Confidence** | A band (**high** 85 and over, **medium** 60 to 84, **low** below 60) and a 0 to 100 score. The score is IMS's own check of the code against the CN list, the product's category and its description, not just the AI's self-reported confidence. |
 | **Flags** | Why the score is what it is, for example an invalid format, a code not in the 2026 list, a superseded code, a category that does not match the code's heading, or a brand-only description. |
 | **Source** | Which classifier produced it (AI, escalated AI, or keyword fallback). |
+| **Customs description** | The proposed goods description. When the product has none, the AI writes one as "article + key attribute" in English (for example "brass nozzle, 3D printer extruder"), at most 50 characters, without filler words such as "parts" or "accessories". A brand-only or empty answer is rejected and the keyword rule's description is used instead (or none if no rule matches). If the product already has a customs description, that value is shown unchanged. |
 
 Click **Review** to open a proposal. Read the reasoning, edit the code if needed, add an optional review note, then choose **Approve** or **Reject**.
 
-- **Approve** writes the code to the product's HS Code. It is refused (with a message) unless the code you are approving, after your edit, is a declarable 8-digit 2026 CN8 with no blocking flag (invalid format, not in 2026, or superseded). Approving only sets the HS code; it does not change the customs description.
+- **Approve** writes the code to the product's HS Code. It is refused (with a message) unless the code you are approving, after your edit, is a declarable 8-digit 2026 CN8 with no blocking flag (invalid format, not in 2026, or superseded). Approving only sets the HS code; it does not change the customs description. The proposed customs description is a suggestion only: it is never written to the product by the classifier, and a description set by an operator or imported from WooCommerce is never replaced.
 - **Reject** leaves the product untouched and closes the proposal.
 - If someone else reviewed the same proposal first, you are told it was already reviewed.
 

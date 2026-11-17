@@ -176,6 +176,8 @@ function makeDependencies(options: {
   alwaysMissExistingRefund?: boolean
   refuseWithQuarantine?: boolean
   order?: Partial<OrderDouble>
+  /** Open "Refund in WooCommerce" tasks on the order (zvec.19). None by default: a refund that began in WooCommerce. */
+  openTasks?: Array<{ id: string; externalOrderId: string; payload: unknown }>
 } = {}) {
   const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
@@ -295,7 +297,10 @@ function makeDependencies(options: {
           }
         },
       },
+      // zvec.19: the open-task match reads these before anything else; with no open task it stops there and the import runs as it always did.
+      wmsOperatorTask: { async findMany() { return options.openTasks ?? [] } },
       salesOrderRefund: {
+        async findMany() { return [] },
         async findFirst(args: { where?: { externalRefundId?: number } }) {
           if (options.alwaysMissExistingRefund) return null
           return refunds.find((refund) => refund.externalRefundId === args.where?.externalRefundId) ?? null
@@ -1861,4 +1866,12 @@ test('the monetary-only fallback is unchanged when there is no fee line: an amou
   assert.equal(refundIsInIms(result.outcome), true, result.error)
   assert.equal(state.createRefundLines.length, 1)
   assert.equal(state.createRefundLines[0].totalForeign, 100)
+})
+
+test('zvec.19: a refund that began in WooCommerce (no open Refund in WooCommerce task) is imported exactly as before', async () => {
+  const state = makeDependencies({ openTasks: [] })
+  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal(state.createRefundCalls, 1, 'one credit note is raised for it')
+  assert.equal(state.refunds.length, 1)
 })
