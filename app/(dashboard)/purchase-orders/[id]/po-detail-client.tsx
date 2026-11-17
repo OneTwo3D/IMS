@@ -2068,11 +2068,11 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
   const money = (n: number) => formatMoney(n, sym, symPos)
   const baseMoney = (n: number) => formatMoney(n, baseCurrency.symbol, baseCurrency.symbolPosition)
 
-  // Optional Order Lines columns (Barcode, Supplier SKU), remembered in this browser. Read after mount so the server render matches.
-  const [lineCols, setLineCols] = useState<PoLineOptionalCol[]>(PO_LINE_COLS_DEFAULT)
-  useEffect(() => {
-    try { setLineCols(parsePoLineCols(localStorage.getItem(PO_LINE_COLS_STORAGE_KEY))) } catch { /* ignore */ }
-  }, [])
+  // Optional Order Lines columns (Barcode, Supplier SKU), remembered in this browser (same approach as the PO list's column picker).
+  const [lineCols, setLineCols] = useState<PoLineOptionalCol[]>(() => {
+    if (typeof window === 'undefined') return PO_LINE_COLS_DEFAULT
+    try { return parsePoLineCols(localStorage.getItem(PO_LINE_COLS_STORAGE_KEY)) } catch { return PO_LINE_COLS_DEFAULT }
+  })
   function toggleLineCol(key: PoLineOptionalCol) {
     setLineCols((prev) => {
       const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
