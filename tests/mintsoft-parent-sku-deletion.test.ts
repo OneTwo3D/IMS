@@ -10,9 +10,8 @@ import test, { mock } from 'node:test'
  */
 
 type Row = Record<string, unknown>
-const SINCE = new Date('2026-11-17T10:00:00Z')
+const RUN = 'run-2'
 const FRESH = new Date('2026-11-17T10:30:00Z')
-const STALE = new Date('2026-11-16T10:30:00Z')
 
 const state = {
   flags: {} as Record<string, string>,
@@ -72,7 +71,7 @@ mock.module('@/lib/connectors/wms/registry', {
   },
 })
 
-const echo = (id: string, sku: string) => ({ ID: Number(id), SKU: sku, Name: sku })
+const echo = (id: string, sku: string, runId: string | null = RUN) => ({ ID: Number(id), SKU: sku, Name: sku, ...(runId ? { _imsMetadataConfirmed: { runId } } : {}) })
 const link = (id: string, sku: string, over: Row = {}) => ({
   externalProductId: id, payloadHash: 'h', lastError: null, metadata: echo(id, sku), updatedAt: FRESH, ...over,
 })
@@ -101,7 +100,7 @@ function reset(opts: { flags?: Record<string, string>; parent?: Row; seam?: 'pro
 
 async function pass() {
   const mod = await import('@/lib/connectors/mintsoft/sync/parent-sku-deletion')
-  return mod.runMintsoftParentSkuDeletionPass({ since: SINCE, triggeredBy: 'test' })
+  return mod.runMintsoftParentSkuDeletionPass({ runId: RUN, triggeredBy: 'test' })
 }
 
 const GOOD = () => parentRow([variation('A', '201'), variation('B', '202')])
@@ -135,7 +134,8 @@ type Case = { name: string; parent: Row; reason: RegExp }
 const REFUSALS: Case[] = [
   { name: 'a variation has no link', parent: parentRow([variation('A', '201'), variation('B', null)]), reason: /B: no Mintsoft link/ },
   { name: 'a variation link records an error', parent: parentRow([variation('A', '201'), variation('B', '202', {}, { lastError: 'x' })]), reason: /B: its link records an error/ },
-  { name: 'a variation link was not refreshed by this run', parent: parentRow([variation('A', '201'), variation('B', '202', {}, { updatedAt: STALE })]), reason: /B: its link was not refreshed by this run/ },
+  { name: 'a variation was confirmed by a PREVIOUS run (even with a fresh updatedAt)', parent: parentRow([variation('A', '201'), variation('B', '202', {}, { metadata: echo('202', 'B', 'run-1') })]), reason: /B: its product metadata was not confirmed in Mintsoft by this run/ },
+  { name: 'a variation whose metadata upsert was SHADOWED but whose content update bumped updatedAt (no confirmation stamp)', parent: parentRow([variation('A', '201'), variation('B', '202', {}, { metadata: echo('202', 'B', null), updatedAt: FRESH })]), reason: /B: its product metadata was not confirmed in Mintsoft by this run/ },
   { name: 'a variation was never matched or sent (no payload hash)', parent: parentRow([variation('A', '201'), variation('B', '202', {}, { payloadHash: null })]), reason: /no payload hash/ },
   { name: 'no stored Mintsoft record', parent: parentRow([variation('A', '201'), variation('B', '202', {}, { metadata: null })]), reason: /B: no stored Mintsoft record/ },
   { name: 'the stored record has another id', parent: parentRow([variation('A', '201'), variation('B', '202', {}, { metadata: echo('999', 'B') })]), reason: /different id/ },
@@ -171,7 +171,7 @@ test('an archived variation is not expected; a live one still must be confirmed'
 
 test('the proof is read TWICE: a link that changes between the reads is refused, nothing is deleted', async () => {
   reset({ parent: GOOD() })
-  state.readParent = (_id, n) => (n === 1 ? GOOD() : parentRow([variation('A', '201'), variation('B', '202', {}, { updatedAt: STALE })]))
+  state.readParent = (_id, n) => (n === 1 ? GOOD() : parentRow([variation('A', '201'), variation('B', '202', {}, { metadata: echo('202', 'B', 'run-1') })]))
   const counters = await pass()
   assert.deepEqual(state.deleteCalls, [])
   assert.equal(counters?.refused, 1)

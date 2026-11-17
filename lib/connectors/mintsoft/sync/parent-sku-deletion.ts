@@ -21,8 +21,8 @@ import { getSettingValue } from '@/lib/settings-store'
  *
  * THE PROOF, from a FRESH read of the stored product links (no Mintsoft call): for EVERY non-archived variation of the parent
  *   - it has a Mintsoft link, with no recorded error and a payload hash;
- *   - the link was refreshed by THIS verify run (`updatedAt` is not before the run began), so a variation the run skipped, shadowed
- *     or failed on cannot count as confirmed on yesterday's evidence;
+ *   - the link was stamped by THIS verify run's id as metadata-confirmed (see METADATA_CONFIRMATION_KEY), so a variation the run skipped, shadowed,
+ *     held or only updated the content of cannot count, and neither can one confirmed by an earlier run;
  *   - the link's stored Mintsoft record is a real product echo whose id is the link's id and whose SKU is the variation's SKU;
  *   - no two variations share a Mintsoft id, and none shares the parent's id or SKU (a "replacement" that IS the parent record
  *     would be deleted with it).
@@ -33,6 +33,25 @@ import { getSettingValue } from '@/lib/settings-store'
  * Mintsoft by the stored id (a read; no write) and must have exactly the parent's SKU, the stored id, the configured ClientId, and
  * be referenced by no variation link. A failed or empty read, or any mismatch, is a refusal and no delete.
  */
+
+/**
+ * Where a link records that its product META was confirmed in Mintsoft by a given verify run: a key inside the link's saved Mintsoft
+ * record (no schema change). Written ONLY by a live upsert that was sent and echoed back with the product's SKU, or by a fresh read
+ * this run that matched the stored payload hash. A shadow, a hold, a skip and a content-only update write the link without it (so an
+ * older stamp is cleared), and `updatedAt` is not evidence of anything.
+ */
+export const METADATA_CONFIRMATION_KEY = '_imsMetadataConfirmed'
+
+export function withMetadataConfirmation(raw: Record<string, unknown> | null | undefined, runId: string): Record<string, unknown> {
+  return { ...(raw ?? {}), [METADATA_CONFIRMATION_KEY]: { runId } }
+}
+
+function confirmedRunId(metadata: Prisma.JsonValue | null): string | null {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null
+  const stamp = (metadata as Record<string, unknown>)[METADATA_CONFIRMATION_KEY]
+  const runId = stamp && typeof stamp === 'object' ? (stamp as Record<string, unknown>).runId : null
+  return typeof runId === 'string' && runId ? runId : null
+}
 
 export type ParentLinkRead = {
   externalProductId: string
@@ -56,21 +75,21 @@ export type ParentDeletionVerdict =
 
 const sameSku = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase()
 
-function confirmationProblem(variationSku: string, link: ParentLinkRead | null, since: Date): string | null {
+function confirmationProblem(variationSku: string, link: ParentLinkRead | null, runId: string): string | null {
   if (!link) return `${variationSku}: no Mintsoft link`
   if (!/^\d+$/.test(link.externalProductId.trim())) return `${variationSku}: its Mintsoft id is not a number`
   if (link.lastError) return `${variationSku}: its link records an error`
   if (!link.payloadHash) return `${variationSku}: its link has no payload hash (never matched or sent)`
-  if (link.updatedAt.getTime() < since.getTime()) return `${variationSku}: its link was not refreshed by this run`
   const echoed = normalizeMintsoftProduct(link.metadata)
   if (!echoed) return `${variationSku}: no stored Mintsoft record for it`
   if (echoed.externalId !== link.externalProductId.trim()) return `${variationSku}: the stored Mintsoft record has a different id`
   if (!sameSku(echoed.sku, variationSku)) return `${variationSku}: the stored Mintsoft record carries a different SKU`
+  if (confirmedRunId(link.metadata) !== runId) return `${variationSku}: its product metadata was not confirmed in Mintsoft by this run`
   return null
 }
 
 /** Pure: given a fresh read, may the parent be deleted? Every doubt is a refusal, and all of them are listed. */
-export function decideParentSkuDeletion(read: ParentDeletionRead, since: Date): ParentDeletionVerdict {
+export function decideParentSkuDeletion(read: ParentDeletionRead, runId: string): ParentDeletionVerdict {
   const reasons: string[] = []
   if (read.type !== 'VARIABLE') reasons.push('the product is not a variable product')
   const parentLink = read.parentLink
@@ -80,7 +99,7 @@ export function decideParentSkuDeletion(read: ParentDeletionRead, since: Date): 
   if (expected.length === 0) reasons.push('the parent has no live variation to replace it')
   for (const variation of expected) {
     if (!variation.sku.trim()) { reasons.push(`variation ${variation.id}: no SKU`); continue }
-    const problem = confirmationProblem(variation.sku, variation.link, since)
+    const problem = confirmationProblem(variation.sku, variation.link, runId)
     if (problem) reasons.push(problem)
     if (sameSku(variation.sku, read.sku)) reasons.push(`${variation.sku}: a variation has the parent's own SKU`)
   }
@@ -132,7 +151,7 @@ async function recordRefusal(read: ParentDeletionRead, reasons: string[], jobTri
 
 export type ParentDeletionCounters = { considered: number; deleted: number; refused: number; shadowed: number; held: number; errors: number }
 
-type ParentDeletionContext = { connector: ReturnType<typeof getWmsConnector>; since: Date; triggeredBy: string }
+type ParentDeletionContext = { connector: ReturnType<typeof getWmsConnector>; runId: string; triggeredBy: string }
 
 /** Proves, by a fresh read-only fetch, that the record about to be deleted is the parent's own. Null = proven; text = the refusal reason. */
 async function parentRecordProblem(read: ParentDeletionRead, parentExternalId: string, context: ParentDeletionContext): Promise<string | null> {
@@ -213,7 +232,7 @@ async function deleteConfirmedParent(
  * The pass: for every VARIABLE product holding a Mintsoft link, decide from a fresh read, decide AGAIN just before the call, and delete
  * or refuse. Returns null when the setting is off (nothing was read, nothing was done).
  */
-export async function runMintsoftParentSkuDeletionPass(input: { since: Date; triggeredBy: string }): Promise<ParentDeletionCounters | null> {
+export async function runMintsoftParentSkuDeletionPass(input: { runId: string; triggeredBy: string }): Promise<ParentDeletionCounters | null> {
   if (!(await readMintsoftParentSkuDeleteEnabled())) return null
   const counters: ParentDeletionCounters = { considered: 0, deleted: 0, refused: 0, shadowed: 0, held: 0, errors: 0 }
   const parents = await db.product.findMany({
@@ -221,14 +240,14 @@ export async function runMintsoftParentSkuDeletionPass(input: { since: Date; tri
     select: { id: true },
     orderBy: { id: 'asc' },
   })
-  const context: ParentDeletionContext = { connector: getWmsConnector('mintsoft'), since: input.since, triggeredBy: input.triggeredBy }
+  const context: ParentDeletionContext = { connector: getWmsConnector('mintsoft'), runId: input.runId, triggeredBy: input.triggeredBy }
 
   for (const { id } of parents) {
     counters.considered += 1
     try {
       const first = await readParent(id)
       if (!first) continue
-      const firstVerdict = decideParentSkuDeletion(first, input.since)
+      const firstVerdict = decideParentSkuDeletion(first, input.runId)
       if (firstVerdict.kind === 'refuse') {
         await recordRefusal(first, firstVerdict.reasons, input.triggeredBy)
         counters.refused += 1
@@ -236,7 +255,7 @@ export async function runMintsoftParentSkuDeletionPass(input: { since: Date; tri
       }
       // The window between the first read and the call is narrowed, not closed: read again, and the verdict must still be the same.
       const second = await readParent(id)
-      const secondVerdict = second ? decideParentSkuDeletion(second, input.since) : null
+      const secondVerdict = second ? decideParentSkuDeletion(second, input.runId) : null
       if (!second || !secondVerdict || secondVerdict.kind === 'refuse' || secondVerdict.parentExternalId !== firstVerdict.parentExternalId) {
         await recordRefusal(first, second && secondVerdict?.kind === 'refuse' ? secondVerdict.reasons : ['the stored links changed while the deletion was being decided'], input.triggeredBy)
         counters.refused += 1

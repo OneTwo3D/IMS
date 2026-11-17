@@ -26,6 +26,7 @@ const state = {
   mutationEvents: [] as unknown[],
   linkWrites: [] as Row[],
   echo: {} as Row,
+  shadow: false,
 }
 
 const PARENT = 'Mandala Rose Works FireThorn Flex Plate with ThornGrip Textured PEI'
@@ -58,7 +59,7 @@ mock.module('@/lib/domain/wms/mutation-audit', { namedExports: { recordWmsMutati
 mock.module('../lib/connectors/mintsoft/producer-seam.ts', {
   namedExports: {
     mintsoftProducerSeam: async (input: { operation: string; payload: Row }) => {
-      if (input.operation !== 'product.upsert') return { proceed: false, shadowed: true, notice: 'skipped in test', reason: 'test', recorded: true, occurrences: 1 }
+      if (state.shadow || input.operation !== 'product.upsert') return { proceed: false, shadowed: true, notice: 'skipped in test', reason: 'test', recorded: true, occurrences: 1 }
       state.seamPayloads.push(input.payload)
       return { proceed: true, clearance: {} }
     },
@@ -83,6 +84,7 @@ function reset(over: { flags?: Record<string, string>; product?: Row; layers?: R
   state.layers = over.layers ?? []
   state.components = over.components ?? []
   state.echo = over.echo ?? {}
+  state.shadow = false
   state.upserts.length = 0
   state.seamPayloads.length = 0
   state.costLayerReads = 0
@@ -247,4 +249,17 @@ test('with the setting OFF the sync log keeps the echo exactly as before (redact
   reset({ product: VARIANT_OVER, echo: { CostPrice: 3.5 } })
   await run()
   assert.ok(JSON.stringify(state.syncLogs).includes('CostPrice'))
+})
+
+test('metadata confirmation (parent-deletion proof): a LIVE upsert stamps the link with the run id; a shadowed one writes no link at all', async () => {
+  reset({ product: VARIANT_OVER })
+  await run()
+  const live = state.linkWrites.at(-1) as { create: { metadata: Row } }
+  assert.deepEqual((live.create.metadata as Row)._imsMetadataConfirmed, { runId: 'job-1' })
+
+  reset({ product: VARIANT_OVER })
+  state.shadow = true
+  await run()
+  assert.equal(state.upserts.length, 0)
+  assert.equal(JSON.stringify(state.linkWrites).includes('_imsMetadataConfirmed'), false, 'a shadow confirms nothing')
 })

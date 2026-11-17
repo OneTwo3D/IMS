@@ -16,7 +16,7 @@ import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identif
 import { classifyMintsoftProductRecord } from '../api/normalizers'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
 import { applyMintsoftProductParity, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
-import { runMintsoftParentSkuDeletionPass } from './parent-sku-deletion'
+import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation } from './parent-sku-deletion'
 import { describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
 const ELIGIBLE_PRODUCT_TYPES = [
@@ -112,6 +112,8 @@ type ProductSyncContext = {
   product: ProductSyncCandidate
   scopes: MintsoftProductSyncScope[]
   connector: ReturnType<typeof getWmsConnector>
+  /** The id of the sync job this product is processed in; stamped on the link only when its metadata is confirmed in Mintsoft. */
+  runId?: string
 }
 
 export type MintsoftProductSyncResult = {
@@ -933,7 +935,13 @@ async function syncOneMintsoftProduct(
       externalProductId,
       payloadHash,
       lastKnownBarcode: wmsBarcode ?? dto.barcode,
-      metadata: toJsonPayload(authoritative?.raw),
+      // CONFIRMED only by a read of the Mintsoft record made in THIS run whose id and SKU are the product's and whose payload
+      // hash equals the stored one: a shadowed, held, skipped or content-only product never reaches here with that proof.
+      metadata: toJsonPayload(
+        context.runId && authoritative && externalProductId === authoritative.externalId && authoritative.sku.trim().toLowerCase() === dto.sku.trim().toLowerCase()
+          ? withMetadataConfirmation(authoritative.raw, context.runId)
+          : authoritative?.raw,
+      ),
       lastError: null,
     })
     await clearMintsoftProductLinkError(context.product.id)
@@ -1035,7 +1043,12 @@ async function syncOneMintsoftProduct(
       externalProductId: synced.externalId,
       payloadHash,
       lastKnownBarcode: trimToNull(synced.barcode) ?? dto.barcode,
-      metadata: toJsonPayload(synced.raw),
+      // CONFIRMED: this run's live upsert was sent (the seam cleared it) and Mintsoft's echo names the product's SKU.
+      metadata: toJsonPayload(
+        context.runId && synced.sku.trim().toLowerCase() === dto.sku.trim().toLowerCase()
+          ? withMetadataConfirmation(synced.raw, context.runId)
+          : synced.raw,
+      ),
       lastError: null,
       touchLastSyncedAt: true,
     })
@@ -1151,6 +1164,7 @@ async function processMintsoftProductChunk(params: {
           product,
           scopes: params.scopes,
           connector: params.connector,
+          runId: params.jobId,
         })
 
         // The content step runs only for a product the meta step accepted, and its failure is its OWN line: it can
@@ -1416,8 +1430,6 @@ export async function runMintsoftProductVerify(triggeredBy: string): Promise<Min
     }
   }
 
-  // The moment the run began: a variation's link must have been refreshed AFTER this to count as confirmed by it.
-  const runStartedAt = new Date()
   const result = await runMintsoftProductSyncJob((async function* () {
     let cursorId: string | undefined
     while (true) {
@@ -1439,9 +1451,9 @@ export async function runMintsoftProductVerify(triggeredBy: string): Promise<Min
   // PARENT SKU DELETION (o3d-zvec.20): behind its own setting (default off; the pass returns at once without reading anything else
   // when it is off). Only after a run that completed with no error, so it never acts on a partly-refreshed catalogue; the pass
   // itself still proves every variation from the stored links and refuses on any doubt.
-  if (result.status === 'SUCCEEDED') {
+  if (result.status === 'SUCCEEDED' && result.jobId) {
     try {
-      await runMintsoftParentSkuDeletionPass({ since: runStartedAt, triggeredBy })
+      await runMintsoftParentSkuDeletionPass({ runId: result.jobId, triggeredBy })
     } catch (error) {
       // The verify run itself succeeded and stays reported as such; a failed pass deleted nothing it could not prove.
       await logActivity({
