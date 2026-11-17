@@ -22,6 +22,9 @@ type ReorderSelectionContextValue = {
   /** Tri-state toggle over the currently-visible ids (none/some → all, all → none). */
   toggleAll: () => void
   clear: () => void
+  /** Per-row supplier overrides (productId -> supplierId); cleared with the selection. */
+  supplierOverrides: Readonly<Record<string, string>>
+  setSupplierOverride: (productId: string, supplierId: string | null) => void
   /**
    * Timestamp-ish counter bumped when an active selection was auto-cleared by a
    * page/filter change. 0 until the first such clear. Consumers watch it to show
@@ -33,7 +36,7 @@ type ReorderSelectionContextValue = {
 const ReorderSelectionContext = createContext<ReorderSelectionContextValue | null>(null)
 
 function initSelection(initialSelected: readonly string[] | undefined): ReorderSelectionState {
-  return { selected: new Set(initialSelected ?? []) }
+  return { selected: new Set(initialSelected ?? []), supplierOverrides: {} }
 }
 
 export function ReorderSelectionProvider({
@@ -60,7 +63,8 @@ export function ReorderSelectionProvider({
   const [prevVisibleKey, setPrevVisibleKey] = useState(visibleKey)
   if (visibleKey !== prevVisibleKey) {
     setPrevVisibleKey(visibleKey)
-    if (state.selected.size > 0) {
+    // Overrides clear with the selection: a stale override must never apply to a re-filtered row set.
+    if (state.selected.size > 0 || Object.keys(state.supplierOverrides).length > 0) {
       dispatch({ type: 'clear' })
       setClearedByNavigationAt((n) => n + 1)
     }
@@ -83,6 +87,10 @@ export function ReorderSelectionProvider({
   const toggle = useCallback((id: string) => dispatch({ type: 'toggle', id }), [])
   const toggleAll = useCallback(() => dispatch({ type: 'toggleAll', visibleIds }), [visibleIds])
   const clear = useCallback(() => dispatch({ type: 'clear' }), [])
+  const setSupplierOverride = useCallback(
+    (productId: string, supplierId: string | null) => dispatch({ type: 'setSupplierOverride', productId, supplierId }),
+    [],
+  )
   const isSelected = useCallback((id: string) => state.selected.has(id), [state.selected])
 
   const value = useMemo<ReorderSelectionContextValue>(() => ({
@@ -93,8 +101,10 @@ export function ReorderSelectionProvider({
     toggle,
     toggleAll,
     clear,
+    supplierOverrides: state.supplierOverrides,
+    setSupplierOverride,
     clearedByNavigationAt,
-  }), [state.selected, visibleIds, isSelected, toggle, toggleAll, clear, clearedByNavigationAt])
+  }), [state.selected, state.supplierOverrides, visibleIds, isSelected, toggle, toggleAll, clear, setSupplierOverride, clearedByNavigationAt])
 
   return (
     <ReorderSelectionContext.Provider value={value}>

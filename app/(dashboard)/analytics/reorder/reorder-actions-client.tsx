@@ -50,7 +50,7 @@ export function ReorderActionsToolbar({
   filters: ReorderActionFilters
 }) {
   const router = useRouter()
-  const { selected, selectedVisibleCount, toggleAll, clear, clearedByNavigationAt } = useReorderSelection()
+  const { selected, selectedVisibleCount, toggleAll, clear, clearedByNavigationAt, supplierOverrides } = useReorderSelection()
   const [pending, startTransition] = useTransition()
   const [message, setMessage] = useState<string>('')
   const [confirmAllOpen, setConfirmAllOpen] = useState(false)
@@ -74,6 +74,8 @@ export function ReorderActionsToolbar({
   const inFlightRef = useRef(false)
 
   const runGeneration = useCallback((purchased: string[], bom: string[]) => {
+    // Only overrides for the rows being generated (a ticked subset leaves other rows' overrides out).
+    const overridesForRun = Object.fromEntries(purchased.filter((id) => supplierOverrides[id]).map((id) => [id, supplierOverrides[id]]))
     if (inFlightRef.current) return
     inFlightRef.current = true
     setMessage('')
@@ -81,7 +83,7 @@ export function ReorderActionsToolbar({
       const parts: string[] = []
       try {
         if (purchased.length > 0) {
-          const result = await createReorderPOs(purchased, { filters })
+          const result = await createReorderPOs(purchased, { filters, supplierOverrides: overridesForRun })
           const notes: string[] = []
           if (result.success && (result.skippedSupplierCount ?? 0) > 0) notes.push(`${result.skippedSupplierCount} supplier(s) with a recent draft`)
           const skippedProducts = result.skippedProducts ?? []
@@ -112,7 +114,7 @@ export function ReorderActionsToolbar({
         inFlightRef.current = false
       }
     })
-  }, [filters, clear, router, startTransition])
+  }, [filters, supplierOverrides, clear, router, startTransition])
 
   const handleClick = useCallback(() => {
     if (hasSelection) {
@@ -187,8 +189,13 @@ export function ReorderActionsToolbar({
             ? 'Generate from selection'
             : 'Generate POs + draft MOs for all visible rows'}
       </Button>
+      {!filters.warehouseId && (
+        <span className="w-full text-xs text-muted-foreground" role="note">
+          Select a warehouse to set the PO destination. Without one, draft POs are created with no destination warehouse.
+        </span>
+      )}
       {navNotice && (
-        <span className="w-full text-xs text-amber-700" role="status">Selection cleared on filter / page change.</span>
+        <span className="w-full text-xs text-amber-700" role="status">Selection and supplier overrides cleared on filter / page change.</span>
       )}
       {message && <span className="w-full text-xs text-muted-foreground">{message}</span>}
 
