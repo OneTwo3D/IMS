@@ -604,7 +604,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         }),
       }
       if (order) {
-        const edited = await updateSalesOrder(order.id, payload)
+        const edited = await updateSalesOrder(order.id, payload, order.updatedAt)
         if (edited.success) {
           router.refresh()
           onClose()

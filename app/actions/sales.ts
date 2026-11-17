@@ -297,6 +297,8 @@ export type SoRow = {
 export type SoDetail = SoRow & {
   /** The linked customer, so the edit form can pre-select it. */
   customerId: string | null
+  /** The order's version as loaded: the edit form sends it back and the edit is refused if the order moved since. */
+  updatedAt: string
   billingAddress: unknown
   shippingAddress: unknown
   lines: SoLineRow[]
@@ -905,6 +907,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     select: {
       ...SO_SELECT,
       customerId: true,
+      updatedAt: true,
       billingAddress: true,
       shippingAddress: true,
       lines: {
@@ -1009,6 +1012,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     ...detailRow,
     settlement,
     customerId: so.customerId,
+    updatedAt: so.updatedAt.toISOString(),
     billingAddress: so.billingAddress,
     shippingAddress: so.shippingAddress,
     lines: so.lines.map(mapLine),
@@ -1443,7 +1447,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
  * Editing a CONFIRMED order (invoice update, reallocation, warehouse amendment, and the owner-ruled warning that the edit desyncs it from WooCommerce) is not built: it is refused here.
  * The order number, status and external order number are never edited. Writes nothing outbound: a draft is not invoiced, allocated or pushed.
  */
-export async function updateSalesOrder(id: string, input: CreateSoInput): Promise<{ success: boolean; order?: SoRow; error?: string }> {
+export async function updateSalesOrder(id: string, input: CreateSoInput, expectedUpdatedAt: string): Promise<{ success: boolean; order?: SoRow; error?: string }> {
   try {
     await requirePermission('sales.create')
     const inputError = validateSalesOrderInput(input)
@@ -1466,7 +1470,9 @@ export async function updateSalesOrder(id: string, input: CreateSoInput): Promis
           externalOrderNumber: true,
           totalForeign: true,
           currency: true,
-          _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true } },
+          updatedAt: true,
+          refundStatus: true,
+          _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true } },
           wmsOrderPush: { select: { id: true } },
         },
       })
@@ -1479,8 +1485,15 @@ export async function updateSalesOrder(id: string, input: CreateSoInput): Promis
         wmsPush: current.wmsOrderPush !== null,
         hasExternalSource: current._count.shoppingLinks > 0,
         erased: current.erasedAt !== null,
+        refunds: current._count.refunds,
+        refundStatus: current.refundStatus,
+        returnExpectations: current._count.returnExpectations,
       })
       if (block) return { error: block.reason } as const
+      // The form was loaded at `expectedUpdatedAt`; any save since (another editor, notes, a status change) makes it stale and this edit would silently discard it.
+      if (!Number.isFinite(Date.parse(expectedUpdatedAt)) || current.updatedAt.getTime() !== Date.parse(expectedUpdatedAt)) {
+        return { error: 'This order was changed by someone else since you opened it. Close this form and reload the order before editing again.' } as const
+      }
 
       // Same locks as create: the rates the order rests on (lines and the header's named rate), then the customer link.
       await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: prepared.orderDefaultRate === null })

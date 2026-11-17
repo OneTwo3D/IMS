@@ -65,6 +65,8 @@ async function seedWorld(): Promise<World> {
   const world: World = {
     tag, products, rateIds: { std: std.id, red: red.id, zero: zero.id }, orderIds: [],
     teardown: async () => {
+      await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: { in: world.orderIds } } } })
+      await db.salesOrderRefund.deleteMany({ where: { orderId: { in: world.orderIds } } })
       await db.salesOrderLine.deleteMany({ where: { orderId: { in: world.orderIds } } })
       await db.salesOrder.deleteMany({ where: { id: { in: world.orderIds } } })
       await db.product.deleteMany({ where: { id: { in: Object.values(products).map((p) => p.id) } } })
@@ -100,6 +102,12 @@ function inputFor(w: World, c: WriteCase, extra: Record<string, unknown> = {}) {
     })),
     ...extra,
   }
+}
+
+/** The version the form would have loaded. */
+async function versionOf(orderId: string): Promise<string> {
+  const { db } = await import('@/lib/db')
+  return (await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { updatedAt: true } })).updatedAt.toISOString()
 }
 
 const isDecimal = (v: unknown) => v !== null && typeof v === 'object' && 'toFixed' in (v as object)
@@ -163,7 +171,7 @@ test('an edited draft writes exactly the rows creating the edited order fresh wr
     const before = await db.salesOrder.findUniqueOrThrow({ where: { id: created.order!.id }, include: { lines: { select: { id: true } } } })
 
     // Changes lines, quantities, prices, discounts, shipping, fees, currency and the tax basis in one edit.
-    const edited = await updateSalesOrder(created.order!.id, inputFor(w, target) as never)
+    const edited = await updateSalesOrder(created.order!.id, inputFor(w, target) as never, await versionOf(created.order!.id))
     assert.equal(edited.success, true, `${target.key}: ${edited.error}`)
 
     const fresh = await createSalesOrder(inputFor(w, target) as never)
@@ -195,7 +203,7 @@ test('the rewrite is one transaction: a line that cannot be written leaves the o
   const before = await writtenRows(w, created.order!.id)
   const bad = inputFor(w, WRITE_CASES[1]) as { lines: { productId: string }[] }
   bad.lines[1] = { ...bad.lines[1], productId: 'no-such-product' }
-  const r = await updateSalesOrder(created.order!.id, bad as never)
+  const r = await updateSalesOrder(created.order!.id, bad as never, await versionOf(created.order!.id))
   assert.equal(r.success, false)
   assert.deepEqual(await writtenRows(w, created.order!.id), before, 'old header and lines are intact (the delete rolled back with the failed create)')
 })
@@ -217,7 +225,7 @@ test('refused edits write nothing: permission, the DRAFT-only rule and each bloc
   const refused = async (id: string, expected: RegExp, label: string) => {
     const before = await writtenRows(w, id)
     const lineIds = (await db.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true }, orderBy: { id: 'asc' } })).map((l) => l.id)
-    const r = await updateSalesOrder(id, inputFor(w, target) as never)
+    const r = await updateSalesOrder(id, inputFor(w, target) as never, await versionOf(id))
     assert.equal(r.success, false, `${label}: refused`)
     assert.match(String(r.error), expected, label)
     assert.deepEqual(await writtenRows(w, id), before, `${label}: nothing was written`)
@@ -230,7 +238,15 @@ test('refused edits write nothing: permission, the DRAFT-only rule and each bloc
   try { await refused(idPerm, /Forbidden/, 'permission') } finally { permissionDenied = false }
 
   // not found
-  assert.match(String((await updateSalesOrder('no-such-order', inputFor(w, target) as never)).error), /Order not found/)
+  assert.match(String((await updateSalesOrder('no-such-order', inputFor(w, target) as never, new Date().toISOString())).error), /Order not found/)
+
+  // a refund (its line link would be orphaned by the line replacement), a return expectation
+  const idRefund = await fresh()
+  const rline = await db.salesOrderLine.findFirstOrThrow({ where: { orderId: idRefund }, select: { id: true } })
+  const refund = await db.salesOrderRefund.create({ data: { orderId: idRefund, totalForeign: 1, totalBase: 1, refundedAt: new Date() } as never, select: { id: true } })
+  await db.salesOrderRefundLine.create({ data: { refundId: refund.id, salesOrderLineId: rline.id, description: 'x', qty: 1, unitPriceForeign: 1, unitPriceBase: 1, totalForeign: 1, totalBase: 1 } as never })
+  await refused(idRefund, /refunds recorded/, 'refund')
+  assert.equal((await db.salesOrderRefundLine.findFirstOrThrow({ where: { refundId: refund.id } })).salesOrderLineId, rline.id, 'the refund line still points at its sale line')
 
   // every non-draft status
   for (const status of ['PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'SHIPPED', 'CANCELLED'] as const) {
@@ -282,11 +298,38 @@ test('an edit that links an anonymised customer is refused and writes nothing; a
   assert.equal(created.success, true, created.error)
   w.orderIds.push(created.order!.id)
   const before = await writtenRows(w, created.order!.id)
-  const refused = await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[0], { customerId: erased.id }) as never)
+  const refused = await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[0], { customerId: erased.id }) as never, await versionOf(created.order!.id))
   assert.equal(refused.success, false)
   assert.match(String(refused.error), /anonymised/)
   assert.deepEqual(await writtenRows(w, created.order!.id), before)
-  const ok = await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[0], { customerId: live.id }) as never)
+  const ok = await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[0], { customerId: live.id }) as never, await versionOf(created.order!.id))
   assert.equal(ok.success, true, ok.error)
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: created.order!.id }, select: { customerId: true } })).customerId, live.id)
+})
+
+test('a stale edit is refused under the lock and writes nothing; a reload then saves', SKIP, async (t) => {
+  const w = await seedWorld()
+  t.after(() => w.teardown())
+  const { createSalesOrder, updateSalesOrder, updateSalesOrderNotes } = await import('@/app/actions/sales')
+  const created = await createSalesOrder(inputFor(w, WRITE_CASES[0]) as never)
+  assert.equal(created.success, true, created.error)
+  w.orderIds.push(created.order!.id)
+  const opened = await versionOf(created.order!.id)
+  // Another editor saves after this one opened the form.
+  await new Promise((r) => setTimeout(r, 15))
+  const other = await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[1]) as never, opened)
+  assert.equal(other.success, true, other.error)
+  const afterOther = await writtenRows(w, created.order!.id)
+  const stale = await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[2]) as never, opened)
+  assert.equal(stale.success, false)
+  assert.match(String(stale.error), /changed by someone else/)
+  assert.deepEqual(await writtenRows(w, created.order!.id), afterOther, 'the first editor\'s rows were not overwritten')
+  // A notes save also moves the version.
+  const v2 = await versionOf(created.order!.id)
+  await new Promise((r) => setTimeout(r, 15))
+  assert.equal((await updateSalesOrderNotes(created.order!.id, 'n2', 'i2')).success, true)
+  assert.match(String((await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[2]) as never, v2)).error), /changed by someone else/)
+  const ok = await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[2]) as never, await versionOf(created.order!.id))
+  assert.equal(ok.success, true, ok.error)
+  assert.equal((await updateSalesOrder(created.order!.id, inputFor(w, WRITE_CASES[2]) as never, 'garbage')).success, false)
 })

@@ -17,6 +17,8 @@ export type SalesOrderEditBlockCode =
   | 'ACCOUNTING_INVOICE'
   | 'WMS_PUSH'
   | 'SHIPMENT'
+  | 'REFUND'
+  | 'RETURN_EXPECTATION'
   | 'ALLOCATION'
 
 export type SalesOrderEditBlock = {
@@ -39,6 +41,11 @@ export function resolveSalesOrderEditBlock(input: {
   hasExternalSource: boolean
   /** Whether the order's personal data was erased. */
   erased?: boolean
+  /** How many refunds exist for the order, and its refund disposition: a refund line points at the order's line rows, which an edit replaces. */
+  refunds?: number
+  refundStatus?: string
+  /** How many return expectations exist (they hang off the refund lines). */
+  returnExpectations?: number
 }): SalesOrderEditBlock | null {
   if (input.erased) {
     return { code: 'ERASED', reason: 'This order\'s personal data has been erased, so it can no longer be edited.' }
@@ -58,6 +65,12 @@ export function resolveSalesOrderEditBlock(input: {
   }
   if (input.wmsPush) {
     return { code: 'WMS_PUSH', reason: 'This order has been sent to the warehouse, so it can no longer be edited.' }
+  }
+  if ((input.refunds ?? 0) > 0 || (input.refundStatus ?? 'NONE') !== 'NONE') {
+    return { code: 'REFUND', reason: 'This order has refunds recorded against its lines, so it can no longer be edited.' }
+  }
+  if ((input.returnExpectations ?? 0) > 0) {
+    return { code: 'RETURN_EXPECTATION', reason: 'This order has return expectations recorded against its lines, so it can no longer be edited.' }
   }
   if (input.shipments > 0) {
     return { code: 'SHIPMENT', reason: 'A shipment exists for this order, so it can no longer be edited.' }

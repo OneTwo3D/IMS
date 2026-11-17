@@ -1089,6 +1089,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     accountingInvoiceId: so.accountingInvoiceId ?? null,
     wmsPush: so.wmsPush !== null,
     hasExternalSource: so.hasExternalSource,
+    refunds: so.refunds.length,
+    refundStatus: so.refundStatus,
   })
   const canEditOrder = hasPermission(currentUserRole, 'sales.create')
   // Refund is allowed once shipped, or to top up an already partially-refunded order.

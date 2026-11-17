@@ -31,6 +31,9 @@ test('each blocker on an otherwise clean draft refuses, with its own reason', ()
     [{ wmsPush: true }, 'WMS_PUSH', /sent to the warehouse/],
     [{ hasExternalSource: true }, 'EXTERNAL_SOURCE', /WooCommerce/],
     [{ erased: true }, 'ERASED', /erased/],
+    [{ refunds: 1 }, 'REFUND', /refunds/],
+    [{ refundStatus: 'PARTIAL' }, 'REFUND', /refunds/],
+    [{ returnExpectations: 1 }, 'RETURN_EXPECTATION', /return expectations/],
   ]
   for (const [over, code, reason] of cases) {
     const block = resolveSalesOrderEditBlock({ ...clean, ...over })
