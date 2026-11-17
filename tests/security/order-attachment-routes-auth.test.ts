@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test, { mock } from 'node:test'
@@ -16,6 +16,7 @@ process.env.UPLOAD_STORAGE_DIR = privateRoot
 type Session = { user: { id: string; role: string } } | NextResponse
 let session: Session = NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 const calls: string[] = []
+let createResult: { ok: true; id: string } | { ok: false; reason: 'ORDER_ERASED' | 'ORDER_NOT_FOUND' } = { ok: true, id: 'att-1' }
 const stored = new Map<string, { storedName: string; originalFilename: string; mimeType: string; byteSize: number }>()
 
 mock.module('@/lib/auth/server', { namedExports: { requireApiAuth: async () => session } })
@@ -28,7 +29,9 @@ test.before(async () => {
   mock.module('@/lib/domain/order-attachments', {
     namedExports: {
       ...actualDomain,
-      createOrderAttachment: async () => { calls.push('create'); return { ok: true, id: 'att-1' } },
+      reserveOrderAttachmentFile: async (name: string) => { calls.push(`reserve:${name.endsWith('.pdf')}:files=${existsSync(path.join(privateRoot, 'order-attachments')) ? readdirSync(path.join(privateRoot, 'order-attachments')).length : 0}`) },
+      releaseReservedOrderAttachmentFile: async () => { calls.push('release') },
+      createOrderAttachment: async () => { calls.push('create'); return createResult },
       findOrderAttachment: async (kind: string, orderId: string, id: string) => { calls.push(`find:${kind}:${orderId}:${id}`); return stored.get(`${kind}:${orderId}:${id}`) ?? null },
       softDeleteOrderAttachment: async (kind: string, orderId: string, id: string) => { calls.push(`delete:${kind}:${orderId}:${id}`); return stored.has(`${kind}:${orderId}:${id}`) ? { storedName: 'x', mimeType: 'application/pdf', byteSize: 1 } : null },
     },
@@ -48,7 +51,7 @@ function uploadRequest(bytes: Buffer = PDF, name = 'quote.pdf'): Request {
 }
 const get = () => new Request('http://localhost/x')
 
-test.beforeEach(() => { calls.length = 0; stored.clear(); session = NextResponse.json({ error: 'Unauthorized' }, { status: 401 }) })
+test.beforeEach(() => { createResult = { ok: true, id: 'att-1' }; calls.length = 0; stored.clear(); session = NextResponse.json({ error: 'Unauthorized' }, { status: 401 }) })
 test.after(() => rmSync(privateRoot, { recursive: true, force: true }))
 
 test('no session: upload, download and delete answer 401 and reach nothing', async () => {
@@ -170,4 +173,19 @@ test('upload: the size cap is enforced WHILE STREAMING: a body with no Content-L
   const { readBodyCapped } = await import('../../lib/order-attachment-routes.ts')
   assert.equal((await readBodyCapped(new Request('http://localhost/x', { method: 'POST', body: new Uint8Array(1000) }), 2000))?.length, 1000)
   assert.equal(await readBodyCapped(new Request('http://localhost/x', { method: 'POST', body: new Uint8Array(3000) }), 2000), null)
+})
+
+test('upload: the file name is RESERVED durably before the file is written, and a rejected upload releases it', async () => {
+  session = as('ADMIN')
+  const dir = path.join(privateRoot, 'order-attachments')
+  const filesBefore = existsSync(dir) ? readdirSync(dir).length : 0
+  const ok = await handleUpload(uploadRequest(), { kind: 'purchase-orders', orderId: 'o1' })
+  assert.equal(ok.status, 201)
+  assert.deepEqual(calls, [`reserve:true:files=${filesBefore}`, 'create'], 'reserved while the file did not exist yet, then the row insert (which releases the reservation)')
+  calls.length = 0
+  // A rejection after the file was written (the row insert refuses) releases the reservation so the file is drained.
+  createResult = { ok: false, reason: 'ORDER_ERASED' }
+  const refused = await handleUpload(uploadRequest(), { kind: 'sales-orders', orderId: 'o1' })
+  assert.equal(refused.status, 409)
+  assert.deepEqual(calls.map((c) => c.split(':')[0]), ['reserve', 'create', 'release'])
 })

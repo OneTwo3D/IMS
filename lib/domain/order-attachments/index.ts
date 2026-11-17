@@ -101,6 +101,8 @@ export async function createOrderAttachment(input: CreateOrderAttachmentInput): 
       },
       select: { id: true },
     })
+    // The row now names the file: the upload's reservation is released in the SAME transaction, so the file is either claimed by this row or still reserved.
+    await tx.orderAttachmentFileDeletion.deleteMany({ where: { storedName: input.storedName } })
     return { ok: true, id: row.id }
   })
 }
@@ -145,12 +147,41 @@ export async function deleteSalesOrderAttachmentsInTx(tx: Prisma.TransactionClie
   return rows.map((r) => r.storedName)
 }
 
+/** How long an upload's reservation stays in the future (the file is in flight until then); past it the drain treats the file as abandoned. */
+export const UPLOAD_RESERVATION_MS = 15 * 60 * 1000
+
+/**
+ * RESERVE A FILE NAME BEFORE THE FILE IS WRITTEN (upload step 1). The entry is due UPLOAD_RESERVATION_MS ahead, so a concurrent drain leaves the in-flight file alone;
+ * createOrderAttachment deletes it when the row commits. If the upload is rejected or the process dies, the entry survives and becomes due: the file is never
+ * untracked, however an erasure or a crash interleaves with the upload.
+ */
+export async function reserveOrderAttachmentFile(storedName: string, now: Date = new Date()): Promise<void> {
+  await db.orderAttachmentFileDeletion.create({ data: { storedName, queuedAt: new Date(now.getTime() + UPLOAD_RESERVATION_MS) } })
+}
+
+/** A reserved upload that did not become a row: make its entry due now and drain, so the file (if it was written) goes at once. */
+export async function releaseReservedOrderAttachmentFile(storedName: string): Promise<{ removed: number; failed: string[] }> {
+  await db.orderAttachmentFileDeletion.updateMany({ where: { storedName }, data: { queuedAt: new Date() } })
+  return drainOrderAttachmentFileDeletions()
+}
+
+/**
+ * Queue the files of every attachment row about to be deleted with its orders (the reset), inside the transaction that deletes them. `scope` picks the order type
+ * whose rows go in that transaction.
+ */
+export async function queueOrderAttachmentFilesInTx(tx: Prisma.TransactionClient, scope: 'sales' | 'purchase'): Promise<number> {
+  const rows = await tx.orderAttachment.findMany({ where: scope === 'sales' ? { salesOrderId: { not: null } } : { purchaseOrderId: { not: null } }, select: { storedName: true } })
+  if (rows.length === 0) return 0
+  await tx.orderAttachmentFileDeletion.createMany({ data: rows.map((r) => ({ storedName: r.storedName })), skipDuplicates: true })
+  return rows.length
+}
+
 /**
  * Remove the files in the deletion queue, oldest first, and clear each entry only after its file is gone (already gone counts). A file that cannot be removed keeps
  * its entry (attempts raised) for the next drain. Safe to run concurrently (unlink and the entry delete are both idempotent). Returns what it removed and the names still owed.
  */
 export async function drainOrderAttachmentFileDeletions(limit = 500): Promise<{ removed: number; failed: string[] }> {
-  const queued = await db.orderAttachmentFileDeletion.findMany({ orderBy: { queuedAt: 'asc' }, take: limit, select: { storedName: true } })
+  const queued = await db.orderAttachmentFileDeletion.findMany({ where: { queuedAt: { lte: new Date() } }, orderBy: { queuedAt: 'asc' }, take: limit, select: { storedName: true } })
   if (queued.length === 0) return { removed: 0, failed: [] }
   const names = queued.map((q) => q.storedName)
   const result = await removeOrderAttachmentFiles(names)

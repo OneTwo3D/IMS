@@ -39,12 +39,17 @@ async function removeQuietly(filepath: string): Promise<void> {
   }
 }
 
+/** A fresh server-chosen stored name. The upload reserves it (see reserveOrderAttachmentFile) BEFORE writing the file. */
+export function newOrderAttachmentStoredName(extension: string): string {
+  return `${randomUUID()}.${extension}`
+}
+
 export async function storeOrderAttachmentFile(
   buffer: Buffer,
   extension: string,
-  options: { scan?: FileScanOptions } = {},
+  options: { scan?: FileScanOptions; storedName?: string } = {},
 ): Promise<StoreOrderAttachmentResult> {
-  const storedName = `${randomUUID()}.${extension}`
+  const storedName = options.storedName ?? newOrderAttachmentStoredName(extension)
   const finalPath = resolveOrderAttachmentFilePath(storedName)
   if (!finalPath) return { ok: false, status: 400, error: 'Invalid file', scan: NO_SCAN }
 

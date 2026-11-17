@@ -282,3 +282,67 @@ test('[order attachments] the deletion obligation commits WITH the row deletion:
   assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName: kept } }), 0)
   assert.ok(filesOnDisk().includes(kept))
 })
+
+test('[order attachments] an upload reserves its file durably: success leaves no queue entry, a rejected one is drained, and a crashed one is drained once due', { skip }, async (t) => {
+  const { db, routes } = await load()
+  const fx = await seedOrders(db)
+  t.after(() => fx.cleanup())
+  await as(db, 'ADMIN')
+  const { drainOrderAttachmentFileDeletions, reserveOrderAttachmentFile } = await import('@/lib/domain/order-attachments')
+  const { newOrderAttachmentStoredName, storeOrderAttachmentFile } = await import('@/lib/order-attachment-storage')
+  const queueBefore = await db.orderAttachmentFileDeletion.count()
+
+  // Success: the reservation is released by the row insert.
+  assert.equal((await routes.handleUpload(upload(PDF('ok'), 'ok.pdf'), { kind: 'purchase-orders', orderId: fx.po1.id })).status, 201)
+  assert.equal(await db.orderAttachmentFileDeletion.count(), queueBefore, 'no reservation left after a successful upload')
+
+  // Rejected AFTER the file was written (the order was erased meanwhile): no file, no entry.
+  await db.salesOrder.update({ where: { id: fx.guest.id }, data: { erasedAt: new Date() } })
+  const filesBefore = filesOnDisk()
+  assert.equal((await routes.handleUpload(upload(PDF('late'), 'late.pdf'), { kind: 'sales-orders', orderId: fx.guest.id })).status, 409)
+  assert.deepEqual(filesOnDisk(), filesBefore)
+  assert.equal(await db.orderAttachmentFileDeletion.count(), queueBefore)
+
+  // Crashed upload: reserved, file written, process dies before the row. The in-flight file is left alone while the reservation is in the future...
+  const name = newOrderAttachmentStoredName('pdf')
+  await reserveOrderAttachmentFile(name)
+  const stored = await storeOrderAttachmentFile(PDF('crash'), 'pdf', { storedName: name })
+  assert.equal(stored.ok, true)
+  assert.ok(filesOnDisk().includes(name))
+  await drainOrderAttachmentFileDeletions()
+  assert.ok(filesOnDisk().includes(name), 'not due yet: an in-flight upload is not drained')
+  // ...and once due, the untracked file is removed and the entry cleared.
+  await db.orderAttachmentFileDeletion.update({ where: { storedName: name }, data: { queuedAt: new Date(Date.now() - 1000) } })
+  await drainOrderAttachmentFileDeletions()
+  assert.ok(!filesOnDisk().includes(name))
+  assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName: name } }), 0)
+})
+
+test('[order attachments] the reset queues attachment files in the transaction that deletes the rows (sales and purchase), so a crash after commit loses none', { skip }, async (t) => {
+  const { db, routes } = await load()
+  const fx = await seedOrders(db)
+  t.after(() => fx.cleanup())
+  await as(db, 'ADMIN')
+  const put = async (kind: string, orderId: string, tag: string) => ((await (await routes.handleUpload(upload(PDF(tag), `${tag}.pdf`), { kind, orderId })).json()) as { id: string }).id
+  const soId = await put('sales-orders', fx.so1.id, 'reset so')
+  const poId = await put('purchase-orders', fx.po1.id, 'reset po')
+  const names = (await db.orderAttachment.findMany({ where: { id: { in: [soId, poId] } }, select: { storedName: true } })).map((r) => r.storedName)
+  const { queueOrderAttachmentFilesInTx, drainOrderAttachmentFileDeletions } = await import('@/lib/domain/order-attachments')
+  // The reset's two transactions, in miniature: queue, then delete the orders (rows cascade). The process then dies before any unlink.
+  await db.$transaction(async (tx) => { await queueOrderAttachmentFilesInTx(tx, 'sales'); await tx.salesOrder.deleteMany({ where: { id: fx.so1.id } }) })
+  await db.$transaction(async (tx) => { await queueOrderAttachmentFilesInTx(tx, 'purchase'); await tx.purchaseOrder.deleteMany({ where: { id: fx.po1.id } }) })
+  assert.equal(await db.orderAttachment.count({ where: { id: { in: [soId, poId] } } }), 0, 'rows cascaded away with their orders')
+  for (const n of names) assert.ok(filesOnDisk().includes(n), 'PRECONDITION: the files are still on disk')
+  assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName: { in: names } } }), 2, 'and both are queued durably')
+  await drainOrderAttachmentFileDeletions()
+  for (const n of names) assert.ok(!filesOnDisk().includes(n), 'drained')
+  assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName: { in: names } } }), 0)
+
+  // The reset action itself queues inside both of its transactions and drains afterwards.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('app/actions/reset.ts', 'utf8')
+  assert.match(src, /queueOrderAttachmentFilesInTx\(tx, 'sales'\)\n\s*await tx\.salesOrder\.deleteMany/)
+  assert.match(src, /queueOrderAttachmentFilesInTx\(tx, 'purchase'\)\n\s*await tx\.purchaseOrder\.deleteMany/)
+  assert.match(src, /drainOrderAttachmentFileDeletions\(/)
+  assert.doesNotMatch(src, /removeOrderAttachmentFiles/, 'no best-effort unlink outside the queue')
+})

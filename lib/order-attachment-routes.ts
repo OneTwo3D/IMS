@@ -7,10 +7,12 @@ import {
   canViewOrderAttachments,
   createOrderAttachment,
   findOrderAttachment,
+  releaseReservedOrderAttachmentFile,
+  reserveOrderAttachmentFile,
   softDeleteOrderAttachment,
   type OrderAttachmentKind,
 } from '@/lib/domain/order-attachments'
-import { removeOrderAttachmentFiles, storeOrderAttachmentFile } from '@/lib/order-attachment-storage'
+import { newOrderAttachmentStoredName, storeOrderAttachmentFile } from '@/lib/order-attachment-storage'
 import { fileScanAuditMetadata } from '@/lib/security/file-scan'
 import {
   MAX_ORDER_ATTACHMENT_BYTES,
@@ -114,8 +116,15 @@ export async function handleUpload(req: Request, params: Params): Promise<NextRe
   const verdict = validateOrderAttachment(file.name, buffer)
   if (!verdict.ok) return json({ error: verdict.error }, verdict.status)
 
-  const stored = await storeOrderAttachmentFile(buffer, verdict.extension)
+  // RESERVE THE NAME BEFORE THE FILE EXISTS: the reservation is a durable record that this file may be on disk, released only when the row commits (or drained if it never does).
+  const storedName = newOrderAttachmentStoredName(verdict.extension)
+  await reserveOrderAttachmentFile(storedName)
+  const stored = await storeOrderAttachmentFile(buffer, verdict.extension, { storedName }).catch(async (error) => {
+    await releaseReservedOrderAttachmentFile(storedName).catch(() => undefined)
+    throw error
+  })
   if (!stored.ok) {
+    await releaseReservedOrderAttachmentFile(storedName)
     await logActivity({
       entityType: ENTITY[kind].entityType,
       entityId: params.orderId,
@@ -139,12 +148,12 @@ export async function handleUpload(req: Request, params: Params): Promise<NextRe
     sha256: createHash('sha256').update(buffer).digest('hex'),
     uploadedByUserId: session.user.id,
   }).catch(async (error) => {
-    await removeOrderAttachmentFiles([stored.storedName])
+    await releaseReservedOrderAttachmentFile(stored.storedName).catch(() => undefined)
     throw error
   })
   if (!created.ok) {
-    // The row was not written, so the file is an orphan: remove it.
-    await removeOrderAttachmentFiles([stored.storedName])
+    // The row was not written, so the file is an orphan: its reservation becomes due and is drained now (and again by the daily job if that fails).
+    await releaseReservedOrderAttachmentFile(stored.storedName)
     if (created.reason === 'ORDER_ERASED') return json({ error: 'This order has been anonymised and cannot take attachments' }, 409)
     return json({ error: 'Not found' }, 404)
   }
