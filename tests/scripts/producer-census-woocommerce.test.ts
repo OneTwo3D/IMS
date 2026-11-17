@@ -76,7 +76,7 @@ test('MUTATION WOO-1 (the consultation is moved AFTER its effect): red, naming t
 })
 
 test('MUTATION WOO-1 (the stock writer stops asking): red', () => {
-  const report = wooCensusFindings(input({}, { 'lib/connectors/woocommerce/sync/stock-sync.ts': (text) => text.replace('await wooProducerSeam(', 'await Promise.resolve(') }))
+  const report = wooCensusFindings(input({}, { 'lib/connectors/woocommerce/sync/stock-sync.ts': (text) => text.replaceAll('await wooProducerSeam(', 'await Promise.resolve(') }))
   assert.equal(red(report, 'WOO-1', 'stock-sync.ts::pushStockToWc').length, 1, JSON.stringify(report.failures))
 })
 

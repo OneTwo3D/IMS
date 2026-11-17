@@ -153,6 +153,17 @@ When you generate draft POs from reorder planning, the system groups suggestions
 
 Products without a preferred supplier are listed under "Unassigned" and require you to pick a supplier before the draft can be generated. The preferred supplier is auto-updated whenever a PO is sent to a different supplier for that product, so once you start ordering from a new vendor, planning follows you.
 
+### Group by supplier
+
+Tick **Group by supplier** in the filters and press Apply to lay Reorder Planning out supplier by supplier, the way purchase orders are placed. Each group has a header with the supplier, the number of rows and the **total recommended quantity** (the sum of the rows' Suggested qty), followed by that supplier's rows. The page then lists every matching row, not one page at a time, so a supplier's group and total are complete.
+
+- Groups do not merge lead times. Every row keeps its own **Lead time** and **Latest PO date**; only the quantity is totalled.
+- Rows with **no supplier** go in a separate amber **No supplier** group at the end, because a draft PO cannot be raised for them. Set a supplier on the product first.
+- Manufactured (BOM) products are not bought, so they get their own groups after the suppliers ("Manufactured by ..." or "Manufactured in-house") and are never in the no-supplier group.
+- Groups follow the filters. Change the **Warehouse** (or any other filter) and Apply, and the groups and totals are worked out again from the rows that remain.
+- Groups use the supplier the report chose for each row. A different supplier picked in a row's own selector, or by the draft PO button, is not reflected until you reload.
+- This is a view only. The CSV, the selection boxes and draft PO and production order generation work exactly as before.
+
 ## Sales and Fulfillment Analytics
 
 | Report | What it shows |
@@ -185,6 +196,8 @@ Non-stock lines are the exception, and deliberately so. A service, a fee or a de
 All of this is stated in each report's own notices and repeated in the CSV export's metadata rows; every bound marker also has its own column in the CSV, and every report-level total — including the bounds on the period figures and the Gross Margin credit that reached no product row — travels with the file as `totals.<name>` metadata rows, because a figure that exists only on the page is a disclosure the file reader never sees. The **COGS Report** carries the same treatment and the same markers (see above); **Inventory Turnover** is a COGS-over-inventory-value ratio that no refund can move.
 
 **Sales Statistics and Product Profitability** use the same rule, so a refunded sale no longer overstates revenue there. In **Sales Statistics**, the **Net Revenue** column and cards deduct the credit that is on the same ex-VAT basis; revenue, tax, shipping and discount stay as invoiced. In **Product Profitability**, the current and previous financial-year revenue and profit are net of that credit. Credit that could not be deducted is shown in the optional **Refunds (gross)** (VAT-inclusive credit) and **Refunds (basis ?)** (basis not recorded) columns, and the affected figure carries **≤**, **≥** or **?** with a tooltip explaining which way it can be wrong. The Product Profitability unit-margin figures (list price against latest cost) are not affected by refunds.
+
+Below the Returns report a **By return reason** table counts refunds and totals their credit per configured return reason (Settings > Inventory), for the same period. A refund counts once however many lines it has, and refunds with no reason are grouped as **Unspecified**. It follows the same basis rule: a reason whose credits mix bases shows the marker instead of one value, with the net, gross and unproven columns alongside.
 
 The **Returns** report shows each credit on its own recorded basis. Where a row -- or the period -- mixes ex-VAT and VAT-inclusive credits, no single total is shown, because adding the two gives an amount on neither basis; the net-basis, gross-basis and unproven-basis columns carry the whole credit instead, and rows with no single stated value sort last rather than among the zeroes.
 

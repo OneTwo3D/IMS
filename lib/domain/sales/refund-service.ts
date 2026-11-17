@@ -3884,6 +3884,8 @@ export async function createSalesOrderRefund(
     orderId: string
     lines: RefundRequestLine[]
     reason: string
+    /** The structured reason (a configured ReturnReason id), validated by the caller. Optional; the free-text `reason` above is separate. */
+    returnReasonId?: string | null
     returnWarehouseId?: string
     externalRefundId?: number
     creditNotePrefix: string
@@ -5191,6 +5193,7 @@ export async function createSalesOrderRefund(
         // by lib/connectors/woocommerce/sync/refund-stock-correction.ts once the stock job is durably recorded.
         stockCorrectionRequired: storefrontRefund && refundLines.some((line) => line.qty > 0 && Boolean(line.productId)),
         reason: input.reason || null,
+        returnReasonId: input.returnReasonId ?? null,
         totalForeign,
         totalBase: headerTotalBase,
         totalsBasis: 'NET',
