@@ -243,4 +243,42 @@ test('[order attachments] erasing a guest order on its own (order-first) deletes
   assert.equal(flagged.length, 1)
   assert.match(JSON.stringify(flagged[0]!.metadata), new RegExp(stuck.replace('.', '\\.')))
   await db.activityLog.deleteMany({ where: { action: 'erasure_attachment_files_not_removed' } })
+
+  // DURABLE: the failed removal left a queue entry (committed with the row deletion), and a later drain removes the file once it can and clears the entry.
+  const { drainOrderAttachmentFileDeletions } = await import('@/lib/domain/order-attachments')
+  const queued = await db.orderAttachmentFileDeletion.findUniqueOrThrow({ where: { storedName: stuck } })
+  assert.equal(queued.attempts, 1, 'the failed attempt is counted')
+  assert.deepEqual((await drainOrderAttachmentFileDeletions()).failed, [stuck], 'still blocked: still owed')
+  rmSync(path.join(attachmentDir, stuck), { recursive: true, force: true })
+  writeFileSync(path.join(attachmentDir, stuck), 'customer file still on disk')
+  const drained = await drainOrderAttachmentFileDeletions()
+  assert.deepEqual(drained.failed, [])
+  assert.ok(!filesOnDisk().includes(stuck), 'the retry removed the file')
+  assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName: stuck } }), 0, 'and cleared its entry')
+})
+
+test('[order attachments] the deletion obligation commits WITH the row deletion: a crash before any unlink leaves every file queued, and a drain removes them', { skip }, async (t) => {
+  const { db, routes } = await load()
+  const fx = await seedOrders(db)
+  t.after(() => fx.cleanup())
+  await as(db, 'ADMIN')
+  const id = ((await (await routes.handleUpload(upload(PDF('crash'), 'crash.pdf'), { kind: 'sales-orders', orderId: fx.so1.id })).json()) as { id: string }).id
+  const { storedName } = await db.orderAttachment.findUniqueOrThrow({ where: { id }, select: { storedName: true } })
+  const { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } = await import('@/lib/domain/order-attachments')
+  // The transaction that deletes the row (the erasure's) commits; the process then dies before any unlink: nothing after the commit runs.
+  await db.$transaction(async (tx) => { await deleteSalesOrderAttachmentsInTx(tx, [fx.so1.id]) })
+  assert.equal(await db.orderAttachment.count({ where: { id } }), 0)
+  assert.ok(filesOnDisk().includes(storedName), 'the customer file is still on disk')
+  assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName } }), 1, 'and a durable record points at it')
+  await drainOrderAttachmentFileDeletions()
+  assert.ok(!filesOnDisk().includes(storedName))
+  assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName } }), 0)
+
+  // A transaction that ROLLS BACK queues nothing and keeps the row (and its file).
+  const id2 = ((await (await routes.handleUpload(upload(PDF('kept'), 'kept.pdf'), { kind: 'sales-orders', orderId: fx.so2.id })).json()) as { id: string }).id
+  const kept = (await db.orderAttachment.findUniqueOrThrow({ where: { id: id2 }, select: { storedName: true } })).storedName
+  await assert.rejects(db.$transaction(async (tx) => { await deleteSalesOrderAttachmentsInTx(tx, [fx.so2.id]); throw new Error('rollback') }), /rollback/)
+  assert.equal(await db.orderAttachment.count({ where: { id: id2 } }), 1)
+  assert.equal(await db.orderAttachmentFileDeletion.count({ where: { storedName: kept } }), 0)
+  assert.ok(filesOnDisk().includes(kept))
 })

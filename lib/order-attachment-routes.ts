@@ -31,6 +31,29 @@ import { uploadFileResponse } from '@/lib/upload-file-response'
  * Authentication first (401), then the permission for that order type (403), then the lookup by (order id, attachment id) (404). A file is
  * never located from a name: the row names it, and the row is found by id within its own order.
  */
+const MULTIPART_ENVELOPE_ALLOWANCE = 1024 * 1024
+
+/**
+ * Read a request body up to `max` bytes. Returns null (and cancels the stream, so the sender is not read further) the moment the running total passes `max`.
+ */
+export async function readBodyCapped(req: Request, max: number): Promise<Buffer | null> {
+  if (!req.body) return Buffer.alloc(0)
+  const reader = req.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > max) {
+      await reader.cancel().catch(() => undefined)
+      return null
+    }
+    chunks.push(value)
+  }
+  return Buffer.concat(chunks, total)
+}
+
 const NO_STORE = { 'Cache-Control': 'private, no-store' } as const
 
 export function kindFromSegment(segment: string): OrderAttachmentKind | null {
@@ -73,9 +96,13 @@ export async function handleUpload(req: Request, params: Params): Promise<NextRe
     return json({ error: `File too large. Maximum ${Math.round(MAX_ORDER_ATTACHMENT_BYTES / (1024 * 1024))}MB.` }, 413)
   }
 
+  // The body is read through a STREAMING BYTE COUNTER that stops at the cap (plus the multipart envelope), so an oversize upload is refused after at most the cap
+  // has been buffered, whatever its Content-Length claimed (or omitted, as a chunked body does), and never parsed as a whole.
+  const body = await readBodyCapped(req, MAX_ORDER_ATTACHMENT_BYTES + MULTIPART_ENVELOPE_ALLOWANCE)
+  if (body === null) return json({ error: `File too large. Maximum ${Math.round(MAX_ORDER_ATTACHMENT_BYTES / (1024 * 1024))}MB.` }, 413)
   let file: File | null = null
   try {
-    const form = await req.formData()
+    const form = await new Request(req.url, { method: 'POST', headers: { 'content-type': req.headers.get('content-type') ?? '' }, body: new Uint8Array(body) }).formData()
     const entry = form.get('file')
     if (entry instanceof File) file = entry
   } catch {

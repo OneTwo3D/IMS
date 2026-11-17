@@ -1,6 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { hasPermission, type Permission } from '@/lib/permissions'
+import { removeOrderAttachmentFiles } from '@/lib/order-attachment-storage'
 
 /**
  * ORDER ATTACHMENTS: the rows. The bytes are in lib/order-attachment-storage.ts; the HTTP surface is app/api/order-attachments/.
@@ -130,10 +131,32 @@ export async function softDeleteOrderAttachment(kind: OrderAttachmentKind, order
   })
 }
 
-/** Rows of sales orders in a transaction that is already erasing them: deleted outright (live and soft-deleted alike). Returns the stored names whose files must go. */
+/**
+ * Rows of sales orders in a transaction that is already erasing them: deleted outright (live and soft-deleted alike), and THE FILES OWED A DELETION ARE RECORDED IN
+ * THE SAME TRANSACTION (order_attachment_file_deletions). A file cannot be rolled back, so it is removed after the commit by drainOrderAttachmentFileDeletions; because
+ * the obligation commits with the row deletion, a crash or a failed unlink leaves a queue entry that a later drain retries, never a customer file nobody points at.
+ * Returns the stored names.
+ */
 export async function deleteSalesOrderAttachmentsInTx(tx: Prisma.TransactionClient, orderIds: string[]): Promise<string[]> {
   const rows = await tx.orderAttachment.findMany({ where: { salesOrderId: { in: orderIds } }, select: { id: true, storedName: true } })
   if (rows.length === 0) return []
   await tx.orderAttachment.deleteMany({ where: { id: { in: rows.map((r) => r.id) } } })
+  await tx.orderAttachmentFileDeletion.createMany({ data: rows.map((r) => ({ storedName: r.storedName })), skipDuplicates: true })
   return rows.map((r) => r.storedName)
+}
+
+/**
+ * Remove the files in the deletion queue, oldest first, and clear each entry only after its file is gone (already gone counts). A file that cannot be removed keeps
+ * its entry (attempts raised) for the next drain. Safe to run concurrently (unlink and the entry delete are both idempotent). Returns what it removed and the names still owed.
+ */
+export async function drainOrderAttachmentFileDeletions(limit = 500): Promise<{ removed: number; failed: string[] }> {
+  const queued = await db.orderAttachmentFileDeletion.findMany({ orderBy: { queuedAt: 'asc' }, take: limit, select: { storedName: true } })
+  if (queued.length === 0) return { removed: 0, failed: [] }
+  const names = queued.map((q) => q.storedName)
+  const result = await removeOrderAttachmentFiles(names)
+  const failed = new Set(result.failed)
+  const done = names.filter((n) => !failed.has(n))
+  if (done.length > 0) await db.orderAttachmentFileDeletion.deleteMany({ where: { storedName: { in: done } } })
+  if (failed.size > 0) await db.orderAttachmentFileDeletion.updateMany({ where: { storedName: { in: [...failed] } }, data: { attempts: { increment: 1 } } })
+  return { removed: result.removed, failed: [...failed] }
 }

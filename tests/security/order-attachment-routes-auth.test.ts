@@ -144,3 +144,30 @@ test('upload: a spoofed or disallowed file is refused with 400 and writes nothin
   assert.deepEqual(readdirSync(privateRoot), before, 'nothing was stored')
   assert.ok(!calls.includes('create'), 'no row was created')
 })
+
+test('upload: the size cap is enforced WHILE STREAMING: a body with no Content-Length is cut off near the cap, not buffered whole', async () => {
+  session = as('ADMIN')
+  const CHUNK = 1024 * 1024
+  const TOTAL_CHUNKS = 200 // a 200 MB body, far past the 20 MB cap
+  let pulled = 0
+  let cancelled = false
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (pulled >= TOTAL_CHUNKS) { controller.close(); return }
+      pulled += 1
+      controller.enqueue(new Uint8Array(CHUNK))
+    },
+    cancel() { cancelled = true },
+  })
+  const req = new Request('http://localhost/x', { method: 'POST', headers: { 'content-type': 'multipart/form-data; boundary=x' }, body: stream, duplex: 'half' } as RequestInit)
+  assert.equal(req.headers.get('content-length'), null, 'PRECONDITION: no declared length to trust')
+  const res = await handleUpload(req, { kind: 'purchase-orders', orderId: 'o1' })
+  assert.equal(res.status, 413)
+  assert.ok(cancelled, 'the sender was cancelled')
+  assert.ok(pulled <= 26, `read ${pulled} MB of a 200 MB body: stopped near the cap`)
+  assert.ok(!calls.includes('create'))
+  // CONTROL: the same reader accepts a body under the cap.
+  const { readBodyCapped } = await import('../../lib/order-attachment-routes.ts')
+  assert.equal((await readBodyCapped(new Request('http://localhost/x', { method: 'POST', body: new Uint8Array(1000) }), 2000))?.length, 1000)
+  assert.equal(await readBodyCapped(new Request('http://localhost/x', { method: 'POST', body: new Uint8Array(3000) }), 2000), null)
+})

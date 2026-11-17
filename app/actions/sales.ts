@@ -179,8 +179,7 @@ import {
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
-import { deleteSalesOrderAttachmentsInTx } from '@/lib/domain/order-attachments'
-import { removeOrderAttachmentFiles } from '@/lib/order-attachment-storage'
+import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 
@@ -3834,7 +3833,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
     if ('error' in outcome) return { success: false, error: outcome.error }
     const { so, released } = outcome
     try {
-      await removeOrderAttachmentFiles(outcome.attachmentFiles)
+      await drainOrderAttachmentFileDeletions()
     } catch (fileError) {
       console.error('Failed to remove attachment files of a deleted sales order', fileError)
     }

@@ -2417,6 +2417,17 @@ model OrderAttachment {
   @@map("order_attachments")
 }
 
+/// FILES OWED A DELETION: the stored names of order-attachment files whose rows were deleted (a personal-data erasure, a deleted draft order). Written in the SAME
+/// transaction as the row deletion, so a crash or a failed unlink can never leave a file with no record pointing at it; a retryable drain removes the file and then
+/// the entry. A stored name is a random uuid and identifies no one.
+model OrderAttachmentFileDeletion {
+  storedName String   @id @map("stored_name")
+  queuedAt   DateTime @default(now()) @map("queued_at")
+  attempts   Int      @default(0)
+
+  @@map("order_attachment_file_deletions")
+}
+
 model SalesOrderInvoiceDocument {
   id                 String              @id @default(cuid())
   orderId            String              @map("order_id")

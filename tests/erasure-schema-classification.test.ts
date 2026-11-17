@@ -168,7 +168,8 @@ test('the erasure deletes the storefront account link rows and does not keep the
 test('order attachments: a sales order\'s attachments are deleted by the erasure (rows and files), classified, and reached only through the sales order', () => {
   const src = readFileSync(new URL('../lib/domain/erasure/erase-personal-data.ts', import.meta.url), 'utf8')
   assert.match(src, /deleteSalesOrderAttachmentsInTx\(tx, ids\)/, 'the erasure core deletes the attachment rows of the erased orders')
-  assert.match(src, /removeOrderAttachmentFiles\(storedNames\)/, 'and removes their files, after the commit')
+  assert.match(src, /drainOrderAttachmentFileDeletions\(\)/, 'and removes their files after the commit, from the durable queue the same transaction wrote')
+  assert.match(readFileSync(new URL('../lib/domain/order-attachments/index.ts', import.meta.url), 'utf8'), /tx\.orderAttachmentFileDeletion\.createMany/, 'the deletion obligation is recorded in the transaction')
   assert.ok(ERASURE_CLASSIFICATION.OrderAttachment!.erased.includes('originalFilename'), 'a file name can carry a name')
   const domain = readFileSync(new URL('../lib/domain/order-attachments/index.ts', import.meta.url), 'utf8')
   assert.match(domain, /tx\.orderAttachment\.deleteMany/, 'deleted outright, soft-deleted rows included')

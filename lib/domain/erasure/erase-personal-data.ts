@@ -11,8 +11,7 @@ import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } fr
 import { summariseWarehouseOrdersInTx, decideSystemVerdicts, recordOpenWarehouseOrdersNoticeInTx } from './warehouse-obligations'
 import { scrubAccountingDerivedCopiesInTx, type DerivedCopyCounts } from './derived-copies'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
-import { deleteSalesOrderAttachmentsInTx } from '@/lib/domain/order-attachments'
-import { removeOrderAttachmentFiles } from '@/lib/order-attachment-storage'
+import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 export { orderIsErasedInTx }
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdentityKeys } from './activity-identity'
@@ -398,13 +397,13 @@ const emptyOutcome = (): ErasureOutcome => ({ warehouse: { ...EMPTY_WAREHOUSE_SU
 /**
  * REMOVE THE FILES OF THE ATTACHMENT ROWS AN ERASURE DELETED. Runs after the commit: a file cannot be rolled back, so deleting it inside the
  * transaction could destroy a document for an erasure that then failed. A file that cannot be removed (a permission problem, say) is NOT silent:
- * an ERROR activity row names the stored file names (random uuids, no person) so an operator can remove them by hand.
+ * an ERROR activity row names the stored file names (random uuids, no person). The obligation is DURABLE: the names were queued in order_attachment_file_deletions in the erasure transaction, so a failed or interrupted removal is retried by the next drain (the daily activity-cleanup cron).
  */
 async function removeErasedAttachmentFiles(storedNames: string[], requestId: string, userId: string | null): Promise<void> {
   if (storedNames.length === 0) return
   let failed: string[]
   try {
-    failed = (await removeOrderAttachmentFiles(storedNames)).failed
+    failed = (await drainOrderAttachmentFileDeletions()).failed
   } catch {
     failed = storedNames
   }
@@ -414,7 +413,7 @@ async function removeErasedAttachmentFiles(storedNames: string[], requestId: str
     tag: 'sales',
     action: 'erasure_attachment_files_not_removed',
     level: 'ERROR',
-    description: 'An erasure deleted order attachment records but could not remove some of their files; remove them by hand',
+    description: 'An erasure deleted order attachment records but could not remove some of their files yet; they stay queued and are retried by the daily cleanup',
     metadata: { requestId, storedNames: failed },
     userId,
   })
