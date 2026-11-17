@@ -3646,7 +3646,24 @@ export async function allocateSalesOrder(
     if (input.capPeggedLines && pegContext) {
       for (const line of lines) {
         const extra = pegContext.ownExtraByLine.get(line.id)
-        if (extra === undefined) continue
+        if (extra === undefined) {
+          // An UNPEGGED line takes nothing new in the peg pass: it keeps what it already holds and waits for the oldest-first
+          // pass, so it cannot reserve newly received stock ahead of an older order. The cap is in line units, over the line's
+          // resolved requirement set, so a kit line keeps its component reservations too.
+          const perUnit = scaleFulfillmentRequirements(requirementsByLine.get(line.id) ?? [], new Prisma.Decimal(1))
+          let heldUnits: Prisma.Decimal | null = null
+          for (const [productId, qtyPerUnit] of perUnit) {
+            if (!toDecimal(qtyPerUnit).gt(0)) continue
+            const heldQty = ownAllocations
+              .filter((row) => row.lineId === line.id && row.productId === productId)
+              .reduce((sum, row) => sum.add(toDecimal(row.qty)), new Prisma.Decimal(0))
+            const units = heldQty.div(toDecimal(qtyPerUnit))
+            heldUnits = heldUnits === null ? units : Prisma.Decimal.min(heldUnits, units)
+          }
+          const kept = Prisma.Decimal.max(new Prisma.Decimal(0), (heldUnits ?? new Prisma.Decimal(0)).sub(committedByLine.get(line.id) ?? new Prisma.Decimal(0)))
+          line.qty = Prisma.Decimal.min(line.qty, kept)
+          continue
+        }
         const held = ownAllocations
           .filter((row) => row.lineId === line.id && row.productId === line.productId)
           .reduce((sum, row) => sum.add(toDecimal(row.qty)), new Prisma.Decimal(0))

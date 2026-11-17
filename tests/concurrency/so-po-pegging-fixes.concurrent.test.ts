@@ -260,3 +260,32 @@ test('a pegged line is served from its receipt before an unpegged line for the s
     await db.salesOrderLinePeg.deleteMany({ where: { purchaseOrderLineId: line.poLineId } })
   }
 })
+
+test('the peg pass allocates only pegged demand: a pegged order\'s unpegged line waits behind an older order for the same receipt', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const { allocateSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const po = await fixtures.seedPo('peg-multi', [10, 10])
+  const [p, q] = po.lines as [typeof po.lines[number], typeof po.lines[number]]
+  const mk = (createdAt: Date, lines: Array<{ productId: string; qty: number }>) => db.salesOrder.create({
+    data: {
+      orderNumber: `PEGFIX-multi-${randomUUID().slice(0, 8)}`, status: 'PROCESSING', currency: 'GBP', createdAt, shipFromWarehouseId: po.warehouseId,
+      subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10,
+      lines: { create: lines.map((l, i) => ({ productId: l.productId, description: `l${i}`, sku: `MULTI-${i}`, qty: l.qty, unitPriceForeign: 10, unitPriceBase: 10, totalForeign: 10 * l.qty, totalBase: 10 * l.qty })) },
+    },
+    select: { id: true, lines: { select: { id: true, productId: true } } },
+  })
+  const older = await mk(new Date('2026-01-01T00:00:00Z'), [{ productId: q.productId, qty: 3 }])
+  const newer = await mk(new Date('2026-02-01T00:00:00Z'), [{ productId: p.productId, qty: 3 }, { productId: q.productId, qty: 3 }])
+  const total = async (orderId: string, productId: string) => Number((await db.orderAllocation.aggregate({ where: { orderId, productId }, _sum: { qty: true } }))._sum.qty ?? 0)
+  try {
+    await pegTo(db, p.poLineId, newer.lines.find((l) => l.productId === p.productId)!.id, 3)
+    for (const line of [p, q]) assert.equal((await fixtures.receive(po, line, 3)).success, true)
+    await allocateSalesOrder(db, { orderId: newer.id, capPeggedLines: true })
+    assert.equal(await total(newer.id, p.productId), 3, 'the pegged line is served from its receipt')
+    assert.equal(await total(newer.id, q.productId), 0, 'its unpegged Q line takes nothing in the peg pass')
+    await allocateSalesOrder(db, { orderId: older.id })
+    assert.equal(await total(older.id, q.productId), 3, 'the older order gets the Q')
+  } finally {
+    await db.salesOrderLinePeg.deleteMany({ where: { purchaseOrderLineId: p.poLineId } })
+  }
+})
