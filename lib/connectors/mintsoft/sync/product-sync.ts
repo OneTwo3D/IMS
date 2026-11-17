@@ -14,6 +14,9 @@ import { snapshotFromRow } from '@/lib/domain/product-content/store'
 import { classifyIdentifierCodes, sameCode, type IdentifierCodes } from '@/lib/domain/products/identifiers'
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
 import { classifyMintsoftProductRecord } from '../api/normalizers'
+import { readMintsoftProductParityEnabled } from '../settings/product-parity'
+import { applyMintsoftProductParity, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
+import { runMintsoftParentSkuDeletionPass } from './parent-sku-deletion'
 import { describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
 const ELIGIBLE_PRODUCT_TYPES = [
@@ -25,11 +28,11 @@ const ELIGIBLE_PRODUCT_TYPES = [
 const ELIGIBLE_PRODUCT_TYPE_SET = new Set<ProductType>(ELIGIBLE_PRODUCT_TYPES)
 const PRODUCT_VERIFY_BATCH_SIZE = 100
 const PRODUCT_SYNC_CONCURRENCY = 5
-const ELIGIBLE_PRODUCT_WHERE = {
+export const ELIGIBLE_PRODUCT_WHERE = {
   type: { in: [...ELIGIBLE_PRODUCT_TYPES] },
   lifecycleStatus: { not: ProductLifecycleStatus.ARCHIVED },
 } satisfies Prisma.ProductWhereInput
-const PRODUCT_SYNC_CANDIDATE_SELECT = {
+export const PRODUCT_SYNC_CANDIDATE_SELECT = {
   id: true,
   sku: true,
   name: true,
@@ -45,6 +48,8 @@ const PRODUCT_SYNC_CANDIDATE_SELECT = {
   imageUrl: true,
   type: true,
   lifecycleStatus: true,
+  // Read for the parity setting only (a variation inherits its parent's name base, weight and dimensions); unused while it is off.
+  parent: { select: { name: true, weight: true, widthCm: true, heightCm: true, depthCm: true } },
   content: { select: { shortDescription: true, longDescription: true, images: true } },
   wmsProductLinks: {
     where: { connector: 'mintsoft' },
@@ -66,7 +71,7 @@ type MintsoftProductSyncScope = {
   warehouseCode: string
 }
 
-type ProductSyncCandidate = {
+export type ProductSyncCandidate = {
   id: string
   sku: string
   name: string
@@ -83,6 +88,7 @@ type ProductSyncCandidate = {
   imageUrl: string | null
   type: ProductType
   lifecycleStatus: ProductLifecycleStatus
+  parent?: { name: string; weight: Prisma.Decimal | null; widthCm: Prisma.Decimal | null; heightCm: Prisma.Decimal | null; depthCm: Prisma.Decimal | null } | null
   content?: { shortDescription: string | null; longDescription: string | null; images: Prisma.JsonValue } | null
   wmsProductLinks: Array<{
     id: string
@@ -752,6 +758,17 @@ async function syncOneMintsoftProduct(
     dto = { ...dto, commodityCode: validatedCommodityCode }
   }
 
+  // PRODUCT PARITY (o3d-zvec.20). Off (the default): nothing below this line changes, `dto` has no costPrice key, and the name,
+  // weight and dimensions are the product's own, so the payload hash and every outbound byte are what they always were. On: the
+  // name is fitted to Mintsoft's 99-character limit, a variation inherits its parent's weight and dimensions where its own are
+  // missing, and the IMS cost is sent. Cost is business-sensitive and is kept out of every log below.
+  const parityEnabled = await readMintsoftProductParityEnabled()
+  if (parityEnabled) {
+    const costPrice = await readMintsoftProductCost(context.product.id, context.product.type)
+    dto = applyMintsoftProductParity(dto, context.product, costPrice)
+  }
+  const logRaw = <T>(raw: T): T => (parityEnabled ? redactMintsoftCostPrice(raw) : raw)
+
   // Customs discrepancies (HS/CN code + country of origin) are reconciled HERE — BEFORE any barcode-related
   // early return — so a barcode conflict can never suppress them and leave a legacy issue unreported (Codex
   // review r9). A bad HS/CN code is omitted from the push; an invalid origin still declares CN for customs
@@ -823,7 +840,7 @@ async function syncOneMintsoftProduct(
       productId: context.product.id,
       action: 'conflict',
       reason: message,
-      payload: toJsonPayload(authoritative?.raw),
+      payload: toJsonPayload(logRaw(authoritative?.raw)),
       remoteUpdated: false,
     }
   }
@@ -928,7 +945,7 @@ async function syncOneMintsoftProduct(
       reason: barcodePlan.kind === 'backfill'
         ? 'Barcode backfilled from Mintsoft; no remote update required'
         : 'Product already matches Mintsoft payload',
-      payload: toJsonPayload(authoritative?.raw),
+      payload: toJsonPayload(logRaw(authoritative?.raw)),
       remoteUpdated: false,
     }
   }
@@ -949,7 +966,7 @@ async function syncOneMintsoftProduct(
       productId: context.product.id,
       action: 'conflict',
       reason: 'Barcode conflict recorded; non-barcode payload already matches Mintsoft',
-      payload: toJsonPayload(authoritative?.raw),
+      payload: toJsonPayload(logRaw(authoritative?.raw)),
       remoteUpdated: false,
     }
   }
@@ -1047,7 +1064,7 @@ async function syncOneMintsoftProduct(
       : synced.externalId === externalProductId
         ? 'Mintsoft product updated'
         : 'Mintsoft product created',
-    payload: toJsonPayload(synced.raw),
+    payload: toJsonPayload(logRaw(synced.raw)),
     remoteUpdated: true,
   }
 }
@@ -1399,7 +1416,9 @@ export async function runMintsoftProductVerify(triggeredBy: string): Promise<Min
     }
   }
 
-  return runMintsoftProductSyncJob((async function* () {
+  // The moment the run began: a variation's link must have been refreshed AFTER this to count as confirmed by it.
+  const runStartedAt = new Date()
+  const result = await runMintsoftProductSyncJob((async function* () {
     let cursorId: string | undefined
     while (true) {
       const batch = await listEligibleMintsoftProductsBatch(cursorId)
@@ -1416,6 +1435,23 @@ export async function runMintsoftProductVerify(triggeredBy: string): Promise<Min
     batchSize: PRODUCT_VERIFY_BATCH_SIZE,
     concurrency: PRODUCT_SYNC_CONCURRENCY,
   } satisfies Prisma.InputJsonObject)
+
+  // PARENT SKU DELETION (o3d-zvec.20): behind its own setting (default off; the pass returns at once without reading anything else
+  // when it is off). Only after a run that completed with no error, so it never acts on a partly-refreshed catalogue; the pass
+  // itself still proves every variation from the stored links and refuses on any doubt.
+  if (result.status === 'SUCCEEDED') {
+    try {
+      await runMintsoftParentSkuDeletionPass({ since: runStartedAt, triggeredBy })
+    } catch (error) {
+      // The verify run itself succeeded and stays reported as such; a failed pass deleted nothing it could not prove.
+      await logActivity({
+        entityType: 'SYSTEM', tag: 'sync', action: 'mintsoft_parent_sku_delete_pass_failed', level: 'ERROR',
+        description: `Mintsoft parent SKU deletion pass failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        resolveUser: false,
+      })
+    }
+  }
+  return result
 }
 
 export async function runMintsoftProductVerifyForSkus(
