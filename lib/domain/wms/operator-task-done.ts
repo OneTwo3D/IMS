@@ -100,14 +100,18 @@ export async function completeWmsOperatorTask(params: {
       level: 'INFO',
       description: partial
         ? `Operator task done for order ${orderLabel} on warehouse order ${task.externalOrderId}: every recorded line was verified gone${settled ? ' and the warehouse link was closed as cancelled' : '; the warehouse link had already moved on, so it was not changed'}.`
-        : `Operator task done for order ${orderLabel} on warehouse order ${task.externalOrderId}: the query was raised in the warehouse's system.`,
+        : task.reason === 'SHOP_REFUND_DUE'
+          ? `Operator task done for order ${orderLabel}: Refund in WooCommerce, marked done by a person. IMS wrote nothing to WooCommerce.`
+          : `Operator task done for order ${orderLabel} on warehouse order ${task.externalOrderId}: the query was raised in the warehouse's system.`,
       metadata: { taskId, connector: task.connector, reason: task.reason, externalOrderId: task.externalOrderId, ...(partial ? { linkSettled: settled } : {}) },
     })
     return {
       ok: true as const,
       notice: partial
         ? (settled ? 'Every line is gone from the warehouse order. The link was closed as cancelled.' : 'Every line is gone from the warehouse order. The link had already moved on, so it was not changed.')
-        : 'Marked done.',
+        : task.reason === 'SHOP_REFUND_DUE'
+          ? 'Marked done. If the refund in WooCommerce has not been imported into IMS yet, IMS can no longer link it to this credit note.'
+          : 'Marked done.',
     }
   }, { maxWait: 5_000, timeout: 20_000 })
 }

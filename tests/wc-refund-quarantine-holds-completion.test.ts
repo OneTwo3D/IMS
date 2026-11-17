@@ -116,6 +116,8 @@ mock.module('@/lib/db', {
           lines: [],
         }),
       },
+      // zvec.19: the open "Refund in WooCommerce" task read; none here (a refund that began in WooCommerce).
+      wmsOperatorTask: { findMany: async () => [] },
       salesOrderRefund: {
         findFirst: async () => (refundLandedInIms ? { id: 'r-1', orderId: IMS_ORDER_ID } : null),
       },
