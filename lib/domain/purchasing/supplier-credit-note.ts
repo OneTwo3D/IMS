@@ -1,7 +1,7 @@
 import { rateBinding, type TaxBindingBasis } from '@/lib/accounting/reverse-charge'
 import { noVatRateKind } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
-import { addMoney, multiplyMoney, roundMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundMoney, toDecimal } from '@/lib/domain/math/decimal'
 // ---------------------------------------------------------------------------
 // Supplier credit-note domain logic (audit-g5u2)
 //
@@ -122,55 +122,119 @@ export function planReverseChargeSupplierCredit(params: { amount: number; lines:
   const { currency } = params
   const places = roundMoney(1.23456789, currency).decimalPlaces()
   const minor = toDecimal(1).div(toDecimal(10).pow(places))
+  const toMinor = (d: ReturnType<typeof toDecimal>) => d.div(minor).toDecimalPlaces(0, 4).toNumber()
   const payables = params.lines.map((l) => linePayable(l, currency))
   const total = payables.reduce((a, b) => addMoney(a, b), toDecimal(0))
   const amount = roundMoney(params.amount, currency)
   if (!total.gt(0) || amount.gt(total)) return 'exceeds'
-  // LARGEST REMAINDER: each share is floored to the minor unit (never negative, never above the line's payable), then the leftover minor units go one at a time to the lines with the
-  // largest remainders. The shares add up to the credit exactly, and a credit smaller than the number of lines lands on as few lines as it needs (a zero share is omitted).
-  const exact = payables.map((p) => amount.mul(p).div(total))
-  const shares = exact.map((e) => e.toDecimalPlaces(places, 1 /* ROUND_DOWN */))
-  let leftover = amount.minus(shares.reduce((a, b) => addMoney(a, b), toDecimal(0))).div(minor).toNumber()
-  const order = exact.map((e, i) => ({ i, rem: e.minus(shares[i]) })).filter((r) => payables[r.i].gt(shares[r.i])).sort((x, y) => y.rem.comparedTo(x.rem) || x.i - y.i)
-  for (const r of order) { if (leftover <= 0) break; shares[r.i] = addMoney(shares[r.i], minor); leftover-- }
-  if (leftover > 0) return 'inexact'
-  // Each line's net from its share: a reverse-charge share is its net; a standard share is gross, turned back into net and VAT.
-  const lineGross = (l: SupplierCreditBillLine, net: ReturnType<typeof toDecimal>) => l.reverseCharge ? net : addMoney(net, roundMoney(multiplyMoney(net, l.rate), currency))
-  const maxNet = params.lines.map((l) => roundMoney(l.net, currency))
-  const nets = params.lines.map((l, i) => {
-    if (!shares[i].gt(0)) return toDecimal(0)
-    return l.reverseCharge ? shares[i] : roundMoney(shares[i].div(addMoney(1, l.rate)), currency)
-  })
-  // VERIFY what Xero will hold (the exclusive nets plus each standard line's VAT, rounded per line as the writer and its predictor do) against the credit. A standard line's gross takes only
-  // some values (VAT rounds per line), so any gap is closed by moving a net one minor unit at a time on lines where that gets closer, within the line's own net; if it cannot be closed
-  // exactly, nothing is planned.
-  const actual = () => nets.reduce((a, n, i) => addMoney(a, lineGross(params.lines[i], n)), toDecimal(0))
-  for (let guard = 0; guard < params.lines.length * 4 + 100; guard++) {
-    const diff = subtractMoney(amount, actual())
-    if (diff.isZero()) break
-    const dir = diff.gt(0) ? minor : minor.neg()
-    let moved = false
-    for (let i = 0; i < nets.length && !moved; i++) {
-      const next = addMoney(nets[i], dir)
-      if (next.lt(0) || next.gt(maxNet[i])) continue
-      const change = subtractMoney(lineGross(params.lines[i], next), lineGross(params.lines[i], nets[i]))
-      if (change.abs().gt(diff.abs()) || change.isZero() || change.gt(0) !== diff.gt(0)) continue
-      nets[i] = next
-      moved = true
-    }
-    if (!moved) return 'inexact'
+  const A = toMinor(amount)
+  const n = params.lines.length
+  const cap = payables.map(toMinor)
+  const isRc = params.lines.map((l) => l.reverseCharge)
+  // The most net a line can carry is its own net (a full credit reproduces the bill line).
+  const maxNet = params.lines.map((l, i) => (isRc[i] ? cap[i] : toMinor(roundMoney(l.net, currency))))
+  // What Xero holds for a line of `net` minor units: a reverse-charge line is its net (the VAT is self-accounted); a standard line is net plus its own VAT rounded to the minor unit.
+  const grossCache = new Map<string, number>()
+  const gross = (i: number, net: number): number => {
+    if (isRc[i]) return net
+    const key = `${params.lines[i].rate}|${net}`
+    let g = grossCache.get(key)
+    if (g === undefined) { g = net + toDecimal(net).mul(toDecimal(params.lines[i].rate)).toDecimalPlaces(0, 4).toNumber(); grossCache.set(key, g) }
+    return g
   }
-  if (!subtractMoney(amount, actual()).isZero()) return 'inexact'
+
+  // 1. STANDARD LINES FIRST: their gross takes only some values (VAT rounds per line), so their nets are chosen first, pro rata (largest remainder on the gross share) and then
+  //    brought under the credit. Reverse-charge lines are exact at any minor-unit amount, so they absorb what is left.
+  const payMinor = cap
+  const totalMinor = payMinor.reduce((a, b) => a + b, 0)
+  const exact = payMinor.map((p) => (A * p) / totalMinor)
+  const shares = exact.map((e) => Math.floor(e + 1e-9))
+  let leftover = A - shares.reduce((a, b) => a + b, 0)
+  const order = exact.map((e, i) => ({ i, rem: e - shares[i] })).filter((r) => payMinor[r.i] > shares[r.i]).sort((x, y) => y.rem - x.rem || x.i - y.i)
+  for (const r of order) { if (leftover <= 0) break; shares[r.i]++; leftover-- }
+  const nets = shares.map((sh, i) => (isRc[i] ? 0 : Math.min(maxNet[i], Math.round(sh / (1 + params.lines[i].rate)))))
+  const stdIdx = params.lines.map((_, i) => i).filter((i) => !isRc[i])
+  const rcIdx = params.lines.map((_, i) => i).filter((i) => isRc[i])
+  const sumStd = () => stdIdx.reduce((a, i) => a + gross(i, nets[i]), 0)
+  const rcCap = rcIdx.reduce((a, i) => a + cap[i], 0)
+  const guard = n * 4 + 100
+  // Too much from the standard lines: take a minor unit of net off the largest, round and round.
+  const byNetDesc = [...stdIdx].sort((x, y) => nets[y] - nets[x])
+  for (let g = 0, k = 0; g < guard && sumStd() > A && byNetDesc.length > 0; g++, k++) {
+    const i = byNetDesc[k % byNetDesc.length]
+    if (nets[i] > 0) nets[i]--
+  }
+  // Too little to be absorbed by the reverse-charge lines: add a minor unit of net where that does not pass the credit.
+  for (let g = 0; g < guard && A - sumStd() > rcCap; g++) {
+    const room = A - sumStd()
+    const i = stdIdx.find((j) => nets[j] < maxNet[j] && gross(j, nets[j] + 1) - gross(j, nets[j]) <= room)
+    if (i === undefined) break
+    nets[i]++
+  }
+  const remaining = A - sumStd()
+  let solved = remaining >= 0 && remaining <= rcCap
+  if (solved) {
+    // 2. The reverse-charge lines take the rest, largest remainder on their payable, each within its own net.
+    const rcNets = new Map<number, number>()
+    const rcExact = rcIdx.map((i) => (rcCap > 0 ? (remaining * cap[i]) / rcCap : 0))
+    const rcShares = rcExact.map((e, k) => Math.min(cap[rcIdx[k]], Math.floor(e + 1e-9)))
+    let left = remaining - rcShares.reduce((a, b) => a + b, 0)
+    const rcOrder = rcIdx.map((_, k) => k).sort((x, y) => (rcExact[y] - rcShares[y]) - (rcExact[x] - rcShares[x]) || x - y)
+    while (left > 0) {
+      let gave = false
+      for (const k of rcOrder) { if (left > 0 && rcShares[k] < cap[rcIdx[k]]) { rcShares[k]++; left--; gave = true } }
+      if (!gave) break
+    }
+    if (left > 0) solved = false
+    else rcIdx.forEach((i, k) => rcNets.set(i, rcShares[k]))
+    if (solved) rcNets.forEach((v, i) => { nets[i] = v })
+  }
+  if (!solved) {
+    // 3. NO EXACT FIT YET (no reverse-charge line to absorb the gap, or too little room on them): search exactly. Every combination of nets within each line's own net is considered
+    //    (a reachability table over the credit in minor units), so the credit is refused only when NO combination equals it. Bounded: a bill too large to search is refused.
+    const work = nets.reduce((acc, _, i) => acc + (Math.min(maxNet[i], A) + 1) * (A + 1), 0)
+    if (work > 60_000_000) return 'inexact'
+    const reach: Uint8Array[] = [new Uint8Array(A + 1)]
+    reach[0][0] = 1
+    for (let i = 0; i < n; i++) {
+      const next = new Uint8Array(A + 1)
+      const prev = reach[i]
+      const top = Math.min(maxNet[i], A)
+      for (let net = 0; net <= top; net++) {
+        const g = gross(i, net)
+        if (g > A) break
+        for (let sum = 0; sum + g <= A; sum++) if (prev[sum]) next[sum + g] = 1
+      }
+      reach.push(next)
+    }
+    if (!reach[n][A]) return 'inexact'
+    let sum = A
+    for (let i = n - 1; i >= 0; i--) {
+      let chosen = -1
+      const top = Math.min(maxNet[i], A)
+      for (let net = 0; net <= top; net++) {
+        const g = gross(i, net)
+        if (g > sum) break
+        if (reach[i][sum - g]) { chosen = net; break }
+      }
+      if (chosen < 0) return 'inexact'
+      nets[i] = chosen
+      sum -= gross(i, chosen)
+    }
+  }
+  // VERIFY what Xero will hold (exclusive nets plus each standard line's VAT, per line) against the credit; never plan a mismatch.
+  const totalGross = nets.reduce((a, v, i) => a + gross(i, v), 0)
+  if (totalGross !== A || nets.some((v, i) => v < 0 || v > maxNet[i])) return 'inexact'
   const lines: ReverseChargeCreditPlan['lines'] = []
-  let netTotal = toDecimal(0)
+  let netSum = 0
   params.lines.forEach((l, i) => {
-    const net = nets[i]
-    if (!net.gt(0)) return
-    const vat = l.reverseCharge ? toDecimal(0) : roundMoney(multiplyMoney(net, l.rate), currency)
-    netTotal = addMoney(netTotal, net)
+    if (nets[i] <= 0) return
+    netSum += nets[i]
+    const net = toDecimal(nets[i]).mul(minor)
+    const vat = toDecimal(gross(i, nets[i]) - nets[i]).mul(minor)
     lines.push({ net: net.toNumber(), vat: vat.toNumber(), taxType: l.taxType, ...(l.taxRateId ? { taxRateId: l.taxRateId } : {}), reverseCharge: l.reverseCharge })
   })
-  return { lines, netTotal: netTotal.toNumber(), xeroTotal: amount.toNumber() }
+  return { lines, netTotal: toDecimal(netSum).mul(minor).toNumber(), xeroTotal: amount.toNumber() }
 }
 
 /** The credit cannot be split across the bill's lines into amounts Xero reproduces exactly: nothing is sent. */

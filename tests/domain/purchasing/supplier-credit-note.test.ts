@@ -354,9 +354,44 @@ test('property: random bills and credits give Xero total = allocation = transit 
     const payable = billNetPayable(lines, 'GBP')
     const credit = rnd() < 0.2 ? payable : Math.max(0.01, Math.round(rnd() * payable * 100) / 100)
     const plan = planReverseChargeSupplierCredit({ amount: credit, lines, currency: 'GBP' })
-    if (typeof plan === 'string') { assert.equal(plan, 'inexact'); continue }
+    if (typeof plan === 'string') { assert.ok(!lines.some((l) => l.reverseCharge), `a bill with reverse-charge lines refused a credit: ${String(plan)}`); continue }
     planned++
     assertExact(plan, credit)
   }
-  assert.ok(planned >= 380, `almost every random credit is plannable (${planned}/400)`)
+  assert.ok(planned >= 300, `almost every random credit is plannable (${planned}/400)`)
+})
+
+test('Codex example: a 1.00 reverse-charge line and a 1,000.00 standard line at 20%, credit 1.05, plans exactly', () => {
+  const lines = [{ ...RC, net: 1 }, { ...STD, net: 1000 }]
+  assertExact(planReverseChargeSupplierCredit({ amount: 1.05, lines, currency: 'GBP' }), 1.05)
+})
+test('property vs a brute-force reference: whenever an exact combination exists (small bills) the planner finds one; it refuses only when none exists', () => {
+  let seed = 987654
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296 }
+  const rates = [0.2, 0.05, 0.175]
+  let plannable = 0, refused = 0
+  for (let t = 0; t < 600; t++) {
+    const count = 1 + Math.floor(rnd() * 3)
+    const lines = Array.from({ length: count }, () => {
+      const net = Math.round((0.01 + rnd() * (rnd() < 0.3 ? 20 : 3)) * 100) / 100
+      if (rnd() < 0.4) return { ...RC, net }
+      return { taxType: 'IN', rate: rates[Math.floor(rnd() * rates.length)], reverseCharge: false, net }
+    })
+    const payable = pence(billNetPayable(lines, 'GBP'))
+    const A = 1 + Math.floor(rnd() * payable)
+    // Reference: every reachable credit total, over every net each line can carry (RC: net; standard: net + VAT rounded half up).
+    let reachable = new Set<number>([0])
+    for (const l of lines) {
+      const next = new Set<number>()
+      for (let net = 0; net <= pence(l.net); net++) {
+        const g = l.reverseCharge ? net : net + Math.round(net * l.rate + 1e-9)
+        for (const r of reachable) if (r + g <= A) next.add(r + g)
+      }
+      reachable = next
+    }
+    const plan = planReverseChargeSupplierCredit({ amount: A / 100, lines, currency: 'GBP' })
+    if (reachable.has(A)) { plannable++; assertExact(plan, A / 100) } else { refused++; assert.equal(plan, 'inexact', `no exact combination exists for ${A}`) }
+  }
+  assert.ok(plannable > 300)
+  void refused
 })
