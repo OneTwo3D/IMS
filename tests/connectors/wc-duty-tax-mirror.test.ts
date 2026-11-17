@@ -18,7 +18,6 @@ const { parseShopIossNumber, iossFieldsFromRegime } = unwrap(shopNs)
 const { wclcComponentColumns } = unwrap(orderImportNs)
 const { readWcHsCodeMirror } = unwrap(hsNs)
 
-const meta = (...pairs: Array<[string, unknown]>) => ({ meta_data: pairs.map(([key, value], id) => ({ id, key, value })) })
 
 test('shop IOSS number: IM plus ten digits only (trimmed, upper-cased); anything else is not a number', () => {
   assert.equal(parseShopIossNumber(' im5280000001 '), 'IM5280000001')

@@ -31,7 +31,7 @@ export async function mirrorIossFromRegime(orderId: string): Promise<void> {
           action: SHOP_IOSS_NUMBER_MISSING_ACTION,
           tag: 'sync',
           level: 'WARNING',
-          description: 'This order is under the IOSS scheme but the shop IOSS number is not set (or is not in the form IM plus ten digits), so no IOSS number is stored and none will be sent to the warehouse. Set it under Integrations > Mintsoft.',
+          description: 'This order is under the IOSS scheme but the shop IOSS number is not set (or is not in the form IM plus ten digits), so no IOSS number is stored and none will be sent to the warehouse. Set the shop IOSS number in the integration settings.',
           resolveUser: false,
         })
       }
