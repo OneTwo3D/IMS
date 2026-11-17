@@ -27,6 +27,8 @@ const state = {
   linkDeletes: [] as Row[],
   events: [] as Row[],
   dbCalls: 0,
+  clientId: '89' as string | null,
+  fetched: 'ok' as 'ok' | 'null' | 'throw' | Row,
 }
 
 mock.module('@/lib/db', {
@@ -51,9 +53,16 @@ mock.module('../lib/connectors/mintsoft/producer-seam.ts', {
         : { proceed: false, shadowed: true, notice: 'shadow', reason: 'test', recorded: true, occurrences: 1 },
   },
 })
+mock.module('@/lib/settings-store', { namedExports: { getSettingValue: async (key: string) => (key === 'mintsoft_client_id' ? state.clientId : null) } })
 mock.module('@/lib/connectors/wms/registry', {
   namedExports: {
     getWmsConnector: () => ({
+      async fetchProduct(id: string) {
+        if (state.fetched === 'throw') throw new Error('read failed')
+        if (state.fetched === 'null') return null
+        if (state.fetched !== 'ok') return state.fetched
+        return { externalId: id, sku: 'PARENT', barcode: null, raw: { ID: Number(id), SKU: 'PARENT', ClientId: 89 } }
+      },
       async deleteProduct(id: string) {
         state.deleteCalls.push(id)
         if (state.deleteThrows) throw new Error('boom')
@@ -86,6 +95,8 @@ function reset(opts: { flags?: Record<string, string>; parent?: Row; seam?: 'pro
   state.linkDeletes.length = 0
   state.events.length = 0
   state.dbCalls = 0
+  state.clientId = '89'
+  state.fetched = 'ok'
 }
 
 async function pass() {
@@ -196,6 +207,41 @@ test('an error while deleting is recorded, counted and deletes no link', async (
   assert.equal(counters?.errors, 1)
   assert.deepEqual(state.linkDeletes, [])
   assert.equal(state.events.at(-1)?.outcome, 'FAILED')
+})
+
+const IDENTITY: Array<[string, () => void, RegExp]> = [
+  ['the stored id points at a variation\'s record (its SKU is the variation\'s)', () => { state.fetched = { externalId: '100', sku: 'A', barcode: null, raw: { ClientId: 89 } } }, /now carries SKU A/],
+  ['the SKU differs', () => { state.fetched = { externalId: '100', sku: 'OTHER', barcode: null, raw: { ClientId: 89 } } }, /now carries SKU OTHER/],
+  ['the SKU differs only by case', () => { state.fetched = { externalId: '100', sku: 'parent', barcode: null, raw: { ClientId: 89 } } }, /now carries SKU parent/],
+  ['the record belongs to another tenant', () => { state.fetched = { externalId: '100', sku: 'PARENT', barcode: null, raw: { ClientId: 7 } } }, /ClientId 7, not the configured 89/],
+  ['the record carries no ClientId', () => { state.fetched = { externalId: '100', sku: 'PARENT', barcode: null, raw: {} } }, /no ClientId/],
+  ['the fresh read fails', () => { state.fetched = 'throw' }, /fresh read .* failed: read failed/],
+  ['the fresh read finds nothing', () => { state.fetched = 'null' }, /not found/],
+  ['the read returns another id', () => { state.fetched = { externalId: '999', sku: 'PARENT', barcode: null, raw: { ClientId: 89 } } }, /returned record 999/],
+  ['no client id is configured', () => { state.clientId = null }, /mintsoft_client_id is not configured/],
+]
+for (const [name, arrange, reason] of IDENTITY) {
+  test(`PARENT IDENTITY: ${name} -> refused, recorded, no DELETE`, async () => {
+    reset({ parent: GOOD() })
+    arrange()
+    const counters = await pass()
+    assert.deepEqual(state.deleteCalls, [])
+    assert.deepEqual(state.linkDeletes, [])
+    assert.equal(counters?.refused, 1)
+    assert.match(String(state.events.find((e) => e.action === 'parent_sku_delete_refused')?.error), reason)
+  })
+}
+
+test('PARENT IDENTITY: all checks pass -> exactly one DELETE, to the parent id', async () => {
+  reset({ parent: GOOD() })
+  await pass()
+  assert.deepEqual(state.deleteCalls, ['100'])
+})
+
+test('the outbound-write hold refuses the real DELETE while IMS is not the live writer: nothing is sent and it reports held', async () => {
+  const { classifyMintsoftRequest } = await import('@/lib/connectors/mintsoft/api/read-allowlist')
+  assert.equal(classifyMintsoftRequest('DELETE', '/api/Product/100').class, 'write', 'a known write, so the hold and the egress barrier govern it')
+  assert.equal(classifyMintsoftRequest('GET', '/api/Product/100').class, 'read', 'the identity read stays a read')
 })
 
 test('the real client refuses a non-numeric id before sending anything, and reports Success:false as not deleted', async () => {

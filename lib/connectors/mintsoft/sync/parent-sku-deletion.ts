@@ -6,6 +6,8 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { mintsoftProducerSeam } from '../producer-seam'
 import { normalizeMintsoftProduct } from '../api/normalizers'
 import { readMintsoftParentSkuDeleteEnabled } from '../settings/product-parity'
+import { parseMintsoftPositiveId } from '../settings/schema'
+import { getSettingValue } from '@/lib/settings-store'
 
 /**
  * DELETING A VARIABLE PRODUCT'S PARENT SKU FROM MINTSOFT (o3d-zvec.20), PORTED FROM THE PYTHON SYNC'S DEFERRED PARENT DELETE.
@@ -25,6 +27,11 @@ import { readMintsoftParentSkuDeleteEnabled } from '../settings/product-parity'
  *   - no two variations share a Mintsoft id, and none shares the parent's id or SKU (a "replacement" that IS the parent record
  *     would be deleted with it).
  * The same read is repeated immediately before the call and must reach the same verdict.
+ *
+ * THE PARENT'S OWN RECORD IS PROVEN TOO (Codex R1): variable parents are not refreshed by the verify run, so a stored parent link can
+ * be stale (its id may now carry another SKU). Immediately before the DELETE, with the seam cleared, the record is read fresh from
+ * Mintsoft by the stored id (a read; no write) and must have exactly the parent's SKU, the stored id, the configured ClientId, and
+ * be referenced by no variation link. A failed or empty read, or any mismatch, is a refusal and no delete.
  */
 
 export type ParentLinkRead = {
@@ -127,6 +134,31 @@ export type ParentDeletionCounters = { considered: number; deleted: number; refu
 
 type ParentDeletionContext = { connector: ReturnType<typeof getWmsConnector>; since: Date; triggeredBy: string }
 
+/** Proves, by a fresh read-only fetch, that the record about to be deleted is the parent's own. Null = proven; text = the refusal reason. */
+async function parentRecordProblem(read: ParentDeletionRead, parentExternalId: string, context: ParentDeletionContext): Promise<string | null> {
+  if (read.variations.some((v) => v.link?.externalProductId.trim() === parentExternalId)) return 'the parent\'s Mintsoft id is referenced by a variation link'
+  let clientId: number | null
+  try {
+    clientId = parseMintsoftPositiveId(await getSettingValue('mintsoft_client_id'))
+  } catch {
+    return 'the configured Mintsoft client id could not be read'
+  }
+  if (clientId === null) return 'mintsoft_client_id is not configured, so the record\'s tenant cannot be verified'
+  let fetched: Awaited<ReturnType<ParentDeletionContext['connector']['fetchProduct']>>
+  try {
+    fetched = await context.connector.fetchProduct(parentExternalId)
+  } catch (error) {
+    return `the fresh read of Mintsoft record ${parentExternalId} failed: ${error instanceof Error ? error.message : 'unknown error'}`
+  }
+  if (!fetched) return `Mintsoft record ${parentExternalId} could not be read (not found)`
+  if (fetched.externalId !== parentExternalId) return `the fresh read returned record ${fetched.externalId}, not ${parentExternalId}`
+  if (fetched.sku !== read.sku) return `Mintsoft record ${parentExternalId} now carries SKU ${fetched.sku}, not the parent's ${read.sku}`
+  const rawClient = Number((fetched.raw as Record<string, unknown> | null)?.ClientId ?? (fetched.raw as Record<string, unknown> | null)?.clientId)
+  if (!Number.isInteger(rawClient)) return `Mintsoft record ${parentExternalId} carries no ClientId, so its tenant cannot be verified`
+  if (rawClient !== clientId) return `Mintsoft record ${parentExternalId} belongs to ClientId ${rawClient}, not the configured ${clientId}`
+  return null
+}
+
 /** The ONE place a parent is deleted. The seam asks first; a shadow deletes nothing and leaves the link as it was. */
 async function deleteConfirmedParent(
   read: ParentDeletionRead,
@@ -145,6 +177,12 @@ async function deleteConfirmedParent(
     summary: { sku: read.sku, replacements: verdict.replacements },
   })
   if (!seam.proceed) return 'shadowed'
+
+  const identityProblem = await parentRecordProblem(read, verdict.parentExternalId, context)
+  if (identityProblem) {
+    await recordRefusal(read, [identityProblem], context.triggeredBy)
+    return 'refused'
+  }
 
   const outcome = await context.connector.deleteProduct(verdict.parentExternalId, seam.clearance)
   if (!outcome.deleted) {
