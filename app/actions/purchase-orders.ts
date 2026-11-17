@@ -1,5 +1,6 @@
 'use server'
 
+import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -446,13 +447,19 @@ const ReceiptLineInputSchema = z.object({
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function makeReference(): Promise<string> {
-  const now = new Date()
-  const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
-  const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
+/**
+ * The next purchase order reference, from the purchase order pattern (Settings → Company → Numbering). Call it inside the
+ * transaction that writes the order: a counter pattern holds its row lock until that transaction ends. The configured
+ * prefix is only what the default pattern starts with.
+ */
+async function makeReference(tx: Prisma.TransactionClient, poPrefix: string): Promise<string> {
+  return mintRequiredDocumentNumber(tx, 'purchase_order', { fallbackPrefix: poPrefix })
+}
+
+/** The prefix the default purchase order pattern starts with. Read BEFORE a transaction opens: it takes a second connection. */
+async function readPoPrefix(): Promise<string> {
   const { getNumberingFormats } = await import('./company')
-  const { po_prefix } = await getNumberingFormats()
-  return `${po_prefix}${ymd}-${rand}`
+  return (await getNumberingFormats()).po_prefix
 }
 
 const PO_SELECT = {
@@ -1494,10 +1501,11 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         sortOrder: i,
       }))
 
-    const poReference = input.reference || await makeReference()
+    const poPrefix = input.reference ? '' : await readPoPrefix()
     const po = await db.$transaction(async (tx) => {
     // A line's supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused, under the row share lock the apply waits on (lib/tax/writable-tax-rate.ts).
     await resolveLinesTaxRates(tx, lineData)
+    const poReference = input.reference || await makeReference(tx, poPrefix)
     return tx.purchaseOrder.create({
       data: {
         reference: poReference,
@@ -5729,12 +5737,12 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
     const costLineData = built.rows
 
-    const freightReference = await makeReference()
     // Create the freight PO + landed-cost links AND run the initial recalc in ONE
     // transaction: if the recalc fails (e.g. a linked primary is CLOSED ->
     // throws, or a lock timeout), the freight PO and its LandedCostLinks roll back
     // too, so we never leave 'linked but unapplied' freight with no retry path
     // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
+    const freightPrefix = await readPoPrefix()
     const { po, landedResult } = await db.$transaction(
       async (tx) => {
         // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): this transaction used to lock NOTHING before
@@ -5744,7 +5752,7 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
         await lockLandedCostRevaluationScope(tx, { primaryPoIds: input.primaryPoIds })
         const po = await tx.purchaseOrder.create({
           data: {
-            reference: freightReference,
+            reference: await makeReference(tx, freightPrefix),
             type: 'FREIGHT',
             supplierId: input.supplierId,
             currency: input.currency,

@@ -1,6 +1,8 @@
 'use client'
 
 import { PurchaseOrderEmailSetting } from '@/components/settings/purchase-order-email'
+import { DocumentNumberingPanel } from '@/components/settings/document-numbering'
+import type { DocumentNumberingOverview } from '@/app/actions/document-numbering'
 import { useState, useTransition, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import {
@@ -34,6 +36,7 @@ type Props = {
   org: OrganisationData
   baseCurrencyLocked: boolean
   numbering: NumberingFormats
+  documentNumbering: DocumentNumberingOverview
   email: EmailSettings
   branding: BrandingColours
   templates: DocumentTemplateData[]
@@ -69,7 +72,7 @@ const SUPPORTED_TIMEZONES: string[] = _intl.supportedValuesOf
   ? _intl.supportedValuesOf('timeZone')
   : ['Europe/London', 'UTC']
 
-export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault, purchaseOrderEmailEnabled }: Props) {
+export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, documentNumbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault, purchaseOrderEmailEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [isEmailPending, startEmailTransition] = useTransition()
@@ -605,6 +608,7 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
           </div>
         </Card>
       )}
+      {tab === 'numbering' && <DocumentNumberingPanel overview={documentNumbering} />}
 
       {/* ---- Email ---- */}
       {tab === 'email' && (

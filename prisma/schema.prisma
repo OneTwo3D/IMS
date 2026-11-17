@@ -469,6 +469,25 @@ model Setting {
   @@map("settings")
 }
 
+/// The numbering pattern and counter of one kind of document IMS numbers itself (sales order, purchase order, credit note, shipment). One row per kind,
+/// created the first time it is needed. The row is the lock: a number is minted with the row held FOR UPDATE inside the transaction that writes the document
+/// (lib/domain/numbering/mint.ts). A NULL `pattern` means the kind's built-in default, which reproduces the numbers IMS minted before patterns existed.
+/// Sales INVOICE numbers are not here: the incumbent owns them.
+model DocumentNumberSequence {
+  documentType String   @id @map("document_type")
+  /// The operator's pattern ({YYYY} {YY} {MM} {DD} {SEQ} {SEQ:n} {RAND:n} and plain text); NULL = the default.
+  pattern      String?
+  /// The period the counter below belongs to (the date tokens of the pattern, rendered); NULL = never used, '' = one counter for ever.
+  scopeKey     String?  @map("scope_key")
+  /// The last counter issued in that period.
+  counter      Int      @default(0)
+  updatedAt    DateTime @default(now()) @map("updated_at")
+  /// The user who last changed the pattern or the counter; NULL for the system.
+  updatedBy    String?  @map("updated_by")
+
+  @@map("document_number_sequences")
+}
+
 /// Customisable document templates for PDF generation
 model DocumentTemplate {
   id             String   @id @default(cuid())
@@ -5468,6 +5487,8 @@ model Shipment {
   id              String         @id @default(cuid())
   orderId         String
   warehouseId     String
+  /// The number IMS gave the shipment from the pattern set under Settings > Company > Numbering. NULL until a shipment pattern is set, and for every shipment created before one was. Unique.
+  reference       String?        @unique
   status          ShipmentStatus @default(PENDING)
   trackingNumber  String?
   shippingService String?

@@ -141,6 +141,7 @@ import {
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
+import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
 import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
 import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
 import {
@@ -409,13 +410,6 @@ export type CreateSoInput = {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function makeReference(prefix: string): string {
-  const now = new Date()
-  const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
-  const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
-  return `${prefix}${ymd}-${rand}`
-}
 
 async function nextDocumentNumber(
   tx: Prisma.TransactionClient,
@@ -1349,11 +1343,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     const { orderDefaultRate } = prepared
     const lineData = prepared.model.lines
 
-    // Generate order number using configured prefix (Settings → Company → Numbering)
+    // The order number is minted inside the transaction below, from the sales order pattern (Settings → Company → Numbering). The configured prefix is only what the default pattern starts with.
     const { getNumberingFormats } = await import('./company')
     const numbering = await getNumberingFormats()
-    const ref = makeReference(numbering.so_prefix)
-    const orderNumber = ref
 
     // Drafts stay in DRAFT and are NOT queued for accounting sync. When the
     // order is finalised later (e.g. moved to PENDING_PAYMENT), the invoice
@@ -1377,6 +1369,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       await resolveLinesTaxRates(tx, lineData)
       // An erased customer is never linked to a new order (lock + re-read; see lib/domain/erasure/customer-link.ts).
       await lockCustomerForOrderLink(tx, input.customerId)
+      // Minted LAST, right before the write: a counter pattern holds its row lock until this transaction ends.
+      const orderNumber = await mintRequiredDocumentNumber(tx, 'sales_order', { fallbackPrefix: numbering.so_prefix })
       return tx.salesOrder.create({
         data: {
           externalOrderNumber,
@@ -3993,7 +3987,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     // The clone copies the amounts as stored, so its flag is the BASIS those amounts are stored in (storedAmountsIncludeVat): net for a WooCommerce source whatever
     // its display flag says, the order's own flag otherwise.
 
-    const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+    let ref = ''
     // A CLONE IS A NEW DOCUMENT: its rate is the table rate NOW (as createSalesOrder), never the source order's (which may be a legacy typed or 1:1 rate), and every base amount is
     // recomputed from the foreign amounts at that rate with the same rounding the draft re-pricing uses (nothing is copied from the source's base fields). A currency with no rate
     // refuses (the central lookup's "Missing <base> FX rate ..."); the base currency is 1.
@@ -4011,6 +4005,8 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     // an active rate when the clone started and has none now was deactivated in between: the clone is refused (NamedTaxRateGoneError), never saved naming it.
     await lockOrderNamedTaxRate(tx, so.taxRateName, { lineRateIds: so.lines.map((l) => l.taxRateId), allowMissing: !cloneNameWasActive })
     const cloneRates = await resolveWritableTaxRateIds(tx, so.lines.map((l) => l.taxRateId))
+    // A clone is numbered like any manual order. It has always started from "SO-" whatever the configured prefix, so the default keeps doing that; a pattern set in Settings applies to it like to every other manual order.
+    ref = await mintRequiredDocumentNumber(tx, 'sales_order', { fallbackPrefix: 'SO-' })
     return tx.salesOrder.create({
       data: {
         orderNumber: ref,

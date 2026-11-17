@@ -1,4 +1,5 @@
 import { shareLockOrderTaxRates } from '@/lib/tax/writable-tax-rate'
+import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
@@ -638,47 +639,6 @@ export function reconcileStagedAndFallbackReturnRows(
     added.push({ ...row, qty: take })
   }
   return { rows: [...stagedRows, ...added], split: splitOf(added) }
-}
-
-async function getExistingCreditNoteNumberMax(
-  tx: Prisma.TransactionClient,
-  prefix: string,
-): Promise<number> {
-  const parseSuffix = (value: string | null): number => {
-    if (!value?.startsWith(prefix)) return 0
-    const suffix = value.slice(prefix.length)
-    return /^\d+$/.test(suffix) ? Number.parseInt(suffix, 10) : 0
-  }
-  const rows = await tx.salesOrderRefund.findMany({
-    where: { creditNoteNumber: { startsWith: prefix } },
-    select: { creditNoteNumber: true },
-  })
-  return rows.reduce((max, row) => Math.max(max, parseSuffix(row.creditNoteNumber)), 0)
-}
-
-async function nextCreditNoteNumber(
-  tx: Prisma.TransactionClient,
-  params: { prefix: string; date?: Date },
-): Promise<string> {
-  const date = params.date ?? new Date()
-  const year = date.getFullYear()
-  const counterKey = `document_counter:credit_note:${year}`
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${counterKey}))`
-  const row = await tx.setting.findUnique({
-    where: { key: counterKey },
-    select: { value: true },
-  })
-  const prefix = `${params.prefix}${year}-`
-  const current = row?.value
-    ? Number.parseInt(row.value, 10)
-    : await getExistingCreditNoteNumberMax(tx, prefix)
-  const next = Number.isFinite(current) && current >= 0 ? current + 1 : 1
-  await tx.setting.upsert({
-    where: { key: counterKey },
-    create: { key: counterKey, value: String(next) },
-    update: { value: String(next) },
-  })
-  return `${params.prefix}${year}-${String(next).padStart(5, '0')}`
 }
 
 /**
@@ -5171,8 +5131,9 @@ export async function createSalesOrderRefund(
       0,
     ))
     const headerTotalBase = round4Sum(refundLines.reduce((sum, line) => sum + round4Sum(line.totalBase), 0))
-    const creditNoteNumber = await nextCreditNoteNumber(tx, {
-      prefix: input.creditNotePrefix,
+    // The credit note pattern (Settings → Company → Numbering) decides the number; the prefix passed in is only what the default pattern starts with. The value minted here is stored on the refund and is the one the accounting payload carries.
+    const creditNoteNumber = await mintRequiredDocumentNumber(tx, 'credit_note', {
+      fallbackPrefix: input.creditNotePrefix,
     })
 
     // o3d-n8p: the WRITER stamps what the stored totals mean and where the refund came from — derived from

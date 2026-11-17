@@ -1,5 +1,6 @@
 'use server'
 
+import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
@@ -484,8 +485,6 @@ export async function createReorderPOs(
       })
       const priceMap = new Map(lastPrices.map((lp) => [lp.productId, Number(lp.lastUnitCost)]))
 
-      const ref = `PO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
-
       const now = new Date()
       let subtotal = 0
       const lineDates: Array<Date | null> = []
@@ -541,9 +540,10 @@ export async function createReorderPOs(
       })
       const subtotalBase = Math.round((subtotal / fxRate) * 10000) / 10000
 
-      await db.purchaseOrder.create({
+      // The reference comes from the purchase order pattern, minted in the same transaction as the order. A reorder order has always started from "PO-" whatever the configured prefix, so the default keeps doing that.
+      await db.$transaction(async (tx) => tx.purchaseOrder.create({
         data: {
-          reference: ref,
+          reference: await mintRequiredDocumentNumber(tx, 'purchase_order', { fallbackPrefix: 'PO-' }),
           type: 'GOODS',
           supplierId,
           currency,
@@ -560,7 +560,7 @@ export async function createReorderPOs(
           expectedDelivery: earliestLineDelivery(lineDates),
           lines: { create: lineData },
         },
-      })
+      }))
       poCount++
     }
 

@@ -37,16 +37,42 @@ A live preview updates as you adjust colours, so you can see the result before s
 
 ### Document Numbering
 
-Configure the prefix and padding for auto-generated document numbers:
+Found on the **Numbering** tab. Two parts work together.
 
-| Document Type | Example |
+**Prefixes.** The table at the top sets the prefix each document type starts with (for example `SO-`, `PO-`, `INV-`, `CN-`) and the prefixes of the shopping connectors. Until you set a pattern (below), IMS numbers documents with the defaults:
+
+| Document type | Default number |
 |---|---|
-| Sales Order | SO-00001 |
-| Purchase Order | PO-00001 |
-| Invoice | INV-00001 |
-| Credit Note | CN-00001 |
+| Sales order entered by hand | `SO-20261117-A7X2` (prefix, date, four random characters) |
+| Purchase order | `PO-20261117-K3B9` (prefix, date, four random characters) |
+| Credit note | `CN-2026-00001` (prefix, year, a counter that starts again each year) |
+| Shipment | no number |
 
-Set your preferred prefix (e.g. `SO`, `INV`) and padding length (e.g. 5 digits) for each type.
+**Number patterns.** The card below the table lets you set a pattern and a counter for each document IMS numbers itself: **sales orders entered by hand, purchase orders (and freight orders), credit notes and shipments**. A pattern is plain text (letters, digits and `- _ . / #`) with these tokens:
+
+| Token | Gives |
+|---|---|
+| `{YYYY}` / `{YY}` | the year, four or two digits |
+| `{MM}` / `{DD}` | the month / the day, two digits |
+| `{SEQ}` | the counter exactly as it is: `7`, `42`, `1043`. **Never padded.** |
+| `{SEQ:n}` | the counter padded with zeros to n digits (1 to 12): `{SEQ:5}` gives `00042`. A longer number is not cut. |
+| `{RAND:n}` | n random letters and digits (1 to 8), for documents that are not numbered in sequence |
+
+A pattern must contain `{SEQ}` or `{RAND:n}`. Examples: `ORD-{YYYY}-{SEQ}` gives `ORD-2026-1`, `ORD-2026-2`, and so on; `PO{YY}{MM}-{SEQ:4}` gives `PO2611-0001`.
+
+- **Next number.** The card shows the next number the pattern will give, updating when you leave the box, before anything is saved. A random part is shown as a sample.
+- **The counter restarts with its period.** A pattern with `{YYYY}` or `{YY}` counts from 1 each year, with `{MM}` each month, with `{DD}` each day; without a date token there is one counter for ever. A period that already holds documents carries on after the highest number in it.
+- **Changing a pattern never renumbers a document.** Only documents created afterwards use it. The counter carries on, so a change from `ORD-{SEQ}` to `SALE{SEQ:4}` after `ORD-12` gives `SALE0013`.
+- **Taken numbers are skipped.** If the next number is already used by another document of that type, IMS takes the next free one. If 1,001 numbers in a row are taken it refuses, and the message tells you to move the counter past them.
+- **Set next number.** Type the number you want the next document to get and press **Set next number**. You can move the counter forward as far as you like. You cannot go back to or below a number already in use: IMS refuses and names the highest one in use.
+- **Emptying a pattern** and saving returns the type to its default (above). **Shipments** carry no reference until you set a shipment pattern; a shipment that is re-planned before it is picked is replaced and takes the next number, so shipment numbers can have gaps.
+- The number is minted once, stored on the document, and read from there everywhere: the PDF, the warehouse and the accounting system (a credit note's number is the one sent to Xero) all show the same value.
+- Needs the **Settings > Company** permission.
+
+**Not configurable here.**
+
+- **Sales invoice numbers.** Xeroom owns sales invoices, so the card lists them as owned by Xeroom and read-only, and IMS does not change how they are numbered. The invoice prefix in the table above is unchanged and applies only to invoices IMS itself numbers for orders entered by hand.
+- **WooCommerce order numbers.** An order imported from WooCommerce keeps the storefront's order number (with its connector prefix) and is never renumbered. Its invoice number is the storefront's own.
 
 ### Email / SMTP
 

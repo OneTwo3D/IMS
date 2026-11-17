@@ -9,6 +9,7 @@ import {
   getDocumentTemplates,
   getShoppingConnectors,
 } from '@/app/actions/company'
+import { getDocumentNumbering } from '@/app/actions/document-numbering'
 import { getCurrencies } from '@/app/actions/currencies'
 import { authorizePage } from '@/lib/auth/server'
 import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
@@ -25,10 +26,11 @@ export default async function CompanySettingsPage() {
   if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
   const session = gate.session
-  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled] = await Promise.all([
+  const [org, baseCurrencySettings, numbering, documentNumbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled] = await Promise.all([
     getOrganisation(),
     getBaseCurrencySettings(),
     getNumberingFormats(),
+    getDocumentNumbering(),
     getEmailSettings(),
     getBrandingColours(),
     getDocumentTemplates(),
@@ -42,6 +44,7 @@ export default async function CompanySettingsPage() {
       org={org}
       baseCurrencyLocked={baseCurrencySettings.locked}
       numbering={numbering}
+      documentNumbering={documentNumbering}
       email={email}
       branding={branding}
       templates={templates}

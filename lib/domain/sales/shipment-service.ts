@@ -1,4 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { mintDocumentNumber } from '@/lib/domain/numbering/mint'
 import type { db } from '@/lib/db'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
@@ -644,10 +645,13 @@ export async function confirmSalesOrderShipments(
     const createdShipments: ConfirmShipmentsResult['createdShipments'] = []
     for (const [warehouseId, whAllocs] of byWarehouse) {
       const pendingMetadata = pendingMetadataByWarehouse.get(warehouseId)
+      // A shipment carries a reference only when an operator has set a shipment pattern (Settings → Company → Numbering); until then this is null and the row is written exactly as before.
+      const reference = await mintDocumentNumber(tx, 'shipment')
       const created = await tx.shipment.create({
         data: {
           orderId,
           warehouseId,
+          ...(reference !== null ? { reference } : {}),
           status: 'PENDING',
           trackingNumber: pendingMetadata?.trackingNumber ?? null,
           shippingService: pendingMetadata?.shippingService ?? null,
