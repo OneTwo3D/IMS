@@ -53,6 +53,9 @@ async function seedWorld(stock = 20): Promise<World> {
   loadEnv()
   const { db } = await import('@/lib/db')
   const tag = uid()
+  // The shared CI database may carry accounting settings an earlier file left (Xero switched on without its shipping account refuses every create). The world starts with none and puts them back at teardown; tests that need invoicing set their own.
+  const leftover = await db.setting.findMany({ where: { OR: [{ key: { startsWith: 'xero_' } }, { key: 'plugin_xero_enabled' }] } })
+  await db.setting.deleteMany({ where: { key: { in: leftover.map((r) => r.key) } } })
   await db.user.upsert({ where: { id: 'test-user' }, create: { id: 'test-user', email: 'test-user@example.invalid', name: 'test user', passwordHash: 'x' }, update: {} })
   const rate = await db.taxRate.create({ data: { name: `ZQEC Std 20 ${tag}`, rate: '0.2', usedFor: 'SALES', taxCategory: 'STANDARD', accountingTaxType: 'OUTPUT2', active: true }, select: { id: true } })
   // syncToStore so a shop-linked order can allocate from it; the only warehouse the orders name.
@@ -76,7 +79,8 @@ async function seedWorld(stock = 20): Promise<World> {
       await db.product.deleteMany({ where: { id: { in: [p1.id, p2.id] } } })
       await db.warehouse.deleteMany({ where: { id: warehouse.id } })
       await db.taxRate.deleteMany({ where: { id: rate.id } })
-      await db.setting.deleteMany({ where: { key: { in: world.settingKeys } } })
+      await db.setting.deleteMany({ where: { key: { in: [...world.settingKeys, ...leftover.map((r) => r.key)] } } })
+      for (const r of leftover) await db.setting.create({ data: { key: r.key, value: r.value } })
       // The guard refuses a database holding users, so the acting user the mocked session names is removed again.
       await db.user.deleteMany({ where: { id: 'test-user' } })
     },
