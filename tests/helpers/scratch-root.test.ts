@@ -147,7 +147,7 @@ test('a worker-like child (TMPDIR already the parent sentinel private dir) picks
   // The sentinel of THIS process redirects any child's TMPDIR to its own private dir, exactly what a test worker inherits; so the
   // child below is a real worker-like one: TMPDIR = this process's private dir, the recorded original and the private chain inherited.
   const spawn = (env: NodeJS.ProcessEnv) => spawnSync(process.execPath, ['--import', 'tsx', '--import', sentinel, probe], { env, encoding: 'utf8' })
-  const inherited: NodeJS.ProcessEnv = { ...process.env, [ORIGINAL_TMPDIR_VAR]: tmpRoot, [PRIVATE_TMPDIRS_VAR]: [process.env[PRIVATE_TMPDIRS_VAR], dir].filter(Boolean).join(':') }
+  const inherited: NodeJS.ProcessEnv = { ...process.env, [ORIGINAL_TMPDIR_VAR]: tmpRoot, [PRIVATE_TMPDIRS_VAR]: saved[PRIVATE_TMPDIRS_VAR], TMPDIR: saved.TMPDIR }
   delete inherited.IMS_SCRATCH_ROOT
   const worker = spawn(inherited)
   assert.equal(worker.status, 0, worker.stderr)
@@ -156,6 +156,6 @@ test('a worker-like child (TMPDIR already the parent sentinel private dir) picks
   const bare = { ...inherited }
   delete bare[ORIGINAL_TMPDIR_VAR]
   const refused = spawn(bare)
-  assert.notEqual(refused.status, 0, 'refuses rather than picking a private directory')
+  assert.notEqual(refused.status, 0, `refuses rather than picking a private directory`)
   assert.match(refused.stderr, /no usable scratch root/)
 })
