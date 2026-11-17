@@ -84,6 +84,7 @@ const EXEMPT_RAW: Readonly<Record<string, string>> = {
 
 const EXPECTED_LOCKED = [
   'app/actions/sales.ts',                                // createSalesOrder (the form, the CSV import and the API go through it)
+  'app/actions/sales.ts',                                // updateSalesOrder (the draft edit)
   'app/actions/sales.ts',                                // cloneSalesOrder
   'lib/connectors/woocommerce/sync/order-import.ts',     // the WooCommerce order import
 ]

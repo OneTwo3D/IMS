@@ -9,7 +9,7 @@ import { missingFormFxRate, type FormFxRate } from '@/lib/currencies/form-fx-rat
  * The rate always comes from the fx_rates table through a server action; a missing rate is `{ state: 'missing' }`.
  * Answers that arrive after a newer currency was chosen are dropped.
  */
-export function useFormFxRate(initial: FormFxRate) {
+export function useFormFxRate(initial: FormFxRate | null) {
   const [fx, setFx] = useState<FormFxRate | null>(initial)
   const seq = useRef(0)
 
