@@ -420,6 +420,8 @@ type OrderForPush = {
   customerName: string | null
   customerEmail: string | null
   customerVatNumber: string | null
+  /** The mirrored IOSS number (SalesOrder.iossNumber); absent on callers that do not select it. */
+  iossNumber?: string | null
   /** Set once the order's personal data was erased. An erased order is never pushed or amended. */
   erasedAt?: Date | null
   shippingAddress: unknown
@@ -640,6 +642,7 @@ export const ORDER_PUSH_SELECT = {
   customerName: true,
   customerEmail: true,
   customerVatNumber: true,
+  iossNumber: true,
   erasedAt: true,
   shippingAddress: true,
   billingAddress: true,
@@ -746,6 +749,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
     email: recipient.email,
     phone: recipient.phone,
     vatNumber: order.customerVatNumber,
+    ...(order.iossNumber ? { iossNumber: order.iossNumber } : {}),
     comments: null,
     ...courierNamesForOrder(order),
     totalVat: num(order.taxForeign),

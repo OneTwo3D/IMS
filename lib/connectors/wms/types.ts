@@ -411,6 +411,11 @@ export type WmsOrderPushInput = {
   phone: string | null
   /** Customer VAT/IOSS number for customs declarations; null when not provided. */
   vatNumber: string | null
+  /**
+   * The shop's own IOSS registration number WooCommerce applied to the order (mirrored, SalesOrder.iossNumber). PRESENT ONLY WHEN the order
+   * carries one. Whether a connector sends it is the connector's own setting (Mintsoft: `mintsoft_send_ioss_number`, default off).
+   */
+  iossNumber?: string | null
   comments: string | null
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null

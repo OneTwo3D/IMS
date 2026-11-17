@@ -108,6 +108,8 @@ as described above.
 
 ### Ongoing Order Sync
 
+**Duty and tax results.** Each order update also refreshes what WooCommerce reported for duty and tax: the IOSS number, the delivery term (IOSS_DDP, DDP or DDU_DAP), the duty, import VAT and handling components, and the per-line customs value override. They are copied as reported and never recalculated; a value WooCommerce stops reporting is cleared. They are shown read-only on the order page (see [Sales](sales.md)). Order lines and invoices are not rebuilt by this.
+
 With the initial import complete, new and updated WooCommerce orders are imported automatically.
 
 **Configuration options:**
@@ -442,6 +444,10 @@ to re-run the same dates.
 ### GTIN and MPN (flag, default OFF)
 
 By default IMS pushes the barcode to WooCommerce's GTIN field whenever it is all digits, and pushes no part number. Setting `product_identifier_split_enabled` (**Sync > Products > Split product identifiers (GTIN / MPN)**, off by default) changes the IMS-to-WooCommerce write only: the GTIN field is then sent only for a real GTIN (valid length and check digit, fewer than four leading zeros), so a zero-padded counter such as `00000287` is no longer sent there, and the product's MPN is written to Yoast's product identifier **MPN** field (`wpseo_global_identifier_values`, or `wpseo_variation_global_identifiers_values` for a variation). WooCommerce itself strips letters from the GTIN field, which is why the part number cannot live there. The same switch governs the Mintsoft EAN/UPC write; see [Warehouse (Mintsoft)](warehouse.md) and [Barcode versus MPN](inventory.md#barcode-versus-mpn). Importing from WooCommerce is not changed by it.
+
+### Tariff codes from WooCommerce (US HS code and per-country codes)
+
+The product import also copies two sets of tariff codes that WooCommerce holds, into their own read-only fields on the product: the **US HS code** (the `pa_us_hs_code` attribute) and the **per-destination codes** the duty plug-in captured (`_dutify_hs_codes`, one code per destination country). They are kept **separately** from the product's own **HS code**, which stays the store's approved code (copied from the `hs_code` attribute as described above) and which IMS never overwrites from these. They follow WooCommerce on every import: a changed code updates, and a code removed in WooCommerce is cleared. IMS does not calculate or correct any of them, and nothing in IMS edits them.
 
 ### What the connector will NOT change
 

@@ -1622,6 +1622,31 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         {so.notes && <div className="col-span-2"><span className="text-muted-foreground">Customer Notes</span><p className="mt-0.5 whitespace-pre-wrap">{so.notes}</p></div>}
         {so.internalNotes && <div className="col-span-2"><span className="text-muted-foreground">Private Notes</span><p className="mt-0.5 whitespace-pre-wrap text-muted-foreground italic">{so.internalNotes}</p></div>}
       </div>
+      {so.wooDutyTax && (
+        <div className="mt-3 rounded-md border border-border p-3 text-sm" data-testid="woo-duty-tax">
+          <div className="mb-2 flex items-center gap-2">
+            <h3 className="text-sm font-medium">Duty and tax</h3>
+            <span className="text-xs text-muted-foreground">from WooCommerce (read-only; IMS does not recalculate these)</span>
+          </div>
+          <dl className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs sm:grid-cols-3">
+            {so.wooDutyTax.iossNumber && <div><dt className="text-muted-foreground">IOSS number</dt><dd className="font-mono">{so.wooDutyTax.iossNumber}</dd></div>}
+            {so.wooDutyTax.deliveryTerm && <div><dt className="text-muted-foreground">Delivery term</dt><dd className="font-mono">{so.wooDutyTax.deliveryTerm}</dd></div>}
+            {so.wooDutyTax.dutyComponent && <div><dt className="text-muted-foreground">Duty</dt><dd className="font-mono">{sym}{so.wooDutyTax.dutyComponent}</dd></div>}
+            {so.wooDutyTax.taxComponent && <div><dt className="text-muted-foreground">Import VAT</dt><dd className="font-mono">{sym}{so.wooDutyTax.taxComponent}</dd></div>}
+            {so.wooDutyTax.handlingComponent && <div><dt className="text-muted-foreground">Handling fee (in duty)</dt><dd className="font-mono">{sym}{so.wooDutyTax.handlingComponent}</dd></div>}
+          </dl>
+          {so.lines.some((l) => l.wcCustomsUnitValue != null) && (
+            <div className="mt-2 text-xs">
+              <p className="text-muted-foreground">Customs value per unit (set in WooCommerce)</p>
+              <ul className="font-mono">
+                {so.lines.filter((l) => l.wcCustomsUnitValue != null).map((l) => (
+                  <li key={l.id}>{l.sku || l.description}: {sym}{l.wcCustomsUnitValue}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Lines table */}
       <div className="rounded-md border">

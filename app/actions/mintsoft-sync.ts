@@ -1045,6 +1045,43 @@ export async function saveMintsoftCourierServiceMap(rawJson: unknown): Promise<{
 }
 
 /**
+ * Whether the Mintsoft order CREATE push carries `IOSSNumber` (the shop's own IOSS number WooCommerce applied to the order, mirrored onto
+ * the IMS order; sent only when the order has one). Default OFF: with it off the push payload is unchanged. Mintsoft is live, so this is
+ * an explicit operator opt-in, recorded in the activity log.
+ */
+export async function getMintsoftSendIossNumber(): Promise<boolean> {
+  await requireMintsoftReadAccess()
+  return (await getMintsoftSettings()).mintsoft_send_ioss_number === 'true'
+}
+
+export async function saveMintsoftSendIossNumber(enabled: unknown): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+  if (typeof enabled !== 'boolean') return { success: false, error: 'Choose on or off.' }
+  const value = serializeSettingValue('mintsoft_send_ioss_number', enabled ? 'true' : 'false')
+  const previous = await db.$transaction(async (tx) => {
+    const row = await tx.setting.findUnique({ where: { key: 'mintsoft_send_ioss_number' } })
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_send_ioss_number' },
+      create: { key: 'mintsoft_send_ioss_number', value },
+      update: { value },
+    })
+    return row?.value === 'true'
+  })
+  if (previous !== enabled) {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_send_ioss_number_updated',
+      level: 'INFO',
+      description: `Mintsoft order push ${enabled ? 'now sends' : 'no longer sends'} IOSSNumber (the IOSS number mirrored from WooCommerce, when the order has one).`,
+      metadata: { before: previous, after: enabled },
+    })
+  }
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+/**
  * Order dispatch deep-link template + courier fallback (Phase 8). Both feed the
  * outbound order-push / order-status flow and previously had no UI — settable
  * only via raw DB. A blank template falls back to the proven default; a blank

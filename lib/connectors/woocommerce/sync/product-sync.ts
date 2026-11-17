@@ -2,6 +2,7 @@
  * Bidirectional product sync between WooCommerce and IMS.
  */
 
+import { readWcHsCodeMirror } from './hs-code-mirror'
 import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
 import { readWcProductPushDecision } from './product-push-gate'
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
@@ -55,7 +56,8 @@ import {
   PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE,
 } from '@/lib/products/type-transforms'
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
-import type { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
+import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 import { storeWcProductContent } from './product-content'
 
@@ -855,6 +857,8 @@ export async function syncWcProductToIms(
     // are unchanged.
     const customsDescriptionAttr = customsDescriptionRaw ? clampCustomsDescription(customsDescriptionRaw) : customsDescriptionRaw
 
+    const hsCodeMirror = readWcHsCodeMirror(wcProduct)
+
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
 
@@ -1068,6 +1072,11 @@ export async function syncWcProductToIms(
               updateData[change.field] = change.to
             }
 
+            // The WooCommerce tariff codes (pa_us_hs_code, _dutify_hs_codes) follow WooCommerce, a removed code clears; never touches `hsCode`.
+            for (const [field, value] of Object.entries(hsCodeMirror)) {
+              updateData[field] = value === null && field === 'wcDutifyHsCodes' ? Prisma.DbNull : value
+            }
+
             // Category — link to mirrored IMS category for the deepest WC category
             // referenced by this product. If WC dropped all categories, clear the link.
             if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
@@ -1218,6 +1227,8 @@ export async function syncWcProductToIms(
               lifecycleStatus,
               type: productType,
               hsCode: hsCodeAttr,
+              wcUsHsCode: hsCodeMirror.wcUsHsCode ?? null,
+              ...(hsCodeMirror.wcDutifyHsCodes ? { wcDutifyHsCodes: hsCodeMirror.wcDutifyHsCodes } : {}),
               countryOfOrigin: originIso ?? DEFAULT_COUNTRY_OF_ORIGIN,
               customsDescription: customsDescriptionAttr,
               externalProductId: BigInt(wcProduct.id),

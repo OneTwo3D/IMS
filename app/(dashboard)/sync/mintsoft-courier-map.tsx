@@ -7,6 +7,8 @@ import { Button } from '@/components/ui/button'
 import {
   getMintsoftCourierServiceMap,
   getMintsoftOrderDispatchSettings,
+  getMintsoftSendIossNumber,
+  saveMintsoftSendIossNumber,
   saveMintsoftCourierServiceMap,
   saveMintsoftOrderDispatchSettings,
 } from '@/app/actions/mintsoft-sync'
@@ -216,6 +218,53 @@ export function MintsoftOrderDispatchSection() {
         </Button>
         {error && <span className="text-xs text-destructive">{error}</span>}
       </div>
+    </Card>
+  )
+}
+
+/**
+ * Whether the order create push sends `IOSSNumber`. Off by default; Mintsoft is live, so it is an explicit opt-in. Saves on change.
+ */
+export function MintsoftSendIossNumberSection() {
+  const [enabled, setEnabled] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState('')
+  const [saving, startSaving] = useTransition()
+
+  useEffect(() => {
+    getMintsoftSendIossNumber()
+      .then(setEnabled)
+      .catch(() => undefined)
+      .finally(() => setLoaded(true))
+  }, [])
+
+  function handleChange(next: boolean) {
+    setError('')
+    startSaving(async () => {
+      const result = await saveMintsoftSendIossNumber(next)
+      if (result.success) setEnabled(next)
+      else setError(result.error ?? 'Failed to save the IOSS number setting.')
+    })
+  }
+
+  return (
+    <Card className="p-4 space-y-2">
+      <h3 className="text-sm font-medium">IOSS number on order push</h3>
+      <label className="flex items-center gap-2 text-sm" htmlFor="mintsoft-send-ioss-number">
+        <input
+          id="mintsoft-send-ioss-number"
+          type="checkbox"
+          checked={enabled}
+          disabled={!loaded || saving}
+          onChange={(event) => handleChange(event.target.checked)}
+        />
+        Send the IOSS number to Mintsoft (<code className="rounded bg-muted px-1">IOSSNumber</code>)
+      </label>
+      <p className="text-xs text-muted-foreground">
+        Off by default. When on, a new order is created in Mintsoft with the IOSS number WooCommerce applied to it, only for orders that carry one.
+        The number is copied from WooCommerce, never worked out here. Orders already in Mintsoft are not changed.
+      </p>
+      {error && <span className="text-xs text-destructive">{error}</span>}
     </Card>
   )
 }

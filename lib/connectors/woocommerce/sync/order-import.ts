@@ -36,7 +36,7 @@ import { surfaceWcOrderEditDrift } from './order-edit-drift'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
-  readWcCustomerVat, resolveWcOrderLevelDiscount,
+  readWcCustomerVat, readWcDutyTaxMirror, readWcLineCustomsUnitValue, resolveWcOrderLevelDiscount,
   type MappedLine,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
@@ -1376,6 +1376,17 @@ export function wclcComponentColumns(wcOrder: WcFullOrder): {
   return { wclcDutyComponent: c.dutyComponent, wclcTaxComponent: c.taxComponent, wclcHandlingComponent: c.handlingComponent }
 }
 
+/**
+ * Everything the duty/tax mirror writes at order level, as SalesOrder columns: the wclc components (above), the IOSS number and the delivery
+ * term. MIRRORED as WooCommerce reports them, never computed (owner decision D5). On create a payload without meta writes nulls; on an update
+ * a payload that carries no meta list at all returns `{}` so the stored values are left alone (an absent list is no evidence they went away).
+ */
+export function dutyTaxMirrorColumns(wcOrder: WcFullOrder, mode: 'create' | 'update'): Record<string, string | null> {
+  const mirror = readWcDutyTaxMirror(wcOrder)
+  if (!mirror) return mode === 'create' ? { iossNumber: null, deliveryTerm: null } : {}
+  return { iossNumber: mirror.iossNumber, deliveryTerm: mirror.deliveryTerm }
+}
+
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string, snapshotVersion?: string): Promise<PaidBlockOutcome> {
   // WOOCOMMERCE HAS ANONYMISED THIS ORDER (positive marker): mirror it FIRST, so the update below reads the erasure marker under the order lock
   // and withholds the placeholder values WooCommerce now holds. Idempotent (an erased order is a no-op); a failure throws and the delivery retries.
@@ -1501,9 +1512,10 @@ async function updateExistingWcOrderCore(
         ...(Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
           ? (({ shippingService, courierKey, shippingMethodId }) => ({ shippingService, courierKey, shippingMethodId }))(mapWcShipping(wcOrder))
           : {}),
-        // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
-        // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
-        // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
+        // The duty/tax mirror (wclc duty/tax/handling components, IOSS number, delivery term) FOLLOWS WooCommerce on every delivery: these are
+        // WooCommerce's own results, stored as reported and never recomputed (owner decision D5). Nothing here is personal data, so an erased
+        // order keeps them. No line or invoice is rebuilt from them (an edit that moves the fee lines is surfaced by surfaceWcOrderEditDrift).
+        ...(Array.isArray(wcOrder.meta_data) ? { ...wclcComponentColumns(wcOrder), ...dutyTaxMirrorColumns(wcOrder, 'update') } : {}),
         ...(erased
           ? {}
           : {
@@ -1528,6 +1540,17 @@ async function updateExistingWcOrderCore(
         unregisteredPaidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
       },
     })
+    // The per-line customs value override follows WooCommerce too, matched on the WooCommerce line item id (the lines themselves are not rebuilt here).
+    if (Array.isArray(wcOrder.line_items)) {
+      for (const item of wcOrder.line_items) {
+        // A line item that carries no meta list says nothing about the override: leave the stored value alone.
+        if (typeof item?.id !== 'number' || !Array.isArray(item.meta_data)) continue
+        await tx.salesOrderLine.updateMany({
+          where: { orderId, externalLineItemId: item.id },
+          data: { wcCustomsUnitValue: readWcLineCustomsUnitValue(item) },
+        })
+      }
+    }
   })
 
   if (repopulationRefused) await recordRepopulationRefused(orderId, wcOrder)
@@ -3561,6 +3584,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         productId: l.productId,
         externalLineItemId: l.externalLineItemId,
         wclcFeeKind: l.wclcFeeKind ?? null,
+        wcCustomsUnitValue: l.wcCustomsUnitValue ?? null,
         sku: l.sku,
         description: l.description,
         qty: l.qty,
@@ -3689,6 +3713,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
                 shippingAddress: mapWcAddress(wcOrder.shipping),
               }),
           ...wclcComponentColumns(wcOrder),
+          ...dutyTaxMirrorColumns(wcOrder, 'create'),
           subtotalForeign,
           shippingService: shipping.shippingService,
           courierKey: shipping.courierKey,
