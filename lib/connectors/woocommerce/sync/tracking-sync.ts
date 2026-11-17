@@ -10,6 +10,7 @@ import { logActivity } from '@/lib/activity-log'
 import { wcFetch, wcPut } from '../api'
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import type { WcFullOrder, WcMeta, WcTrackingItem } from './types'
+import { applyAstProvider, readAstProviderMappingEnabled, resolveAstProvider } from './ast-provider-mapping'
 
 type TrackingSourceRow = {
   trackingNumber: string
@@ -101,6 +102,8 @@ async function buildOutboundTracking(orderId: string): Promise<{
   externalOrderId: number | null
   orderNumber: string | null
   externalOrderNumber: string | null
+  /** The deduped source rows `items` were built from; the AST provider mapping (ast-provider-mapping.ts) needs the courier of each. */
+  rows: TrackingSourceRow[]
   items: WcTrackingItem[]
 }> {
   const order = await db.salesOrder.findUnique({
@@ -129,7 +132,7 @@ async function buildOutboundTracking(orderId: string): Promise<{
   })
 
   if (!order) {
-    return { externalOrderId: null, orderNumber: null, externalOrderNumber: null, items: [] }
+    return { externalOrderId: null, orderNumber: null, externalOrderNumber: null, rows: [], items: [] }
   }
 
   const shipmentRows: TrackingSourceRow[] = order.shipments
@@ -148,14 +151,49 @@ async function buildOutboundTracking(orderId: string): Promise<{
       }]
     : []
 
-  const items = dedupeTrackingRows([...shipmentRows, ...fallbackRows]).map(toWcTrackingItem)
+  const rows = dedupeTrackingRows([...shipmentRows, ...fallbackRows])
+  const items = rows.map(toWcTrackingItem)
   const wcLink = order.shoppingLinks[0]
   return {
     externalOrderId: wcLink?.externalOrderId ? Number(wcLink.externalOrderId) : null,
     orderNumber: order.orderNumber ?? null,
     externalOrderNumber: wcLink?.externalOrderNumber ?? null,
+    rows,
     items,
   }
+}
+
+/**
+ * Apply the AST provider mapping to the outbound items, when `wc_ast_provider_mapping_enabled` is 'true'.
+ *
+ * OFF (the default): returns `items` itself, so the payload is byte-identical to what IMS wrote before the mapping existed
+ * and nothing else is read. ON: each row's courier (and the order's FedEx / Click & Drop meta) is resolved to an AST provider
+ * slug; a courier the table does not know keeps today's item and is counted in the activity log, never guessed.
+ */
+async function applyProviderMappingIfEnabled(
+  orderId: string,
+  outbound: { rows: TrackingSourceRow[]; items: WcTrackingItem[]; externalOrderId: number | null },
+  orderMeta: WcMeta[],
+): Promise<WcTrackingItem[]> {
+  if (!(await readAstProviderMappingEnabled())) return outbound.items
+  const unmapped: string[] = []
+  const items = outbound.rows.map((row) => {
+    const resolution = resolveAstProvider({ courier: row.carrier, orderMeta })
+    if (resolution.kind === 'unmapped' && resolution.courier) unmapped.push(resolution.courier)
+    return applyAstProvider(toWcTrackingItem(row), resolution)
+  })
+  if (unmapped.length > 0) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'wc_tracking_provider_unmapped',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `${unmapped.length} tracking entr${unmapped.length === 1 ? 'y has' : 'ies have'} a courier with no AST provider mapping; written unchanged`,
+      metadata: { externalOrderId: outbound.externalOrderId, unmappedCount: unmapped.length, couriers: [...new Set(unmapped)] },
+    })
+  }
+  return items
 }
 
 export async function pushImsTrackingToWc(orderId: string): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
@@ -190,15 +228,17 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
     }
 
     const wcOrder = currentOrder.data as WcFullOrder
+    // Reassigned from `outbound.items` only when the AST provider mapping is on; every payload and log below uses `items`.
+    const items = await applyProviderMappingIfEnabled(orderId, outbound, wcOrder.meta_data ?? [])
     const existingItems = readExistingTrackingItems(wcOrder.meta_data ?? [])
-    if (trackingItemsEqual(existingItems, outbound.items)) {
+    if (trackingItemsEqual(existingItems, items)) {
       return { success: true, skipped: true }
     }
 
     const existingMeta = (wcOrder.meta_data ?? []).find((item) => item.key === '_wc_shipment_tracking_items')
     const metaPatch = existingMeta
-      ? { id: existingMeta.id, key: existingMeta.key, value: outbound.items }
-      : { key: '_wc_shipment_tracking_items', value: outbound.items }
+      ? { id: existingMeta.id, key: existingMeta.key, value: items }
+      : { key: '_wc_shipment_tracking_items', value: items }
 
     // The writer-side cut-off, re-derived immediately before the write (a no-op outside a queued job's attempt).
     await assertWcAttemptMayStillSend()
@@ -214,7 +254,7 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
           entityType: 'SalesOrder',
           entityId: orderId,
           externalId: String(outbound.externalOrderId),
-          payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
+          payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items })),
           errorMessage: update.error,
         },
       })
@@ -225,7 +265,7 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
         tag: 'sync',
         level: 'WARNING',
         description: `Failed to push tracking to WooCommerce order #${outbound.externalOrderNumber ?? outbound.externalOrderId}`,
-        metadata: { externalOrderId: outbound.externalOrderId, error: update.error, trackingCount: outbound.items.length },
+        metadata: { externalOrderId: outbound.externalOrderId, error: update.error, trackingCount: items.length },
       })
       return { success: false, error: update.error }
     }
@@ -246,7 +286,7 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
         externalId: String(outbound.externalOrderId),
         payload: JSON.parse(JSON.stringify({
           meta_key: '_wc_shipment_tracking_items',
-          items: outbound.items,
+          items,
           pushedDateModifiedGmt,
         })),
         syncedAt: new Date(),
@@ -259,11 +299,11 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
       action: 'wc_tracking_pushed',
       tag: 'sync',
       level: 'INFO',
-      description: `Pushed ${outbound.items.length} tracking entr${outbound.items.length === 1 ? 'y' : 'ies'} to WooCommerce order #${outbound.externalOrderNumber ?? outbound.externalOrderId}`,
+      description: `Pushed ${items.length} tracking entr${items.length === 1 ? 'y' : 'ies'} to WooCommerce order #${outbound.externalOrderNumber ?? outbound.externalOrderId}`,
       metadata: {
         externalOrderId: outbound.externalOrderId,
-        trackingCount: outbound.items.length,
-        trackingNumbers: outbound.items.map((item) => item.tracking_number),
+        trackingCount: items.length,
+        trackingNumbers: items.map((item) => item.tracking_number),
       },
     })
 
