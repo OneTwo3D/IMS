@@ -187,6 +187,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Operator action: PUTs missing tax rates directly to Xero. It asks the producer-side hold first (xeroTaxRateWriteShadow) and creates nothing on a SHADOW verdict; it still checks no sync setting.'),
   d('app/actions/shopping-sync.ts::createShoppingWebhooks::createWcWebhooks#1', 'woocommerce', 'webhooks', 'operator-action', 'not-applicable',
     'The shopping action that fronts webhook registration for the operator.'),
+  d('app/actions/location-buffer.ts::saveLocationBuffers::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+    'Asks the shopping facade to push this product\'s stock to the storefront after a channel buffer changes.'),
   d('app/actions/stock-counts.ts::postStockCount::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/stock.ts::adjustStock::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
