@@ -253,3 +253,35 @@ test('[report names the right set] asserted-counted and may-have-posted-uncounte
   assert.equal(recognisedRevenue(), 40, 'golden: both £30 counted rows (confirmed + asserted) net out of £100 -> 100 - 60')
   console.log('mixed case: 1 report naming 2 rows (confirmed not named); revenue 40')
 })
+
+// o3d-oyur (Codex r2 HIGH) - A COMPACTED REVERSAL IS READ FROM ITS PRESERVED NET, AND AN UNREADABLE ONE IS UNKNOWN, NEVER ZERO.
+// Retention compaction empties `payload` on a settled reversal. Before this the batch read only `payload`, so a compacted
+// £30 reversal counted as £0 and the final shipment recognised the whole £100 again.
+function unreadableReports(): Array<Record<string, unknown>> {
+  return activity.filter((entry) => entry.action === 'daily_batch_trueup_withheld_unreadable_unearned_reversal')
+}
+
+test('[o3d-oyur] a SYNCED reversal compacted to its summary still nets: £100 - £30 = £70, and nothing is withheld', async () => {
+  await runWith([reversalRow('rev-compacted', {
+    status: 'SYNCED',
+    externalTransactionId: 'JNL-9',
+    payload: {},
+    payloadAccountNets: { version: 1, accounts: { '830': { credit: 0, debit: 30 } } },
+  })])
+  assert.equal(recognisedRevenue(), 70, 'NOT 100: the compacted reversal still took £30 out of the deferral')
+  assert.equal(unreadableReports().length, 0)
+})
+
+test('[o3d-oyur] a legacy compacted reversal (no lines, no summary) recognises NOTHING for the order and says so', async () => {
+  await runWith([reversalRow('rev-legacy', {
+    status: 'SYNCED',
+    externalTransactionId: 'JNL-8',
+    payload: {},
+    payloadAccountNets: null,
+  })])
+  assert.equal(recognisedRevenue(), 0, 'NOT 100 (zero reversal assumed) and no true-up: the amount reversed is unknown')
+  const [report] = unreadableReports()
+  assert.ok(report, 'one warning')
+  assert.equal(report.entityId, 'order-1')
+  assert.equal(report.level, 'WARNING')
+})
