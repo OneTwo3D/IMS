@@ -99,8 +99,19 @@ test('a real divergence raises one row (control: the rig can fire)', async () =>
   assert.equal((await pushOnce(clean({ totalForeign: 150 }))).totalMismatchPence, 3000)
 })
 
-test('an order edited in IMS with a changed total raises no mismatch', async () => {
-  const r = await pushOnce(withExtra({ totalForeign: 150, editedInImsAt: new Date('2026-11-01T00:00:00Z') }))
+test('a line-edited order (wcLineBaseline set) skips the component check but its payload check still runs', async () => {
+  // Total 150 vs payload 120: the payload check still records the 30.00 gap; the component check stays silent.
+  const r = await pushOnce(withExtra({ totalForeign: 150, wcLineBaseline: { totalForeign: 120, lines: [] } }))
+  assert.equal(r.totalMismatchPence, 3000)
+})
+
+test('an address-only edit (editedInImsAt set, no line baseline) still records a 2.00 payload discrepancy', async () => {
+  const r = await pushOnce(withExtra({ totalForeign: 122, editedInImsAt: new Date('2026-11-01T00:00:00Z'), wcLineBaseline: null }))
+  assert.equal(r.totalMismatchPence, 200)
+})
+
+test('a line edit whose recomputed total matches the payload raises nothing', async () => {
+  const r = await pushOnce(withExtra({ totalForeign: 120, wcLineBaseline: { totalForeign: 99, lines: [] } }))
   assert.equal(r.totalMismatchPence, null)
 })
 
@@ -111,17 +122,18 @@ test('a discount model other than LINE_ALLOCATED raises no false mismatch', asyn
 
 test('LINE_ALLOCATED and unrecorded models are still checked', async () => {
   assert.equal((await pushOnce(withExtra({ totalForeign: 150, discountModel: 'LINE_ALLOCATED' }))).totalMismatchPence, 3000)
-  assert.equal(totalGuardExclusion({ discountModel: null, editedInImsAt: null }), null)
+  assert.equal(totalGuardExclusion({ discountModel: null, wcLineBaseline: null }, 'component'), null)
 })
 
 test('the push payload is byte-identical whether or not the order is excluded', async () => {
   const a = await pushOnce(clean({ totalForeign: 150 }))
-  const b = await pushOnce(withExtra({ totalForeign: 150, editedInImsAt: new Date('2026-11-01T00:00:00Z') }))
+  const b = await pushOnce(withExtra({ totalForeign: 150, wcLineBaseline: { totalForeign: 99, lines: [] } }))
   assert.equal(JSON.stringify(a.input), JSON.stringify(b.input))
 })
 
-test('payloadTotalMismatchPence itself returns null for excluded orders', () => {
-  assert.equal(totalGuardExclusion({ editedInImsAt: new Date() }), 'EDITED_IN_IMS')
-  assert.equal(totalGuardExclusion({ discountModel: 'X' }), 'DISCOUNT_MODEL_NOT_LINE_ALLOCATED')
+test('exclusion reasons per check', () => {
+  assert.equal(totalGuardExclusion({ wcLineBaseline: {} }, 'component'), 'LINES_EDITED_IN_IMS')
+  assert.equal(totalGuardExclusion({ wcLineBaseline: {} }, 'payload'), null)
+  assert.equal(totalGuardExclusion({ discountModel: 'X' }, 'payload'), 'DISCOUNT_MODEL_NOT_LINE_ALLOCATED')
   assert.equal(typeof payloadTotalMismatchPence, 'function')
 })
