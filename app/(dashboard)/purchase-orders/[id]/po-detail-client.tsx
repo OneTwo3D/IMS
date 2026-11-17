@@ -56,11 +56,13 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatCalendarDate } from '@/lib/format-datetime'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
+import { selectablePoWarehouses } from '@/lib/domain/purchasing/po-warehouse-eligibility'
+import { PO_LINE_COLS_DEFAULT, PO_LINE_COLS_STORAGE_KEY, PO_LINE_OPTIONAL_COLS, parsePoLineCols, type PoLineOptionalCol } from '@/lib/domain/purchasing/po-line-columns'
 import { PoFormDialog } from '../po-form'
 import { PoLineNote } from '../po-line-note'
 import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
 
-type Warehouse = { id: string; code: string; name: string }
+type Warehouse = { id: string; code: string; name: string; availableForPurchaseOrders?: boolean }
 
 type Props = {
   po: PoDetail
@@ -84,6 +86,8 @@ type Props = {
   poEmailEnabled: boolean
   /** May this user write the internal per-line notes (purchasing.create). */
   canEditLineNotes?: boolean
+  /** Supplier SKU per product id, from the supplier's product mapping (getSupplierLastPrices). */
+  supplierSkus?: Record<string, string | null>
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -160,7 +164,10 @@ function ReceiveDialog({
   // double-booked receipt; reset only after a confirmed success.
   const idempotencyTokenRef = useRef<string | null>(null)
 
-  const defaultWarehouseId = po.destinationWarehouseId ?? warehouses[0]?.id ?? ''
+  // Warehouses with "Available in purchase orders" off are not offered, except the order's own destination (kept, with a warning).
+  const receiptWarehouses = selectablePoWarehouses(warehouses, po.destinationWarehouseId)
+  const destinationRestricted = Boolean(po.destinationWarehouseId && warehouses.find((w) => w.id === po.destinationWarehouseId)?.availableForPurchaseOrders === false)
+  const defaultWarehouseId = po.destinationWarehouseId ?? receiptWarehouses[0]?.id ?? ''
   const destinationWarehouseName = po.destinationWarehouseId
     ? warehouses.find((w) => w.id === po.destinationWarehouseId)?.name ?? '(unknown warehouse)'
     : null
@@ -261,6 +268,11 @@ function ReceiveDialog({
 
         {/* Only this middle region scrolls — the header and footer stay put. */}
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {destinationRestricted && (
+            <p className="rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
+              {destinationWarehouseName} is marked as not available for purchase orders. This order already points at it, so you can still receive into it; new orders cannot use it.
+            </p>
+          )}
           <div className="rounded-md border">
             {/* Phone: each line is a stacked card (the table elements are re-laid out with CSS, one DOM). */}
             <Table className="w-full table-fixed max-sm:block">
@@ -303,7 +315,7 @@ function ReceiveDialog({
                         className={`h-8 w-full rounded-md border bg-background px-2 text-xs max-sm:h-11 max-sm:text-base ${lineDiverges(l) ? 'border-amber-400 ring-1 ring-amber-300 dark:border-amber-600' : 'border-input'}`}
                       >
                         <option value="">Select…</option>
-                        {warehouses.map((w) => (
+                        {receiptWarehouses.map((w) => (
                           <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
                         ))}
                       </select>
@@ -2040,7 +2052,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false }: Props) {
+export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2058,6 +2070,21 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const symPos = positionMap[po.currency] ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
   const baseMoney = (n: number) => formatMoney(n, baseCurrency.symbol, baseCurrency.symbolPosition)
+
+  // Optional Order Lines columns (Barcode, Supplier SKU), remembered in this browser (same approach as the PO list's column picker).
+  const [lineCols, setLineCols] = useState<PoLineOptionalCol[]>(() => {
+    if (typeof window === 'undefined') return PO_LINE_COLS_DEFAULT
+    try { return parsePoLineCols(localStorage.getItem(PO_LINE_COLS_STORAGE_KEY)) } catch { return PO_LINE_COLS_DEFAULT }
+  })
+  function toggleLineCol(key: PoLineOptionalCol) {
+    setLineCols((prev) => {
+      const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+      try { localStorage.setItem(PO_LINE_COLS_STORAGE_KEY, JSON.stringify(next)) } catch { /* ignore */ }
+      return next
+    })
+  }
+  const showBarcodeCol = lineCols.includes('barcode')
+  const showSupplierSkuCol = lineCols.includes('supplierSku')
 
   const [editing, setEditing] = useState(false)
   const [showReceive, setShowReceive] = useState(false)
@@ -2564,14 +2591,27 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {/* Lines table */}
       <div className="rounded-md border">
-          <div className="border-b px-4 py-2 bg-muted/50">
+          <div className="border-b px-4 py-2 bg-muted/50 flex items-center justify-between gap-2">
             <h2 className="text-sm font-medium">Order Lines</h2>
+            <details className="relative text-xs">
+              <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">Columns</summary>
+              <div className="absolute right-0 z-10 mt-1 w-44 space-y-1 rounded-md border bg-background p-2 shadow-md">
+                {PO_LINE_OPTIONAL_COLS.map((c) => (
+                  <label key={c.key} className="flex items-center gap-2">
+                    <input type="checkbox" checked={lineCols.includes(c.key)} onChange={() => toggleLineCol(c.key)} className="rounded" />
+                    {c.label}
+                  </label>
+                ))}
+              </div>
+            </details>
           </div>
           <Table className="min-w-[800px]">
             <TableHeader className="bg-muted/30">
               <TableRow>
                 <TableHead className="w-12 px-2" />
                 <TableHead className="px-4 text-xs">Product</TableHead>
+                {showBarcodeCol && <TableHead className="px-4 text-xs">Barcode</TableHead>}
+                {showSupplierSkuCol && <TableHead className="px-4 text-xs">Supplier SKU</TableHead>}
                 <TableHead className="px-4 text-xs text-right w-44">Qty</TableHead>
                 <TableHead className="px-4 text-xs text-right w-32">
                   Unit Cost ({sym})
@@ -2602,6 +2642,8 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
                     <PoLineNote lineId={line.id} initial={line.notes} canEdit={canEditLineNotes} />
                   </TableCell>
+                  {showBarcodeCol && <TableCell className="px-4 font-mono text-xs" data-testid="po-line-barcode">{line.barcode ?? ''}</TableCell>}
+                  {showSupplierSkuCol && <TableCell className="px-4 font-mono text-xs" data-testid="po-line-supplier-sku">{supplierSkus[line.productId] ?? ''}</TableCell>}
                   <TableCell className="px-4 text-right tabular-nums whitespace-nowrap">
                     {line.purchaseUnitQty != null ? (
                       <span>
@@ -2660,9 +2702,9 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               {(() => {
                 const hasDiscountCol = po.lines.some((l) => l.discountAmount > 0)
                 // Columns before "Total ({sym})": 5 always present (thumbnail, Product,
-                // Qty, Unit Cost {sym}, Expected) plus each conditional column. labelSpan must
+                // Qty, Unit Cost {sym}, Expected) plus each conditional column (Barcode and Supplier SKU when shown). labelSpan must
                 // equal that count so the amount cell lands under the Total header.
-                const labelSpan = 5 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + ((po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) ? 1 : 0)
+                const labelSpan = 5 + (showBarcodeCol ? 1 : 0) + (showSupplierSkuCol ? 1 : 0) + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + ((po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) ? 1 : 0)
                 // Total discount = sum of line discounts + order-level
                 // discount. The stored `subtotalForeign` is already
                 // post-discount; we surface the breakdown for clarity.

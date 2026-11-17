@@ -153,6 +153,17 @@ When you generate draft POs from reorder planning, the system groups suggestions
 
 Products without a preferred supplier are listed under "Unassigned" and require you to pick a supplier before the draft can be generated. The preferred supplier is auto-updated whenever a PO is sent to a different supplier for that product, so once you start ordering from a new vendor, planning follows you.
 
+### Group by supplier
+
+Tick **Group by supplier** in the filters and press Apply to lay Reorder Planning out supplier by supplier, the way purchase orders are placed. Each group has a header with the supplier, the number of rows and the **total recommended quantity** (the sum of the rows' Suggested qty), followed by that supplier's rows. The page then lists every matching row, not one page at a time, so a supplier's group and total are complete.
+
+- Groups do not merge lead times. Every row keeps its own **Lead time** and **Latest PO date**; only the quantity is totalled.
+- Rows with **no supplier** go in a separate amber **No supplier** group at the end, because a draft PO cannot be raised for them. Set a supplier on the product first.
+- Manufactured (BOM) products are not bought, so they get their own groups after the suppliers ("Manufactured by ..." or "Manufactured in-house") and are never in the no-supplier group.
+- Groups follow the filters. Change the **Warehouse** (or any other filter) and Apply, and the groups and totals are worked out again from the rows that remain.
+- Groups use the supplier the report chose for each row. A different supplier picked in a row's own selector, or by the draft PO button, is not reflected until you reload.
+- This is a view only. The CSV, the selection boxes and draft PO and production order generation work exactly as before.
+
 ## Sales and Fulfillment Analytics
 
 | Report | What it shows |
