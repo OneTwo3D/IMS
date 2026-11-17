@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { logActivityInTransaction } from '@/lib/activity-log'
+import { getSettingValue } from '@/lib/settings-store'
 import { orderNotFoundQuery, raiseWmsOperatorTask, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -38,6 +39,18 @@ export const PUSH_ERRORS_DISPLAY_CAP = 20
 export const WMS_NOT_FOUND_THRESHOLD = 3
 /** The snapshot status of an order the sweep stopped polling. */
 export const WMS_STATUS_NOT_FOUND = 'NOTFOUND'
+/**
+ * The switch for all of the NOTFOUND behaviour. OFF BY DEFAULT: only an explicit `true` turns it on. While it is off the sweep behaves exactly as it did
+ * before NOTFOUND existed (probe, record "confirmed absent", keep polling), counts no strike, marks nothing and raises no task. An unreadable setting is off.
+ */
+export const WMS_NOT_FOUND_ENABLED_SETTING = 'wms_not_found_after_strikes_enabled'
+async function isNotFoundHandlingEnabled(): Promise<boolean> {
+  try {
+    return (await getSettingValue(WMS_NOT_FOUND_ENABLED_SETTING)) === 'true'
+  } catch {
+    return false
+  }
+}
 const WMS_STATUS_NOT_FOUND_LABEL = 'Not found in warehouse'
 
 export type WmsOrderStatusSweepResult = {
@@ -160,11 +173,12 @@ export async function runWmsOrderStatusSweep(
   const staleBefore = new Date(Date.now() - staleMinutes * 60_000)
   const connectorLabel = getWmsConnectorDef(connectorId).label
 
+  const notFoundEnabled = await isNotFoundHandlingEnabled()
   const inScope = {
     status: { notIn: [...TERMINAL_SALES_STATUSES] },
     shoppingLinks: { some: { connector: lookupConnector, externalOrderNumber: { not: null } } },
     // An order already marked NOTFOUND is not polled again (an operator task asks a person to look): it is out of the batch and out of the unresolved count.
-    NOT: { wmsOrderStatus: { is: { status: WMS_STATUS_NOT_FOUND } } },
+    ...(notFoundEnabled ? { NOT: { wmsOrderStatus: { is: { status: WMS_STATUS_NOT_FOUND } } } } : {}),
   }
   const orders = await db.salesOrder.findMany({
     where: {
@@ -267,7 +281,7 @@ export async function runWmsOrderStatusSweep(
         // An order the warehouse SHOULD hold is probed on every lookup until it is marked NOTFOUND (at most WMS_NOT_FOUND_THRESHOLD probes, then it is no
         // longer polled): each strike needs a fresh answer, because the order may since have been merged, which the first absent answer could not know.
         const alreadyConfirmedAbsent = known
-          && pushedExternalId === ''
+          && !(notFoundEnabled && pushedExternalId !== '')
           && !known.externalOrderId
           && known.lastError === WMS_LOOKUP_CONFIRMED_ABSENT
 
@@ -300,7 +314,8 @@ export async function runWmsOrderStatusSweep(
       // THE NOT-FOUND COUNT. Found: reset. Confirmed absent for an order the warehouse should hold: one more strike. Merged, ambiguous or present with an
       // unreadable status: the order is there, reset. Anything unresolved (a probe that failed or could not run): left exactly as it was.
       let strikes: number | null = null
-      if (status) strikes = 0
+      if (!notFoundEnabled) strikes = null
+      else if (status) strikes = 0
       else if (notFoundReason === WMS_LOOKUP_CONFIRMED_ABSENT) strikes = pushedExternalId !== '' ? priorStrikes + 1 : null
       else if (notFoundReason === WMS_LOOKUP_AMBIGUOUS || notFoundReason === WMS_LOOKUP_PRESENT_NO_STATUS) strikes = 0
       const markNotFound = !status && strikes !== null && strikes >= WMS_NOT_FOUND_THRESHOLD
@@ -321,8 +336,7 @@ export async function runWmsOrderStatusSweep(
             trackingNumber: tracking?.trackingNumber ?? null,
             carrier: tracking?.carrier ?? null,
             lastError: null,
-            notFoundStrikes: 0,
-            notFoundAt: null,
+            ...(notFoundEnabled ? { notFoundStrikes: 0, notFoundAt: null } : {}),
           }
         : {
             connector: connectorId,

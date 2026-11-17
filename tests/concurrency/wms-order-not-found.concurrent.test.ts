@@ -90,6 +90,13 @@ async function cleanup(d: Deps, orders: Array<{ id: string; reference: string }>
   await d.db.shoppingOrderLink.deleteMany({ where: { orderId: { in: ids } } })
   await d.db.salesOrder.deleteMany({ where: { id: { in: ids } } })
   for (const order of orders) { scripts.delete(order.reference); fetchCalls.delete(order.reference) }
+  await setSwitch(d, null)
+}
+
+const SWITCH = 'wms_not_found_after_strikes_enabled'
+async function setSwitch(d: Deps, value: string | null) {
+  if (value === null) await d.db.setting.deleteMany({ where: { key: SWITCH } })
+  else await d.db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value }, update: { value } })
 }
 
 /** One sweep that treats every snapshot as stale (the 30 minute window is not what is under test). */
@@ -102,6 +109,7 @@ test('N CONSECUTIVE 404s mark the order NOTFOUND, stop polling it and raise ONE 
   const d = await setup()
   const order = await seedOrder(d)
   t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
   scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING' })
 
   for (let strike = 1; strike < d.sweep.WMS_NOT_FOUND_THRESHOLD; strike++) {
@@ -143,6 +151,7 @@ test('an intervening SUCCESSFUL lookup resets the count: the order is NOTFOUND o
   const d = await setup()
   const order = await seedOrder(d)
   t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
   const script = (fetch: Script['fetch']) => scripts.set(order.reference, { fetch, probe: 'MISSING' })
 
   script('absent'); await sweepOnce(d); await sweepOnce(d)
@@ -165,6 +174,7 @@ test('a lookup that FAILED proves nothing: it neither counts nor resets, and an 
   const d = await setup()
   const order = await seedOrder(d)
   t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
   scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING' })
   await sweepOnce(d); await sweepOnce(d)
   // Mintsoft is down for a long time: many failed lookups, no strike.
@@ -188,6 +198,7 @@ test('an AMBIGUOUS or PRESENT answer (merged or split) means the order is there:
   const d = await setup()
   const order = await seedOrder(d)
   t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
   for (const probe of ['AMBIGUOUS', 'FOUND'] as const) {
     scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING' })
     await sweepOnce(d); await sweepOnce(d)
@@ -205,6 +216,7 @@ test('an order IMS has NOT pushed is expected to be absent: it is never marked N
   const d = await setup()
   const order = await seedOrder(d, { pushed: false })
   t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
   scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING' })
   for (let i = 0; i < d.sweep.WMS_NOT_FOUND_THRESHOLD + 2; i++) await sweepOnce(d)
   const snapshot = await snapshotOf(d, order.id)
@@ -218,6 +230,7 @@ test('the operator task is created ONCE: a second mark of the same order (a rese
   const d = await setup()
   const order = await seedOrder(d)
   t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
   scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING' })
   for (let i = 0; i < d.sweep.WMS_NOT_FOUND_THRESHOLD; i++) await sweepOnce(d)
   assert.equal((await tasksOf(d, order.id)).length, 1)
@@ -227,4 +240,27 @@ test('the operator task is created ONCE: a second mark of the same order (a rese
   assert.equal((await snapshotOf(d, order.id))?.status, 'NOTFOUND')
   assert.equal((await tasksOf(d, order.id)).length, 1, 'deduplicated on the warehouse order')
   assert.equal(await d.db.activityLog.count({ where: { entityId: order.id, action: 'wms_order_not_found' } }), 1)
+})
+
+test('SWITCH OFF (the default): nothing changes. The order is probed and recorded as confirmed absent, polled on every sweep, never counted, never marked, no task', { skip }, async (t) => {
+  const d = await setup()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order]))
+  scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING' })
+  for (const value of [null, 'false', 'yes']) {
+    await setSwitch(d, value)
+    for (let i = 0; i < d.sweep.WMS_NOT_FOUND_THRESHOLD + 1; i++) await sweepOnce(d)
+  }
+  const snapshot = await snapshotOf(d, order.id)
+  assert.equal(snapshot?.lastError, d.sweep.WMS_LOOKUP_CONFIRMED_ABSENT, 'today\'s record')
+  assert.equal(snapshot?.status, '', 'today\'s placeholder status')
+  assert.equal(snapshot?.notFoundStrikes, 0, 'no strike counted')
+  assert.equal(snapshot?.notFoundAt, null)
+  assert.equal((await tasksOf(d, order.id)).length, 0)
+  assert.equal(polls(order.reference), 3 * (d.sweep.WMS_NOT_FOUND_THRESHOLD + 1), 'still polled on every sweep')
+  // A snapshot already marked NOTFOUND (the switch was on, then turned off) is polled again.
+  await d.db.wmsOrderStatusSnapshot.update({ where: { orderId: order.id }, data: { status: 'NOTFOUND' } })
+  const before = polls(order.reference)
+  await sweepOnce(d)
+  assert.equal(polls(order.reference), before + 1)
 })

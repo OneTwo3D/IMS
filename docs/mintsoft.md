@@ -705,6 +705,8 @@ The connector builds that deep link and stores it on the cached snapshot (core f
 
 ### NOTFOUND after repeated 404s
 
+Behind `wms_not_found_after_strikes_enabled` (default off, only `true` is on; unreadable is off). While off the sweep is exactly the pre-NOTFOUND behaviour: no strike counted, nothing marked, no task, a NOTFOUND snapshot is polled again, and the first confirmed-absent answer is not re-probed. The rest of this section describes the on state. One-way: nothing resumes polling a marked order except switching the setting off (follow-up filed).
+
 The status sweep counts, per order, the CONSECUTIVE lookups that found an order IMS pushed genuinely absent: `fetchOrderStatus` returned nothing AND the presence probe answered missing (a lookup that failed, or a probe that could not run, neither counts nor resets). A found order, a merged or ambiguous one, resets the count (`wms_order_status_snapshots.notFoundStrikes`). An order IMS has not pushed (no SYNCED push link with a warehouse id) is never counted, because absence is expected until the push settles. An order that IMS pushed is probed on every lookup, not only the first, so a later merge is seen before a strike is counted. At `WMS_NOT_FOUND_THRESHOLD` (3, the old bridge's threshold) the snapshot becomes status `NOTFOUND` (`notFoundAt` set, `lastError` still the confirmed-absent marker, so the delete guard reads it as an authoritative absence), the order leaves the sweep's batch, and ONE `ORDER_NOT_FOUND` operator task and one activity row (`wms_order_not_found`) are written in the same transaction. Nothing is written to Mintsoft or WooCommerce.
 
 ## Connector Settings

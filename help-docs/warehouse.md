@@ -139,12 +139,12 @@ Warnings are added to the task and the badge: an **EU destination** needs the cu
 
 ### An order Mintsoft no longer has (NOTFOUND)
 
-The status refresh looks up every in-flight order IMS pushed. When Mintsoft answers that an order does not exist (and a second search by order number agrees) **three times in a row**, IMS marks the order's **WMS Status** as **NOTFOUND**, stops checking it, and adds **one** task under **Integrations > Exceptions > Raise a warehouse query**: *Warehouse order not found on repeated checks*. Look the order up in Mintsoft yourself: if it was cancelled, merged or renamed there, nothing more is needed; if it should still exist, raise a query with the warehouse to find out what happened to it before it is despatched. Then press **Done**. IMS changes nothing in Mintsoft or WooCommerce and writes no note on either, because the warehouse does not read notes.
+**Off by default** (setting `wms_not_found_after_strikes_enabled`; only `true` turns it on). While it is off, nothing described here happens: an order Mintsoft cannot find is recorded as not found and checked again on every refresh, as before. When it is on, the status refresh looks up every in-flight order IMS pushed. When Mintsoft answers that an order does not exist (and a second search by order number agrees) **three times in a row**, IMS marks the order's **WMS Status** as **NOTFOUND**, stops checking it, and adds **one** task under **Integrations > Exceptions > Raise a warehouse query**: *Warehouse order not found on repeated checks*. Look the order up in Mintsoft yourself: if it was cancelled, merged or renamed there, nothing more is needed; if it should still exist, raise a query with the warehouse to find out what happened to it before it is despatched. Then press **Done**. IMS changes nothing in Mintsoft or WooCommerce and writes no note on either, because the warehouse does not read notes.
 
 - **Any answer that finds the order resets the count**, and so does a merged or ambiguous answer (the order is there, under another number or in parts).
 - **A check that fails does not count and does not reset it.** If Mintsoft is unreachable, or the second search cannot run, the order is never marked NOTFOUND: an outage is not read as "the order is gone".
 - **An order IMS has not pushed yet is never counted.** It is expected to be absent until the push succeeds.
-- The task is raised once. A NOTFOUND order is not checked again, so its chip stays **NOTFOUND** until the order is dealt with.
+- The task is raised once. A NOTFOUND order is not checked again, so its chip stays **NOTFOUND**. This is one-way for now: re-pushing the order or marking the task Done does not resume checking (a follow-up is filed). Turning the setting off makes the refresh check such orders again.
 
 ### Holds, cancels and merged orders
 
