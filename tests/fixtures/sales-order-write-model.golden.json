@@ -82,7 +82,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -227,7 +229,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -353,7 +357,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -479,7 +485,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {
@@ -624,7 +632,9 @@
       "erasedAt": null,
       "externalCreatedAt": null,
       "externalUpdatedAt": null,
-      "archived": false
+      "archived": false,
+      "paymentRemovedAt": null,
+      "paymentRemovedForeign": null
     },
     "lines": [
       {

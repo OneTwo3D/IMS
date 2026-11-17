@@ -335,6 +335,61 @@ export function calculateDailyVelocity(sales: VelocitySaleInput[], window: Veloc
     .sort((a, b) => toDecimal(b.dailyQtyVelocity).cmp(toDecimal(a.dailyQtyVelocity)) || a.sku.localeCompare(b.sku))
 }
 
+export const DEFAULT_MAX_CENSORED_FRACTION = 0.9
+
+export type StockoutAdjustedVelocityOptions = {
+  /**
+   * When the stockout days reach this fraction of the window the adjustment is refused and the
+   * unadjusted rate is kept. Without it, 1 sale in 90 days with 89 stockout days would read 1 unit/day.
+   */
+  maxCensoredFraction?: number
+}
+
+export type StockoutAdjustedVelocityRow = DailyVelocityRow & {
+  /** Covered days with no on-hand stock inside the window, as supplied. */
+  stockoutDays: number
+  /** Days the rate was divided by: windowDays - stockoutDays when adjusted, windowDays otherwise. */
+  effectiveDays: number
+  /** The 90% guard refused the adjustment: the rate is the unadjusted one. */
+  clamped: boolean
+}
+
+/**
+ * Daily velocity with stockout days removed from the DENOMINATOR ONLY: unitsSold / (windowDays - stockoutDays).
+ * Days with no snapshot coverage are not in `stockoutDaysByProduct` and stay in the denominator. Lost
+ * sales are not imputed. The result is never below calculateDailyVelocity's, and a product with no
+ * stockout days comes back untouched (the same row object calculateDailyVelocity produced).
+ */
+export function calculateStockoutAdjustedVelocity(
+  sales: VelocitySaleInput[],
+  window: VelocityWindow,
+  stockoutDaysByProduct: ReadonlyMap<string, number>,
+  options: StockoutAdjustedVelocityOptions = {},
+): StockoutAdjustedVelocityRow[] {
+  const maxCensoredFraction = options.maxCensoredFraction ?? DEFAULT_MAX_CENSORED_FRACTION
+  if (!(maxCensoredFraction > 0 && maxCensoredFraction <= 1)) {
+    throw new Error(`maxCensoredFraction must be in (0, 1]; got ${String(maxCensoredFraction)}`)
+  }
+  const { days } = normalizeVelocityWindow(window)
+  return calculateDailyVelocity(sales, window).map((row) => {
+    const raw = stockoutDaysByProduct.get(row.productId) ?? 0
+    const stockoutDays = Number.isFinite(raw) ? Math.min(days, Math.max(0, Math.floor(raw))) : 0
+    if (stockoutDays === 0) return { ...row, stockoutDays: 0, effectiveDays: days, clamped: false }
+    if (stockoutDays >= days * maxCensoredFraction) return { ...row, stockoutDays, effectiveDays: days, clamped: true }
+    const effectiveDays = days - stockoutDays
+    const adjustedQty = roundQuantity(toDecimal(row.qtySold).div(effectiveDays), 6)
+    const adjustedCogs = roundQuantity(toDecimal(row.cogsBase).div(effectiveDays), 6)
+    return {
+      ...row,
+      dailyQtyVelocity: Prisma.Decimal.max(adjustedQty, toDecimal(row.dailyQtyVelocity)).toString(),
+      dailyCogsVelocity: Prisma.Decimal.max(adjustedCogs, toDecimal(row.dailyCogsVelocity)).toString(),
+      stockoutDays,
+      effectiveDays,
+      clamped: false,
+    }
+  })
+}
+
 /**
  * Returns rows sorted by daily quantity velocity descending, then SKU, annotated
  * with 1-indexed rank and quartile. The input array is not mutated.

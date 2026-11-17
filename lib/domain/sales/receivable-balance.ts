@@ -1,3 +1,4 @@
+import { shortfallAsOf } from '@/lib/domain/sales/paid-state'
 import { refundCreditsAsGross, type TurnoverBound, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 
 /**
@@ -31,6 +32,14 @@ import { refundCreditsAsGross, type TurnoverBound, type TurnoverRefund } from '@
  *    LEDGER receipt is registered), so the uncovered remainder is treated as received off-ledger at
  *    `paidAt`: receipts = max(customer receipts in base, invoiceGross). Cash paid out is then
  *    subtracted as usual, and an over-payment stays an over-payment.
+ *    KNOWN LIMIT (pre-dates o3d-cdhl, applies to every order): `paidAt` is the CURRENT flag, not a history. An order whose
+ *    paid state was later cleared (a full payment reversal, delete-payment, the Mark Paid toggle) reads as unpaid for every
+ *    `asOf`, so a report dated before the clear no longer treats it as settled by `paidAt`. Only the Payment rows still
+ *    stand for it. The cleared `paidAt` value is not kept anywhere (activity rows are retention-swept and do not carry it), so
+ *    there is no reliable record to derive the earlier state from without a new column.
+ *  - A PART REMOVED FROM THE LEDGER (o3d-cdhl): when the accounting ledger no longer holds part of the payment, that
+ *    part (`paymentRemovedForeign`, order currency, at the booked rate) comes off the receipts, so the balance owed
+ *    includes it from the moment it was recorded.
  *
  * `balance > 0.01` is a receivable, `balance < -0.01` a customer credit balance, otherwise settled.
  * A payment, refund or credit with no date counts as already happened (real rows always have one).
@@ -48,6 +57,11 @@ export type ReceivableOrder = {
   totalForeign?: unknown
   currency?: string | null
   paidAt?: Date | null
+  /** o3d-cdhl: the part of the paid amount the ledger no longer holds (order currency) and since when. NULL/absent = none. */
+  paymentRemovedForeign?: unknown
+  paymentRemovedAt?: Date | null
+  /** The timestamped history of changes to that figure (REMOVED +, RESTORED/CLEARED -). When given it, not the current columns, decides the figure at `asOf`. */
+  paymentRemovals?: Array<{ kind: string; amountForeign: unknown; createdAt: Date }>
   payments: ReceivablePayment[]
   refunds?: Array<TurnoverRefund & { refundedAt?: Date | null }>
 }
@@ -94,6 +108,16 @@ export function receivableBalance(order: ReceivableOrder, asOf: Date): Receivabl
 
   let receipts = customerPayments.reduce((sum, p) => sum + toBase(p), 0)
   if (order.paidAt != null && onOrBefore(order.paidAt)) receipts = Math.max(receipts, invoiceGross)
+  // o3d-cdhl: the ledger no longer holds PART of what is held as paid (it came off the receipts at the booked rate, as every own-currency
+  // movement does). Without this the order's rows and its paid flag still say settled and the missing part would be owed by nobody.
+  // The figure AS OF the report date, from the history, so a later restore or clear does not rewrite an earlier report. Orders
+  // without history rows (none were ever recorded) fall back to the current columns.
+  const removedForeign = Array.isArray(order.paymentRemovals)
+    ? Number(shortfallAsOf(order.paymentRemovals, asOf))
+    : (order.paymentRemovedForeign == null || !onOrBefore(order.paymentRemovedAt) ? 0 : Number(order.paymentRemovedForeign))
+  if (order.paidAt != null && onOrBefore(order.paidAt) && removedForeign > 0) {
+    receipts -= removedForeign * bookedRate
+  }
   receipts -= cashOut.reduce((sum, p) => sum + Math.abs(toBase(p)), 0)
 
   const balance = round2(invoiceGross - creditResult.credit - receipts)

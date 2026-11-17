@@ -89,6 +89,7 @@ test('every writer of order notes, internal notes and tracking numbers is in the
  */
 const SYNC_LOG_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'app/actions/sync-exceptions.ts': { writers: 5, verdict: 'no-identity (operator resolution: status updateMany)' },
+  'lib/domain/sales/shop-refund-confirm.ts': { writers: 1, verdict: 'no-identity (marks the parked WooCommerce refund row SYNCED after an operator confirms it settles an IMS refund: status and ids only; no name, address or contact)' },
   'lib/connectors/woocommerce/sync/completion-refusal.ts': { writers: 5, verdict: 'no-identity (completion refusal record: WooCommerce order id, status, refusal kind and the fulfilment refusal message; no address, name or contact)' },
   'lib/connectors/woocommerce/sync/order-admission.ts': { writers: 4, verdict: 'raw-woo (the refusal queue parks the raw order)' },
   'lib/connectors/woocommerce/sync/order-edit-drift.ts': { writers: 2, verdict: 'no-identity (WooCommerce line ids, SKUs, quantities and totals only; no address, name or contact)' },

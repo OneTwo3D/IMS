@@ -42,6 +42,8 @@ import { wcOrderEditDriftWhere } from '@/lib/connectors/woocommerce/sync/order-e
 import { giftCardUnsettledHoldWhere } from '@/lib/connectors/woocommerce/sync/gift-card-line-resolution'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
+import { findOpenShopRefunds, shopRefundAmountEquals } from '@/lib/domain/sales/shop-refund-tasks'
+import { confirmParkedRefundSettlement } from '@/lib/domain/sales/shop-refund-confirm'
 import { accountingSyncRowCanPostOrHasPosted, retiredUnprovenRows } from '@/lib/domain/accounting/postable-sync-statuses'
 import { POSTING_REFUSAL_KINDS, POSTING_REFUSAL_NOTE_MAX_LENGTH, postingRefusalClearing, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import {
@@ -466,6 +468,8 @@ export type RefundSyncParkRow = {
   currency: string | null
   refundGrossForeign: string | null
   allocationTargets: RefundParkAllocationTarget[]
+  /** zvec.19: the IMS refunds still waiting for a WooCommerce refund whose amount equals this parked one, each of which a person may confirm this refund settles. */
+  confirmableImsRefunds: Array<{ imsRefundId: string; creditNoteNumber: string | null }>
 }
 
 export type StuckDispatchRow = {
@@ -822,6 +826,8 @@ export type ExceptionInboxSummary = {
   giftCardLinesToResolve: number
   /** Open operator tasks ("raise a warehouse query"): IMS writes no warehouse comments, so each is a query a person raises by hand (counted in the total). */
   wmsOperatorTasksOpen: number
+  /** Standing refusals of an action (an order change the warehouse could not take, a split order that cannot complete) that need a person: serious and medium ones (counted in the total). */
+  refusedActionsOpen: number
   unresolvedDrift: number
   /** Open systemic-failure incidents: a sweep read a pass as a connector-wide fault and parked nothing (counted in the total). */
   systemicFailures: number
@@ -1292,6 +1298,8 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
 
   const giftCardLinesToResolve = await db.shoppingSyncLog.count({ where: giftCardUnsettledHoldWhere() })
   const wmsOperatorTasksOpen = await db.wmsOperatorTask.count({ where: { status: 'OPEN' } })
+  // HIGH and MEDIUM only: LOW is noise by design (listed on the page, never counted).
+  const refusedActionsOpen = await db.refusedAction.count({ where: { resolvedAt: null, severity: { in: ['HIGH', 'MEDIUM'] } } })
   const systemicFailures = (await loadActiveSystemicIncidents()).length
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
   const deadReceiptEvents = deadReceipts + deadWebhooks + deadShoppingWebhooks
@@ -1311,6 +1319,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     doublePostageFlags,
     giftCardLinesToResolve,
     wmsOperatorTasksOpen,
+    refusedActionsOpen,
     unresolvedDrift: driftIncidents.length,
     systemicFailures,
     accountingFollowUpObligations,
@@ -1319,7 +1328,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + driftIncidents.length + systemicFailures
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + refusedActionsOpen + driftIncidents.length + systemicFailures
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }
@@ -1833,9 +1842,21 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     ]
       .sort((left, right) => (right.deadLetteredAt ?? '').localeCompare(left.deadLetteredAt ?? ''))
       .slice(0, SECTION_LIMIT),
-    refundSyncParks: refundLogs.map((log) => {
+    refundSyncParks: await Promise.all(refundLogs.map(async (log) => {
       const order = log.entityId ? refundOrderById.get(log.entityId) : undefined
       const payloadAmount = readParkedRefundGross(log.payload)
+      // zvec.19: which IMS refunds still owed to WooCommerce this parked refund could be the payment of (the same amount). A read failure offers none.
+      let confirmableImsRefunds: Array<{ imsRefundId: string; creditNoteNumber: string | null }> = []
+      if (log.status === 'QUARANTINED' && log.entityId && order && payloadAmount != null) {
+        try {
+          const amount = toDecimal(payloadAmount).abs()
+          confirmableImsRefunds = (await findOpenShopRefunds(db, log.entityId))
+            .filter((open) => shopRefundAmountEquals(open, order.currency, amount))
+            .map((open) => ({ imsRefundId: open.refundId, creditNoteNumber: open.creditNoteNumber }))
+        } catch {
+          confirmableImsRefunds = []
+        }
+      }
       return {
         id: log.id,
         status: log.status,
@@ -1852,8 +1873,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         currency: order?.currency ?? null,
         refundGrossForeign: payloadAmount,
         allocationTargets: buildAllocationTargets(order),
+        confirmableImsRefunds,
       }
-    }),
+    })),
     stuckDispatches,
     pennyMismatches: mismatchLinks.map((link) => ({
       orderId: link.orderId,
@@ -3390,6 +3412,33 @@ export async function recordRefundParkManually(
     revalidatePath('/sync/exceptions')
     revalidatePath(`/sales/${order.id}`)
     return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * "Confirm this WooCommerce refund settles IMS refund <credit note>" (zvec.19).
+ *
+ * A refund recorded in IMS on a WooCommerce order writes nothing to WooCommerce; a person refunds the customer there later. IMS cannot tell that
+ * refund from a separate one with the same amount (it writes no marker), so the import parks it QUARANTINED instead of linking it. This is the
+ * person's answer "it IS the payment of that IMS refund": ONE transaction, under the per-refund advisory lock and the order lock, re-checks the match,
+ * sets the WooCommerce refund id on the IMS refund, resolves the "Refund in WooCommerce" task and the park, and writes the audit entry. No credit
+ * note is raised (the IMS refund already has it). The other answer, "it is a separate refund", is the existing Record-manually path.
+ * Permission is the one recording a refund by hand needs.
+ */
+export async function confirmParkedRefundSettlesImsRefund(parkId: string, imsRefundId: string): Promise<MutationResult> {
+  try {
+    await requirePermission('sync')
+    const session = await requireFreshPermission('sales.refund')
+    const result = await confirmParkedRefundSettlement(db, { parkId, imsRefundId, userId: session.user.id })
+    if (result.success) {
+      revalidatePath('/sync/exceptions')
+      if (result.orderId) revalidatePath(`/sales/${result.orderId}`)
+    }
+    return result.success ? { success: true, notice: result.notice } : { success: false, error: result.error }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

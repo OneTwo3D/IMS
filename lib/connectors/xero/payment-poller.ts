@@ -30,6 +30,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
+import { compareDecimal, ledgerAmountEpsilon, toDecimal as toDecimalSafe } from '@/lib/domain/math/decimal'
 import { xeroGet } from './api'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { notify, notifyPersisted } from '@/lib/notifications'
@@ -42,6 +43,15 @@ import {
   type LedgerClassifierProof,
 } from '@/lib/domain/accounting/payment-reversal'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
+import {
+  matchRemovedRegisteredPayments,
+  measurePartialPaymentRemoval,
+  type PartialRemovalMeasurement,
+  type RegisteredReceipt,
+} from '@/lib/domain/accounting/partial-payment-removal'
+import { appendShortfallCleared, recordPaymentRemoval } from '@/lib/domain/accounting/payment-removal-reconciliation'
+import { loadInvoicePaymentSyncRows } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import {
   closeWithheldMarker,
   deferWithheldMarker,
@@ -288,11 +298,8 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
     // two connectors arrive at the same withholding by different doors. Stated rather than defaulted
     // so that a change making this reachable here is a sentence somebody has to write.
     //
-    // WHAT XERO STILL DOES NOT DO WITH IT is the other half of o3d-cdhl: a stable part-paid Xero
-    // invoice is warned about on every poll that sees it and reconciled by nobody, exactly as the
-    // QuickBooks one is. The difference r9 closes is only that the QuickBooks side now says so in a
-    // form that can be found; extending that to Xero's `partPaid` bucket is filed with the
-    // reconciliation work rather than done here, because both need the same accounting path.
+    // WHAT XERO DOES WITH A PART-PAID INVOICE (o3d-cdhl): a measured removal is recorded on the order and reported once
+    // (`reconcilePartialRemovals`); what cannot be measured stays withheld with the `part-payment` reason.
     case 'LEDGER_PARTIALLY_PAID':
       return ` The ledger states this document is PART PAID: ${verdict.paidAmount} of its `
         + `${verdict.documentTotal} is settled and ${verdict.outstandingAmount} is still outstanding`
@@ -408,12 +415,26 @@ type ResidualReading<T> = {
    * is pushed, and the chunk is not checkpointed.
    */
   zeroPaidReversed: Set<string>
+  /**
+   * o3d-cdhl — invoice id -> a document whose payment the ledger holds only IN PART, where the shortfall is
+   * MEASURED and is a removal rather than IMS's own silence. Neither reversed (the ledger still holds money) nor
+   * withheld (there is nothing left to wait for): the removed part is recorded on the order and reported once.
+   * Always empty on the bill side, which has no such measurement.
+   */
+  partialRemoved: Map<string, PartialRemovalDoc<T>>
   /** Still withheld, with the reason the readings give between them. */
   withheld: ResidualDoc<T>[]
 }
 
+type PartialRemovalDoc<T> = {
+  doc: T
+  invoice: XeroInvoice
+  verdict: RegisteredPaymentVerdict
+  measurement: Extract<PartialRemovalMeasurement, { kind: 'REMOVED' | 'RESTORED' }>
+}
+
 function emptyResidual<T>(): ResidualReading<T> {
-  return { provenGone: new Map(), zeroPaidReversed: new Set(), withheld: [] }
+  return { provenGone: new Map(), zeroPaidReversed: new Set(), partialRemoved: new Map(), withheld: [] }
 }
 
 /**
@@ -452,6 +473,11 @@ async function readResidualVerdicts<T extends {
   ledgerObservedBefore: LedgerReadFence | null,
   /** Sales only: the removal grace window and the instant it is measured at. Absent = no grace (bills). */
   removalGrace?: { ms: number; now: Date },
+  /**
+   * o3d-cdhl — sales only: measure a part-paid ledger document against what IMS recorded. `null` = the facts do not
+   * apply (a bill, or a document that cannot be measured), which keeps the withheld behaviour exactly as it was.
+   */
+  measurePartial?: (doc: T, invoice: XeroInvoice, verdict: RegisteredPaymentVerdict) => PartialRemovalMeasurement | 'ALREADY_RECORDED' | null,
 ): Promise<ResidualReading<T>> {
   const out = emptyResidual<T>()
   if (docs.length === 0) return out
@@ -509,6 +535,14 @@ async function readResidualVerdicts<T extends {
       parseLedgerAmount(invoice.AmountPaid, xeroInvoiceCurrency(invoice)) === null ? 'amount-not-stated' : 'part-payment'
     if (verdict.verdict === 'GONE') {
       out.provenGone.set(invoice.InvoiceID, { doc, invoice, paymentIds: verdict.paymentIds })
+      continue
+    }
+    const measured = reason === 'part-payment' && measurePartial ? measurePartial(doc, invoice, verdict) : null
+    if (measured && measured !== 'ALREADY_RECORDED' && (measured.kind === 'REMOVED' || measured.kind === 'RESTORED')) {
+      out.partialRemoved.set(invoice.InvoiceID, { doc, invoice, verdict, measurement: measured })
+    } else if (measured === 'ALREADY_RECORDED') {
+      // o3d-cdhl: this removal was already reconciled. The ledger and the order agree on what is paid, so there is
+      // nothing to withhold and nothing to say again.
     } else {
       out.withheld.push({ doc, invoice, verdict, reason })
     }
@@ -522,6 +556,7 @@ async function readResidualVerdicts<T extends {
     if (doc.accountingInvoiceId == null) continue
     out.zeroPaidReversed.delete(doc.accountingInvoiceId)
     out.provenGone.delete(doc.accountingInvoiceId)
+    out.partialRemoved.delete(doc.accountingInvoiceId)
   }
   return out
 }
@@ -541,6 +576,12 @@ type WithheldOrderDoc = {
   status: string
   /** o3d-psrx r2 — see SalesOrder.unregisteredPaidAt and readResidualVerdicts. */
   unregisteredPaidAt: Date | null
+  /** o3d-cdhl — what the part-payment measurement needs from the order. Optional so existing callers of the type still compile. */
+  totalForeign?: unknown
+  currency?: string
+  paymentRemovedForeign?: unknown
+  /** The order has at least one credit note or refund. */
+  hasRefunds?: boolean
 }
 
 function billWithheldDescription(bill: WithheldBillDoc, invoice: XeroInvoice, reason: WithheldAmountReason): string {
@@ -724,6 +765,206 @@ async function signalWithheldSalesReversals(
   }
 }
 
+/**
+ * o3d-cdhl — the IMS-registered payments Xero no longer lists against this invoice, when they account for the removal.
+ * Read for NAMING only: the figure is measured from the ledger's own amounts and does not depend on this.
+ */
+async function registeredReceiptsFor(orderId: string, currency: string, invoiceId: string): Promise<RegisteredReceipt[]> {
+  const rows = await loadInvoicePaymentSyncRows(orderId, XERO_CONNECTOR, currency)
+  const out: RegisteredReceipt[] = []
+  for (const row of rows) {
+    if (row.accountingInvoiceId !== invoiceId) continue
+    if (ledgerStanding(row) !== 'CONFIRMED_POSTED') continue
+    const ledgerPaymentId = row.externalTransactionId
+    if (typeof ledgerPaymentId !== 'string' || ledgerPaymentId.trim() === '') continue
+    out.push({ ledgerPaymentId, amount: row.registeredAmount.kind === 'stated' ? row.registeredAmount.amount : null })
+  }
+  return out
+}
+
+function partialRemovalDescription(
+  ref: string,
+  m: Extract<PartialRemovalMeasurement, { kind: 'REMOVED' }>,
+  matched: string[],
+  shortfall: string,
+): string {
+  const named = matched.length > 0
+    ? ` The payment IMS registered that Xero no longer lists is ${matched.join(', ')}.`
+    : ` IMS could not match the missing amount to a single payment it registered, so the amount is the only identification.`
+  return withLedgerCheck(
+    `Xero holds ${m.ledgerPaid.toFixed(2)} ${m.currency} paid against the invoice for order ${ref}, but IMS recorded the order as paid in full `
+    + `(${m.recordedPaid.toFixed(2)} of ${m.documentTotal.toFixed(2)} ${m.currency}). ${m.removed.toFixed(2)} ${m.currency} of the payment is no longer in Xero.${named} `
+    + `IMS has recorded ${shortfall} ${m.currency} on the order as not received, so the order no longer shows as fully paid and its open balance includes it. `
+    + `Revenue was NOT unwound and NO credit note was raised: whether to credit the amount or write it off as a bad debt is a decision for the order owner. `
+    + `This is reported once; it will not repeat unless the ledger changes again.`,
+  )
+}
+
+/**
+ * o3d-cdhl — RECORD THE PART OF A PAYMENT THE LEDGER NO LONGER HOLDS, AND SAY SO ONCE.
+ *
+ * The measurement was taken from the ledger's own amounts in `readSalesResidualVerdicts`. This writes it down: the order's shortfall and its
+ * history move in one transaction, and the operator is told with the exact figures. Order of effects follows the full reversal's (Codex r10 #1):
+ * the alert and the activity row land BEFORE the shortfall is recorded, because recording it is what stops the next poll re-deriving the removal.
+ * A failure before that leaves the removal measurable, so it is reported again rather than lost; a failure after it repeats at most one alert.
+ *
+ * Nothing here posts to Xero or touches revenue.
+ */
+export async function reconcilePartialRemovals(
+  residual: ResidualReading<WithheldOrderDoc>,
+  result: PollResult,
+): Promise<void> {
+  for (const { doc: order, invoice, measurement } of residual.partialRemoved.values()) {
+    const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
+    try {
+      const shortfallBefore = order.paymentRemovedForeign as never
+      if (measurement.kind === 'RESTORED') {
+        const recorded = await recordPaymentRemoval({
+          orderId: order.id, connector: XERO_CONNECTOR, accountingInvoiceId: invoice.InvoiceID,
+          shortfallBefore, measurement, matchedPaymentIds: [],
+        })
+        if (recorded.outcome === 'recorded') {
+          await logActivity({
+            entityType: 'SALES_ORDER', entityId: order.id, action: 'payment_removal_restored', tag: 'sync', level: 'INFO',
+            description: `Xero holds ${measurement.ledgerPaid.toFixed(2)} ${measurement.currency} paid against the invoice for order ${ref} again: ${measurement.restored.toFixed(2)} ${measurement.currency} of the missing payment is back, leaving ${recorded.shortfall.toFixed(2)} ${measurement.currency} recorded as not received.`,
+            metadata: { connector: XERO_CONNECTOR, accountingInvoiceId: invoice.InvoiceID, restored: measurement.restored.toString(), shortfall: recorded.shortfall.toString() },
+            resolveUser: false,
+          })
+        }
+        continue
+      }
+
+      const listed = listedLedgerPaymentIds(invoice)
+      let matched: string[] = []
+      try {
+        matched = matchRemovedRegisteredPayments(
+          measurement.removed, measurement.currency,
+          await registeredReceiptsFor(order.id, measurement.currency, invoice.InvoiceID), listed,
+        )
+      } catch { /* naming is best-effort; the measured figure stands without it */ }
+
+      const before = order.paymentRemovedForeign == null ? 0 : Number(order.paymentRemovedForeign)
+      const shortfallText = (before + Number(measurement.removed)).toFixed(2)
+      const description = partialRemovalDescription(ref, measurement, matched, shortfallText)
+      const logged = await logActivityPersisted({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: 'payment_partially_removed',
+        tag: 'sync',
+        level: 'WARNING',
+        description,
+        metadata: {
+          connector: XERO_CONNECTOR,
+          accountingInvoiceId: invoice.InvoiceID,
+          currency: measurement.currency,
+          removed: measurement.removed.toString(),
+          recordedPaid: measurement.recordedPaid.toString(),
+          ledgerPaid: measurement.ledgerPaid.toString(),
+          documentTotal: measurement.documentTotal.toString(),
+          matchedPaymentIds: matched,
+          ledgerAction: 'OPERATOR_DECISION',
+        },
+        resolveUser: false,
+      })
+      const alerted = await alertAdmins({ title: 'Part of a payment is no longer in Xero', message: description, actionUrl: `/sales/${order.id}` })
+      if (!logged || !alerted) {
+        result.errors.push(`Partial payment removal for order ${ref} left no durable signal (${logged ? '' : 'the activity warning '}${alerted ? '' : 'the operator alert '}could not be written), so it was not recorded and is measured again on the next poll.`)
+        continue
+      }
+      const recorded = await recordPaymentRemoval({
+        orderId: order.id, connector: XERO_CONNECTOR, accountingInvoiceId: invoice.InvoiceID,
+        shortfallBefore, measurement, matchedPaymentIds: matched,
+      })
+      if (recorded.outcome === 'raced') {
+        result.errors.push(`Partial payment removal for order ${ref} changed while it was being recorded; it is measured again on the next poll.`)
+      }
+    } catch (e) {
+      result.errors.push(`Partial payment removal for order ${ref} could not be recorded: ${String(e)}`)
+    }
+  }
+}
+
+/**
+ * o3d-cdhl — A SHORTFALL THE LEDGER HAS MADE GOOD, PROVED BY PAYMENT AND NOT BY STATUS.
+ *
+ * PAID is also what Xero shows when a CREDIT allocation settles the balance, with `AmountPaid` still below the total: that is the
+ * credit-note-or-bad-debt decision, not the payment coming back. So the shortfall is cleared or reduced only when the invoice's
+ * same-currency `AmountPaid` covers more of the order than is recorded as paid AND no credit is allocated. A credit-settled invoice
+ * keeps the shortfall and warns once (per removal) with the figures, leaving the ledger decision to the order owner.
+ */
+export async function restorePaidAgainOrders(
+  paidSalesInvoices: Map<string, XeroInvoice>,
+  result: PollResult,
+): Promise<void> {
+  if (paidSalesInvoices.size === 0) return
+  const orders = await db.salesOrder.findMany({
+    where: { accountingInvoiceId: { in: [...paidSalesInvoices.keys()] }, paidAt: { not: null }, paymentRemovedForeign: { not: null } },
+    select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, currency: true, totalForeign: true, paymentRemovedForeign: true, paymentRemovedAt: true, unregisteredPaidAt: true },
+  })
+  for (const order of orders) {
+    if (!order.accountingInvoiceId || order.paymentRemovedForeign == null) continue
+    const invoice = paidSalesInvoices.get(order.accountingInvoiceId)
+    if (!invoice) continue
+    const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
+    try {
+      const total = toDecimalSafe(order.totalForeign)
+      const shortfall = toDecimalSafe(order.paymentRemovedForeign)
+      const currency = xeroInvoiceCurrency(invoice)
+      const sameCurrency = currency !== null && currency.toUpperCase() === order.currency.toUpperCase()
+      const paid = sameCurrency ? parseLedgerAmount(invoice.AmountPaid, currency) : null
+      let credited = null as ReturnType<typeof toDecimalSafe> | null
+      try { credited = invoice.AmountCredited == null ? toDecimalSafe(0) : toDecimalSafe(invoice.AmountCredited) } catch { credited = null }
+      const epsilon = ledgerAmountEpsilon(order.currency)
+      const noCredit = credited !== null && compareDecimal(credited.abs(), epsilon) <= 0
+
+      if (paid === null || !Number.isFinite(paid) || paid < 0 || !noCredit) {
+        // Settled by something other than a proved payment (a credit, or figures not stated): keep the shortfall, say so once.
+        const seen = await db.activityLog.findFirst({
+          where: { entityId: order.id, action: 'payment_removal_credit_settled', ...(order.paymentRemovedAt ? { createdAt: { gte: order.paymentRemovedAt } } : {}) },
+          select: { id: true },
+        })
+        if (seen) continue
+        const description = withLedgerCheck(
+          `The invoice for order ${ref} reads paid in full in Xero, but Xero holds ${paid === null ? 'a paid amount IMS cannot read' : `${paid.toFixed(2)} ${order.currency} of payments`} `
+          + `against an order total of ${total.toFixed(2)} ${order.currency}${credited !== null && !noCredit ? ` and ${credited.toFixed(2)} ${order.currency} of allocated credit` : ''}. `
+          + `IMS keeps the ${shortfall.toFixed(2)} ${order.currency} recorded as not received, because a credit settling a removed payment is not the payment coming back, `
+          + `and no credit note or write-off was raised by IMS: whether the credit stands as the answer or the amount is written off is a decision for the order owner.`,
+        )
+        const logged = await logActivityPersisted({
+          entityType: 'SALES_ORDER', entityId: order.id, action: 'payment_removal_credit_settled', tag: 'sync', level: 'WARNING', description,
+          metadata: { connector: XERO_CONNECTOR, accountingInvoiceId: order.accountingInvoiceId, shortfall: shortfall.toString(), ledgerPaid: paid, ledgerCredited: credited?.toString() ?? null, documentTotal: total.toString() },
+          resolveUser: false,
+        })
+        const alerted = await alertAdmins({ title: 'Part of a removed payment is still unreceived', message: description, actionUrl: `/sales/${order.id}` })
+        if (!logged || !alerted) result.errors.push(`Credit-settled payment shortfall for order ${ref} left no durable signal; it is reported again on the next poll.`)
+        continue
+      }
+
+      // Same currency, a stated payment, no credit: what is paid is what the ledger says. The new shortfall is what that leaves of the total.
+      const ledgerPaid = toDecimalSafe(paid)
+      const target = compareDecimal(total.minus(ledgerPaid), epsilon) > 0 ? total.minus(ledgerPaid) : toDecimalSafe(0)
+      if (compareDecimal(target, shortfall) >= 0) continue
+      const restored = shortfall.minus(target)
+      const recorded = await recordPaymentRemoval({
+        orderId: order.id, connector: XERO_CONNECTOR, accountingInvoiceId: order.accountingInvoiceId,
+        shortfallBefore: order.paymentRemovedForeign,
+        measurement: { kind: 'RESTORED', restored, currency: order.currency, recordedPaid: total.minus(shortfall), ledgerPaid, documentTotal: total },
+        matchedPaymentIds: [],
+      })
+      if (recorded.outcome === 'recorded') {
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: order.id, action: 'payment_removal_restored', tag: 'sync', level: 'INFO',
+          description: `Xero holds ${ledgerPaid.toFixed(2)} ${order.currency} of payments against the invoice for order ${ref}: ${restored.toFixed(2)} ${order.currency} of the missing payment is back, leaving ${recorded.shortfall.toFixed(2)} ${order.currency} recorded as not received.`,
+          metadata: { connector: XERO_CONNECTOR, accountingInvoiceId: order.accountingInvoiceId, restored: restored.toString(), shortfall: recorded.shortfall.toString() },
+          resolveUser: false,
+        })
+      }
+    } catch (e) {
+      result.errors.push(`Clearing the recorded payment shortfall for order ${ref} failed: ${String(e)}`)
+    }
+  }
+}
+
 type PollResult = {
   salesPaid: number
   billsPaid: number
@@ -783,12 +1024,50 @@ export async function readSalesResidualVerdicts(
       // defect itself: the classifier then answers NOTHING_REGISTERED for a channel-paid sale and the
       // reversal proceeds against a customer who really did pay.
       unregisteredPaidAt: true,
+      // o3d-cdhl: what measuring a PART removal needs. The same query, not a second read, so the figure is taken from
+      // the rows the verdict was.
+      totalForeign: true, currency: true, paymentRemovedForeign: true,
+      _count: { select: { refunds: true } },
     },
   })
+  // `hasRefunds` stays undefined when the count is not there, and undefined is read as "has refunds" (unmeasurable), never as none.
+  const orders = candidateOrders.map(({ _count, ...order }) => ({ ...order, hasRefunds: _count == null ? undefined : _count.refunds > 0 }))
   return await readResidualVerdicts(
-    candidateOrders, candidateInvoices, zeroPaidInvoiceIds, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
+    orders, candidateInvoices, zeroPaidInvoiceIds, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
     { ms: XERO_PAYMENT_REMOVAL_GRACE_MS, now },
+    (doc, invoice, verdict) => measureSalesPartPayment(doc, invoice, verdict.verdict),
   )
+}
+
+/**
+ * o3d-cdhl — the measurement for one part-paid ledger document, from the facts the order and the invoice carry.
+ *
+ * `null` leaves the document exactly where it was before this existed: withheld and reported. `ALREADY_RECORDED`
+ * means a shortfall is on the order and the ledger still agrees with it, which is the idempotent answer to a recheck.
+ */
+function measureSalesPartPayment(
+  doc: WithheldOrderDoc,
+  invoice: XeroInvoice,
+  registrationVerdict: string,
+): PartialRemovalMeasurement | 'ALREADY_RECORDED' | null {
+  if (doc.totalForeign === undefined || doc.currency === undefined) return null
+  const ledgerCurrency = xeroInvoiceCurrency(invoice)
+  const measurement = measurePartialPaymentRemoval({
+    orderCurrency: doc.currency,
+    ledgerCurrency,
+    orderTotal: doc.totalForeign as never,
+    ledgerPaid: parseLedgerAmount(invoice.AmountPaid, ledgerCurrency),
+    ledgerCredited: invoice.AmountCredited,
+    alreadyRemoved: doc.paymentRemovedForeign as never,
+    orderHasRefunds: doc.hasRefunds ?? true,
+    paidFlagIsLedgerSourced: doc.unregisteredPaidAt == null,
+    registrationVerdict,
+  })
+  if (measurement.kind === 'UNPROVEN') return null
+  if (measurement.kind === 'AGREES') {
+    return doc.paymentRemovedForeign != null && compareDecimal(doc.paymentRemovedForeign as never, 0) > 0 ? 'ALREADY_RECORDED' : null
+  }
+  return measurement
 }
 
 /**
@@ -1168,9 +1447,12 @@ async function processDeltaChunk(
             // o3d-psrx r2: the provenance goes with the flag. Leaving it set on an order that is no
             // longer paid would withhold the NEXT reversal on a marker describing a flag that has
             // already been cleared once.
-            await db.salesOrder.update({
-              where: { id: orderId },
-              data: { paidAt: null, unregisteredPaidAt: null },
+            await db.$transaction(async (tx) => {
+              await appendShortfallCleared(tx, orderId)
+              await tx.salesOrder.update({
+                where: { id: orderId },
+                data: { paidAt: null, unregisteredPaidAt: null, paymentRemovedForeign: null, paymentRemovedAt: null },
+              })
             })
           },
           notifyNeedsAttention: (o, { wcHandled, chargebackManualReason }) =>
@@ -1221,6 +1503,16 @@ async function processDeltaChunk(
     }
   } catch (e) {
     result.errors.push(`Sales reversal polling error: ${String(e)}`)
+  }
+
+  // o3d-cdhl: a part payment whose shortfall is a MEASURED removal is recorded on the order and reported once, in its own pass so a
+  // failure here cannot hold back the reversals above or the withheld reporting below. An invoice that reads PAID again clears any
+  // shortfall recorded before.
+  try {
+    await reconcilePartialRemovals(salesResidual, result)
+    await restorePaidAgainOrders(new Map(changed.filter((i) => i.Type === 'ACCREC' && i.Status === 'PAID').map((i) => [i.InvoiceID, i])), result)
+  } catch (e) {
+    result.errors.push(`Partial payment reconciliation error: ${String(e)}`)
   }
 
   // Reported in its own pass so a reporting failure cannot lose a reversal that DID reconcile, and a
