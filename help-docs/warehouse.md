@@ -81,6 +81,7 @@ Effects you will notice in other screens:
 - **Goods are booked in through the ASN, not by hand.** While a line has an ASN that is being created, open, part booked in or booked in but not reconciled, **Receive Goods** refuses that line and names the SKU and ASN. An order with an open ASN also cannot be closed or cancelled, and its lines cannot be reduced or removed, until the ASN is booked in or retired. Details are in [Purchasing](purchasing.md).
 - **Receipt Reviews.** A booked-in callback that cannot be applied safely (for example for a cancelled or closed order) is paused here before any stock changes. Review it on the Mintsoft page. **Recheck booked-in** on the order or transfer re-reads the ASN.
 - A stock count or alignment that brings units in counts as *landed*: the order will not accept a manual receipt for units already landed.
+- **The "Available in Purchase Orders" setting does not apply to warehouse-driven receipts.** Goods the warehouse system books in through an ASN land where the warehouse reports them, even in a location marked **Restricted** under Settings > Inventory > Warehouses. The setting only stops people choosing such a location as a purchase order destination or a **Receive Goods** location in IMS.
 
 
 ## When something goes wrong
