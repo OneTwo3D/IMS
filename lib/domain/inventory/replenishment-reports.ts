@@ -5,6 +5,10 @@ import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
 import { resolveReorderThresholds, type ReorderThresholdField } from '@/lib/domain/inventory/reorder-thresholds'
+import { applyGrowth, formatGrowthPercent, resolveGrowthPercent } from '@/lib/domain/inventory/forecast-growth'
+import { computeForecastMoney, type ForecastMoneyProductInputs } from '@/lib/domain/inventory/reorder-forecast-money'
+import { loadForecastMoneyInputs as defaultLoadForecastMoneyInputs } from '@/lib/domain/inventory/reorder-forecast-money-loader'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { projectStockPosition, type InboundArrival, type StockProjectionBasis } from '@/lib/domain/inventory/reorder-timing'
 import {
   calculateDailyVelocity,
@@ -151,6 +155,10 @@ export type ReplenishmentReportDeps = {
   /** Stockout-aware demand (ignoreStockouts) only. Defaults read the daily inventory snapshots. */
   loadStockoutDayCounts?: (input: { productIds: string[]; warehouseId?: string; dateFrom: string; dateTo: string }) => Promise<Map<string, StockoutDayCount>>
   loadSnapshotCoverage?: (input: { dateFrom: string; dateTo: string }) => Promise<SnapshotCoverage>
+  /** Forecast sales / margin (includeForecastMoney) only. Defaults read products, tax rates and cost layers. */
+  loadForecastMoneyInputs?: (productIds: string[]) => Promise<Map<string, ForecastMoneyProductInputs>>
+  /** Forecast sales / margin only. Defaults to the organisation's base currency. */
+  baseCurrency?: string
 }
 
 type SupplierProductRow = {
@@ -383,6 +391,18 @@ export type ReorderReportRow = {
     /** Too many stockout days (>= 90% of the window): the unadjusted rate was kept. */
     clamped: boolean
   }
+  /**
+   * Only present when the report was run with includeForecastMoney (the page and CSV, for roles that may see
+   * prices). FORWARD-LOOKING ESTIMATES, not booked sales. forecastQty is the row's demand over the target cover
+   * weeks (growth included). forecastSales is that at the product's list price ex-VAT, base currency;
+   * forecastMargin is that less forecastQty x current unit cost. Each is null with a reason when it cannot be
+   * stated (no list price, VAT unresolved, no cost layers): never 0, never 100%.
+   */
+  forecastQty?: string
+  forecastSales?: string | null
+  forecastMargin?: string | null
+  forecastSalesUnavailable?: string | null
+  forecastMarginUnavailable?: string | null
 }
 
 export type ReorderReport = {
@@ -985,6 +1005,9 @@ export async function getReorderReport(
   // includeZero (the "show all products" toggle / CSV export) keeps every candidate,
   // including those with a zero suggested quantity.
   const includeAll = filters.includeZero === true
+  // growth factor on the daily sales rate. Validated here, server-side, whatever the caller
+  // sent; 0 (the default) leaves every figure exactly as it was.
+  const growth = resolveGrowthPercent(filters.growthPercent)
   const window = demandWindow(generatedAt, demandDays)
   const [products, stockLevels, velocityInputs, openPoLines, latestMoRows, bomItemRows] = await Promise.all([
     client.product.findMany({
@@ -1203,7 +1226,9 @@ export async function getReorderReport(
     const inboundOpenPoQty = inboundByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const projectedAvailableQty = availableQty.add(inboundOpenPoQty)
     const velocityRow = velocityByProduct.get(product.id)
-    const averageDailyDemand = toDecimal(velocityRow?.dailyQtyVelocity ?? 0)
+    // Growth scales the rate BEFORE anything is derived from it (cover quantity, reorder point, suggestion,
+    // BOM component demand, timing), so every figure on the row agrees.
+    const averageDailyDemand = applyGrowth(toDecimal(velocityRow?.dailyQtyVelocity ?? 0), growth)
     // Product-level effective lead time. Precedence:
     //   1. manual override (Product.leadTimeDays)
     //   2. auto P95 from PO receipts (Product.observedLeadTimeDays, cron-maintained)
@@ -1495,6 +1520,27 @@ export async function getReorderReport(
   )
   const pageSize = clampPageSize(filters.pageSize)
   const paged = paginate(displayRows, filters.page, pageSize, options.paginate !== false)
+  if (filters.includeForecastMoney === true && paged.rows.length > 0) {
+    const baseCurrency = options.deps?.baseCurrency ?? await getBaseCurrencyCode()
+    const inputs = await (options.deps?.loadForecastMoneyInputs ?? defaultLoadForecastMoneyInputs)(paged.rows.map((row) => row.productId))
+    for (const row of paged.rows) {
+      const forecastQty = candidatesByProductId.get(row.productId)?.targetCoverQty ?? new Prisma.Decimal(0)
+      const input = inputs.get(row.productId)
+      const money = computeForecastMoney({
+        forecastQty,
+        salesPrice: input?.salesPrice ?? null,
+        salesPriceTaxInclusive: input?.salesPriceTaxInclusive ?? false,
+        salesVatRate: input?.salesVatRate ?? null,
+        unitCostBase: input?.unitCostBase ?? null,
+        baseCurrency,
+      })
+      row.forecastQty = integerQuantityString(forecastQty)
+      row.forecastSales = money.forecastSales
+      row.forecastMargin = money.forecastMargin
+      row.forecastSalesUnavailable = money.forecastSalesUnavailable
+      row.forecastMarginUnavailable = money.forecastMarginUnavailable
+    }
+  }
   return {
     generatedAt: generatedAt.toISOString(),
     demandWindowDateFrom: dateOnly(window.dateFrom),
@@ -1514,6 +1560,9 @@ export async function getReorderReport(
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
       'Required receipt is the day projected available stock falls to safety stock (to zero when safety stock is 0): current available, less daily demand, plus each open PO on its expected delivery date (POs already past due are left out and flagged as late). Latest PO date is that day minus the lead time; it is the same statement as the reorder point, in dates. BOM-driven component demand and a manually set reorder point change the reorder point but not these dates.',
       ...stockoutNotices,
+      ...(growth.percent !== 0 ? [`Growth factor ${formatGrowthPercent(growth.percent)} is applied: the calculated daily demand is multiplied by ${growth.factor.toFixed()} before the reorder point, suggested quantity, dates and forecast figures are derived. It is a planning assumption for this view, not a recorded sales figure.`] : []),
+      ...(growth.notice ? [growth.notice] : []),
+      ...(filters.includeForecastMoney === true ? [`Forecast sales and forecast margin are forward-looking estimates, not booked sales: forecast quantity (daily demand x ${targetCoverWeeks} weeks of supply) at the product's list price ex-VAT, less current unit cost (open cost layers, else the latest layer). Margin is unavailable where a product has no cost layers or no usable list price.`] : []),
       'Reorder point, safety stock and reorder quantity use the selected warehouse\'s own override when one is set on the product (Inventory > product > Reorder thresholds by warehouse), otherwise the Product value. The all-warehouses view is consolidated and always uses the Product values.',
       ...(productsWithUnappliedOverrides > 0 ? [`${productsWithUnappliedOverrides} product(s) have a per-warehouse threshold override that this all-warehouses view does not apply. Filter by warehouse to plan against it.`] : []),
       ...(lateInboundRows > 0 ? [`${lateInboundRows} row(s) have open PO quantity past its expected delivery date (late POs). That stock is not yet received, so it is left out of Required receipt, Latest PO date and Overdue and shown separately as a Late PO badge.`] : []),
