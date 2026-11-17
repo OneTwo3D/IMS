@@ -130,10 +130,10 @@ test('[webhook policy] a later shop delivery does not overwrite an IMS-edited or
   assert.equal(c.notes, 'original note')
   assert.equal(c.shippingService, 'Express')
 
-  // The divergence comparison: the edited order is expected to differ and raises nothing (and clears an older row); an unedited order that differs does.
+  // The divergence comparison: an ADDRESS/NOTES-only IMS edit suppresses nothing about the lines or total, so a divergence on the edited order is raised like on the unedited one.
   const drifting = { ...payload(edited.externalId, wcRateId, { billing: 'x', shipping: 'y', note: 'z', title: 'Flat rate' }), total: '999.00' }
   await surfaceWcOrderEditDrift(edited.orderId, drifting as never)
-  assert.equal(await db.shoppingSyncLog.count({ where: { ...wcOrderEditDriftWhere(), entityId: edited.orderId } }), 0, 'no "edited in WooCommerce" row for an order edited in IMS')
+  assert.equal(await db.shoppingSyncLog.count({ where: { ...wcOrderEditDriftWhere(), entityId: edited.orderId } }), 1, 'an address-only IMS edit does not hide a later WooCommerce change')
   await surfaceWcOrderEditDrift(control.orderId, { ...drifting, id: control.externalId } as never)
   assert.equal(await db.shoppingSyncLog.count({ where: { ...wcOrderEditDriftWhere(), entityId: control.orderId } }), 1, 'CONTROL: the unedited order still reports a real divergence')
 })

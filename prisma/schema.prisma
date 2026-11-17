@@ -1913,6 +1913,9 @@ model SalesOrder {
   /// Set when an operator edited this order in IMS after it was confirmed (lines, or addresses/notes after dispatch). While set, a later WooCommerce order.updated delivery does not write its addresses, notes, VAT number or shipping label back over the IMS edit,
   /// and the "edited in WooCommerce after import" comparison is not raised (the order is deliberately desynced). Paid state and the order number still mirror. NULL on every order never edited this way.
   editedInImsAt           DateTime?  @map("edited_in_ims_at")
+  /// The WooCommerce-facing state of this order's lines and total BEFORE the first IMS edit of its lines: { totalForeign, lines: [{ externalLineItemId, qty, sku }] }. Taken once, so the "edited in WooCommerce after import" comparison can keep running
+  /// after an IMS line edit, against what WooCommerce held (an IMS edit does not reach WooCommerce) instead of against the edited lines. NULL when the lines were never edited in IMS (an address or notes edit takes none), and the comparison is against the lines as usual.
+  wcLineBaseline          Json?      @map("wc_line_baseline")
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one

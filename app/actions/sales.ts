@@ -1491,6 +1491,7 @@ const EDIT_GUARD_SELECT = {
   invoiceNumber: true,
   _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
   wmsOrderPush: { select: { id: true, externalOrderId: true } },
+  wcLineBaseline: true,
 } as const
 
 /** Staleness of the form the operator is editing from: refused when the order was saved since the form read it. */
@@ -1547,8 +1548,11 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
 
     let allocationResult: Awaited<ReturnType<typeof allocateSalesOrder>> | null = null
     let invoiceUpdateOutcome: { queued: boolean; reason?: string } | null = null
+    // The products whose reservations the edit released: their freed stock is owed to the storefront even when the edit removed the product (the re-reservation below no longer sees it).
+    let releasedProductIds: string[] = []
     const outcome = await db.$transaction(async (tx) => {
       allocationResult = null
+      releasedProductIds = []
       invoiceUpdateOutcome = null
       await lockSalesOrder(tx, id)
       const current = await tx.salesOrder.findUnique({ where: { id }, select: EDIT_GUARD_SELECT })
@@ -1620,11 +1624,12 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       // RELEASE FIRST (a confirmed order only): the reservations and the draft shipments drawn from them point at the lines about to be replaced. The deallocation helper refuses a shipment that is already picked or packed.
       const allocationsBefore = current._count.allocations
       if (!isDraft) {
+        releasedProductIds = [...new Set((await tx.orderAllocation.findMany({ where: { orderId: id }, select: { productId: true } })).map((a) => a.productId))]
         await releaseOrderAllocationsForDeallocationInTx(tx, id, { cause: 'editing the order', userId: actingUserId })
       }
       // THE LINES ARE EDITED IN PLACE where they continue. A continued line keeps its row, so the WooCommerce line item id (externalLineItemId) a later storefront refund names, its fee kind and its other links survive the edit;
       // only a line the operator removed is deleted and only a line added in IMS is created (it has no storefront id). Deleting and recreating every line (the first version) orphaned every later itemised refund.
-      const existingLines = await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true, productId: true }, orderBy: { id: 'asc' } })
+      const existingLines = await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true, productId: true, externalLineItemId: true, qty: true, sku: true }, orderBy: { id: 'asc' } })
       // A draft is held by nothing outside its own rows (no storefront id, no allocation, no document), so it is rewritten whole, as it always was.
       const continued = isDraft ? input.lines.map(() => null) : matchContinuedOrderLines(existingLines, input.lines)
       const keptIds = new Set(continued.filter((c): c is string => c !== null))
@@ -1643,6 +1648,10 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
           shippingAddress: (input.shippingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
           // An order that came from the shop is marked as edited here, so a later shop delivery does not write its copy over the edit (order-import.ts).
           ...(current._count.shoppingLinks > 0 ? { editedInImsAt: new Date() } : {}),
+          // The WooCommerce-facing state before the FIRST line edit, so the edited-in-WooCommerce comparison keeps running against what the store holds (drafts have no shop copy).
+          ...(current._count.shoppingLinks > 0 && !isDraft && current.wcLineBaseline === null
+            ? { wcLineBaseline: { totalForeign: Number(current.totalForeign), lines: existingLines.filter((l) => l.externalLineItemId !== null).map((l) => ({ externalLineItemId: l.externalLineItemId, qty: Number(l.qty), sku: l.sku })) } as Prisma.InputJsonValue }
+            : {}),
           lines: { create: lineData.filter((_, index) => continued[index] === null) },
         },
       })
@@ -1701,18 +1710,20 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
     await logSalesOrderTaxWarnings(written, input, prepared)
     const committedAllocation = allocationResult as Awaited<ReturnType<typeof allocateSalesOrder>> | null
     if (committedAllocation) {
-      // After the commit, as autoAllocateOrder does: the allocation attempt's own activity and the storefront stock sync it owes.
+      // After the commit, as autoAllocateOrder does: the allocation attempt's own activity.
       const activity = describeAllocationAttempt(committedAllocation)
       if (activity) await logActivity({ entityType: 'SALES_ORDER', entityId: id, tag: 'sales', ...activity })
-      if (committedAllocation.syncProductIds.length > 0) {
-        try {
-          await enqueueStockSync(committedAllocation.syncProductIds, 'IMS_CHANGE')
-        } catch (syncError) {
-          console.error(syncError)
-          postCommitWarnings.push('the storefront stock update for this edit could not be queued; stock levels in the shop may lag until the next stock sync')
-        }
-      }
       if ((committedAllocation.unallocatedQty ?? 0) > 0) postCommitWarnings.push(`${committedAllocation.unallocatedQty} unit(s) could not be reserved and are on backorder`)
+    }
+    // THE STOREFRONT STOCK SYNC: the products the re-reservation touched AND the products whose reservations the edit released (a product the edit removed is not seen by the re-reservation, but its freed stock is owed to the shop).
+    const stockSyncProductIds = [...new Set([...(committedAllocation?.syncProductIds ?? []), ...releasedProductIds])]
+    if (stockSyncProductIds.length > 0) {
+      try {
+        await enqueueStockSync(stockSyncProductIds, 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+        postCommitWarnings.push('the storefront stock update for this edit could not be queued; stock levels in the shop may lag until the next stock sync')
+      }
     }
     try { revalidatePath('/sales'); revalidatePath(`/sales/${id}`) } catch { /* cache refresh only */ }
     const mapped = mapSoRow(written)

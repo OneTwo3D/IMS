@@ -554,3 +554,73 @@ test('the warehouse gate: an order pushed to the warehouse is edited only while 
   assert.equal(addr.success, true, addr.error)
   assert.equal(asked.length, 0)
 })
+
+
+test('storefront stock sync after an edit covers the product the edit REMOVED (its released reservation), not only the re-reserved ones', SKIP, async (t) => {
+  const w = await seedWorld()
+  t.after(() => w.teardown())
+  const { updateSalesOrder } = await import('@/app/actions/sales')
+  const id = await createConfirmed(w, [{ p: 'p1', qty: 2 }, { p: 'p2', qty: 1 }])
+  stockSyncs.length = 0
+  // p1 is removed; only p2 stays.
+  const edited = await updateSalesOrder(id, inputFor(w, [{ p: 'p2', qty: 1 }]) as never, await versionOf(id))
+  assert.equal(edited.success, true, edited.error)
+  const synced = new Set(stockSyncs.flat())
+  assert.ok(synced.has(w.p1.id), 'the removed product\'s freed stock is queued for the storefront')
+  assert.ok(synced.has(w.p2.id), 'and the kept product')
+})
+
+test('WooCommerce drift stays visible after an IMS line edit: the edit itself raises nothing, a later WooCommerce change does; an address-only edit hides nothing', SKIP, async (t) => {
+  const w = await seedWorld()
+  t.after(async () => { const { db: d } = await import('@/lib/db'); await d.shoppingSyncLog.deleteMany({ where: { entityId: { in: w.orderIds } } }); await w.teardown() })
+  const { updateSalesOrder, updateSalesOrderAddressesAndNotes } = await import('@/app/actions/sales')
+  const { surfaceWcOrderEditDrift, wcOrderEditDriftWhere } = await import('@/lib/connectors/woocommerce/sync/order-edit-drift')
+  const { db } = await import('@/lib/db')
+  const wooOf = (n: number) => 6_000_000 + n
+  const mk = async (n: number) => {
+    const id = await createConfirmed(w, [{ p: 'p1', qty: 3 }, { p: 'p2', qty: 2 }])
+    await db.shoppingOrderLink.create({ data: { orderId: id, connector: 'woocommerce', externalOrderId: `${wooOf(n) + Math.floor(Math.random() * 1e6)}` } })
+    const lines = await db.salesOrderLine.findMany({ where: { orderId: id } })
+    for (const l of lines) await db.salesOrderLine.update({ where: { id: l.id }, data: { externalLineItemId: (l.productId === w.p1.id ? 100 : 200) + n } })
+    return { id, l1: 100 + n, l2: 200 + n, sku1: w.p1.sku, sku2: w.p2.sku, lines }
+  }
+  const payload = (o: { l1: number; l2: number; sku1: string; sku2: string }, q1: number, q2: number, total: string) => ({
+    id: 1, total, line_items: [{ id: o.l1, quantity: q1, sku: o.sku1 }, { id: o.l2, quantity: q2, sku: o.sku2 }],
+  }) as never
+  const rows = (id: string) => db.shoppingSyncLog.count({ where: { ...wcOrderEditDriftWhere(), entityId: id } })
+  const totalBefore = async (id: string) => Number((await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { totalForeign: true } })).totalForeign).toFixed(2)
+
+  // LINE EDIT: p1 3 -> 5, p2 removed.
+  const a = await mk(1)
+  const origTotal = await totalBefore(a.id)
+  const lineA = { ...inputFor(w, [{ p: 'p1', qty: 5 }]).lines[0], orderLineId: a.lines.find((l) => l.productId === w.p1.id)!.id }
+  const ed = await updateSalesOrder(a.id, { ...inputFor(w, [{ p: 'p1', qty: 5 }]), lines: [lineA] } as never, await versionOf(a.id), { acknowledgeShopDesync: true })
+  assert.equal(ed.success, true, ed.error)
+  // The store still holds its ORIGINAL order: that is the IMS edit, not a store change, so no row.
+  await surfaceWcOrderEditDrift(a.id, payload(a, 3, 2, origTotal))
+  assert.equal(await rows(a.id), 0, 'the IMS edit alone raises nothing')
+  // The store then changes a line: raised, although the order is marked as edited in IMS.
+  await surfaceWcOrderEditDrift(a.id, payload(a, 4, 2, origTotal))
+  assert.equal(await rows(a.id), 1, 'a WooCommerce-side quantity change after the IMS edit is reported')
+  // And the store changes back: the row clears.
+  await surfaceWcOrderEditDrift(a.id, payload(a, 3, 2, origTotal))
+  assert.equal(await rows(a.id), 0)
+  // A second IMS edit keeps the FIRST baseline (the store never saw either edit).
+  const lineA2 = { ...inputFor(w, [{ p: 'p1', qty: 6 }]).lines[0], orderLineId: a.lines.find((l) => l.productId === w.p1.id)!.id }
+  assert.equal((await updateSalesOrder(a.id, { ...inputFor(w, [{ p: 'p1', qty: 6 }]), lines: [lineA2] } as never, await versionOf(a.id), { acknowledgeShopDesync: true })).success, true)
+  await surfaceWcOrderEditDrift(a.id, payload(a, 3, 2, origTotal))
+  assert.equal(await rows(a.id), 0, 'still the original baseline after a second edit')
+  await surfaceWcOrderEditDrift(a.id, payload(a, 3, 1, origTotal))
+  assert.equal(await rows(a.id), 1, 'a removed WooCommerce line is reported')
+
+  // ADDRESS-ONLY EDIT: marks the order but takes no baseline, so the lines are compared as always.
+  const b = await mk(2)
+  const addr = await updateSalesOrderAddressesAndNotes(b.id, { shippingAddress: { line1: 'new', country: 'GB' } }, await versionOf(b.id), { acknowledgeShopDesync: true })
+  assert.equal(addr.success, true, addr.error)
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: b.id }, select: { wcLineBaseline: true } })).wcLineBaseline, null, 'an address edit takes no baseline')
+  await surfaceWcOrderEditDrift(b.id, payload(b, 3, 2, await totalBefore(b.id)))
+  assert.equal(await rows(b.id), 0)
+  await surfaceWcOrderEditDrift(b.id, payload(b, 9, 2, await totalBefore(b.id)))
+  assert.equal(await rows(b.id), 1, 'a WooCommerce line change after an address-only IMS edit is reported')
+})
+
