@@ -316,7 +316,44 @@ const loosen = (at: string, mode: number, depth = 0): void => {
  * ENOENT is treated as "already removed"; every other error is repaired-and-retried where this
  * uid is allowed to, and then named and failed either way.
  */
+/**
+ * Scratch directories made by `scratchRoot()` (tests/helpers/scratch-root.ts) live outside `own` (a throwaway cluster
+ * parent must sit under a root-owned sticky ancestor), so the sweep below never sees them. The helper registers each
+ * per-process directory it makes under a well-known global key; whatever is still in one at exit is a leak: named,
+ * removed, and failed, exactly like a leak in `own`.
+ */
+const sweepScratch = (): void => {
+  const tracked = (globalThis as Record<symbol, unknown>)[Symbol.for('ims.test.scratchDirs')] as Set<string> | undefined
+  if (tracked === undefined) return
+  const subject = process.argv[1] ?? '<unknown entry point>'
+  for (const dir of tracked) {
+    let entries: string[]
+    try {
+      entries = readdirSync(dir)
+    } catch (error) {
+      if (isMissing(error)) continue
+      process.stderr.write(`temp-dir sentinel: could not enumerate scratch directory ${dir}: ${describe(error)}\n`)
+      if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
+      continue
+    }
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch (error) {
+      process.stderr.write(`temp-dir sentinel: could not remove scratch directory ${dir}: ${describe(error)}\n`)
+      if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
+    }
+    if (entries.length === 0) continue
+    if (process.exitCode === undefined || process.exitCode === 0) process.exitCode = 1
+    process.stderr.write(
+      `temp-dir leak: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} survived ${subject} in the scratch directory ${dir}:\n` +
+        `${entries.slice().sort().map((entry) => `  ${entry}`).join('\n')}\n` +
+        'These came from tests/helpers/scratch-root.ts (throwaway clusters and trusted report trees); remove them where they are made.\n',
+    )
+  }
+}
+
 const settle = (): void => {
+  sweepScratch()
   let leftovers: readonly string[] | null = null
   let unreadable: string | null = null
 

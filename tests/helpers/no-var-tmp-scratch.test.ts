@@ -37,6 +37,7 @@ const ALLOWED: Record<string, string> = {
   'tests/reconciliation-pack/settling.test.ts': 'a repoRoot value for fake ports',
   'tests/reconciliation-pack/sku-exclusions.test.ts': 'a checkout-root argument to the loaders (they only compare it); files are made under the scratch dir',
   'tests/settings/crontab-reconcile-serialization.test.ts': 'a systemd PrivateTmp description string',
+  'tests/helpers/scratch-root.ts': 'the forbidden-path constant scratchRoot() uses to refuse /var/tmp',
   'tests/helpers/scratch-root.test.ts': 'asserts scratchRoot() is never /var/tmp',
   'tests/helpers/no-var-tmp-scratch.test.ts': 'this guard',
 }
@@ -81,6 +82,8 @@ test('every allowlist entry still needs its exception (a stale entry hides a fut
   assert.deepEqual(stale, [])
 })
 
-test('scratchRoot() itself does not fall back to /var/tmp', () => {
-  assert.equal(offending('tests/helpers/scratch-root.ts').length, 0)
+test('scratchRoot() mentions /var/tmp only to refuse it', () => {
+  const lines = offending('tests/helpers/scratch-root.ts')
+  const source = readFileSync(path.join(REPO, 'tests/helpers/scratch-root.ts'), 'utf8').split('\n')
+  assert.deepEqual(lines.map((n) => source[n - 1]!.trim()), ["const FORBIDDEN = '/var/tmp'"])
 })
