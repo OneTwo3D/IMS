@@ -9,7 +9,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { loadPurchaseOrderLineLandedQty } from '@/lib/domain/inventory/po-line-landed-quantity'
 import {
   PEGGABLE_PURCHASE_ORDER_STATUSES, PEG_OPEN_ORDER_STATUSES, decidePeg, endPegInTx, loadLineAllocations, loadLivePegs,
-  lockPegsForProducts, refreshPegReceipts, settlePegs,
+  loadLandedByWarehouse, lockPegsForProducts, refreshPegReceipts, settlePegs, warehouseQtyToJson,
 } from '@/lib/domain/sales/peg-service'
 
 /**
@@ -146,7 +146,7 @@ export async function createPeg(input: { salesOrderLineId: string; purchaseOrder
       await tx.$queryRaw(Prisma.sql`SELECT id FROM "purchase_orders" WHERE id = ${poLineHead.poId} FOR UPDATE`)
       const poLine = await tx.purchaseOrderLine.findUnique({
         where: { id: input.purchaseOrderLineId },
-        select: { id: true, poId: true, productId: true, qty: true, qtyReceived: true, po: { select: { reference: true, status: true } } },
+        select: { id: true, poId: true, productId: true, qty: true, qtyReceived: true, po: { select: { reference: true, status: true, destinationWarehouseId: true } } },
       })
       if (!poLine) return { error: 'Purchase order line not found' }
       if (poLine.productId !== line.productId) return { error: 'The purchase order line is for a different product' }
@@ -157,7 +157,8 @@ export async function createPeg(input: { salesOrderLineId: string; purchaseOrder
       await lockPegsForProducts(tx, [line.productId])
       const live = await loadLivePegs(tx, { salesOrderLine: { productId: line.productId } })
       await refreshPegReceipts(tx, live)
-      const landed = (await loadPurchaseOrderLineLandedQty(tx, [{ id: poLine.id, qtyReceived: poLine.qtyReceived }])).get(poLine.id)!.qty
+      const landedLine = (await loadLandedByWarehouse(tx, [{ id: poLine.id, qtyReceived: poLine.qtyReceived, destinationWarehouseId: poLine.po.destinationWarehouseId }])).get(poLine.id)!
+      const landed = landedLine.total
       const allocated = (await loadLineAllocations(tx, [{ id: line.id, productId: line.productId }])).get(line.id) ?? ZERO
       const refunded = (await tx.salesOrderRefundLine.aggregate({ where: { salesOrderLineId: line.id }, _sum: { qty: true } }))._sum.qty ?? ZERO
 
@@ -173,7 +174,7 @@ export async function createPeg(input: { salesOrderLineId: string; purchaseOrder
       if (!decision.ok) return { error: decision.error }
 
       const peg = await tx.salesOrderLinePeg.create({
-        data: { salesOrderLineId: line.id, purchaseOrderLineId: poLine.id, qty, baselineAllocatedQty: allocated, seenLandedQty: landed, createdById: session.user.id ?? null },
+        data: { salesOrderLineId: line.id, purchaseOrderLineId: poLine.id, qty, baselineAllocatedQty: allocated, seenLandedQty: landed, seenLandedByWarehouse: warehouseQtyToJson(landedLine.byWarehouse), createdById: session.user.id ?? null },
         select: { id: true },
       })
       const orderRef = line.order.orderNumber ?? line.order.externalOrderNumber ?? line.orderId.slice(0, 8)

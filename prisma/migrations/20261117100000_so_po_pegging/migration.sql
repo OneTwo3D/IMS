@@ -1,6 +1,6 @@
 -- Additive: SO-to-PO pegging. Stock received on a PO line is held for, and allocated to, the pegged sales-order line first.
 -- No rows means no peg anywhere: allocation behaves exactly as before. IMS-internal allocation ordering; nothing is pushed anywhere.
-CREATE TYPE "SalesOrderLinePegEndReason" AS ENUM ('FULLY_ALLOCATED', 'SALES_ORDER_CANCELLED', 'SALES_LINE_REMOVED', 'SALES_ORDER_ADVANCED', 'PURCHASE_ORDER_CANCELLED', 'PURCHASE_LINE_RECEIVED_ELSEWHERE', 'REMOVED_BY_USER');
+CREATE TYPE "SalesOrderLinePegEndReason" AS ENUM ('FULLY_ALLOCATED', 'SALES_ORDER_CANCELLED', 'SALES_LINE_REMOVED', 'SALES_ORDER_ADVANCED', 'PURCHASE_ORDER_CANCELLED', 'PURCHASE_LINE_REMOVED', 'PURCHASE_LINE_RECEIVED_ELSEWHERE', 'REMOVED_BY_USER');
 
 CREATE TABLE "sales_order_line_pegs" (
     "id" TEXT NOT NULL,
@@ -11,6 +11,8 @@ CREATE TABLE "sales_order_line_pegs" (
     "allocatedQty" DECIMAL(12,4) NOT NULL DEFAULT 0,
     "baselineAllocatedQty" DECIMAL(12,4) NOT NULL DEFAULT 0,
     "seenLandedQty" DECIMAL(12,4) NOT NULL DEFAULT 0,
+    "receivedByWarehouse" JSONB NOT NULL DEFAULT '{}',
+    "seenLandedByWarehouse" JSONB NOT NULL DEFAULT '{}',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "createdById" TEXT,
     "endedAt" TIMESTAMP(3),

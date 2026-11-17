@@ -29,7 +29,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
-import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
+import { reconcilePegsForPoLineRewrite, recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getPoLineAttributableLayerQty } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -1800,7 +1800,12 @@ export async function updatePurchaseOrder(
         const storedLineEta = new Map((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true } })).map((l) => [l.id, l.expectedDelivery]))
 
         // FULL edit: delete existing lines and recreate. AMEND: lines are reconciled in place further down (ids are kept).
-        if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
+        // SO-to-PO pegging: lines a live peg still applies to are kept (updated in place below) so the stock promise survives
+        // the edit; every other peg is ended with a reason and an activity row before its line goes.
+        const pegKeptLineIds = !amend
+          ? await reconcilePegsForPoLineRewrite(tx, id, input.lines.map((l) => ({ poLineId: l.poLineId, productId: l.productId, qty: l.qty })), session.user.id ?? null)
+          : new Set<string>()
+        if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id, ...(pegKeptLineIds.size > 0 ? { id: { notIn: [...pegKeptLineIds] } } : {}) } })
         // Also clear any pre-existing purchase-unit aggregate data on the PO
         // line level — the edit form currently operates in stock-unit terms
         // (purchaseUnitId is not edited inline), so we preserve only what
@@ -1856,7 +1861,15 @@ export async function updatePurchaseOrder(
           }
         })
         if (!amend) {
-          await tx.purchaseOrderLine.createMany({ data: lineData })
+          const keptRequestIndexes = new Map<number, string>()
+          for (const [index, line] of input.lines.entries()) {
+            if (line.poLineId && pegKeptLineIds.has(line.poLineId) && ![...keptRequestIndexes.values()].includes(line.poLineId)) keptRequestIndexes.set(index, line.poLineId)
+          }
+          for (const [index, lineId] of keptRequestIndexes) {
+            const { poId: _poId, ...rowData } = lineData[index]!
+            await tx.purchaseOrderLine.update({ where: { id: lineId }, data: rowData })
+          }
+          await tx.purchaseOrderLine.createMany({ data: lineData.filter((_, index) => !keptRequestIndexes.has(index)) })
         } else {
           const plan = planLineAmend(editFacts, input.lines.map((l) => ({ poLineId: l.poLineId, productId: l.productId, qty: l.qty })))
           if (!plan.ok) return { refused: plan.error }

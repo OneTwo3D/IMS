@@ -57,7 +57,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { applyPegHoldsToStockMap, evaluateOrderPegsInTx, loadPegContext } from '@/lib/domain/sales/peg-service'
+import { applyPegCapsToStockMap, applyPegHoldsToStockMap, evaluateOrderPegsInTx, loadPegContext } from '@/lib/domain/sales/peg-service'
 import { LEDGER_STANDING_SELECT, isShadowedObligation, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
@@ -3605,6 +3605,11 @@ export async function allocateSalesOrder(
     // it. Taken after the stock locks, like every read here, and the peg rows are locked last (the allocation lock order).
     const pegContext = await loadPegContext(tx, orderId, leafProductIds)
     if (pegContext) applyPegHoldsToStockMap(stockMap, pegContext.holds)
+    // The receipt's peg pass may add only what landed for the pegs, in the warehouse it landed in (the per-line quantity cap below
+    // limits the total; this limits where it may come from, so a receipt into B cannot pull existing stock in A to the order).
+    if (pegContext && input.capPeggedLines) {
+      applyPegCapsToStockMap(stockMap, pegContext.ownExtraByProductWarehouse, ownReservationRows.map((row) => ({ productId: row.productId, warehouseId: row.warehouseId, qty: toDecimal(row.qty) })))
+    }
 
     const committedByLine = calculateDecimalCoverageByLine(
       requirementsByLine,

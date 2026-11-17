@@ -5139,6 +5139,7 @@ enum SalesOrderLinePegEndReason {
   SALES_LINE_REMOVED
   SALES_ORDER_ADVANCED
   PURCHASE_ORDER_CANCELLED
+  PURCHASE_LINE_REMOVED
   PURCHASE_LINE_RECEIVED_ELSEWHERE
   REMOVED_BY_USER
 }
@@ -5151,6 +5152,9 @@ enum SalesOrderLinePegEndReason {
 /// first); `allocatedQty` is the part of that the order has actually absorbed. `receivedQty - allocatedQty` is the hold
 /// other orders' allocation must leave alone. `seenLandedQty` is the line's landed quantity when `receivedQty` was last
 /// refreshed, so the refresh is idempotent whichever receipt path (manual, ASN alignment, WMS book-in) landed the units.
+/// `receivedByWarehouse` / `seenLandedByWarehouse` split the same two figures by the warehouse the units actually landed in
+/// (`{ "<warehouseId>": "<qty>" }`, key "" = landed with no recorded warehouse); the scalars are their sums. Holds and allocation
+/// caps are applied in the warehouse the stock is in.
 model SalesOrderLinePeg {
   id                  String    @id @default(cuid())
   salesOrderLineId    String
@@ -5161,6 +5165,8 @@ model SalesOrderLinePeg {
   /// The sales-order line's allocation when the peg was made: what the order already had from other stock.
   baselineAllocatedQty Decimal  @default(0) @db.Decimal(12, 4)
   seenLandedQty       Decimal   @default(0) @db.Decimal(12, 4)
+  receivedByWarehouse Json      @default("{}")
+  seenLandedByWarehouse Json    @default("{}")
   createdAt           DateTime  @default(now())
   createdById         String?
   endedAt             DateTime?

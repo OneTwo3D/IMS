@@ -34,6 +34,12 @@ type Decimal = Prisma.Decimal
 const ZERO = new Prisma.Decimal(0)
 const EPSILON = new Prisma.Decimal('0.0001')
 
+/** The warehouse key for units that landed with no recorded warehouse (no cost layer and the PO has no destination). */
+export const UNATTRIBUTED_WAREHOUSE = ''
+/** Purchase orders that expect nothing more: a peg on one holds nothing back from other orders. */
+const PO_STATUSES_HOLDING_NOTHING = ['CANCELLED', 'CLOSED'] as const
+type WarehouseQty = Map<string, Decimal>
+
 /** An order in one of these is allocatable, so its unabsorbed peg quantity is held back from other orders. */
 export const PEG_HOLDING_ORDER_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
 /** A peg may be made on, and survives while, the order is in one of these. Any other status ends it. */
@@ -47,6 +53,7 @@ const PEG_END_LABEL: Record<SalesOrderLinePegEndReason, string> = {
   SALES_LINE_REMOVED: 'the sales order line was removed',
   SALES_ORDER_ADVANCED: 'the sales order moved past allocation',
   PURCHASE_ORDER_CANCELLED: 'the purchase order was cancelled or closed',
+  PURCHASE_LINE_REMOVED: 'the purchase order line was removed or reduced below the pegged quantity',
   PURCHASE_LINE_RECEIVED_ELSEWHERE: 'the purchase order line was received without covering the peg',
   REMOVED_BY_USER: 'it was removed by a user',
 }
@@ -59,25 +66,112 @@ export function pegEndReasonLabel(reason: SalesOrderLinePegEndReason): string {
 // Pure arithmetic
 // ---------------------------------------------------------------------------
 
-export type PegReceiptInput = { id: string; createdAt: Date; qty: Decimal; receivedQty: Decimal; seenLandedQty: Decimal }
+export type PegReceiptInput = { id: string; createdAt: Date; qty: Decimal; receivedByWarehouse: WarehouseQty; seenByWarehouse: WarehouseQty }
+export type PegReceiptGrant = { receivedByWarehouse: WarehouseQty; seenByWarehouse: WarehouseQty; receivedQty: Decimal; seenLandedQty: Decimal }
 
-/**
- * Earmark newly landed units for the pegs of ONE purchase-order line, oldest peg first, each up to its qty. Idempotent: the
- * watermark moves to `landed`, so replaying the same landed figure grants nothing. A landed figure BELOW the watermark (a
- * correction) grants nothing and lowers the watermark, so the units that then land again are counted again; that is the
- * conservative direction for a hold that only ever protects an order.
- */
-export function grantReceipts(pegs: PegReceiptInput[], landed: Decimal): Map<string, { receivedQty: Decimal; seenLandedQty: Decimal }> {
-  const sorted = [...pegs].sort(byAge)
-  const seen = sorted.length === 0 ? ZERO : Prisma.Decimal.min(...sorted.map((peg) => peg.seenLandedQty))
-  let pool = Prisma.Decimal.max(ZERO, landed.sub(seen))
-  const out = new Map<string, { receivedQty: Decimal; seenLandedQty: Decimal }>()
-  for (const peg of sorted) {
-    const grant = Prisma.Decimal.min(pool, Prisma.Decimal.max(ZERO, peg.qty.sub(peg.receivedQty)))
-    pool = pool.sub(grant)
-    out.set(peg.id, { receivedQty: peg.receivedQty.add(grant), seenLandedQty: landed })
+function sumQty(map: WarehouseQty): Decimal {
+  let total = ZERO
+  for (const qty of map.values()) total = total.add(qty)
+  return total
+}
+
+/** Split a PO line's landed total over the warehouses its cost layers were laid in; the unlayered remainder goes to `fallback`. */
+export function splitLandedByWarehouse(total: Decimal, layerQtyByWarehouse: WarehouseQty, fallbackWarehouseId: string | null): WarehouseQty {
+  const out: WarehouseQty = new Map()
+  let remaining = Prisma.Decimal.max(ZERO, total)
+  for (const warehouseId of [...layerQtyByWarehouse.keys()].sort()) {
+    const take = Prisma.Decimal.min(remaining, Prisma.Decimal.max(ZERO, layerQtyByWarehouse.get(warehouseId)!))
+    if (take.lte(ZERO)) continue
+    out.set(warehouseId, take)
+    remaining = remaining.sub(take)
+  }
+  if (remaining.gt(ZERO)) {
+    const key = fallbackWarehouseId ?? UNATTRIBUTED_WAREHOUSE
+    out.set(key, (out.get(key) ?? ZERO).add(remaining))
   }
   return out
+}
+
+/**
+ * Earmark newly landed units for the pegs of ONE purchase-order line, oldest peg first, each up to its qty, PER WAREHOUSE: the
+ * units that landed in warehouse B are earmarked in B, whatever the PO's planned destination was. Idempotent: each warehouse's
+ * watermark moves to what is landed there, so replaying the same figures grants nothing.
+ *
+ * RECONCILIATION. The earmarks of the live pegs can never exceed what is landed in that warehouse. When the landed figure falls
+ * (a receipt reversed or corrected), the excess earmark is taken back, NEWEST peg first, and the watermark follows it down, so
+ * the units that land again are earmarked once, not twice.
+ */
+export function grantReceipts(pegs: PegReceiptInput[], landedByWarehouse: WarehouseQty): Map<string, PegReceiptGrant> {
+  const sorted = [...pegs].sort(byAge)
+  const state = sorted.map((peg) => ({ peg, received: new Map(peg.receivedByWarehouse), seen: new Map(peg.seenByWarehouse) }))
+  const warehouseIds = [...new Set([
+    ...landedByWarehouse.keys(),
+    ...sorted.flatMap((peg) => [...peg.receivedByWarehouse.keys(), ...peg.seenByWarehouse.keys()]),
+  ])].sort()
+  for (const warehouseId of warehouseIds) {
+    const landed = Prisma.Decimal.max(ZERO, landedByWarehouse.get(warehouseId) ?? ZERO)
+    let excess = state.reduce((sum, item) => sum.add(item.received.get(warehouseId) ?? ZERO), ZERO).sub(landed)
+    for (const item of [...state].reverse()) {
+      if (excess.lte(ZERO)) break
+      const have = item.received.get(warehouseId) ?? ZERO
+      const cut = Prisma.Decimal.min(excess, have)
+      if (cut.gt(ZERO)) item.received.set(warehouseId, have.sub(cut))
+      excess = excess.sub(cut)
+    }
+    const seen = state.length === 0 ? ZERO : Prisma.Decimal.min(...state.map((item) => item.seen.get(warehouseId) ?? ZERO))
+    let pool = Prisma.Decimal.max(ZERO, landed.sub(seen))
+    for (const item of state) {
+      const room = Prisma.Decimal.max(ZERO, item.peg.qty.sub(sumQty(item.received)))
+      const grant = Prisma.Decimal.min(pool, room)
+      if (grant.gt(ZERO)) item.received.set(warehouseId, (item.received.get(warehouseId) ?? ZERO).add(grant))
+      pool = pool.sub(grant)
+      item.seen.set(warehouseId, landed)
+    }
+  }
+  const out = new Map<string, PegReceiptGrant>()
+  for (const item of state) {
+    for (const [key, qty] of item.received) if (qty.lte(ZERO)) item.received.delete(key)
+    for (const [key, qty] of item.seen) if (qty.lte(ZERO)) item.seen.delete(key)
+    out.set(item.peg.id, { receivedByWarehouse: item.received, seenByWarehouse: item.seen, receivedQty: sumQty(item.received), seenLandedQty: sumQty(item.seen) })
+  }
+  return out
+}
+
+export function readWarehouseQty(json: unknown): WarehouseQty {
+  const out: WarehouseQty = new Map()
+  if (json && typeof json === 'object' && !Array.isArray(json)) {
+    for (const [key, value] of Object.entries(json as Record<string, unknown>)) {
+      const qty = new Prisma.Decimal(String(value ?? 0))
+      if (qty.gt(ZERO)) out.set(key, qty)
+    }
+  }
+  return out
+}
+
+export function warehouseQtyToJson(map: WarehouseQty): Record<string, string> {
+  return Object.fromEntries([...map.entries()].filter(([, qty]) => qty.gt(ZERO)).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, qty]) => [key, qty.toString()]))
+}
+
+/**
+ * A peg's hold (received - absorbed) by warehouse. The absorbed units are taken out of the warehouses the line's own allocation
+ * sits in first (`preferred`, most first), then the rest in id order, so what stays held is what is still in the warehouse it
+ * landed in. The result sums to `hold` (capped at what was received).
+ */
+export function holdByWarehouse(received: WarehouseQty, hold: Decimal, preferred: string[]): WarehouseQty {
+  const total = sumQty(received)
+  let absorbed = Prisma.Decimal.max(ZERO, total.sub(hold))
+  const left: WarehouseQty = new Map(received)
+  const order = [...new Set([...preferred, ...[...received.keys()].sort()])]
+  for (const warehouseId of order) {
+    if (absorbed.lte(ZERO)) break
+    const have = left.get(warehouseId)
+    if (!have) continue
+    const take = Prisma.Decimal.min(have, absorbed)
+    left.set(warehouseId, have.sub(take))
+    absorbed = absorbed.sub(take)
+  }
+  for (const [key, qty] of left) if (qty.lte(ZERO)) left.delete(key)
+  return left
 }
 
 export type PegSettleInput = { id: string; createdAt: Date; qty: Decimal; receivedQty: Decimal; baselineAllocatedQty: Decimal }
@@ -123,7 +217,7 @@ const PEG_INCLUDE = {
   },
   purchaseOrderLine: {
     select: {
-      id: true, poId: true, qty: true, qtyReceived: true,
+      id: true, poId: true, productId: true, qty: true, qtyReceived: true,
       po: { select: { id: true, reference: true, status: true, destinationWarehouseId: true } },
     },
   },
@@ -152,45 +246,98 @@ async function loadLivePegs(tx: Tx, where: Prisma.SalesOrderLinePegWhereInput): 
   })
 }
 
-/** The line's allocation: the order's WHOLE claim on the line's own product (retained through dispatch). */
-async function loadLineAllocations(tx: Tx, lines: Array<{ id: string; productId: string | null }>): Promise<Map<string, Decimal>> {
-  const out = new Map<string, Decimal>(lines.map((line) => [line.id, ZERO]))
-  if (lines.length === 0) return out
+async function loadLineAllocationRows(tx: Tx, lines: Array<{ id: string; productId: string | null }>) {
+  if (lines.length === 0) return []
   const productByLine = new Map(lines.map((line) => [line.id, line.productId]))
   const rows = await tx.orderAllocation.findMany({
     where: { lineId: { in: lines.map((line) => line.id) } },
-    select: { lineId: true, productId: true, qty: true },
+    select: { lineId: true, productId: true, warehouseId: true, qty: true },
   })
-  for (const row of rows) {
-    if (row.productId !== productByLine.get(row.lineId)) continue
-    out.set(row.lineId, (out.get(row.lineId) ?? ZERO).add(row.qty))
+  return rows.filter((row) => row.productId === productByLine.get(row.lineId))
+}
+
+/** The line's allocation: the order's WHOLE claim on the line's own product (retained through dispatch). */
+async function loadLineAllocations(tx: Tx, lines: Array<{ id: string; productId: string | null }>): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>(lines.map((line) => [line.id, ZERO]))
+  for (const row of await loadLineAllocationRows(tx, lines)) out.set(row.lineId, (out.get(row.lineId) ?? ZERO).add(row.qty))
+  return out
+}
+
+/** Per line, the warehouses its own allocation sits in, most first (where absorbed peg units are taken from). */
+async function loadLineAllocationWarehouses(tx: Tx, lines: Array<{ id: string; productId: string | null }>): Promise<Map<string, string[]>> {
+  const byLine = new Map<string, WarehouseQty>()
+  for (const row of await loadLineAllocationRows(tx, lines)) {
+    const inner = byLine.get(row.lineId) ?? new Map<string, Decimal>()
+    inner.set(row.warehouseId, (inner.get(row.warehouseId) ?? ZERO).add(row.qty))
+    byLine.set(row.lineId, inner)
+  }
+  return new Map([...byLine].map(([lineId, inner]) => [lineId, [...inner.entries()].sort((a, b) => b[1].comparedTo(a[1]) || (a[0] < b[0] ? -1 : 1)).map(([id]) => id)]))
+}
+
+/**
+ * Where each PO line's landed units actually landed: the cost layers laid for the line, by warehouse (the manual receipt, the ASN
+ * alignment and the book-in all lay them in the warehouse they put the stock in), capped at the landed total. Landed units no
+ * layer accounts for are attributed to the PO's destination warehouse (or, with none, to "unattributed").
+ */
+export async function loadLandedByWarehouse(
+  tx: Tx,
+  lines: Array<{ id: string; qtyReceived: Prisma.Decimal | number | string; destinationWarehouseId: string | null }>,
+): Promise<Map<string, { total: Decimal; byWarehouse: WarehouseQty }>> {
+  const out = new Map<string, { total: Decimal; byWarehouse: WarehouseQty }>()
+  if (lines.length === 0) return out
+  const landed = await loadPurchaseOrderLineLandedQty(tx, lines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })))
+  const layers = await tx.costLayer.groupBy({ by: ['poLineId', 'warehouseId'], where: { poLineId: { in: lines.map((line) => line.id) } }, _sum: { receivedQty: true } })
+  const layersByLine = new Map<string, WarehouseQty>()
+  for (const row of layers) {
+    if (!row.poLineId) continue
+    const inner = layersByLine.get(row.poLineId) ?? new Map<string, Decimal>()
+    inner.set(row.warehouseId, (inner.get(row.warehouseId) ?? ZERO).add(row._sum.receivedQty ?? ZERO))
+    layersByLine.set(row.poLineId, inner)
+  }
+  for (const line of lines) {
+    const total = new Prisma.Decimal(landed.get(line.id)?.qty.toString() ?? '0')
+    out.set(line.id, { total, byWarehouse: splitLandedByWarehouse(total, layersByLine.get(line.id) ?? new Map(), line.destinationWarehouseId) })
   }
   return out
 }
 
 /**
- * Bring the pegs' `receivedQty` up to what has landed on their PO lines. Writes only pegs that changed. The caller holds the
- * peg row locks (lockPegsForProducts) so two receipts' refreshes serialise.
+ * Bring the pegs' `receivedQty` into line with what has landed on their PO lines, per warehouse (see grantReceipts, which also
+ * takes back earmarks a landed-quantity correction has made impossible). Writes only pegs that changed. The caller holds the peg
+ * row locks (lockPegsForProducts) so two receipts' refreshes serialise.
  */
 export async function refreshPegReceipts(tx: Tx, pegs: LoadedPeg[]): Promise<void> {
   if (pegs.length === 0) return
   const poLines = new Map(pegs.map((peg) => [peg.purchaseOrderLineId, peg.purchaseOrderLine]))
-  const landed = await loadPurchaseOrderLineLandedQty(tx, [...poLines.values()].map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })))
+  const landed = await loadLandedByWarehouse(tx, [...poLines.values()].map((line) => ({ id: line.id, qtyReceived: line.qtyReceived, destinationWarehouseId: line.po.destinationWarehouseId })))
   const byPoLine = new Map<string, LoadedPeg[]>()
   for (const peg of pegs) byPoLine.set(peg.purchaseOrderLineId, [...(byPoLine.get(peg.purchaseOrderLineId) ?? []), peg])
   for (const [poLineId, group] of byPoLine) {
-    const landedQty = landed.get(poLineId)?.qty
-    if (!landedQty) continue
+    const landedLine = landed.get(poLineId)
+    if (!landedLine) continue
     const granted = grantReceipts(
-      group.map((peg) => ({ id: peg.id, createdAt: peg.createdAt, qty: peg.qty, receivedQty: peg.receivedQty, seenLandedQty: peg.seenLandedQty })),
-      landedQty,
+      group.map((peg) => ({ id: peg.id, createdAt: peg.createdAt, qty: peg.qty, receivedByWarehouse: readWarehouseQty(peg.receivedByWarehouse), seenByWarehouse: readWarehouseQty(peg.seenLandedByWarehouse) })),
+      landedLine.byWarehouse,
     )
     for (const peg of group) {
       const next = granted.get(peg.id)!
-      if (next.receivedQty.equals(peg.receivedQty) && next.seenLandedQty.equals(peg.seenLandedQty)) continue
-      await tx.salesOrderLinePeg.update({ where: { id: peg.id }, data: { receivedQty: next.receivedQty, seenLandedQty: next.seenLandedQty } })
+      const receivedJson = warehouseQtyToJson(next.receivedByWarehouse)
+      const seenJson = warehouseQtyToJson(next.seenByWarehouse)
+      if (
+        next.receivedQty.equals(peg.receivedQty) && next.seenLandedQty.equals(peg.seenLandedQty)
+        && JSON.stringify(receivedJson) === JSON.stringify(warehouseQtyToJson(readWarehouseQty(peg.receivedByWarehouse)))
+        && JSON.stringify(seenJson) === JSON.stringify(warehouseQtyToJson(readWarehouseQty(peg.seenLandedByWarehouse)))
+      ) continue
+      const allocatedQty = Prisma.Decimal.min(peg.allocatedQty, next.receivedQty)
+      await tx.salesOrderLinePeg.update({
+        where: { id: peg.id },
+        data: { receivedQty: next.receivedQty, seenLandedQty: next.seenLandedQty, allocatedQty, receivedByWarehouse: receivedJson, seenLandedByWarehouse: seenJson },
+      })
       peg.receivedQty = next.receivedQty
       peg.seenLandedQty = next.seenLandedQty
+      peg.allocatedQty = allocatedQty
+      peg.receivedByWarehouse = receivedJson
+      peg.seenLandedByWarehouse = seenJson
     }
   }
 }
@@ -202,10 +349,12 @@ export async function refreshPegReceipts(tx: Tx, pegs: LoadedPeg[]): Promise<voi
 export type PegContext = {
   /** This order's live pegs, receipts refreshed. */
   own: LoadedPeg[]
-  /** Holds (per product, per destination warehouse hint) other orders' pegs place on stock this order must leave alone. */
-  holds: Array<{ pegId: string; productId: string; warehouseHint: string | null; qty: Decimal }>
+  /** Holds other orders' pegs place on stock this order must leave alone: per product, in the warehouse the units landed in. */
+  holds: Array<{ pegId: string; productId: string; warehouseId: string; qty: Decimal }>
   /** Per own line: the extra quantity the peg pass may add on top of the line's existing allocation. */
   ownExtraByLine: Map<string, Decimal>
+  /** The same extra, per product and warehouse: the peg pass may add it only where the stock landed. */
+  ownExtraByProductWarehouse: Map<string, WarehouseQty>
 }
 
 /**
@@ -225,6 +374,7 @@ export async function loadPegContext(tx: Tx, orderId: string, productIds: string
 
   const lines = [...new Map(pegs.map((peg) => [peg.salesOrderLineId, peg.salesOrderLine])).values()]
   const allocations = await loadLineAllocations(tx, lines)
+  const allocationWarehouses = await loadLineAllocationWarehouses(tx, lines)
   const settledByPeg = new Map<string, PegSettled>()
   const pegsByLine = new Map<string, LoadedPeg[]>()
   for (const peg of pegs) pegsByLine.set(peg.salesOrderLineId, [...(pegsByLine.get(peg.salesOrderLineId) ?? []), peg])
@@ -233,47 +383,82 @@ export async function loadPegContext(tx: Tx, orderId: string, productIds: string
     const settled = settlePegs(group, allocations.get(lineId) ?? ZERO, line.qty)
     for (const [pegId, value] of settled) settledByPeg.set(pegId, value)
   }
+  const holdWarehouses = (peg: LoadedPeg, hold: Decimal): WarehouseQty =>
+    holdByWarehouse(readWarehouseQty(peg.receivedByWarehouse), hold, allocationWarehouses.get(peg.salesOrderLineId) ?? [])
 
   const own = pegs.filter((peg) => peg.salesOrderLine.orderId === orderId)
   const ownExtraByLine = new Map<string, Decimal>()
+  const ownExtraByProductWarehouse = new Map<string, WarehouseQty>()
   for (const peg of own) {
     const settled = settledByPeg.get(peg.id)
     if (!settled) continue
     ownExtraByLine.set(peg.salesOrderLineId, (ownExtraByLine.get(peg.salesOrderLineId) ?? ZERO).add(settled.hold))
+    const productId = peg.salesOrderLine.productId!
+    const inner = ownExtraByProductWarehouse.get(productId) ?? new Map<string, Decimal>()
+    for (const [warehouseId, qty] of holdWarehouses(peg, settled.hold)) inner.set(warehouseId, (inner.get(warehouseId) ?? ZERO).add(qty))
+    ownExtraByProductWarehouse.set(productId, inner)
   }
 
   const holds: PegContext['holds'] = []
   for (const peg of pegs) {
     if (peg.salesOrderLine.orderId === orderId) continue
     if (!(PEG_HOLDING_ORDER_STATUSES as readonly string[]).includes(peg.salesOrderLine.order.status)) continue
+    // Defence in depth: the sweep ends a peg whose purchase order has closed, but until it runs that peg must not keep stock back.
+    if ((PO_STATUSES_HOLDING_NOTHING as readonly string[]).includes(peg.purchaseOrderLine.po.status)) continue
     const settled = settledByPeg.get(peg.id)
     if (!settled || settled.hold.lte(ZERO)) continue
-    holds.push({ pegId: peg.id, productId: peg.salesOrderLine.productId!, warehouseHint: peg.purchaseOrderLine.po.destinationWarehouseId, qty: settled.hold })
+    for (const [warehouseId, qty] of holdWarehouses(peg, settled.hold)) {
+      holds.push({ pegId: peg.id, productId: peg.salesOrderLine.productId!, warehouseId, qty })
+    }
   }
-  return { own, holds, ownExtraByLine }
+  return { own, holds, ownExtraByLine, ownExtraByProductWarehouse }
 }
 
 /**
- * Take the other orders' held quantities out of the availability map (mutates it). A hold is taken from the PO's destination
- * warehouse first, then from wherever else the product has stock, and never below zero: a hold can only ever reduce what
- * this order may take, it can not create a shortage in stock that is not there.
+ * Take the other orders' held quantities out of the availability map (mutates it). A hold comes out of the warehouse the units
+ * landed in and ONLY there, never below zero: a hold can only reduce what this order may take there, it can not create a
+ * shortage in stock that is not there, and it never pulls stock out of another warehouse. (A hold with no recorded warehouse
+ * comes from wherever the product has most stock.)
  */
 export function applyPegHoldsToStockMap(stockMap: Map<string, Map<string, Decimal>>, holds: PegContext['holds']): void {
   for (const hold of holds) {
     const byWarehouse = stockMap.get(hold.productId)
     if (!byWarehouse) continue
+    if (hold.warehouseId !== UNATTRIBUTED_WAREHOUSE) {
+      const available = byWarehouse.get(hold.warehouseId)
+      if (available) byWarehouse.set(hold.warehouseId, available.sub(Prisma.Decimal.min(available, hold.qty)))
+      continue
+    }
     let remaining = hold.qty
-    const order = [...byWarehouse.keys()].sort((a, b) => {
-      if (a === hold.warehouseHint) return -1
-      if (b === hold.warehouseHint) return 1
-      return byWarehouse.get(b)!.comparedTo(byWarehouse.get(a)!)
-    })
+    const order = [...byWarehouse.keys()].sort((a, b) => byWarehouse.get(b)!.comparedTo(byWarehouse.get(a)!) || (a < b ? -1 : 1))
     for (const warehouseId of order) {
       if (remaining.lte(ZERO)) break
       const available = byWarehouse.get(warehouseId)!
       const take = Prisma.Decimal.min(available, remaining)
       byWarehouse.set(warehouseId, available.sub(take))
       remaining = remaining.sub(take)
+    }
+  }
+}
+
+/**
+ * The receipt's peg pass (capPeggedLines): in each warehouse the order may hold at most what it already reserves there plus what
+ * landed THERE for its pegs, so the pegged order cannot reserve existing stock in warehouse A because a receipt landed in B.
+ * Mutates the availability map. Extra with no recorded warehouse may be taken in any warehouse.
+ */
+export function applyPegCapsToStockMap(
+  stockMap: Map<string, Map<string, Decimal>>,
+  extraByProductWarehouse: Map<string, WarehouseQty>,
+  ownReservations: Array<{ productId: string; warehouseId: string; qty: Decimal }>,
+): void {
+  for (const [productId, extra] of extraByProductWarehouse) {
+    const byWarehouse = stockMap.get(productId)
+    if (!byWarehouse) continue
+    const anywhere = extra.get(UNATTRIBUTED_WAREHOUSE) ?? ZERO
+    for (const [warehouseId, available] of byWarehouse) {
+      const held = ownReservations.filter((row) => row.productId === productId && row.warehouseId === warehouseId).reduce((sum, row) => sum.add(row.qty), ZERO)
+      const cap = held.add(extra.get(warehouseId) ?? ZERO).add(anywhere)
+      byWarehouse.set(warehouseId, Prisma.Decimal.min(available, cap))
     }
   }
 }
@@ -378,9 +563,54 @@ export async function recordPegsRemovedWithLines(
   if (or.length === 0) return 0
   const pegs = await loadLivePegs(tx, { OR: or })
   for (const peg of pegs) {
-    await endPeg(tx, peg, where.salesOrderLineIds?.includes(peg.salesOrderLineId) ? 'SALES_LINE_REMOVED' : 'PURCHASE_ORDER_CANCELLED', userId)
+    await endPeg(tx, peg, where.salesOrderLineIds?.includes(peg.salesOrderLineId) ? 'SALES_LINE_REMOVED' : 'PURCHASE_LINE_REMOVED', userId)
   }
   return pegs.length
+}
+
+/**
+ * A FULL edit of a pristine purchase order deletes and recreates its lines, which would cascade away the pegs on them (the
+ * stock promise and its history) with nothing recorded. So, before that delete: decide per live peg whether it can survive.
+ *
+ * A peg survives when its PO line is still in the edit (same line id) for the SAME product and the new quantity still covers it
+ * (oldest pegs first, net of what has landed). Those lines are NOT deleted: the caller updates them in place (the amend path
+ * does the same), so the peg keeps pointing at the same line row. Every other peg is ended here, with a reason and an activity
+ * row, and goes with its line as before. Returns the ids of the lines the caller must keep.
+ */
+export async function reconcilePegsForPoLineRewrite(
+  tx: Tx,
+  poId: string,
+  requestedLines: Array<{ poLineId?: string | null; productId: string; qty: number }>,
+  userId: string | null,
+): Promise<Set<string>> {
+  const keep = new Set<string>()
+  if (!(await tx.salesOrderLinePeg.findFirst({ where: { endedAt: null, purchaseOrderLine: { poId } }, select: { id: true } }))) return keep
+  // After the purchase_orders row the caller holds, the peg rows ascending (the lock order of createPeg).
+  await tx.$queryRaw(Prisma.sql`
+    SELECT p.id FROM "sales_order_line_pegs" p JOIN "purchase_order_lines" l ON l.id = p."purchaseOrderLineId"
+    WHERE p."endedAt" IS NULL AND l."poId" = ${poId} ORDER BY p.id FOR UPDATE OF p
+  `)
+  const pegs = await loadLivePegs(tx, { purchaseOrderLine: { poId } })
+  const requested = new Map<string, { productId: string; qty: Decimal }>()
+  for (const line of requestedLines) {
+    if (line.poLineId && !requested.has(line.poLineId)) requested.set(line.poLineId, { productId: line.productId, qty: new Prisma.Decimal(line.qty) })
+  }
+  const landed = await loadPurchaseOrderLineLandedQty(tx, [...new Map(pegs.map((peg) => [peg.purchaseOrderLineId, peg.purchaseOrderLine])).values()].map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })))
+  const committed = new Map<string, Decimal>()
+  for (const peg of pegs) {
+    const want = requested.get(peg.purchaseOrderLineId)
+    let survives = false
+    if (want && want.productId === peg.purchaseOrderLine.productId) {
+      const room = Prisma.Decimal.max(ZERO, want.qty.sub(landed.get(peg.purchaseOrderLineId)?.qty ?? ZERO).sub(committed.get(peg.purchaseOrderLineId) ?? ZERO))
+      if (peg.qty.sub(peg.receivedQty).lte(room.add(EPSILON))) {
+        survives = true
+        committed.set(peg.purchaseOrderLineId, (committed.get(peg.purchaseOrderLineId) ?? ZERO).add(peg.qty.sub(peg.receivedQty)))
+      }
+    }
+    if (survives) keep.add(peg.purchaseOrderLineId)
+    else await endPeg(tx, peg, 'PURCHASE_LINE_REMOVED', userId)
+  }
+  return keep
 }
 
 /**
@@ -389,16 +619,35 @@ export async function recordPegsRemovedWithLines(
  */
 export async function sweepPegs(
   client: { $transaction: <T>(fn: (tx: Tx) => Promise<T>, options?: { maxWait?: number; timeout?: number }) => Promise<T> },
-  opts: { batch?: number } = {},
-): Promise<{ checked: number; ended: EndedPeg[] }> {
+  opts: { batch?: number; maxBatches?: number } = {},
+): Promise<{ checked: number; ended: EndedPeg[]; exhausted: boolean }> {
   const batch = opts.batch ?? 200
-  return client.$transaction(async (tx) => {
-    const ids = (await tx.salesOrderLinePeg.findMany({ where: { endedAt: null }, select: { id: true }, orderBy: { id: 'asc' }, take: batch })).map((row) => row.id)
-    if (ids.length === 0) return { checked: 0, ended: [] }
-    await tx.$queryRaw(Prisma.sql`SELECT id FROM "sales_order_line_pegs" WHERE id IN (${Prisma.join(ids)}) AND "endedAt" IS NULL ORDER BY id FOR UPDATE`)
-    const pegs = await loadLivePegs(tx, { id: { in: ids } })
-    return { checked: pegs.length, ended: await evaluatePegs(tx, pegs) }
-  }, { maxWait: 5000, timeout: 20000 })
+  // A full pass over every live peg, in keyset order (id > the last id of the previous batch), one transaction per batch. No
+  // cursor is persisted because none is needed: each run starts at the beginning and runs to the end, so no peg is ever skipped
+  // however many are live. `maxBatches` only bounds a pathological run (default 500 batches = 100,000 pegs); `exhausted`
+  // says whether the pass reached the end.
+  const maxBatches = opts.maxBatches ?? 500
+  let after: string | null = null
+  let checked = 0
+  const ended: EndedPeg[] = []
+  for (let round = 0; round < maxBatches; round += 1) {
+    const cursor: string | null = after
+    const result: { ids: string[]; checked: number; ended: EndedPeg[] } = await client.$transaction(async (tx): Promise<{ ids: string[]; checked: number; ended: EndedPeg[] }> => {
+      const ids: string[] = (await tx.salesOrderLinePeg.findMany({
+        where: { endedAt: null, ...(cursor ? { id: { gt: cursor } } : {}) }, select: { id: true }, orderBy: { id: 'asc' }, take: batch,
+      })).map((row) => row.id)
+      if (ids.length === 0) return { ids, checked: 0, ended: [] }
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM "sales_order_line_pegs" WHERE id IN (${Prisma.join(ids)}) AND "endedAt" IS NULL ORDER BY id FOR UPDATE`)
+      const pegs = await loadLivePegs(tx, { id: { in: ids } })
+      return { ids, checked: pegs.length, ended: await evaluatePegs(tx, pegs) }
+    }, { maxWait: 5000, timeout: 20000 })
+    if (result.ids.length === 0) return { checked, ended, exhausted: true }
+    checked += result.checked
+    ended.push(...result.ended)
+    after = result.ids[result.ids.length - 1]!
+    if (result.ids.length < batch) return { checked, ended, exhausted: true }
+  }
+  return { checked, ended, exhausted: false }
 }
 
 // ---------------------------------------------------------------------------
