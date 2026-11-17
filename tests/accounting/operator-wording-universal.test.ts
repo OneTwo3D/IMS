@@ -400,7 +400,9 @@ test('[o3d-1e7sl Codex r14] the help doc carries the generated blocks exactly on
     const a = doc.indexOf(begin)
     assert.equal(doc.slice(a, doc.indexOf(end, a) + end.length), text, 'the help doc disagrees with the generator - regenerate it')
   }
-  assert.ok(doc.split('\n').length < 3200, 'the help doc has not been duplicated')
+  // A duplicated regen would roughly double the page (and the begin markers above are counted exactly once).
+  // The ceiling sits well above the page's real size so ordinary growth does not trip it.
+  assert.ok(doc.split('\n').length < 5000, 'the help doc has not been duplicated')
   const walkAll = (dir: string): string[] => readdirSync(path.join(ROOT, dir)).flatMap((name) => {
     const rel = path.join(dir, name)
     if (name === 'generated' || name === 'node_modules' || name === '.next') return []
