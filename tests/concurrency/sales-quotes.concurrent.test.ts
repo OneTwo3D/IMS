@@ -341,7 +341,7 @@ test('permission denial: converting, sending and the setting each refuse and wri
 test('the database refuses a quote on any live status; a cancelled quote is allowed', SKIP, async (t) => {
   const w = await seedWorld()
   t.after(() => w.teardown())
-  const { createSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const { createSalesOrder } = await import('@/app/actions/sales')
   const { db } = await import('@/lib/db')
   const quote = await createSalesOrder(inputFor(w, { isQuote: true, quoteValidUntil: future(5) }) as never)
   assert.ok(quote.success)
@@ -349,8 +349,8 @@ test('the database refuses a quote on any live status; a cancelled quote is allo
   w.orderIds.push(id)
   await assert.rejects(() => db.salesOrder.update({ where: { id }, data: { status: 'PROCESSING' } }), /sales_orders_quote_is_draft_check|check constraint/i)
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id } })).status, 'DRAFT')
-  const cancelled = await updateSalesOrderStatus(id, 'CANCELLED')
-  assert.equal(cancelled.success, true, cancelled.error)
+  // Cancelling is the one move a quote may make: the constraint admits it (the cancel action itself is covered by the status-move unit tests; this tier mocks the storefront push it calls).
+  await db.salesOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
   const row = await db.salesOrder.findUniqueOrThrow({ where: { id } })
   assert.deepEqual([row.status, row.isQuote], ['CANCELLED', true])
 })
