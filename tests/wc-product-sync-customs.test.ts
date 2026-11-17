@@ -267,6 +267,30 @@ test('variations on create: inherited value, own value, parent legacy descriptio
   assert.deepEqual([fallback.hsCode, fallback.countryOfOrigin, fallback.customsDescription], ['84798997', 'GB', 'parent legacy text'])
 })
 
+test('an attribute-only variation (singular `option`) imports its customs and reaches the Mintsoft payload', async () => {
+  const sync = await loadSync()
+  reset()
+  variationRows = [variation(111, 'VAR-ATTR', {
+    attributes: [
+      { name: 'Colour', option: 'Red' },
+      { name: 'pa_hs_code', option: 'ignored' },
+      { name: 'hs_code', option: '39269097' },
+      { name: 'country_of_origin', option: 'DE' },
+      { name: 'customs_description', option: 'plastic bracket' },
+    ],
+  })]
+  const result = await sync(parent())
+  assert.equal(result.success, true)
+  const row = bySku('VAR-ATTR')
+  assert.deepEqual([row.hsCode, row.countryOfOrigin, row.customsDescription], ['39269097', 'DE', 'plastic bracket'])
+  const { buildMintsoftProductDto } = await import('@/lib/connectors/mintsoft/sync/product-sync')
+  const { buildMintsoftProductUpsertRequest } = await import('@/lib/connectors/mintsoft/api/client')
+  const body = JSON.parse(buildMintsoftProductUpsertRequest(buildMintsoftProductDto(row as never)).body) as Record<string, unknown>
+  assert.deepEqual(body.CommodityCode, { Code: '39269097' })
+  assert.deepEqual(body.CountryOfManufacture, { Code: 'DE' })
+  assert.equal(body.CustomsDescription, 'plastic bracket')
+})
+
 test('variation with no origin anywhere takes the China default on create (as the parent does)', async () => {
   const sync = await loadSync()
   reset()

@@ -10,7 +10,7 @@ import { clampCustomsDescription } from '@/lib/trade/customs-description'
  * A variation in view context already carries its parent's native value.
  */
 export type WcCustomsSource = {
-  attributes?: { name?: unknown; options?: unknown }[] | null
+  attributes?: { name?: unknown; options?: unknown; option?: unknown }[] | null
   meta_data?: { key?: string; value?: unknown }[] | null
   customs_commodity_code?: unknown
   customs_country_of_origin?: unknown
@@ -39,9 +39,11 @@ function attributeValue(attrs: WcCustomsSource['attributes'], ...names: string[]
     const name = trimmed(a?.name)
     return name ? targets.includes(normalise(name)) : false
   })
-  if (!attr || !Array.isArray(attr.options)) return null
-  for (const option of attr.options) {
-    const value = trimmed(option)
+  if (!attr) return null
+  // A product attribute carries `options` (array); a variation attribute carries `option` (singular).
+  const candidates: unknown[] = [...(Array.isArray(attr.options) ? attr.options : []), attr.option]
+  for (const candidate of candidates) {
+    const value = trimmed(candidate)
     if (value) return value
   }
   return null

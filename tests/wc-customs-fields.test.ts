@@ -49,6 +49,17 @@ test('per-field attribute fallback when native fields are absent', () => {
   assert.equal(r.customsDescription, null)
 })
 
+test('variation attributes carry a singular `option`', () => {
+  const r = extractWcCustomsFields({
+    attributes: [
+      { name: 'hs_code', option: '3926909090' },
+      { name: 'country_of_origin', option: 'CN' },
+      { name: 'customs_description', option: 'plastic bracket' },
+    ],
+  })
+  assert.deepEqual(r, { hsCode: '3926909090', countryOfOrigin: 'CN', customsDescription: 'plastic bracket' })
+})
+
 test('nothing supplied yields nulls', () => {
   assert.deepEqual(extractWcCustomsFields({}), { hsCode: null, countryOfOrigin: null, customsDescription: null })
 })
