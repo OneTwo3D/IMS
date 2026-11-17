@@ -38,6 +38,7 @@ import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
+import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
 import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
 import { buildRefundRequest, creditNoteAmounts, salesOrderMoneyView, type MoneyViewOrder } from '@/lib/domain/sales/sales-order-money-view'
@@ -138,14 +139,8 @@ const STATUS_CLASS: Record<SoStatus, string> = {
   DELIVERED: 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900 dark:text-emerald-200',
   CANCELLED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
 }
-// Status flow for orders WITH shipments (shipment-level picking/packing/shipping)
-const STATUS_FLOW_SHIPMENTS: Record<string, { label: string; icon: typeof Truck; target: SoStatus }[]> = {
-  DRAFT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
-  PENDING_PAYMENT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
-  PROCESSING: [{ label: 'Allocate', icon: Package, target: 'ALLOCATED' }],
-  SHIPPED: [{ label: 'Complete', icon: PackageCheck, target: 'COMPLETED' }],
-  COMPLETED: [{ label: 'Delivered', icon: PackageCheck, target: 'DELIVERED' }],
-}
+// Workflow buttons come from the shared flow (lib/domain/sales/status-flow.ts), which the list's bulk Advance also reads.
+const STATUS_ACTION_ICON: Partial<Record<SoStatus, typeof Truck>> = { PROCESSING: Package, ALLOCATED: Package, COMPLETED: PackageCheck, DELIVERED: PackageCheck }
 
 // Optional columns for the line items table
 type OptCol = 'cogs' | 'margin' | 'marginPct' | 'qtyOnHand' | 'qtyReturned' | 'qtyCancelled' | 'qtyShipped'
@@ -1067,7 +1062,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
 
   const hasShipments = shipments.length > 0
   // Filter out Delivered action if delivery tracking is not enabled
-  const nextActions = (STATUS_FLOW_SHIPMENTS[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
+  const nextActions = nextStatusActions(so.status, deliveryTrackingEnabled).map((a) => ({ ...a, icon: STATUS_ACTION_ICON[a.target] ?? Package }))
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   // o3d-0zy: predict the o3d-5r8 delete refusal instead of letting the operator walk into it. Every

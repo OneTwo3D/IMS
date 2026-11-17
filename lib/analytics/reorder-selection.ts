@@ -11,19 +11,26 @@
 export type ReorderSelectionState = {
   /** productIds the operator has ticked. */
   selected: ReadonlySet<string>
+  /**
+   * Per-row supplier override for the draft PO: productId -> supplierId. Only entries that differ from the
+   * row's default supplier are kept. Cleared together with the selection.
+   */
+  supplierOverrides: Readonly<Record<string, string>>
 }
 
 export type ReorderSelectionAction =
   | { type: 'toggle'; id: string }
   | { type: 'toggleAll'; visibleIds: readonly string[] }
   | { type: 'clear' }
+  /** Pick a supplier for one row's draft PO line; a null/empty supplierId removes the override. */
+  | { type: 'setSupplierOverride'; productId: string; supplierId: string | null }
   /** Replace the whole selection (e.g. hydrating from a URL param). */
   | { type: 'set'; ids: readonly string[] }
 
 /** Tri-state of the "select all visible" header checkbox. */
 export type SelectAllState = 'none' | 'some' | 'all'
 
-export const emptyReorderSelection: ReorderSelectionState = { selected: new Set() }
+export const emptyReorderSelection: ReorderSelectionState = { selected: new Set(), supplierOverrides: {} }
 
 /**
  * Cap on the number of selected ids persisted to the URL. Keeps the `selected`
@@ -58,7 +65,7 @@ export function reorderSelectionReducer(
       const next = new Set(state.selected)
       if (next.has(action.id)) next.delete(action.id)
       else next.add(action.id)
-      return { selected: next }
+      return { ...state, selected: next }
     }
     case 'toggleAll': {
       // Tri-state: if every visible id is already selected, clear them all;
@@ -72,12 +79,18 @@ export function reorderSelectionReducer(
       } else {
         for (const id of action.visibleIds) next.add(id)
       }
-      return { selected: next }
+      return { ...state, selected: next }
     }
     case 'set':
-      return { selected: new Set(action.ids) }
+      return { ...state, selected: new Set(action.ids) }
     case 'clear':
       return emptyReorderSelection
+    case 'setSupplierOverride': {
+      const next = new Map(Object.entries(state.supplierOverrides))
+      if (action.supplierId) next.set(action.productId, action.supplierId)
+      else next.delete(action.productId)
+      return { ...state, supplierOverrides: Object.fromEntries(next) }
+    }
     default:
       return state
   }

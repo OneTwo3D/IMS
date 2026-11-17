@@ -842,6 +842,9 @@ The repo now enforces six rules:
 - `node scripts/check-prisma-drift.mjs`
   Runs `prisma migrate diff` against the configured datasource, suppresses only explicitly allowlisted unsupported differences, and prints the full drift when validation fails.
 
+- `npm run crm:identity-report` (`scripts/report-customer-identity.ts`, add `-- --json` for JSON)
+  Read-only customer identity report: how the identity email key (lib/domain/crm/identity-key.ts) groups customers, how many groups hold two or more WooCommerce ids, and how customerless orders bucket (erased, no email, email matches a live customer). It runs every query in one `REPEATABLE READ` transaction set `READ ONLY`, reads in cursor batches of 1,000 and prints COUNTS ONLY, never an email or a name. Run it as `runuser -u ims -- env HOME=/tmp npm run crm:identity-report`. It writes nothing, but a run against production needs the owner's approval.
+
 ## Auth Rate Limiting
 
 Login, TOTP verification, and supplier quote throttling use the shared rate-limit backend in `lib/security/rate-limit.ts`.

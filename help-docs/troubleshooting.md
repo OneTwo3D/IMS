@@ -122,6 +122,10 @@ When something goes wrong, three places hold the information you need:
 
 ## Integrations
 
+### The dashboard "Needs attention" card shows a count I cannot act on, or does not match the inbox
+
+The card shows only categories your role may act on, and its counts are cached for about a minute, so it can briefly lag the exception inbox. "Other sync exceptions" is the inbox total minus the four categories listed on their own, so adding the card's rows never counts an item twice. If a count will not go down, open its link: the row is still open in that section and needs the action described there (replay, record, or mark done). A bell notification is sent once per new item; a failed row that was already announced stays on the card until it is resolved, without notifying again.
+
 ### WooCommerce orders not importing
 1. Check that order sync is enabled in Integrations > WooCommerce > Orders.
 2. Verify the initial import has completed (one-time, must finish before ongoing sync starts).

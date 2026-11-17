@@ -637,6 +637,7 @@ model Warehouse {
   updatedAt             DateTime      @updatedAt
 
   stockLevels           StockLevel[]
+  reorderThresholdOverrides ReorderThresholdOverride[]
   costLayers            CostLayer[]
   inventorySnapshots    InventorySnapshot[]
   inventoryReservationSnapshots InventoryReservationSnapshot[]
@@ -755,6 +756,7 @@ model Product {
   variants        Product[]   @relation("ProductVariants")
 
   stockLevels     StockLevel[]
+  reorderThresholdOverrides ReorderThresholdOverride[]
   costLayers      CostLayer[]
   inventorySnapshots InventorySnapshot[]
   inventoryReservationSnapshots InventoryReservationSnapshot[]
@@ -875,6 +877,26 @@ model StockLevel {
 
   @@unique([productId, warehouseId])
   @@map("stock_levels")
+}
+
+/// Per-warehouse replenishment overrides for one product. A row exists only while the operator has set at least one
+/// value; NULL inherits the Product value (see lib/domain/inventory/reorder-thresholds.ts). Planning-only: kept apart
+/// from stock_levels on purpose, so saving one never creates or touches a stock row and never reaches a WMS or storefront.
+model ReorderThresholdOverride {
+  id             String    @id @default(cuid())
+  productId      String
+  warehouseId    String
+  reorderPoint   Decimal?  @db.Decimal(12, 4)
+  safetyStockQty Decimal?  @db.Decimal(12, 4)
+  reorderQty     Decimal?  @db.Decimal(12, 4)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  product        Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse      Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, warehouseId])
+  @@map("reorder_threshold_overrides")
 }
 
 /// FIFO cost layers — one row per goods receipt (or opening stock seed)
@@ -5003,6 +5025,19 @@ model Notification {
 
   @@index([userId, read, createdAt])
   @@map("notifications")
+}
+
+/// Which failing source rows the "Needs attention" bell has already announced (one row per category and source row). Operational state
+/// of the announcer, not business data: it starts empty, holds only ids (no personal data), and a row is deleted when its source row is
+/// no longer open, so the same row failing again is announced again. The unique key makes the announcement exactly-once under concurrent
+/// passes: the insert that wins is the one that sends the notification.
+model NeedsAttentionAnnouncement {
+  category    String
+  sourceId    String   @map("source_id")
+  announcedAt DateTime @default(now()) @map("announced_at")
+
+  @@id([category, sourceId])
+  @@map("needs_attention_announcements")
 }
 
 /// Per-user read receipt for notifications.

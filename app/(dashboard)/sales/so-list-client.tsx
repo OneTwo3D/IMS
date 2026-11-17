@@ -20,6 +20,7 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { countryName } from '@/lib/countries'
+import { SoBulkActionBar } from '@/components/sales/so-bulk-actions'
 
 const STATUS_LABELS: Record<SoStatus, string> = {
   DRAFT: 'Draft',
@@ -261,6 +262,29 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
   }
 
   const filtered = list.rows
+
+  // Row selection for bulk actions. It is per page: ids that are no longer on the page (page change,
+  // filter, refresh after an action) drop out of it.
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [seenRows, setSeenRows] = useState(list.rows)
+  if (seenRows !== list.rows) {
+    setSeenRows(list.rows)
+    const onPage = new Set(list.rows.map((r) => r.id))
+    const kept = [...selected].filter((id) => onPage.has(id))
+    if (kept.length !== selected.size) setSelected(new Set(kept))
+  }
+  const selectedIds = filtered.filter((r) => selected.has(r.id)).map((r) => r.id)
+  const allOnPageSelected = filtered.length > 0 && selectedIds.length === filtered.length
+  function toggleRow(id: string) {
+    setSelected((prev) => {
+      const n = new Set(prev)
+      if (n.has(id)) n.delete(id); else n.add(id)
+      return n
+    })
+  }
+  function toggleAllOnPage() {
+    setSelected(allOnPageSelected ? new Set() : new Set(filtered.map((r) => r.id)))
+  }
   const searching = urlState.q.trim().length > 0
   const hideNotices: string[] = []
   if (list.queryTooShort) hideNotices.push('Type at least 3 characters to search. Shorter text only matches an exact order number.')
@@ -463,6 +487,8 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
 
       <OrderListSummary page={list.page} pageSize={list.pageSize} total={list.total} noun="sales orders" notices={hideNotices} />
 
+      <SoBulkActionBar selectedIds={selectedIds} onClear={() => setSelected(new Set())} />
+
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">
           {searching ? `No sales orders match "${urlState.q.trim()}" in any order, including completed and archived.` : 'No sales orders found.'}
@@ -476,6 +502,13 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
                 return (
                   <MobileRecordCard key={so.id}>
                     <div className="flex items-start justify-between gap-3">
+                      <input
+                        type="checkbox"
+                        className="accent-primary mt-1 h-4 w-4"
+                        aria-label={`Select order ${so.displayOrderNumber}`}
+                        checked={selected.has(so.id)}
+                        onChange={() => toggleRow(so.id)}
+                      />
                       <div className="min-w-0 flex-1">
                         <Link href={`/sales/${so.id}`} className="font-mono text-sm font-medium text-primary hover:underline">
                           {so.displayOrderNumber}
@@ -524,6 +557,16 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
             <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">
               <TableHeader className="bg-muted/50">
                 <TableRow>
+                  <TableHead className="w-8">
+                    <input
+                      type="checkbox"
+                      className="accent-primary h-3.5 w-3.5"
+                      aria-label="Select all orders on this page"
+                      checked={allOnPageSelected}
+                      ref={(el) => { if (el) el.indeterminate = selectedIds.length > 0 && !allOnPageSelected }}
+                      onChange={toggleAllOnPage}
+                    />
+                  </TableHead>
                   {visCols.map((c) => (
                     <TableHead key={c.key} className={c.align === 'right' ? 'text-right' : undefined}>
                       {c.label}
@@ -534,7 +577,16 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
               </TableHeader>
               <TableBody>
                 {filtered.map((so) => (
-                  <TableRow key={so.id}>
+                  <TableRow key={so.id} data-state={selected.has(so.id) ? 'selected' : undefined}>
+                    <TableCell className="w-8">
+                      <input
+                        type="checkbox"
+                        className="accent-primary h-3.5 w-3.5"
+                        aria-label={`Select order ${so.displayOrderNumber}`}
+                        checked={selected.has(so.id)}
+                        onChange={() => toggleRow(so.id)}
+                      />
+                    </TableCell>
                     {visCols.map((c) => renderCell(c.key, so))}
                     <TableCell>
                       <Link href={`/sales/${so.id}`}>
