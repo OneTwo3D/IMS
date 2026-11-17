@@ -279,7 +279,6 @@ test('with GR/IR posting ON the batch stages one reclass journal per day (Stock 
   await setSettings({ grir_xero_posting_enabled: 'true' })
   const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
   const pending = await s.db.grirSubledgerMovement.findMany({ where: { xeroBatchRef: null, sourceType: { not: 'BILL_PRICE_VARIANCE' } }, select: { baseDelta: true, journalDate: true } })
-  const today = new Date().toISOString().slice(0, 10)
   const expected = new Map<string, number>()
   for (const row of pending) {
     const day = row.journalDate.toISOString().slice(0, 10)
@@ -303,7 +302,6 @@ test('with GR/IR posting ON the batch stages one reclass journal per day (Stock 
     assert.equal(Number(transitRow.baseDelta), net, 'the transit sub-ledger records the transit movement the journal makes')
     assert.equal(transitRow.sourceType, 'GRIR_RECLASS')
   }
-  assert.ok(today)
   // A second run has nothing to consume: no second journal.
   const again = await runDailyBatchSync()
   assert.equal(again.grirReclassJournals, 0)
@@ -329,7 +327,7 @@ test('with GR/IR posting ON and the Xero hold enforced, the journal is shadowed:
   }
   const logs = await grirLogs()
   const added = logs.slice(logsBefore)
-  assert.ok(logs.every((l) => l.status !== 'PENDING' || logsBefore > 0), 'precondition')
+  assert.equal(added.length, 1, 'one shadow row was recorded')
   assert.equal(logs.filter((l) => l.status === 'PENDING').length, logsBefore, 'no NEW pending journal: it is a shadow, never queued')
   assert.equal(added.every((l) => l.status === 'CANCELLED'), true, 'the shadow row is recorded CANCELLED')
   assert.equal(await s.db.integrationOutbox.count(), outboxBefore, 'no outbox job')

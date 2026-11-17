@@ -98,6 +98,15 @@ test('R11 is the WHOLE sub-ledger: open orders + non-open orders still holding t
   assert.deepEqual(keys(noResidue.item, 'outOfPopulation'), [])
 })
 
+// [mutation: leave the GR/IR reclass leg out of the total]
+test('R11 includes the GR/IR reclass leg (the daily batch\'s journals between Stock in Transit and GR/IR): it belongs to no order and the stored balance holds it', async () => {
+  const state = (balance: string) => goodState({ gl: goodState().gl.map((r) => (r.accountCode === CODES.transit && r.balanceDate.getTime() === dateOf(D).getTime() ? { ...r, amountBase: balance } : r)) })
+  // orders hold 80 - 30 = 50; the reclass moved 20 OUT of Stock in Transit into GR/IR, so the account holds 30
+  const ledger = section({ grirReclass: '-20' })
+  assert.equal((await r11(ledger, state('30'))).item.outcome, 'pass')
+  assert.equal((await r11(ledger, state('50'))).item.outcome, 'fail', 'without the leg the schedule would say 50 and the account holds 30')
+})
+
 // [mutation: an order's rows from another order's source added, or a row of an unknown order skipped]
 test('R11 SCHEDULE BY ORDER: the total is every order\'s rows summed across source types plus the refund leg; the residue list holds the non-open orders with a non-zero figure only', () => {
   const s = buildTransitSchedule(section({ net: [net('po1', 'PURCHASE_BILL', '10'), net('po1', 'LANDED_COST_RECLASS', '-2.5'), net('po2', 'PURCHASE_BILL', '5'), net('po2', 'STOCK_RECEIPT', '-5'), net('po3', 'SUPPLIER_RETURN', '1')], orders: [order('po1'), order('po2', { status: 'CLOSED' }), order('po3', { status: 'CLOSED' })], openOrders: [order('po1'), order('po4')], customerReturns: '0.25' }), D)
@@ -198,6 +207,7 @@ test('R11: an unavailable basis, a basis for another date, no IMS port, a failed
   assert.deepEqual(await bad({ asOf: '2026-10-18' }), ['STALE_BASIS'])
   assert.deepEqual(await bad({ net: [net('po1', 'PURCHASE_BILL', 'NaN')] }), ['BAD_VALUE'])
   assert.deepEqual(await bad({ customerReturns: '1e3' }), ['BAD_VALUE'])
+  assert.deepEqual(await bad({ grirReclass: '1e3' }), ['BAD_VALUE'])
   assert.deepEqual(await bad({ net: [net('ghost', 'PURCHASE_BILL', '1')] }), ['BAD_KEY'])
   assert.deepEqual(await bad({ openOrders: [order('po1'), order('po1')] }), ['DUPLICATE_KEY'])
   assert.deepEqual(await bad({ orders: [order('po1'), order('po1')] }), ['DUPLICATE_KEY'])
