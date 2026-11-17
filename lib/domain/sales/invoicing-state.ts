@@ -117,6 +117,8 @@ export type InvoicingStateClient = {
   accountingSyncLog: { findMany(args: unknown): Promise<unknown> }
   $queryRaw?: (query: Prisma.Sql) => Promise<unknown>
   $transaction?: unknown
+  /** Present on the top-level client only; an interactive transaction client has no $connect. */
+  $connect?: unknown
 }
 
 async function readEvidence(client: InvoicingStateClient, orderId: string): Promise<InvoicingEvidence | null> {
@@ -182,7 +184,7 @@ export async function recomputeSalesOrderInvoicingState(
   orderId: string,
 ): Promise<{ state: InvoicingState | null; changed: boolean }> {
   if (!canRecompute(client)) return { state: null, changed: false }
-  if (typeof client.$transaction === 'function') {
+  if (typeof client.$connect === 'function' && typeof client.$transaction === 'function') {
     return (client as unknown as { $transaction<T>(fn: (tx: InvoicingStateClient) => Promise<T>): Promise<T> }).$transaction((tx) => recomputeWithin(tx, orderId))
   }
   return recomputeWithin(client, orderId)
@@ -211,7 +213,7 @@ export async function recomputeInvoicingStateForRow(
  */
 export async function lockOrderFirst(client: unknown, orderId: string): Promise<void> {
   const c = client as Partial<InvoicingStateClient> | null
-  if (!c || typeof c.$queryRaw !== 'function' || typeof c.$transaction === 'function') return
+  if (!c || typeof c.$queryRaw !== 'function' || typeof c.$connect === 'function') return
   const { hasLockedSalesOrder, lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
   if (hasLockedSalesOrder(c as never, orderId)) return
   await lockSalesOrder(c as never, orderId)
