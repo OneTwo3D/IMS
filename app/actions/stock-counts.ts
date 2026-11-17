@@ -508,8 +508,16 @@ export async function saveStockCountSmallVarianceThreshold(input: unknown): Prom
 const bulkAcceptSchema = z.object({
   countId: z.string().min(1),
   mode: z.enum(['NO_VARIANCE', 'SMALL_VARIANCE']),
-  // The lines the operator was looking at. The server re-validates each one; this only bounds which lines are considered.
-  lineIds: z.array(z.string().min(1)).min(1, 'Choose at least one line to accept.'),
+  // The lines the operator was looking at, each with the counted quantity and on-hand it SHOWED. The server accepts a line only when
+  // both still equal those figures under the locks (and the variance is still in the mode's class), so the variance accepted is the
+  // variance that was confirmed, never a changed one.
+  lines: z.array(z.object({
+    lineId: z.string().min(1),
+    countedQty: countedQtySchema,
+    onHand: z.number().refine(Number.isFinite, 'on hand must be finite'),
+  })).min(1, 'Choose at least one line to accept.'),
+  // The small-variance threshold the operator saw (SMALL_VARIANCE only). A different current threshold refuses the whole accept.
+  threshold: z.object({ qty: z.number().min(0), pct: z.number().min(0) }).optional(),
   // Accepting lines that DO have a variance needs an explicit yes.
   confirmSmallVariance: z.boolean().optional(),
 })
@@ -537,7 +545,8 @@ export async function bulkAcceptStockCountLines(input: unknown): Promise<BulkAcc
   const parsed = bulkAcceptSchema.safeParse(input)
   if (!parsed.success) return { message: parsed.error.issues[0]?.message ?? 'Invalid bulk accept request.' }
   const { countId, mode, confirmSmallVariance } = parsed.data
-  const lineIds = [...new Set(parsed.data.lineIds)]
+  const shownById = new Map(parsed.data.lines.map((l) => [l.lineId, l]))
+  const lineIds = [...shownById.keys()]
   if (mode === 'SMALL_VARIANCE' && confirmSmallVariance !== true) {
     return { message: 'Accepting lines that have a variance needs your explicit confirmation. Nothing was accepted.' }
   }
@@ -545,15 +554,33 @@ export async function bulkAcceptStockCountLines(input: unknown): Promise<BulkAcc
   try {
     let outcome: { accepted: string[]; excluded: string[]; threshold: SmallVarianceThreshold; notOnCount: number } | null = null
     await db.$transaction(async (tx) => {
-      // Read inside the transaction, so an edit to the threshold cannot land between the read and the accept.
-      const threshold = mode === 'SMALL_VARIANCE' ? await readSmallVarianceThreshold(tx) : NO_SMALL_VARIANCE
-      if (mode === 'SMALL_VARIANCE' && threshold.qty <= 0 && threshold.pct <= 0) {
-        throw new Error('No small-variance threshold is set, so no line counts as small. Set a quantity and/or a percentage first.')
+      let threshold = NO_SMALL_VARIANCE
+      if (mode === 'SMALL_VARIANCE') {
+        // Hold the threshold rows FOR SHARE until commit, so an edit (which updates them) waits for this accept instead of landing mid-way.
+        // The rows are materialised at 0 (= not set) first: an absent row cannot be locked, and a concurrent first save could insert it unseen.
+        // Lock order: settings, then the count, then stock levels. The threshold save touches only the settings rows.
+        await tx.setting.createMany({ data: [{ key: SMALL_VARIANCE_QTY_KEY, value: '0' }, { key: SMALL_VARIANCE_PCT_KEY, value: '0' }], skipDuplicates: true })
+        await tx.$queryRaw`SELECT key FROM settings WHERE key IN (${SMALL_VARIANCE_QTY_KEY}, ${SMALL_VARIANCE_PCT_KEY}) ORDER BY key FOR SHARE`
+        threshold = await readSmallVarianceThreshold(tx)
+        if (threshold.qty <= 0 && threshold.pct <= 0) {
+          throw new Error('No small-variance threshold is set, so no line counts as small. Set a quantity and/or a percentage first.')
+        }
+        const seen = parsed.data.threshold
+        if (!seen || seen.qty !== threshold.qty || seen.pct !== threshold.pct) {
+          throw new Error('The small-variance threshold changed since you loaded this page. Nothing was accepted. Check the new threshold and try again.')
+        }
       }
       const result = await reconcileCountTx(tx, {
         countId,
         lineIds,
-        eligible: (c) => isBulkAcceptable(mode, c.countedQty, c.liveOnHand, threshold),
+        eligible: (c) => {
+          const shown = shownById.get(c.lineId)
+          if (!shown) return false
+          // The figures the operator saw must still be the figures now: same counted quantity, same on-hand.
+          if (!new Prisma.Decimal(shown.countedQty).toDecimalPlaces(4).eq(new Prisma.Decimal(c.countedQty).toDecimalPlaces(4))) return false
+          if (!new Prisma.Decimal(shown.onHand).eq(new Prisma.Decimal(c.liveOnHand))) return false
+          return isBulkAcceptable(mode, c.countedQty, c.liveOnHand, threshold)
+        },
       })
       const onCount = result.accepted.length + result.excluded.length
       // Lines asked for that were not counted lines of this count at all are excluded too.

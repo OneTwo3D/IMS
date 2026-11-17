@@ -85,6 +85,8 @@ test('bulk accept by variance triage', { skip }, async (t) => {
     const lineOf = (i: number) => created.count!.lines.find((l) => l.sku === products[i]!.sku)!.id
     return { warehouseId: warehouse.id, countId: created.count!.id, products, lineOf }
   }
+  /** The request line as the page would send it: the counted quantity and book quantity on screen. */
+  const shownLine = (lineId: string, countedQty: number, onHand: number) => ({ lineId, countedQty, onHand })
   const movementCount = (productId: string) => db.stockMovement.count({ where: { productId } })
   const lineRow = (id: string) => db.stockCountLine.findUniqueOrThrow({ where: { id } })
   const onHand = async (productId: string, warehouseId: string) => Number((await db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId, warehouseId } } })).quantity)
@@ -96,7 +98,7 @@ test('bulk accept by variance triage', { skip }, async (t) => {
     auth.asked = []
     try {
       const calls: Array<() => Promise<unknown>> = [
-        () => bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lineIds: [f.lineOf(0)] }),
+        () => bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lines: [shownLine(f.lineOf(0), 10, 10)] }),
         () => saveStockCountSmallVarianceThreshold({ qty: 5, pct: 5 }),
         () => getStockCountSmallVarianceThreshold(),
       ]
@@ -123,7 +125,7 @@ test('bulk accept by variance triage', { skip }, async (t) => {
       ],
     })
     activity.length = 0
-    const res = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lineIds: [0, 1, 2, 3, 4].map(f.lineOf) })
+    const res = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lines: [shownLine(f.lineOf(0), 10, 10), shownLine(f.lineOf(1), 5, 5), shownLine(f.lineOf(2), 8, 10), shownLine(f.lineOf(3), 0, 8), shownLine(f.lineOf(4), 10.0001, 10)] })
     assert.equal(res.success, true, JSON.stringify(res))
     assert.equal(res.accepted, 2)
     assert.equal(res.excluded, 3)
@@ -152,10 +154,10 @@ test('bulk accept by variance triage', { skip }, async (t) => {
   await t.test('3. a count changed, or stock moved, after page load drops the line from the accept', async () => {
     const f = await seed('race', [10, 10, 10])
     await saveStockCountCounts({ countId: f.countId, counts: [0, 1, 2].map((i) => ({ lineId: f.lineOf(i), countedQty: 10 })) })
-    const pageLoadLineIds = [0, 1, 2].map(f.lineOf) // the page saw three no-variance lines
+    const pageLoadLines = [0, 1, 2].map((i) => shownLine(f.lineOf(i), 10, 10)) // the page saw three no-variance lines
     await saveStockCountCounts({ countId: f.countId, counts: [{ lineId: f.lineOf(1), countedQty: 7 }] }) // someone recounts line 1
     await db.stockLevel.update({ where: { productId_warehouseId: { productId: f.products[2]!.id, warehouseId: f.warehouseId } }, data: { quantity: 11 } }) // stock moves under line 2
-    const res = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lineIds: pageLoadLineIds })
+    const res = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lines: pageLoadLines })
     assert.equal(res.success, true, JSON.stringify(res))
     assert.equal(res.accepted, 1)
     assert.equal(res.excluded, 2)
@@ -165,7 +167,7 @@ test('bulk accept by variance triage', { skip }, async (t) => {
     // A line id that is not on this count at all is excluded, not accepted.
     const other = await seed('other', [3])
     await saveStockCountCounts({ countId: other.countId, counts: [{ lineId: other.lineOf(0), countedQty: 3 }] })
-    const foreign = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lineIds: [other.lineOf(0)] })
+    const foreign = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'NO_VARIANCE', lines: [shownLine(other.lineOf(0), 3, 3)] })
     assert.equal(foreign.accepted, 0)
     assert.equal((await lineRow(other.lineOf(0))).reconciledQty, null)
   })
@@ -176,11 +178,12 @@ test('bulk accept by variance triage', { skip }, async (t) => {
       countId: f.countId,
       counts: [{ lineId: f.lineOf(0), countedQty: 9 }, { lineId: f.lineOf(1), countedQty: 4 }, { lineId: f.lineOf(2), countedQty: 10 }],
     })
-    const ids = [0, 1, 2].map(f.lineOf)
-    const unconfirmed = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lineIds: ids })
+    const ids = [shownLine(f.lineOf(0), 9, 10), shownLine(f.lineOf(1), 4, 10), shownLine(f.lineOf(2), 10, 10)]
+    const seenThreshold = { qty: 2, pct: 0 }
+    const unconfirmed = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lines: ids })
     assert.equal(unconfirmed.success, undefined)
     assert.match(unconfirmed.message ?? '', /explicit confirmation/)
-    const noThreshold = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lineIds: ids, confirmSmallVariance: true })
+    const noThreshold = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lines: ids, confirmSmallVariance: true, threshold: seenThreshold })
     assert.equal(noThreshold.success, undefined, 'with the default threshold nothing is small')
     assert.match(noThreshold.message ?? '', /No small-variance threshold/)
     for (const i of [0, 1, 2]) assert.equal((await lineRow(f.lineOf(i))).reconciledQty, null)
@@ -188,7 +191,7 @@ test('bulk accept by variance triage', { skip }, async (t) => {
     assert.deepEqual(await saveStockCountSmallVarianceThreshold({ qty: '2', pct: '' }), { success: true, threshold: { qty: 2, pct: 0 } })
     assert.deepEqual(await getStockCountSmallVarianceThreshold(), { qty: 2, pct: 0 })
     assert.equal((await saveStockCountSmallVarianceThreshold({ qty: -1 })).success, undefined)
-    const res = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lineIds: ids, confirmSmallVariance: true })
+    const res = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lines: ids, confirmSmallVariance: true, threshold: seenThreshold })
     assert.equal(res.success, true, JSON.stringify(res))
     assert.equal(res.accepted, 1, 'only the -1 line is small')
     assert.notEqual((await lineRow(f.lineOf(0))).reconciledQty, null)
@@ -203,7 +206,7 @@ test('bulk accept by variance triage', { skip }, async (t) => {
     const single = await seed('twin-single', [10])
     for (const f of [bulk, single]) await saveStockCountCounts({ countId: f.countId, counts: [{ lineId: f.lineOf(0), countedQty: 9 }] })
     await saveStockCountSmallVarianceThreshold({ qty: 2, pct: 0 })
-    const b = await bulkAcceptStockCountLines({ countId: bulk.countId, mode: 'SMALL_VARIANCE', lineIds: [bulk.lineOf(0)], confirmSmallVariance: true })
+    const b = await bulkAcceptStockCountLines({ countId: bulk.countId, mode: 'SMALL_VARIANCE', lines: [shownLine(bulk.lineOf(0), 9, 10)], confirmSmallVariance: true, threshold: { qty: 2, pct: 0 } })
     assert.equal(b.accepted, 1)
     assert.equal((await reconcileStockCount({ countId: single.countId })).success, true)
     const lb = await lineRow(bulk.lineOf(0))
@@ -220,5 +223,62 @@ test('bulk accept by variance triage', { skip }, async (t) => {
     assert.equal(sb.movements.length, 1)
     assert.deepEqual(sb, ss)
     assert.equal(sb.onHand, 9)
+  })
+  await t.test('6. R1 high: a small-variance line whose on-hand or count changed after the page showed it is excluded, even if still small', async () => {
+    await saveStockCountSmallVarianceThreshold({ qty: 2, pct: 0 })
+    const f = await seed('shown', [100, 100])
+    await saveStockCountCounts({ countId: f.countId, counts: [{ lineId: f.lineOf(0), countedQty: 101 }, { lineId: f.lineOf(1), countedQty: 101 }] })
+    const shown = [shownLine(f.lineOf(0), 101, 100), shownLine(f.lineOf(1), 101, 100)] // both showed +1
+    // line 0: stock moves to 102 (variance flips to -1, still small). line 1: recounted to 99 (variance -1, still small).
+    await db.stockLevel.update({ where: { productId_warehouseId: { productId: f.products[0]!.id, warehouseId: f.warehouseId } }, data: { quantity: 102 } })
+    await saveStockCountCounts({ countId: f.countId, counts: [{ lineId: f.lineOf(1), countedQty: 99 }] })
+    const res = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lines: shown, confirmSmallVariance: true, threshold: { qty: 2, pct: 0 } })
+    assert.equal(res.success, true, JSON.stringify(res))
+    assert.equal(res.accepted, 0)
+    assert.equal(res.excluded, 2)
+    for (const i of [0, 1]) assert.equal((await lineRow(f.lineOf(i))).reconciledQty, null, `line ${i} stays unreconciled`)
+    // And the same lines accepted with the figures now on screen go through.
+    const again = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lines: [shownLine(f.lineOf(0), 101, 102), shownLine(f.lineOf(1), 99, 100)], confirmSmallVariance: true, threshold: { qty: 2, pct: 0 } })
+    assert.equal(again.accepted, 2)
+    // Zero-variance mode too: a count that is still zero but against different shown figures is excluded.
+    const z = await seed('shown0', [10])
+    await saveStockCountCounts({ countId: z.countId, counts: [{ lineId: z.lineOf(0), countedQty: 10 }] })
+    const zr = await bulkAcceptStockCountLines({ countId: z.countId, mode: 'NO_VARIANCE', lines: [shownLine(z.lineOf(0), 9, 9)] })
+    assert.equal(zr.accepted, 0)
+  })
+
+  await t.test('7. R1 medium: a changed threshold refuses the accept, and a threshold edit waits for an accept in flight', async () => {
+    await saveStockCountSmallVarianceThreshold({ qty: 2, pct: 0 })
+    const f = await seed('thr', [10])
+    await saveStockCountCounts({ countId: f.countId, counts: [{ lineId: f.lineOf(0), countedQty: 9 }] })
+    const lines = [shownLine(f.lineOf(0), 9, 10)]
+    // (a) the operator saw a threshold of 5, the current one is 2: refused, nothing stamped
+    const stale = await bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lines, confirmSmallVariance: true, threshold: { qty: 5, pct: 0 } })
+    assert.equal(stale.success, undefined)
+    assert.match(stale.message ?? '', /threshold changed/)
+    assert.equal((await lineRow(f.lineOf(0))).reconciledQty, null)
+    // (b) the accept is held up on the count lock; a threshold edit issued meanwhile must wait behind the accept's share lock on the settings
+    let release!: () => void
+    const held = new Promise<void>((r) => { release = r })
+    let locked!: () => void
+    const lockTaken = new Promise<void>((r) => { locked = r })
+    const holder = db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM stock_counts WHERE id = ${f.countId} FOR UPDATE`
+      locked()
+      await held
+    }, { timeout: 30000 })
+    await lockTaken
+    const accept = bulkAcceptStockCountLines({ countId: f.countId, mode: 'SMALL_VARIANCE', lines, confirmSmallVariance: true, threshold: { qty: 2, pct: 0 } })
+    await new Promise((r) => setTimeout(r, 1200)) // the accept has read and share-locked the threshold, and waits on the count
+    let editDone = false
+    const edit = saveStockCountSmallVarianceThreshold({ qty: 0, pct: 0 }).then((r) => { editDone = true; return r })
+    await new Promise((r) => setTimeout(r, 1200))
+    assert.equal(editDone, false, 'the threshold edit waits for the accept in flight')
+    release()
+    await holder
+    const accepted = await accept
+    assert.equal(accepted.accepted, 1, JSON.stringify(accepted))
+    assert.equal((await edit).success, true)
+    assert.deepEqual(await getStockCountSmallVarianceThreshold(), { qty: 0, pct: 0 }, 'the edit lands after the accept')
   })
 })

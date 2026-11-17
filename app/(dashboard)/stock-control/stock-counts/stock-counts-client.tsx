@@ -337,7 +337,10 @@ function StockCountRowView({
   const [thresholdPct, setThresholdPct] = useState(String(threshold.pct || ''))
 
   function handleBulkAccept(mode: 'NO_VARIANCE' | 'SMALL_VARIANCE') {
-    const ids = shown.filter((t) => (mode === 'NO_VARIANCE' ? t.varianceClass === 'NONE' : t.varianceClass === 'SMALL')).map((t) => t.line.id)
+    // Each line goes with the counted quantity and book quantity on screen; the server accepts it only if both are still exactly those.
+    const picked = shown.filter((t) => (mode === 'NO_VARIANCE' ? t.varianceClass === 'NONE' : t.varianceClass === 'SMALL'))
+    const ids = picked.map((t) => t.line.id)
+    const lines = picked.map((t) => ({ lineId: t.line.id, countedQty: t.line.countedQty as number, onHand: t.line.expectedQty }))
     if (ids.length === 0) return
     if (mode === 'SMALL_VARIANCE' && !confirm(
       `Accept ${ids.length} line(s) that DO have a variance, within your small-variance threshold? `
@@ -346,7 +349,7 @@ function StockCountRowView({
     setLocalError(null)
     setDrift([])
     startTransition(async () => {
-      const res = await bulkAcceptStockCountLines({ countId: count.id, mode, lineIds: ids, confirmSmallVariance: mode === 'SMALL_VARIANCE' ? true : undefined })
+      const res = await bulkAcceptStockCountLines({ countId: count.id, mode, lines, ...(mode === 'SMALL_VARIANCE' ? { confirmSmallVariance: true, threshold } : {}) })
       if (res.success) {
         const skipped = res.excluded ?? 0
         onChanged(`${res.accepted ?? 0} line(s) accepted.${skipped > 0 ? ` ${skipped} line(s) no longer qualified (the count or the stock changed) and were left for you to review.` : ''}`)
