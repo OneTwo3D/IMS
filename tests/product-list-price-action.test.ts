@@ -22,6 +22,8 @@ const state = {
   wmsSyncs: [] as string[],
   txCount: 0,
   settingJson: null as string | null,
+  txLoads: 0,
+  txVatRate: undefined as number | null | undefined,
 }
 
 mock.module('@/lib/auth', {
@@ -38,10 +40,14 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/settings-store', { namedExports: { getSettingValue: async () => state.settingJson, serializeSettingValue: (_k: string, v: string) => v } })
 mock.module('@/lib/domain/purchasing/list-price-facts', {
   namedExports: {
-    loadListPriceFacts: async (ids: string[]) => new Map(ids.filter((id) => id === 'p1').map((id) => [id, {
-      productId: id, sku: state.sku, type: state.type, parentId: null, salesPrice: state.price, salesPriceTaxInclusive: state.inclusive,
-      salesVatRate: state.vatRate, categoryChain: [] as string[],
-    }])),
+    loadListPriceFacts: async (ids: string[], client?: unknown) => {
+      if (client) state.txLoads += 1
+      return new Map(ids.filter((id) => id === 'p1').map((id) => [id, {
+        productId: id, sku: state.sku, type: state.type, parentId: null, salesPrice: state.price, salesPriceTaxInclusive: state.inclusive,
+        // The transaction's read sees a rate that changed after the first one.
+        salesVatRate: client && state.txVatRate !== undefined ? state.txVatRate : state.vatRate, categoryChain: [] as string[],
+      }]))
+    },
   },
 })
 mock.module('@/lib/shopping', { namedExports: { pushProductMetadata: async (id: string) => { state.pushes.push(id); return { success: true } }, enqueueStockSync: async () => undefined } })
@@ -88,6 +94,8 @@ function reset() {
   state.wmsSyncs = []
   state.txCount = 0
   state.settingJson = null
+  state.txLoads = 0
+  state.txVatRate = undefined
 }
 
 const previewLine = { key: 'l1', productId: 'p1', qty: 10, unitCost: 6, discount: '', purchaseUnitFactor: 1, taxRate: 0 }
@@ -194,4 +202,23 @@ test('the action is gated on inventory.prices before it reads anything', () => {
   assert.ok(gate > 0)
   assert.ok(gate < src.indexOf('loadListPriceFacts('))
   assert.ok(gate < src.indexOf('db.$transaction'))
+})
+
+test('the VAT rate and price convention are read again under the lock: a rate that changed after the first read prices the edit', async () => {
+  reset()
+  state.inclusive = true
+  state.vatRate = 0.2
+  state.txVatRate = 0.25
+  const r = await updateProductListPrice({ productId: 'p1', exVatPrice: '10' })
+  assert.equal(state.txLoads, 1)
+  assert.deepEqual(state.writes, [{ salesPriceBase: '12.5000' }])
+  assert.equal(r.success && r.storedPrice, '12.5000')
+  // A rate that disappeared under the lock refuses; nothing is written.
+  reset()
+  state.inclusive = true
+  state.vatRate = 0.2
+  state.txVatRate = null
+  assert.equal((await updateProductListPrice({ productId: 'p1', exVatPrice: '10' })).success, false)
+  assert.deepEqual(state.writes, [])
+  assert.deepEqual(state.pushes, [])
 })

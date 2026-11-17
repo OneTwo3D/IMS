@@ -16,7 +16,7 @@ import {
   decideGuard,
   loadMarginGuardContext,
   recordMarginOverride,
-  reloadMarginGuardContextUnderLock,
+  loadMarginGuardContextUnderLock,
   type GuardLineAssessment,
 } from '@/lib/domain/purchasing/margin-threshold-guard'
 import { queueEmail } from '@/lib/email-outbox'
@@ -2180,12 +2180,8 @@ export async function advancePoStatus(
 ): Promise<{ success: boolean; error?: string; notice?: string; warnings?: string[]; closedShort?: boolean }> {
   try {
     const session = await requirePermission('purchasing.create')
-    // Minimum gross margin (o3d-hqvrp.380): placing the order is the commitment, so it is checked here against the stored line
-    // costs. The setting and price facts are read before the transaction (the price/VAT read uses the pooled client); a null
-    // context means no threshold is configured and the transition is unchanged.
-    const marginCtx = targetStatus === 'PO_SENT'
-      ? await loadMarginGuardContext((await db.purchaseOrderLine.findMany({ where: { poId: id }, select: { productId: true } })).map((l) => l.productId))
-      : null
+    // Minimum gross margin (o3d-hqvrp.380): placing the order is the commitment, so it is checked inside the transaction below, under the
+    // PO row lock, from the stored line costs and values read through that transaction.
     const result = await db.$transaction(async (tx) => {
       // Closing a GOODS order may reallocate the unreceived freight share onto the received units (close-short), which revalues
       // cost layers: it takes the whole revaluation scope first, which includes the order row.
@@ -2219,10 +2215,9 @@ export async function advancePoStatus(
 
       if (targetStatus === 'PO_SENT' && existing.type === 'GOODS') {
         const stored = await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { productId: true, unitCostBase: true } })
-        // Threshold and prices re-read through the transaction now that the PO row is locked (a price cut or a raised minimum that committed
-        // after the pre-transaction read must be seen). Lines changed since that read are refused as a retry rather than skipped.
-        if (marginCtx && stored.some((l) => !marginCtx.facts.has(l.productId))) throw new Error('The order changed while it was being sent. Reload it and try again.')
-        const lockedCtx = await reloadMarginGuardContextUnderLock(tx, marginCtx, stored.map((l) => l.productId))
+        // Threshold, prices, categories and sales VAT all read through the transaction now that the PO row is locked: a price cut, a raised or removed
+        // minimum or a tax change that committed earlier is seen, and nothing from before the lock is trusted.
+        const lockedCtx = await loadMarginGuardContextUnderLock(tx, stored.map((l) => l.productId))
         const outcome = decideGuard(lockedCtx, lockedCtx ? assessGuardLines(lockedCtx, stored) : [], { role: session.user.role, overrideNote: payload?.marginOverrideNote, verb: 'send' })
         if (outcome.kind === 'refused') throw new MarginBlockedError(outcome.message)
         if (outcome.override) await recordMarginOverride(tx, { poId: id, reference: existing.reference, userId: session.user.id ?? null, verb: 'send', note: outcome.override.note, below: outcome.override.below })

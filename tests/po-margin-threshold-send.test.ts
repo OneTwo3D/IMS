@@ -20,6 +20,7 @@ const state = {
   poType: 'GOODS',
   poStatus: 'DRAFT',
   factLoads: 0,
+  txFactLoads: 0,
 }
 function fact(over: Record<string, unknown> = {}) {
   return { productId: 'p1', sku: 'SKU-1', type: 'SIMPLE', parentId: null, salesPrice: '10.0000', salesPriceTaxInclusive: false, salesVatRate: null, categoryChain: [] as string[], ...over }
@@ -40,17 +41,25 @@ mock.module('@/lib/settings-store', {
   namedExports: { getSettingValue: async () => state.settingJson, serializeSettingValue: (_k: string, v: string) => v, deserializeSettingValue: (_k: string, v: string) => v },
 })
 mock.module('@/lib/domain/purchasing/list-price-facts', {
-  namedExports: { loadListPriceFacts: async (ids: string[]) => { state.factLoads += 1; return new Map(ids.map((id) => [id, state.facts.get(id) ?? fact({ productId: id })])) } },
+  namedExports: {
+    // With a client argument the read is the transaction's: it sees what committed by lock time (txView), not the pre-lock values.
+    loadListPriceFacts: async (ids: string[], client?: unknown) => {
+      state.factLoads += 1
+      if (client) state.txFactLoads += 1
+      return new Map(ids.map((id) => {
+        const f = state.facts.get(id) ?? fact({ productId: id })
+        return [id, client ? { ...f, salesPrice: txView.price ?? f.salesPrice, salesVatRate: txView.vatRate === undefined ? f.salesVatRate : txView.vatRate } : f]
+      }))
+    },
+  },
 })
 mock.module('@/lib/domain/purchasing/preferred-supplier', {
   namedExports: { updatePreferredSuppliersForPlacedPurchaseOrder: async () => ({ productIds: [], updatedCount: 0 }) },
 })
 // The transaction's own view of the setting and prices: committed values at lock time, which may differ from the pre-transaction read.
-const txView = { settingJson: null as string | null | undefined, price: undefined as string | undefined }
+const txView = { settingJson: null as string | null | undefined, price: undefined as string | undefined, vatRate: undefined as number | null | undefined }
 const tx = {
   setting: { findUnique: async () => { const v = txView.settingJson === undefined ? state.settingJson : txView.settingJson; return v ? { value: v } : null } },
-  product: { findMany: async (a: { where: { id: { in: string[] } } }) => a.where.id.in.map((id) => { const f = (state.facts.get(id) ?? fact({ productId: id })) as Record<string, unknown>; return { id, sku: f.sku, type: f.type, parentId: f.parentId, categoryId: null, salesPriceBase: txView.price ?? f.salesPrice, salesPriceTaxInclusive: f.salesPriceTaxInclusive } }) },
-  productCategory: { findMany: async () => [] },
   $queryRaw: async () => [],
   purchaseOrder: {
     findUnique: async () => ({ status: state.poStatus, reference: 'PO-1', type: state.poType }),
@@ -87,6 +96,8 @@ function reset() {
   state.poType = 'GOODS'
   state.poStatus = 'DRAFT'
   state.factLoads = 0
+  state.txFactLoads = 0
+  txView.vatRate = undefined
   txView.settingJson = undefined
   txView.price = undefined
 }
@@ -221,4 +232,32 @@ test('the send decision uses the threshold and price committed at lock time, not
   state.settingJson = BLOCK
   txView.settingJson = null
   assert.equal((await advancePoStatus('po-1', 'PO_SENT')).success, true)
+})
+
+test('sales VAT is read through the transaction: a rate that changed after any earlier read decides the send', async () => {
+  reset()
+  state.settingJson = BLOCK
+  // Inclusive list price 12.00. Zero-rated earlier (ex-VAT 12, cost 8 = 33.33%, passes); 20% at lock time (ex-VAT 10, 20%, below 30%).
+  state.facts.set('p1', fact({ salesPrice: '12.0000', salesPriceTaxInclusive: true, salesVatRate: 0 }))
+  txView.vatRate = 0.2
+  const r = await advancePoStatus('po-1', 'PO_SENT')
+  assert.equal(r.success, false)
+  assert.equal(state.statusWrites.length, 0)
+  assert.ok(state.txFactLoads >= 1)
+  // The reverse: 20% earlier, zero-rated now: the current rate wins.
+  reset()
+  state.settingJson = BLOCK
+  state.facts.set('p1', fact({ salesPrice: '12.0000', salesPriceTaxInclusive: true, salesVatRate: 0.2 }))
+  txView.vatRate = 0
+  assert.equal((await advancePoStatus('po-1', 'PO_SENT')).success, true)
+})
+
+test('a threshold removed while a line was added is not refused: the locked setting is read first', async () => {
+  reset()
+  state.settingJson = BLOCK
+  txView.settingJson = null
+  state.lines = [{ productId: 'p1', unitCostBase: '8.000000' }, { productId: 'p9', unitCostBase: '9.000000' }]
+  const r = await advancePoStatus('po-1', 'PO_SENT')
+  assert.equal(r.success, true)
+  assert.equal(state.statusWrites.length, 1)
 })

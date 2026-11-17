@@ -773,7 +773,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/purchasing/margin-threshold-guard.ts',
-    figures: ['loadMarginGuardContext', 'margin', 'marginPct', 'margin_override', 'recordMarginOverride', 'reloadMarginGuardContextUnderLock'],
+    figures: ['loadMarginGuardContext', 'margin', 'marginPct', 'margin_override', 'recordMarginOverride', 'loadMarginGuardContextUnderLock'],
     treatment: 'not-refund-sensitive',
     reason:
       'Server-side enforcement: recomputes each line margin from the stored cost and records an accepted override on the order. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',

@@ -26,21 +26,24 @@ export type ListPriceFacts = {
 
 const CHAIN_LIMIT = 20
 
-export async function loadListPriceFacts(productIds: readonly string[]): Promise<Map<string, ListPriceFacts>> {
+/** The delegates the loader reads: the pooled client, or a transaction's `tx` (every read, the tax-rate one included, goes through it). */
+export type ListPriceFactsClient = Pick<typeof db, 'product' | 'organisation' | 'productCategory' | 'taxRate'>
+
+export async function loadListPriceFacts(productIds: readonly string[], client: ListPriceFactsClient = db): Promise<Map<string, ListPriceFacts>> {
   const out = new Map<string, ListPriceFacts>()
   const ids = [...new Set(productIds)]
   if (ids.length === 0) return out
   const [products, org, categories] = await Promise.all([
-    db.product.findMany({
+    client.product.findMany({
       where: { id: { in: ids } },
       select: { id: true, sku: true, type: true, parentId: true, categoryId: true, salesPriceBase: true, salesPriceTaxInclusive: true, taxCategory: true },
     }),
-    db.organisation.findFirst({ select: { country: true } }),
-    db.productCategory.findMany({ select: { id: true, parentId: true } }),
+    client.organisation.findFirst({ select: { country: true } }),
+    client.productCategory.findMany({ select: { id: true, parentId: true } }),
   ])
   const parentIds = [...new Set(products.map((p) => p.parentId).filter((x): x is string => !!x))]
   const parents = parentIds.length > 0
-    ? await db.product.findMany({ where: { id: { in: parentIds } }, select: { id: true, categoryId: true } })
+    ? await client.product.findMany({ where: { id: { in: parentIds } }, select: { id: true, categoryId: true } })
     : []
   const parentCategory = new Map(parents.map((p) => [p.id, p.categoryId]))
   const categoryParent = new Map(categories.map((c) => [c.id, c.parentId]))
@@ -60,6 +63,7 @@ export async function loadListPriceFacts(productIds: readonly string[]): Promise
     const resolved = await resolveLineTaxRateBatch(
       needVat.map((p) => ({ id: p.id, productCategory: p.taxCategory })),
       { destinationCountry: org?.country ?? null, usedFor: 'SALES', orderDefault: { id: null, name: null, rate: 0, accountingTaxType: null } },
+      client,
     )
     for (const [id, r] of resolved) rateByProduct.set(id, r.matched !== 'fallback' ? r.taxRateValue : null)
   }

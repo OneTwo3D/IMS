@@ -11,7 +11,7 @@ import { scheduleWmsProductSync, isAnyWmsConnectorEnabled } from '@/lib/domain/w
 import { ProductSkuTakenError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { resolveExVatListPrice } from '@/lib/domain/purchasing/line-margin'
 import { loadListPriceFacts } from '@/lib/domain/purchasing/list-price-facts'
-import { LIST_PRICE_EDIT_REFUSAL_TEXT, storedListPriceFromExVat } from '@/lib/domain/purchasing/list-price-edit'
+import { LIST_PRICE_EDIT_REFUSAL_TEXT, parseEditedExVatPrice, storedListPriceFromExVat } from '@/lib/domain/purchasing/list-price-edit'
 
 /**
  * INTERNAL ONLY (o3d-hqvrp.381). Adjust a product's default list price from the PO margin column.
@@ -55,32 +55,33 @@ export async function updateProductListPrice(rawInput: z.input<typeof inputSchem
   if (!parsed.success) return { success: false, error: 'Invalid price request' }
   const { productId, exVatPrice } = parsed.data
 
-  const facts = (await loadListPriceFacts([productId])).get(productId)
-  if (!facts) return { success: false, error: 'Product not found' }
-  const converted = storedListPriceFromExVat({
-    exVatPrice,
-    storedVatInclusive: facts.salesPriceTaxInclusive,
-    salesVatRate: facts.salesVatRate,
-    productType: facts.type,
-  })
-  if (!converted.ok) return { success: false, error: LIST_PRICE_EDIT_REFUSAL_TEXT[converted.reason] }
-  const stored = converted.stored
+  if (parseEditedExVatPrice(exVatPrice) === null) return { success: false, error: LIST_PRICE_EDIT_REFUSAL_TEXT['invalid-price'] }
+  // The SKU names the write lock, so it is read first; everything the price depends on is then READ AGAIN under that lock.
+  const first = (await loadListPriceFacts([productId])).get(productId)
+  if (!first) return { success: false, error: 'Product not found' }
 
   let before: string | null = null
+  let stored = ''
+  let storedFacts = first
   try {
     await db.$transaction(async (tx) => {
-      await lockProductSkusForWrite(tx, [facts.sku])
-      const current = await tx.product.findUnique({
-        where: { id: productId },
-        select: { sku: true, type: true, salesPriceBase: true, salesPriceTaxInclusive: true },
+      await lockProductSkusForWrite(tx, [first.sku])
+      // Price convention, tax category and the resolved sales VAT rate are read through the transaction, so the stored price is converted with
+      // the rate in force now, not one read before the lock.
+      const facts = (await loadListPriceFacts([productId], tx)).get(productId)
+      if (!facts) throw new Error('Product not found')
+      if (facts.sku !== first.sku) throw new ProductSkuTakenError(first.sku)
+      const converted = storedListPriceFromExVat({
+        exVatPrice,
+        storedVatInclusive: facts.salesPriceTaxInclusive,
+        salesVatRate: facts.salesVatRate,
+        productType: facts.type,
       })
-      if (!current) throw new Error('Product not found')
-      // Re-checked under the lock: the product may have been renamed, retyped or repriced convention since the facts were read.
-      if (current.sku !== facts.sku) throw new ProductSkuTakenError(facts.sku)
-      if (current.type === 'VARIABLE') throw new Error(LIST_PRICE_EDIT_REFUSAL_TEXT['variable-parent'])
-      if (current.salesPriceTaxInclusive !== facts.salesPriceTaxInclusive) throw new Error('The product changed while the price was being saved. Reload and try again.')
-      before = current.salesPriceBase?.toString() ?? null
-      await tx.product.update({ where: { id: productId }, data: { salesPriceBase: stored.toFixed(4) } })
+      if (!converted.ok) throw new Error(LIST_PRICE_EDIT_REFUSAL_TEXT[converted.reason])
+      storedFacts = facts
+      stored = converted.stored.toFixed(4)
+      before = facts.salesPrice
+      await tx.product.update({ where: { id: productId }, data: { salesPriceBase: stored } })
       await logActivityInTransaction(tx, {
         entityType: 'PRODUCT',
         entityId: productId,
@@ -92,7 +93,7 @@ export async function updateProductListPrice(rawInput: z.input<typeof inputSchem
         metadata: {
           sku: facts.sku,
           from: before,
-          to: stored.toFixed(4),
+          to: stored,
           enteredExVat: exVatPrice.trim(),
           storedVatInclusive: facts.salesPriceTaxInclusive,
           source: 'purchase-order-margin',
@@ -125,13 +126,13 @@ export async function updateProductListPrice(rawInput: z.input<typeof inputSchem
   }
 
   const readBack = resolveExVatListPrice({
-    salesPrice: stored.toFixed(4),
-    salesPriceTaxInclusive: facts.salesPriceTaxInclusive,
-    salesVatRate: facts.salesVatRate,
+    salesPrice: stored,
+    salesPriceTaxInclusive: storedFacts.salesPriceTaxInclusive,
+    salesVatRate: storedFacts.salesVatRate,
   })
   return {
     success: true,
-    storedPrice: stored.toFixed(4),
+    storedPrice: stored,
     exVatPrice: readBack.kind === 'ok' ? readBack.price.toDecimalPlaces(6).toFixed() : exVatPrice.trim(),
     syncNote: problems.length > 0 ? `Price saved; ${problems.join(' and ')}. The product sync will retry.` : null,
   }
