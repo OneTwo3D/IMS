@@ -274,10 +274,24 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
       : 0
     const consumed = layerRows.filter((layer) => !toDecimal(layer.remainingQty).eq(toDecimal(layer.receivedQty)))
     const cogsUse = layerRows.length > 0 ? await tx.cogsEntry.count({ where: { costLayerId: { in: layerRows.map((layer) => layer.id) } } }) : 0
-    // A movement with no tagged layer is only acceptable when the refund restocked units that carried no cost (no layer was ever created): then
-    // the movement's own value is zero. Anything else is a return IMS did not tag, and cannot be reversed exactly.
-    const untraceable = movementRows.some((movement) => !layerQtyByMovement.has(movement.id) && toDecimal(movement.totalValueBase ?? 0).gt(0))
+    // Every return movement must be matched EXACTLY by the layers tagged to it: the same total quantity. An untagged movement (a return made before layers were
+    // tagged, whatever its value: a zero-cost return still creates a layer) or one whose tagged layers fall short cannot be proved to leave no layer behind, so it is refused.
+    const untraceable = movementRows.some((movement) => !(layerQtyByMovement.get(movement.id) ?? toDecimal(0)).eq(toDecimal(movement.qty)))
     if (untraceable) refusals.push(refundDeleteRefusals.stockUntraceable())
+    // No allocation, shipment line or derived layer may point at a layer being removed (an order's allocation pins layer ids in its cost snapshot).
+    if (layerRows.length > 0) {
+      const ids = layerRows.map((layer) => layer.id)
+      const pinned = (snapshot: unknown): boolean => { const text = JSON.stringify(snapshot ?? null); return ids.some((id) => text.includes(id)) }
+      const products = [...new Set(layerRows.map((layer) => layer.productId))]
+      const [allocations, shipmentLines, derived] = await Promise.all([
+        tx.orderAllocation.findMany({ where: { productId: { in: products } }, select: { costLayerSnapshot: true } }),
+        tx.shipmentLine.findMany({ where: { productId: { in: products } }, select: { costLayerSnapshot: true } }),
+        tx.costLayerSourceLine.count({ where: { sourceCostLayerId: { in: ids } } }),
+      ])
+      if (allocations.some((row) => pinned(row.costLayerSnapshot)) || shipmentLines.some((row) => pinned(row.costLayerSnapshot)) || derived > 0) {
+        refusals.push(refundDeleteRefusals.stockMoved('an order allocation or shipment is costed against those cost layers'))
+      }
+    }
     if (consumed.length > 0 || revalued > 0 || cogsUse > 0) {
       refusals.push(refundDeleteRefusals.stockMoved(`${consumed.length > 0 ? 'cost layers partly consumed' : revalued > 0 ? 'cost layers revalued' : 'cost layers drawn on by a sale'}`))
     }

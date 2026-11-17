@@ -87,6 +87,8 @@ async function buildWorld(rig: Rig, opts: { orderOver?: Record<string, unknown> 
       await db.salesOrderRefund.deleteMany({ where: { orderId: oid } }).catch(() => {})
       await db.shipmentLine.deleteMany({ where: { shipment: { orderId: oid } } }).catch(() => {})
       await db.shipment.deleteMany({ where: { orderId: oid } }).catch(() => {})
+      const extra = (world as unknown as { extraOrder?: string }).extraOrder
+      if (extra) { await db.orderAllocation.deleteMany({ where: { orderId: extra } }).catch(() => {}); await db.salesOrderLine.deleteMany({ where: { orderId: extra } }).catch(() => {}); await db.salesOrder.delete({ where: { id: extra } }).catch(() => {}) }
       await db.orderAllocation.deleteMany({ where: { orderId: oid } }).catch(() => {})
       await db.salesOrderLine.deleteMany({ where: { orderId: oid } }).catch(() => {})
       await db.salesOrder.delete({ where: { id: oid } }).catch(() => {})
@@ -285,6 +287,16 @@ const REFUSALS: Refusal[] = [
   { name: 'returned stock that was since reserved', code: 'stock_moved', arrange: async (rig, w) => { await rig.db.stockLevel.update({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } }, data: { reservedQty: '1' } }) } },
   { name: 'returned stock that was since moved out', code: 'stock_moved', arrange: async (rig, w) => { await rig.db.stockLevel.update({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } }, data: { quantity: '0' } }) } },
   { name: 'a return whose layers IMS did not tag', code: 'stock_untraceable', arrange: async (rig, w) => { await rig.db.costLayer.updateMany({ where: { productId: w.productId, warehouseId: w.returnsId }, data: { returnMovementId: null } }) } },
+  { name: 'a legacy zero-cost return that has no tagged layer (a layer may still exist untagged)', code: 'stock_untraceable', arrange: async (rig, w) => { await rig.db.costLayer.updateMany({ where: { productId: w.productId, warehouseId: w.returnsId }, data: { returnMovementId: null, unitCostBase: '0' } }); await rig.db.stockMovement.updateMany({ where: { productId: w.productId, type: 'RETURN_INBOUND' }, data: { unitCostBase: '0', totalValueBase: '0' } }) } },
+  { name: 'a returned layer another order has pinned while a different layer supplies the free stock', code: 'stock_moved', arrange: async (rig, w) => {
+    const layer = await rig.db.costLayer.findFirstOrThrow({ where: { productId: w.productId, warehouseId: w.returnsId }, select: { id: true } })
+    await rig.db.stockLevel.update({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } }, data: { quantity: '5' } })
+    await rig.db.costLayer.create({ data: { productId: w.productId, warehouseId: w.returnsId, receivedQty: '4', remainingQty: '4', unitCostBase: '50' } })
+    const other = await rig.db.salesOrder.create({ data: { orderNumber: `RDX-${w.suffix}`, status: 'PROCESSING', currency: 'GBP', fxRateToBase: '1', subtotalForeign: '100', totalForeign: '100', subtotalBase: '100', taxBase: '0', totalBase: '100', lines: { create: [{ productId: w.productId, description: 'x', qty: '1', unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '0', taxBase: '0', totalForeign: '100', totalBase: '100' }] } }, select: { id: true, lines: { select: { id: true } } } })
+    await rig.db.orderAllocation.create({ data: { orderId: other.id, lineId: other.lines[0].id, productId: w.productId, warehouseId: w.returnsId, qty: '1', costLayerSnapshot: [{ costLayerId: layer.id, qty: '1', unitCostBase: '45' }] } })
+    await rig.db.stockLevel.update({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } }, data: { reservedQty: '1' } })
+    ;(w as unknown as { extraOrder?: string }).extraOrder = other.id
+  } },
   { name: 'an order carrying store credit', code: 'store_credit_order', arrange: async (rig, w) => { await rig.db.salesOrder.update({ where: { id: w.orderId }, data: { storeCreditForeign: '5' } }) } },
   { name: 'an erased order', code: 'order_erased', arrange: async (rig, w) => { await rig.db.salesOrder.update({ where: { id: w.orderId }, data: { erasedAt: new Date() } }) } },
   { name: 'a credit note being sent right now', code: 'accounting_in_flight', arrange: async (rig, _w, id) => { await seedPostedCreditNote(rig, id, { status: 'PROCESSING', id: null }) } },
