@@ -43,7 +43,7 @@ export const RELEASES: AppRelease[] = [
       'Keep the stored Xero tax-rate list fresh (sync the chart of accounts and tax rates before the first batch after deploy); a line whose tax rate is missing from it, or a stale list, refuses the Xero write.',
       'Work the new warehouse queries: IMS no longer writes Mintsoft order comments, so each case the warehouse must act on is a task under Sync > Exceptions > Raise a warehouse query (copy the text into a Mintsoft query, then press Done).',
       'Keep the wms-order-status cron on: the new align-down gate holds a stock write-off for orders pushed to Mintsoft and not yet shipped in IMS unless their cached Mintsoft status is fresh.',
-      'Do the new refund and payment follow-ups by hand: a refund recorded in IMS on a WooCommerce order raises a Refund in WooCommerce task (IMS writes nothing to the store; confirm a later parked WooCommerce refund against the IMS refund so no second credit note is raised), and an order whose payment was partly removed in Xero reads Part paid until the owner credits or writes it off.',
+      'Work the new refund and payment follow-up tasks: a refund recorded in IMS on a WooCommerce order raises a Refund in WooCommerce task (IMS writes nothing to the store; confirm a later parked WooCommerce refund against the IMS refund so no second credit note is raised), and an order whose payment was partly removed in Xero reads Part paid until the owner credits or writes it off.',
       'Watch the new Sync > Exceptions sections (refused WooCommerce completions, possible double postage on merged orders, orders cancelled in Mintsoft, WMS connector-wide failure); IMS changes nothing on its own for these.',
     ],
   },
