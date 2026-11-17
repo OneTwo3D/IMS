@@ -67,6 +67,7 @@ import {
   retryUnresolvedDriftCohort,
   repushMissingWmsOrder,
   recordRefundParkManually,
+  confirmParkedRefundSettlesImsRefund,
   retryRefundSyncPark,
   recoverRefundSyncPark,
   type ExceptionInboxData,
@@ -667,6 +668,23 @@ export function ExceptionsClient({ data }: Props) {
                       >
                         <Split className="h-3 w-3 mr-1" />Wrong order
                       </Button>
+                      {/* zvec.19: this WooCommerce refund may be the payment of an IMS refund the shop still owed. IMS cannot tell (it writes no marker), so a person confirms. */}
+                      {row.confirmableImsRefunds.map((candidate) => (
+                        <Button
+                          key={candidate.imsRefundId}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={isPending}
+                          title="Links this WooCommerce refund to that IMS refund and resolves its task. No second credit note is raised. If it is a separate refund, record it as a separate refund from this row instead."
+                          onClick={() => runAction(
+                            () => confirmParkedRefundSettlesImsRefund(row.id, candidate.imsRefundId),
+                            'Linked: no second credit note was raised and the task is done.',
+                          )}
+                        >
+                          <CheckCircle2 className="h-3 w-3 mr-1" />{`Confirm this WooCommerce refund settles IMS refund ${candidate.creditNoteNumber ?? candidate.imsRefundId}`}
+                        </Button>
+                      ))}
                       {/* o3d-w00 (Codex r1 #3): the only route out of a QUARANTINED park. */}
                       {row.manuallyRecordable ? (
                         <Button

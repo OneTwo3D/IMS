@@ -63,7 +63,9 @@ test('only the PO form and its gated action import the margin modules', () => {
     .filter((f) => /from '@\/(lib\/domain\/purchasing\/line-margin|app\/actions\/purchase-order-margin)'/.test(read(f)))
     .map(rel)
     .sort()
-  assert.deepEqual(importers, ['app/(dashboard)/purchase-orders/po-form.tsx'])
+  // Reorder Planning's forecast money reuses the list-price / VAT-stripping rule (resolveExVatListPrice). Its only
+  // consumers are the internal report and its CSV, both gated on inventory.prices.
+  assert.deepEqual(importers, ['app/(dashboard)/purchase-orders/po-form.tsx', 'lib/domain/inventory/reorder-forecast-money.ts'])
   const actionImports = read('app/actions/purchase-order-margin.ts')
   assert.match(actionImports, /from '@\/lib\/domain\/purchasing\/line-margin'/)
 })

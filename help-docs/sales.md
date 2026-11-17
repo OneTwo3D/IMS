@@ -345,7 +345,18 @@ The refund return-stock movement is bound by `(refundId, refundLineId, warehouse
 
 ### WooCommerce refund deduplication
 
-Refunds synced from WooCommerce are deduplicated by `externalRefundId`. If a duplicate webhook fires (network retry, race condition), the second delivery is silently absorbed without creating a duplicate refund.
+Refunds synced from WooCommerce are deduplicated by `externalRefundId`. If a duplicate webhook fires (network retry, race condition), the second delivery is silently absorbed without creating a duplicate refund. A WooCommerce refund that a person made to pay an IMS refund (see below) has a new id, so it is matched by order, currency and amount instead of being imported as a second refund.
+
+### A refund you record in IMS on a WooCommerce order: Refund in WooCommerce
+
+When you record a refund in IMS on an order that came from WooCommerce, IMS books its own credit note and **writes nothing to WooCommerce**: no refund record, no order status change, no order note and no money movement. The customer is paid back by a person, in WooCommerce.
+
+- IMS raises **one operator task per refund**, **Refund in WooCommerce**, on **Sync > Exceptions**. It gives the tax-inclusive amount to refund (or the net, and says so, if IMS could not work out the tax), the currency and the IMS credit note number. It holds no personal data, and the free-text reason you typed stays on the IMS refund and is not copied into the task. The task is also counted in the Exceptions banner.
+- The sales order shows a **Refund to make in WooCommerce** badge while the task is open.
+- Make the refund in WooCommerce for **that amount**. IMS writes no marker to WooCommerce, so when it imports that refund it **cannot tell it from a separate refund** that began in WooCommerce with the same amount. It therefore never links it on its own: the WooCommerce refund is **parked** under parked refunds on Sync > Exceptions, with the figures, and no credit note is raised yet. On that row you choose: **Confirm this WooCommerce refund settles IMS refund (credit note)**, which links the two, marks the task and the row done and raises **no second credit note**; or **Record manually** if it is a separate refund, which raises a credit note for it as for any WooCommerce refund and leaves the IMS refund owed. Confirming needs the same permission and fresh sign-in as recording a refund by hand, and is recorded in the activity log.
+- **Press Done only if no refund is to be made in WooCommerce.** Done needs the sync permission and a fresh sign-in, and records who and when. Once a task is done, IMS can no longer link a later WooCommerce refund to that credit note.
+- **If the amount differs from every open IMS refund,** no Confirm button is offered: look at the refund in WooCommerce and, if it is a separate refund, use Record manually on that row. If it was meant to pay an IMS refund for a different amount, check the credit note and the refund first; recording it would credit the same money twice. If several IMS refunds have the same amount, each has its own Confirm button, so you name the one it settles.
+- A refund that **began in WooCommerce** is imported as it always was. A full or partial refund in IMS never changes the WooCommerce order status.
 
 ## Payments
 

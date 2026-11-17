@@ -1,11 +1,11 @@
-import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsExpectedOrder, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsExpectedOrder, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDeleteResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 import { updateMintsoftProductContent } from './api/product-content'
-import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
+import { createMintsoftAsn, createMintsoftBundle, deleteMintsoftProduct, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
 import { addMintsoftOrderComment, readMintsoftOrderItemRefs, cancelMintsoftOrder, findMintsoftMergedSurvivor, pushMintsoftOrder, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, probeMintsoftOrderAmendable, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
 import { parseMintsoftPositiveId } from './settings/schema'
@@ -75,6 +75,10 @@ export class MintsoftConnector implements WmsConnector {
 
   async updateProductContent(update: WmsProductContentUpdate): Promise<WmsProductContentResult> {
     return updateMintsoftProductContent(update)
+  }
+
+  async deleteProduct(externalProductId: string): Promise<WmsProductDeleteResult> {
+    return deleteMintsoftProduct(externalProductId)
   }
 
   async createAsn(input: WmsAsnInput): Promise<WmsAsnRef> {

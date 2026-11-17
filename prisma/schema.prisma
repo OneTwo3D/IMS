@@ -621,6 +621,8 @@ model Warehouse {
   name                  String
   type                  WarehouseType @default(STANDARD)
   availableForSale      Boolean       @default(true)
+  // false = cannot be picked as a purchase-order destination or a goods-receipt location (dropship, quarantine, virtual). Existing POs already pointing here keep receiving; WMS-driven receipts are unaffected.
+  availableForPurchaseOrders Boolean  @default(true)
   syncToStore           Boolean       @default(false)
   contactName           String?
   email                 String?
@@ -4189,6 +4191,8 @@ enum WmsOperatorTaskReason {
   REFUND_NOTE
   /// Same-customer orders that are all still NEW in the warehouse: a person checks them there and merges them (IMS never merges).
   MERGE_CANDIDATE
+  /// A refund IMS recorded that the shop still has to pay back to the customer in WooCommerce. Not a warehouse query: raised with connector 'woocommerce'.
+  SHOP_REFUND_DUE
   /// An IMS amendment the warehouse order could not take because it was already past NEW: a person applies the change in the warehouse by hand.
   AMENDMENT_NOT_APPLIED
 }
@@ -4302,6 +4306,63 @@ model RefusedAction {
   @@unique([entityType, entityId, action, gate], map: "refused_actions_key")
   @@index([resolvedAt, severity, firstSeenAt], map: "refused_actions_open_idx")
   @@map("refused_actions")
+}
+
+// ---------------------------------------------------------------------------
+// XERO CUSTOMER-PAYMENT MATCHING
+// ---------------------------------------------------------------------------
+// One durable row per customer receipt (payments.id) that the matching pass has looked at: what it WOULD post (shadow), why it could not (unmatched: no
+// bank-account mapping, wrong currency; blocked: locked period, outbound hold, over the amount due), and in live mode the claim that makes a rerun or a
+// concurrent sweep post it once. The row is the claim: payment_id is unique, so two sweeps share one row and only one of them can move it to CLAIMED.
+// Holds no personal data: ids, a bank-account id, an amount and a reason code in fixed wording built by IMS. No foreign key: the row outlives a deleted receipt.
+
+enum XeroPaymentMatchStatus {
+  /// Shadow: the receipt would be registered against the open invoice. Nothing was written to Xero.
+  WOULD_POST
+  /// No safe match exists (no bank-account mapping for the payment system and currency, a currency other than the invoice's, no invoice).
+  UNMATCHED
+  /// A match exists but a rule stops it (locked Xero period, outbound write hold, over the amount due, an unresolved earlier attempt).
+  BLOCKED
+  /// Live: a sweep holds the claim and is registering the receipt through the existing path.
+  CLAIMED
+  /// Live: the registration is on record (queued for the Xero payment post by the existing path).
+  REGISTERED
+  /// Live: the registration threw or did not reach the record; retried by a later sweep up to a cap.
+  FAILED
+}
+
+model XeroPaymentMatch {
+  id                  String                 @id @default(cuid())
+  /// The local receipt. Unique: this IS the idempotency key.
+  paymentId           String                 @unique @map("payment_id")
+  orderId             String                 @map("order_id")
+  status              XeroPaymentMatchStatus
+  /// The mode of the sweep that last evaluated it (shadow or live).
+  mode                String
+  /// A fixed reason code (NO_BANK_ACCOUNT, LOCKED_PERIOD, OUTBOUND_HOLD, WOULD_OVERPAY, ...); null for WOULD_POST and REGISTERED.
+  reason              String?
+  /// One fixed-wording line an operator can read. Never remote free text.
+  detail              String?
+  /// The Xero bank account the payment map resolved, when one did.
+  bankAccountId       String?                @map("bank_account_id")
+  amount              Decimal                @db.Decimal(18, 4)
+  currency            String
+  /// What is left to pay on the invoice, in the invoice currency, when it could be measured.
+  amountDue           Decimal?               @db.Decimal(18, 4) @map("amount_due")
+  /// The open Xero invoice the receipt would settle.
+  accountingInvoiceId String?                @map("accounting_invoice_id")
+  /// The date the payment would carry in Xero (the receipt's own date; never moved).
+  paymentDate         DateTime?              @map("payment_date")
+  claimToken          String?                @map("claim_token")
+  claimedAt           DateTime?              @map("claimed_at")
+  registeredAt        DateTime?              @map("registered_at")
+  attempts            Int                    @default(0)
+  firstSeenAt         DateTime               @default(now()) @map("first_seen_at")
+  lastEvaluatedAt     DateTime               @default(now()) @map("last_evaluated_at")
+
+  @@index([status, lastEvaluatedAt], map: "xero_payment_matches_status_idx")
+  @@index([orderId], map: "xero_payment_matches_order_idx")
+  @@map("xero_payment_matches")
 }
 
 // ---------------------------------------------------------------------------

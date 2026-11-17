@@ -1,3 +1,4 @@
+import { Fragment } from 'react'
 import Link from 'next/link'
 import { Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -52,6 +53,19 @@ export type StockPositionFilterValues = {
   targetCoverWeeks?: string
   // o3d-s8n.3: reorder-only. Remove stockout days from the demand average.
   ignoreStockouts?: boolean
+  // reorder-only: 'supplier' lays the rows out supplier by supplier.
+  groupBy?: string
+  // reorder-only growth percentage, carried as typed so the page address and CSV link keep it.
+  growthPercent?: string
+}
+
+/** Optional grouped layout: each group is a header row (spanning every column) followed by its rows. Reorder uses it for the supplier view. */
+export type StockPositionRowGroup<Row> = {
+  key: string
+  header: React.ReactNode
+  /** 'warning' shades the header amber (the no-supplier group). */
+  tone?: 'default' | 'warning'
+  rows: Row[]
 }
 
 type StockPositionReportPageProps<Row> = {
@@ -79,6 +93,8 @@ type StockPositionReportPageProps<Row> = {
   headerActions?: React.ReactNode
   /** Optional leading checkbox/selection column (reorder report only today). */
   selectionColumn?: StockPositionSelectionColumn<Row>
+  /** When set, `rows` is rendered grouped (in these groups) instead of as one flat list. */
+  groups?: StockPositionRowGroup<Row>[]
 }
 
 function today(): string {
@@ -106,6 +122,7 @@ export function StockPositionReportPage<Row>({
   extraFilters,
   headerActions,
   selectionColumn,
+  groups,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = reportCsvHref(exportBasePath, params, { type: reportKey })
@@ -275,17 +292,26 @@ export function StockPositionReportPage<Row>({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.map((row, index) => (
-              <TableRow key={rowKey(row, index)}>
-                {selectionColumn && (
-                  <TableCell className="text-center">{selectionColumn.cell(row, index)}</TableCell>
+            {(groups ?? [{ key: '__flat__', header: null, rows }]).map((group) => (
+              <Fragment key={group.key}>
+                {groups && (
+                  <TableRow className={group.tone === 'warning' ? 'bg-amber-50 hover:bg-amber-50' : 'bg-muted/40 hover:bg-muted/40'} data-testid="report-group-header">
+                    <TableCell colSpan={columns.length + (selectionColumn ? 1 : 0)} className="py-2 text-sm font-medium">{group.header}</TableCell>
+                  </TableRow>
                 )}
-                {columns.map((column) => (
-                  <TableCell key={column.key} className={column.align === 'right' ? 'text-right tabular-nums' : ''}>
-                    {column.render(row)}
-                  </TableCell>
+                {group.rows.map((row, index) => (
+                  <TableRow key={rowKey(row, index)}>
+                    {selectionColumn && (
+                      <TableCell className="text-center">{selectionColumn.cell(row, index)}</TableCell>
+                    )}
+                    {columns.map((column) => (
+                      <TableCell key={column.key} className={column.align === 'right' ? 'text-right tabular-nums' : ''}>
+                        {column.render(row)}
+                      </TableCell>
+                    ))}
+                  </TableRow>
                 ))}
-              </TableRow>
+              </Fragment>
             ))}
             {rows.length === 0 && (
               <TableRow>
