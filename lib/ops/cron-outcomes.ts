@@ -33,7 +33,7 @@ import type { WcErasureSweepOutcome } from '@/lib/connectors/woocommerce/sync/an
 import type { purgeExpiredActivityLogs, purgeExpiredCronRuns } from '@/lib/activity-log-cleanup'
 import type { purgeExpiredData } from '@/lib/data-retention'
 import type { ProcessPendingWcWebhookEventsResult } from '@/lib/jobs/woocommerce/process-shopping-webhook-events'
-import type { processShoppingOrderCompletions, processShoppingOrderStatusPushes, processShoppingInvoiceDocumentPublications } from '@/lib/shopping'
+import type { processShoppingOrderCompletions, processShoppingOrderStatusPushes, processShoppingInvoiceDocumentPublications, processShoppingTrackshipRefires } from '@/lib/shopping'
 import type { XeroDailyBatchResult } from '@/lib/connectors/xero/daily-sync'
 import { counts, from, enumResult, noFailureSignal, num, permanentLists, structural, worstOutcome } from './cron-outcome-helpers'
 import { mintsoftCronOutcomes as warehouseConnectorCronOutcomes } from '@/lib/connectors/mintsoft/cron-outcomes' // wms-connector-boundary-ok: 2026-11-13: the registry spreads the connector's own entries
@@ -114,6 +114,7 @@ export type ShoppingDrain =
   | Ret<typeof processShoppingOrderCompletions>
   | Ret<typeof processShoppingOrderStatusPushes>
   | Ret<typeof processShoppingInvoiceDocumentPublications>
+  | Ret<typeof processShoppingTrackshipRefires>
   | { skipped: boolean; reason?: string; error?: string }
 type ShoppingWebhookInboxCronResult = {
   connectors: {
@@ -121,6 +122,7 @@ type ShoppingWebhookInboxCronResult = {
       orderCompletions: ShoppingDrain
       orderStatusPushes: ShoppingDrain
       invoiceDocumentPublications: ShoppingDrain
+      trackshipRefires: ShoppingDrain
     }
   }
 }

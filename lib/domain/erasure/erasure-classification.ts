@@ -124,6 +124,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       storedPath: 'the issued invoice / credit note PDF is a statutory record, kept six years',
     },
   },
+  // lastResult is a fixed vocabulary written by IMS (covered, fired, not-eligible, no-tracking, order-gone, window-closed), never remote free text.
+  TrackshipRefireState: { erased: [], notPersonal: ['id', 'orderId', 'lastResult'], retained: {} },
   InvoiceStorePublication: { erased: [], notPersonal: ['noteInvoiceId', 'noteStoreId', 'flagDocumentId'], retained: {} },
   InvoiceDocumentFetchState: { erased: [], notPersonal: ['subjectKey', 'lastError', 'leaseHolder'], retained: {} },
   ReturnExpectation: { erased: [], notPersonal: ['reference', 'transitJournalKey'], retained: {} },

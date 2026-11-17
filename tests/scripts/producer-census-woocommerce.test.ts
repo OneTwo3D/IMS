@@ -53,11 +53,11 @@ test('PRECONDITION: the real tree is green, and the census reached every part of
   assert.ok(scan.filesScanned >= 800)
   assert.equal(report.counts.seamFunctions, WOO_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamFunctionsConsulting, WOO_SEAM_FUNCTIONS.length)
-  assert.equal(report.counts.transportWrites, 5, 'wcPost, wcPut, the FX push, the FX probe and the partial-shipment push')
+  assert.equal(report.counts.transportWrites, 6, 'wcPost, wcPut, the FX push, the FX probe, the partial-shipment push and the TrackShip re-fire')
   assert.ok(report.counts.transportSites > report.counts.transportWrites, 'the reads were seen too, and are not writes')
-  assert.equal(report.counts.outboxEnqueueSites, 5)
+  assert.equal(report.counts.outboxEnqueueSites, 6)
   assert.equal(report.counts.mapOperationsGoverned, report.counts.mapOperations)
-  assert.equal(report.counts.registryEntries, 11)
+  assert.equal(report.counts.registryEntries, 12)
 })
 
 test('MUTATION WOO-1 (the consultation is moved AFTER its effect): red, naming the function', () => {
@@ -197,7 +197,7 @@ test('WOO-5 reads the registry as SYNTAX: the real registry yields every entry w
   const real = scanOutboxRegistrySource(realText('lib/domain/integrations/outbox-registry.ts'))
   const flat = Object.entries(real).flatMap(([connector, operations]) => Object.entries(operations).map(([operation, entry]) => `${connector}/${operation}=${entry.destination}`))
   console.log(`# registry by syntax: ${flat.join(' ')}`)
-  assert.equal(flat.length, 11)
+  assert.equal(flat.length, 12)
   assert.ok(flat.includes('woocommerce/stock.push=woocommerce'))
   assert.ok(flat.includes('xero/accounting.post=xero'))
   assert.ok(flat.includes('mintsoft/inbound.booked-in=internal'))

@@ -1,4 +1,6 @@
 import { db } from '@/lib/db'
+import { logActivityInTransaction } from '@/lib/activity-log'
+import { orderNotFoundQuery, raiseWmsOperatorTask, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -23,6 +25,20 @@ const DEFAULT_STALE_MINUTES = 30
 const DEFAULT_BATCH_SIZE = 50
 /** How many push error texts the result lists (display only: the counts above cover the whole batch). */
 export const PUSH_ERRORS_DISPLAY_CAP = 20
+
+/**
+ * NOTFOUND: how many CONSECUTIVE status checks may find an order IMS pushed to the warehouse genuinely absent before the sweep marks the snapshot
+ * NOTFOUND, stops polling the order and raises ONE operator task. Three, the bridge plugin's own threshold (its inbound not-found threshold).
+ *
+ * A strike is a lookup that returned nothing AND whose presence probe agreed the order is not there (`WMS_LOOKUP_CONFIRMED_ABSENT`), for an order
+ * IMS has pushed (a SYNCED push link with a warehouse id): an order IMS has not pushed yet is expected to be absent. A lookup that FOUND the order,
+ * or found it merged or ambiguous, resets the count. A lookup that FAILED (a thrown error, a probe that could not run) neither counts nor resets:
+ * it proves nothing, and an outage must never be read as "the order is gone" (the plugin stamped an order NOTFOUND during a Mintsoft outage once).
+ */
+export const WMS_NOT_FOUND_THRESHOLD = 3
+/** The snapshot status of an order the sweep stopped polling. */
+export const WMS_STATUS_NOT_FOUND = 'NOTFOUND'
+const WMS_STATUS_NOT_FOUND_LABEL = 'Not found in warehouse'
 
 export type WmsOrderStatusSweepResult = {
   skipped?: string
@@ -147,6 +163,8 @@ export async function runWmsOrderStatusSweep(
   const inScope = {
     status: { notIn: [...TERMINAL_SALES_STATUSES] },
     shoppingLinks: { some: { connector: lookupConnector, externalOrderNumber: { not: null } } },
+    // An order already marked NOTFOUND is not polled again (an operator task asks a person to look): it is out of the batch and out of the unresolved count.
+    NOT: { wmsOrderStatus: { is: { status: WMS_STATUS_NOT_FOUND } } },
   }
   const orders = await db.salesOrder.findMany({
     where: {
@@ -160,6 +178,9 @@ export async function runWmsOrderStatusSweep(
     },
     select: {
       id: true,
+      orderNumber: true,
+      // Whether the warehouse is EXPECTED to hold this order (IMS pushed it and the push is settled): only then is an absent answer a strike.
+      wmsOrderPush: { select: { externalOrderId: true, state: true } },
       shoppingLinks: {
         where: { connector: lookupConnector },
         select: { externalOrderNumber: true },
@@ -233,13 +254,20 @@ export async function runWmsOrderStatusSweep(
       //
       // The residual is deliberate: the FIRST sweep after an order goes missing still pays for a
       // probe, which is exactly when the answer is worth having.
+      // Whether the warehouse is EXPECTED to hold this order: IMS pushed it and the push settled. Only then is an absent answer a strike.
+      const pushedExternalId = order.wmsOrderPush?.state === 'SYNCED' ? (order.wmsOrderPush.externalOrderId ?? '') : ''
       let notFoundReason: string = WMS_LOOKUP_CONFIRMED_ABSENT
+      let priorStrikes = 0
       if (!status) {
         const known = await db.wmsOrderStatusSnapshot.findUnique({
           where: { orderId: order.id },
-          select: { externalOrderId: true, lastError: true },
+          select: { externalOrderId: true, lastError: true, notFoundStrikes: true },
         })
+        priorStrikes = known?.notFoundStrikes ?? 0
+        // An order the warehouse SHOULD hold is probed on every lookup until it is marked NOTFOUND (at most WMS_NOT_FOUND_THRESHOLD probes, then it is no
+        // longer polled): each strike needs a fresh answer, because the order may since have been merged, which the first absent answer could not know.
         const alreadyConfirmedAbsent = known
+          && pushedExternalId === ''
           && !known.externalOrderId
           && known.lastError === WMS_LOOKUP_CONFIRMED_ABSENT
 
@@ -269,6 +297,14 @@ export async function runWmsOrderStatusSweep(
         }
       }
 
+      // THE NOT-FOUND COUNT. Found: reset. Confirmed absent for an order the warehouse should hold: one more strike. Merged, ambiguous or present with an
+      // unreadable status: the order is there, reset. Anything unresolved (a probe that failed or could not run): left exactly as it was.
+      let strikes: number | null = null
+      if (status) strikes = 0
+      else if (notFoundReason === WMS_LOOKUP_CONFIRMED_ABSENT) strikes = pushedExternalId !== '' ? priorStrikes + 1 : null
+      else if (notFoundReason === WMS_LOOKUP_AMBIGUOUS || notFoundReason === WMS_LOOKUP_PRESENT_NO_STATUS) strikes = 0
+      const markNotFound = !status && strikes !== null && strikes >= WMS_NOT_FOUND_THRESHOLD
+
       const fields = status
         ? {
             connector: connectorId,
@@ -285,6 +321,8 @@ export async function runWmsOrderStatusSweep(
             trackingNumber: tracking?.trackingNumber ?? null,
             carrier: tracking?.carrier ?? null,
             lastError: null,
+            notFoundStrikes: 0,
+            notFoundAt: null,
           }
         : {
             connector: connectorId,
@@ -301,6 +339,8 @@ export async function runWmsOrderStatusSweep(
             trackingNumber: null,
             carrier: null,
             lastError: notFoundReason,
+            ...(strikes !== null ? { notFoundStrikes: strikes } : {}),
+            ...(markNotFound ? { status: WMS_STATUS_NOT_FOUND, statusLabel: WMS_STATUS_NOT_FOUND_LABEL, notFoundAt: new Date() } : {}),
           }
 
       // An erased order keeps its status in the cache but never its tracking number, carrier or deep link: the
@@ -320,6 +360,30 @@ export async function runWmsOrderStatusSweep(
           create: { orderId: order.id, ...storedFields },
           update: { ...storedFields, fetchedAt: new Date() },
         })
+        // NOTFOUND: ONE operator task, in the same transaction as the mark (an IMS task, never a warehouse or storefront note: the warehouse's staff
+        // do not read notes). The task is deduplicated on the warehouse order, and the order leaves the batch once marked, so it is raised once.
+        if (markNotFound) {
+          const raised = await raiseWmsOperatorTask(tx, {
+            connector: connectorId,
+            orderId: order.id,
+            externalOrderId: pushedExternalId,
+            reason: 'ORDER_NOT_FOUND',
+            queryText: orderNotFoundQuery(warehouseOrderRef(reference, pushedExternalId), order.orderNumber ?? order.id, strikes ?? WMS_NOT_FOUND_THRESHOLD),
+            payload: { orderNumber: order.orderNumber, externalOrderNumber: reference },
+            dedupeBasis: `not-found:${pushedExternalId}`,
+          })
+          if (raised) {
+            await logActivityInTransaction(tx, {
+              userId: null,
+              entityType: 'SALES_ORDER',
+              entityId: order.id,
+              action: 'wms_order_not_found',
+              tag: 'sync',
+              level: 'WARNING',
+              description: `${connectorLabel} did not have this order on ${strikes} status checks in a row. IMS marked its warehouse status NOTFOUND, stopped checking it, and raised a task under Sync > Exceptions for a person to look it up.`,
+            })
+          }
+        }
         return erased
       })
       if (status) updated += 1

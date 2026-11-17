@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.3.1
+ * Version:     1.4.0
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -32,6 +32,12 @@
  *      ...). Mirrors the part into the wphub-partial-shipment tables (storefront
  *      partial-shipment UI + customer emails) and transitions the order to
  *      partial-shipped / completed.
+ *   4. TrackShip Re-fire — signed REST endpoint
+ *      POST /wp-json/oti/v1/order/{id}/trackship-refire that IMS asks, per shipped
+ *      order, to make sure TrackShip holds a shipment for every tracking number
+ *      and, when it does not, to fire TrackShip's own `send_order_to_trackship`
+ *      action again (the call TrackShip makes when an order ships and which has
+ *      no retry of its own). Writes nothing itself: TrackShip does the writing.
  */
 
 defined('ABSPATH') || exit;
@@ -303,6 +309,18 @@ add_action('rest_api_init', function () {
         // Same HMAC-of-raw-body check as the FX route (the verifier is generic).
         'permission_callback' => 'oti_verify_fx_signature',
         'callback'            => 'oti_handle_partial_shipment',
+        'args'                => [
+            'order_id' => [
+                'required'          => true,
+                'sanitize_callback' => 'absint',
+            ],
+        ],
+    ]);
+    register_rest_route(OTI_FX_NAMESPACE, '/order/(?P<order_id>\d+)/trackship-refire', [
+        'methods'             => 'POST',
+        // Same HMAC-of-raw-body check as the other signed routes (the verifier is generic).
+        'permission_callback' => 'oti_verify_fx_signature',
+        'callback'            => 'oti_handle_trackship_refire',
         'args'                => [
             'order_id' => [
                 'required'          => true,
@@ -663,6 +681,134 @@ if (!function_exists('oti_handle_partial_shipment')) {
                 'shipment_id' => $next_shipment_id,
                 'status_changed' => $status_eligible,
             ], 200);
+        } finally {
+            $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));
+        }
+    }
+}
+
+/* ============================================================
+ * Module 4 — TrackShip Re-fire
+ * ============================================================ */
+
+// How long a `pending_trackship` row counts as proof of a shipment: TrackShip inserts it at once and finishes from a background job, so a row
+// that stays pending past this is taken to have lost that job and the parcel is treated as missing again.
+const OTI_TS_PENDING_GRACE = 3600;
+
+if (!function_exists('oti_handle_trackship_refire')) {
+    /**
+     * POST /wp-json/oti/v1/order/{id}/trackship-refire   (signed, body ignored)
+     *
+     * Answers one of, always HTTP 200 unless the request itself is wrong:
+     *   result 'covered'         TrackShip holds a shipment for every tracking number on the order; nothing was fired.
+     *   result 'fired'           at least one tracking number had no shipment (or a pending one past the grace window), the order was
+     *                            eligible, and TrackShip's `send_order_to_trackship` action was fired once for the order.
+     *   result 'not_eligible'    something was missing but TrackShip's own gate (`is_order_shipped`) refused the order right now
+     *                            (not in a trigger status, or no tracking visible); nothing was fired.
+     *   result 'no_tracking'     the order carries no tracking number; nothing to register.
+     *   result 'trackship_inactive'  TrackShip is not installed or not ready (HTTP 503); nothing was fired.
+     *   404 oti_ts_not_found     no such order.
+     *
+     * `missing` is the number of tracking numbers that had no shipment. Idempotent: TrackShip upserts on (order, tracking number), so a
+     * repeat call cannot create a duplicate row. Serialised per order under a named lock so two overlapping calls fire once.
+     */
+    function oti_handle_trackship_refire(WP_REST_Request $request)
+    {
+        global $wpdb;
+        if (!function_exists('wc_get_order')) {
+            return new WP_Error('oti_ts_no_wc', 'WooCommerce not active', ['status' => 500]);
+        }
+        $order_id = absint($request['order_id']);
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return new WP_Error('oti_ts_not_found', 'Order not found', ['status' => 404]);
+        }
+        if (!function_exists('trackship_for_woocommerce')) {
+            return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => 0], 503);
+        }
+        $ts = trackship_for_woocommerce();
+        if (!is_object($ts) || !method_exists($ts, 'get_tracking_items')) {
+            return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => 0], 503);
+        }
+
+        $lock_name = 'oti_ts_refire_' . $order_id;
+        if ((int) $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock_name, 0)) !== 1) {
+            return new WP_Error('oti_ts_lock', 'Another re-fire for this order is running', ['status' => 409]);
+        }
+        try {
+            // Read through TrackShip itself, bypassing the object cache whose stale answer is what dropped the shipment in the first place.
+            try {
+                $items = $ts->get_tracking_items($order_id, false);
+            } catch (\Throwable $e) {
+                return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => 0], 503);
+            }
+            if (!is_array($items)) {
+                return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => 0], 503);
+            }
+            $numbers = [];
+            foreach ($items as $item) {
+                $num = isset($item['tracking_number']) ? trim((string) $item['tracking_number']) : '';
+                if ($num !== '') {
+                    $numbers[$num] = true;
+                }
+            }
+            if (empty($numbers)) {
+                return new WP_REST_Response(['ok' => true, 'result' => 'no_tracking', 'missing' => 0], 200);
+            }
+
+            $table = $wpdb->prefix . 'trackship_shipment';
+            $wpdb->last_error = '';
+            // phpcs:ignore WordPress.DB.PreparedSQL -- table name is internal.
+            $rows = $wpdb->get_results($wpdb->prepare("SELECT tracking_number, shipment_status FROM {$table} WHERE order_id = %d", $order_id));
+            if ($wpdb->last_error || !is_array($rows)) {
+                // A failed read must never be taken for "no shipments": firing on it would resubmit parcels that are already tracked.
+                return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => 0], 503);
+            }
+            $status_by_number = [];
+            foreach ($rows as $row) {
+                $status_by_number[(string) $row->tracking_number] = (string) $row->shipment_status;
+            }
+
+            // A pending row is proof only inside the grace window, measured from when the tracking was shipped (the item's own date, which
+            // nothing else touches), not from the order's modified time, which any unrelated save bumps.
+            $now = time();
+            $missing = 0;
+            foreach ($items as $item) {
+                $num = isset($item['tracking_number']) ? trim((string) $item['tracking_number']) : '';
+                if ($num === '') {
+                    continue;
+                }
+                if (!isset($status_by_number[$num])) {
+                    $missing++;
+                    continue;
+                }
+                if ($status_by_number[$num] === 'pending_trackship') {
+                    $shipped = isset($item['date_shipped']) ? (int) $item['date_shipped'] : 0;
+                    if ($shipped > 0 && ($now - $shipped) > OTI_TS_PENDING_GRACE) {
+                        $missing++;
+                    }
+                }
+            }
+            if ($missing === 0) {
+                return new WP_REST_Response(['ok' => true, 'result' => 'covered', 'missing' => 0], 200);
+            }
+
+            // TrackShip's own gate: a trigger status AND tracking visible. When it says no, firing would do nothing.
+            $eligible = false;
+            try {
+                $eligible = (bool) apply_filters('is_order_shipped', false, $order);
+            } catch (\Throwable $e) {
+                return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => $missing], 503);
+            }
+            if (!$eligible) {
+                return new WP_REST_Response(['ok' => true, 'result' => 'not_eligible', 'missing' => $missing], 200);
+            }
+            try {
+                do_action('send_order_to_trackship', $order_id);
+            } catch (\Throwable $e) {
+                return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => $missing], 503);
+            }
+            return new WP_REST_Response(['ok' => true, 'result' => 'fired', 'missing' => $missing], 200);
         } finally {
             $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));
         }

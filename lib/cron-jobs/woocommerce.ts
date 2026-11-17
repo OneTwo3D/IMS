@@ -35,7 +35,7 @@ registerCronJobs([
     module: 'woocommerce',
     moduleLabel: 'WooCommerce',
     label: 'WooCommerce Webhook Inbox',
-    description: 'Processes persisted WooCommerce order, product, and refund webhook events outside the public request path, and retries any queued WooCommerce order completions (the "completed" push that follows an IMS shipment) that did not land.',
+    description: 'Processes persisted WooCommerce order, product, and refund webhook events outside the public request path, and retries any queued WooCommerce order completions (the "completed" push that follows an IMS shipment) that did not land. When the setting `trackship_refire_enabled` is true it also asks the storefront to register shipped orders that TrackShip holds no shipment for.',
     defaultSchedule: '*/5 * * * *',
     defaultEnabled: true,
   },

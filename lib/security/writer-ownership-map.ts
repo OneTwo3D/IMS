@@ -222,6 +222,11 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'Owner answer 6: as order.withdrawal-outcome.',
   }),
+  row('woocommerce', 'order.trackship-refire', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
+    obligationTime: 'not-applicable',
+    outboxOperations: ['woocommerce/trackship.refire'],
+    note: 'Owner decision D10: customer-facing tracking stays with WooCommerce, AST and TrackShip; IMS stores tracking and, when TrackShip holds no shipment for a shipped order, asks the storefront to fire TrackShip\'s own trigger again, as the plugin\'s Python sweep did through /trackship/reconcile (that route above stays the plugin\'s, and is what runs in P1). P1: the plugin\'s sweep does it, so IMS shadows. P2: IMS does it through the companion plugin\'s /order/{id}/trackship-refire route, behind the setting trackship_refire_enabled (default off). A repeat of the same order\'s look is harmless (TrackShip upserts), so no obligation time.',
+  }),
   row('woocommerce', 'order.wms-status-meta', { P1: 'nobody', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
     note: 'IMS-only metadata on the order.',

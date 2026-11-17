@@ -101,6 +101,9 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
       'connectors.woocommerce.invoiceDocumentPublications.deadLettered',
       'connectors.woocommerce.invoiceDocumentPublications.errors',
       'connectors.woocommerce.invoiceDocumentPublications.error',
+      'connectors.woocommerce.trackshipRefires.deadLettered',
+      'connectors.woocommerce.trackshipRefires.errors',
+      'connectors.woocommerce.trackshipRefires.error',
     ],
   },
   'wc-reconcile': {

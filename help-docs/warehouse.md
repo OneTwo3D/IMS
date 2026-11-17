@@ -97,6 +97,7 @@ Each task shows the Mintsoft order number, a link to the IMS order, why it was r
 - **Courier fallback: verify the courier** — the shipping method did not map to a Mintsoft courier, so the default was used.
 - **Hold not honoured** / **Cancel not honoured** — the order is already being picked, packed or despatched (or merged), so IMS could not hold or cancel it.
 - **Refund on an order the warehouse already holds** — a full refund (cancel it if not despatched) or a part refund that reduced quantities.
+- **Warehouse order not found on repeated checks** — IMS pushed the order, but Mintsoft has answered "no such order" on three status checks in a row. See *An order Mintsoft no longer has* below.
 
 An open task never turns the `wms-order-push` job red; the job's result reports how many are open. A task that IMS could not save is retried on the next run, and the job reports that as a failure. Tasks are removed with their order by the transaction reset, and hold no personal data.
 
@@ -135,6 +136,15 @@ What you see for a group:
 - ONE task for the group under **Integrations > Exceptions > Raise a warehouse query**: check these orders in Mintsoft and merge them there if appropriate. IMS writes no note on the Mintsoft or WooCommerce order for this, because the warehouse does not read notes. If the group stops qualifying (an order leaves New, ships, is cancelled or its address changes) IMS resolves the task itself. If you press **Done** first it stays done.
 
 Warnings are added to the task and the badge: an **EU destination** needs the customs declaration and IOSS number checked before merging, and a group that ships by **FedEx** needs its label created by hand. Switching the mode back to Off stops new flags but does not remove open tasks: mark them Done.
+
+### An order Mintsoft no longer has (NOTFOUND)
+
+The status refresh looks up every in-flight order IMS pushed. When Mintsoft answers that an order does not exist (and a second search by order number agrees) **three times in a row**, IMS marks the order's **WMS Status** as **NOTFOUND**, stops checking it, and adds **one** task under **Integrations > Exceptions > Raise a warehouse query**: *Warehouse order not found on repeated checks*. Look the order up in Mintsoft yourself: if it was cancelled, merged or renamed there, nothing more is needed; if it should still exist, raise a query with the warehouse to find out what happened to it before it is despatched. Then press **Done**. IMS changes nothing in Mintsoft or WooCommerce and writes no note on either, because the warehouse does not read notes.
+
+- **Any answer that finds the order resets the count**, and so does a merged or ambiguous answer (the order is there, under another number or in parts).
+- **A check that fails does not count and does not reset it.** If Mintsoft is unreachable, or the second search cannot run, the order is never marked NOTFOUND: an outage is not read as "the order is gone".
+- **An order IMS has not pushed yet is never counted.** It is expected to be absent until the push succeeds.
+- The task is raised once. A NOTFOUND order is not checked again, so its chip stays **NOTFOUND** until the order is dealt with.
 
 ### Holds, cancels and merged orders
 
