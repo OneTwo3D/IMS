@@ -9,6 +9,8 @@ import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
 import { MergeCandidateBadge } from '@/components/sales/merge-candidate-badge'
+import { ShopRefundBadge } from '@/components/sales/shop-refund-badge'
+import type { ShopRefundBadgeView } from '@/app/actions/shop-refund-tasks'
 import type { MergeCandidateBadgeView } from '@/app/actions/wms-merge-candidates'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -110,6 +112,7 @@ type Props = {
   wmsOrderStatus?: WmsOrderStatusView | null
   wmsPushState?: WmsOrderPushStateView | null
   mergeCandidate?: MergeCandidateBadgeView | null
+  shopRefundDue?: ShopRefundBadgeView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -1014,7 +1017,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1478,6 +1481,11 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
               <WmsOrderPushChip orderId={so.id} push={wmsPushState} />
             </span>
           )}
+          {shopRefundDue && (
+            <span className="inline-flex items-center self-center">
+              <ShopRefundBadge view={shopRefundDue} />
+            </span>
+          )}
           {mergeCandidate && (
             <span className="inline-flex items-center self-center">
               <MergeCandidateBadge view={mergeCandidate} />
@@ -1858,6 +1866,11 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                invoice is still outstanding — that gap is exactly what this line names. */
             <p className="px-4 pt-2 text-[11px] text-red-700 dark:text-red-300">{settlement.detail}</p>
           )}
+          {so.paymentRemovedForeign != null && so.paymentRemovedForeign > 0 && (
+            <p className="px-4 pt-2 text-[11px] text-amber-800 dark:text-amber-300" data-testid="payment-removed-notice">
+              The accounting ledger no longer holds {money(so.paymentRemovedForeign)} of this order&apos;s payment, so it is not fully paid. Revenue was not unwound: whether to credit the amount or write it off is decided by the order owner.
+            </p>
+          )}
           <div className="px-4 py-3 text-sm grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <span className="text-muted-foreground text-xs">Invoice Date</span>
@@ -1870,13 +1883,13 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             <div>
               <span className="text-muted-foreground text-xs">Paid</span>
               <p className="font-medium font-mono">
-                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0); return money(paid) })()}
+                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); return money(Math.max(0, paid)) })()}
               </p>
             </div>
             <div>
               <span className="text-muted-foreground text-xs">Balance</span>
-              <p className={`font-medium font-mono ${(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); return so.totalForeign - paid > 0.01 ? 'text-destructive' : 'text-green-600' })()}`}>
-                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${money(bal)} due` : 'Settled' })()}
+              <p className={`font-medium font-mono ${(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); return so.totalForeign - paid > 0.01 ? 'text-destructive' : 'text-green-600' })()}`}>
+                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${money(bal)} due` : 'Settled' })()}
               </p>
             </div>
           </div>

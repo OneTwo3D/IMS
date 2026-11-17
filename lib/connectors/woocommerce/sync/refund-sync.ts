@@ -15,6 +15,7 @@ import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idem
 import { REFUND_TOTAL_EPSILON } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
+import { findOpenShopRefunds, shopRefundParkMessage } from '@/lib/domain/sales/shop-refund-tasks'
 import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): shared with the exception inbox's hand-recording path — see refund-line-link.
 import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
@@ -50,7 +51,7 @@ export type WcRefundSyncDependencies = {
   // states the VAT WooCommerce reported per refunded line and lets the fence there act on it.
   // `organisation` is read only when the order's stored FX rate is unusable (to tell a base-currency order, rate 1,
   // from a foreign one that must be refused): a refund on an order with a usable rate never touches it.
-  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | '$transaction'> & Partial<Pick<typeof db, 'organisation' | 'returnReason'>>
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'wmsOperatorTask' | '$transaction'> & Partial<Pick<typeof db, 'organisation' | 'returnReason'>>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -806,6 +807,43 @@ export async function syncWcRefund(
       // must do for the chargeback suppression further down, and the reason one outcome could not
       // carry both.
       return { outcome: 'handled-unapplied-resolvable', error: `WooCommerce refund ${wcRefund.id} is quarantined for this order and awaits manual resolution` }
+    }
+
+    // IS AN IMS REFUND STILL WAITING FOR ITS WOOCOMMERCE REFUND? (the "Refund in WooCommerce" task, lib/domain/sales/shop-refund-tasks.ts)
+    // IMS wrote no refund to WooCommerce for a refund recorded in IMS; a person makes it there later, under a NEW storefront refund id, and this import
+    // dedups on that id alone. But IMS writes no marker to WooCommerce either, so it cannot tell that refund from a separate one that began in
+    // WooCommerce with the same amount: it NEVER links on its own and never raises a credit note for it. On an order with an open task the storefront
+    // refund is parked QUARANTINED, with the figures, and a person chooses on the parked row: confirm it settles a named IMS refund (a link, no
+    // second credit note), or record it as a separate refund (the usual route). An order with no open task is imported exactly as before.
+    // The cheap unlocked read decides whether this applies at all; the decision is made again under the per-refund lock the writer and the park
+    // write also take, so a delivery that lost a race to a confirmation answers "already in IMS" instead of parking a refund that was just settled.
+    const wcAmount = parseDecimalAbs(wcRefund.amount)
+    if ((await findOpenShopRefunds(client, so.id)).length > 0) {
+      type Decision = { kind: 'landed-here' } | { kind: 'park'; message: string } | { kind: 'none' }
+      const decision = await client.$transaction(async (tx): Promise<Decision> => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${wcRefund.id}`}))`
+        const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
+        if (landed) return landed.orderId === so.id ? { kind: 'landed-here' } : { kind: 'none' }
+        const open = await findOpenShopRefunds(tx, so.id)
+        if (open.length === 0) return { kind: 'none' }
+        return { kind: 'park', message: shopRefundParkMessage({ wcRefundId: wcRefund.id, orderCurrency: so.currency, amountForeign: wcAmount, open }) }
+      })
+      if (decision.kind === 'landed-here') return { outcome: 'already-applied' }
+      if (decision.kind === 'park') {
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: decision.message, payload: wcRefund })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_awaits_ims_refund_confirmation',
+          tag: 'sync',
+          level: 'WARNING',
+          description: decision.message,
+          metadata: { externalRefundId: wcRefund.id },
+          resolveUser: false,
+        })
+        return { outcome: 'quarantined-refusal', error: decision.message }
+      }
+      // 'none': under the lock no task is open any more (a person resolved it): the import below runs as it always did.
     }
 
     // o3d-q0x56.8 - THE ORDER'S BOOKED RATE, OR THE REFUND IS PARKED WITH A NAMED REASON. A foreign order whose stored

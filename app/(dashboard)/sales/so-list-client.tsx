@@ -145,6 +145,7 @@ function invoiceStatus(so: SoRow): { label: string; cls: string } {
   // Refund state is orthogonal to the lifecycle status now — read refundStatus.
   if (so.refundStatus === 'FULL') return { label: 'Refunded', cls: 'bg-red-100 text-red-800' }
   if (so.refundStatus === 'PARTIAL') return { label: 'Part. Refunded', cls: 'bg-orange-100 text-orange-800' }
+  if (so.paidAt && so.paymentRemovedForeign) return { label: 'Part paid', cls: 'bg-amber-100 text-amber-800' }
   if (so.paidAt) return { label: 'Paid', cls: 'bg-green-100 text-green-800' }
   if (so.invoiceNumber) return { label: 'Invoiced', cls: 'bg-purple-100 text-purple-800' }
   return { label: 'Pending', cls: 'bg-gray-100 text-gray-800' }

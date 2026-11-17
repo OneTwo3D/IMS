@@ -930,6 +930,34 @@ matters most on bills: clearing `paidAt` re-arms **Mark Paid** in the UI, and pr
 **second** supplier payment on top of the part payment. Settle the balance in Xero, or correct the
 bill total in IMS.
 
+**A sales invoice that loses PART of its payment is recorded, not reversed.** When a payment Xero used to hold against a
+sales invoice is deleted or reduced, the invoice reads *AUTHORISED* with less paid than the IMS recorded (the IMS holds the
+order as paid in full). If the order was marked paid **from Xero**, the shortfall is a removal, and the IMS measures it from
+Xero's own figures: the amount the IMS recorded as paid (the order total, less any shortfall already recorded) minus what Xero
+reports as paid against the invoice. The IMS then:
+
+- **Records the amount on the order** as *not received* (`Payment removed from Xero`). **Paid** stays set, because revenue was
+  recognised on the payment, but the order is no longer **fully** paid: the order list shows **Part paid**, the order page shows the
+  reduced paid figure and the balance due, the receivables reports and customer balances include the missing amount, the invoice PDF
+  drops its **PAID** stamp, and the order is not sent to the warehouse until the shortfall clears. **Mark Paid** is not re-armed, so
+  nothing can be paid twice.
+- **Names the payment**, when it can. If a payment the IMS registered is no longer among the payments Xero lists, and the missing
+  payments add up to the measured amount exactly, the warning names the Xero payment id. Otherwise the amount is the only
+  identification, and the warning says so.
+- **Warns once.** An order warning *Part of a payment is no longer in Xero* and an admin notification carry the exact figures (Xero
+  paid, IMS recorded, amount removed, order total). Because the removal is now on the order, later polls and rechecks of the same
+  Xero state measure nothing and write nothing: the withheld warning for this document closes on its next recheck and does not
+  repeat. A further removal adds to the recorded amount; a payment that comes back subtracts; an invoice that reads **paid** again clears it **only when Xero's payments cover it** (no allocated credit). An invoice that reads paid because a credit settled it keeps the recorded amount and warns once, because a credit settling a removed payment is the credit-versus-write-off decision, not the payment coming back. Receivables reports for an earlier date use the amount that stood on that date, from the recorded history. **Limit:** receivables reports read the order's *current* paid flag, as they always have. An order whose paid state was later cleared outright (a full payment reversal, a deleted payment, or Mark Paid turned off) therefore shows as unpaid in a report dated before that clear, and its earlier shortfall is not subtracted; only the order's payment rows stand for it there.
+- **Does not touch revenue and does not post to Xero.** No credit note is raised and no deferred or recognised revenue is unwound.
+  Whether the removed amount should be **credited** (a credit note against the sale) or **written off as a bad debt** is an accounting
+  decision for the order owner, so the IMS leaves it to them and the warning says so. Credit notes you raise in Xero or in the IMS
+  follow the usual refund path.
+
+Not measured, and left withheld exactly as before: an order paid in a shopping channel or marked paid by hand (the ledger's figure is
+then the IMS's own silence, not a removal), an order that already has a credit note or refund, an invoice that also carries allocated
+credit in Xero, an invoice in a different currency from the order, a payment registration that had not finished when Xero was asked,
+and any figure Xero did not state. A **full** removal (nothing paid any more) is unchanged: the zero-paid proof above decides it.
+
 **But a payment that is present need not be *ours*.** If somebody in Xero deletes the payment the IMS
 registered and applies a different one in its place, the ledger still holds *a* payment — and reading
 only the amount would keep the bill marked paid for ever, with the supplier never actually paid. So

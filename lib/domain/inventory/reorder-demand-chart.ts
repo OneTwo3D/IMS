@@ -12,6 +12,7 @@ import {
   type ReplenishmentReportDeps,
 } from '@/lib/domain/inventory/replenishment-reports'
 import { DEFAULT_PROJECTION_HORIZON_DAYS, projectStockPosition } from '@/lib/domain/inventory/reorder-timing'
+import { applyGrowth, formatGrowthPercent, resolveGrowthPercent } from '@/lib/domain/inventory/forecast-growth'
 import { calculateDailyVelocity, calculateStockoutAdjustedVelocity } from '@/lib/domain/inventory/velocity'
 import { MAX_STOCKOUT_WINDOW_DAYS, getStockoutHistory, type StockoutHistory } from '@/lib/domain/inventory/stockout-history'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
@@ -98,6 +99,8 @@ export type ReorderDemandChart = {
   hasHistory: boolean
   /** The Ignore stockouts toggle: averageDailyDemand excludes stockout days from the average. */
   ignoreStockouts: boolean
+  /** Growth factor applied to the demand rate. Only present when it is not 0. */
+  growthPercent?: number
   /** Snapshot coverage over the history window (and the demand window when it reaches further back). */
   stockout: {
     firstCoveredDate: string | null
@@ -115,7 +118,7 @@ export type ReorderDemandChart = {
 
 export type ReorderDemandChartFilters = Pick<
   StockPositionFilters,
-  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'ignoreStockouts'
+  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'ignoreStockouts' | 'growthPercent'
 >
 
 type ChartClient = ReplenishmentReportClient & {
@@ -170,6 +173,8 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     loadSnapshotCoverage: input.deps?.loadSnapshotCoverage,
   }
   const ignoreStockouts = filters.ignoreStockouts === true
+  // Same validation as the report, so the chart cannot show a different rate than the row it was opened from.
+  const growth = resolveGrowthPercent(filters.growthPercent)
 
   const demandDays = positiveInt(filters.thresholdDays) ?? DEFAULT_DEMAND_WINDOW_DAYS
   const targetCoverWeeks = Math.min(MAX_TARGET_COVER_WEEKS, positiveInt(filters.targetCoverWeeks) ?? DEFAULT_TARGET_COVER_WEEKS)
@@ -184,6 +189,7 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     targetCoverWeeks,
     includeZero: true,
     ...(ignoreStockouts ? { ignoreStockouts: true } : {}),
+    ...(growth.percent !== 0 ? { growthPercent: growth.percent } : {}),
   }
   const report = await getReorderReport(planFilters, { paginate: false, deps: reportDeps })
   const row = report.rows.find((candidate) => candidate.productId === input.productId)
@@ -225,7 +231,7 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     ? calculateStockoutAdjustedVelocity(sources.sales, velocityWindow, new Map([[input.productId, demandWindowStockoutDays]]))
       .find((entry) => entry.productId === input.productId)
     : calculateDailyVelocity(sources.sales, velocityWindow).find((entry) => entry.productId === input.productId)
-  const averageDailyDemand = toDecimal(velocity?.dailyQtyVelocity ?? 0)
+  const averageDailyDemand = applyGrowth(toDecimal(velocity?.dailyQtyVelocity ?? 0), growth)
   const demandClamped = adjustDemand && velocity != null && 'clamped' in velocity && velocity.clamped === true
   const stockoutByDate = new Map(stockoutHistory.days.map((day) => [day.date, day]))
   const historyFromStr = dateOnly(historyFrom)
@@ -341,6 +347,10 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
       ? `Ignore stockouts is on, but ${demandWindowStockoutDays} of ${demandDays} demand-window days had no stock (90% or more), so the unadjusted demand rate is used.`
       : `Ignore stockouts is on: ${demandWindowStockoutDays} stockout day(s) in the ${demandDays}-day demand window are excluded, so demand is units sold / ${demandDays - demandWindowStockoutDays} days.`)
   }
+  if (growth.percent !== 0) {
+    notices.push(`Growth factor ${formatGrowthPercent(growth.percent)} is applied: projected demand is the flat average multiplied by ${growth.factor.toFixed()}. History bars are actual sales and are not scaled.`)
+  }
+  if (growth.notice) notices.push(growth.notice)
   if (projection.lateInboundQty.gt(0)) {
     notices.push(`${roundQuantity(projection.lateInboundQty, 0).toString()} units on open POs are past their expected delivery date (earliest ${projection.lateInboundEarliestDate}). They are not in the projection until received or re-dated.`)
   }
@@ -392,6 +402,7 @@ export async function getReorderDemandChart(input: GetReorderDemandChartInput): 
     openingQty: num(sources.availableQty),
     hasHistory: historyRows > 0,
     ignoreStockouts,
+    ...(growth.percent !== 0 ? { growthPercent: growth.percent } : {}),
     stockout: {
       firstCoveredDate: stockoutHistory.firstCoveredDate,
       coveredDays: stockoutHistory.coveredDayCount,

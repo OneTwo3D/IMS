@@ -178,6 +178,8 @@ function makeDependencies(options: {
   order?: Partial<OrderDouble>
   /** Configured return reasons the db double knows about; absent = the double has no returnReason delegate at all. */
   returnReasons?: Array<{ id: string; name: string; active: boolean; sortOrder: number }>
+  /** Open "Refund in WooCommerce" tasks on the order (zvec.19). None by default: a refund that began in WooCommerce. */
+  openTasks?: Array<{ id: string; externalOrderId: string; payload: unknown }>
 } = {}) {
   const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
@@ -297,7 +299,10 @@ function makeDependencies(options: {
           }
         },
       },
+      // zvec.19: the open-task match reads these before anything else; with no open task it stops there and the import runs as it always did.
+      wmsOperatorTask: { async findMany() { return options.openTasks ?? [] } },
       salesOrderRefund: {
+        async findMany() { return [] },
         async findFirst(args: { where?: { externalRefundId?: number } }) {
           if (options.alwaysMissExistingRefund) return null
           return refunds.find((refund) => refund.externalRefundId === args.where?.externalRefundId) ?? null
@@ -1910,4 +1915,12 @@ test('resolveReturnReasonId never creates a reason: it only reads', async () => 
   const { resolveReturnReasonId } = await import('@/lib/connectors/woocommerce/sync/refund-sync')
   assert.equal(await resolveReturnReasonId(client as never, 'Something new'), null)
   assert.deepEqual(calls, ['findFirst'])
+})
+
+test('zvec.19: a refund that began in WooCommerce (no open Refund in WooCommerce task) is imported exactly as before', async () => {
+  const state = makeDependencies({ openTasks: [] })
+  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal(state.createRefundCalls, 1, 'one credit note is raised for it')
+  assert.equal(state.refunds.length, 1)
 })

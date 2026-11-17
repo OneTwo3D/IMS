@@ -13,6 +13,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { classifyByKeyword } from '@/lib/trade/hs-keyword-rules'
+import { clampCustomsDescription, isUnusableCustomsDescription } from '@/lib/trade/customs-description'
 
 // Models: cheap workhorse first, escalate to the stronger model on ambiguity (matches plugin).
 export const HS_CLASSIFIER_DEFAULT_MODEL = 'claude-sonnet-4-6'
@@ -31,6 +32,8 @@ export type HsProposal = {
   cnCode: string | null
   modelConfidence: number
   reasoning: string
+  /** Model-written customs description ("article + key attribute"); clamped to 50 chars. Optional for stubs. */
+  customsDescription?: string | null
 }
 
 export type HsClassificationSource = 'ai-default' | 'ai-escalated' | 'keyword-fallback'
@@ -44,6 +47,11 @@ export type HsClassification = {
   modelConfidence: number
   reasoning: string
   escalated: boolean
+  /**
+   * Proposed customs description (<= 50 chars) or null. AI-written when usable, otherwise the
+   * keyword rule's description. A PROPOSAL only: never applied over a stored product value.
+   */
+  customsDescription: string | null
 }
 
 /** A single model pass — injectable so the escalation pipeline is testable without the API. */
@@ -106,7 +114,21 @@ export async function classifyWithEscalation(
     modelConfidence: proposal.modelConfidence,
     reasoning: proposal.reasoning,
     escalated,
+    customsDescription: finalizeCustomsDescription(proposal.customsDescription, input),
   }
+}
+
+/** Clamp the model's description; if blank/stop-word-only/brand-only, fall back to the keyword rule's. */
+function finalizeCustomsDescription(raw: string | null | undefined, input: HsClassifierInput): string | null {
+  const clamped = clampCustomsDescription(raw)
+  if (clamped && !isUnusableCustomsDescription(clamped, input.name)) return clamped
+  return keywordCustomsDescription(input)
+}
+
+function keywordCustomsDescription(input: HsClassifierInput): string | null {
+  const text = [input.name, input.description, input.categoryPath].filter(Boolean).join(' ')
+  const match = classifyByKeyword(text)
+  return match.matched ? clampCustomsDescription(match.customsDescription) || null : null
 }
 
 /** Deterministic keyword classification, used when the Claude tier is unavailable. */
@@ -124,6 +146,7 @@ export function classifyByKeywordFallback(input: HsClassifierInput): HsClassific
       ? `Keyword rule matched: ${match.customsDescription}`
       : 'No keyword match; defaulted to generic 3D-printer component code',
     escalated: false,
+    customsDescription: match.matched ? clampCustomsDescription(match.customsDescription) || null : null,
   }
 }
 
@@ -134,17 +157,24 @@ const CLASSIFY_SCHEMA = {
     cn_code: { type: 'string', description: 'The 8-digit 2026 EU CN (Combined Nomenclature) code, digits only.' },
     confidence: { type: 'integer', description: 'Your confidence in the code, 0-100.' },
     reasoning: { type: 'string', description: 'One or two sentences justifying the code.' },
+    customs_description: {
+      type: 'string',
+      description:
+        'Customs goods description: "article + key attribute", English, no stop words, never brand-only, at most 50 characters.',
+    },
   },
-  required: ['cn_code', 'confidence', 'reasoning'],
+  required: ['cn_code', 'confidence', 'reasoning', 'customs_description'],
 } as const
 
 const SYSTEM_PROMPT =
   'You are a customs classification specialist. Given a product, return its 2026 EU Combined ' +
   'Nomenclature (CN) code as exactly 8 digits, with a short justification and a 0-100 confidence. ' +
   'Classify by the essential character and material of the goods, not the brand or marketing copy. ' +
-  'If you are unsure, give your best code and a lower confidence rather than refusing.'
+  'If you are unsure, give your best code and a lower confidence rather than refusing. ' +
+  'Also return customs_description: "article + key attribute" (e.g. "brass nozzle, 3D printer extruder"), ' +
+  'in English, free of stop words ("parts", "accessories", "spares"), never brand-only, and at most 50 characters.'
 
-function buildAnthropicClassify(client: Anthropic): HsModelClassify {
+export function buildAnthropicClassify(client: Anthropic): HsModelClassify {
   return async (input, model, { thinking }) => {
     const userText = [
       `Name: ${input.name}`,
@@ -178,6 +208,7 @@ function buildAnthropicClassify(client: Anthropic): HsModelClassify {
       cn_code?: unknown
       confidence?: unknown
       reasoning?: unknown
+      customs_description?: unknown
     }
     if (typeof parsed.cn_code !== 'string' || parsed.cn_code.trim() === '') {
       throw new Error(`HS classifier: ${model} returned no cn_code`)
@@ -187,6 +218,9 @@ function buildAnthropicClassify(client: Anthropic): HsModelClassify {
       cnCode: parsed.cn_code,
       modelConfidence: Math.max(0, Math.min(100, Math.round(rawConfidence))),
       reasoning: typeof parsed.reasoning === 'string' ? parsed.reasoning : '',
+      // Missing/non-string is tolerated: finalizeCustomsDescription falls back to the keyword rule.
+      customsDescription:
+        typeof parsed.customs_description === 'string' ? clampCustomsDescription(parsed.customs_description) : null,
     }
   }
 }

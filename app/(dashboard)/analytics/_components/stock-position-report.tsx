@@ -52,6 +52,8 @@ export type StockPositionFilterValues = {
   targetCoverWeeks?: string
   // o3d-s8n.3: reorder-only. Remove stockout days from the demand average.
   ignoreStockouts?: boolean
+  // reorder-only growth percentage, carried as typed so the page address and CSV link keep it.
+  growthPercent?: string
 }
 
 type StockPositionReportPageProps<Row> = {

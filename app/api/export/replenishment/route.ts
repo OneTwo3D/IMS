@@ -9,11 +9,13 @@ import {
 } from '@/lib/domain/inventory/replenishment-reports'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { canAccessReplenishmentReports } from '@/lib/security/replenishment-report-access'
+import { growthForCarry } from '@/lib/domain/inventory/forecast-growth'
+import { hasPermission } from '@/lib/permissions'
 import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
 import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const EXPORT_COLUMNS: Record<string, string[]> = {
-  'reorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency', 'requiredReceiptDate', 'latestPoDate', 'latestPoOverdue', 'timingBasis', 'firstShortageDate', 'lateInboundQty', 'lateInboundDueDate'],
+  'reorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'neededFor', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency', 'requiredReceiptDate', 'latestPoDate', 'latestPoOverdue', 'timingBasis', 'firstShortageDate', 'lateInboundQty', 'lateInboundDueDate', 'forecastSales', 'forecastMargin'],
   'backorder': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt'],
   'component-shortage': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts'],
 }
@@ -67,6 +69,8 @@ function filtersFromRequest(req: NextRequest): StockPositionFilters {
     targetCoverWeeks: positiveInteger(one(req, 'targetCoverWeeks')),
     // o3d-s8n.3: the CSV must carry the same demand the page showed.
     ...(one(req, 'ignoreStockouts') === '1' ? { ignoreStockouts: true } : {}),
+    // the CSV carries the same growth-scaled demand the page showed (validated again in the report).
+    ...(growthForCarry(one(req, 'growthPercent')) !== undefined ? { growthPercent: growthForCarry(one(req, 'growthPercent')) } : {}),
   }
 }
 
@@ -98,7 +102,10 @@ export async function GET(req: NextRequest) {
     case 'reorder': {
       // audit-5f19: the CSV always lists every product (including zero-reorder),
       // even when the on-screen report is filtered to products needing replenishment.
-      const report = await getReorderReport({ ...filters, includeZero: true }, { paginate: false })
+      // forecast sales / margin are price and cost figures, gated like the PO margin (inventory.prices).
+      // Without the permission the two appended columns stay in the contract but are blank.
+      const canSeeMoney = hasPermission(session.user.role, 'inventory.prices')
+      const report = await getReorderReport({ ...filters, includeZero: true, ...(canSeeMoney ? { includeForecastMoney: true } : {}) }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
@@ -130,6 +137,10 @@ export async function GET(req: NextRequest) {
         firstShortageDate: row.firstShortageDate ?? '',
         lateInboundQty: row.lateInboundQty,
         lateInboundDueDate: row.lateInboundDueDate ?? '',
+        // Appended LAST so every existing column keeps its position. A forward-looking estimate, base currency
+        // ex-VAT; the word "unavailable" (never 0) where the price or the cost history is missing.
+        forecastSales: row.forecastSales === undefined ? '' : row.forecastSales ?? 'unavailable',
+        forecastMargin: row.forecastMargin === undefined ? '' : row.forecastMargin ?? 'unavailable',
       }))
       return csvResponseWithNotices(toCsv(data, EXPORT_COLUMNS['reorder']), `reorder-${date}.csv`, report.notices, { includeInBody })
     }

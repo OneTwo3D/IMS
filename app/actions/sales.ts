@@ -1,5 +1,6 @@
 'use server'
 
+import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
@@ -275,6 +276,8 @@ export type SoRow = {
   invoicedAt: string | null
   accountingInvoiceId: string | null
   paidAt: string | null
+  /** o3d-cdhl: the part of the payment the accounting ledger no longer holds (order currency), or null. */
+  paymentRemovedForeign: number | null
   notes: string | null
   internalNotes: string | null
   shippingCountryCode: string | null
@@ -544,6 +547,7 @@ const SO_SELECT = {
   invoicedAt: true,
   accountingInvoiceId: true,
   paidAt: true,
+  paymentRemovedForeign: true,
   notes: true,
   internalNotes: true,
   shippingAddress: true,
@@ -610,6 +614,7 @@ function mapSoRow(so: {
   invoicedAt: Date | null
   accountingInvoiceId: string | null
   paidAt: Date | null
+  paymentRemovedForeign?: unknown
   notes: string | null
   internalNotes: string | null
   shippingAddress: unknown
@@ -717,6 +722,7 @@ function mapSoRow(so: {
     invoicedAt: so.invoicedAt?.toISOString() ?? null,
     accountingInvoiceId: so.accountingInvoiceId,
     paidAt: so.paidAt?.toISOString() ?? null,
+    paymentRemovedForeign: so.paymentRemovedForeign == null ? null : Number(so.paymentRemovedForeign),
     notes: so.notes,
     internalNotes: so.internalNotes,
     shippingCountryCode: toIsoCountryCode((so.shippingAddress as Record<string, string> | null)?.country) ?? null,
@@ -3896,6 +3902,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
       const paidAt = markingAsPaid ? new Date() : null
+      await appendShortfallCleared(tx, id)
       await tx.salesOrder.update({
         where: { id },
         data: {
@@ -3909,6 +3916,10 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
           // sets the flag records where it came from; toggling OFF clears both together, which is what
           // stops a later ledger-sourced paid transition inheriting a stale marker.
           unregisteredPaidAt: paidAt,
+          // o3d-cdhl: a part of the payment recorded as missing from the ledger belongs to the paid state it describes. Toggling the
+          // flag either way starts a new paid state, so the figure goes with it.
+          paymentRemovedForeign: null,
+          paymentRemovedAt: null,
         },
       })
       return { so: row, markingAsPaid }
@@ -4633,10 +4644,13 @@ async function removePaymentAndSettlePaidAt(
   // Only a genuine paid → not-paid transition is a mismatch. An order that was never fully paid
   // (e.g. shipped on credit terms) isn't flagged just because a partial payment was removed.
   const becameUnpaid = input.paidAt !== null && !stillFullyPaid
+  if (!stillFullyPaid) await appendShortfallCleared(tx, input.orderId)
   await tx.salesOrder.update({
     where: { id: input.orderId },
     data: {
       paidAt: stillFullyPaid ? undefined : null,
+      // o3d-cdhl: the shortfall describes the paid state that is being cleared.
+      ...(stillFullyPaid ? {} : { paymentRemovedForeign: null, paymentRemovedAt: null }),
       // o3d-psrx r2: the provenance follows `paidAt` exactly — cleared when the flag is cleared, left
       // alone when the remaining receipts still settle the order. A marker outliving the flag it
       // describes would withhold the next reversal on evidence that no longer exists.
