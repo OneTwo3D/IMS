@@ -21,7 +21,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import {
   updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
-  updateSalesOrderNotes, generateInvoiceNumber,
+  updateSalesOrderNotes, updateSalesOrderAddressesAndNotes, generateInvoiceNumber,
   addPayment, deletePayment, reverseLedgerPayment, releaseWithdrawalHold,
   type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
@@ -40,7 +40,7 @@ import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
-import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
+import { SHOP_DESYNC_WARNING, resolveSalesOrderEditBlock, resolveSalesOrderEditScope } from '@/lib/domain/sales/order-edit-affordance'
 import { SoFormDialog } from '../so-form'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
 import { nextStatusActions } from '@/lib/domain/sales/status-flow'
@@ -318,6 +318,72 @@ function NotesDialog({ order, onClose }: { order: SoDetail; onClose: () => void 
         <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
         <Button onClick={handleSave} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Notes</Button>
       </DialogFooter>
+    </DialogContent></Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Edit addresses and notes (the one edit a dispatched order allows)
+// ---------------------------------------------------------------------------
+const ADDRESS_FIELDS: Array<[string, string]> = [['line1', 'Address line 1'], ['line2', 'Address line 2'], ['city', 'City'], ['county', 'County / state'], ['postcode', 'Postcode'], ['country', 'Country']]
+
+function AddressFields({ title, value, onChange }: { title: string; value: Record<string, string>; onChange: (next: Record<string, string>) => void }) {
+  return (
+    <div className="space-y-2">
+      <h3 className="text-sm font-medium">{title}</h3>
+      {ADDRESS_FIELDS.map(([key, label]) => (
+        <div key={key} className="space-y-1">
+          <Label className="text-xs text-muted-foreground">{label}</Label>
+          <Input value={value[key] ?? ''} onChange={(e) => onChange({ ...value, [key]: e.target.value })} className="h-8 text-sm" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function AddressesDialog({ order, onClose }: { order: SoDetail; onClose: () => void }) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [billing, setBilling] = useState<Record<string, string>>({ ...((order.billingAddress ?? {}) as Record<string, string>) })
+  const [shipping, setShipping] = useState<Record<string, string>>({ ...((order.shippingAddress ?? {}) as Record<string, string>) })
+  const [notes, setNotes] = useState(order.notes ?? '')
+  const [internal, setInternal] = useState(order.internalNotes ?? '')
+  const [error, setError] = useState('')
+  const [confirmDesync, setConfirmDesync] = useState(false)
+  function save(acknowledged: boolean) {
+    if (order.hasExternalSource && !acknowledged) { setConfirmDesync(true); return }
+    startTransition(async () => {
+      const r = await updateSalesOrderAddressesAndNotes(order.id, { billingAddress: billing, shippingAddress: shipping, notes, internalNotes: internal }, order.updatedAt, order.hasExternalSource ? { acknowledgeShopDesync: acknowledged } : undefined)
+      if (r.success) { router.refresh(); onClose() } else setError(r.error ?? 'Failed')
+    })
+  }
+  return (
+    <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogHeader><DialogTitle>Edit addresses and notes</DialogTitle></DialogHeader>
+      <p className="text-xs text-muted-foreground">This order has been dispatched, so only its addresses and notes can change. Use Refund (or add a line) for a change to what was sent.</p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <AddressFields title="Billing address" value={billing} onChange={setBilling} />
+        <AddressFields title="Shipping address" value={shipping} onChange={setShipping} />
+      </div>
+      <div className="space-y-1.5"><Label>Customer Notes</Label>
+        <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" /></div>
+      <div className="space-y-1.5"><Label>Private Notes (internal only)</Label>
+        <Textarea value={internal} onChange={(e) => setInternal(e.target.value)} rows={2} className="text-sm resize-none" /></div>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      <DialogFooter>
+        <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+        <Button onClick={() => save(false)} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save</Button>
+      </DialogFooter>
+      {confirmDesync && (
+        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false}>
+          <DialogHeader><DialogTitle>This edit will not reach WooCommerce</DialogTitle></DialogHeader>
+          <p className="text-sm" data-testid="shop-desync-warning">{SHOP_DESYNC_WARNING}</p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDesync(false)}>Go back</Button>
+            <Button onClick={() => { setConfirmDesync(false); save(true) }}>Edit anyway</Button>
+          </DialogFooter>
+        </DialogContent></Dialog>
+      )}
     </DialogContent></Dialog>
   )
 }
@@ -1027,6 +1093,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
   const [isPending, startTransition] = useTransition()
   const [showRefund, setShowRefund] = useState(false)
   const [showNotes, setShowNotes] = useState(false)
+  const [showAddresses, setShowAddresses] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
   const [showRefunds, setShowRefunds] = useState(false)
   const [showColPicker, setShowColPicker] = useState(false)
@@ -1098,10 +1165,12 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
     accountingSyncEnabled,
   })
   // The same rule the updateSalesOrder action applies, so a disabled Edit says why instead of letting the operator walk into the refusal.
-  const editBlock = resolveSalesOrderEditBlock({
+  const editInput = {
     status: so.status,
     allocations: allocations.length,
     shipments: shipments.length,
+    committedShipments: shipments.filter((shipment) => shipment.status !== 'PENDING').length,
+    shippedShipments: shipments.filter((shipment) => shipment.status === 'SHIPPED').length,
     accountingInvoiceId: so.accountingInvoiceId ?? null,
     wmsPush: so.wmsPush !== null,
     hasExternalSource: so.hasExternalSource,
@@ -1111,8 +1180,13 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
     paid: so.paidAt !== null,
     storeCreditForeign: so.storeCreditForeign,
     invoiceRecords: so.invoiceNumber ? 1 : 0,
-  })
-  const canEditOrder = hasPermission(currentUserRole, 'sales.create')
+    productlessLines: so.lines.filter((l) => !l.productId).length,
+  }
+  const editBlock = resolveSalesOrderEditBlock(editInput)
+  // What the page offers: the full edit; only addresses and notes (a dispatched order); or nothing, with the reason.
+  const editScope = resolveSalesOrderEditScope(editInput)
+  // A confirmed edit re-reserves stock, so the server also asks for the permission to allocate (sales.process); a draft edit and an addresses-and-notes edit need only sales.create.
+  const canEditOrder = hasPermission(currentUserRole, 'sales.create') && (so.status === 'DRAFT' || editScope.scope === 'ADDRESS_NOTES' || hasPermission(currentUserRole, 'sales.process'))
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
   // Reads the orthogonal refundStatus so it keeps working once a partial refund no
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
@@ -1512,8 +1586,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
           {canEditOrder && (
             // The reason lives on the wrapper, not the button: a disabled button swallows pointer events in several browsers.
             <span title={editBlock?.reason} className="inline-flex">
-              <Button variant="outline" size="sm" onClick={() => setShowEdit(true)} disabled={isPending || editBlock !== null || !editForm} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
-                <Pencil className="h-4 w-4 mr-1" />{so.isQuote ? 'Edit quote' : 'Edit order'}
+              <Button variant="outline" size="sm" onClick={() => (editScope.scope === 'ADDRESS_NOTES' ? setShowAddresses(true) : setShowEdit(true))} disabled={isPending || editScope.scope === 'NONE' || (editScope.scope === 'FULL' && !editForm)} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
+                <Pencil className="h-4 w-4 mr-1" />{editScope.scope === 'ADDRESS_NOTES' ? 'Edit addresses & notes' : so.isQuote ? 'Edit quote' : 'Edit order'}
               </Button>
               {editBlock && <span id="edit-order-blocked-reason" className="sr-only">{editBlock.reason}</span>}
             </span>
@@ -2178,7 +2252,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
       {/* Dialogs */}
       {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
-      {showEdit && editForm && editBlock === null && (
+      {showAddresses && editScope.scope === 'ADDRESS_NOTES' && <AddressesDialog order={so} onClose={() => setShowAddresses(false)} />}
+      {showEdit && editForm && editScope.scope === 'FULL' && (
         <SoFormDialog {...editForm} warehouses={warehouses} currencies={currencies} order={so} onClose={() => setShowEdit(false)} />
       )}
       {accountingAvailable && showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}
