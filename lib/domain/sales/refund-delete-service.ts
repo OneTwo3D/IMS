@@ -527,7 +527,8 @@ export async function deleteSalesOrderRefund(
 
       // ---- 5. THE RECORD: PDF evidence is withdrawn (kept, detached), fetch state and lines go, then the refund ----
       await tx.salesOrderInvoiceDocument.updateMany({ where: { refundId: refund.id }, data: { refundId: null, withdrawnAt: now } })
-      await tx.invoiceDocumentFetchState.deleteMany({ where: { refundId: refund.id } })
+      // Statutory records are never deleted: the credit note's fetch state is detached from the refund and closed (DONE, nothing scheduled), not removed.
+      await tx.invoiceDocumentFetchState.updateMany({ where: { refundId: refund.id }, data: { refundId: null, status: 'DONE', nextAttemptAt: null, leaseUntil: null, leaseHolder: null } })
       await tx.salesOrderRefundLine.deleteMany({ where: { refundId: refund.id } })
       await tx.salesOrderRefund.delete({ where: { id: refund.id } })
 
@@ -594,14 +595,18 @@ async function retireSyncRow(tx: Tx, row: SyncRow, reason: string): Promise<void
 export async function completeRefundDeletionAfterVoid(
   client: RefundDeleteClient,
   input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
-): Promise<{ ok: true; productIds: string[] } | { ok: false; error: string }> {
+): Promise<{ ok: true; productIds: string[]; stockSyncFailed: boolean } | { ok: false; error: string }> {
   const result = await deleteSalesOrderRefund(client, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
   if (!result.success) return { ok: false, error: `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${result.error}` }
+  // The delete is committed; a storefront stock push that could not be queued is reported to the caller (it records it), never swallowed.
+  let stockSyncFailed = false
   if (result.productIds.length > 0) {
     try {
       const { enqueueStockSync } = await import('@/lib/shopping')
       await enqueueStockSync(result.productIds, 'IMS_CHANGE')
-    } catch { /* the stock change goes with the next stock sync */ }
+    } catch {
+      stockSyncFailed = true
+    }
   }
-  return { ok: true, productIds: result.productIds }
+  return { ok: true, productIds: result.productIds, stockSyncFailed }
 }

@@ -6790,6 +6790,9 @@ export async function processClaimedEntry(
         const { completeRefundDeletionAfterVoid } = await import('@/lib/domain/sales/refund-delete-service')
         const finished = await completeRefundDeletionAfterVoid(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null })
         if (!finished.ok) return { success: false, error: finished.error }
+        if (finished.stockSyncFailed) {
+          await logActivity({ entityType: 'SALES_ORDER', entityId: referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
+        }
       }
       return { success: true, externalId: voidCreditNoteId }
     }
