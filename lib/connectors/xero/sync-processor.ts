@@ -6776,8 +6776,8 @@ export async function processClaimedEntry(
       // from what is there (voidCreditNote), so a retry after a lost response or a partial failure converges instead of erroring.
       const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
       if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
-      const voidFence = await lease.fenceBeforeRemoteWrite('credit-note-void')
-      if (!voidFence.ok) return voidFence.result
+      const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
+      if (!fence.ok) return fence.result
       const voided = await voidCreditNote(
         { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
         { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
