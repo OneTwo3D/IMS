@@ -3983,6 +3983,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           },
         })
       }
+      // The stamped regime is mirrored on EVERY successful create-path return (held invoice, non-processing, initial import), not only the
+      // fully accounted one.
+      await mirrorIossFromRegime(so.id)
       return { success: true as const, orderId: so.id }
     }
 

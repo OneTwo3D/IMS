@@ -16,6 +16,13 @@ export function parseShopIossNumber(raw: string | null | undefined): string | nu
   return /^IM\d{10}$/.test(value) ? value : null
 }
 
+/** The shop's CURRENT IOSS number (null when unset or malformed). Read at warehouse-create time, never from a copy stored on an order. */
+export async function readShopIossNumber(): Promise<string | null> {
+  const { db } = await import('@/lib/db')
+  const row = await db.setting.findUnique({ where: { key: SHOP_IOSS_NUMBER_SETTING } })
+  return parseShopIossNumber(row?.value)
+}
+
 export type MirroredIossFields = { iossNumber: string | null; deliveryTerm: 'IOSS_DDP' | 'DDP' | null }
 
 export function iossFieldsFromRegime(regime: string | null | undefined, shopIossNumber: string | null): MirroredIossFields {
