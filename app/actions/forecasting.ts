@@ -512,6 +512,7 @@ export async function createReorderPOs(
           timingBasis: row.timingBasis,
           earliestPossibleDate: delivery.earliestPossibleDate,
           expectedDeliveryClamped: delivery.clamped,
+          expectedDeliveryBasis: delivery.basis,
         }
         return {
           productId: row.productId,
@@ -542,7 +543,8 @@ export async function createReorderPOs(
           totalBase: subtotalBase,
           internalNotes: REORDER_PO_NOTE,
           destinationWarehouseId,
-          // Each line carries its own date; the header is the earliest of them (null when no line is dated).
+          // Each line carries its own date; the header is the earliest of them, null if any line is undated (an undated
+          // line would otherwise inherit the header's date).
           expectedDelivery: earliestLineDelivery(lineDates),
           lines: { create: lineData },
         },

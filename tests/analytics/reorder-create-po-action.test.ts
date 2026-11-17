@@ -99,7 +99,7 @@ test('a recent draft for the same supplier and destination is still skipped as a
   assert.equal(state.created.length, 0)
 })
 
-test('line dates come from requiredReceiptDate (clamped to today + lead time); header is the earliest line date', async () => {
+test('line dates come from requiredReceiptDate (clamped to today + lead time), undated rows take the lead-time floor; header is the earliest line date', async () => {
   const { createReorderPOs } = await import('@/app/actions/forecasting')
   state.rows = [
     row('far', { requiredReceiptDate: day(60), leadTimeDays: 10, timingBasis: 'projected', latestPoDate: day(50) }),
@@ -111,8 +111,10 @@ test('line dates come from requiredReceiptDate (clamped to today + lead time); h
   const [far, overdue, none] = data.lines.create
   assert.equal(far.expectedDelivery.toISOString().slice(0, 10), day(60))
   assert.equal(overdue.expectedDelivery.toISOString().slice(0, 10), day(14))
-  assert.equal(none.expectedDelivery, null)
-  assert.equal(data.expectedDelivery.toISOString().slice(0, 10), day(14))
+  assert.equal(none.expectedDelivery.toISOString().slice(0, 10), day(10), 'undated row: today + its own lead time')
+  assert.equal(none.reorderEvidence.expectedDeliveryBasis, 'lead_time_floor')
+  assert.equal(far.reorderEvidence.expectedDeliveryBasis, 'required_receipt')
+  assert.equal(data.expectedDelivery.toISOString().slice(0, 10), day(10))
   assert.equal(overdue.reorderEvidence.expectedDeliveryClamped, true)
   assert.equal(overdue.reorderEvidence.requiredReceiptDate, day(-5))
   assert.equal(overdue.reorderEvidence.earliestPossibleDate, day(14))
@@ -121,13 +123,18 @@ test('line dates come from requiredReceiptDate (clamped to today + lead time); h
   assert.equal(far.reorderEvidence.timingBasis, 'projected')
 })
 
-test('all rows without a required date leave line and header dates null', async () => {
+test('every line is dated, so none inherits the header date; an unusable lead time nulls line and header', async () => {
   const { createReorderPOs } = await import('@/app/actions/forecasting')
   state.rows = [row('p1'), row('p2')]
   await createReorderPOs(['p1', 'p2'], {})
-  const data = state.created[0].data
-  assert.equal(data.expectedDelivery, null)
-  assert.deepEqual(data.lines.create.map((l: Row) => l.expectedDelivery), [null, null])
+  const first = state.created[0].data
+  assert.ok(first.lines.create.every((l: Row) => l.expectedDelivery instanceof Date))
+  state.rows = [row('p1', { requiredReceiptDate: day(30) }), row('bad', { leadTimeDays: Number.NaN })]
+  await createReorderPOs(['p1', 'bad'], {})
+  const second = state.created[1].data
+  assert.equal(second.lines.create[1].expectedDelivery, null)
+  assert.equal(second.lines.create[1].reorderEvidence.expectedDeliveryBasis, 'none')
+  assert.equal(second.expectedDelivery, null, 'header null when any line is undated')
 })
 
 test('a supplier override moves the line to the chosen supplier draft and is stamped in the evidence', async () => {

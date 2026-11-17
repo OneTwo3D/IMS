@@ -170,17 +170,26 @@ test('a required date exactly at today + lead time is not reported as clamped', 
   assert.equal(r.clamped, false)
 })
 
-test('no required receipt date leaves the line undated', () => {
+test('no required receipt date uses the lead-time floor, not null', () => {
   const r = reorderLineExpectedDelivery({ requiredReceiptDate: null, leadTimeDays: 14 }, NOW)
-  assert.equal(r.expectedDelivery, null)
+  assert.equal(r.expectedDelivery?.toISOString(), '2026-11-30T00:00:00.000Z')
+  assert.equal(r.basis, 'lead_time_floor')
   assert.equal(r.clamped, false)
   assert.equal(r.rawRequiredReceiptDate, null)
+  assert.equal(reorderLineExpectedDelivery({ requiredReceiptDate: '2026-12-31', leadTimeDays: 14 }, NOW).basis, 'required_receipt')
 })
 
-test('header date is the earliest dated line, null when none is dated', () => {
+test('no required date and an unusable lead time leaves the line null', () => {
+  const r = reorderLineExpectedDelivery({ requiredReceiptDate: null, leadTimeDays: Number.NaN }, NOW)
+  assert.equal(r.expectedDelivery, null)
+  assert.equal(r.basis, 'none')
+})
+
+test('header date is the earliest line date, null when any line is undated', () => {
   const a = new Date('2026-12-05T00:00:00.000Z')
   const b = new Date('2026-11-30T00:00:00.000Z')
-  assert.equal(earliestLineDelivery([a, null, b])?.toISOString(), b.toISOString())
+  assert.equal(earliestLineDelivery([a, b])?.toISOString(), b.toISOString())
+  assert.equal(earliestLineDelivery([a, null, b]), null)
   assert.equal(earliestLineDelivery([null, null]), null)
   assert.equal(earliestLineDelivery([]), null)
 })

@@ -93,12 +93,14 @@ export function sanitizeSupplierOverrides(raw: unknown, allowedProductIds: Itera
 }
 
 export type ReorderLineExpectedDelivery = {
-  /** Date written to the draft line's expectedDelivery; null when the row has no required receipt date. */
+  /** Date written to the draft line's expectedDelivery; null only when neither a required date nor a lead time is usable. */
   expectedDelivery: Date | null
+  /** Where the date came from: the required receipt date, the lead-time floor (no required date), or nothing. */
+  basis: 'required_receipt' | 'lead_time_floor' | 'none'
   /** The row's requiredReceiptDate as read (YYYY-MM-DD), or null. */
   rawRequiredReceiptDate: string | null
   /** today + the row's lead time: the soonest a PO placed today can physically arrive. */
-  earliestPossibleDate: string
+  earliestPossibleDate: string | null
   /** True when the required receipt date was earlier than earliestPossibleDate and was moved to it. */
   clamped: boolean
 }
@@ -106,28 +108,40 @@ export type ReorderLineExpectedDelivery = {
 /**
  * Per-line estimated delivery for a draft PO line: the row's required receipt date, clamped to
  * today + lead time (an overdue row's required date is already in the past, and goods cannot arrive sooner than
- * the lead time). No required date (no-demand rows, beyond the horizon) leaves the line undated rather than
- * inventing one. `now` is injected for tests; dates are whole UTC days like the Reorder Planning columns.
+ * the lead time). A row with no required date (no-demand, beyond the horizon) gets the lead-time floor, the earliest
+ * possible arrival, so it never inherits another line's earlier date through the PO header. Only an unusable lead
+ * time leaves the line null. `now` is injected for tests; dates are whole UTC days like the Reorder Planning columns.
  */
 export function reorderLineExpectedDelivery(
   row: Pick<ReorderReportRow, 'requiredReceiptDate' | 'leadTimeDays'>,
   now: Date,
 ): ReorderLineExpectedDelivery {
-  const earliest = new Date(startOfUtcDay(now).getTime() + Math.max(0, row.leadTimeDays) * UTC_DAY_MS)
   const raw = row.requiredReceiptDate
+  if (!Number.isFinite(row.leadTimeDays)) {
+    const needed = raw ? new Date(`${raw}T00:00:00.000Z`) : null
+    const ok = needed != null && !Number.isNaN(needed.getTime())
+    return { expectedDelivery: ok ? needed : null, basis: ok ? 'required_receipt' : 'none', rawRequiredReceiptDate: raw ?? null, earliestPossibleDate: null, clamped: false }
+  }
+  const earliest = new Date(startOfUtcDay(now).getTime() + Math.max(0, row.leadTimeDays) * UTC_DAY_MS)
   const earliestPossibleDate = dateOnly(earliest)
-  if (!raw) return { expectedDelivery: null, rawRequiredReceiptDate: null, earliestPossibleDate, clamped: false }
-  const needed = new Date(`${raw}T00:00:00.000Z`)
-  if (Number.isNaN(needed.getTime())) return { expectedDelivery: null, rawRequiredReceiptDate: raw, earliestPossibleDate, clamped: false }
+  const needed = raw ? new Date(`${raw}T00:00:00.000Z`) : null
+  if (needed == null || Number.isNaN(needed.getTime())) {
+    return { expectedDelivery: earliest, basis: 'lead_time_floor', rawRequiredReceiptDate: raw ?? null, earliestPossibleDate, clamped: false }
+  }
   const clamped = needed.getTime() < earliest.getTime()
-  return { expectedDelivery: clamped ? earliest : needed, rawRequiredReceiptDate: raw, earliestPossibleDate, clamped }
+  return { expectedDelivery: clamped ? earliest : needed, basis: 'required_receipt', rawRequiredReceiptDate: raw, earliestPossibleDate, clamped }
 }
 
-/** PO header date: the earliest dated line (the soonest the order starts to matter), or null when no line is dated. */
+/**
+ * PO header date: the earliest line date, or null when ANY line is undated. A null line inherits the header date
+ * (effectiveLineEta), so a header taken from the other lines would date it wrongly; a null header keeps the order
+ * showing as undated in planning.
+ */
 export function earliestLineDelivery(dates: Array<Date | null>): Date | null {
   let min: Date | null = null
   for (const d of dates) {
-    if (d && (min === null || d.getTime() < min.getTime())) min = d
+    if (!d) return null
+    if ((min === null || d.getTime() < min.getTime())) min = d
   }
   return min
 }
