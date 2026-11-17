@@ -12,7 +12,6 @@ CREATE TABLE "accounting_document_deletions" (
     "released_number" TEXT NOT NULL,
     "target_status" TEXT,
     "state" TEXT NOT NULL DEFAULT 'PENDING',
-    "sync_log_id" TEXT,
     "requested_by_id" TEXT,
     "requested_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "completed_at" TIMESTAMP(3),

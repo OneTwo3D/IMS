@@ -314,18 +314,29 @@ export async function requestAccountingDocumentDelete(
     if (locked.facts.externalDocumentId !== externalId) {
       return { ok: false, code: 'CHANGED', error: `The ${wording(params.kind)} was relinked while the request was being made. Nothing was changed; try again.` }
     }
-    const enqueue = {
-      referenceType: document.referenceType,
-      referenceId: document.referenceId,
-      payload,
-      idempotencyKey: `document-delete:${externalId}`,
-      chartConnector: 'xero' as const,
-      documentConnector: asRoutableAccountingConnector(document.documentConnector),
-    }
+    let outcome: Awaited<ReturnType<typeof queueAccountingSyncTxWithOutcome>>
     // One enqueue per operation the ownership map names (the producer census declares each site).
-    const outcome = params.kind === 'SALES_INVOICE'
-      ? await queueAccountingSyncTxWithOutcome(tx, { ...enqueue, type: 'SALES_INVOICE_DELETE' })
-      : await queueAccountingSyncTxWithOutcome(tx, { ...enqueue, type: 'PURCHASE_INVOICE_DELETE' })
+    if (params.kind === 'SALES_INVOICE') {
+      outcome = await queueAccountingSyncTxWithOutcome(tx, {
+        type: 'SALES_INVOICE_DELETE',
+        referenceType: document.referenceType,
+        referenceId: document.referenceId,
+        payload,
+        idempotencyKey: `document-delete:${externalId}`,
+        chartConnector: 'xero',
+        documentConnector: asRoutableAccountingConnector(document.documentConnector),
+      })
+    } else {
+      outcome = await queueAccountingSyncTxWithOutcome(tx, {
+        type: 'PURCHASE_INVOICE_DELETE',
+        referenceType: document.referenceType,
+        referenceId: document.referenceId,
+        payload,
+        idempotencyKey: `document-delete:${externalId}`,
+        chartConnector: 'xero',
+        documentConnector: asRoutableAccountingConnector(document.documentConnector),
+      })
+    }
     if (!outcome.queued) {
       if (outcome.reason === 'shadowed') {
         return {
@@ -338,11 +349,6 @@ export async function requestAccountingDocumentDelete(
       }
       return { ok: false, code: 'REFUSED', error: `The accounting queue declined the delete (${outcome.reason ?? 'no reason given'}). Nothing was changed. Check the accounting activity log.` }
     }
-    const syncRow = await tx.accountingSyncLog.findFirst({
-      where: { type: syncType, referenceType: document.referenceType, referenceId: document.referenceId, payload: { path: ['_idempotencyKey'], equals: `document-delete:${externalId}` } },
-      orderBy: { createdAt: 'desc' },
-      select: { id: true },
-    })
     const deletion = await tx.accountingDocumentDeletion.create({
       data: {
         kind: params.kind,
@@ -352,7 +358,6 @@ export async function requestAccountingDocumentDelete(
         externalDocumentId: externalId,
         originalNumber: document.number,
         releasedNumber,
-        syncLogId: syncRow?.id ?? null,
         requestedById: params.requestedById,
         snapshot: { requestedFor: document.orderLabel, number: document.number, date: document.date, token, purchaseOrderId: document.purchaseOrderId },
       },
@@ -366,7 +371,7 @@ export async function requestAccountingDocumentDelete(
       tag: 'accounting',
       level: 'INFO',
       description: `Requested deletion of ${locked.facts.label} (${document.orderLabel}) in IMS and Xero. The number is freed first (${releasedNumber || 'no number'}), then the document is deleted or voided in Xero; IMS is updated when Xero confirms.`,
-      metadata: { deletionId: deletion.id, accountingInvoiceId: externalId, originalNumber: document.number, releasedNumber, syncLogId: syncRow?.id ?? null },
+      metadata: { deletionId: deletion.id, accountingInvoiceId: externalId, originalNumber: document.number, releasedNumber },
     })
     return { ok: true, deletionId: deletion.id, releasedNumber }
   })

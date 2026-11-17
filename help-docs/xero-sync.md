@@ -1232,14 +1232,7 @@ The suffix is chosen once, when the delete is queued. IMS reads the document in 
 
 **When the delete is refused** (the page shows the reason in place of the button; every one of these tells the operator to remove the blocking items in the accounting system first, where that is the remedy):
 
-| Reason | Detail |
-|---|---|
-| Payments | A receipt recorded against the invoice, an order held as paid, a payment on the bill. Xero will not void or delete a paid document. |
-| Credit notes | A refund or credit note on the invoice; a supplier credit note on the bill. |
-| Locked period | The document is dated on or before the imported Xero books lock date. |
-| Not created by IMS | The document was raised by another system (Xeroom for sales invoices, Qoblex for bills, during the parallel run) or linked by hand. For an invoice the invoice-number ownership check must also show Xero holds the number under that very document. |
-| Something already queued | Another posting for the document (an update, a payment) or a delete is still queued or running. |
-| Xero's own state | At the moment of the delete, Xero reports a payment, credit note or allocation IMS did not know about, a different document type, or a different number. Nothing is changed. |
+Payments (a receipt on the invoice, an order held as paid, a payment on the bill); credit notes (a refund or credit note on the invoice, a supplier credit note on the bill); a document dated on or before the imported Xero books lock date; a document IMS did not create (raised by another system during the parallel run, or linked by hand; for an invoice the invoice-number ownership check must also show Xero holds the number under that very document); another posting or a delete still queued for it. At the moment of the delete IMS also reads Xero: a payment, credit note or allocation IMS did not know about, a different document type or a different number changes nothing and reports why.
 
 Refund and credit-note deletion is not part of this. After a delete, a replacement invoice that is identical in content to the deleted one can still be treated as already posted by the posting dedupe; raise the replacement with a changed line or reference.
 

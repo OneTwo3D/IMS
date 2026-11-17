@@ -5473,7 +5473,6 @@ model AccountingDocumentDeletion {
   /// DELETED (DRAFT or SUBMITTED in the ledger) or VOIDED (AUTHORISED, no payments). Set when the ledger write is done.
   targetStatus       String?   @map("target_status")
   state              String    @default("PENDING")
-  syncLogId          String?   @map("sync_log_id")
   requestedById      String?   @map("requested_by_id")
   requestedAt        DateTime  @default(now()) @map("requested_at")
   completedAt        DateTime? @map("completed_at")
