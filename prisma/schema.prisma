@@ -3787,6 +3787,8 @@ model StockSyncState {
   lastPushedQty    Int?
   lastPushedAt     DateTime?
   lastPushedRemoteId String?
+  /// o3d-taro: the back-in-stock date last pushed as product meta ('' = cleared). Null until the feature has pushed once.
+  lastPushedEtaDate String?
   lastWebhookQty   Int?
   lastWebhookAt    DateTime?
   lastCorrectedAt  DateTime?

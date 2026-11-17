@@ -88,6 +88,7 @@ An order has one **Expected Delivery** date, but a supplier sometimes ships one 
 - Receiving goods, in full or in part, never changes a line's date.
 - The **Reorder** report's inbound arrival date uses the effective date, so a product arriving in a later batch is no longer shown as arriving with the earliest line of the order. The **Open purchase orders** report shows the earliest effective date of the lines still to come.
 - The **PO PDF** (and so the emailed PO) adds a **Delivery** column when at least one line's date differs from the order's. Lines that follow the order's date show a dash there.
+- **Storefront back-in-stock date.** When the WooCommerce setting *Include estimated back-in-stock date* is on, an out-of-stock product's customer-facing date is the earliest of these dates over its sent, shipped or part-received orders, with an open warehouse ASN's expected arrival taking the place of the order date where it has one. A date that is already in the past is never shown to customers, so a supplier who has slipped makes the product show no date until the expected delivery (or the ASN eta) is updated to a future day: keep the Expected dates current. An order with no date shows none. See the WooCommerce help.
 - The purchase order CSV export and import have a **lineExpectedDelivery** column (YYYY-MM-DD, blank = follows the order's date), so a round trip keeps the line dates.
 - A line's date can be changed on any order that can still be edited, including one that has been part-received.
 
