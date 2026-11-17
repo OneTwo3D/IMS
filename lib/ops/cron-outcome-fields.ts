@@ -137,6 +137,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     ignored: {
       deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads',
       staleBindingAlerts: 'the number of stale-sync alerts that WERE raised and delivered; an alert that could not be delivered is `deliveryFailures`, which decides `status`',
+      refusedActionAlerts: 'the number of refused-or-stalled-action alerts that WERE raised and delivered; one that could not be delivered is `deliveryFailures`, which decides `status`',
     },
   },
   'writers-check': {},

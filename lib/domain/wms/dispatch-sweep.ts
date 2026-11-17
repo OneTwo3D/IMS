@@ -41,6 +41,7 @@ import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { scrubWmsError } from './error-scrub'
+import { recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { recordWmsMutationEvent } from './mutation-audit'
 import { proveMergeLineage, type MergeLineageProof } from './merge-lineage'
 import { flagDoublePostageForMergedLink } from './double-postage'
@@ -539,6 +540,12 @@ export type WmsDispatchSweepDeps = {
    */
   recordWmsTerminalNonDespatch?(candidate: WmsDispatchCandidate, wmsStatus: string): Promise<void>
   clearWmsTerminalNonDespatch?(orderId: string): Promise<void>
+  /**
+   * Record the refused-or-stalled action an outcome carries (an idempotent upsert), and close it when the order later despatches or the cause is
+   * gone. Best effort in the sweep: a failure holds the watermark (the refusal is not yet written, so the change must stay in the next window).
+   */
+  recordRefusedAction?(candidate: WmsDispatchCandidate, refusal: NonNullable<WmsDispatchOutcome['refusal']>): Promise<void>
+  resolveRefusedActions?(orderId: string): Promise<void>
   /**
    * o3d-bjc.9: unresolved-record streak, kept SEPARATE from the transport
    * failure counter above. `recordUnresolvedRead` increments and returns the new
@@ -1123,6 +1130,32 @@ async function reconcileSplitOrder(
     // without ever knowing the second part). Any of those means unknown.
     const anyPartStateUnknown = parts.some((entry) => !dispatchStateEstablished(entry))
     const incompleteEnumeration = !allRecorded || parts.length < totalParts || anyPartStateUnknown
+    // A CANCELLED PART WILL NEVER DESPATCH (o3d-zvec.9 / zvec.10): the order is part-way for good, so it can never reach totalParts despatched. That is a
+    // STALL, not "not yet": it is recorded as a refused action (permanent once every part is either despatched or cancelled) and held UNRESOLVED, so the
+    // watermark does not advance over it. The hold is bounded: `unresolved` never counts as a failure (no dead-letter), and the quarantine after
+    // DISPATCH_MAX_CONSECUTIVE_UNRESOLVED reads isolates it so it stops pinning the delta for everyone else.
+    const cancelledParts = parts.filter((entry) => !entry.dispatched && isWmsTerminalNonDespatchStatus({ status: entry.status, statusLabel: '' }))
+    if (cancelledParts.length > 0) {
+      const allAccountedFor = dispatchedParts.length + cancelledParts.length >= totalParts
+      return {
+        action: 'pending',
+        reason: `${dispatchedParts.length}/${totalParts} parts despatched; part ${cancelledParts.map((entry) => entry.partNumber).join(', ')} is cancelled in the WMS and will not despatch, so this order cannot complete`,
+        unresolved: requireResolution,
+        refusal: {
+          action: 'WMS_SPLIT_ORDER_COMPLETE',
+          gate: 'WMS_SPLIT_PART_CANCELLED',
+          permanence: allAccountedFor ? 'PERMANENT' : 'RETRYABLE',
+          severity: 'MEDIUM',
+          intent: {
+            warehouseOrderNumber: orderNumber,
+            totalParts,
+            despatchedParts: dispatchedParts.length,
+            cancelledParts: cancelledParts.map((entry) => ({ part: entry.partNumber, status: scrubWmsError(entry.status, 'unknown') })),
+          },
+          detail: `${dispatchedParts.length} of ${totalParts} parts have despatched and a part is cancelled in the warehouse, so IMS will never see the last despatch. Complete the order by hand once the cancelled part has shipped from elsewhere.`,
+        },
+      }
+    }
     return {
       action: 'pending',
       reason: !allRecorded
@@ -1219,6 +1252,11 @@ export type WmsDispatchOutcome = {
   wmsTerminal?: string
   /** A part of a split order is confirmed despatched: any "cancelled in the WMS" exception raised earlier is false and is closed. */
   partDespatched?: boolean
+  /**
+   * The order can NEVER complete from what the WMS shows (a split part was cancelled and will not despatch). Recorded as a refused or stalled action
+   * (lib/domain/refused-actions.ts) so the condition has a name, an age and an alert instead of reading as "N/M parts despatched" for ever.
+   */
+  refusal?: Pick<RefusedActionInput, 'action' | 'gate' | 'permanence' | 'severity' | 'intent' | 'detail'>
 }
 
 /**
@@ -1714,6 +1752,15 @@ export async function runWmsDispatchSweepCore(
       console.error('[wms-dispatch-sweep] could not record a WMS-terminal order for an operator:', terminalError)
       // The operator-facing row did not commit, so this pass has not finished deciding the order: hold the watermark
       // (as for a withdrawal park that did not commit) so the change cannot age out before the row is written.
+      passClean = false
+    }
+    // A refused or stalled action is recorded; once the order despatches (or the cause is gone) its record is closed. If the record cannot be written the
+    // watermark is held (the change must stay in the next window), as for the terminal row above.
+    try {
+      if (outcome.refusal) await deps.recordRefusedAction?.(candidate, outcome.refusal)
+      else if (outcome.action !== 'error' && !outcome.unresolved) await deps.resolveRefusedActions?.(candidate.orderId)
+    } catch (refusalError) {
+      console.error('[wms-dispatch-sweep] could not record a refused action:', refusalError)
       passClean = false
     }
     try {
@@ -3216,6 +3263,14 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         message: `Order ${order.orderNumber ?? candidate.orderId} is ${shown} in the WMS but still live in IMS. Review it in the sync exception inbox.`,
         actionUrl: '/sync/exceptions',
       })))
+    },
+    async recordRefusedAction(candidate, refusal) {
+      const order = await db.salesOrder.findUnique({ where: { id: candidate.orderId }, select: { orderNumber: true } })
+      const intent = { ...(refusal.intent as Record<string, unknown> | null), orderNumber: order?.orderNumber ?? null } as Prisma.InputJsonValue
+      await recordRefusedAction(db, { ...refusal, intent, entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: candidate.orderId })
+    },
+    async resolveRefusedActions(orderId) {
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WMS_SPLIT_ORDER_COMPLETE' }, 'ACTION_SUCCEEDED')
     },
     async clearWmsTerminalNonDespatch(orderId) {
       await db.wmsOrderDiscrepancy.updateMany({

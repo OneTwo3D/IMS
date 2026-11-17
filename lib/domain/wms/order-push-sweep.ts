@@ -23,7 +23,8 @@ import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidB
 import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
-import { courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
+import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type RefusedActionInput } from '@/lib/domain/refused-actions'
+import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
 import { runSystemicPass, type SystemicFailureStore } from './systemic-failure'
 import { createDbSystemicFailureStore } from './systemic-failure-store'
@@ -1177,6 +1178,13 @@ export interface WmsOrderPushPort {
   noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date; orderNumber?: string | null; externalOrderNumber?: string | null; lastError?: string | null }>>
   /** Record one operator task ("raise a query"), once: true when a new row was written, false when the same task already exists. A rejection means it was NOT recorded. */
   raiseOperatorTask?(task: WmsOperatorTaskInput): Promise<boolean>
+  /**
+   * Record a refused or stalled action (lib/domain/refused-actions.ts): an idempotent upsert on (entity, action, gate). THROWS when it cannot be
+   * written: the caller then leaves the link due rather than advancing it over a refusal nobody can see. Absent: nothing is recorded (test doubles).
+   */
+  recordRefusedAction?(input: RefusedActionInput): Promise<void>
+  /** Close this order's open refusals of one action: the action later succeeded. */
+  resolveRefusedActions?(orderId: string, action: RefusedActionInput['action']): Promise<void>
   /** Live links with a courier-fallback task due and not yet recorded. */
   courierTasksDue?(connector: string, limit: number): Promise<Array<{ orderId: string; externalOrderId: string; externalOrderNumber: string | null; orderNumber: string | null; service: string; pushedAt?: Date | null; courierTaskEpisode?: Date | null }>>
   /** Persist the courier due-marker for this order and service BEFORE an amendment call, only while none is set. True when this call set it. */
@@ -1361,6 +1369,45 @@ export async function runWmsOrderPushSweepCore(
   const raiseTaskOrThrow = async (task: Omit<WmsOperatorTaskInput, 'connector'>): Promise<void> => {
     if (!port.raiseOperatorTask) return
     if (await port.raiseOperatorTask({ connector: connectorId, ...task })) operatorTasksRaised += 1
+  }
+
+  /**
+   * Record an amendment the warehouse order could not take. Severity comes from the INTENT: it is HIGH when the lines (SKU or quantity) differ from the
+   * lines recorded on the warehouse order (or cannot be compared), LOW when only money, courier or other header data moved. A HIGH one also raises an
+   * operator task carrying the exact lines IMS wants (the owner's ruling: warehouse-facing follow-up is a person raising a query, never an order comment).
+   */
+  const recordRefusedAmendment = async (link: { id: string; externalOrderId: string | null; order: { id: string; orderNumber: string | null } }, input: WmsOrderPushInput, wmsStatus: string): Promise<void> => {
+    if (!port.recordRefusedAction) return
+    const status = scrubWmsError(wmsStatus, 'unknown')
+    const recorded = port.readOrderItems ? await port.readOrderItems(link.id).catch(() => null) : null
+    const lineChange = classifyAmendmentLineChange(input.lines.map((line) => ({ sku: line.sku, quantity: Number(line.quantity) })), recorded)
+    const severity = amendmentSeverity(lineChange)
+    const notNew = wmsStatus === 'NOT_NEW'
+    await port.recordRefusedAction({
+      entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
+      entityId: link.order.id,
+      action: 'WMS_ORDER_AMEND',
+      gate: notNew ? 'WMS_ORDER_NOT_NEW' : 'WMS_ORDER_NOT_AMENDABLE',
+      permanence: 'PERMANENT',
+      severity,
+      intent: { ...pushIntentSummary(input), wmsStatus: status, lineChange } as unknown as Prisma.InputJsonValue,
+      detail: notNew
+        ? 'The warehouse order is already past NEW, so IMS could not amend it and changed nothing there.'
+        : `The warehouse order could not be amended (warehouse status ${status}) and IMS changed nothing there.`,
+      now: now(),
+    })
+    if (severity === 'HIGH' && link.externalOrderId) {
+      const orderRef = link.order.orderNumber ?? link.order.id
+      await raiseTaskBestEffort({
+        orderId: link.order.id,
+        externalOrderId: link.externalOrderId,
+        reason: 'AMENDMENT_NOT_APPLIED',
+        queryText: amendmentNotAppliedQuery(link.externalOrderId, orderRef, input.lines.map((line) => ({ sku: line.sku, quantity: Number(line.quantity) })), status),
+        payload: { orderNumber: link.order.orderNumber ?? null },
+        // The same intent is one task; a changed intent (different lines) is a new one.
+        dedupeBasis: `amend:${JSON.stringify(input.lines.map((line) => [line.sku, Number(line.quantity)]).sort())}`,
+      })
+    }
   }
 
   /**
@@ -3457,6 +3504,11 @@ export async function runWmsOrderPushSweepCore(
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
         // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
         const settled = await settleAmendedCourier(link, update.updated ? update : {}, courierMarkerSetHere, earlierCourierTaskRecorded, amendService, amendEpisode)
+        // A REFUSED AMENDMENT IS RECORDED BEFORE THE LINK ADVANCES (o3d-zvec.8 / zvec.10): pushedAt is bumped below so IMS does not hammer the warehouse, but
+        // that used to erase the fact that a change was outstanding. The refusal is now a durable row with the full intent and the warehouse status, so it
+        // is visible on Sync > Exceptions and ages into an alert. If it cannot be written this throws and the link stays due. NO warehouse comment is written.
+        if (update.updated) await port.resolveRefusedActions?.(link.order.id, 'WMS_ORDER_AMEND')
+        else await recordRefusedAmendment(link, input, update.status)
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
         await port.updateLink(link.id, {
@@ -4625,6 +4677,12 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async raiseOperatorTask(task) {
       return raiseWmsOperatorTask(db, task)
+    },
+    async recordRefusedAction(input) {
+      await recordRefusedAction(db, input)
+    },
+    async resolveRefusedActions(orderId, action) {
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action }, 'ACTION_SUCCEEDED')
     },
     async courierTasksDue(connector, limit) {
       const rows = await db.wmsOrderPushLink.findMany({

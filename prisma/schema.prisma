@@ -4129,6 +4129,8 @@ enum WmsOperatorTaskReason {
   REFUND_NOTE
   /// Same-customer orders that are all still NEW in the warehouse: a person checks them there and merges them (IMS never merges).
   MERGE_CANDIDATE
+  /// An IMS amendment the warehouse order could not take because it was already past NEW: a person applies the change in the warehouse by hand.
+  AMENDMENT_NOT_APPLIED
 }
 
 enum WmsOperatorTaskStatus {
@@ -4184,6 +4186,59 @@ model WmsOperatorTask {
   @@index([status, createdAt, id], map: "wms_operator_tasks_status_created_idx")
   @@index([orderId], map: "wms_operator_tasks_order_idx")
   @@map("wms_operator_tasks")
+}
+
+// ---------------------------------------------------------------------------
+// REFUSED OR STALLED ACTIONS
+// ---------------------------------------------------------------------------
+// One durable record of "IMS wanted to do this, a gate refused it, and nothing else says so". A refusal used to be a string on a link or a
+// pending result that read as "come back later"; this row says what was asked, which gate refused it, whether it can ever succeed, and how long
+// it has been standing (firstSeenAt / lastSeenAt), so a condition that lasts a fortnight no longer looks like one that began a minute ago.
+// Keyed on (entity, action, gate): a repeat refusal bumps lastSeenAt and never makes a second row. Holds no personal data: order and warehouse
+// numbers, SKUs, quantities and amounts in fixed wording built by IMS. No foreign key: the row must outlive a deleted entity.
+
+enum RefusedActionPermanence {
+  /// The gate will not open on its own (the warehouse order is past NEW; a part was cancelled and will never despatch).
+  PERMANENT
+  /// The gate may open later; the action is retried.
+  RETRYABLE
+}
+
+/// Declared lowest first: the upsert keeps the GREATEST severity seen, which relies on this order.
+enum RefusedActionSeverity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model RefusedAction {
+  id          String                  @id @default(cuid())
+  /// What the action was about, e.g. SALES_ORDER.
+  entityType  String                  @map("entity_type")
+  entityId    String                  @map("entity_id")
+  /// What was requested, e.g. WMS_ORDER_AMEND.
+  action      String
+  /// The gate that refused it, e.g. WMS_ORDER_NOT_NEW.
+  gate        String
+  permanence  RefusedActionPermanence
+  severity    RefusedActionSeverity
+  /// The INTENT, without personal data (the warehouse push summary: order number, SKUs, quantities, amounts). Built by IMS, never copied from a remote error.
+  intent      Json?
+  /// One fixed-wording line an operator can read: what the gate saw (the warehouse status), never remote free text.
+  detail      String?
+  /// How many times the same refusal was seen in this episode.
+  attempts    Int                     @default(1)
+  firstSeenAt DateTime                @default(now()) @map("first_seen_at")
+  lastSeenAt  DateTime                @default(now()) @map("last_seen_at")
+  /// Set when the action later succeeded or the entity no longer needs it. A later refusal of the same action starts a new episode on the same row.
+  resolvedAt  DateTime?               @map("resolved_at")
+  resolution  String?
+  /// When the age-based alert was raised for this episode. Once per episode: cleared only when a new episode starts.
+  alertedAt   DateTime?               @map("alerted_at")
+
+  @@unique([entityType, entityId, action, gate], map: "refused_actions_key")
+  @@index([resolvedAt, severity, firstSeenAt], map: "refused_actions_open_idx")
+  @@map("refused_actions")
 }
 
 // ---------------------------------------------------------------------------
