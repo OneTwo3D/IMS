@@ -135,6 +135,7 @@ Two read-only lists sit at the bottom of **Settings > Sales**:
 
 - **Purchase units** — define units of measure with conversion factors (e.g. 1 case = 12 units)
 - **Landed cost distribution method** — choose how landed costs are allocated across purchase order lines
+- **Purchase order approval threshold** — **Settings > Company > Documents**. An amount in base currency (ex VAT). A goods purchase order at or above it must be approved by a user holding the `purchasing.approve` permission (Administrators and Managers; never the order's creator) before it can be sent or emailed to the supplier. Blank or 0 (the default) means no approval is needed. See [Purchasing](purchasing.md#purchase-order-approval).
 
 ## Accounting Settings
 

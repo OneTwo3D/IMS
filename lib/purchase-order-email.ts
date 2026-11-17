@@ -7,6 +7,7 @@ import { db } from '@/lib/db'
 import { PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { EmailKindDisabledError } from '@/lib/email-kind-disabled'
 import { PO_EMAIL_DISABLED_REASON, PO_EMAIL_SETTING_KEY } from '@/lib/domain/purchasing/po-document'
+import { assertPoApprovedForSend } from '@/lib/domain/purchasing/po-approval'
 import { renderEmailHtml } from '@/lib/email-template'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -38,6 +39,8 @@ export async function buildPurchaseOrderEmail(id: string) {
   const [po, status] = await Promise.all([loadPurchaseOrderDocument(id), db.purchaseOrder.findUnique({ where: { id }, select: { status: true } })])
   if (!po || !status) throw new Error('PO not found')
   if (UNSENDABLE_STATUSES.has(status.status)) throw new Error(`PO ${po.reference} is ${status.status}; the purchase order email is only sent for a confirmed order`)
+  // Checked at SEND time too: an order queued while approved and edited dearer since is not mailed.
+  await assertPoApprovedForSend(db, id)
   const to = po.supplier.email?.trim()
   if (!to) throw new Error('No supplier email address')
 
