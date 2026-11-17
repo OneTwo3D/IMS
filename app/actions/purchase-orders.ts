@@ -10,6 +10,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { runPostCommit } from '@/lib/domain/post-commit'
 import { queueEmail } from '@/lib/email-outbox'
 import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
@@ -151,6 +152,7 @@ import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantitie
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import { computeReturnCreditNoteDraft } from '@/lib/domain/purchasing/return-credit-note'
 import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
+import { checkReceiptLocations, refuseRestrictedDestination } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 import {
   validateLinkedFreightReceiptStatus,
   validatePurchaseOrderStatusTransition,
@@ -188,13 +190,24 @@ const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
 export type PoStatus = 'DRAFT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'PO_SENT' | 'SHIPPED' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'CLOSED' | 'INVOICED' | 'PARTIALLY_RETURNED' | 'RETURNED' | 'CANCELLED'
 
+/** The internal remark on a PO line: trimmed, blank is none, capped at the length the form allows. Never sent to the supplier. */
+const PO_LINE_NOTES_MAX_LENGTH = 2000
+function normalizePoLineNotes(value: string | null | undefined): string | null {
+  const text = value?.trim()
+  return text ? text.slice(0, PO_LINE_NOTES_MAX_LENGTH) : null
+}
+
 export type PoLineRow = {
   id: string
   productId: string
   sku: string
   productName: string
   imageUrl: string | null
+  /** Product.barcode; null when the variant has none (the page shows an empty cell). */
+  barcode: string | null
   description: string | null
+  /** Internal per-line remark. Never printed on the supplier PO PDF or sent in the supplier email. */
+  notes: string | null
   qty: number
   unitCostForeign: number
   unitCostBase: number
@@ -352,6 +365,8 @@ export type PoLineInput = {
   sku: string
   productName: string
   description?: string
+  /** Internal remark on this line (never sent to the supplier). Omitted = keep the stored note on an existing line; blank clears it. */
+  notes?: string | null
   qty: number // stock units
   purchaseUnitId?: string
   purchaseUnitQty?: number // qty in purchase units
@@ -479,6 +494,7 @@ const PO_SELECT = {
       id: true,
       productId: true,
       description: true,
+      notes: true,
       qty: true,
       unitCostForeign: true,
       unitCostBase: true,
@@ -496,7 +512,7 @@ const PO_SELECT = {
       taxRateId: true,
       taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
       landedUnitCostBase: true,
-      product: { select: { sku: true, name: true, imageUrl: true, weight: true, parent: { select: { imageUrl: true } } } },
+      product: { select: { sku: true, name: true, imageUrl: true, barcode: true, weight: true, parent: { select: { imageUrl: true } } } },
     },
     orderBy: { sortOrder: 'asc' as const },
   },
@@ -593,6 +609,7 @@ function mapLine(l: {
   id: string
   productId: string
   description: string | null
+  notes?: string | null
   qty: unknown
   unitCostForeign: unknown
   unitCostBase: unknown
@@ -609,7 +626,7 @@ function mapLine(l: {
   expectedDelivery?: Date | null
   taxRateId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
-  product: { sku: string; name: string; imageUrl: string | null; parent?: { imageUrl: string | null } | null }
+  product: { sku: string; name: string; imageUrl: string | null; barcode?: string | null; parent?: { imageUrl: string | null } | null }
 }, headerEta: Date | null = null): PoLineRow {
   const qty = Number(l.qty)
   const qtyReceived = Number(l.qtyReceived)
@@ -620,7 +637,9 @@ function mapLine(l: {
     sku: l.product.sku,
     productName: l.product.name,
     imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
+    barcode: l.product.barcode ?? null,
     description: l.description,
+    notes: l.notes ?? null,
     qty,
     unitCostForeign: Number(l.unitCostForeign),
     unitCostBase: Number(l.unitCostBase),
@@ -1313,6 +1332,9 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
       if (l.unitCostForeign < 0) return { success: false, error: `Negative cost for ${l.sku}` }
     }
+    // A warehouse with "Available in purchase orders" off cannot be a new order's destination.
+    const restrictedDestination = await refuseRestrictedDestination(db, input.destinationWarehouseId)
+    if (restrictedDestination) return { success: false, error: restrictedDestination }
 
     const baseCurrency = await getBaseCurrencyCode()
     const fxRate = await resolvePurchaseOrderFxRateToBase(db, {
@@ -1388,6 +1410,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       return {
         productId: l.productId,
         description: l.description || null,
+        notes: normalizePoLineNotes(l.notes),
         qty: l.qty,
         purchaseUnitId: l.purchaseUnitId || null,
         purchaseUnitQty: l.purchaseUnitQty ?? null,
@@ -1688,6 +1711,10 @@ export async function updatePurchaseOrder(
       if (!isPurchaseOrderEditableStatus(locked.status)) return { refused: PO_EDIT_REFUSED_STATUS_MESSAGE }
       // A freight order is edited through its own cost editor once it has left Draft (it has no goods lines to amend).
       if (locked.type === 'FREIGHT' && locked.status !== 'DRAFT') return { refused: PO_EDIT_REFUSED_STATUS_MESSAGE }
+      // Changing the destination to a warehouse that is not available for purchase orders is refused; an order that
+      // already points at one keeps it (the unchanged value passes).
+      const restrictedDestination = await refuseRestrictedDestination(tx, requestedEdit.destinationWarehouseId, locked.destinationWarehouseId)
+      if (restrictedDestination) return { refused: restrictedDestination }
 
       // WHICH EDIT THIS IS, decided from facts read under the lock (lib/domain/purchasing/po-edit-plan.ts). A PRISTINE order
       // — no receipt, bill, return, landed quantity or ASN row of any state — gets the full edit below in every editable
@@ -1796,7 +1823,10 @@ export async function updatePurchaseOrder(
         const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
         const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx, priorLineRates)
         // A line whose `expectedDelivery` is ABSENT keeps its stored date (a caller that predates the field must not erase it); an explicit null or blank clears it.
-        const storedLineEta = new Map((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true } })).map((l) => [l.id, l.expectedDelivery]))
+        const storedLineRows = await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true, notes: true } })
+        const storedLineEta = new Map(storedLineRows.map((l) => [l.id, l.expectedDelivery]))
+        // Same rule for the internal note: an ABSENT `notes` keeps the stored one (a caller that predates the field must not erase it); an explicit null or blank clears it.
+        const storedLineNotes = new Map(storedLineRows.map((l) => [l.id, l.notes]))
 
         // FULL edit: delete existing lines and recreate. AMEND: lines are reconciled in place further down (ids are kept).
         if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
@@ -1836,6 +1866,9 @@ export async function updatePurchaseOrder(
             poId: id,
             productId: l.productId,
             description: l.description || null,
+            notes: l.notes === undefined
+              ? (l.poLineId ? storedLineNotes.get(l.poLineId) ?? null : null)
+              : normalizePoLineNotes(l.notes),
             qty: l.qty,
             purchaseUnitId: l.purchaseUnitId || null,
             purchaseUnitQty: l.purchaseUnitQty ?? null,
@@ -1886,6 +1919,7 @@ export async function updatePurchaseOrder(
                   ...scaled,
                   ...(k.qtyChanged ? { purchaseUnitQty: row.purchaseUnitQty, ...scaleLineDiscountForQty(k.fact, req.qty) } : {}),
                   description: row.description,
+                  notes: row.notes,
                   sortOrder: row.sortOrder,
                   expectedDelivery: row.expectedDelivery,
                 },
@@ -1902,7 +1936,7 @@ export async function updatePurchaseOrder(
                 // Unchanged: the stored figures stand. Recomputing under the request's VAT convention can differ by rounding (and
                 // the form sends net prices), and an unchanged save must not move a stored money field.
                 const stored = { totalForeign: k.fact.totalForeign, totalBase: k.fact.totalBase, taxForeign: k.fact.taxForeign, taxBase: k.fact.taxBase }
-                lineUpdates.push({ id: k.fact.id, data: { description: row.description, sortOrder: row.sortOrder, expectedDelivery: row.expectedDelivery } })
+                lineUpdates.push({ id: k.fact.id, data: { description: row.description, notes: row.notes, sortOrder: row.sortOrder, expectedDelivery: row.expectedDelivery } })
                 finalRows.push(stored)
               } else {
                 lineMoneyChanged = true
@@ -2347,6 +2381,39 @@ export async function updatePoTracking(
   }
 }
 
+/**
+ * Save the internal note on one PO line, on any order status (it is a remark, not a money or stock field, so it does not wait for a draft).
+ * The note is never printed on the supplier PO PDF or sent in the supplier email. Blank clears it.
+ */
+export async function updatePoLineNote(
+  poLineId: string,
+  notes: string | null,
+): Promise<{ success: boolean; notes?: string | null; error?: string }> {
+  try {
+    await requirePermission('purchasing.create')
+    const line = await db.purchaseOrderLine.findUnique({ where: { id: poLineId }, select: { id: true, poId: true, po: { select: { reference: true } } } })
+    if (!line) return { success: false, error: 'PO line not found' }
+    const saved = normalizePoLineNotes(notes)
+    await db.purchaseOrderLine.update({ where: { id: poLineId }, data: { notes: saved } })
+    const postCommit = await runPostCommit(async () => {
+      revalidatePath(`/purchase-orders/${line.poId}`)
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: line.poId,
+        action: 'line_note_updated',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `${saved ? 'Updated' : 'Cleared'} the internal note on a line of PO ${line.po.reference}`,
+        metadata: { reference: line.po.reference, poLineId },
+      })
+    }, 'Failed to record the line note change')
+    void postCommit // the note is saved either way; a failed audit entry must not report it as unsaved
+    return { success: true, notes: saved }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
 export async function receivePurchaseOrder(
   id: string,
   receiptLines: ReceiptLineInput[],
@@ -2418,6 +2485,12 @@ export async function receivePurchaseOrder(
     ])
     const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
     const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
+
+    // "Available in purchase orders": a restricted warehouse is refused as a receipt location unless it is this order's own
+    // destination (an order placed before the flag was turned off still receives, with a warning). WMS-driven receipts
+    // (ASN / book-in) never come through here.
+    const receiptLocations = await checkReceiptLocations(db, po.destinationWarehouseId, linesWithQty.map((rl) => rl.warehouseId))
+    if (receiptLocations.refusal) return { success: false, error: receiptLocations.refusal }
 
     // Per-row sanity: warehouse present, PO line exists.
     for (const rl of linesWithQty) {
@@ -2960,7 +3033,7 @@ export async function receivePurchaseOrder(
 
     // A negative landed cost larger than the goods cost was held at zero (see allocateLandedCost). The
     // operator is told in the result and the durable WARNING is written now, AFTER the commit.
-    const warnings: string[] = []
+    const warnings: string[] = [...receiptLocations.warnings]
     if (receiptResult.creditFloorEntries.length > 0) {
       warnings.push(await logFlooredLandedCredit({
         purchaseOrderId: id,

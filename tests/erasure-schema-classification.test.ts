@@ -50,7 +50,7 @@ function modelsLinkedToCustomerOrOrder(): string[] {
 }
 
 /** The two tables that point at an order only by a reference id (referenceType / referenceId, an action url), so no relation finds them. */
-const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation', 'StorefrontCustomerErasureTombstone', 'ShoppingWebhookEvent', 'ShoppingSyncLog', 'AccountingSyncLog', 'AccountingEvent', 'AccountingEventLog', 'RefusedAction', 'WcOrderDivergence', 'WcOrderDivergenceRecheck']
+const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation', 'StorefrontCustomerErasureTombstone', 'ShoppingWebhookEvent', 'ShoppingSyncLog', 'AccountingSyncLog', 'AccountingEvent', 'AccountingEventLog', 'RefusedAction', 'XeroPaymentMatch', 'WcOrderDivergence', 'WcOrderDivergenceRecheck']
 
 test('every table with a relation path to Customer or SalesOrder is classified, column by column, and a new linked table fails here', () => {
   const models = parseModels()
@@ -119,6 +119,8 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   'SalesOrder.accountingInvoiceId': 'retained',
   'SalesOrderRefund.accountingCreditNoteId': 'retained',
   'PaymentRemovalReconciliation.accountingInvoiceId': 'retained',
+  'XeroPaymentMatch.accountingInvoiceId': 'retained',
+  'XeroPaymentMatch.bankAccountId': 'not-customer',
   'SalesOrder.customerId': 'surrogate',
   'ShoppingCustomerLink.customerId': 'surrogate',
   // not customer data: suppliers, products, ledger accounts, staff users, purchasing documents

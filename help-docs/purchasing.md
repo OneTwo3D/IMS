@@ -20,6 +20,7 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 3. Confirm the **currency** (defaults to the supplier's currency).
 4. The **FX rate to base currency** is shown read-only: it is the rate in Settings > Accounting > FX Rates for the order's currency, read when the order is saved. It cannot be typed here (see [FX rate](#fx-rate) below).
 5. Select the **destination warehouse** where the goods will be received.
+   Warehouses marked **Restricted** (Settings > Inventory > Warehouses, "Available in Purchase Orders" off) are not offered, and the server refuses them. An order saved earlier with a warehouse that was restricted afterwards keeps showing it, and you can leave it as it is.
 6. Add lines by searching for products. The system pre-fills the last purchase price for that supplier if one exists.
 7. Enter quantities and adjust prices as needed.
 8. (Optional) Tick **"Skip preferred-supplier update"** on the PO header if you don't want this PO to overwrite the products' preferred suppliers — useful for emergency or one-off orders. See [Preferred supplier auto-update](#preferred-supplier-auto-update) below.
@@ -90,6 +91,18 @@ An order has one **Expected Delivery** date, but a supplier sometimes ships one 
 - The purchase order CSV export and import have a **lineExpectedDelivery** column (YYYY-MM-DD, blank = follows the order's date), so a round trip keeps the line dates.
 - A line's date can be changed on any order that can still be edited, including one that has been part-received.
 
+## Notes on lines
+
+Each purchase order line can carry a short **internal note** (colourway, substitute accepted, chase this one). On the PO form click the notepad icon under the product to open a text field; the note is saved with the order. On the PO page the note shows under the product, and with the Purchasing permission the notepad opens the same field and **Save note** stores it, on any status, including a part-received order.
+
+- **Notes are internal: they are never printed on the PO PDF and never sent in the supplier email**, and they do not appear in the supplier portal. The order's own **Notes** field is the one that goes to the supplier. To tell the supplier something about one line, put it in the order Notes or in the line's **Description**, which does print on the PO.
+- A note is up to 2,000 characters. Clearing the text removes it.
+- Editing an order from an older screen that does not send notes keeps the stored notes.
+
+### Barcode and Supplier SKU on the order lines
+
+The **Order Lines** table on the PO page has **Barcode** and **Supplier SKU** columns after the product, so you can check goods against the order without opening the catalogue. Barcode is the product's barcode (empty when it has none). Supplier SKU is the supplier's own reference for the product from the supplier's product list (the same one the PO form uses); it is empty when none is recorded for this supplier. Use **Columns** above the table to hide either one; the choice is remembered in your browser only. The PO PDF sent to the supplier is unchanged.
+
 ## Editing a Purchase Order
 
 An order can be edited from **Draft** through **Partially Received**: click **Edit** on the PO page. What you can change depends on whether anything has touched the order yet.
@@ -136,6 +149,8 @@ The **PO PDF** button on any purchase order opens the priced purchase order: sup
 ## Receiving a Purchase Order
 
 When goods arrive, open the PO and click **Receive Goods**. You can receive all lines at once or partially receive individual lines. You cannot receive more than the line's ordered quantity less what has already landed (including anything the warehouse has booked in or aligned).
+
+The warehouse list in **Receive Goods** leaves out warehouses marked **Restricted** ("Available in Purchase Orders" off), and the server refuses them. The one exception is the order's own destination: an order that was placed before its warehouse was restricted can still be received into it, with a warning. Receipts booked in by the warehouse system (ASN book-in) are not affected by this setting.
 
 **Lines with an open warehouse ASN are booked in through the ASN, not by hand.** If a line's Mintsoft (warehouse) ASN is still open, partly booked in, or being created, **Receive Goods** refuses that line and names the SKU and the ASN. Use **Recheck booked-in** on the order once the warehouse has booked the goods, so the stock is added once. Other lines of the same order, and lines whose ASN is fully booked in or closed, can still be received here.
 

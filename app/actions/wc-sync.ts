@@ -65,6 +65,8 @@ export type WcSyncSettings = {
   product_identifier_split_enabled: string
   /** Read-only report of WooCommerce orders that no longer match the IMS order (Sync > Exceptions). Default 'false'. Changes nothing when off. */
   wc_order_divergence_detection_enabled: string
+  /** Courier -> AST provider slug on the tracking IMS writes to WooCommerce. Default 'false'. */
+  wc_ast_provider_mapping_enabled: string
   // The webhook secret itself is never sent to the client (masked to ''); the
   // UI only needs to know whether one is configured.
   wc_webhook_secret: string
@@ -103,7 +105,7 @@ export type WcSyncSettings = {
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses',
   'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
-  'product_identifier_split_enabled', 'wc_order_divergence_detection_enabled',
+  'product_identifier_split_enabled', 'wc_order_divergence_detection_enabled', 'wc_ast_provider_mapping_enabled',
   'wc_webhook_secret', 'wc_webhook_last_received_at', 'wc_order_webhook_last_received_at', 'wc_product_webhook_last_received_at',
   'wc_order_webhook_last_processed_at', 'wc_product_webhook_last_processed_at',
   'last_wc_order_sync_at', 'last_wc_order_reconcile_at', 'last_wc_product_sync_at', 'last_wc_product_reconcile_at', 'last_wc_stock_sync_at',
@@ -139,6 +141,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_cogs_sync_enabled: 'false',
   product_identifier_split_enabled: 'false',
   wc_order_divergence_detection_enabled: 'false',
+  wc_ast_provider_mapping_enabled: 'false',
   wc_webhook_secret: '',
   wc_webhook_secret_set: 'false',
   wc_webhook_last_received_at: '',

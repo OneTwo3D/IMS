@@ -291,7 +291,10 @@ To process a refund:
 1. Open the sales order and select **Refund**
 2. Choose the items and quantities being returned
 3. Select the **return warehouse** where the stock will be received back
-4. Confirm the refund
+4. Optionally pick a **Return reason** (the dialog shows the field only when return reasons are configured in Settings > Inventory), and type the free-text **Reason**, which stays required
+5. Confirm the refund
+
+The return reason is one structured value **per refund** (not per line): it is what the Returns report counts and totals. The free-text reason is kept exactly as before and is a separate field. A refund imported from WooCommerce takes a return reason only if the store's refund reason text matches an active return reason name (ignoring case); otherwise the return reason stays empty and the text is kept as the free-text reason. The refund's return reason shows on the order page under Refunds.
 
 Returned stock is added back into the selected warehouse's inventory automatically.
 
