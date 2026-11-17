@@ -117,6 +117,21 @@ test('permission denied: a role without inventory.prices cannot edit, and nothin
   assert.deepEqual(state.wmsSyncs, [])
 })
 
+test('FINANCE (inventory.prices without inventory.edit) is refused: no write, no sync, and the margin row offers no edit', async () => {
+  reset()
+  state.role = 'FINANCE'
+  await assert.rejects(() => updateProductListPrice({ productId: 'p1', exVatPrice: '12' }), /missing permission inventory\.edit/)
+  assert.equal(state.txCount, 0)
+  assert.deepEqual(state.writes, [])
+  assert.deepEqual(state.pushes, [])
+  assert.deepEqual(state.wmsSyncs, [])
+  const preview = await previewPoLineMargins({ pricesIncludeVat: false, fxRate: 1, lines: [previewLine] })
+  assert.ok(preview.success && preview.lines[0]!.listPriceEditable === false)
+  state.role = 'MANAGER'
+  const manager = await previewPoLineMargins({ pricesIncludeVat: false, fxRate: 1, lines: [previewLine] })
+  assert.ok(manager.success && manager.lines[0]!.listPriceEditable === true)
+})
+
 test('the edit goes through the normal product update: SKU lock, one transaction, only salesPriceBase written, audit row in the same transaction', async () => {
   reset()
   const r = await updateProductListPrice({ productId: 'p1', exVatPrice: '12.5' })
@@ -140,13 +155,7 @@ test('the vendors are reached only through the normal product sync dispatchers, 
   assert.equal(r.success, true)
   assert.deepEqual(state.pushes, ['p1'])
   assert.deepEqual(state.wmsSyncs, ['p1'])
-  // MANAGER holds `sync`; a role with inventory.prices but not `sync` (FINANCE) saves the price and does not schedule the warehouse sync.
-  reset()
-  state.role = 'FINANCE'
-  const f = await updateProductListPrice({ productId: 'p1', exVatPrice: '12.5' })
-  assert.equal(f.success, true)
-  assert.deepEqual(state.wmsSyncs, [])
-  assert.deepEqual(state.pushes, ['p1'])
+  // A role holding inventory.prices but not inventory.edit (FINANCE) is refused outright: see the permission test above.
 })
 
 test('no direct connector call: the action imports no connector or HTTP client, and no module-level fetch', () => {
@@ -198,8 +207,8 @@ test('refusals write nothing and sync nothing: unresolved VAT, variable parent, 
 
 test('the action is gated on inventory.prices before it reads anything', () => {
   const src = readFileSync('app/actions/product-list-price.ts', 'utf8')
-  const gate = src.indexOf("requirePermission('inventory.prices')")
-  assert.ok(gate > 0)
+  const gate = src.indexOf("requirePermission('inventory.edit')")
+  assert.ok(gate > 0 && src.indexOf("requirePermission('inventory.prices')") > gate)
   assert.ok(gate < src.indexOf('loadListPriceFacts('))
   assert.ok(gate < src.indexOf('db.$transaction'))
 })

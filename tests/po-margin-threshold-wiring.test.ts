@@ -63,3 +63,9 @@ test('amend: a raised quantity on a received, billed or returned line is assesse
   const body = fn('updatePurchaseOrder')
   assert.match(body, /if \(k\.qtyChanged && req\.qty > k\.fact\.qty\) amendMarginRows\.push\(\{ productId: row\.productId, unitCostBase: k\.fact\.unitCostBase \}\)/)
 })
+
+test('the sales VAT rate is resolved for every VAT-inclusive product, priced or not, so a first list price can be set', () => {
+  const facts = readFileSync('lib/domain/purchasing/list-price-facts.ts', 'utf8')
+  assert.match(facts, /products\.filter\(\(p\) => p\.salesPriceTaxInclusive\)/)
+  assert.doesNotMatch(facts, /salesPriceTaxInclusive && p\.salesPriceBase/)
+})

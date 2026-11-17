@@ -3,6 +3,7 @@
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import { loadListPriceFacts } from '@/lib/domain/purchasing/list-price-facts'
 import { getSettingValue } from '@/lib/settings-store'
 import {
@@ -54,7 +55,7 @@ export type PoLineMarginRow = {
   currentCostBase: string | null
   /** The line against its minimum margin (o3d-hqvrp.380): 'none' when no minimum applies, 'unknown' when the margin is unavailable. */
   threshold: LineThresholdAssessment
-  /** o3d-hqvrp.381: the list price can be edited from the margin column. False for a variable parent, which is priced by its variations. */
+  /** o3d-hqvrp.381: the list price can be edited from the margin column (needs inventory.edit as well as inventory.prices). False for a variable parent, which is priced by its variations. */
   listPriceEditable: boolean
   /** The list price is stored VAT-inclusive; the edit still takes the ex-VAT price the column shows. */
   listPriceStoredVatInclusive: boolean
@@ -71,7 +72,8 @@ export type PoMarginPreview =
   | { success: false; error: string }
 
 export async function previewPoLineMargins(rawInput: z.input<typeof inputSchema>): Promise<PoMarginPreview> {
-  await requirePermission('inventory.prices')
+  const session = await requirePermission('inventory.prices')
+  const mayEditPrice = hasPermission(session.user.role, 'inventory.edit')
   const parsed = inputSchema.safeParse(rawInput)
   if (!parsed.success) return { success: false, error: 'Invalid margin request' }
   const { lines, pricesIncludeVat, fxRate } = parsed.data
@@ -121,7 +123,7 @@ export async function previewPoLineMargins(rawInput: z.input<typeof inputSchema>
       result,
       currentCostBase: agg && agg.qty.gt(0) ? agg.value.div(agg.qty).toDecimalPlaces(4).toFixed() : null,
       threshold: assessLineAgainstMinimum(result, minimum),
-      listPriceEditable: !!f && f.type !== 'VARIABLE',
+      listPriceEditable: mayEditPrice && !!f && f.type !== 'VARIABLE',
       listPriceStoredVatInclusive: f?.salesPriceTaxInclusive ?? false,
     }
   })

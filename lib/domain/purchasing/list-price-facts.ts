@@ -58,7 +58,7 @@ export async function loadListPriceFacts(productIds: readonly string[], client: 
   }
 
   const rateByProduct = new Map<string, number | null>()
-  const needVat = products.filter((p) => p.salesPriceTaxInclusive && p.salesPriceBase != null)
+  const needVat = products.filter((p) => p.salesPriceTaxInclusive) // also an unpriced one: its first list price needs the rate
   if (needVat.length > 0) {
     const resolved = await resolveLineTaxRateBatch(
       needVat.map((p) => ({ id: p.id, productCategory: p.taxCategory })),

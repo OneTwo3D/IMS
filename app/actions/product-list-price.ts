@@ -50,6 +50,8 @@ export type ListPriceEditResult =
   | { success: false; error: string }
 
 export async function updateProductListPrice(rawInput: z.input<typeof inputSchema>): Promise<ListPriceEditResult> {
+  // Both: the product editor needs inventory.edit to change a product, and this edit must not be a way round it; inventory.prices is what shows the column.
+  await requirePermission('inventory.edit')
   const session = await requirePermission('inventory.prices')
   const parsed = inputSchema.safeParse(rawInput)
   if (!parsed.success) return { success: false, error: 'Invalid price request' }
