@@ -112,7 +112,7 @@ export function receivableBalance(order: ReceivableOrder, asOf: Date): Receivabl
   // movement does). Without this the order's rows and its paid flag still say settled and the missing part would be owed by nobody.
   // The figure AS OF the report date, from the history, so a later restore or clear does not rewrite an earlier report. Orders
   // without history rows (none were ever recorded) fall back to the current columns.
-  const removedForeign = order.paymentRemovals !== undefined
+  const removedForeign = Array.isArray(order.paymentRemovals)
     ? Number(shortfallAsOf(order.paymentRemovals, asOf))
     : (order.paymentRemovedForeign == null || !onOrBefore(order.paymentRemovedAt) ? 0 : Number(order.paymentRemovedForeign))
   if (order.paidAt != null && onOrBefore(order.paidAt) && removedForeign > 0) {
