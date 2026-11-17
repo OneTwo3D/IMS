@@ -396,7 +396,7 @@ The **Products** tab controls bidirectional product synchronisation.
 - **Product content** (see below): short description, long description and the picture references
 - Weight and dimensions (length, width, height)
 - GTIN/barcode from WooCommerce's `global_unique_id` field (only written if the IMS barcode field is empty)
-- HS code and country of origin from WC product attributes (only written if the IMS fields are empty)
+- HS code, country of origin and customs description from WooCommerce's native customs fields, falling back to the older product attributes per field (a store value replaces a differing IMS value; a blank store value never clears IMS)
 - **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). If the store marks a **primary category** (the SEO plugins Yoast and Rank Math record one), the product is linked to that category, provided it is one of the product's own categories and has been mirrored; otherwise it is linked to its **deepest** WC category. Variations take the category of their parent product. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable — or the category list cannot be read to its end — the product's existing category link is left alone rather than wiped or linked to a partial tree.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 

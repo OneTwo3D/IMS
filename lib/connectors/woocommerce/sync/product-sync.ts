@@ -28,9 +28,9 @@ import {
 } from './product-sync-errors'
 import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../credentials'
 import type { ConnectorCredentials } from '../../types'
-import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
-import { clampCustomsDescription } from '@/lib/trade/customs-description'
+import { extractWcCustomsFields } from './customs-fields'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -632,21 +632,6 @@ function normalizeAttributeOptions(options: unknown): string[] {
     .filter((option): option is string => Boolean(option))
 }
 
-/** Search WC product attributes array by name (case-insensitive, ignores underscores/spaces), return first option value. */
-function getWcAttribute(
-  attrs: WcFullProduct['attributes'] | undefined,
-  ...names: string[]
-): string | null {
-  if (!Array.isArray(attrs)) return null
-  const normalise = (s: string) => s.toLowerCase().replace(/[_\s]+/g, '')
-  const targets = names.map(normalise)
-  const attr = attrs.find((a) => {
-    const name = asTrimmedString(a?.name)
-    return name ? targets.includes(normalise(name)) : false
-  })
-  return attr ? normalizeAttributeOptions(attr.options)[0] ?? null : null
-}
-
 async function snapshotProductSyncContext(): Promise<{
   creds: ConnectorCredentials | null
   syncVersion: string
@@ -844,16 +829,12 @@ export async function syncWcProductToIms(
     const imageUrl = getFirstImageUrl(wcProduct.images)
     const gtin = asTrimmedString(wcProduct.global_unique_id)
 
-    // Customs fields from WC attributes
-    const hsCodeAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'hs_code', 'hs code', 'hscode'))
-    const originAttr = getWcAttribute(wcProduct.attributes, 'country_of_origin', 'Country of Origin', 'coo')
-    const originIso = toIsoCountryCode(originAttr)
-    const customsDescriptionRaw = asTrimmedString(getWcAttribute(wcProduct.attributes, 'customs_description', 'customs description', 'customsdescription'))
-    // Cap at the downstream WMS 50-char customs-description limit on the way in,
-    // so the stored value matches what we can push downstream (and never blocks
-    // a WMS product create). Preserve null/blank so "WC omitted it" semantics
-    // are unchanged.
-    const customsDescriptionAttr = customsDescriptionRaw ? clampCustomsDescription(customsDescriptionRaw) : customsDescriptionRaw
+    // Customs fields: WooCommerce native fields first, attribute / legacy-meta fallback per field.
+    // The description is clamped on the way in (null/blank preserved: "WC omitted it").
+    const customs = extractWcCustomsFields(wcProduct)
+    const hsCodeAttr = customs.hsCode
+    const originIso = customs.countryOfOrigin
+    const customsDescriptionAttr = customs.customsDescription
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'

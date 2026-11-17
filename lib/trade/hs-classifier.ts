@@ -32,7 +32,7 @@ export type HsProposal = {
   cnCode: string | null
   modelConfidence: number
   reasoning: string
-  /** Model-written customs description ("article + key attribute"); clamped to 50 chars. Optional for stubs. */
+  /** Model-written customs description ("article + key attribute"); clamped to 35 chars. Optional for stubs. */
   customsDescription?: string | null
 }
 
@@ -48,7 +48,7 @@ export type HsClassification = {
   reasoning: string
   escalated: boolean
   /**
-   * Proposed customs description (<= 50 chars) or null. AI-written when usable, otherwise the
+   * Proposed customs description (<= 35 chars) or null. AI-written when usable, otherwise the
    * keyword rule's description. A PROPOSAL only: never applied over a stored product value.
    */
   customsDescription: string | null
@@ -160,7 +160,7 @@ const CLASSIFY_SCHEMA = {
     customs_description: {
       type: 'string',
       description:
-        'Customs goods description: "article + key attribute", English, no stop words, never brand-only, at most 50 characters.',
+        'Customs goods description: "article + key attribute", English, no stop words, never brand-only, at most 35 characters.',
     },
   },
   required: ['cn_code', 'confidence', 'reasoning', 'customs_description'],
@@ -172,7 +172,7 @@ const SYSTEM_PROMPT =
   'Classify by the essential character and material of the goods, not the brand or marketing copy. ' +
   'If you are unsure, give your best code and a lower confidence rather than refusing. ' +
   'Also return customs_description: "article + key attribute" (e.g. "brass nozzle, 3D printer extruder"), ' +
-  'in English, free of stop words ("parts", "accessories", "spares"), never brand-only, and at most 50 characters.'
+  'in English, free of stop words ("parts", "accessories", "spares"), never brand-only, and at most 35 characters.'
 
 export function buildAnthropicClassify(client: Anthropic): HsModelClassify {
   return async (input, model, { thinking }) => {
