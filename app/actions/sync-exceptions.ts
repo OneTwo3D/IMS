@@ -824,6 +824,8 @@ export type ExceptionInboxSummary = {
   wmsOperatorTasksOpen: number
   /** Standing refusals of an action (an order change the warehouse could not take, a split order that cannot complete) that need a person: serious and medium ones (counted in the total). */
   refusedActionsOpen: number
+  /** WooCommerce orders that no longer match the IMS order (WC_ORDER_DIVERGED; counted in the total). Read-only: IMS changed nothing. */
+  wcOrderDivergencesOpen: number
   unresolvedDrift: number
   /** Open systemic-failure incidents: a sweep read a pass as a connector-wide fault and parked nothing (counted in the total). */
   systemicFailures: number
@@ -1296,6 +1298,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   const wmsOperatorTasksOpen = await db.wmsOperatorTask.count({ where: { status: 'OPEN' } })
   // HIGH and MEDIUM only: LOW is noise by design (listed on the page, never counted).
   const refusedActionsOpen = await db.refusedAction.count({ where: { resolvedAt: null, severity: { in: ['HIGH', 'MEDIUM'] } } })
+  const wcOrderDivergencesOpen = await db.wcOrderDivergence.count({ where: { resolvedAt: null } })
   const systemicFailures = (await loadActiveSystemicIncidents()).length
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
   const deadReceiptEvents = deadReceipts + deadWebhooks + deadShoppingWebhooks
@@ -1316,6 +1319,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     giftCardLinesToResolve,
     wmsOperatorTasksOpen,
     refusedActionsOpen,
+    wcOrderDivergencesOpen,
     unresolvedDrift: driftIncidents.length,
     systemicFailures,
     accountingFollowUpObligations,
@@ -1324,7 +1328,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + refusedActionsOpen + driftIncidents.length + systemicFailures
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + refusedActionsOpen + wcOrderDivergencesOpen + driftIncidents.length + systemicFailures
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }

@@ -4298,6 +4298,31 @@ model RefusedAction {
   @@map("refused_actions")
 }
 
+/// A WooCommerce order and the IMS order disagree (lines, prices, shipping, discount, tax or total), found READ-ONLY by the order.updated path while
+/// `wc_order_divergence_detection_enabled` is on. One row per order: it is reopened when a later delivery disagrees again and closed (resolvedAt) when a
+/// later delivery matches. Nothing is ever written to the order, WooCommerce or the warehouse because of it. Carries SKUs, quantities and amounts only.
+model WcOrderDivergence {
+  id                  String    @id @default(cuid())
+  /// The IMS sales order id (no foreign key, so the row outlives a deleted order, like RefusedAction).
+  orderId             String    @unique @map("order_id")
+  externalOrderId     String    @map("external_order_id")
+  /// The storefront order number, for display.
+  externalOrderNumber String?   @map("external_order_number")
+  /// The field-level differences: [{ field, label, sku?, woocommerce, ims }]. SKUs, quantities and amounts only; built by IMS, never copied from a payload's free text.
+  differences         Json
+  /// Hash of the differences: the same difference seen again refreshes lastSeenAt instead of rewriting the row.
+  fingerprint         String
+  seenCount           Int       @default(1) @map("seen_count")
+  firstSeenAt         DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt          DateTime  @default(now()) @map("last_seen_at")
+  /// Set when a later delivery matched the IMS order again (or the order ended). A later difference starts a new episode on the same row.
+  resolvedAt          DateTime? @map("resolved_at")
+  resolution          String?
+
+  @@index([resolvedAt, firstSeenAt], map: "wc_order_divergences_open_idx")
+  @@map("wc_order_divergences")
+}
+
 // ---------------------------------------------------------------------------
 // WMS / WAREHOUSE CONNECTOR
 // ---------------------------------------------------------------------------

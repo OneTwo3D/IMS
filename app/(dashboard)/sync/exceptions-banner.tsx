@@ -31,6 +31,7 @@ export function ExceptionsBanner({ summary }: { summary: ExceptionInboxSummary }
     summary.doublePostageFlags > 0 ? `${summary.doublePostageFlags} possible double postage` : null,
     summary.wmsOperatorTasksOpen > 0 ? `${summary.wmsOperatorTasksOpen} warehouse query task(s) to raise` : null,
     summary.refusedActionsOpen > 0 ? `${summary.refusedActionsOpen} refused or stalled action(s)` : null,
+    summary.wcOrderDivergencesOpen > 0 ? `${summary.wcOrderDivergencesOpen} WooCommerce order(s) that no longer match IMS` : null,
     summary.orderReconcileDrift > 0 ? `${summary.orderReconcileDrift} order reconcile drift(s)` : null,
   ].filter(Boolean)
 

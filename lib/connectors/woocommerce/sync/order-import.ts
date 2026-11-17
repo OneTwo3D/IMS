@@ -33,6 +33,7 @@ import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import { surfaceWcOrderEditDrift } from './order-edit-drift'
+import { surfaceWcOrderDivergence } from './order-divergence'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
@@ -1393,6 +1394,8 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   // delivery whose total or currency disagrees with IMS already left its own durable obligation row (paid-block, retried until the two agree):
   // the total is not surfaced a second time then, so one disagreement is one row.
   await surfaceWcOrderEditDrift(orderId, wcOrder, { ignoreTotal: outcome.blocked })
+  // READ-ONLY and behind `wc_order_divergence_detection_enabled` (off by default): reports price, shipping, discount and tax differences too, net of refunds. Writes nothing to the order; never throws.
+  await surfaceWcOrderDivergence(orderId, wcOrder)
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.

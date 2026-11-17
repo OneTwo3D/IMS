@@ -174,6 +174,13 @@ ERASURE_CLASSIFICATION.RefusedAction = {
   notPersonal: ['entityType', 'entityId', 'action', 'gate', 'intent', 'detail', 'resolution'],
   retained: {},
 }
+// WooCommerce-vs-IMS order divergence records: keyed by the order id (no foreign key, so the row outlives a deleted order). The differences are built by IMS
+// from SKUs, quantities and amounts only (never a payload's free text, name, address or note), so nothing is erased and no free-text guard is needed.
+ERASURE_CLASSIFICATION.WcOrderDivergence = {
+  erased: [],
+  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution'],
+  retained: {},
+}
 ERASURE_CLASSIFICATION.EmailSuppression = { erased: ['email', 'reason'], notPersonal: ['id', 'source'], retained: {} }
 ERASURE_CLASSIFICATION.WmsMutationEvent = {
   erased: ['before', 'after'],
