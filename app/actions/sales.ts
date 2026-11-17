@@ -1624,7 +1624,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       const isDraft = current.status === 'DRAFT'
       // The status moved between the unlocked read that chose the pricing and this lock: the edit was priced for the other kind of order.
       if (isDraft === confirmedEdit) return { error: 'This order was changed by someone else since you opened it. Close this form and reload the order before editing again.' } as const
-      const { gate: editGate, committedShipments, shippedShipments } = await readOrderEditGateInput(tx, id, current)
+      const { gate: editGate } = await readOrderEditGateInput(tx, id, current)
       const block = resolveSalesOrderEditBlock(editGate)
       if (block) return { error: block.reason } as const
       // The warehouse order the gate was read for must still be the order's: a push that happened (or a link that moved) since is an answer about something else.

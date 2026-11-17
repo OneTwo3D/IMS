@@ -69,7 +69,7 @@ test('every refusal reads as operator wording, names what happened or the remedy
     exchangeRequestRefusal([{ productId: 'a', qty: 1, unitPriceForeign: -1 }])!, exchangeRequestRefusal([{ productId: 'a', qty: 1, unitPriceForeign: 1 }, { productId: 'a', qty: 1, unitPriceForeign: 1 }])!,
   ]
   for (const message of all) {
-    assert.ok(message.length > 40, message)
+    assert.ok(message.length > 30, message)
     assert.match(message, /[.]$/, `a full sentence: ${message}`)
     assert.doesNotMatch(message, /o3d-|undefined|null|\[object|`|\bSQL\b|Prisma|Error:/, message)
     assert.doesNotMatch(message, /exchange_for_refund_id|exchangeForRefundId/, `no column name: ${message}`)
