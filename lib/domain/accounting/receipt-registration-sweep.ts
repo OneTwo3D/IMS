@@ -96,7 +96,7 @@ function receiptAgeFloor(): Date {
  * current merely for being unrecorded: an older one behind a newer row is superseded. "Latest" ignores FAILED and CANCELLED rows, which never became the invoice (a later failed attempt must not demote the real pending row); when
  * EVERY row failed there is no viable row to supersede anything, so a marker row stays current. A marker left on a SUPERSEDED invoice excludes nothing, or it would hide every later receipt of the order for ever.
  */
-async function ordersOwingCurrentInvoiceFollowUps(): Promise<string[]> {
+export async function ordersOwingCurrentInvoiceFollowUps(): Promise<string[]> {
   const rows = await db.$queryRaw<Array<{ id: string }>>`
     SELECT DISTINCT m."referenceId" AS id FROM "accounting_sync_logs" m
     JOIN "sales_orders" o ON o.id = m."referenceId"

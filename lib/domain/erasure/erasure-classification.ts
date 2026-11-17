@@ -86,6 +86,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       actionUrl: 'an internal path; it is what links the notification to the order',
     },
   },
+  // o3d-cdhl: dated partial-payment-removal history; ids, kinds, amounts and the matched ledger payment ids only.
+  PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
     notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
@@ -170,6 +172,13 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
 ERASURE_CLASSIFICATION.RefusedAction = {
   erased: [],
   notPersonal: ['entityType', 'entityId', 'action', 'gate', 'intent', 'detail', 'resolution'],
+  retained: {},
+}
+// Xero payment-matching results: one row per customer receipt, keyed by the payment and order ids (no foreign key, so the row outlives a deleted receipt). It holds ids, a Xero
+// bank-account id, an amount, a currency and a reason code in fixed wording built by IMS: no person is named and no remote free text is stored, so nothing is erased.
+ERASURE_CLASSIFICATION.XeroPaymentMatch = {
+  erased: [],
+  notPersonal: ['paymentId', 'orderId', 'mode', 'reason', 'detail', 'bankAccountId', 'currency', 'accountingInvoiceId', 'claimToken'],
   retained: {},
 }
 ERASURE_CLASSIFICATION.EmailSuppression = { erased: ['email', 'reason'], notPersonal: ['id', 'source'], retained: {} }

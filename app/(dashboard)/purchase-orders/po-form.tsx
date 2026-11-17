@@ -28,9 +28,10 @@ import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
 import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
 import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, usableRate, type FormFxRate } from '@/lib/currencies/form-fx-rate'
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
+import { selectablePoWarehouses } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 
-type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null }
+type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null; availableForPurchaseOrders?: boolean }
 
 type Props = {
   suppliers: SupplierRow[]
@@ -969,8 +970,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
             >
               <option value="">Not specified</option>
-              {warehouses.map((w) => (
-                <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
+              {selectablePoWarehouses(warehouses, existingPo?.destinationWarehouseId).map((w) => (
+                <option key={w.id} value={w.id}>{w.code} — {w.name}{w.availableForPurchaseOrders === false ? ' (restricted: not available in purchase orders)' : ''}</option>
               ))}
             </select>
             {destWarehouse && (destWarehouse.addressLine1 || destWarehouse.city || destWarehouse.contactName) && (
