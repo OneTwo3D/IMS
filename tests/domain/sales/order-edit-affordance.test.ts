@@ -138,10 +138,10 @@ test('the server action and the order page both go through the helpers (one rule
   assert.match(importer, /const keepImsEdit = erasure\?\.editedInImsAt != null/)
   assert.match(importer, /\.\.\.\(!keepImsEdit && Array\.isArray\(wcOrder\.shipping_lines\)/)
   assert.match(importer, /\.\.\.\(erased \|\| keepImsEdit\s*\?\s*\{\}/)
-  // The refund and status-echo paths are untouched by the policy: only the importer's update path and the divergence comparison read the marker.
+  // The status-echo path is untouched by the policy: only the importer's update path, the divergence comparison and the refund sync (which quarantines a refund of a line the edit removed instead of writing it unlinked) read the marker.
   const dir = 'lib/connectors/woocommerce/sync'
   const readers = (await readdir(dir)).filter((f) => f.endsWith('.ts'))
   const readersOfMarker: string[] = []
   for (const file of readers) if ((await readFile(`${dir}/${file}`, 'utf8')).includes('editedInImsAt')) readersOfMarker.push(file)
-  assert.deepEqual(readersOfMarker.sort(), ['order-edit-drift.ts', 'order-import.ts'])
+  assert.deepEqual(readersOfMarker.sort(), ['order-edit-drift.ts', 'order-import.ts', 'refund-sync.ts'])
 })

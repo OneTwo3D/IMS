@@ -320,9 +320,20 @@ test('dispatched: addresses and notes can be edited, lines cannot; partly shippe
   }
 })
 
+/** The warehouse's answer to the amend gate, supplied without a network: the real gate reads the link and asks the connector; here only the connector's answer is replaced. */
+async function warehouseAnswers(t: { after: (fn: () => void) => void }, answer: { amendable: true } | { amendable: false; status: string } | 'throw'): Promise<unknown[][]> {
+  const gate = await import('@/lib/domain/sales/order-edit-wms-gate')
+  const real = gate.orderEditWmsGateDeps.current
+  const asked: unknown[][] = []
+  gate.orderEditWmsGateDeps.current = { ...real, probe: async (...args) => { asked.push(args); if (answer === 'throw') throw new Error('warehouse unreachable'); return answer } }
+  t.after(() => { gate.orderEditWmsGateDeps.current = real })
+  return asked
+}
+
 test('the edited order is a warehouse amendment candidate carrying the new lines; the edit writes no warehouse comment', SKIP, async (t) => {
   const w = await seedWorld()
   t.after(() => w.teardown())
+  await warehouseAnswers(t, { amendable: true })
   const { updateSalesOrder } = await import('@/app/actions/sales')
   const { db } = await import('@/lib/db')
   const { createPrismaWmsOrderPushPort, buildPushInput } = await import('@/lib/domain/wms/order-push-sweep')
@@ -411,4 +422,135 @@ test('an edit that cannot re-reserve its stock changes nothing; a paid order kee
   // Same total, different lines: allowed (a swap at the same price).
   const swap = await updateSalesOrder(paid, inputFor(w, [{ p: 'p2', qty: 1 }]) as never, await versionOf(paid))
   assert.equal(swap.success, true, swap.error)
+})
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// CODEX ROUND 1 (PR 975): Woo line identity, the invoice update, the warehouse gate.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+test('a Woo order keeps the storefront line id of every line the edit continues; only a line added in IMS has none; a later storefront refund of a removed line is quarantined, one of a kept line is linked', SKIP, async (t) => {
+  const w = await seedWorld()
+  t.after(() => w.teardown())
+  const { updateSalesOrder } = await import('@/app/actions/sales')
+  const { syncWcRefund } = await import('@/lib/connectors/woocommerce/sync/refund-sync')
+  const { db } = await import('@/lib/db')
+  const id = await createConfirmed(w, [{ p: 'p1', qty: 3 }, { p: 'p2', qty: 2 }])
+  await db.shoppingOrderLink.create({ data: { orderId: id, connector: 'woocommerce', externalOrderId: `${900000 + Math.floor(Math.random() * 99999)}` } })
+  const saved = await db.salesOrderLine.findMany({ where: { orderId: id } })
+  const l1 = saved.find((l) => l.productId === w.p1.id)!
+  const l2 = saved.find((l) => l.productId === w.p2.id)!
+  const woo1 = 710000 + Math.floor(Math.random() * 9999)
+  await db.salesOrderLine.update({ where: { id: l1.id }, data: { externalLineItemId: woo1 } })
+  await db.salesOrderLine.update({ where: { id: l2.id }, data: { externalLineItemId: woo1 + 1 } })
+  const link = await db.shoppingOrderLink.findFirstOrThrow({ where: { orderId: id } })
+
+  // The edit changes p1's quantity and REMOVES p2.
+  const lineA = { ...inputFor(w, [{ p: 'p1', qty: 4 }]).lines[0], orderLineId: l1.id }
+  const edited = await updateSalesOrder(id, { ...inputFor(w, [{ p: 'p1', qty: 4 }]), lines: [lineA] } as never, await versionOf(id), { acknowledgeShopDesync: true })
+  assert.equal(edited.success, true, edited.error)
+  const after = await db.salesOrderLine.findMany({ where: { orderId: id } })
+  assert.equal(after.length, 1)
+  assert.equal(after[0].id, l1.id, 'the continued line keeps its row')
+  assert.equal(after[0].externalLineItemId, woo1, 'and its storefront line item id')
+  assert.equal(Number(after[0].qty), 4, 'with the edited quantity')
+
+  // A line added by the edit has no storefront id; a line without an orderLineId continues the saved line of its product (the id is not lost because a client omitted it).
+  const added = await updateSalesOrder(id, inputFor(w, [{ p: 'p1', qty: 5 }, { p: 'p2', qty: 1 }]) as never, await versionOf(id), { acknowledgeShopDesync: true })
+  assert.equal(added.success, true, added.error)
+  const after2 = await db.salesOrderLine.findMany({ where: { orderId: id } })
+  assert.equal(after2.find((l) => l.productId === w.p1.id)!.externalLineItemId, woo1, 'id kept without a client-supplied orderLineId')
+  assert.equal(after2.find((l) => l.productId === w.p2.id)!.externalLineItemId, null, 'a line added in IMS has no storefront id (the removed line\'s id is not reused)')
+  assert.equal(after2.find((l) => l.productId === w.p2.id)!.id === l2.id, false)
+
+  // LATER STOREFRONT REFUNDS, through the same per-refund path syncRefundsForOrder runs. The stock and the refund rows are the evidence of "no mis-match, no double cost reversal".
+  const stockBefore = JSON.stringify(await db.stockLevel.findMany({ where: { warehouseId: w.warehouseId }, orderBy: { productId: 'asc' } }))
+  const refundLine = (orderItemId: number, name: string) => ({ id: orderItemId + 1000, name, product_id: 1, variation_id: 0, quantity: -1, tax_class: '', subtotal: '-10.00', subtotal_tax: '-2.00', total: '-10.00', total_tax: '-2.00', taxes: [], meta_data: [{ id: 1, key: '_refunded_item_id', value: String(orderItemId) }], sku: '', price: 10 })
+  const wcRefund = (refundId: number, lineItems: unknown[]) => ({ id: refundId, date_created: '2026-11-17T00:00:00', date_created_gmt: '2026-11-17T00:00:00', amount: '12.00', reason: 'r', refunded_by: 1, refunded_payment: true, meta_data: [], line_items: lineItems }) as never
+  const created: unknown[][] = []
+  const fakeCreate = (async (...args: unknown[]) => { created.push(args); return { success: true } }) as never
+
+  const removedRefundId = 810000 + Math.floor(Math.random() * 9999)
+  const removed = await syncWcRefund(Number(link.externalOrderId), wcRefund(removedRefundId, [refundLine(woo1 + 1, 'Desc p2')]), { createRefund: fakeCreate })
+  assert.equal(removed.outcome, 'quarantined-refusal', 'a refund of a line the edit removed is not written unlinked')
+  assert.match(String(removed.error), /no longer has because it was edited in IMS/)
+  assert.equal(created.length, 0, 'no refund was created, so no stock return and no cost reversal can be booked (let alone twice)')
+  assert.equal(await db.salesOrderRefund.count({ where: { orderId: id } }), 0)
+  assert.equal(JSON.stringify(await db.stockLevel.findMany({ where: { warehouseId: w.warehouseId }, orderBy: { productId: 'asc' } })), stockBefore, 'stock untouched')
+  // Delivered again, it is the same answer (a quarantined park is not re-opened, nothing is written twice).
+  const again = await syncWcRefund(Number(link.externalOrderId), wcRefund(removedRefundId, [refundLine(woo1 + 1, 'Desc p2')]), { createRefund: fakeCreate })
+  assert.notEqual(again.outcome, 'applied')
+  assert.equal(created.length, 0)
+
+  const keptRefundId = removedRefundId + 1
+  const kept = await syncWcRefund(Number(link.externalOrderId), wcRefund(keptRefundId, [refundLine(woo1, 'Desc p1')]), { createRefund: fakeCreate })
+  assert.notEqual(kept.outcome, 'quarantined-refusal', String(kept.error))
+  assert.equal(created.length, 1, 'a refund of a continued line is written')
+  const [, lines] = created[0] as [string, Array<{ lineId?: string; productId: string | null; qty: number }>]
+  assert.equal(lines[0].lineId, l1.id, 'linked to the continued line')
+  assert.equal(lines[0].productId, w.p1.id, 'with its product, so the stock return and the cost reversal are made once, for the right goods')
+  await db.shoppingSyncLog.deleteMany({ where: { entityId: id } })
+})
+
+test('an invoice update that cannot be queued (the posted invoice belongs to another connector than the active one) refuses the edit and rolls everything back', SKIP, async (t) => {
+  process.env.SETTINGS_ENCRYPTION_KEY ??= 'a1'.repeat(32)
+  const w = await seedWorld()
+  t.after(() => w.teardown())
+  const { updateSalesOrder } = await import('@/app/actions/sales')
+  const { db } = await import('@/lib/db')
+  await enableXeroInvoicing(w)
+  const id = await createConfirmed(w, [{ p: 'p1', qty: 2 }])
+  await db.accountingSyncLog.deleteMany({ where: { referenceId: id } })
+  // The invoice was posted by ANOTHER accounting connector: the update helper declines without asking the queue, which used to commit the edit with the invoice left at the old lines.
+  await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `QBO-${w.tag}`, accountingInvoiceConnector: 'quickbooks', invoiceNumber: `INV-${w.tag}` } })
+  const before = await snapshot(id)
+  const reservationBefore = await reservation(w, id)
+  const refused = await updateSalesOrder(id, inputFor(w, [{ p: 'p1', qty: 3 }]) as never, await versionOf(id))
+  assert.equal(refused.success, false, 'the edit does not report success')
+  assert.match(String(refused.error), /out of step with its total, so nothing was changed/)
+  assert.match(String(refused.error), /not attempted/)
+  assert.equal(await snapshot(id), before, 'the order, its lines and its totals are as they were')
+  assert.deepEqual(await reservation(w, id), reservationBefore, 'the reservation is as it was')
+  assert.equal(await db.accountingSyncLog.count({ where: { referenceId: id, type: 'SALES_INVOICE_UPDATE' } }), 0)
+  assert.equal(await db.activityLog.count({ where: { entityId: id, action: 'confirmed_order_edited' } }), 0, 'no audit entry for an edit that did not happen')
+})
+
+test('the warehouse gate: an order pushed to the warehouse is edited only while the warehouse order is amendable; past NEW or unknown refuses lines and addresses, and writes nothing', SKIP, async (t) => {
+  const w = await seedWorld()
+  t.after(() => w.teardown())
+  const { updateSalesOrder, updateSalesOrderAddressesAndNotes } = await import('@/app/actions/sales')
+  const { db } = await import('@/lib/db')
+  const id = await createConfirmed(w, [{ p: 'p1', qty: 2 }])
+  await db.wmsOrderPushLink.create({ data: { orderId: id, connector: 'mintsoft', state: 'SYNCED', externalOrderId: `MS-${w.tag}`, pushedAt: new Date() } as never })
+  const before = await snapshot(id)
+  const reservationBefore = await reservation(w, id)
+
+  for (const [label, answer] of [['past NEW', { amendable: false, status: 'NOT_NEW' }], ['unreadable', 'throw']] as const) {
+    const asked = await warehouseAnswers(t, answer as never)
+    const lines = await updateSalesOrder(id, inputFor(w, [{ p: 'p1', qty: 5 }]) as never, await versionOf(id))
+    assert.equal(lines.success, false, label)
+    assert.match(String(lines.error), /^AMENDMENT_NOT_APPLIED:/, label)
+    const addr = await updateSalesOrderAddressesAndNotes(id, { shippingAddress: { line1: 'x', country: 'GB' }, notes: 'late' }, await versionOf(id))
+    assert.equal(addr.success, false, label)
+    assert.match(String(addr.error), /^AMENDMENT_NOT_APPLIED:/, label)
+    assert.deepEqual(asked.map((a) => a.slice(0, 2)), [['mintsoft', `MS-${w.tag}`], ['mintsoft', `MS-${w.tag}`]], `${label}: the warehouse was asked about its order`)
+    assert.equal(await snapshot(id), before, `${label}: nothing was written`)
+    assert.deepEqual(await reservation(w, id), reservationBefore, `${label}: the reservation is untouched`)
+  }
+
+  // Amendable: the edit goes through.
+  await warehouseAnswers(t, { amendable: true })
+  const ok = await updateSalesOrder(id, inputFor(w, [{ p: 'p1', qty: 5 }]) as never, await versionOf(id))
+  assert.equal(ok.success, true, ok.error)
+  assert.equal((await updateSalesOrderAddressesAndNotes(id, { notes: 'on time' }, await versionOf(id))).success, true)
+
+  // A dispatched order is not amended by the warehouse: its address edit does not ask the gate (and is allowed even though the warehouse is past NEW).
+  const shipped = await createConfirmed(w, [{ p: 'p2', qty: 1 }])
+  await db.wmsOrderPushLink.create({ data: { orderId: shipped, connector: 'mintsoft', state: 'SYNCED', externalOrderId: `MS2-${w.tag}`, pushedAt: new Date() } as never })
+  await db.shipment.create({ data: { orderId: shipped, warehouseId: w.warehouseId, status: 'SHIPPED' } })
+  await db.salesOrder.update({ where: { id: shipped }, data: { status: 'SHIPPED' } })
+  const asked = await warehouseAnswers(t, { amendable: false, status: 'NOT_NEW' })
+  const addr = await updateSalesOrderAddressesAndNotes(shipped, { shippingAddress: { line1: 'after dispatch', country: 'GB' } }, await versionOf(shipped))
+  assert.equal(addr.success, true, addr.error)
+  assert.equal(asked.length, 0)
 })

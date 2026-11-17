@@ -129,6 +129,8 @@ import {
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExtraMapping, isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
+import { matchContinuedOrderLines } from '@/lib/domain/sales/order-edit-lines'
+import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
 import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -359,6 +361,11 @@ export type SoLineInput = {
    * country. When set, this rate is used verbatim.
    */
   taxRateId?: string | null
+  /**
+   * An EDIT only: the id of the saved order line this line continues. A continued line keeps its row (so the WooCommerce line item id a later storefront refund names, and every other link to it, survive the edit); a line
+   * without one is matched to a saved line of the same product that nothing else claimed, and otherwise is a new line with no storefront id. Ignored by create.
+   */
+  orderLineId?: string
 }
 
 export type CreateSoInput = {
@@ -1483,7 +1490,7 @@ const EDIT_GUARD_SELECT = {
   storeCreditForeign: true,
   invoiceNumber: true,
   _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
-  wmsOrderPush: { select: { id: true } },
+  wmsOrderPush: { select: { id: true, externalOrderId: true } },
 } as const
 
 /** Staleness of the form the operator is editing from: refused when the order was saved since the form read it. */
@@ -1529,6 +1536,15 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
     const lineData = prepared.model.lines
     const actingUserId = session.user.id ?? null
 
+    // THE WAREHOUSE GATE (the one the amendment pass asks): an order already pushed to the warehouse is edited only while the warehouse order can still be amended. Read before the transaction (a remote read does not
+    // belong under the order lock); the transaction re-checks that the warehouse order is the one this answer was read for.
+    let wmsGateOrderId: string | null = null
+    if (confirmedEdit) {
+      const gate = await resolveOrderEditWmsGate(id, 'lines')
+      if (!gate.ok) return { success: false, error: gate.error }
+      wmsGateOrderId = gate.externalOrderId
+    }
+
     let allocationResult: Awaited<ReturnType<typeof allocateSalesOrder>> | null = null
     let invoiceUpdateOutcome: { queued: boolean; reason?: string } | null = null
     const outcome = await db.$transaction(async (tx) => {
@@ -1570,6 +1586,10 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
         productlessLines,
       })
       if (block) return { error: block.reason } as const
+      // The warehouse order the gate was read for must still be the order's: a push that happened (or a link that moved) since is an answer about something else.
+      if (!isDraft && (current.wmsOrderPush?.externalOrderId ?? null) !== wmsGateOrderId) {
+        return { error: 'The warehouse order for this sales order changed while the edit was being checked. Reload the order and edit it again. Nothing was changed.' } as const
+      }
       // THE DESYNC ACKNOWLEDGEMENT: an order from the shop is not changed in the shop by this edit; the operator confirmed they know. Refused before anything is written.
       const desyncRefusal = shopDesyncAcknowledgementRefusal(current._count.shoppingLinks > 0, options?.acknowledgeShopDesync)
       if (desyncRefusal) return { error: desyncRefusal } as const
@@ -1602,7 +1622,16 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       if (!isDraft) {
         await releaseOrderAllocationsForDeallocationInTx(tx, id, { cause: 'editing the order', userId: actingUserId })
       }
-      await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
+      // THE LINES ARE EDITED IN PLACE where they continue. A continued line keeps its row, so the WooCommerce line item id (externalLineItemId) a later storefront refund names, its fee kind and its other links survive the edit;
+      // only a line the operator removed is deleted and only a line added in IMS is created (it has no storefront id). Deleting and recreating every line (the first version) orphaned every later itemised refund.
+      const existingLines = await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true, productId: true }, orderBy: { id: 'asc' } })
+      // A draft is held by nothing outside its own rows (no storefront id, no allocation, no document), so it is rewritten whole, as it always was.
+      const continued = isDraft ? input.lines.map(() => null) : matchContinuedOrderLines(existingLines, input.lines)
+      const keptIds = new Set(continued.filter((c): c is string => c !== null))
+      await tx.salesOrderLine.deleteMany({ where: { orderId: id, id: { notIn: [...keptIds] } } })
+      for (const [index, lineId] of continued.entries()) {
+        if (lineId !== null) await tx.salesOrderLine.update({ where: { id: lineId }, data: lineData[index]! })
+      }
       await tx.salesOrder.update({
         where: { id },
         data: {
@@ -1614,7 +1643,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
           shippingAddress: (input.shippingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
           // An order that came from the shop is marked as edited here, so a later shop delivery does not write its copy over the edit (order-import.ts).
           ...(current._count.shoppingLinks > 0 ? { editedInImsAt: new Date() } : {}),
-          lines: { create: lineData },
+          lines: { create: lineData.filter((_, index) => continued[index] === null) },
         },
       })
 
@@ -1630,6 +1659,11 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
         // THE POSTED INVOICE: its update is queued in this transaction. An order with no posted invoice has nothing to update (an invoice still queued refused the edit above).
         if (current.accountingInvoiceId) {
           await queueSalesInvoiceForOrder(id, { client: tx as unknown as typeof db, updateInTx: true, onUpdateOutcome: (o) => { invoiceUpdateOutcome = o } })
+          // EXPLICITLY queued, shadowed (the producer-side hold) or not owed -- never silence. The update helper returns without asking the queue when the chart or the invoice belongs to another connector than the active one, or
+          // the connector cannot update invoices; none of those records an outcome, and that used to commit the edit with the posted invoice left at the old lines. No outcome is a refusal: the edit rolls back.
+          const recorded = invoiceUpdateOutcome as { queued: boolean; reason?: string } | null
+          if (recorded === null) throw new SalesInvoiceNotQueuedError('the update of the posted invoice was not attempted (the invoice belongs to another accounting connector than the active one, or the active connector cannot update invoices)')
+          assertInvoiceQueuedOrNotOwed(recorded)
         }
       }
 
@@ -1679,10 +1713,6 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
         }
       }
       if ((committedAllocation.unallocatedQty ?? 0) > 0) postCommitWarnings.push(`${committedAllocation.unallocatedQty} unit(s) could not be reserved and are on backorder`)
-    }
-    const invoiceOutcome = invoiceUpdateOutcome as { queued: boolean; reason?: string } | null
-    if (invoiceOutcome && !invoiceOutcome.queued && invoiceOutcome.reason !== 'shadowed' && invoiceOutcome.reason !== 'not-configured') {
-      postCommitWarnings.push('the update of this order\'s accounting invoice was NOT queued (see the exceptions list); the edit is saved, but the invoice in the accounting system still shows the previous version')
     }
     try { revalidatePath('/sales'); revalidatePath(`/sales/${id}`) } catch { /* cache refresh only */ }
     const mapped = mapSoRow(written)
@@ -1738,15 +1768,28 @@ export async function updateSalesOrderAddressesAndNotes(
   try {
     const session = await requirePermission('sales.create')
     const actingUserId = session.user.id ?? null
+    // THE WAREHOUSE GATE for an order not yet dispatched: its address and notes reach the warehouse order through the same amendment, so the edit waits for the same answer (see order-edit-wms-gate.ts). A dispatched order is never amended.
+    const dispatchedStatuses = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED']
+    const preRead = await db.salesOrder.findUnique({ where: { id }, select: { status: true } })
+    let wmsGateOrderId: string | null | undefined
+    if (preRead && !dispatchedStatuses.includes(preRead.status)) {
+      const gate = await resolveOrderEditWmsGate(id, 'addresses and notes')
+      if (!gate.ok) return { success: false, error: gate.error }
+      wmsGateOrderId = gate.externalOrderId
+    }
     const outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, id)
       const current = await tx.salesOrder.findUnique({
         where: { id },
-        select: { status: true, erasedAt: true, updatedAt: true, orderNumber: true, externalOrderNumber: true, _count: { select: { shoppingLinks: true } } },
+        select: { status: true, erasedAt: true, updatedAt: true, orderNumber: true, externalOrderNumber: true, _count: { select: { shoppingLinks: true } }, wmsOrderPush: { select: { externalOrderId: true } } },
       })
       if (!current) return { error: 'Order not found' } as const
       const block = resolveSalesOrderAddressEditBlock({ status: current.status, erased: current.erasedAt !== null })
       if (block) return { error: block.reason } as const
+      // Gate read for an order that was not dispatched: still the same warehouse order, and the order was not dispatched in between.
+      if (!dispatchedStatuses.includes(current.status) && (wmsGateOrderId === undefined || (current.wmsOrderPush?.externalOrderId ?? null) !== wmsGateOrderId)) {
+        return { error: 'The order or its warehouse order changed while the edit was being checked. Reload the order and edit it again. Nothing was changed.' } as const
+      }
       const desyncRefusal = shopDesyncAcknowledgementRefusal(current._count.shoppingLinks > 0, options?.acknowledgeShopDesync)
       if (desyncRefusal) return { error: desyncRefusal } as const
       const stale = staleEditRefusal(current, expectedUpdatedAt)

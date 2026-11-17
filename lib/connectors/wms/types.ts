@@ -708,6 +708,11 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
    * recorded line id of the order) before a link is re-pointed at it.
    */
   fetchOrderItemRefs?(externalOrderId: string): Promise<WmsOrderItemRef[]>
+  /**
+   * READ-ONLY. The amend gate without the amendment: can this warehouse order still be amended (it exists, is this order, is not merged, is still NEW)? Used before IMS commits a change the warehouse order would have to take.
+   * Throws when the warehouse cannot be read; the caller treats that as unknown, never as amendable.
+   */
+  probeOrderAmendable?(externalOrderId: string, expectedOrderNumber: string | null): Promise<{ amendable: true } | { amendable: false; status: string }>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */

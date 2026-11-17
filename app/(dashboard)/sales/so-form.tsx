@@ -46,6 +46,8 @@ type Props = {
 
 type LineItem = {
   key: string
+  /** The saved order line this one continues (an edit), so the server keeps that row and its WooCommerce line item id. */
+  orderLineId?: string
   productId: string
   sku: string
   name: string
@@ -157,6 +159,7 @@ function editLinesFromOrder(order: SoDetail, products: ProductRow[], taxRates: T
     const auto = resolved.taxRateId === l.taxRateId
     return {
       key: makeKey(),
+      orderLineId: l.id,
       productId: l.productId ?? '',
       sku: l.sku,
       name: l.description,
@@ -600,6 +603,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           const gross = l.qty * l.unitPrice
           const disc = parseDiscount(l.discount, gross)
           return {
+            orderLineId: l.orderLineId,
             productId: l.productId,
             sku: l.sku,
             description: l.name,
