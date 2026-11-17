@@ -36,7 +36,7 @@ export type BackInStockAsnLine = {
   qtyAccountedViaSnapshot: DecimalInput
   qtyAccountedViaReceipt: DecimalInput
   /** The ASN header. `status` decides whether the row can DATE supply; every row, whatever its status, counts as landed stock. */
-  asn: { eta: Date | null; status: string }
+  asn: { eta: Date | null; status: string; closedAt?: Date | null }
 }
 
 /** ASN statuses that still expect units: only these rows can date a line's remaining supply. */
@@ -69,7 +69,8 @@ export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: Ba
     let outstanding = toDecimal(line.qty).sub(landed.qty)
     if (outstanding.lte(0)) continue
     for (const asnLine of lineAsnRows) {
-      if (!OPEN_ASN_STATUSES.includes(asnLine.asn.status)) continue
+      // closeAsnShort sets closedAt and leaves the status, so a closed-short ASN still reads PARTIALLY_BOOKED_IN: closedAt wins.
+      if (asnLine.asn.closedAt || !OPEN_ASN_STATUSES.includes(asnLine.asn.status)) continue
       // The row's own landed units are max(snapshot, receipt): a receipt can absorb the very units alignment credited, so the two
       // counters are not added.
       const accounted = toDecimal(asnLine.qtyAccountedViaSnapshot).gt(toDecimal(asnLine.qtyAccountedViaReceipt))
@@ -108,7 +109,7 @@ export async function loadBackInStockDates(productIds: string[], now: Date = new
     },
     select: {
       sourceLineId: true, expectedQty: true, qtyAccountedViaSnapshot: true, qtyAccountedViaReceipt: true,
-      asn: { select: { eta: true, status: true } },
+      asn: { select: { eta: true, status: true, closedAt: true } },
     },
   })
   return resolveBackInStockDates(lines, asnLines, now)

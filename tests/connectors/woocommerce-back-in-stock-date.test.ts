@@ -234,6 +234,20 @@ test('resolver: units WMS alignment already landed are NOT outstanding supply (o
   assert.equal(closedPartial.get('a'), ymd(2))
 })
 
+test('resolver: a closed-short ASN (closedAt set, status still PARTIALLY_BOOKED_IN) cannot date supply; its landed units still count (o3d-taro Codex r2)', async () => {
+  const { resolveBackInStockDates } = await import('@/lib/domain/inventory/back-in-stock-date')
+  const closedShort = { sourceLineId: 'l1', expectedQty: 10, qtyAccountedViaSnapshot: 0, qtyAccountedViaReceipt: 4, asn: { eta: at(3), status: 'PARTIALLY_BOOKED_IN', closedAt: at(-1) } }
+  // 10-unit line, 4 received, the closed ASN's ETA (+3) must not date the 6 short units: the later PO date (+12) does
+  const withPo = resolveBackInStockDates([poLine('l1', 'a', null, at(12), 10, 4)], [closedShort], NOW)
+  assert.equal(withPo.get('a'), ymd(12))
+  // no PO date: no date at all, never the closed ASN's
+  const noPo = resolveBackInStockDates([poLine('l1', 'a', null, null, 10, 4)], [closedShort], NOW)
+  assert.equal(noPo.has('a'), false)
+  // the same ASN not closed still dates
+  const open = resolveBackInStockDates([poLine('l1', 'a', null, at(12), 10, 4)], [{ ...closedShort, asn: { ...closedShort.asn, closedAt: null } }], NOW)
+  assert.equal(open.get('a'), ymd(3))
+})
+
 // ───────────────────────── 2. setting OFF: byte-identical ─────────────────────────
 
 test('setting OFF (absent, and "false"): the posted payloads are byte-identical and no supply is read', async () => {
