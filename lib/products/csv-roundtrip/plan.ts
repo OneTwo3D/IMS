@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import type { Permission } from '@/lib/permissions'
-import { stripCsvFormulaGuard } from '@/lib/csv'
+import { csvFormulaGuardApplies } from '@/lib/csv'
 import {
   buildProductCategoryPathNormalized,
   parseProductCategoryPath,
@@ -11,6 +12,7 @@ import { blocksClearingInvalidOrigin, normalizeCsvCountryOfOrigin } from '@/lib/
 import {
   CSV_CLEAR_TOKEN,
   PRODUCT_CSV_KEY_COLUMN,
+  PRODUCT_CSV_REV_COLUMN,
   findProductCsvColumn,
   type ProductCsvColumn,
 } from '@/lib/products/csv-roundtrip/columns'
@@ -27,7 +29,11 @@ import {
  *   - an unknown SKU is an error, not a create: this is an update-only path;
  *   - an unrecognised value is an error for its row, never a silent default (the importer's boolean reader turns every
  *     word it does not know into FALSE; this one refuses it);
- *   - a row with any error writes nothing at all, so a product is never half-edited.
+ *   - a row with any error writes nothing at all, so a product is never half-edited;
+ *   - a cell the operator did not edit is never written, even when the product has moved on since the download. The
+ *     download carries a `rev` column holding a short hash of each exported value; a cell whose value still hashes to
+ *     its token is "unedited" and skipped, and an EDITED cell whose field no longer holds the downloaded value refuses
+ *     the row ("changed since you downloaded it"), so an old file can never restore stale values over a newer edit.
  */
 
 /** What the plan needs to know about a product as it stands. Decimals arrive as strings. */
@@ -53,6 +59,8 @@ export type RoundTripProduct = {
   preferredSupplierLocked: boolean
   categoryId: string | null
   lifecycleStatus: ProductLifecycleStatus
+  /** The row version: the write only lands on a product still carrying it. */
+  updatedAt: Date
 }
 
 export type PlanLookups = {
@@ -95,11 +103,12 @@ export type RowOutcome =
 
 export type HeaderAnalysis =
   | { ok: false; error: string }
-  | { ok: true; columns: ProductCsvColumn[]; ignored: string[]; headerByColumn: Map<string, string>; skuHeader: string }
+  | { ok: true; columns: ProductCsvColumn[]; ignored: string[]; headerByColumn: Map<string, string>; skuHeader: string; revHeader: string | null }
 
 /** Which of the file's headers are editable columns. The file must carry SKU and at least one editable column. */
 export function analyseProductCsvHeaders(headers: readonly string[], canUse: (permission: Permission) => boolean): HeaderAnalysis {
   let skuHeader: string | null = null
+  let revHeader: string | null = null
   const seen = new Set<string>()
   const columns: ProductCsvColumn[] = []
   const ignored: string[] = []
@@ -109,6 +118,7 @@ export function analyseProductCsvHeaders(headers: readonly string[], canUse: (pe
     if (seen.has(lowered)) return { ok: false, error: `The column "${header.trim()}" appears more than once in the file.` }
     seen.add(lowered)
     if (lowered === PRODUCT_CSV_KEY_COLUMN) { skuHeader = header; continue }
+    if (lowered === PRODUCT_CSV_REV_COLUMN) { revHeader = header; continue }
     const column = findProductCsvColumn(header)
     if (column) {
       columns.push(column)
@@ -126,7 +136,7 @@ export function analyseProductCsvHeaders(headers: readonly string[], canUse: (pe
       error: `The file changes ${blocked.map((column) => column.key).join(', ')}, which needs the ${blocked[0].requires} permission. You do not have it, so nothing was applied.`,
     }
   }
-  return { ok: true, columns, ignored, headerByColumn, skuHeader }
+  return { ok: true, columns, ignored, headerByColumn, skuHeader, revHeader }
 }
 
 const TRUE_WORDS = new Set(['true', 'yes', 'y', '1'])
@@ -212,20 +222,58 @@ function sameValue(column: ProductCsvColumn, current: string | boolean | null, n
   return current === next
 }
 
+/** Eight hex characters of a SHA-256: enough that an edit is not mistaken for "unchanged" by chance. */
+function shortHash(text: string): string {
+  return createHash('sha256').update(text.trim()).digest('hex').slice(0, 8)
+}
+
+/** The `rev` cell of one downloaded row: `column=hash;column=hash`, one hash per exported column. */
+export function buildRevToken(
+  product: RoundTripProduct,
+  columns: readonly ProductCsvColumn[],
+  lookups: Pick<PlanLookups, 'supplierNameById' | 'categoryPathById'>,
+): string {
+  return columns.map((column) => `${column.key}=${shortHash(displayCurrentValue(product, column, lookups))}`).join(';')
+}
+
+export function parseRevToken(token: string): Map<string, string> {
+  const hashes = new Map<string, string>()
+  for (const part of token.split(';')) {
+    const at = part.indexOf('=')
+    if (at > 0) hashes.set(part.slice(0, at).trim(), part.slice(at + 1).trim())
+  }
+  return hashes
+}
+
 export type PlanChunkInput = {
   /** The 1-based data row number, for messages (the header is row 1, so the first product is row 2). */
   rows: ReadonlyArray<{ line: number; cells: Record<string, string> }>
   columns: readonly ProductCsvColumn[]
   headerByColumn: ReadonlyMap<string, string>
   skuHeader: string
+  /** The file's `rev` header, or null for a file that was not downloaded from here. */
+  revHeader: string | null
   productsBySku: ReadonlyMap<string, RoundTripProduct>
   lookups: PlanLookups
   state: PlanFileState
 }
 
-/** The cells of one file row that this plan reads: stripped of the exporter's formula guard, never undefined. */
+/** One cell of a file row, trimmed, never undefined. The exporter's formula guard is NOT removed here; see isUneditedCell. */
 function cell(cells: Record<string, string>, header: string): string {
-  return stripCsvFormulaGuard((cells[header] ?? '').trim())
+  return (cells[header] ?? '').trim()
+}
+
+/**
+ * Whether a cell still holds what the download put there. The exporter writes `'=SUM(1)` for a stored `=SUM(1)` (the
+ * formula guard) and writes `'=SUM(1)` unchanged for a stored `'=SUM(1)`, so an apostrophe is only the guard when the
+ * downloaded value (known through its hash) is the text without it. Anything else is what the operator typed and is kept
+ * verbatim.
+ */
+function isUneditedCell(raw: string, canonical: string | null, token: string | undefined): boolean {
+  if (token === undefined) return false
+  if (shortHash(raw) === token) return true
+  if (raw.startsWith("'") && csvFormulaGuardApplies(raw.slice(1)) && shortHash(raw.slice(1)) === token) return true
+  return canonical !== null && shortHash(canonical) === token
 }
 
 export function planProductCsvChunk(input: PlanChunkInput): RowOutcome[] {
@@ -245,6 +293,7 @@ export function planProductCsvChunk(input: PlanChunkInput): RowOutcome[] {
       continue
     }
 
+    const tokens = input.revHeader ? parseRevToken(cell(cells, input.revHeader)) : new Map<string, string>()
     const changes: FieldChange[] = []
     const problems: string[] = []
     const claimedBarcodes: Array<[string, string]> = []
@@ -252,10 +301,13 @@ export function planProductCsvChunk(input: PlanChunkInput): RowOutcome[] {
       const raw = cell(cells, input.headerByColumn.get(column.key)!)
       if (raw === '') continue // blank: leave unchanged. Never a clear.
       const before = currentValue(product, column)
+      const token = tokens.get(column.key)
       let next: string | boolean | null
       let display: string
+      let canonical: string | null = null
       if (raw === CSV_CLEAR_TOKEN) {
         if (!column.nullable) { problems.push(`${column.key} cannot be cleared (it is required)`); continue }
+        if (isUneditedCell(raw, null, token)) continue
         if (column.kind === 'country' && blocksClearingInvalidOrigin(before as string | null, null)) {
           problems.push(`${column.key}: this product has an invalid stored country of origin; supply a valid country instead of clearing it`)
           continue
@@ -264,9 +316,20 @@ export function planProductCsvChunk(input: PlanChunkInput): RowOutcome[] {
         display = ''
       } else {
         const parsed = parseValue(column, raw, input.lookups)
+        if (parsed.ok) canonical = parsed.display
+        // A cell the operator did not touch is skipped even if the product has moved on since the download.
+        if (isUneditedCell(raw, canonical, token)) continue
         if (!parsed.ok) { problems.push(parsed.message); continue }
         next = parsed.value
         display = parsed.display
+      }
+      // An EDITED cell: refuse it if the field is no longer what the file was downloaded with.
+      if (token !== undefined) {
+        const nowDisplay = displayCurrentValue(product, column, input.lookups)
+        if (shortHash(nowDisplay) !== token) {
+          problems.push(`${column.key} was changed in IMS after this file was downloaded (it is now "${nowDisplay}"); download the file again before editing it`)
+          continue
+        }
       }
       if (sameValue(column, before, next)) continue
       if (column.key === 'barcode' && typeof next === 'string') {

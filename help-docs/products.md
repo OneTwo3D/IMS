@@ -15,6 +15,7 @@
 
 - **A blank cell leaves the field as it is.** It never empties it. A file with a blank description will not wipe an existing description.
 - **To empty a field, type `__CLEAR__` in the cell.** Only fields that can be empty accept it: description, category, image URL, barcode, MPN, country of origin, weight, width, height, depth, regular price, sale price and preferred supplier. Name, stock unit, lifecycle status and the yes/no fields cannot be cleared; a row that tries is not applied.
+- **Only cells you edited are applied.** The downloaded file ends with a `rev` column recording what each value was. Leave it as it is. A cell you did not change is ignored even if the product has been edited in IMS since you downloaded the file, so an old file cannot put old values back. If you edit a cell whose field has changed in IMS since the download, that product's row is refused with a message asking you to download again. A file without the `rev` column (one you built yourself) applies every non-blank cell, and the preview warns that changes made in IMS in the meantime cannot be detected.
 - **A column you delete from the file is not touched.** Only the columns present are read.
 - **Only existing products are updated.** A SKU that is not in IMS is rejected; nothing is created. A SKU may appear only once in a file.
 - **A row with any problem changes nothing for that product.** The other rows still apply. The preview lists every problem before you apply.
@@ -40,7 +41,7 @@ Edit by CSV needs the same permission as editing a product (inventory edit). The
 
 ## What happens after Apply
 
-Each product that changed goes through the same follow-up as when you save it in the product editor: its details are pushed to the storefront, a stock sync is queued (forced for archived products), the warehouse (Mintsoft) product sync is scheduled if you hold the sync permission and a warehouse connector is on, and a pending HS-code suggestion is dropped if the name, description or category changed. These run in the background after the upload finishes, so a large edit returns quickly while the pushes catch up. IMS never writes to the storefront or warehouse directly from the upload.
+Each product that changed goes through the same follow-up as when you save it in the product editor: its details are pushed to the storefront, a stock sync is queued (forced for archived products), the warehouse (Mintsoft) product sync is scheduled if you hold the sync permission and a warehouse connector is on, and a pending HS-code suggestion is dropped if the name, description or category changed. These run in the background after the upload finishes, so a large edit returns quickly while the pushes catch up. IMS never writes to the storefront or warehouse directly from the upload. The warehouse sync is queued product by product only for small edits (25 products or fewer). A larger edit is not queued individually, because that many separate Mintsoft syncs would flood the warehouse API; the preview result says so, and **Run Product Verify** on the Sync page (or the scheduled Mintsoft product verify) brings those products up to date in paced batches.
 
 ## Large files
 
@@ -51,4 +52,5 @@ A file may hold up to 50,000 rows and 25 MB. A 20,000-variant file is read and s
 - **"SKU not found"**: the SKU in the file does not match a product exactly. Spreadsheets sometimes strip leading zeros or turn long numbers into scientific notation; format the sku column as text.
 - **"cannot be cleared (it is required)"**: you used `__CLEAR__` on a field that must always have a value. Delete the cell's contents instead to leave it unchanged.
 - **A batch "was rolled back and not saved"**: something changed while the file was applying (for example a barcode was taken by another user). The message names the first and last SKU of that batch. Upload the file again; products already saved show as already matching.
-- **A description beginning with `=`, `+`, `-` or `@`** is exported with a leading apostrophe so spreadsheets do not run it as a formula. Edit by CSV removes that apostrophe on upload, so an untouched cell is not read as a change.
+- **A description beginning with `=`, `+`, `-` or `@`** is exported with a leading apostrophe so spreadsheets do not run it as a formula. An untouched cell is recognised as unchanged and skipped, so the stored text is never altered. Text you type yourself is stored exactly as typed.
+- **"was changed in IMS after this file was downloaded"**: another user edited that field after you downloaded the file. Download again and redo the edit.

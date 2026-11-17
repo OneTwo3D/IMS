@@ -22,7 +22,7 @@ const SELECT = {
   id: true, sku: true, name: true, description: true, barcode: true, mpn: true, countryOfOrigin: true,
   weight: true, widthCm: true, heightCm: true, depthCm: true, imageUrl: true,
   salesPriceBase: true, salePriceBase: true, salesPriceTaxInclusive: true, stockUnit: true, oversellAllowed: true,
-  preferredSupplierId: true, preferredSupplierLocked: true, categoryId: true, lifecycleStatus: true,
+  preferredSupplierId: true, preferredSupplierLocked: true, categoryId: true, lifecycleStatus: true, updatedAt: true,
 } as const
 
 export class ProductCsvSelectionTooLargeError extends Error {

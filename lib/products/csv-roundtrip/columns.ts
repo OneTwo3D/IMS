@@ -14,6 +14,9 @@ export const CSV_CLEAR_TOKEN = '__CLEAR__'
 
 export const PRODUCT_CSV_KEY_COLUMN = 'sku'
 
+/** The download's version column: what each exported value was, as short hashes. Not an editable column. */
+export const PRODUCT_CSV_REV_COLUMN = 'rev'
+
 export type ProductCsvColumnKind = 'text' | 'decimal' | 'boolean' | 'country' | 'lifecycle' | 'supplier' | 'category'
 
 export type ProductCsvColumnGroup = 'Basics' | 'Identifiers' | 'Logistics' | 'Prices' | 'Supplier' | 'Status'

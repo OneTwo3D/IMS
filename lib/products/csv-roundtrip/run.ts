@@ -90,13 +90,17 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
 
   const headers = analyseProductCsvHeaders(Object.keys(rows[0]), args.canUse)
   if (!headers.ok) return fatalResult(mode, headers.error)
-  const { columns, headerByColumn, skuHeader } = headers
+  const { columns, headerByColumn, skuHeader, revHeader } = headers
 
   const result = emptyResult(mode)
   result.totalRows = rows.length
   result.columns = columns.map((column) => column.key)
   if (headers.ignored.length > 0) {
     result.warnings.push(`Ignored columns that cannot be edited here: ${headers.ignored.join(', ')}.`)
+  }
+
+  if (!revHeader) {
+    result.warnings.push('The file has no "rev" column, so it was not downloaded from Edit by CSV (or the column was deleted). Every non-blank cell is applied as an edit, and changes made in IMS since the values were typed cannot be detected.')
   }
 
   const tables = await store.loadLookupTables()
@@ -119,13 +123,15 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
     pending = []
     pendingTargets = []
     try {
-      const { written } = await store.writeBatch(updates, columns)
+      const { written, staleIds } = await store.writeBatch(updates, columns)
+      const stale = new Set(staleIds)
       result.written += written
       result.changedProducts += written
-      if (written !== updates.length) {
-        result.warnings.push(`${updates.length - written} product(s) in a batch no longer exist and were skipped (${updates.map((u) => u.sku).slice(0, 5).join(', ')}).`)
+      for (const update of updates) {
+        if (stale.has(update.id)) noteError(`Row (${update.sku}): this product was changed in IMS while the import was running, so nothing was changed for it. Download the file again and re-apply your edits`)
       }
-      await args.onBatchWritten?.({ updates, targets })
+      const landed = updates.filter((update) => !stale.has(update.id))
+      if (landed.length > 0) await args.onBatchWritten?.({ updates: landed, targets: targets.filter((target) => !stale.has(target.id)) })
     } catch (error) {
       result.failedProducts += updates.length
       const detail = error instanceof Error ? error.message : String(error)
@@ -149,6 +155,7 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
       columns,
       headerByColumn,
       skuHeader,
+      revHeader,
       productsBySku: new Map(products.map((product) => [product.sku, product])),
       lookups,
       state,
@@ -171,7 +178,7 @@ export async function runProductCsvEdit(args: ProductCsvEditArgs): Promise<Produ
         }
         continue
       }
-      pending.push({ id: outcome.product.id, sku: outcome.sku, changes: outcome.changes })
+      pending.push({ id: outcome.product.id, sku: outcome.sku, expectedUpdatedAt: outcome.product.updatedAt, changes: outcome.changes })
       pendingTargets.push({
         id: outcome.product.id,
         lifecycleStatus: (outcome.changes.find((change) => change.column === 'lifecycleStatus')?.value as ProductCsvSyncTarget['lifecycleStatus'] | undefined)

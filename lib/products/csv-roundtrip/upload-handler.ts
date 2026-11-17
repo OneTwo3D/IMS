@@ -4,14 +4,14 @@ import type { logActivity as logActivityFn } from '@/lib/activity-log'
 import { hasPermission } from '@/lib/permissions'
 import { PRODUCT_CSV_IMPORT_MAX_BYTES, runProductCsvEdit } from '@/lib/products/csv-roundtrip/run'
 import { createProductCsvStore, type ProductCsvDb } from '@/lib/products/csv-roundtrip/store'
-import type { ProductCsvSyncTarget } from '@/lib/products/csv-roundtrip/sync'
+import type { ProductCsvSyncTarget, ProductCsvWmsOutcome } from '@/lib/products/csv-roundtrip/sync'
 
 export type ProductCsvUploadDeps = {
   requireApiAuth: () => Promise<AuthSession | Response>
   client: ProductCsvDb
   logActivity: typeof logActivityFn
   /** Warehouse sync; must be called while the request is in scope. */
-  scheduleWmsSync: (targets: readonly ProductCsvSyncTarget[]) => Promise<void>
+  scheduleWmsSync: (targets: readonly ProductCsvSyncTarget[]) => Promise<ProductCsvWmsOutcome | void>
   /** Runs the storefront sync after the response is sent. */
   afterResponse: (task: () => Promise<void>) => void
   storefrontSync: (targets: readonly ProductCsvSyncTarget[]) => Promise<void>
@@ -76,7 +76,12 @@ export async function handleProductCsvUpload(req: Request, deps: ProductCsvUploa
     })
     if (allTargets.length > 0) {
       // The warehouse sync registers its work with `after`, so it has to be scheduled while the request is in scope.
-      if (hasPermission(role, 'sync')) await deps.scheduleWmsSync(allTargets)
+      if (hasPermission(role, 'sync')) {
+        const wms = await deps.scheduleWmsSync(allTargets)
+        if (wms && wms.deferred > 0) {
+          result.warnings.push(`${wms.deferred} products were not queued for the warehouse one by one, because that many individual syncs would flood it. Run Product Verify on the Sync page, or wait for the scheduled warehouse product verify, to bring them up to date.`)
+        }
+      }
       deps.afterResponse(() => deps.storefrontSync(allTargets))
       deps.revalidateInventory()
     }

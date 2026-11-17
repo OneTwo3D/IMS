@@ -68,9 +68,17 @@ test(
       // A batch that violates a constraint (duplicate barcode, raced past the preflight) rolls back whole.
       const before = await db.product.findUniqueOrThrow({ where: { id: b.id } })
       await assert.rejects(store.writeBatch([
-        { id: b.id, sku: b.sku, changes: [{ column: 'name', label: 'Name', field: 'name', from: '', to: 'X', value: 'X' }] },
-        { id: bystander.id, sku: bystander.sku, changes: [{ column: 'barcode', label: 'Barcode', field: 'barcode', from: '', to: `${tag}-bc`, value: `${tag}-bc` }] },
+        { id: b.id, sku: b.sku, expectedUpdatedAt: before.updatedAt, changes: [{ column: 'name', label: 'Name', field: 'name', from: '', to: 'X', value: 'X' }] },
+        { id: bystander.id, sku: bystander.sku, expectedUpdatedAt: bystander.updatedAt, changes: [{ column: 'barcode', label: 'Barcode', field: 'barcode', from: '', to: `${tag}-bc`, value: `${tag}-bc` }] },
       ], [{ key: 'name', label: 'Name', group: 'Basics', kind: 'text', nullable: false, requires: null, field: 'name' }, { key: 'barcode', label: 'Barcode', group: 'Identifiers', kind: 'text', nullable: true, requires: null, field: 'barcode' }]))
+      assert.equal((await db.product.findUniqueOrThrow({ where: { id: b.id } })).name, before.name)
+
+      // The version guard: a row whose updatedAt moved on since the plan read it is skipped, not overwritten.
+      const fresh = await db.product.findUniqueOrThrow({ where: { id: b.id } })
+      const outcome = await store.writeBatch([
+        { id: b.id, sku: b.sku, expectedUpdatedAt: new Date(fresh.updatedAt.getTime() - 5_000), changes: [{ column: 'name', label: 'Name', field: 'name', from: '', to: 'Stale', value: 'Stale' }] },
+      ], [{ key: 'name', label: 'Name', group: 'Basics', kind: 'text', nullable: false, requires: null, field: 'name' }])
+      assert.deepEqual(outcome, { written: 0, staleIds: [b.id] })
       assert.equal((await db.product.findUniqueOrThrow({ where: { id: b.id } })).name, before.name)
     } finally {
       await db.product.deleteMany({ where: { sku: { startsWith: tag } } })

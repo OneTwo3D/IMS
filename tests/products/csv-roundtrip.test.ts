@@ -33,6 +33,7 @@ function product(sku: string, overrides: Partial<RoundTripProduct> = {}): RoundT
     weight: '0.5000', widthCm: '10.00', heightCm: null, depthCm: null, imageUrl: null,
     salesPriceBase: '9.9900', salePriceBase: null, salesPriceTaxInclusive: true, stockUnit: 'pcs', oversellAllowed: true,
     preferredSupplierId: null, preferredSupplierLocked: false, categoryId: null, lifecycleStatus: 'ACTIVE',
+    updatedAt: new Date('2026-11-01T10:00:00.000Z'),
     ...overrides,
   }
 }
@@ -63,16 +64,41 @@ class FakeStore implements ProductCsvStore {
   }
   async writeBatch(updates: readonly PlannedUpdate[]) {
     this.calls.batches++
+    const staleIds: string[] = []
     if (this.failBatchContaining && updates.some((u) => u.sku === this.failBatchContaining)) throw new Error('simulated failure')
+    let written = 0
     for (const update of updates) {
       const target = this.products.get(update.sku)!
+      // The statement's version guard: a row that moved on since the plan read it is not written.
+      if (target.updatedAt.getTime() !== update.expectedUpdatedAt.getTime()) { staleIds.push(update.id); continue }
       for (const change of update.changes) (target as unknown as Record<string, unknown>)[change.field] = change.value
+      target.updatedAt = new Date(target.updatedAt.getTime() + 1)
+      written++
     }
-    return { written: updates.length }
+    return { written, staleIds }
   }
 }
 
 const csv = (rows: string[]) => rows.join('\n')
+
+/** A downloaded file for `products`, in the exact form the download produces. */
+function download(products: RoundTripProduct[], keys: string[]): string {
+  const chosen = chooseProductCsvColumns(keys, canAll)
+  assert.ok(chosen.ok)
+  return buildProductCsvTemplate(products, chosen.ok ? chosen.columns : [], TABLES)
+}
+/** Replace one cell of a downloaded file's first data row. */
+function editCell(file: string, sku: string, column: string, value: string): string {
+  const rows = parseCsv(file)
+  const headers = Object.keys(rows[0])
+  const lines = [headers.join(',')]
+  for (const row of rows) {
+    const copy = { ...row }
+    if (row.sku === sku) copy[column] = value
+    lines.push(headers.map((h) => `"${copy[h].replace(/"/g, '""')}"`).join(','))
+  }
+  return lines.join('\n')
+}
 
 // --------------------------------------------------------------------------------------------- the column registry
 
@@ -151,9 +177,9 @@ test('the template holds exactly the selection, its variants, SKU first and only
   assert.ok(chosen.ok)
   const file = buildProductCsvTemplate(selected, chosen.ok ? chosen.columns : [], TABLES)
   const lines = file.split('\r\n')
-  assert.equal(lines[0], 'sku,name,weight')
+  assert.equal(lines[0], 'sku,name,weight,rev')
   assert.equal(lines.length, 5)
-  assert.equal(lines[2], 'TSHIRT,Name TSHIRT,0.5000')
+  assert.match(lines[2], /^TSHIRT,Name TSHIRT,0\.5000,name=[0-9a-f]{8};weight=[0-9a-f]{8}$/)
 })
 
 test('the template renders supplier and category by name and booleans as TRUE/FALSE', () => {
@@ -162,6 +188,7 @@ test('the template renders supplier and category by name and booleans as TRUE/FA
   const file = buildProductCsvTemplate([product('A', { preferredSupplierId: 'sup-1', categoryId: 'cat-2' })], chosen.ok ? chosen.columns : [], TABLES)
   assert.deepEqual(parseCsv(file), [{
     sku: 'A', category: 'Apparel > T-Shirts', oversellAllowed: 'TRUE', salesPriceBase: '9.9900', preferredSupplierName: 'Acme Ltd',
+    rev: parseCsv(file)[0].rev,
   }])
 })
 
@@ -248,7 +275,7 @@ test('a column absent from the file is never touched', async () => {
     { name: 'Renamed', description: 'Keep', weight: '1.0000', price: '3.0000', unit: 'pcs' },
   )
   const sql = buildBatchUpdateSql(
-    [{ id: 'id-A', sku: 'A', changes: [{ column: 'name', label: 'Name', field: 'name', from: '', to: 'Renamed', value: 'Renamed' }] }],
+    [{ id: 'id-A', sku: 'A', expectedUpdatedAt: new Date(0), changes: [{ column: 'name', label: 'Name', field: 'name', from: '', to: 'Renamed', value: 'Renamed' }] }],
     PRODUCT_CSV_COLUMNS.filter((c) => c.key === 'name'),
   )
   assert.ok(!/"description"|"weight"|"salesPriceBase"/.test(sql.sql), 'the statement names only the columns the file carries')
@@ -408,8 +435,8 @@ test('a failing batch is rolled back and reported, and the other batches still a
 test('the SQL for a batch is parameterised, set-based, and bumps updatedAt', () => {
   const columns = PRODUCT_CSV_COLUMNS.filter((c) => ['name', 'weight', 'lifecycleStatus', 'preferredSupplierName'].includes(c.key))
   const sql = buildBatchUpdateSql([
-    { id: 'id-A', sku: 'A', changes: [{ column: 'name', label: 'Name', field: 'name', from: '', to: "x'; DROP TABLE products;--", value: "x'; DROP TABLE products;--" }] },
-    { id: 'id-B', sku: 'B', changes: [{ column: 'lifecycleStatus', label: 'Lifecycle status', field: 'lifecycleStatus', from: '', to: 'ARCHIVED', value: 'ARCHIVED' }] },
+    { id: 'id-A', sku: 'A', expectedUpdatedAt: new Date(0), changes: [{ column: 'name', label: 'Name', field: 'name', from: '', to: "x'; DROP TABLE products;--", value: "x'; DROP TABLE products;--" }] },
+    { id: 'id-B', sku: 'B', expectedUpdatedAt: new Date(0), changes: [{ column: 'lifecycleStatus', label: 'Lifecycle status', field: 'lifecycleStatus', from: '', to: 'ARCHIVED', value: 'ARCHIVED' }] },
   ], columns)
   assert.ok(!sql.sql.includes('DROP TABLE'), 'values travel as bind parameters, never in the text')
   assert.match(sql.sql, /UPDATE "products" AS p/)
@@ -425,4 +452,96 @@ test('a chunk is one SKU read, however many rows it holds', async () => {
   const store = new FakeStore(products)
   await preview(store, csv(['sku,name', ...products.map((p) => `${p.sku},X`)]))
   assert.equal(store.calls.bySku, 1)
+})
+
+// --------------------------------------------------------------------------------------------- review round 1
+
+test('REGRESSION (stale file): an unedited cell never overwrites a newer edit made in IMS after the download', async () => {
+  const original = product('A', { salesPriceBase: '9.9900', description: 'Old description' })
+  const file = download([original], ['description', 'salesPriceBase', 'weight'])
+  // Someone edits the product in IMS after the download.
+  const store = new FakeStore([{ ...original, salesPriceBase: '15.0000', description: 'Newer description', updatedAt: new Date('2026-11-02T10:00:00.000Z') }])
+  // The operator only edits the weight in the file.
+  const done = await apply(store, editCell(file, 'A', 'weight', '2.5'))
+  assert.deepEqual(done.errors, [])
+  assert.equal(done.written, 1)
+  const after = store.products.get('A')!
+  assert.equal(after.weight, '2.5000')
+  assert.equal(after.salesPriceBase, '15.0000', 'the untouched price cell did not restore the old value')
+  assert.equal(after.description, 'Newer description')
+})
+
+test('REGRESSION (stale file): an EDITED cell whose field changed in IMS since the download refuses the row', async () => {
+  const original = product('A', { salesPriceBase: '9.9900' })
+  const file = download([original], ['salesPriceBase', 'weight'])
+  const store = new FakeStore([{ ...original, salesPriceBase: '15.0000', updatedAt: new Date('2026-11-02T10:00:00.000Z') }])
+  const done = await apply(store, editCell(editCell(file, 'A', 'salesPriceBase', '11'), 'A', 'weight', '3'))
+  assert.equal(done.written, 0)
+  assert.match(done.errors[0], /salesPriceBase was changed in IMS after this file was downloaded \(it is now "15\.0000"\)/)
+  assert.equal(store.products.get('A')!.weight, '0.5000', 'the row is refused whole, including its other edit')
+  assert.equal(store.products.get('A')!.salesPriceBase, '15.0000')
+})
+
+test('REGRESSION (race): a product edited between the plan read and the write is not overwritten', async () => {
+  const original = product('A')
+  const store = new FakeStore([original])
+  const file = download([original], ['name'])
+  const racing: ProductCsvStore = {
+    loadLookupTables: () => store.loadLookupTables(),
+    findProductsBySku: async (skus) => {
+      const found = await store.findProductsBySku(skus)
+      // The editor saves right after the plan read this product.
+      const live = store.products.get('A')!
+      live.name = 'Edited meanwhile'
+      live.updatedAt = new Date('2026-11-03T10:00:00.000Z')
+      return found
+    },
+    findBarcodeOwners: (b) => store.findBarcodeOwners(b),
+    writeBatch: (u) => store.writeBatch(u),
+  }
+  const done = await runProductCsvEdit({ mode: 'apply', text: editCell(file, 'A', 'name', 'From the file'), canUse: canAll, store: racing })
+  assert.equal(done.written, 0)
+  assert.match(done.errors[0], /changed in IMS while the import was running/)
+  assert.equal(store.products.get('A')!.name, 'Edited meanwhile')
+})
+
+test('a file without the rev column still applies its non-blank cells, with a warning that staleness cannot be detected', async () => {
+  const store = new FakeStore([product('A')])
+  const done = await apply(store, csv(['sku,name', 'A,Renamed']))
+  assert.equal(done.written, 1)
+  assert.match(done.warnings.join(' '), /no "rev" column/)
+  const withRev = await apply(store, download([store.products.get('A')!], ['name']))
+  assert.deepEqual(withRev.warnings, [])
+})
+
+test('a numerically equal retyped cell (0.5 for 0.5000) is unedited and does not trip the stale check', async () => {
+  const original = product('A')
+  const file = download([original], ['weight', 'name'])
+  const store = new FakeStore([{ ...original, weight: '0.7000', updatedAt: new Date('2026-11-02T10:00:00.000Z') }])
+  const done = await apply(store, editCell(editCell(file, 'A', 'weight', '0.5'), 'A', 'name', 'New'))
+  assert.deepEqual(done.errors, [])
+  assert.equal(store.products.get('A')!.weight, '0.7000')
+  assert.equal(store.products.get('A')!.name, 'New')
+})
+
+test('REGRESSION (formula guard): stored text is only unguarded when the download added the guard', async () => {
+  const stored = ["=SUM(1)", "'=SUM(1)", "-10% off", "'-10% off", "'quoted", "+44 now", "@home"]
+  const products = stored.map((description, i) => product(`F${i}`, { description }))
+  const file = download(products, ['description'])
+  const cells = parseCsv(file).map((r) => r.description)
+  assert.deepEqual(cells, ["'=SUM(1)", "'=SUM(1)", "'-10% off", "'-10% off", "'quoted", "'+44 now", "'@home"])
+  const store = new FakeStore(products)
+  const dry = await preview(store, file)
+  assert.equal(dry.changedProducts, 0, JSON.stringify(dry.diffs))
+  const done = await apply(store, file)
+  assert.equal(done.written, 0)
+  assert.deepEqual(products.map((p) => store.products.get(p.sku)!.description), stored, 'no stored text was altered')
+})
+
+test('an edit TO a guard-looking value is stored verbatim, not stripped', async () => {
+  const original = product('A', { description: 'plain' })
+  const file = download([original], ['description'])
+  const store = new FakeStore([original])
+  await apply(store, editCell(file, 'A', 'description', "'=keep the apostrophe"))
+  assert.equal(store.products.get('A')!.description, "'=keep the apostrophe")
 })

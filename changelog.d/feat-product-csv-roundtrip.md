@@ -5,5 +5,7 @@
 - **Same follow-up as the editor.** Applied in batches of at most 250 products, each in one transaction and one set-based statement; each changed product then gets the storefront metadata push, stock sync, warehouse product sync (with the `sync` permission) and HS-proposal invalidation that the product editor performs. Nothing writes to a vendor directly.
 - **Scale.** Files of up to 50,000 rows / 25 MB, uploaded through a route handler instead of a server action; one SKU lookup per 1,000 rows. A test pins the round-trip count for thousands of rows.
 - **Permissions.** Needs inventory edit; the price columns also need inventory prices, for download and for a file that contains them.
-- **Changed: the exporter's formula guard is undone on upload** for this path, so a description such as `=SUM(A1)` or `-10% off` round-trips unchanged.
+- **Stale files cannot overwrite newer edits.** The download ends with a `rev` column of per-value hashes. Only cells that differ from what was downloaded are applied; an edited cell whose field has since changed in IMS refuses its row, and the write itself only lands on a product whose `updatedAt` is unchanged since it was read.
+- **Formula-guarded text round-trips exactly.** A cell is recognised as unedited by comparing against the downloaded value; the exporter's apostrophe is never stripped blindly, so stored text such as `'=SUM(1)` is not altered.
+- **No warehouse flood.** Per-product Mintsoft syncs are scheduled only for edits of 25 products or fewer; larger edits are left to the Mintsoft product verify run and the result says so.
 - Help document: Products (Edit by CSV).
