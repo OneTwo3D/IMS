@@ -50,7 +50,7 @@ Then, in this order:
 1. **Fetch first, publish later.** Set `invoice_documents_sweep_floor` to the P2 go-live date, enable the `invoice_documents` cron.
    Watch the cron results: `stored` rises, `needsAttention` stays at 0 or is explained (Sync > Exceptions).
    Leave `wc_invoice_document_enabled` off. Orders accumulate stored documents with nothing shown to anyone.
-2. **Historic orders.** Set `invoice_documents_lazy_fetch_enabled` to `true`. Leave the caps at their defaults unless Xero's shared daily budget
+2. **Historic orders.** **Not reachable from the storefront yet.** The queue behind `invoice_documents_lazy_fetch_enabled` is only started by a signed request through the helper plugin, and the shipped plugin refuses to show or accept a request for an order without the `_ims_invoice_pdf_available` flag, which is every historic order (see *The button for orders with no flag*). Until the plugin change below is deployed to the store, setting the flag changes nothing for a customer; the queue can only be started by a signed request made by hand. When that plugin change is ready, set `invoice_documents_lazy_fetch_enabled` to `true`. Leave the caps at their defaults unless Xero's shared daily budget
    (5,000 calls, shared with the invoicing incumbent) is already tight: each queued document costs at most three Xero reads, so the default
    200 a day is at most 600 reads. Credit notes: leave `invoice_documents_credit_notes_enabled` off until a credit note has been
    fetched and checked by hand (see *Verification*), because the number a credit note carries in Xero is unverified.
@@ -84,7 +84,7 @@ minutes, 30 minutes, 2 hours, 6 hours, then daily, and after 14 days it needs a 
 * **The button for orders with no flag.** The helper plugin shows its button only when the order's `_ims_invoice_pdf_available` is `yes`.
   IMS writes that flag only for an order that has a stored document, and writes nothing to historic orders in bulk. A historic order
   therefore has **no helper button** until the plugin is changed to show it for orders that carry the old invoice number
-  (`_wcpdf_invoice_number`, which IMS reads). That rule is the plugin's; IMS answers any such order through the same endpoint. It is pinned in
+  (`_wcpdf_invoice_number`, which IMS reads). **This gap is entirely on the WooCommerce plugin side, not an IMS defect:** the plugin hides the button and, in its own permission check, refuses the request itself (404) before IMS is ever called, so nothing IMS can change lets a historic order's customer start the fetch. IMS side is complete and tested (the endpoint queues and answers 202 for an order with no flag). The on-demand flow for customers therefore needs the plugin change deployed first; it is not available merely by turning the setting on. That rule is the plugin's; IMS answers any such order through the same endpoint. It is pinned in
   `tests/fixtures/woo-helper-invoice-contract.json`. Until that plugin change ships, historic customers keep the old plugin's button, so
   **do not remove the old plugin's My Account button for orders older than the go-live date** (decision needed from the owner).
 * **What the customer sees on a "preparing" click.** IMS answers HTTP 202 with `{ "status": "preparing", "retryAfterSeconds": 900 }`. The
@@ -109,7 +109,7 @@ After step 3 (publish):
   customer, and signed out: not served (the helper refuses at the storefront, IMS refuses at its own check; both are logged).
 * Send the invoice e-mail for a stored-document order (**Email PDF**): the attachment is the same PDF. With `wc_invoice_document_enabled` off
   the attachment is IMS's own rendering, as before.
-* A historic order (no stored document): click as its customer through the helper or a signed request: the answer is 202 "preparing", the
+* A historic order (no stored document): click as its customer through the helper (only once the plugin change above is deployed; the shipped plugin shows no button for it) or make a signed request by hand: the answer is 202 "preparing", the
   activity log shows `invoice_document_requested` once however often it is clicked, and after the next cron run the PDF is served.
 * Credit notes (only once enabled): a refunded order's credit note is fetched and, through `/api/shopping/woocommerce/credit-note-pdf` with
   the Woo refund id, served to that order's customer and refused for any other order's refund.
@@ -142,5 +142,5 @@ the `invoice_documents` cron and `invoice_documents_lazy_fetch_enabled`.
 
 * Who numbers invoices once the old plugin is gone (Xeroom reads `_wcpdf_invoice_number`)? During the parallel phase the numbers stay the
   Xeroom-generated ones everywhere; no change is made here.
-* Should the helper plugin show its button, and a "preparing" message, for historic orders without the flag (a plugin change)?
+* Should the helper plugin show its button, and a "preparing" message, for historic orders without the flag (a plugin change)? **This blocks the on-demand flow: without it no customer of a historic order can start the fetch.**
 * Backup set for `INVOICE_PDF_STORAGE_DIR` (the IMS host's backup status).

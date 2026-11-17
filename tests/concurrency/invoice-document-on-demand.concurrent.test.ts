@@ -302,6 +302,27 @@ test('CREDIT NOTES: queued only with the credit note switch, fetched by the swee
   } finally { await cleanup(ctx, order.id, other.id) }
 })
 
+test('NO FLOOR: a queued credit note and a queued invoice that are stored (DONE) are rechecked when due, so an amended one is not served for ever', { skip }, async () => {
+  const ctx = await setup()
+  const order = await seedOrder(ctx, { refund: true })
+  try {
+    const refundId = order.refunds[0]!.id
+    await withSettings(ctx, { invoice_documents_lazy_fetch_enabled: 'true', invoice_documents_credit_notes_enabled: 'true' }, async () => {
+      assert.equal((await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: order.id, kind: 'CREDIT_NOTE', refundId })).status, 'preparing')
+      assert.equal((await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: order.id, kind: 'INVOICE' })).status, 'preparing')
+      assert.equal((await ctx.sweep.runInvoiceDocumentSweep(ledger([order]).deps)).stored, 2, 'both stored by the first run (no floor is set)')
+      // Nothing is due yet: the next run has nothing to do.
+      assert.equal((await ctx.sweep.runInvoiceDocumentSweep(ledger([order]).deps)).considered, 0)
+      // Both rechecks fall due.
+      await ctx.db.invoiceDocumentFetchState.updateMany({ where: { orderId: order.id }, data: { nextAttemptAt: new Date(Date.now() - 60_000) } })
+      const again = ledger([order])
+      const run = await ctx.sweep.runInvoiceDocumentSweep(again.deps)
+      assert.equal(run.considered, 2, 'a stored, queued document is looked at again when its recheck is due, with no floor set')
+      assert.ok(again.calls.creditLookups.length > 0 && again.calls.lookups.length > 0, 'the ledger was asked about both')
+    })
+  } finally { await cleanup(ctx, order.id) }
+})
+
 test('THE INVOICE E-MAIL: flag off attaches what IMS renders itself, exactly as before; flag on attaches the stored ledger PDF; a stored document that cannot be served holds the mail back', { skip }, async () => {
   const ctx = await setup()
   const order = await seedOrder(ctx, { customerEmail: 'buyer@example.test' })

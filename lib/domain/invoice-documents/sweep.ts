@@ -215,6 +215,13 @@ export async function runInvoiceDocumentSweep(
     const planned = await selectInvoiceDocumentCandidates(floor, now, limit - requested.length, includeCreditNotes)
     const seen = new Set(requested.map((candidate) => `${candidate.orderId}:${candidate.kind}:${candidate.refundId ?? '-'}`))
     candidates = [...requested, ...planned.filter((candidate) => !seen.has(`${candidate.orderId}:${candidate.kind}:${candidate.refundId ?? '-'}`))]
+  } else if (lazyOn) {
+    // NO FLOOR (or a bad one) with on-demand fetching on: the floor only limits NEW unsolicited fetches, so it is not asked for here. A document a customer already received (a queued invoice or credit
+    // note, now stored and DONE) still has to be looked at again when its recheck falls due, or an amended or voided one would stay downloadable for ever (a credit note has no read-time refresh).
+    await markDocumentsWithBadFilesDue(now).catch(() => 0)
+    const rechecks = await selectDueRechecks(now, Math.max(0, limit - requested.length), includeCreditNotes)
+    const seen = new Set(requested.map((candidate) => `${candidate.orderId}:${candidate.kind}:${candidate.refundId ?? '-'}`))
+    candidates = [...requested, ...rechecks.filter((candidate) => !seen.has(`${candidate.orderId}:${candidate.kind}:${candidate.refundId ?? '-'}`))]
   }
   let consecutiveFailures = 0
   for (const candidate of candidates) {
