@@ -47,9 +47,9 @@ test('attribute description beats legacy meta', () => {
 test('per-field attribute fallback when native fields are absent', () => {
   const r = extractWcCustomsFields({
     customs_country_of_origin: 'US',
-    attributes: [attr('pa_hs_code', 'x'), attr('hs_code', '39269097'), attr('country_of_origin', 'CN')],
+    attributes: [attr('pa_hs_code', 'x'), attr('hs_code', '3926909090'), attr('country_of_origin', 'CN')],
   })
-  assert.equal(r.hsCode, '39269097')
+  assert.equal(r.hsCode, '3926909090')
   assert.equal(r.countryOfOrigin, 'US')
   assert.equal(r.customsDescription, null)
 })
@@ -57,12 +57,12 @@ test('per-field attribute fallback when native fields are absent', () => {
 test('variation attributes carry a singular `option`', () => {
   const r = extractWcCustomsFields({
     attributes: [
-      { name: 'hs_code', option: '39269097' },
+      { name: 'hs_code', option: '3926909090' },
       { name: 'country_of_origin', option: 'CN' },
       { name: 'customs_description', option: 'plastic bracket' },
     ],
   })
-  assert.deepEqual(r, { hsCode: '39269097', countryOfOrigin: 'CN', customsDescription: 'plastic bracket', rejected: [] })
+  assert.deepEqual(r, { hsCode: '3926909090', countryOfOrigin: 'CN', customsDescription: 'plastic bracket', rejected: [] })
 })
 
 test('nothing supplied yields nulls', () => {
@@ -104,9 +104,11 @@ test('6-digit native code falls back to a valid 8-digit attribute', () => {
   assert.equal(r.hsCode, '85011099')
 })
 
-test('native codes with separators normalise; overlong or non-numeric ones are unusable', () => {
+test('native codes with separators normalise; 6-digit, overlong or non-numeric ones are unusable', () => {
   assert.equal(extractWcCustomsFields({ customs_commodity_code: '8501.10.99' }).hsCode, '85011099')
-  assert.equal(extractWcCustomsFields({ customs_commodity_code: '8501109900' }).hsCode, null)
+  assert.equal(extractWcCustomsFields({ customs_commodity_code: '8501109900' }).hsCode, '8501109900')
+  assert.equal(extractWcCustomsFields({ customs_commodity_code: '850110' }).hsCode, null)
+  assert.equal(extractWcCustomsFields({ customs_commodity_code: '850110990011223' }).hsCode, null)
   assert.equal(extractWcCustomsFields({ customs_commodity_code: '8501ABCD' }).hsCode, null)
 })
 

@@ -53,14 +53,14 @@ function attributeValue(attrs: WcCustomsSource['attributes'], ...names: string[]
 export type WcRejectedCustomsValue = { field: keyof WcCustomsFields; value: string }
 
 /**
- * The commodity code IMS can push: digits only, exactly 8 (the warehouse CN8 rule). WooCommerce
- * itself accepts 6-14 digits, so a shorter or longer native code is unusable here and must not
- * displace a valid IMS value. Separators (spaces, dots, dashes) are stripped; any other character
- * makes the value unusable.
+ * A usable commodity code: digits only after stripping separators (spaces, dots, dashes), 8 to 14
+ * digits. Stored in full (a 10-digit code stays 10 digits); downstream CN8 handling is unchanged.
+ * Fewer than 8 digits (WooCommerce accepts 6) or any other character makes it unusable, so it
+ * cannot displace a valid IMS value.
  */
 function normaliseCommodityCode(raw: string): string | null {
   const compact = raw.replace(/[\s.\-]+/g, '')
-  return /^\d{8}$/.test(compact) ? compact : null
+  return /^\d{8,14}$/.test(compact) ? compact : null
 }
 
 /**
