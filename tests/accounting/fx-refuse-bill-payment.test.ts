@@ -77,6 +77,8 @@ function transactionClient(pending: Array<() => void>) {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // o3d-ngmt.21: the pending-delete fence reads this; no delete is pending in these tests.
+      accountingDocumentDeletion: { findFirst: async () => null },
       purchaseInvoice: {
         findUnique: async () => ({
           id: 'inv-1', poId: 'po-1', invoiceNumber: 'BILL-1', totalForeign: new Prisma.Decimal('100'), totalBase: new Prisma.Decimal('80'),

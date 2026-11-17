@@ -101,7 +101,7 @@ export async function loadDocumentDeleteCandidate(
             select: { id: true, payload: true },
           })
         : Promise.resolve(null),
-      externalId ? client.accountingDocumentDeletion.findFirst({ where: { externalDocumentId: externalId, state: 'PENDING' }, select: { id: true } }) : Promise.resolve(null),
+      externalId ? client.accountingDocumentDeletion.findFirst({ where: { externalDocumentId: externalId, state: { in: ['PENDING', 'NEEDS_REVIEW'] } }, select: { id: true } }) : Promise.resolve(null),
     ])
     const payload = (createRow?.payload ?? {}) as Record<string, unknown>
     const date = dayOf(typeof payload.date === 'string' ? payload.date : order.invoicedAt)
@@ -165,7 +165,7 @@ export async function loadDocumentDeleteCandidate(
           select: { id: true, payload: true },
         })
       : Promise.resolve(null),
-    externalId ? client.accountingDocumentDeletion.findFirst({ where: { externalDocumentId: externalId, state: 'PENDING' }, select: { id: true } }) : Promise.resolve(null),
+    externalId ? client.accountingDocumentDeletion.findFirst({ where: { externalDocumentId: externalId, state: { in: ['PENDING', 'NEEDS_REVIEW'] } }, select: { id: true } }) : Promise.resolve(null),
   ])
   const payload = (createRow?.payload ?? {}) as Record<string, unknown>
   const number = bill.invoiceNumber ?? ''
@@ -218,7 +218,7 @@ export async function documentDeleteEligibility(kind: DeletableDocumentKind, doc
 export type DocumentDeleteUiState =
   | { show: false }
   | { show: true; eligible: true; label: string }
-  | { show: true; eligible: false; label: string; reason: string }
+  | { show: true; eligible: false; label: string; reason: string; /** Xero removed it but IMS stopped before unwinding: an operator can resume once the late activity is cleared. */ review?: true }
 
 export async function documentDeleteUiStates(
   kind: DeletableDocumentKind,
@@ -235,6 +235,12 @@ export async function documentDeleteUiStates(
     if (!settings.featureEnabled) { out[id] = { show: false }; continue }
     const candidate = await loadDocumentDeleteCandidate(db, kind, id, settings)
     if (!candidate || !candidate.facts.externalDocumentId) { out[id] = { show: false }; continue }
+    const review = await db.accountingDocumentDeletion.findFirst({ where: { documentId: id, state: 'NEEDS_REVIEW' }, select: { snapshot: true } })
+    if (review) {
+      const late = ((review.snapshot as { lateActivity?: string[] })?.lateActivity ?? []).join(', ')
+      out[id] = { show: true, eligible: false, label: candidate.facts.label, review: true, reason: `Xero has already removed it, but IMS did not unwind it because ${late || 'activity'} was recorded against it after the delete was requested. Remove or move that activity, then resume.` }
+      continue
+    }
     const verdict = decideDocumentDelete(candidate.facts)
     out[id] = verdict.eligible
       ? { show: true, eligible: true, label: candidate.facts.label }
@@ -392,7 +398,7 @@ export async function recordDeletionTargetStatus(externalDocumentId: string, sta
   await db.accountingDocumentDeletion.updateMany({ where: { externalDocumentId, targetStatus: null }, data: { targetStatus: status } })
 }
 
-export type DocumentDeleteCompletion = 'completed' | 'already-complete' | 'no-record'
+export type DocumentDeleteCompletion = 'completed' | 'already-complete' | 'no-record' | 'needs-review'
 
 /**
  * The ledger has deleted or voided the document: unwind IMS. Idempotent and keyed on the ledger's document id, so the follow-up retry that
@@ -404,6 +410,27 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
     if (rows.length === 0) return 'no-record'
     const deletion = await tx.accountingDocumentDeletion.findUniqueOrThrow({ where: { id: rows[0].id } })
     if (deletion.state === 'COMPLETED') return 'already-complete'
+    // BLOCK FIRST, THEN RE-CHECK: the actions refuse new activity while the delete is pending (pendingDeletionError); this is the second half,
+    // under the document's lock, for anything recorded between the request and now. Xero has already deleted or voided the document, so IMS
+    // must not unwind over a payment, credit note or refund that now names it: it stops, says so, and waits for an operator.
+    const late = await lateActivityOn(tx, deletion)
+    if (late.length > 0) {
+      await tx.accountingDocumentDeletion.update({
+        where: { id: deletion.id },
+        data: { state: 'NEEDS_REVIEW', snapshot: { ...(deletion.snapshot as Record<string, unknown>), lateActivity: late } as Prisma.InputJsonValue },
+      })
+      await logActivityInTransaction(tx, {
+        userId: deletion.requestedById,
+        entityType: deletion.kind === 'SALES_INVOICE' ? 'SALES_ORDER' : 'PURCHASE_ORDER',
+        entityId: deletion.kind === 'SALES_INVOICE' ? deletion.referenceId : ((deletion.snapshot as { purchaseOrderId?: string })?.purchaseOrderId ?? null),
+        action: 'accounting_document_delete_needs_review',
+        tag: 'accounting',
+        level: 'ERROR',
+        description: `Xero has already ${deletion.targetStatus === 'VOIDED' ? 'voided' : 'deleted'} ${deletion.originalNumber || externalDocumentId}, but IMS recorded ${late.join(', ')} against it after the delete was requested, so IMS did NOT unwind it. The document is gone from Xero while IMS still holds it. Remove or move that activity in IMS, then use Resume on the document page; nothing else is changed until then.`,
+        metadata: { deletionId: deletion.id, accountingInvoiceId: externalDocumentId, lateActivity: late },
+      })
+      return 'needs-review'
+    }
     const unwound: Record<string, unknown> = {}
     if (deletion.kind === 'SALES_INVOICE') {
       await lockSalesOrder(tx, deletion.documentId)
@@ -469,6 +496,38 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
     })
     return 'completed'
   })
+}
+
+/** What was recorded against the document after the delete was requested; empty when nothing was. Read under the document's lock. */
+async function lateActivityOn(tx: Client, deletion: { kind: string; documentId: string }): Promise<string[]> {
+  const late: string[] = []
+  if (deletion.kind === 'SALES_INVOICE') {
+    const [payments, refunds, order] = await Promise.all([
+      tx.payment.count({ where: { orderId: deletion.documentId } }),
+      tx.salesOrderRefund.count({ where: { orderId: deletion.documentId } }),
+      tx.salesOrder.findUnique({ where: { id: deletion.documentId }, select: { paidAt: true } }),
+    ])
+    if (payments > 0) late.push(`${payments} payment(s)`)
+    if (order?.paidAt && payments === 0) late.push('a paid flag')
+    if (refunds > 0) late.push(`${refunds} refund(s) or credit note(s)`)
+  } else {
+    const [bill, credits, payments] = await Promise.all([
+      tx.purchaseInvoice.findUnique({ where: { id: deletion.documentId }, select: { paidAt: true, poId: true } }),
+      tx.supplierCreditNote.count({ where: { purchaseInvoiceId: deletion.documentId } }),
+      tx.accountingSyncLog.count({ where: { type: 'BILL_PAYMENT', status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] }, referenceId: { in: [deletion.documentId] } } }),
+    ])
+    if (bill?.paidAt) late.push('a payment')
+    if (credits > 0) late.push(`${credits} supplier credit note(s)`)
+    if (payments > 0) late.push(`${payments} bill payment posting(s)`)
+  }
+  return late
+}
+
+/** An operator has cleared the late activity: re-run the unwind, which re-checks under the lock. */
+export async function resumeAccountingDocumentDeletion(kind: DeletableDocumentKind, documentId: string): Promise<DocumentDeleteCompletion> {
+  const row = await db.accountingDocumentDeletion.findFirst({ where: { kind, documentId, state: 'NEEDS_REVIEW' }, select: { externalDocumentId: true } })
+  if (!row) return 'no-record'
+  return completeAccountingDocumentDeletion(row.externalDocumentId)
 }
 
 /** VOID the mirrored events of the deleted document so reconciliation stops expecting it. Matched on the ledger id, which is never reused. */

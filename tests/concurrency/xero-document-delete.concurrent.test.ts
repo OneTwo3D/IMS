@@ -448,3 +448,69 @@ test('what the page shows: nothing with the switch off or without the permission
     for (const f of [ok, paid, unpushed]) await cleanSales(db, f)
   }
 })
+
+test('NEW ACTIVITY AFTER THE REQUEST: a receipt is refused while the delete is pending; one that slips in anyway stops the unwind, flags the document, and resuming re-checks', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  await applySettings()
+  const f = await seedSalesInvoice(db, 'late')
+  try {
+    const { requestAccountingDocumentDelete, completeAccountingDocumentDeletion, resumeAccountingDocumentDeletion, documentDeleteUiStates } = await service()
+    const { pendingDeletionError } = await import('@/lib/domain/accounting/document-delete-pending')
+    assert.ok((await requestAccountingDocumentDelete({ kind: 'SALES_INVOICE', documentId: f.orderId, requestedById: null }, deps(f))).ok)
+
+    // (a) BLOCK FIRST: the real receipt action refuses against the pending delete, and writes nothing.
+    assert.match(String(await pendingDeletionError(f.orderId)), /is being deleted in IMS and Xero/)
+    const { addPayment } = await import('@/app/actions/sales')
+    const refused = await addPayment({ orderId: f.orderId, amount: 10, currency: 'GBP' })
+    assert.equal(refused.success, false)
+    assert.match(String(refused.error), /is being deleted in IMS and Xero/)
+    assert.equal(await db.payment.count({ where: { orderId: f.orderId } }), 0)
+
+    // (b) THEN RE-CHECK: a receipt that nevertheless got in (written straight to the table, as a race would) stops the unwind.
+    await db.payment.create({ data: { orderId: f.orderId, amount: 10, currency: 'GBP' } })
+    assert.equal(await completeAccountingDocumentDeletion(f.xeroId), 'needs-review')
+    const order = await db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId } })
+    assert.equal(order.invoiceNumber, f.number, 'IMS was not unwound over the payment')
+    assert.equal(order.accountingInvoiceId, f.xeroId)
+    const flagged = await db.accountingDocumentDeletion.findUniqueOrThrow({ where: { externalDocumentId: f.xeroId } })
+    assert.equal(flagged.state, 'NEEDS_REVIEW')
+    assert.deepEqual((flagged.snapshot as { lateActivity: string[] }).lateActivity, ['1 payment(s)'])
+    const warning = await db.activityLog.findFirstOrThrow({ where: { entityId: f.orderId, action: 'accounting_document_delete_needs_review' } })
+    assert.equal(warning.level, 'ERROR')
+    assert.match(warning.description, /did NOT unwind it/)
+    // Visible on the page, with a way back; further activity stays refused.
+    const ui = (await documentDeleteUiStates('SALES_INVOICE', [f.orderId], true))[f.orderId]!
+    assert.ok(ui.show && !ui.eligible && ui.review === true)
+    assert.match(String(await pendingDeletionError(f.orderId)), /already removed/)
+    // Resume while the payment is still there: still stopped. Clear it, resume: unwound.
+    assert.equal(await resumeAccountingDocumentDeletion('SALES_INVOICE', f.orderId), 'needs-review')
+    await db.payment.deleteMany({ where: { orderId: f.orderId } })
+    assert.equal(await resumeAccountingDocumentDeletion('SALES_INVOICE', f.orderId), 'completed')
+    assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId } })).invoiceNumber, null)
+    assert.equal(await pendingDeletionError(f.orderId), null)
+  } finally {
+    await cleanSales(db, f)
+  }
+})
+
+test('NEW ACTIVITY ON A BILL: a supplier credit note recorded after the request stops the unwind and its link to the bill survives', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  await applySettings()
+  const f = await seedBill(db, 'blate')
+  try {
+    const { requestAccountingDocumentDelete, completeAccountingDocumentDeletion } = await service()
+    const { pendingDeletionError } = await import('@/lib/domain/accounting/document-delete-pending')
+    assert.ok((await requestAccountingDocumentDelete({ kind: 'PURCHASE_BILL', documentId: f.billId, requestedById: null }, billDeps)).ok)
+    assert.match(String(await pendingDeletionError(f.billId)), /bill/)
+    const po = await db.purchaseOrder.findUniqueOrThrow({ where: { id: f.poId }, select: { supplierId: true } })
+    const cn = await db.supplierCreditNote.create({ data: { poId: f.poId, purchaseInvoiceId: f.billId, supplierId: po.supplierId, amountForeign: 5, amountBase: 5, currency: 'GBP', fxRateToBase: 1 } })
+    assert.equal(await completeAccountingDocumentDeletion(f.xeroId), 'needs-review')
+    assert.ok(await db.purchaseInvoice.findUnique({ where: { id: f.billId } }), 'the bill was not hard-deleted')
+    assert.equal((await db.supplierCreditNote.findUniqueOrThrow({ where: { id: cn.id } })).purchaseInvoiceId, f.billId, 'the credit note still names its bill')
+    assert.equal((await db.accountingDocumentDeletion.findUniqueOrThrow({ where: { externalDocumentId: f.xeroId } })).state, 'NEEDS_REVIEW')
+    const transit = (await db.transitSubledgerMovement.findMany({ where: { sourceRef: f.poId } })).reduce((sum, row) => sum + Number(row.baseDelta), 0)
+    assert.equal(transit, 120, 'no reversal was recorded')
+  } finally {
+    await cleanBill(db, f)
+  }
+})

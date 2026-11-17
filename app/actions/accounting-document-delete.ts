@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { requirePermission } from '@/lib/auth/server'
 import { getActiveAccountingConnectorId } from '@/lib/accounting'
 import { lookupXeroInvoiceNumberClaim } from '@/lib/connectors/xero/invoice-number-claim'
-import { requestAccountingDocumentDelete } from '@/lib/domain/accounting/document-delete-service'
+import { requestAccountingDocumentDelete, resumeAccountingDocumentDeletion } from '@/lib/domain/accounting/document-delete-service'
 
 // ---------------------------------------------------------------------------
 // o3d-ngmt.21 — delete a synced sales invoice or supplier bill in IMS and Xero together.
@@ -44,6 +44,17 @@ export async function deleteSyncedPurchaseBill(billId: string): Promise<DeleteSy
   revalidatePath('/purchase-orders')
   if (!result.ok) return { success: false, error: result.error, held: result.held }
   return { success: true, notice: queuedNotice(result.releasedNumber) }
+}
+
+/** Re-run the IMS unwind of a delete Xero already completed but IMS stopped on (late activity). It re-checks under the document's lock. */
+export async function resumeSyncedDocumentDelete(kind: 'SALES_INVOICE' | 'PURCHASE_BILL', documentId: string): Promise<DeleteSyncedDocumentResult> {
+  await requirePermission(kind === 'SALES_INVOICE' ? 'sales.process' : 'purchasing.invoice')
+  if (typeof documentId !== 'string' || documentId.trim() === '') return { success: false, error: 'No document was named.' }
+  const outcome = await resumeAccountingDocumentDeletion(kind, documentId)
+  revalidatePath(kind === 'SALES_INVOICE' ? `/sales/${documentId}` : '/purchase-orders')
+  if (outcome === 'completed') return { success: true, notice: 'Unwound: IMS now matches Xero.' }
+  if (outcome === 'needs-review') return { success: false, error: 'The activity recorded against the document is still there, so IMS did not unwind it.' }
+  return { success: false, error: 'There is no delete waiting to be resumed for that document.' }
 }
 
 function queuedNotice(releasedNumber: string): string {

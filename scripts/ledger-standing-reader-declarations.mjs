@@ -15,6 +15,8 @@
 // slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question.
 
 export const DECLARATIONS = [
+  { key: "lib/domain/accounting/document-delete-service.ts::lateActivityOn::where-admits-synced#1", class: "GUARD",
+    reason: "o3d-ngmt.21: the unwind's re-check under the document's lock: a bill payment queued, running or synced since the delete was requested stops the unwind (the bill is paid in the ledger sense); a cancelled row is not a payment." },
   { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#1", class: "GUARD",
     reason: "o3d-ngmt.21: the ownership proof for a sales invoice delete. A delete is offered only when a SYNCED create row with no settlement basis (a connector confirmation, never an operator assertion) names the very document id; a shadow or asserted row proves nothing about who created the document and refuses the delete." },
   { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#2", class: "GUARD",

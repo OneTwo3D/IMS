@@ -1,5 +1,6 @@
 'use server'
 
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -4208,6 +4209,9 @@ export async function updateInvoice(
       },
     })
     if (!invoice) return { success: false, error: 'Bill not found' }
+    // o3d-ngmt.21: no edit of a bill whose delete is pending.
+    const deletePendingForEdit = await pendingDeletionError(invoice.id)
+    if (deletePendingForEdit) return { success: false, error: deletePendingForEdit }
     try {
       assertPurchaseInvoiceEditable(invoice)
     } catch (error) {
@@ -4747,6 +4751,9 @@ export async function markBillPaid(
       },
     })
     if (!invoice) return { success: false, error: 'Bill not found' }
+    // o3d-ngmt.21: no payment against a bill whose delete is pending.
+    const deletePendingForPayment = await pendingDeletionError(invoice.id)
+    if (deletePendingForPayment) return { success: false, error: deletePendingForPayment }
     if (invoice.paidAt) return { success: false, error: 'Bill is already marked as paid' }
     if (!input.bankAccountId) return { success: false, error: 'Select a bank account' }
     if (!input.paymentDate) return { success: false, error: 'Payment date is required' }
@@ -5189,6 +5196,12 @@ export async function recordSupplierFreightCreditNote(input: {
       ? po.invoices.find((inv) => inv.id === input.purchaseInvoiceId) ?? null
       : po.invoices[0] ?? null
 
+    // o3d-ngmt.21: no supplier credit note against a bill whose delete is pending.
+    if (selectedInvoice) {
+      const deletePendingForRecord = await pendingDeletionError(selectedInvoice.id)
+      if (deletePendingForRecord) return { success: false, error: deletePendingForRecord }
+    }
+
     // Remaining creditable = the bill's total minus credit notes already recorded
     // against it, so a PO can't be over-credited (Codex review).
     let remainingCreditableForeign: number | null = null
@@ -5272,7 +5285,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     const cn = await db.supplierCreditNote.findUnique({
       where: { id },
       select: {
-        id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true,
+        id: true, poId: true, purchaseInvoiceId: true, supplierId: true, currency: true, fxRateToBase: true,
         amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
@@ -5308,6 +5321,11 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     })
     if (!cn) return { success: false, error: 'Credit note not found' }
     if (cn.status !== 'DRAFT') return { success: false, error: 'Credit note is already posted' }
+    // o3d-ngmt.21: no supplier credit note against a bill whose delete is pending.
+    if (cn.purchaseInvoiceId) {
+      const deletePendingForCredit = await pendingDeletionError(cn.purchaseInvoiceId)
+      if (deletePendingForCredit) return { success: false, error: deletePendingForCredit }
+    }
 
     // Resolve connector/settings BEFORE the transaction (Codex review: a lookup
     // failure must not occur after the row is already POSTED).

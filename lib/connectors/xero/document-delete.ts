@@ -77,6 +77,8 @@ export type XeroDeleteTarget = {
 export type XeroDeletePlan =
   | { kind: 'refuse'; reason: string }
   | { kind: 'already-done'; status: string }
+  /** Removed in Xero (perhaps by someone else) but still carrying the original number, which Xero keeps reserved: only the rename is left. */
+  | { kind: 'rename-only'; status: string }
   | { kind: 'steps'; renumber: boolean; targetStatus: 'DELETED' | 'VOIDED' }
 
 const BLOCKERS_FIRST = 'Remove the blocking items in Xero first (delete or unapply the payments, credit notes and allocations on it), then delete it again.'
@@ -98,7 +100,12 @@ function nonEmpty(list: unknown): boolean {
 export function planXeroDocumentDelete(doc: XeroDocumentForDelete, target: XeroDeleteTarget): XeroDeletePlan {
   const label = target.originalNumber || target.invoiceId
   const status = String(doc.Status ?? '').toUpperCase()
-  if (status === 'VOIDED' || status === 'DELETED') return { kind: 'already-done', status }
+  if (status === 'VOIDED' || status === 'DELETED') {
+    const stillOriginal = target.originalNumber !== ''
+      ? sameText(doc.InvoiceNumber, target.originalNumber)
+      : target.originalReference !== '' && sameText(doc.Reference, target.originalReference)
+    return stillOriginal ? { kind: 'rename-only', status } : { kind: 'already-done', status }
+  }
   if (doc.Type !== undefined && doc.Type !== target.expectedType) {
     return {
       kind: 'refuse',
@@ -239,6 +246,17 @@ export async function runXeroDocumentDelete<R>(
   const plan = planXeroDocumentDelete(read.document, target)
   if (plan.kind === 'refuse') return { kind: 'failed', error: plan.reason }
   if (plan.kind === 'already-done') return { kind: 'done', status: plan.status, externalRevisionAt: null }
+  if (plan.kind === 'rename-only') {
+    // Someone removed it in Xero first: the number is still reserved, so the rename is still owed. Xero may refuse to change a removed document;
+    // that is reported, never completed over, because the unwind would otherwise hand the operator a number Xero still holds.
+    const fence = await hooks.fence('document-delete-renumber')
+    if (!fence.ok) return { kind: 'fenced', result: fence.result }
+    const renamed = await renumberXeroDocument(target, hooks.idempotencyKey('document-renumber'))
+    if (!renamed.success) {
+      return { kind: 'failed', error: `${target.originalNumber || target.invoiceId} was already ${plan.status.toLowerCase()} in Xero, which still reserves its number, and the rename that would free it failed: ${renamed.error}. IMS has not changed anything. Free the number in Xero by hand (rename the removed document), then retry the delete.` }
+    }
+    return { kind: 'done', status: plan.status, externalRevisionAt: renamed.externalRevisionAt }
+  }
   if (plan.renumber) {
     const fence = await hooks.fence('document-delete-renumber')
     if (!fence.ok) return { kind: 'fenced', result: fence.result }

@@ -1,5 +1,6 @@
 'use server'
 
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -2794,6 +2795,10 @@ export async function createRefund(
     // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
     const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
+    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending.
+    const deletePendingForRefund = await pendingDeletionError(orderId)
+    if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
+
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
       // scjz.71: internal callers (the payment-poller chargeback) have no session, so
@@ -3878,6 +3883,9 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
+    // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned.
+    const deletePendingForPaid = await pendingDeletionError(id)
+    if (deletePendingForPaid) return { success: false, error: deletePendingForPaid }
     // audit-mmvp: lock the order row (same FOR UPDATE pattern as addPayment) so a
     // concurrent addPayment/markSalesOrderPaid can't both observe paidAt=null,
     // both flip it, and both run the warn/generate block — double-warning the
@@ -4131,6 +4139,9 @@ export async function addPayment(input: {
         },
       })
       if (!so) return { error: 'Order not found' }
+      // o3d-ngmt.21: no receipt against an invoice whose delete is pending (read under the order lock the delete request also takes).
+      const deletePending = await pendingDeletionError(input.orderId, tx)
+      if (deletePending) return { error: deletePending }
       // A CANCELLED order can still receive a receipt: money really does arrive for orders that were
       // cancelled (a bank transfer in flight, a customer who paid late), and an operator must be able to
       // record it. What happens to it afterwards is decided by WHEN it was paid against the database-minted

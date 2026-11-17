@@ -222,7 +222,7 @@ test('when the renumber fails the status is never written; a document already vo
   assert.equal(remote.Status, 'AUTHORISED')
 
   for (const Status of ['VOIDED', 'DELETED']) {
-    ledgerHolds({ Status })
+    ledgerHolds({ Status, InvoiceNumber: 'INV-1001-DEL-K7M2QX', Reference: 'SO-1001-DEL-K7M2QX' })
     const done = await runXeroDocumentDelete(target(), { fence: fenceOk, idempotencyKey: keys })
     assert.ok(done.kind === 'done' && done.status === Status)
     assert.equal(writes().length, 0)
@@ -332,4 +332,28 @@ test('the processor hands a held delete back unsent: the real processClaimedEntr
     for (const key of Object.keys(HELD_ENV)) delete process.env[key]
     Object.assign(process.env, previous)
   }
+})
+
+test('an externally removed document that still carries the original number is renamed before the delete counts as done', async () => {
+  for (const Status of ['VOIDED', 'DELETED']) {
+    ledgerHolds({ Status })
+    const run = await runXeroDocumentDelete(target(), { fence: fenceOk, idempotencyKey: keys })
+    assert.ok(run.kind === 'done' && run.status === Status, Status)
+    assert.deepEqual(writes().map((w) => w.body), [{ InvoiceID: ID, InvoiceNumber: 'INV-1001-DEL-K7M2QX', Reference: 'SO-1001-DEL-K7M2QX' }], 'only the rename; no status write on a removed document')
+    assert.equal(remote.InvoiceNumber, 'INV-1001-DEL-K7M2QX')
+  }
+})
+
+test('when Xero refuses to rename an already removed document the delete is NOT completed, and the operator is told how to free the number', async () => {
+  ledgerHolds({ Status: 'VOIDED' })
+  writeFailures.push({ error: 'HTTP 400: cannot modify a voided invoice' })
+  const run = await runXeroDocumentDelete(target(), { fence: fenceOk, idempotencyKey: keys })
+  assert.ok(run.kind === 'failed')
+  assert.match(run.error, /still reserves its number/)
+  assert.match(run.error, /IMS has not changed anything/)
+  // The held fence refuses the rename too: nothing is sent.
+  ledgerHolds({ Status: 'DELETED' })
+  const held = await runXeroDocumentDelete<string>(target(), { fence: async () => ({ ok: false, result: 'held' }), idempotencyKey: keys })
+  assert.deepEqual(held, { kind: 'fenced', result: 'held' })
+  assert.equal(writes().length, 0)
 })

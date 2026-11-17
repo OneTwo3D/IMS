@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation'
 import { Loader2, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { deleteSyncedPurchaseBill, deleteSyncedSalesInvoice } from '@/app/actions/accounting-document-delete'
+import { deleteSyncedPurchaseBill, deleteSyncedSalesInvoice, resumeSyncedDocumentDelete } from '@/app/actions/accounting-document-delete'
 import type { DocumentDeleteUiState } from '@/lib/domain/accounting/document-delete-service'
 
 /**
@@ -22,7 +22,21 @@ export function DeleteSyncedDocument({ kind, documentId, state }: { kind: 'SALES
   const what = kind === 'SALES_INVOICE' ? 'invoice' : 'bill'
 
   if (!state.eligible) {
-    return <p className="text-xs text-muted-foreground max-w-xl" data-testid="delete-synced-document-reason">Cannot delete: {state.reason}</p>
+    const resume = () => {
+      setError('')
+      startTransition(async () => {
+        const result = await resumeSyncedDocumentDelete(kind, documentId)
+        if (result.success) { setNotice(result.notice ?? 'Resumed.'); router.refresh() } else setError(result.error ?? 'Could not resume.')
+      })
+    }
+    return (
+      <div className="space-y-1">
+        <p className="text-xs text-muted-foreground max-w-xl" data-testid="delete-synced-document-reason">{state.review ? state.reason : `Cannot delete: ${state.reason}`}</p>
+        {state.review && <Button variant="outline" size="sm" className="h-7 text-xs" onClick={resume} disabled={isPending}>Resume</Button>}
+        {error && <p className="text-xs text-destructive" role="alert">{error}</p>}
+        {notice && <p className="text-xs text-muted-foreground max-w-xl">{notice}</p>}
+      </div>
+    )
   }
 
   const confirm = () => {
