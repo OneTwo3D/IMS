@@ -89,6 +89,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Operator button: e-mail the sales order confirmation.'),
   d('app/actions/email.ts::sendInvoiceEmail::queueEmail#1', 'customer-email', 'invoice', 'operator-action', 'not-applicable',
     'Operator button: e-mail the invoice.'),
+  d('app/actions/sales-quotes.ts::sendQuoteEmail::queueEmail#1', 'customer-email', 'quote', 'operator-action', 'not-applicable',
+    'Operator button: e-mail the sales quote (behind the sales_quote_email_enabled setting, default off).'),
   d('app/actions/import.ts::scheduleProductImportShoppingSync::pushProductMetadata#1', 'woocommerce', 'product.meta', 'facade', 'not-applicable',
     'Pushes product metadata to the storefront through the shopping facade.'),
   d('app/actions/import.ts::scheduleProductImportShoppingSync::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',

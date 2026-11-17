@@ -256,6 +256,10 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'Mapped only (as despatch): WooCommerce in P1, IMS in P2 (owner answers 2026-10-09).',
   }),
+  row('customer-email', 'quote', { P1: 'IMS', P2: 'IMS' }, {
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. A sales quotation exists only in IMS (the storefront has no quote), so IMS is the sender in P1 and P2: customer e-mail comes from IMS. Enforced by its own setting `sales_quote_email_enabled` (default off), read when the e-mail is queued and again at send time, not by the producer hold.',
+  }),
 ] as const satisfies readonly OwnershipRow[]
 
 export type OwnershipEntry = (typeof WRITER_OWNERSHIP_MAP)[number]
