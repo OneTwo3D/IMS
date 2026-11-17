@@ -70,6 +70,7 @@ export const MINTSOFT_KNOWN_WRITES: readonly MintsoftKnownWrite[] = [
   { label: 'GET /api/Order/{id}/Cancel', pattern: new RegExp(`^/api/Order/${ID}/Cancel$`), why: 'CANCELS the order although it is a GET' },
   { label: 'GET /api/Order/{id}/MarkAwaitingConfirmation', pattern: new RegExp(`^/api/Order/${ID}/MarkAwaitingConfirmation$`), why: 'changes order state although it is a GET' },
   { label: 'PUT|POST /api/Product', pattern: /^\/api\/Product$/, why: 'creates or updates a product' },
+  { label: 'DELETE /api/Product/{id}', pattern: new RegExp(`^/api/Product/${ID}$`), why: 'DELETES a product record (the parent of a variable product, once every variation is confirmed)' },
   { label: 'PUT /api/Product/Bundle', pattern: /^\/api\/Product\/Bundle$/, why: 'creates a bundle' },
   { label: 'PUT /api/ASN', pattern: /^\/api\/ASN$/, why: 'creates an advance shipping notice' },
   { label: 'DELETE /api/ASN/{id}', pattern: new RegExp(`^/api/ASN/${ID}$`), why: 'removes an advance shipping notice' },

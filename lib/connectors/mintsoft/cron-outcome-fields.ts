@@ -11,8 +11,11 @@ export const mintsoftCronFailureFields = {
   'mintsoft-product-verify': {
     skipState: { status: 'SKIPPED' },
     consumed: ['errors'],
-    breakdownOf: { 'content.errors': 'errors' },
-    ignored: { mismatched: 'warehouse mismatches are findings the sweep reports as data and, by binding mode, corrects or notifies (the discrepancy inbox); a run that finds them has done its job, and a sweep that could not compare is `errors`, which is consumed' },
+    breakdownOf: { 'content.errors': 'errors', 'parentDeletion.errors': 'errors' },
+    ignored: {
+      mismatched: 'warehouse mismatches are findings the sweep reports as data and, by binding mode, corrects or notifies (the discrepancy inbox); a run that finds them has done its job, and a sweep that could not compare is `errors`, which is consumed',
+      'parentDeletion.refused': 'a parent SKU deletion refusal is a deliberate fail-closed outcome: each one is recorded for an operator and nothing was deleted, so the run did its job; a pass that errored is `parentDeletion.errors`, folded into `errors`',
+    },
   },
   'mintsoft-returns-sync': {
     consumed: ['errors'],
