@@ -14,6 +14,37 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '5.0.0',
+    date: '2026-11-17',
+    title: 'Xero rounding account required, Mintsoft operator tasks instead of order comments, purchase order PDF, prepared stocktakes, reorder planning dates',
+    summary: 'Breaking release: one Xero setting must be mapped before the first Xero push after deploy (the Rounding account, setting xero_rounding_difference_account), and warehouse cases that used to be Mintsoft order comments are now operator tasks on Sync > Exceptions. Migrations (all additive) apply automatically on deploy. New and changed: a priced purchase order PDF and per-line expected delivery dates, prepared stocktakes, Reorder Planning latest PO date, required receipt, coverage weeks, demand chart and richer draft POs, sales-order list bulk actions, a Needs attention dashboard card and bell, Xero journals dated by event with the Xero lock date respected, COGS booked when goods ship, and many WooCommerce, Mintsoft and accounting audit fixes. Built, switched off: purchase order emailing (purchase_order_email_enabled), the GTIN / MPN identifier split (product_identifier_split_enabled) and Mintsoft merge-candidate flagging (wms_merge_candidate_mode).',
+    userMessage: 'IMS 5.0 adds a purchase order PDF, prepared stocktakes, reorder planning dates and charts, bulk actions on the sales-order list and a Needs attention card. Administrators: map the Xero Rounding account in Settings > Accounting.',
+    userHighlights: [
+      'Purchase orders: a priced PO PDF, an expected delivery date per line, and a profit margin per line for users who may see prices. Emailing the PO to the supplier is built, switched off.',
+      'Stock Control: prepared stocktakes, where you choose the products to count and can add or remove them while the count is open.',
+      'Reorder Planning: Latest PO date, Required receipt, Order qty and Coverage weeks on every row, a per-product demand chart, and draft POs that carry a destination warehouse, line delivery dates and a per-row supplier choice.',
+      'Sales orders: tick orders on the list to allocate, advance status or print packing slips together; the status badge shows picking, packing and partial dispatch; each shipment has its own packing slip.',
+      'Documents: order references, VAT and company numbers, non-Latin characters and a new credit note PDF are corrected on customer PDFs.',
+      'A Needs attention card on the dashboard and bell notifications bring failed pushes, parked refunds, failed accounting rows and paused receipts into one view.',
+      'Warehouse (Mintsoft): IMS no longer writes order comments. Cases the warehouse must act on appear as tasks under Sync > Exceptions > Raise a warehouse query. Merge-candidate flagging for same-customer orders is built, switched off.',
+    ],
+    technicalHighlights: [
+      'Migrations (all additive): wms_operator_tasks table and enums; needs_attention_announcements table; stock_counts.prepared and a unique index on stock_count_lines (countId, productId); PurchaseOrderLine.expectedDelivery; wms_order_push_links columns courier_task_service, courier_task_episode, double_postage_at and double_postage_detail; shipments accounting_cogs_relieved_from_inventory_at, _amount and _sync_log_id; deferral_adjustment_ref; one added value on the operator-task reason enum.',
+      'Xero: every document write carries unitdp=4; the lost penny is posted as an untaxed Rounding adjustment line sized from the predicted whole-document total, tax included, and the write is refused unless the prediction equals the IMS total. The daily batch dates journals by event, imports and respects the Xero books lock date, nets pre-batch refunds, and books COGS when goods ship, paid or not.',
+      'WooCommerce: the stock push subtracts orders IMS has not reserved under a completeness proof and records deleted or released orders; a resumable cancellation backstop runs on every reconcile pass; a status can no longer move a shipped order backwards; edits after import are surfaced on Sync > Exceptions.',
+      'Mintsoft: systemic-failure circuit breaker on the order push and dispatch sweeps; WMS-cancelled orders, refused completions and possible double postage are surfaced; align-down is held for units already despatched; an approved over-receipt books the full quantity; a partly delivered ASN can be closed short.',
+      'Built, switched off: purchase_order_email_enabled (default off; the outbox drain refuses a PO email while off), product_identifier_split_enabled (default off; payloads byte-identical when off) and wms_merge_candidate_mode (default off; flag mode only, IMS never merges).',
+      'New read-only tools: npm run crm:identity-report and scripts/report-identifier-reclassification.ts write nothing.',
+    ],
+    operatorActions: [
+      'Map the Xero Rounding account (Settings > Accounting > Xero, setting xero_rounding_difference_account, for example account 860). Without it, a Xero document whose 4-decimal unit prices leave a rounding gap is refused and nothing is sent.',
+      'Keep the stored Xero tax-rate list fresh (sync the chart of accounts and tax rates before the first batch after deploy); a line whose tax rate is missing from it, or a stale list, refuses the Xero write.',
+      'Work the new warehouse queries: IMS no longer writes Mintsoft order comments, so each case the warehouse must act on is a task under Sync > Exceptions > Raise a warehouse query (copy the text into a Mintsoft query, then press Done).',
+      'Keep the wms-order-status cron on: the new align-down gate holds a stock write-off for orders pushed to Mintsoft and not yet shipped in IMS unless their cached Mintsoft status is fresh.',
+      'Watch the new Sync > Exceptions sections (refused WooCommerce completions, possible double postage on merged orders, orders cancelled in Mintsoft, WMS connector-wide failure); IMS changes nothing on its own for these.',
+    ],
+  },
+  {
     version: '4.4.1',
     date: '2026-11-15',
     title: 'Warehouse note for removed merged-order lines is no longer lost; order push runs one at a time',
