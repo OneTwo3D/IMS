@@ -50,6 +50,7 @@ test('every refusal reads as operator wording, names its remedy and never carrie
     refundDeleteRefusals.inTransitReturn(),
     refundDeleteRefusals.warehouseReleaseInFlight(),
     refundDeleteRefusals.legacyBasis(),
+    refundDeleteRefusals.exchangeRefund(),
   ]
   for (const refusal of all) {
     assert.ok(REFUND_DELETE_REFUSAL_CODES.includes(refusal.code), `${refusal.code} is a registered code`)

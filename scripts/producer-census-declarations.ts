@@ -189,6 +189,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Queues CREDIT_NOTE_VOID for the posted credit note of a refund being deleted as recorded in error (phase 1; the refund is unwound only after the ledger confirms the void).'),
   d('app/actions/sales.ts::createRefund::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
+  d('app/actions/sales.ts::createRefund::enqueueStockSync#2', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+    'Asks the shopping facade to push the stock of the replacement products an exchange recorded with a return reserved, and of the units the same allocation pass gave back (after the refund commits).'),
   d('app/actions/sales.ts::retryRefundAccounting::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/sales.ts::deleteSalesOrder::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',

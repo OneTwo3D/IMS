@@ -2,7 +2,7 @@ import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
-import { getSalesOrder } from '@/app/actions/sales'
+import { getReturnExchangeOffer, getSalesOrder } from '@/app/actions/sales'
 import { getReturnReasons } from '@/app/actions/return-reasons'
 import { getWarehouses, getScopedStockLevelMap, getAvgCogsMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
@@ -22,6 +22,8 @@ import { getShopRefundDueForSalesOrder } from '@/app/actions/shop-refund-tasks'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { hasPermission } from '@/lib/permissions'
+import { buildExchangeCatalogue } from '@/lib/domain/sales/return-exchange'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -74,6 +76,12 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
 
+  // EXCHANGES INSIDE A RETURN: the refund dialog's replacement section. Asked only of a person who may refund; the catalogue is loaded only when the section is actually offered (switched on, permitted, no gate blocks it).
+  const exchangeOffer = hasPermission(session.user.role, 'sales.refund') ? await getReturnExchangeOffer(id) : null
+  const exchangeCatalogue = exchangeOffer?.offered
+    ? buildExchangeCatalogue((await listProducts({ pageSize: 1000, type: 'ALL', active: 'true' })).products, { pricesIncludeVat: so.pricesIncludeVat, taxRatePercent: so.taxRatePercent, fxRateToBase: so.fxRateToBase })
+    : []
+
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
@@ -105,6 +113,8 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         rejectedAccountingSyncs={rejectedAccountingSyncs}
         paidWithoutInvoice={paidWithoutInvoice}
         editForm={editForm}
+        exchangeOffer={exchangeOffer}
+        exchangeCatalogue={exchangeCatalogue}
       />
     </div>
   )

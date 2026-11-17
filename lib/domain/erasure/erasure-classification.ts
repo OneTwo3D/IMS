@@ -130,7 +130,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   ReturnExpectationLine: { erased: [], notPersonal: ['sku', 'costSnapshot'], retained: {} },
   SalesOrderLine: {
     erased: [],
-    notPersonal: ['wclcFeeKind', 'sku', 'discountStr', 'fulfillmentRequirements'],
+    notPersonal: ['wclcFeeKind', 'sku', 'discountStr', 'fulfillmentRequirements', 'exchangeForRefundId'],
     retained: { description: 'the product or fee text on an invoiced line: part of the retained sale record' },
   },
   SalesOrderRefundLine: {

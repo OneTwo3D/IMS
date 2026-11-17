@@ -143,6 +143,13 @@ export const RETURNS_MIXED_BASIS_MARKER = 'Mixed basis'
 export const RETURNS_MIXED_BASIS_NOTICE =
   'Refund values are shown on their own recorded basis. Where a row or the period mixes NET (ex-VAT) and GROSS (VAT-inclusive) credits, no single total is shown — adding the two gives an amount on neither basis — and the NET, GROSS and unproven-basis columns carry the whole credit instead. Rows with no single stated value sort last.'
 
+/**
+ * Why the Returns report shows exchanges apart. A return recorded with an exchange is returned AND replaced: the replacement lines sit on the SAME order, so the order's invoiced total and every revenue figure already
+ * include them, and the credit note is not a lost sale. The report therefore counts those returns as exchanged and shows the credit that was NOT exchanged as the refund that really left.
+ */
+export const RETURNS_EXCHANGE_NOTICE =
+  'A return recorded with an exchange is shown as exchanged: its units count in Returned and in Exchanged, and the replacement items added to the same order are counted in Replacement qty. The credit of an exchanged return is shown in Exchanged refund value, and only the credit that was not exchanged is shown as Lost refund value, so a swap is not read as a lost sale. Return rate excluding exchanges leaves the exchanged units out.'
+
 // ---------------------------------------------------------------------------------------------
 // The inventory. Generated from the field-name sweep, then classified by hand, one file at a time.
 // ---------------------------------------------------------------------------------------------

@@ -88,6 +88,7 @@ import { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
+import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -427,6 +428,27 @@ export type RefundAccountingSyncRequest = {
  * it to a clean no-op plus an operator-visible warning.
  */
 export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback'
+
+/**
+ * THE EXCHANGE HOOK OF A REFUND (Return exchanges). The refund transaction calls it twice, both under the order's row lock:
+ *   check  - before anything is written: whether replacement lines may be added to the order now (null) or the operator-wording refusal (nothing is created).
+ *   apply  - once the refund row exists: add the replacement lines linked to it, move the order's totals, queue the posted invoice's update. It returns the NET (ex-VAT) value it added to the order in the BASE currency,
+ *            because the refund is classified full or partial against the order total AFTER the replacement lines are on it: a return that is refunded in full but replaced is a partial refund of a larger order,
+ *            which keeps the order's demand, allocation and shipping alive (a fully refunded order holds none).
+ * A throw from either rolls the whole refund back.
+ */
+export type ReturnExchangeHook = {
+  check(tx: Prisma.TransactionClient): Promise<string | null>
+  apply(tx: Prisma.TransactionClient, context: { refundId: string; creditNoteNumber: string }): Promise<{ addedNetBase: number }>
+}
+
+/** Thrown inside the refund transaction to roll it back with an operator-wording message (the exchange would leave the order fully refunded). */
+class ReturnExchangeRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ReturnExchangeRefusedError'
+  }
+}
 
 export type CreateSalesOrderRefundResult =
   | { success: false; error: string; conflict?: RefundCreationConflict; quarantine?: true }
@@ -3989,6 +4011,8 @@ export async function createSalesOrderRefund(
     statedGrossForeign?: number
     /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across ALL its rate ids, set only when the refund carried tax on the EAS plugin's rate 182. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
     eas182StatedTaxForeign?: number
+    /** An exchange recorded with this return: replacement lines added to the SAME order, in this transaction, linked to this refund. Set only by the operator's refund action (never by an internal caller). */
+    exchange?: ReturnExchangeHook
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // THE ROW-SHAPE CHECKS RUN ON THE REQUEST AS SENT, before any filtering: a row the filter below would drop (a negative quantity with no money)
@@ -4143,6 +4167,12 @@ export async function createSalesOrderRefund(
         return { error: `Refund not created: ${error.message}`, quarantine: true as const }
       }
       throw error
+    }
+
+    // AN EXCHANGE IS CHECKED BEFORE ANYTHING IS WRITTEN: under the order lock, the replacement lines may be added now, or the whole refund is refused (nothing created).
+    if (input.exchange) {
+      const refusal = await input.exchange.check(tx)
+      if (refusal) return { error: refusal } as const
     }
 
     // The itemised sale lines are cut from what each order line has LEFT, here, under the order lock (see deriveSaleLineNetsFromStoredBalance).
@@ -5345,6 +5375,12 @@ export async function createSalesOrderRefund(
       })
     }
 
+    // THE REPLACEMENT LINES GO ON THE ORDER NOW, before the refund is classified: a return that is replaced is a refund of a LARGER order. They are added (and the posted invoice's update queued) in this
+    // transaction, so the refund, its credit note and the exchange commit together or not at all.
+    const exchangeApplied = input.exchange
+      ? await input.exchange.apply(tx, { refundId: createdRefund.id, creditNoteNumber })
+      : null
+
     const totalRefundedNow = previouslyRefunded + totalBase
     // Chargebacks unwind recognised revenue on the NET (ex-VAT) basis: the refund
     // lines are stored net and the credit note grosses them back up via taxType to
@@ -5359,7 +5395,7 @@ export async function createSalesOrderRefund(
     // 0, so this is identical to the gross basis for them. Safe to use the net total unconditionally here:
     // an order with any legacy/unknown-basis refund was already blocked above (o3d-n8p), so at this point
     // every refund on the order is NET-basis.
-    const orderTotal = netOrderTotal
+    const orderTotal = netOrderTotal + (exchangeApplied?.addedNetBase ?? 0)
     // `newStatus` is the refund *classification* (drives the accounting reversal
     // treatment), NOT the order's lifecycle status — refund state is now the
     // orthogonal refundStatus dimension.
@@ -5369,7 +5405,12 @@ export async function createSalesOrderRefund(
     // A cancelled order has nothing to refund — preserve the prior reject (the old
     // status machine blocked CANCELLED → REFUNDED/PARTIALLY_REFUNDED).
     if (so.status === 'CANCELLED') {
+      if (exchangeApplied) throw new ReturnExchangeRefusedError('Cannot refund a cancelled order')
       return { error: 'Cannot refund a cancelled order' } as const
+    }
+    // A replaced return that STILL refunds the whole order (replacement worth nothing) would leave the order fully refunded: it would hold no demand and the replacement lines could not be shipped.
+    if (exchangeApplied && newStatus === 'REFUNDED') {
+      throw new ReturnExchangeRefusedError(returnExchangeRefusals.wouldFullyRefund)
     }
     // The lifecycle status is left untouched; only the refund disposition is written,
     // so an order can be e.g. Delivered + Fully refunded and keep flowing through
@@ -5536,6 +5577,7 @@ export async function createSalesOrderRefund(
     if (isRefundReturnSourceError(error)) {
       return { error: refundReturnSourceErrorMessage(error) } as const
     }
+    if (error instanceof ReturnExchangeRefusedError) return { error: error.message } as const
     throw error
   })
 

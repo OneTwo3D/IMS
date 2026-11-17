@@ -40,6 +40,7 @@ export const REFUND_DELETE_REFUSAL_CODES = [
   'in_transit_return',
   'warehouse_release_in_flight',
   'legacy_basis',
+  'exchange_refund',
 ] as const
 export type RefundDeleteRefusalCode = (typeof REFUND_DELETE_REFUSAL_CODES)[number]
 
@@ -116,6 +117,10 @@ export const refundDeleteRefusals = {
   warehouseReleaseInFlight: (): RefundDeleteRefusal => ({
     code: 'warehouse_release_in_flight',
     message: 'The stock reservation for this refund is being released right now. Wait a few minutes and try again.',
+  }),
+  exchangeRefund: (): RefundDeleteRefusal => ({
+    code: 'exchange_refund',
+    message: 'Replacement items were added to the order for this return (an exchange), and they have been reserved, shipped or invoiced on the strength of it. Deleting the refund would leave them unexplained, so it cannot be deleted here. Correct it with a new entry instead.',
   }),
   legacyBasis: (): RefundDeleteRefusal => ({
     code: 'legacy_basis',
