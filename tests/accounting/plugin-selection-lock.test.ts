@@ -1112,6 +1112,8 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // The read-sync alarm bounds its claim transaction with a constant `SET LOCAL statement_timeout`; it names no plugin key.
   'lib/ops/read-sync-liveness-alarm.ts': 'runtime-assembled-sql',
   'lib/db/savepoint.ts': 'runtime-assembled-sql',
+  // The CRM identity report (o3d-t6lg8): its only raw statement is the constant `SET TRANSACTION READ ONLY`; it reads and writes no plugin key.
+  'lib/domain/crm/identity-report.ts': 'runtime-assembled-sql',
   'lib/domain/erasure/reconcile-free-text.ts': 'runtime-assembled-sql', // table and column names come from a constant list; it writes no plugin key
   // o3d-zjsb5.9 r13. The duplicate-recipe repair's logic, discovered here because `readServerIdentity`
   // issues raw SELECTs. Read to classify: it constructs NO client of its own -- every statement runs on
