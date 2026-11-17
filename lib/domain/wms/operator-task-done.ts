@@ -3,7 +3,6 @@ import { logActivityInTransaction } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { isWmsConnectorId, type WmsOrderItemRef } from '@/lib/connectors/wms/types'
-import { resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER } from '@/lib/domain/refused-actions'
 import { removalNoteKey } from './removal-note-obligation'
 import type { WmsOperatorTaskPayload } from './operator-tasks'
 
@@ -89,8 +88,9 @@ export async function completeWmsOperatorTask(params: {
       // The obligation row has done its work either way: the lines are verified gone.
       await tx.setting.deleteMany({ where: { key: removalNoteKey(task.connector, payload.linkId as string, task.externalOrderId) } })
     }
-    // A person has taken the unapplied amendment to the warehouse: the standing refusal it recorded is dealt with.
-    if (task.reason === 'AMENDMENT_NOT_APPLIED') await resolveRefusedActions(tx, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: task.orderId, action: 'WMS_ORDER_AMEND' }, 'NO_LONGER_NEEDED', at)
+    // Marking an AMENDMENT_NOT_APPLIED task done says only that the query was RAISED. The refused-action record stays OPEN (and keeps its age alert): it
+    // is closed when the warehouse's lines are read back and match the intent, when the order ends, or when an amendment later succeeds
+    // (order-push-sweep verifyAmendmentRefusals). Done only stops a second task for the same intent (the task dedupe).
     await logActivityInTransaction(tx, {
       userId,
       entityType: 'SALES_ORDER',

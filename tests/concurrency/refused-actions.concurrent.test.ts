@@ -137,3 +137,28 @@ test('obsolete: refusals of an order that was cancelled or deleted are closed; o
   const open = (await w.db.refusedAction.findMany({ where: { entityId: { in: [live, cancelled, gone] }, resolvedAt: null } })).map((r) => r.entityId)
   assert.deepEqual(open, [live])
 })
+
+test('marking the AMENDMENT_NOT_APPLIED task Done leaves the refusal OPEN; a terminal order then closes it', SKIP, async (t) => {
+  const w = await world()
+  const done = await import('@/lib/domain/wms/operator-task-done')
+  const id = `ra-${randomUUID()}`
+  const user = await w.db.user.create({ data: { email: `ra-${randomUUID()}@example.test`, name: 'RA done', role: 'ADMIN', active: true, passwordHash: 'x' } })
+  await w.db.salesOrder.create({ data: { id, orderNumber: `IMSTEST-${id}`, status: 'PROCESSING', currency: 'GBP', subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1, customerEmail: 'x@example.test', billingAddress: {}, shippingAddress: {} } })
+  t.after(async () => {
+    await w.db.refusedAction.deleteMany({ where: { entityId: id } })
+    await w.db.activityLog.deleteMany({ where: { userId: user.id } })
+    await w.db.salesOrder.deleteMany({ where: { id } })
+    await w.db.user.delete({ where: { id: user.id } })
+  })
+  await w.ra.recordRefusedAction(w.db, base(id))
+  const task = await w.db.wmsOperatorTask.create({ data: { connector: 'mintsoft', orderId: id, externalOrderId: `w-${id}`, reason: 'AMENDMENT_NOT_APPLIED', queryText: 'q', contentHash: id } })
+  const result = await done.completeWmsOperatorTask({ taskId: task.id, userId: user.id })
+  assert.equal(result.ok, true)
+  const open = () => w.db.refusedAction.count({ where: { entityId: id, resolvedAt: null } })
+  assert.equal(await open(), 1, 'Done says the query was raised, not that the warehouse applied it')
+  await w.ra.resolveObsoleteRefusedActions(w.db)
+  assert.equal(await open(), 1, 'the order is still in flight')
+  await w.db.salesOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
+  await w.ra.resolveObsoleteRefusedActions(w.db)
+  assert.equal(await open(), 0, 'a terminal order closes it')
+})

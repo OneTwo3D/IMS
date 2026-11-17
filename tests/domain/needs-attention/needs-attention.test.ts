@@ -141,6 +141,7 @@ test('countsFromSnapshot maps every category and never double-counts the inbox t
     dispatchDeadLetters: 2,
     refundParks: 4,
     operatorTasks: 1,
+    refusedActions: 0,
     otherExceptions: 10, // 20 - (3 + 2 + 4 + 1)
     failedAccounting: 5,
     receiptReviews: 6,
@@ -219,14 +220,14 @@ test('ttl cache: a failed load is not cached', async () => {
 // ---- permission filtering ----------------------------------------------------------------------
 
 test('permissions: a role sees only categories it may act on, and the total covers only those', () => {
-  const counts = { wmsPushBlocked: 1, dispatchDeadLetters: 1, refundParks: 1, operatorTasks: 1, otherExceptions: 1, failedAccounting: 1, receiptReviews: 1, stockDiscrepancies: 1 }
+  const counts = { wmsPushBlocked: 1, dispatchDeadLetters: 1, refundParks: 1, operatorTasks: 1, refusedActions: 1, otherExceptions: 1, failedAccounting: 1, receiptReviews: 1, stockDiscrepancies: 1 }
   const admin = buildNeedsAttentionView(counts, 'ADMIN')
-  assert.equal(admin.rows.length, 8)
-  assert.equal(admin.total, 8)
+  assert.equal(admin.rows.length, 9)
+  assert.equal(admin.total, 9)
 
   const manager = buildNeedsAttentionView(counts, 'MANAGER')
   assert.equal(manager.rows.some((r) => r.key === 'receiptReviews'), false, 'receipt approval is admin-only')
-  assert.equal(manager.total, 7)
+  assert.equal(manager.total, 8)
 
   for (const role of ['WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER']) {
     assert.deepEqual(buildNeedsAttentionView(counts, role), { rows: [], total: 0 }, role)
@@ -389,6 +390,7 @@ test('dashboard card links point at existing routes, and anchors at existing sec
   const exceptionsSource = [
     'app/(dashboard)/sync/exceptions/exceptions-client.tsx',
     'app/(dashboard)/sync/exceptions/wms-operator-tasks-section.tsx',
+    'app/(dashboard)/sync/exceptions/refused-actions-section.tsx',
     'app/(dashboard)/sync/exceptions/gift-card-lines-section.tsx',
   ].map((f) => readFileSync(path.join(ROOT, f), 'utf8')).join('\n')
 

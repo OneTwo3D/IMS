@@ -269,7 +269,7 @@ const CANCELLED_PART_SPLIT = {
   fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
 }
 
-test('split order with a cancelled part: recorded as a PERMANENT stall, and the delta watermark is NOT advanced over it', async () => {
+test('split order with a cancelled part: recorded as a PERMANENT stall, and the watermark MAY advance past it (the record is the trace)', async () => {
   const saved: Array<{ watermark?: string }> = []
   const recorded: Array<{ orderId: string; action: string; gate: string; permanence: string; severity: string; intent: unknown }> = []
   const { counters, logs } = await runWmsDispatchSweepCore(dispatchDeps({
@@ -288,7 +288,7 @@ test('split order with a cancelled part: recorded as a PERMANENT stall, and the 
   assert.equal(recorded[0]!.gate, 'WMS_SPLIT_PART_CANCELLED')
   assert.equal(recorded[0]!.permanence, 'PERMANENT')
   assert.equal(recorded[0]!.severity, 'MEDIUM')
-  assert.deepEqual(saved.filter((s) => s.watermark !== undefined), [], 'the watermark did not advance past the unresolved order')
+  assert.equal(saved.filter((s) => s.watermark !== undefined).length, 1, 'the watermark advanced: a recorded stall is not unresolved')
 })
 
 test('the same split order WITHOUT a cancelled part (part genuinely in progress) is not a stall and still advances the watermark', async () => {
@@ -310,7 +310,7 @@ test('the same split order WITHOUT a cancelled part (part genuinely in progress)
   assert.equal(saved.filter((s) => s.watermark !== undefined).length, 1)
 })
 
-test('the stall is bounded: an unresolved split order is never counted as a failure, so it is never dead-lettered', async () => {
+test('the stall is its own outcome: never an error, never unresolved, so never dead-lettered and never part of the drift cohort', async () => {
   let errorsRecorded = 0
   const { counters } = await runWmsDispatchSweepCore(dispatchDeps({
     ...CANCELLED_PART_SPLIT,
@@ -324,7 +324,48 @@ test('the stall is bounded: an unresolved split order is never counted as a fail
   assert.equal(errorsRecorded, 0)
 })
 
-test('a record that cannot be written holds the watermark too (the change must stay in the next window)', async () => {
+test('SEVERAL cancelled splits with no dispatched control: no drift incident, the watermark advances, every record exists, and isolation comes after N reads', async () => {
+  const links = ['1', '2', '3', '4'].map((n) => candidate({ linkId: `l${n}`, orderId: `o${n}`, externalOrderNumber: `WC-100${n}`, externalOrderId: `M-${n}` }))
+  const recorded: string[] = []
+  const reads = new Map<string, number>()
+  const quarantined: Array<{ linkId: string; count: number; kind?: string }> = []
+  const drift: unknown[] = []
+  const saved: Array<{ watermark?: string }> = []
+  const run = () => runWmsDispatchSweepCore(dispatchDeps({
+    listCandidates: async () => links,
+    listActiveByExternalOrderIds: async () => links,
+    listActiveByOrderNumbers: async () => links,
+    fetchOrderStatus: async (number) => status({ externalOrderNumber: number, status: 'PROCESSING', isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'P-1', partNumber: 1, status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN' })] }),
+      part({ externalId: 'P-2', partNumber: 2, status: 'CANCELLED' }),
+    ],
+    fetchPartItems: async () => [{ sku: 'A', qty: 1 }],
+    fetchDelta: async () => links.map((l) => status({ externalOrderId: l.externalOrderId as string, externalOrderNumber: l.externalOrderNumber, isSplit: true, partCount: 2 })),
+    getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+    saveDeltaState: async (state) => { saved.push(state) },
+    recordRefusedAction: async (c) => { recorded.push(c.orderId) },
+    recordUnresolvedRead: async (c) => { const n = (reads.get(c.linkId) ?? 0) + 1; reads.set(c.linkId, n); return { count: n } },
+    quarantineUnresolved: async (c, _reason, count, kind) => { quarantined.push({ linkId: c.linkId, count, kind }); return { quarantined: true } },
+    reportUnresolvedDrift: async (report) => { drift.push(report) },
+    saveUnresolvedDriftState: async () => true,
+    probeControlLinks: async () => ({ probed: 0, resolved: 0, representative: 0 }),
+  }), { now: SWEEP_NOW })
+  for (let pass = 1; pass <= 4; pass += 1) {
+    const result = await run()
+    assert.equal(result.unresolvedSystemic, false, 'never read as connector drift')
+    assert.equal(result.unresolved, 0)
+  }
+  assert.deepEqual(drift, [], 'no drift incident')
+  assert.equal(saved.filter((s) => s.watermark !== undefined).length, 4, 'the watermark advanced on every pass')
+  assert.deepEqual([...new Set(recorded)].sort(), ['o1', 'o2', 'o3', 'o4'])
+  assert.deepEqual(quarantined, [], 'not yet: only 4 reads')
+  await run()
+  assert.equal(quarantined.length, 4, 'isolated after N reads (5)')
+  assert.ok((quarantined as Array<{ count: number; kind?: string }>).every((q) => q.count === 5 && q.kind === 'STALLED'))
+})
+
+test('a record that cannot be written holds the watermark (the trace is not yet durable) (the change must stay in the next window)', async () => {
   const saved: Array<{ watermark?: string }> = []
   await runWmsDispatchSweepCore(dispatchDeps({
     ...CANCELLED_PART_SPLIT,
@@ -349,4 +390,30 @@ test('RESOLUTION: when the order later despatches, its standing split-order stal
   }), { now: SWEEP_NOW })
   assert.equal(counters.dispatched, 1)
   assert.deepEqual(resolved, ['o1'])
+})
+
+// --- an unapplied amendment is closed only by verified warehouse lines ----------------------------------------------------------------------
+
+async function verify(held: Array<{ externalItemId: string; sku: string; quantity: number }> | Error) {
+  const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
+  const resolved: string[] = []
+  const port = {
+    activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: '301' }],
+    releasableHeldOrders: async () => [], createCandidates: async () => [], revalidatableLinks: async () => ({ links: [], total: 0 }),
+    ambiguousCreateLinks: async () => ({ links: [], total: 0 }), verifiableLinks: async () => [], holdableLinks: async () => [], cancellableLinks: async () => [],
+    updatableLinks: async () => [], updateLink: async () => undefined, updateLinkByOrder: async () => undefined, updateLinkIfState: async () => true, upsertByOrder: async () => undefined,
+    screenLiveWithdrawals: async () => new Set<string>(), verifyWithdrawalFence: async () => true, recordEvent: async () => undefined,
+    openAmendmentRefusals: async () => [{ orderId: 'so-u', externalOrderId: 'wms-u', lines: [{ sku: 'A', quantity: 3 }] }],
+    resolveRefusedActions: async (orderId: string) => { resolved.push(orderId) },
+  } as unknown as WmsOrderPushPort
+  const connector = { pushOrder: async () => { throw new Error('no') }, updateOrder: async () => { throw new Error('no') }, fetchOrderItemRefs: async () => { if (held instanceof Error) throw held; return held } }
+  await runWmsOrderPushSweepCore(connector as never, 'mintsoft', port, { now: NOW })
+  return resolved
+}
+
+test('an unapplied serious amendment is resolved only when the warehouse lines read back MATCH the intent', async () => {
+  assert.deepEqual(await verify([{ externalItemId: 'x', sku: 'A', quantity: 3 }]), ['so-u'])
+  assert.deepEqual(await verify([{ externalItemId: 'x', sku: 'A', quantity: 2 }]), [], 'the old quantity: still unapplied')
+  assert.deepEqual(await verify([]), [], 'no lines read: nothing proven')
+  assert.deepEqual(await verify(new Error('down')), [], 'a failed read proves nothing')
 })

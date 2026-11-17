@@ -13,7 +13,7 @@ export function RefusedActionsSection({ data }: { data: RefusedActionPage }) {
   const { rows, total, shown } = data
   if (total === 0) return null
   return (
-    <Card className="p-4 space-y-3">
+    <Card id="refused-actions" className="p-4 space-y-3 scroll-mt-4">
       <div>
         <h2 className="text-sm font-semibold">{`Refused or stalled actions (${total})`}</h2>
         <p className="text-xs text-muted-foreground">

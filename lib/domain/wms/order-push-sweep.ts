@@ -845,6 +845,9 @@ const RESET_DISPATCH_FAILURES = {
  * order. An expired lease leaves the untrusted-ids mark set; the next owner re-reads before anything is trusted. A remote write that stalls
  * past this (several request timeouts) is the accepted limit.
  */
+/** How many open serious amendment refusals one sweep re-reads from the warehouse (one read-only fetch each). */
+export const AMENDMENT_VERIFY_BATCH = 10
+
 export const AMEND_LEASE_TTL_MS = 10 * 60_000
 
 /** Where the held create pass's walk stands (a Setting). Cleared when a page comes back short. */
@@ -1183,6 +1186,11 @@ export interface WmsOrderPushPort {
    * written: the caller then leaves the link due rather than advancing it over a refusal nobody can see. Absent: nothing is recorded (test doubles).
    */
   recordRefusedAction?(input: RefusedActionInput): Promise<void>
+  /**
+   * Open HIGH amendment refusals of this connector's linked orders, with the lines IMS wanted the warehouse order to hold, oldest first. Read by the
+   * verification pass, which closes one only when the warehouse's own lines match.
+   */
+  openAmendmentRefusals?(connector: string, limit: number): Promise<Array<{ orderId: string; externalOrderId: string; lines: Array<{ sku: string; quantity: number }> }>>
   /** Close this order's open refusals of one action: the action later succeeded. */
   resolveRefusedActions?(orderId: string, action: RefusedActionInput['action']): Promise<void>
   /** Live links with a courier-fallback task due and not yet recorded. */
@@ -3352,6 +3360,20 @@ export async function runWmsOrderPushSweepCore(
         } as LinkWrite,
       }
     }
+    // VERIFY THE UNAPPLIED AMENDMENTS (o3d-zvec.10). A serious refused amendment is closed ONLY when the warehouse's own lines (one read-only fetch,
+    // never a write) equal the lines IMS wanted: a person raising the query (the task Done) proves nothing about what the warehouse will pick. An order
+    // that ended is closed by the watchdog; a later successful amendment closes it above. A read that fails or finds no lines leaves the row open.
+    if (port.openAmendmentRefusals && port.resolveRefusedActions && connector.fetchOrderItemRefs) {
+      try {
+        for (const open of await port.openAmendmentRefusals(connectorId, AMENDMENT_VERIFY_BATCH)) {
+          const held = await connector.fetchOrderItemRefs(open.externalOrderId).catch(() => null)
+          if (!held || held.length === 0) continue
+          if (classifyAmendmentLineChange(open.lines, held.map((item) => ({ sku: item.sku, quantity: Number(item.quantity) }))) === 'UNCHANGED') await port.resolveRefusedActions(open.orderId, 'WMS_ORDER_AMEND')
+        }
+      } catch (error) {
+        console.error('[wms-order-push] could not verify the unapplied amendments', error)
+      }
+    }
     for (const link of await (createFloor ? port.updatableLinks(connectorId, batchSize, createFloor) : port.updatableLinks(connectorId, batchSize))) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId || !link.externalOrderId) continue
@@ -4680,6 +4702,24 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async recordRefusedAction(input) {
       await recordRefusedAction(db, input)
+    },
+    async openAmendmentRefusals(connector, limit) {
+      const refusals = await db.refusedAction.findMany({
+        where: { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, action: 'WMS_ORDER_AMEND', resolvedAt: null, severity: 'HIGH' },
+        orderBy: [{ firstSeenAt: 'asc' }, { id: 'asc' }], take: limit, select: { entityId: true, intent: true },
+      })
+      if (refusals.length === 0) return []
+      const links = await db.wmsOrderPushLink.findMany({
+        where: { connector, orderId: { in: refusals.map((row) => row.entityId) }, state: 'SYNCED', externalOrderId: { not: null } },
+        select: { orderId: true, externalOrderId: true },
+      })
+      const byOrder = new Map(links.map((link) => [link.orderId, link.externalOrderId as string]))
+      return refusals.flatMap((row) => {
+        const externalOrderId = byOrder.get(row.entityId)
+        const intent = row.intent && typeof row.intent === 'object' && !Array.isArray(row.intent) ? (row.intent as { lines?: unknown }) : {}
+        const lines = Array.isArray(intent.lines) ? intent.lines.flatMap((line) => (line && typeof (line as { sku?: unknown }).sku === 'string' ? [{ sku: (line as { sku: string }).sku, quantity: Number((line as { quantity?: unknown }).quantity) }] : [])) : []
+        return externalOrderId && lines.length > 0 ? [{ orderId: row.entityId, externalOrderId, lines }] : []
+      })
     },
     async resolveRefusedActions(orderId, action) {
       await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action }, 'ACTION_SUCCEEDED')
