@@ -1294,6 +1294,13 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                     <p className="text-xs text-muted-foreground">Pushes the next FIFO unit cost to WooCommerce&apos;s native Cost of Goods Sold field</p>
                   </div>
                 </label>
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" checked={s.wc_back_in_stock_date_enabled === 'true'} onChange={(e) => setS({ ...s, wc_back_in_stock_date_enabled: e.target.checked ? 'true' : 'false' })} className="rounded border-input" />
+                  <div>
+                    <span className="text-sm font-medium">Include estimated back-in-stock date</span>
+                    <p className="text-xs text-muted-foreground">For out-of-stock products, pushes the earliest committed supplier arrival date (never a past or undated one) as the _oti_eta_date product meta. Clears it when stock returns.</p>
+                  </div>
+                </label>
                 {isStockPushUnsaved && (
                   <p className="text-xs text-amber-600">
                     Stock push is not enabled on the server yet — click Save Settings below before pushing.
