@@ -3,9 +3,12 @@ import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
 import { getSalesOrder } from '@/app/actions/sales'
-import { getWarehouses, getScopedStockLevelMap } from '@/app/actions/stock'
+import { getWarehouses, getScopedStockLevelMap, getAvgCogsMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
-import { getSetting } from '@/app/actions/settings'
+import { getSetting, getTaxRates, getUsers } from '@/app/actions/settings'
+import { listProducts } from '@/app/actions/products'
+import { getCustomers } from '@/app/actions/customers'
+import { getOrganisation } from '@/app/actions/company'
 import { getOrderAllocations, getOrderFulfillmentRequirements, getOrderShipments } from '@/app/actions/allocation'
 import { getRejectedAccountingDocumentUpdateWarnings } from '@/app/actions/accounting-sync'
 import { getAccountingSettings } from '@/lib/accounting'
@@ -64,6 +67,9 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     warehouseIds: stockWarehouseIds,
   })
 
+  // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
+  const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
+
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
@@ -92,7 +98,37 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         currentUserRole={session.user.role}
         rejectedAccountingSyncs={rejectedAccountingSyncs}
         paidWithoutInvoice={paidWithoutInvoice}
+        editForm={editForm}
       />
     </div>
   )
+}
+
+async function loadEditFormData(session: Awaited<ReturnType<typeof requireAuth>>) {
+  const [{ products }, warehouses, taxRates, customers, avgCogs, users, organisation] = await Promise.all([
+    listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
+    getWarehouses(),
+    getTaxRates(),
+    getCustomers(),
+    getAvgCogsMap(),
+    getUsers(),
+    getOrganisation(),
+  ])
+  const stockable = products.filter(
+    (p) => !['VARIABLE', 'NON_INVENTORY'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'EOL'),
+  )
+  const stockLevels = await getScopedStockLevelMap({
+    productIds: stockable.map((product) => product.id),
+    warehouseIds: warehouses.map((warehouse) => warehouse.id),
+  })
+  return {
+    products: stockable,
+    taxRates,
+    customers,
+    avgCogs,
+    users,
+    stockLevels,
+    currentUserName: session.user.name ?? session.user.email ?? '',
+    companyHomeCountry: organisation.country,
+  }
 }
