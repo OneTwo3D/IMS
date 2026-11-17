@@ -88,6 +88,9 @@ export async function completeWmsOperatorTask(params: {
       // The obligation row has done its work either way: the lines are verified gone.
       await tx.setting.deleteMany({ where: { key: removalNoteKey(task.connector, payload.linkId as string, task.externalOrderId) } })
     }
+    // Marking an AMENDMENT_NOT_APPLIED task done says only that the query was RAISED. The refused-action record stays OPEN (and keeps its age alert): it
+    // is closed when the warehouse's lines are read back and match the intent, when the order ends, or when an amendment later succeeds
+    // (order-push-sweep verifyAmendmentRefusals). Done only stops a second task for the same intent (the task dedupe).
     await logActivityInTransaction(tx, {
       userId,
       entityType: 'SALES_ORDER',

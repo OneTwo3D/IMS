@@ -164,6 +164,14 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
 
 // Reached from an erased order's return by the inbox row id / the order id, not by a foreign key (named in the schema test).
 // The suppression table is keyed by ADDRESS: the erasure deletes the rows for the subject's addresses (the address and the mail server's raw text).
+// Refused-or-stalled action records: keyed by an entity id (no foreign key, so the row outlives a deleted order). The intent is the warehouse push summary
+// (order number, SKUs, quantities, amounts) and the detail is fixed wording built by IMS from a status token: no person is named and no remote free text
+// is stored, so nothing is erased and no free-text guard is needed.
+ERASURE_CLASSIFICATION.RefusedAction = {
+  erased: [],
+  notPersonal: ['entityType', 'entityId', 'action', 'gate', 'intent', 'detail', 'resolution'],
+  retained: {},
+}
 ERASURE_CLASSIFICATION.EmailSuppression = { erased: ['email', 'reason'], notPersonal: ['id', 'source'], retained: {} }
 ERASURE_CLASSIFICATION.WmsMutationEvent = {
   erased: ['before', 'after'],
