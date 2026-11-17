@@ -60,6 +60,7 @@ import {
 } from './held-sales-invoice'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
+import { recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { previewTreatedSalesInvoice, treatImportedSalesInvoice, type EuVatTreatmentAccounts } from './eu-vat-invoice-treatment'
 import { regimePolicyDifference, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
@@ -1699,6 +1700,8 @@ async function applyResolvedWcInvoiceNumber(
         data: { invoiceNumber: decision.to },
       })
       if (written.count !== 1) return { decision, applied: false }
+      // The incumbent's number is the evidence of the incumbent's invoice: the order is invoiced from the moment it is recorded (and a corrected number stays so).
+      await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, orderId)
     }
     return { decision, applied: true }
   })
@@ -3803,6 +3806,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           lines: { create: lineData },
         },
         })
+        // A WooCommerce order that arrives already numbered by the invoicing incumbent (`_wcpdf_invoice_number`) is invoiced from its first row.
+        await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, created.id)
 
         // THE RECEIPT, as a local Payment row (the owner's ruling: an imported paid order has one, like any
         // other paid order). Written in the SAME transaction as the order so there is no instant at which

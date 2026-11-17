@@ -73,6 +73,10 @@ export const publicRouteSecurityPolicy: Partial<Record<ApiRoutePath, PublicRoute
     properties: ['hmac-signature', 'timestamp-replay-protection', 'body-size-limit', 'no-sensitive-output'],
     rationale: 'Shopping customer invoice PDFs require a short-lived connector HMAC request; the shopping platform enforces customer login and order ownership before calling IMS server-to-server.',
   },
+  '/api/shopping/[connector]/credit-note-pdf': {
+    properties: ['hmac-signature', 'timestamp-replay-protection', 'body-size-limit', 'no-sensitive-output'],
+    rationale: 'Shopping customer credit note PDFs require a short-lived connector HMAC request with a one-time nonce; the shopping platform enforces customer login and order ownership before calling IMS server-to-server, and IMS only reads a refund that belongs to the proved order.',
+  },
   '/api/uploads/branding/[filename]': {
     properties: ['path-traversal-protection', 'extension-allowlist', 'no-sensitive-output'],
     rationale: 'Public branding assets are limited to safe image extensions and not-found responses for missing or disallowed files.',

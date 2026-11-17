@@ -28,6 +28,9 @@ const HEADERS = [
   'salesRep',
   'notes',
 ]
+// The export adds the order's invoicing state as the LAST column (no existing column moves). The import template does not carry it: the import
+// ignores it (it reads columns by name), because invoicing state is derived from the order's invoices, never imported.
+const EXPORT_HEADERS = [...HEADERS, 'invoicingState']
 const REQUIRED_HEADERS = ['customerName', 'sku', 'qty', 'unitPriceForeign']
 
 export async function GET(req: NextRequest) {
@@ -82,8 +85,9 @@ export async function GET(req: NextRequest) {
         expectedDelivery: order.expectedDelivery?.toISOString().slice(0, 10),
         salesRep: order.salesRep ?? '',
         notes: order.notes ?? '',
+        invoicingState: order.invoicingState,
       })
     }
   }
-  return csvResponse(toCsv(data, HEADERS), `sales-orders-${new Date().toISOString().slice(0, 10)}.csv`)
+  return csvResponse(toCsv(data, EXPORT_HEADERS), `sales-orders-${new Date().toISOString().slice(0, 10)}.csv`)
 }

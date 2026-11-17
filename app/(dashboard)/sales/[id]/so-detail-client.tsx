@@ -1,5 +1,6 @@
 'use client'
 
+import { INVOICING_STATE_CLASS, INVOICING_STATE_LABELS } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
@@ -26,6 +27,7 @@ import {
   type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
+import { deleteRefund, getRefundDeleteEligibility, type RefundDeleteEligibility } from '@/app/actions/refund-delete'
 import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
   deallocateOrder, confirmAllocations, updateAllocation, addAllocation,
@@ -388,6 +390,46 @@ function AddressesDialog({ order, onClose }: { order: SoDetail; onClose: () => v
 // ---------------------------------------------------------------------------
 // Add Payment dialog
 // ---------------------------------------------------------------------------
+// Delete refund dialog (o3d-ngmt.22). Shown only for a refund the server said is eligible; the server checks every rule again on confirm.
+function DeleteRefundDialog({ refund, onClose }: { refund: { id: string; creditNoteNumber: string | null }; onClose: () => void }) {
+  const router = useRouter()
+  const [reason, setReason] = useState('')
+  const [error, setError] = useState('')
+  const [isPending, startTransition] = useTransition()
+  function handleConfirm() {
+    setError('')
+    startTransition(async () => {
+      const result = await deleteRefund(refund.id, reason)
+      if (result.success) {
+        if (result.pending) alert('The credit note void has been queued. The refund and its stock stay as they are until the accounting system confirms the void; then the refund is removed. Check the sync page if it does not disappear.')
+        if (result.warning) alert(result.warning)
+        router.refresh()
+        onClose()
+      } else setError(result.error ?? 'Failed to delete the refund')
+    })
+  }
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open && !isPending) onClose() }}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>Delete refund{refund.creditNoteNumber ? ` ${refund.creditNoteNumber}` : ''}</DialogTitle></DialogHeader>
+        <div className="space-y-3 text-sm">
+          <p>Use this only for a refund that was recorded in error. It removes the refund and undoes exactly what it did: any stock it returned goes back out, its cost-of-sales entry is reversed, and the credit note is voided in the accounting system (queued, not sent immediately).</p>
+          <p className="text-muted-foreground">This cannot be undone. To refund the customer again, record a new refund.</p>
+          <div className="space-y-1">
+            <Label htmlFor="delete-refund-reason">Reason (optional, kept in the audit record)</Label>
+            <Textarea id="delete-refund-reason" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} rows={2} />
+          </div>
+          {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
+        </div>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button type="button" variant="destructive" onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Delete refund</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultAmount, onClose }: { orderId: string; refundId?: string; creditNoteNumber?: string; currency: string; defaultAmount?: number; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -1096,6 +1138,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
   const [showColPicker, setShowColPicker] = useState(false)
   const [showInvoice, setShowInvoice] = useState(false)
   const [showPayment, setShowPayment] = useState<{ refundId?: string; creditNoteNumber?: string } | null>(null)
+  const [deleteEligibility, setDeleteEligibility] = useState<RefundDeleteEligibility | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; creditNoteNumber: string | null } | null>(null)
   const [visibleCols, setVisibleCols] = useState<Set<OptCol>>(new Set())
   const [error, setError] = useState('')
   const { promptReauth, stepUpDialog } = useStepUpReauth()
@@ -1188,6 +1232,15 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
   const canRefund = (['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && so.refundStatus !== 'FULL') || so.refundStatus === 'PARTIAL'
   const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
+  // o3d-ngmt.22: whether each refund can be deleted, asked of the server (which owns every rule). Nothing is asked, and no control shown, unless the refund
+  // permission is held and there is a refund; the server answers `enabled: false` while the switch is off.
+  const refundCount = so.refunds.length
+  useEffect(() => {
+    if (!canRetryRefundAccounting || refundCount === 0) { setDeleteEligibility(null); return }
+    let cancelled = false
+    getRefundDeleteEligibility(so.id).then((result) => { if (!cancelled) setDeleteEligibility(result) }).catch(() => { if (!cancelled) setDeleteEligibility(null) })
+    return () => { cancelled = true }
+  }, [so.id, refundCount, canRetryRefundAccounting])
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
   const committedByLine = calculateClientCoverageByLine(
@@ -1392,6 +1445,13 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             </span>
           ) : null
         })()}
+        <span
+          data-testid="invoicing-state-badge"
+          className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${INVOICING_STATE_CLASS[so.invoicingState]}`}
+          title="Whether an invoice exists for this order. Independent of the order status: a cancelled order keeps the state it had."
+        >
+          {INVOICING_STATE_LABELS[so.invoicingState]}
+        </span>
         {so.refundStatus !== 'NONE' && (
           <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${
             so.refundStatus === 'FULL'
@@ -2201,6 +2261,17 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                   ))}
                 </div>
               )}
+              {deleteEligibility?.enabled && deleteEligibility.refunds[r.id] && (
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {deleteEligibility.refunds[r.id].eligible ? (
+                    <Button variant="outline" size="sm" className="h-6 text-xs text-destructive" onClick={() => setDeleteTarget({ id: r.id, creditNoteNumber: r.creditNoteNumber })} disabled={isPending}>
+                      <Trash2 className="h-3 w-3 mr-1" />Delete refund
+                    </Button>
+                  ) : (
+                    <span className="text-xs text-muted-foreground" data-testid="refund-delete-refusal">Cannot be deleted: {deleteEligibility.refunds[r.id].refusals.map((refusal) => refusal.message).join(' ')}</span>
+                  )}
+                </div>
+              )}
               {accountingAvailable && (
                 <div className="flex flex-wrap items-center gap-1.5 pt-1">
                   <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
@@ -2220,6 +2291,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
       )}
 
       {/* Dialogs */}
+      {deleteTarget && <DeleteRefundDialog refund={deleteTarget} onClose={() => setDeleteTarget(null)} />}
       {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
       {showAddresses && editScope.scope === 'ADDRESS_NOTES' && <AddressesDialog order={so} onClose={() => setShowAddresses(false)} />}
