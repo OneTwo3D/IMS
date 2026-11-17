@@ -4,7 +4,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
 import { type WmsConnectorId } from '@/lib/connectors/wms/types'
 import { getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
-import type { WmsSyncTrigger } from '@/lib/connectors/wms/connector-hooks'
+import type { WmsProductSyncOutcome, WmsSyncTrigger } from '@/lib/connectors/wms/connector-hooks'
 
 /**
  * Connector-agnostic dispatch of product/bundle sync triggered by IMS product
@@ -39,12 +39,12 @@ async function activeWmsProductSync() {
   return hook ? hook() : null
 }
 
-export async function runWmsProductSyncForProduct(productId: string, triggeredBy: SyncTrigger): Promise<void> {
-  await (await activeWmsProductSync())?.syncProduct(productId, triggeredBy)
+export async function runWmsProductSyncForProduct(productId: string, triggeredBy: SyncTrigger): Promise<WmsProductSyncOutcome> {
+  return (await (await activeWmsProductSync())?.syncProduct(productId, triggeredBy)) ?? { ok: true }
 }
 
-export async function runWmsBundleSyncForProduct(productId: string, triggeredBy: SyncTrigger): Promise<void> {
-  await (await activeWmsProductSync())?.syncBundle(productId, triggeredBy)
+export async function runWmsBundleSyncForProduct(productId: string, triggeredBy: SyncTrigger): Promise<WmsProductSyncOutcome> {
+  return (await (await activeWmsProductSync())?.syncBundle(productId, triggeredBy)) ?? { ok: true }
 }
 
 async function syncWmsProductBestEffort(productId: string): Promise<void> {
@@ -99,11 +99,15 @@ export function scheduleWmsProductSync(productId: string): void {
  * the fire-and-forget `after()` form cannot.
  */
 export async function syncWmsProductNow(productId: string): Promise<void> {
-  // Unlike the fire-and-forget form, a failure THROWS, so the drain can keep the product's mark and retry it.
-  await runWmsProductSyncForProduct(productId, 'product_mutation')
-  await runWmsBundleSyncForProduct(productId, 'product_mutation')
+  // Unlike the fire-and-forget form, anything but a clean success THROWS (an exception from the connector, or a returned
+  // failed / partial / error outcome), so the drain keeps the product's mark and retries it.
+  const failures: string[] = []
+  const note = (label: string, outcome: WmsProductSyncOutcome) => { if (!outcome.ok) failures.push(`${label}: ${outcome.detail}`) }
+  note('product', await runWmsProductSyncForProduct(productId, 'product_mutation'))
+  note('bundle', await runWmsBundleSyncForProduct(productId, 'product_mutation'))
   const parents = await db.productComponent.findMany({ where: { componentId: productId }, select: { productId: true } })
   for (const parentId of new Set(parents.map((parent) => parent.productId))) {
-    await runWmsBundleSyncForProduct(parentId, 'product_mutation')
+    note(`parent bundle ${parentId}`, await runWmsBundleSyncForProduct(parentId, 'product_mutation'))
   }
+  if (failures.length > 0) throw new Error(`Warehouse sync did not complete: ${failures.join('; ')}`)
 }

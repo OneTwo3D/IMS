@@ -11,6 +11,7 @@ import { hasPermission, type Permission } from '@/lib/permissions'
 
 const state = { calls: [] as string[], inFlight: 0, peak: 0 }
 const failing = new Set<string>()
+const wmsFailing = new Set<string>()
 mock.module('@/lib/shopping', {
   namedExports: {
     pushProductMetadata: async (id: string) => {
@@ -30,7 +31,10 @@ mock.module('@/lib/shopping', {
 mock.module('@/lib/domain/wms/product-sync-dispatch', {
   namedExports: {
     isAnyWmsConnectorEnabled: async () => true,
-    syncWmsProductNow: async (id: string) => { state.calls.push(`wms:${id}`) },
+    syncWmsProductNow: async (id: string) => {
+      state.calls.push(`wms:${id}`)
+      if (wmsFailing.has(id)) throw new Error('Warehouse sync did not complete: product: product sync FAILED (1 error(s))')
+    },
   },
 })
 mock.module('@/lib/trade/hs-classification-trigger', {
@@ -108,7 +112,7 @@ test('SCALE: a 20,000-variant preview reads in bulk and keeps its report bounded
 // ------------------------------------------------------------------ the sweep: the editor's follow-up, paced
 
 type Mark = { productId: string; storefrontPending: boolean; warehousePending: boolean; updatedAt: Date }
-const sweepWorld = { marks: [] as Mark[], deleted: [] as string[], released: [] as string[], limitsSeen: [] as number[], lifecycle: new Map<string, string>() }
+const sweepWorld = { marks: [] as Mark[], deleted: [] as string[], released: [] as string[], limitsSeen: [] as number[], claimSql: [] as string[], lifecycle: new Map<string, string>() }
 mock.module('@/lib/db', {
   namedExports: {
     db: {
@@ -116,6 +120,7 @@ mock.module('@/lib/db', {
         if (/UPDATE "product_sync_marks" SET "claimedAt" = now\(\)/.test(sql.sql)) {
           const limit = sql.values.find((v) => typeof v === 'number' && v <= 1000 && v !== 5 && v !== 15) as number
           sweepWorld.limitsSeen.push(limit)
+          sweepWorld.claimSql.push(sql.sql)
           return sweepWorld.marks.splice(0, limit)
         }
         return [{ remaining: sweepWorld.marks.length, parked: 0 }]
@@ -177,6 +182,19 @@ test('SWEEP: a product whose storefront push throws is released with its error, 
   assert.equal(result.failed, 1)
   assert.deepEqual(sweepWorld.released, ['f0'])
   assert.deepEqual(sweepWorld.deleted, ['f1'])
+})
+
+test('REGRESSION: a warehouse sync that fails (FAILED, PARTIAL or ERROR surfaces as a throw) keeps the mark and counts the attempt', async () => {
+  const { runProductSyncSweep } = await import('@/lib/products/csv-roundtrip/sync-sweep')
+  sweepWorld.marks = marksFor(3, 'w')
+  sweepWorld.deleted.length = 0; sweepWorld.released.length = 0
+  wmsFailing.add('w0'); wmsFailing.add('w1')
+  const result = await runProductSyncSweep()
+  wmsFailing.clear()
+  assert.equal(result.failed, 2)
+  assert.deepEqual(sweepWorld.released.sort(), ['w0', 'w1'], 'released with the error, lease cleared, not deleted')
+  assert.deepEqual(sweepWorld.deleted, ['w2'])
+  assert.ok(sweepWorld.claimSql.some((q) => /"attempts" = "attempts" \+ 1/.test(q)), 'the claim counts the attempt')
 })
 
 test('the sweep and the apply write to no vendor directly', () => {
