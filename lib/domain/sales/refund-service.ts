@@ -88,6 +88,7 @@ export { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
+import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -5363,6 +5364,22 @@ export async function createSalesOrderRefund(
         queryText: refundNoteQuery(warehouseOrderRef(wmsLink.externalOrderNumber, wmsLink.externalOrderId), orderRef, creditNoteNumber, newStatus === 'REFUNDED'),
         dedupeBasis: `refund:${creditNoteNumber || createdRefund.id}:${newStatus === 'REFUNDED' ? 'full' : 'partial'}`,
         payload: { orderNumber: orderRef, externalOrderNumber: wmsLink.externalOrderNumber ?? null },
+      })
+    }
+
+    // THE SHOP MUST PAY THE CUSTOMER BACK: a refund recorded in IMS on an order that came from WooCommerce is money the shop still owes the customer.
+    // IMS writes NOTHING to WooCommerce for it (no refund, no status, no note); it raises ONE operator task ("Refund in WooCommerce"), here, in the
+    // refund's own transaction, so a committed refund always has its task. When the person's WooCommerce refund is imported it is matched to this
+    // refund instead of raising a second credit note (lib/domain/sales/shop-refund-tasks.ts). Only a refund a person recorded here: a storefront
+    // refund (WOO_SYNC) is already paid and a chargeback was taken by the payment provider.
+    if (refundSource === 'MANUAL_UI' && so.shoppingLinks.some((link) => link.connector === SHOP_REFUND_CONNECTOR)) {
+      await raiseShopRefundTask(tx, {
+        orderId: input.orderId,
+        orderNumber: so.orderNumber ?? input.orderId,
+        refundId: createdRefund.id,
+        creditNoteNumber,
+        currency: so.currency,
+        lines: createdRefundLines,
       })
     }
 
