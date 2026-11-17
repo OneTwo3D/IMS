@@ -5,13 +5,29 @@ import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
 import { resolveReorderThresholds, type ReorderThresholdField } from '@/lib/domain/inventory/reorder-thresholds'
+import { applyGrowth, formatGrowthPercent, resolveGrowthPercent } from '@/lib/domain/inventory/forecast-growth'
+import { computeForecastMoney, type ForecastMoneyProductInputs } from '@/lib/domain/inventory/reorder-forecast-money'
+import { loadForecastMoneyInputs as defaultLoadForecastMoneyInputs } from '@/lib/domain/inventory/reorder-forecast-money-loader'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { projectStockPosition, type InboundArrival, type StockProjectionBasis } from '@/lib/domain/inventory/reorder-timing'
-import { calculateDailyVelocity, saleMovementCogsBase, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
+import {
+  calculateDailyVelocity,
+  calculateStockoutAdjustedVelocity,
+  saleMovementCogsBase,
+  type VelocitySaleInput,
+} from '@/lib/domain/inventory/velocity'
+import {
+  getSnapshotCoverage,
+  getStockoutDayCounts,
+  MAX_STOCKOUT_WINDOW_DAYS,
+  type SnapshotCoverage,
+  type StockoutDayCount,
+} from '@/lib/domain/inventory/stockout-history'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { CLAIMED_BOM_SELECT, CLAIMED_BOM_WHERE, claimedBomItems } from '@/lib/products/claimed-bom'
 import { parseProductionOrderComponentSnapshot } from '@/lib/domain/manufacturing/component-consumption'
-import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
+import { SourceScanTooLargeError, assertSourceLimit, isSourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
   type DecimalFulfillmentRequirement,
@@ -136,6 +152,13 @@ async function countProductsWithThresholdOverrides(client: ReplenishmentReportCl
 export type ReplenishmentReportDeps = {
   client?: ReplenishmentReportClient
   now?: () => Date
+  /** Stockout-aware demand (ignoreStockouts) only. Defaults read the daily inventory snapshots. */
+  loadStockoutDayCounts?: (input: { productIds: string[]; warehouseId?: string; dateFrom: string; dateTo: string }) => Promise<Map<string, StockoutDayCount>>
+  loadSnapshotCoverage?: (input: { dateFrom: string; dateTo: string }) => Promise<SnapshotCoverage>
+  /** Forecast sales / margin (includeForecastMoney) only. Defaults read products, tax rates and cost layers. */
+  loadForecastMoneyInputs?: (productIds: string[]) => Promise<Map<string, ForecastMoneyProductInputs>>
+  /** Forecast sales / margin only. Defaults to the organisation's base currency. */
+  baseCurrency?: string
 }
 
 type SupplierProductRow = {
@@ -355,6 +378,31 @@ export type ReorderReportRow = {
    * ["Direct sales"]. For raw materials it can include multiple BOM parents.
    */
   neededFor: string[]
+  /**
+   * Only present when the report was run with ignoreStockouts and this product lost demand-window days to
+   * stockouts (or the 90% guard refused the adjustment). Absent otherwise, so a report without the toggle
+   * carries exactly the fields it always did.
+   */
+  stockoutAdjustment?: {
+    /** Snapshot-covered days in the demand window with no on-hand stock, removed from the denominator. */
+    stockoutDays: number
+    /** Days averageDailyDemand was divided by. */
+    effectiveDays: number
+    /** Too many stockout days (>= 90% of the window): the unadjusted rate was kept. */
+    clamped: boolean
+  }
+  /**
+   * Only present when the report was run with includeForecastMoney (the page and CSV, for roles that may see
+   * prices). FORWARD-LOOKING ESTIMATES, not booked sales. forecastQty is the row's demand over the target cover
+   * weeks (growth included). forecastSales is that at the product's list price ex-VAT, base currency;
+   * forecastMargin is that less forecastQty x current unit cost. Each is null with a reason when it cannot be
+   * stated (no list price, VAT unresolved, no cost layers): never 0, never 100%.
+   */
+  forecastQty?: string
+  forecastSales?: string | null
+  forecastMargin?: string | null
+  forecastSalesUnavailable?: string | null
+  forecastMarginUnavailable?: string | null
 }
 
 export type ReorderReport = {
@@ -883,6 +931,65 @@ export async function loadReorderChartSources(
   }
 }
 
+/**
+ * Stockout-adjusted velocity for the report: ONE aggregate query over the products that sold in the window
+ * (only they have a rate to correct) plus a two-query coverage read for the disclosure notices.
+ */
+async function loadStockoutAdjustedVelocity(
+  deps: ReplenishmentReportDeps | undefined,
+  filters: StockPositionFilters,
+  window: { dateFrom: Date; dateTo: Date },
+  velocityInputs: VelocitySaleInput[],
+): Promise<{
+  rows: ReturnType<typeof calculateStockoutAdjustedVelocity>
+  notices: string[]
+  refused?: boolean
+}> {
+  const dateFrom = dateOnly(window.dateFrom)
+  const dateTo = dateOnly(window.dateTo)
+  const soldProductIds = [...new Set(velocityInputs.map((input) => input.productId))]
+  const loadCounts = deps?.loadStockoutDayCounts ?? ((input) => getStockoutDayCounts(input))
+  const loadCoverage = deps?.loadSnapshotCoverage ?? ((input) => getSnapshotCoverage(input))
+  let counts: Map<string, StockoutDayCount>
+  let coverage: SnapshotCoverage
+  try {
+    ;[counts, coverage] = await Promise.all([
+    soldProductIds.length > 0
+      ? loadCounts({ productIds: soldProductIds, warehouseId: filters.warehouseId, dateFrom, dateTo })
+      : Promise.resolve(new Map<string, StockoutDayCount>()),
+    loadCoverage({ dateFrom, dateTo }),
+  ])
+  } catch (error) {
+    if (!isSourceScanTooLargeError(error)) throw error
+    // Too many snapshot rows to read: keep demand unadjusted and say so. The report itself still computes.
+    return {
+      rows: calculateDailyVelocity(velocityInputs, window).map((row) => ({ ...row, stockoutDays: 0, effectiveDays: 0, clamped: false })),
+      notices: ['Ignore stockouts is on but there are too many inventory snapshot rows to apply it for these filters, so demand is not adjusted. Narrow the filters (warehouse, category, supplier or a shorter demand window) and try again.'],
+      refused: true,
+    }
+  }
+  const stockoutDaysByProduct = new Map([...counts].map(([productId, count]) => [productId, count.stockoutDays]))
+  const rows = calculateStockoutAdjustedVelocity(velocityInputs, window, stockoutDaysByProduct)
+
+  const notices = [
+    'Ignore stockouts is on: days the product had no on-hand stock (from the daily inventory snapshots) are removed from the demand window before averaging, so demand is units sold / (window days - stockout days). Lost sales are not estimated, and days without a snapshot are not treated as stockouts.',
+  ]
+  if (coverage.coveredDays < coverage.windowDays) {
+    notices.push(
+      coverage.firstCoveredDate == null
+        ? `Daily inventory snapshots have never run, so none of the ${coverage.windowDays} demand-window days can be checked for stockouts and demand is unchanged.`
+        : `Daily inventory snapshots cover ${coverage.coveredDays} of the ${coverage.windowDays} demand-window days (earliest snapshot ${coverage.firstCoveredDate}). The other days are unknown, not in stock, and stay in the average.`,
+    )
+  }
+  const adjusted = rows.filter((row) => row.stockoutDays > 0 && !row.clamped)
+  const clamped = rows.filter((row) => row.clamped)
+  if (adjusted.length > 0) notices.push(`Demand was raised for ${adjusted.length} product(s) by excluding their stockout days.`)
+  if (clamped.length > 0) {
+    notices.push(`${clamped.length} product(s) were out of stock for 90% or more of the demand window, so the unadjusted demand was kept: ${clamped.slice(0, 10).map((row) => row.sku).join(', ')}${clamped.length > 10 ? ', ...' : ''}.`)
+  }
+  return { rows, notices }
+}
+
 export async function getReorderReport(
   filters: StockPositionFilters = {},
   options: { paginate?: boolean; deps?: ReplenishmentReportDeps } = {},
@@ -898,6 +1005,9 @@ export async function getReorderReport(
   // includeZero (the "show all products" toggle / CSV export) keeps every candidate,
   // including those with a zero suggested quantity.
   const includeAll = filters.includeZero === true
+  // growth factor on the daily sales rate. Validated here, server-side, whatever the caller
+  // sent; 0 (the default) leaves every figure exactly as it was.
+  const growth = resolveGrowthPercent(filters.growthPercent)
   const window = demandWindow(generatedAt, demandDays)
   const [products, stockLevels, velocityInputs, openPoLines, latestMoRows, bomItemRows] = await Promise.all([
     client.product.findMany({
@@ -990,7 +1100,23 @@ export async function getReorderReport(
   const undatedInboundIds = undatedInboundProductIds(openPoLines)
   let undatedInboundRows = 0
   let lateInboundRows = 0
-  const velocityByProduct = new Map(calculateDailyVelocity(velocityInputs, window).map((row) => [row.productId, row]))
+  // ignoreStockouts: days the product had no on-hand stock (per the daily inventory snapshots, covered
+  // days only) leave the demand denominator. Off by default; off runs calculateDailyVelocity untouched.
+  let stockoutNotices: string[] = []
+  let velocityRows: Array<ReturnType<typeof calculateDailyVelocity>[number] & { stockoutDays?: number; effectiveDays?: number; clamped?: boolean }>
+  if (filters.ignoreStockouts === true && demandDays > MAX_STOCKOUT_WINDOW_DAYS) {
+    // The day-count query is bounded by the snapshot rows in the window; refuse an unbounded window rather
+    // than scan years of snapshots. Demand stays unadjusted and the report says so.
+    velocityRows = calculateDailyVelocity(velocityInputs, window)
+    stockoutNotices = [`Ignore stockouts is on but the ${demandDays}-day demand window is longer than the ${MAX_STOCKOUT_WINDOW_DAYS} days it can check, so demand is not adjusted. Use a window of ${MAX_STOCKOUT_WINDOW_DAYS} days or fewer.`]
+  } else if (filters.ignoreStockouts === true) {
+    const adjusted = await loadStockoutAdjustedVelocity(options.deps, filters, window, velocityInputs)
+    velocityRows = adjusted.rows
+    stockoutNotices = adjusted.notices
+  } else {
+    velocityRows = calculateDailyVelocity(velocityInputs, window)
+  }
+  const velocityByProduct = new Map(velocityRows.map((row) => [row.productId, row]))
   const defaultLeadTimeSkus: string[] = []
   const derivedLeadTimeSkus: string[] = []
 
@@ -1060,6 +1186,7 @@ export async function getReorderReport(
     inboundOpenPoQty: Prisma.Decimal
     projectedAvailableQty: Prisma.Decimal
     averageDailyDemand: Prisma.Decimal
+    stockoutAdjustment?: ReorderReportRow['stockoutAdjustment']
     leadTimeDays: number
     safetyStockQty: Prisma.Decimal
     /** Reorder point before BOM-driven demand is folded in. */
@@ -1098,7 +1225,10 @@ export async function getReorderReport(
     const availableQty = availableByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const inboundOpenPoQty = inboundByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const projectedAvailableQty = availableQty.add(inboundOpenPoQty)
-    const averageDailyDemand = toDecimal(velocityByProduct.get(product.id)?.dailyQtyVelocity ?? 0)
+    const velocityRow = velocityByProduct.get(product.id)
+    // Growth scales the rate BEFORE anything is derived from it (cover quantity, reorder point, suggestion,
+    // BOM component demand, timing), so every figure on the row agrees.
+    const averageDailyDemand = applyGrowth(toDecimal(velocityRow?.dailyQtyVelocity ?? 0), growth)
     // Product-level effective lead time. Precedence:
     //   1. manual override (Product.leadTimeDays)
     //   2. auto P95 from PO receipts (Product.observedLeadTimeDays, cron-maintained)
@@ -1132,6 +1262,9 @@ export async function getReorderReport(
       inboundOpenPoQty,
       projectedAvailableQty,
       averageDailyDemand,
+      ...(velocityRow && velocityRow.stockoutDays !== undefined && (velocityRow.stockoutDays > 0 || velocityRow.clamped)
+        ? { stockoutAdjustment: { stockoutDays: velocityRow.stockoutDays, effectiveDays: velocityRow.effectiveDays ?? 0, clamped: velocityRow.clamped === true } }
+        : {}),
       leadTimeDays,
       safetyStockQty,
       baseReorderPoint,
@@ -1334,6 +1467,7 @@ export async function getReorderReport(
       inboundOpenPoQty: integerQuantityString(candidate.inboundOpenPoQty),
       // Daily demand is a rate, not a stock quantity — keep its fractional precision.
       averageDailyDemand: quantityString(candidate.averageDailyDemand),
+      ...(candidate.stockoutAdjustment ? { stockoutAdjustment: candidate.stockoutAdjustment } : {}),
       leadTimeDays: candidate.leadTimeDays,
       safetyStockQty: integerQuantityString(candidate.safetyStockQty),
       reorderPoint: integerQuantityString(reorderPoint),
@@ -1386,6 +1520,27 @@ export async function getReorderReport(
   )
   const pageSize = clampPageSize(filters.pageSize)
   const paged = paginate(displayRows, filters.page, pageSize, options.paginate !== false)
+  if (filters.includeForecastMoney === true && paged.rows.length > 0) {
+    const baseCurrency = options.deps?.baseCurrency ?? await getBaseCurrencyCode()
+    const inputs = await (options.deps?.loadForecastMoneyInputs ?? defaultLoadForecastMoneyInputs)(paged.rows.map((row) => row.productId))
+    for (const row of paged.rows) {
+      const forecastQty = candidatesByProductId.get(row.productId)?.targetCoverQty ?? new Prisma.Decimal(0)
+      const input = inputs.get(row.productId)
+      const money = computeForecastMoney({
+        forecastQty,
+        salesPrice: input?.salesPrice ?? null,
+        salesPriceTaxInclusive: input?.salesPriceTaxInclusive ?? false,
+        salesVatRate: input?.salesVatRate ?? null,
+        unitCostBase: input?.unitCostBase ?? null,
+        baseCurrency,
+      })
+      row.forecastQty = integerQuantityString(forecastQty)
+      row.forecastSales = money.forecastSales
+      row.forecastMargin = money.forecastMargin
+      row.forecastSalesUnavailable = money.forecastSalesUnavailable
+      row.forecastMarginUnavailable = money.forecastMarginUnavailable
+    }
+  }
   return {
     generatedAt: generatedAt.toISOString(),
     demandWindowDateFrom: dateOnly(window.dateFrom),
@@ -1404,6 +1559,10 @@ export async function getReorderReport(
       'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
       'Required receipt is the day projected available stock falls to safety stock (to zero when safety stock is 0): current available, less daily demand, plus each open PO on its expected delivery date (POs already past due are left out and flagged as late). Latest PO date is that day minus the lead time; it is the same statement as the reorder point, in dates. BOM-driven component demand and a manually set reorder point change the reorder point but not these dates.',
+      ...stockoutNotices,
+      ...(growth.percent !== 0 ? [`Growth factor ${formatGrowthPercent(growth.percent)} is applied: the calculated daily demand is multiplied by ${growth.factor.toFixed()} before the reorder point, suggested quantity, dates and forecast figures are derived. It is a planning assumption for this view, not a recorded sales figure.`] : []),
+      ...(growth.notice ? [growth.notice] : []),
+      ...(filters.includeForecastMoney === true ? [`Forecast sales and forecast margin are forward-looking estimates, not booked sales: forecast quantity (daily demand x ${targetCoverWeeks} weeks of supply) at the product's list price ex-VAT, less current unit cost (open cost layers, else the latest layer). Margin is unavailable where a product has no cost layers or no usable list price.`] : []),
       'Reorder point, safety stock and reorder quantity use the selected warehouse\'s own override when one is set on the product (Inventory > product > Reorder thresholds by warehouse), otherwise the Product value. The all-warehouses view is consolidated and always uses the Product values.',
       ...(productsWithUnappliedOverrides > 0 ? [`${productsWithUnappliedOverrides} product(s) have a per-warehouse threshold override that this all-warehouses view does not apply. Filter by warehouse to plan against it.`] : []),
       ...(lateInboundRows > 0 ? [`${lateInboundRows} row(s) have open PO quantity past its expected delivery date (late POs). That stock is not yet received, so it is left out of Required receipt, Latest PO date and Overdue and shown separately as a Late PO badge.`] : []),

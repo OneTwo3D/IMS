@@ -7,6 +7,7 @@
 import { db } from '@/lib/db'
 import { Prisma, ProductType, ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { classifyHsCode } from '@/lib/trade/hs-classifier'
+import { resolveProposedCustomsDescription } from '@/lib/trade/customs-description'
 import { validateHsCode } from '@/lib/trade/hs-validate'
 import { hsClassificationFieldsHash, shouldSkipHsReclassification } from '@/lib/trade/hs-classification-fields'
 
@@ -71,14 +72,15 @@ export async function upsertHsCodeProposal(
   })
   const validation = validateHsCode({
     cnCode: classification.cnCode,
-    customsDescription: product.customsDescription,
+    customsDescription: resolveProposedCustomsDescription(product.customsDescription, classification.customsDescription),
     name: product.name,
     categoryPath,
   })
 
   const data = {
     proposedHsCode: classification.cnCode,
-    proposedCustomsDescription: product.customsDescription,
+    // An existing (operator/Woo) value is carried unchanged; the AI one only fills a blank.
+    proposedCustomsDescription: resolveProposedCustomsDescription(product.customsDescription, classification.customsDescription),
     source: classification.source,
     modelConfidence: classification.modelConfidence,
     confidence: validation.confidence,

@@ -176,6 +176,10 @@ function makeDependencies(options: {
   alwaysMissExistingRefund?: boolean
   refuseWithQuarantine?: boolean
   order?: Partial<OrderDouble>
+  /** Configured return reasons the db double knows about; absent = the double has no returnReason delegate at all. */
+  returnReasons?: Array<{ id: string; name: string; active: boolean; sortOrder: number }>
+  /** Open "Refund in WooCommerce" tasks on the order (zvec.19). None by default: a refund that began in WooCommerce. */
+  openTasks?: Array<{ id: string; externalOrderId: string; payload: unknown }>
 } = {}) {
   const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
@@ -295,7 +299,10 @@ function makeDependencies(options: {
           }
         },
       },
+      // zvec.19: the open-task match reads these before anything else; with no open task it stops there and the import runs as it always did.
+      wmsOperatorTask: { async findMany() { return options.openTasks ?? [] } },
       salesOrderRefund: {
+        async findMany() { return [] },
         async findFirst(args: { where?: { externalRefundId?: number } }) {
           if (options.alwaysMissExistingRefund) return null
           return refunds.find((refund) => refund.externalRefundId === args.where?.externalRefundId) ?? null
@@ -306,6 +313,17 @@ function makeDependencies(options: {
           return { id: 'return-wh' }
         },
       },
+      ...(options.returnReasons ? {
+        returnReason: {
+          async findFirst(args: { where: { name: { equals: string; mode: string }; active: boolean }; orderBy: Array<{ sortOrder?: string; name?: string }> }) {
+            assert.equal(args.where.name.mode, 'insensitive')
+            assert.equal(args.where.active, true)
+            return [...options.returnReasons!]
+              .filter((r) => r.active && r.name.toLowerCase() === args.where.name.equals.toLowerCase())
+              .sort((x, y) => x.sortOrder - y.sortOrder || x.name.localeCompare(y.name))[0] ?? null
+          },
+        },
+      } : {}),
       // o3d-q0x56.8: read only when the order's stored FX rate is unusable (base-currency vs foreign).
       organisation: { async findFirst() { return { baseCurrency: 'GBP' } } },
       // o3d-w00 (Codex r7 #5): NO taxRate double. The sync no longer reads the tax table at all — the
@@ -1861,4 +1879,48 @@ test('the monetary-only fallback is unchanged when there is no fee line: an amou
   assert.equal(refundIsInIms(result.outcome), true, result.error)
   assert.equal(state.createRefundLines.length, 1)
   assert.equal(state.createRefundLines[0].totalForeign, 100)
+})
+
+const REASONS = [
+  { id: 'rr-damaged', name: 'Damaged item', active: true, sortOrder: 1 },
+  { id: 'rr-retired', name: 'Too small', active: false, sortOrder: 2 },
+]
+
+test('a WooCommerce refund reason that matches a configured return reason by name (ignoring case) is mapped', async () => {
+  const state = makeDependencies({ returnReasons: REASONS })
+  const result = await syncWcRefund(1001, makeRefund({ reason: '  damaged ITEM ' }), state.dependencies)
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal(state.createRefundOptionsSeen[0]!.returnReasonId, 'rr-damaged')
+})
+
+test('an unknown WooCommerce refund reason, an inactive reason, and no reason all leave the return reason unset, and nothing is created', async () => {
+  for (const reason of ['Customer was unhappy', 'Too small', '', '   ']) {
+    const state = makeDependencies({ returnReasons: REASONS })
+    const result = await syncWcRefund(1001, makeRefund({ reason }), state.dependencies)
+    assert.deepEqual(result, { outcome: 'applied' }, reason)
+    assert.equal('returnReasonId' in state.createRefundOptionsSeen[0]!, false, `"${reason}" is not mapped`)
+  }
+})
+
+test('with no return reason table available the sync still applies the refund and maps nothing', async () => {
+  const state = makeDependencies()
+  const result = await syncWcRefund(1001, makeRefund({ reason: 'Damaged item' }), state.dependencies)
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal('returnReasonId' in state.createRefundOptionsSeen[0]!, false)
+})
+
+test('resolveReturnReasonId never creates a reason: it only reads', async () => {
+  const calls: string[] = []
+  const client = { returnReason: { findFirst: async () => { calls.push('findFirst'); return null }, create: async () => { calls.push('create'); return null } } }
+  const { resolveReturnReasonId } = await import('@/lib/connectors/woocommerce/sync/refund-sync')
+  assert.equal(await resolveReturnReasonId(client as never, 'Something new'), null)
+  assert.deepEqual(calls, ['findFirst'])
+})
+
+test('zvec.19: a refund that began in WooCommerce (no open Refund in WooCommerce task) is imported exactly as before', async () => {
+  const state = makeDependencies({ openTasks: [] })
+  const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal(state.createRefundCalls, 1, 'one credit note is raised for it')
+  assert.equal(state.refunds.length, 1)
 })

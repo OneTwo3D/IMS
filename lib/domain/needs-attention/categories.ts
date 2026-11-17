@@ -11,6 +11,7 @@ export const NEEDS_ATTENTION_CATEGORY_KEYS = [
   'dispatchDeadLetters',
   'refundParks',
   'operatorTasks',
+  'refusedActions',
   'otherExceptions',
   'failedAccounting',
   'receiptReviews',
@@ -57,6 +58,13 @@ export const NEEDS_ATTENTION_CATEGORIES: readonly NeedsAttentionCategory[] = [
     label: 'Warehouse queries to raise',
     detail: 'Open warehouse queries waiting for an operator.',
     href: '/sync/exceptions#wms-operator-tasks',
+    permission: 'sync',
+  },
+  {
+    key: 'refusedActions',
+    label: 'Refused or stalled actions',
+    detail: 'Actions a check refused or stalled (a change the warehouse could not take, a split order that cannot complete): serious and medium only.',
+    href: '/sync/exceptions#refused-actions',
     permission: 'sync',
   },
   {

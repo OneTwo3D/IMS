@@ -58,8 +58,8 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
   {
     file: 'lib/connectors/woocommerce/sync/stock-sync.ts', decl: 'pushStockToWc', role: 'producer',
     mustCall: ['wooProducerSeam'], beforeCalls: ['snapshotSyncContext'],
-    operations: ['stock'],
-    why: 'The one stock writer: the queue drain, the daily reconcile, the manual push and a webhook correction all reach WooCommerce through it, so asking here covers the paths below the enqueue.',
+    operations: ['stock', 'product.meta'],
+    why: 'The one stock writer: the queue drain, the daily reconcile, the manual push and a webhook correction all reach WooCommerce through it, so asking here covers the paths below the enqueue. With the back-in-stock date setting on it also asks for product.meta (the _oti_eta_date meta rides the same batch); a shadow there drops the meta and keeps the stock write.',
   },
   {
     file: 'lib/connectors/woocommerce/sync/stock-sync-jobs.ts', decl: 'processQueuedWcStockSyncJobs', role: 'drain',

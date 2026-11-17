@@ -37,12 +37,13 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
 import { commitDirtyOrderOutcome, loadDirtyOrdersForGuard, parseDirtySnapshot } from './stock-dirty-orders'
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
+import { loadBackInStockDates } from '@/lib/domain/inventory/back-in-stock-date'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
@@ -55,6 +56,11 @@ import {
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
 import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
+
+/** o3d-taro: the setting that turns the back-in-stock date push on. Absent or anything but 'true' is OFF (the default). */
+export const WC_BACK_IN_STOCK_DATE_SETTING = 'wc_back_in_stock_date_enabled'
+/** o3d-taro: the WooCommerce product meta key. Value is a plain YYYY-MM-DD date, or '' when there is no date to show. */
+export const WC_ETA_DATE_META_KEY = '_oti_eta_date'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -300,7 +306,14 @@ export type PushEntry = {
     stock_quantity: number
     manage_stock: boolean
     cost_of_goods_sold?: { values: { defined_value: string }[] }
+    /** o3d-taro: only present when the back-in-stock date push is enabled AND the value changed or is non-empty. */
+    meta_data?: { key: string; value: string }[]
   }
+  /**
+   * o3d-taro: the date this push settles for the product ('' = cleared). Undefined whenever the feature is off, so nothing about the
+   * push or its persisted state changes. Never sent to WooCommerce (only `payload` is).
+   */
+  etaDate?: string
 }
 
 export type VariantPushEntry = PushEntry & {
@@ -374,11 +387,13 @@ async function persistSuccessfulPushState(
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
         lastPushedRemoteId: String(entry.externalId),
+        ...(entry.etaDate !== undefined ? { lastPushedEtaDate: entry.etaDate } : {}),
       },
       update: {
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
         lastPushedRemoteId: String(entry.externalId),
+        ...(entry.etaDate !== undefined ? { lastPushedEtaDate: entry.etaDate } : {}),
       },
     })
   }
@@ -565,6 +580,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     summary: { source: options?.source ?? null, forceAll: options?.forceAll === true, productCount: scopedProductIds ? scopedProductIds.length : null },
   })
   if (!seam.proceed) return shadowedStockResult(seam)
+  // o3d-taro: the back-in-stock date rides this push as product meta, which is its OWN operation of the ownership map ('product.meta':
+  // the plugin owns it in P1). Asked only when the setting is on; a shadow switches the date off for this run and leaves the stock push alone.
+  const etaSetting = await db.setting.findUnique({ where: { key: WC_BACK_IN_STOCK_DATE_SETTING } })
+  let etaEnabled = false
+  if (etaSetting?.value === 'true') {
+    const etaSeam = await wooProducerSeam({
+      operation: 'product.meta',
+      subjectType: 'StockPushEtaMeta',
+      subjectId: scopedProductIds ? [...scopedProductIds].sort().join(',').slice(0, 400) || '(none)' : '(all products)',
+      payload: { metaKey: WC_ETA_DATE_META_KEY, products: scopedProductIds ? [...scopedProductIds].sort() : 'all' },
+      summary: { source: options?.source ?? null, productCount: scopedProductIds ? scopedProductIds.length : null },
+    })
+    etaEnabled = etaSeam.proceed
+  }
   const forceProductIds = new Set(options?.forceProductIds ?? [])
   const forceAll = options?.forceAll === true
 
@@ -869,7 +898,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // ACCEPTED RACE (inter-system, documented, not fixed): an order WooCommerce takes AFTER the read above and BEFORE this run's
   // write has been decremented by the store but is in neither the read nor IMS, so that one write can still give its units
   // back. The window is one push run; the next push (or the daily forceAll reconcile) sees the order and corrects it.
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps, heldByProduct)
+  const { stockByProduct, stockByProductWarehouse, exactProducts } = buildStockMaps(stockLevelsForMaps, heldByProduct, await loadLocationBuffers(whIds, scopedStockIdsWithSiblings))
 
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
@@ -888,6 +917,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     stockByProductWarehouse,
     productById,
     result.errors,
+    exactProducts,
   )
 
   const previousStates = await db.stockSyncState.findMany({
@@ -895,7 +925,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       connector: WC_STOCK_SYNC_CONNECTOR,
       productId: { in: products.map((product) => product.id) },
     },
-    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true },
+    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true, lastPushedEtaDate: true },
   })
   const previousStateByProductId = new Map(
     previousStates.map((state) => [state.productId, state]),
@@ -1237,6 +1267,26 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     result.errors.push(`Stock push skipped ${held.blockedProductIds.size} product(s): an on-hold/processing WooCommerce order names a variation IMS cannot resolve, so their stock cannot be proven safe.`)
   }
 
+  // -------- Back-in-stock dates (o3d-taro; only with the setting on) --------
+  // Only a simple stockable product at zero pushed availability can carry a date, and only committed, dated, not-late supply produces one.
+  const stockQuantityFor = (product: CandidateProduct): number => resolvePushStockQuantity(
+    availableByProduct.get(product.id) ?? 0,
+    freshAvailableByProduct.get(product.id) ?? 0,
+    shouldForceWooZeroStock(product.lifecycleStatus),
+  )
+  let etaDateByProduct = new Map<string, string>()
+  if (etaEnabled) {
+    const zeroIds = products
+      .filter((product) => effectiveTargets.has(product.id)
+        && (product.type === 'SIMPLE' || product.type === 'VARIANT')
+        && !shouldForceWooZeroStock(product.lifecycleStatus)
+        && stockQuantityFor(product) <= 0)
+      .map((product) => product.id)
+    etaDateByProduct = await loadBackInStockDates(zeroIds)
+  }
+  const unchangedEta = (entry: PushEntry, prev: { lastPushedEtaDate: string | null } | undefined): boolean =>
+    entry.etaDate === undefined || (prev?.lastPushedEtaDate ?? '') === entry.etaDate
+
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
   const variantPushEntries: VariantPushEntry[] = []
@@ -1254,11 +1304,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       result.skipped++
       continue
     }
-    const stockQuantity = resolvePushStockQuantity(
-      availableByProduct.get(product.id) ?? 0,
-      freshAvailableByProduct.get(product.id) ?? 0,
-      shouldForceWooZeroStock(product.lifecycleStatus),
-    )
+    const stockQuantity = stockQuantityFor(product)
     const payload: PushEntry['payload'] = {
       id: target.externalId,
       stock_quantity: stockQuantity,
@@ -1268,6 +1314,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     if (cogs !== undefined) {
       payload.cost_of_goods_sold = { values: [{ defined_value: cogs.toFixed(2) }] }
     }
+    let etaDate: string | undefined
+    if (etaEnabled) {
+      // '' = no date (stock returned, supply gone, undated or late). The meta is written when it has a value or when it clears a value we pushed before.
+      etaDate = (stockQuantity <= 0 ? etaDateByProduct.get(product.id) : undefined) ?? ''
+      if (etaDate !== '' || (previousStateByProductId.get(product.id)?.lastPushedEtaDate ?? '') !== '') {
+        payload.meta_data = [{ key: WC_ETA_DATE_META_KEY, value: etaDate }]
+      }
+    }
     if (isVariationCandidate(product) && target.parentWcId != null) {
       const entry: VariantPushEntry = {
         productId: product.id,
@@ -1275,6 +1329,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         externalId: target.externalId,
         parentWcId: target.parentWcId,
         payload,
+        ...(etaDate !== undefined ? { etaDate } : {}),
       }
       const prev = previousStateByProductId.get(product.id)
       if (
@@ -1283,12 +1338,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
         && prev.lastPushedRemoteId === String(entry.externalId)
+        && unchangedEta(entry, prev)
       ) {
         continue
       }
       variantPushEntries.push(entry)
     } else {
-      const entry: PushEntry = { productId: product.id, sku: product.sku, externalId: target.externalId, payload }
+      const entry: PushEntry = { productId: product.id, sku: product.sku, externalId: target.externalId, payload, ...(etaDate !== undefined ? { etaDate } : {}) }
       const prev = previousStateByProductId.get(product.id)
       if (
         !forceAll
@@ -1296,6 +1352,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
         && prev.lastPushedRemoteId === String(entry.externalId)
+        && unchangedEta(entry, prev)
       ) {
         continue
       }
@@ -1675,10 +1732,28 @@ export type StockLevelSnapshotRow = {
 
 /**
  * Build the per-product and per-(product,warehouse) available-stock maps from a
- * stockLevel snapshot. `available = max(0, quantity - reservedQty)`. Extracted so
+ * stockLevel snapshot. `available = max(0, quantity - reservedQty)`, then the location buffer is taken off
+ * (`max(0, available - buffer)`, the buffer being the LocationStockBuffer row for that product and warehouse): THE ONE
+ * PLACE the buffer reduces what a channel is told. It is looked up per stock row, so a buffer with no stock row has no effect
+ * and never makes a product a candidate. Nothing else (allocation, on-hand, the WMS alignment pass) reads it. Extracted so
  * the exact same availability basis can be recomputed against a fresh re-read
  * immediately before pushing (the 1qsb stale-snapshot oversell guard).
  */
+const nonNegative = (value: Decimal): Decimal => (value.lt(0) ? toDecimal(0) : value)
+
+export function bufferKey(productId: string, warehouseId: string): string {
+  return `${productId}\u0000${warehouseId}`
+}
+
+/** The location buffers for these warehouses (and, when scoped, these products). Read failure throws: never push unbuffered by accident. */
+export async function loadLocationBuffers(whIds: string[], productIds: string[] | null): Promise<Map<string, number>> {
+  const rows = await db.locationStockBuffer.findMany({
+    where: { warehouseId: { in: whIds }, bufferQty: { gt: 0 }, ...(productIds ? { productId: { in: productIds } } : {}) },
+    select: { productId: true, warehouseId: true, bufferQty: true },
+  })
+  return new Map(rows.map((r) => [bufferKey(r.productId, r.warehouseId), Number(r.bufferQty)]))
+}
+
 export function buildStockMaps(
   stockLevels: StockLevelSnapshotRow[],
   /**
@@ -1687,27 +1762,61 @@ export function buildStockMaps(
    * rows in turn, never below 0.
    */
   heldUnits?: ReadonlyMap<string, number>,
+  /** Units held back per location, keyed by bufferKey(productId, warehouseId). Absent or empty means no buffer anywhere. */
+  buffers?: ReadonlyMap<string, number>,
 ): {
   stockByProduct: Map<string, number>
   stockByProductWarehouse: Map<string, Map<string, number>>
+  /**
+   * Products with at least one buffered location. Their figures are computed EXACTLY (Decimal, 2.3 - 0.3 is 2, not
+   * 1.9999999999999998) so the single floor at the end cannot lose a unit; every other product keeps the arithmetic
+   * it always had, so with no buffer anywhere the result is byte-identical to before.
+   */
+  exactProducts: ReadonlySet<string>
 } {
   const stockByProduct = new Map<string, number>()
   const stockByProductWarehouse = new Map<string, Map<string, number>>()
   const heldRemaining = new Map<string, number>(heldUnits ?? [])
+  const exactProducts = new Set<string>()
+  if (buffers) {
+    for (const sl of stockLevels) if ((buffers.get(bufferKey(sl.productId, sl.warehouseId)) ?? 0) > 0) exactProducts.add(sl.productId)
+  }
+  const exactHeldRemaining = new Map<string, Decimal>()
+  const exactSum = new Map<string, Decimal>()
   for (const sl of stockLevels) {
-    let available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
-    const held = heldRemaining.get(sl.productId) ?? 0
-    if (held > 0 && available > 0) {
-      const taken = Math.min(held, available)
-      available -= taken
-      heldRemaining.set(sl.productId, held - taken)
+    let available: number
+    if (exactProducts.has(sl.productId)) {
+      // The buffer comes off BEFORE the unreserved-order guard: WooCommerce only ever saw the buffered figure, so the
+      // units it already took for orders IMS holds no reservation for came out of that, not out of the held-back units.
+      let exact = nonNegative(toDecimal(sl.quantity).minus(toDecimal(sl.reservedQty)))
+      const buffer = buffers?.get(bufferKey(sl.productId, sl.warehouseId)) ?? 0
+      if (buffer > 0) exact = nonNegative(exact.minus(toDecimal(buffer)))
+      const held = exactHeldRemaining.get(sl.productId) ?? toDecimal(heldRemaining.get(sl.productId) ?? 0)
+      if (held.gt(0) && exact.gt(0)) {
+        const taken = held.lt(exact) ? held : exact
+        exact = exact.minus(taken)
+        exactHeldRemaining.set(sl.productId, held.minus(taken))
+      } else {
+        exactHeldRemaining.set(sl.productId, held)
+      }
+      exactSum.set(sl.productId, (exactSum.get(sl.productId) ?? toDecimal(0)).plus(exact))
+      available = exact.toNumber()
+    } else {
+      available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
+      const held = heldRemaining.get(sl.productId) ?? 0
+      if (held > 0 && available > 0) {
+        const taken = Math.min(held, available)
+        available -= taken
+        heldRemaining.set(sl.productId, held - taken)
+      }
+      stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
     }
-    stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
     const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
     byWarehouse.set(sl.warehouseId, available)
     stockByProductWarehouse.set(sl.productId, byWarehouse)
   }
-  return { stockByProduct, stockByProductWarehouse }
+  for (const [productId, sum] of exactSum) stockByProduct.set(productId, sum.toNumber())
+  return { stockByProduct, stockByProductWarehouse, exactProducts }
 }
 
 /**
@@ -1723,6 +1832,8 @@ export function computeAvailableByProduct(
   stockByProductWarehouse: Map<string, Map<string, number>>,
   productById: Map<string, CandidateProduct>,
   errors: string[],
+  /** Components whose figures are exact because a location buffer applies (see buildStockMaps); their kit division is exact too. */
+  exactProducts?: ReadonlySet<string>,
 ): Map<string, number> {
   const availableByProduct = new Map<string, number>()
   const kitAvailabilityMemo = new Map<string, number>()
@@ -1738,6 +1849,7 @@ export function computeAvailableByProduct(
           new Set<string>(),
           errors,
           kitAvailabilityErrors,
+          exactProducts,
         )
       : (stockByProduct.get(product.id) ?? 0)
     availableByProduct.set(product.id, available)
@@ -1876,7 +1988,7 @@ async function computeFreshAvailableByProduct(
     },
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels, heldUnits)
+  const { stockByProduct, stockByProductWarehouse, exactProducts } = buildStockMaps(freshStockLevels, heldUnits, await loadLocationBuffers(whIds, scopedStockProductIds))
   // Throwaway error sink: any kit-cycle diagnostics were already surfaced from the
   // snapshot pass; recomputing here must not double-report them.
   return computeAvailableByProduct(
@@ -1886,6 +1998,7 @@ async function computeFreshAvailableByProduct(
     stockByProductWarehouse,
     productById,
     [],
+    exactProducts,
   )
 }
 
@@ -1898,6 +2011,7 @@ function computeKitAvailability(
   stack: Set<string>,
   errors: string[],
   seenCycleErrors: Set<string>,
+  exactProducts?: ReadonlySet<string>,
 ): number {
   // yi4m: the result depends on the warehouse set passed in — a nested KIT is evaluated
   // per single warehouse (computeKitAvailability(nested, [warehouseId], …)) while a
@@ -1939,10 +2053,14 @@ function computeKitAvailability(
       if (component.component.type === 'KIT') {
         const nested = productById.get(component.componentId)
         available = nested
-          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack, errors, seenCycleErrors)
+          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack, errors, seenCycleErrors, exactProducts)
           : 0
       }
-      kitsInWarehouse = Math.min(kitsInWarehouse, Math.floor(available / required))
+      // A buffered component divides exactly (0.9 / 0.3 is 3), so the floor cannot lose a kit to binary rounding.
+      const kitsFromComponent = exactProducts?.has(component.componentId) && component.component.type !== 'KIT'
+        ? toDecimal(available).div(toDecimal(required)).floor().toNumber()
+        : Math.floor(available / required)
+      kitsInWarehouse = Math.min(kitsInWarehouse, kitsFromComponent)
     }
     total += kitsInWarehouse === Infinity ? 0 : kitsInWarehouse
   }

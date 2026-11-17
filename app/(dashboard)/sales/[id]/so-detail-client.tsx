@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useCallback, useEffect } from 'react'
+import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -9,6 +9,8 @@ import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
 import { MergeCandidateBadge } from '@/components/sales/merge-candidate-badge'
+import { ShopRefundBadge } from '@/components/sales/shop-refund-badge'
+import type { ShopRefundBadgeView } from '@/app/actions/shop-refund-tasks'
 import type { MergeCandidateBadgeView } from '@/app/actions/wms-merge-candidates'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -19,7 +21,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import {
   updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
-  updateSalesOrderNotes, generateInvoiceNumber,
+  updateSalesOrderNotes, updateSalesOrderAddressesAndNotes, generateInvoiceNumber,
   addPayment, deletePayment, reverseLedgerPayment, releaseWithdrawalHold,
   type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
@@ -37,10 +39,13 @@ import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
+import { SHOP_DESYNC_WARNING, resolveSalesOrderEditBlock, resolveSalesOrderEditScope } from '@/lib/domain/sales/order-edit-affordance'
+import { SoFormDialog } from '../so-form'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
 import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
 import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
+import type { ReturnReason } from '@/app/actions/return-reasons'
 import { buildRefundRequest, creditNoteAmounts, salesOrderMoneyView, type MoneyViewOrder } from '@/lib/domain/sales/sales-order-money-view'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
@@ -100,11 +105,14 @@ type AllocationPanelLine = {
 type Props = {
   order: SoDetail
   warehouses: WarehouseInfo[]
+  /** The active configured return reasons the refund dialog offers. */
+  returnReasons?: ReturnReason[]
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
   wmsOrderStatus?: WmsOrderStatusView | null
   wmsPushState?: WmsOrderPushStateView | null
   mergeCandidate?: MergeCandidateBadgeView | null
+  shopRefundDue?: ShopRefundBadgeView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -118,6 +126,8 @@ type Props = {
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   /** audit-H2: order is fully paid but its trigger won't auto-generate an invoice. */
   paidWithoutInvoice: boolean
+  /** The catalogue the Edit order dialog needs; loaded by the page only for a DRAFT (the only status that can be edited). */
+  editForm?: Omit<ComponentProps<typeof SoFormDialog>, 'order' | 'onClose' | 'warehouses' | 'currencies'>
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -181,10 +191,11 @@ function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number
 // ---------------------------------------------------------------------------
 // Refund dialog
 // ---------------------------------------------------------------------------
-function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; sym: string; onClose: () => void }) {
+function RefundDialog({ order, warehouses, returnReasons, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; returnReasons: ReturnReason[]; sym: string; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [reason, setReason] = useState('')
+  const [returnReasonId, setReturnReasonId] = useState('')
   const [returnWhId, setReturnWhId] = useState(warehouses[0]?.id ?? '')
   const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0 })))
   const [error, setError] = useState('')
@@ -200,7 +211,7 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
     startTransition(async () => {
-      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined)
+      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined, returnReasonId ? { returnReasonId } : undefined)
       if (result.success) {
         router.refresh()
         // The server cuts the refund again under the order lock; if what it recorded differs from this preview, show the server's figure.
@@ -220,6 +231,13 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
       <div className="space-y-4">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="space-y-1.5"><Label>Reason *</Label><Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Customer request" className="h-9 text-sm" /></div>
+          {returnReasons.length > 0 && (
+            <div className="space-y-1.5"><Label>Return reason</Label>
+              <select value={returnReasonId} onChange={(e) => setReturnReasonId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <option value="">No category</option>
+                {returnReasons.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
+              </select></div>
+          )}
           <div className="space-y-1.5"><Label>Return to Warehouse</Label>
             <select value={returnWhId} onChange={(e) => setReturnWhId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
               <option value="">No stock return</option>
@@ -297,6 +315,72 @@ function NotesDialog({ order, onClose }: { order: SoDetail; onClose: () => void 
         <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
         <Button onClick={handleSave} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Notes</Button>
       </DialogFooter>
+    </DialogContent></Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Edit addresses and notes (the one edit a dispatched order allows)
+// ---------------------------------------------------------------------------
+const ADDRESS_FIELDS: Array<[string, string]> = [['line1', 'Address line 1'], ['line2', 'Address line 2'], ['city', 'City'], ['county', 'County / state'], ['postcode', 'Postcode'], ['country', 'Country']]
+
+function AddressFields({ title, value, onChange }: { title: string; value: Record<string, string>; onChange: (next: Record<string, string>) => void }) {
+  return (
+    <div className="space-y-2">
+      <h3 className="text-sm font-medium">{title}</h3>
+      {ADDRESS_FIELDS.map(([key, label]) => (
+        <div key={key} className="space-y-1">
+          <Label className="text-xs text-muted-foreground">{label}</Label>
+          <Input value={value[key] ?? ''} onChange={(e) => onChange({ ...value, [key]: e.target.value })} className="h-8 text-sm" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function AddressesDialog({ order, onClose }: { order: SoDetail; onClose: () => void }) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [billing, setBilling] = useState<Record<string, string>>({ ...((order.billingAddress ?? {}) as Record<string, string>) })
+  const [shipping, setShipping] = useState<Record<string, string>>({ ...((order.shippingAddress ?? {}) as Record<string, string>) })
+  const [notes, setNotes] = useState(order.notes ?? '')
+  const [internal, setInternal] = useState(order.internalNotes ?? '')
+  const [error, setError] = useState('')
+  const [confirmDesync, setConfirmDesync] = useState(false)
+  function save(acknowledged: boolean) {
+    if (order.hasExternalSource && !acknowledged) { setConfirmDesync(true); return }
+    startTransition(async () => {
+      const r = await updateSalesOrderAddressesAndNotes(order.id, { billingAddress: billing, shippingAddress: shipping, notes, internalNotes: internal }, order.updatedAt, order.hasExternalSource ? { acknowledgeShopDesync: acknowledged } : undefined)
+      if (r.success) { router.refresh(); onClose() } else setError(r.error ?? 'Failed')
+    })
+  }
+  return (
+    <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogHeader><DialogTitle>Edit addresses and notes</DialogTitle></DialogHeader>
+      <p className="text-xs text-muted-foreground">This order has been dispatched, so only its addresses and notes can change. Use Refund (or add a line) for a change to what was sent.</p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <AddressFields title="Billing address" value={billing} onChange={setBilling} />
+        <AddressFields title="Shipping address" value={shipping} onChange={setShipping} />
+      </div>
+      <div className="space-y-1.5"><Label>Customer Notes</Label>
+        <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" /></div>
+      <div className="space-y-1.5"><Label>Private Notes (internal only)</Label>
+        <Textarea value={internal} onChange={(e) => setInternal(e.target.value)} rows={2} className="text-sm resize-none" /></div>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      <DialogFooter>
+        <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+        <Button onClick={() => save(false)} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save</Button>
+      </DialogFooter>
+      {confirmDesync && (
+        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false}>
+          <DialogHeader><DialogTitle>This edit will not reach WooCommerce</DialogTitle></DialogHeader>
+          <p className="text-sm" data-testid="shop-desync-warning">{SHOP_DESYNC_WARNING}</p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDesync(false)}>Go back</Button>
+            <Button onClick={() => { setConfirmDesync(false); save(true) }}>Edit anyway</Button>
+          </DialogFooter>
+        </DialogContent></Dialog>
+      )}
     </DialogContent></Dialog>
   )
 }
@@ -999,13 +1083,15 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showRefund, setShowRefund] = useState(false)
   const [showNotes, setShowNotes] = useState(false)
+  const [showAddresses, setShowAddresses] = useState(false)
+  const [showEdit, setShowEdit] = useState(false)
   const [showRefunds, setShowRefunds] = useState(false)
   const [showColPicker, setShowColPicker] = useState(false)
   const [showInvoice, setShowInvoice] = useState(false)
@@ -1074,6 +1160,29 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     accountingInvoiceId: so.accountingInvoiceId ?? null,
     accountingSyncEnabled,
   })
+  // The same rule the updateSalesOrder action applies, so a disabled Edit says why instead of letting the operator walk into the refusal.
+  const editInput = {
+    status: so.status,
+    allocations: allocations.length,
+    shipments: shipments.length,
+    committedShipments: shipments.filter((shipment) => shipment.status !== 'PENDING').length,
+    shippedShipments: shipments.filter((shipment) => shipment.status === 'SHIPPED').length,
+    accountingInvoiceId: so.accountingInvoiceId ?? null,
+    wmsPush: so.wmsPush !== null,
+    hasExternalSource: so.hasExternalSource,
+    refunds: so.refunds.length,
+    refundStatus: so.refundStatus,
+    payments: so.payments.length,
+    paid: so.paidAt !== null,
+    storeCreditForeign: so.storeCreditForeign,
+    invoiceRecords: so.invoiceNumber ? 1 : 0,
+    productlessLines: so.lines.filter((l) => !l.productId).length,
+  }
+  const editBlock = resolveSalesOrderEditBlock(editInput)
+  // What the page offers: the full edit; only addresses and notes (a dispatched order); or nothing, with the reason.
+  const editScope = resolveSalesOrderEditScope(editInput)
+  // A confirmed edit re-reserves stock, so the server also asks for the permission to allocate (sales.process); a draft edit and an addresses-and-notes edit need only sales.create.
+  const canEditOrder = hasPermission(currentUserRole, 'sales.create') && (so.status === 'DRAFT' || editScope.scope === 'ADDRESS_NOTES' || hasPermission(currentUserRole, 'sales.process'))
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
   // Reads the orthogonal refundStatus so it keeps working once a partial refund no
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
@@ -1418,7 +1527,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
 
           <span className="w-px h-5 bg-border mx-0.5" />
 
-          {/* Notes / Delete / WC */}
+          {/* Edit order / Notes / Delete / WC */}
+          {canEditOrder && (
+            // The reason lives on the wrapper, not the button: a disabled button swallows pointer events in several browsers.
+            <span title={editBlock?.reason} className="inline-flex">
+              <Button variant="outline" size="sm" onClick={() => (editScope.scope === 'ADDRESS_NOTES' ? setShowAddresses(true) : setShowEdit(true))} disabled={isPending || editScope.scope === 'NONE' || (editScope.scope === 'FULL' && !editForm)} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
+                <Pencil className="h-4 w-4 mr-1" />{editScope.scope === 'ADDRESS_NOTES' ? 'Edit addresses & notes' : 'Edit order'}
+              </Button>
+              {editBlock && <span id="edit-order-blocked-reason" className="sr-only">{editBlock.reason}</span>}
+            </span>
+          )}
           <Button variant="outline" size="sm" onClick={() => setShowNotes(true)}>
             <Pencil className="h-4 w-4 mr-1" />Notes
           </Button>
@@ -1435,6 +1553,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {wmsPushState && (
             <span className="inline-flex items-center self-center">
               <WmsOrderPushChip orderId={so.id} push={wmsPushState} />
+            </span>
+          )}
+          {shopRefundDue && (
+            <span className="inline-flex items-center self-center">
+              <ShopRefundBadge view={shopRefundDue} />
             </span>
           )}
           {mergeCandidate && (
@@ -1817,6 +1940,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                invoice is still outstanding — that gap is exactly what this line names. */
             <p className="px-4 pt-2 text-[11px] text-red-700 dark:text-red-300">{settlement.detail}</p>
           )}
+          {so.paymentRemovedForeign != null && so.paymentRemovedForeign > 0 && (
+            <p className="px-4 pt-2 text-[11px] text-amber-800 dark:text-amber-300" data-testid="payment-removed-notice">
+              The accounting ledger no longer holds {money(so.paymentRemovedForeign)} of this order&apos;s payment, so it is not fully paid. Revenue was not unwound: whether to credit the amount or write it off is decided by the order owner.
+            </p>
+          )}
           <div className="px-4 py-3 text-sm grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
               <span className="text-muted-foreground text-xs">Invoice Date</span>
@@ -1829,13 +1957,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             <div>
               <span className="text-muted-foreground text-xs">Paid</span>
               <p className="font-medium font-mono">
-                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0); return money(paid) })()}
+                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); return money(Math.max(0, paid)) })()}
               </p>
             </div>
             <div>
               <span className="text-muted-foreground text-xs">Balance</span>
-              <p className={`font-medium font-mono ${(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); return so.totalForeign - paid > 0.01 ? 'text-destructive' : 'text-green-600' })()}`}>
-                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${money(bal)} due` : 'Settled' })()}
+              <p className={`font-medium font-mono ${(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); return so.totalForeign - paid > 0.01 ? 'text-destructive' : 'text-green-600' })()}`}>
+                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0) - (so.paymentRemovedForeign ?? 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${money(bal)} due` : 'Settled' })()}
               </p>
             </div>
           </div>
@@ -1994,6 +2122,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 </div>
                 <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>
+              {r.returnReasonName && <p className="text-xs"><span className="text-muted-foreground">Return reason:</span> {r.returnReasonName}</p>}
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <Table className="text-xs">
                 <TableHeader>
@@ -2066,8 +2195,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       )}
 
       {/* Dialogs */}
-      {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
+      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
+      {showAddresses && editScope.scope === 'ADDRESS_NOTES' && <AddressesDialog order={so} onClose={() => setShowAddresses(false)} />}
+      {showEdit && editForm && editScope.scope === 'FULL' && (
+        <SoFormDialog {...editForm} warehouses={warehouses} currencies={currencies} order={so} onClose={() => setShowEdit(false)} />
+      )}
       {accountingAvailable && showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}
 
       {/* Invoice detail dialog */}

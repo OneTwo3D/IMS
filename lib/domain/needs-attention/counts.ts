@@ -14,6 +14,8 @@ export type InboxSummarySlice = {
   stuckDispatches: number
   refundSyncParks: number
   wmsOperatorTasksOpen: number
+  /** Serious and medium refused or stalled actions (optional: absent reads as none). */
+  refusedActionsOpen?: number
 }
 
 export type NeedsAttentionSnapshot = {
@@ -24,18 +26,19 @@ export type NeedsAttentionSnapshot = {
 
 /**
  * Pure: fold a snapshot into one count per category. `otherExceptions` is the inbox total minus the
- * four categories shown on their own, so the card total never counts an exception twice.
+ * five categories shown on their own, so the card total never counts an exception twice.
  */
 export function countsFromSnapshot(snapshot: NeedsAttentionSnapshot): NeedsAttentionCounts {
   const inbox = snapshot.inbox
   const dedicated = inbox
-    ? inbox.wmsPushDeadLetters + inbox.stuckDispatches + inbox.refundSyncParks + inbox.wmsOperatorTasksOpen
+    ? inbox.wmsPushDeadLetters + inbox.stuckDispatches + inbox.refundSyncParks + inbox.wmsOperatorTasksOpen + (inbox.refusedActionsOpen ?? 0)
     : 0
   return {
     wmsPushBlocked: inbox?.wmsPushDeadLetters ?? 0,
     dispatchDeadLetters: inbox?.stuckDispatches ?? 0,
     refundParks: inbox?.refundSyncParks ?? 0,
     operatorTasks: inbox?.wmsOperatorTasksOpen ?? 0,
+    refusedActions: inbox?.refusedActionsOpen ?? 0,
     otherExceptions: inbox ? Math.max(0, inbox.total - dedicated) : 0,
     ...snapshot.nonInbox,
   }

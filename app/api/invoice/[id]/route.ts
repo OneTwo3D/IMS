@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { isFullyPaid } from '@/lib/domain/sales/paid-state'
 import { storeCreditBlock, storeCreditInvoiceDocumentRefusal } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
@@ -86,7 +87,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
 
-  if (so.paidAt) {
+  if (isFullyPaid(so)) {
     doc.font('Helvetica-Bold').fontSize(10).fillColor('#16a34a').text('PAID', 50, doc.y)
     doc.fillColor('#000')
     doc.y += 8
