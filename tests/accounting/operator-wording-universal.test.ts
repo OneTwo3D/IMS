@@ -573,6 +573,7 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'no credit note of theirs recorded in the ledger', verdict: 'DESCRIPTION', why: 'states a fact about the ledger' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'IMS records refund(s) {}', verdict: 'DESCRIPTION', why: 'states what IMS holds' },
   { file: 'lib/connectors/xero/credit-notes.ts', prefix: 'Credit note not found in Xero for allocation', verdict: 'DESCRIPTION', why: 'error label' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'VOIDED a sales credit note in Xero', verdict: 'DESCRIPTION', why: 'states what the void posting did (the effect label of the post-effect table)' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the activity row for the lost claim could not be written', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the single-statement fallback write failed', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'created a DRAFT manual journal in Xero', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },

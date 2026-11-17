@@ -38,7 +38,7 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
@@ -3843,7 +3843,13 @@ const POST_EFFECT_DOCUMENT_UPDATE = {
     + 'Xero if the change should not stand; there is nothing to void or credit-note.',
 } as const
 
+const POST_EFFECT_DOCUMENT_VOID = {
+  effect: 'VOIDED a sales credit note in Xero',
+  remedy: 'The credit note named above was set to Voided because its refund was deleted in IMS. Nothing new was created. If it should still stand, re-create it in Xero by hand; there is nothing to void or reverse.',
+} as const
+
 const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }> = {
+  CREDIT_NOTE_VOID: POST_EFFECT_DOCUMENT_VOID,
   SALES_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
   PURCHASE_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
   CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
@@ -6762,6 +6768,22 @@ export async function processClaimedEntry(
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+    }
+
+    case 'CREDIT_NOTE_VOID': {
+      // o3d-ngmt.22: the refund this credit note was raised for was deleted in IMS (recorded in error). The row carries the ledger id the
+      // credit note was posted under; nothing here consults the refund, which no longer exists. The void READS the document first and decides
+      // from what is there (voidCreditNote), so a retry after a lost response or a partial failure converges instead of erroring.
+      const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
+      if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
+      const voidFence = await lease.fenceBeforeRemoteWrite('credit-note-void')
+      if (!voidFence.ok) return voidFence.result
+      const voided = await voidCreditNote(
+        { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
+        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
+      )
+      // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
+      return { success: voided.success, externalId: voided.success ? voidCreditNoteId : undefined, error: voided.error }
     }
 
     case 'PURCHASE_CREDIT_NOTE': {

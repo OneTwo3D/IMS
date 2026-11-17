@@ -141,7 +141,7 @@ test('INLINE PRODUCERS: the declared date field sits in the payload each produce
   const covered = new Set<string>([
     'PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE', 'PURCHASE_CREDIT_NOTE', 'COGS_REVERSAL', 'INVENTORY_ADJUSTMENT', 'STOCK_IN_TRANSIT', 'COGS_JOURNAL',
     // Xeroom-owned in every phase (never LIVE): their date cannot gate a posting, see the test above.
-    'SALES_INVOICE', 'SALES_INVOICE_UPDATE', 'CREDIT_NOTE',
+    'SALES_INVOICE', 'SALES_INVOICE_UPDATE', 'CREDIT_NOTE', 'CREDIT_NOTE_VOID',
   ])
   for (const site of INLINE_SITES) {
     const text = readFileSync(path.join(process.cwd(), site.file), 'utf8')
@@ -344,7 +344,7 @@ test('A HOP MUST BE THE SAME DOCUMENT: a parent of the right type from another r
  */
 const POSTING_PATH_FIELD: Record<string, 'date' | 'paymentDate'> = {
   PURCHASE_INVOICE: 'date', PURCHASE_INVOICE_UPDATE: 'date', COGS_JOURNAL: 'date', INVENTORY_ADJUSTMENT: 'date', SALES_INVOICE: 'date', SALES_INVOICE_UPDATE: 'date',
-  INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
+  INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', CREDIT_NOTE_VOID: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
   STOCK_RECEIPT: 'date', COGS_REVERSAL: 'date', DAILY_BATCH_REVENUE_DEFERRAL: 'date', DAILY_BATCH_INVENTORY_ALLOC: 'date', DAILY_BATCH_GROUP_B: 'date',
   DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', UNEARNED_REV_REVERSAL: 'date',
   ALLOCATION_REVERSAL: 'date', BILL_PAYMENT: 'paymentDate', MANUFACTURING_JOURNAL: 'date', MANUFACTURING_RECLASS: 'date',
