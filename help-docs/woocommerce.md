@@ -108,7 +108,7 @@ as described above.
 
 ### Ongoing Order Sync
 
-**Duty and tax results.** Each order update also refreshes what WooCommerce reported for duty and tax: the IOSS number, the delivery term (IOSS_DDP, DDP or DDU_DAP), the duty, import VAT and handling components, and the per-line customs value override. They are copied as reported and never recalculated; a value WooCommerce stops reporting is cleared. They are shown read-only on the order page (see [Sales](sales.md)). Order lines and invoices are not rebuilt by this.
+**Duty and tax results.** Each order update also refreshes what WooCommerce reported for duty and tax: the duty, import VAT and handling components and the per-line customs value override. They are copied as reported and never recalculated; a value WooCommerce stops reporting is cleared. They are shown read-only on the order page (see [Sales](sales.md)). Order lines and invoices are not rebuilt by this.
 
 With the initial import complete, new and updated WooCommerce orders are imported automatically.
 

@@ -1,5 +1,6 @@
 'use server'
 
+import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
 import { revalidatePath } from 'next/cache'
@@ -1075,6 +1076,44 @@ export async function saveMintsoftSendIossNumber(enabled: unknown): Promise<{ su
       level: 'INFO',
       description: `Mintsoft order push ${enabled ? 'now sends' : 'no longer sends'} IOSSNumber (the IOSS number mirrored from WooCommerce, when the order has one).`,
       metadata: { before: previous, after: enabled },
+    })
+  }
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+/**
+ * The shop's own IOSS number (setting `shop_ioss_number`, one value for the whole shop). Orders the EU VAT stamp puts under IOSS store it
+ * (never decided again here) and Mintsoft receives it only with `mintsoft_send_ioss_number` on. Blank clears it. Admin-only, audited.
+ */
+export async function getShopIossNumber(): Promise<string> {
+  await requireMintsoftReadAccess()
+  const row = await db.setting.findUnique({ where: { key: SHOP_IOSS_NUMBER_SETTING } })
+  return row?.value ?? ''
+}
+
+export async function saveShopIossNumber(raw: unknown): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  const parsed = text ? parseShopIossNumber(text) : ''
+  if (parsed === null) return { success: false, error: 'An IOSS number is IM followed by ten digits, for example IM1234567890, or blank to clear it.' }
+  const previous = await db.$transaction(async (tx) => {
+    const row = await tx.setting.findUnique({ where: { key: SHOP_IOSS_NUMBER_SETTING } })
+    await tx.setting.upsert({
+      where: { key: SHOP_IOSS_NUMBER_SETTING },
+      create: { key: SHOP_IOSS_NUMBER_SETTING, value: parsed },
+      update: { value: parsed },
+    })
+    return row?.value ?? ''
+  })
+  if (previous !== parsed) {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'shop_ioss_number_updated',
+      level: 'INFO',
+      description: parsed ? `Shop IOSS number ${previous ? `changed from ${previous} to ${parsed}` : `set to ${parsed}`}.` : `Shop IOSS number cleared (was ${previous}).`,
+      metadata: { before: previous, after: parsed },
     })
   }
   revalidatePath('/sync')

@@ -110,15 +110,14 @@ test('[duty/tax mirror] import stores what WooCommerce reported, edits resync, n
 
   // 1. Create. The reported duty component (999.99) and the DDU_DAP term contradict the order's own fee lines and totals on purpose.
   const first = withLine(payload(externalId, wcRateId, [
-    ...orderMeta(['_o3d_ioss_number', 'IM5280000001'], ['_o3d_delivery_term', 'DDU_DAP'], ['_wclc_duty_component', '999.99'], ['_wclc_tax_component', '0.01']),
+    ...orderMeta(['_wclc_duty_component', '999.99'], ['_wclc_tax_component', '0.01']),
     { id: 90, key: '_wcpdf_invoice_number', value: `INV-${externalId}` },
   ]), '12.50')
   const result = await importWcOrder(first as never)
   assert.equal(result.success, true, `import succeeded: ${JSON.stringify(result)}`)
   const orderId = (ids.orderId = (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId)
   let order = await read()
-  assert.equal(order.iossNumber, 'IM5280000001')
-  assert.equal(order.deliveryTerm, 'DDU_DAP')
+  assert.deepEqual([order.iossNumber, order.deliveryTerm], [null, null], 'no EU VAT stamp: nothing is inferred')
   assert.equal(order.wclcDutyComponent?.toString(), '999.99', 'stored as reported, not reconciled with the fee lines')
   assert.equal(order.wclcTaxComponent?.toString(), '0.01')
   assert.equal(order.totalForeign.toString(), '189.5', 'the order total is untouched by the mirror')
@@ -127,10 +126,13 @@ test('[duty/tax mirror] import stores what WooCommerce reported, edits resync, n
   assert.ok(order.lines.filter((l) => l.description !== 'Widget').every((l) => l.wcCustomsUnitValue === null), 'fee lines carry no override')
 
   // 2. Edit in WooCommerce: every value changes; the next delivery resyncs the stored values and rebuilds no line.
-  const edited = withLine(payload(externalId, wcRateId, orderMeta(['_o3d_ioss_number', 'IM5280000002'], ['_o3d_delivery_term', 'IOSS_DDP'], ['_wclc_duty_component', '3.10'], ['_wclc_handling_component', '2.00'])), '9.99')
+  const edited = withLine(payload(externalId, wcRateId, orderMeta(['_wclc_duty_component', '3.10'], ['_wclc_handling_component', '2.00'])), '9.99')
   await updateExistingWcOrderFromPayload(orderId, edited as never)
   order = await read()
-  assert.deepEqual([order.iossNumber, order.deliveryTerm, order.wclcDutyComponent?.toString(), order.wclcTaxComponent, order.wclcHandlingComponent?.toString()], ['IM5280000002', 'IOSS_DDP', '3.1', null, '2'])
+  assert.deepEqual([order.wclcDutyComponent?.toString(), order.wclcTaxComponent, order.wclcHandlingComponent?.toString()], ['3.1', null, '2'])
+  const warned = await db.activityLog.findMany({ where: { entityId: orderId, action: 'wc_duty_tax_components_changed' } })
+  assert.equal(warned.length, 1, 'moving the split away from the retained fee lines and invoice is flagged, once')
+  assert.equal(warned[0]!.level, 'WARNING')
   assert.equal(widget().wcCustomsUnitValue?.toString(), '9.99')
   assert.equal(order.lines.length, 5, 'no line added or rebuilt')
   assert.equal(order.totalForeign.toString(), '189.5')
@@ -141,13 +143,13 @@ test('[duty/tax mirror] import stores what WooCommerce reported, edits resync, n
   delete (silent.line_items as Array<Record<string, unknown>>)[0]!.meta_data
   await updateExistingWcOrderFromPayload(orderId, silent as never)
   order = await read()
-  assert.deepEqual([order.iossNumber, order.deliveryTerm, order.wclcDutyComponent?.toString()], ['IM5280000002', 'IOSS_DDP', '3.1'])
+  assert.deepEqual([order.wclcDutyComponent?.toString()], ['3.1'])
   assert.equal(widget().wcCustomsUnitValue?.toString(), '9.99')
 
   // 4. WooCommerce removed them (a meta list is present and carries none): they clear.
-  await updateExistingWcOrderFromPayload(orderId, withLine(payload(externalId, wcRateId, orderMeta(['_o3d_delivery_term', 'not-a-term'])), undefined) as never)
+  await updateExistingWcOrderFromPayload(orderId, withLine(payload(externalId, wcRateId, orderMeta()), undefined) as never)
   order = await read()
-  assert.deepEqual([order.iossNumber, order.deliveryTerm, order.wclcDutyComponent, order.wclcTaxComponent, order.wclcHandlingComponent], [null, null, null, null, null])
+  assert.deepEqual([order.wclcDutyComponent, order.wclcTaxComponent, order.wclcHandlingComponent], [null, null, null])
   assert.equal(widget().wcCustomsUnitValue, null)
 })
 
@@ -202,4 +204,58 @@ test('[duty/tax mirror] the product import mirrors pa_us_hs_code and _dutify_hs_
   result = await syncWcProductToIms(product([], []) as never)
   assert.equal(result.success, true, JSON.stringify(result))
   assert.deepEqual(await read(), { hsCode: '11111111', wcUsHsCode: null, wcDutifyHsCodes: null })
+})
+
+test('[duty/tax mirror] a redelivery with the SAME components and a changed total-neutral edit raises no component warning', { skip }, async (t) => {
+  const db = await loadDb()
+  const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const id = `WDW-${process.pid}-${randomUUID()}`
+  const externalId = Math.floor(Math.random() * 2_000_000_000)
+  t.after(async () => {
+    await db.activityLog.deleteMany({ where: { entityId: id } })
+    await db.salesOrder.deleteMany({ where: { id } })
+  })
+  await db.salesOrder.create({ data: { id, status: 'PROCESSING', currency: 'GBP', subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1, wclcDutyComponent: '7.00', shoppingLinks: { create: { connector: 'woocommerce', externalOrderId: String(externalId), externalOrderNumber: String(externalId) } } } })
+  await updateExistingWcOrderFromPayload(id, payload(externalId, 1, orderMeta(['_wclc_duty_component', '7'])) as never)
+  assert.equal(await db.activityLog.count({ where: { entityId: id, action: 'wc_duty_tax_components_changed' } }), 0, '7 equals 7.00')
+})
+
+const REGIME_ORDER = (id: string, regime: 'IOSS' | 'DDP' | 'VOEC' | null, stamped = true) => ({
+  id, status: 'PROCESSING' as const, currency: 'EUR', subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1,
+  ...(stamped ? { euVatRegimeStampedAt: new Date(), ...(regime ? { euVatRegime: regime, euVatLineAccount: '820' } : {}) } : {}),
+})
+
+test('[ioss mirror] an IOSS-stamped order stores the shop number and IOSS_DDP; DDP stores DDP; others null; no setting gives null plus a notice', { skip }, async (t) => {
+  const db = await loadDb()
+  const { mirrorIossFromRegime } = await import('@/lib/connectors/woocommerce/sync/duty-tax-regime-mirror')
+  const tag = randomUUID()
+  const ids = { ioss: `WIO-${tag}`, ddp: `WDD-${tag}`, voec: `WVO-${tag}`, skip: `WSK-${tag}`, none: `WNO-${tag}` }
+  const prior = await db.setting.findUnique({ where: { key: 'shop_ioss_number' } })
+  t.after(async () => {
+    await db.activityLog.deleteMany({ where: { entityId: { in: Object.values(ids) } } })
+    await db.salesOrder.deleteMany({ where: { id: { in: Object.values(ids) } } })
+    if (prior) await db.setting.update({ where: { key: 'shop_ioss_number' }, data: { value: prior.value } })
+    else await db.setting.deleteMany({ where: { key: 'shop_ioss_number' } })
+  })
+  await db.salesOrder.create({ data: REGIME_ORDER(ids.ioss, 'IOSS') })
+  await db.salesOrder.create({ data: REGIME_ORDER(ids.ddp, 'DDP') })
+  await db.salesOrder.create({ data: REGIME_ORDER(ids.voec, 'VOEC') })
+  await db.salesOrder.create({ data: REGIME_ORDER(ids.skip, null) })
+  await db.salesOrder.create({ data: REGIME_ORDER(ids.none, null, false) })
+  const read = async (id: string) => { const o = await db.salesOrder.findUniqueOrThrow({ where: { id } }); return [o.iossNumber, o.deliveryTerm] }
+
+  // No setting: IOSS keeps no number (term still IOSS_DDP) and an operator notice is raised, once.
+  await db.setting.deleteMany({ where: { key: 'shop_ioss_number' } })
+  await mirrorIossFromRegime(ids.ioss)
+  await mirrorIossFromRegime(ids.ioss)
+  assert.deepEqual(await read(ids.ioss), [null, 'IOSS_DDP'])
+  assert.equal(await db.activityLog.count({ where: { entityId: ids.ioss, action: 'shop_ioss_number_missing' } }), 1)
+
+  await db.setting.create({ data: { key: 'shop_ioss_number', value: 'IM5280000001' } })
+  for (const id of Object.values(ids)) await mirrorIossFromRegime(id)
+  assert.deepEqual(await read(ids.ioss), ['IM5280000001', 'IOSS_DDP'])
+  assert.deepEqual(await read(ids.ddp), [null, 'DDP'])
+  assert.deepEqual(await read(ids.voec), [null, null])
+  assert.deepEqual(await read(ids.skip), [null, null])
+  assert.deepEqual(await read(ids.none), [null, null], 'no stamp: nothing inferred')
 })

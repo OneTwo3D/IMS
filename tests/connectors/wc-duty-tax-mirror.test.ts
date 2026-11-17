@@ -6,50 +6,36 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import * as orderImportNs from '../../lib/connectors/woocommerce/sync/order-import.ts'
+import * as shopNs from '../../lib/domain/accounting/shop-ioss-number.ts'
 import * as dutyNs from '../../lib/connectors/woocommerce/sync/duty-tax-mirror.ts'
 import * as hsNs from '../../lib/connectors/woocommerce/sync/hs-code-mirror.ts'
 
 function unwrap<T extends object>(ns: T): T {
   return ('default' in ns ? (ns as { default: T }).default : ns) as T
 }
-const { readWcDutyTaxMirror, readWcLineCustomsUnitValue } = unwrap(dutyNs)
-const { dutyTaxMirrorColumns, wclcComponentColumns } = unwrap(orderImportNs)
+const { readWcLineCustomsUnitValue } = unwrap(dutyNs)
+const { parseShopIossNumber, iossFieldsFromRegime } = unwrap(shopNs)
+const { wclcComponentColumns } = unwrap(orderImportNs)
 const { readWcHsCodeMirror } = unwrap(hsNs)
 
 const meta = (...pairs: Array<[string, unknown]>) => ({ meta_data: pairs.map(([key, value], id) => ({ id, key, value })) })
 
-test('IOSS number and delivery term are mirrored exactly as WooCommerce holds them', () => {
-  assert.deepEqual(readWcDutyTaxMirror(meta(['_o3d_ioss_number', 'IM5280000001'], ['_o3d_delivery_term', 'IOSS_DDP'])), { iossNumber: 'IM5280000001', deliveryTerm: 'IOSS_DDP' })
-  for (const term of ['IOSS_DDP', 'DDP', 'DDU_DAP']) assert.equal(readWcDutyTaxMirror(meta(['_o3d_delivery_term', term]))!.deliveryTerm, term)
+test('shop IOSS number: IM plus ten digits only (trimmed, upper-cased); anything else is not a number', () => {
+  assert.equal(parseShopIossNumber(' im5280000001 '), 'IM5280000001')
+  for (const bad of ['', null, undefined, 'IM123', 'IM52800000012', 'XX5280000001', 'IM 5280000001']) assert.equal(parseShopIossNumber(bad as never), null, String(bad))
 })
 
-test('missing, blank or unusable meta leaves the fields null (never defaulted or derived)', () => {
-  assert.deepEqual(readWcDutyTaxMirror(meta()), { iossNumber: null, deliveryTerm: null })
-  assert.deepEqual(readWcDutyTaxMirror(meta(['_o3d_ioss_number', '  '], ['_o3d_delivery_term', ''])), { iossNumber: null, deliveryTerm: null })
-  assert.deepEqual(readWcDutyTaxMirror(meta(['_o3d_ioss_number', 'has space'], ['_o3d_delivery_term', 'FOB'])), { iossNumber: null, deliveryTerm: null })
-  assert.deepEqual(readWcDutyTaxMirror(meta(['_o3d_ioss_number', { n: 1 }], ['_o3d_delivery_term', 7])), { iossNumber: null, deliveryTerm: null })
-  // No meta list at all is "WooCommerce said nothing": no mirror (an update leaves the stored values alone), not a pair of nulls.
-  assert.equal(readWcDutyTaxMirror({} as never), null)
+test('order IOSS fields come from the EU VAT stamp: IOSS -> number + IOSS_DDP, DDP -> DDP, anything else null (DDU_DAP never inferred)', () => {
+  assert.deepEqual(iossFieldsFromRegime('IOSS', 'IM5280000001'), { iossNumber: 'IM5280000001', deliveryTerm: 'IOSS_DDP' })
+  assert.deepEqual(iossFieldsFromRegime('IOSS', null), { iossNumber: null, deliveryTerm: 'IOSS_DDP' }, 'no shop number set: no number, never invented')
+  assert.deepEqual(iossFieldsFromRegime('DDP', 'IM5280000001'), { iossNumber: null, deliveryTerm: 'DDP' })
+  for (const regime of ['VOEC', null, undefined, 'junk']) assert.deepEqual(iossFieldsFromRegime(regime as never, 'IM5280000001'), { iossNumber: null, deliveryTerm: null })
 })
 
-test('order columns: create writes null for missing meta; update with no meta list writes nothing, with a list follows it (a removed value clears)', () => {
-  const full = { meta_data: [{ id: 1, key: '_o3d_ioss_number', value: 'IM1' }, { id: 2, key: '_wclc_duty_component', value: '3.10' }] } as never
-  assert.deepEqual(dutyTaxMirrorColumns(full, 'create'), { iossNumber: 'IM1', deliveryTerm: null })
-  assert.deepEqual(dutyTaxMirrorColumns({} as never, 'create'), { iossNumber: null, deliveryTerm: null })
-  assert.deepEqual(dutyTaxMirrorColumns({} as never, 'update'), {})
-  assert.deepEqual(dutyTaxMirrorColumns({ meta_data: [] } as never, 'update'), { iossNumber: null, deliveryTerm: null })
-  assert.deepEqual(wclcComponentColumns(full), { wclcDutyComponent: '3.10', wclcTaxComponent: null, wclcHandlingComponent: null })
-})
-
-test('nothing is recomputed: values that disagree with each other and with the order are stored as reported', () => {
-  // A DDU_DAP order that also reports a duty component and an IOSS number: IMS neither reconciles nor "corrects" any of it.
-  const odd = { currency: 'GBP', total: '10.00', billing: { country: 'GB' }, fee_lines: [], meta_data: [
-    { id: 1, key: '_o3d_ioss_number', value: 'IM0000000000' }, { id: 2, key: '_o3d_delivery_term', value: 'DDU_DAP' },
-    { id: 3, key: '_wclc_duty_component', value: '999.99' }, { id: 4, key: '_wclc_tax_component', value: '0.01' },
-  ] } as never
-  assert.deepEqual({ ...dutyTaxMirrorColumns(odd, 'create'), ...wclcComponentColumns(odd) }, {
-    iossNumber: 'IM0000000000', deliveryTerm: 'DDU_DAP', wclcDutyComponent: '999.99', wclcTaxComponent: '0.01', wclcHandlingComponent: null,
-  })
+test('wclc components are mirrored as reported, never reconciled', () => {
+  const odd = { meta_data: [{ id: 3, key: '_wclc_duty_component', value: '999.99' }, { id: 4, key: '_wclc_tax_component', value: '0.01' }] } as never
+  assert.deepEqual(wclcComponentColumns(odd), { wclcDutyComponent: '999.99', wclcTaxComponent: '0.01', wclcHandlingComponent: null })
+  assert.deepEqual(wclcComponentColumns({ meta_data: [] } as never), { wclcDutyComponent: null, wclcTaxComponent: null, wclcHandlingComponent: null })
 })
 
 test('line customs value override: the WooCommerce value, exactly; absent / zero / junk is null', () => {

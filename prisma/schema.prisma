@@ -1824,12 +1824,12 @@ model SalesOrder {
   wclcDutyComponent     Decimal?  @db.Decimal(18, 4) @map("wclc_duty_component")
   wclcTaxComponent      Decimal?  @db.Decimal(18, 4) @map("wclc_tax_component")
   wclcHandlingComponent Decimal?  @db.Decimal(18, 4) @map("wclc_handling_component")
-  /// MIRRORED from the WooCommerce order meta `_o3d_ioss_number` (the shop's own IOSS registration number WooCommerce applied to
-  /// this order). Never computed or defaulted by IMS; null when WooCommerce carries none. Sent on the Mintsoft create push only
-  /// when `mintsoft_send_ioss_number` is on. Not personal data (the shop's own number).
+  /// The shop's own IOSS number (setting `shop_ioss_number`), stored only on an order whose EU VAT stamp (`euVatRegime`) is IOSS.
+  /// Read from the stamp, never decided here; null otherwise. Sent on the Mintsoft create push only when `mintsoft_send_ioss_number`
+  /// is on. Not personal data (the shop's own number).
   iossNumber            String?   @map("ioss_number")
-  /// MIRRORED from the WooCommerce order meta `_o3d_delivery_term` (IOSS_DDP | DDP | DDU_DAP). Never derived by IMS; null when
-  /// WooCommerce carries none or carries a value outside the three. Informational.
+  /// IOSS_DDP when the order's EU VAT stamp is IOSS, DDP when it is DDP, null otherwise (DDU_DAP is never inferred). Read from the
+  /// stamp, never decided here. Informational.
   deliveryTerm          String?   @map("delivery_term")
   billingAddress    Json?
   shippingAddress   Json?
