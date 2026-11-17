@@ -45,3 +45,13 @@ test('ignoreTotal drops only the total difference (a paid delivery whose total d
   assert.match(d[0], /is x 3; IMS holds x 2/)
   assert.deepEqual(detectWcOrderEditDrift(wc([{ id: 11, quantity: 2, sku: 'RED-M' }], '36.00'), stored, { ignoreTotal: true }), [])
 })
+
+test('against a baseline (taken at the first IMS line edit) the store\'s unchanged copy is no drift, and a later store change is', async () => {
+  const { parseWcLineBaseline } = await import('@/lib/connectors/woocommerce/sync/order-edit-drift')
+  const baseline = parseWcLineBaseline({ totalForeign: 24, lines: [{ externalLineItemId: 11, qty: 2, sku: 'RED-M' }] })!
+  const asStored = { currency: 'GBP', totalForeign: baseline.totalForeign, lines: baseline.lines }
+  assert.deepEqual(detectWcOrderEditDrift(wc([{ id: 11, quantity: 2, sku: 'RED-M' }], '24.00'), asStored), [])
+  assert.equal(detectWcOrderEditDrift(wc([{ id: 11, quantity: 3, sku: 'RED-M' }], '24.00'), asStored).length, 1)
+  assert.equal(parseWcLineBaseline(null), null)
+  assert.equal(parseWcLineBaseline({ totalForeign: 'x', lines: [] }), null, 'an unreadable baseline never silences: the lines are compared instead')
+})

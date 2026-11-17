@@ -61,6 +61,8 @@ export type WcSyncSettings = {
   wc_sync_product_direction: string
   wc_stock_sync_enabled: string
   wc_cogs_sync_enabled: string
+  /** o3d-taro: push the estimated back-in-stock date (`_oti_eta_date` product meta) with the stock push. Default 'false'. */
+  wc_back_in_stock_date_enabled: string
   /** o3d-mu0a: GTIN/MPN identifier split for the storefront and warehouse product writes. Default 'false'. */
   product_identifier_split_enabled: string
   /** Read-only report of WooCommerce orders that no longer match the IMS order (Sync > Exceptions). Default 'false'. Changes nothing when off. */
@@ -104,7 +106,7 @@ export type WcSyncSettings = {
  */
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses',
-  'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
+  'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled', 'wc_back_in_stock_date_enabled',
   'product_identifier_split_enabled', 'wc_order_divergence_detection_enabled', 'wc_ast_provider_mapping_enabled',
   'wc_webhook_secret', 'wc_webhook_last_received_at', 'wc_order_webhook_last_received_at', 'wc_product_webhook_last_received_at',
   'wc_order_webhook_last_processed_at', 'wc_product_webhook_last_processed_at',
@@ -139,6 +141,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_sync_product_direction: 'from_wc',
   wc_stock_sync_enabled: 'false',
   wc_cogs_sync_enabled: 'false',
+  wc_back_in_stock_date_enabled: 'false',
   product_identifier_split_enabled: 'false',
   wc_order_divergence_detection_enabled: 'false',
   wc_ast_provider_mapping_enabled: 'false',
