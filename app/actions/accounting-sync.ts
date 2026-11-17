@@ -38,7 +38,8 @@ import {
   type ReleaseSaleState,
 } from '@/lib/domain/accounting/cancelled-sale-release'
 import { cancelOrphanedPendingRows } from '@/lib/domain/accounting/orphan-sweep'
-import { UNCLAIMED_ATTEMPT_REVISION, applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
+import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt-decision'
 import { OPERATOR_RELEASE_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import {

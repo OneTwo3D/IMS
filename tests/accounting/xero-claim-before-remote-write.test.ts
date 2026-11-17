@@ -312,6 +312,8 @@ test('r5 #1: EVERY remote mutation in processEntry is fenced immediately before 
     'await sendAccountingInvoiceEmailInternal(',
     'await pushInvoiceNoteToWc(',
     'return pushCreditNote(',
+    // o3d-ngmt.22: the status write that voids the credit note of a deleted refund (it reads the document first, then writes, all inside this one call).
+    'await voidCreditNote(',
     'return pushPurchaseCreditNote(',
     'await allocatePurchaseCreditNote(',
     // o3d-jit6 r2 #1: the journal's own gates were lifted out of the post (`prepareManualJournal`,

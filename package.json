@@ -79,6 +79,7 @@
     "e2e:full-chain:restore": "NODE_OPTIONS='--import tsx' node --env-file=.env scripts/restore-stage-connectors.ts",
     "e2e:headed": "NODE_OPTIONS='--import tsx' playwright test --headed",
     "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui",
+    "sales:invoicing-state:recompute": "tsx scripts/recompute-invoicing-state.ts",
     "refunds:basis:backfill": "tsx scripts/backfill-refund-basis.ts",
     "check:server-action-auth-bypass": "node scripts/check-server-action-auth-bypass.mjs",
     "check:system-import-capability": "node scripts/check-system-import-capability.mjs",

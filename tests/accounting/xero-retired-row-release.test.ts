@@ -54,6 +54,8 @@ const dbStub = {
       if (!row) return null
       return Object.fromEntries(selectedKeys(select).map((key) => [key, (row as unknown as Record<string, unknown>)[key]]))
     },
+    // The invoicing state recompute that every operator decision on a sales invoice row runs (lib/domain/sales/invoicing-state.ts): the double holds no invoicing column, so it writes nothing.
+    updateMany: async () => ({ count: 0 }),
     update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
       const row = salesOrders.get(where.id)
       if (!row) throw new Error(`no sales order ${where.id}`)

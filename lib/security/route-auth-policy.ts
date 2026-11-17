@@ -375,6 +375,10 @@ export const apiRouteAuthPolicy = {
     access: 'public-webhook',
     reason: 'Public shopping customer invoice PDF handoff; requires connector plugin enablement plus a short-lived connector HMAC request from the shopping platform.',
   },
+  '/api/shopping/[connector]/credit-note-pdf': {
+    access: 'public-webhook',
+    reason: 'Public shopping customer credit note PDF handoff; requires connector plugin enablement plus a short-lived connector HMAC request from the shopping platform, and the refund must belong to the proved order.',
+  },
   '/api/manufacturing-order/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with manufacturing permission.',
