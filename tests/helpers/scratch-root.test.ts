@@ -144,23 +144,18 @@ test('a worker-like child (TMPDIR already the parent sentinel private dir) picks
   const helper = path.resolve('tests/helpers/scratch-root.ts')
   const probe = path.join(dir, 'worker.test.ts')
   writeFileSync(probe, `import { scratchRoot } from ${JSON.stringify(helper)}\nprocess.stdout.write('ROOT=' + scratchRoot() + '\\n')\n`)
-  const outer: NodeJS.ProcessEnv = { ...process.env, TMPDIR: tmpRoot }
-  for (const v of ['IMS_SCRATCH_ROOT', ORIGINAL_TMPDIR_VAR, PRIVATE_TMPDIRS_VAR]) delete outer[v]
-  const spawn = (env: NodeJS.ProcessEnv, script: string) => spawnSync(process.execPath, ['--import', 'tsx', '--import', sentinel, script], { env, encoding: 'utf8' })
-  // Level 1: the outermost process records tmpRoot as the original.
-  const first = spawn(outer, probe)
-  assert.equal(first.status, 0, first.stderr)
-  assert.equal(first.stdout.trim(), `ROOT=${tmpRoot}`)
-  // Level 2: a child of a sentinel process inherits TMPDIR = a private dir and the recorded original.
-  const parentPrivate = mkdtempSync(path.join(tmpRoot, 'sr-'))
-  try {
-    const worker = spawn({ ...outer, TMPDIR: parentPrivate, [ORIGINAL_TMPDIR_VAR]: tmpRoot, [PRIVATE_TMPDIRS_VAR]: parentPrivate }, probe)
-    assert.equal(worker.status, 0, worker.stderr)
-    assert.equal(worker.stdout.trim(), `ROOT=${tmpRoot}`)
-    // Even with no recorded original, the inherited private dir is skipped rather than chosen.
-    const bare = spawn({ ...outer, TMPDIR: parentPrivate, [PRIVATE_TMPDIRS_VAR]: parentPrivate }, probe)
-    assert.notEqual(bare.status, 0, 'refuses rather than picking a private directory')
-  } finally {
-    rmSync(parentPrivate, { recursive: true, force: true })
-  }
+  // The sentinel of THIS process redirects any child's TMPDIR to its own private dir, exactly what a test worker inherits; so the
+  // child below is a real worker-like one: TMPDIR = this process's private dir, the recorded original and the private chain inherited.
+  const spawn = (env: NodeJS.ProcessEnv) => spawnSync(process.execPath, ['--import', 'tsx', '--import', sentinel, probe], { env, encoding: 'utf8' })
+  const inherited: NodeJS.ProcessEnv = { ...process.env, [ORIGINAL_TMPDIR_VAR]: tmpRoot, [PRIVATE_TMPDIRS_VAR]: [process.env[PRIVATE_TMPDIRS_VAR], dir].filter(Boolean).join(':') }
+  delete inherited.IMS_SCRATCH_ROOT
+  const worker = spawn(inherited)
+  assert.equal(worker.status, 0, worker.stderr)
+  assert.equal(worker.stdout.trim(), `ROOT=${tmpRoot}`, 'the real original, not the parent private dir the worker inherited as TMPDIR')
+  // With no recorded original the worker would record its inherited (private) TMPDIR; that is skipped, so it refuses instead of choosing it.
+  const bare = { ...inherited }
+  delete bare[ORIGINAL_TMPDIR_VAR]
+  const refused = spawn(bare)
+  assert.notEqual(refused.status, 0, 'refuses rather than picking a private directory')
+  assert.match(refused.stderr, /no usable scratch root/)
 })
