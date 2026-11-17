@@ -8,6 +8,8 @@ import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
+import { MergeCandidateBadge } from '@/components/sales/merge-candidate-badge'
+import type { MergeCandidateBadgeView } from '@/app/actions/wms-merge-candidates'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -38,6 +40,7 @@ import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-af
 import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
 import { SoFormDialog } from '../so-form'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
+import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
 import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
 import { buildRefundRequest, creditNoteAmounts, salesOrderMoneyView, type MoneyViewOrder } from '@/lib/domain/sales/sales-order-money-view'
@@ -103,6 +106,7 @@ type Props = {
   externalOrderLinks?: Array<{ label: string; url: string }>
   wmsOrderStatus?: WmsOrderStatusView | null
   wmsPushState?: WmsOrderPushStateView | null
+  mergeCandidate?: MergeCandidateBadgeView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -139,14 +143,8 @@ const STATUS_CLASS: Record<SoStatus, string> = {
   DELIVERED: 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900 dark:text-emerald-200',
   CANCELLED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
 }
-// Status flow for orders WITH shipments (shipment-level picking/packing/shipping)
-const STATUS_FLOW_SHIPMENTS: Record<string, { label: string; icon: typeof Truck; target: SoStatus }[]> = {
-  DRAFT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
-  PENDING_PAYMENT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
-  PROCESSING: [{ label: 'Allocate', icon: Package, target: 'ALLOCATED' }],
-  SHIPPED: [{ label: 'Complete', icon: PackageCheck, target: 'COMPLETED' }],
-  COMPLETED: [{ label: 'Delivered', icon: PackageCheck, target: 'DELIVERED' }],
-}
+// Workflow buttons come from the shared flow (lib/domain/sales/status-flow.ts), which the list's bulk Advance also reads.
+const STATUS_ACTION_ICON: Partial<Record<SoStatus, typeof Truck>> = { PROCESSING: Package, ALLOCATED: Package, COMPLETED: PackageCheck, DELIVERED: PackageCheck }
 
 // Optional columns for the line items table
 type OptCol = 'cogs' | 'margin' | 'marginPct' | 'qtyOnHand' | 'qtyReturned' | 'qtyCancelled' | 'qtyShipped'
@@ -1005,7 +1003,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1069,7 +1067,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
 
   const hasShipments = shipments.length > 0
   // Filter out Delivered action if delivery tracking is not enabled
-  const nextActions = (STATUS_FLOW_SHIPMENTS[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
+  const nextActions = nextStatusActions(so.status, deliveryTrackingEnabled).map((a) => ({ ...a, icon: STATUS_ACTION_ICON[a.target] ?? Package }))
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   // o3d-0zy: predict the o3d-5r8 delete refusal instead of letting the operator walk into it. Every
@@ -1091,6 +1089,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     hasExternalSource: so.hasExternalSource,
     refunds: so.refunds.length,
     refundStatus: so.refundStatus,
+    payments: so.payments.length,
+    paid: so.paidAt !== null,
+    storeCreditForeign: so.storeCreditForeign,
+    invoiceRecords: so.invoiceNumber ? 1 : 0,
   })
   const canEditOrder = hasPermission(currentUserRole, 'sales.create')
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
@@ -1463,6 +1465,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {wmsPushState && (
             <span className="inline-flex items-center self-center">
               <WmsOrderPushChip orderId={so.id} push={wmsPushState} />
+            </span>
+          )}
+          {mergeCandidate && (
+            <span className="inline-flex items-center self-center">
+              <MergeCandidateBadge view={mergeCandidate} />
             </span>
           )}
           {canCancel && (

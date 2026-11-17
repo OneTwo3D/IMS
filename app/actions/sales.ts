@@ -1472,11 +1472,16 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
           currency: true,
           updatedAt: true,
           refundStatus: true,
-          _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true } },
+          paidAt: true,
+          unregisteredPaidAt: true,
+          storeCreditForeign: true,
+          invoiceNumber: true,
+          _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
           wmsOrderPush: { select: { id: true } },
         },
       })
       if (!current) return { error: 'Order not found' } as const
+      const accountingSyncLogs = await tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id } })
       const block = resolveSalesOrderEditBlock({
         status: current.status,
         allocations: current._count.allocations,
@@ -1485,6 +1490,11 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
         wmsPush: current.wmsOrderPush !== null,
         hasExternalSource: current._count.shoppingLinks > 0,
         erased: current.erasedAt !== null,
+        payments: current._count.payments,
+        paid: current.paidAt !== null || current.unregisteredPaidAt !== null,
+        storeCreditForeign: Number(current.storeCreditForeign),
+        invoiceRecords: current._count.invoiceDocuments + (current.invoiceNumber ? 1 : 0),
+        accountingSyncLogs,
         refunds: current._count.refunds,
         refundStatus: current.refundStatus,
         returnExpectations: current._count.returnExpectations,

@@ -41,6 +41,7 @@ import { Select } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { MintsoftCourierMapSection, MintsoftOrderDispatchSection } from './mintsoft-courier-map'
 import { Textarea } from '@/components/ui/textarea'
+import { MergeCandidatesSection } from './merge-candidates-section'
 
 type Props = {
   data: MintsoftDashboardData
@@ -582,6 +583,8 @@ export function MintsoftClient({ data, configured }: Props) {
       <MintsoftCourierMapSection />
 
       <MintsoftOrderDispatchSection />
+
+      <MergeCandidatesSection />
 
       <Card className="p-6 space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">

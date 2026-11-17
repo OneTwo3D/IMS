@@ -17,6 +17,10 @@ export type SalesOrderEditBlockCode =
   | 'ACCOUNTING_INVOICE'
   | 'WMS_PUSH'
   | 'SHIPMENT'
+  | 'PAYMENT'
+  | 'STORE_CREDIT'
+  | 'INVOICE_RECORD'
+  | 'ACCOUNTING_SYNC'
   | 'REFUND'
   | 'RETURN_EXPECTATION'
   | 'ALLOCATION'
@@ -44,6 +48,16 @@ export function resolveSalesOrderEditBlock(input: {
   /** How many refunds exist for the order, and its refund disposition: a refund line points at the order's line rows, which an edit replaces. */
   refunds?: number
   refundStatus?: string
+  /**
+   * Order-level money records a currency or total change would desync. addPayment accepts a DRAFT, and an imported/paid order carries `paidAt` with no Payment row.
+   * `payments`: Payment rows; `paid`: paidAt or unregisteredPaidAt is set; `storeCreditForeign`: store credit applied; `invoiceRecords`: an invoice number was generated or an invoice document exists;
+   * `accountingSyncLogs`: any accounting sync row (an invoice, a payment registration) references the order.
+   */
+  payments?: number
+  paid?: boolean
+  storeCreditForeign?: number
+  invoiceRecords?: number
+  accountingSyncLogs?: number
   /** How many return expectations exist (they hang off the refund lines). */
   returnExpectations?: number
 }): SalesOrderEditBlock | null {
@@ -65,6 +79,18 @@ export function resolveSalesOrderEditBlock(input: {
   }
   if (input.wmsPush) {
     return { code: 'WMS_PUSH', reason: 'This order has been sent to the warehouse, so it can no longer be edited.' }
+  }
+  if ((input.payments ?? 0) > 0 || input.paid) {
+    return { code: 'PAYMENT', reason: 'A payment is recorded on this order, so it can no longer be edited: changing its currency or total would no longer match what was paid.' }
+  }
+  if ((input.storeCreditForeign ?? 0) > 0) {
+    return { code: 'STORE_CREDIT', reason: 'Store credit has been applied to this order, so it can no longer be edited.' }
+  }
+  if ((input.invoiceRecords ?? 0) > 0) {
+    return { code: 'INVOICE_RECORD', reason: 'An invoice number or invoice document has been generated for this order, so it can no longer be edited.' }
+  }
+  if ((input.accountingSyncLogs ?? 0) > 0) {
+    return { code: 'ACCOUNTING_SYNC', reason: 'An accounting entry (invoice or payment registration) is queued or posted for this order, so it can no longer be edited.' }
   }
   if ((input.refunds ?? 0) > 0 || (input.refundStatus ?? 'NONE') !== 'NONE') {
     return { code: 'REFUND', reason: 'This order has refunds recorded against its lines, so it can no longer be edited.' }

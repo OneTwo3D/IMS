@@ -28,7 +28,7 @@ export const DISPATCH_LOCK_SKIPPED: DispatchLockSkipped = { lockSkipped: true }
 
 /** Namespace for pg_try_advisory_lock(key1, key2) — distinct from other locks. */
 export { DISPATCH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
-import { DISPATCH_SWEEP_LOCK_NAMESPACE, ORDER_PUSH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { DISPATCH_SWEEP_LOCK_NAMESPACE, MERGE_CANDIDATE_LOCK_NAMESPACE, ORDER_PUSH_SWEEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 
 /**
  * Stable 32-bit key for a connector id. A hash rather than a registry so a new
@@ -82,6 +82,18 @@ export async function withOrderPushSweepLockOrSkip<T>(
   fn: () => Promise<T>,
 ): Promise<T | DispatchLockSkipped> {
   return withSweepLockOrSkip(ORDER_PUSH_SWEEP_LOCK_NAMESPACE, connectorId, '[wms-order-push]', fn)
+}
+
+/**
+ * Run `fn` holding the per-connector MERGE-CANDIDATE lock, or skip if another detection pass holds it. The pass computes the groups, raises
+ * a task per group and resolves every open task not among them: two overlapping passes that saw different groups would each resolve the
+ * other's task. Skipping is safe (the next sweep runs it again). Its own namespace, so it never excludes a push or status sweep.
+ */
+export async function withMergeCandidateLockOrSkip<T>(
+  connectorId: string,
+  fn: () => Promise<T>,
+): Promise<T | DispatchLockSkipped> {
+  return withSweepLockOrSkip(MERGE_CANDIDATE_LOCK_NAMESPACE, connectorId, '[wms-merge-candidates]', fn)
 }
 
 async function withSweepLockOrSkip<T>(

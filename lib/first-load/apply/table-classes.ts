@@ -66,6 +66,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   landed_cost_revaluation_runs: { kind: 'MUST_BE_EMPTY', reason: 'landed-cost records' },
   manufacturing_cost_lines: { kind: 'MUST_BE_EMPTY', reason: 'manufacturing cost records' },
   notification_read_receipts: { kind: 'CONFIG_ALLOWED', reason: 'which operator read which notification' },
+  needs_attention_announcements: { kind: 'CONFIG_ALLOWED', reason: 'which failing rows the bell has announced: operational state of the announcer, ids only, starts empty, no business data' },
   notifications: { kind: 'CONFIG_ALLOWED', reason: 'operator notifications, no business data' },
   one_time_tokens: { kind: 'CONFIG_ALLOWED', reason: 'login and invitation tokens' },
   order_allocations: { kind: 'MUST_BE_EMPTY', reason: 'sales-order stock allocations' },

@@ -248,6 +248,24 @@ test('refused edits write nothing: permission, the DRAFT-only rule and each bloc
   await refused(idRefund, /refunds recorded/, 'refund')
   assert.equal((await db.salesOrderRefundLine.findFirstOrThrow({ where: { refundId: refund.id } })).salesOrderLineId, rline.id, 'the refund line still points at its sale line')
 
+  // money records: a Payment row; paidAt with no Payment row; unregisteredPaidAt; store credit; an invoice number; an accounting sync row
+  const idPay = await fresh()
+  await db.payment.create({ data: { orderId: idPay, amount: 1, currency: 'GBP', method: 'BANK', paidAt: new Date() } as never })
+  await refused(idPay, /payment is recorded/, 'payment row')
+  await db.payment.deleteMany({ where: { orderId: idPay } })
+  const idPaidAt = await fresh()
+  await db.salesOrder.update({ where: { id: idPaidAt }, data: { paidAt: new Date() } })
+  await refused(idPaidAt, /payment is recorded/, 'paidAt without a Payment row')
+  const idUnreg = await fresh()
+  await db.salesOrder.update({ where: { id: idUnreg }, data: { paidAt: new Date(), unregisteredPaidAt: new Date() } })
+  await refused(idUnreg, /payment is recorded/, 'paidAt + unregisteredPaidAt (the column cannot be set without paidAt)')
+  const idCredit = await fresh()
+  await db.salesOrder.update({ where: { id: idCredit }, data: { storeCreditForeign: 2 } })
+  await refused(idCredit, /Store credit/, 'store credit')
+  const idInvNo = await fresh()
+  await db.salesOrder.update({ where: { id: idInvNo }, data: { invoiceNumber: `IN-${w.tag}` } })
+  await refused(idInvNo, /invoice number or invoice document/, 'invoice number')
+
   // every non-draft status
   for (const status of ['PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'SHIPPED', 'CANCELLED'] as const) {
     const id = await fresh()
