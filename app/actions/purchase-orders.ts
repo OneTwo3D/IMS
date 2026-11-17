@@ -10,10 +10,18 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import {
+  MarginBlockedError,
+  assessGuardLines,
+  decideGuard,
+  loadMarginGuardContext,
+  recordMarginOverride,
+  type GuardLineAssessment,
+} from '@/lib/domain/purchasing/margin-threshold-guard'
 import { queueEmail } from '@/lib/email-outbox'
 import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
-import { requirePermission } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
 // order the WMS alignment relies on. See that module's census of every writer.
 import {
@@ -405,6 +413,8 @@ export type CreatePoInput = {
    * `pricesIncludeVat`, else net). Applied after per-line discounts.
    */
   orderDiscountForeign?: number
+  /** Why a line below the minimum gross margin is being saved anyway. Honoured only in block mode and only for a user holding inventory.prices; recorded on the order. */
+  marginOverrideNote?: string
   lines: PoLineInput[]
 }
 
@@ -1300,6 +1310,8 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
     // A system-actor context (the first-load apply runner) replaces the session check; anything that is not the real
     // capability takes the permission check, so a forged argument fails closed.
     if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
+    // The acting user for the minimum-margin guard (null for a system import, which is not assessed). Read after the permission check above.
+    const session = system?.systemImportToken !== SYSTEM_IMPORT ? await requireAuth() : null
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
     if (input.reference?.trim()) {
       const existing = await db.purchaseOrder.findUnique({
@@ -1470,11 +1482,25 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         sortOrder: i,
       }))
 
+    // Minimum gross margin (o3d-hqvrp.380), recomputed here from the costs about to be stored. A system import (historical
+    // data) is not a purchasing decision and is not assessed. No threshold configured: `ctx` is null and nothing changes.
+    let marginOverride: { note: string; below: GuardLineAssessment[] } | null = null
+    if (session) {
+      const ctx = await loadMarginGuardContext(lineData.map((l) => l.productId))
+      const outcome = decideGuard(
+        ctx,
+        ctx ? assessGuardLines(ctx, lineData.map((l) => ({ productId: l.productId, unitCostBase: l.unitCostBase }))) : [],
+        { role: session.user.role, overrideNote: input.marginOverrideNote, verb: 'save' },
+      )
+      if (outcome.kind === 'refused') return { success: false, error: outcome.message }
+      marginOverride = outcome.override
+    }
+
     const poReference = input.reference || await makeReference()
     const po = await db.$transaction(async (tx) => {
     // A line's supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused, under the row share lock the apply waits on (lib/tax/writable-tax-rate.ts).
     await resolveLinesTaxRates(tx, lineData)
-    return tx.purchaseOrder.create({
+    const created = await tx.purchaseOrder.create({
       data: {
         reference: poReference,
         type: 'GOODS',
@@ -1508,6 +1534,10 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       },
       select: PO_SELECT,
     })
+    if (marginOverride && session) {
+      await recordMarginOverride(tx, { poId: created.id, reference: poReference, userId: session.user.id ?? null, verb: 'save', note: marginOverride.note, below: marginOverride.below })
+    }
+    return created
     })
 
     const postCommitWarnings: string[] = []
@@ -1643,6 +1673,10 @@ export async function updatePurchaseOrder(
     if (!existing) return { success: false, error: 'PO not found' }
     if (!isPurchaseOrderEditableStatus(existing.status)) return { success: false, error: PO_EDIT_REFUSED_STATUS_MESSAGE }
 
+    // Minimum gross margin (o3d-hqvrp.380): the setting and the price facts are read HERE, before the transaction, because the
+    // price/VAT read uses the pooled client. Null when no threshold is configured, and then the save is unchanged.
+    const marginCtx = requestedEdit.lines ? await loadMarginGuardContext(requestedEdit.lines.map((l) => l.productId)) : null
+
     // ─── o3d-fgu3: THE WHOLE DRAFT EDIT IS ONE TRANSACTION, PARENT FIRST ───
     //
     // This action used to run on the POOLED client: every delete and create below autocommitted, so a
@@ -1663,6 +1697,7 @@ export async function updatePurchaseOrder(
       const locked = await tx.purchaseOrder.findUnique({
         where: { id },
         select: {
+          reference: true,
           status: true,
           type: true,
           supplierId: true,
@@ -1798,6 +1833,16 @@ export async function updatePurchaseOrder(
         // A line whose `expectedDelivery` is ABSENT keeps its stored date (a caller that predates the field must not erase it); an explicit null or blank clears it.
         const storedLineEta = new Map((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true } })).map((l) => [l.id, l.expectedDelivery]))
 
+        // Minimum gross margin: refuses by THROWING, which rolls this whole transaction back (a return after the line delete below
+        // would commit it). Goods orders only. An accepted override is recorded in this same transaction.
+        const enforceMargin = async (rows: Array<{ productId: string; unitCostBase: number }>) => {
+          if (!marginCtx || locked.type !== 'GOODS' || rows.length === 0) return
+          const outcome = decideGuard(marginCtx, assessGuardLines(marginCtx, rows), { role: session.user.role, overrideNote: requestedEdit.marginOverrideNote, verb: 'save' })
+          if (outcome.kind === 'refused') throw new MarginBlockedError(outcome.message)
+          if (outcome.override) await recordMarginOverride(tx, { poId: id, reference: locked.reference, userId: session.user.id ?? null, verb: 'save', note: outcome.override.note, below: outcome.override.below })
+        }
+        // A FULL edit rewrites every line, so every line is assessed (before the delete). An AMEND assesses only lines it adds or reprices (below).
+        // The cost is computed below; the full edit's check runs right after the line data is built.
         // FULL edit: delete existing lines and recreate. AMEND: lines are reconciled in place further down (ids are kept).
         if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
         // Also clear any pre-existing purchase-unit aggregate data on the PO
@@ -1855,6 +1900,7 @@ export async function updatePurchaseOrder(
           }
         })
         if (!amend) {
+          await enforceMargin(lineData)
           await tx.purchaseOrderLine.createMany({ data: lineData })
         } else {
           const plan = planLineAmend(editFacts, input.lines.map((l) => ({ poLineId: l.poLineId, productId: l.productId, qty: l.qty })))
@@ -1862,6 +1908,7 @@ export async function updatePurchaseOrder(
           const round4 = (n: number) => Math.round(n * 10000) / 10000
           const finalRows: Array<{ totalForeign: number; totalBase: number; taxForeign: number; taxBase: number }> = []
           const lineUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
+          const amendMarginRows: Array<{ productId: string; unitCostBase: number }> = []
           for (const k of plan.keep) {
             const req = input.lines[k.requestIndex]!
             const row = lineData[k.requestIndex]!
@@ -1906,6 +1953,7 @@ export async function updatePurchaseOrder(
                 finalRows.push(stored)
               } else {
                 lineMoneyChanged = true
+                amendMarginRows.push(row)
                 const { poId: _poId, ...rowData } = row
                 lineUpdates.push({ id: k.fact.id, data: rowData })
                 finalRows.push(row)
@@ -1923,6 +1971,8 @@ export async function updatePurchaseOrder(
           })
           if (discountRefusal) return { refused: discountRefusal }
           for (const index of plan.create) finalRows.push(lineData[index]!)
+          // Only lines this amend adds or reprices are assessed; a line left as it was is not held to a minimum set after it was ordered.
+          await enforceMargin([...amendMarginRows, ...plan.create.map((index) => lineData[index]!)])
           if (plan.remove.length > 0) {
             await tx.purchaseOrderLine.deleteMany({ where: { poId: id, id: { in: plan.remove.map((l) => l.id) } } })
           }
@@ -2106,6 +2156,7 @@ export async function updatePurchaseOrder(
     })
     return { success: true, po: mapped }
   } catch (e) {
+    if (e instanceof MarginBlockedError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
@@ -2122,17 +2173,23 @@ export async function updatePurchaseOrder(
 export async function advancePoStatus(
   id: string,
   targetStatus: 'PO_SENT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'SHIPPED' | 'CLOSED',
-  payload?: { trackingNumber?: string; shippingProvider?: string },
+  payload?: { trackingNumber?: string; shippingProvider?: string; marginOverrideNote?: string },
 ): Promise<{ success: boolean; error?: string; notice?: string; warnings?: string[]; closedShort?: boolean }> {
   try {
-    await requirePermission('purchasing.create')
+    const session = await requirePermission('purchasing.create')
+    // Minimum gross margin (o3d-hqvrp.380): placing the order is the commitment, so it is checked here against the stored line
+    // costs. The setting and price facts are read before the transaction (the price/VAT read uses the pooled client); a null
+    // context means no threshold is configured and the transition is unchanged.
+    const marginCtx = targetStatus === 'PO_SENT'
+      ? await loadMarginGuardContext((await db.purchaseOrderLine.findMany({ where: { poId: id }, select: { productId: true } })).map((l) => l.productId))
+      : null
     const result = await db.$transaction(async (tx) => {
       // Closing a GOODS order may reallocate the unreceived freight share onto the received units (close-short), which revalues
       // cost layers: it takes the whole revaluation scope first, which includes the order row.
       const typeProbe = targetStatus === 'CLOSED' ? await tx.purchaseOrder.findUnique({ where: { id }, select: { type: true } }) : null
       if (typeProbe?.type === 'GOODS') await lockLandedCostRevaluationScope(tx, { primaryPoIds: [id] })
       else await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
-      const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
+      const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true, type: true } })
       if (!existing) throw new Error('PO not found')
       if (existing.status === targetStatus) {
         return { existing, changed: false, preferredSupplierUpdate: { productIds: [], updatedCount: 0 }, retired: null as RetireOutcome | null }
@@ -2155,6 +2212,15 @@ export async function advancePoStatus(
       if (targetStatus === 'SHIPPED') {
         if (payload?.trackingNumber) data.trackingNumber = payload.trackingNumber
         if (payload?.shippingProvider) data.shippingProvider = payload.shippingProvider
+      }
+
+      if (targetStatus === 'PO_SENT' && marginCtx && existing.type === 'GOODS') {
+        const stored = await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { productId: true, unitCostBase: true } })
+        // Lines changed between the read above and this lock: the facts do not cover them, so refuse rather than skip them.
+        if (stored.some((l) => !marginCtx.facts.has(l.productId))) throw new Error('The order changed while it was being sent. Reload it and try again.')
+        const outcome = decideGuard(marginCtx, assessGuardLines(marginCtx, stored), { role: session.user.role, overrideNote: payload?.marginOverrideNote, verb: 'send' })
+        if (outcome.kind === 'refused') throw new MarginBlockedError(outcome.message)
+        if (outcome.override) await recordMarginOverride(tx, { poId: id, reference: existing.reference, userId: session.user.id ?? null, verb: 'send', note: outcome.override.note, below: outcome.override.below })
       }
 
       await tx.purchaseOrder.update({ where: { id }, data })
@@ -2214,6 +2280,7 @@ export async function advancePoStatus(
       ...(warnings.length > 0 ? { warnings } : {}),
     }
   } catch (e) {
+    if (e instanceof MarginBlockedError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
@@ -2269,8 +2336,9 @@ async function queuePurchaseOrderEmail(id: string, reference: string, supplierEm
  */
 export async function confirmAndSendPurchaseOrder(
   id: string,
+  options?: { marginOverrideNote?: string },
 ): Promise<{ success: boolean; error?: string; warnings?: string[]; send?: PoSendResult }> {
-  const advanced = await advancePoStatus(id, 'PO_SENT')
+  const advanced = await advancePoStatus(id, 'PO_SENT', options?.marginOverrideNote ? { marginOverrideNote: options.marginOverrideNote } : undefined)
   if (!advanced.success) return { success: false, error: advanced.error }
   let send: PoSendResult
   try {

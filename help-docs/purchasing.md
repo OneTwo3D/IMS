@@ -27,7 +27,7 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 
 ### Line margin (internal)
 
-When you hold the **inventory.prices** permission (Admin, Manager, Finance), the PO create/edit form shows a **Margin (internal)** column and an **Order margin** summary under the lines. It is read-only: it shows you what the entered price would earn so you can reconsider the price or the sales price; it does not block, warn-and-stop or require approval, and it cannot change a sales price.
+When you hold the **inventory.prices** permission (Admin, Manager, Finance), the PO create/edit form shows a **Margin (internal)** column and an **Order margin** summary under the lines. It shows you what the entered price would earn so you can reconsider the price or the sales price. On its own it does not block anything; a minimum margin (below) can warn or block, and the sales price can be edited from the column.
 
 - **Sales price used:** the product's default list price (not the sale price), ex-VAT, in the base currency. A price stored VAT-inclusive has VAT removed using the product's sales VAT rate for the company's home country. If none is configured the line shows "—" instead of guessing.
 - **Cost used:** the unit price you entered, ex-VAT, after the line discount, per stock unit (purchase units are converted), converted to the base currency at the order's exchange rate. It is the **plain unit price, not landed cost**: freight, duty and other additional costs are not included.
@@ -35,6 +35,27 @@ When you hold the **inventory.prices** permission (Admin, Manager, Finance), the
 - **Lines without a number:** a line with no sales price, no quantity or price yet, or no exchange rate (it shows "Rate unavailable", never a rate of 1) shows "—" with the reason and is left out of the order total.
 - **Order margin:** the total margin % and amount over the lines that have a sales price, and how many lines were left out.
 - **Internal only:** the margin is never shown in the supplier portal, a quote request (RFQ) view, the PO PDF or a supplier email, and users without the permission do not see the column.
+
+### Minimum margin (warn or block)
+
+An administrator can set a minimum gross margin in **Settings > Purchasing > Minimum Margin** (see Settings). Until one is set, nothing changes. When one is set:
+
+- **Which minimum applies:** the most specific one: the product's own, then its parent product's (for a variation), then its category's (the nearest category up the tree that has one), then the global minimum.
+- **Warn mode:** a line below its minimum shows an amber "Below the N% minimum (warning)" under its margin. Saving and sending are not affected.
+- **Block mode:** the line shows a red "blocked without an override note" and the form asks for an **override note**. The server refuses to **save** the order, or to **confirm and send** it, while any line is below its minimum, unless a note of at least 5 characters is entered. The refusal names the SKUs. On a draft that is already saved, press **Confirm and send**; if it is refused a note box appears and **Confirm and send with override** places the order.
+- **The override is recorded:** an accepted override is written to the order's activity (action "margin_override") with the note, the lines and their margins, who entered it and when, in the same step as the save or send, so it cannot be saved without the record. Only someone holding **inventory.prices** can override.
+- **Unknown is never blocked:** a line whose margin is unavailable (no sales price, no price entered, no exchange rate) shows "Margin unknown: not checked" and is never warned or blocked.
+- **What is checked:** the server recomputes each line from the cost it is about to store (the same plain unit price, ex-VAT, after discount, in base currency) against the product's list price ex-VAT. It does not trust the figures on screen. A line left as it was on an order that has been received against is not re-checked; lines you add or reprice are. Imported historical orders are not assessed.
+- **Equal passes:** a margin exactly at the minimum is fine; only a lower margin is below it.
+
+### Adjusting the sales price from the margin column
+
+With **inventory.prices**, each line's margin cell has **Edit sales price**. Enter the new **ex-VAT** list price (the "sells" figure) and save:
+
+- It changes that product's default list price through the normal product update, and the activity log records the old and new price and who changed it. The shop (WooCommerce) and the warehouse (Mintsoft) only receive it through the normal product sync, never directly from this screen; if that sync is not ready the price is still saved and the sync retries.
+- A product that stores its price VAT-inclusive keeps doing so: the ex-VAT price you enter is converted with the product's sales VAT rate. If no rate is configured the edit is refused.
+- A variation is priced on its own; the parent and the other variations are not touched. A variable parent product has no price of its own, so it cannot be edited here: set the price on its variations.
+- The margin is recomputed from the new price straight away.
 
 ### FX rate
 

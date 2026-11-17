@@ -57,6 +57,7 @@ import { formatCalendarDate } from '@/lib/format-datetime'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { PoFormDialog } from '../po-form'
+import { MARGIN_BLOCK_ERROR_PREFIX, marginBlockMessageForDisplay } from '@/lib/domain/purchasing/margin-threshold-constants'
 import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
 
 type Warehouse = { id: string; code: string; name: string }
@@ -2072,6 +2073,9 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [warnings, setWarnings] = useState<string[]>([])
+  // Block-mode minimum margin (o3d-hqvrp.380): set when the server refused to confirm the order, so an override note can be entered.
+  const [sendMarginBlocked, setSendMarginBlocked] = useState(false)
+  const [sendOverrideNote, setSendOverrideNote] = useState('')
   const [retireIntent, setRetireIntent] = useState<'close' | 'cancel' | null>(null)
 
   // Edit / Close / Cancel at every stage (lib/domain/workflows/purchase-order-state.ts is the server's table). Edit: Draft through
@@ -2104,11 +2108,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
     setNotice('')
     startTransition(async () => {
       // Confirms the order first, then queues the PO PDF email; a missing supplier address or a failed enqueue leaves the order confirmed.
-      const result = await confirmAndSendPurchaseOrder(po.id)
+      const result = await confirmAndSendPurchaseOrder(po.id, sendOverrideNote.trim() ? { marginOverrideNote: sendOverrideNote.trim() } : undefined)
       if (result.success) {
+        setSendMarginBlocked(false)
+        setSendOverrideNote('')
         setNotice(result.send?.message ?? 'The order is confirmed.')
         router.refresh()
-      } else setError(result.error ?? 'Failed')
+      } else {
+        setSendMarginBlocked(!!result.error?.startsWith(MARGIN_BLOCK_ERROR_PREFIX))
+        setError(marginBlockMessageForDisplay(result.error ?? 'Failed'))
+      }
     })
   }
 
@@ -2284,6 +2293,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {sendMarginBlocked && showMargin && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs space-y-2 max-w-xl" data-testid="po-send-margin-override">
+          <Label htmlFor="sendOverrideNote" className="text-xs">Override note</Label>
+          <Textarea id="sendOverrideNote" value={sendOverrideNote} onChange={(e) => setSendOverrideNote(e.target.value)} rows={2} maxLength={500} placeholder="Why is this order acceptable below the minimum margin?" className="text-sm resize-none" />
+          <p className="text-muted-foreground">Recorded on the order with your name and the time. Internal only.</p>
+          <Button size="sm" disabled={isPending || sendOverrideNote.trim().length < 5} onClick={handleAdvanceToOrdered}>
+            Confirm and send with override
+          </Button>
+        </div>
+      )}
       {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
       {/* This banner covers RETURNED billed goods (→ auto-created credit note);
           the prepaid-reconciliation banner below covers genuine NON-delivery.
