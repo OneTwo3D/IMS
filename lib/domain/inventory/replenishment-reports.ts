@@ -4,6 +4,7 @@ import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
+import { resolveReorderThresholds, type ReorderThresholdField } from '@/lib/domain/inventory/reorder-thresholds'
 import { projectStockPosition, type InboundArrival, type StockProjectionBasis } from '@/lib/domain/inventory/reorder-timing'
 import { calculateDailyVelocity, saleMovementCogsBase, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
@@ -65,8 +66,12 @@ type FindManyDelegate = {
   findMany(args?: unknown): Promise<unknown[]>
 }
 
+type CountableFindManyDelegate = FindManyDelegate & {
+  count?(args?: unknown): Promise<number>
+}
+
 export type ReplenishmentReportClient = {
-  product: FindManyDelegate
+  product: CountableFindManyDelegate
   stockLevel: FindManyDelegate
   stockMovement: FindManyDelegate
   purchaseOrderLine: FindManyDelegate
@@ -76,6 +81,56 @@ export type ReplenishmentReportClient = {
   shipmentLine: FindManyDelegate
   productionOrder: FindManyDelegate
   bomItem: FindManyDelegate
+  /** Per-warehouse threshold overrides. Optional so a client without the table reads as "no overrides". */
+  reorderThresholdOverride?: FindManyDelegate
+}
+
+type ThresholdOverrideRow = {
+  productId: string
+  warehouseId: string
+  reorderPoint: DecimalInput | null
+  safetyStockQty: DecimalInput | null
+  reorderQty: DecimalInput | null
+}
+
+const OVERRIDE_IN_BATCH = 1000
+
+/**
+ * Overrides for ONE warehouse, only for the report's own products, keyed by product (the table is unique per
+ * product and warehouse). Batched with IN so no query is bounded by the size of the whole table; the result is
+ * at most one row per report product, which the product source limit already bounds.
+ */
+async function loadWarehouseThresholdOverrides(
+  client: ReplenishmentReportClient,
+  warehouseId: string,
+  productIds: string[],
+): Promise<Map<string, ThresholdOverrideRow>> {
+  const byProduct = new Map<string, ThresholdOverrideRow>()
+  if (!client.reorderThresholdOverride) return byProduct
+  for (let i = 0; i < productIds.length; i += OVERRIDE_IN_BATCH) {
+    const rows = await client.reorderThresholdOverride.findMany({
+      where: { warehouseId, productId: { in: productIds.slice(i, i + OVERRIDE_IN_BATCH) } },
+      select: { productId: true, warehouseId: true, reorderPoint: true, safetyStockQty: true, reorderQty: true },
+    }) as ThresholdOverrideRow[]
+    for (const row of rows) byProduct.set(row.productId, row)
+  }
+  return byProduct
+}
+
+/**
+ * The all-warehouses view applies no override, so it only needs HOW MANY report products have one (for a notice).
+ * A count query: no override row is loaded, so a large override table can never make the report refuse.
+ */
+async function countProductsWithThresholdOverrides(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<number> {
+  if (!client.product.count) return 0
+  return client.product.count({
+    where: {
+      AND: [
+        productWhere(filters),
+        { reorderThresholdOverrides: { some: { OR: [{ reorderPoint: { not: null } }, { safetyStockQty: { not: null } }, { reorderQty: { not: null } }] } } },
+      ],
+    },
+  })
 }
 
 export type ReplenishmentReportDeps = {
@@ -263,6 +318,11 @@ export type ReorderReportRow = {
   leadTimeDays: number
   safetyStockQty: string
   reorderPoint: string
+  /**
+   * Fields (reorderPoint, safetyStockQty, reorderQty) that came from the selected warehouse's own override
+   * instead of the Product value. Always empty unless the report is scoped to one warehouse.
+   */
+  thresholdOverrides: ReorderThresholdField[]
   configuredReorderQty: string
   suggestedReorderQty: string
   // Always computed (by demand volume) — never null. See computeAbcByVolume.
@@ -1009,10 +1069,19 @@ export async function getReorderReport(
      * of the reorder point to form the order-up-to level. */
     targetCoverQty: Prisma.Decimal
     abcClass: ReorderReportRow['abcClass']
+    thresholdOverrides: ReorderThresholdField[]
   }
+  // Per-warehouse thresholds apply when the report is scoped to ONE warehouse: that warehouse's StockLevel
+  // override, else the Product value. The unscoped report is a consolidated, product-level view (stock is summed
+  // over every warehouse), so it keeps the Product thresholds. Overrides it does not apply are counted in a notice.
+  const overrideByProduct = filters.warehouseId
+    ? await loadWarehouseThresholdOverrides(client, filters.warehouseId, products.map((p) => p.id))
+    : new Map<string, ThresholdOverrideRow>()
+  const productsWithUnappliedOverrides = filters.warehouseId ? 0 : await countProductsWithThresholdOverrides(client, filters)
   const candidatesByProductId = new Map<string, Candidate>()
   for (const product of products) {
-    const configuredReorderQty = product.reorderQty == null ? null : toDecimal(product.reorderQty)
+    const thresholds = resolveReorderThresholds(product, overrideByProduct.get(product.id))
+    const configuredReorderQty = thresholds.reorderQty
     // reorderQty <= 0 used to be an immediate opt-out, but raw materials that
     // are pure components often never have one set. We still want them to
     // appear when a BOM parent drives demand into them, so the actual drop
@@ -1050,10 +1119,10 @@ export async function getReorderReport(
         defaultLeadTimeSkus.push(product.sku)
       }
     }
-    const safetyStockQty = toDecimal(product.safetyStockQty ?? 0)
+    const safetyStockQty = thresholds.safetyStockQty ?? new Prisma.Decimal(0)
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
-    const baseReorderPoint = product.reorderPoint == null ? computedReorderPoint : toDecimal(product.reorderPoint)
+    const baseReorderPoint = thresholds.reorderPoint ?? computedReorderPoint
     const targetCoverQty = averageDailyDemand.mul(new Prisma.Decimal(targetCoverWeeks).mul(7))
     const abcClass = abcByProduct.get(product.id) ?? 'C'
     candidatesByProductId.set(product.id, {
@@ -1069,6 +1138,7 @@ export async function getReorderReport(
       configuredReorderQty,
       targetCoverQty,
       abcClass,
+      thresholdOverrides: thresholds.overridden,
     })
   }
 
@@ -1267,6 +1337,7 @@ export async function getReorderReport(
       leadTimeDays: candidate.leadTimeDays,
       safetyStockQty: integerQuantityString(candidate.safetyStockQty),
       reorderPoint: integerQuantityString(reorderPoint),
+      thresholdOverrides: candidate.thresholdOverrides,
       configuredReorderQty: integerQuantityString(candidate.configuredReorderQty ?? 0),
       suggestedReorderQty: suggestedReorderQty.toString(),
       abcClass: candidate.abcClass,
@@ -1333,6 +1404,8 @@ export async function getReorderReport(
       'ABC class is computed by demand volume over the window above (Pareto: top 80% of units = A, next 15% = B, remainder including no-movement = C), not the stored product field.',
       'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
       'Required receipt is the day projected available stock falls to safety stock (to zero when safety stock is 0): current available, less daily demand, plus each open PO on its expected delivery date (POs already past due are left out and flagged as late). Latest PO date is that day minus the lead time; it is the same statement as the reorder point, in dates. BOM-driven component demand and a manually set reorder point change the reorder point but not these dates.',
+      'Reorder point, safety stock and reorder quantity use the selected warehouse\'s own override when one is set on the product (Inventory > product > Reorder thresholds by warehouse), otherwise the Product value. The all-warehouses view is consolidated and always uses the Product values.',
+      ...(productsWithUnappliedOverrides > 0 ? [`${productsWithUnappliedOverrides} product(s) have a per-warehouse threshold override that this all-warehouses view does not apply. Filter by warehouse to plan against it.`] : []),
       ...(lateInboundRows > 0 ? [`${lateInboundRows} row(s) have open PO quantity past its expected delivery date (late POs). That stock is not yet received, so it is left out of Required receipt, Latest PO date and Overdue and shown separately as a Late PO badge.`] : []),
       ...(undatedInboundRows > 0 ? [`${undatedInboundRows} row(s) have open PO quantity with no expected delivery date. Those quantities are counted in Inbound PO but excluded from the dates, because an unknown arrival cannot rescue a run-out date.`] : []),
       ...(unplannedBomSkus.length > 0 ? [`No claimed recipe: component demand not planned for ${unplannedBomSkus.length} BOM product(s) that need building: ${unplannedBomSkus.slice(0, 10).join(', ')}${unplannedBomSkus.length > 10 ? ', ...' : ''}. Import or claim a recipe for them.`] : []),
