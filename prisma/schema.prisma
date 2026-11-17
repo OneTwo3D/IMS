@@ -492,6 +492,22 @@ model AdjustmentReason {
   @@map("adjustment_reasons")
 }
 
+/// Configurable reasons a customer return / refund happened (damaged, wrong item, changed mind ...). A configured list, not an enum, because the useful
+/// categories differ by business. Reason names are business configuration, not personal data. A refund points at one by id (`SalesOrderRefund.returnReasonId`);
+/// the free-text `SalesOrderRefund.reason` is a separate field and is untouched.
+model ReturnReason {
+  id        String   @id @default(cuid())
+  name      String
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refunds SalesOrderRefund[]
+
+  @@map("return_reasons")
+}
+
 // ---------------------------------------------------------------------------
 // CURRENCIES & FX
 // ---------------------------------------------------------------------------
@@ -1389,6 +1405,8 @@ model PurchaseOrderLine {
   reorderEvidence Json?
   /// Per-line estimated delivery. Null = inherit the order's expectedDelivery (lib/domain/purchasing/line-eta.ts). Receiving never writes it.
   expectedDelivery DateTime?
+  /// Internal remark on this line (colourway, substitute accepted, chase this one). Never printed on the supplier PO PDF or sent in the supplier email.
+  notes           String?
   qtyReceived     Decimal   @db.Decimal(12, 4) @default(0)
   qtyReturned     Decimal   @db.Decimal(12, 4) @default(0)
   sortOrder       Int       @default(0)
@@ -2227,6 +2245,9 @@ model SalesOrderRefund {
   stockCorrectionQueuedAt DateTime? @map("stock_correction_queued_at")
   returnWarehouseId String?
   reason          String?
+  /// The structured reason (configured in Settings, one per refund). Optional; the free-text `reason` above is separate and unchanged. SetNull so removing a reason never touches a refund.
+  returnReasonId  String?    @map("return_reason_id")
+  returnReason    ReturnReason? @relation(fields: [returnReasonId], references: [id], onDelete: SetNull)
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
   // What the stored totals MEAN, and which trusted writer created the refund (o3d-n8p). Set by the
@@ -2342,6 +2363,7 @@ model SalesOrderRefund {
   @@unique([externalRefundId])
   @@index([orderId])
   @@index([stockCorrectionRequired, stockCorrectionQueuedAt])
+  @@index([returnReasonId])
   @@map("sales_order_refunds")
 }
 

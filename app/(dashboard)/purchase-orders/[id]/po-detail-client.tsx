@@ -57,6 +57,7 @@ import { formatCalendarDate } from '@/lib/format-datetime'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { PoFormDialog } from '../po-form'
+import { PoLineNote } from '../po-line-note'
 import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
 
 type Warehouse = { id: string; code: string; name: string }
@@ -81,6 +82,8 @@ type Props = {
   prepaidReconciliation: PrepaidReconciliationSummary
   /** Setting `purchase_order_email_enabled` (default off): whether Confirm & Send PO and Email PO mail the supplier. */
   poEmailEnabled: boolean
+  /** May this user write the internal per-line notes (purchasing.create). */
+  canEditLineNotes?: boolean
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -2037,7 +2040,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2597,6 +2600,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   </TableCell>
                   <TableCell className="px-4">
                     <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                    <PoLineNote lineId={line.id} initial={line.notes} canEdit={canEditLineNotes} />
                   </TableCell>
                   <TableCell className="px-4 text-right tabular-nums whitespace-nowrap">
                     {line.purchaseUnitQty != null ? (

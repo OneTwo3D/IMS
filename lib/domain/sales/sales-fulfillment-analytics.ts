@@ -2425,6 +2425,83 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
   }
 }
 
+/** One row of the returns-by-reason summary: the structured ReturnReason (or "Unspecified" for refunds with none), how many refunds, and what they credited. */
+export type ReturnsByReasonRow = {
+  reasonId: string | null
+  reason: string
+  refundCount: number
+  returnedQty: string
+  /** The credit on its own basis, or null when the group's credits are not all on one basis (the same admission as ReturnsReportRow.refundValueBase). */
+  refundValueBase: string | null
+  refundValueBasis: string
+  refundValueNetBasis: string
+  refundValueGrossBasis: string
+  refundValueUnknownBasis: string
+}
+
+export const RETURN_REASON_UNSPECIFIED = 'Unspecified'
+
+/**
+ * Returns by configured return reason: refund counts, returned quantity and credit value per ReturnReason, over the same refund lines and period as the
+ * Returns report. A refund counts once however many lines it has. Refunds with no reason (everything before reasons existed, manual refunds where none was
+ * picked, WooCommerce text that matched no reason) are grouped as "Unspecified". The free-text refund reason is not consulted.
+ */
+export async function getReturnsByReasonReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<{ rows: ReturnsByReasonRow[] }> {
+  const client = clientFromDeps(deps)
+  const generatedAt = nowFromDeps(deps)
+  const baseCurrency = await baseCurrencyFromDeps(deps)
+  const window = period(filters, generatedAt)
+  const lines = await client.salesOrderRefundLine.findMany({
+    where: refundLinesRaisedInPeriodWhere(window.dateFrom, window.dateToExclusive),
+    select: {
+      refundId: true,
+      qty: true,
+      totalBase: true,
+      refund: { select: { totalsBasis: true, returnReasonId: true, returnReason: { select: { name: true } } } },
+    },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as unknown as Array<{ refundId: string; qty: DecimalInput; totalBase: DecimalInput; refund: { totalsBasis: string | null; returnReasonId: string | null; returnReason: { name: string } | null } }>
+  assertSourceLimit(lines.length, SOURCE_ROW_LIMIT, 'Returns-by-reason source rows')
+  type Group = { reasonId: string | null; reason: string; refundIds: Set<string>; returned: Prisma.Decimal; net: Prisma.Decimal; gross: Prisma.Decimal; unknown: Prisma.Decimal }
+  const groups = new Map<string, Group>()
+  for (const line of lines) {
+    const reasonId = line.refund.returnReasonId
+    const key = reasonId ?? ''
+    const group: Group = groups.get(key) ?? {
+      reasonId,
+      reason: line.refund.returnReason?.name ?? RETURN_REASON_UNSPECIFIED,
+      refundIds: new Set<string>(),
+      returned: new Prisma.Decimal(0),
+      net: new Prisma.Decimal(0),
+      gross: new Prisma.Decimal(0),
+      unknown: new Prisma.Decimal(0),
+    }
+    group.refundIds.add(line.refundId)
+    group.returned = group.returned.add(toDecimal(line.qty))
+    const amount = toDecimal(line.totalBase)
+    const bucket = refundTotalsBasis(line.refund.totalsBasis)
+    if (bucket === 'NET') group.net = group.net.add(amount)
+    else if (bucket === 'GROSS') group.gross = group.gross.add(amount)
+    else group.unknown = group.unknown.add(amount)
+    groups.set(key, group)
+  }
+  const rows = [...groups.values()].map((group): ReturnsByReasonRow => {
+    const stated = statedRefundValue(group.net, group.gross, group.unknown)
+    return {
+      reasonId: group.reasonId,
+      reason: group.reason,
+      refundCount: group.refundIds.size,
+      returnedQty: qtyString(group.returned),
+      refundValueBase: stated.value == null ? null : moneyString(stated.value, baseCurrency),
+      refundValueBasis: stated.basis,
+      refundValueNetBasis: moneyString(group.net, baseCurrency),
+      refundValueGrossBasis: moneyString(group.gross, baseCurrency),
+      refundValueUnknownBasis: moneyString(group.unknown, baseCurrency),
+    }
+  }).sort((a, b) => b.refundCount - a.refundCount || a.reason.localeCompare(b.reason))
+  return { rows }
+}
+
 export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<FulfillmentReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)

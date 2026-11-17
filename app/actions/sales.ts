@@ -306,6 +306,8 @@ export type SoDetail = SoRow & {
     id: string
     creditNoteNumber: string | null
     reason: string | null
+    /** The structured return reason's name (Settings), when one was picked or mapped. */
+    returnReasonName: string | null
     totalForeign: number
     totalBase: number
     accountingRetryRequired: boolean
@@ -923,7 +925,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       },
       refunds: {
         select: {
-          id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
+          id: true, creditNoteNumber: true, reason: true, returnReason: { select: { name: true } }, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
             select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true, lineKind: true },
@@ -1020,6 +1022,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       id: r.id,
       creditNoteNumber: r.creditNoteNumber,
       reason: r.reason,
+      returnReasonName: r.returnReason?.name ?? null,
       totalForeign: Number(r.totalForeign),
       totalBase: Number(r.totalBase),
       accountingRetryRequired: r.accountingRetryRequired,
@@ -2752,6 +2755,8 @@ export async function createRefund(
     statedGrossForeign?: number
     /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across all its rate ids. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
     eas182StatedTaxForeign?: number
+    /** The structured return reason (a configured ReturnReason id), one per refund. Optional. An unknown or inactive id is refused for an operator and ignored for an internal caller (which resolves it itself). */
+    returnReasonId?: string | null
   },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
@@ -2788,6 +2793,13 @@ export async function createRefund(
     // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
     const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
+    let returnReasonId: string | null = null
+    if (options?.returnReasonId) {
+      const reason = await db.returnReason.findFirst({ where: { id: options.returnReasonId, active: true }, select: { id: true } })
+      if (reason) returnReasonId = reason.id
+      else if (!isInternal) return { success: false, error: 'That return reason does not exist or is inactive.' }
+    }
+
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
       // scjz.71: internal callers (the payment-poller chargeback) have no session, so
@@ -2809,6 +2821,7 @@ export async function createRefund(
         ? lines
         : lines.map((line) => ({ ...line, chargedTaxForeign: undefined })),
       reason,
+      returnReasonId,
       returnWarehouseId,
       externalRefundId: options?.externalRefundId,
       creditNotePrefix: numbering.cn_prefix,

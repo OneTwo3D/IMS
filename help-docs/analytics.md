@@ -184,6 +184,8 @@ All of this is stated in each report's own notices and repeated in the CSV expor
 
 **Sales Statistics and Product Profitability** use the same rule, so a refunded sale no longer overstates revenue there. In **Sales Statistics**, the **Net Revenue** column and cards deduct the credit that is on the same ex-VAT basis; revenue, tax, shipping and discount stay as invoiced. In **Product Profitability**, the current and previous financial-year revenue and profit are net of that credit. Credit that could not be deducted is shown in the optional **Refunds (gross)** (VAT-inclusive credit) and **Refunds (basis ?)** (basis not recorded) columns, and the affected figure carries **≤**, **≥** or **?** with a tooltip explaining which way it can be wrong. The Product Profitability unit-margin figures (list price against latest cost) are not affected by refunds.
 
+Below the Returns report a **By return reason** table counts refunds and totals their credit per configured return reason (Settings > Inventory), for the same period. A refund counts once however many lines it has, and refunds with no reason are grouped as **Unspecified**. It follows the same basis rule: a reason whose credits mix bases shows the marker instead of one value, with the net, gross and unproven columns alongside.
+
 The **Returns** report shows each credit on its own recorded basis. Where a row -- or the period -- mixes ex-VAT and VAT-inclusive credits, no single total is shown, because adding the two gives an amount on neither basis; the net-basis, gross-basis and unproven-basis columns carry the whole credit instead, and rows with no single stated value sort last rather than among the zeroes.
 
 ## Purchasing and Supplier Analytics
