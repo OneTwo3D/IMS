@@ -3,11 +3,11 @@ import test from 'node:test'
 
 import {
   UNCLAIMED_ATTEMPT_REVISION,
-  applyFencedAttemptDecision,
   claimAttemptWhere,
   nextAttemptRevision,
   updateAtAttemptRevision,
 } from '@/lib/domain/accounting/sync-log-attempt'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt-decision'
 import { createSyncLogStore, syncLogRow } from '../../fixtures/accounting-sync-log-store.ts'
 
 /**

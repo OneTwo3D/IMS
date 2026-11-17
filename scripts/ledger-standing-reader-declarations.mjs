@@ -143,7 +143,7 @@ export const DECLARATIONS = [
     reason: "o3d-1e7sl (D9): worst-first reduction of several payment rows to the one the verdict is derived from. It carries the BASIS through (an asserted leg makes the whole aggregate asserted) and reports the missing-id case as unverifiable; the aggregate is an input to a display, not a decision about the ledger." },
   { key: "lib/domain/accounting/settlement-status.ts::aggregatePaymentSyncRows::id-read#1", class: "DISPLAY",
     reason: "o3d-1e7sl (D9): worst-first reduction of several payment rows to the one the verdict is derived from. It carries the BASIS through (an asserted leg makes the whole aggregate asserted) and reports the missing-id case as unverifiable; the aggregate is an input to a display, not a decision about the ledger." },
-  { key: "lib/domain/accounting/sync-log-attempt.ts::applyFencedAttemptDecision::where-admits-synced#1", class: "GUARD",
+  { key: "lib/domain/accounting/sync-log-attempt-decision.ts::applyFencedAttemptDecision::where-admits-synced#1", class: "GUARD",
     reason: "The attempt fence: a compare-and-swap on the status the caller OBSERVED (`status: expectedStatus`). A fence on an observed value, not a reading of what the status means." },
   { key: "lib/domain/accounting/sync-row-settlement.ts::refuseSettlement::cmp-cancelled#1", class: "PENDING_CONVERSION:o3d-2by1",
     reason: "G12: `TERMINAL_ACCOUNTING_SYNC_STATUSES.has(row.status)` is a RE-SETTLEABILITY precondition, not a ledger verdict; an orphan-swept row is \"already terminal\" too, so the row whose id nothing accounted for is also the one no operator can settle. That is an authority question recorded on o3d-2by1 and not changed here." },

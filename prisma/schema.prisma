@@ -112,6 +112,15 @@ enum RefundDisposition {
   FULL
 }
 
+// Invoicing state of a sales order, orthogonal to the fulfilment lifecycle status (and to RefundDisposition): an order can
+// be SHIPPED and NOT_INVOICED, or CANCELLED and FULLY_INVOICED. Derived from the order's invoice evidence, never set by hand:
+// lib/domain/sales/invoicing-state.ts (SalesOrder.invoicingState).
+enum InvoicingState {
+  NOT_INVOICED
+  PARTIALLY_INVOICED
+  FULLY_INVOICED
+}
+
 // o3d-9te: WHAT SalesOrder.discountAmount MEANS on this row, recorded by whoever wrote it.
 //
 // The o3d-y14 double-count existed because two different meanings shared one column and
@@ -1786,6 +1795,8 @@ model SalesOrder {
   // by the refund service; the legacy PARTIALLY_REFUNDED/REFUNDED `status` values are
   // being retired in favour of this field (epic: orthogonal refund status).
   refundStatus      RefundDisposition @default(NONE)
+  /// Whether an invoice exists for the order, orthogonal to `status`. Derived and maintained by lib/domain/sales/invoicing-state.ts (the only writer); a cancelled order keeps it.
+  invoicingState    InvoicingState @default(NOT_INVOICED) @map("invoicing_state")
   /// o3d-e1yb [wdraw]: set when this order is ON_HOLD because the customer filed an EU
   /// right-of-withdrawal request in the storefront. It marks the hold as
   /// withdrawal-originated, which does two things nothing else does:
