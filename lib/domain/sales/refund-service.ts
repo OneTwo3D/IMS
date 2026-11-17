@@ -2054,7 +2054,7 @@ async function stageRefundAccountingReversals(
           action: 'refund_unearned_reversal_withheld_unreadable_prior',
           tag: 'accounting',
           level: 'WARNING',
-          description: `${unreadableUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order have no readable lines and no preserved account summary (compacted before summaries existed), so how much unearned revenue they already reversed cannot be established. This refund reversed NO unearned revenue rather than risk reversing it twice: check the unearned revenue account for this order and post the reversal by hand.`,
+          description: `${unreadableUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order have no readable lines and no preserved account summary (compacted before summaries existed), so how much unearned revenue they already reversed cannot be established. This refund reversed NO unearned revenue rather than risk reversing it twice: the unearned revenue account for this order needs reviewing.`,
           metadata: {
             orderId: params.orderId,
             refundId: params.refundId,
