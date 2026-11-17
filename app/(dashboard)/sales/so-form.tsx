@@ -23,6 +23,7 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
 import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
+import { SHOP_DESYNC_WARNING } from '@/lib/domain/sales/order-edit-affordance'
 import { FX_RATE_CHANGED_FORM_MESSAGE, convertAnchored, convertDiscountAnchored, fxBlocksSubmit, isFxRateChangedError, usableRate, type MoneyAnchor } from '@/lib/currencies/form-fx-rate'
 
 type Warehouse = { id: string; code: string; name: string; isDefault?: boolean }
@@ -187,6 +188,10 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   // Customer
   const [allCustomers, setAllCustomers] = useState(customers)
   const editing = order !== undefined
+  // A confirmed (not draft) order being edited, and an order that came from the shop: the latter must be warned, and its save confirmed, before IMS writes an edit WooCommerce will never see.
+  const editingConfirmed = editing && order.status !== 'DRAFT'
+  const shopLinked = editing && order.hasExternalSource
+  const [showDesyncConfirm, setShowDesyncConfirm] = useState(false)
   const [customerId, setCustomerId] = useState(order?.customerId ?? '')
   const [customerName, setCustomerName] = useState(order?.customerName ?? '')
   const [customerEmail, setCustomerEmail] = useState(order?.customerEmail ?? '')
@@ -553,7 +558,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     return p.sku.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
   }).slice(0, 20)
 
-  function handleSubmit(isDraft: boolean = false) {
+  function handleSubmit(isDraft: boolean = false, shopDesyncAcknowledged: boolean = false) {
     setError('')
     if (!customerId && !customerName.trim()) { setError('Select or enter a customer'); return }
     if (!lines.length) { setError('Add at least one product'); return }
@@ -563,6 +568,9 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
       setError(INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE)
       return
     }
+
+    // THE DESYNC WARNING: an order from the shop is confirmed here before anything is sent to the server, which refuses an unacknowledged edit anyway.
+    if (shopLinked && !shopDesyncAcknowledged) { setShowDesyncConfirm(true); return }
 
     startTransition(async () => {
       const resolvedName = customerName || allCustomers.find((c) => c.id === customerId)?.fullName || ''
@@ -604,8 +612,9 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         }),
       }
       if (order) {
-        const edited = await updateSalesOrder(order.id, payload, order.updatedAt)
+        const edited = await updateSalesOrder(order.id, payload, order.updatedAt, shopLinked ? { acknowledgeShopDesync: shopDesyncAcknowledged } : undefined)
         if (edited.success) {
+          if (edited.postCommitWarnings?.length) window.alert(`The order was saved, but: ${edited.postCommitWarnings.join('; ')}`)
           router.refresh()
           onClose()
         } else if (isFxRateChangedError(edited.error)) {
@@ -636,7 +645,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     <Dialog open onOpenChange={() => {}}>
       <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw]">
         <DialogHeader>
-          <DialogTitle>{editing ? 'Edit Draft Order' : 'New Sales Order'}</DialogTitle>
+          <DialogTitle>{editing ? (editingConfirmed ? 'Edit Order' : 'Edit Draft Order') : 'New Sales Order'}</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-6">
@@ -1007,6 +1016,20 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           )}
         </DialogFooter>
       </DialogContent>
+      {showDesyncConfirm && (
+        <Dialog open onOpenChange={() => {}}>
+          <DialogContent showCloseButton={false}>
+            <DialogHeader>
+              <DialogTitle>This edit will not reach WooCommerce</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm" data-testid="shop-desync-warning">{SHOP_DESYNC_WARNING}</p>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowDesyncConfirm(false)}>Go back</Button>
+              <Button onClick={() => { setShowDesyncConfirm(false); handleSubmit(true, true) }}>Edit anyway</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </Dialog>
   )
 }

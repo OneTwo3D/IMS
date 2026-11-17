@@ -11,7 +11,7 @@ import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
 import { findOrderShipmentShortfall } from '@/lib/domain/sales/shipment-service'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { freshAuthFailureResult, requireFreshPermission, requireInternalUser, requirePermission } from '@/lib/auth/server'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
@@ -165,6 +165,7 @@ import {
   allocateSalesOrder,
   cancelSalesOrderFulfillmentState,
   lockSalesOrder,
+  releaseOrderAllocationsForDeallocationInTx,
   releaseOrderAllocationsInTx,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
@@ -179,7 +180,7 @@ import {
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
-import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
+import { paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal } from '@/lib/domain/sales/order-edit-affordance'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -1070,11 +1071,12 @@ export type CreateSalesOrderResult = { success: boolean; order?: SoRow; error?: 
  * (manual override, else the category / destination resolver, else the order default), the inclusive-prices-without-a-rate refusal and the caller's tax assertions. Shared by createSalesOrder and
  * updateSalesOrder so an edited draft is priced by the same path as a fresh one (no second pricing path). Writes nothing.
  */
-async function prepareSalesOrderWrite(input: CreateSoInput) {
+async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFxRate?: number }) {
   // THE ORDER'S RATE IS THE TABLE RATE (owner ruling 2026-10-25, one rate). There is no typed rate: a foreign order is priced by the central lookup at the moment it is created
   // (end-of-day rule inside getFxRateToBase), and a missing rate REFUSES the order ("Missing <base> FX rate for <cur> on or before <date>"); it is never read as 1:1. The base currency is 1.
-  const fxRate = await resolveFxRateToBase(db, input.currency, await getBaseCurrencyCode(), new Date())
-  if (input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { ok: false as const, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
+  // A CONFIRMED order's edit pins the rate the order was booked at (its invoice, its payment and its base-currency figures were made at it): `pinnedFxRate` replaces the lookup and the form's expected-rate check.
+  const fxRate = options?.pinnedFxRate ?? await resolveFxRateToBase(db, input.currency, await getBaseCurrencyCode(), new Date())
+  if (options?.pinnedFxRate === undefined && input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { ok: false as const, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
   const vatRate = input.taxRateValue ?? 0
   const inclVat = !!input.pricesIncludeVat
   // --- Tax category resolution ---------------------------------------
@@ -1445,53 +1447,113 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
   }
 }
 
+/** The edit's allocation could not be re-made, thrown to roll the whole edit back (the order keeps its old lines and its old reservations). */
+class EditedOrderAllocationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'EditedOrderAllocationError'
+  }
+}
+
+export type UpdateSalesOrderOptions = {
+  /**
+   * The operator confirmed the warning that editing an order that came from the shop does not reach the shop. REQUIRED, and exactly `true`, for an order with a ShoppingOrderLink: without it the edit is refused and nothing is
+   * written. Ignored for a manual order.
+   */
+  acknowledgeShopDesync?: boolean
+}
+
+export type UpdateSalesOrderResult = { success: boolean; order?: SoRow; error?: string; postCommitWarnings?: string[] }
+
+/** What an edit reads about the order under its row lock, to decide whether (and how) the edit may proceed. One definition for the full edit and the address-and-notes edit. */
+const EDIT_GUARD_SELECT = {
+  id: true,
+  status: true,
+  erasedAt: true,
+  accountingInvoiceId: true,
+  orderNumber: true,
+  externalOrderNumber: true,
+  totalForeign: true,
+  currency: true,
+  fxRateToBase: true,
+  updatedAt: true,
+  refundStatus: true,
+  paidAt: true,
+  unregisteredPaidAt: true,
+  storeCreditForeign: true,
+  invoiceNumber: true,
+  _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
+  wmsOrderPush: { select: { id: true } },
+} as const
+
+/** Staleness of the form the operator is editing from: refused when the order was saved since the form read it. */
+function staleEditRefusal(current: { updatedAt: Date }, expectedUpdatedAt: string): string | null {
+  // The form was loaded at `expectedUpdatedAt`; any save since (another editor, notes, a status change) makes it stale and this edit would silently discard it.
+  if (!Number.isFinite(Date.parse(expectedUpdatedAt)) || current.updatedAt.getTime() !== Date.parse(expectedUpdatedAt)) {
+    return 'This order was changed by someone else since you opened it. Close this form and reload the order before editing again.'
+  }
+  return null
+}
+
 /**
- * Edit a DRAFT sales order: its header (customer, addresses, shipping, tax basis, discount, notes) and its lines, re-priced by the same builder createSalesOrder uses.
+ * Edit a sales order: its header (customer, addresses, shipping, tax basis, discount, notes) and its lines, re-priced by the same builder createSalesOrder uses (no second line-math path).
  *
- * Only an order nothing else holds a copy of can be rewritten (resolveSalesOrderEditBlock): a draft with no allocation, shipment, posted invoice, warehouse push or shopping-connector link. Every one of those is
- * re-read under the order row lock, so an allocation, push or webhook link that commits first refuses the edit; the lock and the rewrite are one transaction, so the old lines stay until the new ones commit.
- * Editing a CONFIRMED order (invoice update, reallocation, warehouse amendment, and the owner-ruled warning that the edit desyncs it from WooCommerce) is not built: it is refused here.
- * The order number, status and external order number are never edited. Writes nothing outbound: a draft is not invoiced, allocated or pushed.
+ * STATUS DECIDES (resolveSalesOrderEditBlock, the rule the order page also shows): a DRAFT is rewritten as it always was, held by nothing. A CONFIRMED order that has not been dispatched is edited after the operator
+ * acknowledged that an order from the shop is not changed in the shop (`acknowledgeShopDesync: true`, required when the order has a shopping link); a dispatched order's lines are refused (use updateSalesOrderAddressesAndNotes). Cancelled, closed and erased
+ * orders are refused.
+ *
+ * A CONFIRMED EDIT is one transaction under the order row lock: the stock reservations are released (the deallocation helper, which refuses a picked or packed shipment), the lines are rewritten, the totals recomputed, the stock
+ * re-reserved (the allocation primitive autoAllocateOrder runs, on this transaction), and -- when an invoice has been posted -- an update of it is queued through the existing invoice-update path and its producer-side hold. The order's
+ * updatedAt moves, which makes it an amendment candidate of the warehouse push sweep (the sweep decides what is sent; IMS writes no warehouse comment). The order's currency and booked FX rate are kept: a confirmed order is not re-priced.
+ * A failed re-allocation, an invoice that no longer reconciles to the order total or a refused queue roll the whole edit back.
+ *
+ * The order number, status and external order number are never edited. An audit entry (written in the same transaction) and an activity entry record the edit.
  */
-export async function updateSalesOrder(id: string, input: CreateSoInput, expectedUpdatedAt: string): Promise<{ success: boolean; order?: SoRow; error?: string }> {
+export async function updateSalesOrder(id: string, input: CreateSoInput, expectedUpdatedAt: string, options?: UpdateSalesOrderOptions): Promise<UpdateSalesOrderResult> {
   try {
-    await requirePermission('sales.create')
+    const session = await requirePermission('sales.create')
     const inputError = validateSalesOrderInput(input)
     if (inputError) return { success: false, error: inputError }
 
-    const prepared = await prepareSalesOrderWrite(input)
+    // The status decides which rate prices the edit: read it here only to choose (the order is re-read under its lock below, and a status that moved since makes the edit stale there).
+    const preRead = await db.salesOrder.findUnique({ where: { id }, select: { status: true, currency: true, fxRateToBase: true } })
+    if (!preRead) return { success: false, error: 'Order not found' }
+    const confirmedEdit = preRead.status !== 'DRAFT'
+    if (confirmedEdit) {
+      // Allocation is stock: a confirmed edit re-reserves it, so it needs the same permission as allocating.
+      await requirePermission('sales.process')
+    }
+
+    const prepared = await prepareSalesOrderWrite(input, confirmedEdit ? { pinnedFxRate: Number(preRead.fxRateToBase) } : undefined)
     if (!prepared.ok) return { success: false, error: prepared.error }
     const lineData = prepared.model.lines
+    const actingUserId = session.user.id ?? null
 
+    let allocationResult: Awaited<ReturnType<typeof allocateSalesOrder>> | null = null
+    let invoiceUpdateOutcome: { queued: boolean; reason?: string } | null = null
     const outcome = await db.$transaction(async (tx) => {
+      allocationResult = null
+      invoiceUpdateOutcome = null
       await lockSalesOrder(tx, id)
-      const current = await tx.salesOrder.findUnique({
-        where: { id },
-        select: {
-          id: true,
-          status: true,
-          erasedAt: true,
-          accountingInvoiceId: true,
-          orderNumber: true,
-          externalOrderNumber: true,
-          totalForeign: true,
-          currency: true,
-          updatedAt: true,
-          refundStatus: true,
-          paidAt: true,
-          unregisteredPaidAt: true,
-          storeCreditForeign: true,
-          invoiceNumber: true,
-          _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
-          wmsOrderPush: { select: { id: true } },
-        },
-      })
+      const current = await tx.salesOrder.findUnique({ where: { id }, select: EDIT_GUARD_SELECT })
       if (!current) return { error: 'Order not found' } as const
-      const accountingSyncLogs = await tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id } })
+      const isDraft = current.status === 'DRAFT'
+      // The status moved between the unlocked read that chose the pricing and this lock: the edit was priced for the other kind of order.
+      if (isDraft === confirmedEdit) return { error: 'This order was changed by someone else since you opened it. Close this form and reload the order before editing again.' } as const
+      const [accountingSyncLogs, unpostedInvoices, productlessLines, committedShipments, shippedShipments] = await Promise.all([
+        tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id } }),
+        // An invoice queued (or failed) and not yet posted: its payload is the order as it was, so it must not be left to go out stale under an edit.
+        tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id, type: 'SALES_INVOICE', externalTransactionId: null, status: { in: ['PENDING', 'PROCESSING', 'FAILED'] } } }),
+        tx.salesOrderLine.count({ where: { orderId: id, productId: null } }),
+        tx.shipment.count({ where: { orderId: id, status: { not: 'PENDING' } } }),
+        tx.shipment.count({ where: { orderId: id, status: 'SHIPPED' } }),
+      ])
       const block = resolveSalesOrderEditBlock({
         status: current.status,
         allocations: current._count.allocations,
         shipments: current._count.shipments,
+        committedShipments,
+        shippedShipments,
         accountingInvoiceId: current.accountingInvoiceId,
         wmsPush: current.wmsOrderPush !== null,
         hasExternalSource: current._count.shoppingLinks > 0,
@@ -1504,19 +1566,44 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
         refunds: current._count.refunds,
         refundStatus: current.refundStatus,
         returnExpectations: current._count.returnExpectations,
+        invoiceNotPosted: unpostedInvoices > 0,
+        productlessLines,
       })
       if (block) return { error: block.reason } as const
-      // The form was loaded at `expectedUpdatedAt`; any save since (another editor, notes, a status change) makes it stale and this edit would silently discard it.
-      if (!Number.isFinite(Date.parse(expectedUpdatedAt)) || current.updatedAt.getTime() !== Date.parse(expectedUpdatedAt)) {
-        return { error: 'This order was changed by someone else since you opened it. Close this form and reload the order before editing again.' } as const
+      // THE DESYNC ACKNOWLEDGEMENT: an order from the shop is not changed in the shop by this edit; the operator confirmed they know. Refused before anything is written.
+      const desyncRefusal = shopDesyncAcknowledgementRefusal(current._count.shoppingLinks > 0, options?.acknowledgeShopDesync)
+      if (desyncRefusal) return { error: desyncRefusal } as const
+      const stale = staleEditRefusal(current, expectedUpdatedAt)
+      if (stale) return { error: stale } as const
+      // A confirmed order was invoiced (and may have been paid) in its currency at its booked rate: the edit is priced at that rate (pinned above), so a different currency is refused rather than converted.
+      if (!isDraft && input.currency !== current.currency) {
+        return { error: `The currency of a confirmed order cannot be changed (it was booked in ${current.currency}). Nothing was changed.` } as const
       }
+      // A paid (or store-credited) confirmed order keeps its total and currency: the payment and the posted invoice were made for that amount.
+      const moneyRefusal = paidOrderTotalChangeRefusal({
+        status: current.status,
+        payments: current._count.payments,
+        paid: current.paidAt !== null || current.unregisteredPaidAt !== null,
+        storeCreditForeign: Number(current.storeCreditForeign),
+        currencyBefore: current.currency,
+        currencyAfter: input.currency,
+        totalBefore: Number(current.totalForeign),
+        totalAfter: prepared.model.totals.totalForeign,
+      })
+      if (moneyRefusal) return { error: moneyRefusal } as const
 
       // Same locks as create: the rates the order rests on (lines and the header's named rate), then the customer link.
       await lockOrderNamedTaxRate(tx, input.taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: prepared.orderDefaultRate === null })
       await resolveLinesTaxRates(tx, lineData)
       await lockCustomerForOrderLink(tx, input.customerId)
+
+      // RELEASE FIRST (a confirmed order only): the reservations and the draft shipments drawn from them point at the lines about to be replaced. The deallocation helper refuses a shipment that is already picked or packed.
+      const allocationsBefore = current._count.allocations
+      if (!isDraft) {
+        await releaseOrderAllocationsForDeallocationInTx(tx, id, { cause: 'editing the order', userId: actingUserId })
+      }
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
-      const written = await tx.salesOrder.update({
+      await tx.salesOrder.update({
         where: { id },
         data: {
           customerId: input.customerId || null,
@@ -1525,17 +1612,78 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
           // An edit that clears an address clears it (create simply leaves the column unset).
           billingAddress: (input.billingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
           shippingAddress: (input.shippingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
+          // An order that came from the shop is marked as edited here, so a later shop delivery does not write its copy over the edit (order-import.ts).
+          ...(current._count.shoppingLinks > 0 ? { editedInImsAt: new Date() } : {}),
           lines: { create: lineData },
         },
-        select: SO_SELECT,
       })
-      return { written, previous: { totalForeign: Number(current.totalForeign), currency: current.currency, lineCount: current._count.lines } } as const
+
+      // An ALLOCATED order holds no reservation now: it steps back to PROCESSING (as deallocating does) and the re-reservation below promotes it again when stock is reserved.
+      if (!isDraft && current.status === 'ALLOCATED') await tx.salesOrder.updateMany({ where: { id, status: 'ALLOCATED' }, data: { status: 'PROCESSING' } })
+      if (!isDraft) {
+        // RE-RESERVE under the same lock. The reservations the order held (or the stock a normal order of this status would hold) are re-made against the new lines; a hold-state order that held nothing stays unreserved.
+        if (allocationsBefore > 0 || ['PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED'].includes(current.status)) {
+          const allocation = await allocateSalesOrder(tx as never, { orderId: id, userId: actingUserId, runInCallerTransaction: true })
+          allocationResult = allocation
+          if (!allocation.success) throw new EditedOrderAllocationError(allocation.error ?? 'Could not re-reserve stock for the edited order')
+        }
+        // THE POSTED INVOICE: its update is queued in this transaction. An order with no posted invoice has nothing to update (an invoice still queued refused the edit above).
+        if (current.accountingInvoiceId) {
+          await queueSalesInvoiceForOrder(id, { client: tx as unknown as typeof db, updateInTx: true, onUpdateOutcome: (o) => { invoiceUpdateOutcome = o } })
+        }
+      }
+
+      // Read back AFTER the re-reservation, which may have moved the status (PROCESSING to ALLOCATED).
+      const written = await tx.salesOrder.findUniqueOrThrow({ where: { id }, select: SO_SELECT })
+      // THE AUDIT ENTRY, durable: written in this transaction, so an edit that committed always has its record and an edit that rolled back leaves none.
+      await logActivityInTransaction(tx, {
+        userId: actingUserId,
+        entityType: 'SALES_ORDER',
+        entityId: id,
+        action: isDraft ? 'order_edited' : 'confirmed_order_edited',
+        tag: 'audit',
+        level: 'INFO',
+        description: `${isDraft ? 'Edited draft' : 'Edited confirmed'} sales order ${getSalesOrderReference(current)}`
+          + (current._count.shoppingLinks > 0 ? '; the operator acknowledged that the edit does not reach WooCommerce' : ''),
+        metadata: {
+          status: current.status,
+          previousTotalForeign: Number(current.totalForeign),
+          totalForeign: prepared.model.totals.totalForeign,
+          currency: current.currency,
+          previousLineCount: current._count.lines,
+          lineCount: lineData.length,
+          shopDesyncAcknowledged: current._count.shoppingLinks > 0 ? options?.acknowledgeShopDesync === true : null,
+          releasedAllocations: isDraft ? 0 : allocationsBefore,
+          invoiceUpdateQueued: current.accountingInvoiceId ? true : false,
+        },
+      })
+      return { written, previous: { totalForeign: Number(current.totalForeign), currency: current.currency, lineCount: current._count.lines }, isDraft, shopLinked: current._count.shoppingLinks > 0 } as const
     }, STOCK_TX_OPTIONS)
 
     if ('error' in outcome) return { success: false, error: outcome.error }
     const { written, previous } = outcome
+    const postCommitWarnings: string[] = []
 
     await logSalesOrderTaxWarnings(written, input, prepared)
+    const committedAllocation = allocationResult as Awaited<ReturnType<typeof allocateSalesOrder>> | null
+    if (committedAllocation) {
+      // After the commit, as autoAllocateOrder does: the allocation attempt's own activity and the storefront stock sync it owes.
+      const activity = describeAllocationAttempt(committedAllocation)
+      if (activity) await logActivity({ entityType: 'SALES_ORDER', entityId: id, tag: 'sales', ...activity })
+      if (committedAllocation.syncProductIds.length > 0) {
+        try {
+          await enqueueStockSync(committedAllocation.syncProductIds, 'IMS_CHANGE')
+        } catch (syncError) {
+          console.error(syncError)
+          postCommitWarnings.push('the storefront stock update for this edit could not be queued; stock levels in the shop may lag until the next stock sync')
+        }
+      }
+      if ((committedAllocation.unallocatedQty ?? 0) > 0) postCommitWarnings.push(`${committedAllocation.unallocatedQty} unit(s) could not be reserved and are on backorder`)
+    }
+    const invoiceOutcome = invoiceUpdateOutcome as { queued: boolean; reason?: string } | null
+    if (invoiceOutcome && !invoiceOutcome.queued && invoiceOutcome.reason !== 'shadowed' && invoiceOutcome.reason !== 'not-configured') {
+      postCommitWarnings.push('the update of this order\'s accounting invoice was NOT queued (see the exceptions list); the edit is saved, but the invoice in the accounting system still shows the previous version')
+    }
     try { revalidatePath('/sales'); revalidatePath(`/sales/${id}`) } catch { /* cache refresh only */ }
     const mapped = mapSoRow(written)
     await logActivity({
@@ -1544,7 +1692,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       action: 'updated',
       tag: 'sales',
       level: 'INFO',
-      description: `Edited draft sales order ${mapped.displayOrderNumber}`,
+      description: `${outcome.isDraft ? 'Edited draft' : 'Edited confirmed'} sales order ${mapped.displayOrderNumber}`,
       metadata: {
         orderNumber: mapped.displayOrderNumber,
         previousTotalForeign: previous.totalForeign,
@@ -1553,11 +1701,15 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
         totalForeign: mapped.totalForeign,
         currency: mapped.currency,
         lineCount: lineData.length,
+        confirmed: !outcome.isDraft,
+        shopLinked: outcome.shopLinked,
       },
     })
-    return { success: true, order: mapped }
+    return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
+    if (e instanceof EditedOrderAllocationError) return { success: false, error: `Stock could not be re-reserved for the edited order, so nothing was changed: ${e.message}` }
+    if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The edit would leave the order's invoice out of step with its total, so nothing was changed: ${e.message}` }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
@@ -1565,6 +1717,83 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       tag: 'sales',
       level: 'ERROR',
       description: `Failed to edit sales order: ${String(e)}`,
+      metadata: null,
+    })
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Edit only an order's ADDRESSES and NOTES: the one edit a dispatched order allows (the goods have left, so its lines cannot change), and available to any order that is not cancelled, closed or erased.
+ * Nothing about stock, money or the invoice is touched. For an order from the shop the same acknowledgement as the full edit is required (`acknowledgeShopDesync: true`), and the order is marked as edited in IMS so a later
+ * shop delivery does not write its copy back. The order's updatedAt moves, so a pushed, not-yet-dispatched order is an amendment candidate of the warehouse push sweep (a dispatched one is not: the sweep only amends orders
+ * the warehouse can still change).
+ */
+export async function updateSalesOrderAddressesAndNotes(
+  id: string,
+  input: { billingAddress?: unknown; shippingAddress?: unknown; notes?: string; internalNotes?: string },
+  expectedUpdatedAt: string,
+  options?: UpdateSalesOrderOptions,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const session = await requirePermission('sales.create')
+    const actingUserId = session.user.id ?? null
+    const outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, id)
+      const current = await tx.salesOrder.findUnique({
+        where: { id },
+        select: { status: true, erasedAt: true, updatedAt: true, orderNumber: true, externalOrderNumber: true, _count: { select: { shoppingLinks: true } } },
+      })
+      if (!current) return { error: 'Order not found' } as const
+      const block = resolveSalesOrderAddressEditBlock({ status: current.status, erased: current.erasedAt !== null })
+      if (block) return { error: block.reason } as const
+      const desyncRefusal = shopDesyncAcknowledgementRefusal(current._count.shoppingLinks > 0, options?.acknowledgeShopDesync)
+      if (desyncRefusal) return { error: desyncRefusal } as const
+      const stale = staleEditRefusal(current, expectedUpdatedAt)
+      if (stale) return { error: stale } as const
+      await tx.salesOrder.update({
+        where: { id },
+        data: {
+          billingAddress: (input.billingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
+          shippingAddress: (input.shippingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
+          notes: input.notes || null,
+          internalNotes: input.internalNotes || null,
+          ...(current._count.shoppingLinks > 0 ? { editedInImsAt: new Date() } : {}),
+        },
+      })
+      await logActivityInTransaction(tx, {
+        userId: actingUserId,
+        entityType: 'SALES_ORDER',
+        entityId: id,
+        action: 'order_addresses_edited',
+        tag: 'audit',
+        level: 'INFO',
+        description: `Edited the addresses and notes of sales order ${getSalesOrderReference({ id, ...current })} (status ${current.status})`
+          + (current._count.shoppingLinks > 0 ? '; the operator acknowledged that the edit does not reach WooCommerce' : ''),
+        metadata: { status: current.status, shopDesyncAcknowledged: current._count.shoppingLinks > 0 ? options?.acknowledgeShopDesync === true : null },
+      })
+      return { ref: getSalesOrderReference({ id, ...current }), status: current.status } as const
+    }, STOCK_TX_OPTIONS)
+    if ('error' in outcome) return { success: false, error: outcome.error }
+    try { revalidatePath('/sales'); revalidatePath(`/sales/${id}`) } catch { /* cache refresh only */ }
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Edited addresses and notes of sales order ${outcome.ref}`,
+      metadata: { orderNumber: outcome.ref, status: outcome.status },
+    })
+    return { success: true }
+  } catch (e) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to edit the addresses and notes of a sales order: ${String(e)}`,
       metadata: null,
     })
     return { success: false, error: String(e) }
@@ -1580,7 +1809,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
  * invoice id, IMS cannot mutate that accounting document through this create
  * queue; attempts are logged so post-push changes are not silently dropped.
  */
-async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boolean; client?: typeof db; enqueueInTx?: boolean }): Promise<void> {
+async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boolean; client?: typeof db; enqueueInTx?: boolean; updateInTx?: boolean; onUpdateOutcome?: (outcome: { queued: boolean; reason?: string }) => void }): Promise<void> {
   // `client` is the creating transaction when the order is not committed yet (the pre-commit reconciliation of a live order).
   const reader = options?.client ?? db
   const so = await reader.salesOrder.findUnique({
@@ -1765,6 +1994,38 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   }, Number(so.totalForeign))
   if (reconciliation) throw new SalesInvoiceDoesNotReconcileError(reconciliation, so.currency)
   if (options?.checkOnly) return
+
+  if (options?.updateInTx) {
+    // AN EDIT OF A CONFIRMED ORDER WITH A POSTED INVOICE: the update of that document is queued INSIDE the edit's transaction (the caller holds the order row lock and has already rewritten the lines, which `reader` -- the same
+    // transaction -- read above), so the edit and the update that it owes commit together or not at all. The same helper as ever does the queueing, with the facade's transactional enqueue handed in as its queue: the chart and
+    // document provenance guards, the producer-side hold (a shadow is recorded and nothing is sent) and the refusal inbox all apply as they did.
+    if (!options.client) throw new Error('queueSalesInvoiceForOrder: updateInTx needs the transaction')
+    if (!so.accountingInvoiceId) throw new Error('queueSalesInvoiceForOrder: updateInTx is for an order that already has an accounting invoice')
+    const tx = options.client as unknown as Prisma.TransactionClient
+    const updatePayload = { ...payload, accountingInvoiceId: so.accountingInvoiceId }
+    const idempotencyKey = accountingPayloadKey(`sales-invoice-update:${so.id}:${so.accountingInvoiceId}`, updatePayload)
+    const { getActiveAccountingConnectorInfo } = await import('@/lib/accounting')
+    await queueSalesInvoiceUpdateForExistingAccountingInvoice({
+      salesOrderId: so.id,
+      orderNumber,
+      accountingInvoiceId: so.accountingInvoiceId,
+      payload: updatePayload,
+      idempotencyKey,
+      chartConnector: settings.connector,
+      documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
+    }, {
+      getActiveAccountingConnectorInfo,
+      queueAccountingSync: async (queueParams) => {
+        // chartConnector RESTATED (not merely spread): the census of transactional enqueues reads own properties of the argument object.
+        const outcome = await queueAccountingSyncTxWithOutcome(tx, { ...queueParams, chartConnector: queueParams.chartConnector })
+        options.onUpdateOutcome?.(outcome)
+        return outcome
+      },
+      logActivity,
+      recordPostingRefusal: async ({ posting, ...record }) => { await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record) },
+    })
+    return
+  }
 
   if (options?.enqueueInTx) {
     // The invoice is queued INSIDE the caller's transaction (live creation, draft finalisation): it commits with the order and the status, or none of them does.

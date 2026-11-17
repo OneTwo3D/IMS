@@ -103,11 +103,16 @@ export async function surfaceWcOrderEditDrift(orderId: string, wcOrder: WcFullOr
   try {
     const stored = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { currency: true, totalForeign: true, externalOrderNumber: true, lines: { select: { externalLineItemId: true, qty: true, sku: true } } },
+      select: { currency: true, totalForeign: true, externalOrderNumber: true, editedInImsAt: true, lines: { select: { externalLineItemId: true, qty: true, sku: true } } },
     })
     if (!stored) return
-    const differences = detectWcOrderEditDrift(wcOrder, stored, options)
     const rowWhere = { ...wcOrderEditDriftWhere(), entityId: orderId }
+    // An order an operator edited in IMS (owner-ruled desync) is EXPECTED to differ from WooCommerce's original: that difference is the edit, not an edit made in WooCommerce, so none is raised and any earlier row is cleared.
+    if (stored.editedInImsAt !== null) {
+      await db.shoppingSyncLog.deleteMany({ where: rowWhere })
+      return
+    }
+    const differences = detectWcOrderEditDrift(wcOrder, stored, options)
     if (differences.length === 0) {
       await db.shoppingSyncLog.deleteMany({ where: rowWhere })
       return

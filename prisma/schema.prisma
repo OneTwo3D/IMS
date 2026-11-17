@@ -1910,6 +1910,9 @@ model SalesOrder {
   /// A value that is still set means an invoice obligation has not been recorded anywhere yet, so an existing-order import of it cannot succeed until a held invoice or a
   /// SALES_INVOICE row (any status) exists. NULL for every order imported before this column and for orders the import does not invoice.
   salesInvoiceOwedAt      DateTime?  @map("sales_invoice_owed_at")
+  /// Set when an operator edited this order in IMS after it was confirmed (lines, or addresses/notes after dispatch). While set, a later WooCommerce order.updated delivery does not write its addresses, notes, VAT number or shipping label back over the IMS edit,
+  /// and the "edited in WooCommerce after import" comparison is not raised (the order is deliberately desynced). Paid state and the order number still mirror. NULL on every order never edited this way.
+  editedInImsAt           DateTime?  @map("edited_in_ims_at")
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
