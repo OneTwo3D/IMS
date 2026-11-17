@@ -210,6 +210,27 @@ test('[divergence] a refund the payload names that IMS has not recorded defers d
   assert.equal(after.seenCount, before.seenCount)
 })
 
+test('[divergence] a comparison deferred for an unrecorded refund is repeated after the refund sweep, so an edit in the same update is not lost', { skip }, async (t) => {
+  const f = await fixture(t)
+  await f.setFlag(true)
+  await f.deliver({})
+  // The update names a refund IMS has not recorded AND carries a price/shipping edit: deferred, nothing recorded yet.
+  const edited = { qty: 3, shipping: 9, refunds: [{ id: 888002, reason: '', total: '-5.00' }] }
+  await f.deliver(edited)
+  assert.equal((await f.records()).length, 0, 'deferred: nothing recorded by the import itself')
+  // A rerun for an order that was never deferred does nothing (a refund-free order is not compared twice).
+  // The refund sweep then records the refund (as syncRefundsForOrder would), and the repeat runs with the SAME payload.
+  await f.db.salesOrderRefund.create({ data: { orderId: f.orderId, totalForeign: '5.00', totalBase: '5.00', externalRefundId: 888002 } })
+  await f.div.rerunDeferredWcOrderDivergence(f.payload(edited) as never)
+  const rows = await f.records()
+  assert.equal(rows.length, 1, 'the deferred comparison ran after the refund was recorded')
+  assert.equal(rows[0].resolvedAt, null)
+  assert.ok((rows[0].differences as Array<{ field: string }>).some((d) => d.field === 'SHIPPING'), 'the edit that rode along with the refund is reported')
+  // consumed: a second call is a no-op and does not double-count
+  await f.div.rerunDeferredWcOrderDivergence(f.payload(edited) as never)
+  assert.equal((await f.records())[0].seenCount, 1)
+})
+
 test('[divergence] a detection failure never fails the import or stops the six-field update', { skip }, async (t) => {
   const f = await fixture(t)
   await f.setFlag(true)

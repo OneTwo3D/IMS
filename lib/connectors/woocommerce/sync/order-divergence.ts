@@ -289,6 +289,25 @@ export function describeDivergence(differences: ReadonlyArray<DivergenceDifferen
   }).join('; ')
 }
 
+/**
+ * DEFERRED COMPARISONS AWAITING A REFUND SWEEP. A delivery whose payload names a refund IMS has not recorded yet is deferred (above), and the refund sweep runs AFTER the import in the same
+ * delivery (webhook), poll page or admission drain. Left alone, an order edited in the same update as the refund would not be compared until some later delivery, which may never come. So a deferral
+ * is remembered here (WooCommerce order id -> IMS order id) and `rerunDeferredWcOrderDivergence` repeats the comparison with the same payload once the sweep has run. The marker lives in this process
+ * for the lifetime of the delivery that set it: a crash before the rerun leaves the delivery unacknowledged (WooCommerce redelivers it) or the poll cursor held, and a later delivery compares afresh.
+ *
+ * NOTE (follow-up, deliberately not used here): PR #975 adds `sales_orders.edited_in_ims_at` and is not merged. Nothing in this module depends on that column. Once it has landed, the comparison could
+ * use it to tell an IMS-side edit from a WooCommerce-side one; until then it must stay out of this file.
+ */
+const deferredAwaitingRefundSweep = new Map<number, string>()
+
+/** Repeat a comparison that was deferred for an unrecorded refund. Call it after the refund sweep of the same delivery; a no-op for an order whose comparison was not deferred. Never throws. */
+export async function rerunDeferredWcOrderDivergence(wcOrder: WcFullOrder): Promise<void> {
+  const orderId = deferredAwaitingRefundSweep.get(wcOrder.id)
+  if (orderId === undefined) return
+  deferredAwaitingRefundSweep.delete(wcOrder.id)
+  await surfaceWcOrderDivergence(orderId, wcOrder)
+}
+
 export async function isWcOrderDivergenceDetectionEnabled(): Promise<boolean> {
   const row = await db.setting.findUnique({ where: { key: WC_ORDER_DIVERGENCE_SETTING }, select: { value: true } })
   return row?.value === 'true'
@@ -324,7 +343,11 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       }
     }
     const verdict = compareWcOrderWithIms(wcOrder, stored, { recordedExternalRefundIds, refundedQtyByLineId })
-    if (verdict.kind === 'deferred') return
+    if (verdict.kind === 'deferred') {
+      deferredAwaitingRefundSweep.set(wcOrder.id, orderId)
+      return
+    }
+    deferredAwaitingRefundSweep.delete(wcOrder.id)
     const now = new Date()
     if (verdict.kind === 'not-comparable' || verdict.differences.length === 0) {
       await db.wcOrderDivergence.updateMany({

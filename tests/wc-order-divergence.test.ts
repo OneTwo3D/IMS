@@ -66,7 +66,7 @@ test('a changed unit price (ex-tax) is reported, not mistaken for a quantity cha
 })
 
 test('an added line and a removed line are reported by SKU', () => {
-  const added = compareWcOrderWithIms(payload({ line_items: [...(payload().line_items as unknown[]), { id: 13, quantity: 1, sku: 'NEW-1', subtotal: '8.00', total: '8.00' }] }), stored(), NO_REFUNDS)
+  const added = compareWcOrderWithIms(payload({ line_items: [...((payload() as unknown as { line_items: unknown[] }).line_items), { id: 13, quantity: 1, sku: 'NEW-1', subtotal: '8.00', total: '8.00' }] }), stored(), NO_REFUNDS)
   assert.ok(fields(added).includes('LINE_ADDED'))
   if (added.kind === 'compared') assert.equal(added.differences.find((d) => d.field === 'LINE_ADDED')?.woocommerce, '1 x NEW-1 at 8.00 each')
   const removed = compareWcOrderWithIms(payload({ line_items: [{ id: 11, quantity: 2, sku: 'RED-M', subtotal: '20.00', total: '20.00' }] }), stored(), NO_REFUNDS)

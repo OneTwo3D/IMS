@@ -33,7 +33,7 @@ import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import { surfaceWcOrderEditDrift } from './order-edit-drift'
-import { surfaceWcOrderDivergence } from './order-divergence'
+import { rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
@@ -5114,6 +5114,7 @@ export async function syncNewWcOrders(
           // nothing here is re-driven by anything else. Recorded as an error so the cursor is HELD
           // and the next run re-reads this order from the first page (o3d-ecbj r5).
           const refundSweep = await syncRefundsForOrder(order.id)
+          await rerunDeferredWcOrderDivergence(order)
           if (!refundSweep.complete) {
             result.errors.push(
               `syncRefundsForOrder #${order.id}: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`,
