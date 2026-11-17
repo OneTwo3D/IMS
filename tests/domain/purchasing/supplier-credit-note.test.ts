@@ -7,6 +7,8 @@ import {
   resolveSupplierCreditNoteTaxType,
   SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE,
   resolveSupplierCreditNoteTransitBase,
+  billNetPayable,
+  planReverseChargeSupplierCredit,
 } from '@/lib/domain/purchasing/supplier-credit-note'
 
 // 6oyu.4 (khdw): the NET base amount a credit note posts to the transit account (for
@@ -287,5 +289,109 @@ test('wiring: the supplier credit note poster reads the SELECTED bill\'s lines a
 test('wiring: a mixed bill is refused before anything is claimed, only when the credit would be sent to the ledger', async () => {
   const { readFileSync } = await import('node:fs')
   const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
-  assert.match(source, /if \(shouldQueueXero && creditNoteTreatment\.mixed\) return \{ success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE \}/)
+  assert.match(source, /if \(shouldQueueXero && creditNoteTreatment\.mixed && !billHasReverseCharge\) return \{ success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE \}/)
+})
+
+// Net payable of a reverse-charge bill: reverse-charge lines at their net, standard lines at net plus VAT.
+const RC = { taxType: 'RC', rate: 0.2, reverseCharge: true }
+const STD = { taxType: 'IN', rate: 0.2, reverseCharge: false }
+test('billNetPayable: a reverse-charge line is its net; a standard line is net plus VAT', () => {
+  assert.equal(billNetPayable([{ ...RC, net: 100 }], 'GBP'), 100)
+  assert.equal(billNetPayable([{ ...RC, net: 100 }, { ...STD, net: 50 }], 'GBP'), 160)
+})
+test('planReverseChargeSupplierCredit: a full credit reproduces every bill line (incl. odd-penny VAT), a partial is pro rata, and an excess is refused', () => {
+  const lines = [{ ...RC, net: 33.33 }, { ...STD, net: 10.01 }, { ...STD, net: 0.07 }]
+  const payable = billNetPayable(lines, 'GBP')
+  const full = planReverseChargeSupplierCredit({ amount: payable, lines, currency: 'GBP' }) as Exclude<ReturnType<typeof planReverseChargeSupplierCredit>, string>
+  assert.deepEqual(full.lines.map((l) => l.net), [33.33, 10.01, 0.07])
+  assert.equal(full.xeroTotal, payable)
+  assert.equal(full.netTotal, 43.41)
+  const half = planReverseChargeSupplierCredit({ amount: 20, lines, currency: 'GBP' }) as Exclude<ReturnType<typeof planReverseChargeSupplierCredit>, string>
+  assert.equal(half.xeroTotal, 20)
+  assert.equal(planReverseChargeSupplierCredit({ amount: payable + 0.01, lines, currency: 'GBP' }), 'exceeds')
+})
+
+// What Xero holds for a plan: exclusive nets plus each standard line's VAT as the writer computes it (per line, rounded to the minor unit).
+type Plan = Exclude<ReturnType<typeof planReverseChargeSupplierCredit>, string>
+const xeroHolds = (plan: Plan) => Math.round(plan.lines.reduce((a, l) => a + Math.round(l.net * 100) + Math.round(l.vat * 100), 0))
+const pence = (n: number) => Math.round(n * 100)
+function assertExact(plan: ReturnType<typeof planReverseChargeSupplierCredit>, credit: number): Plan {
+  assert.ok(typeof plan === 'object', `planned: ${String(plan)}`)
+  assert.equal(xeroHolds(plan), pence(credit), 'Xero credit total (lines plus VAT) equals the credit')
+  assert.equal(pence(plan.xeroTotal), pence(credit), 'the allocation equals the credit')
+  assert.equal(pence(plan.netTotal) + plan.lines.reduce((a, l) => a + pence(l.vat), 0), pence(credit), 'journal: transit net plus VAT equals the credit total')
+  assert.ok(plan.lines.every((l) => l.net > 0), 'no empty or negative line')
+  return plan
+}
+test('1,000 equal reverse-charge lines with a 5.00 credit: exactly 5.00 on 500 lines, never more', () => {
+  const lines = Array.from({ length: 1000 }, () => ({ ...RC, net: 10 }))
+  const plan = assertExact(planReverseChargeSupplierCredit({ amount: 5, lines, currency: 'GBP' }), 5)
+  assert.equal(plan.lines.length, 500)
+  assert.equal(plan.netTotal, 5)
+})
+test('a 0.01 credit over many lines lands on one line', () => {
+  const lines = Array.from({ length: 300 }, (_, i) => (i % 2 ? { ...RC, net: 7.77 } : { ...STD, net: 3.33 }))
+  const plan = assertExact(planReverseChargeSupplierCredit({ amount: 0.01, lines, currency: 'GBP' }), 0.01)
+  assert.equal(plan.lines.length, 1)
+})
+test('a mixed bill with odd amounts gives an exact total, for a full and a partial credit', () => {
+  const lines = [{ ...RC, net: 17.17 }, { ...STD, net: 9.99 }, { ...STD, net: 0.33 }, { ...RC, net: 41.03 }, { ...STD, net: 123.45 }]
+  const payable = billNetPayable(lines, 'GBP')
+  assertExact(planReverseChargeSupplierCredit({ amount: payable, lines, currency: 'GBP' }), payable)
+  assertExact(planReverseChargeSupplierCredit({ amount: 77.77, lines, currency: 'GBP' }), 77.77)
+})
+test('property: random bills and credits give Xero total = allocation = transit + VAT = the credit, or are refused, never mismatched', () => {
+  let seed = 12345
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296 }
+  let planned = 0
+  for (let n = 0; n < 400; n++) {
+    const count = 1 + Math.floor(rnd() * 40)
+    const lines = Array.from({ length: count }, () => {
+      const net = Math.round((0.01 + rnd() * 200) * 100) / 100
+      const r = rnd()
+      return r < 0.4 ? { ...RC, net } : r < 0.8 ? { ...STD, net } : { taxType: 'IN5', rate: 0.05, reverseCharge: false, net }
+    })
+    const payable = billNetPayable(lines, 'GBP')
+    const credit = rnd() < 0.2 ? payable : Math.max(0.01, Math.round(rnd() * payable * 100) / 100)
+    const plan = planReverseChargeSupplierCredit({ amount: credit, lines, currency: 'GBP' })
+    if (typeof plan === 'string') { assert.ok(!lines.some((l) => l.reverseCharge), `a bill with reverse-charge lines refused a credit: ${String(plan)}`); continue }
+    planned++
+    assertExact(plan, credit)
+  }
+  assert.ok(planned >= 300, `almost every random credit is plannable (${planned}/400)`)
+})
+
+test('Codex example: a 1.00 reverse-charge line and a 1,000.00 standard line at 20%, credit 1.05, plans exactly', () => {
+  const lines = [{ ...RC, net: 1 }, { ...STD, net: 1000 }]
+  assertExact(planReverseChargeSupplierCredit({ amount: 1.05, lines, currency: 'GBP' }), 1.05)
+})
+test('property vs a brute-force reference: whenever an exact combination exists (small bills) the planner finds one; it refuses only when none exists', () => {
+  let seed = 987654
+  const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296 }
+  const rates = [0.2, 0.05, 0.175]
+  let plannable = 0, refused = 0
+  for (let t = 0; t < 600; t++) {
+    const count = 1 + Math.floor(rnd() * 3)
+    const lines = Array.from({ length: count }, () => {
+      const net = Math.round((0.01 + rnd() * (rnd() < 0.3 ? 20 : 3)) * 100) / 100
+      if (rnd() < 0.4) return { ...RC, net }
+      return { taxType: 'IN', rate: rates[Math.floor(rnd() * rates.length)], reverseCharge: false, net }
+    })
+    const payable = pence(billNetPayable(lines, 'GBP'))
+    const A = 1 + Math.floor(rnd() * payable)
+    // Reference: every reachable credit total, over every net each line can carry (RC: net; standard: net + VAT rounded half up).
+    let reachable = new Set<number>([0])
+    for (const l of lines) {
+      const next = new Set<number>()
+      for (let net = 0; net <= pence(l.net); net++) {
+        const g = l.reverseCharge ? net : net + Math.round(net * l.rate + 1e-9)
+        for (const r of reachable) if (r + g <= A) next.add(r + g)
+      }
+      reachable = next
+    }
+    const plan = planReverseChargeSupplierCredit({ amount: A / 100, lines, currency: 'GBP' })
+    if (reachable.has(A)) { plannable++; assertExact(plan, A / 100) } else { refused++; assert.equal(plan, 'inexact', `no exact combination exists for ${A}`) }
+  }
+  assert.ok(plannable > 300)
+  void refused
 })

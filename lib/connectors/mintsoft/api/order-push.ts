@@ -950,18 +950,35 @@ function amendmentIdentityRefusal(identity: WarehouseOrderIdentity, orderNumber:
   return null
 }
 
+/**
+ * THE AMEND GATE, as one read: the warehouse order must exist, be this order (not merged, not another number) and still be NEW. Null when it can be amended; otherwise the refusal the amendment answers with.
+ * updateMintsoftOrder runs it before it writes, and the sales-order edit asks it (probeMintsoftOrderAmendable) before it commits a line change, so the two can never disagree about what "amendable" means.
+ */
+async function amendGateRefusal(externalOrderId: string, clientId: number, expectedOrderNumber: string | null): Promise<WmsOrderUpdateResult | null> {
+  const { found, isNew, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, expectedOrderNumber)
+  if (!found) return { updated: false, status: 'NOT_FOUND' }
+  const refusal = amendmentIdentityRefusal(identity, orderNumber)
+  if (refusal) return refusal
+  if (!isNew) return { updated: false, status: 'NOT_NEW' }
+  return null
+}
+
+/** READ-ONLY. Can this warehouse order be amended right now? Throws when the warehouse cannot be read (the caller treats that as unknown). Writes nothing. */
+export async function probeMintsoftOrderAmendable(externalOrderId: string, expectedOrderNumber: string | null): Promise<{ amendable: true } | { amendable: false; status: string }> {
+  const clientId = await getPushClientId('Mintsoft order amendability read')
+  const refusal = await amendGateRefusal(externalOrderId, clientId, expectedOrderNumber)
+  return refusal ? { amendable: false, status: refusal.status } : { amendable: true }
+}
+
 export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
   const clientId = await getPushClientId('Mintsoft order update')
-  const { found, isNew, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
-  if (!found) return { updated: false, status: 'NOT_FOUND' }
   // THE IDENTITY GATE, before any order post or item write. MERGED (flagged MergedOrder=True): the order holds other orders' goods and the
   // absorbing order keeps the survivor's id, so its link can still name it; amending it would diff ALL its lines against this one
   // order's, so the link is handed to the merged paths. MISMATCH / UNVERIFIABLE (not flagged, but the number is not the one IMS pushed, or
   // is missing: a merge whose flag is missing, a rename, an incomplete detail): the same safety, but it proves nothing about a merge, so
   // the link is NOT moved to MERGED; the caller raises a durable notice and leaves the amendment due. Only OK amends.
-  const refusal = amendmentIdentityRefusal(identity, orderNumber)
-  if (refusal) return refusal
-  if (!isNew) return { updated: false, status: 'NOT_NEW' }
+  const gateRefusal = await amendGateRefusal(externalOrderId, clientId, input.orderNumber)
+  if (gateRefusal) return gateRefusal
 
   const settings = await getMintsoftSettings()
   const courierMap = settings.mintsoft_courier_service_map

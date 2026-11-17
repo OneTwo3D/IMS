@@ -5,9 +5,10 @@ import test, { mock } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 
 /**
- * A XERO-BOUND SUPPLIER CREDIT AGAINST A BILL WITH REVERSE-CHARGE LINES IS REFUSED, before anything is claimed (the credit stays a draft). Driven through the real server action and
- * the real accounting facade, on the harness of supplier-credit-note-chart-verdict.test.ts. The IMS credit amount is the bill's gross (net plus the self-accounted VAT) while Xero holds the
- * bill's net, so the figures cannot agree yet; the credit is raised in Xero directly. A local-only credit (sync off) and a credit against a bill with no reverse-charge line are unaffected.
+ * A SUPPLIER CREDIT AGAINST A REVERSE-CHARGE BILL CARRIES THE BILL'S NET PAYABLE END TO END. Driven through the real server action and the real accounting facade, on the harness of
+ * supplier-credit-note-chart-verdict.test.ts, with every HTTP call mocked (nothing here can reach Xero). A reverse-charge line of net 100 at 20% is 120 in IMS (it includes the VAT the bill
+ * accounts for itself) but 100 in Xero and owed to the supplier: the credit is capped at the net payable, and one amount is the Xero credit lines (exclusive net, the booked code), the
+ * allocation to the bill and the transit movement.
  */
 
 let enabledPlugins: string[] = ['xero']
@@ -73,11 +74,13 @@ mock.module('@/lib/domain/accounting/accounting-event-mirror', { namedExports: {
 mock.module('@/lib/connectors/xero/outbox', { namedExports: { scheduleXeroAccountingOutbox: async () => undefined } })
 mock.module('@/lib/domain/accounting/followup-scope-lock', { namedExports: { lockFollowUpScope: async () => undefined } })
 mock.module('@/lib/db/savepoint', { namedExports: { withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => fn() } })
-mock.module('@/lib/domain/accounting/transit-subledger-movement', { namedExports: { recordTransitSubledgerMovement: async () => undefined } })
+const transit: Array<{ sourceType: string; baseDelta: number }> = []
+mock.module('@/lib/domain/accounting/transit-subledger-movement', { namedExports: { recordTransitSubledgerMovement: async (_tx: unknown, row: { sourceType: string; baseDelta: number }) => { transit.push({ sourceType: row.sourceType, baseDelta: row.baseDelta }) } } })
 
 const committed = { posted: 0, syncRows: [] as Array<{ connector: string; type: string }>, payloads: [] as Array<Record<string, unknown>> }
 // What the stored rate rows and the connected organisation say (the credit's checks read them).
 let inactiveRateRows: Array<{ id: string; name: string }> = []
+let otherCredits: string | null = null
 let ledgerTenant: string | null = null
 let ledgerRates: Array<{ taxType: string; effectiveRate: number }> = []
 
@@ -119,7 +122,7 @@ function transactionClient(pending: Array<() => void>) {
 }
 
 const dbModelled: Record<string, unknown> = {
-  supplierCreditNote: { findUnique: async () => CREDIT_NOTE },
+  supplierCreditNote: { findUnique: async () => CREDIT_NOTE, aggregate: async () => ({ _sum: { amountForeign: otherCredits === null ? null : new Prisma.Decimal(otherCredits) } }) },
   setting: { findUnique: async () => null },
   accountingToken: { findFirst: async () => null, findUnique: async () => (ledgerTenant === null ? null : { tenantId: ledgerTenant }) },
   taxRate: { findMany: async ({ where }: { where: { id?: { in: string[] }; active?: boolean } }) => (where.id ? inactiveRateRows.filter((r) => where.id!.in.includes(r.id)) : []) },
@@ -143,10 +146,10 @@ mock.module('@/lib/db', {
 })
 
 
-const baseCredit = (amount: string, lines: Array<Record<string, unknown>>, taxForeign = '20') => ({
-  id: 'cn-1', poId: 'po-1', supplierId: 'sup-1', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'),
+const baseCredit = (amount: string, lines: Array<Record<string, unknown>>, taxForeign = '20', accountingInvoiceId: string | null = null) => ({
+  id: 'cn-1', poId: 'po-1', supplierId: 'sup-1', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'), purchaseInvoiceId: 'inv-1',
   amountForeign: new Prisma.Decimal(amount), creditNoteNumber: 'CN-1', reference: null, reason: null, status: 'DRAFT',
-  purchaseInvoice: { subtotalForeign: new Prisma.Decimal('100'), taxForeign: new Prisma.Decimal(taxForeign), accountingInvoiceId: null, accountingInvoiceConnector: null, lines },
+  purchaseInvoice: { subtotalForeign: new Prisma.Decimal('100'), taxForeign: new Prisma.Decimal(taxForeign), accountingInvoiceId, accountingInvoiceConnector: accountingInvoiceId ? 'xero' : null, lines },
   po: { reference: 'PO-1', type: 'GOODS', taxRatePercent: null, taxRateName: null, supplier: { name: 'Supplier', taxRate: null }, lines: [], freightCostLines: [] },
 })
 const snapshot = (over: Record<string, unknown>) => ({ poLineId: null, costLineId: null, totalForeign: new Prisma.Decimal('100'), taxBookedAt: new Date(), taxType: 'INPUT2', taxRateValue: new Prisma.Decimal('0.2'), taxRateId: 'r-std', taxReverseCharge: false, ...over })
@@ -161,6 +164,8 @@ function reset() {
   committed.syncRows = []
   committed.payloads = []
   inactiveRateRows = []
+  otherCredits = null
+  transit.length = 0
   ledgerTenant = null
   ledgerRates = []
   activity.length = 0
@@ -171,42 +176,137 @@ async function post() {
   return postSupplierCreditNote('cn-1')
 }
 
-for (const [label, amount] of [['a FULL credit (the bill gross, net plus the self-accounted VAT)', '120'], ['a PARTIAL credit', '30']] as const) {
-  test(`${label} against a reverse-charge bill is refused before anything is claimed: nothing posted, nothing queued, still a draft`, async () => {
+type XeroLine = { unitAmount: number; taxType: string; accountCode: string; taxRateId?: string }
+type Queued = { lines: XeroLine[]; lineAmountsIncludeTax: boolean; allocateToInvoiceId?: string; allocateAmount?: number }
+const queued = () => committed.payloads[0] as unknown as Queued
+const round2 = (n: number) => Math.round(n * 100) / 100
+const stdLine = snapshot({ totalForeign: new Prisma.Decimal('50') })
+
+/**
+ * The figures every reverse-charge credit must agree on. The Xero credit (exclusive) holds net plus the VAT Xero adds on STANDARD lines; reverse-charge VAT is self-accounted, so it posts a
+ * debit and an equal credit on the VAT accounts and adds nothing to what is owed. The credit's journal is then Dr payables (the credit total) = Cr transit (the nets) + Cr input VAT (standard
+ * lines only), and the allocation is that same total, never above the bill's outstanding amount in Xero (net payable less credits already against it).
+ */
+function assertAgrees(opts: { netPayable: number; credit: number; standardNet: number; standardRate: number; xeroNet: number; others?: number }) {
+  const q = queued()
+  assert.equal(q.lineAmountsIncludeTax, false, 'posts exclusive, as the bill does')
+  const nets = q.lines.reduce((a, l) => a + l.unitAmount, 0)
+  assert.equal(round2(nets), opts.xeroNet, 'the Xero credit lines carry the credit net')
+  const stdVat = round2(opts.standardNet * opts.standardRate)
+  const total = round2(nets + stdVat)
+  assert.equal(total, opts.credit, 'the Xero credit total is the credit amount')
+  assert.equal(q.allocateAmount, total, 'the allocation is the Xero credit total')
+  assert.ok(q.allocateAmount! <= round2(opts.netPayable - (opts.others ?? 0)) + 1e-9, 'the allocation does not exceed what is outstanding on the Xero bill')
+  assert.equal(transit.length, 1)
+  assert.equal(transit[0]!.sourceType, 'SUPPLIER_CREDIT_NOTE')
+  assert.equal(round2(-transit[0]!.baseDelta), round2(nets), 'the transit movement is the credit net')
+  assert.equal(round2(total), round2(-transit[0]!.baseDelta + stdVat), 'journal balances: Dr payables = Cr transit + Cr VAT')
+}
+
+for (const [label, amount] of [['a FULL credit', '100'], ['a PARTIAL credit', '30']] as const) {
+  test(`${label} against a reverse-charge bill (net 100 at 20%, IMS total 120): the net is credited, allocated and moved through transit`, async () => {
     reset()
-    CREDIT_NOTE = baseCredit(amount, [rcLine], '0')
+    CREDIT_NOTE = baseCredit(amount, [rcLine], '20', 'xero-bill-1')
     const result = await post()
-    assert.equal(result.success, false)
-    assert.match(String(result.error), /Supplier credits against reverse-charge bills are not posted from IMS yet: raise this credit in Xero directly/)
-    assert.equal(committed.posted, 0, 'the credit note was not claimed')
-    assert.equal(committed.syncRows.length, 0, 'nothing was queued')
+    assert.equal(result.success, true, JSON.stringify(result))
+    assert.equal(committed.posted, 1)
+    assert.deepEqual(committed.syncRows, [{ connector: 'xero', type: 'PURCHASE_CREDIT_NOTE' }])
+    const q = queued()
+    assert.equal(q.lines.length, 1)
+    assert.deepEqual([q.lines[0]!.unitAmount, q.lines[0]!.taxType, q.lines[0]!.accountCode, q.lines[0]!.taxRateId], [Number(amount), 'REVERSECHARGES', 'X-TRANSIT', 'r-rc'])
+    assert.equal(q.allocateToInvoiceId, 'xero-bill-1')
+    assertAgrees({ netPayable: 100, credit: Number(amount), standardNet: 0, standardRate: 0, xeroNet: Number(amount) })
   })
 }
 
-test('a reverse-charge line mixed with another treatment is refused as reverse charge too', async () => {
+test('a credit of the IMS bill TOTAL (120) against a reverse-charge bill is refused: it exceeds the net payable (100); nothing is claimed or queued', async () => {
   reset()
-  CREDIT_NOTE = baseCredit('30', [rcLine, snapshot({ taxType: 'NONE', taxRateValue: new Prisma.Decimal('0'), taxRateId: null })], '0')
+  CREDIT_NOTE = baseCredit('120', [rcLine], '20', 'xero-bill-1')
   const result = await post()
   assert.equal(result.success, false)
-  assert.match(String(result.error), /reverse-charge bills are not posted from IMS yet/)
+  assert.match(String(result.error), /limited to what is owed to the supplier \(100\.00, excluding the VAT the bill accounts for itself\); 100\.00 is still creditable/)
+  assert.equal(committed.posted, 0)
+  assert.equal(committed.syncRows.length, 0)
+  assert.equal(transit.length, 0)
+})
+
+test('credits already against the bill count against the net payable: 80 recorded + 30 more is refused, 80 + 20 is allowed', async () => {
+  reset()
+  otherCredits = '80'
+  CREDIT_NOTE = baseCredit('30', [rcLine], '20', 'xero-bill-1')
+  const refused = await post()
+  assert.equal(refused.success, false)
+  assert.match(String(refused.error), /20\.00 is still creditable/)
+  assert.equal(committed.posted, 0)
+
+  reset()
+  otherCredits = '80'
+  CREDIT_NOTE = baseCredit('20', [rcLine], '20', 'xero-bill-1')
+  const ok = await post()
+  assert.equal(ok.success, true, JSON.stringify(ok))
+  assertAgrees({ netPayable: 100, credit: 20, standardNet: 0, standardRate: 0, xeroNet: 20, others: 80 })
+})
+
+// MIXED BILL: reverse-charge net 100 (owed 100) + standard net 50 at 20% (owed 60): IMS total 180, net payable 160.
+for (const [label, amount, rcNet, stdNet, xeroNet] of [['a FULL credit', '160', 100, 50, 150], ['a PARTIAL credit', '80', 50, 25, 75]] as const) {
+  test(`${label} against a MIXED bill (reverse-charge plus standard lines): each line on its own code, exclusive, net payable 160`, async () => {
+    reset()
+    CREDIT_NOTE = baseCredit(amount, [rcLine, stdLine], '30', 'xero-bill-1')
+    const result = await post()
+    assert.equal(result.success, true, JSON.stringify(result))
+    assert.equal(committed.posted, 1)
+    const q = queued()
+    assert.deepEqual(q.lines.map((l) => [l.unitAmount, l.taxType, l.taxRateId]), [[rcNet, 'REVERSECHARGES', 'r-rc'], [stdNet, 'INPUT2', 'r-std']])
+    assertAgrees({ netPayable: 160, credit: Number(amount), standardNet: stdNet, standardRate: 0.2, xeroNet })
+  })
+}
+
+test('a mixed bill refuses a credit above its net payable (160), not its IMS total (180)', async () => {
+  reset()
+  CREDIT_NOTE = baseCredit('170', [rcLine, stdLine], '30', 'xero-bill-1')
+  const result = await post()
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /\(160\.00, excluding the VAT/)
   assert.equal(committed.posted, 0)
 })
 
-test('CONTROL: a credit against a NON-reverse-charge bill is unaffected (posted and queued)', async () => {
+test('a foreign-currency reverse-charge credit moves its net through transit in the BASE currency (divided by the rate)', async () => {
   reset()
-  CREDIT_NOTE = baseCredit('120', [snapshot({})])
+  CREDIT_NOTE = { ...baseCredit('100', [rcLine], '20', 'xero-bill-1'), currency: 'EUR', fxRateToBase: new Prisma.Decimal('2') }
+  const result = await post()
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(transit[0]!.baseDelta, -50)
+  assert.equal(queued().lines[0]!.unitAmount, 100, 'the Xero line stays in the document currency')
+})
+
+test('a bill with a non-reverse-charge mix (taxable plus exempt) is still refused as mixed', async () => {
+  reset()
+  CREDIT_NOTE = baseCredit('30', [snapshot({}), snapshot({ taxType: 'NONE', taxRateValue: new Prisma.Decimal('0'), taxRateId: null })], '20')
+  const result = await post()
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /mixes VAT treatments/)
+  assert.equal(committed.posted, 0)
+})
+
+test('CONTROL: a credit against a NON-reverse-charge bill is unchanged (one gross inclusive line, allocation = the amount, transit = the net by the VAT ratio)', async () => {
+  reset()
+  CREDIT_NOTE = baseCredit('120', [snapshot({})], '20', 'xero-bill-1')
   const result = await post()
   assert.equal(result.success, true, JSON.stringify(result))
   assert.equal(committed.posted, 1)
   assert.deepEqual(committed.syncRows, [{ connector: 'xero', type: 'PURCHASE_CREDIT_NOTE' }])
+  const q = queued()
+  assert.equal(q.lines.length, 1)
+  assert.deepEqual([q.lines[0]!.unitAmount, q.lines[0]!.taxType, q.lineAmountsIncludeTax, q.allocateAmount], [120, 'INPUT2', true, 120])
+  assert.equal(round2(-transit[0]!.baseDelta), 100)
 })
 
-test('CONTROL: a LOCAL-ONLY credit (Xero sync off, nothing goes to Xero) against a reverse-charge bill is not refused by this rule', async () => {
+test('CONTROL: a LOCAL-ONLY credit (Xero sync off, nothing goes to Xero) against a reverse-charge bill posts without Xero figures', async () => {
   reset()
   xeroSync = 'false'
   CREDIT_NOTE = baseCredit('30', [rcLine], '0')
   const result = await post()
-  assert.doesNotMatch(String(result.error ?? ''), /reverse-charge bills are not posted from IMS yet/)
+  assert.equal(result.success, true, JSON.stringify(result))
   assert.equal(committed.syncRows.length, 0, 'nothing goes to Xero')
 })
 

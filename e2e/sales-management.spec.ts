@@ -31,7 +31,7 @@ async function createShippedSalesOrder(page: Page) {
   await createShipmentsButton.click()
   await expect(page.getByText(/shipment from/i)).toBeVisible({ timeout: 15000 })
   await page.getByRole('button', { name: /start picking/i }).click()
-  await expect(page.getByText('Picking', { exact: false })).toBeVisible()
+  await expect(page.getByText('Picking', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: /mark packed/i }).click()
   await page.getByRole('button', { name: /^Ship$/ }).click()
   const shipDialog = page.getByRole('dialog', { name: /Ship/ })

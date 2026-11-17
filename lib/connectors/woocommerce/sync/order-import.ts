@@ -1514,9 +1514,12 @@ async function updateExistingWcOrderCore(
     // the very next order.updated would undo the erasure silently. Only the identity columns are withheld; the
     // rest of the update (shipping, paid state, order number) proceeds exactly as before.
     await lockSalesOrder(tx, orderId)
-    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
+    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true, wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
     storedComponents = erasure ?? null
     const erased = erasure?.erasedAt != null
+    // EDITED IN IMS (owner-ruled desync, o3d-tgt2j policy): an operator edited this order here after confirming it, so WooCommerce's copy of the fields the edit can set (addresses, notes, shipping label / courier) is the
+    // ORIGINAL and must not be written back over the edit. Paid state, the order number and the VAT number still mirror; the lines and total never did (see order-edit-drift.ts).
+    const keepImsEdit = erasure?.editedInImsAt != null
     // Recorded after the transaction (below). Only a delivery that still carries real identity counts: an anonymised delivery, or one whose placeholders
     // WooCommerce wrote, is the expected steady state and says nothing.
     repopulationRefused = erased && !isWcOrderAnonymised(wcOrder) && wcPayloadCarriesIdentity(wcOrder)
@@ -1540,14 +1543,15 @@ async function updateExistingWcOrderCore(
         // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
         // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
         // which decides what to send. A payload without shipping lines (empty or absent) leaves the last known values alone: an empty list is no evidence that the courier went away.
-        ...(Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
+        ...(!keepImsEdit && Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
           ? (({ shippingService, courierKey, shippingMethodId }) => ({ shippingService, courierKey, shippingMethodId }))(mapWcShipping(wcOrder))
           : {}),
         // The wclc duty/tax/handling components FOLLOW WooCommerce on every delivery: these are
         // WooCommerce's own results, stored as reported and never recomputed (owner decision D5). Nothing here is personal data, so an erased
-        // order keeps them. No line or invoice is rebuilt from them (an edit that moves the fee lines is surfaced by surfaceWcOrderEditDrift).
+        // order keeps them, and an order edited in IMS keeps following them (the edit cannot set them). No line or invoice is rebuilt from them
+        // (an edit that moves the fee lines is surfaced by surfaceWcOrderEditDrift).
         ...(Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
-        ...(erased
+        ...(erased || keepImsEdit
           ? {}
           : {
               billingAddress: mapWcAddress(wcOrder.billing),
