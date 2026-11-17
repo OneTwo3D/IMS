@@ -91,6 +91,14 @@ An order has one **Expected Delivery** date, but a supplier sometimes ships one 
 - The purchase order CSV export and import have a **lineExpectedDelivery** column (YYYY-MM-DD, blank = follows the order's date), so a round trip keeps the line dates.
 - A line's date can be changed on any order that can still be edited, including one that has been part-received.
 
+## Notes on lines
+
+Each purchase order line can carry a short **internal note** (colourway, substitute accepted, chase this one). On the PO form click the notepad icon under the product to open a text field; the note is saved with the order. On the PO page the note shows under the product, and with the Purchasing permission the notepad opens the same field and **Save note** stores it, on any status, including a part-received order.
+
+- **Notes are internal: they are never printed on the PO PDF and never sent in the supplier email**, and they do not appear in the supplier portal. The order's own **Notes** field is the one that goes to the supplier. To tell the supplier something about one line, put it in the order Notes or in the line's **Description**, which does print on the PO.
+- A note is up to 2,000 characters. Clearing the text removes it.
+- Editing an order from an older screen that does not send notes keeps the stored notes.
+
 ### Barcode and Supplier SKU on the order lines
 
 The **Order Lines** table on the PO page has **Barcode** and **Supplier SKU** columns after the product, so you can check goods against the order without opening the catalogue. Barcode is the product's barcode (empty when it has none). Supplier SKU is the supplier's own reference for the product from the supplier's product list (the same one the PO form uses); it is empty when none is recorded for this supplier. Use **Columns** above the table to hide either one; the choice is remembered in your browser only. The PO PDF sent to the supplier is unchanged.

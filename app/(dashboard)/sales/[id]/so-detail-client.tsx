@@ -45,6 +45,7 @@ import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/f
 import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
 import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
+import type { ReturnReason } from '@/app/actions/return-reasons'
 import { buildRefundRequest, creditNoteAmounts, salesOrderMoneyView, type MoneyViewOrder } from '@/lib/domain/sales/sales-order-money-view'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
@@ -104,6 +105,8 @@ type AllocationPanelLine = {
 type Props = {
   order: SoDetail
   warehouses: WarehouseInfo[]
+  /** The active configured return reasons the refund dialog offers. */
+  returnReasons?: ReturnReason[]
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
   wmsOrderStatus?: WmsOrderStatusView | null
@@ -188,10 +191,11 @@ function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number
 // ---------------------------------------------------------------------------
 // Refund dialog
 // ---------------------------------------------------------------------------
-function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; sym: string; onClose: () => void }) {
+function RefundDialog({ order, warehouses, returnReasons, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; returnReasons: ReturnReason[]; sym: string; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [reason, setReason] = useState('')
+  const [returnReasonId, setReturnReasonId] = useState('')
   const [returnWhId, setReturnWhId] = useState(warehouses[0]?.id ?? '')
   const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0 })))
   const [error, setError] = useState('')
@@ -207,7 +211,7 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
     startTransition(async () => {
-      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined)
+      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined, returnReasonId ? { returnReasonId } : undefined)
       if (result.success) {
         router.refresh()
         // The server cuts the refund again under the order lock; if what it recorded differs from this preview, show the server's figure.
@@ -227,6 +231,13 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
       <div className="space-y-4">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="space-y-1.5"><Label>Reason *</Label><Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Customer request" className="h-9 text-sm" /></div>
+          {returnReasons.length > 0 && (
+            <div className="space-y-1.5"><Label>Return reason</Label>
+              <select value={returnReasonId} onChange={(e) => setReturnReasonId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <option value="">No category</option>
+                {returnReasons.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
+              </select></div>
+          )}
           <div className="space-y-1.5"><Label>Return to Warehouse</Label>
             <select value={returnWhId} onChange={(e) => setReturnWhId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
               <option value="">No stock return</option>
@@ -1006,7 +1017,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2037,6 +2048,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 </div>
                 <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>
+              {r.returnReasonName && <p className="text-xs"><span className="text-muted-foreground">Return reason:</span> {r.returnReasonName}</p>}
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <Table className="text-xs">
                 <TableHeader>
@@ -2109,7 +2121,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       )}
 
       {/* Dialogs */}
-      {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
+      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
       {showEdit && editForm && editBlock === null && (
         <SoFormDialog {...editForm} warehouses={warehouses} currencies={currencies} order={so} onClose={() => setShowEdit(false)} />

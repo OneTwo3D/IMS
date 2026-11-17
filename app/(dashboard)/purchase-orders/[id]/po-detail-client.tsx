@@ -59,6 +59,7 @@ import { formatMoney } from '@/lib/utils'
 import { selectablePoWarehouses } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 import { PO_LINE_COLS_DEFAULT, PO_LINE_COLS_STORAGE_KEY, PO_LINE_OPTIONAL_COLS, parsePoLineCols, type PoLineOptionalCol } from '@/lib/domain/purchasing/po-line-columns'
 import { PoFormDialog } from '../po-form'
+import { PoLineNote } from '../po-line-note'
 import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
 
 type Warehouse = { id: string; code: string; name: string; availableForPurchaseOrders?: boolean }
@@ -83,6 +84,8 @@ type Props = {
   prepaidReconciliation: PrepaidReconciliationSummary
   /** Setting `purchase_order_email_enabled` (default off): whether Confirm & Send PO and Email PO mail the supplier. */
   poEmailEnabled: boolean
+  /** May this user write the internal per-line notes (purchasing.create). */
+  canEditLineNotes?: boolean
   /** Supplier SKU per product id, from the supplier's product mapping (getSupplierLastPrices). */
   supplierSkus?: Record<string, string | null>
 }
@@ -2049,7 +2052,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled }: Props) {
+export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2637,6 +2640,7 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
                   </TableCell>
                   <TableCell className="px-4">
                     <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                    <PoLineNote lineId={line.id} initial={line.notes} canEdit={canEditLineNotes} />
                   </TableCell>
                   {showBarcodeCol && <TableCell className="px-4 font-mono text-xs" data-testid="po-line-barcode">{line.barcode ?? ''}</TableCell>}
                   {showSupplierSkuCol && <TableCell className="px-4 font-mono text-xs" data-testid="po-line-supplier-sku">{supplierSkus[line.productId] ?? ''}</TableCell>}

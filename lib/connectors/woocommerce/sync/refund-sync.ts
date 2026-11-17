@@ -26,13 +26,32 @@ import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
 type CreateRefundAction = typeof createRefundAction
 
+/**
+ * Map the store's free-text refund reason onto a configured return reason: an ACTIVE reason whose name equals the text, ignoring case and surrounding
+ * whitespace. No match (or no text, or no reason table available to the caller) is null, never a guess and never a new reason. If two active reasons
+ * differ only by case (the Settings screen refuses that, but a direct write could) the first in the configured order wins.
+ */
+export async function resolveReturnReasonId(
+  client: Partial<Pick<typeof db, 'returnReason'>>,
+  text: string | null | undefined,
+): Promise<string | null> {
+  const name = text?.trim()
+  if (!name || !client.returnReason) return null
+  const match = await client.returnReason.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' }, active: true },
+    orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+    select: { id: true },
+  })
+  return match?.id ?? null
+}
+
 export type WcRefundSyncDependencies = {
   // o3d-w00 (Codex r7 #5): the identity an ITEMISED refund line will be re-grossed under is priced by
   // the WRITER now, inside the refund transaction, so this sync reads no tax rates of its own — it
   // states the VAT WooCommerce reported per refunded line and lets the fence there act on it.
   // `organisation` is read only when the order's stored FX rate is unusable (to tell a base-currency order, rate 1,
   // from a foreign one that must be refused): a refund on an order with a usable rate never touches it.
-  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'wmsOperatorTask' | '$transaction'> & Partial<Pick<typeof db, 'organisation'>>
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'wmsOperatorTask' | '$transaction'> & Partial<Pick<typeof db, 'organisation' | 'returnReason'>>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -1145,6 +1164,9 @@ export async function syncWcRefund(
       returnWarehouseId = returnWh?.id
     }
 
+    // The store's refund reason text maps onto a configured return reason only when it matches an ACTIVE reason's name (ignoring case); anything else stays unmapped. Reasons are never created here.
+    const returnReasonId = await resolveReturnReasonId(client, wcRefund.reason)
+
     // Use the createRefund action
     const createRefund = dependencies.createRefund
       ?? (await import('@/app/actions/sales')).createRefund
@@ -1155,7 +1177,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}) },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, ...(returnReasonId ? { returnReasonId } : {}), statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}) },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error
