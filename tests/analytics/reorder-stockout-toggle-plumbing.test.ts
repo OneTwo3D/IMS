@@ -77,3 +77,30 @@ test('the demand chart route carries the toggle from searchParams and omits it w
   assert.equal('ignoreStockouts' in chartFiltersFromSearch({ ignoreStockouts: '0' }), false)
   assert.equal('ignoreStockouts' in chartFiltersFromSearch({}), false)
 })
+
+test('growth percentage is validated and carried by the draft actions, the CSV and the chart, and absent at 0', async () => {
+  const { createReorderPOs } = await import('@/app/actions/forecasting')
+  reportCalls.length = 0
+  await createReorderPOs([], { filters: { growthPercent: 50 } })
+  await createReorderPOs([], { filters: { growthPercent: 9999 } })
+  await createReorderPOs([], { filters: { growthPercent: 'abc' as never } })
+  await createReorderPOs([], { filters: { growthPercent: 0 } })
+  assert.equal(reportCalls[0]!.growthPercent, 50)
+  assert.equal(reportCalls[1]!.growthPercent, 500)
+  for (const call of reportCalls.slice(2)) assert.equal('growthPercent' in call, false)
+
+  const { GET } = await import('@/app/api/export/replenishment/route')
+  reportCalls.length = 0
+  await GET(new NextRequest('http://localhost/api/export/replenishment?type=reorder&growthPercent=25'))
+  await GET(new NextRequest('http://localhost/api/export/replenishment?type=reorder&growthPercent=-200'))
+  await GET(new NextRequest('http://localhost/api/export/replenishment?type=reorder&growthPercent=0'))
+  assert.equal(reportCalls[0]!.growthPercent, 25)
+  assert.equal(reportCalls[1]!.growthPercent, -90)
+  assert.equal('growthPercent' in reportCalls[2]!, false)
+  assert.equal(reportCalls[0]!.includeForecastMoney, true)
+
+  const { chartFiltersFromSearch } = await import('@/app/(dashboard)/analytics/reorder/[productId]/chart-params')
+  assert.equal(chartFiltersFromSearch({ growthPercent: '50' }).growthPercent, 50)
+  assert.equal('growthPercent' in chartFiltersFromSearch({ growthPercent: '0' }), false)
+  assert.equal('growthPercent' in chartFiltersFromSearch({}), false)
+})
