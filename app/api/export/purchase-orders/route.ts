@@ -45,6 +45,8 @@ export async function GET(req: NextRequest) {
       supplier: { select: { name: true } },
       destinationWarehouse: { select: { code: true } },
       lines: {
+        // Stable line order (form order), so an export round-trips and is reproducible.
+        orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
         select: {
           qty: true,
           unitCostForeign: true,

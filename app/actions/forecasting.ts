@@ -15,6 +15,7 @@ import {
   selectReorderPoCandidates,
   type ReorderPoSkip,
 } from '@/lib/domain/purchasing/reorder-po-planning'
+import { growthForCarry } from '@/lib/domain/inventory/forecast-growth'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { ProductType } from '@/app/generated/prisma/client'
 
@@ -24,7 +25,7 @@ import { ProductType } from '@/app/generated/prisma/client'
 // scope, ABC/urgency/search), instead of a separately-recomputed default.
 export type ReorderActionFilters = Pick<
   StockPositionFilters,
-  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'abcClass' | 'urgency' | 'search' | 'ignoreStockouts'
+  'warehouseId' | 'categoryId' | 'supplierId' | 'productType' | 'thresholdDays' | 'targetCoverWeeks' | 'abcClass' | 'urgency' | 'search' | 'ignoreStockouts' | 'growthPercent'
 >
 
 // Server actions can't trust their argument — the ReorderActionFilters type is only a
@@ -49,6 +50,10 @@ function sanitizeReorderActionFilters(filters?: ReorderActionFilters): ReorderAc
     // o3d-s8n.3: only ever the literal `true`, and only added when set, so a call without the toggle
     // produces exactly the object (and the persisted evidence) it always did.
     ...(f.ignoreStockouts === true ? { ignoreStockouts: true } : {}),
+    // validated server-side (non-numeric dropped, out-of-range clamped to -90..+500) and only added
+    // when not 0, so a call without growth produces exactly the object and evidence it always did. Drafts are
+    // computed from the same growth-scaled getReorderReport the operator saw.
+    ...(growthForCarry(f.growthPercent) !== undefined ? { growthPercent: growthForCarry(f.growthPercent) } : {}),
   }
 }
 
