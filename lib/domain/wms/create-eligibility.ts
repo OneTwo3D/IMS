@@ -47,6 +47,9 @@ export const WMS_CREATE_READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
 export const WMS_CREATE_ELIGIBLE_ORDER_FENCES = {
   status: { in: [...WMS_CREATE_READY_STATUSES] },
   paidAt: { not: null },
+  // o3d-cdhl: part of the payment is recorded as no longer held by the accounting ledger. The order is not fully paid, so it
+  // is not pushed to the warehouse until that is settled (the shortfall clears when the ledger holds the full amount again).
+  paymentRemovedForeign: null,
   refundStatus: { not: 'FULL' },
   withdrawalHoldAt: null,
   withdrawalApprovedAt: null,

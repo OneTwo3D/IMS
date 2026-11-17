@@ -2,7 +2,7 @@ import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
-import { getPurchaseOrder } from '@/app/actions/purchase-orders'
+import { getPurchaseOrder, getSupplierLastPrices } from '@/app/actions/purchase-orders'
 import { getRejectedAccountingDocumentUpdateWarnings } from '@/app/actions/accounting-sync'
 import { getWmsPurchaseOrderAsnState } from '@/app/actions/wms-asn'
 import { getSuppliers } from '@/app/actions/suppliers'
@@ -47,6 +47,11 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   ])
 
   if (!po) notFound()
+  // Supplier SKU per product from the existing supplier-product mapping (the loader the PO form uses); a failed read leaves the column empty rather than breaking the page.
+  const supplierSkus: Record<string, string | null> = {}
+  try {
+    for (const [productId, row] of Object.entries(await getSupplierLastPrices(po.supplierId))) supplierSkus[productId] = row.supplierSku
+  } catch { /* column stays empty */ }
   const rejectedAccountingSyncs = await getRejectedAccountingDocumentUpdateWarnings([
     { referenceType: 'PurchaseOrder', referenceId: id },
     ...po.invoices.map((invoice) => ({ referenceType: 'PurchaseInvoice', referenceId: invoice.id })),
@@ -86,7 +91,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} />
     </div>
   )
 }

@@ -179,6 +179,7 @@ type Refund = {
   creditNoteNumber: string | null
   externalRefundId: number | null
   reason: string | null
+  returnReasonId?: string | null
   totalForeign: number
   totalBase: number
   returnWarehouseId: string | null
@@ -970,6 +971,19 @@ test('createSalesOrderRefund creates a partial refund record', async () => {
   assert.equal(state.refundLines[0].qty, 1)
   assert.equal(state.refundLines[0].unitPriceBase, 50)
   assert.equal(state.refundLines[0].salesOrderLineId, 'line-1')
+})
+
+test('a refund carries the structured return reason beside the untouched free-text reason; with none it is null', async () => {
+  const withReason = baseState()
+  const lines = [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }]
+  await createSalesOrderRefund(createClient(withReason), { orderId: 'order-1', lines, reason: 'Box was crushed', returnReasonId: 'rr-damaged', creditNotePrefix: 'CN-' })
+  assert.equal(withReason.refunds[0].returnReasonId, 'rr-damaged')
+  assert.equal(withReason.refunds[0].reason, 'Box was crushed', 'the free-text reason is unchanged')
+
+  const without = baseState()
+  await createSalesOrderRefund(createClient(without), { orderId: 'order-1', lines, reason: 'Customer return', creditNotePrefix: 'CN-' })
+  assert.equal(without.refunds[0].returnReasonId, null)
+  assert.equal(without.refunds[0].reason, 'Customer return')
 })
 
 test('createSalesOrderRefund dual-writes refundStatus=FULL on a full refund', async () => {

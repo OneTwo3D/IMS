@@ -3,6 +3,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { bindingStaleAfterMs } from '@/lib/ops/read-sync-liveness-constants'
+import { escalateAgedRefusedActions, resolveObsoleteRefusedActions, type EscalationClient } from '@/lib/domain/refused-actions'
 
 
 /**
@@ -17,6 +18,10 @@ import { bindingStaleAfterMs } from '@/lib/ops/read-sync-liveness-constants'
  *  2. Stale stock sync — an active binding whose stock sync hasn't completed
  *                        within a multiple of its own configured cadence: the
  *                        cron is dead and drift accumulates undetected.
+ *  3. Aged refusals    — an action a gate refused (a warehouse amendment past NEW,
+ *                        a split order with a cancelled part) that has stood past
+ *                        its severity's age. One alert per record
+ *                        (lib/domain/refused-actions.ts).
  *
  * Each breach alerts ONCE (WARNING activity + individual admin bell), deduped
  * by a stamp on the entity that clears when the condition heals (a fresh
@@ -106,6 +111,8 @@ export type WmsWatchdogResult = {
   status: 'SKIPPED' | 'SUCCEEDED' | 'FAILED'
   overdueAsnAlerts: number
   staleBindingAlerts: number
+  /** Refused or stalled actions (an amendment the warehouse could not take, a split order that cannot complete) that stood past their severity's age and were alerted. */
+  refusedActionAlerts?: number
   deliveryFailures?: number
   reason?: string
 }
@@ -391,11 +398,23 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     staleBindingAlerts += 1
   }
 
+  // 3 — refused or stalled actions. Rows whose order no longer needs the action are closed first, then each row past its severity's age is alerted once.
+  let refusedActionAlerts = 0
+  try {
+    await resolveObsoleteRefusedActions(db)
+    const escalation = await escalateAgedRefusedActions(db as unknown as EscalationClient, notifyActiveAdmins, now, (error) => error instanceof NoActiveAdminsError)
+    refusedActionAlerts = escalation.alerts
+    deliveryFailures += escalation.deliveryFailures
+  } catch (refusalError) {
+    deliveryFailures += 1
+    console.error('[wms-watchdog] refused-action escalation failed:', refusalError)
+  }
+
   // Any undelivered breach fails the run (Codex r6): the cron route maps
   // FAILED to HTTP 500, so scheduler monitoring goes red instead of reporting
   // a healthy watchdog that alerted no one. Un-claimed breaches retry next run.
   if (deliveryFailures > 0) {
-    return { status: 'FAILED', overdueAsnAlerts, staleBindingAlerts, deliveryFailures, reason: `${deliveryFailures} breach alert(s) could not be delivered` }
+    return { status: 'FAILED', overdueAsnAlerts, staleBindingAlerts, refusedActionAlerts, deliveryFailures, reason: `${deliveryFailures} breach alert(s) could not be delivered` }
   }
-  return { status: 'SUCCEEDED', overdueAsnAlerts, staleBindingAlerts }
+  return { status: 'SUCCEEDED', overdueAsnAlerts, staleBindingAlerts, refusedActionAlerts }
 }

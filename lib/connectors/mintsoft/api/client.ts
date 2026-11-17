@@ -1,7 +1,7 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from './auth-no-login'
 import { BUNDLE_CLAIM_CHANGED_TEXT } from '../sync/bundle-create-outcome'
-import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDeleteResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   readMintsoftAsnItemExpectedQuantity,
   readMintsoftAsnItemLineIdentity,
@@ -327,6 +327,8 @@ function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolea
   if (product.widthCm != null) payload.Width = product.widthCm
   if (product.depthCm != null) payload.Depth = product.depthCm
   if (product.imageUrl) payload.ImageURL = product.imageUrl
+  // Only ever present under the product parity setting (the DTO has no costPrice key otherwise), so with it off this never fires.
+  if (product.costPrice != null) payload.CostPrice = product.costPrice
   if (product.commodityCode) payload.CommodityCode = { Code: product.commodityCode }
   if (product.countryOfManufacture) payload.CountryOfManufacture = { Code: product.countryOfManufacture }
 
@@ -608,6 +610,21 @@ export async function upsertMintsoftProduct(
   }
 
   return normalized
+}
+
+/**
+ * `DELETE /api/Product/{id}`: removes a product record. Mintsoft answers `{ Success, Message }`; a refusal (the record is linked to
+ * orders or bundles) is `Success: false` and is returned, never thrown, so the caller records it and deletes nothing else.
+ */
+export async function deleteMintsoftProduct(externalProductId: string): Promise<WmsProductDeleteResult> {
+  const id = externalProductId.trim()
+  if (!/^\d+$/.test(id)) return { deleted: false, message: 'The Mintsoft product id is not a number; nothing was sent.' }
+  const result = await mintsoftRequest<unknown>(`/api/Product/${id}`, { method: 'DELETE' })
+  if (result.held) return { deleted: false, held: true, message: result.error ?? 'The outbound-write hold refused the request.' }
+  if (result.error) throw new Error(result.error)
+  const body = result.data as { Success?: unknown; Message?: unknown } | null
+  if (body && typeof body === 'object' && body.Success === true) return { deleted: true }
+  return { deleted: false, message: typeof body?.Message === 'string' && body.Message ? body.Message : 'Mintsoft did not confirm the deletion.' }
 }
 
 export async function createMintsoftAsn(input: WmsAsnInput): Promise<WmsAsnRef> {
