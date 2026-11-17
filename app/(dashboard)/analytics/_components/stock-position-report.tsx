@@ -55,6 +55,8 @@ export type StockPositionFilterValues = {
   ignoreStockouts?: boolean
   // reorder-only: 'supplier' lays the rows out supplier by supplier.
   groupBy?: string
+  // reorder-only growth percentage, carried as typed so the page address and CSV link keep it.
+  growthPercent?: string
 }
 
 /** Optional grouped layout: each group is a header row (spanning every column) followed by its rows. Reorder uses it for the supplier view. */

@@ -82,19 +82,35 @@ export function parseDiscountDecimal(input: string | null | undefined, lineGross
   return isPct ? lineGross.mul(n).div(100) : n
 }
 
+export type ExVatListPriceInput = Pick<LineMarginInput, 'salesPrice' | 'salesPriceTaxInclusive' | 'salesVatRate'>
+
+/**
+ * The product's default list price, ex-VAT, base currency. A price stored VAT-inclusive is divided by
+ * (1 + the sales VAT rate); with no resolved rate it refuses rather than guessing. Shared by the PO line
+ * margin and the Reorder Planning forecast money so the two cannot disagree on a product's price.
+ */
+export function resolveExVatListPrice(
+  input: ExVatListPriceInput,
+): { kind: 'ok'; price: Decimal } | { kind: 'refused'; reason: 'no-sales-price' | 'sales-vat-unresolved' } {
+  const hasSalesPrice = input.salesPrice != null && toDecimal(input.salesPrice).gt(0)
+  if (!hasSalesPrice) return { kind: 'refused', reason: 'no-sales-price' }
+  let price = toDecimal(input.salesPrice)
+  if (input.salesPriceTaxInclusive) {
+    if (input.salesVatRate == null) return { kind: 'refused', reason: 'sales-vat-unresolved' }
+    const vat = toDecimal(input.salesVatRate)
+    if (vat.lt(0)) return { kind: 'refused', reason: 'sales-vat-unresolved' }
+    price = price.div(vat.add(1))
+  }
+  return { kind: 'ok', price }
+}
+
 export function computeLineMargin(input: LineMarginInput): LineMarginResult {
   const fx = input.fxRate == null ? null : toDecimal(input.fxRate)
   if (fx === null || !fx.gt(0)) return refused('rate-unavailable')
 
-  const hasSalesPrice = input.salesPrice != null && toDecimal(input.salesPrice).gt(0)
-  if (!hasSalesPrice) return refused('no-sales-price')
-  let price = toDecimal(input.salesPrice)
-  if (input.salesPriceTaxInclusive) {
-    if (input.salesVatRate == null) return refused('sales-vat-unresolved')
-    const vat = toDecimal(input.salesVatRate)
-    if (vat.lt(0)) return refused('sales-vat-unresolved')
-    price = price.div(vat.add(1))
-  }
+  const listPrice = resolveExVatListPrice(input)
+  if (listPrice.kind === 'refused') return refused(listPrice.reason)
+  const price = listPrice.price
 
   const qty = toDecimal(input.qty)
   const unitCost = toDecimal(input.unitCost)

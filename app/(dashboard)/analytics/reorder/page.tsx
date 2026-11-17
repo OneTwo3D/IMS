@@ -17,6 +17,9 @@ import { BarChart3 } from 'lucide-react'
 import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
 import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { hasPermission } from '@/lib/permissions'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { growthForCarry, MAX_GROWTH_PERCENT, MIN_GROWTH_PERCENT } from '@/lib/domain/inventory/forecast-growth'
+import { formatMoneyCodeExact, moneyCodeFractionDigits } from '@/lib/utils'
 import { getForecastSettings } from '@/app/actions/forecasting'
 import { HistoricalImportTrigger } from './historical-import-trigger'
 import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-context'
@@ -71,6 +74,8 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
     targetCoverWeeks: positiveInteger(one(searchParams.targetCoverWeeks)),
     includeZero: one(searchParams.includeZero) === '1',
     ...(one(searchParams.ignoreStockouts) === '1' ? { ignoreStockouts: true } : {}),
+    // validated again (and clamped) inside getReorderReport; 0 is carried as absent.
+    ...(growthForCarry(one(searchParams.growthPercent)) !== undefined ? { growthPercent: growthForCarry(one(searchParams.growthPercent)) } : {}),
     page: Number(one(searchParams.page) ?? 1),
     pageSize: Number(one(searchParams.pageSize) ?? 100),
   }
@@ -145,6 +150,14 @@ function DailyDemandCell({ row }: { row: ReorderReportRow }) {
   )
 }
 
+/** Forecast sales / margin: base-currency ex-VAT estimate, or the muted word "unavailable" with the reason. */
+function ForecastMoneyCell({ value, reason, currency }: { value: string | null | undefined; reason: string | null | undefined; currency: string }) {
+  if (value == null) {
+    return <span className="text-muted-foreground" title={reason ?? undefined}>unavailable</span>
+  }
+  return <>{formatMoneyCodeExact(value, currency, { fractionDigits: moneyCodeFractionDigits(currency) })}</>
+}
+
 function urgencyLabel(urgency: ReorderReportRow['urgency']): string {
   return urgency === 'critical' ? 'Critical' : urgency === 'reorder' ? 'Reorder' : 'Watch'
 }
@@ -157,7 +170,10 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
   // the trigger, so FINANCE never hits the analytics permission check.
   const canImportHistory = hasPermission(session.user.role, 'sync')
   const resolvedSearchParams = await searchParams
-  const filters = filtersFromSearch(resolvedSearchParams)
+  // Forecast sales / margin are price and cost figures: shown only to roles holding inventory.prices.
+  const canSeeMoney = hasPermission(session.user.role, 'inventory.prices')
+  const filters = { ...filtersFromSearch(resolvedSearchParams), ...(canSeeMoney ? { includeForecastMoney: true } : {}) }
+  const baseCurrency = canSeeMoney ? await getBaseCurrencyCode() : ''
   // Grouped view: every row for the filters is loaded (not one page) so a supplier's group and its total are complete.
   const groupBySupplier = one(resolvedSearchParams.groupBy) === 'supplier'
   const [report, filterOptions, importSettings] = await Promise.all([
@@ -181,6 +197,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     includeZero: filters.includeZero,
     ignoreStockouts: filters.ignoreStockouts,
     groupBy: groupBySupplier ? 'supplier' : undefined,
+    growthPercent: filters.growthPercent == null ? undefined : String(filters.growthPercent),
     pageSize: String(filters.pageSize ?? 100),
   }
   // Carry the filters that shape one product's figures into the demand chart drill-down.
@@ -192,6 +209,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     thresholdDays: filters.thresholdDays,
     targetCoverWeeks: filters.targetCoverWeeks,
     ignoreStockouts: filters.ignoreStockouts,
+    growthPercent: filters.growthPercent,
   }).toString()
   const columns: Array<StockPositionColumn<ReorderReportRow>> = [
     {
@@ -225,6 +243,20 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       ) : row.reorderPoint,
     },
     { key: 'suggested', label: 'Suggested qty', align: 'right', render: (row) => row.suggestedReorderQty, footer: report.totals.suggestedReorderQty },
+    ...(canSeeMoney ? [
+      {
+        key: 'forecastSales',
+        label: 'Forecast sales',
+        align: 'right' as const,
+        render: (row: ReorderReportRow) => <ForecastMoneyCell value={row.forecastSales} reason={row.forecastSalesUnavailable} currency={baseCurrency} />,
+      },
+      {
+        key: 'forecastMargin',
+        label: 'Forecast margin',
+        align: 'right' as const,
+        render: (row: ReorderReportRow) => <ForecastMoneyCell value={row.forecastMargin} reason={row.forecastMarginUnavailable} currency={baseCurrency} />,
+      },
+    ] : []),
     {
       key: 'orderQty',
       label: 'Order qty',
@@ -290,6 +322,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     search: filters.search,
     // The draft PO / MO quantities must use the demand the operator is looking at.
     ...(filters.ignoreStockouts ? { ignoreStockouts: true } : {}),
+    ...(filters.growthPercent !== undefined ? { growthPercent: filters.growthPercent } : {}),
   }
   const visibleProductIds = report.rows.map((row) => row.productId)
   // Hydrate selection from the URL, but only for ids still on the current page
@@ -363,6 +396,10 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
             <input type="checkbox" name="groupBy" value="supplier" defaultChecked={groupBySupplier} className="rounded border-input" />
             Group by supplier
           </label>
+          <div className="space-y-1.5">
+            <label htmlFor="growthPercent" className="text-sm font-medium" title="Scales the calculated daily demand by 1 + growth/100 before the suggested quantity, dates and forecast figures are worked out. For a promotion or a seasonal peak. Not saved: it applies to this view only. Leave empty for none.">Growth %</label>
+            <input id="growthPercent" name="growthPercent" type="number" min={MIN_GROWTH_PERCENT} max={MAX_GROWTH_PERCENT} step="any" placeholder="0" defaultValue={filtersForUi.growthPercent ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm" />
+          </div>
           <label className="flex items-center gap-2 self-end pb-2 text-sm" title="Remove days with no on-hand stock (from the daily inventory snapshots) from the demand average. Days without a snapshot are not counted as stockouts.">
             <input type="checkbox" name="ignoreStockouts" value="1" defaultChecked={filtersForUi.ignoreStockouts} className="rounded border-input" />
             Ignore stockouts
