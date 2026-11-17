@@ -151,6 +151,7 @@ import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantitie
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
 import { computeReturnCreditNoteDraft } from '@/lib/domain/purchasing/return-credit-note'
 import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
+import { checkReceiptLocations, refuseRestrictedDestination } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 import {
   validateLinkedFreightReceiptStatus,
   validatePurchaseOrderStatusTransition,
@@ -194,6 +195,8 @@ export type PoLineRow = {
   sku: string
   productName: string
   imageUrl: string | null
+  /** Product.barcode; null when the variant has none (the page shows an empty cell). */
+  barcode: string | null
   description: string | null
   qty: number
   unitCostForeign: number
@@ -496,7 +499,7 @@ const PO_SELECT = {
       taxRateId: true,
       taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
       landedUnitCostBase: true,
-      product: { select: { sku: true, name: true, imageUrl: true, weight: true, parent: { select: { imageUrl: true } } } },
+      product: { select: { sku: true, name: true, imageUrl: true, barcode: true, weight: true, parent: { select: { imageUrl: true } } } },
     },
     orderBy: { sortOrder: 'asc' as const },
   },
@@ -609,7 +612,7 @@ function mapLine(l: {
   expectedDelivery?: Date | null
   taxRateId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
-  product: { sku: string; name: string; imageUrl: string | null; parent?: { imageUrl: string | null } | null }
+  product: { sku: string; name: string; imageUrl: string | null; barcode?: string | null; parent?: { imageUrl: string | null } | null }
 }, headerEta: Date | null = null): PoLineRow {
   const qty = Number(l.qty)
   const qtyReceived = Number(l.qtyReceived)
@@ -620,6 +623,7 @@ function mapLine(l: {
     sku: l.product.sku,
     productName: l.product.name,
     imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
+    barcode: l.product.barcode ?? null,
     description: l.description,
     qty,
     unitCostForeign: Number(l.unitCostForeign),
@@ -1313,6 +1317,9 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
       if (l.unitCostForeign < 0) return { success: false, error: `Negative cost for ${l.sku}` }
     }
+    // A warehouse with "Available in purchase orders" off cannot be a new order's destination.
+    const restrictedDestination = await refuseRestrictedDestination(db, input.destinationWarehouseId)
+    if (restrictedDestination) return { success: false, error: restrictedDestination }
 
     const baseCurrency = await getBaseCurrencyCode()
     const fxRate = await resolvePurchaseOrderFxRateToBase(db, {
@@ -1688,6 +1695,10 @@ export async function updatePurchaseOrder(
       if (!isPurchaseOrderEditableStatus(locked.status)) return { refused: PO_EDIT_REFUSED_STATUS_MESSAGE }
       // A freight order is edited through its own cost editor once it has left Draft (it has no goods lines to amend).
       if (locked.type === 'FREIGHT' && locked.status !== 'DRAFT') return { refused: PO_EDIT_REFUSED_STATUS_MESSAGE }
+      // Changing the destination to a warehouse that is not available for purchase orders is refused; an order that
+      // already points at one keeps it (the unchanged value passes).
+      const restrictedDestination = await refuseRestrictedDestination(tx, requestedEdit.destinationWarehouseId, locked.destinationWarehouseId)
+      if (restrictedDestination) return { refused: restrictedDestination }
 
       // WHICH EDIT THIS IS, decided from facts read under the lock (lib/domain/purchasing/po-edit-plan.ts). A PRISTINE order
       // — no receipt, bill, return, landed quantity or ASN row of any state — gets the full edit below in every editable
@@ -2419,6 +2430,12 @@ export async function receivePurchaseOrder(
     const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
     const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
 
+    // "Available in purchase orders": a restricted warehouse is refused as a receipt location unless it is this order's own
+    // destination (an order placed before the flag was turned off still receives, with a warning). WMS-driven receipts
+    // (ASN / book-in) never come through here.
+    const receiptLocations = await checkReceiptLocations(db, po.destinationWarehouseId, linesWithQty.map((rl) => rl.warehouseId))
+    if (receiptLocations.refusal) return { success: false, error: receiptLocations.refusal }
+
     // Per-row sanity: warehouse present, PO line exists.
     for (const rl of linesWithQty) {
       if (!rl.warehouseId) return { success: false, error: 'Warehouse is required for each line' }
@@ -2960,7 +2977,7 @@ export async function receivePurchaseOrder(
 
     // A negative landed cost larger than the goods cost was held at zero (see allocateLandedCost). The
     // operator is told in the result and the durable WARNING is written now, AFTER the commit.
-    const warnings: string[] = []
+    const warnings: string[] = [...receiptLocations.warnings]
     if (receiptResult.creditFloorEntries.length > 0) {
       warnings.push(await logFlooredLandedCredit({
         purchaseOrderId: id,

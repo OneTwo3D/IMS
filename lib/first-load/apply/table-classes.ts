@@ -91,6 +91,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   purchase_returns: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
   purchase_units: { kind: 'CONFIG_ALLOWED', reason: 'configured units of measure' },
   refused_actions: { kind: 'MUST_BE_EMPTY', reason: 'refused-or-stalled action records: runtime state a first load starts empty' },
+  xero_payment_matches: { kind: 'MUST_BE_EMPTY', reason: 'Xero customer-payment matching results: runtime state a first load starts empty' },
   return_expectation_lines: { kind: 'MUST_BE_EMPTY', reason: 'return expectations: goods a refund sent back that have not arrived' },
   return_expectations: { kind: 'MUST_BE_EMPTY', reason: 'return expectations: goods a refund sent back that have not arrived' },
   sales_order_invoice_documents: { kind: 'MUST_BE_EMPTY', reason: 'customer invoice documents fetched from the ledger for existing orders' },
