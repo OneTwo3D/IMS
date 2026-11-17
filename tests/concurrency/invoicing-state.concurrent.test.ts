@@ -247,3 +247,32 @@ test('[invoicing state] MIGRATION BACKFILL: the migration\'s own UPDATE marks ex
   const { recomputeSalesOrderInvoicingState } = await import('@/lib/domain/sales/invoicing-state')
   for (const id of ids) assert.equal((await recomputeSalesOrderInvoicingState(db as never, id)).changed, false, id)
 })
+
+test('[invoicing state] LOCK ORDER: the held-backlog retirement takes the order lock BEFORE it locks the sync row, so it cannot deadlock with a cancellation of the same invoice', { skip }, async (t) => {
+  const db = await loadDb()
+  const { applyHeldBacklogRetirement } = await import('@/lib/domain/outbound-shadow/retire-held-backlog')
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const id = await makeOrder(db, t)
+  const row = await db.accountingSyncLog.create({ data: { connector: 'xero', type: 'SALES_INVOICE', status: 'PENDING', referenceType: 'SalesOrder', referenceId: id, payload: payload(3, randomUUID()) } })
+  const plan = {
+    generatedAt: new Date(), truncated: {}, unscoped: [],
+    items: [{ destination: 'xero', kind: 'xero_sync_log', id: row.id, subject: 'invoice', createdAt: row.createdAt, status: 'PENDING', classification: { disposition: 'PARK', reason: 'test' } }],
+  }
+  const scope = { destinations: ['xero'], cutoffs: { xero: new Date(Date.now() + 60_000) }, allQueued: true, limit: 10 }
+  let retirement: Promise<{ outcomes: { result: string }[] }> | undefined
+  let parked: { observedAfterMs: number } | undefined
+  // The CANCELLATION holds the order lock and then writes the invoice row. The retirement must queue behind the ORDER lock before it locks the row; locking the row first
+  // is the reverse order, and each side would wait for the lock the other holds (Postgres aborts one of them).
+  await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, id)
+    const holder = await backendPid(tx)
+    retirement = applyHeldBacklogRetirement(plan as never, scope as never, { client: db as never }) as never
+    parked = await waitUntilParkedBehind(db, { holderPid: holder, waitingOn: FOR_UPDATE, describe: 'retirement behind the cancellation\'s order lock' })
+    await tx.accountingSyncLog.updateMany({ where: { id: row.id }, data: { status: 'CANCELLED', attemptRevision: { increment: 1 } } })
+    await tx.salesOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
+  })
+  const result = await retirement!
+  assert.ok(parked, 'the retirement parked behind the order lock before it locked the row')
+  assert.deepEqual(result.outcomes.map((o) => o.result), ['changed_since_plan'], 'it then found the row already retired and changed nothing')
+  assert.equal(await stateOf(db, id), 'NOT_INVOICED')
+})

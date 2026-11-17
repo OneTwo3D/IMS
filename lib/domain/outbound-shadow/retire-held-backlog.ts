@@ -436,6 +436,10 @@ function retirementDecision(destination: OutboundConnector, operation: string, s
 }
 
 async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementItem, scope: RetirementScope, now: Date): Promise<RetirementOutcome> {
+  // CANONICAL LOCK ORDER: THE SALES ORDER FIRST, THEN THE SYNC ROW (cancellation's order). The row's order is resolved by an unlocked read, locked, and only then is
+  // the row locked and re-read under the guards below (so a row that moved in between is simply re-classified). lib/domain/sales/invoicing-state.ts.
+  const owner = await tx.accountingSyncLog.findUnique({ where: { id: item.id }, select: { type: true, referenceType: true, referenceId: true } })
+  if (owner) await lockOrderForRow(tx, owner)
   // Under a row lock, and re-derived: the row must still be Xero's, still queued, and still created before the effective cut-off.
   await tx.$queryRaw`SELECT id FROM accounting_sync_logs WHERE id = ${item.id} FOR UPDATE`
   const row = await tx.accountingSyncLog.findUnique({
