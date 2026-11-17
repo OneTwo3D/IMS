@@ -70,6 +70,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   needs_attention_announcements: { kind: 'CONFIG_ALLOWED', reason: 'which failing rows the bell has announced: operational state of the announcer, ids only, starts empty, no business data' },
   notifications: { kind: 'CONFIG_ALLOWED', reason: 'operator notifications, no business data' },
   one_time_tokens: { kind: 'CONFIG_ALLOWED', reason: 'login and invitation tokens' },
+  order_attachments: { kind: 'MUST_BE_EMPTY', reason: 'supporting documents attached to purchase and sales orders: uploaded by staff, business data this runner never writes (the files are not part of any import)' },
   order_allocations: { kind: 'MUST_BE_EMPTY', reason: 'sales-order stock allocations' },
   organisations: { kind: 'CONFIG_ALLOWED', reason: 'the company record (base currency); seeded' },
   outbound_shadow_writes: { kind: 'MUST_BE_EMPTY', reason: 'outbound-write shadow record' },

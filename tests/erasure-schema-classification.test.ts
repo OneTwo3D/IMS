@@ -137,6 +137,8 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   'Session.userId': 'not-customer',
   'ActivityLog.userId': 'not-customer',
   'Notification.userId': 'not-customer',
+  // the staff user who attached a supporting document to a purchase or sales order (no foreign key)
+  'OrderAttachment.uploadedByUserId': 'not-customer',
   'NotificationReadReceipt.userId': 'not-customer',
 }
 
@@ -161,4 +163,14 @@ test('the erasure deletes the storefront account link rows and does not keep the
   const src = readFileSync(new URL('../lib/domain/erasure/erase-personal-data.ts', import.meta.url), 'utf8')
   assert.match(src, /tx\.shoppingCustomerLink\.deleteMany\(\{ where: \{ customerId \} \}\)/)
   assert.match(src, /externalCustomerId: null/)
+})
+
+test('order attachments: a sales order\'s attachments are deleted by the erasure (rows and files), classified, and reached only through the sales order', () => {
+  const src = readFileSync(new URL('../lib/domain/erasure/erase-personal-data.ts', import.meta.url), 'utf8')
+  assert.match(src, /deleteSalesOrderAttachmentsInTx\(tx, ids\)/, 'the erasure core deletes the attachment rows of the erased orders')
+  assert.match(src, /removeOrderAttachmentFiles\(storedNames\)/, 'and removes their files, after the commit')
+  assert.ok(ERASURE_CLASSIFICATION.OrderAttachment!.erased.includes('originalFilename'), 'a file name can carry a name')
+  const domain = readFileSync(new URL('../lib/domain/order-attachments/index.ts', import.meta.url), 'utf8')
+  assert.match(domain, /tx\.orderAttachment\.deleteMany/, 'deleted outright, soft-deleted rows included')
+  assert.doesNotMatch(domain.slice(domain.indexOf('deleteSalesOrderAttachmentsInTx')), /deletedAt:\s*null/, 'a soft-deleted attachment is erased too')
 })

@@ -548,6 +548,17 @@ Three PDF documents are available for each sales order:
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
 
+## Attachments
+
+Every sales order page has an **Attachments** card under the order, for documents that belong to it: a customer's purchase order, an email thread, a proof of delivery or a photo of damage.
+
+- **Upload** -- Anyone who can create or process sales orders (administrators, managers and warehouse users) sees an **Upload** button. Accepted: PDF, images (PNG, JPEG, GIF, WebP), CSV, Excel (.xlsx), Word (.docx) and email (.eml, .msg), up to **20 MB** each. IMS checks the content of the file, not just its name, and refuses a file that is not what its name says.
+- **Download** -- Anyone who can view sales orders sees the list and a **Download** button. A file always downloads; it is never opened in the browser.
+- **Delete** -- The **Delete** button asks you to confirm. A deleted attachment disappears from the list and cannot be downloaded; the file is kept on the server and the row is only marked deleted.
+- **They can hold personal data.** A customer's purchase order or an email can carry a name, address or phone number. When a customer is erased (**GDPR Anonymise**, or WooCommerce anonymising an order that IMS mirrors) every attachment of their orders is **deleted for good**, deleted ones included, together with its file. An anonymised order takes no new attachment. Attachments do not go to WooCommerce, Mintsoft or Xero. See [Personal-data erasure](erasure.md).
+- Deleting a draft order deletes its attachments too.
+- **Backups:** the files are in the server's upload folder (`UPLOAD_STORAGE_DIR`, under `order-attachments`), not in the database; a database backup does not contain them. After a restore, an attachment whose file was not restored shows in the list but fails to download. See [Backup & Restore](backup-restore.md).
+
 ## Other Actions
 
 - **Clone an order** to quickly create a new order based on an existing one

@@ -1064,7 +1064,7 @@ the client sends.
 | `/opt/one-two-inventory/.env` | Environment configuration (chmod 600) |
 | `/var/lib/one-two-inventory/backups` | Runtime backup storage directory used by backup create/restore/upload flows |
 | `/var/lib/one-two-inventory/invoice-pdfs` | Accounting connector invoice PDFs served through signed invoice links |
-| `/var/lib/one-two-inventory/uploads` | Private uploaded files served through authenticated routes, such as supplier invoice PDFs |
+| `/var/lib/one-two-inventory/uploads` | Private uploaded files served through authenticated routes, such as supplier invoice PDFs and, under `order-attachments/`, the supporting documents attached to purchase and sales orders (**in the backup set**: see backup-restore.md; the files are not in the database backup) |
 | `/var/lib/one-two-inventory/public-uploads/branding` | Logo and branding images served through `/api/uploads/branding/*` |
 | `/var/lib/one-two-inventory/public-uploads/avatars` | User avatar images served through `/uploads/avatars/*` |
 | `/var/lib/one-two-inventory` | Persistent data directory |

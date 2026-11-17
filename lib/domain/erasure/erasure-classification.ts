@@ -157,6 +157,15 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     notPersonal: ['id', 'connector', 'orderId', 'externalOrderId', 'queryText', 'payload', 'contentHash', 'doneBy'],
     retained: {},
   },
+  // Supporting documents attached to an order. A SALES order's attachment can hold the customer's personal data in its CONTENT (a customer purchase order, an
+  // email, a proof of address), which cannot be redacted, so an erasure DELETES the rows (live and soft-deleted) and the files of the erased orders
+  // (deleteSalesOrderAttachmentsInTx + removeOrderAttachmentFiles). The original file name can carry a name and goes with the row. A PURCHASE order's
+  // attachments are supplier-side commercial documents, not personal data of a customer, and are not reached by an erasure (a purchase order has no customer link).
+  OrderAttachment: {
+    erased: ['originalFilename'],
+    notPersonal: ['id', 'storedName', 'mimeType', 'sha256', 'uploadedByUserId'],
+    retained: {},
+  },
   WmsReturnsInbox: {
     erased: ['reason', 'rawPayload', 'resolutionNote'],
     notPersonal: ['connector', 'externalReturnId', 'sku', 'reference', 'resolvedBy'],

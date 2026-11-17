@@ -379,6 +379,14 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission; prints only the orders named in the request (capped).',
   },
+  '/api/order-attachments/[kind]/[orderId]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated session holding the edit permission for the order type (purchasing for purchase orders, sales for sales orders) before accepting a supporting document; type and size are validated from the bytes.',
+  },
+  '/api/order-attachments/[kind]/[orderId]/[id]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated session holding the view permission (download) or edit permission (delete) for the order type; the file is found by attachment id within its own order, never by name, and served as a nosniff attachment.',
+  },
   '/api/preview/document': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with settings permission.',

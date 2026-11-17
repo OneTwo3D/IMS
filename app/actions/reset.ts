@@ -19,6 +19,7 @@ import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { InvoiceDocumentsRetainedError, invoiceDocumentResetVerdict } from '@/lib/domain/invoice-documents/reset-guard'
 import { AdvisoryLockWaitTimeoutError, lockResetInTransaction, withInvoiceDocumentResetLock } from '@/lib/domain/invoice-documents/reset-lock'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
+import { removeOrderAttachmentFiles } from '@/lib/order-attachment-storage'
 import {
   countUnrecordedIncidents,
   describePreservedUnrecordedIncidents,
@@ -107,6 +108,8 @@ async function clearTransactionScope(guards: ResetGuards) {
   // lock still being alive: a promotion cannot commit between the verdict and the order delete (it takes both keys shared), and a refusal
   // rolls the whole stage back. The stages before and after it are separate statements that commit one by one; see the note on resetDatabase.
   guards.assertHeld('sales')
+  // Order attachment rows go with their orders (cascade); their files are removed once no row names them (below).
+  const attachmentStoredNames = (await db.orderAttachment.findMany({ select: { storedName: true } })).map((r) => r.storedName)
   await db.$transaction(async (tx) => {
     await lockResetInTransaction(tx)
     const verdict = await invoiceDocumentResetVerdict(tx)
@@ -153,6 +156,10 @@ async function clearTransactionScope(guards: ResetGuards) {
   await db.landedCostLink.deleteMany({})
   await db.purchaseOrderLine.deleteMany({})
   await db.purchaseOrder.deleteMany({})
+  if (attachmentStoredNames.length > 0) {
+    const stillNamed = new Set((await db.orderAttachment.findMany({ where: { storedName: { in: attachmentStoredNames } }, select: { storedName: true } })).map((r) => r.storedName))
+    await removeOrderAttachmentFiles(attachmentStoredNames.filter((name) => !stillNamed.has(name)))
+  }
 
   guards.assertHeld('manufacturing and warehouse ops')
   // Manufacturing / warehouse ops

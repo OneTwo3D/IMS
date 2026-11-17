@@ -1358,6 +1358,7 @@ model PurchaseOrder {
   invoices        PurchaseInvoice[]
   returns         PurchaseReturn[]
   supplierCreditNotes SupplierCreditNote[]
+  attachments     OrderAttachment[]
 
   // Landed cost links — this PO as primary
   landedCostLinks LandedCostLink[]   @relation("PrimaryPO")
@@ -2128,6 +2129,7 @@ model SalesOrder {
   refunds           SalesOrderRefund[]
   returnExpectations ReturnExpectation[]
   invoiceDocuments  SalesOrderInvoiceDocument[]
+  attachments       OrderAttachment[]
   invoiceDocumentFetches InvoiceDocumentFetchState[]
   invoiceStorePublication InvoiceStorePublication?
   payments          Payment[]
@@ -2385,6 +2387,36 @@ enum InvoiceDocumentFetchStatus {
 ///
 /// This table is the READ side only. It does not write `SalesOrder.accountingInvoiceId` (the ledger document
 /// may be one IMS did not post, and that column drives payment polling and updates).
+/// A supporting document (supplier quote, proforma, packing list, customer PO, email) attached to ONE purchase order OR ONE sales order.
+/// Exactly one of purchase_order_id / sales_order_id is set (a CHECK constraint in the migration enforces it). The bytes live in the private upload
+/// root under order-attachments/<storedName>; the row is the only thing that names the file, and every read goes by this row's id, never by a name.
+/// Soft delete (deletedAt): a deleted row is hidden and its download is refused; the file stays on disk (an operator can recover it) until an erasure or a purge removes it. A sales order's
+/// attachments can hold customer personal data, so a personal-data erasure DELETES the rows and files of the erased orders.
+/// Not pushed to Xero in v1 (the ledger's attachment path is untouched).
+model OrderAttachment {
+  id               String    @id @default(cuid())
+  purchaseOrderId  String?   @map("purchase_order_id")
+  salesOrderId     String?   @map("sales_order_id")
+  /// The name the uploader's browser sent. Shown and offered as the download name after sanitising; never used to locate the file.
+  originalFilename String    @map("original_filename")
+  /// Random, server-chosen file name inside the attachments directory (a uuid plus the extension of the verified type).
+  storedName       String    @unique @map("stored_name")
+  mimeType         String    @map("mime_type")
+  byteSize         Int       @map("byte_size")
+  sha256           String
+  /// The staff user who uploaded it. A plain id (no foreign key) so removing a user never touches the document record.
+  uploadedByUserId String    @map("uploaded_by_user_id")
+  uploadedAt       DateTime  @default(now()) @map("uploaded_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  salesOrder    SalesOrder?    @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderId, deletedAt])
+  @@index([salesOrderId, deletedAt])
+  @@map("order_attachments")
+}
+
 model SalesOrderInvoiceDocument {
   id                 String              @id @default(cuid())
   orderId            String              @map("order_id")

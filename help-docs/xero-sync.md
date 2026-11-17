@@ -822,6 +822,10 @@ And the check costs one extra Xero API call per sales-invoice create, which coun
 > re-imported, backfilled or re-queued, and treat a refusal as the system working. Switch xeroom off
 > for the orders IMS will handle before enabling Sales Invoices against the live organisation.
 
+## Order attachments are not sent to Xero
+
+Files attached to purchase and sales orders (the **Attachments** card on the order page) are **never** pushed to Xero in this version. They stay in IMS. The existing bill-attachment follow-up (`BILL_ATTACHMENT`, which attaches a supplier invoice PDF to the bill) is unchanged and does not read order attachments. Whether supplier documents should follow the bill into Xero is an open decision for the owner; until it is made, attach the document in Xero by hand if the accountant needs it there.
+
 ## Multi-Currency FX Rates
 
 Every sales invoice, purchase bill, credit note and **payment** pushed to Xero is stamped with a `CurrencyRate` derived from IMS's own rate: a document's stored `fxRateToBase` (SalesOrder, PurchaseOrder, SalesOrderRefund), a payment's settlement rate. This stops Xero from substituting its own daily XE.com rate, which previously caused 1–3 % drift between IMS base totals and Xero base totals on the same multi-currency document. **A foreign-currency document or payment without a usable IMS rate is never sent**: it is refused (see the table below), because leaving `CurrencyRate` out is exactly what makes Xero apply its own rate.

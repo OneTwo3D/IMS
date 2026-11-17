@@ -21,6 +21,8 @@ import { getShopRefundDueForSalesOrder } from '@/app/actions/shop-refund-tasks'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { listOrderAttachments, canEditOrderAttachments, canViewOrderAttachments } from '@/lib/domain/order-attachments'
+import { OrderAttachmentsCard } from '@/components/orders/order-attachments-card'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -69,6 +71,10 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     warehouseIds: stockWarehouseIds,
   })
 
+  // Supporting documents (a customer purchase order, an email): the routes re-check both permissions.
+  const attachments = canViewOrderAttachments(session.user.role, 'sales') ? await listOrderAttachments('sales', so.id) : []
+  const canEditAttachments = canEditOrderAttachments(session.user.role, 'sales')
+
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
 
@@ -103,6 +109,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         paidWithoutInvoice={paidWithoutInvoice}
         editForm={editForm}
       />
+      <OrderAttachmentsCard kind="sales" orderId={so.id} attachments={attachments} canEdit={canEditAttachments} />
     </div>
   )
 }
