@@ -129,6 +129,7 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: [
       'DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B',
       'DAILY_BATCH_INVENTORY_RECONCILIATION', 'DAILY_BATCH_COGS_RECONCILIATION', 'DAILY_BATCH_TRANSIT_RECONCILIATION',
+      'DAILY_BATCH_GRIR_RECLASS',
     ],
     note: 'Owner answer 2026-10-09: Qoblex does the daily batches natively in Xero today; IMS owns from P2. The obligation time is the batch date. Whether IMS\'s batches are correct on top of invoices posted by Xeroom is an open accountant question.',
   }),

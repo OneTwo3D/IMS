@@ -59,6 +59,7 @@ import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floo
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
 import {
   isTransferLineFullyLanded,
@@ -1200,6 +1201,16 @@ export async function processBookedInEvent(
                   poLineId: poLine.id,
                   isOpeningStock: false,
                 },
+              })
+
+              // GR/IR accrual: the same units the layer above carries, at the PO goods unit cost, keyed on the stock movement's own key so a replayed
+              // book-in (which the movement's unique key already refused) records nothing. In this transaction, whether or not Xero posting is on.
+              await recordGrirReceipt(tx, {
+                poId,
+                sourceRef: lockedEvent.id,
+                keyBase: wmsPurchaseReceiptMovementKey({ asnLineMapId: receiptLine.asnLineMapId, receiptEventId: lockedEvent.id }),
+                at: now,
+                lines: [{ poLineId: poLine.id, qty: receiptLine.stockQtyToAdd }],
               })
 
               // o3d-8f0p6: accumulated HERE, beside the layer it is the value of, and deliberately

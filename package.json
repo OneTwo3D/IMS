@@ -81,6 +81,7 @@
     "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui",
     "sales:invoicing-state:recompute": "tsx scripts/recompute-invoicing-state.ts",
     "refunds:basis:backfill": "tsx scripts/backfill-refund-basis.ts",
+    "grir:opening-balance": "tsx scripts/grir-opening-balance.ts",
     "check:server-action-auth-bypass": "node scripts/check-server-action-auth-bypass.mjs",
     "check:system-import-capability": "node scripts/check-system-import-capability.mjs",
     "check:server-action-guard-coverage": "tsx --test --experimental-test-module-mocks tests/security/server-action-guard-coverage.test.ts tests/security/server-action-guard-detector.test.ts tests/security/module-graph.test.ts",

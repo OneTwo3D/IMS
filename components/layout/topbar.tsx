@@ -75,6 +75,7 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/analytics/dead-stock', title: 'Dead Stock' },
   { prefix: '/analytics/fulfillment', title: 'Fulfillment KPIs' },
   { prefix: '/analytics/fx-gain-loss', title: 'FX Gain/Loss' },
+  { prefix: '/analytics/grir', title: 'GR/IR' },
   { prefix: '/analytics/inventory-aging', title: 'Inventory Aging' },
   { prefix: '/analytics/inventory-turnover', title: 'Inventory Turnover' },
   { prefix: '/analytics/inventory-valuation', title: 'Inventory Valuation' },

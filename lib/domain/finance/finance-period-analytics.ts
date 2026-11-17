@@ -31,6 +31,9 @@ export type FinanceAnalyticsClient = {
   fxRate: FindManyDelegate
   /** Read for the FX source regime (lib/currencies/fx-source-regime.ts); a real client always has it. */
   setting?: FindManyDelegate
+  /** The GR/IR report's sources (a real client always has them). */
+  grirSubledgerMovement?: FindManyDelegate & { groupBy(args: unknown): Promise<unknown[]> }
+  purchaseOrder?: FindManyDelegate
 }
 
 export type FinanceAnalyticsDeps = {
@@ -101,7 +104,17 @@ export type FxGainLossReportTotals = {
   unconvertedCount: string
 }
 
+export type GrirReportTotals = {
+  receivedNotBilledBase: string
+  billedNotReceivedBase: string
+  creditNotesBase: string
+  netBase: string
+  priceVarianceBase: string
+  orderCount: string
+}
+
 export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
+  grir: { receivedNotBilledBase: '0', billedNotReceivedBase: '0', creditNotesBase: '0', netBase: '0', priceVarianceBase: '0', orderCount: '0' } satisfies GrirReportTotals,
   vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' } satisfies VatReportTotals,
   arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
   apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
@@ -134,6 +147,30 @@ export type AgingReportRow = {
   bucket4: string
   outstandingBase: string
   lastPaymentDate: string | null
+}
+
+/** One purchase order's open GR/IR (goods received, not invoiced) balance. Amounts are base currency; `netBase` is credit-positive (an accrual owed). */
+export type GrirReportRow = {
+  supplierId: string
+  supplierName: string
+  poId: string
+  poReference: string
+  poStatus: string
+  /** Goods received that no bill covers yet, summed over the order lines that are net received-not-billed. */
+  receivedNotBilledBase: string
+  receivedNotBilledQty: string
+  /** Goods billed ahead of receipt (a prepaid supplier) or billed and then returned and not yet credited, as a positive figure. */
+  billedNotReceivedBase: string
+  billedNotReceivedQty: string
+  /** Return-generated supplier credit notes posted against the order (they lift a billed-not-received debit). */
+  creditNotesBase: string
+  /** received not billed - billed not received + credit notes. */
+  netBase: string
+  /** Bills' price difference against the PO valuation (billed - ordered value); informational, outside the balance. */
+  priceVarianceBase: string
+  /** The date of the oldest event on a line (or credit) that still has a balance, and the whole days from it to the as-of date. */
+  oldestOpenDate: string | null
+  ageDays: number
 }
 
 export type FxGainLossReportRow = {
@@ -886,6 +923,135 @@ export async function getApAgingReport(
     `AP aging is as of ${dateOnly(asOf)} and treats PurchaseInvoice.totalBase as fully outstanding until PurchaseInvoice.paidAt is set because the schema does not store partial supplier payments.`,
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
+  ], options.paginate !== false)
+}
+
+type GrirGroupRow = {
+  poId: string
+  poLineId: string | null
+  sourceType: string
+  _sum: { baseDelta: DecimalInput | null; qtyDelta: DecimalInput | null }
+  _min: { occurredAt: Date | null }
+}
+
+/**
+ * THE OPEN GR/IR BALANCE BY SUPPLIER AND PURCHASE ORDER, from the GR/IR sub-ledger (lib/domain/accounting/grir-subledger-movement.ts), as of `dateTo`.
+ *
+ * Per order line the balance is the sum of its receipt, bill, bill-edit and return movements (credit-positive). A line with a positive balance is
+ * RECEIVED NOT BILLED; a negative one is BILLED NOT RECEIVED. The two are summed separately across the lines (never netted against each other: a line
+ * received and not billed does not cancel another line billed and not received), and the order's return-generated credit notes, which belong to no
+ * line, sit in their own column. The price difference between bills and the order is shown beside the balance and is not part of it. The age is the
+ * days from the oldest source event of any line or credit that still has a balance to the as-of date. `dateFrom` plays no part: a balance is cumulative.
+ * Orders whose every figure is zero are not listed.
+ */
+export async function getGrirReport(
+  filters: FinanceAnalyticsFilters = {},
+  options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
+): Promise<FinanceAnalyticsReport<GrirReportRow, GrirReportTotals>> {
+  const client = clientFromDeps(options.deps)
+  const generatedAt = nowFromDeps(options.deps)
+  const baseCurrency = await baseCurrencyFromDeps(options.deps)
+  const window = period(filters, generatedAt)
+  const asOf = window.dateTo
+  const movements = client.grirSubledgerMovement
+  const orders = client.purchaseOrder
+  if (!movements || !orders) throw new Error('GR/IR report: the client carries no GR/IR sub-ledger')
+  const groups = await movements.groupBy({
+    by: ['poId', 'poLineId', 'sourceType'],
+    where: { journalDate: { lt: window.dateToExclusive } },
+    _sum: { baseDelta: true, qtyDelta: true },
+    _min: { occurredAt: true },
+    orderBy: [{ poId: 'asc' }, { poLineId: 'asc' }, { sourceType: 'asc' }],
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as GrirGroupRow[]
+  assertSourceLimit(groups.length, SOURCE_ROW_LIMIT, 'GR/IR sub-ledger groups')
+
+  type PoAccumulator = {
+    lines: Map<string, { net: Prisma.Decimal; qty: Prisma.Decimal; oldest: Date | null }>
+    credits: Prisma.Decimal
+    creditOldest: Date | null
+    variance: Prisma.Decimal
+  }
+  const byPo = new Map<string, PoAccumulator>()
+  const older = (a: Date | null, b: Date | null): Date | null => (a === null ? b : b === null ? a : (b.getTime() < a.getTime() ? b : a))
+  for (const group of groups) {
+    let po = byPo.get(group.poId)
+    if (!po) {
+      po = { lines: new Map(), credits: new Prisma.Decimal(0), creditOldest: null, variance: new Prisma.Decimal(0) }
+      byPo.set(group.poId, po)
+    }
+    const base = toDecimal(group._sum.baseDelta)
+    if (group.sourceType === 'BILL_PRICE_VARIANCE') {
+      po.variance = po.variance.add(base)
+      continue
+    }
+    if (group.poLineId === null) {
+      po.credits = po.credits.add(base)
+      po.creditOldest = older(po.creditOldest, group._min.occurredAt)
+      continue
+    }
+    const line = po.lines.get(group.poLineId) ?? { net: new Prisma.Decimal(0), qty: new Prisma.Decimal(0), oldest: null }
+    line.net = line.net.add(base)
+    line.qty = line.qty.add(toDecimal(group._sum.qtyDelta))
+    line.oldest = older(line.oldest, group._min.occurredAt)
+    po.lines.set(group.poLineId, line)
+  }
+
+  const poIds = [...byPo.keys()]
+  const poRows = poIds.length === 0 ? [] : await orders.findMany({
+    where: { id: { in: poIds } },
+    select: { id: true, reference: true, status: true, supplierId: true, supplier: { select: { name: true } } },
+  }) as Array<{ id: string; reference: string; status: string; supplierId: string; supplier: { name: string } }>
+  const poById = new Map(poRows.map((row) => [row.id, row]))
+
+  const zero = new Prisma.Decimal(0)
+  const rows: GrirReportRow[] = []
+  for (const [poId, acc] of byPo) {
+    let receivedNotBilled = zero
+    let receivedNotBilledQty = zero
+    let billedNotReceived = zero
+    let billedNotReceivedQty = zero
+    let oldest: Date | null = null
+    for (const line of acc.lines.values()) {
+      if (line.net.gt(0)) { receivedNotBilled = receivedNotBilled.add(line.net); receivedNotBilledQty = receivedNotBilledQty.add(line.qty) }
+      else if (line.net.lt(0)) { billedNotReceived = billedNotReceived.add(line.net.neg()); billedNotReceivedQty = billedNotReceivedQty.add(line.qty.neg()) }
+      if (!line.net.isZero()) oldest = older(oldest, line.oldest)
+    }
+    if (!acc.credits.isZero()) oldest = older(oldest, acc.creditOldest)
+    const net = receivedNotBilled.sub(billedNotReceived).add(acc.credits)
+    if (receivedNotBilled.isZero() && billedNotReceived.isZero() && acc.credits.isZero()) continue
+    const po = poById.get(poId)
+    rows.push({
+      supplierId: po?.supplierId ?? '',
+      supplierName: po?.supplier.name ?? '(order not found)',
+      poId,
+      poReference: po?.reference ?? poId,
+      poStatus: po?.status ?? '',
+      receivedNotBilledBase: moneyString(receivedNotBilled, baseCurrency),
+      receivedNotBilledQty: qtyString(receivedNotBilledQty),
+      billedNotReceivedBase: moneyString(billedNotReceived, baseCurrency),
+      billedNotReceivedQty: qtyString(billedNotReceivedQty),
+      creditNotesBase: moneyString(acc.credits, baseCurrency),
+      netBase: moneyString(net, baseCurrency),
+      priceVarianceBase: moneyString(acc.variance, baseCurrency),
+      oldestOpenDate: oldest ? dateOnly(oldest) : null,
+      ageDays: oldest ? Math.max(0, ageDays(asOf, oldest)) : 0,
+    })
+  }
+  rows.sort((a, b) => a.supplierName.localeCompare(b.supplierName) || a.poReference.localeCompare(b.poReference))
+  const sum = (pick: (row: GrirReportRow) => string) => rows.reduce((total, row) => total.add(pick(row)), zero)
+  return report(rows, filters, window, generatedAt, {
+    receivedNotBilledBase: moneyString(sum((row) => row.receivedNotBilledBase), baseCurrency),
+    billedNotReceivedBase: moneyString(sum((row) => row.billedNotReceivedBase), baseCurrency),
+    creditNotesBase: moneyString(sum((row) => row.creditNotesBase), baseCurrency),
+    netBase: moneyString(sum((row) => row.netBase), baseCurrency),
+    priceVarianceBase: moneyString(sum((row) => row.priceVarianceBase), baseCurrency),
+    orderCount: String(rows.length),
+  }, [
+    `The GR/IR balance is as of ${dateOnly(asOf)} (cumulative: the start date plays no part). It holds the GOODS value at the purchase-order valuation; freight and landed cost stay on the Stock in Transit path and are not in it.`,
+    'Received not billed and billed not received are summed per order line and never netted against each other. Credit notes are return-generated supplier credits, which belong to no line.',
+    'The price difference column is the bills\' charge less the order valuation of the billed goods. It stays on Stock in Transit as before and is not part of the GR/IR balance.',
+    'The age is the days from the oldest source event on a line (or credit) that still has a balance.',
   ], options.paginate !== false)
 }
 

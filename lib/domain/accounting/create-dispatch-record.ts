@@ -159,6 +159,7 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
   DAILY_BATCH_INVENTORY_RECONCILIATION: 'no-remedy',
   DAILY_BATCH_COGS_RECONCILIATION: 'no-remedy',
   DAILY_BATCH_TRANSIT_RECONCILIATION: 'no-remedy',
+  DAILY_BATCH_GRIR_RECLASS: 'no-remedy',
   UNEARNED_REV_REVERSAL: 'no-remedy',
   ALLOCATION_REVERSAL: 'no-remedy',
   REALISED_FX_JOURNAL: 'no-remedy',

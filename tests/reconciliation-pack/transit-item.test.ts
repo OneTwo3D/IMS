@@ -26,7 +26,7 @@ const net = (poId: string, sourceType: string, amount: string): TransitNetRow =>
 const PRE_KINDS = ['purchase-orders', 'purchase-invoices', 'purchase-receipts', 'purchase-returns', 'supplier-credit-notes', 'landed-cost-links', 'landed-cost-revaluations', 'sales-order-refunds', 'return-expectations', 'subledger-rows', 'sync-log-reversals'] as const
 const pre = (over: Record<string, number> = {}): Record<string, number> => ({ ...Object.fromEntries(PRE_KINDS.map((kind) => [kind, 0])), ...over })
 function section(over: Partial<ImsTransitSchedule> = {}): ImsTransitSchedule {
-  return { asOf: D, coverageStart: '2026-01-01', preWatermark: pre(), net: [net('po1', 'PURCHASE_BILL', '80'), net('po1', 'STOCK_RECEIPT', '-30')], customerReturns: '0', orders: [order('po1')], openOrders: [order('po1')], ...over }
+  return { asOf: D, coverageStart: '2026-01-01', preWatermark: pre(), net: [net('po1', 'PURCHASE_BILL', '80'), net('po1', 'STOCK_RECEIPT', '-30')], customerReturns: '0', grirReclass: '0', orders: [order('po1')], openOrders: [order('po1')], ...over }
 }
 function rig(value: ImsTransitSchedule | 'section-error' | 'read-error' | 'throws' | 'no-section') {
   const calls: ImsReadOptions[] = []
