@@ -52,7 +52,7 @@ test('an approval covers the order only while the total, supplier and currency m
   assert.deepEqual(evaluatePoApproval(facts({ ...APPROVED, supplierId: 's2' }), threshold), { required: true, approved: false, reason: 'supplier_changed' })
   assert.deepEqual(evaluatePoApproval(facts({ ...APPROVED, currency: 'EUR' }), threshold), { required: true, approved: false, reason: 'currency_changed' })
   // A lower total keeps the approval.
-  assert.deepEqual(evaluatePoApproval(facts({ ...APPROVED, totalBase: '600' }), threshold), { required: true, approved: true })
+  assert.deepEqual(evaluatePoApproval(facts({ ...APPROVED, totalBase: '1100' }), threshold), { required: true, approved: true })
 })
 
 test('self-approval: the creator is refused, another user and an unknown creator are not', () => {
