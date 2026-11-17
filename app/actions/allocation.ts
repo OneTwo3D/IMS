@@ -24,6 +24,7 @@ import {
 } from '@/lib/products/fulfillment-requirement-snapshot'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
+import { QUOTE_ACTION_REFUSAL, assertNotQuoteUnderLock } from '@/lib/domain/sales/sales-quote-guard'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   allocateSalesOrder,
@@ -560,6 +561,7 @@ export async function updateAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
+      await assertNotQuoteUnderLock(tx, alloc.orderId, 'stock cannot be allocated to it')
 
       // o3d-4kfh: RE-READ THE ROW UNDER THE ORDER LOCK, and derive EVERYTHING from that read.
       //
@@ -919,6 +921,7 @@ export async function addAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      await assertNotQuoteUnderLock(tx, orderId, 'stock cannot be allocated to it')
       await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])
 
@@ -1508,6 +1511,7 @@ export async function confirmAllocations(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
+    if ((await db.salesOrder.findUnique({ where: { id: orderId }, select: { isQuote: true } }))?.isQuote) return { success: false, error: QUOTE_ACTION_REFUSAL('its allocations cannot be confirmed into shipments') }
     const result = await confirmSalesOrderShipments(db, orderId)
 
     revalidatePath('/sales')

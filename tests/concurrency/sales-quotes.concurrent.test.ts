@@ -354,3 +354,42 @@ test('the database refuses a quote on any live status; a cancelled quote is allo
   const row = await db.salesOrder.findUniqueOrThrow({ where: { id } })
   assert.deepEqual([row.status, row.isQuote], ['CANCELLED', true])
 })
+
+test('a quote takes no money or stock action: payment, mark-paid, refund, invoice number, manual allocation, confirm and the order confirmation are all refused and write nothing', SKIP, async (t) => {
+  const w = await seedWorld()
+  t.after(() => w.teardown())
+  const { createSalesOrder, addPayment, markSalesOrderPaid, createRefund, generateInvoiceNumber } = await import('@/app/actions/sales')
+  const { addAllocation, confirmAllocations } = await import('@/app/actions/allocation')
+  const { sendSalesOrderEmail } = await import('@/app/actions/email')
+  const { db } = await import('@/lib/db')
+  const quote = await createSalesOrder(inputFor(w, { isQuote: true, quoteValidUntil: future(5) }) as never)
+  assert.ok(quote.success)
+  const id = quote.order!.id
+  w.orderIds.push(id)
+  const lineId = (await db.salesOrderLine.findFirstOrThrow({ where: { orderId: id }, select: { id: true } })).id
+
+  const results = {
+    addPayment: await addPayment({ orderId: id, amount: 10, currency: 'GBP' }),
+    markPaid: await markSalesOrderPaid(id),
+    refund: await createRefund(id, [], 'x'),
+    invoiceNumber: await generateInvoiceNumber(id),
+    allocate: await addAllocation(id, lineId, w.productId, w.warehouseId, 1),
+    confirm: await confirmAllocations(id),
+    confirmationEmail: await sendSalesOrderEmail(id),
+  }
+  for (const [name, r] of Object.entries(results)) {
+    assert.equal(r.success, false, name)
+    assert.match(r.error ?? '', /quote/i, `${name}: ${r.error}`)
+  }
+  const row = await db.salesOrder.findUniqueOrThrow({ where: { id } })
+  assert.equal(row.paidAt, null)
+  assert.equal(row.unregisteredPaidAt, null)
+  assert.equal(row.invoiceNumber, null)
+  assert.equal(await db.payment.count({ where: { orderId: id } }), 0)
+  assert.equal(await db.salesOrderRefund.count({ where: { orderId: id } }), 0)
+  assert.equal(await db.orderAllocation.count({ where: { orderId: id } }), 0)
+  assert.equal(await db.shipment.count({ where: { orderId: id } }), 0)
+  assert.equal(await db.emailOutbox.count({ where: { referenceId: id } }), 0)
+  assert.equal(String((await db.stockLevel.findFirstOrThrow({ where: { productId: w.productId } })).reservedQty), '0')
+  assert.equal(await db.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id } }), 0)
+})

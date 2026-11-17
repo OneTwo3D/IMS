@@ -147,6 +147,8 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
 async function buildSalesOrderConfirmationEmail(orderId: string): Promise<PreparedEmail> {
   const so = await getSalesOrderEmailOrder(orderId)
   if (!so) throw new Error('Order not found')
+  // At send time too: a confirmation queued before the order was a quote is not sent for the quote.
+  if ((so as { isQuote?: boolean }).isQuote) throw new Error('This is a quote, not an order: no order confirmation is sent for a quote')
   if (!so.customerEmail) throw new Error('No customer email address')
 
   const branding = await getBranding()
@@ -294,9 +296,10 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, orderNumber: true, externalOrderNumber: true, customerEmail: true },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, customerEmail: true, isQuote: true },
   })
   if (!so) throw new Error('Order not found')
+  if (so.isQuote) throw new Error('This is a quote, not an order: use Send quote. No order confirmation is sent for a quote.')
   if (!so.customerEmail) throw new Error('No customer email address')
   const ref = getSalesOrderReference(so)
   return { to: so.customerEmail, subject: `Order Confirmation ${ref}`, reference: ref }

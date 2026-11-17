@@ -186,6 +186,7 @@ import { paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolve
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 import { isQuoteExpired, quoteDateToYmd, quoteStatusMoveRefused, quoteYmdToDate, validateQuoteInput } from '@/lib/domain/sales/sales-quote'
 import { quoteTodayYmd } from '@/lib/sales-quote-clock'
+import { QUOTE_ACTION_REFUSAL, assertNotQuoteUnderLock } from '@/lib/domain/sales/sales-quote-guard'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -3152,6 +3153,8 @@ export async function createRefund(
     if (!isInternal) {
       await requirePermission('sales.refund')
     }
+    // o3d-ngmt.16: a quote has nothing to refund (it takes no payment and is never invoiced).
+    if ((await db.salesOrder.findUnique({ where: { id: orderId }, select: { isQuote: true } }))?.isQuote) return { success: false, error: QUOTE_ACTION_REFUSAL('it cannot be refunded') }
     // o3d-n8p (Codex): chargeback and externalRefundId are provenance-bearing and have material effects —
     // chargeback suppresses restock + COGS reversal, and externalRefundId occupies the globally unique Woo
     // replay key. They must come only from the trusted internal entry points (Woo sync, chargeback poller),
@@ -4266,6 +4269,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
     // lock makes exactly one caller see the unpaid→paid transition.
     const locked = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, id)
+      await assertNotQuoteUnderLock(tx, id, 'it cannot be marked paid')
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
@@ -4497,6 +4501,7 @@ export async function addPayment(input: {
     const baseCurrency = await getBaseCurrencyCode()
     const txResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, input.orderId)
+      await assertNotQuoteUnderLock(tx, input.orderId, 'no payment can be recorded against it')
       const so = await tx.salesOrder.findUnique({
         where: { id: input.orderId },
         select: {

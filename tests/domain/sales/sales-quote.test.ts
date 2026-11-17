@@ -138,3 +138,15 @@ test('the outbox kind spelled out where the document census reads it is the shar
   assert.match(read('lib/order-email.ts'), /kind === 'SALES_QUOTE'/)
   assert.match(read('app/actions/sales-quotes.ts'), /kind: 'SALES_QUOTE'/)
 })
+
+test('the locked quote guard is called after the order lock by every money or stock action (census of the gated actions)', () => {
+  const sales = read('app/actions/sales.ts')
+  const alloc = read('app/actions/allocation.ts')
+  assert.match(sales, /await lockSalesOrder\(tx, input\.orderId\)\n\s*await assertNotQuoteUnderLock\(tx, input\.orderId, 'no payment can be recorded against it'\)/, 'addPayment')
+  assert.match(sales, /await lockSalesOrder\(tx, id\)\n\s*await assertNotQuoteUnderLock\(tx, id, 'it cannot be marked paid'\)/, 'markSalesOrderPaid')
+  assert.match(sales, /QUOTE_ACTION_REFUSAL\('it cannot be refunded'\)/, 'createRefund')
+  assert.match(sales, /A quote is not invoiced/, 'generateInvoiceNumber')
+  assert.equal((alloc.match(/assertNotQuoteUnderLock\(tx, /g) ?? []).length, 2, 'updateAllocation and addAllocation')
+  assert.match(alloc, /QUOTE_ACTION_REFUSAL\('its allocations cannot be confirmed into shipments'\)/, 'confirmAllocations')
+  assert.match(read('lib/order-email.ts'), /This is a quote, not an order: use Send quote/, 'order confirmation')
+})
