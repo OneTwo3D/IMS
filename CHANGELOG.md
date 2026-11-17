@@ -129,7 +129,6 @@ These are in the release but off by default; nothing changes until an administra
 - **Fixed: a hold or cancel refused on identity (number mismatch, unverifiable) or not-found grounds no longer drops out of the task queue.** It raises an investigative "check the warehouse order and act" operator task (reasons Hold / Cancel not honoured), and the notice is stamped settled only after the task is recorded; a task that fails to record is retried by the next sweep with the same text.
 - **Fixed: a later courier fallback for the same service after the earlier task was marked done raises a new task.** The dedupe key carries the fallback episode (a stable timestamp); the episode is written WITH the due-marker before the warehouse call (new nullable column `wms_order_push_links.courier_task_episode`, additive migration) and used by the due pass and every retry. An amendment the warehouse accepted is no longer repeated because its task could not be recorded: the link advances and the courier pass records the task. Tasks recorded before this change keep their old key.
 - Help document: Warehouse (Mintsoft).
-=======
 
 ### Refused WooCommerce completions and double postage on merged orders now show on Sync > Exceptions (backend / sync / UI)
 
