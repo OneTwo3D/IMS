@@ -1,6 +1,7 @@
 import { rateBinding, type TaxBindingBasis } from '@/lib/accounting/reverse-charge'
 import { noVatRateKind } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { addMoney, multiplyMoney, roundMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 // ---------------------------------------------------------------------------
 // Supplier credit-note domain logic (audit-g5u2)
 //
@@ -74,13 +75,75 @@ export function validateRecordSupplierCreditNote(params: {
 }
 
 /**
- * A Xero-bound supplier credit against a bill with REVERSE-CHARGE lines is refused. The IMS credit amount is the bill's gross (net plus the self-accounted VAT) while Xero holds the
- * bill's net, and the transit movement is taken from the VAT ratio: the figures disagree and a full credit could exceed the Xero bill. The proper design (net payable cap, the same amount on
- * the Xero line, the allocation and the transit movement) is separate work; until then the credit is raised in Xero directly. Local-only credits (nothing goes to Xero) are unaffected.
+ * A supplier credit against a bill with REVERSE-CHARGE lines is raised against the bill's NET PAYABLE: what is actually owed to the supplier, which is each reverse-charge line's net
+ * (the self-accounted VAT is never paid to the supplier) plus each standard line's net and VAT. IMS stores the bill's total WITH the self-accounted VAT, so the total is not the figure
+ * to credit: the credit is capped at the net payable, and that one amount is the Xero credit lines, the allocation to the bill and the transit movement.
  */
-export const SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE = withLedgerCheck(
-  'Supplier credits against reverse-charge bills are not posted from IMS yet: raise this credit in Xero directly. The credit note was not posted and is still a draft.',
+export const SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE = (payable: string, available: string) => withLedgerCheck(
+  `This bill has reverse-charge lines, so a credit against it is limited to what is owed to the supplier (${payable}, excluding the VAT the bill accounts for itself); `
+  + `${available} is still creditable. The credit note was not posted and is still a draft: record it again for no more than that amount.`,
 )
+
+/** One bill line's booked treatment, as the net-payable planner reads it. */
+export type SupplierCreditBillLine = {
+  taxType: string | undefined
+  rate: number
+  taxRateId?: string
+  reverseCharge: boolean
+  /** The line's net (before any VAT). */
+  net: number
+}
+
+/** What a bill line obliges the buyer to pay the supplier: its net for a reverse-charge line, net plus its (per-line rounded) VAT otherwise. */
+function linePayable(line: SupplierCreditBillLine, currency: string) {
+  return line.reverseCharge ? roundMoney(line.net, currency) : addMoney(roundMoney(line.net, currency), roundMoney(multiplyMoney(line.net, line.rate), currency))
+}
+
+/** The bill's NET PAYABLE: the sum of what each line obliges the buyer to pay the supplier. */
+export function billNetPayable(lines: ReadonlyArray<SupplierCreditBillLine>, currency: string): number {
+  return lines.reduce((sum, l) => addMoney(sum, linePayable(l, currency)), toDecimal(0)).toNumber()
+}
+
+export type ReverseChargeCreditPlan = {
+  /** One Xero credit line per bill line that carries a share of the credit: exclusive net, the line's own booked code. */
+  lines: Array<{ net: number; vat: number; taxType: string | undefined; taxRateId?: string; reverseCharge: boolean }>
+  /** The credit's net: the sum of the line nets. This is what leaves the transit clearing account. */
+  netTotal: number
+  /** What Xero will hold as the credit's total (net lines plus the VAT Xero adds on standard lines); never above the credit amount. This is what is allocated to the bill. */
+  xeroTotal: number
+}
+
+/**
+ * SPLIT A CREDIT OF `amount` (against the bill's net payable) ACROSS THE BILL'S LINES, pro rata to what each owes the supplier, as exclusive net Xero lines on each line's own booked code.
+ * A reverse-charge line's share is its net (Xero self-accounts the VAT under the reverse-charge code, as it did on the bill); a standard line's share is gross and is turned back
+ * into net and VAT, so the credit mirrors the bill exactly: a full credit reproduces every bill line. Returns null when the credit exceeds the net payable.
+ */
+export function planReverseChargeSupplierCredit(params: { amount: number; lines: ReadonlyArray<SupplierCreditBillLine>; currency: string }): ReverseChargeCreditPlan | null {
+  const { currency } = params
+  const payables = params.lines.map((l) => linePayable(l, currency))
+  const total = payables.reduce((a, b) => addMoney(a, b), toDecimal(0))
+  const amount = roundMoney(params.amount, currency)
+  if (!total.gt(0) || amount.gt(total)) return null
+  // Pro-rata shares rounded to the minor unit, the last carrying line taking the remainder so the shares add up to the credit exactly.
+  const shares = payables.map((p) => roundMoney(amount.mul(p).div(total), currency))
+  let lastWithPayable = -1
+  payables.forEach((p, i) => { if (p.gt(0)) lastWithPayable = i })
+  const drift = subtractMoney(amount, shares.reduce((a, b) => addMoney(a, b), toDecimal(0)))
+  if (lastWithPayable >= 0 && !drift.isZero()) shares[lastWithPayable] = addMoney(shares[lastWithPayable], drift)
+  const lines: ReverseChargeCreditPlan['lines'] = []
+  let netTotal = toDecimal(0)
+  let xeroTotal = toDecimal(0)
+  params.lines.forEach((l, i) => {
+    const share = shares[i]
+    if (!share.gt(0)) return
+    const net = l.reverseCharge ? share : roundMoney(share.div(addMoney(1, l.rate)), currency)
+    const vat = l.reverseCharge ? toDecimal(0) : roundMoney(multiplyMoney(net, l.rate), currency)
+    netTotal = addMoney(netTotal, net)
+    xeroTotal = addMoney(xeroTotal, addMoney(net, vat))
+    lines.push({ net: net.toNumber(), vat: vat.toNumber(), taxType: l.taxType, ...(l.taxRateId ? { taxRateId: l.taxRateId } : {}), reverseCharge: l.reverseCharge })
+  })
+  return { lines, netTotal: netTotal.toNumber(), xeroTotal: (xeroTotal.gt(amount) ? amount : xeroTotal).toNumber() }
+}
 
 /** Shown to the operator when a supplier credit note is raised against a bill whose lines carry more than one VAT treatment. */
 export const SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE = withLedgerCheck(
@@ -268,14 +331,24 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   // rather than netting the amount down. Standard/freight credits carry a GROSS
   // amount and post INCLUSIVE. Defaults to inclusive.
   lineAmountsIncludeTax?: boolean
+  /**
+   * A credit against a bill with reverse-charge lines (planReverseChargeSupplierCredit): one EXCLUSIVE net line per bill line, each on its own booked code, replacing the single
+   * line; the allocation is then `allocateAmount`. `amountForeign`, `taxType` and `lineAmountsIncludeTax` are ignored for the lines.
+   */
+  reverseChargePlan?: ReverseChargeCreditPlan
 }): Record<string, unknown> {
-  return {
-    creditNoteNumber: mintedSupplierCreditNoteNumber(params.creditNoteId),
-    contactName: params.supplierName,
-    date: params.date,
-    currency: params.currency,
-    currencyRateToBase: params.fxRateToBase,
-    lines: [
+  const planned = params.reverseChargePlan
+  const lines = planned
+    ? planned.lines.map((l, i) => ({
+      description: `${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`,
+      quantity: 1,
+      unitAmount: l.net,
+      accountCode: params.transitAccount,
+      taxType: l.taxType,
+      ...(noVatRateKind(l.taxType) ? { noTaxKind: noVatRateKind(l.taxType) } : {}),
+      ...(l.taxRateId ? rateBinding(l.taxRateId, 'purchase_line') : {}),
+    }))
+    : [
       {
         description: params.reason ?? 'Supplier credit note',
         quantity: 1,
@@ -286,14 +359,21 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         ...(noVatRateKind(params.taxType) ? { noTaxKind: noVatRateKind(params.taxType) } : {}),
         ...(params.taxRateBasis ? rateBinding(params.taxRateId, params.taxRateBasis) : {}),
       },
-    ],
+    ]
+  return {
+    creditNoteNumber: mintedSupplierCreditNoteNumber(params.creditNoteId),
+    contactName: params.supplierName,
+    date: params.date,
+    currency: params.currency,
+    currencyRateToBase: params.fxRateToBase,
+    lines,
     // Standard/freight: the amount is GROSS (the over-credit cap is the bill's
     // gross total), so post tax-INCLUSIVE — Xero splits net + VAT under the
     // mirrored tax type (treating it as net would add VAT on top and over-credit).
     // Reverse charge: the amount is NET and posts EXCLUSIVE so Xero applies the
     // notional RC VAT on top, mirroring the net/exclusive RC bill. With a NONE
     // tax type inclusive vs exclusive is identical (no VAT).
-    lineAmountsIncludeTax: params.lineAmountsIncludeTax ?? true,
+    lineAmountsIncludeTax: planned ? false : (params.lineAmountsIncludeTax ?? true),
     reference: params.reference ?? undefined,
     supplierId: params.supplierId,
     // audit-v08m: only carried when the bill has an external id — the follow-up

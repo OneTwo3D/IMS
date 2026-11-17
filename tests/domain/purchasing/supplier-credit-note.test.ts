@@ -7,6 +7,8 @@ import {
   resolveSupplierCreditNoteTaxType,
   SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE,
   resolveSupplierCreditNoteTransitBase,
+  billNetPayable,
+  planReverseChargeSupplierCredit,
 } from '@/lib/domain/purchasing/supplier-credit-note'
 
 // 6oyu.4 (khdw): the NET base amount a credit note posts to the transit account (for
@@ -287,5 +289,24 @@ test('wiring: the supplier credit note poster reads the SELECTED bill\'s lines a
 test('wiring: a mixed bill is refused before anything is claimed, only when the credit would be sent to the ledger', async () => {
   const { readFileSync } = await import('node:fs')
   const source = readFileSync('app/actions/purchase-orders.ts', 'utf8')
-  assert.match(source, /if \(shouldQueueXero && creditNoteTreatment\.mixed\) return \{ success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE \}/)
+  assert.match(source, /if \(shouldQueueXero && creditNoteTreatment\.mixed && !billHasReverseCharge\) return \{ success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE \}/)
+})
+
+// Net payable of a reverse-charge bill: reverse-charge lines at their net, standard lines at net plus VAT.
+const RC = { taxType: 'RC', rate: 0.2, reverseCharge: true }
+const STD = { taxType: 'IN', rate: 0.2, reverseCharge: false }
+test('billNetPayable: a reverse-charge line is its net; a standard line is net plus VAT', () => {
+  assert.equal(billNetPayable([{ ...RC, net: 100 }], 'GBP'), 100)
+  assert.equal(billNetPayable([{ ...RC, net: 100 }, { ...STD, net: 50 }], 'GBP'), 160)
+})
+test('planReverseChargeSupplierCredit: a full credit reproduces every bill line (incl. odd-penny VAT), a partial is pro rata, and an excess is refused', () => {
+  const lines = [{ ...RC, net: 33.33 }, { ...STD, net: 10.01 }, { ...STD, net: 0.07 }]
+  const payable = billNetPayable(lines, 'GBP')
+  const full = planReverseChargeSupplierCredit({ amount: payable, lines, currency: 'GBP' })!
+  assert.deepEqual(full.lines.map((l) => l.net), [33.33, 10.01, 0.07])
+  assert.equal(full.xeroTotal, payable)
+  assert.equal(full.netTotal, 43.41)
+  const half = planReverseChargeSupplierCredit({ amount: 20, lines, currency: 'GBP' })!
+  assert.ok(half.xeroTotal <= 20 && half.xeroTotal >= 19.98)
+  assert.equal(planReverseChargeSupplierCredit({ amount: payable + 0.01, lines, currency: 'GBP' }), null)
 })
