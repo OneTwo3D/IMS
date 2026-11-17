@@ -28,6 +28,9 @@ export const INVOICE_DOCUMENTS_INTEGRITY_CURSOR_SETTING = 'invoice_documents_int
 const INTEGRITY_SCAN_BATCH = 100
 const MAX_CONSECUTIVE_FAILURES = 3
 
+/** On-demand requests run only while at least this many of the ledger's 950 daily calls are left (the rest belongs to other work). */
+export const LAZY_MIN_DAY_CALLS_REMAINING = 600
+
 export type InvoiceDocumentSweepResult = {
   skipped?: 'no-floor' | 'bad-floor'
   considered: number
@@ -36,6 +39,8 @@ export type InvoiceDocumentSweepResult = {
   needsAttention: number
   failed: number
   stoppedEarly: string | null
+  /** Customer-queued requests were left for a later run because the shared ledger budget is low. */
+  lazyDeferred?: 'ledger-budget-low'
 }
 
 function parseFloor(raw: string | null): Date | 'bad' | null {
@@ -207,7 +212,11 @@ export async function runInvoiceDocumentSweep(
   const now = deps.now()
 
   // A customer is waiting on these: they go first, capped per run.
-  const requested = lazyOn ? await selectCustomerRequested(now, Math.min(limit, LAZY_REQUESTS_PER_RUN), includeCreditNotes) : []
+  // A queued request spends up to three ledger reads from the SHARED rolling day: while less than LAZY_MIN_DAY_CALLS_REMAINING is left they wait (they stay queued; nothing is lost).
+  const remaining = deps.dayCallsRemaining?.() ?? null
+  const budgetLow = remaining !== null && remaining < LAZY_MIN_DAY_CALLS_REMAINING
+  if (lazyOn && budgetLow) result.lazyDeferred = 'ledger-budget-low'
+  const requested = lazyOn && !budgetLow ? await selectCustomerRequested(now, Math.min(limit, LAZY_REQUESTS_PER_RUN), includeCreditNotes) : []
   let candidates: Candidate[] = requested
   if (floor instanceof Date) {
     // Verify stored files first, so a bad one is due for a re-fetch in this very run.

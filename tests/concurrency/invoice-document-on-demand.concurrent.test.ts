@@ -245,6 +245,55 @@ test('RATE LIMIT: the daily cap and the waiting cap stop new requests (nothing q
   } finally { await cleanup(ctx, a.id, b.id, c.id) }
 })
 
+test('CAPS ARE ATOMIC: a burst of first clicks on DIFFERENT documents never queues more than the daily cap or the waiting cap', { skip }, async () => {
+  const ctx = await setup()
+  const orders = await Promise.all(Array.from({ length: 12 }, () => seedOrder(ctx)))
+  try {
+    const today = await ctx.db.invoiceDocumentFetchState.count({ where: { customerRequestedAt: { gte: ctx.onDemand.startOfUtcDay(new Date()) } } })
+    await withSettings(ctx, { invoice_documents_lazy_fetch_enabled: 'true', invoice_documents_lazy_daily_cap: String(today + 3) }, async () => {
+      const results = await Promise.all(orders.map((o) => ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: o.id, kind: 'INVOICE' })))
+      assert.equal(results.filter((r) => r.status === 'preparing' && r.queued).length, 3, 'exactly the daily cap was queued')
+      assert.equal(results.filter((r) => r.status === 'throttled').length, 9)
+      assert.equal(await ctx.db.invoiceDocumentFetchState.count({ where: { orderId: { in: orders.map((o) => o.id) }, customerRequestedAt: { not: null } } }), 3)
+    })
+    await ctx.db.invoiceDocumentFetchState.deleteMany({ where: { orderId: { in: orders.map((o) => o.id) } } })
+    const waiting = await ctx.db.invoiceDocumentFetchState.count({ where: { customerRequestedAt: { not: null }, status: 'PENDING' } })
+    await withSettings(ctx, { invoice_documents_lazy_fetch_enabled: 'true', invoice_documents_lazy_outstanding_cap: String(waiting + 2) }, async () => {
+      const results = await Promise.all(orders.map((o) => ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: o.id, kind: 'INVOICE' })))
+      assert.equal(results.filter((r) => r.status === 'preparing' && r.queued).length, 2, 'exactly the waiting cap was queued')
+    })
+  } finally { await cleanup(ctx, ...orders.map((o) => o.id)) }
+})
+
+test('THE DEFAULT CAP IS DERIVED FROM THE REAL 950-CALL LIMIT: worst case (3 reads each) is at most 20% of it', { skip }, async () => {
+  const ctx = await setup()
+  assert.ok(ctx.onDemand.DEFAULT_LAZY_DAILY_CAP * ctx.onDemand.LAZY_READS_PER_DOCUMENT <= ctx.onDemand.XERO_DAY_CALL_LIMIT * ctx.onDemand.LAZY_BUDGET_SHARE)
+  assert.equal(ctx.onDemand.XERO_DAY_CALL_LIMIT, 950)
+  const { readFileSync } = await import('node:fs')
+  assert.match(readFileSync('lib/connectors/xero/api.ts', 'utf8'), /const XERO_DAY_LIMIT = 950/, 'the constant the cap is derived from is the client\'s real one')
+})
+
+test('THE SWEEP DEFERS QUEUED REQUESTS WHILE THE SHARED LEDGER BUDGET IS LOW, and runs them (nothing lost) once it recovers', { skip }, async () => {
+  const ctx = await setup()
+  const order = await seedOrder(ctx)
+  try {
+    await withSettings(ctx, { invoice_documents_lazy_fetch_enabled: 'true' }, async () => {
+      assert.equal((await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: order.id, kind: 'INVOICE' })).status, 'preparing')
+      const low = ledger([order])
+      low.deps.dayCallsRemaining = () => ctx.sweep.LAZY_MIN_DAY_CALLS_REMAINING - 1
+      const deferred = await ctx.sweep.runInvoiceDocumentSweep(low.deps)
+      assert.equal(deferred.lazyDeferred, 'ledger-budget-low')
+      assert.equal(deferred.considered, 0)
+      assert.equal(low.calls.lookups.length, 0, 'the ledger was not asked')
+      const ok = ledger([order])
+      ok.deps.dayCallsRemaining = () => ctx.sweep.LAZY_MIN_DAY_CALLS_REMAINING
+      const ran = await ctx.sweep.runInvoiceDocumentSweep(ok.deps)
+      assert.equal(ran.stored, 1, 'the queued request is still there and runs once the budget allows')
+      assert.equal(ran.lazyDeferred, undefined)
+    })
+  } finally { await cleanup(ctx, order.id) }
+})
+
 test('nothing is queued for a document that cannot be found, is already stored, or needs a person', { skip }, async () => {
   const ctx = await setup()
   const noNumber = await seedOrder(ctx)

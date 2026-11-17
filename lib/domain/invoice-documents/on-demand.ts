@@ -11,11 +11,10 @@
  *
  *  - DE-DUPLICATED. One fetch state row per document (unique subject key) and a compare-and-set on `customerRequestedAt`: however many
  *    clicks arrive, one request is queued, and only the click that queued it writes an activity row.
- *  - RATE LIMITED. A daily cap on NEW requests (default 200 a day, setting `invoice_documents_lazy_daily_cap`) and a cap on requests still
- *    waiting (default 200, `invoice_documents_lazy_outstanding_cap`). Past either, the answer is "throttled" and nothing is queued. Each
- *    queued document costs at most three ledger GETs, so the default daily cap spends well under a fifth of the shared 5,000-a-day budget.
- *    The caps are read-then-write, so concurrent clicks can overshoot by at most the number in flight, which the route's per-address rate
- *    limit already bounds.
+ *  - RATE LIMITED. A daily cap on NEW requests (default 60 a day, setting `invoice_documents_lazy_daily_cap`) and a cap on requests still
+ *    waiting (default 60, `invoice_documents_lazy_outstanding_cap`). Past either, the answer is "throttled" and nothing is queued. Each
+ *    queued document costs at most three ledger GETs, so the default daily cap is at most 180 of the Xero client's real 950-call rolling day (under 20%).
+ *    The two counts and the claim run under one advisory lock, so a burst of first clicks on different documents cannot exceed either cap.
  *  - BOUNDED. A request that the ledger never answers follows the fetch's own backoff and is escalated to a person after 14 days, after
  *    which it is not retried (and a customer's click on it is answered "not available", not queued again).
  *
@@ -32,8 +31,16 @@ export const INVOICE_DOCUMENTS_LAZY_FETCH_SETTING = 'invoice_documents_lazy_fetc
 export const INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING = 'invoice_documents_credit_notes_enabled'
 export const INVOICE_DOCUMENTS_LAZY_DAILY_CAP_SETTING = 'invoice_documents_lazy_daily_cap'
 export const INVOICE_DOCUMENTS_LAZY_OUTSTANDING_CAP_SETTING = 'invoice_documents_lazy_outstanding_cap'
-export const DEFAULT_LAZY_DAILY_CAP = 200
-export const DEFAULT_LAZY_OUTSTANDING_CAP = 200
+/**
+ * CALIBRATED AGAINST THE REAL LIMIT. The Xero client enforces 950 calls per rolling 24 hours per organisation (`XERO_DAY_LIMIT` in lib/connectors/xero/api.ts; Xero's own cap is 1,000 since 2026-03-02, NOT 5,000),
+ * shared with every other Xero job. A queued document costs at most three reads, so the daily cap is derived to keep the worst case at or under a fifth of that limit: floor(950 x 20% / 3) = 63, rounded down to 60
+ * (worst case 180 calls). Rechecks of stored documents are not counted by this cap and draw on the rest, which is why the sweep also defers queued requests while the shared budget is low (sweep.ts).
+ */
+export const XERO_DAY_CALL_LIMIT = 950
+export const LAZY_READS_PER_DOCUMENT = 3
+export const LAZY_BUDGET_SHARE = 0.2
+export const DEFAULT_LAZY_DAILY_CAP = 60
+export const DEFAULT_LAZY_OUTSTANDING_CAP = 60
 /** How many queued customer requests one sweep run takes first (each costs at most three ledger GETs). */
 export const LAZY_REQUESTS_PER_RUN = 5
 /** What the customer is told to wait: the sweep runs every 15 minutes by default. */
@@ -106,27 +113,30 @@ export async function requestInvoiceDocumentOnDemand(input: OnDemandRequestInput
     capSetting(INVOICE_DOCUMENTS_LAZY_OUTSTANDING_CAP_SETTING, DEFAULT_LAZY_OUTSTANDING_CAP),
   ])
   const dayStart = startOfUtcDay(now)
-  const [today, outstanding] = await Promise.all([
-    db.invoiceDocumentFetchState.count({ where: { customerRequestedAt: { gte: dayStart } } }),
-    db.invoiceDocumentFetchState.count({ where: { customerRequestedAt: { not: null }, status: 'PENDING' } }),
-  ])
-  if (today >= dailyCap) {
-    const untilMidnight = Math.ceil((dayStart.getTime() + 24 * 3_600_000 - now.getTime()) / 1000)
-    return { status: 'throttled', retryAfterSeconds: Math.min(Math.max(untilMidnight, 60), MAX_THROTTLE_RETRY_AFTER_SECONDS) }
-  }
-  if (outstanding >= outstandingCap) return { status: 'throttled', retryAfterSeconds: PREPARING_RETRY_AFTER_SECONDS }
 
-  // QUEUE: the row exists (created here or by the sweep), then ONE compare-and-set claims the request.
-  await db.invoiceDocumentFetchState.upsert({
-    where: { subjectKey },
-    create: { subjectKey, orderId: input.orderId, refundId: input.refundId ?? null, kind: input.kind },
-    update: {},
-  }).catch(() => { /* a concurrent creator won: the row exists */ })
-  const claimed = await db.invoiceDocumentFetchState.updateMany({
-    where: { subjectKey, customerRequestedAt: null, status: { not: 'NEEDS_ATTENTION' } },
-    data: { customerRequestedAt: now },
+  // ADMISSION IS ATOMIC: the two cap counts and the claim run under one transaction-scoped advisory lock, so requests for DIFFERENT documents cannot all see room and all queue. The lock is held only for
+  // two counts and one update. The compare-and-set on `customerRequestedAt` still de-duplicates clicks on the same document.
+  const admitted = await db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('invoice-documents-lazy-queue'))`
+    const [today, outstanding] = await Promise.all([
+      tx.invoiceDocumentFetchState.count({ where: { customerRequestedAt: { gte: dayStart } } }),
+      tx.invoiceDocumentFetchState.count({ where: { customerRequestedAt: { not: null }, status: 'PENDING' } }),
+    ])
+    if (today >= dailyCap) {
+      const untilMidnight = Math.ceil((dayStart.getTime() + 24 * 3_600_000 - now.getTime()) / 1000)
+      return { kind: 'throttled' as const, retryAfterSeconds: Math.min(Math.max(untilMidnight, 60), MAX_THROTTLE_RETRY_AFTER_SECONDS) }
+    }
+    if (outstanding >= outstandingCap) return { kind: 'throttled' as const, retryAfterSeconds: PREPARING_RETRY_AFTER_SECONDS }
+    // The row exists (created here or by the sweep) before the claim; created only once admitted, so a throttled click leaves nothing behind. ON CONFLICT DO NOTHING: a concurrent creator is no error.
+    await tx.invoiceDocumentFetchState.createMany({ data: [{ subjectKey, orderId: input.orderId, refundId: input.refundId ?? null, kind: input.kind }], skipDuplicates: true })
+    const claimed = await tx.invoiceDocumentFetchState.updateMany({
+      where: { subjectKey, customerRequestedAt: null, status: { not: 'NEEDS_ATTENTION' } },
+      data: { customerRequestedAt: now },
+    })
+    return { kind: claimed.count === 0 ? ('lost' as const) : ('queued' as const) }
   })
-  if (claimed.count === 0) return { status: 'preparing', queued: false, retryAfterSeconds: PREPARING_RETRY_AFTER_SECONDS }
+  if (admitted.kind === 'throttled') return { status: 'throttled', retryAfterSeconds: admitted.retryAfterSeconds }
+  if (admitted.kind === 'lost') return { status: 'preparing', queued: false, retryAfterSeconds: PREPARING_RETRY_AFTER_SECONDS }
 
   await logActivity({
     entityType: 'SALES_ORDER', entityId: input.orderId, action: 'invoice_document_requested', tag: 'sync', level: 'INFO',
