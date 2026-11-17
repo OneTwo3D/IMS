@@ -13,7 +13,7 @@ import { PEG_HOLDING_ORDER_STATUSES, sweepPegs, type EndedPeg } from '@/lib/doma
  * order, and the reallocation sweep re-runs allocation.
  *
  * Each order is allocated with `capPeggedLines`: the pegged line may grow only by what has landed for its pegs, so being
- * allocated first never lets it take free stock an older order is owed. Never throws; errors are logged per order.
+ * allocated first never lets it take free stock an older order is owed. Never throws: a failure is counted in `errors` (and logged per order); every caller reads the count.
  *
  * No outbound write: this pass does not enqueue a storefront stock sync. Every caller enqueues one for the received products
  * straight after it (the manual receipt, the WMS book-in and the ASN alignment all do), which covers the reservations made here.
@@ -28,7 +28,9 @@ export async function allocatePeggedOrdersForProducts(
   const ids = [...new Set(productIds.filter(Boolean))]
   if (ids.length === 0) return result
 
-  const pegs = await db.salesOrderLinePeg.findMany({
+  let pegs: Array<{ createdAt: Date; salesOrderLine: { orderId: string; order: { orderNumber: string | null; externalOrderNumber: string | null } } }>
+  try {
+    pegs = await db.salesOrderLinePeg.findMany({
     where: {
       endedAt: null,
       salesOrderLine: {
@@ -42,7 +44,13 @@ export async function allocatePeggedOrdersForProducts(
     },
     select: { createdAt: true, salesOrderLine: { select: { orderId: true, order: { select: { orderNumber: true, externalOrderNumber: true } } } } },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-  })
+    })
+  } catch (error) {
+    // Never throws (the callers are receipt paths): the failure is counted, and the reallocation sweep re-runs allocation.
+    console.error(error)
+    result.errors += 1
+    return result
+  }
   const orders = new Map<string, string>()
   for (const peg of pegs) {
     const order = peg.salesOrderLine.order
@@ -95,17 +103,20 @@ export async function allocatePeggedOrdersForProducts(
  * The reallocation sweep's peg pass: end pegs whose order or purchase order has gone (whatever allocation did or did not run),
  * then hand what they were holding on to the oldest waiting order. Never throws.
  */
-export async function sweepPegsAndRelease(): Promise<{ checked: number; ended: number }> {
+export async function sweepPegsAndRelease(): Promise<{ checked: number; ended: number; errors: number }> {
   const result = await sweepPegs(db)
   const released: EndedPeg[] = result.ended
   const productIds = [...new Set(released.map((peg) => peg.productId))]
+  let errors = 0
   if (productIds.length > 0) {
     try {
       const { allocateBackordersForProducts } = await import('@/lib/fulfillment/backorder-allocator')
-      await allocateBackordersForProducts(productIds, { source: 'stock_adjustment', referenceLabel: 'ended peg(s)' })
+      // The hand-on is the cron's work: its per-order failures are folded into the tick's `errors` so the run is reported failed.
+      errors += (await allocateBackordersForProducts(productIds, { source: 'stock_adjustment', referenceLabel: 'ended peg(s)' })).errors
     } catch (error) {
       console.error(error)
+      errors += 1
     }
   }
-  return { checked: result.checked, ended: released.length }
+  return { checked: result.checked, ended: released.length, errors }
 }

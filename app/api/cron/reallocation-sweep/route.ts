@@ -83,7 +83,8 @@ export async function GET(request: Request) {
 
   const failed = Object.keys(failures).length > 0
   // A pass that threw only because the outbound-write hold refused a write is held, not failed.
-  const body = { ...(result ?? {}), directCreateMarkers, ...(pegs && pegs.ended > 0 ? { pegsEnded: pegs.ended } : {}), ...(failed ? { ok: false, failures } : {}) }
+  // The peg pass's hand-on failures count with the allocation pass's `errors` (the one field the mapping reads).
+  const body = { ...(result ?? {}), ...(pegs && pegs.errors > 0 ? { errors: (result?.errors ?? 0) + pegs.errors } : {}), directCreateMarkers, ...(pegs && pegs.ended > 0 ? { pegsEnded: pegs.ended } : {}), ...(failed ? { ok: false, failures } : {}) }
   const mapped = cronOutcome('reallocation-sweep', body)
   // Passes that failed only on a thrown hold are held; counted per-order errors in the passes that did run still make it failed.
   const withoutThrown = failed && !genuineFailure ? cronOutcome('reallocation-sweep', { ...body, ok: undefined }) : mapped
