@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useCallback, useEffect } from 'react'
+import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -37,6 +37,8 @@ import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
+import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
+import { SoFormDialog } from '../so-form'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
 import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
@@ -118,6 +120,8 @@ type Props = {
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   /** audit-H2: order is fully paid but its trigger won't auto-generate an invoice. */
   paidWithoutInvoice: boolean
+  /** The catalogue the Edit order dialog needs; loaded by the page only for a DRAFT (the only status that can be edited). */
+  editForm?: Omit<ComponentProps<typeof SoFormDialog>, 'order' | 'onClose' | 'warehouses' | 'currencies'>
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -999,13 +1003,14 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showRefund, setShowRefund] = useState(false)
   const [showNotes, setShowNotes] = useState(false)
+  const [showEdit, setShowEdit] = useState(false)
   const [showRefunds, setShowRefunds] = useState(false)
   const [showColPicker, setShowColPicker] = useState(false)
   const [showInvoice, setShowInvoice] = useState(false)
@@ -1074,6 +1079,22 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     accountingInvoiceId: so.accountingInvoiceId ?? null,
     accountingSyncEnabled,
   })
+  // The same rule the updateSalesOrder action applies, so a disabled Edit says why instead of letting the operator walk into the refusal.
+  const editBlock = resolveSalesOrderEditBlock({
+    status: so.status,
+    allocations: allocations.length,
+    shipments: shipments.length,
+    accountingInvoiceId: so.accountingInvoiceId ?? null,
+    wmsPush: so.wmsPush !== null,
+    hasExternalSource: so.hasExternalSource,
+    refunds: so.refunds.length,
+    refundStatus: so.refundStatus,
+    payments: so.payments.length,
+    paid: so.paidAt !== null,
+    storeCreditForeign: so.storeCreditForeign,
+    invoiceRecords: so.invoiceNumber ? 1 : 0,
+  })
+  const canEditOrder = hasPermission(currentUserRole, 'sales.create')
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
   // Reads the orthogonal refundStatus so it keeps working once a partial refund no
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
@@ -1418,7 +1439,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
 
           <span className="w-px h-5 bg-border mx-0.5" />
 
-          {/* Notes / Delete / WC */}
+          {/* Edit order / Notes / Delete / WC */}
+          {canEditOrder && (
+            // The reason lives on the wrapper, not the button: a disabled button swallows pointer events in several browsers.
+            <span title={editBlock?.reason} className="inline-flex">
+              <Button variant="outline" size="sm" onClick={() => setShowEdit(true)} disabled={isPending || editBlock !== null || !editForm} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
+                <Pencil className="h-4 w-4 mr-1" />Edit order
+              </Button>
+              {editBlock && <span id="edit-order-blocked-reason" className="sr-only">{editBlock.reason}</span>}
+            </span>
+          )}
           <Button variant="outline" size="sm" onClick={() => setShowNotes(true)}>
             <Pencil className="h-4 w-4 mr-1" />Notes
           </Button>
@@ -2068,6 +2098,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       {/* Dialogs */}
       {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
+      {showEdit && editForm && editBlock === null && (
+        <SoFormDialog {...editForm} warehouses={warehouses} currencies={currencies} order={so} onClose={() => setShowEdit(false)} />
+      )}
       {accountingAvailable && showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}
 
       {/* Invoice detail dialog */}

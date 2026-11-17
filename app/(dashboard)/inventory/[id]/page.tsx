@@ -17,6 +17,8 @@ import { StockFlowButton } from '@/components/inventory/stock-flow-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { StockDetailPopup } from '@/components/inventory/stock-detail-popups'
+import { LocationBuffer } from '@/components/inventory/location-buffer'
+import { getLocationBuffers } from '@/app/actions/location-buffer'
 import { WarehouseReorderThresholds } from '@/components/inventory/warehouse-reorder-thresholds'
 import { getWarehouseReorderThresholds } from '@/app/actions/reorder-thresholds'
 import { getSession } from '@/lib/auth/server'
@@ -84,6 +86,7 @@ export default async function ProductDetailPage({
   const holdsOwnStock = product.type === 'SIMPLE' || product.type === 'VARIANT' || product.type === 'BOM'
   const session = await getSession()
   const canEditInventory = session ? hasPermission(session.user.role, 'inventory.edit') : false
+  const locationBuffers = holdsOwnStock ? await getLocationBuffers(id) : null
   const reorderThresholds = holdsOwnStock ? await getWarehouseReorderThresholds(id) : null
 
   const [productOptions, suppliers, productComponents, kitStock, hsProposal] = await Promise.all([
@@ -479,6 +482,10 @@ export default async function ProductDetailPage({
                 </div>
               )}
             </Card>
+          )}
+
+          {locationBuffers && (
+            <LocationBuffer data={locationBuffers} canEdit={canEditInventory} />
           )}
 
           {reorderThresholds && (
