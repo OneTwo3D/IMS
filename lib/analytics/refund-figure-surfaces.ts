@@ -757,6 +757,20 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     reason:
       'Pure margin computation for the PO preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
   },
+  {
+    file: 'app/actions/purchase-orders.ts',
+    figures: ['netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`netTotal` is the net amount of a SUPPLIER credit note under the reverse-charge plan (the PO action converts it to base for the transit posting). It is a purchase-side ledger amount; customer refunds of past sales never enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/supplier-credit-note.ts',
+    figures: ['netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`netTotal` is the sum of the net lines of a supplier credit note split into reverse-charge net/VAT for the Xero posting. A purchase-side posting amount, not a sales revenue figure; no customer refund moves it.',
+  },
 ]
 
 /** Look a file up. Used by the coverage test and useful from a REPL when triaging a red run. */
