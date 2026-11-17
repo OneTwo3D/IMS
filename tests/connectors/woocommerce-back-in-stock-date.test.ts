@@ -181,7 +181,7 @@ test('resolver: undated, fully received and zero-outstanding lines produce no da
 
 test('resolver: an open ASN eta WINS over the PO date; an ASN with no eta falls through to the PO date', async () => {
   const { resolveBackInStockDates } = await import('@/lib/domain/inventory/back-in-stock-date')
-  const asn = (sourceLineId: string, eta: Date | null, expectedQty = 10) => ({ sourceLineId, expectedQty, qtyAccountedViaSnapshot: 0, qtyAccountedViaReceipt: 0, asn: { eta } })
+  const asn = (sourceLineId: string, eta: Date | null, expectedQty = 10) => ({ sourceLineId, expectedQty, qtyAccountedViaSnapshot: 0, qtyAccountedViaReceipt: 0, asn: { eta, status: 'OPEN' } })
   const result = resolveBackInStockDates([
     poLine('l1', 'a', null, at(6)),
     poLine('l2', 'b', null, at(6)),
@@ -192,14 +192,14 @@ test('resolver: an open ASN eta WINS over the PO date; an ASN with no eta falls 
 
 test('resolver: a half-covered line keeps both sources and takes the earliest resolved date; a late ASN eta is dropped', async () => {
   const { resolveBackInStockDates } = await import('@/lib/domain/inventory/back-in-stock-date')
-  const asn = (sourceLineId: string, eta: Date | null, expectedQty: number) => ({ sourceLineId, expectedQty, qtyAccountedViaSnapshot: 0, qtyAccountedViaReceipt: 0, asn: { eta } })
+  const asn = (sourceLineId: string, eta: Date | null, expectedQty: number) => ({ sourceLineId, expectedQty, qtyAccountedViaSnapshot: 0, qtyAccountedViaReceipt: 0, asn: { eta, status: 'OPEN' } })
   const half = resolveBackInStockDates([poLine('l1', 'a', null, at(8), 10)], [asn('l1', at(20), 4)], NOW)
   assert.equal(half.get('a'), ymd(8), 'the 6 uncovered units are dated by the PO, the 4 covered ones by the ASN: the earliest is shown')
   const lateAsn = resolveBackInStockDates([poLine('l1', 'a', null, at(8), 10)], [asn('l1', at(-2), 10)], NOW)
   assert.equal(lateAsn.has('a'), false, 'a late ASN covering the whole line leaves nothing dated: no date')
 })
 
-test('loader: only committed GOODS purchase orders are read, and only open ASNs', async () => {
+test('loader: only committed GOODS purchase orders are read, with every ASN row so landed units are counted', async () => {
   reset([])
   poLines = [poLine('l1', 'a', null, realAt(4))]
   const { loadBackInStockDates } = await import('@/lib/domain/inventory/back-in-stock-date')
@@ -210,6 +210,28 @@ test('loader: only committed GOODS purchase orders are read, and only open ASNs'
   assert.equal(where.po.type, 'GOODS')
   assert.deepEqual(where.po.status.in, INCOMING_PO_STATUSES)
   assert.deepEqual((await loadBackInStockDates([])).size, 0)
+})
+
+test('resolver: units WMS alignment already landed are NOT outstanding supply (o3d-taro Codex r1)', async () => {
+  const { resolveBackInStockDates } = await import('@/lib/domain/inventory/back-in-stock-date')
+  const asn = (sourceLineId: string, eta: Date | null, expectedQty: number, snapshot: number, receipt: number, status = 'OPEN') => (
+    { sourceLineId, expectedQty, qtyAccountedViaSnapshot: snapshot, qtyAccountedViaReceipt: receipt, asn: { eta, status } })
+  // 10-unit line, 5 landed by alignment (qtyReceived stays 0), PO ETA +2, open ASN for the 10 with ETA +10: the 5 remaining units are
+  // covered by the ASN, so the date is +10, never the earlier PO date.
+  const partial = resolveBackInStockDates([poLine('l1', 'a', null, at(2), 10, 0)], [asn('l1', at(10), 10, 5, 0)], NOW)
+  assert.equal(partial.get('a'), ymd(10), 'landed units do not leave an uncovered remainder dated by the PO')
+  // fully landed by alignment: nothing outstanding, no date from the PO or the ASN
+  const full = resolveBackInStockDates([poLine('l1', 'a', null, at(2), 10, 0)], [asn('l1', at(10), 10, 10, 0)], NOW)
+  assert.equal(full.has('a'), false)
+  // receipt absorbed the same snapshot units: qtyReceived 5 + snapshot 5 / receipt 5 is 5 landed, not 10
+  const absorbed = resolveBackInStockDates([poLine('l1', 'a', null, at(2), 10, 5)], [asn('l1', at(10), 10, 5, 5)], NOW)
+  assert.equal(absorbed.get('a'), ymd(10), '5 units are still to come, all covered by the ASN: its date, and nothing double-counted')
+  // landed units on a CLOSED ASN row still count as landed stock
+  const closed = resolveBackInStockDates([poLine('l1', 'a', null, at(2), 10, 0)], [asn('l1', at(10), 10, 10, 0, 'CLOSED')], NOW)
+  assert.equal(closed.has('a'), false, 'a closed row cannot date supply, and its landed units are not outstanding')
+  // a closed ASN row does not cover the remainder of a part-landed line: the PO dates it
+  const closedPartial = resolveBackInStockDates([poLine('l1', 'a', null, at(2), 10, 0)], [asn('l1', at(10), 10, 4, 0, 'CLOSED')], NOW)
+  assert.equal(closedPartial.get('a'), ymd(2))
 })
 
 // ───────────────────────── 2. setting OFF: byte-identical ─────────────────────────

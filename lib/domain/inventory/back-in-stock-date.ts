@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { resolvePurchaseOrderLineLandedQty } from '@/lib/domain/inventory/po-line-landed-quantity'
 import { dateOnly } from '@/lib/domain/math/date-window'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
@@ -8,7 +9,9 @@ import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
  * ESTIMATED BACK-IN-STOCK DATE for a zero-availability product (customer-facing; o3d-taro).
  *
  * The date comes ONLY from committed inbound supply: purchase-order lines on INCOMING_PO_STATUSES (GOODS orders) with units still
- * outstanding, and WMS ASNs that cover them. A past promise must never reach a customer and no date beats a wrong one, so:
+ * outstanding, and WMS ASNs that cover them. OUTSTANDING means not yet landed by the one definition the rest of IMS uses
+ * (lib/domain/inventory/po-line-landed-quantity.ts: qtyReceived plus the unabsorbed WMS alignment credit over EVERY ASN row of the line,
+ * closed and retired included), so units WMS alignment or a book-in already brought into stock never date a future arrival. A past promise must never reach a customer and no date beats a wrong one, so:
  *
  *   - a supply source's date is the ASN's eta when the line is covered by an open ASN (OPEN / PARTIALLY_BOOKED_IN) that has one, else the
  *     line's effective ETA (its own date, else the order's: lib/domain/purchasing/line-eta.ts). An ASN with no eta falls through to the PO date;
@@ -22,7 +25,6 @@ export type BackInStockPoLine = {
   productId: string
   qty: DecimalInput
   qtyReceived: DecimalInput
-  qtyReturned: DecimalInput
   expectedDelivery: Date | null
   po: { expectedDelivery: Date | null }
 }
@@ -33,9 +35,17 @@ export type BackInStockAsnLine = {
   expectedQty: DecimalInput
   qtyAccountedViaSnapshot: DecimalInput
   qtyAccountedViaReceipt: DecimalInput
-  asn: { eta: Date | null }
+  /** The ASN header. `status` decides whether the row can DATE supply; every row, whatever its status, counts as landed stock. */
+  asn: { eta: Date | null; status: string }
 }
 
+/** ASN statuses that still expect units: only these rows can date a line's remaining supply. */
+const OPEN_ASN_STATUSES: ReadonlyArray<string> = ['OPEN', 'PARTIALLY_BOOKED_IN']
+
+/**
+ * `asnLines` must be EVERY ASN row of the lines (closed and retired included): they all feed the landed quantity, and only the open ones
+ * date supply.
+ */
 /** Pure: product id to its earliest committed, not-late arrival date (YYYY-MM-DD). Products with none are absent. */
 export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: BackInStockAsnLine[], now: Date): Map<string, string> {
   const today = dateOnly(now)
@@ -54,10 +64,18 @@ export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: Ba
     if (!existing || day < existing) earliest.set(productId, day)
   }
   for (const line of lines) {
-    let outstanding = toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned))
+    const lineAsnRows = asnByLine.get(line.id) ?? []
+    const landed = resolvePurchaseOrderLineLandedQty({ poLineId: line.id, qtyReceived: line.qtyReceived, wmsAsnLines: lineAsnRows })
+    let outstanding = toDecimal(line.qty).sub(landed.qty)
     if (outstanding.lte(0)) continue
-    for (const asnLine of asnByLine.get(line.id) ?? []) {
-      const remaining = toDecimal(asnLine.expectedQty).sub(toDecimal(asnLine.qtyAccountedViaSnapshot)).sub(toDecimal(asnLine.qtyAccountedViaReceipt))
+    for (const asnLine of lineAsnRows) {
+      if (!OPEN_ASN_STATUSES.includes(asnLine.asn.status)) continue
+      // The row's own landed units are max(snapshot, receipt): a receipt can absorb the very units alignment credited, so the two
+      // counters are not added.
+      const accounted = toDecimal(asnLine.qtyAccountedViaSnapshot).gt(toDecimal(asnLine.qtyAccountedViaReceipt))
+        ? toDecimal(asnLine.qtyAccountedViaSnapshot)
+        : toDecimal(asnLine.qtyAccountedViaReceipt)
+      const remaining = toDecimal(asnLine.expectedQty).sub(accounted)
       // An ASN without an eta does not cover the units for dating: they fall through to the PO date.
       if (remaining.lte(0) || !asnLine.asn.eta) continue
       consider(line.productId, asnLine.asn.eta)
@@ -77,7 +95,7 @@ export async function loadBackInStockDates(productIds: string[], now: Date = new
   const lines = await db.purchaseOrderLine.findMany({
     where: { productId: { in: productIds }, po: { type: 'GOODS', status: { in: INCOMING_PO_STATUSES } } },
     select: {
-      id: true, productId: true, qty: true, qtyReceived: true, qtyReturned: true, expectedDelivery: true,
+      id: true, productId: true, qty: true, qtyReceived: true, expectedDelivery: true,
       po: { select: { expectedDelivery: true } },
     },
   })
@@ -85,12 +103,12 @@ export async function loadBackInStockDates(productIds: string[], now: Date = new
   const asnLines = await db.wmsAsnLineMap.findMany({
     where: {
       sourceType: 'PURCHASE_ORDER_LINE',
+      // NO status filter: closed and retired rows still hold landed units (po-line-landed-quantity.ts). The resolver dates from open ones only.
       sourceLineId: { in: lines.map((line) => line.id) },
-      asn: { status: { in: ['OPEN', 'PARTIALLY_BOOKED_IN'] } },
     },
     select: {
       sourceLineId: true, expectedQty: true, qtyAccountedViaSnapshot: true, qtyAccountedViaReceipt: true,
-      asn: { select: { eta: true } },
+      asn: { select: { eta: true, status: true } },
     },
   })
   return resolveBackInStockDates(lines, asnLines, now)
