@@ -1,0 +1,13 @@
+-- o3d-oyur: compaction keeps the per-account net the A2 posting proof needs.
+--
+-- Retention's compaction empties `payload` on a journal row it keeps, which made a legitimately old A2
+-- journal permanently unprovable (the posting proof fails closed on an unreadable row). The proof asks
+-- one question of the lines - the NET movement of one account code in one direction - so compaction now
+-- writes that answer, per account, in the same statement that empties the payload:
+--   { "version": 1, "accounts": { "<code>": { "credit": <number>, "debit": <number> } } }
+-- Account codes and two totals each; nothing personal.
+--
+-- Additive and nullable, no default, no backfill. NULL means no record: rows compacted before this
+-- migration have no payload to derive a summary from and stay unprovable (the proof fails closed, as it
+-- did), and rows never compacted still carry their payload.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "payload_account_nets" JSONB;

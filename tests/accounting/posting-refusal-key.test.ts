@@ -111,6 +111,8 @@ const CASES: Record<string, Case> = {
     retryOfA: { type: 'PURCHASE_INVOICE_UPDATE', referenceType: 'PurchaseOrder', referenceId: 'po-1', idempotencyKey: 'upd:A:h2', payload: { accountingInvoiceId: 'xero-bill-A' } },
   },
   CREDIT_NOTE: doc('CREDIT_NOTE', 'SalesOrderRefund'),
+  // o3d-ngmt.22: one void per deleted refund, referenced by the deleted refund's id.
+  CREDIT_NOTE_VOID: doc('CREDIT_NOTE_VOID', 'SalesOrderRefundDeletion'),
   PURCHASE_CREDIT_NOTE: doc('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'),
   PURCHASE_CREDIT_NOTE_ALLOCATION: doc('PURCHASE_CREDIT_NOTE_ALLOCATION', 'SupplierCreditNote'),
   BILL_PAYMENT: doc('BILL_PAYMENT', 'PurchaseInvoice'),

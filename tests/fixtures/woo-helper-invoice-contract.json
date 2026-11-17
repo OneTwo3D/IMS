@@ -1,0 +1,44 @@
+{
+  "about": "The contract between IMS and the WooCommerce helper plugin (lib/connectors/woocommerce/wp-plugin/onetwoinventory-helper.php) for the customer invoice. IMS never sends the PDF to the storefront: it sets order meta, and the plugin asks IMS for the PDF when the customer clicks. tests/connectors/woo-helper-invoice-contract.test.ts pins this file against the plugin source (what it reads and sends) and against IMS (what it writes and answers). Edit the plugin or IMS and this file together, never one alone. No customer data: every value is a placeholder.",
+  "orderMeta": {
+    "downloadFlag": {
+      "key": "_ims_invoice_pdf_available",
+      "valueThatShowsTheButton": "yes",
+      "writtenBy": "IMS, order.invoice-document writer, behind wc_invoice_document_enabled (default off)"
+    },
+    "accountingUrl": {
+      "key": "_accounting_invoice_url",
+      "writtenBy": "IMS, order.invoice-note writer, only for an invoice IMS posted itself"
+    },
+    "imsWritesOnPublish": {
+      "meta_data": [
+        { "key": "_ims_invoice_pdf_available", "value": "yes" }
+      ]
+    },
+    "flaglessHistoricOrders": {
+      "note": "An order the flag was never written for (a historic order) shows no button, because the plugin shows it only when the flag is yes. IMS writes nothing to historic orders (no bulk write to the storefront). IMS serves such an order's PDF on request through the same endpoint, so the plugin shows its button for them by a rule of its own: the order carries the invoice number the previous invoice plugin stored.",
+      "invoiceNumberMetaIMSReads": "_wcpdf_invoice_number",
+      "imsEndpointAnswersFlaglessOrders": true
+    }
+  },
+  "signedRequest": {
+    "endpointPath": "/api/shopping/woocommerce/invoice-pdf",
+    "creditNoteEndpointPath": "/api/shopping/woocommerce/credit-note-pdf",
+    "signatureHeader": "X-OTI-Signature",
+    "bodyKeysTheInvoiceRequestSends": ["connector", "externalOrderId", "externalCustomerId", "externalOrderKey", "issuedAt", "expiresAt", "nonce"],
+    "additionalKeyOfACreditNoteRequest": "externalRefundId",
+    "ttlSecondsMax": 300
+  },
+  "answers": {
+    "served": { "status": 200, "contentType": "application/pdf" },
+    "preparing": {
+      "status": 202,
+      "bodyKeys": ["status", "retryAfterSeconds"],
+      "statusValue": "preparing",
+      "headers": ["Retry-After", "X-IMS-Invoice-Status"],
+      "pluginBehaviourToday": "The helper plugin turns every answer other than 200 into an error (a status below 400 becomes 502), so a customer who clicks while IMS is preparing the PDF sees the plugin's generic 'not found' message and clicks again later. Showing a 'being prepared, try again shortly' message instead is a plugin change, not an IMS one."
+    },
+    "busy": { "status": 429, "headers": ["Retry-After"] },
+    "notAvailable": { "status": 404 }
+  }
+}

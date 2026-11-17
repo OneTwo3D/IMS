@@ -110,6 +110,8 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   // The invoice note is raised from the posted INVOICE_PDF row, which is raised from the posted sales invoice row (enqueueSalesInvoiceFollowUps).
   WC_INVOICE_NOTE: { kind: 'parent', via: [['INVOICE_PDF'], ['SALES_INVOICE', 'SALES_INVOICE_UPDATE']] },
   CREDIT_NOTE: { kind: 'payload', field: 'date' },
+  // o3d-ngmt.22: the void carries the day it was raised (the payload's own `date`), the day the process-time hold is judged against.
+  CREDIT_NOTE_VOID: { kind: 'payload', field: 'date' },
   PURCHASE_CREDIT_NOTE: { kind: 'payload', field: 'date' },
   PURCHASE_CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date' },
   STOCK_IN_TRANSIT: { kind: 'payload', field: 'date' },
