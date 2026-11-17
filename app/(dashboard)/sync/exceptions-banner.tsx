@@ -30,6 +30,7 @@ export function ExceptionsBanner({ summary }: { summary: ExceptionInboxSummary }
     summary.wcCompletionRefusals > 0 ? `${summary.wcCompletionRefusals} refused WooCommerce completion(s)` : null,
     summary.doublePostageFlags > 0 ? `${summary.doublePostageFlags} possible double postage` : null,
     summary.wmsOperatorTasksOpen > 0 ? `${summary.wmsOperatorTasksOpen} operator task(s) to raise (warehouse queries and refunds to make in WooCommerce)` : null,
+    summary.refusedActionsOpen > 0 ? `${summary.refusedActionsOpen} refused or stalled action(s)` : null,
     summary.orderReconcileDrift > 0 ? `${summary.orderReconcileDrift} order reconcile drift(s)` : null,
   ].filter(Boolean)
 

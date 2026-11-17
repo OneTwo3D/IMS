@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Bar, CartesianGrid, ComposedChart, Legend, Line, ReferenceLine, Tooltip, XAxis, YAxis } from 'recharts'
+import { Bar, CartesianGrid, ComposedChart, Legend, Line, ReferenceArea, ReferenceLine, Tooltip, XAxis, YAxis } from 'recharts'
 import type { ReorderDemandChart } from '@/lib/domain/inventory/reorder-demand-chart'
 
 // Raw hsl() strings, as the dashboard charts use. Chosen to stay distinguishable in light and dark.
@@ -15,6 +15,9 @@ const COLORS = {
   receipt: 'hsl(190, 80%, 38%)',
   shortage: 'hsl(0, 84%, 50%)',
   today: 'hsl(0, 0%, 45%)',
+  onHand: 'hsl(262, 25%, 50%)',
+  stockoutShade: 'hsl(0, 84%, 50%)',
+  unknownShade: 'hsl(0, 0%, 50%)',
 }
 
 const CHART_HEIGHT = 380
@@ -66,12 +69,21 @@ export function DemandChartClient({ chart, summary }: { chart: ReorderDemandChar
               <XAxis dataKey="weekStart" tickFormatter={shortDate} tick={{ fontSize: 11 }} interval="preserveStartEnd" label={{ value: 'Week starting (Monday, UTC)', position: 'insideBottom', offset: -18, fontSize: 12 }} />
               <YAxis tick={{ fontSize: 11 }} width={56} label={{ value: `Units (${unit})`, angle: -90, position: 'insideLeft', fontSize: 12 }} />
               <Tooltip />
+              {chart.weeks.map((week) => {
+                // Three states, three looks: stockout is red, UNKNOWN (no snapshot that day) is grey and never
+                // reads as in stock, a week with some unknown days is a lighter grey, in stock is unshaded.
+                if (week.stockState === 'stockout') return <ReferenceArea key={`shade-${week.weekStart}`} x1={week.weekStart} x2={week.weekStart} fill={COLORS.stockoutShade} fillOpacity={0.14} stroke="none" ifOverflow="visible" />
+                if (week.stockState === 'unknown') return <ReferenceArea key={`shade-${week.weekStart}`} x1={week.weekStart} x2={week.weekStart} fill={COLORS.unknownShade} fillOpacity={0.22} stroke={COLORS.unknownShade} strokeDasharray="3 3" ifOverflow="visible" />
+                if (week.stockState === 'partly_unknown') return <ReferenceArea key={`shade-${week.weekStart}`} x1={week.weekStart} x2={week.weekStart} fill={COLORS.unknownShade} fillOpacity={0.08} stroke="none" ifOverflow="visible" />
+                return null
+              })}
               <Legend verticalAlign="top" wrapperStyle={{ fontSize: 12 }} />
               <Bar dataKey="actualDemandQty" name="Actual demand" fill={COLORS.actual} isAnimationActive={false} />
               <Bar dataKey="projectedDemandQty" name="Projected demand (flat average)" fill={COLORS.projected} stroke={COLORS.actual} strokeDasharray="3 2" isAnimationActive={false} />
               <Bar dataKey="inboundQty" name="Inbound PO arrivals" fill={COLORS.inbound} isAnimationActive={false} />
               <Bar dataKey="requiredReceiptQty" name="Required receipt (suggested qty)" fill={COLORS.receipt} isAnimationActive={false} />
               <Line type="monotone" dataKey="stockPositionQty" name="Projected available stock" stroke={COLORS.stock} strokeWidth={2} dot={{ r: 2 }} connectNulls={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="historicalStockQty" name="On-hand stock (daily snapshots)" stroke={COLORS.onHand} strokeWidth={2} strokeDasharray="5 3" dot={{ r: 2 }} connectNulls={false} isAnimationActive={false} />
               <ReferenceLine y={chart.safetyStockQty} stroke={COLORS.safety} strokeDasharray="6 3" label={{ value: `Safety stock ${chart.safetyStockQty}`, position: 'insideTopLeft', fontSize: 11, fill: COLORS.safety }} />
               <ReferenceLine y={chart.reorderPoint} stroke={COLORS.reorder} strokeDasharray="2 3" label={{ value: `Reorder point ${chart.reorderPoint}`, position: 'insideBottomLeft', fontSize: 11, fill: COLORS.reorder }} />
               {receiptWeek ? <ReferenceLine x={receiptWeek} stroke={COLORS.receipt} strokeWidth={2} label={{ value: 'Required receipt', position: 'top', fontSize: 11, fill: COLORS.receipt }} /> : null}
@@ -83,7 +95,7 @@ export function DemandChartClient({ chart, summary }: { chart: ReorderDemandChar
         )}
       </ChartFrame>
       <figcaption className="text-xs text-muted-foreground">
-        Read-only. Bars are weekly units; the purple line is projected available stock at the end of each week. Adjust the demand window and weeks of supply on Reorder Planning.
+        Read-only. Bars are weekly units; the solid purple line is projected available stock at the end of each week and the dashed line is on-hand stock from the daily snapshots. Red weeks had a day with no stock; dark grey weeks are unknown (no snapshot taken), not in stock; light grey weeks have some unknown days. Adjust the demand window and weeks of supply on Reorder Planning.
       </figcaption>
     </figure>
   )

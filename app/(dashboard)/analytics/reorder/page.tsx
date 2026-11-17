@@ -68,6 +68,7 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
     search: search || undefined,
     targetCoverWeeks: positiveInteger(one(searchParams.targetCoverWeeks)),
     includeZero: one(searchParams.includeZero) === '1',
+    ...(one(searchParams.ignoreStockouts) === '1' ? { ignoreStockouts: true } : {}),
     page: Number(one(searchParams.page) ?? 1),
     pageSize: Number(one(searchParams.pageSize) ?? 100),
   }
@@ -123,6 +124,25 @@ function LatestPoDateText({ row }: { row: ReorderReportRow }) {
 
 const PROJECTION_HORIZON_LABEL = '365 days'
 
+/** Daily demand, with a badge when stockout days were removed from (or the 90% guard blocked) its average. */
+function DailyDemandCell({ row }: { row: ReorderReportRow }) {
+  const adjustment = row.stockoutAdjustment
+  if (!adjustment) return <>{row.averageDailyDemand}</>
+  return (
+    <div>
+      {row.averageDailyDemand}
+      <span
+        className="mt-0.5 block text-[10px] text-muted-foreground"
+        title={adjustment.clamped
+          ? 'Out of stock for 90% or more of the demand window: the unadjusted demand is used.'
+          : `Averaged over ${adjustment.effectiveDays} days: ${adjustment.stockoutDays} stockout day(s) in the window are excluded.`}
+      >
+        {adjustment.clamped ? 'stockouts not excluded (>= 90%)' : `${adjustment.stockoutDays} stockout day(s) excluded`}
+      </span>
+    </div>
+  )
+}
+
 function urgencyLabel(urgency: ReorderReportRow['urgency']): string {
   return urgency === 'critical' ? 'Critical' : urgency === 'reorder' ? 'Reorder' : 'Watch'
 }
@@ -155,6 +175,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     search: filters.search,
     targetCoverWeeks: filters.targetCoverWeeks == null ? undefined : String(filters.targetCoverWeeks),
     includeZero: filters.includeZero,
+    ignoreStockouts: filters.ignoreStockouts,
     pageSize: String(filters.pageSize ?? 100),
   }
   // Carry the filters that shape one product's figures into the demand chart drill-down.
@@ -165,6 +186,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     productType: filters.productType,
     thresholdDays: filters.thresholdDays,
     targetCoverWeeks: filters.targetCoverWeeks,
+    ignoreStockouts: filters.ignoreStockouts,
   }).toString()
   const columns: Array<StockPositionColumn<ReorderReportRow>> = [
     {
@@ -180,7 +202,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'available', label: 'Available', align: 'right', render: (row) => `${row.availableQty} ${row.stockUnit}`, footer: report.totals.availableQty },
     { key: 'warehouseAvailability', label: 'Warehouse availability', render: (row) => row.warehouseAvailabilityBreakdown || 'None' },
     { key: 'inbound', label: 'Inbound PO', align: 'right', render: (row) => row.inboundOpenPoQty, footer: report.totals.inboundOpenPoQty },
-    { key: 'demand', label: 'Daily demand', align: 'right', render: (row) => row.averageDailyDemand },
+    { key: 'demand', label: 'Daily demand', align: 'right', render: (row) => <DailyDemandCell row={row} /> },
     { key: 'leadTime', label: 'Lead time', align: 'right', render: (row) => `${row.leadTimeDays} days` },
     { key: 'latestPoDate', label: 'Latest PO date', render: (row) => <LatestPoDateCell row={row} /> },
     { key: 'requiredReceipt', label: 'Required receipt', render: (row) => row.requiredReceiptDate ?? MUTED_DASH },
@@ -244,6 +266,8 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     abcClass: filters.abcClass,
     urgency: filters.urgency,
     search: filters.search,
+    // The draft PO / MO quantities must use the demand the operator is looking at.
+    ...(filters.ignoreStockouts ? { ignoreStockouts: true } : {}),
   }
   const visibleProductIds = report.rows.map((row) => row.productId)
   // Hydrate selection from the URL, but only for ids still on the current page
@@ -313,6 +337,10 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
               <option value="16" />
             </datalist>
           </div>
+          <label className="flex items-center gap-2 self-end pb-2 text-sm" title="Remove days with no on-hand stock (from the daily inventory snapshots) from the demand average. Days without a snapshot are not counted as stockouts.">
+            <input type="checkbox" name="ignoreStockouts" value="1" defaultChecked={filtersForUi.ignoreStockouts} className="rounded border-input" />
+            Ignore stockouts
+          </label>
         </>
       }
       selectionColumn={{

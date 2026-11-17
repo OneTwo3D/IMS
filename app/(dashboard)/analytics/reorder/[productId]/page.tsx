@@ -83,6 +83,8 @@ export default async function ReorderDemandChartPage({
                 <TableHead scope="col" className="text-right">Projected demand (flat average)</TableHead>
                 <TableHead scope="col" className="text-right">Inbound PO</TableHead>
                 <TableHead scope="col" className="text-right">Projected stock (end of week)</TableHead>
+                <TableHead scope="col" className="text-right">On-hand (daily snapshot)</TableHead>
+                <TableHead scope="col">Stock days (out / in / unknown)</TableHead>
                 <TableHead scope="col" className="text-right">Required receipt qty</TableHead>
                 <TableHead scope="col">Marker</TableHead>
               </TableRow>
@@ -103,6 +105,8 @@ export default async function ReorderDemandChartPage({
                     <TableCell className="text-right">{week.projectedDemandQty ?? DASH}</TableCell>
                     <TableCell className="text-right">{week.inboundQty || DASH}</TableCell>
                     <TableCell className="text-right">{week.stockPositionQty ?? DASH}</TableCell>
+                    <TableCell className="text-right">{week.historicalStockQty ?? DASH}</TableCell>
+                    <TableCell>{week.stockState == null ? DASH : `${week.stockoutDays} / ${week.inStockDays} / ${week.unknownDays}${week.stockState === 'stockout' ? ' (stockout)' : week.stockState === 'unknown' ? ' (unknown)' : ''}`}</TableCell>
                     <TableCell className="text-right">{week.requiredReceiptQty ?? DASH}</TableCell>
                     <TableCell>{markers.join('; ') || DASH}</TableCell>
                   </TableRow>

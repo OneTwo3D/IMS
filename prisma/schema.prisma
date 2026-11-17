@@ -1929,6 +1929,15 @@ model SalesOrder {
   /// can never be provenance-less, and cleared in the same statement when the claim is released.
   accountingInvoiceConnector String? @map("accounting_invoice_connector")
   paidAt            DateTime?
+  /// PART OF THE PAID AMOUNT THE LEDGER NO LONGER HOLDS, in the ORDER currency (o3d-cdhl). Set when the accounting
+  /// ledger shows less paid against the order's invoice than IMS recorded (a payment deleted there, or
+  /// part of it), and cleared when the ledger holds the full amount again. NULL (never 0) means no part of the payment is
+  /// missing. `paidAt` is deliberately LEFT SET while this is non-null: the order was paid and revenue was
+  /// recognised on that, and the unwind is the operator's decision; every reader that asks "is it fully paid?" asks
+  /// `paymentRemovedForeign` too (lib/domain/sales/paid-state.ts).
+  paymentRemovedForeign Decimal? @map("payment_removed_foreign") @db.Decimal(18, 4)
+  /// When `paymentRemovedForeign` last changed. NULL with it.
+  paymentRemovedAt  DateTime? @map("payment_removed_at")
   /// o3d-psrx r2 — THE PAID FLAG BESIDE IT WAS SET FROM EVIDENCE THE LEDGER WAS NEVER GIVEN.
   ///
   /// `paidAt` records THAT this order is held as paid. It does not record WHERE that belief came
@@ -2120,6 +2129,7 @@ model SalesOrder {
   invoiceDocumentFetches InvoiceDocumentFetchState[]
   invoiceStorePublication InvoiceStorePublication?
   payments          Payment[]
+  paymentRemovals   PaymentRemovalReconciliation[]
   allocations       OrderAllocation[]
   shipments         Shipment[]
   shoppingLinks     ShoppingOrderLink[]
@@ -4175,6 +4185,8 @@ enum WmsOperatorTaskReason {
   MERGE_CANDIDATE
   /// A refund IMS recorded that the shop still has to pay back to the customer in WooCommerce. Not a warehouse query: raised with connector 'woocommerce'.
   SHOP_REFUND_DUE
+  /// An IMS amendment the warehouse order could not take because it was already past NEW: a person applies the change in the warehouse by hand.
+  AMENDMENT_NOT_APPLIED
 }
 
 enum WmsOperatorTaskStatus {
@@ -4230,6 +4242,62 @@ model WmsOperatorTask {
   @@index([status, createdAt, id], map: "wms_operator_tasks_status_created_idx")
   @@index([orderId], map: "wms_operator_tasks_order_idx")
   @@map("wms_operator_tasks")
+}
+
+// ---------------------------------------------------------------------------
+// REFUSED OR STALLED ACTIONS
+// ---------------------------------------------------------------------------
+// One durable record of "IMS wanted to do this, a gate refused it, and nothing else says so". A refusal used to be a string on a link or a
+// pending result that read as "come back later"; this row says what was asked, which gate refused it, whether it can ever succeed, and how long
+// it has been standing (firstSeenAt / lastSeenAt), so a condition that lasts a fortnight no longer looks like one that began a minute ago.
+// Keyed on (entity, action, gate): a repeat refusal bumps lastSeenAt and never makes a second row. Holds no personal data: order and warehouse
+// numbers, SKUs, quantities and amounts in fixed wording built by IMS. No foreign key: the row must outlive a deleted entity.
+
+enum RefusedActionPermanence {
+  /// The gate will not open on its own (the warehouse order is past NEW; a part was cancelled and will never despatch).
+  PERMANENT
+  /// The gate may open later; the action is retried.
+  RETRYABLE
+}
+
+/// Declared lowest first: the upsert keeps the GREATEST severity seen, which relies on this order.
+enum RefusedActionSeverity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model RefusedAction {
+  id          String                  @id @default(cuid())
+  /// What the action was about, e.g. SALES_ORDER.
+  entityType  String                  @map("entity_type")
+  entityId    String                  @map("entity_id")
+  /// What was requested, e.g. WMS_ORDER_AMEND.
+  action      String
+  /// The gate that refused it, e.g. WMS_ORDER_NOT_NEW.
+  gate        String
+  permanence  RefusedActionPermanence
+  severity    RefusedActionSeverity
+  /// The INTENT, without personal data (the warehouse push summary: order number, SKUs, quantities, amounts). Built by IMS, never copied from a remote error.
+  intent      Json?
+  /// One fixed-wording line an operator can read: what the gate saw (the warehouse status), never remote free text.
+  detail      String?
+  /// How many times the same refusal was seen in this episode.
+  attempts    Int                     @default(1)
+  firstSeenAt DateTime                @default(now()) @map("first_seen_at")
+  lastSeenAt  DateTime                @default(now()) @map("last_seen_at")
+  /// Set when the action later succeeded or the entity no longer needs it. A later refusal of the same action starts a new episode on the same row.
+  resolvedAt  DateTime?               @map("resolved_at")
+  resolution  String?
+  /// When the age-based alert was raised for this episode. Once per episode: cleared only when a new episode starts.
+  alertedAt   DateTime?               @map("alerted_at")
+  /// When a verification pass last tried to confirm this row against the warehouse (a read attempt, successful or not). The pass takes the
+  /// least recently tried rows first (never-tried first), so a persistent mismatch cannot starve newer rows.
+  lastVerifiedAt DateTime?            @map("last_verified_at")
+
+  @@unique([entityType, entityId, action, gate], map: "refused_actions_key")
+  @@index([resolvedAt, severity, firstSeenAt], map: "refused_actions_open_idx")
+  @@map("refused_actions")
 }
 
 // ---------------------------------------------------------------------------
@@ -5336,4 +5404,41 @@ model StorefrontCustomerErasureTombstone {
 
   @@id([connector, customerKeyHash])
   @@map("storefront_customer_erasure_tombstones")
+}
+
+/// One reconciliation of a payment that the accounting ledger no longer holds, in whole or in part (o3d-cdhl). Written
+/// by the payment poller in the same transaction that moves `SalesOrder.paymentRemovedForeign`, so the order's figure
+/// and this history cannot disagree. It is the record that a given removal has already been reconciled: a recheck
+/// finds the order's figure already equal to what the ledger shows and writes nothing.
+///
+/// IMS posts nothing to the ledger for this row. `ledgerAction` says what is owed: the unwind of revenue (credit note
+/// or bad debt) is a policy decision left to an operator, and `OPERATOR_DECISION` stays until one is made.
+model PaymentRemovalReconciliation {
+  id                 String   @id @default(cuid())
+  orderId            String   @map("order_id")
+  /// Which accounting connector's document this describes (`xero`).
+  connector          String
+  accountingInvoiceId String  @map("accounting_invoice_id")
+  /// REMOVED: the ledger holds less than IMS recorded. RESTORED: it holds more than before (a payment was re-applied).
+  kind               String
+  /// The size of THIS change, in the order currency, always positive.
+  amountForeign      Decimal  @map("amount_foreign") @db.Decimal(18, 4)
+  /// What IMS had recorded as paid, what the ledger showed, and the document total, all in the order currency.
+  recordedPaidForeign Decimal @map("recorded_paid_foreign") @db.Decimal(18, 4)
+  ledgerPaidForeign  Decimal  @map("ledger_paid_foreign") @db.Decimal(18, 4)
+  documentTotalForeign Decimal @map("document_total_foreign") @db.Decimal(18, 4)
+  /// The order's `paymentRemovedForeign` before and after this change (0 for none).
+  shortfallBeforeForeign Decimal @map("shortfall_before_foreign") @db.Decimal(18, 4)
+  shortfallAfterForeign Decimal @map("shortfall_after_foreign") @db.Decimal(18, 4)
+  currency           String
+  /// The IMS payment registrations proved absent from the ledger's list, when they could be matched; empty otherwise.
+  matchedPaymentIds  Json     @default("[]") @map("matched_payment_ids")
+  /// OPERATOR_DECISION while the revenue unwind is owed; NONE for a restoration.
+  ledgerAction       String   @default("OPERATOR_DECISION") @map("ledger_action")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  order SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("payment_removal_reconciliations")
 }

@@ -21,6 +21,7 @@ export function chartFiltersFromSearch(searchParams: ChartSearchParams): Reorder
     productType: (one(searchParams.productType) || undefined) as ProductType | undefined,
     thresholdDays: positiveInteger(one(searchParams.thresholdDays)),
     targetCoverWeeks: positiveInteger(one(searchParams.targetCoverWeeks)),
+    ...(one(searchParams.ignoreStockouts) === '1' ? { ignoreStockouts: true } : {}),
   }
 }
 

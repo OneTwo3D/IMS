@@ -33,11 +33,13 @@ function chart(overrides: Partial<ReorderDemandChart> = {}): ReorderDemandChart 
   return {
     productId: 'p1', sku: 'SKU-1', productName: 'Widget', stockUnit: 'pcs', warehouseId: null, warehouseName: null,
     generatedAt: '2027-01-06T10:00:00.000Z', today: '2027-01-06',
-    weeks: [{ weekStart: '2027-01-04', kind: 'history', isCurrentWeek: true, actualDemandQty: 4, projectedDemandQty: null, stockPositionQty: 10, inboundQty: 0, requiredReceiptQty: null, isFirstShortageWeek: false }],
+    weeks: [{ weekStart: '2027-01-04', kind: 'history', isCurrentWeek: true, actualDemandQty: 4, projectedDemandQty: null, stockPositionQty: 10, inboundQty: 0, requiredReceiptQty: null, isFirstShortageWeek: false, historicalStockQty: null, stockoutDays: 0, inStockDays: 0, unknownDays: 7, stockState: 'unknown' }],
     historyWeeks: 1, forecastWeeks: 12, historyFrom: '2026-12-24', historyTo: '2027-01-06',
     requiredReceiptDate: null, latestPoDate: null, latestPoOverdue: false, firstShortageDate: null, firstShortageWeekStart: null, latestPoWeekStart: null,
     safetyStockQty: 3, reorderPoint: 14, suggestedReorderQty: 0, averageDailyDemand: 1.5, leadTimeDays: 7, openingQty: 20,
-    hasHistory: true, notices: [], ...overrides,
+    hasHistory: true, ignoreStockouts: false,
+    stockout: { firstCoveredDate: null, coveredDays: 0, unknownDays: 14, stockoutDays: 0, demandWindowStockoutDays: 0, demandWindowDays: 90, clamped: false },
+    notices: [], ...overrides,
   }
 }
 
