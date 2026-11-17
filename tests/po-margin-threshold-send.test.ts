@@ -37,7 +37,7 @@ mock.module('@/lib/activity-log', {
   },
 })
 mock.module('@/lib/settings-store', {
-  namedExports: { getSettingValue: async () => state.settingJson, serializeSettingValue: (_k: string, v: string) => v },
+  namedExports: { getSettingValue: async () => state.settingJson, serializeSettingValue: (_k: string, v: string) => v, deserializeSettingValue: (_k: string, v: string) => v },
 })
 mock.module('@/lib/domain/purchasing/list-price-facts', {
   namedExports: { loadListPriceFacts: async (ids: string[]) => { state.factLoads += 1; return new Map(ids.map((id) => [id, state.facts.get(id) ?? fact({ productId: id })])) } },
@@ -45,7 +45,12 @@ mock.module('@/lib/domain/purchasing/list-price-facts', {
 mock.module('@/lib/domain/purchasing/preferred-supplier', {
   namedExports: { updatePreferredSuppliersForPlacedPurchaseOrder: async () => ({ productIds: [], updatedCount: 0 }) },
 })
+// The transaction's own view of the setting and prices: committed values at lock time, which may differ from the pre-transaction read.
+const txView = { settingJson: null as string | null | undefined, price: undefined as string | undefined }
 const tx = {
+  setting: { findUnique: async () => { const v = txView.settingJson === undefined ? state.settingJson : txView.settingJson; return v ? { value: v } : null } },
+  product: { findMany: async (a: { where: { id: { in: string[] } } }) => a.where.id.in.map((id) => { const f = (state.facts.get(id) ?? fact({ productId: id })) as Record<string, unknown>; return { id, sku: f.sku, type: f.type, parentId: f.parentId, categoryId: null, salesPriceBase: txView.price ?? f.salesPrice, salesPriceTaxInclusive: f.salesPriceTaxInclusive } }) },
+  productCategory: { findMany: async () => [] },
   $queryRaw: async () => [],
   purchaseOrder: {
     findUnique: async () => ({ status: state.poStatus, reference: 'PO-1', type: state.poType }),
@@ -82,6 +87,8 @@ function reset() {
   state.poType = 'GOODS'
   state.poStatus = 'DRAFT'
   state.factLoads = 0
+  txView.settingJson = undefined
+  txView.price = undefined
 }
 
 test('no threshold configured: the order is placed exactly as before and no price facts are even read', async () => {
@@ -189,4 +196,29 @@ test('only placing the order is assessed: other transitions skip the guard', asy
   const r = await advancePoStatus('po-1', 'RFQ_SENT')
   assert.equal(r.success, true)
   assert.equal(state.factLoads, 0)
+})
+
+test('the send decision uses the threshold and price committed at lock time, not the ones read before the transaction', async () => {
+  // Pre-transaction read: block mode at 30%, price 10, cost 6 (40%): passes. Before the lock a price cut to 8 commits (25%).
+  reset()
+  state.settingJson = BLOCK
+  state.lines = [{ productId: 'p1', unitCostBase: '6.000000' }]
+  txView.price = '8.0000'
+  const cut = await advancePoStatus('po-1', 'PO_SENT')
+  assert.equal(cut.success, false)
+  assert.match(cut.error ?? '', /^MARGIN_BELOW_MINIMUM/)
+  assert.equal(state.statusWrites.length, 0)
+  // A raised minimum committed after the pre-transaction read (which saw none) is enforced too.
+  reset()
+  state.settingJson = null
+  state.lines = [{ productId: 'p1', unitCostBase: '8.000000' }]
+  txView.settingJson = BLOCK
+  const raised = await advancePoStatus('po-1', 'PO_SENT')
+  assert.equal(raised.success, false)
+  assert.equal(state.statusWrites.length, 0)
+  // And a minimum removed in the meantime lets it through.
+  reset()
+  state.settingJson = BLOCK
+  txView.settingJson = null
+  assert.equal((await advancePoStatus('po-1', 'PO_SENT')).success, true)
 })

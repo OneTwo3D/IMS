@@ -16,6 +16,7 @@ import {
   decideGuard,
   loadMarginGuardContext,
   recordMarginOverride,
+  reloadMarginGuardContextUnderLock,
   type GuardLineAssessment,
 } from '@/lib/domain/purchasing/margin-threshold-guard'
 import { queueEmail } from '@/lib/email-outbox'
@@ -1915,6 +1916,8 @@ export async function updatePurchaseOrder(
             if (k.touched) {
               // Received, billed or returned: the cost layers and the bill carry this price, so it is not editable here.
               if (k.qtyChanged) lineMoneyChanged = true
+              // More units bought at the stored price are a new purchasing decision: a raised quantity on a received, billed or returned line is assessed too.
+              if (k.qtyChanged && req.qty > k.fact.qty) amendMarginRows.push({ productId: row.productId, unitCostBase: k.fact.unitCostBase })
               if (!unitCostMatchesStored(row.unitCostForeign, k.fact.unitCostForeign)) {
                 return { refused: `${k.fact.sku ?? k.fact.id}: the price is locked because this line has been received, billed or returned. Correct it on the supplier bill or with a credit note.` }
               }
@@ -2214,11 +2217,13 @@ export async function advancePoStatus(
         if (payload?.shippingProvider) data.shippingProvider = payload.shippingProvider
       }
 
-      if (targetStatus === 'PO_SENT' && marginCtx && existing.type === 'GOODS') {
+      if (targetStatus === 'PO_SENT' && existing.type === 'GOODS') {
         const stored = await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { productId: true, unitCostBase: true } })
-        // Lines changed between the read above and this lock: the facts do not cover them, so refuse rather than skip them.
-        if (stored.some((l) => !marginCtx.facts.has(l.productId))) throw new Error('The order changed while it was being sent. Reload it and try again.')
-        const outcome = decideGuard(marginCtx, assessGuardLines(marginCtx, stored), { role: session.user.role, overrideNote: payload?.marginOverrideNote, verb: 'send' })
+        // Threshold and prices re-read through the transaction now that the PO row is locked (a price cut or a raised minimum that committed
+        // after the pre-transaction read must be seen). Lines changed since that read are refused as a retry rather than skipped.
+        if (marginCtx && stored.some((l) => !marginCtx.facts.has(l.productId))) throw new Error('The order changed while it was being sent. Reload it and try again.')
+        const lockedCtx = await reloadMarginGuardContextUnderLock(tx, marginCtx, stored.map((l) => l.productId))
+        const outcome = decideGuard(lockedCtx, lockedCtx ? assessGuardLines(lockedCtx, stored) : [], { role: session.user.role, overrideNote: payload?.marginOverrideNote, verb: 'send' })
         if (outcome.kind === 'refused') throw new MarginBlockedError(outcome.message)
         if (outcome.override) await recordMarginOverride(tx, { poId: id, reference: existing.reference, userId: session.user.id ?? null, verb: 'send', note: outcome.override.note, below: outcome.override.below })
       }

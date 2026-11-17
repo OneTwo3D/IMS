@@ -41,7 +41,9 @@ test('update: facts read before the transaction, refusal THROWN inside it (rolls
 
 test('placing the order: assessed under the row lock from the stored line costs, before the status write; only PO_SENT', () => {
   const body = fn('advancePoStatus')
-  assert.ok(body.indexOf("targetStatus === 'PO_SENT' && marginCtx") > 0)
+  assert.ok(body.indexOf("targetStatus === 'PO_SENT' && existing.type === 'GOODS'") > 0)
+  assert.ok(body.indexOf('reloadMarginGuardContextUnderLock(tx') > body.indexOf('FOR UPDATE') || body.indexOf('lockLandedCostRevaluationScope') >= 0)
+  assert.ok(body.indexOf('reloadMarginGuardContextUnderLock(tx') < body.indexOf('decideGuard('))
   assert.ok(body.indexOf('decideGuard(') < body.indexOf('await tx.purchaseOrder.update({ where: { id }, data })'))
   assert.match(body, /tx\.purchaseOrderLine\.findMany\(\{ where: \{ poId: id \}, select: \{ productId: true, unitCostBase: true \}/)
   assert.match(body, /payload\?\.marginOverrideNote/)
@@ -54,4 +56,9 @@ test('the client never supplies a margin: the guard reads the product price and 
   assert.match(guard, /loadListPriceFacts/)
   assert.doesNotMatch(guard, /marginPct\s*:\s*input|input\.marginPct|clientMargin/)
   assert.match(guard, /hasPermission\(opts\.role, OVERRIDE_PERMISSION\)/)
+})
+
+test('amend: a raised quantity on a received, billed or returned line is assessed at its stored cost', () => {
+  const body = fn('updatePurchaseOrder')
+  assert.match(body, /if \(k\.qtyChanged && req\.qty > k\.fact\.qty\) amendMarginRows\.push\(\{ productId: row\.productId, unitCostBase: k\.fact\.unitCostBase \}\)/)
 })

@@ -1,4 +1,4 @@
-import { getSettingValue } from '@/lib/settings-store'
+import { deserializeSettingValue, getSettingValue } from '@/lib/settings-store'
 import { logActivityInTransaction } from '@/lib/activity-log'
 import { hasPermission, type Permission } from '@/lib/permissions'
 import { computeLineMargin } from '@/lib/domain/purchasing/line-margin'
@@ -39,6 +39,56 @@ export async function loadMarginGuardContext(productIds: readonly string[]): Pro
   const settings = parseMarginThresholdSettings(await getSettingValue(MARGIN_THRESHOLD_SETTING_KEY))
   if (!hasAnyMarginThreshold(settings)) return null
   return { settings, facts: await loadListPriceFacts(productIds) }
+}
+
+type ReloadClient = {
+  setting: { findUnique: (args: { where: { key: string }; select: { value: true } }) => Promise<{ value: string } | null> }
+  product: { findMany: (args: { where: { id: { in: string[] } }; select: { id: true; sku: true; type: true; parentId: true; categoryId: true; salesPriceBase: true; salesPriceTaxInclusive: true } }) => Promise<Array<{ id: string; sku: string; type: string; parentId: string | null; categoryId: string | null; salesPriceBase: { toString(): string } | null; salesPriceTaxInclusive: boolean }>> }
+  productCategory: { findMany: (args: { select: { id: true; parentId: true } }) => Promise<Array<{ id: string; parentId: string | null }>> }
+}
+
+/**
+ * Re-read the threshold setting and the line products' prices and categories THROUGH THE TRANSACTION, after the caller has
+ * taken the PO row lock, so the decision is made on committed values at that moment and not on ones read before the lock (a list-price
+ * cut or a raised minimum committed in between would otherwise be missed). The sales VAT rate is the one resolved before the transaction
+ * (tax rates are not part of this race; the resolver uses the pooled client and cannot run here); a VAT-inclusive product that was not
+ * covered by it is refused as a retry rather than guessed. Throws `MarginBlockedError` for that retry. Null when no threshold is set now.
+ */
+export async function reloadMarginGuardContextUnderLock(
+  tx: ReloadClient,
+  preloaded: MarginGuardContext | null,
+  productIds: readonly string[],
+): Promise<MarginGuardContext | null> {
+  const row = await tx.setting.findUnique({ where: { key: MARGIN_THRESHOLD_SETTING_KEY }, select: { value: true } })
+  const settings = parseMarginThresholdSettings(row ? deserializeSettingValue(MARGIN_THRESHOLD_SETTING_KEY, row.value) : null)
+  if (!hasAnyMarginThreshold(settings)) return null
+  const retry = () => new MarginBlockedError('The minimum margin or a price changed while the order was being sent. Reload it and try again.')
+  if (!preloaded) throw retry()
+  const ids = [...new Set(productIds)]
+  const [products, categories] = await Promise.all([
+    tx.product.findMany({ where: { id: { in: ids } }, select: { id: true, sku: true, type: true, parentId: true, categoryId: true, salesPriceBase: true, salesPriceTaxInclusive: true } }),
+    tx.productCategory.findMany({ select: { id: true, parentId: true } }),
+  ])
+  const categoryParent = new Map(categories.map((c) => [c.id, c.parentId]))
+  const parentIds = [...new Set(products.map((p) => p.parentId).filter((x): x is string => !!x))]
+  const parents = parentIds.length ? await tx.product.findMany({ where: { id: { in: parentIds } }, select: { id: true, sku: true, type: true, parentId: true, categoryId: true, salesPriceBase: true, salesPriceTaxInclusive: true } }) : []
+  const parentCategory = new Map(parents.map((p) => [p.id, p.categoryId]))
+  const facts = new Map<string, ListPriceFacts>()
+  for (const p of products) {
+    const before = preloaded.facts.get(p.id)
+    if (p.salesPriceTaxInclusive && p.salesPriceBase != null && !before) throw retry()
+    const chain: string[] = []
+    let cur: string | null = p.categoryId ?? (p.parentId ? parentCategory.get(p.parentId) ?? null : null)
+    while (cur && chain.length < 20 && !chain.includes(cur)) { chain.push(cur); cur = categoryParent.get(cur) ?? null }
+    facts.set(p.id, {
+      productId: p.id, sku: p.sku, type: p.type, parentId: p.parentId,
+      salesPrice: p.salesPriceBase?.toString() ?? null,
+      salesPriceTaxInclusive: p.salesPriceTaxInclusive,
+      salesVatRate: before?.salesVatRate ?? null,
+      categoryChain: chain,
+    })
+  }
+  return { settings, facts }
 }
 
 export type GuardLine = {
