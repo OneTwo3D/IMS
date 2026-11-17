@@ -485,7 +485,7 @@ A kit or BOM paired with a **simple** WooCommerce product is **not** one of thes
 Stock levels are pushed from One Two Inventory to WooCommerce. Enable this in the **Products** tab under "Stock Sync".
 
 - Only warehouses with **Sync to Store** enabled contribute to the stock count (configured per-warehouse in Settings > Inventory)
-- Available stock = on-hand quantity minus reserved quantity, summed across all synced warehouses
+- Available stock = on-hand quantity minus reserved quantity, less any **channel buffer** set for that product at that warehouse (never below 0), summed across all synced warehouses. With no buffer set anywhere the figures sent are exactly as before. See *Channel buffer* in the Inventory help. The buffer applies only to this push: the warehouse-system (Mintsoft) stock alignment and IMS order allocation use the real stock
 - **Include COGS** — optionally pushes the oldest FIFO cost layer unit cost to WooCommerce's native COGS field (requires WooCommerce 9.2+ or the WC COGS plugin)
 - Stock is pushed in batches of 100 products via the WC batch API
 
@@ -774,6 +774,7 @@ Separately from the order sync, you can import past completed WooCommerce orders
 Stock sync and order allocation use warehouses marked with **Sync to Store**:
 
 - Stock push aggregates available quantities across all synced warehouses
+- A product's **channel buffer** at a synced warehouse is held back from that aggregate
 - Imported orders are assigned to the first synced warehouse that is also marked as default
 - Configure this per-warehouse in **Settings > Inventory**
 

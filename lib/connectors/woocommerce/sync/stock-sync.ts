@@ -37,7 +37,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
 import { commitDirtyOrderOutcome, loadDirtyOrdersForGuard, parseDirtySnapshot } from './stock-dirty-orders'
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
@@ -869,7 +869,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // ACCEPTED RACE (inter-system, documented, not fixed): an order WooCommerce takes AFTER the read above and BEFORE this run's
   // write has been decremented by the store but is in neither the read nor IMS, so that one write can still give its units
   // back. The window is one push run; the next push (or the daily forceAll reconcile) sees the order and corrects it.
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(stockLevelsForMaps, heldByProduct)
+  const { stockByProduct, stockByProductWarehouse, exactProducts } = buildStockMaps(stockLevelsForMaps, heldByProduct, await loadLocationBuffers(whIds, scopedStockIdsWithSiblings))
 
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
@@ -888,6 +888,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     stockByProductWarehouse,
     productById,
     result.errors,
+    exactProducts,
   )
 
   const previousStates = await db.stockSyncState.findMany({
@@ -1675,10 +1676,28 @@ export type StockLevelSnapshotRow = {
 
 /**
  * Build the per-product and per-(product,warehouse) available-stock maps from a
- * stockLevel snapshot. `available = max(0, quantity - reservedQty)`. Extracted so
+ * stockLevel snapshot. `available = max(0, quantity - reservedQty)`, then the location buffer is taken off
+ * (`max(0, available - buffer)`, the buffer being the LocationStockBuffer row for that product and warehouse): THE ONE
+ * PLACE the buffer reduces what a channel is told. It is looked up per stock row, so a buffer with no stock row has no effect
+ * and never makes a product a candidate. Nothing else (allocation, on-hand, the WMS alignment pass) reads it. Extracted so
  * the exact same availability basis can be recomputed against a fresh re-read
  * immediately before pushing (the 1qsb stale-snapshot oversell guard).
  */
+const nonNegative = (value: Decimal): Decimal => (value.lt(0) ? toDecimal(0) : value)
+
+export function bufferKey(productId: string, warehouseId: string): string {
+  return `${productId}\u0000${warehouseId}`
+}
+
+/** The location buffers for these warehouses (and, when scoped, these products). Read failure throws: never push unbuffered by accident. */
+export async function loadLocationBuffers(whIds: string[], productIds: string[] | null): Promise<Map<string, number>> {
+  const rows = await db.locationStockBuffer.findMany({
+    where: { warehouseId: { in: whIds }, bufferQty: { gt: 0 }, ...(productIds ? { productId: { in: productIds } } : {}) },
+    select: { productId: true, warehouseId: true, bufferQty: true },
+  })
+  return new Map(rows.map((r) => [bufferKey(r.productId, r.warehouseId), Number(r.bufferQty)]))
+}
+
 export function buildStockMaps(
   stockLevels: StockLevelSnapshotRow[],
   /**
@@ -1687,27 +1706,61 @@ export function buildStockMaps(
    * rows in turn, never below 0.
    */
   heldUnits?: ReadonlyMap<string, number>,
+  /** Units held back per location, keyed by bufferKey(productId, warehouseId). Absent or empty means no buffer anywhere. */
+  buffers?: ReadonlyMap<string, number>,
 ): {
   stockByProduct: Map<string, number>
   stockByProductWarehouse: Map<string, Map<string, number>>
+  /**
+   * Products with at least one buffered location. Their figures are computed EXACTLY (Decimal, 2.3 - 0.3 is 2, not
+   * 1.9999999999999998) so the single floor at the end cannot lose a unit; every other product keeps the arithmetic
+   * it always had, so with no buffer anywhere the result is byte-identical to before.
+   */
+  exactProducts: ReadonlySet<string>
 } {
   const stockByProduct = new Map<string, number>()
   const stockByProductWarehouse = new Map<string, Map<string, number>>()
   const heldRemaining = new Map<string, number>(heldUnits ?? [])
+  const exactProducts = new Set<string>()
+  if (buffers) {
+    for (const sl of stockLevels) if ((buffers.get(bufferKey(sl.productId, sl.warehouseId)) ?? 0) > 0) exactProducts.add(sl.productId)
+  }
+  const exactHeldRemaining = new Map<string, Decimal>()
+  const exactSum = new Map<string, Decimal>()
   for (const sl of stockLevels) {
-    let available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
-    const held = heldRemaining.get(sl.productId) ?? 0
-    if (held > 0 && available > 0) {
-      const taken = Math.min(held, available)
-      available -= taken
-      heldRemaining.set(sl.productId, held - taken)
+    let available: number
+    if (exactProducts.has(sl.productId)) {
+      // The buffer comes off BEFORE the unreserved-order guard: WooCommerce only ever saw the buffered figure, so the
+      // units it already took for orders IMS holds no reservation for came out of that, not out of the held-back units.
+      let exact = nonNegative(toDecimal(sl.quantity).minus(toDecimal(sl.reservedQty)))
+      const buffer = buffers?.get(bufferKey(sl.productId, sl.warehouseId)) ?? 0
+      if (buffer > 0) exact = nonNegative(exact.minus(toDecimal(buffer)))
+      const held = exactHeldRemaining.get(sl.productId) ?? toDecimal(heldRemaining.get(sl.productId) ?? 0)
+      if (held.gt(0) && exact.gt(0)) {
+        const taken = held.lt(exact) ? held : exact
+        exact = exact.minus(taken)
+        exactHeldRemaining.set(sl.productId, held.minus(taken))
+      } else {
+        exactHeldRemaining.set(sl.productId, held)
+      }
+      exactSum.set(sl.productId, (exactSum.get(sl.productId) ?? toDecimal(0)).plus(exact))
+      available = exact.toNumber()
+    } else {
+      available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
+      const held = heldRemaining.get(sl.productId) ?? 0
+      if (held > 0 && available > 0) {
+        const taken = Math.min(held, available)
+        available -= taken
+        heldRemaining.set(sl.productId, held - taken)
+      }
+      stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
     }
-    stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
     const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
     byWarehouse.set(sl.warehouseId, available)
     stockByProductWarehouse.set(sl.productId, byWarehouse)
   }
-  return { stockByProduct, stockByProductWarehouse }
+  for (const [productId, sum] of exactSum) stockByProduct.set(productId, sum.toNumber())
+  return { stockByProduct, stockByProductWarehouse, exactProducts }
 }
 
 /**
@@ -1723,6 +1776,8 @@ export function computeAvailableByProduct(
   stockByProductWarehouse: Map<string, Map<string, number>>,
   productById: Map<string, CandidateProduct>,
   errors: string[],
+  /** Components whose figures are exact because a location buffer applies (see buildStockMaps); their kit division is exact too. */
+  exactProducts?: ReadonlySet<string>,
 ): Map<string, number> {
   const availableByProduct = new Map<string, number>()
   const kitAvailabilityMemo = new Map<string, number>()
@@ -1738,6 +1793,7 @@ export function computeAvailableByProduct(
           new Set<string>(),
           errors,
           kitAvailabilityErrors,
+          exactProducts,
         )
       : (stockByProduct.get(product.id) ?? 0)
     availableByProduct.set(product.id, available)
@@ -1876,7 +1932,7 @@ async function computeFreshAvailableByProduct(
     },
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(freshStockLevels, heldUnits)
+  const { stockByProduct, stockByProductWarehouse, exactProducts } = buildStockMaps(freshStockLevels, heldUnits, await loadLocationBuffers(whIds, scopedStockProductIds))
   // Throwaway error sink: any kit-cycle diagnostics were already surfaced from the
   // snapshot pass; recomputing here must not double-report them.
   return computeAvailableByProduct(
@@ -1886,6 +1942,7 @@ async function computeFreshAvailableByProduct(
     stockByProductWarehouse,
     productById,
     [],
+    exactProducts,
   )
 }
 
@@ -1898,6 +1955,7 @@ function computeKitAvailability(
   stack: Set<string>,
   errors: string[],
   seenCycleErrors: Set<string>,
+  exactProducts?: ReadonlySet<string>,
 ): number {
   // yi4m: the result depends on the warehouse set passed in — a nested KIT is evaluated
   // per single warehouse (computeKitAvailability(nested, [warehouseId], …)) while a
@@ -1939,10 +1997,14 @@ function computeKitAvailability(
       if (component.component.type === 'KIT') {
         const nested = productById.get(component.componentId)
         available = nested
-          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack, errors, seenCycleErrors)
+          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack, errors, seenCycleErrors, exactProducts)
           : 0
       }
-      kitsInWarehouse = Math.min(kitsInWarehouse, Math.floor(available / required))
+      // A buffered component divides exactly (0.9 / 0.3 is 3), so the floor cannot lose a kit to binary rounding.
+      const kitsFromComponent = exactProducts?.has(component.componentId) && component.component.type !== 'KIT'
+        ? toDecimal(available).div(toDecimal(required)).floor().toNumber()
+        : Math.floor(available / required)
+      kitsInWarehouse = Math.min(kitsInWarehouse, kitsFromComponent)
     }
     total += kitsInWarehouse === Infinity ? 0 : kitsInWarehouse
   }

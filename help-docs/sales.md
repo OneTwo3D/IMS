@@ -37,6 +37,8 @@ To create a new order manually:
 5. Add notes if needed
 6. Save the order
 
+A Draft can be changed afterwards with **Edit order** (see *Editing an order* below).
+
 The **Ship From** warehouse is pre-selected with your default warehouse (the first warehouse if none is marked default); change it if the order ships from elsewhere. The stock figures beside each product are for the selected warehouse.
 
 **VAT and "Incl. VAT".** The order has one default VAT rate and one setting for whether the prices you type include VAT. If prices include VAT, choose the order's default VAT rate: the VAT is taken out of the prices you typed, the order totals are what you typed, and the invoice goes to the accounting system as VAT-inclusive at those same prices. Ticking **Incl. VAT** while the default rate is **No VAT** and a line carries VAT (from its product's tax category or a rate you chose on the line) is refused, because the prices could be read two ways: choose the default rate, or untick **Incl. VAT** and enter net prices. The **Incl. VAT** box is always shown, even when the rate is **No VAT**. A draft saved earlier in that state cannot be moved out of Draft; cancel it and create a new order. Clones made and shipped before this was fixed have no invoice and need one raising by hand.
@@ -466,17 +468,19 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
 
-### Editing an order after it has been pushed to the accounting system
+### Editing an order
 
-Editing a sales order that already has an external accounting invoice (Xero) queues a
+**A Draft order can be edited.** Open the order and press **Edit order**: the same form you used to create it opens pre-filled, and you can change the customer, addresses, lines, quantities, prices, discounts, shipping, VAT basis, warehouse, delivery date and notes. **Save changes** re-prices the whole order exactly as creating it would (the same rounding, VAT and exchange-rate rules; a foreign-currency order is re-priced at today's table rate and refused if that rate is missing), replaces the lines, and keeps the order number, the status (still Draft) and the activity history, which records the edit with the old and new totals. An order that was saved with separate fee rows shows their sum as part of **Shipping** when you edit it. The order's external order number is not editable.
+
+**Edit order is disabled, with the reason shown when you hover it, when the order is not a Draft** (or is a draft that already has stock allocated, a shipment, a posted accounting invoice, a warehouse push, a payment recorded (or the order marked paid), store credit applied, an invoice number or document or accounting entry, a refund or return expectation, or a link to a WooCommerce order, or whose personal data has been erased). The server applies the same rule and refuses the edit if anything changed since the page was drawn; if someone else saved the order after you opened the form, your save is refused with a "changed by someone else, reload" message instead of overwriting their change. **Editing a confirmed order (Pending Payment onwards) is not available yet:** it would have to amend the queued or posted invoice, re-allocate stock and amend the order at the warehouse, and, for an order that came from WooCommerce, would desync it from the store. Until that is built, change a confirmed order's notes with **Notes**, or **Cancel** it and create a new one (**Clone** copies the lines and VAT basis). Editing never writes anything to the accounting system, the warehouse or the store.
+
+### Orders that already have an accounting invoice
+
+A sales order that already has an external accounting invoice (Xero) and is changed by a path that re-queues its invoice (for example a status change or a WooCommerce update) queues a
 `SALES_INVOICE_UPDATE` to push the changes through, instead of silently dropping them. The update
 payload is constructed by the same builder used for the original push, so what Xero sees matches a
 fresh post would have sent. A payload-derived idempotency key prevents duplicates if you re-save
-without any content change.
-
-If the active accounting connector is one that does not support this (Xero is the only one shipped today), IMS records a
-`sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
-behaviour is symmetric with the purchase bill edit path.
+without any content change. (This is not an operator Edit: see **Editing an order** above.)
 
 If the accounting connector rejects the update (e.g. the external invoice is locked, paid, or
 voided), an amber **rejected sync** alert appears at the top of the sales order detail page with

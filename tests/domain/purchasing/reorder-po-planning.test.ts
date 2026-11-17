@@ -32,6 +32,7 @@ function row(over: Partial<ReorderReportRow> & { productId: string }): ReorderRe
     leadTimeDays: over.leadTimeDays ?? 7,
     safetyStockQty: '0',
     reorderPoint: '10',
+    thresholdOverrides: [],
     configuredReorderQty: '0',
     suggestedReorderQty: over.suggestedReorderQty ?? '5',
     abcClass: over.abcClass ?? 'C',
