@@ -394,6 +394,42 @@ test('a cancelled part with another part STILL PENDING is never isolated: after 
   assert.equal(recorded[recorded.length - 1], 'PERMANENT', 'now every part is accounted for')
 })
 
+test('a cancelled part plus a despatched part with UNREADABLE lines stays RETRYABLE, is never isolated, holds the watermark, and records the shipment once the lines can be read', async () => {
+  const reads = new Map<string, number>()
+  const quarantined: number[] = []
+  const pushed: number[] = []
+  const permanence: string[] = []
+  const saved: Array<{ watermark?: string }> = []
+  let readable = false
+  const run = () => runWmsDispatchSweepCore(dispatchDeps({
+    ...ENUMERATED,
+    listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+    fetchOrderStatus: async () => status({ status: 'PROCESSING', isSplit: true, partCount: 2 }),
+    fetchOrderParts: async () => [
+      part({ externalId: 'P-1', partNumber: 1, status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN-1' })] }),
+      part({ externalId: 'P-2', partNumber: 2, status: 'CANCELLED' }),
+    ],
+    fetchPartItems: async () => (readable ? [{ sku: 'A', qty: 1 }] : []),
+    pushPartialShipment: async (_o, input) => { pushed.push(input.part); return { ok: true } },
+    fetchDelta: async () => [status({ externalOrderId: 'M-1', isSplit: true, partCount: 2 })],
+    getDeltaState: async () => ({ watermark: null, lastReconcile: RECENT }),
+    saveDeltaState: async (state) => { saved.push(state) },
+    recordRefusedAction: async (_c, refusal) => { permanence.push(refusal.permanence) },
+    recordUnresolvedRead: async (c) => { const n = (reads.get(c.linkId) ?? 0) + 1; reads.set(c.linkId, n); return { count: n } },
+    quarantineUnresolved: async (_c, _r, count) => { quarantined.push(count); return { quarantined: true } },
+    clearUnresolvedReads: async (linkId) => { reads.delete(linkId) },
+  }), { now: SWEEP_NOW })
+  for (let i = 0; i < 8; i += 1) await run()
+  assert.ok(permanence.length === 8 && permanence.every((p) => p === 'RETRYABLE'), 'never PERMANENT while a shipment is unrecorded')
+  assert.deepEqual(pushed, [], 'nothing recorded while the lines are unreadable')
+  assert.equal(saved.filter((s) => s.watermark !== undefined).length, 0, 'the delta does not age out: the watermark is held')
+  readable = true
+  await run()
+  assert.deepEqual(pushed, [1], 'the shipment is recorded once the lines are readable')
+  assert.equal(permanence[permanence.length - 1], 'PERMANENT')
+  assert.deepEqual(quarantined, [], 'never isolated while a shipment is unrecorded')
+})
+
 test('a record that cannot be written holds the watermark (the trace is not yet durable) (the change must stay in the next window)', async () => {
   const saved: Array<{ watermark?: string }> = []
   await runWmsDispatchSweepCore(dispatchDeps({

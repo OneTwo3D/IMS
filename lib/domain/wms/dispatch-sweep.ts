@@ -1145,12 +1145,19 @@ async function reconcileSplitOrder(
     // past it because the record is the durable trace. It is bounded by a per-link read count (DISPATCH_MAX_CONSECUTIVE_STALLED_READS) that isolates it.
     const cancelledParts = parts.filter((entry) => !entry.dispatched && isWmsTerminalNonDespatchStatus({ status: entry.status, statusLabel: '' }))
     if (cancelledParts.length > 0) {
-      const allAccountedFor = dispatchedParts.length + cancelledParts.length >= totalParts
+      // PERMANENT needs all three: every despatched part's shipment was RECORDED (an unreadable items read leaves allRecorded false), the part set is COMPLETE
+      // and every part's state is known, and every remaining part is cancelled. Otherwise something can still change (a shipment still to record), so it is
+      // RETRYABLE: never isolated, and (below) held unresolved like any part set we could not fully account for.
+      const allAccountedFor = allRecorded && !incompleteEnumeration && dispatchedParts.length + cancelledParts.length >= totalParts
       return {
         action: 'pending',
         reason: `${dispatchedParts.length}/${totalParts} parts despatched; part ${cancelledParts.map((entry) => entry.partNumber).join(', ')} is cancelled in the WMS and will not despatch, so this order cannot complete`,
-        // NOT unresolved: a known stall is its own outcome (see `refusal`). It does not join the connector-drift cohort and does not hold the watermark.
+        // A known stall is its own outcome (see `refusal`): it does not join the connector-drift cohort. EXCEPT when the part set is not fully accounted for
+        // (a despatched part with unreadable lines, a missing or unknown part): then the delta must not age out before the shipment is recorded, so the
+        // WATERMARK is held for it (`holdWatermark`) while the link stays a fully polled candidate. It is deliberately NOT isolated: isolating would hide
+        // the unrecorded despatch. Its refused-action record (RETRYABLE, MEDIUM) ages into an alert instead.
         unresolved: false,
+        ...(requireResolution && incompleteEnumeration ? { holdWatermark: true } : {}),
         refusal: {
           action: 'WMS_SPLIT_ORDER_COMPLETE',
           gate: 'WMS_SPLIT_PART_CANCELLED',
@@ -1266,6 +1273,8 @@ export type WmsDispatchOutcome = {
    * The order can NEVER complete from what the WMS shows (a split part was cancelled and will not despatch). Recorded as a refused or stalled action
    * (lib/domain/refused-actions.ts) so the condition has a name, an age and an alert instead of reading as "N/M parts despatched" for ever.
    */
+  /** Hold the delta watermark for this order without calling it unresolved (no drift cohort, no quarantine): its despatch is still to be recorded. */
+  holdWatermark?: boolean
   refusal?: Pick<RefusedActionInput, 'action' | 'gate' | 'permanence' | 'severity' | 'intent' | 'detail'>
 }
 
@@ -1745,7 +1754,7 @@ export async function runWmsDispatchSweepCore(
     // ambiguous order would otherwise dead-letter itself after five sweeps for a
     // condition the operator has to fix in the WMS, not in IMS. It IS counted for
     // the job outcome (below) so it can never hide behind a SUCCEEDED job.
-    if (outcome.action === 'error') passClean = false
+    if (outcome.action === 'error' || outcome.holdWatermark) passClean = false
     if (outcome.unresolved) unresolvedCount += 1
     counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
     linksDecided += 1
