@@ -17,6 +17,7 @@ import {
 } from '@/lib/domain/purchasing/reorder-po-planning'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { ProductType } from '@/app/generated/prisma/client'
+import { refuseRestrictedDestination } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 
 // audit-pcc0: the filter subset the Reorder Planning page passes to the PO/MO
 // buttons so draft quantities are computed from the SAME getReorderReport the
@@ -422,6 +423,9 @@ export async function createReorderPOs(
   try {
     const generatedAt = new Date().toISOString()
     const actionFilters = sanitizeReorderActionFilters(options.filters)
+    // A warehouse with "Available in purchase orders" off cannot be a PO destination (po-warehouse-eligibility.ts).
+    const restrictedDestination = await refuseRestrictedDestination(db, actionFilters.warehouseId)
+    if (restrictedDestination) return { success: false, poCount: 0, error: restrictedDestination }
     // audit-pcc0: source draft-PO quantities from the SAME Reorder Planning report
     // the operator selected from (whole-unit order-up-to suggestedReorderQty, the
     // page's filters, inbound netting, lowest-cost supplier choice) — not the legacy

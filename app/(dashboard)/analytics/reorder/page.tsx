@@ -22,12 +22,14 @@ import { HistoricalImportTrigger } from './historical-import-trigger'
 import { ReorderSelectionProvider } from '@/lib/analytics/reorder-selection-context'
 import { parseSelectedParam } from '@/lib/analytics/reorder-selection'
 import { ReorderCoverageProvider, ReorderCoverageWeeksCell, ReorderOrderQtyCell } from './reorder-coverage-cells'
+import { groupReorderRowsBySupplier } from '@/lib/domain/purchasing/reorder-supplier-groups'
 import { ReorderSupplierSelect } from './reorder-supplier-select'
 import { ReorderSelectAllCheckbox, ReorderRowCheckbox } from './reorder-selection-checkboxes'
 import { currentParams } from '../_components/report-utils'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
+  type StockPositionRowGroup,
   type StockPositionFilterValues,
 } from '../_components/stock-position-report'
 
@@ -156,8 +158,10 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
   const canImportHistory = hasPermission(session.user.role, 'sync')
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
+  // Grouped view: every row for the filters is loaded (not one page) so a supplier's group and its total are complete.
+  const groupBySupplier = one(resolvedSearchParams.groupBy) === 'supplier'
   const [report, filterOptions, importSettings] = await Promise.all([
-    getReorderReport(filters).catch((error: unknown) => {
+    getReorderReport(filters, groupBySupplier ? { paginate: false } : undefined).catch((error: unknown) => {
       if (isSourceScanTooLargeError(error)) return emptyReorderReportForSourceLimit(filters, error)
       throw error
     }),
@@ -176,6 +180,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     targetCoverWeeks: filters.targetCoverWeeks == null ? undefined : String(filters.targetCoverWeeks),
     includeZero: filters.includeZero,
     ignoreStockouts: filters.ignoreStockouts,
+    groupBy: groupBySupplier ? 'supplier' : undefined,
     pageSize: String(filters.pageSize ?? 100),
   }
   // Carry the filters that shape one product's figures into the demand chart drill-down.
@@ -248,6 +253,23 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
       ),
     },
   ]
+
+  const supplierGroups: StockPositionRowGroup<ReorderReportRow>[] = groupReorderRowsBySupplier(report.rows).map((group) => ({
+    key: group.key,
+    tone: group.kind === 'no_supplier' ? 'warning' : 'default',
+    rows: group.rows,
+    header: group.kind === 'no_supplier' ? (
+      <span className="text-amber-900" title="No supplier is set for these rows, so a draft PO cannot be raised for them. Set a supplier on the product first.">
+        No supplier ({group.rows.length} {group.rows.length === 1 ? 'row' : 'rows'}) — needs a supplier before it can be ordered. Total recommended: {group.totalSuggestedQty}
+      </span>
+    ) : (
+      <span>
+        {group.label}
+        {group.kind === 'manufactured' ? <span className="ml-2 text-xs font-normal text-muted-foreground">(made, not purchased)</span> : null}
+        <span className="ml-2 text-xs font-normal text-muted-foreground">{group.rows.length} {group.rows.length === 1 ? 'row' : 'rows'} · total recommended {group.totalSuggestedQty}</span>
+      </span>
+    ),
+  }))
 
   const toolbarRows = report.rows.map((row) => ({
     productId: row.productId,
@@ -337,12 +359,17 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
               <option value="16" />
             </datalist>
           </div>
+          <label className="flex items-center gap-2 self-end pb-2 text-sm" title="Lay the rows out supplier by supplier, each group with its total recommended quantity. Every row keeps its own lead time and PO date. Rows with no supplier are listed in their own warning group.">
+            <input type="checkbox" name="groupBy" value="supplier" defaultChecked={groupBySupplier} className="rounded border-input" />
+            Group by supplier
+          </label>
           <label className="flex items-center gap-2 self-end pb-2 text-sm" title="Remove days with no on-hand stock (from the daily inventory snapshots) from the demand average. Days without a snapshot are not counted as stockouts.">
             <input type="checkbox" name="ignoreStockouts" value="1" defaultChecked={filtersForUi.ignoreStockouts} className="rounded border-input" />
             Ignore stockouts
           </label>
         </>
       }
+      groups={groupBySupplier ? supplierGroups : undefined}
       selectionColumn={{
         header: <ReorderSelectAllCheckbox />,
         cell: (row) => <ReorderRowCheckbox productId={row.productId} label={row.sku} />,

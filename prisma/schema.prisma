@@ -621,6 +621,8 @@ model Warehouse {
   name                  String
   type                  WarehouseType @default(STANDARD)
   availableForSale      Boolean       @default(true)
+  // false = cannot be picked as a purchase-order destination or a goods-receipt location (dropship, quarantine, virtual). Existing POs already pointing here keep receiving; WMS-driven receipts are unaffected.
+  availableForPurchaseOrders Boolean  @default(true)
   syncToStore           Boolean       @default(false)
   contactName           String?
   email                 String?
