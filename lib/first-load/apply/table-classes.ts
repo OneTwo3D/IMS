@@ -97,6 +97,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   return_reasons: { kind: 'CONFIG_ALLOWED', reason: 'configured return reasons: business configuration (names and order), not personal data; the runner never writes it' },
   sales_order_invoice_documents: { kind: 'MUST_BE_EMPTY', reason: 'customer invoice documents fetched from the ledger for existing orders' },
   sales_order_lines: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
+  sales_order_line_pegs: { kind: 'MUST_BE_EMPTY', reason: 'sales-order to purchase-order pegs: they reference sales orders, which a first load never creates' },
   reorder_threshold_overrides: { kind: 'CONFIG_ALLOWED', reason: 'per-warehouse reorder threshold overrides: planning configuration set by operators; the runner never writes it' },
   sales_order_refund_lines: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
   sales_order_refunds: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },

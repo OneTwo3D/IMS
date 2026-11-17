@@ -57,6 +57,7 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
+import { applyPegCapsToStockMap, applyPegHoldsToStockMap, evaluateOrderPegsInTx, loadPegContext } from '@/lib/domain/sales/peg-service'
 import { LEDGER_STANDING_SELECT, isShadowedObligation, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
@@ -190,6 +191,12 @@ export type AllocateSalesOrderInput = {
    * have no user, and inventing one would be worse than recording none.
    */
   userId?: string | null
+  /**
+   * SO-to-PO pegging: the receipt's peg pass. A pegged line may grow only by the stock that has landed for its pegs (on top of
+   * what it already holds), so a pegged order cannot take free stock an older order is owed just because it is allocated first.
+   * Leave unset for every other caller: they allocate the line's whole demand from what other orders' pegs leave free.
+   */
+  capPeggedLines?: boolean
 }
 
 export type AllocateSalesOrderResult = {
@@ -3593,6 +3600,17 @@ export async function allocateSalesOrder(
       buildAvailableStockMapIncludingOwnReservations(stockLevels, ownReservationRows),
     )
 
+    // SO-to-PO pegging. Other orders' pegs hold back the stock that has landed for them and not yet been absorbed, so this order
+    // (the sweep, the backorder pass, a poller re-run: all of them) cannot take it. This order's OWN pegs are not held back from
+    // it. Taken after the stock locks, like every read here, and the peg rows are locked last (the allocation lock order).
+    const pegContext = await loadPegContext(tx, orderId, leafProductIds)
+    if (pegContext) applyPegHoldsToStockMap(stockMap, pegContext.holds)
+    // The receipt's peg pass may add only what landed for the pegs, in the warehouse it landed in (the per-line quantity cap below
+    // limits the total; this limits where it may come from, so a receipt into B cannot pull existing stock in A to the order).
+    if (pegContext && input.capPeggedLines) {
+      applyPegCapsToStockMap(stockMap, pegContext.ownExtraByProductWarehouse, ownReservationRows.map((row) => ({ productId: row.productId, warehouseId: row.warehouseId, qty: toDecimal(row.qty) })))
+    }
+
     const committedByLine = calculateDecimalCoverageByLine(
       requirementsByLine,
       activeShipmentLines,
@@ -3624,6 +3642,42 @@ export async function allocateSalesOrder(
         qty: Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committed).sub(refunded)),
       }
     }).filter((line) => line.qty.gt(0))
+
+    if (input.capPeggedLines && pegContext) {
+      for (const line of lines) {
+        const extra = pegContext.ownExtraByLine.get(line.id)
+        if (extra === undefined) {
+          // An UNPEGGED line takes nothing new in the peg pass: it keeps what it already holds and waits for the oldest-first
+          // pass, so it cannot reserve newly received stock ahead of an older order. The cap is in line units, over the line's
+          // resolved requirement set, so a kit line keeps its component reservations too.
+          const perUnit = scaleFulfillmentRequirements(requirementsByLine.get(line.id) ?? [], new Prisma.Decimal(1))
+          let heldUnits: Prisma.Decimal | null = null
+          for (const [productId, qtyPerUnit] of perUnit) {
+            if (!toDecimal(qtyPerUnit).gt(0)) continue
+            const heldQty = ownAllocations
+              .filter((row) => row.lineId === line.id && row.productId === productId)
+              .reduce((sum, row) => sum.add(toDecimal(row.qty)), new Prisma.Decimal(0))
+            const units = heldQty.div(toDecimal(qtyPerUnit))
+            heldUnits = heldUnits === null ? units : Prisma.Decimal.min(heldUnits, units)
+          }
+          const kept = Prisma.Decimal.max(new Prisma.Decimal(0), (heldUnits ?? new Prisma.Decimal(0)).sub(committedByLine.get(line.id) ?? new Prisma.Decimal(0)))
+          line.qty = Prisma.Decimal.min(line.qty, kept)
+          continue
+        }
+        const held = ownAllocations
+          .filter((row) => row.lineId === line.id && row.productId === line.productId)
+          .reduce((sum, row) => sum.add(toDecimal(row.qty)), new Prisma.Decimal(0))
+        const inFlight = Prisma.Decimal.max(new Prisma.Decimal(0), held.sub(committedByLine.get(line.id) ?? new Prisma.Decimal(0)))
+        line.qty = Prisma.Decimal.min(line.qty, inFlight.add(extra))
+      }
+    }
+
+    // SO-to-PO pegging: a pegged line is served before the order's other lines, so an unpegged line for the same product can not
+    // consume the stock that landed for the peg (stable: otherwise the order of the lines is unchanged).
+    if (pegContext && pegContext.own.length > 0) {
+      const peggedLineIds = new Set(pegContext.own.map((peg) => peg.salesOrderLineId))
+      lines.sort((a, b) => Number(peggedLineIds.has(b.id)) - Number(peggedLineIds.has(a.id)))
+    }
 
     // o3d-kouj: FEASIBILITY AND EXPANSION NOW COME FROM ONE SOURCE — the line's RESOLVED requirement
     // set, which is its pinned snapshot when it has one and the current graph when it does not.
@@ -4200,6 +4254,9 @@ export async function allocateSalesOrder(
     // NOTE: the storefront stock-sync (enqueueStockSync in autoAllocateOrder) still runs POST-commit and remains
     // best-effort — a crash after commit can lose it. That is a pre-existing, cross-cutting stock-sync durability
     // gap (all allocation flows, non-Woo connectors), tracked separately in o3d-jhq, not resolved here.
+    // SO-to-PO pegging: settle this order's pegs against the allocation just written, ending those that are done or void.
+    await evaluateOrderPegsInTx(tx, orderId)
+
     await input.onReconciledInTx?.(tx)
 
     return {

@@ -43,6 +43,8 @@ import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-poli
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
 import { SHOP_DESYNC_WARNING, resolveSalesOrderEditBlock, resolveSalesOrderEditScope } from '@/lib/domain/sales/order-edit-affordance'
 import { SoFormDialog } from '../so-form'
+import { PeggedBadge, SoPegsCard } from '@/components/sales/so-pegs-card'
+import type { SalesOrderPegRow } from '@/app/actions/pegging'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
 import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
@@ -130,6 +132,8 @@ type Props = {
   paidWithoutInvoice: boolean
   /** The catalogue the Edit order dialog needs; loaded by the page only for a DRAFT (the only status that can be edited). */
   editForm?: Omit<ComponentProps<typeof SoFormDialog>, 'order' | 'onClose' | 'warehouses' | 'currencies'>
+  /** SO-to-PO pegging: this order's live pegs. */
+  pegs?: SalesOrderPegRow[]
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -1125,7 +1129,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, pegs = [] }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1831,7 +1835,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                   <TableCell className="w-12 px-2 py-1">
                     {line.productId && <ProductThumb productId={line.productId} imageUrl={line.imageUrl} name={line.description} />}
                   </TableCell>
-                  <TableCell className="px-4">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}</TableCell>
+                  <TableCell className="px-4">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}{pegs.some((peg) => peg.salesOrderLineId === line.id) && <PeggedBadge />}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">{line.qty}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{formatMoney(line.unitPriceForeign, sym)}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}</TableCell>
@@ -1937,6 +1941,14 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
           </tfoot>
         </Table>
       </div>
+
+      {/* SO-to-PO pegging */}
+      <SoPegsCard
+        lines={so.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.sku, description: l.description, qty: l.qty }))}
+        pegs={pegs}
+        canPeg={hasPermission(currentUserRole, 'sales.process')}
+        pegOpen={['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED'].includes(so.status)}
+      />
 
       {/* Allocation Panel */}
       {showAllocations && (
