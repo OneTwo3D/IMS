@@ -4325,6 +4325,20 @@ model WcOrderDivergence {
   @@map("wc_order_divergences")
 }
 
+/// A divergence comparison deferred because the payload names a refund IMS has not recorded yet. One row per order; removed by any later comparison that completes, and dropped after an attempt or age cap.
+model WcOrderDivergenceRecheck {
+  id              String   @id @default(cuid())
+  /// The IMS sales order id (no foreign key, like WcOrderDivergence).
+  orderId         String   @unique @map("order_id")
+  externalOrderId String   @map("external_order_id")
+  deferredAt      DateTime @default(now()) @map("deferred_at")
+  attempts        Int      @default(0)
+  lastAttemptAt   DateTime @default(now()) @map("last_attempt_at")
+
+  @@index([lastAttemptAt], map: "wc_order_divergence_rechecks_attempt_idx")
+  @@map("wc_order_divergence_rechecks")
+}
+
 // ---------------------------------------------------------------------------
 // WMS / WAREHOUSE CONNECTOR
 // ---------------------------------------------------------------------------

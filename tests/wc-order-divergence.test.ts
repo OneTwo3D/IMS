@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
@@ -150,4 +151,13 @@ test('the wording names the field and the currency, and carries only SKUs, quant
   assert.match(text, /Quantity of RED-M changed in WooCommerce: WooCommerce 3, IMS 2/)
   assert.match(text, /Shipping \(excluding tax\) changed in WooCommerce: WooCommerce 7\.50 GBP, IMS 5\.00 GBP/)
   assert.equal(divergenceFingerprint(v.differences), divergenceFingerprint(JSON.parse(JSON.stringify(v.differences))), 'stable')
+})
+
+test('every order sweep, the ordinary poll included, drains deferred comparisons BEFORE the cursor commit', () => {
+  const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  const drain = src.indexOf('await drainDeferredWcOrderDivergences()')
+  const commit = src.indexOf('await advancePullCursor(tx, cursorKey, cursorCandidate)')
+  assert.ok(drain > 0 && commit > drain, 'the drain is called once, before the cursor can advance, outside the `mode !== poll` refund block')
+  const refundBlock = src.indexOf("if (mode !== 'poll' && !importResult.skipped)")
+  assert.ok(drain > refundBlock + 600 || drain < refundBlock, 'not inside the refund-sweep block')
 })

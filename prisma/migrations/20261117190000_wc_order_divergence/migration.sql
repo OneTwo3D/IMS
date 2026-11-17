@@ -18,3 +18,18 @@ CREATE TABLE "wc_order_divergences" (
 
 CREATE UNIQUE INDEX "wc_order_divergences_order_id_key" ON "wc_order_divergences"("order_id");
 CREATE INDEX "wc_order_divergences_open_idx" ON "wc_order_divergences"("resolved_at", "first_seen_at");
+
+-- A comparison deferred because the payload names a refund IMS has not recorded yet; rechecked by every order sweep, dropped after an attempt or age cap.
+CREATE TABLE "wc_order_divergence_rechecks" (
+    "id" TEXT NOT NULL,
+    "order_id" TEXT NOT NULL,
+    "external_order_id" TEXT NOT NULL,
+    "deferred_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "last_attempt_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "wc_order_divergence_rechecks_pkey" PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX "wc_order_divergence_rechecks_order_id_key" ON "wc_order_divergence_rechecks"("order_id");
+CREATE INDEX "wc_order_divergence_rechecks_attempt_idx" ON "wc_order_divergence_rechecks"("last_attempt_at");

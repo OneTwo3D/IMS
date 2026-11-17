@@ -290,22 +290,71 @@ export function describeDivergence(differences: ReadonlyArray<DivergenceDifferen
 }
 
 /**
- * DEFERRED COMPARISONS AWAITING A REFUND SWEEP. A delivery whose payload names a refund IMS has not recorded yet is deferred (above), and the refund sweep runs AFTER the import in the same
- * delivery (webhook), poll page or admission drain. Left alone, an order edited in the same update as the refund would not be compared until some later delivery, which may never come. So a deferral
- * is remembered here (WooCommerce order id -> IMS order id) and `rerunDeferredWcOrderDivergence` repeats the comparison with the same payload once the sweep has run. The marker lives in this process
- * for the lifetime of the delivery that set it: a crash before the rerun leaves the delivery unacknowledged (WooCommerce redelivers it) or the poll cursor held, and a later delivery compares afresh.
+ * DEFERRED COMPARISONS AWAITING A REFUND. A delivery whose payload names a refund IMS has not recorded yet is deferred (above): the comparison cannot be made safely until the refund sync has run.
+ * The deferral is PERSISTED (`wc_order_divergence_rechecks`, one row per order, removed by any later comparison that completes), so it survives a restart and is the same in every mode:
+ *   - the refund sweep of a webhook / reconcile run repeats the comparison straight away (`rerunDeferredWcOrderDivergence`, same payload);
+ *   - the ordinary poll runs no refund sweep, so `drainDeferredWcOrderDivergences` (called by every order sweep, poll included) re-reads each deferred order live and compares again, a few per run;
+ *   - a row that stays deferred (the refund never arrives) is dropped after `RECHECK_MAX_ATTEMPTS` attempts or `RECHECK_MAX_AGE_DAYS` days, so the table is bounded and nothing grows with the order history.
  *
  * NOTE (follow-up, deliberately not used here): PR #975 adds `sales_orders.edited_in_ims_at` and is not merged. Nothing in this module depends on that column. Once it has landed, the comparison could
  * use it to tell an IMS-side edit from a WooCommerce-side one; until then it must stay out of this file.
  */
-const deferredAwaitingRefundSweep = new Map<number, string>()
+export const RECHECK_MAX_ATTEMPTS = 20
+export const RECHECK_MAX_AGE_DAYS = 14
+export const RECHECK_PER_RUN = 25
+
+export const divergenceSeams: { readLiveOrder?: (externalOrderId: string) => Promise<WcFullOrder | null> } = {}
+
+async function readLiveOrder(externalOrderId: string): Promise<WcFullOrder | null> {
+  if (divergenceSeams.readLiveOrder) return divergenceSeams.readLiveOrder(externalOrderId)
+  try {
+    const { wcFetch } = await import('../api')
+    const { data, error } = await wcFetch(`/orders/${externalOrderId}`)
+    if (error || !data || typeof data !== 'object' || !('status' in data)) return null
+    return data as WcFullOrder
+  } catch {
+    return null
+  }
+}
 
 /** Repeat a comparison that was deferred for an unrecorded refund. Call it after the refund sweep of the same delivery; a no-op for an order whose comparison was not deferred. Never throws. */
 export async function rerunDeferredWcOrderDivergence(wcOrder: WcFullOrder): Promise<void> {
-  const orderId = deferredAwaitingRefundSweep.get(wcOrder.id)
-  if (orderId === undefined) return
-  deferredAwaitingRefundSweep.delete(wcOrder.id)
-  await surfaceWcOrderDivergence(orderId, wcOrder)
+  try {
+    const row = await db.wcOrderDivergenceRecheck.findFirst({ where: { externalOrderId: String(wcOrder.id) }, select: { orderId: true } })
+    if (!row) return
+    await surfaceWcOrderDivergence(row.orderId, wcOrder)
+  } catch (e) {
+    console.error('wc_order_divergence: could not repeat a deferred comparison', e instanceof Error ? e.constructor.name : typeof e)
+  }
+}
+
+/**
+ * Resolve deferred comparisons by a live read, for the runs that do not sweep refunds (the ordinary poll). Bounded per run, oldest first; a row that is still deferred counts an attempt and is dropped at the
+ * attempt or age cap. Never throws.
+ */
+export async function drainDeferredWcOrderDivergences(limit: number = RECHECK_PER_RUN): Promise<{ examined: number; resolved: number; dropped: number }> {
+  const out = { examined: 0, resolved: 0, dropped: 0 }
+  try {
+    if (!(await isWcOrderDivergenceDetectionEnabled())) {
+      // Detection is off: nothing is owed, so nothing is kept.
+      out.dropped = (await db.wcOrderDivergenceRecheck.deleteMany({})).count
+      return out
+    }
+    const cutoff = new Date(Date.now() - RECHECK_MAX_AGE_DAYS * 86_400_000)
+    out.dropped += (await db.wcOrderDivergenceRecheck.deleteMany({ where: { OR: [{ deferredAt: { lt: cutoff } }, { attempts: { gte: RECHECK_MAX_ATTEMPTS } }] } })).count
+    const rows = await db.wcOrderDivergenceRecheck.findMany({ orderBy: { lastAttemptAt: 'asc' }, take: Math.max(1, limit) })
+    for (const row of rows) {
+      out.examined++
+      await db.wcOrderDivergenceRecheck.update({ where: { id: row.id }, data: { attempts: { increment: 1 }, lastAttemptAt: new Date() } })
+      const live = await readLiveOrder(row.externalOrderId)
+      if (!live) continue
+      await surfaceWcOrderDivergence(row.orderId, live)
+      if ((await db.wcOrderDivergenceRecheck.count({ where: { id: row.id } })) === 0) out.resolved++
+    }
+  } catch (e) {
+    console.error('wc_order_divergence: could not drain deferred comparisons', e instanceof Error ? e.constructor.name : typeof e)
+  }
+  return out
 }
 
 export async function isWcOrderDivergenceDetectionEnabled(): Promise<boolean> {
@@ -344,10 +393,11 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     }
     const verdict = compareWcOrderWithIms(wcOrder, stored, { recordedExternalRefundIds, refundedQtyByLineId })
     if (verdict.kind === 'deferred') {
-      deferredAwaitingRefundSweep.set(wcOrder.id, orderId)
+      // Remembered durably, so a run that sweeps no refunds (the poll) still repeats the comparison. A row already there keeps its age and attempt count.
+      await db.wcOrderDivergenceRecheck.upsert({ where: { orderId }, create: { orderId, externalOrderId: String(wcOrder.id) }, update: {} })
       return
     }
-    deferredAwaitingRefundSweep.delete(wcOrder.id)
+    await db.wcOrderDivergenceRecheck.deleteMany({ where: { orderId } })
     const now = new Date()
     if (verdict.kind === 'not-comparable' || verdict.differences.length === 0) {
       await db.wcOrderDivergence.updateMany({

@@ -86,6 +86,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     orderId ??= (await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } }))?.orderId
     if (orderId) {
       await db.wcOrderDivergence.deleteMany({ where: { orderId } })
+      await db.wcOrderDivergenceRecheck.deleteMany({ where: { orderId } })
       await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId } } })
       await db.salesOrderRefund.deleteMany({ where: { orderId } })
       await db.accountingSyncLog.deleteMany({ where: { referenceId: orderId } })
@@ -229,6 +230,47 @@ test('[divergence] a comparison deferred for an unrecorded refund is repeated af
   // consumed: a second call is a no-op and does not double-count
   await f.div.rerunDeferredWcOrderDivergence(f.payload(edited) as never)
   assert.equal((await f.records())[0].seenCount, 1)
+})
+
+test('[divergence] POLL mode: a deferral is a durable row, and the next order sweep (no refund sweep) resolves it by a live read and clears it', { skip }, async (t) => {
+  const f = await fixture(t)
+  await f.setFlag(true)
+  await f.deliver({})
+  const edited = { qty: 3, shipping: 9, refunds: [{ id: 888003, reason: '', total: '-5.00' }] }
+  await f.deliver(edited)
+  assert.equal((await f.records()).length, 0)
+  assert.equal(await f.db.wcOrderDivergenceRecheck.count({ where: { orderId: f.orderId } }), 1, 'the deferral is persisted, not held in memory')
+  // Refund not recorded yet: the live read still defers; an attempt is counted, the row stays.
+  f.div.divergenceSeams.readLiveOrder = async () => f.payload(edited) as never
+  t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+  const first = await f.div.drainDeferredWcOrderDivergences()
+  assert.deepEqual(first, { examined: 1, resolved: 0, dropped: 0 })
+  assert.equal((await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })).attempts, 1)
+  // The refund is recorded (by a webhook or reconcile); the next sweep's drain compares and clears the marker.
+  await f.db.salesOrderRefund.create({ data: { orderId: f.orderId, totalForeign: '5.00', totalBase: '5.00', externalRefundId: 888003 } })
+  const second = await f.div.drainDeferredWcOrderDivergences()
+  assert.equal(second.resolved, 1)
+  assert.equal(await f.db.wcOrderDivergenceRecheck.count({ where: { orderId: f.orderId } }), 0, 'marker cleared')
+  const rows = await f.records()
+  assert.equal(rows.length, 1)
+  assert.ok((rows[0].differences as Array<{ field: string }>).some((d) => d.field === 'SHIPPING'))
+})
+
+test('[divergence] the deferral table is bounded: an unreadable or never-recorded refund is dropped at the attempt cap and by age, and detection OFF keeps nothing', { skip }, async (t) => {
+  const f = await fixture(t)
+  await f.setFlag(true)
+  await f.deliver({})
+  await f.deliver({ qty: 3, refunds: [{ id: 888004, reason: '', total: '-5.00' }] })
+  f.div.divergenceSeams.readLiveOrder = async () => null
+  t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+  await f.db.wcOrderDivergenceRecheck.update({ where: { orderId: f.orderId }, data: { attempts: f.div.RECHECK_MAX_ATTEMPTS } })
+  assert.equal((await f.div.drainDeferredWcOrderDivergences()).dropped, 1, 'dropped at the attempt cap')
+  await f.db.wcOrderDivergenceRecheck.create({ data: { orderId: f.orderId, externalOrderId: String(f.externalId), deferredAt: new Date(Date.now() - 20 * 86_400_000) } })
+  assert.equal((await f.div.drainDeferredWcOrderDivergences()).dropped, 1, 'dropped by age')
+  await f.db.wcOrderDivergenceRecheck.create({ data: { orderId: f.orderId, externalOrderId: String(f.externalId) } })
+  await f.setFlag(false)
+  assert.equal((await f.div.drainDeferredWcOrderDivergences()).dropped, 1, 'detection off: nothing is kept')
+  assert.equal(await f.db.wcOrderDivergenceRecheck.count({ where: { orderId: f.orderId } }), 0)
 })
 
 test('[divergence] a detection failure never fails the import or stops the six-field update', { skip }, async (t) => {

@@ -181,6 +181,7 @@ ERASURE_CLASSIFICATION.WcOrderDivergence = {
   notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution'],
   retained: {},
 }
+ERASURE_CLASSIFICATION.WcOrderDivergenceRecheck = { erased: [], notPersonal: ['orderId', 'externalOrderId'], retained: {} }
 ERASURE_CLASSIFICATION.EmailSuppression = { erased: ['email', 'reason'], notPersonal: ['id', 'source'], retained: {} }
 ERASURE_CLASSIFICATION.WmsMutationEvent = {
   erased: ['before', 'after'],

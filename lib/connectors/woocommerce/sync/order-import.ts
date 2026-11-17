@@ -33,7 +33,7 @@ import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import { surfaceWcOrderEditDrift } from './order-edit-drift'
-import { rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
+import { drainDeferredWcOrderDivergences, rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
@@ -5147,6 +5147,9 @@ export async function syncNewWcOrders(
     ? await walkOrders(statuses, lastSync)
     : { endedOnEmptyPage: false, page: 1 }
   const { endedOnEmptyPage, page } = walked
+  // Comparisons deferred for an unrecorded refund are resolved here in EVERY mode, the ordinary poll included (it sweeps no refunds): the deferral is a durable row, so this is a retry that survives a restart,
+  // and it runs before the cursor below can advance. It never throws and never holds the cursor.
+  await drainDeferredWcOrderDivergences()
 
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a
