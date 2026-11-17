@@ -185,6 +185,14 @@ ERASURE_CLASSIFICATION.RefusedAction = {
   notPersonal: ['entityType', 'entityId', 'action', 'gate', 'intent', 'detail', 'resolution'],
   retained: {},
 }
+// WooCommerce-vs-IMS order divergence records: keyed by the order id (no foreign key, so the row outlives a deleted order). The differences are built by IMS
+// from SKUs, quantities and amounts only (never a payload's free text, name, address or note), so nothing is erased and no free-text guard is needed.
+ERASURE_CLASSIFICATION.WcOrderDivergence = {
+  erased: [],
+  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution'],
+  retained: {},
+}
+ERASURE_CLASSIFICATION.WcOrderDivergenceRecheck = { erased: [], notPersonal: ['orderId', 'externalOrderId'], retained: {} }
 // Xero payment-matching results: one row per customer receipt, keyed by the payment and order ids (no foreign key, so the row outlives a deleted receipt). It holds ids, a Xero
 // bank-account id, an amount, a currency and a reason code in fixed wording built by IMS: no person is named and no remote free text is stored, so nothing is erased.
 ERASURE_CLASSIFICATION.XeroPaymentMatch = {
