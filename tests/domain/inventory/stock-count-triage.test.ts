@@ -116,3 +116,11 @@ test('isBulkAcceptable: no-variance mode takes only exact zero; small mode takes
   assert.equal(isBulkAcceptable('SMALL_VARIANCE', 5, 10, t), false)
   assert.equal(isBulkAcceptable('SMALL_VARIANCE', 9, 10, NO_SMALL_VARIANCE), false)
 })
+
+test('triageLine: variance at 4dp and value at pence, exact (no float drift), negative rounds away from zero', () => {
+  const t = triageLine(line('A', 10, 10.3, 0.1), NO_SMALL_VARIANCE)
+  assert.equal(t.variance, 0.3)
+  assert.equal(t.varianceValue, 0.03)
+  assert.equal(triageLine(line('B', 1, 0, 1.005), NO_SMALL_VARIANCE).varianceValue, -1.01)
+  assert.equal(triageLine(line('C', 0.1 + 0.2, 0.3, 5), NO_SMALL_VARIANCE).varianceClass, 'NONE')
+})

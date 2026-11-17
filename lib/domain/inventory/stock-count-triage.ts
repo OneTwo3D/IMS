@@ -7,10 +7,13 @@
  * bulk accept may touch (app/actions/stock-counts.ts), so what the page shows and what the commit accepts
  * cannot drift apart.
  *
+ * CLIENT-SAFE: the reconciliation page imports this module, so it must not reach the database, Prisma's runtime or any node:* module
+ * (the Turbopack client build fails on them). Arithmetic is therefore exact integer (BigInt) arithmetic at the 6dp scale of stock_levels,
+ * not Prisma.Decimal. tests/domain/inventory/stock-count-client-imports.test.ts pins the import graph.
+ *
  * Variance here is counted minus on-hand (the live book at commit time, or the line's book figure on the
  * page). Never counted lines are not triaged: there is no variance to judge.
  */
-import { toDecimal } from '@/lib/domain/math/decimal'
 
 export type VarianceClass = 'NONE' | 'SMALL' | 'REVIEW' | 'UNCOUNTED'
 export type VarianceTab = 'ALL' | 'NONE' | 'SMALL' | 'REVIEW'
@@ -27,9 +30,30 @@ export const NO_SMALL_VARIANCE: SmallVarianceThreshold = { qty: 0, pct: 0 }
 const MAX_THRESHOLD_QTY = 99_999_999.9999
 const MAX_THRESHOLD_PCT = 100
 
+
+const SCALE = BigInt(1_000_000)
+
+/** A quantity as an exact integer count of millionths (the 6dp scale of stock_levels). */
+function micro(n: number): bigint {
+  return BigInt(n.toFixed(6).replace('.', ''))
+}
+
+/** Divide with half-away-from-zero rounding, like Decimal's default. */
+function divRound(a: bigint, b: bigint): bigint {
+  const neg = (a < BigInt(0)) !== (b < BigInt(0))
+  const x = a < BigInt(0) ? -a : a
+  const y = b < BigInt(0) ? -b : b
+  const q = (BigInt(2) * x + y) / (BigInt(2) * y)
+  return neg ? -q : q
+}
+
+function varianceMicro(countedQty: number, onHand: number): bigint {
+  return micro(countedQty) - micro(onHand)
+}
+
 /** A variance is exactly zero at the 6dp scale of stock_levels. */
 export function isZeroVariance(countedQty: number, onHand: number): boolean {
-  return toDecimal(countedQty).sub(toDecimal(onHand)).toDecimalPlaces(6).isZero()
+  return varianceMicro(countedQty, onHand) === BigInt(0)
 }
 
 /**
@@ -44,17 +68,18 @@ export function classifyVariance(
   threshold: SmallVarianceThreshold,
 ): VarianceClass {
   if (countedQty == null) return 'UNCOUNTED'
-  const variance = toDecimal(countedQty).sub(toDecimal(onHand)).toDecimalPlaces(6)
-  if (variance.isZero()) return 'NONE'
-  const abs = variance.abs()
+  const variance = varianceMicro(countedQty, onHand)
+  if (variance === BigInt(0)) return 'NONE'
+  const abs = variance < BigInt(0) ? -variance : variance
   const useQty = threshold.qty > 0
   const usePct = threshold.pct > 0
   if (!useQty && !usePct) return 'REVIEW'
-  if (useQty && abs.gt(toDecimal(threshold.qty))) return 'REVIEW'
+  if (useQty && abs > micro(threshold.qty)) return 'REVIEW'
   if (usePct) {
-    const base = toDecimal(onHand).abs()
-    if (base.isZero()) return 'REVIEW'
-    if (abs.div(base).mul(100).gt(toDecimal(threshold.pct))) return 'REVIEW'
+    const base = micro(onHand) < BigInt(0) ? -micro(onHand) : micro(onHand)
+    if (base === BigInt(0)) return 'REVIEW'
+    // |variance| / base * 100 > pct, kept in integers: |variance| * 100 * 1e6 > pct(micro) * base
+    if (abs * BigInt(100) * SCALE > micro(threshold.pct) * base) return 'REVIEW'
   }
   return 'SMALL'
 }
@@ -80,9 +105,12 @@ export type TriagedLine<T extends TriageLineInput> = {
 export function triageLine<T extends TriageLineInput>(line: T, threshold: SmallVarianceThreshold): TriagedLine<T> {
   const varianceClass = classifyVariance(line.countedQty, line.expectedQty, threshold)
   if (line.countedQty == null) return { line, varianceClass, variance: null, varianceValue: null }
-  const variance = toDecimal(line.countedQty).sub(toDecimal(line.expectedQty)).toDecimalPlaces(4)
-  const varianceValue = line.unitCost == null ? null : variance.mul(toDecimal(line.unitCost)).toDecimalPlaces(2)
-  return { line, varianceClass, variance: variance.toNumber(), varianceValue: varianceValue?.toNumber() ?? null }
+  const v6 = varianceMicro(line.countedQty, line.expectedQty)
+  const v4 = divRound(v6, BigInt(100)) // variance at 4dp (ten-thousandths)
+  const variance = Number(v4) / 10_000
+  // variance (1e-4) x unit cost (1e-6) = 1e-10; round to pence (1e-2)
+  const varianceValue = line.unitCost == null ? null : Number(divRound(v4 * micro(line.unitCost), BigInt(100_000_000))) / 100
+  return { line, varianceClass, variance, varianceValue }
 }
 
 export function filterByTab<T extends TriageLineInput>(lines: TriagedLine<T>[], tab: VarianceTab): TriagedLine<T>[] {
