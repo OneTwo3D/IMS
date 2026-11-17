@@ -157,6 +157,7 @@ test('a quote needs a draft and a real, not-past validity date; a storefront-num
     [{ isQuote: true, quoteValidUntil: '2020-01-01' }, /in the past/],
     [{ isQuote: true, quoteValidUntil: '2026-02-30' }, /valid until/],
     [{ isQuote: true, isDraft: false, quoteValidUntil: future(5) }, /saved as a draft/],
+    [{ isQuote: true, isDraft: undefined, quoteValidUntil: future(5) }, /saved as a draft/],
     [{ isQuote: true, quoteValidUntil: future(5), externalOrderNumber: `X-${w.tag}` }, /storefront order is never a quote/],
     [{ quoteValidUntil: future(5) }, /belongs to a quote only/],
   ] as const) {
@@ -335,4 +336,21 @@ test('permission denial: converting, sending and the setting each refuse and wri
   assert.equal(row.isQuote, true)
   assert.equal(await db.emailOutbox.count({ where: { referenceId: id } }), 0)
   assert.equal((await db.setting.findUniqueOrThrow({ where: { key: 'sales_quote_email_enabled' } })).value, 'true')
+})
+
+test('the database refuses a quote on any live status; a cancelled quote is allowed', SKIP, async (t) => {
+  const w = await seedWorld()
+  t.after(() => w.teardown())
+  const { createSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const { db } = await import('@/lib/db')
+  const quote = await createSalesOrder(inputFor(w, { isQuote: true, quoteValidUntil: future(5) }) as never)
+  assert.ok(quote.success)
+  const id = quote.order!.id
+  w.orderIds.push(id)
+  await assert.rejects(() => db.salesOrder.update({ where: { id }, data: { status: 'PROCESSING' } }), /sales_orders_quote_is_draft_check|check constraint/i)
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id } })).status, 'DRAFT')
+  const cancelled = await updateSalesOrderStatus(id, 'CANCELLED')
+  assert.equal(cancelled.success, true, cancelled.error)
+  const row = await db.salesOrder.findUniqueOrThrow({ where: { id } })
+  assert.deepEqual([row.status, row.isQuote], ['CANCELLED', true])
 })

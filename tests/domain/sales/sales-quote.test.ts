@@ -43,6 +43,7 @@ test('create/edit input: a quote is a draft with a real, not-past validity date;
   assert.deepEqual(validateQuoteInput({ isQuote: true, isDraft: true, quoteValidUntil: '2026-12-01' }, TODAY), { ok: true, isQuote: true, quoteValidUntil: '2026-12-01' })
   assert.deepEqual(validateQuoteInput({ isDraft: true }, TODAY), { ok: true, isQuote: false, quoteValidUntil: null })
   assert.equal(validateQuoteInput({ isQuote: true, isDraft: false, quoteValidUntil: '2026-12-01' }, TODAY).ok, false, 'never a live order')
+  assert.equal(validateQuoteInput({ isQuote: true, quoteValidUntil: '2026-12-01' }, TODAY).ok, false, 'isDraft omitted is a live order: refused')
   assert.equal(validateQuoteInput({ isQuote: true, isDraft: true }, TODAY).ok, false, 'a date is required')
   assert.equal(validateQuoteInput({ isQuote: true, isDraft: true, quoteValidUntil: '2026-02-30' }, TODAY).ok, false)
   assert.equal(validateQuoteInput({ isQuote: true, isDraft: true, quoteValidUntil: '2026-11-17' }, TODAY).ok, false, 'past')
@@ -128,6 +129,7 @@ test('the migration is additive and not before the floor', () => {
   assert.match(sql, /ADD COLUMN "is_quote" BOOLEAN NOT NULL DEFAULT false/)
   assert.match(sql, /ADD COLUMN "quote_valid_until" DATE/)
   assert.match(sql, /ADD COLUMN "quote_sent_at" TIMESTAMP\(3\)/)
+  assert.match(sql, /CHECK \(NOT "is_quote" OR "status" IN \('DRAFT', 'CANCELLED'\)\)/, 'the database refuses a live quote')
   assert.doesNotMatch(sql, /DROP|RENAME|UPDATE |DELETE /i)
 })
 

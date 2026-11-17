@@ -75,7 +75,7 @@ export function validateQuoteInput(input: QuoteInputFacts, todayYmd: string, opt
     if (input.quoteValidUntil) return { ok: false, error: 'A validity date belongs to a quote only.' }
     return { ok: true, isQuote: false, quoteValidUntil: null }
   }
-  if (input.isDraft === false) return { ok: false, error: 'A quote is saved as a draft: it cannot be created as a live order.' }
+  if (input.isDraft !== true) return { ok: false, error: 'A quote is saved as a draft: it cannot be created as a live order (isDraft must be true; omitting it is a live order).' }
   const ymd = parseQuoteDate(input.quoteValidUntil)
   if (!ymd) return { ok: false, error: 'Enter the date the quote is valid until.' }
   if (ymd < todayYmd && ymd !== options.allowPastDate) return { ok: false, error: 'The quote validity date is in the past.' }
