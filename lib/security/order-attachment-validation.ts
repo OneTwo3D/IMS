@@ -148,7 +148,6 @@ export function displayNameForAttachment(claimedName: string, extension: string)
   const base = claimedName.split(/[\\/]/).pop() ?? ''
   const stem = base.replace(/\.[^.]*$/, '')
   const cleaned = stem
-    // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f"\\/:*?<>|;]+/g, '_')
     .replace(/\s+/g, ' ')
     .trim()
