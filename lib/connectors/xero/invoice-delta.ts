@@ -41,11 +41,14 @@ export type XeroInvoice = {
    * Optional only because the fixtures predate them. A reversal verdict that needs them and does not
    * have them is WITHHELD rather than guessed — see partitionPaymentReversals.
    *
-   * AmountCredited is deliberately not read: an allocated credit note is not a payment, and `paidAt`
-   * records a payment.
+   * AmountCredited is deliberately not read by the reversal buckets: an allocated credit note is not a
+   * payment, and `paidAt` records a payment. The part-removal measurement (o3d-cdhl) reads it for one
+   * reason only: a ledger that also holds credit against the invoice cannot attribute a shortfall to a
+   * removed payment, so it is left to the operator.
    */
   AmountPaid?: number | string
   AmountDue?: number | string
+  AmountCredited?: number | string
   /**
    * The currency the two amounts above are denominated in, as Xero states it (`"GBP"`, `"KWD"`).
    *

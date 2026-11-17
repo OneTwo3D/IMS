@@ -379,7 +379,10 @@ const dbDouble: Record<string, unknown> = {
   },
   user: { findMany: async () => [{ id: 'admin_1' }] },
   salesOrderRefund: { findFirst: async () => null },
+  // o3d-cdhl: clearing paidAt also appends the shortfall history inside one transaction; no shortfall exists in these fixtures.
+  $transaction: async (fn: (tx: unknown) => unknown) => fn(dbDouble),
   salesOrder: {
+    findUnique: async () => null,
     findMany: async ({ where }: { where: Row }) => state.salesOrders.filter((r) => rowMatches(r, where)),
     updateMany: async () => ({ count: 0 }),
     update: async ({ where, data }: { where: { id: unknown }; data: Row }) => {

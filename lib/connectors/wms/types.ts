@@ -83,6 +83,7 @@ export type WmsWriteOperation =
   | 'order.comment'
   | 'product.upsert'
   | 'product.content'
+  | 'product.delete'
   | 'product.bundle'
   | 'asn.create'
 
@@ -142,6 +143,12 @@ export type WmsProductDto = {
   widthCm: number | null
   depthCm: number | null
   imageUrl: string | null
+  /**
+   * The IMS unit cost (GBP), sent to the WMS as the product's cost price. ABSENT, not null, unless the product parity setting is
+   * on and IMS holds a cost: a key that is present changes the payload hash, so it must not
+   * appear while the setting is off. Business-sensitive: never log it.
+   */
+  costPrice?: number | null
   raw?: Record<string, unknown> | null
 }
 
@@ -284,6 +291,13 @@ export type WmsProductContentUpdate = {
 
 /** `sent: false, held: true` is the outbound-write hold refusing BEFORE the request left IMS: nothing was sent. */
 export type WmsProductContentResult = { sent: true } | { sent: false; held: true; message: string }
+
+/**
+ * The answer of {@link WmsConnector.deleteProduct}. `deleted: true` is the WMS confirming the removal. `deleted: false` with `held` is
+ * the outbound-write hold refusing BEFORE the request left IMS; without it the WMS refused (for instance because the record is
+ * linked to orders or bundles) and `message` says why. Either way nothing was removed.
+ */
+export type WmsProductDeleteResult = { deleted: true } | { deleted: false; held?: true; message: string }
 
 export type WmsBundleComponent = {
   externalProductId: string | null
@@ -616,6 +630,8 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   upsertProduct(product: WmsProductDto, options: WmsUpsertProductOptions | undefined, clearance: WmsWriteClearance<'product.upsert'>): Promise<WmsProductRef>
   /** Update a linked product's content (description, short description, picture). Absent: the WMS takes no content. */
   updateProductContent?(update: WmsProductContentUpdate, clearance: WmsWriteClearance<'product.content'>): Promise<WmsProductContentResult>
+  /** Delete a product record in the WMS. DESTRUCTIVE: a caller deletes only on proof that its replacements exist. Absent: the WMS cannot. */
+  deleteProduct?(externalProductId: string, clearance: WmsWriteClearance<'product.delete'>): Promise<WmsProductDeleteResult>
   createAsn(input: WmsAsnInput, clearance: WmsWriteClearance<'asn.create'>): Promise<WmsAsnRef>
   fetchAsnById?(externalAsnId: string): Promise<WmsAsnRef | null>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>

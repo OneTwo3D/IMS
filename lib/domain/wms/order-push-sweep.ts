@@ -23,7 +23,8 @@ import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidB
 import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
-import { courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
+import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type RefusedActionInput } from '@/lib/domain/refused-actions'
+import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
 import { runSystemicPass, type SystemicFailureStore } from './systemic-failure'
 import { createDbSystemicFailureStore } from './systemic-failure-store'
@@ -848,6 +849,9 @@ const RESET_DISPATCH_FAILURES = {
  * order. An expired lease leaves the untrusted-ids mark set; the next owner re-reads before anything is trusted. A remote write that stalls
  * past this (several request timeouts) is the accepted limit.
  */
+/** How many open serious amendment refusals one sweep re-reads from the warehouse (one read-only fetch each). */
+export const AMENDMENT_VERIFY_BATCH = 10
+
 export const AMEND_LEASE_TTL_MS = 10 * 60_000
 
 /** Where the held create pass's walk stands (a Setting). Cleared when a page comes back short. */
@@ -1181,6 +1185,18 @@ export interface WmsOrderPushPort {
   noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date; orderNumber?: string | null; externalOrderNumber?: string | null; lastError?: string | null }>>
   /** Record one operator task ("raise a query"), once: true when a new row was written, false when the same task already exists. A rejection means it was NOT recorded. */
   raiseOperatorTask?(task: WmsOperatorTaskInput): Promise<boolean>
+  /**
+   * Record a refused or stalled action (lib/domain/refused-actions.ts): an idempotent upsert on (entity, action, gate). THROWS when it cannot be
+   * written: the caller then leaves the link due rather than advancing it over a refusal nobody can see. Absent: nothing is recorded (test doubles).
+   */
+  recordRefusedAction?(input: RefusedActionInput): Promise<void>
+  /**
+   * Open HIGH amendment refusals of this connector's linked orders, with the lines IMS wanted the warehouse order to hold, oldest first. Read by the
+   * verification pass, which closes one only when the warehouse's own lines match.
+   */
+  openAmendmentRefusals?(connector: string, limit: number): Promise<Array<{ orderId: string; externalOrderId: string; lines: Array<{ sku: string; quantity: number }> }>>
+  /** Close this order's open refusals of one action: the action later succeeded. */
+  resolveRefusedActions?(orderId: string, action: RefusedActionInput['action']): Promise<void>
   /** Live links with a courier-fallback task due and not yet recorded. */
   courierTasksDue?(connector: string, limit: number): Promise<Array<{ orderId: string; externalOrderId: string; externalOrderNumber: string | null; orderNumber: string | null; service: string; pushedAt?: Date | null; courierTaskEpisode?: Date | null }>>
   /** Persist the courier due-marker for this order and service BEFORE an amendment call, only while none is set. True when this call set it. */
@@ -1365,6 +1381,45 @@ export async function runWmsOrderPushSweepCore(
   const raiseTaskOrThrow = async (task: Omit<WmsOperatorTaskInput, 'connector'>): Promise<void> => {
     if (!port.raiseOperatorTask) return
     if (await port.raiseOperatorTask({ connector: connectorId, ...task })) operatorTasksRaised += 1
+  }
+
+  /**
+   * Record an amendment the warehouse order could not take. Severity comes from the INTENT: it is HIGH when the lines (SKU or quantity) differ from the
+   * lines recorded on the warehouse order (or cannot be compared), LOW when only money, courier or other header data moved. A HIGH one also raises an
+   * operator task carrying the exact lines IMS wants (the owner's ruling: warehouse-facing follow-up is a person raising a query, never an order comment).
+   */
+  const recordRefusedAmendment = async (link: { id: string; externalOrderId: string | null; order: { id: string; orderNumber: string | null } }, input: WmsOrderPushInput, wmsStatus: string): Promise<void> => {
+    if (!port.recordRefusedAction) return
+    const status = scrubWmsError(wmsStatus, 'unknown')
+    const recorded = port.readOrderItems ? await port.readOrderItems(link.id).catch(() => null) : null
+    const lineChange = classifyAmendmentLineChange(input.lines.map((line) => ({ sku: line.sku, quantity: Number(line.quantity) })), recorded)
+    const severity = amendmentSeverity(lineChange)
+    const notNew = wmsStatus === 'NOT_NEW'
+    await port.recordRefusedAction({
+      entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
+      entityId: link.order.id,
+      action: 'WMS_ORDER_AMEND',
+      gate: notNew ? 'WMS_ORDER_NOT_NEW' : 'WMS_ORDER_NOT_AMENDABLE',
+      permanence: 'PERMANENT',
+      severity,
+      intent: { ...pushIntentSummary(input), wmsStatus: status, lineChange } as unknown as Prisma.InputJsonValue,
+      detail: notNew
+        ? 'The warehouse order is already past NEW, so IMS could not amend it and changed nothing there.'
+        : `The warehouse order could not be amended (warehouse status ${status}) and IMS changed nothing there.`,
+      now: now(),
+    })
+    if (severity === 'HIGH' && link.externalOrderId) {
+      const orderRef = link.order.orderNumber ?? link.order.id
+      await raiseTaskBestEffort({
+        orderId: link.order.id,
+        externalOrderId: link.externalOrderId,
+        reason: 'AMENDMENT_NOT_APPLIED',
+        queryText: amendmentNotAppliedQuery(link.externalOrderId, orderRef, input.lines.map((line) => ({ sku: line.sku, quantity: Number(line.quantity) })), status),
+        payload: { orderNumber: link.order.orderNumber ?? null },
+        // The same intent is one task; a changed intent (different lines) is a new one.
+        dedupeBasis: `amend:${JSON.stringify(input.lines.map((line) => [line.sku, Number(line.quantity)]).sort())}`,
+      })
+    }
   }
 
   /**
@@ -3309,6 +3364,20 @@ export async function runWmsOrderPushSweepCore(
         } as LinkWrite,
       }
     }
+    // VERIFY THE UNAPPLIED AMENDMENTS (o3d-zvec.10). A serious refused amendment is closed ONLY when the warehouse's own lines (one read-only fetch,
+    // never a write) equal the lines IMS wanted: a person raising the query (the task Done) proves nothing about what the warehouse will pick. An order
+    // that ended is closed by the watchdog; a later successful amendment closes it above. A read that fails or finds no lines leaves the row open.
+    if (port.openAmendmentRefusals && port.resolveRefusedActions && connector.fetchOrderItemRefs) {
+      try {
+        for (const open of await port.openAmendmentRefusals(connectorId, AMENDMENT_VERIFY_BATCH)) {
+          const held = await connector.fetchOrderItemRefs(open.externalOrderId).catch(() => null)
+          if (!held || held.length === 0) continue
+          if (classifyAmendmentLineChange(open.lines, held.map((item) => ({ sku: item.sku, quantity: Number(item.quantity) }))) === 'UNCHANGED') await port.resolveRefusedActions(open.orderId, 'WMS_ORDER_AMEND')
+        }
+      } catch (error) {
+        console.error('[wms-order-push] could not verify the unapplied amendments', error)
+      }
+    }
     for (const link of await (createFloor ? port.updatableLinks(connectorId, batchSize, createFloor) : port.updatableLinks(connectorId, batchSize))) {
       const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId || !link.externalOrderId) continue
@@ -3461,6 +3530,11 @@ export async function runWmsOrderPushSweepCore(
         // What the accepted order post did to the courier is settled here (form recorded, review flag, warehouse note); the same
         // settlement runs when the item reconcile fails AFTER the post was accepted (see the catch below).
         const settled = await settleAmendedCourier(link, update.updated ? update : {}, courierMarkerSetHere, earlierCourierTaskRecorded, amendService, amendEpisode)
+        // A REFUSED AMENDMENT IS RECORDED BEFORE THE LINK ADVANCES (o3d-zvec.8 / zvec.10): pushedAt is bumped below so IMS does not hammer the warehouse, but
+        // that used to erase the fact that a change was outstanding. The refusal is now a durable row with the full intent and the warehouse status, so it
+        // is visible on Sync > Exceptions and ages into an alert. If it cannot be written this throws and the link stays due. NO warehouse comment is written.
+        if (update.updated) await port.resolveRefusedActions?.(link.order.id, 'WMS_ORDER_AMEND')
+        else await recordRefusedAmendment(link, input, update.status)
         // Bump pushedAt either way so we don't re-attempt until the next change;
         // a non-NEW WMS order can no longer be amended (inbound webhooks aside).
         await port.updateLink(link.id, {
@@ -4629,6 +4703,36 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async raiseOperatorTask(task) {
       return raiseWmsOperatorTask(db, task)
+    },
+    async recordRefusedAction(input) {
+      await recordRefusedAction(db, input)
+    },
+    async openAmendmentRefusals(connector, limit) {
+      // ROTATION: the eligible rows (this connector, a live SYNCED link with a warehouse order id) are filtered BEFORE the limit, the least recently tried
+      // come first (never tried first), and every row picked is stamped in the same statement, so a failed read or a persistent mismatch is retried in
+      // turn and can never starve a newer refusal.
+      const rows = await db.$queryRaw<Array<{ entity_id: string; intent: unknown; external_order_id: string }>>`
+        WITH picked AS (
+          SELECT r.id, l."externalOrderId" AS external_order_id
+            FROM refused_actions r
+            JOIN wms_order_push_links l ON l."orderId" = r.entity_id AND l.connector = ${connector} AND l.state::text = 'SYNCED' AND l."externalOrderId" IS NOT NULL
+           WHERE r.entity_type = ${REFUSED_ACTION_ENTITY_SALES_ORDER} AND r.action = 'WMS_ORDER_AMEND' AND r.resolved_at IS NULL AND r.severity = 'HIGH'
+           ORDER BY r.last_verified_at ASC NULLS FIRST, r.id ASC
+           LIMIT ${limit}
+             FOR UPDATE OF r SKIP LOCKED
+        )
+        UPDATE refused_actions r SET last_verified_at = (now() AT TIME ZONE 'UTC')
+          FROM picked p WHERE r.id = p.id
+        RETURNING r.entity_id, r.intent, p.external_order_id
+      `
+      return rows.flatMap((row) => {
+        const intent = row.intent && typeof row.intent === 'object' && !Array.isArray(row.intent) ? (row.intent as { lines?: unknown }) : {}
+        const lines = Array.isArray(intent.lines) ? intent.lines.flatMap((line) => (line && typeof (line as { sku?: unknown }).sku === 'string' ? [{ sku: (line as { sku: string }).sku, quantity: Number((line as { quantity?: unknown }).quantity) }] : [])) : []
+        return lines.length > 0 ? [{ orderId: row.entity_id, externalOrderId: row.external_order_id, lines }] : []
+      })
+    },
+    async resolveRefusedActions(orderId, action) {
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action }, 'ACTION_SUCCEEDED')
     },
     async courierTasksDue(connector, limit) {
       const rows = await db.wmsOrderPushLink.findMany({

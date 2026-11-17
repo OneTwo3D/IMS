@@ -351,6 +351,22 @@ Behavior notes:
 - Re-saving the same tracking is idempotent and does not intentionally create duplicate upstream entries
 - Reflected WooCommerce `order.updated` webhooks from IMS-originated status/tracking pushes are explicitly suppressed
 
+#### Tracking provider mapping (off by default)
+
+Advanced Shipment Tracking (AST) builds the customer's tracking link and branding from a provider slug such as `royal-mail`. By default IMS writes the courier's display name instead, which AST cannot resolve, so the link may show as plain text.
+
+Tick **Map couriers to tracking providers** under **Sync > WooCommerce > Order Sync** (setting `wc_ast_provider_mapping_enabled`) and the tracking item IMS writes carries the AST provider slug instead:
+
+- A courier in the warehouse courier table (Royal Mail, Parcelforce, Evri, DHL Express, UPS, Spring Global) is written with its slug. The name must match the table exactly, including capitals and brackets: there are no aliases and no partial matches.
+- An order the FedEx label plugin has labelled (it carries a `_fedex_tracking_number`) is written as **FedEx**, and an order forwarded to Click & Drop is written as **Royal Mail**, whatever courier name the warehouse reported. FedEx wins if an order has both. On an order with several shipments the label applies only to the shipment it identifies: the FedEx tracking number matches only that shipment's number, and a shipment with a table courier (for example UPS) keeps its own provider.
+- A courier that is not in the table (Palletline, Local Collection, anything new) is written exactly as before, and each one is counted in the activity log as `wc_tracking_provider_unmapped` with the courier name, so you can see what is missing. IMS never guesses a provider.
+
+If IMS cannot read the setting, it behaves as if it were unticked (the tracking is written as before and the failure is logged as `wc_tracking_provider_setting_unreadable`); tracking is never held up by it.
+
+With the box unticked (the default) nothing changes: the tracking written to WooCommerce is identical to what IMS wrote before this setting existed. Turning it on affects tracking written from then on; an order whose tracking was already written is rewritten with the slug the next time its tracking is pushed. Like every WooCommerce write, it goes through the outbox and is held while WooCommerce is shadowed.
+
+This does not change whether AST sends its own despatch email: that is checked separately on the stage store. Partial shipments go through the companion plugin's partial-shipment route, which records the tracking number only and carries no provider.
+
 ### EU withdrawal requests
 
 If your store uses the EU order-withdrawal button plugin, IMS follows its statuses (the defaults are `pending-wdraw` for a submitted request and `withdrawn` for an approved one; the names can be changed in settings if your plugin uses others):
@@ -547,6 +563,10 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 - **Monetary-only refunds** (no quantities) create a single refund line with the full amount and the WC refund reason
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
+
+**IMS-initiated refunds are not pushed to WooCommerce.** A refund recorded in IMS on a WooCommerce order creates no refund record, no status change, no order note and no money movement in WooCommerce. IMS raises one **Refund in WooCommerce** operator task (Sync > Exceptions) and shows a badge on the order; a person refunds the customer in WooCommerce. IMS never maps a refunded or partly refunded order to a WooCommerce status.
+
+**The matching WooCommerce refund is linked, not imported twice.** WooCommerce refunds are normally deduplicated by refund ID, but the refund a person makes later has a new ID. IMS writes no marker to WooCommerce, so on an order with an open Refund in WooCommerce task it cannot tell the refund a person made for an IMS refund from a separate refund that began in WooCommerce with the same amount. It therefore **never links on its own**: it records nothing and parks the WooCommerce refund, quarantined, with the figures (see Parked refunds below). On the parked row a person chooses **Confirm this WooCommerce refund settles IMS refund (credit note)** (one transaction under the refund and order locks: the WooCommerce refund ID is set on the IMS refund, the task and the row are resolved, an activity entry is written and **no second credit note is raised**), or records it as a separate refund as for any WooCommerce refund. Orders with no open task are imported as before. The optional order meta flag from the original design is not built; no WooCommerce write path was added.
 
 **WooCommerce restocks first.** WooCommerce raises its own stock for a refunded line inside the refund request, before IMS hears of it. IMS is the stock master, so once the `order.updated` delivery has applied a refund, IMS force-pushes its own absolute stock level for the refunded products (reason `IMS_CHANGE`, `force`), through the normal stock job: behind the producer seam and the outbound hold, so it is a recorded shadow while `woocommerce.stock` is not IMS's to write. It follows the refund sweep, so the level already reflects what the refund did in IMS; with refund-returns-in-transit on, the returned units are not back yet and WooCommerce is lowered to IMS's level until they arrive. The push cannot undo what WooCommerce already did at the moment of the refund (a flip to in-stock and any back-in-stock mail); only a store-side change (not restocking refunded items) prevents that. Backstops: the `product.updated` webhook correction and the stock reconcile. The reservation-release backstop pushes the released unshipped units the same way.
 

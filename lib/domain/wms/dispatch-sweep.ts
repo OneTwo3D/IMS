@@ -41,6 +41,7 @@ import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { scrubWmsError } from './error-scrub'
+import { recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { recordWmsMutationEvent } from './mutation-audit'
 import { proveMergeLineage, type MergeLineageProof } from './merge-lineage'
 import { flagDoublePostageForMergedLink } from './double-postage'
@@ -247,6 +248,13 @@ export function shouldDeadLetterDispatch(failureCount: number, deadLetteredAt: D
  * degraded on the per-order fallback for as long as the record exists.
  */
 export const DISPATCH_MAX_CONSECUTIVE_UNRESOLVED = 5
+
+/**
+ * How many CONSECUTIVE reads of a KNOWN STALL (a split order with a cancelled part) isolate one link. A stall is not an unreadable record: the WMS
+ * answered and said exactly what is wrong, so it stays OUT of the unresolved cohort and the connector-drift verdict, never holds the delta watermark
+ * (its refused-action record is the durable trace), and is bounded by its own per-link read count.
+ */
+export const DISPATCH_MAX_CONSECUTIVE_STALLED_READS = 5
 
 /**
  * ...and the other side of it: how many links must be unresolved AT ONCE before
@@ -540,6 +548,12 @@ export type WmsDispatchSweepDeps = {
   recordWmsTerminalNonDespatch?(candidate: WmsDispatchCandidate, wmsStatus: string): Promise<void>
   clearWmsTerminalNonDespatch?(orderId: string): Promise<void>
   /**
+   * Record the refused-or-stalled action an outcome carries (an idempotent upsert), and close it when the order later despatches or the cause is
+   * gone. Best effort in the sweep: a failure holds the watermark (the refusal is not yet written, so the change must stay in the next window).
+   */
+  recordRefusedAction?(candidate: WmsDispatchCandidate, refusal: NonNullable<WmsDispatchOutcome['refusal']>): Promise<void>
+  resolveRefusedActions?(orderId: string): Promise<void>
+  /**
    * o3d-bjc.9: unresolved-record streak, kept SEPARATE from the transport
    * failure counter above. `recordUnresolvedRead` increments and returns the new
    * consecutive count; the sweep decides in BULK at the end of the pass whether
@@ -589,6 +603,8 @@ export type WmsDispatchSweepDeps = {
     candidate: WmsDispatchCandidate,
     reason: string,
     count: number,
+    /** 'STALLED': a known stall (a cancelled split part), not an unreadable record: worded as such. */
+    kind?: 'STALLED',
   ): Promise<{ quarantined: boolean }>
   clearUnresolvedReads?(linkId: string): Promise<void>
   /**
@@ -1123,6 +1139,40 @@ async function reconcileSplitOrder(
     // without ever knowing the second part). Any of those means unknown.
     const anyPartStateUnknown = parts.some((entry) => !dispatchStateEstablished(entry))
     const incompleteEnumeration = !allRecorded || parts.length < totalParts || anyPartStateUnknown
+    // A CANCELLED PART WILL NEVER DESPATCH (o3d-zvec.9 / zvec.10): the order is part-way for good, so it can never reach totalParts despatched. That is a
+    // STALL, not "not yet": it is recorded as a refused action (permanent once every part is either despatched or cancelled). It is its OWN outcome: not
+    // unresolved (so never part of the connector-drift cohort, which would mistake several of them for a connector fault), and the watermark may advance
+    // past it because the record is the durable trace. It is bounded by a per-link read count (DISPATCH_MAX_CONSECUTIVE_STALLED_READS) that isolates it.
+    const cancelledParts = parts.filter((entry) => !entry.dispatched && isWmsTerminalNonDespatchStatus({ status: entry.status, statusLabel: '' }))
+    if (cancelledParts.length > 0) {
+      // PERMANENT needs all three: every despatched part's shipment was RECORDED (an unreadable items read leaves allRecorded false), the part set is COMPLETE
+      // and every part's state is known, and every remaining part is cancelled. Otherwise something can still change (a shipment still to record), so it is
+      // RETRYABLE: never isolated, and (below) held unresolved like any part set we could not fully account for.
+      const allAccountedFor = allRecorded && !incompleteEnumeration && dispatchedParts.length + cancelledParts.length >= totalParts
+      return {
+        action: 'pending',
+        reason: `${dispatchedParts.length}/${totalParts} parts despatched; part ${cancelledParts.map((entry) => entry.partNumber).join(', ')} is cancelled in the WMS and will not despatch, so this order cannot complete`,
+        // A known stall is its own outcome (see `refusal`): it does not join the connector-drift cohort. EXCEPT when the part set is not fully accounted for
+        // (a despatched part with unreadable lines, a missing or unknown part): then the delta must not age out before the shipment is recorded, so the
+        // WATERMARK is held for it (`holdWatermark`) while the link stays a fully polled candidate. It is deliberately NOT isolated: isolating would hide
+        // the unrecorded despatch. Its refused-action record (RETRYABLE, MEDIUM) ages into an alert instead.
+        unresolved: false,
+        ...(requireResolution && incompleteEnumeration ? { holdWatermark: true } : {}),
+        refusal: {
+          action: 'WMS_SPLIT_ORDER_COMPLETE',
+          gate: 'WMS_SPLIT_PART_CANCELLED',
+          permanence: allAccountedFor ? 'PERMANENT' : 'RETRYABLE',
+          severity: 'MEDIUM',
+          intent: {
+            warehouseOrderNumber: orderNumber,
+            totalParts,
+            despatchedParts: dispatchedParts.length,
+            cancelledParts: cancelledParts.map((entry) => ({ part: entry.partNumber, status: scrubWmsError(entry.status, 'unknown') })),
+          },
+          detail: `${dispatchedParts.length} of ${totalParts} parts have despatched and a part is cancelled in the warehouse, so IMS will never see the last despatch. Complete the order by hand once the cancelled part has shipped from elsewhere.`,
+        },
+      }
+    }
     return {
       action: 'pending',
       reason: !allRecorded
@@ -1219,6 +1269,13 @@ export type WmsDispatchOutcome = {
   wmsTerminal?: string
   /** A part of a split order is confirmed despatched: any "cancelled in the WMS" exception raised earlier is false and is closed. */
   partDespatched?: boolean
+  /**
+   * The order can NEVER complete from what the WMS shows (a split part was cancelled and will not despatch). Recorded as a refused or stalled action
+   * (lib/domain/refused-actions.ts) so the condition has a name, an age and an alert instead of reading as "N/M parts despatched" for ever.
+   */
+  /** Hold the delta watermark for this order without calling it unresolved (no drift cohort, no quarantine): its despatch is still to be recorded. */
+  holdWatermark?: boolean
+  refusal?: Pick<RefusedActionInput, 'action' | 'gate' | 'permanence' | 'severity' | 'intent' | 'detail'>
 }
 
 /**
@@ -1697,7 +1754,7 @@ export async function runWmsDispatchSweepCore(
     // ambiguous order would otherwise dead-letter itself after five sweeps for a
     // condition the operator has to fix in the WMS, not in IMS. It IS counted for
     // the job outcome (below) so it can never hide behind a SUCCEEDED job.
-    if (outcome.action === 'error') passClean = false
+    if (outcome.action === 'error' || outcome.holdWatermark) passClean = false
     if (outcome.unresolved) unresolvedCount += 1
     counters[outcome.action === 'dispatched' ? 'dispatched' : outcome.action === 'error' ? 'errors' : 'pending'] += 1
     linksDecided += 1
@@ -1714,6 +1771,15 @@ export async function runWmsDispatchSweepCore(
       console.error('[wms-dispatch-sweep] could not record a WMS-terminal order for an operator:', terminalError)
       // The operator-facing row did not commit, so this pass has not finished deciding the order: hold the watermark
       // (as for a withdrawal park that did not commit) so the change cannot age out before the row is written.
+      passClean = false
+    }
+    // A refused or stalled action is recorded; once the order despatches (or the cause is gone) its record is closed. If the record cannot be written the
+    // watermark is held (the change must stay in the next window), as for the terminal row above.
+    try {
+      if (outcome.refusal) await deps.recordRefusedAction?.(candidate, outcome.refusal)
+      else if (outcome.action !== 'error' && !outcome.unresolved) await deps.resolveRefusedActions?.(candidate.orderId)
+    } catch (refusalError) {
+      console.error('[wms-dispatch-sweep] could not record a refused action:', refusalError)
       passClean = false
     }
     try {
@@ -1749,6 +1815,18 @@ export async function runWmsDispatchSweepCore(
         // budget would isolate the stragglers the moment a connector outage
         // partially recovers — records that would have recovered by themselves.
         unresolvedLinks.push({ candidate, reason: outcome.reason, count: 0 })
+      } else if (outcome.refusal && outcome.refusal.permanence !== 'PERMANENT') {
+        // A cancelled part with other parts STILL TO DESPATCH: those parts can still ship, so the link stays an ordinary, fully-polled candidate (nothing
+        // is counted, nothing is isolated, an earlier streak is cleared). Isolating it would stop their despatches being recorded.
+        await deps.clearUnresolvedReads?.(candidate.linkId)
+      } else if (outcome.refusal) {
+        // A PERMANENT stall: every part is despatched (and was recorded this pass) or cancelled, so nothing is left to observe. Counted per link, outside the
+        // drift cohort, and isolated after N consecutive reads so it stops being polled; the watermark is not held.
+        const { count } = (await deps.recordUnresolvedRead?.(candidate, outcome.reason)) ?? { count: 0 }
+        if (count >= DISPATCH_MAX_CONSECUTIVE_STALLED_READS) {
+          const isolated = await deps.quarantineUnresolved?.(candidate, outcome.reason, count, 'STALLED')
+          if (isolated?.quarantined) console.warn(`[wms-dispatch-sweep] stalled order ${candidate.externalOrderNumber} set aside after ${count} consecutive reads`)
+        }
       } else if (outcome.action !== 'error') {
         await deps.clearUnresolvedReads?.(candidate.linkId)
       }
@@ -3217,6 +3295,14 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         actionUrl: '/sync/exceptions',
       })))
     },
+    async recordRefusedAction(candidate, refusal) {
+      const order = await db.salesOrder.findUnique({ where: { id: candidate.orderId }, select: { orderNumber: true } })
+      const intent = { ...(refusal.intent as Record<string, unknown> | null), orderNumber: order?.orderNumber ?? null } as Prisma.InputJsonValue
+      await recordRefusedAction(db, { ...refusal, intent, entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: candidate.orderId })
+    },
+    async resolveRefusedActions(orderId) {
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WMS_SPLIT_ORDER_COMPLETE' }, 'ACTION_SUCCEEDED')
+    },
     async clearWmsTerminalNonDespatch(orderId) {
       await db.wmsOrderDiscrepancy.updateMany({
         where: { orderId, category: WMS_TERMINAL_NON_DESPATCH_CATEGORY, status: 'OPEN' },
@@ -3238,7 +3324,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         data: { dispatchUnresolvedCount: 0, dispatchUnresolvedError: null, dispatchUnresolvedAt: null },
       })
     },
-    async quarantineUnresolved(candidate, reason, count) {
+    async quarantineUnresolved(candidate, reason, count, kind) {
       // Compare-and-set, like the dead-letter path: an overlapping sweep whose
       // read RESOLVED clears the streak between our count and this write, and
       // that success must veto the quarantine — the count has to still be at the
@@ -3263,7 +3349,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         entityId: candidate.orderId,
         tag: 'sync',
         action: 'wms_dispatch_unresolved_quarantined',
-        description: `Dispatch reconciliation quarantined after ${count} consecutive unresolved reads `
+        description: kind === 'STALLED' ? `Dispatch reconciliation set aside after ${count} consecutive reads of a stalled order (WMS order ${candidate.externalOrderNumber}): ${reason}` : `Dispatch reconciliation quarantined after ${count} consecutive unresolved reads `
           + `(WMS order ${candidate.externalOrderNumber}): ${reason}`,
         metadata: {
           orderId: candidate.orderId,
@@ -3282,8 +3368,10 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       await Promise.all(admins.map((admin) => notify({
         userId: admin.id,
         type: 'error',
-        title: 'WMS record unreadable',
-        message: `Order ${candidate.externalOrderNumber} cannot be read from the WMS (${count} consecutive `
+        title: kind === 'STALLED' ? 'WMS order cannot complete' : 'WMS record unreadable',
+        message: kind === 'STALLED'
+          ? `Order ${candidate.externalOrderNumber} cannot complete in IMS: a part is cancelled in the WMS and will not despatch. IMS has stopped polling it; see Refused or stalled actions in the sync exception inbox.`
+          : `Order ${candidate.externalOrderNumber} cannot be read from the WMS (${count} consecutive `
           + 'unresolved reads). It has been quarantined so it stops holding the inbound sync back, and '
           + 'needs attention in the sync exception inbox.',
         actionUrl: '/sync/exceptions',
