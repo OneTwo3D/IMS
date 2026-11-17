@@ -5,6 +5,26 @@ The dashboard gives you a real-time snapshot of business performance. It combine
 Administrators who have not finished or dismissed the guided setup also see a **Welcome** banner at the top; see the [Onboarding Walkthrough](onboarding-walkthrough.md). Supplier users never see the dashboard: they land on the supplier portal.
 
 
+## Needs attention
+
+When something has failed and nothing will retry it on its own, a **Needs attention** card appears at the top of the dashboard. It lists one count per category, with a total, and each count links to where you act on it: a section of the sync exception inbox (**Sync > Exceptions**), or the Integrations page for items that live there. When nothing needs a person the card is not shown.
+
+| Category | Opens |
+|---|---|
+| Warehouse order pushes blocked | Exception inbox, "WMS order pushes - blocked" |
+| Dispatch reconciliation dead-lettered | Exception inbox, "Dispatch reconciliation" |
+| WooCommerce refunds parked | Exception inbox, "WooCommerce refunds - parked" |
+| Warehouse queries to raise | Exception inbox, "Raise a warehouse query" |
+| Other sync exceptions | The exception inbox (everything else it counts) |
+| Failed accounting sync rows | Integrations page (the failed-sync banner) |
+| Paused warehouse receipts | Integrations page, Receipt Reviews (administrators) |
+| Open stock discrepancies | Integrations page, Open Discrepancies |
+
+You only see the categories your role may act on, and the total covers only those. Counts are cached for about a minute, so a cleared item can take up to a minute to disappear.
+
+The notification bell also announces newly failed items in these categories: blocked warehouse order pushes, parked refunds, failed accounting rows, paused receipts and new stock discrepancies. Each item is announced once, as a single notification per category listing how many are new. An item that stays open does not notify again; if it clears and later fails again, it does. Dispatch dead-letters were already announced by the dispatch sweep, so they are not announced a second time.
+
+
 ## KPI Cards
 
 Four headline figures appear at the top of the dashboard:
