@@ -16,7 +16,7 @@ import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identif
 import { classifyMintsoftProductRecord } from '../api/normalizers'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
 import { applyMintsoftProductParity, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
-import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation } from './parent-sku-deletion'
+import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation, type ParentDeletionCounters } from './parent-sku-deletion'
 import { describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
 const ELIGIBLE_PRODUCT_TYPES = [
@@ -136,6 +136,11 @@ export type MintsoftProductSyncResult = {
   shadowed?: number
   /** PRESENT ONLY WHEN NON-ZERO: errors that are writes the outbound-write hold refused (also counted in `errors`). */
   outboundHeld?: number
+  /**
+   * What the parent SKU deletion pass did after a succeeded verify run (o3d-zvec.20). PRESENT ONLY WHEN THE PASS RAN (it is behind its own
+   * setting, default off). Its `errors` are also counted in `errors`, and a pass that threw is counted there as one, so the cron reports it.
+   */
+  parentDeletion?: ParentDeletionCounters
 }
 
 export type MintsoftContentCounters = {
@@ -1453,9 +1458,16 @@ export async function runMintsoftProductVerify(triggeredBy: string): Promise<Min
   // itself still proves every variation from the stored links and refuses on any doubt.
   if (result.status === 'SUCCEEDED' && result.jobId) {
     try {
-      await runMintsoftParentSkuDeletionPass({ runId: result.jobId, triggeredBy })
+      const deletion = await runMintsoftParentSkuDeletionPass({ runId: result.jobId, triggeredBy })
+      if (deletion) {
+        // Folded into the result, not discarded: a pass that hit errors must reach the cron's exit status. Refusals and holds are
+        // deliberate outcomes (each is recorded by the pass) and stay informational in `parentDeletion`.
+        result.parentDeletion = deletion
+        result.errors += deletion.errors
+      }
     } catch (error) {
       // The verify run itself succeeded and stays reported as such; a failed pass deleted nothing it could not prove.
+      result.errors += 1
       await logActivity({
         entityType: 'SYSTEM', tag: 'sync', action: 'mintsoft_parent_sku_delete_pass_failed', level: 'ERROR',
         description: `Mintsoft parent SKU deletion pass failed: ${error instanceof Error ? error.message : 'unknown error'}`,
