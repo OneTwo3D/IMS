@@ -910,6 +910,8 @@ export const OPERATION_SEMANTIC_BY_TYPE =
     // returns the id OF THAT DOCUMENT. There is no duplicate and nothing to void.
     SALES_INVOICE_UPDATE: 'UPDATE_DOCUMENT',
     PURCHASE_INVOICE_UPDATE: 'UPDATE_DOCUMENT',
+    // o3d-ngmt.22: the void writes the status of a credit note that already stood and returns the id OF THAT DOCUMENT; nothing is created.
+    CREDIT_NOTE_VOID: 'UPDATE_DOCUMENT',
     // A PAYMENT id, applied against a document nobody created here.
     INVOICE_PAYMENT: 'APPLY_PAYMENT',
     BILL_PAYMENT: 'APPLY_PAYMENT',

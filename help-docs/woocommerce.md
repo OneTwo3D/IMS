@@ -667,7 +667,10 @@ When an invoice is generated for a WooCommerce order, the system pushes invoice 
 
 - The invoice note and the link to the accounting invoice are written to the WooCommerce order **once per invoice**. A retry never adds a second note.
 - **Nothing is sent for a cancelled order.** If the order was cancelled in IMS, the invoice email and the WooCommerce invoice note are not queued when the invoice posts, and one that was queued before the cancellation is dropped as Cancelled when it comes to run (the reason is in the activity log). The invoice PDF copy is still saved.
-- **Showing the invoice in My Account is not yet switched on.** IMS can tell the storefront to show the stored invoice in the customer's My Account, but this is off (setting `wc_invoice_document_enabled`) and nothing is sent for it. The helper plugin shows the **Invoice** button only on an order whose `_ims_invoice_pdf_available` meta is `yes`, and only IMS's invoice publication writes that flag. While the setting is off, an order that was never published has no Invoice button, so do not point a customer at it; send the invoice by email instead. The download steps below apply once publication is switched on.
+- **Showing the invoice in My Account is not yet switched on.** IMS can tell the storefront to show the stored invoice in the customer's My Account, but this is off (setting `wc_invoice_document_enabled`) and nothing is sent for it. The helper plugin shows the **Invoice** button only on an order whose `_ims_invoice_pdf_available` meta is `yes`, and only IMS's invoice publication writes that flag. While the setting is off, an order that was never published has no Invoice button, so do not point a customer at it; send the invoice by email instead. The download steps below apply once publication is switched on. The order of switching things on at the switchover (IMS first, the old invoice plugin off right after, two buttons for a short while), the check list and the rollback (turn the setting off and clear the order meta) are in the **Customer invoice in My Account** runbook (`docs/ops/invoice-documents-switchover-runbook.md`).
+- **Orders from before IMS held an invoice.** About fourteen thousand older orders have no stored invoice. They are not fetched in advance: when a customer first asks for one, IMS queues the fetch and tells the plugin the invoice is **being prepared**; the next click, after the scheduled fetch has run (about a quarter of an hour), downloads it. IMS asks Xero at most a few hundred times a day for this, so a rush of customers is told to try again later rather than spending Xero's shared daily allowance. IMS writes nothing to those older orders in WooCommerce, so their Invoice button depends on the helper plugin showing it for orders that carry the old invoice number.
+- **Credit notes are their own document.** A customer can download the credit note of a refund of their own order (a separate download, never the invoice); a refund of another customer's order is refused. It is off until credit note documents are enabled.
+- **The invoice e-mail.** With publication switched on, the invoice e-mail attaches the same Xero PDF the customer downloads; with it off, it attaches the invoice IMS renders itself, as before.
 
 ### How customer PDF downloads work
 
@@ -683,12 +686,9 @@ This means the customer never sees a direct IMS URL, no reusable token leaves th
 
 ### Shared secret
 
-The HMAC signing key is the same value as the **WC webhook secret** (`wc_webhook_secret`). When you generate or rotate this secret in **Sync > WooCommerce > Orders**, paste the same value into the helper plugin's settings page (WP admin → Settings → OneTwoInventory Helper). The secret has two purposes:
+The customer PDF requests are signed with their **own** key, the invoice PDF secret (`wc_invoice_pdf_secret`), which is a different value from the **WC webhook secret** (`wc_webhook_secret`); never reuse the webhook secret for it. Paste the invoice PDF secret into the helper plugin's settings page (WP admin → Settings → onetwoInventory), next to the HTTPS base URL of IMS.
 
-1. Verifying incoming WC webhooks at IMS
-2. Signing outgoing PDF requests from the helper plugin to IMS
-
-Rotating this secret requires updating it in BOTH places — IMS and the WP helper plugin — or webhooks AND invoice PDF downloads will both break.
+Rotating it requires updating it in BOTH places, IMS and the WP helper plugin, or customer invoice and credit note downloads break. Webhooks are unaffected.
 
 ### Admin-only links
 

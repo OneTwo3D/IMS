@@ -38,7 +38,7 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
@@ -57,6 +57,7 @@ import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { lockOrderForRow, recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
 import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
@@ -1119,6 +1120,8 @@ export async function applyMainSyncFailureRetry(
 ): Promise<{ finalFailure: boolean }> {
   const retryCount = entry.retryCount + 1
   const computedFinal = retryCount >= MAX_RETRIES
+  // Canonical lock order (order row, then sync row): a sales invoice's order is locked BEFORE its row is written. lib/domain/sales/invoicing-state.ts.
+  await lockOrderForRow(tx, entry)
   // o3d-e2mz: fenced on the claimed attempt as well as the observed retryCount. A
   // failure belongs to ONE attempt; without the revision this write reopens a row an
   // operator settled while this attempt was in flight, sending it round again as
@@ -1142,6 +1145,8 @@ export async function applyMainSyncFailureRetry(
   })
   if (updated.count > 0) {
     if (computedFinal) {
+      // A sales invoice that has failed for good (and names no document) is no longer queued or posted: the order's invoicing state follows it.
+      await recomputeInvoicingStateForRow(tx, entry)
       await updateMirroredEventForSyncLog(tx, {
         syncLogId: attempt.id,
         type: entry.type,
@@ -3843,7 +3848,13 @@ const POST_EFFECT_DOCUMENT_UPDATE = {
     + 'Xero if the change should not stand; there is nothing to void or credit-note.',
 } as const
 
+const POST_EFFECT_DOCUMENT_VOID = {
+  effect: 'VOIDED a sales credit note in Xero',
+  remedy: 'The credit note named above was set to Voided because its refund was deleted in IMS. Nothing new was created. If it should still stand, re-create it in Xero by hand; there is nothing to void or reverse.',
+} as const
+
 const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }> = {
+  CREDIT_NOTE_VOID: POST_EFFECT_DOCUMENT_VOID,
   SALES_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
   PURCHASE_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
   CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
@@ -6762,6 +6773,33 @@ export async function processClaimedEntry(
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+    }
+
+    case 'CREDIT_NOTE_VOID': {
+      // o3d-ngmt.22: the refund this credit note was raised for was deleted in IMS (recorded in error). The row carries the ledger id the
+      // credit note was posted under; nothing here consults the refund, which no longer exists. The void READS the document first and decides
+      // from what is there (voidCreditNote), so a retry after a lost response or a partial failure converges instead of erroring.
+      const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
+      if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
+      const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
+      if (!fence.ok) return fence.result
+      const voided = await voidCreditNote(
+        { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
+        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
+      )
+      // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
+      if (!voided.success) return { success: false, error: voided.error }
+      // Phase 2 of a refund delete: the ledger has confirmed the void, so IMS now unwinds the refund (idempotent: an already deleted refund is a success).
+      if (referenceType === 'SalesOrderRefund') {
+        const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
+        const { completeRefundDeletionAfterVoid } = await import('@/lib/domain/sales/refund-delete-service')
+        const finished = await completeRefundDeletionAfterVoid(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null })
+        if (!finished.ok) return { success: false, error: finished.error }
+        if (finished.stockSyncFailed) {
+          await logActivity({ entityType: 'SALES_ORDER', entityId: referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
+        }
+      }
+      return { success: true, externalId: voidCreditNoteId }
     }
 
     case 'PURCHASE_CREDIT_NOTE': {

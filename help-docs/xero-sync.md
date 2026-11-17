@@ -703,6 +703,10 @@ This is why it matters: if the Discount account was configured *after* an invoic
 invoice charged the full goods value. Reversing it with a discount line would credit less than was
 charged and silently leave the difference on the customer's account.
 
+**Credit note void (a refund deleted in IMS).** When a refund recorded in error is deleted in IMS (see the Refunds help page), a credit note that was already posted is voided in Xero through the normal outbox. The delete is two-phase: IMS changes nothing about the refund until this entry succeeds, and then unwinds the refund as part of the same entry (a failure in that second step leaves the entry failed; retrying it repeats the harmless void read and finishes the delete). The sync page shows it as **Credit note void** against the deleted refund. It is **off unless** the credit note sync type is on, it follows the same posting hold as every other write (nothing is sent while outbound writes are held), and it is queued by the delete itself, never sent from the delete.
+
+How it behaves when it runs: it **reads the credit note first** and decides from what is there, so a retry after a lost response, or after a partial failure, converges. A credit note already **Voided** (or deleted) is a success and nothing is sent. An *Authorised* one is set to **Voided**; a draft one is deleted. One that has been **allocated to an invoice or paid out in Xero** is refused with that reason and is never changed: reverse the allocation or payment in Xero, then retry the entry. The credit note keeps its number as its audit trail; numbers are never reused because they come from a counter that does not go back. IMS refuses to start the delete when the credit note's date is on or before the lock date it last read from Xero, because Xero does not accept a change in a locked period. A posted COGS reversal journal is countered the same way, by a new journal with its lines swapped, queued as a COGS reversal against the deleted refund; an unsent one is simply cancelled.
+
 ## Transaction Types
 
 Configure which documents are synced to Xero under **Integrations → Xero → Transaction Types**. Each type can be set to **Off**, **Draft**, or **Submitted** (AUTHORISED in Xero):
@@ -1945,6 +1949,8 @@ When a sales invoice is synced to Xero and payment is registered:
 3. A signed download link is pushed to the WooCommerce order as a customer-visible note
 4. An admin-only note with a "View in Xero" link is added to the WC order
 
+For an invoice **Xeroom** (not IMS) posted, IMS finds it in Xero read-only by its number, fetches the PDF and keeps it as the customer's one invoice; see the **Customer invoice in My Account** runbook (`docs/ops/invoice-documents-switchover-runbook.md`). Orders from before this existed are fetched on the customer's first click (queued, then fetched in the background within the shared 5,000-a-day Xero allowance, with a per-day cap), never in bulk. Credit notes are separate documents. IMS only reads from Xero for all of this; it writes nothing to Xero.
+
 Invoice PDFs are accessible via a signed URL: `/api/invoices/[orderId]?token=<hmac>`. The token is generated using HMAC-SHA256 and verified with timing-safe comparison.
 
 ## Xero Deep Links
@@ -2396,6 +2402,8 @@ to erase, and the warning is raised only for what that record names. Two consequ
   that could not;
 - a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
   the intended outcome, not a missing alarm: there was nothing to lose.
+
+**A compacted journal keeps its per-account net.** Retention writes each reversal-proof journal's per-account totals (codes and two numbers, no names) onto the row as it clears the payload, and the proof reads them once the lines are gone; a journal that cannot be summarised is left uncompacted and reported. A journal compacted **before this shipped** has neither, stays unprovable, and the credit is posted by hand. The refund and the daily batch treat such an unearned-revenue reversal as an **unknown amount, never zero**: the refund reverses no unearned revenue and logs a warning, and the daily batch skips that order's shipments (warning logged, nothing journaled) until the reversal is readable.
 
 A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
 against — recorded in a column retention does not touch — so it can be posted. Before, it was queued
