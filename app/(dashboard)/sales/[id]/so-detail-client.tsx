@@ -9,6 +9,8 @@ import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
 import { MergeCandidateBadge } from '@/components/sales/merge-candidate-badge'
+import { ShopRefundBadge } from '@/components/sales/shop-refund-badge'
+import type { ShopRefundBadgeView } from '@/app/actions/shop-refund-tasks'
 import type { MergeCandidateBadgeView } from '@/app/actions/wms-merge-candidates'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -104,6 +106,7 @@ type Props = {
   wmsOrderStatus?: WmsOrderStatusView | null
   wmsPushState?: WmsOrderPushStateView | null
   mergeCandidate?: MergeCandidateBadgeView | null
+  shopRefundDue?: ShopRefundBadgeView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -1004,7 +1007,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1440,6 +1443,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {wmsPushState && (
             <span className="inline-flex items-center self-center">
               <WmsOrderPushChip orderId={so.id} push={wmsPushState} />
+            </span>
+          )}
+          {shopRefundDue && (
+            <span className="inline-flex items-center self-center">
+              <ShopRefundBadge view={shopRefundDue} />
             </span>
           )}
           {mergeCandidate && (

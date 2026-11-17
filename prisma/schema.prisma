@@ -4129,6 +4129,8 @@ enum WmsOperatorTaskReason {
   REFUND_NOTE
   /// Same-customer orders that are all still NEW in the warehouse: a person checks them there and merges them (IMS never merges).
   MERGE_CANDIDATE
+  /// A refund IMS recorded that the shop still has to pay back to the customer in WooCommerce. Not a warehouse query: raised with connector 'woocommerce'.
+  SHOP_REFUND_DUE
 }
 
 enum WmsOperatorTaskStatus {
