@@ -44,7 +44,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     consumed: ['failed', 'backReferenceRepair.failed', 'creditNoteAllocationReenqueue.failed', 'landedCostJournalOutbox.failed', 'provisionalPostingRefusals.failed', 'errors'],
     ignored: { provisionalPostingRefusals: 'the replay result as a whole; its failure count is `provisionalPostingRefusals.failed`, which is consumed' },
   },
-  'activity-cleanup': {},
+  'activity-cleanup': { consumed: ['attachmentFiles.failed'] },
   backup: { consumed: ['error', 'uploadError', 'cleanupError'], skipState: { skipped: true, reason: 'x' } },
   'delivery-status': { consumed: ['failed'] },
   'email-outbox': {
@@ -102,6 +102,9 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
       'connectors.woocommerce.invoiceDocumentPublications.deadLettered',
       'connectors.woocommerce.invoiceDocumentPublications.errors',
       'connectors.woocommerce.invoiceDocumentPublications.error',
+      'connectors.woocommerce.trackshipRefires.deadLettered',
+      'connectors.woocommerce.trackshipRefires.errors',
+      'connectors.woocommerce.trackshipRefires.error',
     ],
   },
   'wc-reconcile': {

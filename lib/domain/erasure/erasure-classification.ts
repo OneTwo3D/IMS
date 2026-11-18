@@ -125,6 +125,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       storedPath: 'the issued invoice / credit note PDF is a statutory record, kept six years',
     },
   },
+  // lastResult is a fixed vocabulary written by IMS (covered, fired, not-eligible, no-tracking, order-gone, window-closed), never remote free text.
+  TrackshipRefireState: { erased: [], notPersonal: ['id', 'orderId', 'lastResult'], retained: {} },
   InvoiceStorePublication: { erased: [], notPersonal: ['noteInvoiceId', 'noteStoreId', 'flagDocumentId'], retained: {} },
   InvoiceDocumentFetchState: { erased: [], notPersonal: ['subjectKey', 'lastError', 'leaseHolder'], retained: {} },
   ReturnExpectation: { erased: [], notPersonal: ['reference', 'transitJournalKey'], retained: {} },
@@ -166,6 +168,15 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     // and no free text from the customer or the warehouse is stored (the connector's error text is not copied in). Deleted with its order (cascade).
     erased: [],
     notPersonal: ['id', 'connector', 'orderId', 'externalOrderId', 'queryText', 'payload', 'contentHash', 'doneBy'],
+    retained: {},
+  },
+  // Supporting documents attached to an order. A SALES order's attachment can hold the customer's personal data in its CONTENT (a customer purchase order, an
+  // email, a proof of address), which cannot be redacted, so an erasure DELETES the rows (live and soft-deleted) and the files of the erased orders
+  // (deleteSalesOrderAttachmentsInTx + removeOrderAttachmentFiles). The original file name can carry a name and goes with the row. A PURCHASE order's
+  // attachments are supplier-side commercial documents, not personal data of a customer, and are not reached by an erasure (a purchase order has no customer link).
+  OrderAttachment: {
+    erased: ['originalFilename'],
+    notPersonal: ['id', 'storedName', 'mimeType', 'sha256', 'uploadedByUserId'],
     retained: {},
   },
   WmsReturnsInbox: {

@@ -166,6 +166,12 @@ export type ClaimIntegrationOutboxOptions = {
   claimLimit?: number
   /** Rows to skip (already attempted by this drain). */
   excludeIds?: string[]
+  /**
+   * The queued `xero/accounting.post` job ids whose sync row writes to WooCommerce, when the caller already read them (`wooAccountingPostJobIds`).
+   * A drain that claims job by job reads them ONCE and passes them to every claim instead of repeating the unbounded query each time. Membership
+   * never changes and a job created after the read is newer than any floor in force, so the one read serves every claim of the drain.
+   */
+  wooAccountingJobIds?: readonly string[]
   claimGate?: {
     keyOf: (row: IntegrationOutboxRow) => string | null
     mayClaim: (tx: IntegrationOutboxClient, row: IntegrationOutboxRow, now: Date) => Promise<boolean>
@@ -733,7 +739,7 @@ export async function claimIntegrationOutboxWork(
   const now = options.now ?? new Date()
   const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)
-  const wooJobIds = scopeMayIncludeAccountingPost(options) ? await wooAccountingPostJobIds(now) : []
+  const wooJobIds = options.wooAccountingJobIds ?? (scopeMayIncludeAccountingPost(options) ? await wooAccountingPostJobIds(now) : [])
   const baseWhere = claimableWhere({
     wooAccountingJobIds: wooJobIds,
     connector: options.connector,
