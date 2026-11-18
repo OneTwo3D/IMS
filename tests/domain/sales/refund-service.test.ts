@@ -3839,6 +3839,83 @@ test('createSalesOrderRefund reverses the FULL deferral on a full refund of a sh
   assert.equal(debitLine?.debit, 100)
 })
 
+function unearnedDebit(result: Awaited<ReturnType<typeof createSalesOrderRefund>>): number | undefined {
+  const sync = result.success && result.accountingSyncs.find((s) => s.type === 'UNEARNED_REV_REVERSAL')
+  if (!sync) return undefined
+  return (sync.payload as { lines?: Array<{ accountCode?: string; debit?: number }> })
+    .lines?.find((l) => l.accountCode === accountingSettings.unearnedRevenueAccount && l.debit)?.debit
+}
+
+test('o3d-hqvrp.37: a refund at 99.95% is FULL and sweeps the uncovered unearned remainder', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1', externalOrderNumber: null, orderNumber: 'SO-1', status: 'SHIPPED', fxRateToBase: 1, totalBase: 1000.5,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 1000.5,
+      inventoryAllocatedDate: null, allocationBatchAmount: null,
+    }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 1000 }],
+  })
+  // The lines (1000) are refunded in full: 1000 / 1000.5 = 99.95%, classed FULL, so no later batch ever touches the 0.50 (shipping share) left deferred.
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 1000 }],
+    reason: 'Near-full', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(unearnedDebit(result), 1000.5)
+})
+
+test('o3d-hqvrp.38: refunding the unshipped remainder of a part-shipped order sweeps the shipping/discount share', async () => {
+  // Two lines worth 50 each, 120 deferred (20 shipping). Line 1 shipped and recognised 60 (its pro-rata share of the 120).
+  const state = baseState({
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 },
+    ],
+    orders: [{
+      id: 'order-1', externalOrderNumber: null, orderNumber: 'SO-1', status: 'ALLOCATED', fxRateToBase: 1, totalBase: 120,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 120,
+      inventoryAllocatedDate: null, allocationBatchAmount: null,
+    }],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 60, cogsBatchAmount: 0,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 1, costLayerSnapshot: [] }],
+    }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 }],
+    reason: 'Unshipped remainder', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'PARTIAL')
+  // Nothing else will ship, so the 60 left deferred (50 of line value + the 10 share) is released, not just the 50.
+  assert.equal(unearnedDebit(result), 60)
+})
+
+test('o3d-hqvrp.38: a refund that leaves units still to ship keeps the line-driven unearned reversal', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1', externalOrderNumber: null, orderNumber: 'SO-1', status: 'ALLOCATED', fxRateToBase: 1, totalBase: 120,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 120,
+      inventoryAllocatedDate: null, allocationBatchAmount: null,
+    }],
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 },
+    ],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 }],
+    reason: 'One of two', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebit(result), 50)
+})
+
 // ---------------------------------------------------------------------------
 // o3d-o97 — the A2 allocated contra a full refund un-stages.
 //

@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { lockOrderFirst, recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
@@ -103,6 +104,30 @@ export async function assertNoSalesInvoicePostingInFlight(
     + 'happened. Wait for the post to settle — at most 15 minutes — then cancel: if it posted, the cancellation '
     + 'will need an explicit credit note.',
   )
+}
+
+/**
+ * The posted (ledger-side) sales invoice for an order, if one exists: a SALES_INVOICE row that is a ledger fact. Cancelling an order never touches it, so a cancellation of such an order
+ * leaves a receivable, its revenue deferral and its allocation journals standing in the ledger.
+ */
+export async function findPostedSalesInvoiceSync(
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  orderId: string,
+): Promise<{ id: string; connector: string; type: string } | null> {
+  // The ledger-standing module's own predicate for a ledger fact (the connector's writeback, with a document id or an id-less SYNCED).
+  return tx.accountingSyncLog.findFirst({
+    where: {
+      referenceId: orderId,
+      type: { in: [...SALES_INVOICE_SYNC_TYPES] },
+      ...PROVEN_LEDGER_FACT_WHERE,
+    },
+    select: { id: true, connector: true, type: true },
+  })
+}
+
+/** What a manual cancellation of an order with a posted invoice is told. */
+export function cancelWithPostedInvoiceMessage(invoice: { connector: string; id: string }): string {
+  return `This order's invoice is already posted to ${invoice.connector} (sync log ${invoice.id}), and cancelling the order does not void it or raise a credit note, so the receivable and its revenue deferral would stay in the ledger. Refund the order in full first (which raises the credit note), then cancel it.`
 }
 
 /**

@@ -372,6 +372,8 @@ type MemoryState = {
    * behind its back. Undefined — the default — means nothing is in flight.
    */
   syncPostingClaim?: { id: string; connector: string; type: string; processingStartedAt: Date | null }
+  /** o3d-hqvrp.41: a SALES_INVOICE row that reached the ledger (carries the connector's document id). */
+  postedInvoiceSync?: { id: string; connector: string; type: string }
 }
 
 function decimalLikeToNumber(value: number | { toNumber(): number } | undefined): number {
@@ -920,6 +922,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
         }
       }) => {
         const where = args?.where ?? {}
+        if ((where as { AND?: unknown }).AND !== undefined) return state.postedInvoiceSync ?? null
         if (where.payload == null) return state.syncPostingClaim ?? null
         const found = accountingSyncRows.find((row) => {
           // o3d-i0o6: the connector is part of the predicate when the caller asks for it. A double
@@ -1688,6 +1691,51 @@ test('cancelSalesOrderFulfillmentState refuses a partially-shipped order with a 
     /Cannot cancel an order with a dispatched shipment/,
   )
   assert.equal(state.order.status, 'ALLOCATED')
+})
+
+test('o3d-hqvrp.41: a manual cancel of an order with a POSTED invoice is refused, permanently, and changes nothing', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+
+  const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
+
+  assert.match(String(error?.message), /already posted to xero \(sync log sync-9\).*Refund the order in full first/)
+  assert.equal(isPermanentStatusTransitionError(error), true)
+  assert.equal(state.order.status, 'ALLOCATED')
+  assert.equal(state.stockLevels[0].reservedQty, 3)
+  assert.equal(state.allocations?.length, 1)
+})
+
+test('o3d-hqvrp.41: a storefront-driven cancel (bypass) still lands but records a WARNING naming the posted invoice', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1', bypass: true })
+
+  assert.equal(state.order.status, 'CANCELLED')
+  const warning = activityLogWrites.find((row) => row.action === 'cancelled_with_posted_invoice')
+  assert.ok(warning, 'a cancelled_with_posted_invoice activity is written')
+  assert.equal(warning.level, 'WARNING')
+  assert.match(String(warning.description), /sync log sync-9/)
+})
+
+test('o3d-hqvrp.41: a fully refunded order with a posted invoice may be cancelled (the credit note is the reversal)', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED', refundStatus: 'FULL' },
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+  assert.equal(state.order.status, 'CANCELLED')
 })
 
 test('o3d-7o0: cancelSalesOrderFulfillmentState REFUSES while an invoice post is on the wire', async () => {

@@ -25,6 +25,7 @@ import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
 import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
+import { resolveUnearnedReversal } from '@/lib/domain/sales/refund-unearned-remainder'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import {
   REVERSAL_STAGING_NOT_STAGED,
@@ -3453,10 +3454,18 @@ async function stageRefundAccountingReversals(
       // COGS reconciliation has an independent subledger source (the GL gets the 2dp
       // value above; the 6dp-vs-2dp residue is what the reconciliation sweeps).
       cogsReversalBase: roundQuantity(sumCostLayerSnapshot(shipmentRefundSnapshot), 6).toNumber(),
-      unearnedReversal: Math.min(
+      // o3d-hqvrp.37/.38: sweep the remainder no later posting can recognise (a 99.9% FULL refund, or the
+      // shipping/discount share once the unshipped remainder has been refunded).
+      unearnedReversal: resolveUnearnedReversal({
         remainingUnearned,
-        Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
-      ),
+        lineDrivenRevenue: unshippedQtyRevenue + nonQtyRevenue,
+        isFullRefund: params.newStatus === 'REFUNDED',
+        // No product lines at all means nothing proves the order is done shipping: treat as outstanding.
+        hasOutstandingUnshippedQty: !lineContexts.some((line) => !!line.productId)
+          || lineContexts.some((line) => (
+            !!line.productId && (remainingUnshippedQtyByLine.get(line.id) ?? 0) > 0.0000001
+          )),
+      }),
       // o3d-o97: the lines' own allocation cost, capped by the open balance, PLUS — on a full
       // refund — the part of that balance no line reached. On a resolved full refund the two sum
       // to exactly the open balance.
