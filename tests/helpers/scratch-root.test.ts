@@ -1,52 +1,161 @@
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
-import { scratchRoot } from './scratch-root'
+import { spawnSync } from 'node:child_process'
+import { MAX_SCRATCH_ROOT_LENGTH, ORIGINAL_TMPDIR_VAR, PRIVATE_TMPDIRS_VAR, scratchRoot } from './scratch-root'
 
-let saved: string | undefined
+const VARS = ['IMS_SCRATCH_ROOT', ORIGINAL_TMPDIR_VAR, PRIVATE_TMPDIRS_VAR, 'TMPDIR'] as const
+let saved: Record<string, string | undefined>
 let dir: string
+let tmpRoot: string
 beforeEach(() => {
-  saved = process.env.IMS_SCRATCH_ROOT
-  dir = mkdtempSync(path.join(tmpdir(), 'scratch-root-unit-'))
+  saved = Object.fromEntries(VARS.map((v) => [v, process.env[v]]))
+  // Short names: the root itself must stay under MAX_SCRATCH_ROOT_LENGTH. The base is where scratch material goes anyway.
+  tmpRoot = process.env[ORIGINAL_TMPDIR_VAR] ?? tmpdir()
+  dir = mkdtempSync(path.join(tmpRoot, 'sr-'))
+  for (const v of VARS) delete process.env[v]
+  process.env.TMPDIR = dir
 })
 afterEach(() => {
-  if (saved === undefined) delete process.env.IMS_SCRATCH_ROOT
-  else process.env.IMS_SCRATCH_ROOT = saved
+  for (const v of VARS) {
+    if (saved[v] === undefined) delete process.env[v]
+    else process.env[v] = saved[v]
+  }
   chmodSync(dir, 0o700)
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('unset: /var/tmp', () => {
-  delete process.env.IMS_SCRATCH_ROOT
-  assert.equal(scratchRoot(), '/var/tmp')
+test('nothing set: os.tmpdir(), which honours TMPDIR, never /var/tmp', () => {
+  assert.equal(scratchRoot(), dir)
+  assert.ok(!scratchRoot().startsWith('/var/tmp'))
 })
 
-test('empty: /var/tmp', () => {
+test('IMS_SCRATCH_ROOT wins over TMPDIR', () => {
+  const other = mkdtempSync(path.join(tmpRoot, 'sr-'))
+  try {
+    process.env.IMS_SCRATCH_ROOT = other
+    assert.equal(scratchRoot(), other)
+  } finally {
+    rmSync(other, { recursive: true, force: true })
+  }
+})
+
+test('the sentinel-preserved original TMPDIR wins over the (private) current TMPDIR', () => {
+  const original = mkdtempSync(path.join(tmpRoot, 'sr-'))
+  try {
+    process.env[ORIGINAL_TMPDIR_VAR] = original
+    assert.equal(scratchRoot(), original)
+  } finally {
+    rmSync(original, { recursive: true, force: true })
+  }
+})
+
+test('empty IMS_SCRATCH_ROOT is unset', () => {
   process.env.IMS_SCRATCH_ROOT = ''
-  assert.equal(scratchRoot(), '/var/tmp')
-})
-
-test('set to an existing writable directory: that directory', () => {
-  process.env.IMS_SCRATCH_ROOT = dir
   assert.equal(scratchRoot(), dir)
 })
 
-test('set but missing: /var/tmp', () => {
+test('set but missing: the next candidate, not /var/tmp', () => {
   process.env.IMS_SCRATCH_ROOT = path.join(dir, 'does-not-exist')
-  assert.equal(scratchRoot(), '/var/tmp')
+  assert.equal(scratchRoot(), dir)
 })
 
-test('set to a file, not a directory: /var/tmp', () => {
+test('set to a file, not a directory: the next candidate', () => {
   const file = path.join(dir, 'file')
   writeFileSync(file, '')
   process.env.IMS_SCRATCH_ROOT = file
-  assert.equal(scratchRoot(), '/var/tmp')
+  assert.equal(scratchRoot(), dir)
 })
 
-test('set but not writable: /var/tmp', { skip: process.getuid?.() === 0 && 'root bypasses directory permissions' }, () => {
-  chmodSync(dir, 0o500)
-  process.env.IMS_SCRATCH_ROOT = dir
-  assert.equal(scratchRoot(), '/var/tmp')
+test('set but not writable: the next candidate', { skip: process.getuid?.() === 0 && 'root bypasses directory permissions' }, () => {
+  const locked = mkdtempSync(path.join(tmpRoot, 'sr-'))
+  try {
+    chmodSync(locked, 0o500)
+    process.env.IMS_SCRATCH_ROOT = locked
+    assert.equal(scratchRoot(), dir)
+  } finally {
+    chmodSync(locked, 0o700)
+    rmSync(locked, { recursive: true, force: true })
+  }
+})
+
+test('a root too long for a Postgres unix-socket path is refused with the fix named', () => {
+  const long = path.join(dir, 'x'.repeat(MAX_SCRATCH_ROOT_LENGTH))
+  rmSync(long, { recursive: true, force: true })
+  process.env.IMS_SCRATCH_ROOT = mkdtempSync(path.join(dir, 'x'.repeat(MAX_SCRATCH_ROOT_LENGTH)))
+  assert.throws(() => scratchRoot(), /unix-socket[\s\S]*IMS_SCRATCH_ROOT/)
+})
+
+test('/var/tmp is never a scratch root: IMS_SCRATCH_ROOT, the original TMPDIR and TMPDIR all skip it', () => {
+  process.env.IMS_SCRATCH_ROOT = '/var/tmp'
+  process.env[ORIGINAL_TMPDIR_VAR] = '/var/tmp/'
+  assert.equal(scratchRoot(), dir, 'falls through to the next candidate (TMPDIR)')
+})
+
+test('a directory under /var/tmp, and a symlink into it, are refused; with nothing else usable it throws', () => {
+  const under = '/var/tmp/ims-scratch-root-probe-' + process.pid
+  const link = path.join(dir, 'to-var-tmp')
+  symlinkSync('/var/tmp', link)
+  try {
+    process.env.IMS_SCRATCH_ROOT = link
+    process.env[ORIGINAL_TMPDIR_VAR] = under
+    process.env.TMPDIR = '/var/tmp'
+    assert.throws(() => scratchRoot(), /no usable scratch root/)
+  } finally {
+    rmSync(link, { force: true })
+  }
+})
+
+test('the sentinel reports, removes and fails on a scratch directory a test left behind', () => {
+  const sentinel = path.resolve('tests/temp-dir-sentinel.ts')
+  const probe = path.join(dir, 'leak.test.ts')
+  const helper = path.resolve('tests/helpers/scratch-root.ts')
+  const body = (leak: boolean) => `import { mkdtempSync } from 'node:fs'\nimport { join } from 'node:path'\nimport { scratchRoot } from ${JSON.stringify(helper)}\n${leak ? "mkdtempSync(join(scratchRoot(), 'ims-leaky-'))" : "scratchRoot()"}\n`
+  const run = (leak: boolean) => {
+    writeFileSync(probe, body(leak))
+    const env: NodeJS.ProcessEnv = { ...process.env, IMS_SCRATCH_ROOT: dir }
+    delete env[ORIGINAL_TMPDIR_VAR]
+    return spawnSync(process.execPath, ['--import', 'tsx', '--import', sentinel, probe], { env, encoding: 'utf8' })
+  }
+  const clean = run(false)
+  assert.equal(clean.status, 0, clean.stderr)
+  const leaky = run(true)
+  assert.notEqual(leaky.status, 0, 'a leaked scratch directory fails the process')
+  assert.match(leaky.stderr, /temp-dir leak: 1 entry survived[\s\S]*ims-leaky-/)
+  assert.deepEqual(readdirSync(dir).filter((e) => e.startsWith('ims-leaky-')), [], 'and the directory is removed')
+})
+
+test('a sentinel private directory is never a scratch root', () => {
+  const priv = mkdtempSync(path.join(tmpRoot, 'sr-'))
+  try {
+    process.env[PRIVATE_TMPDIRS_VAR] = priv
+    process.env.IMS_SCRATCH_ROOT = priv
+    process.env[ORIGINAL_TMPDIR_VAR] = priv
+    assert.equal(scratchRoot(), dir, 'falls through to TMPDIR')
+  } finally {
+    rmSync(priv, { recursive: true, force: true })
+  }
+})
+
+test('a worker-like child (TMPDIR already the parent sentinel private dir) picks the real original, not the private dir', () => {
+  const sentinel = path.resolve('tests/temp-dir-sentinel.ts')
+  const helper = path.resolve('tests/helpers/scratch-root.ts')
+  const probe = path.join(dir, 'worker.test.ts')
+  writeFileSync(probe, `import { scratchRoot } from ${JSON.stringify(helper)}\nprocess.stdout.write('ROOT=' + scratchRoot() + '\\n')\n`)
+  // The sentinel of THIS process redirects any child's TMPDIR to its own private dir, exactly what a test worker inherits; so the
+  // child below is a real worker-like one: TMPDIR = this process's private dir, the recorded original and the private chain inherited.
+  const spawn = (env: NodeJS.ProcessEnv) => spawnSync(process.execPath, ['--import', 'tsx', '--import', sentinel, probe], { env, encoding: 'utf8' })
+  const inherited: NodeJS.ProcessEnv = { ...process.env, [ORIGINAL_TMPDIR_VAR]: tmpRoot, [PRIVATE_TMPDIRS_VAR]: saved[PRIVATE_TMPDIRS_VAR], TMPDIR: saved.TMPDIR }
+  delete inherited.IMS_SCRATCH_ROOT
+  const worker = spawn(inherited)
+  assert.equal(worker.status, 0, worker.stderr)
+  assert.equal(worker.stdout.trim(), `ROOT=${tmpRoot}`, 'the real original, not the parent private dir the worker inherited as TMPDIR')
+  // With no recorded original the worker would record its inherited (private) TMPDIR; that is skipped, so it refuses instead of choosing it.
+  const bare = { ...inherited }
+  delete bare[ORIGINAL_TMPDIR_VAR]
+  const refused = spawn(bare)
+  assert.notEqual(refused.status, 0, `refuses rather than picking a private directory`)
+  assert.match(refused.stderr, /no usable scratch root/)
 })

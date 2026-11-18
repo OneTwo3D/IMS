@@ -371,7 +371,9 @@ This means an admin viewing the activity log can see who did what but not see se
   On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
   write its external id onto the order or bill, because everything that write needs survives
   compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment
-  registration, bill attachment). If the sweep repairs one of these rows — or if you retry one by hand
+  registration, bill attachment). A compacted **journal** also keeps the per-account net the Allocated
+  Inventory reversal proof reads, so it stays provable (see *Xero Sync*); a journal whose payload cannot be
+  read is left uncompacted and reported. If the sweep repairs one of these rows — or if you retry one by hand
   from the Accounting Sync page, which settles it against the id it already has rather than
   re-sending it — a WARNING is written to the activity log
   (`xero_backreference_followups_discarded`) naming the document, so you can check whether its PDF or
@@ -434,11 +436,12 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/accounting-fx-revaluation` | Unrealised FX on open AR/AP | Daily | Not in the Scheduler list; schedule it from the server's own cron if you use accounting |
 | `/api/cron/delivery-status` | Tracking provider polling | Every 15 min | On |
 | `/api/cron/refund-reservation-release` | Safety net that releases stock reservations for refunded units | Every 15 min | On |
+| `/api/cron/product-sync-marks` | Sends the shop and warehouse sync owed by products edited by CSV, 25 products per run | Every 5 min | On |
 | `/api/cron/reallocation-sweep` | Re-run allocation for processing orders left short | Every 15 min | On |
 | `/api/cron/invariant-check` | Scheduled data-integrity check (see below) | Daily at 04:00 | On |
 | `/api/cron/read-sync-liveness` | Hourly check that every read feed that keeps IMS current (store order sweep, warehouse despatch poll and status refresh, account balance snapshots, tax rates, chart refresh) has succeeded recently; alerts administrators once per breach | Hourly (at :25) | On |
 | `/api/cron/writers-check` | Hourly record of whether IMS and another system could both write the same thing; for the switchover only | Hourly (at :40) | Off |
-| `/api/cron/invoice-documents` | Fetch the customer invoice PDF from the ledger for storefront orders after a set start date | Every 15 min | Off |
+| `/api/cron/invoice-documents` | Fetch the customer invoice PDF from the ledger for storefront orders after a set start date, and for any historic order a customer has asked for (when on-demand fetch is on) | Every 15 min | Off |
 | `/api/cron/backup` | Database backup (also controlled from Backup & Restore) | Daily at 01:00 | Off until you switch it on |
 | `/api/cron/product-lifecycle-archive` | Auto-archive exhausted EOL products | Daily at 00:30 | On |
 | `/api/cron/recompute-product-lead-times` | Recompute each product's observed supplier lead time for Reorder Planning | Daily at 04:00 | On |

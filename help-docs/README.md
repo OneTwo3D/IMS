@@ -20,6 +20,7 @@ The overlapping user manuals in `docs/` should be symlinks back to this director
 ### Day-to-day usage
 - [Dashboard](dashboard.md) — KPIs and live overview
 - [Inventory](inventory.md) — product catalogue and stock levels
+- [Products: Edit by CSV](products.md) — change many products through a spreadsheet
 - [Stock Control](stock-control.md) — adjustments and transfers
 - [Sales Orders](sales.md) — order workflow, allocation, shipments, refunds
 - [Purchasing](purchasing.md) — purchase orders, receiving, suppliers

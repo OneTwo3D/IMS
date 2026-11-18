@@ -1,0 +1,6 @@
+### Test scratch clusters and temp roots no longer default to /var/tmp (tests, dev tooling)
+- `scratchRoot()` (the parent of every throwaway Postgres cluster and trusted temp tree the tests create) now resolves to the first of `IMS_SCRATCH_ROOT`, the `TMPDIR` the process started with, and `os.tmpdir()`. It no longer falls back to `/var/tmp`, which is on the SSD and took about 84 GB of cluster writes a day on the build host.
+- A scratch root longer than 48 bytes is refused with a clear message (a Postgres unix-socket path under it would exceed the ~107 byte limit).
+- The unit-tier temp-dir sentinel records the original `TMPDIR` in `IMS_TEST_ORIGINAL_TMPDIR`, so scratch stays on a trusted (root-owned, sticky) ancestor instead of the sentinel's private directory.
+- New guard test `tests/helpers/no-var-tmp-scratch.test.ts` fails on a `/var/tmp` literal in test-reachable scratch code, with a documented allowlist.
+- Unchanged on purpose: the operator defaults of `first-load:apply --rehearse`, `rehearse:first-install` and `rehearse:woo-import` (`--root`, `--report-dir`) and the report-directory defaults under `/var/tmp` stay for real server runs. Documented in `docs/development.md` and `docs/first-load-apply.md`.

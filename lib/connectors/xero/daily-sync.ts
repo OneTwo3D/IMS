@@ -102,6 +102,7 @@ import {
   countedUnearnedReversalRows,
   describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
+  unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
   unearnedReversalStandingReport,
@@ -1806,9 +1807,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             },
           ],
         },
-        select: { id: true, referenceType: true, referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
+        select: { id: true, referenceType: true, referenceId: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
       })
-      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown }>>()
       const reversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
       for (const sync of reversalSyncs) {
         const targetOrderId = sync.referenceType === 'SalesOrder'
@@ -1822,7 +1823,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       for (const [targetOrderId, allRows] of reversalStandingRowsByOrder) {
         reversalSyncsByOrder.set(
           targetOrderId,
-          countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload })),
+          countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload, payloadAccountNets: sync.payloadAccountNets })),
         )
       }
 
@@ -1937,6 +1938,21 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           reversalSyncsByOrder.get(orderId) ?? [],
           settings.xero_unearned_revenue_account,
         )
+        // o3d-oyur (Codex r2 HIGH): a counted reversal with no readable lines and no compaction summary moved an UNKNOWN amount.
+        // The true-up (which recognises the whole remaining deferral) is withheld rather than risk debiting it twice.
+        const unreadableUnearnedReversals = unreadableUnearnedReversalRows(reversalSyncsByOrder.get(orderId) ?? [])
+        if (unreadableUnearnedReversals.length > 0) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: orderId,
+            action: 'daily_batch_trueup_withheld_unreadable_unearned_reversal',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Order ${firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so how much unearned revenue a refund already reversed cannot be established. Its shipments were NOT journaled this run (no revenue, no COGS, no stamp) and will be retried once the reversal is readable; check the unearned revenue account.`,
+            metadata: { orderId, unreadableCount: unreadableUnearnedReversals.length },
+            resolveUser: false,
+          }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
+        }
         // o3d-3la07 (M5, D3): say which rows the netting rests on that are not ledger facts.
         const unearnedStanding = unearnedReversalStandingReport(reversalStandingRowsByOrder.get(orderId) ?? [])
         const unearnedReport = describeUnearnedReversalReport(
@@ -1955,6 +1971,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             resolveUser: false,
           }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
         }
+        // o3d-oyur (Codex r3): an unreadable counted reversal means the figure is unknown, so this order's shipments are NOT processed at
+        // all this run: no revenue, no COGS, no stamp. Nothing is published for them (results, snapshots and layer decrements are only
+        // recorded further down), so shipmentJournalDate stays null and a later run picks them up once the reversal is readable, exactly
+        // once. Recognising 0 and stamping the shipment journaled would strand the deferral for good.
+        if (unreadableUnearnedReversals.length > 0) continue
         const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
         let runningRevenue = 0
 

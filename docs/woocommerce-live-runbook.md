@@ -125,11 +125,13 @@ Expected result:
 
 ## 5. Customer-facing invoice PDF download
 
+This check follows the switch-on, overlap and rollback procedure in [ops/invoice-documents-switchover-runbook.md](ops/invoice-documents-switchover-runbook.md); do that first.
+
 1. Pick an IMS-generated invoice for a WooCommerce-backed order.
 2. From the WC storefront, sign in as the order's customer and open the order page.
 3. Click **Download Invoice**.
 4. Verify:
-   - The download link is served via the `wc-invoice-handoff` WordPress helper plugin (not a direct IMS URL).
+   - The download link is served via the **onetwoInventory Helper** WordPress plugin (`onetwoinventory-helper.php`; older notes called it `wc-invoice-handoff`) and is not a direct IMS URL.
    - The token used by the handoff is single-use and scoped to that customer + order.
    - The PDF streams back through the storefront, not via an IMS login redirect.
 5. Repeat the download from a different network/incognito session as the same customer to confirm a fresh token is issued for each request.

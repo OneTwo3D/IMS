@@ -11,6 +11,7 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Hide completed** (ticked by default) keeps finished work out of the everyday list, and the line above the table says how many Completed and Delivered orders that hides. Untick it to see them. Choosing **Completed** or **Delivered** in the status filter shows them too.
 - **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
+- **Filter by invoicing** — the **Invoicing** filter shows orders that are **Not invoiced**, **Partially invoiced** or **Fully invoiced** (pick one or several). It is separate from the status filter and combines with it. Picking an invoicing state includes Completed and Delivered orders, because a shipped order that was never invoiced is exactly what it is for; archived orders stay hidden unless you tick **Include archived**. See [Invoicing state](#invoicing-state).
 - **Quotes tab** — the **Quotes** button above the search shows only quotations (see [Quotations](#quotations)); **All orders** goes back. A quote carries a **Quote** badge, and an **Expired** badge once its validity date has passed.
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
@@ -105,6 +106,25 @@ While an order is Allocated, Picking or Packing and has shipments, a second chip
 
 **Refund state is shown separately.** Refunds no longer change an order's stage. An order that has been refunded keeps its stage (for example **Delivered**) and carries a second badge beside it: **Partially refunded** (orange) or **Fully refunded** (red). So the order detail page can show two badges, the order status and the refund status. Orders that used to read "Partially Refunded" or "Refunded" now show their real stage plus the refund badge, and the stage filter on the list has no refund entries. A fully refunded order takes no further payments.
 
+
+### Invoicing state
+
+**Invoicing is shown separately from the stage**, like the refund state. The order detail page carries a badge beside the status: **Not invoiced**, **Partially invoiced** or **Fully invoiced**. An order can be Shipped and Not invoiced, or Cancelled and Fully invoiced: a cancelled order keeps the invoicing state it had, so its invoicing history stays visible. The sales order CSV export has the state as its last column (`invoicingState`).
+
+IMS works the state out itself from the order's invoices; you never set it. An order counts as **invoiced** when any of these holds:
+
+- IMS has **queued or posted** a sales invoice for it (the moment the invoice is queued, the order reads invoiced; a posted invoice stays counted);
+- the accounting invoice is **linked** to the order (it carries the accounting system's invoice id);
+- during the parallel phase, the invoicing incumbent (Xeroom) has **raised the invoice** and its number is on a WooCommerce order: IMS reads that number, so the order reads invoiced.
+
+What does **not** count: an invoice that failed without reaching the accounting system, one that was cancelled before it posted (for example, the order was cancelled first), and an invoice IMS only *recorded as a shadow* while writes to the accounting system are held. When the last invoice an order had is retired like that, the order goes back to **Not invoiced**.
+
+**Credit notes and refunds do not un-invoice an order.** A fully refunded order that was invoiced stays **Fully invoiced**; the refund state shows the credit.
+
+**Partially invoiced** means the invoice IMS holds covers fewer units than the order now holds. IMS invoices a whole order (there is no per-shipment invoice), so this is rare, for example units added to the order after its invoice was raised. An invoice IMS cannot read (one raised by Xeroom, or whose stored detail has been trimmed) reads **Fully invoiced**: IMS does not guess a shortfall it cannot measure.
+
+When IMS is upgraded to this version, existing orders that already have invoice evidence are set to **Fully invoiced** by the upgrade itself. An order IMS could now find to be only partly covered is corrected by running `npm run sales:invoicing-state:recompute` once (add `-- --dry-run` to see how many orders it would change). It is safe to run again at any time: it only rewrites a state that is wrong.
+
 The exact allowed transitions are kept in the canonical workflow reference so UI help does not drift from the enforced state-machine rules.
 
 ## Stock Allocation
@@ -165,6 +185,18 @@ The order detail page includes an allocation panel that shows:
 The panel is **refund-aware**: units that have been refunded are no longer outstanding demand, so a refunded line is not offered for allocation and does not show as a backorder.
 
 The allocation panel reappears whenever there are unfulfilled order lines, even after some shipments have already been created or shipped. This enables the partial fulfillment workflow described below.
+
+### Pegging an order to a purchase order
+
+When stock is being bought for one particular customer order, **peg** the order line to the purchase order. Stock received on that purchase order is then allocated to the pegged order **first**, up to the pegged quantity; whatever is left over follows the normal rule, oldest order first. This replaces holding other orders back or deallocating them by hand and undoing that after the receipt.
+
+- **Peg to PO.** On the order page, the **Pegged to purchase orders** panel lists each line with a **Peg to PO** button (open orders only: Pending payment, On hold, Processing or Allocated). It opens a picker of the open purchase-order lines for that product that still have quantity that has not been received and is not already pegged to another order. Choose a line and a quantity. A line that has a peg shows a **Pegged** badge.
+- **What is refused.** A peg larger than the unreceived quantity of the purchase-order line (less what other orders have pegged to it), or larger than what the order line still lacks (ordered, less allocated, less other pegs), is refused with the figure. A kit line cannot be pegged. Only a purchase order that has been sent and is still expecting goods can be pegged to.
+- **How it behaves.** The stock that has landed for a peg is held for the pegged order: the reallocation sweep, the backorder allocation after any receipt and every other automatic allocation leave it alone, so an older order cannot be handed pegged stock (the hold sits in the warehouse the units were actually received into, which can differ from the purchase order's destination, and the pegged order's first allocation after a receipt draws only on stock received there), and automatic allocation never takes stock away from a pegged allocation to give it to another order. Receipts count however they arrive: receiving by hand, a warehouse ASN alignment, or a warehouse book-in. When stock is lost and reservations have to be released, a pegged order is released last. Stock is still shared between orders by quantity: pegging controls who is allocated first, it does not label individual units. Allocating by hand is unaffected.
+- **When a peg ends.** A peg ends by itself when the order line is fully allocated, when the order is cancelled or fully refunded, when the order moves on to picking or beyond, when the purchase order is cancelled or closed, or when the purchase-order line is received without covering the peg (for example it was edited down). The end and its reason are written to the activity log of both the order and the purchase order. Deleting either line removes its pegs and records that in the same way. You can also remove a peg yourself (**Remove**); the stock it held then goes to the oldest waiting order.
+- **Permission.** Creating or removing a peg needs **sales.process**, the same permission as allocating by hand (Admin, Manager and Warehouse). Everyone who can see the order sees the pegs.
+
+Pegging is entirely inside IMS: nothing is sent to WooCommerce, the warehouse or the accounting system.
 
 ### Shipment-Only Fulfillment
 
@@ -380,6 +412,38 @@ When you record a refund in IMS on an order that came from WooCommerce, IMS book
 - **Press Done only if no refund is to be made in WooCommerce.** Done needs the sync permission and a fresh sign-in, and records who and when. Once a task is done, IMS can no longer link a later WooCommerce refund to that credit note.
 - **If the amount differs from every open IMS refund,** no Confirm button is offered: look at the refund in WooCommerce and, if it is a separate refund, use Record manually on that row. If it was meant to pay an IMS refund for a different amount, check the credit note and the refund first; recording it would credit the same money twice. If several IMS refunds have the same amount, each has its own Confirm button, so you name the one it settles.
 - A refund that **began in WooCommerce** is imported as it always was. A full or partial refund in IMS never changes the WooCommerce order status.
+
+### Deleting a refund recorded in error
+
+A refund an operator recorded in IMS by mistake can be deleted, and the delete undoes exactly what that refund did. **It is off by default**: an administrator switches it on with the `refund_delete_enabled` setting (the value `true`). While it is off the order page shows no delete control.
+
+**Where.** On the order page, open **Refunds**. Each refund shows **Delete refund** when it can be deleted, or a line beginning *Cannot be deleted* with the reason when it cannot. The action needs the same permission as recording a refund (`sales.refund`). A confirmation asks for an optional reason, which is kept in the audit record.
+
+**What it undoes, from the record of what the refund did (it never recalculates a cost):**
+
+- **Returned stock** goes back out: the refund's return movement and the cost layers that return created are removed and the stock level goes down by exactly the recorded quantity.
+- **The cost-of-sales (COGS) reversal** is reversed at the amount it carried. A reversal not yet sent to the accounting system is cancelled; one already posted is countered with a journal that swaps its debit and credit lines. The COGS sub-ledger gets the exact opposite movement, so it nets back to what it was before the refund. Because the delete reverses the amounts the refund actually posted, the result does not depend on how refund COGS reversal is valued (the open finance decision on refund cost basis).
+- **The credit note**: one never sent is cancelled and everything is undone at once. One already in the accounting system makes the delete **two steps**: confirming it only queues the *Credit note void* (see Xero sync) and changes nothing else, so the refund and its stock stay exactly as they were. Only when the accounting system confirms the void does IMS unwind the refund. If the accounting system refuses (for example the credit note was allocated or paid there), the refund stays as it is and the entry fails on the sync page with the reason. Nothing is sent when the delete is confirmed, and nothing leaves at all while outbound writes are held.
+- **A "Refund in WooCommerce" task** raised for the refund (on an order that came from WooCommerce) is marked done, so nobody is told to pay the customer back for a refund that no longer exists.
+- **Stock reservation**: the order is re-reserved for its remaining demand after the delete (best effort; if a shipment exists or stock is short, a warning says to allocate it from the order page).
+- **The order's refund status** is recalculated from the refunds that remain. Refund analytics and the Returns report no longer include the refund.
+
+A warehouse query the refund raised for an order already pushed to the warehouse is **not** withdrawn (IMS writes nothing to the warehouse): raise a follow-up query there if the warehouse acted on it.
+
+The refund row is removed; a record of the deletion (who, when, why, the credit note number and what was reversed) is kept, and the order's activity log shows *refund_deleted*.
+
+**When it is refused** (always with the reason in plain words, and nothing is changed):
+
+- The refund **came from WooCommerce** (it would be imported again) or was raised automatically, for example from a payment reversal. Delete or correct those in WooCommerce.
+- The credit note has **payments or allocations** recorded against it.
+- The credit note's date is **on or before the accounting lock date** IMS last read from Xero.
+- The stock the refund returned has **since been used, reserved or moved**, or the return predates IMS recording which cost layers it created.
+- The order carries **store credit**, or has been **erased**.
+- The refund's accounting is **being sent right now**, **still needs a retry**, or IMS **cannot prove** whether a queued entry reached the accounting system.
+- The refund routed goods **in transit**, or also moved unearned revenue, allocated inventory or a daily-batch adjustment, which a delete cannot unwind exactly. Correct those with a new entry.
+- The delete setting is off.
+
+The delete is idempotent: pressing it twice, or retrying after an interruption, reports success and does nothing a second time. If the accounting system cannot void the credit note (for example it was allocated there since), the queued entry fails with the reason and can be retried from the sync page after the allocation is removed in Xero.
 
 ## Payments
 

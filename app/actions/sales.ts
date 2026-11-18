@@ -1,5 +1,6 @@
 'use server'
 
+import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -177,11 +178,12 @@ import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-gua
 import { queueSalesInvoiceUpdateForExistingAccountingInvoice } from '@/lib/domain/sales/sales-invoice-update-sync'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 import {
-  ORDER_LIST_PAGE_SIZE, isShortListQuery, SO_COMPLETED_STATUSES, SO_STATUSES, buildListPage, buildSalesOrderListWhere,
+  ORDER_LIST_PAGE_SIZE, isShortListQuery, SO_COMPLETED_STATUSES, SO_INVOICING_FILTERS, SO_STATUSES, buildListPage, buildSalesOrderListWhere,
   normaliseListQuery, normalisePage, normaliseStatuses, soListHides,
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
+import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal } from '@/lib/domain/sales/order-edit-affordance'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 import { isQuoteExpired, quoteDateToYmd, quoteStatusMoveRefused, quoteYmdToDate, validateQuoteInput } from '@/lib/domain/sales/sales-quote'
@@ -255,6 +257,8 @@ export type SoRow = {
   /// Set by the list / detail reads: the quote's validity date has passed. Always false for an order that is not a quote.
   quoteExpired: boolean
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
+  /// Whether an invoice exists for the order (orthogonal to `status`; a cancelled order keeps it). lib/domain/sales/invoicing-state.ts.
+  invoicingState: InvoicingState
   /// o3d-e1yb [wdraw]: set while an EU withdrawal request holds this order.
   withdrawalHoldAt: string | null
   /// o3d-rbyg r4: WHICH request the hold is — carried to the release so the button cannot clear a
@@ -547,6 +551,7 @@ const SO_SELECT = {
   orderNumber: true,
   status: true,
   refundStatus: true,
+  invoicingState: true,
   withdrawalHoldAt: true,
   withdrawalHoldGeneration: true,
   currency: true,
@@ -617,6 +622,7 @@ function mapSoRow(so: {
   orderNumber: string | null
   status: string
   refundStatus: string
+  invoicingState: string
   withdrawalHoldAt: Date | null
   withdrawalHoldGeneration: number
   currency: string
@@ -726,6 +732,7 @@ function mapSoRow(so: {
     quoteSentAt: so.quoteSentAt?.toISOString() ?? null,
     quoteExpired: false,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
+    invoicingState: so.invoicingState as InvoicingState,
     withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
     withdrawalHoldGeneration: so.withdrawalHoldGeneration,
     currency: so.currency,
@@ -821,6 +828,8 @@ export type SoListParams = {
   q?: string
   /** Comma-separated string (from the URL) or a list. Unknown values are ignored. */
   status?: string | string[]
+  /** Invoicing state picks, comma-separated or a list (NOT_INVOICED, PARTIALLY_INVOICED, FULLY_INVOICED). Unknown values are ignored. */
+  invoicing?: string | string[]
   page?: number | string
   /** Include COMPLETED / DELIVERED in the default view. */
   showCompleted?: boolean
@@ -859,6 +868,7 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
   const filter: SoListFilter = {
     q: normaliseListQuery(params.q),
     statuses: normaliseStatuses(params.status, SO_STATUSES),
+    invoicing: normaliseStatuses(params.invoicing, SO_INVOICING_FILTERS),
     showCompleted: params.showCompleted === true,
     includeArchived: params.includeArchived === true,
     quotesOnly: params.quotes === true,
@@ -4206,6 +4216,8 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
         // orphaning the journal or stranding the debit — see releaseOrderAllocationsInTx.
         orderIsBeingDeleted: true,
       })
+      // SO-to-PO pegging: the order's pegs go with its lines (FK cascade); record their end first.
+      await recordPegsRemovedWithLines(tx, { salesOrderLineIds: (await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true } })).map((l) => l.id) }, session.user.id ?? null)
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
       await tx.salesOrder.delete({ where: { id } })
       return { so, released }

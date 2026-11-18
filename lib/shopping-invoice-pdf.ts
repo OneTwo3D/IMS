@@ -15,6 +15,8 @@ export type ShoppingInvoicePdfRequest = {
   externalOrderId: string
   externalCustomerId?: string
   externalOrderKey?: string
+  /** The storefront's id of ONE refund: sent only by a credit note request, and ignored by the invoice route. */
+  externalRefundId?: string
   issuedAt: number
   expiresAt: number
   nonce: string
@@ -85,6 +87,7 @@ export function parseShoppingInvoicePdfRequest(
   const externalOrderId = parseString(payload.externalOrderId)
   const externalCustomerId = payload.externalCustomerId === undefined ? undefined : parseString(payload.externalCustomerId)
   const externalOrderKey = payload.externalOrderKey === undefined ? undefined : parseString(payload.externalOrderKey)
+  const externalRefundId = payload.externalRefundId === undefined ? undefined : parseString(payload.externalRefundId)
   const issuedAt = parseSafeInteger(payload.issuedAt)
   const expiresAt = parseSafeInteger(payload.expiresAt)
   const nonce = parseString(payload.nonce)
@@ -95,6 +98,7 @@ export function parseShoppingInvoicePdfRequest(
   if (payloadConnector !== connector) return { valid: false, reason: 'connector_mismatch' }
   if (payload.externalCustomerId !== undefined && !externalCustomerId) return { valid: false, reason: 'malformed' }
   if (payload.externalOrderKey !== undefined && !externalOrderKey) return { valid: false, reason: 'malformed' }
+  if (payload.externalRefundId !== undefined && !externalRefundId) return { valid: false, reason: 'malformed' }
   if (issuedAt > expiresAt) return { valid: false, reason: 'malformed' }
   if (expiresAt - issuedAt > SHOPPING_INVOICE_PDF_TTL_SECONDS) {
     return { valid: false, reason: 'ttl_exceeded' }
@@ -113,6 +117,7 @@ export function parseShoppingInvoicePdfRequest(
       externalOrderId,
       externalCustomerId: externalCustomerId ?? undefined,
       externalOrderKey: externalOrderKey ?? undefined,
+      externalRefundId: externalRefundId ?? undefined,
       issuedAt,
       expiresAt,
       nonce,
@@ -125,6 +130,7 @@ export function createShoppingInvoicePdfRequestBody(input: {
   externalOrderId: string
   externalCustomerId?: string | number | null
   externalOrderKey?: string | null
+  externalRefundId?: string | number | null
   now?: Date | number
   ttlSeconds?: number
   nonce: string
@@ -141,6 +147,7 @@ export function createShoppingInvoicePdfRequestBody(input: {
       ? { externalCustomerId: String(input.externalCustomerId) }
       : {}),
     ...(input.externalOrderKey ? { externalOrderKey: input.externalOrderKey } : {}),
+    ...(input.externalRefundId !== undefined && input.externalRefundId !== null ? { externalRefundId: String(input.externalRefundId) } : {}),
     issuedAt,
     expiresAt: issuedAt + ttlSeconds,
     nonce: input.nonce,

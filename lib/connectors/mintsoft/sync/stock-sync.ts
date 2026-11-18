@@ -88,6 +88,11 @@ import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selecti
  * Best-effort post-commit: a failure is surfaced as a WARNING, never thrown.
  */
 async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string, sku: string): Promise<StockEnqueueOutcome> {
+  // SO-to-PO pegging: units the alignment just landed on a purchase-order line go to the order pegged to it first. Best-effort,
+  // IMS-internal; a no-op for a product nothing is pegged on.
+  const { allocatePeggedOrdersForProducts } = await import('@/lib/fulfillment/peg-allocator')
+  const pegPass = await allocatePeggedOrdersForProducts([productId], { source: 'wms_alignment', referenceId: binding.id, referenceLabel: 'WMS stock alignment' })
+  if (pegPass.errors > 0) console.error(`[peg-pass] ${pegPass.errors} pegged order(s) failed to allocate after the WMS alignment (each is in the activity log; the reallocation sweep retries)`)
   try {
     await enqueueStockSync([productId], 'IMS_CHANGE')
     return 'ok'

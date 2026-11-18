@@ -3,6 +3,7 @@ import { EmailRecipientErasedError } from '@/lib/domain/erasure/email-recipient'
 import { assertNoStoreCreditInvoiceDocument } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { renderEmailHtml } from '@/lib/email-template'
 import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
+import { isInvoiceDocumentPublishingEnabled } from '@/lib/domain/invoice-documents/publishing-switch'
 import { formatCountryDisplay } from '@/lib/countries'
 import {
   createPdfDocument,
@@ -178,6 +179,28 @@ async function buildSalesOrderConfirmationEmail(orderId: string): Promise<Prepar
   }
 }
 
+/**
+ * The PDF the `INVOICE` e-mail (the manual and the queued customer invoice mail, ownership row `customer-email.invoice`) attaches.
+ *
+ * SWITCH OFF (`wc_invoice_document_enabled`, the default): exactly what it always was, the invoice IMS renders itself.
+ * SWITCH ON: the ONE customer invoice, the ledger's own PDF IMS stored (the same file the My Account button serves, through the same reader
+ * and its refusals), so the customer is never mailed a different rendering of the number. If IMS holds a stored document for the order that it
+ * will not serve right now (withdrawn, changed since, number shared, file missing or altered), the mail is NOT sent with a rendering of its own: it
+ * fails and stays queued for the next attempt, after the recheck has had its chance. An order with no stored document and no flat file
+ * (IMS has not fetched it yet) keeps the rendering it always had.
+ */
+async function invoiceEmailPdf(orderId: string, so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
+  if (await isInvoiceDocumentPublishingEnabled()) {
+    const stored = await loadCurrentInvoicePdf(orderId)
+    if (stored) return stored
+    const held = await db.salesOrderInvoiceDocument.findFirst({ where: { orderId, kind: 'INVOICE', refundId: null, supersededAt: null }, select: { id: true } })
+    if (held) {
+      throw new Error('The stored invoice document is not available to send right now (withdrawn, changed, shared or its file is not intact); the invoice e-mail waits rather than attaching a different rendering of the invoice')
+    }
+  }
+  return generateInvoicePdf(so, branding)
+}
+
 async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: boolean }): Promise<PreparedEmail> {
   const so = await getSalesOrderEmailOrder(orderId)
   if (!so) throw new Error('Order not found')
@@ -190,7 +213,7 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
   const { money } = await getCurrencyFormat(so.currency)
   const pdfBuffer = options?.accountingPdf
     ? await loadCurrentInvoicePdf(orderId)
-    : await generateInvoicePdf(so, branding)
+    : await invoiceEmailPdf(orderId, so, branding)
   if (!pdfBuffer) {
     throw new Error(options?.accountingPdf ? 'Invoice PDF file not found on disk' : 'Failed to generate invoice PDF')
   }

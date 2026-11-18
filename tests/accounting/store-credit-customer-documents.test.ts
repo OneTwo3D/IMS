@@ -69,6 +69,11 @@ test('CENSUS 2: every place a STORED invoice PDF is served is the accounting sys
     'lib/connectors/woocommerce/sync/invoice-document-jobs.ts', 'lib/connectors/woocommerce/sync/invoice-document.ts',
     'lib/domain/invoice-documents/current-document.ts', 'lib/invoice-pdf.ts', 'lib/order-email.ts',
   ].sort(), 'a new place serves a stored invoice PDF: classify it')
+  // A stored CREDIT NOTE is the ledger's own document for one refund (it states the refund's credit, never an order total, so the
+  // store-credit rule for invoices does not apply). It is read by the customer credit note route, through the one reader.
+  const creditNoteReaders = grepFiles('(loadCurrentCreditNotePdf|loadCreditNotePdf)\\(')
+  precondition('stored credit note servers', { files: creditNoteReaders })
+  assert.deepEqual(creditNoteReaders, ['app/api/shopping/[connector]/credit-note-pdf/route.ts', 'lib/domain/invoice-documents/current-document.ts'].sort(), 'a new place serves a stored credit note PDF: classify it')
   // Stored PDFs are written only by the Xero INVOICE_PDF follow-up (saveInvoicePdf), which never runs for a credit order.
   assert.ok(read('lib/connectors/xero/sync-processor.ts').includes('saveInvoicePdf'))
 

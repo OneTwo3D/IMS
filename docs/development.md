@@ -349,15 +349,29 @@ npm run db:unstamp-scratch -- ims_scratch_<suffix>      # if you keep the databa
 dropdb ims_scratch_<suffix>
 ```
 
-**Scratch clusters and temp trees on a RAM disk (`IMS_SCRATCH_ROOT`).** Tests that start a throwaway Postgres
-cluster or need a trusted report directory create it under `scratchRoot()` (`tests/helpers/scratch-root.ts`):
-`/var/tmp` by default, or the directory named by `IMS_SCRATCH_ROOT` when that is an existing writable directory.
-Point it at a RAM-backed directory to keep those short-lived, write-heavy clusters off the SSD. The directory must be
-root-owned with the sticky bit (`1777`, as `/var/tmp` is): the report-directory trust checks refuse an ancestor that
-another account could modify unless it is a root-owned sticky directory. Keep the path short, because a Postgres
-unix-socket path is limited to about 107 bytes. The rehearsal tests (`tests/scripts/rehearse-*.test.ts`) use
-`scratchRoot()` too. A real rehearsal refuses a RAM-backed (`tmpfs`/`ramfs`) parent and has no waiver, so on a genuinely
-tmpfs scratch root those tests cannot run; a disk-backed RAM disk (for example ext4 on zram) is accepted.
+**Scratch clusters and temp trees (`IMS_SCRATCH_ROOT`, then `TMPDIR`; never `/var/tmp`).** Tests, rehearsal tests and gate
+scripts that start a throwaway Postgres cluster or need a trusted report directory create it under `scratchRoot()`
+(`tests/helpers/scratch-root.ts`): the first of `IMS_SCRATCH_ROOT`, the `TMPDIR` the process started with (the unit-tier
+temp-dir sentinel swaps `TMPDIR` for a private directory, so it records the original in `IMS_TEST_ORIGINAL_TMPDIR`), then
+`os.tmpdir()` that names an existing writable directory. `/var/tmp` is on the SSD and is no longer a fallback: throwaway
+clusters there wrote about 84 GB a day. On the build host `TMPDIR` and `IMS_SCRATCH_ROOT` are `/scratch/ram/tmp` (ext4 on
+zram). The directory must be root-owned with the sticky bit (`1777`, as `/tmp` is): the report-directory trust checks
+refuse an ancestor that another account could modify unless it is a root-owned sticky directory. **Keep the path short
+(at most 48 bytes):** a Postgres unix-socket path is limited to about 107 bytes and the cluster lives below the root, so
+`scratchRoot()` refuses a longer root with a message that names the fix (set `IMS_SCRATCH_ROOT` to a short directory) instead
+of failing inside Postgres. The rehearsal tests (`tests/scripts/rehearse-*.test.ts`) use `scratchRoot()` too and pass it
+as `parentDir` explicitly. A real rehearsal refuses a RAM-backed (`tmpfs`/`ramfs`) parent and has no waiver, so on a genuinely
+tmpfs scratch root those tests cannot run; a disk-backed RAM disk (for example ext4 on zram) is accepted. Every test must
+remove what it creates (the temp-dir sentinel fails a unit process that leaves its private `TMPDIR` non-empty).
+`tests/helpers/no-var-tmp-scratch.test.ts` fails when a `/var/tmp` literal appears in test-reachable scratch code.
+
+**Where `/var/tmp` is kept, on purpose.** Only real operator runs on a server, whose reports must survive a reboot, and
+which tests never reach without an explicit directory: the `--root` (cluster parent) default of `first-load:apply --rehearse`
+(`lib/first-load/apply/cli.ts`, `DEFAULT_ROOT`) and of `rehearse:first-install` / `rehearse:woo-import`; the report-directory
+defaults `/var/tmp/ims-rehearsal-reports`, `/var/tmp/ims-first-load-apply-reports`,
+`/var/tmp/ims-reconciliation-pack-reports` and `/var/tmp/ims-readiness-gate-reports`; and the gate's lock file
+`/var/tmp/ims-gate-heavy.lock`. These are documented operator defaults (docs/installation.md, docs/first-load-apply.md);
+override them with `--root` / `--report-dir` when you do not want a run on the SSD.
 
 RESIDUALS, so nobody has to discover them:
 

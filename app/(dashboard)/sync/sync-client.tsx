@@ -1105,6 +1105,14 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
             </label>
 
             <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={s.wc_order_divergence_detection_enabled === 'true'} onChange={(e) => setS({ ...s, wc_order_divergence_detection_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
+              <div>
+                <span className="text-sm font-medium">Report orders edited in WooCommerce</span>
+                <p className="text-xs text-muted-foreground">Off by default. When on, IMS compares each updated WooCommerce order with the IMS order (items, quantities, prices, shipping, discount, tax and total, with refunds taken out) and lists any difference under Sync &gt; Exceptions. It only reports: nothing is changed in IMS, WooCommerce or the warehouse.</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
               <input type="checkbox" checked={s.wc_ast_provider_mapping_enabled === 'true'} onChange={(e) => setS({ ...s, wc_ast_provider_mapping_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
               <div>
                 <span className="text-sm font-medium">Map couriers to tracking providers</span>

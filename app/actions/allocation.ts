@@ -407,6 +407,8 @@ export async function autoAllocateOrder(
     // under-lock status to still be in this set; otherwise allocation is an explicit no-op (skipped:true,
     // committed:false, no error). See AllocateSalesOrderInput.requireStatusUnderLock.
     requireStatusUnderLock?: readonly SalesOrderStatus[]
+    // SO-to-PO pegging: the receipt's peg pass. See AllocateSalesOrderInput.capPeggedLines.
+    capPeggedLines?: boolean
   },
 ): Promise<{
   success: boolean
@@ -454,6 +456,7 @@ export async function autoAllocateOrder(
       trimUnshippedWhenShipmentsExist: options?.trimUnshippedWhenShipmentsExist,
       onReconciledInTx: options?.onReconciledInTx,
       requireStatusUnderLock: options?.requireStatusUnderLock,
+      capPeggedLines: options?.capPeggedLines,
       userId: actingUserId,
     })
     allocationCommitted = true

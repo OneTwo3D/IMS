@@ -52,9 +52,16 @@ export type WmsAsnActions = {
 export type WmsSyncTrigger = 'cron' | 'product_mutation' | 'manual'
 
 /** Product and bundle sync runs for a single product (lib/domain/wms/product-sync-dispatch.ts). */
+/**
+ * What a product or bundle sync reports. `ok: false` is anything other than a clean success (a failed or partial run, an
+ * error, a conflict, a push the outbound hold kept back): nothing reached the warehouse, or not all of it. A hook that
+ * returns nothing is read as a success, as it always was.
+ */
+export type WmsProductSyncOutcome = { ok: true } | { ok: false; detail: string }
+
 export type WmsProductSyncActions = {
-  syncProduct(productId: string, triggeredBy: WmsSyncTrigger): Promise<void>
-  syncBundle(productId: string, triggeredBy: WmsSyncTrigger): Promise<void>
+  syncProduct(productId: string, triggeredBy: WmsSyncTrigger): Promise<WmsProductSyncOutcome | void>
+  syncBundle(productId: string, triggeredBy: WmsSyncTrigger): Promise<WmsProductSyncOutcome | void>
 }
 
 /**

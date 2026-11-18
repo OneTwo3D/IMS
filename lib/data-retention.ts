@@ -7,6 +7,7 @@ import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   backReferenceEvidenceTombstone,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { isJournalPayloadSyncType, summariseAccountNets } from '@/lib/domain/accounting/journal-account-nets'
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { WC_REFUND_PARK_RECOVERED_ACTION, WC_REFUND_PARK_VERIFICATION_MIGRATION } from '@/lib/domain/sales/refund-park-recovery'
@@ -164,6 +165,12 @@ export async function purgeExpiredData(): Promise<{
    * question keeps the row.
    */
   backReferenceEvidenceCompacted: number
+  /**
+   * Journal rows (o3d-oyur) LEFT WHOLE because their payload could not be summarised into the per-account
+   * net the posting proof needs, so dropping it would have made them unprovable for no reason: payload
+   * kept, reported here and in the cleanup activity row. They stay eligible and are retried every run.
+   */
+  backReferenceEvidenceKeptUnsummarisable: number
   stockMovementsDeleted: number
   webhookEventsCompacted: number
   salesOrdersArchived: number
@@ -175,6 +182,8 @@ export async function purgeExpiredData(): Promise<{
   let wmsInboundEventsCompacted = 0
   let wmsSyncJobsDeleted = 0
   let backReferenceEvidenceCompacted = 0
+  let backReferenceEvidenceKeptUnsummarisable = 0
+  const unsummarisableSyncLogIds: string[] = []
   let stockMovementsDeleted = 0
   let webhookEventsCompacted = 0
   let salesOrdersArchived = 0
@@ -545,13 +554,16 @@ export async function purgeExpiredData(): Promise<{
     }
     let compacted = 0
     let examined = 0
+    // Journal rows whose payload cannot be summarised (o3d-oyur): left whole, and excluded from the
+    // page query for the rest of THIS run so they cannot starve the rows behind them.
+    const keptWhole: string[] = []
     // Paged from the head each time rather than by cursor: every row this loop touches LEAVES the
     // predicate, so the next page is always what is left.
     for (;;) {
       const remaining = BACK_REFERENCE_EVIDENCE_COMPACTION_MAX_ROWS - examined
       if (remaining <= 0) break
       const page = await db.accountingSyncLog.findMany({
-        where: compactableWhere,
+        where: keptWhole.length > 0 ? { ...compactableWhere, id: { notIn: keptWhole } } : compactableWhere,
         select: { id: true, type: true, referenceType: true, externalTransactionId: true, payload: true },
         orderBy: { createdAt: 'asc' },
         take: Math.min(BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE, remaining),
@@ -564,7 +576,26 @@ export async function purgeExpiredData(): Promise<{
       // the row out of the predicate — in which case the next select will not return it either, and
       // re-reading the page is work with no end. Stop and let the next run see the settled state.
       let writtenThisPage = 0
+      const keptBefore = keptWhole.length
       for (const row of page) {
+        // o3d-oyur — A JOURNAL'S PAYLOAD IS NEVER DROPPED WITHOUT ITS PER-ACCOUNT NET. The posting proof
+        // reads the net of one account in one direction; once the lines are gone that summary is all
+        // there is. It is derived here, from the very payload this statement empties, and written in the
+        // SAME statement, so there is no state in which the lines are gone and the summary was never
+        // written. A journal whose payload cannot be summarised (no `lines`, an unreadable line) is NOT
+        // compacted: it keeps its payload, is reported, and is retried next run. Non-journal types
+        // (invoices, bills, credit notes) have nothing for the proof to read and compact as before.
+        let accountNets: Prisma.InputJsonValue | undefined
+        if (isJournalPayloadSyncType(row.type)) {
+          const summary = summariseAccountNets(row.payload)
+          if (!summary) {
+            keptWhole.push(row.id)
+            backReferenceEvidenceKeptUnsummarisable += 1
+            if (unsummarisableSyncLogIds.length < 20) unsummarisableSyncLogIds.push(row.id)
+            continue
+          }
+          accountNets = summary as unknown as Prisma.InputJsonValue
+        }
         const { count } = await db.accountingSyncLog.updateMany({
           // THE WHOLE SELECTION PREDICATE, RE-ASSERTED — not just the row id and the compaction stamp
           // (o3d-bqw7 r3, Codex HIGH). The read and the write are separate statements, so every
@@ -576,9 +607,19 @@ export async function purgeExpiredData(): Promise<{
           // the row had already moved on from, which is the one way this pass can UNDER-report what
           // is owed. Re-asserting the predicate makes the write a no-op instead, and the row is
           // re-selected on the next run if it is still eligible.
-          where: { ...compactableWhere, id: row.id },
+          //
+          // o3d-oyur: for a journal the PAYLOAD is part of that predicate too. The summary was computed
+          // from the payload read above; if a concurrent writer replaced it in between, the summary
+          // would describe lines that are not the ones being dropped. Equality on the stored JSON makes
+          // that write a no-op instead, and the row is summarised afresh on the next run.
+          where: {
+            ...compactableWhere,
+            id: row.id,
+            ...(accountNets ? { payload: { equals: row.payload as Prisma.InputJsonValue } } : {}),
+          },
           data: {
             ...backReferenceEvidenceTombstone(now),
+            ...(accountNets ? { payloadAccountNets: accountNets } : {}),
             // Keys only — no name, address, amount or document text. See the migration.
             followUpObligations: followUpObligationsOwedBy(row),
           },
@@ -586,9 +627,11 @@ export async function purgeExpiredData(): Promise<{
         compacted += count
         writtenThisPage += count
       }
-      if (writtenThisPage === 0) break
+      // Rows kept whole are excluded from the next page's query, so a page of them is progress too.
+      if (writtenThisPage === 0 && keptWhole.length === keptBefore) break
       if (page.length < BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE) break
-    }    backReferenceEvidenceCompacted = compacted
+    }
+    backReferenceEvidenceCompacted = compacted
   }
 
   // Shopping webhook inbox — COMPACT succeeded rows (o3d-ahk). Clear the bulky payloadJson to reclaim
@@ -782,6 +825,7 @@ export async function purgeExpiredData(): Promise<{
   const parts: string[] = []
   if (syncLogsDeleted > 0) parts.push(`${syncLogsDeleted} sync logs deleted`)
   if (backReferenceEvidenceCompacted > 0) parts.push(`${backReferenceEvidenceCompacted} unresolved back-reference sync logs compacted`)
+  if (backReferenceEvidenceKeptUnsummarisable > 0) parts.push(`${backReferenceEvidenceKeptUnsummarisable} journal sync logs left uncompacted because their payload could not be summarised`)
   if (stockMovementsDeleted > 0) parts.push(`${stockMovementsDeleted} stock movements deleted`)
   if (webhookEventsCompacted > 0) parts.push(`${webhookEventsCompacted} webhook events compacted`)
   if (wmsInboundEventsCompacted > 0) parts.push(`${wmsInboundEventsCompacted} WMS inbound events compacted`)
@@ -796,10 +840,10 @@ export async function purgeExpiredData(): Promise<{
       action: 'cleanup',
       tag: 'system',
       description: `Data retention cleanup: ${parts.join(', ')}`,
-      metadata: { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
+      metadata: { syncLogsDeleted, backReferenceEvidenceCompacted, backReferenceEvidenceKeptUnsummarisable, unsummarisableSyncLogIds, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
       resolveUser: false,
     })
   }
 
-  return { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
+  return { syncLogsDeleted, backReferenceEvidenceCompacted, backReferenceEvidenceKeptUnsummarisable, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
 }

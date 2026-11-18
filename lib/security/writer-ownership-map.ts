@@ -85,6 +85,11 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: ['CREDIT_NOTE'],
     note: 'As sales.invoice.',
   }),
+  row('xero', 'sales.credit-note-void', { P1: 'xeroom', P2: 'xeroom' }, {
+    obligationTime: 'required',
+    accountingSyncTypes: ['CREDIT_NOTE_VOID'],
+    note: 'o3d-ngmt.22: voiding the credit note of a refund deleted in IMS. As sales.credit-note: Xeroom owns sales credit notes, so IMS shadows the void in P1 and P2 like the document it undoes.',
+  }),
   row('xero', 'sales.payment', { P1: 'nobody', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['INVOICE_PAYMENT'],

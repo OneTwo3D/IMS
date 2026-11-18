@@ -335,17 +335,14 @@ export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: WmsConnectorRegistrations<Wms
         }
       },
       productSync: async () => {
-        const [product, bundle] = await Promise.all([
+        const [product, bundle, outcome] = await Promise.all([
           import('@/lib/connectors/mintsoft/sync/product-sync'),
           import('@/lib/connectors/mintsoft/sync/bundle-sync'),
+          import('@/lib/connectors/mintsoft/sync/wms-outcome'),
         ])
         return {
-          syncProduct: async (productId, triggeredBy) => {
-            await product.runMintsoftProductSyncForProduct(productId, triggeredBy)
-          },
-          syncBundle: async (productId, triggeredBy) => {
-            await bundle.runBundleSyncForProduct(productId, triggeredBy)
-          },
+          syncProduct: async (productId, triggeredBy) => outcome.mintsoftProductOutcome(await product.runMintsoftProductSyncForProduct(productId, triggeredBy)),
+          syncBundle: async (productId, triggeredBy) => outcome.mintsoftBundleOutcome(await bundle.runBundleSyncForProduct(productId, triggeredBy)),
         }
       },
       // The /sync WMS panel and the onboarding connection step (o3d-remove-shiphero round 4,

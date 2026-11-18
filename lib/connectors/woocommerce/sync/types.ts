@@ -207,6 +207,9 @@ export type WcFullProduct = {
   meta_data: WcMeta[]
   parent_id: number
   global_unique_id?: string  // WC 9.2+ native GTIN/EAN/UPC/ISBN field
+  customs_commodity_code?: string  // WC 11.3 native customs fields
+  customs_country_of_origin?: string  // ISO 3166-1 alpha-2
+  customs_description?: string  // <= 35 chars, plain text
 }
 
 export type WcVariation = {
@@ -229,6 +232,9 @@ export type WcVariation = {
   meta_data: WcMeta[]
   parent_id: number
   global_unique_id?: string
+  customs_commodity_code?: string  // in view context a variation inherits its parent's value
+  customs_country_of_origin?: string
+  customs_description?: string
 }
 
 export type WcTrackingItem = {
