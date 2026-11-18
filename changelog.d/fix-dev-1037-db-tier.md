@@ -1,0 +1,1 @@
+- Test-only: the freight revaluation concurrency tests now accept the lines fingerprint that updateFreightPoCosts returns (development DB tier was red after #1037).
