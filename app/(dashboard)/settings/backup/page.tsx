@@ -107,6 +107,7 @@ export default async function BackupSettingsPage({
           <BackupRemoteSettings
             s3={storageData.s3}
             sftp={storageData.sftp}
+            encryptionEnabled={storageData.encryptionEnabled}
           />
         </Card>
       )}
@@ -144,7 +145,7 @@ function maskSecret(value: string | null | undefined): { masked: string; hasValu
 async function loadStorage() {
   const [
     s3Endpoint, s3Region, s3Bucket, s3AccessKey, s3SecretKey, s3Prefix,
-    sftpHost, sftpPort, sftpUser, sftpPassword, sftpKey, sftpFingerprint, sftpPath,
+    sftpHost, sftpPort, sftpUser, sftpPassword, sftpKey, sftpFingerprint, sftpPath, encryption,
   ] = await Promise.all([
     getSetting('backup_s3_endpoint'),
     getSetting('backup_s3_region'),
@@ -159,6 +160,7 @@ async function loadStorage() {
     getSetting('backup_sftp_private_key'),
     getSetting('backup_sftp_host_fingerprint'),
     getSetting('backup_sftp_path'),
+    getSetting('backup_remote_encryption_enabled'),
   ])
 
   const s3SecretMasked = maskSecret(s3SecretKey)
@@ -166,6 +168,7 @@ async function loadStorage() {
   const sftpKeyMasked = maskSecret(sftpKey)
 
   return {
+    encryptionEnabled: encryption === 'true',
     s3: {
       endpoint: s3Endpoint ?? '',
       region: s3Region ?? '',

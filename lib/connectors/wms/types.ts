@@ -162,7 +162,20 @@ export type WmsClearableProductField = 'customsDescription' | 'commodityCode' | 
 export type WmsProductClearOutcome = {
   cleared: WmsClearableProductField[]
   rejected: { field: WmsClearableProductField; message: string }[]
+  /** Not sent: the claim made immediately before the request found the clear no longer wanted (the field was refilled, or the marker was replaced). Not a failure: nothing is retried. */
+  skipped: { field: WmsClearableProductField; reason: string }[]
+  /** Not sent: the WMS has no API way to clear this field. Never retried; an operator clears it by hand. */
+  unsupported: WmsClearableProductField[]
 }
+
+/**
+ * Taken around each clear request: runs `send` only while the caller can still stand behind the clear, holding whatever
+ * lock keeps that true until `send` settles. `claimed: false` means the clear was not wanted any more and nothing was sent.
+ */
+export type WmsClearClaim = <T>(
+  field: WmsClearableProductField,
+  send: () => Promise<T>,
+) => Promise<{ claimed: true; value: T } | { claimed: false; reason: string }>
 
 export type WmsProductRef = {
   externalId: string
@@ -295,6 +308,8 @@ export type WmsUpsertProductOptions = {
    * nothing to clear). Barcode/EAN/UPC are not clearable.
    */
   clearFields?: WmsClearableProductField[]
+  /** Wraps each clear request so a clear planned earlier is re-verified immediately before it is sent. Absent: every clear is sent as planned. */
+  clearClaim?: WmsClearClaim
 }
 
 /**

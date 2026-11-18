@@ -2,7 +2,7 @@ import { ORDER_STATUSES_NOT_READY_TO_DISPATCH } from '@/lib/domain/workflows/sal
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -74,6 +74,7 @@ export type ExternalFulfillmentRefusal =
   | 'coverage_shortfall'
   | 'order_not_ready_to_ship'
   | 'shipment_status_transition_failed'
+  | 'despatch_review_not_recorded'
 
 export type ExternalFulfillmentOutcome =
   | {
@@ -878,21 +879,28 @@ export async function applyExternalFulfillmentUpdate(
           message: notice,
           actionUrl: `/sales/${order.id}`,
         })))
-        noticesPersisted = persisted.every(Boolean)
+        // With no active admin there is nobody to tell: `[].every(Boolean)` is true, so require at least one persisted notice.
+        noticesPersisted = persisted.length > 0 && persisted.every(Boolean)
       } catch (noticeError) {
         console.error('[external-fulfillment] not-ready despatch notice failed:', noticeError)
       }
-      if (noticesPersisted) {
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: order.id,
-          action: NOT_READY_DESPATCH_ACTION,
-          tag: 'sync',
-          level: 'WARNING',
-          description: notice,
-          metadata: { source: update.source, orderStatus: reviewStatus, shipmentsProcessed: shipments.length },
-          resolveUser: false,
-        })
+      const markerPersisted = noticesPersisted && await logActivityPersisted({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: NOT_READY_DESPATCH_ACTION,
+        tag: 'sync',
+        level: 'WARNING',
+        description: notice,
+        metadata: { source: update.source, orderStatus: reviewStatus, shipmentsProcessed: shipments.length },
+        resolveUser: false,
+      })
+      if (!markerPersisted) {
+        // The despatch itself is recorded; only the review event is not. Retryable: the next tick finds nothing left to ship
+        // and raises the event again (no marker exists).
+        return refuseExternalFulfillment(
+          'despatch_review_not_recorded',
+          'The despatch was recorded but the review notice for the not-ready order could not be saved (no active admin, or a notice/marker write failed); it will be retried',
+        )
       }
     }
     return { success: true, despatchedWhileNotReady: reviewStatus }
