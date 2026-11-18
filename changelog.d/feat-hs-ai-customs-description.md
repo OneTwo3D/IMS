@@ -1,4 +1,0 @@
-### HS classifier proposes a customs description (inventory)
-
-- **New: AI-written customs description on HS proposals.** The classifier now also returns a customs description in the form "article + key attribute" (English, no filler words, never brand-only, at most 50 characters), matching the WooCommerce HS plugin. It is clamped to 50 characters at a word boundary. A brand-only, filler-only or empty answer is rejected and the keyword rule's description is used instead. The keyword fallback and the escalation pass both carry it.
-- **Unchanged: proposals stay proposals.** The description appears on the HS Code Review proposal only when the product has none; an operator-set or WooCommerce-imported description is never overwritten, and approving a proposal still sets only the HS code. No schema change.

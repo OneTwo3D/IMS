@@ -24,6 +24,7 @@ import { requireAuth } from '@/lib/auth/server'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { hasPermission } from '@/lib/permissions'
 import { buildExchangeCatalogue } from '@/lib/domain/sales/return-exchange'
+import { getSalesOrderPegs } from '@/app/actions/pegging'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -58,6 +59,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   if (!so) notFound()
+  const pegs = await getSalesOrderPegs(id)
   // audit-H2: a fully-paid order whose trigger won't auto-generate an invoice.
   const paidWithoutInvoice = shouldWarnPaidWithoutInvoice({
     becamePaid: Boolean(so.paidAt),
@@ -115,6 +117,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         editForm={editForm}
         exchangeOffer={exchangeOffer}
         exchangeCatalogue={exchangeCatalogue}
+        pegs={pegs}
       />
     </div>
   )

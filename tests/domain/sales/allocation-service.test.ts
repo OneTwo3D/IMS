@@ -876,6 +876,8 @@ function createClient(state: MemoryState): AllocationServiceClient {
         return { count }
       },
     },
+    // SO-to-PO pegging: no peg exists in these scenarios (the peg behaviour is covered in peg-service.test.ts and the concurrency tier).
+    salesOrderLinePeg: { findFirst: async () => null, findMany: async () => [] },
     salesOrderRefundLine: {
       findMany: async ({ where }: { where: { refund: { orderId: string } } }) => refundLines
         .filter((refundLine) => refundLine.orderId === where.refund.orderId)

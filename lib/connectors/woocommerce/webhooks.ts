@@ -23,6 +23,7 @@ import {
   recordIncomingWcWebhook,
   shouldSuppressWcWebhookEcho,
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { rerunDeferredWcOrderDivergence } from '@/lib/connectors/woocommerce/sync/order-divergence'
 import { queueRefundStockCorrections } from '@/lib/connectors/woocommerce/sync/refund-stock-correction'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { judgeWebhookOrigin, type WebhookOriginJudgement } from '@/lib/connectors/webhook-origin'
@@ -555,6 +556,8 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // coverage check never nets, so a complete 3PL dispatch is refused until they land. A
       // retried delivery re-reads the order from page one, so this is self-clearing (o3d-ecbj r5).
       refundSweep = await syncRefundsForOrder(wcOrder.id)
+      // A divergence comparison deferred for a refund IMS had not recorded is repeated now that the sweep has run (the refund path itself is untouched). Never throws.
+      await rerunDeferredWcOrderDivergence(wcOrder)
       if (!refundSweep.complete) {
         failures.push(`syncRefundsForOrder: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`)
       }

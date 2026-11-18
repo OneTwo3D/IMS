@@ -18,6 +18,7 @@ const HELP_DOCS = [
   { slug: 'troubleshooting', title: 'Troubleshooting' },
   { slug: 'dashboard', title: 'Dashboard' },
   { slug: 'inventory', title: 'Inventory Management' },
+  { slug: 'products', title: 'Products: Edit by CSV' },
   { slug: 'stock-control', title: 'Stock Control' },
   { slug: 'purchasing', title: 'Purchasing' },
   { slug: 'sales', title: 'Sales Orders' },

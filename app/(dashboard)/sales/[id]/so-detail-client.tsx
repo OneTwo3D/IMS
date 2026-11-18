@@ -44,6 +44,8 @@ import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-af
 import { SHOP_DESYNC_WARNING, resolveSalesOrderEditBlock, resolveSalesOrderEditScope } from '@/lib/domain/sales/order-edit-affordance'
 import { exchangeDifference, exchangeDifferenceLabel, exchangeLineBadge, type ExchangeCatalogueRow } from '@/lib/domain/sales/return-exchange'
 import { SoFormDialog } from '../so-form'
+import { PeggedBadge, SoPegsCard } from '@/components/sales/so-pegs-card'
+import type { SalesOrderPegRow } from '@/app/actions/pegging'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
 import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
@@ -135,6 +137,8 @@ type Props = {
   exchangeOffer?: ReturnExchangeOffer | null
   /** The replacement products the refund dialog searches; empty unless the exchange is offered. */
   exchangeCatalogue?: ExchangeCatalogueRow[]
+  /** SO-to-PO pegging: this order's live pegs. */
+  pegs?: SalesOrderPegRow[]
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -1224,7 +1228,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, exchangeOffer = null, exchangeCatalogue = [] }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [] }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1933,6 +1937,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                   </TableCell>
                   <TableCell className="px-4">
                     {line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}
+                    {pegs.some((peg) => peg.salesOrderLineId === line.id) && <PeggedBadge />}
                     {line.exchangeForRefundId && (
                       <span data-testid="exchange-line-badge" className="ml-2 inline-flex items-center rounded-sm border border-emerald-300 bg-emerald-50 px-1 py-0 text-[10px] font-medium text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950 dark:text-emerald-200">
                         {exchangeLineBadge(so.refunds.find((r) => r.id === line.exchangeForRefundId)?.creditNoteNumber ?? null)}
@@ -2044,6 +2049,14 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
           </tfoot>
         </Table>
       </div>
+
+      {/* SO-to-PO pegging */}
+      <SoPegsCard
+        lines={so.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.sku, description: l.description, qty: l.qty }))}
+        pegs={pegs}
+        canPeg={hasPermission(currentUserRole, 'sales.process')}
+        pegOpen={['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED'].includes(so.status)}
+      />
 
       {/* Allocation Panel */}
       {showAllocations && (

@@ -142,6 +142,8 @@ An unreadable database is never treated as an empty one: the read fails closed (
 | `--root` | `<dir>` | --rehearse | Where the throwaway cluster is made (default /var/tmp; not on a RAM-backed file system; every ancestor must be trustworthy). |
 | `--help` | none | all | Print this text. |
 
+The default `--root` (`/var/tmp`) is deliberate for a real operator run on a server and is unchanged: the cluster must sit on a disk-backed file system (a RAM-backed one is refused) whose every ancestor is trustworthy, and the report directory must survive a reboot. Tests and development runs never rely on it: they pass `--root` / `--report-dir` explicitly (the test suites use `scratchRoot()`, i.e. `IMS_SCRATCH_ROOT`, then `TMPDIR`; see docs/development.md). Keep a `--root` short (at most about 50 bytes): the cluster's unix-socket path lives below it and Postgres limits that to about 107 bytes.
+
 Modes: `--rehearse` is the default (the safe one). `--plan` reads and reports. `--apply` writes, and only with a rehearsal record. The command refuses to run as root in `--rehearse` (the throwaway cluster's `initdb` will not); `--plan` and `--apply` run as the account that owns the env file.
 
 ### The rehearsal

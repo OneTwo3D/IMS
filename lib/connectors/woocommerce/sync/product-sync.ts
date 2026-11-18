@@ -30,7 +30,7 @@ import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../cre
 import type { ConnectorCredentials } from '../../types'
 import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
-import { extractWcCustomsFields, type WcCustomsFields } from './customs-fields'
+import { extractWcCustomsFields, type WcCustomsFields, type WcRejectedCustomsValue } from './customs-fields'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -593,6 +593,27 @@ export function resolveWcTradeFieldUpdates(
   return changes
 }
 
+/**
+ * Operator-facing sentences for customs data WooCommerce supplied that IMS could not use, plus
+ * the new-row case where the China default had to be declared because no usable origin existed.
+ * Empty when there is nothing to say. Pure: the caller decides where it is recorded.
+ */
+export function describeWcCustomsWarnings(
+  sku: string,
+  rejected: readonly WcRejectedCustomsValue[],
+  opts: { isNewRow: boolean; resolvedOrigin: string | null },
+): string[] {
+  const warnings = rejected.map(
+    (r) => `${sku}: WooCommerce ${r.field} "${r.value}" is not usable by IMS and was ignored`,
+  )
+  if (opts.isNewRow && !opts.resolvedOrigin) {
+    warnings.push(
+      `${sku}: no usable country of origin from WooCommerce; created with the default ${DEFAULT_COUNTRY_OF_ORIGIN}. Correct the product's origin.`,
+    )
+  }
+  return warnings
+}
+
 /** Parse a WC numeric-ish value, returning null if empty/NaN. */
 function parseNum(val: unknown): number | null {
   const normalized = asTrimmedString(val)
@@ -838,6 +859,7 @@ export async function syncWcProductToIms(
     const hsCodeAttr = customs.hsCode
     const originIso = customs.countryOfOrigin
     const customsDescriptionAttr = customs.customsDescription
+    const customsWarnings: string[] = []
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
@@ -876,7 +898,7 @@ export async function syncWcProductToIms(
     )
 
     // --- Local writes: all of them, in ONE transaction ---
-    const { syncedProductId, syncedSku, tradeChanges, wasUpdate, structureConflicts } = await db.$transaction(
+    const { syncedProductId, syncedSku, customsWarnings: importWarnings, tradeChanges, wasUpdate, structureConflicts } = await db.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // Fence step 3 (o3d-mlc7): the settings lock comes FIRST, before any per-SKU lock.
         // Both families are taken inside this transaction, so a fixed order between them is
@@ -1274,6 +1296,7 @@ export async function syncWcProductToIms(
           structureConflicts.push(
             ...await applyVariations(
               tx, variations, productId, wcProduct.name, imsCategoryId, structurallyTransformed, customs,
+              customsWarnings,
             ),
           )
         }
@@ -1304,9 +1327,17 @@ export async function syncWcProductToIms(
         // LAST, so it sees as much of the concurrent world as this transaction ever can.
         await assertTransformedRowsStillTransformable(tx, structurallyTransformed)
 
+        customsWarnings.unshift(
+          ...describeWcCustomsWarnings(productSku, customs.rejected, {
+            isNewRow: !existing,
+            resolvedOrigin: originIso,
+          }),
+        )
+
         return {
           syncedProductId: productId,
           syncedSku: productSku,
+          customsWarnings,
           tradeChanges: changes,
           wasUpdate: Boolean(existing),
           structureConflicts,
@@ -1322,6 +1353,20 @@ export async function syncWcProductToIms(
     // sync/cron contexts too); never affects the import result.
     if (wasUpdate) {
       void invalidateStaleHsProposal(syncedProductId).catch((err) => console.error(err))
+    }
+
+    // Customs values IMS could not use (and a defaulted origin on a new row): a durable WARNING the
+    // operator can see, never a failure of the import. logActivity swallows its own errors.
+    if (importWarnings.length > 0) {
+      await logActivity({
+        entityType: 'PRODUCT',
+        entityId: syncedProductId,
+        action: 'wc_customs_value_unusable',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce customs data needs attention: ${importWarnings.slice(0, 10).join('; ')}${importWarnings.length > 10 ? `; +${importWarnings.length - 10} more` : ''}`,
+        resolveUser: false,
+      })
     }
 
     // Audit trail when hs-code-woo overwrote IMS trade fields (bhdm.2). logActivity
@@ -1804,6 +1849,8 @@ async function applyVariations(
    * store, a legacy-description meta that lives on the parent) falls back to these per field.
    */
   parentCustoms: WcCustomsFields,
+  /** Collects customs warnings (unusable WC values, defaulted origin) for the caller to record. */
+  customsWarnings: string[],
 ): Promise<WcProductStructureConflict[]> {
   const conflicts: WcProductStructureConflict[] = []
   const entries = variations
@@ -1877,6 +1924,12 @@ async function applyVariations(
     }
 
     const existing = existingBySku.get(sku)
+    customsWarnings.push(
+      ...describeWcCustomsWarnings(sku, ownCustoms.rejected, {
+        isNewRow: !existing,
+        resolvedOrigin: variantCustoms.countryOfOrigin,
+      }),
+    )
 
     if (existing) {
       // The update below rewrites type/parentId/externalProductId, so refuse a row a

@@ -30,6 +30,7 @@ import {
 } from '@/lib/products/bom-recipe'
 import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 import { productSchema } from '@/lib/products/product-schema'
+import { buildProductListWhere } from '@/lib/products/list-filter'
 import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 // o3d-zzgp: every incoming-stock badge below asks "how much of this transfer line is
@@ -181,35 +182,7 @@ export async function listProducts(params: {
   const sortDir = params.dir ?? 'asc'
   const isComputedSort = !DB_SORT_FIELDS.has(sortField)
 
-  const where = {
-    ...(params.search
-      ? {
-          OR: [
-            { sku: { contains: params.search, mode: 'insensitive' as const } },
-            { name: { contains: params.search, mode: 'insensitive' as const } },
-            { barcode: { contains: params.search, mode: 'insensitive' as const } },
-            { mpn: { contains: params.search, mode: 'insensitive' as const } },
-            { variants: { some: { sku: { contains: params.search, mode: 'insensitive' as const } } } },
-            { variants: { some: { mpn: { contains: params.search, mode: 'insensitive' as const } } } },
-          ],
-        }
-      : {}),
-    // By default exclude VARIANT products; pass type='ALL' to include everything
-    ...(params.type === 'ALL'
-      ? {}
-      : params.type
-      ? { type: params.type as ProductType }
-      : { parentId: null }),
-    ...(params.lifecycleStatus && params.lifecycleStatus !== 'ALL'
-      ? { lifecycleStatus: params.lifecycleStatus }
-      : params.active === 'true'
-      ? { lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES } }
-      : params.active === 'false'
-      ? { lifecycleStatus: 'ARCHIVED' as const }
-      : {}),
-    ...(params.categoryId ? { categoryId: params.categoryId } : {}),
-    ...(params.supplierId ? { preferredSupplierId: params.supplierId } : {}),
-  }
+  const where = buildProductListWhere(params)
 
   const categoryNodes = await listProductCategoryNodes()
   const categoryPathById = new Map(categoryNodes.map((n) => [n.id, n.path] as const))
