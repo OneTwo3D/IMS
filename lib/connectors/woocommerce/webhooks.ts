@@ -805,13 +805,11 @@ async function refuseNonBoundStoreDelivery(
   //   - `unproven` or `foreign-store` evidence is judged only AFTER the binding is known to be readable: with
   //     `wc_url` missing the comparison cannot be made, and a delivery refused (acknowledged) then would be lost
   //     for good although it may be perfectly valid once the URL is repaired.
-  //   - header-only evidence (`store-header:`) naming ANOTHER store: the header sits outside the HMAC, so it is not
-  //     proof of foreignness either. A header that MATCHES the bound store on a delivery whose signature verified
-  //     is accepted: core order bodies carry no `_links` and no `permalink`, so the header is the only identity
-  //     a normal live order delivery has.
+  //   - header-only evidence (`store-header:`): X-WC-Webhook-Source sits outside the HMAC, so a signed body
+  //     replayed with a forged header would otherwise look like it came from the bound store.
   const held = origin.verdict === 'binding-unreadable'
     || origin.boundStore === null
-    || (origin.verdict === 'same-store' && origin.scope === 'under')
+    || (origin.verdict === 'same-store' && origin.scope !== 'exact')
     || (origin.verdict === 'foreign-store' && origin.scope === 'header')
   if (held) {
     try {
@@ -887,9 +885,7 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
   // o3d-h5b79: header-only evidence (`store-header:`) is HELD, as for orders and refunds. X-WC-Webhook-Source sits
   // outside the HMAC, so a signed body replayed with a forged header must not pass as the bound store, and a header
   // naming another store is not proof of foreignness either. 503 so the inbox retries and then dead-letters visibly.
-  // A header that MATCHES the bound store on a signature-verified delivery is accepted (the signature already
-  // proved the secret holder sent it); only a header naming another store is held.
-  if (origin.scope === 'header' && origin.verdict === 'foreign-store') {
+  if (origin.scope === 'header' && (origin.verdict === 'same-store' || origin.verdict === 'foreign-store')) {
     await logActivity({
       entityType: 'SYNC',
       action: 'wc_product_webhook_held',

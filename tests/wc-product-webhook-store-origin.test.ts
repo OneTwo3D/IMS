@@ -221,27 +221,20 @@ test('a delivery that names no store records THAT, positively, rather than a bla
 
 // --- o3d-h5b79: a header outside the signature is not proof of the store -------------------------
 
-test('header-only evidence naming the BOUND store is accepted: imported and stock corrected', async () => {
-  reset()
-  const response = await dispatchProduct('store-header:store-a.example.com')
+for (const header of ['store-header:store-a.example.com', 'store-header:store-b.example.com']) {
+  test(`header-only evidence "${header}" is HELD (503): nothing imported, no stock correction`, async () => {
+    reset()
+    const response = await dispatchProduct(header)
 
-  assert.equal(response.status, 200)
-  assert.equal(state.syncCalls.length, 1)
-  assert.equal(state.activity.some((entry) => entry.action === 'wc_product_webhook_held'), false)
-})
-
-test('header-only evidence naming ANOTHER store is HELD (503): nothing imported, no stock correction', async () => {
-  reset()
-  const response = await dispatchProduct('store-header:store-b.example.com')
-
-  assert.equal(response.status, 503)
-  assert.deepEqual(state.syncCalls, [])
-  assert.deepEqual(state.stockSyncCalls, [])
-  const held = state.activity.find((entry) => entry.action === 'wc_product_webhook_held')
-  assert.ok(held)
-  assert.equal((held.metadata as Row).originScope, 'header')
-  assert.equal(refusal(), undefined, 'held, not acknowledged as foreign')
-})
+    assert.equal(response.status, 503)
+    assert.deepEqual(state.syncCalls, [])
+    assert.deepEqual(state.stockSyncCalls, [])
+    const held = state.activity.find((entry) => entry.action === 'wc_product_webhook_held')
+    assert.ok(held)
+    assert.equal((held.metadata as Row).originScope, 'header')
+    assert.equal(refusal(), undefined, 'held, not acknowledged as foreign')
+  })
+}
 
 // --- retry: the recorded origin is replayed, never re-derived ------------------------------
 
