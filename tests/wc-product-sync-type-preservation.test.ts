@@ -793,6 +793,7 @@ const txClient = {
     // No rows => credentials null and version '0', which findUnique agrees with, so the
     // credential-rebind fence (o3d-mlc7) is a consistent no-op here.
     findMany: async () => [],
+    deleteMany: async ({ where }: { where: { key: string } }) => ({ count: settingValues.delete(where.key) ? 1 : 0 }),
     findUnique: async ({ where }: { where: { key: string } }) => (settingValues.has(where.key) ? { key: where.key, value: settingValues.get(where.key) } : null),
   },
   $executeRaw: cursorRaw((key) => { state.settingUpserts.push(key) }, async () => 1),
@@ -3389,24 +3390,29 @@ test('the stored list never evicts: a new conflict that does not fit is rejected
   assert.deepEqual(rejected.map((i) => i.id), [9])
 })
 
-test('a full list holds the product cursor for a new permanent conflict it cannot record, and raises an ERROR', async () => {
+test('a full list never pins the cursor: a new conflict is recorded in the durable overflow marker, logged at ERROR, and the sweep still advances (repeatedly)', async () => {
   const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
-  const { MAX_STORED_PERMANENT_CONFLICTS } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
+  const { MAX_STORED_PERMANENT_CONFLICTS, PERMANENT_CONFLICT_OVERFLOW_SETTING } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
   resetState()
   seedCursorRun()
   const full = Array.from({ length: MAX_STORED_PERMANENT_CONFLICTS }, (_, i) => entry(1000 + i))
   settingValues.set(CONFLICTS_KEY, JSON.stringify(full))
-  // The buried ones still conflict (their direct fetch finds nothing: 404 drops them is NOT wanted here), so make them fail transiently.
+  // The listed ones keep failing for a passing reason; only 20 are re-attempted per run, the rest are not touched.
   for (const item of full) productById[`/products/${item.id}`] = { error: 'WC API error: 503 unavailable' }
   state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
   productPages = { '1': [variableProduct() as unknown as Row] }
-  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
-  assert.equal(result.errors.length, 1, 'the unlistable conflict is an error, so the cursor is held')
-  assert.deepEqual(state.settingUpserts.filter((key) => key === CURSOR), [], 'cursor NOT advanced past a product that is not on the list')
-  assert.equal(listed().length, MAX_STORED_PERMANENT_CONFLICTS)
-  assert.ok(!listed().some((item) => item.id === 77), 'nothing was evicted to make room')
-  const loud = state.activity.find((a) => a.action === 'wc_product_conflict_list_full')
-  assert.ok(loud)
-  assert.equal(loud!.level, 'ERROR')
-  assert.match(String(loud!.description), /PARENT-SKU/)
+  for (const run of [1, 2]) {
+    state.settingUpserts.length = 0
+    state.activity.length = 0
+    const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+    assert.deepEqual(result.errors, [], `run ${run}: a full list is not a sync error`)
+    assert.ok(state.settingUpserts.includes(CURSOR), `run ${run}: the cursor advances`)
+    assert.equal(listed().length, MAX_STORED_PERMANENT_CONFLICTS, `run ${run}: nothing evicted`)
+    const loud = state.activity.find((a) => a.action === 'wc_product_conflict_list_full')
+    assert.ok(loud, `run ${run}: ERROR logged`)
+    assert.equal(loud!.level, 'ERROR')
+    assert.match(String(loud!.description), /PARENT-SKU/)
+    const marker = JSON.parse(settingValues.get(PERMANENT_CONFLICT_OVERFLOW_SETTING) ?? 'null') as { ids: Array<{ id: number; sku: string }> } | null
+    assert.deepEqual(marker?.ids.map((e) => e.id), [77], `run ${run}: durable marker holds the overflow id once`)
+  }
 })

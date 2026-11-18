@@ -2695,13 +2695,12 @@ export async function syncAllWcProducts(
   // not on the list never has its cursor advanced (a failed write throws and the cursor stays).
   const { rejected: unlistedConflicts } = await recordPermanentConflictDelta(conflictDelta)
   if (unlistedConflicts.length > 0) {
-    // The list is FULL and never evicts, so these products cannot be remembered for re-attempt. Advancing the cursor past
-    // them would bury them with no way back, so the cursor is HELD: the next run reads the same window and lists them as
-    // soon as room frees up (a fixed product leaves the list on its next re-attempt).
+    // The list is FULL (a bound that is not expected to be reached). It never evicts, and it never holds the cursor
+    // either: holding it would re-read a growing window for ever. The overflowing products are recorded durably in
+    // `wc_product_conflict_overflow` (written with the list, under its lock) and named in this ERROR.
     const unlistedNames = unlistedConflicts.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')
-    const message = `The list of buried WooCommerce products is full (${MAX_STORED_PERMANENT_CONFLICTS}), so ${unlistedConflicts.length} new product(s) with a conflict could not be recorded for automatic re-attempt `
-      + `(${unlistedNames}) and the product sync cursor is held back so they are not lost. Resolve the conflicts on the products already listed (the list shrinks as they import), or re-save them in WooCommerce.`
-    result.errors.push(message)
+    const message = `The list of buried WooCommerce products is full (${MAX_STORED_PERMANENT_CONFLICTS}), so ${unlistedConflicts.length} new product(s) with a conflict cannot be re-attempted automatically `
+      + `(${unlistedNames}). The product sync carries on; re-save these products in WooCommerce after fixing them. They are kept in the setting wc_product_conflict_overflow.`
     await logActivity({
       entityType: 'SYNC', action: 'wc_product_conflict_list_full', tag: 'sync', level: 'ERROR',
       description: message,

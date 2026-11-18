@@ -9,8 +9,8 @@
  * one Setting, and fetched DIRECTLY by id at the start of each run, in addition to the `modified_after`
  * window.
  *
- * Bounded twice: the list holds at most MAX_STORED_PERMANENT_CONFLICTS ids (a full list never evicts: a new conflict
- * that does not fit holds the product cursor and is reported), and one run re-attempts at most MAX_PERMANENT_CONFLICT_REATTEMPTS of them,
+ * Bounded twice: the list holds at most MAX_STORED_PERMANENT_CONFLICTS ids (a full list never evicts and never holds the
+ * cursor: an overflowing conflict is written to the durable overflow marker and reported at ERROR), and one run re-attempts at most MAX_PERMANENT_CONFLICT_REATTEMPTS of them,
  * least recently attempted first so every id gets its turn. What a run did NOT re-attempt is logged by the
  * caller: a bound that stays quiet reads as "covered everything".
  */
@@ -18,7 +18,23 @@
 import { db } from '@/lib/db'
 
 export const PERMANENT_CONFLICTS_SETTING = 'wc_product_permanent_conflicts'
-export const MAX_STORED_PERMANENT_CONFLICTS = 200
+export const MAX_STORED_PERMANENT_CONFLICTS = 5000
+/** The durable record of conflicts that did not fit (a bound that will not be hit in practice, but never silent if it is). */
+export const PERMANENT_CONFLICT_OVERFLOW_SETTING = 'wc_product_conflict_overflow'
+export const MAX_OVERFLOW_IDS = 500
+
+export type PermanentConflictOverflow = { since: string; ids: Array<{ id: number; sku: string }>; truncated: boolean }
+
+export function parsePermanentConflictOverflow(raw: string | null | undefined): PermanentConflictOverflow | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as Partial<PermanentConflictOverflow>
+    if (!parsed || typeof parsed.since !== 'string' || !Array.isArray(parsed.ids)) return null
+    return { since: parsed.since, ids: parsed.ids.filter((e) => e && typeof e.id === 'number'), truncated: parsed.truncated === true }
+  } catch {
+    return null
+  }
+}
 export const MAX_PERMANENT_CONFLICT_REATTEMPTS = 20
 
 export type PermanentConflict = {
@@ -153,6 +169,18 @@ export async function recordPermanentConflictDelta(delta: PermanentConflictDelta
     const row = await tx.setting.findUnique({ where: { key: PERMANENT_CONFLICTS_SETTING } })
     const { items, rejected } = applyPermanentConflictDelta(parsePermanentConflicts(row?.value), delta, new Date().toISOString())
     const value = JSON.stringify(items)
+    if (rejected.length > 0) {
+      // The cursor WILL move past these, so they are recorded durably (bounded) rather than only logged.
+      const marker = parsePermanentConflictOverflow((await tx.setting.findUnique({ where: { key: PERMANENT_CONFLICT_OVERFLOW_SETTING } }))?.value)
+      const merged = new Map((marker?.ids ?? []).map((e) => [e.id, e]))
+      for (const entry of rejected) merged.set(entry.id, entry)
+      const ids = [...merged.values()]
+      const next: PermanentConflictOverflow = { since: marker?.since ?? new Date().toISOString(), ids: ids.slice(-MAX_OVERFLOW_IDS), truncated: (marker?.truncated ?? false) || ids.length > MAX_OVERFLOW_IDS }
+      const markerValue = JSON.stringify(next)
+      await tx.setting.upsert({ where: { key: PERMANENT_CONFLICT_OVERFLOW_SETTING }, create: { key: PERMANENT_CONFLICT_OVERFLOW_SETTING, value: markerValue }, update: { value: markerValue } })
+    } else if (items.length === 0) {
+      await tx.setting.deleteMany({ where: { key: PERMANENT_CONFLICT_OVERFLOW_SETTING } })
+    }
     await tx.setting.upsert({
       where: { key: PERMANENT_CONFLICTS_SETTING },
       create: { key: PERMANENT_CONFLICTS_SETTING, value },
