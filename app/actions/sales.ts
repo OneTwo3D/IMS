@@ -1024,6 +1024,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         },
       },
       refunds: {
+        where: { deletedAt: null },
         select: {
           id: true, creditNoteNumber: true, reason: true, returnReason: { select: { name: true } }, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,

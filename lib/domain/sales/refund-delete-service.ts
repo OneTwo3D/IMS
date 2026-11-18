@@ -45,7 +45,8 @@ import {
  *                 the document first). Nothing is sent from here, and nothing at all leaves while the outbound write hold is on.
  *   reservations  the durable release job is resolved so it cannot run against a refund that no longer exists; the caller re-allocates the
  *                 order after the commit.
- *   the record    lines, the credit note's PDF records and fetch state go; the refund row goes; a tombstone (SalesOrderRefundDeletion) keeps
+ *   the record    SOFT DELETE: the refund row stays for audit, marked deleted (deletedAt) and skipped by readers, and its lines are copied whole into the tombstone; the credit note's PDF
+ *                 records are withdrawn and its fetch state closed; a tombstone (SalesOrderRefundDeletion) keeps
  *                 what it carried and what was reversed, and is the idempotency anchor for a retry.
  *
  * WHAT IT DELIBERATELY DOES NOT UNWIND, AND REFUSES INSTEAD: a refund that moved unearned revenue / allocated inventory, routed goods in transit,
@@ -157,6 +158,7 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
       source: true,
       externalRefundId: true,
       chargeback: true,
+      deletedAt: true,
       creditNoteNumber: true,
       accountingCreditNoteId: true,
       accountingCreditNoteConnector: true,
@@ -183,6 +185,8 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
       },
     },
   })
+  // SOFT DELETE: a deleted refund is still a row, marked. It reads as already deleted (the idempotent retry), never as a live refund to refuse or unwind again.
+  if (refund?.deletedAt) return { eligible: false, refusals: [], plan: null, alreadyDeleted: true }
   if (!refund) {
     const tombstone = await tx.salesOrderRefundDeletion.findUnique({ where: { refundId }, select: { id: true } })
     return { eligible: false, refusals: [], plan: null, alreadyDeleted: tombstone !== null }
@@ -215,7 +219,7 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
   }
 
   // The other refunds on the order: the status must be recomputable after this one goes.
-  const remaining = await tx.salesOrderRefund.findMany({ where: { orderId: refund.orderId, id: { not: refund.id } }, select: { totalBase: true, totalsBasis: true } })
+  const remaining = await tx.salesOrderRefund.findMany({ where: { orderId: refund.orderId, id: { not: refund.id }, deletedAt: null }, select: { totalBase: true, totalsBasis: true } })
   if (refundDispositionAfterDelete({ orderTotalBase: order.totalBase, orderTaxBase: order.taxBase, remaining }) === null) refusals.push(refundDeleteRefusals.legacyBasis())
 
   // ---- accounting rows ----
@@ -400,7 +404,11 @@ export async function deleteSalesOrderRefund(
   try {
     return await inTransaction(client, async (tx): Promise<RefundDeleteResult> => {
       // The order is found without a lock only to know WHICH row to lock; every decision below is taken under it.
-      const located = await tx.salesOrderRefund.findUnique({ where: { id: input.refundId }, select: { orderId: true } })
+      const located = await tx.salesOrderRefund.findUnique({ where: { id: input.refundId }, select: { orderId: true, deletedAt: true } })
+      if (located?.deletedAt) {
+        const done = await tx.salesOrderRefundDeletion.findUnique({ where: { refundId: input.refundId }, select: { creditNoteNumber: true } })
+        return { success: true, alreadyDeleted: true, orderId: located.orderId, creditNoteNumber: done?.creditNoteNumber ?? null, productIds: [], voidQueued: false, counterJournalQueued: false }
+      }
       if (!located) {
         const tombstone = await tx.salesOrderRefundDeletion.findUnique({ where: { refundId: input.refundId }, select: { orderId: true, creditNoteNumber: true } })
         if (tombstone) return { success: true, alreadyDeleted: true, orderId: tombstone.orderId, creditNoteNumber: tombstone.creditNoteNumber, productIds: [], voidQueued: false, counterJournalQueued: false }
@@ -537,16 +545,20 @@ export async function deleteSalesOrderRefund(
       })
       reversal.shopRefundTasksClosed = shopTasks.count
 
-      // ---- 5. THE RECORD: PDF evidence is withdrawn (kept, detached), fetch state and lines go, then the refund ----
-      await tx.salesOrderInvoiceDocument.updateMany({ where: { refundId: refund.id }, data: { refundId: null, withdrawnAt: now } })
-      // Statutory records are never deleted: the credit note's fetch state is detached from the refund and closed (DONE, nothing scheduled), not removed.
-      await tx.invoiceDocumentFetchState.updateMany({ where: { refundId: refund.id }, data: { refundId: null, status: 'DONE', nextAttemptAt: null, leaseUntil: null, leaseHolder: null } })
+      // ---- 5. THE RECORD: SOFT DELETE (owner decision 2026-11-18). The refund and its lines are KEPT for audit and marked deleted; readers skip it. ----
+      // PDF evidence is withdrawn (kept, still attached) and the credit note's fetch state is closed (DONE, nothing scheduled), not removed.
+      await tx.salesOrderInvoiceDocument.updateMany({ where: { refundId: refund.id }, data: { withdrawnAt: now } })
+      await tx.invoiceDocumentFetchState.updateMany({ where: { refundId: refund.id }, data: { status: 'DONE', nextAttemptAt: null, leaseUntil: null, leaseHolder: null } })
+      // THE LINES are copied whole into the tombstone's reversal record and then removed: every line-level reader (refundable quantity, demand netting, shipment
+      // netting, analytics) keys off the lines, and a deleted refund's units must not count against any of them. The refund row stays; its lines live in the audit record.
+      const keptLines = await tx.salesOrderRefundLine.findMany({ where: { refundId: refund.id } })
+      reversal.lines = JSON.parse(JSON.stringify(keptLines)) as Prisma.InputJsonValue
       await tx.salesOrderRefundLine.deleteMany({ where: { refundId: refund.id } })
-      await tx.salesOrderRefund.delete({ where: { id: refund.id } })
+      await tx.salesOrderRefund.update({ where: { id: refund.id }, data: { deletedAt: now, deletedById: input.actorUserId, deleteReason: input.reason } })
 
       // ---- 6. THE ORDER'S REFUND STATUS, from the refunds that remain ----
       const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: refund.orderId }, select: { totalBase: true, taxBase: true } })
-      const remaining = await tx.salesOrderRefund.findMany({ where: { orderId: refund.orderId }, select: { totalBase: true, totalsBasis: true } })
+      const remaining = await tx.salesOrderRefund.findMany({ where: { orderId: refund.orderId, deletedAt: null }, select: { totalBase: true, totalsBasis: true } })
       const disposition = refundDispositionAfterDelete({ orderTotalBase: order.totalBase, orderTaxBase: order.taxBase, remaining })
       if (disposition === null) throw new RefundDeleteRefused([refundDeleteRefusals.legacyBasis()])
       await tx.salesOrder.update({ where: { id: refund.orderId }, data: { refundStatus: disposition } })

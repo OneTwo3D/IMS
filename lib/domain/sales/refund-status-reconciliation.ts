@@ -223,6 +223,7 @@ export async function collectRefundStatusReconciliationRows(
       totalBase: true,
       taxBase: true,
       refunds: {
+        where: { deletedAt: null },
         orderBy: { refundedAt: 'asc' },
         select: {
           id: true,

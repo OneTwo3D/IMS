@@ -1001,7 +1001,7 @@ export async function recreateMissingDailyBatchLogs(
       unearnedRevenueAmount: true,
       // ACC-H13: the paid-day journal carries the GROSS deferral; pre-batch refunds are separate adjustment
       // journals. The stored amount is net, so the refunds that were netted are added back here.
-      refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true, deferralAdjustmentRef: true } },
+      refunds: { where: { deletedAt: null }, select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true, deferralAdjustmentRef: true } },
       // ACC-H12: the revenue shipments recognised before the deferral, which the paid-day journal leaves out. Such an
       // order is rebuilt from its gross figure (see below), so the inputs of that figure ride along.
       shipments: { where: { cogsRelievedFromInventoryAt: { not: null } }, select: { revenueRecognizedAmount: true } },
@@ -1800,7 +1800,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               pricesIncludeVat: true,
               taxRatePercent: true,
               shoppingLinks: { select: { connector: true } },
-              refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
+              refunds: { where: { deletedAt: null }, select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
               lines: {
                 select: {
                   id: true,
@@ -2548,7 +2548,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         taxRatePercent: true,
         paidAt: true,
         // o3d-hqvrp.35: refunds entered before this first run, netted out of the deferral.
-        refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
+        refunds: { where: { deletedAt: null }, select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
         // ACC-H12: revenue already recorded by shipments whose COGS the batch posted before payment. The invoice
         // put it in Sales and nothing moved it to Unearned Revenue, so the deferral below leaves it out.
         // It also names a shipment that left while the order was unpaid and that the direct pass of Group B has not

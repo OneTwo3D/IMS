@@ -183,9 +183,13 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     assert.ok(done.ok, done.ok ? '' : done.error)
     const result = { success: true as const, voidQueued: true }
 
-    // The record is gone; the tombstone remembers it.
-    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 0)
-    assert.equal(await rig.db.salesOrderRefundLine.count({ where: { refundId } }), 0)
+    // SOFT DELETE: the record and its lines are KEPT for audit, marked deleted; the tombstone remembers it too.
+    const kept = await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refundId } })
+    assert.ok(kept.deletedAt, 'the refund is marked deleted, not removed')
+    assert.equal(kept.deleteReason, 'entered twice')
+    assert.equal(await rig.db.salesOrderRefundLine.count({ where: { refundId } }), 0, 'no live line counts against refundable quantity')
+    const keptLines = (await rig.db.salesOrderRefundDeletion.findUniqueOrThrow({ where: { refundId } })).reversal as { lines?: unknown[] }
+    assert.equal(keptLines.lines?.length, 1, 'the lines are kept whole in the audit record')
     const tomb = await rig.db.salesOrderRefundDeletion.findUniqueOrThrow({ where: { refundId } })
     assert.equal(tomb.accountingCreditNoteId, 'LEDGER-CN-1')
     assert.equal(tomb.reason, 'entered twice')
@@ -442,8 +446,8 @@ test('concurrency: the delete waits for the order lock a shipment holds, and run
     ])
     assert.equal(deleted.success, true, deleted.success ? '' : deleted.error)
     assert.equal(created.success, true, created.success ? '' : created.error)
-    const remaining = await rig.db.salesOrderRefund.findMany({ where: { orderId: w.orderId }, select: { totalBase: true } })
-    assert.equal(remaining.length, 1, 'exactly the second refund remains')
+    const remaining = await rig.db.salesOrderRefund.findMany({ where: { orderId: w.orderId, deletedAt: null }, select: { totalBase: true } })
+    assert.equal(remaining.length, 1, 'exactly the second refund remains live')
     const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId }, select: { refundStatus: true } })
     assert.equal(order.refundStatus, 'PARTIAL', 'status follows the refunds that remain (one of two units)')
     const stock = await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })
@@ -467,8 +471,9 @@ test('analytics: the Returns report and the figure reads exclude the deleted ref
     const result = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: null })
     assert.equal(result.success, true, result.success ? '' : result.error)
     assert.equal((await mine()).length, 0, 'and is gone from it once deleted')
-    const aggregate = await rig.db.salesOrderRefund.aggregate({ where: { orderId: w.orderId }, _sum: { totalBase: true }, _count: true })
+    const aggregate = await rig.db.salesOrderRefund.aggregate({ where: { orderId: w.orderId, deletedAt: null }, _sum: { totalBase: true }, _count: true })
     assert.equal(aggregate._count, 0)
+    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 1, 'the row itself is kept for audit')
   } finally {
     await w.cleanup()
     await rig.db.$disconnect()

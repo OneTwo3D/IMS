@@ -844,6 +844,7 @@ async function buildRefundFallbackReturnRows(
       // would hand that refund's units to the next one. `returnWarehouseId` says only whether stock came
       // back, and is used to debit stock, never to decide whether the refund consumed line quantity.
       refunds: {
+        where: { deletedAt: null },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         select: {
           id: true,
@@ -1707,7 +1708,7 @@ async function stageRefundAccountingReversals(
           },
         },
         refunds: {
-          where: { id: { not: params.refundId } },
+          where: { id: { not: params.refundId }, deletedAt: null },
           select: {
             id: true,
             // o3d-o97 r3: the CR Allocated Inventory this earlier refund's own reversal raised,
@@ -4765,7 +4766,7 @@ export async function createSalesOrderRefund(
       // A chargeback is refused by ANY prior refund; an ordinary refund only by a chargeback
       // (partial refunds may legitimately stack). An existing chargeback replayed above, so a
       // hit here on the chargeback branch is always the other path's row.
-      where: input.chargeback ? { orderId: input.orderId } : { orderId: input.orderId, chargeback: true },
+      where: input.chargeback ? { orderId: input.orderId, deletedAt: null } : { orderId: input.orderId, chargeback: true, deletedAt: null },
       select: { id: true, creditNoteNumber: true },
     })
     if (conflictingRefund) {
@@ -4848,7 +4849,7 @@ export async function createSalesOrderRefund(
     }
 
     const existingRefunds = await tx.salesOrderRefund.findMany({
-      where: { orderId: input.orderId },
+      where: { orderId: input.orderId, deletedAt: null },
       select: { totalBase: true, accountingRetryRequired: true, totalsBasis: true },
     })
     // scjz.22: block a NEW refund while a prior refund on this order still has

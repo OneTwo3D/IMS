@@ -121,7 +121,7 @@ export async function findOpenShopRefunds(client: OpenClient, orderId: string): 
   })
   if (open.length === 0) return []
   const waiting = new Set((await client.salesOrderRefund.findMany({
-    where: { id: { in: open.map((task) => task.externalOrderId) }, orderId, externalRefundId: null },
+    where: { id: { in: open.map((task) => task.externalOrderId) }, orderId, externalRefundId: null, deletedAt: null },
     select: { id: true },
   })).map((refund) => refund.id))
   return open

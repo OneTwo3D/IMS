@@ -1166,6 +1166,7 @@ export async function collectAccountingInvariantRows(
           },
         },
         refunds: {
+          where: { deletedAt: null },
           select: {
             id: true,
             creditNoteNumber: true,
@@ -1248,7 +1249,7 @@ export async function collectAccountingInvariantRows(
     // 20260821090100) is the matching partial index, so this reads the outstanding refusals and
     // nothing else. A row leaves the set when a retry resolves the basis and clears the note.
     client.salesOrderRefund.findMany({
-      where: { allocationBasisUnresolved: { not: null } },
+      where: { allocationBasisUnresolved: { not: null }, deletedAt: null },
       select: {
         id: true,
         orderId: true,
@@ -1290,7 +1291,7 @@ export async function collectAccountingInvariantRows(
     // that carries no witness is precisely the one that has to be reported as undecidable, and
     // filtering it out here would be the silence this whole issue is about.
     client.salesOrderRefund.findMany({
-      where: { accountingRetryRequired: true },
+      where: { accountingRetryRequired: true, deletedAt: null },
       select: {
         id: true,
         orderId: true,

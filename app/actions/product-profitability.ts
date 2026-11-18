@@ -186,7 +186,7 @@ export async function getProductProfitability(): Promise<{
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
         lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
-        refunds: { select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
+        refunds: { where: { deletedAt: null }, select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
     }),
     db.salesOrder.findMany({
@@ -195,7 +195,7 @@ export async function getProductProfitability(): Promise<{
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
         lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
-        refunds: { select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
+        refunds: { where: { deletedAt: null }, select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
     }),
   ])

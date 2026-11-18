@@ -2515,6 +2515,12 @@ model SalesOrderRefund {
   reversalStagingStatePredatesColumn Boolean @default(false) @map("reversal_staging_state_predates_column")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
+  /// SOFT DELETE (owner decision 2026-11-18): set when an operator deletes a refund recorded in error. The row, its lines and its credit note
+  /// number stay for audit; every ordinary reader (order refund list, refund status and ceiling, analytics, accounting checks) skips a row with
+  /// this set. NULL: a live refund. Written only by lib/domain/sales/refund-delete-service.ts.
+  deletedAt       DateTime?  @map("deleted_at")
+  deletedById     String?    @map("deleted_by_id")
+  deleteReason    String?    @map("delete_reason")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])
@@ -2530,6 +2536,7 @@ model SalesOrderRefund {
   @@index([orderId])
   @@index([stockCorrectionRequired, stockCorrectionQueuedAt])
   @@index([returnReasonId])
+  @@index([orderId, deletedAt])
   @@map("sales_order_refunds")
 }
 
@@ -2537,7 +2544,7 @@ model SalesOrderRefund {
 /// It holds NO stock: nothing here is on hand, allocatable or pushed to a storefront. The value sits in the
 /// Stock in Transit account (the refund's COGS reversal debits it) until the units arrive or are written off.
 /// Lines carry the dispatch-cost snapshot the refund was valued at, so arrival can clear exactly that value.
-/// The record that a refund recorded in error was deleted (o3d-ngmt.22). The refund row and its lines are gone; this keeps the
+/// The record that a refund recorded in error was deleted (o3d-ngmt.22). The refund row is SOFT-deleted (deletedAt) and stays with its lines; this keeps the
 /// identity, the credit note number and the figures it carried, who deleted it and why, and what the delete reversed. It is also the
 /// idempotency anchor: one row per deleted refund id, so a retried delete finds it and reports done.
 /// Structural data only (ids, numbers, amounts, dates): no line text and no customer detail is copied in. `reason` is the operator's own text.

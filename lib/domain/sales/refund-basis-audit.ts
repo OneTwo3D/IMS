@@ -457,6 +457,7 @@ export async function collectRefundBasisRows(
       taxBase: true,
       lines: { select: { id: true, productId: true, qty: true, totalBase: true, taxBase: true } },
       refunds: {
+        where: { deletedAt: null },
         orderBy: { refundedAt: 'asc' },
         select: {
           id: true,
