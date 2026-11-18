@@ -605,21 +605,43 @@ export function resolveWcTradeFieldUpdates(
 
 /**
  * Fields a variation clears: the merged value is still empty, nothing present-but-unusable was supplied by the variation
- * OR its parent, and the VARIATION's own native value is empty and its own cleared-fields meta lists it.
+ * OR its parent, and EITHER the VARIATION's own native value is empty and its own cleared-fields meta lists it, OR the
+ * parent's cleared-fields meta lists it and the variation held that value by inheritance (`inherited`, what the previous
+ * import recorded). A variation with a value of its own is never touched by a parent clear.
  */
 export function resolveVariationCleared(
   own: { cleared: readonly WcTradeField[]; rejected: readonly WcRejectedCustomsValue[] },
   parent: { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
   merged: WcTradeSnapshot,
+  inherited: readonly string[] = [],
 ): WcTradeField[] {
   return WC_TRADE_FIELDS.filter(
     (f) =>
       merged[f] === null
       && !own.rejected.some((r) => r.field === f)
       && !parent.rejected?.some((r) => r.field === f)
-      // Only the variation's OWN marker counts: a parent-only marker says nothing about a value set on the variation itself.
-      && own.cleared.includes(f),
+      && (own.cleared.includes(f) || (Boolean(parent.cleared?.includes(f)) && inherited.includes(f))),
   )
+}
+
+/**
+ * The customs fields a variation holds by inheritance after this import. WooCommerce's REST view of a variation already
+ * carries the parent's native value, so a value equal to the parent's counts as inherited (when the parent is later cleared
+ * and the variation still shows a value, it has its own, and the clear rule below never fires). A different value is the
+ * variation's own; one neither supplies keeps the previous record while the IMS value is preserved, and is dropped once
+ * the field has been cleared.
+ */
+export function resolveVariationInherited(
+  own: WcTradeSnapshot,
+  parent: WcTradeSnapshot,
+  previous: readonly string[],
+  cleared: readonly WcTradeField[],
+): WcTradeField[] {
+  return WC_TRADE_FIELDS.filter((f) => {
+    if (own[f] && own[f] !== parent[f]) return false
+    if (parent[f]) return true
+    return previous.includes(f) && !cleared.includes(f)
+  })
 }
 
 /**
@@ -1962,11 +1984,12 @@ async function applyVariations(
       customsDescription: ownCustoms.customsDescription ?? parentCustoms.customsDescription,
     }
 
-    // Cleared only when the variation itself is explicitly emptied (or has no value of its own and the parent is), and
-    // nothing inherited from the parent fills the field: a variation inheriting a populated parent is never cleared.
-    const variantCleared = resolveVariationCleared(ownCustoms, parentCustoms, variantCustoms)
-
+    // Cleared when the variation itself is explicitly emptied, or when the parent is explicitly cleared and the variation held
+    // that value by inheritance (recorded on the previous import). Nothing inherited may still fill the field, and a variation
+    // with a value of its own is never cleared by its parent.
     const existing = existingBySku.get(sku)
+    const variantCleared = resolveVariationCleared(ownCustoms, parentCustoms, variantCustoms, existing?.customsInherited ?? [])
+    const variantInherited = resolveVariationInherited(ownCustoms, parentCustoms, existing?.customsInherited ?? [], variantCleared)
     customsWarnings.push(
       ...describeWcCustomsWarnings(sku, ownCustoms.rejected, {
         isNewRow: !existing,
@@ -2075,6 +2098,7 @@ async function applyVariations(
       )) {
         updateData[change.field] = change.to
       }
+      updateData.customsInherited = variantInherited
 
       // o3d-4kfh r7 (Codex finding 2): the VARIATION path writes a type too — `VARIANT`, over
       // whatever the IMS row was. An IMS KIT whose SKU is adopted as a WC variation is the same
@@ -2150,6 +2174,7 @@ async function applyVariations(
           // Mirrors the parent's create: the China default only when WooCommerce supplies no origin.
           countryOfOrigin: variantCustoms.countryOfOrigin ?? DEFAULT_COUNTRY_OF_ORIGIN,
           customsDescription: variantCustoms.customsDescription,
+          customsInherited: variantInherited,
         },
       })
       // WC can repeat a SKU across variations of one parent; keep the map authoritative
