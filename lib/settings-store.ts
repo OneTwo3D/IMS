@@ -142,6 +142,8 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'wc_consumer_secret',
   'wc_invoice_pdf_secret',
   'wc_webhook_secret',
+  // The rotated-out webhook secret kept for the grace window (o3d-hqvrp.91): still a bearer credential.
+  'wc_webhook_secret_previous',
   'xero_client_secret',
 ])
 

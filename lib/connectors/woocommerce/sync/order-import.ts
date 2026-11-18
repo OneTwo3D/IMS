@@ -1519,7 +1519,7 @@ async function updateExistingWcOrderCore(
     // the very next order.updated would undo the erasure silently. Only the identity columns are withheld; the
     // rest of the update (shipping, paid state, order number) proceeds exactly as before.
     await lockSalesOrder(tx, orderId)
-    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true } })
+    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true, externalUpdatedAt: true } })
     // The stored split is read only when this delivery carries one (an order without wclc components reads nothing extra).
     if (Array.isArray(wcOrder.meta_data) && Object.values(wclcComponentColumns(wcOrder)).some((v) => v !== null)) {
       storedComponents = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
@@ -1527,7 +1527,15 @@ async function updateExistingWcOrderCore(
     const erased = erasure?.erasedAt != null
     // EDITED IN IMS (owner-ruled desync, o3d-tgt2j policy): an operator edited this order here after confirming it, so WooCommerce's copy of the fields the edit can set (addresses, notes, shipping label / courier) is the
     // ORIGINAL and must not be written back over the edit. Paid state, the order number and the VAT number still mirror; the lines and total never did (see order-edit-drift.ts).
-    const keepImsEdit = erasure?.editedInImsAt != null
+    // OLDER THAN WHAT IS STORED (o3d-hqvrp.85): frozen payloads are replayed in claim order, and a retried older delivery would overwrite the address, notes and
+    // shipping method a newer one already applied (and the warehouse amendment pass would then push the reverted address). A delivery whose WooCommerce modified time
+    // is OLDER than the one stored is not applied to those fields; paid state and the order number still mirror. A missing time on either side applies, as before.
+    const incomingModifiedAt = parseWcGmtInstant(wcOrder.date_modified_gmt || wcOrder.date_modified || '')
+    const storedModifiedAt = erasure?.externalUpdatedAt ?? null
+    const staleDelivery = incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) && storedModifiedAt !== null && incomingModifiedAt.getTime() < storedModifiedAt.getTime()
+    const keepImsEdit = erasure?.editedInImsAt != null || staleDelivery
+    // A stale delivery must not move the wclc split or the per-line customs values either (and so reports no drift against what it did not write).
+    if (staleDelivery) storedComponents = null
     // Recorded after the transaction (below). Only a delivery that still carries real identity counts: an anonymised delivery, or one whose placeholders
     // WooCommerce wrote, is the expected steady state and says nothing.
     repopulationRefused = erased && !isWcOrderAnonymised(wcOrder) && wcPayloadCarriesIdentity(wcOrder)
@@ -1546,7 +1554,7 @@ async function updateExistingWcOrderCore(
       where: { id: orderId },
       data: {
         externalOrderNumber: wcOrder.number,
-        ...(erased ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
+        ...(erased || staleDelivery ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
         // The shipping label, method id and courier key are refreshed TOGETHER from the CURRENT first shipping line (the key
         // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
         // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
@@ -1556,7 +1564,7 @@ async function updateExistingWcOrderCore(
           : {}),
         // The wclc components FOLLOW WooCommerce on every delivery (stored as reported, never recomputed, D5; not personal data, so erased and
         // IMS-edited orders keep following them). No line or invoice is rebuilt from them (surfaceWcOrderEditDrift reports a moved split).
-        ...(Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
+        ...(!staleDelivery && Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
         ...(erased || keepImsEdit
           ? {}
           : {
@@ -1564,6 +1572,8 @@ async function updateExistingWcOrderCore(
               shippingAddress: mapWcAddress(wcOrder.shipping),
               notes: wcOrder.customer_note || null,
             }),
+        // The stored modified time follows the newest delivery applied (it was only ever written on create).
+        ...(!staleDelivery && incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) ? { externalUpdatedAt: incomingModifiedAt } : {}),
         paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //
@@ -1582,7 +1592,7 @@ async function updateExistingWcOrderCore(
       },
     })
     // The per-line customs value override follows WooCommerce too, matched on the WooCommerce line item id (the lines themselves are not rebuilt here).
-    if (Array.isArray(wcOrder.line_items)) {
+    if (!staleDelivery && Array.isArray(wcOrder.line_items)) {
       for (const item of wcOrder.line_items) {
         // A line item that carries no meta list says nothing about the override: leave the stored value alone.
         if (typeof item?.id !== 'number' || !Array.isArray(item.meta_data)) continue

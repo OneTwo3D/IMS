@@ -35,6 +35,7 @@ import {
 } from '@/lib/connectors/woocommerce/connection-test-gate'
 import { normaliseStoreIdentity } from '@/lib/connectors/woocommerce/tax-rate-plan'
 import { normaliseWcOrderStatus } from '@/lib/connectors/woocommerce/order-status-filter'
+import { WC_WEBHOOK_SECRET_GRACE_HOURS, WC_WEBHOOK_SECRET_PREVIOUS_KEY, WC_WEBHOOK_SECRET_PREVIOUS_UNTIL_KEY } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import {
   UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS,
   isUnresolvedWcOrderRowFamily,
@@ -348,6 +349,23 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
         update: { value: serializeSettingValue(k, v ?? '') },
       }),
     )
+  // o3d-hqvrp.91: a rotated webhook secret leaves every existing WC webhook signing with the old one
+  // until "Setup Webhooks" is re-run, so keep the replaced secret for a grace window instead of
+  // refusing every delivery (verifyWcWebhook accepts it until the stored expiry).
+  const newSecret = typeof data.wc_webhook_secret === 'string' ? data.wc_webhook_secret : null
+  if (newSecret && !isMaskedSecret(newSecret)) {
+    const priorSecret = await getSettingValue('wc_webhook_secret')
+    if (priorSecret && priorSecret !== newSecret) {
+      const until = String(Date.now() + WC_WEBHOOK_SECRET_GRACE_HOURS * 3_600_000)
+      for (const [key, value] of [[WC_WEBHOOK_SECRET_PREVIOUS_KEY, priorSecret], [WC_WEBHOOK_SECRET_PREVIOUS_UNTIL_KEY, until]] as const) {
+        ops.push(db.setting.upsert({
+          where: { key },
+          create: { key, value: serializeSettingValue(key, value) },
+          update: { value: serializeSettingValue(key, value) },
+        }))
+      }
+    }
+  }
   await db.$transaction(ops)
   await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce sync settings' })
   revalidatePath('/sync')
@@ -959,6 +977,26 @@ const WC_WEBHOOK_DEFS = [
   { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/woocommerce/products' },
 ] as const
 
+/**
+ * "Revoke previous secret now" (o3d-hqvrp.91): a rotation keeps the replaced secret valid for the grace window so existing
+ * webhooks do not fail. When the old secret LEAKED that window is the problem, so this clears it immediately. Same gate as
+ * writing the secret itself (sync permission plus a fresh admin sign-in).
+ */
+export async function revokePreviousWcWebhookSecret(): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
+  await requireSyncPermission()
+  try {
+    await requireFreshAdmin()
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
+    throw e
+  }
+  await db.setting.deleteMany({ where: { key: { in: [WC_WEBHOOK_SECRET_PREVIOUS_KEY, WC_WEBHOOK_SECRET_PREVIOUS_UNTIL_KEY] } } })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Revoked the previous WooCommerce webhook secret' })
+  revalidatePath('/sync')
+  return { success: true }
+}
+
 export async function createWcWebhooks(): Promise<{
   success: boolean
   created: number
@@ -981,13 +1019,13 @@ export async function createWcWebhooks(): Promise<{
   const webhookShadow = await wooWebhookRegistrationShadow()
   if (webhookShadow) return { success: false, created: 0, existing: 0, errors: [webhookShadow.notice] }
 
-  const { wcFetch, wcPost } = await import('@/lib/connectors/woocommerce/api')
+  const { wcFetch, wcPost, wcPut } = await import('@/lib/connectors/woocommerce/api')
 
   // List existing webhooks to avoid duplicates
   const { data: existing, error: listError } = await wcFetch('/webhooks', { per_page: '100' })
   if (listError) return { success: false, created: 0, existing: 0, errors: [listError] }
 
-  const existingWebhooks = Array.isArray(existing) ? existing as Array<{ topic?: string; delivery_url?: string }> : []
+  const existingWebhooks = Array.isArray(existing) ? existing as Array<{ id?: number | string; topic?: string; delivery_url?: string }> : []
 
   let created = 0
   let alreadyExist = 0
@@ -996,11 +1034,18 @@ export async function createWcWebhooks(): Promise<{
   for (const def of WC_WEBHOOK_DEFS) {
     const deliveryUrl = `${appUrl}${def.path}`
 
-    const isDuplicate = existingWebhooks.some(
-      (wh) => wh.topic === def.topic && wh.delivery_url === deliveryUrl,
-    )
+    const matching = existingWebhooks.filter((wh) => wh.topic === def.topic && wh.delivery_url === deliveryUrl)
+    const isDuplicate = matching.length > 0
     if (isDuplicate) {
       alreadyExist++
+      // o3d-hqvrp.91: an existing hook keeps the secret it was created with, so after a rotation
+      // push the current one to EVERY matching hook (a store can hold duplicates for one topic and URL; a hook left on the
+      // old secret would start failing silently when the grace window ends). Each failure is reported.
+      for (const hook of matching) {
+        if (hook.id === undefined) continue
+        const { error: updateError } = await wcPut(`/webhooks/${hook.id}`, { secret })
+        if (updateError) errors.push(`${def.topic}: could not update the secret on webhook ${hook.id}: ${updateError}`)
+      }
       continue
     }
 
