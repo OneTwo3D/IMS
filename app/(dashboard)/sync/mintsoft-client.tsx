@@ -183,6 +183,7 @@ export function MintsoftClient({ data, configured }: Props) {
   const [restockItemId, setRestockItemId] = useState('')
   const [restockItemSku, setRestockItemSku] = useState('')
   const [restockWarehouseId, setRestockWarehouseId] = useState(defaultWarehouseId)
+  const [restockReasonId, setRestockReasonId] = useState('')
   const [error, setError] = useState('')
   const [feedbackMessage, setFeedbackMessage] = useState('')
   const [saved, setSaved] = useState(false)
@@ -244,6 +245,7 @@ export function MintsoftClient({ data, configured }: Props) {
       setRestockItemId('')
       setRestockItemSku('')
       setRestockWarehouseId(defaultWarehouseId)
+      setRestockReasonId('')
     }
   }
 
@@ -502,6 +504,7 @@ export function MintsoftClient({ data, configured }: Props) {
       const result = await restockMintsoftReturnInboxItem({
         id: restockItemId,
         warehouseId: restockWarehouseId,
+        adjustmentReasonId: restockReasonId || null,
       })
       if (!result.success) {
         setError(result.error ?? 'Failed to restock Mintsoft return')
@@ -1398,6 +1401,21 @@ export function MintsoftClient({ data, configured }: Props) {
                   </option>
                 ))}
             </Select>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Stock-gain reason (GL account)</Label>
+            <Select value={restockReasonId} onChange={(event) => setRestockReasonId(event.target.value)}>
+              <option value="">None (the journal must be posted by hand)</option>
+              {data.adjustmentReasons.map((reason) => (
+                <option key={reason.id} value={reason.id} disabled={!reason.hasAccountCode}>
+                  {reason.name}{reason.hasAccountCode ? '' : ' (needs GL account)'}
+                </option>
+              ))}
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Units the refund did not already restock are valued and journalled Dr Inventory / Cr this reason&apos;s account, as a manual stock addition is, not COGS.
+            </p>
           </div>
 
           <DialogFooter showCloseButton>

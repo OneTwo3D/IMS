@@ -1601,7 +1601,7 @@ async function stageGrirReclassJournals(
         take: batchLimit + 1,
       }), batchLimit)
       if (window.rows.length === 0) return
-      const dated = groupByPostingDate(window.rows, (row) => utcDay(row.journalDate), context)
+      const dated = groupByPostingDate(window.rows, (row) => businessDay(row.journalDate), context)
       for (const group of dated.groups) {
         const referenceId = buildGrirReclassReferenceId(group.date, group.rows.map((row) => row.id))
         const journal = buildGrirReclassJournal({

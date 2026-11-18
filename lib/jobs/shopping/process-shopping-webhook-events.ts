@@ -237,10 +237,16 @@ export async function processPendingShoppingWebhookEvents(
 
   for (const event of events) {
     try {
+      // The claim stamps updatedAt = now and "stale" is measured from it, so `now` must be taken
+      // per event: a batch-start stamp makes an event claimed late in a long batch born stale and
+      // lets a concurrent drain claim it again while it is still running. An injected clock
+      // (options.now) or explicit stale cutoff is honoured unchanged.
+      const eventNow = options.now ?? new Date()
       const result = await processShoppingWebhookEvent(event.id, {
         ...options,
-        now,
-        staleProcessingBefore,
+        now: eventNow,
+        staleProcessingBefore: options.staleProcessingBefore
+          ?? new Date(eventNow.getTime() - getWcWebhookStaleProcessingMs(options.env)),
       })
       if (result.status === 'processed') counters.processed += 1
       else if (result.status === 'failed') counters.failed += 1

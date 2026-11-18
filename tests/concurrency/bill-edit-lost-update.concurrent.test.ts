@@ -73,7 +73,7 @@ test('an edit that commits between another edit\'s read and its lock is not over
   assert.equal(created.success, true, String(created.error))
   const po = await db.purchaseOrder.findUniqueOrThrow({ where: { reference: tag }, select: { id: true, lines: { select: { id: true } } } })
   await db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
-  const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', allowDuplicateInvoiceNumber: true, lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
   assert.equal(bill.success, true, String(bill.error))
   const invoice = await db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
   const edit = (unitCostForeign: number, invoiceNumber = 'SUP-1') => updateInvoice(invoice.id, { invoiceDate: '2026-11-01', invoiceNumber, lines: [{ id: invoice.lines[0]!.id, qtyBilled: 10, unitCostForeign }] } as never)

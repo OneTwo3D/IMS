@@ -1,5 +1,6 @@
 import { businessDateYmd } from '@/lib/business-date'
 import { shareLockOrderTaxRates } from '@/lib/tax/writable-tax-rate'
+import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
@@ -661,47 +662,6 @@ export function reconcileStagedAndFallbackReturnRows(
     added.push({ ...row, qty: take })
   }
   return { rows: [...stagedRows, ...added], split: splitOf(added) }
-}
-
-async function getExistingCreditNoteNumberMax(
-  tx: Prisma.TransactionClient,
-  prefix: string,
-): Promise<number> {
-  const parseSuffix = (value: string | null): number => {
-    if (!value?.startsWith(prefix)) return 0
-    const suffix = value.slice(prefix.length)
-    return /^\d+$/.test(suffix) ? Number.parseInt(suffix, 10) : 0
-  }
-  const rows = await tx.salesOrderRefund.findMany({
-    where: { creditNoteNumber: { startsWith: prefix } },
-    select: { creditNoteNumber: true },
-  })
-  return rows.reduce((max, row) => Math.max(max, parseSuffix(row.creditNoteNumber)), 0)
-}
-
-async function nextCreditNoteNumber(
-  tx: Prisma.TransactionClient,
-  params: { prefix: string; date?: Date },
-): Promise<string> {
-  const date = params.date ?? new Date()
-  const year = date.getFullYear()
-  const counterKey = `document_counter:credit_note:${year}`
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${counterKey}))`
-  const row = await tx.setting.findUnique({
-    where: { key: counterKey },
-    select: { value: true },
-  })
-  const prefix = `${params.prefix}${year}-`
-  const current = row?.value
-    ? Number.parseInt(row.value, 10)
-    : await getExistingCreditNoteNumberMax(tx, prefix)
-  const next = Number.isFinite(current) && current >= 0 ? current + 1 : 1
-  await tx.setting.upsert({
-    where: { key: counterKey },
-    create: { key: counterKey, value: String(next) },
-    update: { value: String(next) },
-  })
-  return `${params.prefix}${year}-${String(next).padStart(5, '0')}`
 }
 
 /**
@@ -3937,6 +3897,30 @@ function stagedAReversal(syncs: RefundAccountingSyncRequest[]): boolean {
   return syncs.some((sync) => sync.type === 'COGS_REVERSAL' || sync.type === 'UNEARNED_REV_REVERSAL')
 }
 
+/**
+ * An operator-typed refund needs a booked sale. A DRAFT never has one. A PENDING_PAYMENT order is refused only while it carries no recorded payment, receipt (`paidAt`) or invoice:
+ * `addPayment` never moves an order's status, so a confirmed order can hold real money while still PENDING_PAYMENT, and that money must stay refundable (cancelling it would be terminal and unrefundable).
+ */
+export function manualRefundStatusRefusal(
+  status: string,
+  booked: { hasPayment: boolean; hasInvoice?: boolean; paidAt?: Date | null } = { hasPayment: false },
+): string | null {
+  if (status === 'DRAFT') return 'A draft order has not been booked, so it cannot be refunded. Delete the draft instead.'
+  if (status === 'PENDING_PAYMENT' && !booked.hasPayment && !booked.hasInvoice && !booked.paidAt) {
+    return 'This order is still waiting for payment and has no recorded payment or receipt, so there is nothing to refund. Delete the order if it was created in error; if a payment has been received, record it first.'
+  }
+  return null
+}
+
+/** The first refund line whose order-line id is not one of the order's own lines, or null. */
+export function refundLinesNotOnOrder<T extends { lineId?: string | null; description?: string | null }>(
+  refundLines: ReadonlyArray<T>,
+  orderLines: ReadonlyArray<{ id: string }>,
+): T | null {
+  const ids = new Set(orderLines.map((l) => l.id))
+  return refundLines.find((l) => l.lineId != null && !ids.has(l.lineId)) ?? null
+}
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
@@ -4100,6 +4084,8 @@ export async function createSalesOrderRefund(
         externalOrderNumber: true,
         orderNumber: true,
         status: true,
+        paidAt: true,
+        invoiceNumber: true,
         refundStatus: true,
         fxRateToBase: true,
         totalBase: true,
@@ -4149,6 +4135,16 @@ export async function createSalesOrderRefund(
       },
     })
     if (!so) return { error: 'Order not found' } as const
+
+    // Every refund line that names an order line must name one of THIS order's lines: a foreign id would be stored as-is and pollute per-line refunded quantities. Pure tightening for every caller.
+    const foreignLine = refundLinesNotOnOrder(refundLines, so.lines)
+    if (foreignLine) return { error: `Refund line "${foreignLine.description ?? foreignLine.lineId}" names an order line that does not belong to this order.` } as const
+    // An operator-typed (manual) refund needs a booked sale: a draft or an order still waiting for payment has nothing to return and no invoice to credit. Internal callers (storefront, chargeback) are unchanged.
+    if (input.deriveSaleLineNetsFromStoredBalance) {
+      const paymentRows = await tx.payment.count({ where: { orderId: input.orderId, refundId: null } })
+      const stateRefusal = manualRefundStatusRefusal(so.status, { hasPayment: paymentRows > 0, hasInvoice: !!so.invoiceNumber, paidAt: so.paidAt })
+      if (stateRefusal) return { error: stateRefusal } as const
+    }
 
     // o3d-q0x56.8 - THE ORDER'S BOOKED RATE, OR A REFUSAL. Never 1 for a missing one: a foreign order with no usable
     // stored rate would have had every refund line converted one-for-one. A credit note reverses what was booked, so
@@ -4229,7 +4225,7 @@ export async function createSalesOrderRefund(
           // check cannot tell two lines of one product apart, so a line is never refunded above its own units.
           const remainingQty = qty - (takenQty.get(id) ?? 0)
           if (refundLine.qty > remainingQty + 1e-9) {
-            return { error: `Refund qty ${refundLine.qty} for "${orderLine.description}" exceeds the ${Math.max(0, remainingQty)} still refundable on that line.` } as const
+            return { error: `Refund qty ${refundLine.qty} for "${orderLine.description}" exceeds the ${Math.max(0, remainingQty)} still refundable on that line.`, quarantine: true as const } as const
           }
           const foreign = refundableNet({
             line: { qty, net: refundBoundaryNumber(orderLine.totalForeign) },
@@ -4760,7 +4756,7 @@ export async function createSalesOrderRefund(
     // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
     // is pounds of headroom) so N partial refunds can't creep over.
     if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, netOrderTotal)) {
-      return { error: 'Refund total would exceed order total' } as const
+      return { error: 'Refund total would exceed order total', quarantine: true as const } as const
     }
 
     const existingRefundLines = await tx.salesOrderRefundLine.findMany({
@@ -4777,7 +4773,7 @@ export async function createSalesOrderRefund(
       const priorNetForeign = existingRefundLines.reduce((sum, line) => sum + refundBoundaryNumber(line.totalForeign), 0)
       const newNetForeign = refundLines.reduce((sum, line) => sum + storedForeign(line), 0)
       if (priorNetForeign + newNetForeign > netPaidForeign + 0.005) {
-        return { error: 'Refund total would exceed what the order was paid in its own currency.' } as const
+        return { error: 'Refund total would exceed what the order was paid in its own currency.', quarantine: true as const } as const
       }
       // Earlier refunds are valued line by line at the rate each was posted at. A line whose rate cannot be established is valued conservatively:
       // a positive credit at the HIGHER of the blended rate and the order's highest line rate, a reversal (negative) at no VAT at all.
@@ -4796,7 +4792,7 @@ export async function createSalesOrderRefund(
       }, 0)
       const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null, storedForeign(line))), 0)
       if (priorGrossForeign + newGrossForeign > paidForeign + 0.005) {
-        return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}` } as const
+        return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}`, quarantine: true as const } as const
       }
     }
 
@@ -4872,7 +4868,7 @@ export async function createSalesOrderRefund(
       const alreadyRefunded = refundedQtyByProduct.get(refundLine.productId) ?? 0
       const remainingRefundable = originalQty - alreadyRefunded
       if (refundLine.qty > remainingRefundable + 0.001) {
-        return { error: `Refund qty ${refundLine.qty} for product ${refundLine.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}` } as const
+        return { error: `Refund qty ${refundLine.qty} for product ${refundLine.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}`, quarantine: true as const } as const
       }
     }
 
@@ -5202,8 +5198,9 @@ export async function createSalesOrderRefund(
       0,
     ))
     const headerTotalBase = round4Sum(refundLines.reduce((sum, line) => sum + round4Sum(line.totalBase), 0))
-    const creditNoteNumber = await nextCreditNoteNumber(tx, {
-      prefix: input.creditNotePrefix,
+    // The credit note pattern (Settings → Company → Numbering) decides the number; the prefix passed in is only what the default pattern starts with. The value minted here is stored on the refund and is the one the accounting payload carries.
+    const creditNoteNumber = await mintRequiredDocumentNumber(tx, 'credit_note', {
+      fallbackPrefix: input.creditNotePrefix,
     })
 
     // o3d-n8p: the WRITER stamps what the stored totals mean and where the refund came from — derived from

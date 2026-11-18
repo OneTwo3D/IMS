@@ -112,7 +112,8 @@ test('variation: only the variation own marker clears; parent-only marker and pr
 
 test('variation: a parent clear clears the variations that held the value by inheritance, never one with its own value', () => {
   const none = { hsCode: null, countryOfOrigin: null, customsDescription: null }
-  const own = { cleared: [] as never[], rejected: [] }
+  // the variation's own native key is present and empty (WooCommerce shows the parent's cleared value on an inheriting variation)
+  const own = { cleared: [] as never[], rejected: [], nativeEmpty: ['hsCode' as const, 'countryOfOrigin' as const] }
   const parentCleared = { cleared: ['hsCode' as const], rejected: [] }
   // held by inheritance on the previous import: cleared
   assert.deepEqual(productSync.resolveVariationCleared(own, parentCleared, none, ['hsCode']), ['hsCode'])
@@ -120,12 +121,25 @@ test('variation: a parent clear clears the variations that held the value by inh
   assert.deepEqual(productSync.resolveVariationCleared(own, parentCleared, none, ['countryOfOrigin']), [])
   // never recorded as inherited (it had its own value, or the record predates the flag): kept
   assert.deepEqual(productSync.resolveVariationCleared(own, parentCleared, none, []), [])
+  // the variation's native key is ABSENT from the payload (or not reported empty): a parent clear proves nothing for it
+  assert.deepEqual(productSync.resolveVariationCleared({ cleared: [], rejected: [] }, parentCleared, none, ['hsCode']), [])
+  assert.deepEqual(productSync.resolveVariationCleared({ cleared: [], rejected: [], nativeEmpty: [] }, parentCleared, none, ['hsCode']), [])
   // the parent is not cleared: nothing, however it was held
   assert.deepEqual(productSync.resolveVariationCleared(own, { cleared: [], rejected: [] }, none, ['hsCode']), [])
   // the variation still shows a value (its own after all): kept
   assert.deepEqual(productSync.resolveVariationCleared(own, parentCleared, { ...none, hsCode: '90211000' }, ['hsCode']), [])
   // a present-but-unusable parent value blocks the clear
   assert.deepEqual(productSync.resolveVariationCleared(own, { cleared: ['hsCode'], rejected: [{ field: 'hsCode', value: '85' }] }, none, ['hsCode']), [])
+})
+
+test('inheritance history: a recorded list stands; an empty one falls back to equality with the parent IMS value before the import', () => {
+  const none = { hsCode: null, countryOfOrigin: null, customsDescription: null }
+  const parent = { hsCode: '90211000', countryOfOrigin: 'CN', customsDescription: 'Part' }
+  assert.deepEqual(productSync.resolveInheritedHistory(['hsCode'], { ...none, countryOfOrigin: 'CN' }, parent), ['hsCode'])
+  assert.deepEqual(productSync.resolveInheritedHistory([], { hsCode: '90211000', countryOfOrigin: 'GB', customsDescription: null }, parent), ['hsCode'])
+  assert.deepEqual(productSync.resolveInheritedHistory([], none, parent), [], 'an empty variation value is not inherited')
+  assert.deepEqual(productSync.resolveInheritedHistory([], parent, none), [], 'a parent with nothing before the import: nothing was inherited')
+  assert.deepEqual(productSync.resolveInheritedHistory([], parent, null), [], 'a parent created by this import: nothing was inherited')
 })
 
 test('variation inheritance is recorded per field at import', () => {

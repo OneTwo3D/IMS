@@ -16,7 +16,7 @@ import { invoicedPeriodDate, isInvoicedOrder } from '@/lib/domain/sales/invoiced
  *   3. a Xeroom-era order (number, no invoicedAt) is placed in a period by its order date.
  */
 
-mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) } })
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) } })
 
 const D = (v: string | number) => new Prisma.Decimal(v)
 type Row = Record<string, unknown>

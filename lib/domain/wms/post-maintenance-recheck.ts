@@ -3,6 +3,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { MAINTENANCE_ENABLED_KEY, WMS_BOOKED_IN_RECHECK_DUE_KEY } from '@/lib/maintenance-mode'
+import { shouldEmitWarning } from '@/lib/domain/wms/warning-throttle'
 import { clearPostMaintenanceRecheckMarker } from '@/lib/domain/system/maintenance-recovery'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
 
@@ -54,8 +55,10 @@ export type PostMaintenanceRecheckResult = {
   skipped: boolean
   /** Open ASNs the pass attempted. */
   attempted: number
-  /** Attempts that threw; the marker is kept so they are retried. */
+  /** Attempts that threw or whose callback reported failures; the marker is kept so they are retried. */
   failed: number
+  /** Open ASNs whose outstanding event has a retry that is not due yet (kept for a later tick). */
+  deferred?: number
   /** True when the marker was cleared (every open ASN was attempted this tick). */
   drained: boolean
   windowEndedAt?: string
@@ -96,8 +99,29 @@ async function isMaintenanceModeOn(): Promise<boolean> {
   return row?.value === 'true'
 }
 
+const RECHECK_CURSOR_KEY = 'wms_booked_in_recheck_cursor'
+
+type RecheckCursor = { after: string | null; owed: boolean }
+
+async function readCursor(windowEndedAt: string): Promise<RecheckCursor> {
+  const row = await db.setting.findUnique({ where: { key: RECHECK_CURSOR_KEY } })
+  if (!row?.value) return { after: null, owed: false }
+  try {
+    const parsed = JSON.parse(row.value) as { w?: string; after?: string | null; owed?: boolean }
+    if (parsed.w !== windowEndedAt) return { after: null, owed: false }
+    return { after: typeof parsed.after === 'string' ? parsed.after : null, owed: parsed.owed === true }
+  } catch {
+    return { after: null, owed: false }
+  }
+}
+
+async function writeCursor(windowEndedAt: string, cursor: RecheckCursor): Promise<void> {
+  const value = JSON.stringify({ w: windowEndedAt, after: cursor.after, owed: cursor.owed })
+  await db.setting.upsert({ where: { key: RECHECK_CURSOR_KEY }, create: { key: RECHECK_CURSOR_KEY, value }, update: { value } })
+}
+
 export type PostMaintenanceRecheckDeps = {
-  recheckAsn: (externalAsnId: string, options: { reason: string }) => Promise<unknown>
+  recheckAsn: (externalAsnId: string, options: { reason: string; respectRetryDelay?: boolean }) => Promise<unknown>
 }
 
 export async function runPostMaintenanceBookedInRecheck(
@@ -119,15 +143,18 @@ export async function runPostMaintenanceBookedInRecheck(
   // Open ASNs only, and NOT the ones that were never verifiably created in the WMS — a synthetic
   // external id has nothing to re-read, so a re-check would fetch a shipment that does not exist.
   // Same exclusion, and the same reason, as the watchdog's overdue query.
+  // A KEYSET CURSOR, persisted across ticks. Always taking the first page would starve every ASN beyond it for as
+  // long as the first page keeps failing or waiting (an expired key does exactly that): the pass never got past them.
+  // The cursor is tied to the window it was written for, so a new window starts from the beginning.
+  const cursor = await readCursor(windowEndedAt)
   const openAsns = await db.wmsAsnMap.findMany({
     where: {
       connector: connectorId,
       closedAt: null,
       status: { notIn: ['CREATE_PENDING', 'CREATE_IN_FLIGHT'] },
+      ...(cursor.after ? { externalAsnId: { gt: cursor.after } } : {}),
     },
-    // Oldest first: if the page truncates, the ASNs that have been waiting longest go first rather
-    // than whichever the planner happened to return.
-    orderBy: { createdAt: 'asc' },
+    orderBy: { externalAsnId: 'asc' },
     take: pageSize + 1,
     select: { externalAsnId: true },
   })
@@ -136,6 +163,7 @@ export async function runPostMaintenanceBookedInRecheck(
   const candidates = truncated ? openAsns.slice(0, pageSize) : openAsns
 
   let failed = 0
+  let deferred = 0
   let attempted = 0
   let reopened = false
   for (const asn of candidates) {
@@ -151,9 +179,22 @@ export async function runPostMaintenanceBookedInRecheck(
     }
     attempted += 1
     try {
-      await deps.recheckAsn(asn.externalAsnId, {
+      const outcome = await deps.recheckAsn(asn.externalAsnId, {
         reason: `automatic re-check after maintenance window ended ${windowEndedAt}`,
+        // An outstanding event keeps its own retry schedule; this pass does not pull it forward.
+        respectRetryDelay: true,
       })
+      // A callback that RESOLVES can still report that it did not do the work: the booked-in processor
+      // catches its own failures (an expired key in no-login mode, a WMS error) and returns a `failed`
+      // counter. That is an attempt that did not recover the ASN, so it keeps the marker exactly as a throw does.
+      const reported = outcome as { failed?: unknown; deferred?: unknown } | null | undefined
+      // An event that is not due yet is still owed: keep the marker without retrying it early.
+      if (typeof reported?.deferred === 'number' && reported.deferred > 0) deferred += 1
+      const reportedFailures = reported?.failed
+      if (typeof reportedFailures === 'number' && reportedFailures > 0) {
+        failed += 1
+        console.error(`[wms-post-maintenance-recheck] re-check reported ${reportedFailures} failure(s) for ${asn.externalAsnId}`)
+      }
     } catch (error) {
       failed += 1
       console.error(`[wms-post-maintenance-recheck] re-check failed for ${asn.externalAsnId}:`, error)
@@ -163,7 +204,17 @@ export async function runPostMaintenanceBookedInRecheck(
   // Keep the marker when anything is still owed — a truncated page, an attempt that threw, or a
   // window that reopened. The next tick repeats the pass; a re-check of an ASN with nothing
   // outstanding books nothing in, so repeating is cheap and losing an ASN is not.
-  const complete = !truncated && failed === 0 && !reopened
+  const owedThisPass = cursor.owed || failed > 0 || deferred > 0
+  // Drain only when a FULL pass (every page, from the start) found nothing outstanding.
+  const complete = !truncated && !owedThisPass && !reopened
+  if (!reopened) {
+    if (truncated) {
+      await writeCursor(windowEndedAt, { after: candidates[candidates.length - 1]!.externalAsnId, owed: owedThisPass })
+    } else if (owedThisPass) {
+      // End of the list with work still owed: the next tick starts a fresh pass from the beginning.
+      await writeCursor(windowEndedAt, { after: null, owed: false })
+    }
+  }
   let drained = false
   let refusal: PostMaintenanceRecheckResult['refusal'] = reopened ? 'window_reopened' : undefined
   if (complete) {
@@ -184,7 +235,11 @@ export async function runPostMaintenanceBookedInRecheck(
     }
   }
 
-  if (attempted > 0 || reopened) {
+  // A pass that keeps its marker repeats every tick; one warning an hour per window is enough to be seen
+  // without writing a row every five minutes for as long as the key stays expired.
+  const stillOwed = failed > 0 || deferred > 0 || truncated || reopened || !!refusal
+  const noisy = stillOwed && !shouldEmitWarning(`wms-post-maintenance-recheck:${connectorId}:${windowEndedAt}`)
+  if ((attempted > 0 || reopened) && !noisy) {
     await logActivity({
       entityType: 'SYNC',
       tag: 'sync',
@@ -193,15 +248,16 @@ export async function runPostMaintenanceBookedInRecheck(
       description:
         `Re-checked ${attempted} open ASN(s) after a maintenance window ended ${windowEndedAt}`
         + (failed > 0 ? ` — ${failed} could not be re-checked and will be retried` : '')
+        + (deferred > 0 ? ` — ${deferred} have a retry that is not due yet and will be re-checked when it is` : '')
         + (reopened ? ' — a maintenance window opened mid-pass, so the rest were left for the next tick' : '')
         + (refusal === 'recheck_marker_moved' ? ' — the marker moved during the pass and was left alone' : '')
         + (truncated ? ' — more remain and will be re-checked next tick' : ''),
-      metadata: { connector: connectorId, windowEndedAt, attempted, failed, truncated, refusal: refusal ?? null },
+      metadata: { connector: connectorId, windowEndedAt, attempted, failed, deferred, truncated, refusal: refusal ?? null },
       resolveUser: false,
     })
   }
 
-  return { skipped: false, attempted, failed, drained, windowEndedAt, ...(refusal ? { refusal } : {}) }
+  return { skipped: false, attempted, failed, ...(deferred > 0 ? { deferred } : {}), drained, windowEndedAt, ...(refusal ? { refusal } : {}) }
 }
 
 /**

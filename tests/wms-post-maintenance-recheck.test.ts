@@ -17,6 +17,8 @@ import test, { mock } from 'node:test'
 // every open ASN of BOTH source types.
 // ---------------------------------------------------------------------------------------------
 
+import { resetWarningThrottleForTests } from '../lib/domain/wms/warning-throttle.ts'
+
 type AsnRow = {
   externalAsnId: string
   connector: string
@@ -46,6 +48,7 @@ function matchesAsnWhere(row: AsnRow, where: {
   closedAt: null
   status: { notIn: string[] }
   sourceType?: string
+  externalAsnId?: { gt: string }
 }): boolean {
   if (row.connector !== where.connector) return false
   if (where.closedAt === null && row.closedAt !== null) return false
@@ -53,6 +56,7 @@ function matchesAsnWhere(row: AsnRow, where: {
   // Applied so a query that narrows to one ASN kind is VISIBLE here. Silently ignoring an
   // unexpected clause is how a double stops being able to observe the thing under test.
   if (where.sourceType !== undefined && row.sourceType !== where.sourceType) return false
+  if (where.externalAsnId && !(row.externalAsnId > where.externalAsnId.gt)) return false
   return true
 }
 
@@ -98,13 +102,13 @@ const db = {
   }),
   wmsAsnMap: {
     findMany: async (args: {
-      where: { connector: string; closedAt: null; status: { notIn: string[] }; sourceType?: string }
-      orderBy: { createdAt: 'asc' }
+      where: { connector: string; closedAt: null; status: { notIn: string[] }; sourceType?: string; externalAsnId?: { gt: string } }
+      orderBy: { externalAsnId: 'asc' }
       take: number
     }) => {
       const rows = state.asns
         .filter((row) => matchesAsnWhere(row, args.where))
-        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .sort((a, b) => (a.externalAsnId < b.externalAsnId ? -1 : a.externalAsnId > b.externalAsnId ? 1 : 0))
         .slice(0, args.take)
       return rows.map((row) => ({ externalAsnId: row.externalAsnId }))
     },
@@ -148,6 +152,7 @@ function asn(overrides: Partial<AsnRow> & { externalAsnId: string }): AsnRow {
 }
 
 function reset() {
+  resetWarningThrottleForTests()
   state.settings.clear()
   state.asns = []
   state.logs = []
@@ -262,13 +267,15 @@ test('o3d-hl8l r4: a page-truncated pass keeps the stamp rather than dropping th
   assert.equal(result.attempted, 1)
   assert.deepEqual(state.deletedKeys, [], 'the ASNs beyond the page have not been re-checked yet')
   assert.equal(result.drained, false, 'a truncated page has not finished the pass')
-  assert.deepEqual(
-    state.rechecked.map((r) => r.externalAsnId),
-    ['ASN-OLD'],
-    'oldest first: a truncated page must take the ASNs that have been waiting longest',
-  )
+  // Keyset order (by ASN id), not age: a cursor needs a stable key. The guarantee that matters is coverage.
+  assert.deepEqual(state.rechecked.map((r) => r.externalAsnId), ['ASN-NEW'])
   const entry = state.logs.find((log) => log.action === 'wms_post_maintenance_recheck')
   assert.match(entry?.description ?? '', /more remain and will be re-checked next tick/)
+
+  // The next tick continues from the cursor and reaches the remainder; the marker drains only after that.
+  const second = await runPostMaintenanceBookedInRecheck('mintsoft', deps, { pageSize: 1 })
+  assert.deepEqual(state.rechecked.map((r) => r.externalAsnId), ['ASN-NEW', 'ASN-OLD'])
+  assert.equal(second.drained, true)
 })
 
 test('o3d-hl8l r4: the page size is bounded so a backlog cannot stall the five-minute sweeper', async () => {
@@ -401,4 +408,85 @@ test('o3d-hl8l r6: with no restore anywhere near it, the pass still drains exact
   assert.equal(result.refusal, undefined)
   assert.equal(result.attempted, 2)
   assert.equal(state.settings.has(WMS_BOOKED_IN_RECHECK_DUE_KEY), false)
+})
+
+test('a re-check that RESOLVES with a failed count keeps the marker (an expired key in no-login mode never throws)', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-REFUSED' })]
+  const resolvingDeps = {
+    // The real callback catches its own processing failure and returns counters.
+    recheckAsn: async () => ({ processed: 0, duplicates: 0, pending: 0, requiresReview: 0, failed: 1, created: true }),
+  }
+
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', resolvingDeps)
+
+  assert.equal(result.failed, 1)
+  assert.equal(result.drained, false)
+  assert.deepEqual(state.deletedKeys, [])
+  assert.equal(state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY), '2026-07-20T10:00:00.000Z')
+})
+
+test('a re-check that resolves with failed 0 still drains the marker', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-OK' })]
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', {
+    recheckAsn: async () => ({ processed: 1, failed: 0 }),
+  })
+  assert.equal(result.failed, 0)
+  assert.equal(result.drained, true)
+})
+
+test('a not-due outstanding event keeps the marker, is not retried early, and does not warn on every tick', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-WAITING' })]
+  const seen: Array<{ respectRetryDelay?: boolean }> = []
+  const waiting = {
+    recheckAsn: async (_id: string, options: { reason: string; respectRetryDelay?: boolean }) => {
+      seen.push(options)
+      return { processed: 0, failed: 0, deferred: 1 }
+    },
+  }
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const first = await runPostMaintenanceBookedInRecheck('mintsoft', waiting)
+  const second = await runPostMaintenanceBookedInRecheck('mintsoft', waiting)
+  assert.equal(seen[0]?.respectRetryDelay, true, 'the automatic pass asks the callback to honour nextRetryAt')
+  assert.equal(first.drained, false)
+  assert.equal(first.deferred, 1)
+  assert.equal(second.drained, false)
+  assert.equal(state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY), '2026-07-20T10:00:00.000Z')
+  assert.equal(state.logs.filter((l) => l.action === 'wms_post_maintenance_recheck').length, 1, 'one warning per hour, not one per tick')
+})
+
+test('ASNs beyond the first page are reached across ticks even while the first page keeps failing, and the marker drains only after a full clean pass', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = ['A1', 'A2', 'A3', 'A4', 'A5'].map((id) => asn({ externalAsnId: id }))
+  const failing = new Set(['A1', 'A2'])
+  const reached: string[] = []
+  const flaky = {
+    recheckAsn: async (id: string) => {
+      reached.push(id)
+      return { failed: failing.has(id) ? 1 : 0 }
+    },
+  }
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+
+  // Page size 2: tick 1 = A1,A2 (fail), tick 2 = A3,A4, tick 3 = A5 (end, owed -> restart), tick 4 = A1,A2 ...
+  await runPostMaintenanceBookedInRecheck('mintsoft', flaky, { pageSize: 2 })
+  await runPostMaintenanceBookedInRecheck('mintsoft', flaky, { pageSize: 2 })
+  const third = await runPostMaintenanceBookedInRecheck('mintsoft', flaky, { pageSize: 2 })
+  assert.deepEqual(reached, ['A1', 'A2', 'A3', 'A4', 'A5'], 'the pages after the failing one are reached, not starved')
+  assert.equal(third.drained, false, 'an earlier page owed work, so a full clean pass is still required')
+  assert.ok(state.settings.has(WMS_BOOKED_IN_RECHECK_DUE_KEY))
+
+  failing.clear()
+  const results = []
+  for (let i = 0; i < 3; i += 1) results.push(await runPostMaintenanceBookedInRecheck('mintsoft', flaky, { pageSize: 2 }))
+  assert.equal(results[results.length - 1]!.drained, true, 'drains once a whole pass finds nothing outstanding')
+  assert.equal(results.slice(0, -1).some((r) => r.drained), false)
 })
