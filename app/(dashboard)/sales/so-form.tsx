@@ -36,7 +36,7 @@ type Props = {
   taxRates: TaxRateRow[]
   customers: CustomerRow[]
   stockLevels: Record<string, Record<string, StockLevelEntry>>
-  avgCogs: Record<string, number>
+  avgCogs: Record<string, number> | null
   users: UserOption[]
   currentUserName: string
   companyHomeCountry?: string | null
@@ -557,7 +557,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   // fees + total VAT. Earlier code double-counted shipping/fees VAT by
   // adding it both via totalVat and separately.
   const grandTotal = lineSubtotal + shippingNet + feesNet + totalVat
-  const totalCogs = lines.reduce((s, l) => s + l.qty * (avgCogs[l.productId] ?? 0), 0)
+  const totalCogs = lines.reduce((s, l) => s + l.qty * (avgCogs?.[l.productId] ?? 0), 0)
   const totalLineDiscounts = lines.reduce((s, l) => s + parseDiscount(l.discount, l.qty * l.unitPrice), 0)
   const totalAllDiscounts = totalLineDiscounts + orderDiscountAmount
 
@@ -779,7 +779,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     <TableHead className="text-xs text-center w-24">Discount</TableHead>
                     <TableHead className="text-xs text-center w-32">VAT</TableHead>
                     <TableHead className="text-xs text-right w-24">Total ({sym})</TableHead>
-                    <TableHead className="text-xs text-right w-20">COGS ({baseCurrency.code})</TableHead>
+                    {avgCogs !== null && <TableHead className="text-xs text-right w-20">COGS ({baseCurrency.code})</TableHead>}
                     <TableHead className="w-8" />
                   </TableRow>
                 </TableHeader>
@@ -789,7 +789,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     const grossTotal = line.qty * line.unitPrice
                     const discAmount = parseDiscount(line.discount, grossTotal)
                     const lineTotal = grossTotal - discAmount
-                    const cogs = (avgCogs[line.productId] ?? 0) * line.qty
+                    const cogs = (avgCogs?.[line.productId] ?? 0) * line.qty
                     return (
                       <TableRow key={line.key}>
                         <TableCell>
@@ -839,7 +839,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                           </div>
                         </TableCell>
                         <TableCell className="text-right font-mono text-xs">{money(lineTotal)}</TableCell>
-                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</TableCell>
+                        {avgCogs !== null && <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</TableCell>}
                         <TableCell>
                           <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
                             <X className="h-4 w-4" />
@@ -997,6 +997,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                       {currency !== baseCurrency.code && <span className="text-muted-foreground font-normal ml-2">({fxRate === null ? '—' : formatMoney(grandTotal / fxRate, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>}
                     </span>
                   </div>
+                  {avgCogs !== null && (
+                    <>
                   <div className="flex justify-between text-muted-foreground border-t pt-1">
                     <span>Est. COGS</span>
                     <span className="font-mono">{formatMoney(totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
@@ -1005,6 +1007,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     <span>Est. Margin</span>
                     <span className="font-mono">{fxRate === null ? '—' : formatMoney((lineSubtotal / fxRate) - totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
                   </div>
+                    </>
+                  )}
                 </div>
               </div>
             </div>

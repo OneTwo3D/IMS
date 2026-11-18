@@ -38,6 +38,8 @@ Four headline figures appear at the top of the dashboard:
 
 Each card shows the current period value, the comparison period value, and the percentage change between them.
 
+COGS, profit, margin, the Cash Bridge, the COGS and Margin % charts, the margin beside each Best Seller and the Inventory Value tile are shown to Admin, Manager and Finance users only. Other roles see the rest of the dashboard without them.
+
 ### Figures marked with a symbol
 
 Net sales is built from amounts that exclude VAT, so only a return that was also recorded excluding
