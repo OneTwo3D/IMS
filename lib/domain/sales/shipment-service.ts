@@ -1,5 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { mintDocumentNumber } from '@/lib/domain/numbering/mint'
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 import type { db } from '@/lib/db'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
@@ -679,6 +680,9 @@ export async function confirmSalesOrderShipments(
       })
     }
 
+    // The shipments (and their lines) just changed: the warehouse's part of the order must be re-derived.
+    await markWmsScopeDirtyInTx(tx, orderId)
+
     // A FLOOR, not a move — see ORDER_STATUSES_AT_OR_BEYOND_ALLOCATED. An order already at or past
     // ALLOCATED keeps the status it has, so the residual shipments an order held short at PICKING or
     // PACKING needs can actually be created; only an order BEHIND the floor is raised to it.
@@ -824,6 +828,7 @@ export async function discardCancelledOrderShipmentsInTx(
     },
   })
   await tx.shipment.deleteMany({ where: { id: { in: discarded.map((row) => row.id) } } })
+  await markWmsScopeDirtyInTx(tx, orderId)
   return { discarded }
 }
 
@@ -995,6 +1000,7 @@ export async function reopenShipmentForRepack(
     }
 
     const previousStatus = String(shipment.status)
+    await markWmsScopeDirtyInTx(tx, shipment.orderId)
     await tx.shipment.update({
       where: { id: shipmentId },
       // Status ONLY. trackingNumber and shippingService are deliberately untouched — see the note
@@ -1308,6 +1314,7 @@ export async function transitionShipmentStatus(
 
       const lockedProductIds = [...new Set(lockedShipment.lines.map((line) => line.productId))]
 
+      await markWmsScopeDirtyInTx(tx, lockedShipment.orderId)
       await tx.shipment.update({ where: { id: shipmentId }, data })
       const updatedShipment = await loadShipmentTransitionContext(tx, shipmentId)
       if (!updatedShipment) throw new Error('Shipment not found')
@@ -1496,6 +1503,7 @@ export async function transitionShipmentStatus(
     if (locked.status === targetStatus) return false
     const lockedTransition = validateShipmentStatusTransition(locked.status, targetStatus)
     if (!lockedTransition.success) throw new Error(lockedTransition.error)
+    await markWmsScopeDirtyInTx(tx, locked.orderId)
     await tx.shipment.update({ where: { id: shipmentId }, data })
 
     // Verified AFTER the update on purpose: the check reads the non-PENDING set from the

@@ -298,6 +298,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         }
       }),
     },
+    wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
     orderAllocation: {
       // `lineId: { in: [...] }` is a real predicate the scoped integrity/coverage checks pass;
       // ignoring it would hand them the whole order's rows and let a check that should have been
