@@ -170,6 +170,7 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
         { label: 'GL variance', value: report.totals.glVarianceBase == null ? 'Not captured' : money(report.totals.glVarianceBase) },
         { label: `Revenue (${currency}, net of credit)`, value: markMoney(report.totals.revenueBase, report.totals.revenueBaseBound) },
         { label: `Gross margin (${currency})`, value: markMoney(report.totals.grossMarginBase, report.totals.grossMarginBaseBound) },
+        { label: `COGS of matched rows (${currency}) \u2014 what Gross margin is taken against`, value: money(report.totals.cogsBaseWithRevenue) },
         { label: 'Revenue matched rows', value: `${report.totals.revenueCapturedRows}/${report.pageInfo.totalRows}` },
         // Credit that reached no row, ON ITS BASIS — three amounts per case, for the reason the
         // per-row columns are three. A zero across all six is the claim that every credit reached a

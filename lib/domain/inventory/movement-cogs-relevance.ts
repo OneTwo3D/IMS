@@ -313,11 +313,11 @@ export type TransferStatusCostConsumption = {
  * type error, so a new transfer state cannot silently fall out of (or into) the
  * revaluation exclusion.
  *
- * Do NOT derive this from STOCK_TRANSFER_TRANSITIONS. That map models the plain
- * cancel path only and states IN_TRANSIT -> RECEIVED as the sole transition out of
- * IN_TRANSIT, yet cancelDispatchedTransfer (app/actions/transfers.ts) deliberately
- * performs IN_TRANSIT -> CANCELLED outside the machine. Trusting the map is exactly
- * how the CANCELLED case was missed.
+ * Do NOT derive this from STOCK_TRANSFER_TRANSITIONS. Reachability says nothing about
+ * whether the dispatch-time consumption is still outstanding: IN_TRANSIT -> CANCELLED
+ * (cancelDispatchedTransfer) leaves it outstanding, while DRAFT -> CANCELLED never
+ * consumed anything. An earlier version trusted a map that omitted the former edge and
+ * so missed the CANCELLED case.
  */
 export const STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION: Record<StockTransferStatus, TransferStatusCostConsumption> = {
   DRAFT: {

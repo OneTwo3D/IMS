@@ -282,19 +282,11 @@ test('no status-level export may claim IN_TRANSIT has no destination layer (Code
 })
 
 test('the transfer-status list is NOT derived from the transfer state machine (6oyu.19)', () => {
-  // Why this test exists: STOCK_TRANSFER_TRANSITIONS models the plain cancel path
-  // only and states IN_TRANSIT -> RECEIVED as the sole exit from IN_TRANSIT.
-  // cancelDispatchedTransfer deliberately performs IN_TRANSIT -> CANCELLED outside
-  // the machine. The first fix for 6oyu.19 trusted the map and hard-coded
-  // ('IN_TRANSIT', 'RECEIVED'), which is precisely how the cancelled-dispatch case
-  // stayed broken. Assert the divergence so that "just derive it from the state
-  // machine" is never a tidy-up someone makes.
-  assert.deepEqual(STOCK_TRANSFER_TRANSITIONS.IN_TRANSIT, ['RECEIVED'])
-  const reachableFromInTransit = new Set<string>(STOCK_TRANSFER_TRANSITIONS.IN_TRANSIT)
-  assert.ok(
-    !reachableFromInTransit.has('CANCELLED'),
-    'if the machine ever models IN_TRANSIT -> CANCELLED, re-read this test before deriving the list from it',
-  )
+  // Why this test exists: the state machine now models IN_TRANSIT -> CANCELLED (cancelDispatchedTransfer), but
+  // the first fix for 6oyu.19 trusted the map and hard-coded ('IN_TRANSIT', 'RECEIVED'), which is how the
+  // cancelled-dispatch case stayed broken. The consumption classification is its own total per-status table;
+  // deriving it from the machine's reachability is never a tidy-up.
+  assert.deepEqual([...STOCK_TRANSFER_TRANSITIONS.IN_TRANSIT], ['RECEIVED', 'CANCELLED'])
   assert.ok(
     TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes('CANCELLED'),
     'CANCELLED is only reachable post-dispatch via a path the state machine does not model',
