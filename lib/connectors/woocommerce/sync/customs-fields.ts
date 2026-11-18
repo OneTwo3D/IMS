@@ -133,7 +133,7 @@ function firstUsable(
  */
 export function extractWcCustomsFields(
   source: WcCustomsSource,
-): WcCustomsFields & { rejected: WcRejectedCustomsValue[]; cleared: WcCustomsField[] } {
+): WcCustomsFields & { rejected: WcRejectedCustomsValue[]; cleared: WcCustomsField[]; nativeEmpty: WcCustomsField[] } {
   const rejected: WcRejectedCustomsValue[] = []
   const hsCode = firstUsable(
     'hsCode',
@@ -174,5 +174,13 @@ export function extractWcCustomsFields(
       && !rejected.some((r) => r.field === field)
       && explicitlyCleared(source, field, markedCleared),
   )
-  return { ...resolved, rejected, cleared }
+  // The native key is PRESENT and empty (null / blank), whatever the cleared-fields meta says: on a variation, WooCommerce's view context
+  // carries the parent's native value, so a parent clear reaches the variation as exactly this.
+  const nativeEmpty = (Object.keys(NATIVE_KEYS) as WcCustomsField[]).filter((field) => {
+    const key = NATIVE_KEYS[field]
+    if (!Object.prototype.hasOwnProperty.call(source, key)) return false
+    const value = source[key]
+    return value === null || (typeof value === 'string' && value.trim() === '')
+  })
+  return { ...resolved, rejected, cleared, nativeEmpty }
 }
