@@ -56,7 +56,7 @@ type SendEmailResult = {
 
 
 /** Reason on a send that hit its deadline: the message may or may not have been accepted, so it is never retried automatically. */
-export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending (Email PO).'
+export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending.'
 
 const emailSchema = z.email()
 const RESERVED_EXAMPLE_DOMAIN_PATTERN = /\bexample\.(com|org|net)\b/i

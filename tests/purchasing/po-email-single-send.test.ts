@@ -267,7 +267,7 @@ function makeRow(overrides: Partial<EmailOutboxRow>): EmailOutboxRow {
 
 const T0 = new Date('2026-09-10T10:00:00.000Z')
 
-async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> | null, failFirstSettlement = false) {
+async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> | null, failFirstSettlement = false, logEntity = 'PURCHASE_ORDER') {
   const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
   const { client, rows } = await makeClient([row], failFirstSettlement)
@@ -281,7 +281,7 @@ async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> 
       sendEmail: ((m: Parameters<typeof sendEmailWithSmtpSettings>[1]) => sendEmailWithSmtpSettings(SMTP, m)) as never,
     },
   })
-  return { result, row: rows[0], logs: logs.filter((l) => l.entityType === 'PURCHASE_ORDER') }
+  return { result, row: rows[0], logs: logs.filter((l) => l.entityType === logEntity) }
 }
 
 test('outbox: a PO send rejected exactly at the deadline ends FAILED, is not requeued, and is logged on the PO at WARNING', async () => {
@@ -323,11 +323,28 @@ test('outbox: a guard-level unknown outcome on a PO is also logged on the PO', a
   assert.equal(logs[0].action, 'email_outcome_unknown')
 })
 
-test('outbox: another kind with the same socket failure after DATA is unchanged (requeued, nothing logged on a PO)', async () => {
-  behave = async (o) => { if (o.logger) sendCommand(o, 'DATA'); throw reject('ESOCKET', 'read ECONNRESET') }
-  const { row, logs } = await drainWith(makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1' }), null)
-  assert.equal(row.status, 'PENDING')
+test('outbox: a customer kind with a socket failure after DATA is single-send too: FAILED, not requeued, "may not have been delivered" notice on the order', async () => {
+  sendMailCalls = 0
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('ESOCKET', 'read ECONNRESET') }
+  const row0 = makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1', toEmail: 'supplier@example.test' })
+  const { row, logs } = await drainWith(row0, null, false, 'SALES_ORDER')
+  assert.equal(row.status, 'FAILED')
   assert.equal(row.attempts, 1)
+  assert.match(String(row.lastError ?? ''), /Outcome unknown/)
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].action, 'email_outcome_unknown')
+  assert.equal(logs[0].entityId, 'order-1')
+  assert.equal(logs[0].level, 'WARNING')
+  assert.match((logs[0] as unknown as { description: string }).description, /may not have been delivered/)
+  const again = await drainWith(row, null, false, 'SALES_ORDER')
+  assert.equal(again.result.processed, 0)
+  assert.equal(sendMailCalls, 1, 'no second send, so no duplicate')
+})
+
+test('outbox: a customer kind refused before DATA is still retryable', async () => {
+  behave = async () => { throw reject('ECONNECTION', 'connect ECONNREFUSED 127.0.0.1:587') }
+  const { row, logs } = await drainWith(makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1' }), null, false, 'SALES_ORDER')
+  assert.equal(row.status, 'PENDING')
   assert.equal(logs.length, 0)
 })
 

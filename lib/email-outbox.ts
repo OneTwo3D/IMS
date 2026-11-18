@@ -2414,7 +2414,26 @@ export async function processPendingEmailOutbox(
     email: { id: string; kind: string; referenceType: string | null; referenceId: string | null },
     reason: string,
   ): Promise<void> => {
-    if (email.referenceType !== 'PurchaseOrder' || !email.referenceId) return
+    if (email.referenceType !== 'PurchaseOrder' || !email.referenceId) {
+      // CUSTOMER (non-PO) kinds are single-send too (owner decision: never duplicate a customer email). The operator is told, on the order
+      // when there is one, that the mail MAY NOT HAVE BEEN DELIVERED and was not retried. Best effort, after the settlement.
+      try {
+        const onOrder = email.referenceType === 'SalesOrder' && !!email.referenceId
+        await log({
+          entityType: onOrder ? 'SALES_ORDER' : 'SYSTEM',
+          ...(onOrder ? { entityId: email.referenceId as string } : {}),
+          action: 'email_outcome_unknown',
+          tag: onOrder ? 'sales' : 'system',
+          level: 'WARNING',
+          description: `Email (${email.kind}) may not have been delivered: ${reason} It was not retried, to avoid sending the customer a duplicate. Check with the customer, then re-send it manually if needed.`,
+          metadata: { emailOutboxId: email.id, kind: email.kind },
+          resolveUser: false,
+        })
+      } catch (logError) {
+        console.error('[email-outbox] failed to record an unknown outcome:', logError)
+      }
+      return
+    }
     try {
       await log({
         entityType: 'PURCHASE_ORDER',
@@ -2578,7 +2597,9 @@ export async function processPendingEmailOutbox(
         html: prepared?.html ?? email.html,
         attachments,
         ...(prepared?.sendDeadlineMs ? { deadlineMs: prepared.sendDeadlineMs } : {}),
-        ...(prepared?.singleSend ? { singleSend: true } : {}),
+        // EVERY kind is single-send (owner decision 2026-11-18): a lost final SMTP response ends FAILED with an operator notice rather than
+        // requeueing, so a customer is never sent a duplicate. Possibly-undelivered mail is the accepted trade.
+        singleSend: true,
       }
       let sendResult: Awaited<ReturnType<typeof smtp.send>>
       if (prepared?.sendGuard) {
