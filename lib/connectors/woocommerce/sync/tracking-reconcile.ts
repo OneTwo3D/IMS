@@ -64,19 +64,62 @@ const defaultDeps: WcTrackingReconcileDeps = {
 
 const trackingRowWhere = { path: ['meta_key'], equals: TRACKING_META_KEY } as const
 
-/** The tracking numbers the order's shipments carry now, normalised the way the outbound push dedupes them. */
-export function currentTrackingNumbers(shipments: Array<{ trackingNumber: string | null }>): string[] {
-  return [...new Set(shipments.map((s) => (s.trackingNumber ?? '').trim().toLowerCase()).filter(Boolean))].sort()
+type TrackingShipment = { trackingNumber: string | null; shippingService?: string | null; shippedAt?: Date | null; createdAt?: Date | null }
+type CoverageItem = { number: string; provider: string; dateShipped: string }
+
+function sortedItems(items: CoverageItem[]): CoverageItem[] {
+  const seen = new Set<string>()
+  return items
+    .filter((i) => {
+      const key = `${i.number}|${i.provider}`
+      if (!i.number || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .sort((a, b) => `${a.number}|${a.provider}`.localeCompare(`${b.number}|${b.provider}`))
 }
 
-/** The tracking numbers a logged push (or a reconcile verification mark) says it delivered. */
-export function loggedTrackingNumbers(payload: unknown): string[] {
+/**
+ * The outbound tracking items the order's shipments produce now, normalised the way the outbound push builds and dedupes
+ * them (toWcTrackingItem): number, provider (carrier, else 'Custom') and date_shipped (epoch seconds). Coverage compares the
+ * whole item, so a carrier or date edit whose push was lost is retried, not only a changed number.
+ */
+export function currentTrackingItems(shipments: TrackingShipment[]): CoverageItem[] {
+  return sortedItems(shipments.map((s) => ({
+    number: (s.trackingNumber ?? '').trim().toLowerCase(),
+    provider: (s.shippingService ?? '').trim().toLowerCase() || 'custom',
+    // The outbound push uses shippedAt, falling back to createdAt.
+    dateShipped: (s.shippedAt ?? s.createdAt) ? String(Math.floor((s.shippedAt ?? s.createdAt)!.getTime() / 1000)) : '',
+  })))
+}
+
+/** Back-compat view: just the numbers. */
+export function currentTrackingNumbers(shipments: TrackingShipment[]): string[] {
+  return [...new Set(currentTrackingItems(shipments).map((i) => i.number))].sort()
+}
+
+/** The tracking items a logged push (or a reconcile verification mark) says it delivered. */
+export function loggedTrackingItems(payload: unknown): CoverageItem[] {
   if (typeof payload !== 'object' || payload === null) return []
-  const p = payload as { reconcileTrackingNumbers?: unknown; items?: unknown }
-  const raw: unknown[] = Array.isArray(p.reconcileTrackingNumbers)
-    ? p.reconcileTrackingNumbers
-    : Array.isArray(p.items) ? p.items.map((item) => (item as { tracking_number?: unknown } | null)?.tracking_number) : []
-  return [...new Set(raw.map((n) => (typeof n === 'string' ? n.trim().toLowerCase() : '')).filter(Boolean))].sort()
+  const p = payload as { reconcileTrackingItems?: unknown; items?: unknown }
+  if (Array.isArray(p.reconcileTrackingItems)) {
+    return sortedItems((p.reconcileTrackingItems as Array<Partial<CoverageItem> | null>).map((i) => ({
+      number: typeof i?.number === 'string' ? i.number.trim().toLowerCase() : '',
+      provider: typeof i?.provider === 'string' ? i.provider.trim().toLowerCase() : '',
+      dateShipped: typeof i?.dateShipped === 'string' ? i.dateShipped : '',
+    })))
+  }
+  if (!Array.isArray(p.items)) return []
+  return sortedItems(p.items.map((raw) => {
+    const i = (raw ?? {}) as { tracking_number?: unknown; tracking_provider?: unknown; custom_tracking_provider?: unknown; date_shipped?: unknown }
+    const custom = typeof i.custom_tracking_provider === 'string' ? i.custom_tracking_provider.trim() : ''
+    const provider = typeof i.tracking_provider === 'string' ? i.tracking_provider.trim() : ''
+    return {
+      number: typeof i.tracking_number === 'string' ? i.tracking_number.trim().toLowerCase() : '',
+      provider: (custom || provider || 'custom').toLowerCase(),
+      dateShipped: typeof i.date_shipped === 'string' ? i.date_shipped : String(i.date_shipped ?? ''),
+    }
+  }))
 }
 
 export async function reconcileWcTrackingPushes(overrides: Partial<WcTrackingReconcileDeps> = {}): Promise<WcTrackingReconcileResult> {
@@ -96,14 +139,14 @@ export async function reconcileWcTrackingPushes(overrides: Partial<WcTrackingRec
   const result = { scanned: 0, pushed: 0, unchanged: 0, held: 0, failed: 0 }
   let cursor: string | null = null
   while (result.scanned < WC_TRACKING_RECONCILE_BATCH) {
-    const orders: Array<{ id: string; shipments: Array<{ trackingNumber: string | null }> }> = await deps.db.salesOrder.findMany({
+    const orders: Array<{ id: string; shipments: TrackingShipment[] }> = await deps.db.salesOrder.findMany({
       where: {
         shoppingLinks: { some: { connector: 'woocommerce' } },
         shipments: { some: shipmentFilter },
         ...(cursor ? { id: { gt: cursor } } : {}),
       },
       // ALL of the order's SHIPPED tracking, not only the recently changed rows: coverage is judged on the whole set.
-      select: { id: true, shipments: { where: { status: 'SHIPPED', trackingNumber: { not: null } }, select: { trackingNumber: true } } },
+      select: { id: true, shipments: { where: { status: 'SHIPPED', trackingNumber: { not: null } }, select: { trackingNumber: true, shippingService: true, shippedAt: true, createdAt: true } } },
       orderBy: { id: 'asc' },
       take: PAGE_SIZE,
     })
@@ -127,9 +170,9 @@ export async function reconcileWcTrackingPushes(overrides: Partial<WcTrackingRec
 
     for (const order of orders) {
       if (result.scanned >= WC_TRACKING_RECONCILE_BATCH) break
-      const current = currentTrackingNumbers(order.shipments)
+      const current = currentTrackingItems(order.shipments)
       if (current.length === 0) continue
-      const logged = latestSynced.has(order.id) ? loggedTrackingNumbers(latestSynced.get(order.id)) : null
+      const logged = latestSynced.has(order.id) ? loggedTrackingItems(latestSynced.get(order.id)) : null
       if (logged !== null && JSON.stringify(logged) === JSON.stringify(current)) continue
       if (backedOff.has(order.id)) continue
 
@@ -146,7 +189,7 @@ export async function reconcileWcTrackingPushes(overrides: Partial<WcTrackingRec
             data: {
               direction: 'TO_CONNECTOR', status: 'SYNCED', entityType: 'SalesOrder', entityId: order.id,
               // `items` stays empty on purpose: the webhook echo check reads `items`, and a mark must never suppress a real webhook.
-              payload: { meta_key: TRACKING_META_KEY, items: [], reconcileVerified: true, reconcileTrackingNumbers: current },
+              payload: { meta_key: TRACKING_META_KEY, items: [], reconcileVerified: true, reconcileTrackingItems: current },
               syncedAt: now,
             },
           })

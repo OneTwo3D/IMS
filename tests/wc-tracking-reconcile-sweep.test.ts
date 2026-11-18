@@ -15,7 +15,7 @@ import {
 const NOW = new Date('2026-11-18T12:00:00Z')
 const minutesAgo = (m: number) => new Date(NOW.getTime() - m * 60_000)
 
-type Order = { id: string; shipments: Array<{ updatedAt?: Date; trackingNumber: string | null }> }
+type Order = { id: string; shipments: Array<{ updatedAt?: Date; trackingNumber: string | null; shippingService?: string | null; shippedAt?: Date | null }> }
 type Log = { entityId: string; status: 'SYNCED' | 'FAILED'; createdAt: Date; payload?: unknown }
 
 function harness(orders: Order[], logs: Log[] = [], enabled = true) {
@@ -89,8 +89,27 @@ test('the LATEST synced row decides: an older matching row does not cover a newe
   assert.equal(h.pushes.length, 1)
 })
 
+test('a carrier or date edit whose push was lost is retried (items compared, not only numbers)', async () => {
+  const shippedAt = new Date('2026-11-17T10:00:00Z')
+  const epoch = String(Math.floor(shippedAt.getTime() / 1000))
+  const order: Order = { id: 'o1', shipments: [{ trackingNumber: 'TRK1', shippingService: 'DPD', shippedAt }] }
+  const log = (provider: string, date: string): Log => ({
+    entityId: 'o1', status: 'SYNCED', createdAt: minutesAgo(30),
+    payload: { meta_key: '_wc_shipment_tracking_items', items: [{ tracking_number: 'TRK1', tracking_provider: provider, custom_tracking_provider: provider, date_shipped: date }] },
+  })
+  const same = harness([order], [log('DPD', epoch)])
+  await reconcileWcTrackingPushes(same.deps)
+  assert.equal(same.pushes.length, 0, 'identical item is covered')
+  const carrierEdit = harness([order], [log('Royal Mail', epoch)])
+  await reconcileWcTrackingPushes(carrierEdit.deps)
+  assert.equal(carrierEdit.pushes.length, 1, 'carrier changed, same number')
+  const dateEdit = harness([order], [log('DPD', String(Number(epoch) - 86400))])
+  await reconcileWcTrackingPushes(dateEdit.deps)
+  assert.equal(dateEdit.pushes.length, 1, 'date changed, same number')
+})
+
 test('a verification mark covers the order by its recorded tracking numbers', async () => {
-  const mark: Log = { entityId: 'o1', status: 'SYNCED', createdAt: minutesAgo(5), payload: { meta_key: '_wc_shipment_tracking_items', items: [], reconcileVerified: true, reconcileTrackingNumbers: ['trk1'] } }
+  const mark: Log = { entityId: 'o1', status: 'SYNCED', createdAt: minutesAgo(5), payload: { meta_key: '_wc_shipment_tracking_items', items: [], reconcileVerified: true, reconcileTrackingItems: [{ number: 'trk1', provider: 'custom', dateShipped: '' }] } }
   const covered = harness([lost('o1')], [mark])
   await reconcileWcTrackingPushes(covered.deps)
   assert.equal(covered.pushes.length, 0)
@@ -140,7 +159,7 @@ test('an unchanged push writes a verification mark so the order stops being a ca
   assert.equal(h.created.length, 1)
   assert.equal(h.created[0].status, 'SYNCED')
   assert.equal(h.created[0].entityId, 'o1')
-  assert.deepEqual(h.created[0].payload, { meta_key: '_wc_shipment_tracking_items', items: [], reconcileVerified: true, reconcileTrackingNumbers: ['trk1'] })
+  assert.deepEqual(h.created[0].payload, { meta_key: '_wc_shipment_tracking_items', items: [], reconcileVerified: true, reconcileTrackingItems: [{ number: 'trk1', provider: 'custom', dateShipped: '' }] })
 })
 
 test('failures and throws are counted and do not stop the batch', async () => {

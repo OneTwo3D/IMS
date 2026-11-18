@@ -206,13 +206,31 @@ async function receive(resource: 'orders' | 'refunds' | 'products', body: string
   return persisted[0].originAttestation as string
 }
 
+// Realistic core bodies: WooCommerce's get_endpoint_data() strips `_links`, and orders have no `permalink`.
+const CORE_PAYLOAD = {
+  orders: { id: 9001, parent_id: 0, number: '9001', order_key: 'wc_order_abc', status: 'processing', currency: 'GBP', total: '20.00', billing: { first_name: 'A' }, line_items: [{ id: 1, name: 'Widget', quantity: 1 }], meta_data: [] },
+  refunds: { id: 77, parent_id: 9001, order_id: 9001, amount: '5.00', reason: '', line_items: [] },
+} as const
+
 for (const resource of ['orders', 'refunds'] as const) {
-  test(`${resource}: a valid signature with a FORGED source header and no signed store evidence is held, not imported`, async () => {
+  test(`${resource}: a core payload (no _links, no permalink) with a verified signature and a MATCHING source header is accepted`, async () => {
     reset()
-    const body = JSON.stringify({ id: 9001, order_id: 9001 })
+    const body = JSON.stringify(CORE_PAYLOAD[resource])
     const attestation = await receive(resource, body, { 'x-wc-webhook-source': `${STORE_A}/` })
     assert.equal(attestation, 'store-header:store-a.example.com', 'header-only evidence is recorded as unsigned')
 
+    const { calls, dependencies } = spies()
+    const response = await dispatch(resource, attestation, JSON.parse(body), dependencies)
+
+    assert.equal(response.status, 200)
+    assert.equal(calls[resource === 'orders' ? 'order' : 'refund'].length, 1)
+    assert.equal(state.activity.some((entry) => String(entry.action).endsWith('_webhook_held')), false)
+  })
+
+  test(`${resource}: a core payload with a MISMATCHED source header is held, not imported`, async () => {
+    reset()
+    const body = JSON.stringify(CORE_PAYLOAD[resource])
+    const attestation = await receive(resource, body, { 'x-wc-webhook-source': 'https://forged.example.com/' })
     const { calls, dependencies } = spies()
     const response = await dispatch(resource, attestation, JSON.parse(body), dependencies)
 
