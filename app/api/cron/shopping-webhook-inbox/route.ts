@@ -111,6 +111,24 @@ async function drainInvoiceDocumentPublications(): Promise<DrainResult> {
   }
 }
 
+/**
+ * Queue and drain the TrackShip re-fires: for a shipped, tracked order TrackShip has no shipment for, ask the storefront to register the tracking
+ * with TrackShip again, on a per-order back-off. OFF unless `trackship_refire_enabled` is `true`; while it is not, nothing is scanned, queued,
+ * claimed or sent. Same plugin gate as the other drains, separate so one failing never hides another. Never throws.
+ */
+async function drainTrackshipRefires(): Promise<DrainResult> {
+  try {
+    if (!(await isIntegrationPluginEnabled('woocommerce'))) {
+      return { skipped: true, reason: 'woocommerce_plugin_disabled' }
+    }
+    const { processShoppingTrackshipRefires } = await import('@/lib/shopping')
+    return { ...(await processShoppingTrackshipRefires()) }
+  } catch (error) {
+    console.warn('[shopping-webhook-inbox] TrackShip re-fire drain failed', { error: normalizeCronError(error) })
+    return { skipped: false, error: normalizeCronError(error) }
+  }
+}
+
 async function getWcSyncEnabled(): Promise<boolean> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
   return enabled?.value === 'true'
@@ -145,8 +163,9 @@ export async function GET(request: Request) {
       const orderCompletions = await drainOrderCompletions()
       const orderStatusPushes = await drainOrderStatusPushes()
       const invoiceDocumentPublications = await drainInvoiceDocumentPublications()
+      const trackshipRefires = await drainTrackshipRefires()
 
-      return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes, invoiceDocumentPublications } } }
+      return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes, invoiceDocumentPublications, trackshipRefires } } }
     },
     outcomeOf: (result) => cronOutcome('shopping-webhook-inbox', result),
   })

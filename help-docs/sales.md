@@ -12,6 +12,7 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
 - **Filter by invoicing** — the **Invoicing** filter shows orders that are **Not invoiced**, **Partially invoiced** or **Fully invoiced** (pick one or several). It is separate from the status filter and combines with it. Picking an invoicing state includes Completed and Delivered orders, because a shipped order that was never invoiced is exactly what it is for; archived orders stay hidden unless you tick **Include archived**. See [Invoicing state](#invoicing-state).
+- **Quotes tab** — the **Quotes** button above the search shows only quotations (see [Quotations](#quotations)); **All orders** goes back. A quote carries a **Quote** badge, and an **Expired** badge once its validity date has passed.
 - **Filter by a custom field** — when [custom fields](#custom-fields-on-orders) exist for orders, a drop-down lists every text field that has fixed choices, and every yes / no field, with each choice. Pick one to see only the orders holding that value (for example *Process stage: Pack*). Orders that have no value for the field are not matched by any choice. The filter is in the address, so it combines with search, status and the other filters and can be bookmarked.
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
@@ -51,6 +52,8 @@ To create a new order manually:
 
 A Draft can be changed afterwards with **Edit order** (see *Editing an order* below).
 
+The order form shows an estimated **COGS** per line, **Est. COGS** and **Est. Margin** to Admin, Manager and Finance users only; other roles do not see unit costs.
+
 The **Ship From** warehouse is pre-selected with your default warehouse (the first warehouse if none is marked default); change it if the order ships from elsewhere. The stock figures beside each product are for the selected warehouse.
 
 **VAT and "Incl. VAT".** The order has one default VAT rate and one setting for whether the prices you type include VAT. If prices include VAT, choose the order's default VAT rate: the VAT is taken out of the prices you typed, the order totals are what you typed, and the invoice goes to the accounting system as VAT-inclusive at those same prices. Ticking **Incl. VAT** while the default rate is **No VAT** and a line carries VAT (from its product's tax category or a rate you chose on the line) is refused, because the prices could be read two ways: choose the default rate, or untick **Incl. VAT** and enter net prices. The **Incl. VAT** box is always shown, even when the rate is **No VAT**. A draft saved earlier in that state cannot be moved out of Draft; cancel it and create a new order. Clones made and shipped before this was fixed have no invoice and need one raising by hand.
@@ -74,6 +77,25 @@ WooCommerce orders always enter the IMS as **Processing**. When WooCommerce mark
 ### Duty and tax from WooCommerce
 
 WooCommerce works out duty, import VAT and the delivery terms; IMS **never recalculates them**. For a WooCommerce order the order page shows a read-only **Duty and tax** panel, labelled "from WooCommerce", with what the store reported: the **IOSS number** and **delivery term** (IOSS_DDP or DDP) IMS recorded from the order's EU VAT treatment, the **duty**, **import VAT** and (when there is one) **handling fee** the store recorded, and any **customs value per unit** set on an order line in WooCommerce. A value the store did not report is simply not shown, and the panel does not appear when there is nothing to show. These values cannot be edited in IMS. When the order is edited in WooCommerce they follow on the next order update; if the store removes one, it disappears here too. Orders imported before this feature show nothing until WooCommerce next updates them.
+
+## Quotations
+
+A **quote** is an offer you send a customer before they order. In IMS a quote is a **Draft** order with a quote flag, a validity date and (once sent) the time it was queued for sending. It is not a new status, so every rule that applies to a Draft applies to it unchanged:
+
+- **It reserves no stock.** A quote is never allocated, exactly like a Draft. Stock you quote is still available to everyone else.
+- **It is not sent to the warehouse**, not invoiced, and not mirrored to WooCommerce.
+- **Prices are held on the quote only for show.** Nothing is recalculated when the quote is converted.
+- WooCommerce orders are never quotes.
+
+**Creating a quote.** On **New Sales Order**, fill in the order as usual, set **Quote valid until** (it starts 30 days ahead) and click **Save as quote** instead of Save as Draft. The date must be a real date that is not in the past. A quote can be changed with **Edit quote** (its date too); an order that is not a quote cannot be turned into one, and a quote cannot be saved as a live order.
+
+**The quote document.** The order's **Quote PDF** (the ⋮ menu) is the sales order document with a **QUOTE** heading and the line "Valid until ...". It prints no payment terms. Its wording comes from **Settings > Company > Documents > Quote**: until you save one it uses a built-in default that states this is a quotation, not an order or an invoice.
+
+**Sending a quote.** Download the PDF and send it yourself, or switch on **Settings > Company > Documents > Email quotes to customers** (off by default). With it on a quote shows **Send quote**, which puts a branded email with the quote PDF on the same email queue as order confirmations. It is **queued, not sent at that moment**: the queue delivers it under your SMTP settings and the suppression list, so an installation with no SMTP configured mails nobody. An expired quote cannot be sent (edit its date first). The detail page shows when the quote was queued. Switching the setting off also stops a quote already waiting in the queue: it ends Failed with the reason and nothing is sent.
+
+**Converting a quote to an order.** **Convert to order** clears the quote flag in one click. The order is then an ordinary **Draft** with the same lines and prices; you confirm it through the usual flow (**Process**), which allocates stock and queues the invoice. A quote cannot be processed, put on hold or invoiced before it is converted (it can be cancelled). If the validity date has passed, IMS asks for a note saying why the prices still stand; the note is added to the order's internal notes, and converting without one is refused.
+
+**Cloning** a quote makes an ordinary Draft, not a quote.
 
 ## Customer Turnover
 
@@ -550,6 +572,10 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
 
+### Deleting an invoice that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), an invoice that IMS itself created in Xero shows a **Delete invoice** button on the order page for people who can process sales. It renames the Xero invoice with a random `-DEL-` suffix so the original number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it, and clears the invoice number and link from the order when Xero confirms. If the invoice has payments, refunds or credit notes, is dated in a locked period, was created by another system or is already being deleted, the page shows the reason instead. See [Xero sync](xero-sync.md) for the full rules.
+
 ### Editing an order
 
 **A Draft order can be edited.** Open the order and press **Edit order**: the same form you used to create it opens pre-filled, and you can change the customer, addresses, lines, quantities, prices, discounts, shipping, VAT basis, warehouse, delivery date and notes. **Save changes** re-prices the whole order exactly as creating it would (the same rounding, VAT and exchange-rate rules; a foreign-currency order is re-priced at today's table rate and refused if that rate is missing), replaces the lines, and keeps the order number, the status (still Draft) and the activity history, which records the edit with the old and new totals. An order that was saved with separate fee rows shows their sum as part of **Shipping** when you edit it. The order's external order number is not editable.
@@ -630,13 +656,24 @@ This means the taxable base column in the report shows the net amount in both ca
 
 ## Documents
 
-Three PDF documents are available for each sales order:
+Three PDF documents are available for each sales order (a quote has its own, the **Quote PDF**, see [Quotations](#quotations)):
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically
 - **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu for every order that is not a Draft or Cancelled, and from a **Packing slip** button on each shipment card (from Pending onwards, so it can be printed to pick from). The shipment button prints only that parcel. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
+
+## Attachments
+
+Every sales order page has an **Attachments** card under the order, for documents that belong to it: a customer's purchase order, an email thread, a proof of delivery or a photo of damage.
+
+- **Upload** -- Anyone who can create or process sales orders (administrators, managers and warehouse users) sees an **Upload** button. Accepted: PDF, images (PNG, JPEG, GIF, WebP), CSV, Excel (.xlsx), Word (.docx) and email (.eml, .msg), up to **20 MB** each. IMS checks the content of the file, not just its name, and refuses a file that is not what its name says.
+- **Download** -- Anyone who can view sales orders sees the list and a **Download** button. A file always downloads; it is never opened in the browser.
+- **Delete** -- The **Delete** button asks you to confirm. A deleted attachment disappears from the list and cannot be downloaded; the file is kept on the server and the row is only marked deleted.
+- **They can hold personal data.** A customer's purchase order or an email can carry a name, address or phone number. When a customer is erased (**GDPR Anonymise**, or WooCommerce anonymising an order that IMS mirrors) every attachment of their orders is **deleted for good**, deleted ones included, together with its file. An anonymised order takes no new attachment. Attachments do not go to WooCommerce, Mintsoft or Xero. See [Personal-data erasure](erasure.md).
+- Deleting a draft order deletes its attachments too.
+- **Backups:** the files are in the server's upload folder (`UPLOAD_STORAGE_DIR`, under `order-attachments`), not in the database; a database backup does not contain them. After a restore, an attachment whose file was not restored shows in the list but fails to download. See [Backup & Restore](backup-restore.md).
 
 ## Other Actions
 

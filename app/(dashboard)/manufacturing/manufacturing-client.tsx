@@ -31,6 +31,7 @@ import {
   type SupplierOption,
 } from '@/app/actions/manufacturing'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { buildGuardedCsv } from '@/lib/csv-escape'
 
 const STATUS_BADGE: Record<string, string> = {
   DRAFT: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -100,11 +101,11 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
   function handlePage(p: number) { setPage(p); refresh({ p }) }
 
   function handleExport() {
-    const header = 'Reference,Type,SKU,Product,Warehouse,Manufacturer,Planned,Produced,Status,Created'
-    const csv = rows.map((r) =>
-      [r.reference, r.orderType, r.productSku, `"${r.productName}"`, r.warehouseName, r.manufacturerName ?? '', r.qtyPlanned, r.qtyProduced, r.status, r.createdAt.slice(0, 10)].join(',')
-    )
-    const blob = new Blob([header + '\n' + csv.join('\n')], { type: 'text/csv' })
+    const header = ['Reference', 'Type', 'SKU', 'Product', 'Warehouse', 'Manufacturer', 'Planned', 'Produced', 'Status', 'Created']
+    const csv = buildGuardedCsv(header, rows.map((r) =>
+      [r.reference, r.orderType, r.productSku, r.productName, r.warehouseName, r.manufacturerName ?? '', r.qtyPlanned, r.qtyProduced, r.status, r.createdAt.slice(0, 10)]
+    ))
+    const blob = new Blob([csv], { type: 'text/csv' })
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)
     a.download = `manufacturing-orders-${new Date().toISOString().slice(0, 10)}.csv`

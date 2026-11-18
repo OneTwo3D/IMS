@@ -23,7 +23,50 @@ export type WcCustomsFields = {
   customsDescription: string | null
 }
 
+export type WcCustomsField = keyof WcCustomsFields
+
+const NATIVE_KEYS: Record<WcCustomsField, 'customs_commodity_code' | 'customs_country_of_origin' | 'customs_description'> = {
+  hsCode: 'customs_commodity_code',
+  countryOfOrigin: 'customs_country_of_origin',
+  customsDescription: 'customs_description',
+}
+
 const LEGACY_DESCRIPTION_META_KEY = '_customs_description_legacy'
+
+/**
+ * hs-code-woo records an EXPLICIT clear in the product meta `_customs_cleared_fields` = { <field>: ISO timestamp }, written
+ * only on a populated -> empty transition and removed when the field is set again. WooCommerce REST reports a never-populated
+ * and a cleared native field identically (null), so this meta is the only evidence of a clear.
+ */
+const CLEARED_FIELDS_META_KEY = '_customs_cleared_fields'
+const CLEARED_META_NAME: Record<WcCustomsField, string> = {
+  hsCode: 'commodity_code',
+  countryOfOrigin: 'country_of_origin',
+  customsDescription: 'description',
+}
+
+function clearedFieldNames(source: WcCustomsSource): Set<string> {
+  const raw = Array.isArray(source.meta_data) ? source.meta_data.find((m) => m?.key === CLEARED_FIELDS_META_KEY)?.value : undefined
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw)
+    } catch {
+      value = null
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return new Set()
+  return new Set(Object.entries(value as Record<string, unknown>).filter(([, ts]) => ts != null && ts !== '').map(([k]) => k))
+}
+
+/** The native value is empty (key present with null / blank) AND hs-code-woo recorded the field as cleared. */
+function explicitlyCleared(source: WcCustomsSource, field: WcCustomsField, marked: Set<string>): boolean {
+  const key = NATIVE_KEYS[field]
+  if (!Object.prototype.hasOwnProperty.call(source, key)) return false
+  const value = source[key]
+  const empty = value === null || (typeof value === 'string' && value.trim() === '')
+  return empty && marked.has(CLEARED_META_NAME[field])
+}
 
 function trimmed(value: unknown): string | null {
   if (typeof value === 'string') return value.trim() || null
@@ -83,7 +126,14 @@ function firstUsable(
   return null
 }
 
-export function extractWcCustomsFields(source: WcCustomsSource): WcCustomsFields & { rejected: WcRejectedCustomsValue[] } {
+/**
+ * `cleared` lists the fields WooCommerce explicitly emptied: the native value is empty AND hs-code-woo's `_customs_cleared_fields` meta lists it, and NO other source
+ * (attribute, legacy meta) supplied a usable value or a present-but-unusable one. Distinct from a null field that is merely
+ * unknown (key absent) or rejected (present but invalid): both of those keep the IMS value, only `cleared` erases it.
+ */
+export function extractWcCustomsFields(
+  source: WcCustomsSource,
+): WcCustomsFields & { rejected: WcRejectedCustomsValue[]; cleared: WcCustomsField[] } {
   const rejected: WcRejectedCustomsValue[] = []
   const hsCode = firstUsable(
     'hsCode',
@@ -116,5 +166,13 @@ export function extractWcCustomsFields(source: WcCustomsSource): WcCustomsFields
     (raw) => clampCustomsDescription(raw) || null,
     rejected,
   )
-  return { hsCode, countryOfOrigin, customsDescription, rejected }
+  const markedCleared = clearedFieldNames(source)
+  const resolved: WcCustomsFields = { hsCode, countryOfOrigin, customsDescription }
+  const cleared = (Object.keys(NATIVE_KEYS) as WcCustomsField[]).filter(
+    (field) =>
+      resolved[field] === null
+      && !rejected.some((r) => r.field === field)
+      && explicitlyCleared(source, field, markedCleared),
+  )
+  return { ...resolved, rejected, cleared }
 }

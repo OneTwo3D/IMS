@@ -1,6 +1,6 @@
 import QRCode from 'qrcode'
 import { generateSecret, generateURI } from 'otplib'
-import { requireApiAuth } from '@/lib/auth/server'
+import { requireApiFreshAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { serializeTotpSecret } from '@/lib/totp-secrets'
 import type { AuthSession } from '@/lib/auth/server'
@@ -34,7 +34,7 @@ export async function handleTotpSetupGet(dependencies: TotpSetupGetDependencies)
 }
 
 export const defaultTotpSetupGetDependencies: TotpSetupGetDependencies = {
-  authorize: requireApiAuth,
+  authorize: requireApiFreshAuth,
   generateSecret,
   generateUri: generateURI,
   generateQrDataUrl: QRCode.toDataURL,

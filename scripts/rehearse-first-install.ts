@@ -496,6 +496,25 @@ export function shredFile(file: string, expected: FileIdentity | null): { ok: bo
   return { ok: !existsSync(file) }
 }
 
+/**
+ * Block (synchronously, so it still works inside a signal handler) until `anyAlive()` is false or
+ * `budgetMs` has passed; returns whether it settled. `pg_ctl -m immediate stop` returns once the
+ * POSTMASTER is gone, but it SIGQUITs its children and does not wait for them, so for a few
+ * milliseconds a backend or auxiliary process can still be alive and still name the run directory.
+ * Reading the process table in that window reported a clean teardown as orphans plus "not removing
+ * the run directory", which is exit 3 instead of the 1 the interruption and symlink tests expect
+ * (o3d-hqvrp.394). A process that is really stuck is still reported: the budget is bounded.
+ */
+export function settleProcesses(anyAlive: () => boolean, budgetMs = 5000, stepMs = 25): boolean {
+  const gate = new Int32Array(new SharedArrayBuffer(4))
+  const deadline = Date.now() + budgetMs
+  while (anyAlive()) {
+    if (Date.now() >= deadline) return false
+    Atomics.wait(gate, 0, 0, stepMs)
+  }
+  return true
+}
+
 export function teardownRun(state: RunState): TeardownResult {
   const errors: string[] = []
   // A start that failed after the fork left no handle and no pid: read both from the data directory.
@@ -535,6 +554,9 @@ export function teardownRun(state: RunState): TeardownResult {
   } else if (state.cluster) {
     errors.push('the postmaster this run started no longer matches its captured identity; it was not stopped, because whatever owns the data directory now is not ours to stop')
   }
+
+  // Let the stopped cluster's children finish exiting before the process table is read as evidence.
+  settleProcesses(() => family.some((candidate) => processIsAlive(candidate)) || processesNaming(state.root).length > 0)
 
   const shred = shredFile(state.envFile, state.envFileId)
   const envFileShredded = shred.ok

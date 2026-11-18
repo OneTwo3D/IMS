@@ -255,8 +255,10 @@ test('[o3d-1e7sl Codex r10] the drift guard: the reused-key types the instructio
 })
 
 test('[o3d-1e7sl Codex r10] per posting type: every state variation renders the SAME action and the SAME Mark-as-handled condition on every surface', () => {
-  const TYPES: Array<[string | undefined, 'update' | 'payment' | 'conditional' | 'untyped']> = [
+  const TYPES: Array<[string | undefined, 'update' | 'payment' | 'delete' | 'conditional' | 'untyped']> = [
     ['SALES_INVOICE_UPDATE', 'update'], ['PURCHASE_INVOICE_UPDATE', 'update'], ['BILL_PAYMENT', 'payment'],
+    // o3d-ngmt.21: removing a document is its own flow; "post it if absent" would be the opposite of the step.
+    ['SALES_INVOICE_DELETE', 'delete'], ['PURCHASE_INVOICE_DELETE', 'delete'],
     ['SALES_INVOICE', 'conditional'], ['STOCK_RECEIPT', 'conditional'], [undefined, 'untyped'],
   ]
   const PLAIN = /post it in the ledger now|Then post it,|only once it is posted/i
@@ -306,6 +308,7 @@ test('[o3d-1e7sl Codex r10] per posting type: every state variation renders the 
           if (name === 'claim dialog' || name.endsWith('row')) assert.match(text, /identify the posting type before any ledger work/i, `${where}: ${name}`)
         }
         if (flow === 'conditional') assert.doesNotMatch(text, /CURRENT payment|apply the update|register THIS/, `${where}: ${name}`)
+        if (flow === 'delete') assert.doesNotMatch(text, /CURRENT payment|apply the update|register THIS|post it ONLY if it is absent/, `${where}: ${name}: a delete is never told to post the document`)
         if (flow === 'update' || flow === 'payment') {
           for (const clause of text.split(/(?<=[.;])\s+/).filter((c) => /do not post again/i.test(c))) assert.match(clause, /if the current (version|payment) is there/i, `${where}: ${name}: "do not post again" only under the CURRENT condition: ${clause}`)
         }

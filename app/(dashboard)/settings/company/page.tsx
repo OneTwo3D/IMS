@@ -13,6 +13,7 @@ import { getCurrencies } from '@/app/actions/currencies'
 import { authorizePage } from '@/lib/auth/server'
 import { getPoApprovalThresholdSetting } from '@/app/actions/purchase-orders'
 import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
+import { isSalesQuoteEmailEnabled } from '@/lib/sales-quote-email'
 import { CompanySettingsClient } from './company-client'
 
 export const metadata: Metadata = { title: 'Company Settings' }
@@ -26,7 +27,7 @@ export default async function CompanySettingsPage() {
   if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
   const session = gate.session
-  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled, poApproval] = await Promise.all([
+  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled, quoteEmailEnabled, poApproval] = await Promise.all([
     getOrganisation(),
     getBaseCurrencySettings(),
     getNumberingFormats(),
@@ -36,6 +37,7 @@ export default async function CompanySettingsPage() {
     getShoppingConnectors(),
     getCurrencies(false),
     isPurchaseOrderEmailEnabled(),
+    isSalesQuoteEmailEnabled(),
     getPoApprovalThresholdSetting(),
   ])
 
@@ -51,6 +53,7 @@ export default async function CompanySettingsPage() {
       currencies={currencies}
       testEmailDefault={session.user.email}
       purchaseOrderEmailEnabled={poEmailEnabled}
+      salesQuoteEmailEnabled={quoteEmailEnabled}
       poApprovalThreshold={poApproval.value}
       baseCurrency={poApproval.baseCurrency}
     />

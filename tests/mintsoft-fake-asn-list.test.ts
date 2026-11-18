@@ -24,8 +24,9 @@ function asns(count: number): FakeAsn[] {
     estimatedDelivery: null,
     goodsInType: 'Carton',
     quantity: 1,
+    // Mintsoft's own vocabulary and a consistent id (GET /api/ASN/Statuses: 1 is NEW), not IMS's `OPEN`.
     statusId: 1,
-    status: 'OPEN',
+    status: 'NEW',
     createdAt: '2026-09-18T00:00:00.000Z',
     // o3d-btiw: an ASN item carries three quantities, and these rows describe ones nothing has been
     // booked in against yet — which is what the list contract under test is about.
@@ -62,4 +63,24 @@ test('the fake ASN list carries POReference and items only when asked, and filte
   assert.deepEqual(withItems[0]!.Items, [{ ID: 'L0', SourceLineId: 'line-0', ProductId: 7, SKU: 'SKU-7', QuantityExpected: 3 }])
   const warehouse6 = (await list('PageNo=1&Limit=100&WarehouseId=6')).body as Array<Record<string, unknown>>
   assert.ok(warehouse6.length > 0 && warehouse6.every((row) => row.WarehouseId === 6))
+})
+
+test('the fake ASN list serves ALL THREE status fields, like the by-id fake and live ASN 6114 (o3d-1838k)', async () => {
+  const rows = (await list('PageNo=1&Limit=1')).body as Array<Record<string, unknown>>
+  assert.deepEqual(rows[0]!.ASNStatus, { Name: 'NEW', Colour: 'purple', TextColour: null, ID: 1 })
+  assert.equal(rows[0]!.ASNStatusId, 1)
+})
+
+test('a seeded disagreement between the list fake status fields is read as unreadable on the LIST path (o3d-1838k)', async () => {
+  const { normalizeMintsoftAsnListRowForRecovery } = await import('../lib/connectors/mintsoft/api/client.ts')
+  const { MINTSOFT_ASN_STATUS_UNREADABLE_MARKER } = await import('../lib/connectors/mintsoft/api/asn-status.ts')
+  const disagreeing = { ...asns(1)[0]!, status: 'NEW', statusId: 3 }
+  const response = fakeMintsoftRoute.fakeMintsoftAsnListResponse([disagreeing], new URLSearchParams('PageNo=1&Limit=1&IncludeASNItems=true'))
+  const [row] = await response.json() as Array<Record<string, unknown>>
+  const ref = normalizeMintsoftAsnListRowForRecovery(row!)
+  assert.ok(ref.status?.startsWith(MINTSOFT_ASN_STATUS_UNREADABLE_MARKER), `status was ${ref.status}`)
+  const agreeing = normalizeMintsoftAsnListRowForRecovery(
+    (await fakeMintsoftRoute.fakeMintsoftAsnListResponse(asns(1), new URLSearchParams('PageNo=1&Limit=1&IncludeASNItems=true')).json() as Array<Record<string, unknown>>)[0]!,
+  )
+  assert.equal(agreeing.status, 'NEW')
 })

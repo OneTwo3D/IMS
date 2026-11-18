@@ -143,7 +143,7 @@ test('the component pass addresses the product it QUEUED, not whatever holds the
 
   assert.match(
     src,
-    /componentRows: \{ lineNum: number; sku: string; productId: string; components: string \}\[\]/,
+    /componentRows: ComponentPassRow\[\]/,
     'the queue must carry the immutable product id',
   )
   assert.match(src, /componentRows\.push\(\{ lineNum, sku, productId: componentProductId/, 'the id must be captured at enqueue')

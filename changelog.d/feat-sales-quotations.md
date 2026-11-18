@@ -1,0 +1,7 @@
+### Sales quotations (sales)
+
+- A sales order can now be saved as a **quote**: a Draft carrying a quote flag and a validity date. It reserves no stock and is never allocated, invoiced, sent to the warehouse or mirrored to WooCommerce, exactly like a Draft; a WooCommerce order is never a quote. **Save as quote** is on the new-order form, the list has a **Quotes** tab and an **Expired** badge, and a quote cannot be processed or put on hold until it is converted (it can be cancelled).
+- **Convert to order** clears the flag in one click and leaves an ordinary Draft with prices unchanged, which you confirm as usual. A quote past its validity date converts only with a note, which is added to the order's internal notes.
+- A **Quote** document template (Settings > Company > Documents) sits beside Sales Order and Invoice, with a built-in default. The quote PDF is the sales order document with a QUOTE heading, the validity date and no payment terms; the sales order PDF and order confirmation now share one renderer with it.
+- **Send quote** queues the quote PDF on the customer email queue. Behind a new setting, **Email quotes to customers** (`sales_quote_email_enabled`), off by default; with it off a quote offers a PDF download only and nothing is queued. Switching it off also stops quotes already queued.
+- Migration `20261118050000_sales_quotations` is additive: `sales_orders.is_quote` (default false), `quote_valid_until`, `quote_sent_at`.

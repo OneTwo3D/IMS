@@ -467,6 +467,12 @@ export async function processShoppingInvoiceDocumentPublications(options?: { ide
   return processWcInvoiceDocumentPublications(options)
 }
 
+/** The TrackShip re-fire sweep (off unless `trackship_refire_enabled` is `true`): register shipped orders, queue the looks that are due, drain. */
+export async function processShoppingTrackshipRefires(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
+  const { processWcTrackshipRefires } = await import('@/lib/connectors/woocommerce/sync/trackship-refire-jobs')
+  return processWcTrackshipRefires(options)
+}
+
 /**
  * Fan the current FX rate set out to every configured shopping connector so the
  * storefront, IMS and the accounting platform share one rate. Each connector
