@@ -28,6 +28,8 @@ export type RefusedActionSeverity = (typeof REFUSED_ACTION_SEVERITIES)[number]
 export const REFUSED_ACTIONS = {
   /** An amendment attempted after the warehouse order left NEW. */
   WMS_ORDER_AMEND: { label: 'Order change not applied in the warehouse', gates: ['WMS_ORDER_NOT_NEW', 'WMS_AMEND_UNBUILDABLE', 'WMS_SCOPE_UNSENDABLE'] },
+  /** A warehouse despatch for a mixed-warehouse order that IMS could not apply because the part it sent no longer matches the order's allocation and shipments. */
+  WMS_DESPATCH_SCOPE: { label: 'Despatch does not match the part sent to the warehouse', gates: ['WMS_SCOPE_MISMATCH'] },
   /** A split warehouse order that can never complete in IMS because a part was cancelled. */
   WMS_SPLIT_ORDER_COMPLETE: { label: 'Split order cannot complete', gates: ['WMS_SPLIT_PART_CANCELLED'] },
 } as const

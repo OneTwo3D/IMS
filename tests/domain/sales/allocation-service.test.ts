@@ -576,6 +576,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
         return { count: rows.length }
       },
     },
+    wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
     orderAllocation: {
       findMany: async ({ where }: { where: { orderId: string } }) => allocations
         .filter((allocation) => allocation.orderId === where.orderId)

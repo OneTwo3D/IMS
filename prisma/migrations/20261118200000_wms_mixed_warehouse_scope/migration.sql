@@ -37,7 +37,7 @@ CREATE TABLE "wms_despatch_applications" (
     CONSTRAINT "wms_despatch_applications_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX "wms_order_push_scope_lines_link_id_scope_version_order_line_id_key" ON "wms_order_push_scope_lines"("link_id", "scope_version", "order_line_id");
+CREATE UNIQUE INDEX "wms_scope_lines_link_version_line_key" ON "wms_order_push_scope_lines"("link_id", "scope_version", "order_line_id");
 CREATE INDEX "wms_order_push_scope_lines_link_id_idx" ON "wms_order_push_scope_lines"("link_id");
 CREATE UNIQUE INDEX "wms_despatch_applications_idempotency_key_key" ON "wms_despatch_applications"("idempotency_key");
 CREATE INDEX "wms_despatch_applications_link_id_idx" ON "wms_despatch_applications"("link_id");

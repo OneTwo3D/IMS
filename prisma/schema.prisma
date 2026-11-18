@@ -4494,7 +4494,7 @@ model WmsOrderPushScopeLine {
 
   link         WmsOrderPushLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
 
-  @@unique([linkId, scopeVersion, orderLineId])
+  @@unique([linkId, scopeVersion, orderLineId], map: "wms_scope_lines_link_version_line_key")
   @@index([linkId])
   @@map("wms_order_push_scope_lines")
 }

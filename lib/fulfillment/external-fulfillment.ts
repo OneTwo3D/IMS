@@ -15,6 +15,9 @@ import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
 import { isShoppingConnectorId, shoppingOrderLookupSkipReason } from '@/lib/fulfillment/shopping-order-lookup'
 import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
+import { isMixedWarehousePushEnabled } from '@/lib/domain/wms/mixed-scope-flag'
+import { loadMixedScopeForOrder } from '@/lib/domain/wms/mixed-scope-loader'
+import { sameScopeLines, warehouseShipmentsMatchAllocations } from '@/lib/domain/wms/scoped-despatch-checks'
 
 // A fulfillment update originates from either a storefront (shopping) connector
 // that owns the order's ShoppingOrderLink, or a WMS/3PL connector that
@@ -76,6 +79,10 @@ export type ExternalFulfillmentRefusal =
   | 'shipment_status_transition_failed'
   | 'despatch_review_not_recorded'
   | 'wms_other_warehouse_shipments'
+  /** Mixed-warehouse scope: the part the warehouse was sent no longer matches what IMS holds for it (or the warehouse's shipments do not match it). Retryable; not a connector failure. */
+  | 'wms_scope_mismatch'
+  /** Mixed-warehouse scope: the store reported the order completed while the warehouse's part is still open. Ignored (nothing is shipped); permanent, so the delivery is acknowledged and an exception is raised. */
+  | 'wms_part_open'
 
 export type ExternalFulfillmentOutcome =
   | {
@@ -119,6 +126,8 @@ export type ExternalFulfillmentOutcome =
 /** The refusals a retry can never resolve. Everything unlisted stays retryable, which is the safe direction. */
 const PERMANENT_EXTERNAL_FULFILLMENT_REFUSALS: ReadonlySet<ExternalFulfillmentRefusal> = new Set([
   'coverage_shortfall',
+  // A storefront completion echo for a mixed order whose warehouse part is still open is ignored for good: the warehouse's own despatch is the evidence that completes it.
+  'wms_part_open',
 ])
 
 /**
@@ -677,6 +686,187 @@ async function refuseWmsForeignWarehouseShipments(
   return refuseExternalFulfillment('wms_other_warehouse_shipments', error)
 }
 
+
+/** The push link of an order the warehouse was sent only a PART of (mixed-warehouse scope), or null while the feature is off or the order is not scoped. */
+type MixedDespatchLink = { id: string; scopeVersion: number; pushWarehouseId: string | null; despatchSettledAt: Date | null }
+
+async function readMixedDespatchLink(orderId: string): Promise<MixedDespatchLink | null> {
+  if (!(await isMixedWarehousePushEnabled())) return null
+  const link = await db.wmsOrderPushLink.findUnique({
+    where: { orderId },
+    select: { id: true, scopeMode: true, scopeVersion: true, pushWarehouseId: true, despatchSettledAt: true, state: true },
+  })
+  if (!link || link.scopeMode !== 'MIXED' || link.state === 'CANCELLED') return null
+  return { id: link.id, scopeVersion: link.scopeVersion, pushWarehouseId: link.pushWarehouseId, despatchSettledAt: link.despatchSettledAt }
+}
+
+/**
+ * A storefront (WooCommerce) 'completed' echo for a MIXED order whose warehouse part is still open (owner answer Q6). The warehouse's own despatch completes the
+ * order; the storefront cannot, because applying it would ship the OTHER warehouse's shipments on the word of a status. It is ignored: nothing is shipped, the
+ * refusal is permanent (the delivery is acknowledged) and the caller raises the exception row on Sync > Exceptions, cleared when the order is fulfilled.
+ */
+async function refuseCompletionEchoOnOpenMixedPart(update: ExternalFulfillmentUpdate, orderId: string, orderRef: string): Promise<ExternalFulfillmentOutcome> {
+  const error = `${update.source} reported order ${orderRef} completed, but the order is split across warehouses and the warehouse's part has not been despatched yet, `
+    + 'so the completion was ignored and no shipment was marked shipped. The warehouse despatch completes its part; ship the other warehouse\'s part in IMS when it leaves.'
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'external_fulfillment_completion_echo_ignored',
+    tag: 'sync',
+    level: 'WARNING',
+    description: error,
+    metadata: { source: update.source },
+    resolveUser: false,
+  })
+  return refuseExternalFulfillment('wms_part_open', error)
+}
+
+/**
+ * THE SCOPED WAREHOUSE DESPATCH (mixed-warehouse scope, flag on, link MIXED). The warehouse despatched the part IMS sent it; only the warehouse's OWN shipments
+ * are shipped and the other warehouses' are left exactly as they are.
+ *
+ *  - APPLIED ONCE PER SCOPE VERSION: an application row keyed by (link, scope version) is written in the same transaction that stamps the link settled, so a
+ *    replayed despatch finds it and ships nothing, and a crash between the shipments and the row simply repeats (a shipped shipment is not shipped again).
+ *  - EXACT MATCH OR NOTHING: the scope IMS would send now must carry the units that were sent, and the warehouse's open shipments must hold exactly the
+ *    allocations in the warehouse. Otherwise the despatch is refused as `wms_scope_mismatch` (retryable, raised for a person, never counted as a connector
+ *    failure): shipping a different set of goods than the warehouse picked would book the wrong stock and cost.
+ *  - The order is promoted (and the storefront completed) only when EVERY shipment has shipped, exactly as for any partial despatch.
+ */
+async function applyScopedWmsDespatch(
+  update: ExternalFulfillmentUpdate,
+  order: ResolvedOrder,
+  orderRef: string,
+  link: MixedDespatchLink,
+): Promise<ExternalFulfillmentOutcome> {
+  const idempotencyKey = `${link.id}:${link.scopeVersion}`
+  const alreadyApplied = link.despatchSettledAt !== null
+    || (await db.wmsDespatchApplication.findUnique({ where: { idempotencyKey }, select: { id: true } })) !== null
+  if (alreadyApplied) return { success: true }
+
+  const mismatch = async (why: string): Promise<ExternalFulfillmentOutcome> => {
+    const error = `${update.source} despatched order ${orderRef}, but ${why}. Nothing was shipped; reconcile the order's allocation and shipments (or the warehouse order), then the despatch is applied on the next pass.`
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: order.id,
+      action: 'external_fulfillment_scope_mismatch',
+      tag: 'sync',
+      level: 'WARNING',
+      description: error,
+      metadata: { source: update.source, scopeVersion: link.scopeVersion },
+      resolveUser: false,
+    })
+    return refuseExternalFulfillment('wms_scope_mismatch', error)
+  }
+
+  const wmsWarehouseId = link.pushWarehouseId
+  if (!wmsWarehouseId) return mismatch('the warehouse order records no IMS warehouse')
+  const [current, sentLines] = await Promise.all([
+    loadMixedScopeForOrder(db, order.id, wmsWarehouseId),
+    db.wmsOrderPushScopeLine.findMany({ where: { linkId: link.id, scopeVersion: link.scopeVersion }, select: { orderLineId: true, quantity: true } }),
+  ])
+  if (!current || current.mode !== 'MIXED') return mismatch('the order is no longer split the way it was when it was sent to the warehouse')
+  if (!sameScopeLines(sentLines.map((line) => ({ lineId: line.orderLineId, quantity: line.quantity.toString() })), current.lines.map((line) => ({ lineId: line.lineId, quantity: line.quantity })))) {
+    return mismatch('the units IMS holds for the warehouse differ from the units it was sent')
+  }
+
+  const { confirmAllocations, updateShipmentStatus } = await import('@/app/actions/allocation')
+  let shipments = await db.shipment.findMany({
+    where: { orderId: order.id },
+    select: { id: true, status: true, warehouseId: true, lines: { select: { lineId: true, productId: true, qty: true } } },
+    orderBy: { createdAt: 'asc' },
+  })
+  if (shipments.length === 0) {
+    const created = await confirmAllocations(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+    if (!created.success) return refuseExternalFulfillment('shipment_creation_failed', created.error ?? 'Shipment creation failed')
+    shipments = await db.shipment.findMany({
+      where: { orderId: order.id },
+      select: { id: true, status: true, warehouseId: true, lines: { select: { lineId: true, productId: true, qty: true } } },
+      orderBy: { createdAt: 'asc' },
+    })
+  }
+  const wmsShipments = shipments.filter((shipment) => shipment.warehouseId === wmsWarehouseId)
+  const wmsAllocations = await db.orderAllocation.findMany({ where: { orderId: order.id, warehouseId: wmsWarehouseId }, select: { lineId: true, productId: true, qty: true } })
+  const difference = warehouseShipmentsMatchAllocations(
+    wmsShipments.flatMap((shipment) => shipment.lines.map((row) => ({ lineId: row.lineId, productId: row.productId, qty: row.qty.toString() }))),
+    wmsAllocations.map((row) => ({ lineId: row.lineId, productId: row.productId, qty: row.qty.toString() })),
+  )
+  if (difference) return mismatch(difference)
+
+  const shortfalls = await findExternalFulfillmentShortfall(order.id)
+  if (shortfalls.length > 0) {
+    const error = describeExternalFulfillmentShortfall(shortfalls)
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: order.id,
+      action: 'external_fulfillment_short',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `${update.source} dispatch for order ${orderRef} was refused: the IMS shipment lines do not cover everything ordered`,
+      metadata: { source: update.source, shortfalls },
+      resolveUser: false,
+    })
+    return refuseExternalFulfillment('coverage_shortfall', error)
+  }
+
+  const open = wmsShipments.filter((shipment) => shipment.status !== 'SHIPPED')
+  for (let index = 0; index < open.length; index++) {
+    const shipment = open[index]
+    const tracking = update.tracking?.[index] ?? (update.tracking?.length === 1 ? update.tracking[0] : undefined)
+    for (const target of statusesToApply(shipment.status as ExternalShipmentStatus, 'SHIPPED')) {
+      const result = await updateShipmentStatus(
+        shipment.id,
+        target,
+        target === 'SHIPPED' && tracking ? { trackingNumber: tracking.trackingNumber, shippingService: tracking.shippingService ?? undefined } : undefined,
+        {
+          internalBypassToken: INTERNAL_ACTION_BYPASS,
+          completionAuthority: 'EXTERNAL',
+          allowRecordWhenNotReady: true,
+          // The completion job is enqueued WITH the order flip, which happens only when every shipment has shipped (see promoteOrderIfFulfilledInTx).
+          storefrontCompletion: update.storefrontAlreadyCompleted !== true,
+          skipStorefrontPush: update.storefrontAlreadyCompleted === true,
+          ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
+        },
+      )
+      if (!result.success) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: 'external_fulfillment_failed',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `${update.source} fulfillment update failed at ${target} for order ${orderRef}`,
+          metadata: { source: update.source, shipmentId: shipment.id, target, error: result.error },
+          resolveUser: false,
+        })
+        return refuseExternalFulfillment('shipment_status_transition_failed', result.error ?? `Failed to update shipment to ${target}`)
+      }
+    }
+  }
+
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.wmsDespatchApplication.create({ data: { linkId: link.id, scopeVersion: link.scopeVersion, idempotencyKey, shipmentIds: open.map((shipment) => shipment.id) } })
+      await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { despatchSettledAt: new Date() } })
+    })
+  } catch (error) {
+    // A concurrent apply wrote the row first: the despatch is recorded, which is the outcome wanted.
+    if ((error as { code?: string } | null)?.code !== 'P2002') {
+      return refuseExternalFulfillment('shipment_status_transition_failed', `The warehouse's part was shipped but the despatch could not be recorded; it will be retried: ${error instanceof Error ? error.message : 'unknown error'}`)
+    }
+  }
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: order.id,
+    action: 'external_fulfillment_applied',
+    tag: 'sync',
+    level: 'INFO',
+    description: `Applied ${update.source} fulfillment update to SHIPPED for the warehouse's part of order ${orderRef} (${open.length} shipment(s); other warehouses' shipments left open)`,
+    metadata: { source: update.source, targetShipmentStatus: 'SHIPPED', shipmentsProcessed: open.length, scoped: true, scopeVersion: link.scopeVersion },
+    resolveUser: false,
+  })
+  return { success: true }
+}
+
 export async function applyExternalFulfillmentUpdate(
   update: ExternalFulfillmentUpdate,
 ): Promise<ExternalFulfillmentOutcome> {
@@ -712,6 +902,15 @@ export async function applyExternalFulfillmentUpdate(
         resolveUser: false,
       })
       return refuseExternalFulfillment('order_not_ready_to_ship', error)
+    }
+  }
+
+  // MIXED-WAREHOUSE SCOPE (flag on, link MIXED only; otherwise this reads nothing and everything below is as it always was).
+  if (update.targetShipmentStatus === 'SHIPPED' && !orderNotReady) {
+    const mixedLink = await readMixedDespatchLink(order.id)
+    if (mixedLink) {
+      if (isWmsConnectorId(update.source)) return applyScopedWmsDespatch(update, order, orderRef, mixedLink)
+      if (mixedLink.despatchSettledAt === null) return refuseCompletionEchoOnOpenMixedPart(update, order.id, orderRef)
     }
   }
 

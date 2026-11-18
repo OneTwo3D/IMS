@@ -525,6 +525,7 @@ const tx = {
       return { count: rows.length }
     },
   },
+  wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
   orderAllocation: {
     // Answers BOTH unique shapes production uses: the merge-target lookup by
     // (lineId, warehouseId, productId), and — since o3d-4kfh round 3 — the re-read by `id` that

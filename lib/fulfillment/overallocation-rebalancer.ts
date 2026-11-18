@@ -1,3 +1,4 @@
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
@@ -253,6 +254,7 @@ export async function releaseOverallocationsForItemInTx(
           data: { qty: nextQty! },
         })
       }
+      await markWmsScopeDirtyInTx(tx, alloc.orderId)
       await tx.stockLevel.updateMany({
         where: { productId: item.productId, warehouseId: item.warehouseId },
         data: { reservedQty: { decrement: release } },

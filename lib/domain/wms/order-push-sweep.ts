@@ -4718,7 +4718,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     holdableLinks: (connector, limit) =>
       db.wmsOrderPushLink.findMany({
         // MERGED links are included (their survivor holds the goods); a link whose hold the WMS already refused carries a notice and is not retried.
-        where: { connector, state: { in: ['SYNCED', 'MERGED'] }, holdNoticeAt: null, externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
+        // despatchSettledAt: the warehouse's part has already left (mixed-warehouse scope; null while the feature is off): it is never held or cancelled there.
+        where: { connector, state: { in: ['SYNCED', 'MERGED'] }, holdNoticeAt: null, despatchSettledAt: null, externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
         select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true },
         take: limit,
       }) as Promise<WmsPushLinkRef[]>,
@@ -4728,6 +4729,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           connector,
           state: { in: ['SYNCED', 'MERGED'] },
           cancelNoticeAt: null,
+          // The warehouse's part of a mixed-warehouse order has already despatched: a full refund or cancel of the order never cancels it there.
+          despatchSettledAt: null,
           externalOrderId: { not: null },
           order: WMS_CANCELLABLE_ORDER_WHERE,
         },

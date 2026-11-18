@@ -5,6 +5,7 @@ import {
   runWmsOrderPushSweepCore,
   type WmsOrderPushPort,
   type WmsPushCandidate,
+  type WmsPushRevalidateLink,
   type WmsPushUpdateLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
 import type { MixedScope } from '../lib/domain/wms/mixed-scope.ts'
@@ -175,8 +176,27 @@ test('amend: the warehouse order is amended in the warehouse the link was pushed
   assert.equal(sentInput!.externalWarehouseId, '302')
 })
 
+// ---- revalidation -----------------------------------------------------------------------------------------------------------------------------------
+const parked = (): WmsPushRevalidateLink => ({ id: 'link-1', orderId: 'so-1', lastError: 'old', attempts: 0, pushedAt: null, externalOrderId: null, order: { ...candidate(), shipFromWarehouseId: 'wh-1' } })
+
+test('revalidation: a parked order whose scope is still unsendable stays parked with the new reason (no re-queue, no remote call)', async () => {
+  const { port, updates } = makePort({ revalidatable: { links: [parked()], total: 1 }, loadMixedScope: async () => ({ mode: 'HOLD', reason: 'units unallocated', unallocated: [] }) })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.revalidated, 0)
+  assert.match(String(updates[0].data.lastError), /units unallocated/)
+  assert.notEqual(updates[0].data.state, 'PENDING_CREATE')
+})
+
+test('revalidation: once the scope is sendable the order is re-queued for the create pass', async () => {
+  const { port, updates } = makePort({ revalidatable: { links: [parked()], total: 1 }, loadMixedScope: async () => MIXED })
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.revalidated, 1)
+  assert.equal(updates.some((u) => u.data.state === 'PENDING_CREATE'), true)
+})
+
 // ---- harness ---------------------------------------------------------------------------------------------------------------------------------------
 type Seed = {
+  revalidatable?: { links: WmsPushRevalidateLink[]; total: number }
   bindings?: Array<{ warehouseId: string; externalWarehouseId: string }>
   createCandidates?: WmsPushCandidate[]
   updatable?: WmsPushUpdateLink[]
@@ -193,7 +213,7 @@ function makePort(seed: Seed) {
     activeBindings: async () => seed.bindings ?? BINDINGS,
     releasableHeldOrders: async () => [],
     createCandidates: async () => seed.createCandidates ?? [],
-    revalidatableLinks: async () => ({ links: [], total: 0 }),
+    revalidatableLinks: async () => seed.revalidatable ?? { links: [], total: 0 },
     recordValidationFailure: async (orderId, _connector, error) => { validationFailures.push({ orderId, error }); return true },
     claimForCreate: async () => 'CLAIMED',
     verifiableLinks: async () => [],
