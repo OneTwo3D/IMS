@@ -51,7 +51,7 @@ export type MintsoftAsnExpectation = {
     expectedQty: number
     /**
      * Mintsoft's ProductId for the line. Needed only to tell a row that carries NO source line ids at all
-     * (a warehouse-made ASN) apart from ours by item set; absent, such a row stays unreadable and refuses.
+     * (a warehouse-made ASN) apart from ours by a DISJOINT product set; absent, such a row refuses.
      */
     externalProductId?: string
   }>
@@ -150,7 +150,7 @@ export type MintsoftAsnDifference =
   | { kind: 'lineIdentityUnreadable' }
   /**
    * Every item on the row has NO usable SourceLineId (the shape of an ASN made in the Mintsoft UI: the key
-   * is there and null), and its item set (ProductId + QuantityExpected, as a multiset) is NOT ours. IMS
+   * is there and null), and its PRODUCT set is disjoint from ours (no ProductId in common). IMS
    * always sends a SourceLineId and Mintsoft returns it verbatim, so such a row can only be ours if it
    * holds exactly our items; one that does not is a warehouse-made ASN that merely quotes our reference.
    */
@@ -233,27 +233,26 @@ function rawProductId(item: unknown): string | null {
 }
 
 /**
- * Could a row whose items carry NO SourceLineId be the ASN we sent? Only if its items are exactly ours as a
- * multiset of (ProductId, QuantityExpected). Conservative in every doubtful direction, because `true` means
- * "refuse": a ProductId or quantity that cannot be read, an expectation line without a ProductId, or a
- * quantity within rounding of ours all answer true. Only a readable, determinate difference answers false.
+ * Could a row whose items carry NO SourceLineId overlap the goods we are about to send? Answers `true`
+ * ("refuse") unless the row's PRODUCT SET is DISJOINT from ours: no product appears on both sides. Item
+ * count and quantities play no part (Codex R1 HIGH on #1002): a warehouse-made ASN for the same product
+ * with a different quantity may be our own ASN edited at the warehouse, or a delivery that already covers
+ * these units, and creating another would have the warehouse expecting both. Any ProductId missing or
+ * unreadable on either side, or an empty item set, answers `true`.
  */
 function unkeyedItemSetCouldBeOurs(items: unknown[], expectation: MintsoftAsnExpectation): boolean {
-  if (items.length !== expectation.lines.length) return false
-  const remaining = expectation.lines.map((line) => ({ ...line }))
+  if (items.length === 0 || expectation.lines.length === 0) return true
+  const ours = new Set<string>()
+  for (const line of expectation.lines) {
+    const id = line.externalProductId?.trim()
+    if (!id) return true
+    ours.add(id)
+  }
   for (const item of items) {
     const productId = rawProductId(item)
-    const qty = readMintsoftAsnItemExpectedQuantity(item)
-    if (productId == null || qty == null) return true
-    const sameProduct = (line: { externalProductId?: string }) =>
-      line.externalProductId == null || line.externalProductId.trim() === productId
-    // Exact quantities first, so a rounding-explainable pairing cannot consume the line an exact one needs.
-    let index = remaining.findIndex((line) => sameProduct(line) && quantitiesMatch(qty, line.expectedQty))
-    if (index < 0) index = remaining.findIndex((line) => sameProduct(line) && roundingCouldExplain(line.expectedQty, qty))
-    if (index < 0) return false
-    remaining.splice(index, 1)
+    if (productId == null || ours.has(productId)) return true
   }
-  return true
+  return false
 }
 
 /**
@@ -356,7 +355,7 @@ export function isProofThatMintsoftAsnIsNotThisOne(
     case 'unkeyedItemsDiffer':
       // o3d-66ca1 (owner decision Q7). The row quotes OUR reference but none of its items carries a source
       // line id, which an ASN IMS sent always does (Mintsoft returns it verbatim, proven live 2026-09-24),
-      // and its item set is not ours: a warehouse-made ASN against the same PO number. Not a lost create.
+      // and its products are disjoint from ours: a warehouse-made ASN against the same PO number. Not a lost create.
       // The identity rule is untouched for any row that carries a SourceLineId, and a row whose items DO
       // match ours stays `lineIdentityUnreadable` and refuses.
       return true
