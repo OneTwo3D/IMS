@@ -389,6 +389,8 @@ export type PennyMismatchRow = {
 
 export type OutboxFailureRow = {
   id: string
+  /** True when the row's status is not one this version recognises: Replay cannot work and an administrator must act. */
+  unrecognisedStatus: boolean
   connector: string
   operation: string
   status: string
@@ -908,6 +910,7 @@ export type ExceptionInboxData = {
 // either recovers or lands here as PERMANENT_FAILED. Listing mid-backoff rows
 // would surface self-resolving noise, and "acknowledging" them (flipping to
 // PERMANENT_FAILED) would not have removed them from this same list.
+const KNOWN_OUTBOX_STATUS_VALUES = Object.values(INTEGRATION_OUTBOX_STATUS)
 const OUTBOX_FAILURE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
@@ -1812,6 +1815,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     wmsPushDeadLetters: pushLinks.map((link) => buildBlockedWmsPushRow(link)),
     outboxFailures: outbox.map((row) => ({
       id: row.id,
+      unrecognisedStatus: !(KNOWN_OUTBOX_STATUS_VALUES as string[]).includes(row.status),
       connector: row.connector,
       operation: row.operation,
       status: row.status,

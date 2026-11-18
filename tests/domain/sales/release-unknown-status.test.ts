@@ -27,8 +27,8 @@ test('a release row in a status this binary cannot name is classified and surfac
   assert.deepEqual(statuses, ['QUARANTINED'])
   const text = describeUnknownReleaseStatuses(statuses)
   assert.match(text, /QUARANTINED/)
-  assert.match(text, /roll forward/i)
-  assert.match(text, /Sync > Exceptions/)
+  assert.match(text, /Deploy the version that recognises this status/)
+  assert.match(text, /cannot be cleared from the app/)
 })
 
 test('known statuses (including SUCCEEDED) are never reported as unknown', async () => {

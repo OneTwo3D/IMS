@@ -506,7 +506,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Integration outbox — permanently failed rows (${data.summary.outboxFailures})`}
-            detail="Accounting posts, WooCommerce stock pushes, booked-in events and landed-cost journals that exhausted their retries. Replay resets the row with its original payload and restarts its retry ladder."
+            detail="Accounting posts, WooCommerce stock pushes, booked-in events and landed-cost journals that exhausted their retries. Replay resets the row with its original payload and restarts its retry ladder. A row with an unrecognised status was written by another version of IMS and needs an administrator."
             shown={data.outboxFailures.length}
             total={data.summary.outboxFailures}
           />
@@ -525,20 +525,24 @@ export function ExceptionsClient({ data }: Props) {
               {data.outboxFailures.map((row) => (
                 <TableRow key={row.id}>
                   <TableCell className="text-xs font-mono">{row.connector}/{row.operation}</TableCell>
-                  <TableCell className="text-xs">Permanent</TableCell>
+                  <TableCell className="text-xs">{row.unrecognisedStatus ? `Unrecognised: ${row.status}` : 'Permanent'}</TableCell>
                   <TableCell className="text-xs">{row.attempts}</TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[300px] truncate" title={row.lastError ?? ''}>{row.lastError ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.updatedAt)}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(() => replayOutboxException(row.id), 'Outbox row re-queued.')}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Replay
-                    </Button>
+                    {row.unrecognisedStatus ? (
+                      <span className="text-xs text-muted-foreground" title="Written by a version of IMS that is not running. Replay cannot work; deploy the version that recognises this status or escalate to whoever runs deployments.">Needs an administrator</span>
+                    ) : (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(() => replayOutboxException(row.id), 'Outbox row re-queued.')}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Replay
+                      </Button>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}

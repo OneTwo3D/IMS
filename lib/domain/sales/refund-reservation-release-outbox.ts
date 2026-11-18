@@ -392,11 +392,10 @@ export async function listUnknownReleaseStatuses(
 /** The sentence appended to the dispatch refusal when unknown statuses are what block it. */
 export function describeUnknownReleaseStatuses(statuses: string[]): string {
   if (statuses.length === 0) return ''
-  return ` Blocking release row status not recognised by this version of IMS: ${statuses.join(', ')}. `
-    + 'There is no "Finish repack recovery" control for it, because it was written by a different (newer) '
-    + 'version, most likely before a rollback. Roll forward to the version that wrote it so it can resolve '
-    + 'the row, or have an administrator review the row under Sync > Exceptions (Integration outbox) and set '
-    + 'it to SUCCEEDED once the refunded units\u2019 reservation has been reconciled by hand.'
+  return ` The blocking release row has a status this version of IMS does not recognise: ${statuses.join(', ')}. `
+    + 'There is no Finish repack recovery control for it, because it was written by a different (newer) '
+    + 'version, most likely before a rollback. This cannot be cleared from the app. Deploy the version that '
+    + 'recognises this status so it can finish the row, or escalate it to whoever runs IMS deployments.'
 }
 
 /**

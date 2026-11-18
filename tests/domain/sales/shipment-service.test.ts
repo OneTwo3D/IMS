@@ -2932,8 +2932,8 @@ test('o3d-2k5r r9: a backstop row carrying a status THIS BINARY DOES NOT KNOW st
   assert.equal(result.success, false)
   assert.match((result as { error: string }).error, /repack recovery/)
   // The refusal names the unrecognised status and the rollback remedy rather than only a control that is not rendered.
-  assert.match((result as { error: string }).error, /not recognised by this version of IMS: QUARANTINED_BY_NEWER_RELEASE/)
-  assert.match((result as { error: string }).error, /roll forward/i)
+  assert.match((result as { error: string }).error, /does not recognise: QUARANTINED_BY_NEWER_RELEASE/)
+  assert.match((result as { error: string }).error, /Deploy the version that recognises/)
   assert.equal(state.shipments[1].status, 'PACKED')
   assert.equal(state.movements.length, 0)
 })
