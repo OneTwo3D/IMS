@@ -1,8 +1,9 @@
 import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
-import { hasPermission } from '@/lib/permissions'
+import { hasPermission, type Permission } from '@/lib/permissions'
 import { toIsoCountryCode } from '@/lib/countries'
+import { gateLegacyExportPrices } from '@/lib/products/legacy-export-price-gate'
 import { loadActiveDefinitions } from '@/lib/custom-fields/values-service'
 import { customFieldCsvHeader, formatCustomFieldValue } from '@/lib/custom-fields/values'
 
@@ -151,6 +152,8 @@ export async function GET(req: Request) {
     }
   })
 
+  // Price columns stay in the header but are blank in every batch without inventory.prices (same gate as Edit-by-CSV).
+  const canSeePrices = (permission: Permission) => hasPermission(session.user.role, permission)
   const filename = `products-${new Date().toISOString().slice(0, 10)}.csv`
   const headerLine = toCsv([], headers)
   const encoder = new TextEncoder()
@@ -170,7 +173,7 @@ export async function GET(req: Request) {
       if (batch.length === 0) { done = true; controller.close(); return }
       cursor = lastId
       if (batch.length < EXPORT_BATCH_SIZE) done = true
-      const body = toCsv(buildRows(batch, values), headers).slice(headerLine.length)
+      const body = toCsv(gateLegacyExportPrices(buildRows(batch, values), canSeePrices), headers).slice(headerLine.length)
       controller.enqueue(encoder.encode(body))
     },
   })

@@ -20,6 +20,8 @@ export type ImportDryRunResult = {
 
 export type CsvImportPreviewResult = ImportDryRunResult & {
   preview: true
+  /** Rows whose product write would land but whose components / BOM recipe would be refused (product import only). */
+  componentsFailed?: number
   error?: string
 }
 
@@ -45,6 +47,11 @@ export type CsvImportExecutionResult = {
   created: number
   updated: number
   skipped: number
+  /**
+   * Product import only: rows whose product write committed (counted in created/updated) but whose
+   * components / BOM recipe were refused. Any value above zero makes the result unsuccessful.
+   */
+  componentsFailed?: number
   errors: string[]
   error?: string
   message?: string
@@ -101,11 +108,13 @@ export function createCsvImportPreviewResult(args: {
   errors: string[]
   warnings?: string[]
   error?: string
+  componentsFailed?: number
 }): CsvImportPreviewResult {
   return {
     ...createImportDryRunResult(args),
     preview: true,
     error: args.error,
+    ...(args.componentsFailed ? { componentsFailed: args.componentsFailed } : {}),
   }
 }
 
@@ -113,6 +122,7 @@ export function createCsvImportExecutionResult(args: {
   created: number
   updated: number
   skipped: number
+  componentsFailed?: number
   errors: string[]
   error?: string
   message?: string
@@ -120,13 +130,15 @@ export function createCsvImportExecutionResult(args: {
   count?: number
 }): CsvImportExecutionResult {
   const count = args.count ?? (args.created + args.updated)
+  const componentsFailed = args.componentsFailed ?? 0
   return {
     preview: false,
-    success: args.success ?? (!args.error && (count > 0 || args.errors.length === 0)),
+    success: args.success ?? (!args.error && componentsFailed === 0 && (count > 0 || args.errors.length === 0)),
     count,
     created: args.created,
     updated: args.updated,
     skipped: args.skipped,
+    ...(componentsFailed > 0 ? { componentsFailed } : {}),
     errors: args.errors,
     error: args.error,
     message: args.message,

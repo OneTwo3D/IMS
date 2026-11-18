@@ -437,6 +437,7 @@ export async function updateAdjustmentMovement(
         where: { id },
         select: {
           id: true,
+          type: true,
           productId: true,
           fromWarehouseId: true,
           toWarehouseId: true,
@@ -451,6 +452,9 @@ export async function updateAdjustmentMovement(
         },
       })
       if (!movement) throw new Error('Movement not found')
+      if (movement.type !== 'ADJUSTMENT') {
+        throw new Error('Only stock adjustments can be edited')
+      }
 
       const oldIsAddition = movement.toWarehouseId !== null
       const oldWarehouseId = (oldIsAddition ? movement.toWarehouseId : movement.fromWarehouseId)!

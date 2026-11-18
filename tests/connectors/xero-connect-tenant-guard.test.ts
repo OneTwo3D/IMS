@@ -326,6 +326,11 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
     salesOrderRefund: inertModel,
     salesOrderLine: inertModel,
     salesOrder: inertModel,
+    // Order attachments: the reset queues their files for deletion in the same transactions that delete the orders (nothing is attached in this file).
+    orderAttachment: inertModel,
+    orderAttachmentFileDeletion: inertModel,
+    // The purchasing stage deletes purchase orders in a transaction of its own (their attachment files are queued in it).
+    purchaseOrder: inertModel,
     euVatGiftCardLineResolution: inertModel,
     setting: {
       findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
