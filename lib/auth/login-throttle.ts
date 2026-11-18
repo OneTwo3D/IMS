@@ -11,17 +11,25 @@
  *                 attacker is held to roughly one guess per cooldown; the owner waits the same cooldown.
  *                 Applies to every client, including 'unknown' IPs, so it is the control that still bounds
  *                 guessing when no trusted proxy is configured.
- *  - in flight    one password check per account at a time (a short DB claim). Concurrent requests cannot
- *                 all read the same counter and then verify in parallel; the extra ones are told to retry in
- *                 a second. The claim is released when the check ends and expires on its own if the process dies.
+ *  - device       OWASP "device cookie". After a successful sign-in a signed, HttpOnly cookie bound to the
+ *                 account is set. A request carrying a valid cookie for the account skips the per-account
+ *                 cooldown, so an attacker who keeps the account in cooldown by failing from elsewhere cannot
+ *                 lock the real user out. The cookie has its own failure counter and cooldown (keyed by its
+ *                 random id), so a stolen cookie cannot be used to brute-force: once it is cooling down the
+ *                 request is treated as cookie-less and meets the account cooldown instead.
+ *  - in flight    one password check per account (per device id for a cookie request) at a time (a short DB
+ *                 claim). Concurrent requests cannot all read the same counter and then verify in parallel;
+ *                 the extra ones are told to retry in a second. The claim is released when the check ends
+ *                 and expires on its own if the process dies.
  *  - IP           only FAILED attempts are counted per source IP. Past LOGIN_IP_FREE_FAILURES an attempt from
- *                 that IP is slowed (a fixed delay) and serialised (one in flight per IP). It is never refused
- *                 on account of the count, so an attacker sharing a public IP with a user cannot stop that
- *                 user's correct password; it only costs them a bounded wait. Unresolved ('unknown') and
- *                 untrusted addresses are one shared bucket, so they get a much higher threshold.
+ *                 that IP is slowed (a bounded fixed delay). There is no per-IP lane or claim and no refusal
+ *                 on account of the count, so one sender can never monopolise sign-ins for everyone behind
+ *                 the same NAT (or for the shared 'unknown' bucket). Unresolved ('unknown') and untrusted
+ *                 addresses are one shared bucket, so they get a much higher threshold.
  *
  * State lives in the existing one_time_tokens table (no migration), so it is shared by every process.
  */
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { CredentialsSignin } from 'next-auth'
 import { db } from '@/lib/db'
 
@@ -34,6 +42,8 @@ export const LOGIN_BUSY_RETRY_MS = 1000
 export const LOGIN_IP_FREE_FAILURES = 20
 export const LOGIN_IP_FREE_FAILURES_SHARED = 200
 export const LOGIN_IP_DELAY_MS = 2000
+export const LOGIN_DEVICE_COOKIE_NAME = 'ims_login_device'
+export const LOGIN_DEVICE_COOKIE_MAX_AGE_SEC = 180 * 24 * 60 * 60
 const KEY_MAX = 200
 
 /** Thrown from authorize() so the sign-in form can say how long to wait (code `login_wait_<seconds>`). */
@@ -94,7 +104,6 @@ export function loginThrottleKeys(email: string, clientIp: string) {
     accountFailures: `login_fail:acct:${normalized}`,
     accountInFlight: `login_busy:acct:${normalized}`,
     ipFailures: `login_fail:ip:${ip}`,
-    ipInFlight: `login_busy:ip:${ip}`,
   }
 }
 
@@ -122,18 +131,63 @@ async function bumpFailures(store: LoginStore, key: string, nowMs: number): Prom
   await store.set(key, `${current.count + 1}|${nowMs}`, nowMs + Math.max(LOGIN_WINDOW_MS, LOGIN_COOLDOWN_MAX_MS))
 }
 
+/** Device cookie value: `<userId>.<issuedAtSec>.<deviceId>.<hmac>`. */
+export type DeviceCookie = { userId: string; issuedAtSec: number; deviceId: string }
+
+function deviceMac(payload: string, secret: string): string {
+  return createHmac('sha256', secret).update(`login-device:${payload}`, 'utf8').digest('base64url')
+}
+
+export function signDeviceCookie(userId: string, secret: string, nowMs: number = Date.now()): string {
+  const payload = `${userId}.${Math.floor(nowMs / 1000)}.${randomBytes(12).toString('base64url')}`
+  return `${payload}.${deviceMac(payload, secret)}`
+}
+
+/** The cookie's contents when it is genuine, unexpired and bound to `userId`; otherwise null. */
+export function verifyDeviceCookie(
+  value: string | null | undefined,
+  userId: string,
+  secret: string,
+  nowMs: number = Date.now(),
+): DeviceCookie | null {
+  if (!value || !secret || value.length > 400) return null
+  const parts = value.split('.')
+  if (parts.length !== 4) return null
+  const [cookieUserId, issuedRaw, deviceId, mac] = parts
+  const expected = deviceMac(`${cookieUserId}.${issuedRaw}.${deviceId}`, secret)
+  const a = Buffer.from(mac)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+  const issuedAtSec = Number(issuedRaw)
+  if (!deviceId || !Number.isFinite(issuedAtSec) || cookieUserId !== userId) return null
+  const ageMs = nowMs - issuedAtSec * 1000
+  if (ageMs < -60_000 || ageMs > LOGIN_DEVICE_COOKIE_MAX_AGE_SEC * 1000) return null
+  return { userId: cookieUserId, issuedAtSec, deviceId }
+}
+
+/** Pull one cookie out of a Cookie header. */
+export function readCookie(header: string | null | undefined, name: string): string | null {
+  for (const part of (header ?? '').split(';')) {
+    const eq = part.indexOf('=')
+    if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim()
+  }
+  return null
+}
+
 export type LoginAttempt =
   | { allowed: true; finish(outcome: 'success' | 'failure'): Promise<void> }
   | { allowed: false; retryAfterSec: number; reason: 'cooldown' | 'busy' }
 
 /**
  * Call before the password check. When allowed, the caller MUST call finish() exactly once in a finally block
- * (success clears the account counter, failure charges the account and the source IP, either releases the claims).
+ * (success clears the counters, failure charges the account or device and the source IP, either releases the claim).
+ * `device` is a verified device cookie for this account (see verifyDeviceCookie), or null.
  */
 export async function beginLoginAttempt(input: {
   email: string
   clientIp: string
   ipIsTrustworthy: boolean
+  device?: DeviceCookie | null
   store?: LoginStore
   now?: () => number
   sleep?: (ms: number) => Promise<void>
@@ -144,38 +198,41 @@ export async function beginLoginAttempt(input: {
   const keys = loginThrottleKeys(input.email, input.clientIp)
   const busy = { allowed: false, retryAfterSec: Math.ceil(LOGIN_BUSY_RETRY_MS / 1000), reason: 'busy' } as const
 
-  // One password check per account at a time.
-  if (!(await store.claim(keys.accountInFlight, LOGIN_CLAIM_TTL_MS))) return busy
-  let ipClaimed = false
-  const releaseAll = async () => {
-    await store.release(keys.accountInFlight)
-    if (ipClaimed) await store.release(keys.ipInFlight)
+  const deviceId = input.device ? input.device.deviceId.slice(0, KEY_MAX) : null
+  const deviceFailuresKey = deviceId ? `login_fail:dev:${deviceId}` : null
+  const deviceInFlightKey = deviceId ? `login_busy:dev:${deviceId}` : null
+
+  // A cookie that is itself cooling down (failures with it) is treated as no cookie at all.
+  let useDevice = false
+  if (deviceFailuresKey) {
+    const dev = await readFailures(store, deviceFailuresKey)
+    useDevice = dev.lastMs + loginCooldownMs(dev.count) - now() <= 0
   }
+  const claimKey = useDevice && deviceInFlightKey ? deviceInFlightKey : keys.accountInFlight
+
+  // One password check at a time: per account, or per device for a cookie request.
+  if (!(await store.claim(claimKey, LOGIN_CLAIM_TTL_MS))) return busy
+  const release = () => store.release(claimKey)
 
   try {
-    // Account cooldown, enforced before any password work.
-    const acct = await readFailures(store, keys.accountFailures)
-    const waitMs = acct.lastMs + loginCooldownMs(acct.count) - now()
-    if (waitMs > 0) {
-      await releaseAll()
-      return { allowed: false, retryAfterSec: Math.ceil(waitMs / 1000), reason: 'cooldown' }
+    if (!useDevice) {
+      // Account cooldown, enforced before any password work.
+      const acct = await readFailures(store, keys.accountFailures)
+      const waitMs = acct.lastMs + loginCooldownMs(acct.count) - now()
+      if (waitMs > 0) {
+        await release()
+        return { allowed: false, retryAfterSec: Math.ceil(waitMs / 1000), reason: 'cooldown' }
+      }
     }
 
-    // Source IP: failed attempts only; a delay and a single lane, never a refusal on the count.
+    // Source IP: failed attempts only; a bounded delay, never a refusal or an exclusive lane.
     const ipFreeFailures = input.ipIsTrustworthy && input.clientIp !== 'unknown'
       ? LOGIN_IP_FREE_FAILURES
       : LOGIN_IP_FREE_FAILURES_SHARED
     const ip = await readFailures(store, keys.ipFailures)
-    if (ip.count > ipFreeFailures) {
-      if (!(await store.claim(keys.ipInFlight, LOGIN_CLAIM_TTL_MS))) {
-        await releaseAll()
-        return busy
-      }
-      ipClaimed = true
-      await sleep(LOGIN_IP_DELAY_MS)
-    }
+    if (ip.count > ipFreeFailures) await sleep(LOGIN_IP_DELAY_MS)
   } catch (error) {
-    await releaseAll().catch(() => undefined)
+    await release().catch(() => undefined)
     throw error
   }
 
@@ -188,12 +245,15 @@ export async function beginLoginAttempt(input: {
       try {
         if (outcome === 'success') {
           await store.del(keys.accountFailures)
+          if (deviceFailuresKey) await store.del(deviceFailuresKey)
         } else {
-          await bumpFailures(store, keys.accountFailures, now())
+          // A cookie request is charged to its device only, so a stolen cookie cannot raise the account cooldown.
+          if (useDevice && deviceFailuresKey) await bumpFailures(store, deviceFailuresKey, now())
+          else await bumpFailures(store, keys.accountFailures, now())
           await bumpFailures(store, keys.ipFailures, now())
         }
       } finally {
-        await releaseAll()
+        await release()
       }
     },
   }

@@ -8,6 +8,8 @@ import {
   LOGIN_IP_FREE_FAILURES,
   beginLoginAttempt,
   loginCooldownMs,
+  signDeviceCookie,
+  verifyDeviceCookie,
   type LoginStore,
 } from '../../lib/auth/login-throttle.ts'
 
@@ -31,11 +33,12 @@ function harness() {
     async set(key, value, expiresAtMs) { rows.set(key, { value, expiresAtMs }) },
     async del(key) { rows.delete(key) },
   }
+  const nowMsRef = () => nowMs
   const slept: number[] = []
   const common = { store, now: () => nowMs, sleep: async (ms: number) => { slept.push(ms) } }
   /** One login attempt; `correct` decides whether the password verifies. Returns the throttle verdict. */
-  async function login(email: string, ip: string, correct: boolean, opts: { trusted?: boolean; verifyTime?: () => Promise<void> } = {}) {
-    const attempt = await beginLoginAttempt({ email, clientIp: ip, ipIsTrustworthy: opts.trusted ?? true, ...common })
+  async function login(email: string, ip: string, correct: boolean, opts: { trusted?: boolean; device?: ReturnType<typeof verifyDeviceCookie>; verifyTime?: () => Promise<void> } = {}) {
+    const attempt = await beginLoginAttempt({ email, clientIp: ip, ipIsTrustworthy: opts.trusted ?? true, device: opts.device ?? null, ...common })
     if (!attempt.allowed) return attempt
     let verified = false
     try {
@@ -46,7 +49,8 @@ function harness() {
     }
     return { allowed: true as const, verified }
   }
-  return { login, advance: (ms: number) => { nowMs += ms }, slept, rows }
+  const clock = () => nowMsRef()
+  return { login, clock, advance: (ms: number) => { nowMs += ms }, slept, rows }
 }
 
 test('the cooldown is free for the first failures, then doubles, and is capped at 15 minutes', () => {
@@ -168,4 +172,75 @@ test('an exception between begin and finish still releases the claim', async () 
   const h = harness()
   await assert.rejects(h.login('e@example.com', '203.0.113.1', true, { verifyTime: async () => { throw new Error('db down') } }))
   assert.equal((await h.login('e@example.com', '203.0.113.1', true)).allowed, true)
+})
+
+const SECRET = 'test-secret'
+
+test('device cookie: signed, bound to the account, expires, and tamper-proof', () => {
+  const now = 1_700_000_000_000
+  const cookie = signDeviceCookie('user1', SECRET, now)
+  assert.ok(verifyDeviceCookie(cookie, 'user1', SECRET, now))
+  assert.equal(verifyDeviceCookie(cookie, 'user2', SECRET, now), null, 'bound to the account')
+  assert.equal(verifyDeviceCookie(cookie, 'user1', 'other-secret', now), null, 'wrong secret')
+  assert.equal(verifyDeviceCookie(cookie + 'x', 'user1', SECRET, now), null, 'tampered')
+  assert.equal(verifyDeviceCookie(cookie, 'user1', SECRET, now + 181 * 86_400_000), null, 'expired')
+  assert.equal(verifyDeviceCookie(null, 'user1', SECRET, now), null)
+})
+
+test('an attacker failing continuously without a cookie does not block a legitimate user with a valid device cookie', async () => {
+  const h = harness()
+  const device = verifyDeviceCookie(signDeviceCookie('u1', SECRET, h.clock()), 'u1', SECRET, h.clock())
+  assert.ok(device)
+  for (let round = 0; round < 40; round += 1) {
+    // the attacker fails as soon as each cooldown expires, so the account is permanently cooling down
+    const r = await h.login('owner@example.com', '203.0.113.9', false)
+    if (!r.allowed) h.advance((r as { retryAfterSec: number }).retryAfterSec * 1000)
+    await h.login('owner@example.com', '203.0.113.9', false)
+    // the owner with the cookie still gets through with the correct password, every time
+    assert.deepEqual(await h.login('owner@example.com', '198.51.100.7', true, { device }), { allowed: true, verified: true })
+    // re-establish the attacker's cooldown (the owner's success cleared the account counter)
+    for (let i = 0; i < LOGIN_FREE_FAILURES + 2; i += 1) await h.login('owner@example.com', '203.0.113.9', false)
+    const noCookie = await h.login('owner@example.com', '198.51.100.7', true)
+    assert.equal(noCookie.allowed, false, 'without the cookie the owner still waits out the cooldown')
+    h.advance(30_000)
+  }
+})
+
+test('the account cooldown still refuses a cookie-less correct password while the attacker holds it', async () => {
+  const h = harness()
+  for (let i = 0; i < LOGIN_FREE_FAILURES + 1; i += 1) await h.login('o2@example.com', '203.0.113.9', false)
+  assert.equal((await h.login('o2@example.com', '198.51.100.7', true)).allowed, false)
+})
+
+test('a device cookie that keeps failing is put into its own cooldown and then meets the account cooldown', async () => {
+  const h = harness()
+  const device = verifyDeviceCookie(signDeviceCookie('u3', SECRET, h.clock()), 'u3', SECRET, h.clock())
+  assert.ok(device)
+  let verifications = 0
+  const guess = () => h.login('s@example.com', '203.0.113.9', false, { device, verifyTime: async () => { verifications += 1 } })
+  for (let i = 0; i < 100; i += 1) await guess()
+  // the cookie-holder got the free failures on the device counter, then the device cooldown, then the account
+  // free failures, then the account cooldown: a bounded number of guesses, not unlimited
+  assert.equal(verifications, LOGIN_FREE_FAILURES * 2)
+  const refused = await guess()
+  assert.equal(refused.allowed, false)
+})
+
+test('the per-IP delay never refuses: concurrent sign-ins from one IP past the threshold all reach the password check', async () => {
+  const h = harness()
+  const ip = '203.0.113.77'
+  for (let i = 0; i < LOGIN_IP_FREE_FAILURES + 5; i += 1) await h.login(`spray${i}@example.com`, ip, false)
+  h.slept.length = 0
+  let verifications = 0
+  const results = await Promise.all(Array.from({ length: 25 }, (_, i) => h.login(`user${i}@example.com`, ip, true, {
+    verifyTime: async () => { verifications += 1; await new Promise((r) => setTimeout(r, 2)) },
+  })))
+  assert.equal(verifications, 25)
+  assert.ok(results.every((r) => r.allowed))
+  assert.equal(h.slept.length, 25, 'each is only delayed')
+  // the same for the shared unknown-IP bucket
+  const u = harness()
+  for (let i = 0; i < 205; i += 1) await u.login(`s${i}@example.com`, 'unknown', false, { trusted: false })
+  const out = await Promise.all(Array.from({ length: 10 }, (_, i) => u.login(`w${i}@example.com`, 'unknown', true, { trusted: false })))
+  assert.ok(out.every((r) => r.allowed))
 })

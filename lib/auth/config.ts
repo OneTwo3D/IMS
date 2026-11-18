@@ -5,7 +5,16 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
-import { beginLoginAttempt, LoginThrottledError } from '@/lib/auth/login-throttle'
+import { cookies } from 'next/headers'
+import {
+  beginLoginAttempt,
+  LOGIN_DEVICE_COOKIE_MAX_AGE_SEC,
+  LOGIN_DEVICE_COOKIE_NAME,
+  LoginThrottledError,
+  readCookie,
+  signDeviceCookie,
+  verifyDeviceCookie,
+} from '@/lib/auth/login-throttle'
 import { getClientIp, isTrustedProxyConfigured } from '@/lib/request-ip'
 import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
 import {
@@ -20,6 +29,8 @@ const loginSchema = z.object({
 })
 
 const DUMMY_BCRYPT_HASH = '$2b$12$Q7QxTQqR0p6vJY9Yx1m8JOkjH3J0mD6G4jY6YtV2v0mL4YvM1gM9S'
+
+const deviceCookieSecret = () => process.env.NEXTAUTH_SECRET || process.env.AUTH_SECRET || ''
 
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 
@@ -195,17 +206,23 @@ export const authConfig: NextAuthConfig = {
 
         // Per-account cooldown + one in-flight check per account + failed-attempt IP slowdown; none of it
         // refuses a correct password beyond the short cooldown. See lib/auth/login-throttle.ts.
+        // A valid signed device cookie for this account (set after a previous successful sign-in) skips the
+        // per-account cooldown so an attacker cannot keep the real user locked out.
+        const user = await findLoginUser(parsed.data.email)
+        const secret = deviceCookieSecret()
+        const device = user && secret
+          ? verifyDeviceCookie(readCookie(request.headers.get('cookie'), LOGIN_DEVICE_COOKIE_NAME), user.id, secret)
+          : null
         const attempt = await beginLoginAttempt({
           email: parsed.data.email,
           clientIp,
           ipIsTrustworthy: isTrustedProxyConfigured(),
+          device,
         })
         if (!attempt.allowed) throw new LoginThrottledError(attempt.retryAfterSec)
 
         let outcome: 'success' | 'failure' = 'failure'
-        let user: Awaited<ReturnType<typeof findLoginUser>>
         try {
-          user = await findLoginUser(parsed.data.email)
           const passwordHash = user?.passwordHash ?? DUMMY_BCRYPT_HASH
           const passwordMatch = await bcrypt.compare(parsed.data.password, passwordHash)
           if (user && user.active && passwordMatch) outcome = 'success'
@@ -213,6 +230,20 @@ export const authConfig: NextAuthConfig = {
           await attempt.finish(outcome)
         }
         if (outcome !== 'success' || !user) return null
+
+        if (secret) {
+          try {
+            ;(await cookies()).set(LOGIN_DEVICE_COOKIE_NAME, signDeviceCookie(user.id, secret), {
+              httpOnly: true,
+              secure: true,
+              sameSite: 'lax',
+              path: '/',
+              maxAge: LOGIN_DEVICE_COOKIE_MAX_AGE_SEC,
+            })
+          } catch {
+            // No request cookie store in this context: the sign-in still succeeds, just without a device cookie.
+          }
+        }
 
         return {
           id: user.id,
