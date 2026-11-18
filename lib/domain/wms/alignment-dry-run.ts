@@ -34,6 +34,40 @@ export type AlignmentDryRunScope = {
   connectionId: string
   /** When the binding was last re-pointed; the evidence must have started after it. */
   pairingChangedAt: Date
+  /** Clock for the age limit; tests pass a fixed one. */
+  now?: Date
+}
+
+/**
+ * A dry run is evidence for a week. Stock moves on, so a dry run reviewed long ago says nothing about
+ * what live corrections would write off today; an operator who waited longer runs a fresh one.
+ */
+export const ALIGNMENT_DRY_RUN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+function stableJson(value: unknown): string {
+  if (value === null || value === undefined) return 'null'
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    return `{${Object.keys(obj).sort().map((k) => `${JSON.stringify(k)}:${stableJson(obj[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+/**
+ * Whether a binding save leaves the alignment confirmation intact. The confirmation was given for one
+ * pairing AND one set of write-off thresholds: changing either re-arms the confirmation, so live
+ * corrections stay off until it is typed again. `null` and "no thresholds" compare equal.
+ */
+export function alignmentConfirmationSurvivesSave(input: {
+  wasAlignToWms: boolean
+  willBeAlignToWms: boolean
+  pointsAtSameTarget: boolean
+  previousThresholds: unknown
+  nextThresholds: unknown
+}): boolean {
+  if (!input.wasAlignToWms || !input.willBeAlignToWms || !input.pointsAtSameTarget) return false
+  return stableJson(input.previousThresholds) === stableJson(input.nextThresholds)
 }
 
 /**
@@ -49,7 +83,8 @@ export function alignmentDryRunEvidenceQuery(scope: AlignmentDryRunScope) {
       type: 'STOCK_SYNC' as const,
       warehouseId: scope.warehouseId,
       status: { in: ['SUCCEEDED', 'PARTIAL'] as WmsSyncJobStatus[] },
-      finishedAt: { not: null },
+      // Newer than the age limit: older evidence no longer counts.
+      finishedAt: { not: null, gt: new Date((scope.now ?? new Date()).getTime() - ALIGNMENT_DRY_RUN_MAX_AGE_MS) },
       // Evidence belongs to ONE pairing: it must have started after the binding was last re-pointed
       // and must record the external warehouse and connection the binding points at now. Runs
       // recorded before the connection was stamped carry no connectionId and so never match.

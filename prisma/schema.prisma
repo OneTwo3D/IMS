@@ -4762,6 +4762,8 @@ enum WmsDiscrepancyCategory {
   BARCODE_BACKFILLED_FROM_WMS
   INVALID_HS_CODE
   INVALID_COUNTRY_OF_ORIGIN
+  /// An IMS SKU rename the warehouse product does not yet follow: nothing is created, the operator renames it there.
+  PRODUCT_SKU_RENAMED
 }
 
 enum WmsDiscrepancyStatus {

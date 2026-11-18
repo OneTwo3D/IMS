@@ -747,11 +747,19 @@ async function getBarcodeOwner(barcode: string, excludeProductId: string) {
   })
 }
 
-async function fetchAuthoritativeMintsoftProduct(context: ProductSyncContext): Promise<{
+/**
+ * The Mintsoft product behind an IMS product. `renamedFrom` is set when the link points at a Mintsoft product whose
+ * SKU is no longer the IMS SKU AND nothing in Mintsoft carries the new SKU: the product was renamed in IMS (o3d-hqvrp.122).
+ * The caller must not create a second Mintsoft product for it: that orphans the old product and its stock and the new
+ * SKU shows 0 against IMS.
+ */
+export async function fetchAuthoritativeMintsoftProduct(context: Pick<ProductSyncContext, 'product' | 'connector'>): Promise<{
   product: WmsProductRef | null
   existingLinkMatchesSku: boolean
+  renamedFrom: { externalProductId: string; sku: string } | null
 }> {
   const existingLink = getExistingLink(context.product)
+  let linkedElsewhere: { externalProductId: string; sku: string } | null = null
 
   if (existingLink?.externalProductId) {
     const linked = await context.connector.fetchProduct(existingLink.externalProductId)
@@ -759,13 +767,17 @@ async function fetchAuthoritativeMintsoftProduct(context: ProductSyncContext): P
       return {
         product: linked,
         existingLinkMatchesSku: true,
+        renamedFrom: null,
       }
     }
+    if (linked) linkedElsewhere = { externalProductId: existingLink.externalProductId, sku: linked.sku }
   }
 
+  const bySku = await context.connector.fetchProductBySku(context.product.sku)
   return {
-    product: await context.connector.fetchProductBySku(context.product.sku),
+    product: bySku,
     existingLinkMatchesSku: false,
+    renamedFrom: bySku ? null : linkedElsewhere,
   }
 }
 
@@ -880,6 +892,30 @@ async function syncOneMintsoftProduct(
   const existingLink = getExistingLink(context.product)
   const authoritativeLookup = await fetchAuthoritativeMintsoftProduct(context)
   const authoritative = authoritativeLookup.product
+  if (authoritativeLookup.renamedFrom) {
+    // The SKU was renamed in IMS and Mintsoft has no product under the new SKU. Creating one would orphan the old product
+    // and its stock. IMS writes nothing: the warehouse renames the Mintsoft product (SKU) to match, or IMS renames back.
+    const renamed = authoritativeLookup.renamedFrom
+    await upsertProductDiscrepancy({
+      scopes: context.scopes,
+      productId: context.product.id,
+      sku: context.product.sku,
+      category: 'PRODUCT_SKU_RENAMED',
+      imsValue: context.product.sku,
+      wmsValue: renamed.sku,
+      message: `IMS SKU is now "${context.product.sku}" but the linked Mintsoft product (id ${renamed.externalProductId}) still has SKU "${renamed.sku}" and Mintsoft has no product under the new SKU. Nothing was created or changed in Mintsoft, so its stock stays with the existing product. Rename the Mintsoft product to the new SKU (or rename the IMS SKU back), then the next sync re-links it.`,
+    })
+    await recordMintsoftProductLinkError(context.product.id, `SKU renamed in IMS: Mintsoft product ${renamed.externalProductId} still has SKU ${renamed.sku}`)
+    return {
+      sku: context.product.sku,
+      productId: context.product.id,
+      action: 'skip',
+      reason: 'SKU renamed in IMS; Mintsoft product not renamed, so no second product was created',
+      payload: toJsonPayload(null),
+      remoteUpdated: false,
+    }
+  }
+  await resolveProductDiscrepancy(context.scopes, context.product.id, 'PRODUCT_SKU_RENAMED')
   let dto = buildMintsoftProductDto(context.product)
   // CN validation (bhdm.3): never declare a malformed / non-2026 CN8 to the WMS. A valid code is
   // normalised to canonical 8 digits; a bad code is omitted (the rest of the product still syncs)

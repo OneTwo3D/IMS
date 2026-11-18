@@ -252,7 +252,9 @@ test('the ONE dry run a pending ALIGN_TO_WMS confirmation depends on is NOT dele
   assert.equal(dryRun.where.connector, 'mintsoft')
   assert.equal(dryRun.where.type, 'STOCK_SYNC')
   assert.deepEqual(dryRun.where.status, { in: ['SUCCEEDED', 'PARTIAL'] })
-  assert.deepEqual(dryRun.where.finishedAt, { not: null })
+  // Finished, and recently enough to still count as evidence (the age limit, o3d-hqvrp.124).
+  assert.equal((dryRun.where.finishedAt as { not: null }).not, null)
+  assert.ok((dryRun.where.finishedAt as unknown as { gt: Date }).gt instanceof Date)
   assert.deepEqual(dryRun.where.AND, [
     { summary: { path: ['dryRun'], equals: true } },
     { summary: { path: ['externalWarehouseId'], equals: 'ext-1' } },

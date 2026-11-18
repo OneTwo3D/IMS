@@ -13,7 +13,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
-import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
+import { alignmentConfirmationSurvivesSave, alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import { lockMintsoftCourierServiceMap, lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
 import { resetWmsDeltaCursors } from '@/lib/domain/wms/dispatch-sweep'
 import { wmsDeltaCursorKeys } from '@/lib/domain/wms/delta-cursor-generation'
@@ -2510,12 +2510,14 @@ export async function saveMintsoftBinding(
           data: {
             ...bindingData,
             ...(pointsAtSameTarget ? {} : { pairingChangedAt: new Date() }),
-            alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS'
-              ? (
-                  existingBinding.stockSyncMode === 'ALIGN_TO_WMS' && pointsAtSameTarget
-                    ? existingBinding.alignmentConfirmedAt
-                    : null
-                )
+            alignmentConfirmedAt: alignmentConfirmationSurvivesSave({
+              wasAlignToWms: existingBinding.stockSyncMode === 'ALIGN_TO_WMS',
+              willBeAlignToWms: bindingData.stockSyncMode === 'ALIGN_TO_WMS',
+              pointsAtSameTarget,
+              previousThresholds: existingBinding.discrepancyThresholds,
+              nextThresholds: discrepancyThresholds,
+            })
+              ? existingBinding.alignmentConfirmedAt
               : null,
           },
         })
@@ -5569,8 +5571,11 @@ export async function updateMintsoftReturnInboxStatus(
   const isResolvedStatus = ['QUARANTINED', 'REFUNDED_ONLY', 'REPLACED', 'INSPECT', 'DISMISSED']
     .includes(parsedStatus.data)
 
-  await db.wmsReturnsInbox.update({
-    where: { id: item.id },
+  // Compare-and-set: a restock that committed after the read above left the row RESTOCKED, and an
+  // unconditional update by id would overwrite that and let a second restock through. Postgres re-checks
+  // this predicate after waiting on the restock's row lock, so the loser matches nothing.
+  const written = await db.wmsReturnsInbox.updateMany({
+    where: { id: item.id, connector: 'mintsoft', status: { not: 'RESTOCKED' } },
     data: {
       status: parsedStatus.data,
       resolvedAt: isResolvedStatus ? new Date() : null,
@@ -5579,6 +5584,9 @@ export async function updateMintsoftReturnInboxStatus(
         : `Marked ${parsedStatus.data.toLowerCase().replace(/_/g, ' ')} from Mintsoft sync dashboard`,
     },
   })
+  if (written.count === 0) {
+    return { success: false, error: 'This Mintsoft return has already been restocked.' }
+  }
 
   await logActivity({
     entityType: 'SYNC',
