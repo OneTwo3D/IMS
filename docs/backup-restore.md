@@ -217,6 +217,15 @@ step 1 is still yours.
 
 Denied restore attempts are written to the activity log as `WARNING` entries with action `backup_restore_denied` and a machine-readable `metadata.reason`, such as `production_restore_disabled`, `production_upload_restore_disabled`, or `cross_origin_restore_request`.
 
+## Files that a database backup does not contain
+
+A database backup (the `.sql` file and its manifest) holds rows only. Files that IMS stores on disk are **not** in it and must be in your file backup, restored together with the database:
+
+- **Order attachments** (supporting documents on purchase and sales orders): `$UPLOAD_STORAGE_DIR/order-attachments/`. Each row in `order_attachments` names its file by a random stored name and carries the file's SHA-256 and size, so a restore of the rows without the files is detectable (the download fails) but not recoverable. Files that an erasure deleted stay deleted: after any restore, repeat the erasures made since that backup (see [Personal-data erasure](erasure.md)).
+- The stored customer invoice PDFs (`INVOICE_PDF_STORAGE_DIR`) and the supplier invoice uploads (`$UPLOAD_STORAGE_DIR/invoices/`).
+
+**The IMS container (CT 115) storage is not backed up** at the moment (see the backup topology note: the Proxmox backups cover other guests). Until that changes, order attachments held there are not backed up either, and a loss of the container's disk loses them. The upload directory therefore has to be a mounted persistent volume that is in the backup set, or the container backed up, before attachments are relied on in production.
+
 ## Remote Storage
 
 Backups can be uploaded to remote storage for off-site protection. Two storage types are supported.

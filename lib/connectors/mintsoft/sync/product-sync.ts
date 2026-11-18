@@ -6,7 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
-import type { WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
+import type { WmsClearableProductField, WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { mintsoftProducerSeam } from '../producer-seam'
@@ -14,6 +14,7 @@ import { snapshotFromRow } from '@/lib/domain/product-content/store'
 import { classifyIdentifierCodes, sameCode, type IdentifierCodes } from '@/lib/domain/products/identifiers'
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
 import { classifyMintsoftProductRecord } from '../api/normalizers'
+import { mintsoftFieldIsEmpty } from '../api/client'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
 import { applyMintsoftProductParity, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
 import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation, type ParentDeletionCounters } from './parent-sku-deletion'
@@ -51,6 +52,8 @@ export const PRODUCT_SYNC_CANDIDATE_SELECT = {
   // Read for the parity setting only (a variation inherits its parent's name base, weight and dimensions); unused while it is off.
   parent: { select: { name: true, weight: true, widthCm: true, heightCm: true, depthCm: true } },
   content: { select: { shortDescription: true, longDescription: true, images: true } },
+  // Customs fields emptied in IMS (value -> nothing): the only evidence that Mintsoft's copy is to be cleared.
+  customsClears: { select: { field: true } },
   wmsProductLinks: {
     where: { connector: 'mintsoft' },
     select: {
@@ -90,6 +93,8 @@ export type ProductSyncCandidate = {
   lifecycleStatus: ProductLifecycleStatus
   parent?: { name: string; weight: Prisma.Decimal | null; widthCm: Prisma.Decimal | null; heightCm: Prisma.Decimal | null; depthCm: Prisma.Decimal | null } | null
   content?: { shortDescription: string | null; longDescription: string | null; images: Prisma.JsonValue } | null
+  /** Customs fields emptied in IMS; absent on a candidate built without the relation (none). */
+  customsClears?: Array<{ field: string }>
   wmsProductLinks: Array<{
     id: string
     externalProductId: string
@@ -268,6 +273,49 @@ export function resolveMintsoftCommodityCode(commodityCode: string | null): {
     return { commodityCode: null, invalidCnCode: commodityCode }
   }
   return { commodityCode: normalizeCn8(commodityCode), invalidCnCode: null }
+}
+
+/** The IMS product field behind each clearable WMS field (the marker table is keyed by the IMS name). */
+export const IMS_FIELD_OF_WMS_CLEAR: Readonly<Record<WmsClearableProductField, 'customsDescription' | 'hsCode' | 'countryOfOrigin'>> = {
+  customsDescription: 'customsDescription',
+  commodityCode: 'hsCode',
+  countryOfManufacture: 'countryOfOrigin',
+}
+
+/**
+ * Customs fields to ERASE in Mintsoft on an UPDATE. A field is cleared only on EVIDENCE of intent: IMS recorded a
+ * populated -> empty transition for it (`marked`, the IMS names from product_customs_clears), it is still empty, and Mintsoft
+ * holds (or may hold) a value. A field that was merely never set is NOT a clear: an unset origin was historically declared to
+ * Mintsoft as the CN default, so Mintsoft holds CN for products nobody cleared. `remoteRaw` is the Mintsoft record read in this
+ * run; undefined means unknown, which counts as "may hold". An unusable IMS value (malformed HS code, invalid origin) is not
+ * empty and never clears. Barcode / EAN / UPC are not here and never will be.
+ */
+export function resolveMintsoftCustomsClears(
+  product: Pick<ProductSyncCandidate, 'hsCode' | 'countryOfOrigin' | 'customsDescription'>,
+  remoteRaw: Record<string, unknown> | null | undefined,
+  marked: readonly string[],
+): WmsClearableProductField[] {
+  const mayHold = (field: WmsClearableProductField): boolean => (remoteRaw ? !mintsoftFieldIsEmpty(remoteRaw, field) : true)
+  const clears: WmsClearableProductField[] = []
+  if (marked.includes('customsDescription') && !trimToNull(product.customsDescription) && mayHold('customsDescription')) clears.push('customsDescription')
+  if (marked.includes('hsCode') && !trimToNull(product.hsCode) && mayHold('commodityCode')) clears.push('commodityCode')
+  if (marked.includes('countryOfOrigin') && !trimToNull(product.countryOfOrigin) && mayHold('countryOfManufacture')) clears.push('countryOfManufacture')
+  return clears
+}
+
+/**
+ * Marked fields whose Mintsoft copy is already known to be empty: nothing to send, so the marker has done its job. Only
+ * decidable from a read of the record (`remoteRaw` defined).
+ */
+export function resolveSettledCustomsMarkers(
+  product: Pick<ProductSyncCandidate, 'hsCode' | 'countryOfOrigin' | 'customsDescription'>,
+  remoteRaw: Record<string, unknown> | null | undefined,
+  marked: readonly string[],
+): string[] {
+  if (!remoteRaw) return []
+  const pending = new Set(resolveMintsoftCustomsClears(product, remoteRaw, marked).map((f) => IMS_FIELD_OF_WMS_CLEAR[f]))
+  // The origin marker is never settled here: while the origin stays blank it also stops the CN default being re-declared.
+  return marked.filter((m) => m !== 'countryOfOrigin' && !pending.has(m as never))
 }
 
 export function hashMintsoftProductDto(product: WmsProductDto): string {
@@ -776,6 +824,31 @@ async function syncOneMintsoftProduct(
   }
   const logRaw = <T>(raw: T): T => (parityEnabled ? redactMintsoftCostPrice(raw) : raw)
 
+  // CLEARED CUSTOMS DATA reaches Mintsoft on an UPDATE only (a create has nothing to clear): a customs field IMS holds nothing
+  // for is erased there rather than left stale. A blank origin no longer declares the CN default on an update; the
+  // create keeps it. The payload hash carries the null, so the change is detected once and not re-sent.
+  const earlyExternalProductId = resolveMintsoftExternalProductId({
+    authoritativeProduct: authoritative,
+    existingExternalProductId: existingLink?.externalProductId ?? null,
+    existingLinkMatchesSku: authoritativeLookup.existingLinkMatchesSku,
+  })
+  const markedFields = earlyExternalProductId
+    ? (context.product.customsClears ?? []).map((m) => m.field)
+    : []
+  const remoteRawForClears = authoritative ? (authoritative.raw ?? {}) : undefined
+  const clearFields = earlyExternalProductId ? resolveMintsoftCustomsClears(context.product, remoteRawForClears, markedFields) : []
+  // Markers whose Mintsoft copy is already empty are settled: drop them (no request needed).
+  const settledMarkers = earlyExternalProductId ? resolveSettledCustomsMarkers(context.product, remoteRawForClears, markedFields) : []
+  if (settledMarkers.length > 0) {
+    await db.productCustomsClear.deleteMany({ where: { productId: context.product.id, field: { in: settledMarkers } } })
+  }
+  // An origin the operator CLEARED (marked, still blank) is not re-declared as the CN default on an update, which would undo the
+  // clear. An origin that was merely never set keeps the CN default exactly as before. This marker is kept after the clear
+  // is verified (see resolveSettledCustomsMarkers) and goes only when the origin is filled again.
+  if (earlyExternalProductId && markedFields.includes('countryOfOrigin') && !trimToNull(context.product.countryOfOrigin)) {
+    dto = { ...dto, countryOfManufacture: null }
+  }
+
   // Customs discrepancies (HS/CN code + country of origin) are reconciled HERE — BEFORE any barcode-related
   // early return — so a barcode conflict can never suppress them and leave a legacy issue unreported (Codex
   // review r9). A bad HS/CN code is omitted from the push; an invalid origin still declares CN for customs
@@ -923,6 +996,8 @@ async function syncOneMintsoftProduct(
     externalProductId
       && existingLink?.payloadHash
       && existingLink.payloadHash === payloadHash
+      // A pending clear is work: an unchanged hash (a field blank in IMS all along) must not hide a value Mintsoft still holds.
+      && clearFields.length === 0
       && (
         barcodePlan.kind === 'noop'
         || barcodePlan.kind === 'match'
@@ -996,6 +1071,7 @@ async function syncOneMintsoftProduct(
       externalProductId: externalProductId ?? null,
       omitBarcode: barcodePlan.omitBarcode,
       ...(identifierPlan ? { omitMpn: identifierPlan.omitMpn } : {}),
+      ...(externalProductId && clearFields.length ? { clearFields } : {}),
     },
     summary: { sku: context.product.sku, creating: !externalProductId },
   })
@@ -1016,6 +1092,7 @@ async function syncOneMintsoftProduct(
       externalProductId,
       omitBarcode: barcodePlan.omitBarcode,
       ...(identifierPlan ? { omitMpn: identifierPlan.omitMpn } : {}),
+      ...(externalProductId && clearFields.length ? { clearFields } : {}),
     }, upsertSeam.clearance)
   } catch (error) {
     await recordWmsMutationEvent({
@@ -1027,6 +1104,17 @@ async function syncOneMintsoftProduct(
     })
     throw error
   }
+  // A rejected clear never fails the update. It is recorded on the event, and the stored hash is marked so the next run
+  // offers the product again and retries the clear.
+  const verifiedCleared = synced.clearOutcome?.cleared ?? []
+  if (verifiedCleared.length > 0) {
+    // Verified empty by the read-back: the marker is spent.
+    await db.productCustomsClear.deleteMany({
+      where: { productId: context.product.id, field: { in: verifiedCleared.filter((f) => f !== 'countryOfManufacture').map((f) => IMS_FIELD_OF_WMS_CLEAR[f]) } },
+    })
+  }
+  const rejectedClears = synced.clearOutcome?.rejected ?? []
+  if (rejectedClears.length > 0) payloadHash = `${payloadHash}:clear-pending`
   const upsertEvent = {
     connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'SUCCEEDED',
     entityType: 'PRODUCT', entityId: context.product.id, externalId: synced.externalId,
@@ -1034,7 +1122,7 @@ async function syncOneMintsoftProduct(
       ? `Mintsoft product updated for ${context.product.sku}`
       : `Mintsoft product created for ${context.product.sku}`,
     before: { externalProductId: externalProductId ?? null, payloadHash: existingLink?.payloadHash ?? null },
-    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, ...(identifierPlan ? { mpnOmitted: identifierPlan.omitMpn } : {}), payloadHash },
+    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, ...(identifierPlan ? { mpnOmitted: identifierPlan.omitMpn } : {}), payloadHash, ...(rejectedClears.length ? { rejectedClears } : {}) },
   } as const
 
   // The event records only AFTER the local link persisted (Codex r2) — a link

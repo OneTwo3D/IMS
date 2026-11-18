@@ -148,6 +148,7 @@ Found at **Settings > Custom fields** (needs the company settings permission). A
 
 - **Purchase units** — define units of measure with conversion factors (e.g. 1 case = 12 units)
 - **Landed cost distribution method** — choose how landed costs are allocated across purchase order lines
+- **Purchase order approval threshold** — **Settings > Company > Documents**. An amount in base currency (ex VAT). A goods purchase order at or above it must be approved by a user holding the `purchasing.approve` permission (Administrators and Managers; never the order's creator) before it can be sent or emailed to the supplier. Blank or 0 (the default) means no approval is needed. See [Purchasing](purchasing.md#purchase-order-approval).
 
 ## Accounting Settings
 
@@ -439,7 +440,7 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/fx-rates` | Fetch exchange rates from frankfurter.dev (the ECB rates) and replay any WooCommerce orders waiting for a rate. With the Aelia FX source (not yet switched on) it would read them from the store instead | Daily at 07:00 | On |
 | `/api/cron/wc-reconcile` | WooCommerce backup reconciliation of orders and products and stock catch-up | Hourly | On |
 | `/api/cron/wc-withdrawal-sweep` | Re-check every order IMS refused (EU withdrawal requests, orders held back by the status selection or an unmapped status) against the live store | Every 15 min | On |
-| `/api/cron/shopping-webhook-inbox` | Process stored WooCommerce webhook events and retry queued "completed" pushes | Every 5 min | On |
+| `/api/cron/shopping-webhook-inbox` | Process stored WooCommerce webhook events, retry queued "completed" pushes, and (only when `trackship_refire_enabled` is `true`) re-register shipped orders TrackShip holds no shipment for | Every 5 min | On |
 | `/api/cron/accounting-sync` | Drain the pending accounting sync queue | Every 5 min | On |
 | `/api/cron/accounting-payment-poll` | Detect paid invoices and bills in Xero | Every 15 min | On |
 | `/api/cron/accounting-payment-reconcile` | Slow backlog check of every linked invoice and bill against its current Xero status (report only unless switched to apply) | Daily at 03:00 | On |

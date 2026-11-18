@@ -13,6 +13,7 @@ import {
   getSettingValue,
   getSettingValues,
   maskSettingSecret,
+  SENSITIVE_SETTING_KEYS,
   serializeSettingValue,
 } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
@@ -336,6 +337,10 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   if (!gate.ok) return { success: false, error: gate.error }
   const ops = Object.entries(data)
     .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && !MACHINE_MANAGED_SYNC_KEYS.has(entry[0]) && typeof entry[1] === 'string')
+    // SEC-M8: a masked secret means "keep the stored one". It skips the step-up gate above
+    // (shouldFreshGateSecretWrite), so it must also skip the write, or a caller could set the
+    // webhook secret to a value it knows ("abcd****") without ever re-authenticating.
+    .filter(([k, v]) => !(isMaskedSecret(v) && SENSITIVE_SETTING_KEYS.has(k)))
     .map(([k, v]) =>
       db.setting.upsert({
         where: { key: k },

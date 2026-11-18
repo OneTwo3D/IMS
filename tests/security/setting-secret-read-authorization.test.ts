@@ -495,11 +495,12 @@ test('the seeded retired-connector rows ARE readable — by ADMIN, and only by A
       settingWrites.length = 0
       warnings.length = 0
 
+      // SEC-M9: still answerable to ADMIN (so the operator can see one is configured), but MASKED:
+      // getSetting has no step-up gate, so it must never return the credential itself.
       assert.equal(
         await getSetting(key),
-        plaintext,
-        `${key} must still be readable by a principal WITH the settings permission — `
-        + 'over-gating a retired credential would break the operator\'s only route to rotate or clear it',
+        `${plaintext.slice(0, 4)}****`,
+        `${key} must be readable, masked, by a principal WITH the settings permission`,
       )
 
       // The read, then the opportunistic re-encryption. Exact, and in order.
