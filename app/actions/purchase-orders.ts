@@ -25,7 +25,7 @@ import { runPostCommit } from '@/lib/domain/post-commit'
 import { queueEmail } from '@/lib/email-outbox'
 import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
 // order the WMS alignment relies on. See that module's census of every writer.
 import {
@@ -1368,9 +1368,12 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
     // A system-actor context (the first-load apply runner) replaces the session check; anything that is not the real
     // capability takes the permission check, so a forged argument fails closed.
     let creatorId: string | null = null
-    if (system?.systemImportToken !== SYSTEM_IMPORT) creatorId = (await requirePermission('purchasing.create')).user.id
-    // The acting user for the minimum-margin guard (null for a system import, which is not assessed). Read after the permission check above.
-    const session = system?.systemImportToken !== SYSTEM_IMPORT ? await requireAuth() : null
+    // The acting user for the minimum-margin guard (null for a system import, which is not assessed): the session the permission check returns.
+    let session: Awaited<ReturnType<typeof requirePermission>> | null = null
+    if (system?.systemImportToken !== SYSTEM_IMPORT) {
+      session = await requirePermission('purchasing.create')
+      creatorId = session.user.id
+    }
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
     if (input.reference?.trim()) {
       const existing = await db.purchaseOrder.findUnique({
