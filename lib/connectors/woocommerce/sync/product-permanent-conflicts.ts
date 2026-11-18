@@ -29,7 +29,15 @@ export type PermanentConflict = {
   since: string
   /** When a run last re-attempted it; null until one has. */
   lastAttemptAt: string | null
+  /** When it was last (re-)recorded as conflicting by a page walk; a removal decided before this is stale. */
+  conflictAt?: string
+  /** Consecutive re-attempts that failed TRANSIENTLY (reset by a permanent outcome); never holds the product cursor. */
+  attempts?: number
+  lastError?: string
 }
+
+/** After this many consecutive transient re-attempt failures an operator-visible warning is raised. */
+export const PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD = 5
 
 export function parsePermanentConflicts(raw: string | null | undefined): PermanentConflict[] {
   if (!raw) return []
@@ -40,7 +48,7 @@ export function parsePermanentConflicts(raw: string | null | undefined): Permane
     const items: PermanentConflict[] = []
     for (const entry of parsed) {
       if (!entry || typeof entry !== 'object') continue
-      const { id, sku, since, lastAttemptAt } = entry as Record<string, unknown>
+      const { id, sku, since, lastAttemptAt, conflictAt, attempts, lastError } = entry as Record<string, unknown>
       if (typeof id !== 'number' || !Number.isInteger(id) || id <= 0 || seen.has(id)) continue
       seen.add(id)
       items.push({
@@ -48,6 +56,9 @@ export function parsePermanentConflicts(raw: string | null | undefined): Permane
         sku: typeof sku === 'string' ? sku : '',
         since: typeof since === 'string' ? since : new Date(0).toISOString(),
         lastAttemptAt: typeof lastAttemptAt === 'string' ? lastAttemptAt : null,
+        ...(typeof conflictAt === 'string' ? { conflictAt } : {}),
+        ...(typeof attempts === 'number' && Number.isFinite(attempts) && attempts > 0 ? { attempts } : {}),
+        ...(typeof lastError === 'string' ? { lastError } : {}),
       })
     }
     return items
@@ -75,10 +86,15 @@ export function selectPermanentConflictReattempts(
 export type PermanentConflictDelta = {
   /** Newly buried (or buried again): added, keeping an existing entry's `since`. */
   add: Array<{ id: number; sku: string }>
-  /** Imported successfully, or gone from WooCommerce: dropped from the list. */
-  remove: number[]
-  /** Re-attempted this run and still not imported: stamped so the next run takes others first. */
+  /**
+   * Imported successfully, or gone from WooCommerce: dropped from the list. `at` is when that was decided: a removal
+   * never erases a conflict recorded after it (in this run, or by a concurrent one).
+   */
+  remove: Array<{ id: number; at: string }>
+  /** Re-attempted this run and still permanently in conflict: stamped so the next run takes others first. */
   attempted: number[]
+  /** Re-attempted this run and failed transiently: counted and kept; this never holds the product cursor. */
+  failed: Array<{ id: number; error: string }>
 }
 
 /** Pure: the list after a delta, bounded. `dropped` is whatever the bound pushed out. */
@@ -88,17 +104,28 @@ export function applyPermanentConflictDelta(
   nowIso: string,
   maxStored: number = MAX_STORED_PERMANENT_CONFLICTS,
 ): { items: PermanentConflict[]; dropped: PermanentConflict[] } {
-  const removed = new Set(delta.remove)
   const attempted = new Set(delta.attempted)
+  const failed = new Map(delta.failed.map((entry) => [entry.id, entry.error]))
   const byId = new Map<number, PermanentConflict>()
   for (const item of current) {
-    if (removed.has(item.id)) continue
-    byId.set(item.id, attempted.has(item.id) ? { ...item, lastAttemptAt: nowIso } : item)
+    let next = item
+    if (attempted.has(item.id)) next = { ...next, lastAttemptAt: nowIso, attempts: undefined, lastError: undefined }
+    if (failed.has(item.id)) next = { ...next, lastAttemptAt: nowIso, attempts: (item.attempts ?? 0) + 1, lastError: failed.get(item.id)!.slice(0, 200) }
+    byId.set(item.id, next)
+  }
+  // Removals first, then additions: a conflict recorded in the same run (a page-walk failure after a retry that succeeded)
+  // is the LATER event and must win. A removal also leaves alone an entry conflicting since after it was decided.
+  for (const removal of delta.remove) {
+    const existing = byId.get(removal.id)
+    if (!existing) continue
+    if (existing.conflictAt && Date.parse(existing.conflictAt) > Date.parse(removal.at)) continue
+    byId.delete(removal.id)
   }
   for (const entry of delta.add) {
-    if (removed.has(entry.id)) continue
     const existing = byId.get(entry.id)
-    byId.set(entry.id, existing ? { ...existing, sku: entry.sku || existing.sku } : { id: entry.id, sku: entry.sku, since: nowIso, lastAttemptAt: null })
+    byId.set(entry.id, existing
+      ? { ...existing, sku: entry.sku || existing.sku, conflictAt: nowIso }
+      : { id: entry.id, sku: entry.sku, since: nowIso, lastAttemptAt: null, conflictAt: nowIso })
   }
   const all = [...byId.values()]
   if (all.length <= maxStored) return { items: all, dropped: [] }
@@ -116,7 +143,7 @@ export async function readPermanentConflicts(): Promise<PermanentConflict[]> {
  * reconcile can overlap, and a read-modify-write outside the lock would lose the other's entries.
  */
 export async function recordPermanentConflictDelta(delta: PermanentConflictDelta): Promise<{ dropped: PermanentConflict[] }> {
-  if (delta.add.length === 0 && delta.remove.length === 0 && delta.attempted.length === 0) return { dropped: [] }
+  if (delta.add.length === 0 && delta.remove.length === 0 && delta.attempted.length === 0 && delta.failed.length === 0) return { dropped: [] }
   return db.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${PERMANENT_CONFLICTS_SETTING}))`
     const row = await tx.setting.findUnique({ where: { key: PERMANENT_CONFLICTS_SETTING } })

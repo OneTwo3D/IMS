@@ -3286,7 +3286,7 @@ test('a buried product that still conflicts stays listed, is stamped, and is not
   assert.ok(state.settingUpserts.includes(CURSOR))
 })
 
-test('a TRANSIENT failure on a re-attempt holds the cursor exactly as in the main loop, and keeps the id', async () => {
+test('a TRANSIENT failure on a re-attempt is recorded on its id and does NOT hold the product cursor', async () => {
   const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
   for (const failure of ['fetch', 'import'] as const) {
     resetState()
@@ -3298,10 +3298,57 @@ test('a TRANSIENT failure on a re-attempt holds the cursor exactly as in the mai
       state.throwForSku.set('PARENT-SKU', new Error('connection terminated unexpectedly'))
     }
     const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
-    assert.equal(result.errors.length, 1, failure)
-    assert.deepEqual(state.settingUpserts.filter((key) => key === CURSOR), [], `${failure}: cursor held`)
+    assert.deepEqual(result.errors, [], `${failure}: a stuck buried id is not a sync error`)
+    assert.ok(state.settingUpserts.includes(CURSOR), `${failure}: cursor advances because the window walk succeeded`)
     assert.equal(listed().length, 1, `${failure}: id kept`)
+    assert.equal((listed()[0] as { attempts?: number }).attempts, 1, `${failure}: attempt counted`)
+    assert.ok((listed()[0] as { lastError?: string }).lastError, `${failure}: last error recorded`)
   }
+})
+
+test('after repeated transient re-attempt failures an operator-visible WARNING is raised, and the cursor still moves', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  const { PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD: N } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
+  resetState()
+  seedCursorRun()
+  settingValues.set(CONFLICTS_KEY, JSON.stringify([{ ...entry(77, { sku: 'PARENT-SKU' }), attempts: N - 1 }]))
+  productById = { '/products/77': { error: 'WC API error: 503 unavailable' } }
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  assert.deepEqual(result.errors, [])
+  assert.ok(state.settingUpserts.includes(CURSOR))
+  const warn = state.activity.find((a) => a.action === 'wc_product_conflict_reattempt_stuck')
+  assert.ok(warn, 'warned')
+  assert.equal(warn!.level, 'WARNING')
+  assert.match(String(warn!.description), /PARENT-SKU/)
+})
+
+test('a retry that succeeds and a LATER page-walk permanent conflict on the same id leaves the id listed', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  seedCursorRun()
+  settingValues.set(CONFLICTS_KEY, JSON.stringify([entry(77, { sku: 'PARENT-SKU' })]))
+  // The direct fetch imports cleanly (the first call), then WooCommerce's modified copy in the window conflicts.
+  productById = { '/products/77': { data: variableProduct() as unknown as Row } }
+  productPages = { '1': [variableProduct() as unknown as Row] }
+  let calls = 0
+  const original = state.throwForSku
+  const realGet = original.get.bind(original)
+  original.get = (key: string) => (key === 'PARENT-SKU' ? (calls++ === 0 ? undefined : duplicateBarcodeConflict()) : realGet(key))
+  original.has = (key: string) => (key === 'PARENT-SKU' ? calls !== 0 : Map.prototype.has.call(original, key))
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  assert.equal(result.permanentErrors.length, 1)
+  assert.deepEqual(listed().map((item) => item.id), [77], 'the later conflict wins over the earlier success')
+})
+
+test('a removal decided before a newer recorded conflict does not erase it', async () => {
+  const { applyPermanentConflictDelta } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
+  const current = [{ ...entry(5), conflictAt: '2026-11-18T10:00:00.000Z' }]
+  const stale = applyPermanentConflictDelta(current, { add: [], remove: [{ id: 5, at: '2026-11-18T09:00:00.000Z' }], attempted: [], failed: [] }, '2026-11-18T11:00:00.000Z')
+  assert.deepEqual(stale.items.map((i) => i.id), [5])
+  const fresh = applyPermanentConflictDelta(current, { add: [], remove: [{ id: 5, at: '2026-11-18T10:30:00.000Z' }], attempted: [], failed: [] }, '2026-11-18T11:00:00.000Z')
+  assert.deepEqual(fresh.items, [])
+  const same = applyPermanentConflictDelta([entry(6)], { add: [{ id: 6, sku: 'SKU-6' }], remove: [{ id: 6, at: '2026-11-18T10:30:00.000Z' }], attempted: [], failed: [] }, '2026-11-18T11:00:00.000Z')
+  assert.deepEqual(same.items.map((i) => i.id), [6], 'an addition in the same delta overrides the removal')
 })
 
 test('a buried product that no longer exists in WooCommerce (404) leaves the list', async () => {
@@ -3337,7 +3384,7 @@ test('only a bounded number is re-attempted per run, least recently attempted fi
 test('the stored list is bounded: the longest-buried drop first and the drop is logged', async () => {
   const { applyPermanentConflictDelta } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
   const current = [1, 2, 3].map((i) => entry(i, { since: `2026-0${i}-01T00:00:00.000Z` }))
-  const { items, dropped } = applyPermanentConflictDelta(current, { add: [{ id: 9, sku: 'NEW' }], remove: [], attempted: [] }, '2026-11-18T00:00:00.000Z', 3)
+  const { items, dropped } = applyPermanentConflictDelta(current, { add: [{ id: 9, sku: 'NEW' }], remove: [], attempted: [], failed: [] }, '2026-11-18T00:00:00.000Z', 3)
   assert.deepEqual(items.map((i) => i.id).sort(), [2, 3, 9])
   assert.deepEqual(dropped.map((i) => i.id), [1])
 })
