@@ -43,6 +43,9 @@
       "shipFromWarehouseId": null,
       "expectedDelivery": null,
       "salesRep": "rep",
+      "isQuote": false,
+      "quoteValidUntil": null,
+      "quoteSentAt": null,
       "shippedAt": null,
       "trackingNumber": null,
       "discountStr": null,
@@ -87,7 +90,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -107,7 +112,8 @@
         "totalForeign": "14.2",
         "totalBase": "14.2",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       },
       {
         "productId": "STD1",
@@ -126,7 +132,8 @@
         "totalForeign": "37.035",
         "totalBase": "37.035",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       },
       {
         "productId": "STD2",
@@ -145,7 +152,8 @@
         "totalForeign": "149.985",
         "totalBase": "149.985",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       }
     ]
   },
@@ -193,6 +201,9 @@
       "shipFromWarehouseId": null,
       "expectedDelivery": null,
       "salesRep": "rep",
+      "isQuote": false,
+      "quoteValidUntil": null,
+      "quoteSentAt": null,
       "shippedAt": null,
       "trackingNumber": null,
       "discountStr": "10",
@@ -237,7 +248,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -257,7 +270,8 @@
         "totalForeign": "9.5238",
         "totalBase": "9.5238",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       },
       {
         "productId": "STD1",
@@ -276,7 +290,8 @@
         "totalForeign": "72",
         "totalBase": "72",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       }
     ]
   },
@@ -324,6 +339,9 @@
       "shipFromWarehouseId": null,
       "expectedDelivery": null,
       "salesRep": "rep",
+      "isQuote": false,
+      "quoteValidUntil": null,
+      "quoteSentAt": null,
       "shippedAt": null,
       "trackingNumber": null,
       "discountStr": "5.55",
@@ -368,7 +386,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -388,7 +408,8 @@
         "totalForeign": "116.6083",
         "totalBase": "89.6987",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       },
       {
         "productId": "STD2",
@@ -407,7 +428,8 @@
         "totalForeign": "4.625",
         "totalBase": "3.5577",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       }
     ]
   },
@@ -455,6 +477,9 @@
       "shipFromWarehouseId": null,
       "expectedDelivery": null,
       "salesRep": "rep",
+      "isQuote": false,
+      "quoteValidUntil": null,
+      "quoteSentAt": null,
       "shippedAt": null,
       "trackingNumber": null,
       "discountStr": "100000",
@@ -499,7 +524,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -519,7 +546,8 @@
         "totalForeign": "40",
         "totalBase": "32",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       },
       {
         "productId": "STD1",
@@ -538,7 +566,8 @@
         "totalForeign": "31",
         "totalBase": "24.8",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       },
       {
         "productId": "STD2",
@@ -557,7 +586,8 @@
         "totalForeign": "9.7",
         "totalBase": "7.76",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       }
     ]
   },
@@ -605,6 +635,9 @@
       "shipFromWarehouseId": null,
       "expectedDelivery": null,
       "salesRep": "rep",
+      "isQuote": false,
+      "quoteValidUntil": null,
+      "quoteSentAt": null,
       "shippedAt": null,
       "trackingNumber": null,
       "discountStr": null,
@@ -649,7 +682,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -669,7 +704,8 @@
         "totalForeign": "11",
         "totalBase": "8.4615",
         "cogsBase": null,
-        "fulfillmentRequirements": null
+        "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null
       }
     ]
   }

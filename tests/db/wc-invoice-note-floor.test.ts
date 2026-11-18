@@ -187,14 +187,27 @@ test('BOUNDARY: a job the producer decided LIVE is never stamped before the inst
   const tag = tagOf()
   const keys: string[] = []
   t.after(async () => { await d.db.integrationOutbox.deleteMany({ where: { idempotencyKey: { in: keys } } }) })
-  const instant = new Date(Date.now() + 150)
+  // WARM UP FIRST (o3d-hqvrp.394). The first enqueue pays for a cold pool connection and a cold plan; on a loaded CI runner
+  // that took longer than the 150 ms lead the instant used to have, so the loop STARTED after the instant, never made a
+  // shadow decision, and failed the PRECONDITION below although nothing was wrong. A far-future instant makes the warm-up a
+  // shadow decision (cleaned up with the others); the real instant is then taken from a clock that is already hot, with a
+  // lead that is large against a warm round trip.
+  const warmKey = `${tag}-warm`
+  await withEnv({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: new Date(Date.now() + 3_600_000).toISOString() }, async () => {
+    const warm = await d.outbox.enqueueIntegrationOutbox({
+      connector: 'woocommerce', operation: 'order.cancel', idempotencyKey: warmKey, payloadJson: { orderId: warmKey },
+      producer: { subjectType: 'SalesOrder', subjectId: warmKey, obligationAt: new Date() },
+    })
+    if (!('shadowed' in warm)) keys.push(warmKey)
+  })
+  const instant = new Date(Date.now() + 400)
   const live = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: instant.toISOString() }
   let queued = 0
   let shadowed = 0
   await withEnv(live, async () => {
     // Enqueue continuously across the instant. Before it every decision is a shadow; from it every decision is live. A live-decided row
     // must carry a creation time at or after the instant: the decision clock and the stamping clock are both this process's.
-    for (let i = 0; Date.now() < instant.getTime() + 120 && i < 5000; i++) {
+    for (let i = 0; Date.now() < instant.getTime() + 120 && i < 100_000; i++) {
       const key = `${tag}-${i}`
       const answer = await d.outbox.enqueueIntegrationOutbox({
         connector: 'woocommerce', operation: 'order.cancel', idempotencyKey: key, payloadJson: { orderId: key },

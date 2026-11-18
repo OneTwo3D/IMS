@@ -1,5 +1,6 @@
 'use server'
 
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
@@ -183,9 +184,15 @@ import {
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
+import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal } from '@/lib/domain/sales/order-edit-affordance'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
+import { isQuoteExpired, quoteDateToYmd, quoteStatusMoveRefused, quoteYmdToDate, validateQuoteInput } from '@/lib/domain/sales/sales-quote'
+import { quoteTodayYmd } from '@/lib/sales-quote-clock'
+import { QUOTE_ACTION_REFUSAL, assertNotQuoteUnderLock } from '@/lib/domain/sales/sales-quote-guard'
+import { filterableCustomFields, resolveCustomFieldListFilter, type FilterableCustomField } from '@/lib/custom-fields/filter'
+import { loadActiveDefinitions } from '@/lib/custom-fields/values-service'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -209,6 +216,8 @@ export type SoStatus =
 
 export type SoLineRow = {
   id: string
+  /** Per-unit customs value override mirrored from WooCommerce (`_wc_label_customs_unit_value`), order currency, as a decimal string; null when none. Read-only. */
+  wcCustomsUnitValue?: string | null
   productId: string | null
   sku: string
   imageUrl: string | null
@@ -245,6 +254,14 @@ export type SoRow = {
   status: SoStatus
   /// Hidden from the default operational list by data retention; still searchable and still counted by reports.
   archived: boolean
+  /// o3d-ngmt.16: a quotation (a draft with the flag). Never true for a storefront order.
+  isQuote: boolean
+  /// The last day the quote's prices stand (YYYY-MM-DD); kept after the quote is converted.
+  quoteValidUntil: string | null
+  /// When the quote was last queued to the customer by email.
+  quoteSentAt: string | null
+  /// Set by the list / detail reads: the quote's validity date has passed. Always false for an order that is not a quote.
+  quoteExpired: boolean
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
   /// Whether an invoice exists for the order (orthogonal to `status`; a cancelled order keeps it). lib/domain/sales/invoicing-state.ts.
   invoicingState: InvoicingState
@@ -304,7 +321,18 @@ export type SoRow = {
   shipmentOutstandingQty: number | null
 }
 
+/** What WooCommerce reported for duty and tax on this order, mirrored as stored and shown read-only. Decimal amounts are strings in the ORDER currency. */
+export type WooDutyTaxMirror = {
+  iossNumber: string | null
+  deliveryTerm: string | null
+  dutyComponent: string | null
+  taxComponent: string | null
+  handlingComponent: string | null
+}
+
 export type SoDetail = SoRow & {
+  /** The duty/tax results mirrored from WooCommerce; null when the order carries none of them. */
+  wooDutyTax?: WooDutyTaxMirror | null
   /** The linked customer, so the edit form can pre-select it. */
   customerId: string | null
   /** The order's version as loaded: the edit form sends it back and the edit is refused if the order moved since. */
@@ -404,6 +432,12 @@ export type CreateSoInput = {
    * PROCESSING, etc.) at which point the accounting invoice is queued.
    */
   isDraft?: boolean
+  /**
+   * o3d-ngmt.16: save the draft as a QUOTATION. A quote is a draft with a flag, so it reserves nothing, is not allocated, invoiced or sent to the warehouse. Requires `isDraft` and a validity date (YYYY-MM-DD).
+   * Editing a quote must repeat `isQuote: true`; an order cannot be turned into a quote.
+   */
+  isQuote?: boolean
+  quoteValidUntil?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +556,9 @@ async function refreshDraftOrderFxAtFinalization(
 const SO_SELECT = {
   id: true,
   archived: true,
+  isQuote: true,
+  quoteValidUntil: true,
+  quoteSentAt: true,
   externalOrderNumber: true,
   shoppingLinks: {
     select: { connector: true, externalOrderId: true },
@@ -594,6 +631,9 @@ const SO_SELECT = {
 function mapSoRow(so: {
   id: string
   archived: boolean
+  isQuote: boolean
+  quoteValidUntil: Date | null
+  quoteSentAt: Date | null
   externalOrderNumber: string | null
   shoppingLinks: { connector: string; externalOrderId: string }[]
   orderNumber: string | null
@@ -704,6 +744,10 @@ function mapSoRow(so: {
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
     archived: so.archived,
+    isQuote: so.isQuote,
+    quoteValidUntil: quoteDateToYmd(so.quoteValidUntil),
+    quoteSentAt: so.quoteSentAt?.toISOString() ?? null,
+    quoteExpired: false,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
     invoicingState: so.invoicingState as InvoicingState,
     withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
@@ -752,6 +796,7 @@ function mapSoRow(so: {
 
 function mapLine(l: {
   id: string
+  wcCustomsUnitValue?: { toString(): string } | null
   productId: string | null
   sku: string | null
   description: string
@@ -771,6 +816,7 @@ function mapLine(l: {
 }): SoLineRow {
   return {
     id: l.id,
+    wcCustomsUnitValue: l.wcCustomsUnitValue == null ? null : l.wcCustomsUnitValue.toString(),
     productId: l.productId,
     sku: l.sku ?? '',
     imageUrl: l.product?.imageUrl ?? l.product?.parent?.imageUrl ?? null,
@@ -808,9 +854,17 @@ export type SoListParams = {
   showCompleted?: boolean
   /** Include archived orders in the default view. */
   includeArchived?: boolean
+  /** The Quotes tab: only quotations (drafts carrying the quote flag). */
+  quotes?: boolean
+  /** Filter by a custom field (a dropdown or yes / no field): its key and the chosen value. Unknown keys and values are ignored. */
+  customFieldKey?: string
+  customFieldValue?: string
 }
 
 export type SoListResult = ListPage & {
+  /** The custom fields the list can be filtered by (dropdown and yes / no fields), and the filter currently applied. */
+  customFieldFilters: FilterableCustomField[]
+  appliedCustomField: { key: string; value: string } | null
   rows: SoRow[]
   /** What the current view is hiding by default; search and explicit status picks lift it. */
   hides: SoListHidden
@@ -836,12 +890,16 @@ async function attachShipmentOutstanding(row: SoRow): Promise<void> {
 
 export async function getSalesOrders(params: SoListParams = {}): Promise<SoListResult> {
   await requireInternalUser()
+  const customFieldDefinitions = await loadActiveDefinitions(db, 'SALES_ORDER')
+  const customFieldFilter = resolveCustomFieldListFilter(customFieldDefinitions, params.customFieldKey, params.customFieldValue)
   const filter: SoListFilter = {
     q: normaliseListQuery(params.q),
     statuses: normaliseStatuses(params.status, SO_STATUSES),
     invoicing: normaliseStatuses(params.invoicing, SO_INVOICING_FILTERS),
     showCompleted: params.showCompleted === true,
     includeArchived: params.includeArchived === true,
+    quotesOnly: params.quotes === true,
+    ...(customFieldFilter ? { customField: customFieldFilter } : {}),
   }
   const where = buildSalesOrderListWhere(filter)
   const hides = soListHides(filter)
@@ -882,7 +940,13 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     return row
   })
   await Promise.all(rows.map(attachShipmentOutstanding))
-  return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
+  const quoteToday = await quoteTodayYmd()
+  for (const row of rows) row.quoteExpired = isQuoteExpired(row, quoteToday)
+  return {
+    ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q),
+    customFieldFilters: filterableCustomFields(customFieldDefinitions),
+    appliedCustomField: customFieldFilter ? { key: params.customFieldKey!, value: params.customFieldValue! } : null,
+  }
 }
 
 /**
@@ -936,8 +1000,14 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       updatedAt: true,
       billingAddress: true,
       shippingAddress: true,
+      iossNumber: true,
+      deliveryTerm: true,
+      wclcDutyComponent: true,
+      wclcTaxComponent: true,
+      wclcHandlingComponent: true,
       lines: {
         select: {
+          wcCustomsUnitValue: true,
           id: true, productId: true, sku: true, description: true,
           qty: true, unitPriceForeign: true, unitPriceBase: true, discountStr: true, discountAmount: true,
           taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
@@ -1033,9 +1103,21 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
 
   const detailRow = mapSoRow(so)
   await attachShipmentOutstanding(detailRow)
+  detailRow.quoteExpired = isQuoteExpired(detailRow, await quoteTodayYmd())
+
+  const decimalText = (value: { toString(): string } | null | undefined) => (value == null ? null : value.toString())
+  const wooDutyTax: WooDutyTaxMirror = {
+    iossNumber: so.iossNumber,
+    deliveryTerm: so.deliveryTerm,
+    dutyComponent: decimalText(so.wclcDutyComponent),
+    taxComponent: decimalText(so.wclcTaxComponent),
+    handlingComponent: decimalText(so.wclcHandlingComponent),
+  }
+  const hasWooDutyTax = Object.values(wooDutyTax).some((v) => v !== null) || so.lines.some((l) => l.wcCustomsUnitValue != null)
 
   return {
     ...detailRow,
+    wooDutyTax: hasWooDutyTax ? wooDutyTax : null,
     settlement,
     customerId: so.customerId,
     updatedAt: so.updatedAt.toISOString(),
@@ -1336,6 +1418,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     const inputError = validateSalesOrderInput(input)
     if (inputError) return { success: false, error: inputError }
     const externalOrderNumber = input.externalOrderNumber?.trim() || null
+    const quote = validateQuoteInput({ isQuote: input.isQuote, isDraft: input.isDraft, quoteValidUntil: input.quoteValidUntil }, await quoteTodayYmd())
+    if (!quote.ok) return { success: false, error: quote.error }
+    if (quote.isQuote && externalOrderNumber) return { success: false, error: 'A quote has no external order number: a storefront order is never a quote.' }
     if (externalOrderNumber) {
       const existing = await db.salesOrder.findFirst({
         where: { externalOrderNumber },
@@ -1382,6 +1467,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
           externalOrderNumber,
           orderNumber,
           status: initialStatus,
+          isQuote: quote.isQuote,
+          quoteValidUntil: quote.quoteValidUntil ? quoteYmdToDate(quote.quoteValidUntil) : null,
           customerId: input.customerId || null,
           taxRateName: input.taxRateName || null,
           ...salesOrderHeaderData(input, prepared),
@@ -1447,8 +1534,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       action: 'created',
       tag: 'sales',
       level: 'INFO',
-      description: `Created sales order ${mapped.displayOrderNumber}`,
-      metadata: { orderNumber: mapped.displayOrderNumber, totalBase: mapped.totalBase, currency: mapped.currency },
+      description: quote.isQuote ? `Created quote ${mapped.displayOrderNumber} (valid until ${quote.quoteValidUntil})` : `Created sales order ${mapped.displayOrderNumber}`,
+      metadata: { orderNumber: mapped.displayOrderNumber, totalBase: mapped.totalBase, currency: mapped.currency, ...(quote.isQuote ? { quote: true, quoteValidUntil: quote.quoteValidUntil } : {}) },
     })
     return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
@@ -1489,6 +1576,8 @@ export type UpdateSalesOrderResult = { success: boolean; order?: SoRow; error?: 
 const EDIT_GUARD_SELECT = {
   id: true,
   status: true,
+  isQuote: true,
+  quoteValidUntil: true,
   erasedAt: true,
   accountingInvoiceId: true,
   orderNumber: true,
@@ -1548,6 +1637,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
     const prepared = await prepareSalesOrderWrite(input, confirmedEdit ? { pinnedFxRate: Number(preRead.fxRateToBase) } : undefined)
     if (!prepared.ok) return { success: false, error: prepared.error }
     const lineData = prepared.model.lines
+    const editToday = await quoteTodayYmd()
     const actingUserId = session.user.id ?? null
 
     // THE WAREHOUSE GATE (the one the amendment pass asks): an order already pushed to the warehouse is edited only while the warehouse order can still be amended. Read before the transaction (a remote read does not
@@ -1603,6 +1693,12 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
         productlessLines,
       })
       if (block) return { error: block.reason } as const
+      // Whether the order is a quote is decided by creating it and by converting it, never by an edit: an edit repeats the flag it was opened with, and may move the validity date.
+      if (Boolean(input.isQuote) !== current.isQuote) {
+        return { error: current.isQuote ? 'This is a quote: keep it a quote while editing, or convert it with Convert to order.' : 'An order cannot be turned into a quote.' } as const
+      }
+      const editedQuote = validateQuoteInput({ isQuote: input.isQuote, isDraft: true, quoteValidUntil: input.quoteValidUntil }, editToday, { allowPastDate: quoteDateToYmd(current.quoteValidUntil) })
+      if (!editedQuote.ok) return { error: editedQuote.error } as const
       // The warehouse order the gate was read for must still be the order's: a push that happened (or a link that moved) since is an answer about something else.
       if (!isDraft && (current.wmsOrderPush?.externalOrderId ?? null) !== wmsGateOrderId) {
         return { error: 'The warehouse order for this sales order changed while the edit was being checked. Reload the order and edit it again. Nothing was changed.' } as const
@@ -1656,6 +1752,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
           customerId: input.customerId || null,
           taxRateName: input.taxRateName || null,
           ...salesOrderHeaderData(input, prepared),
+          ...(editedQuote.isQuote ? { quoteValidUntil: quoteYmdToDate(editedQuote.quoteValidUntil!) } : {}),
           // An edit that clears an address clears it (create simply leaves the column unset).
           billingAddress: (input.billingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
           shippingAddress: (input.shippingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
@@ -1746,7 +1843,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       action: 'updated',
       tag: 'sales',
       level: 'INFO',
-      description: `${outcome.isDraft ? 'Edited draft' : 'Edited confirmed'} sales order ${mapped.displayOrderNumber}`,
+      description: mapped.isQuote ? `Edited quote ${mapped.displayOrderNumber}` : `${outcome.isDraft ? 'Edited draft' : 'Edited confirmed'} sales order ${mapped.displayOrderNumber}`,
       metadata: {
         orderNumber: mapped.displayOrderNumber,
         previousTotalForeign: previous.totalForeign,
@@ -2253,6 +2350,7 @@ export async function applySalesOrderStatusTransition(
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        isQuote: true,
         archived: true,
         shipFromWarehouseId: true,
         // audit-s3en/45kd: detect a paid (full or partial), uninvoiced order being cancelled.
@@ -2272,6 +2370,9 @@ export async function applySalesOrderStatusTransition(
       },
     })
     if (!so) return { success: false, error: 'Order not found' }
+    // o3d-ngmt.16: a quote is a draft that cannot leave the draft state (bar cancelling) until it is converted, whoever asks: re-checked under the lock below.
+    const quoteRefusal = quoteStatusMoveRefused(so.isQuote, targetStatus)
+    if (quoteRefusal) return { success: false, error: quoteRefusal, permanent: true }
     // audit-M-o2c: an archived order is filed away — block MANUAL status edits.
     // Automated data-pushes still apply: the WooCommerce force-sync
     // (INTERNAL_STATUS_TRANSITION_BYPASS) and the sessionless delivery cron
@@ -2459,8 +2560,10 @@ export async function applySalesOrderStatusTransition(
             if (targetStatus !== 'CANCELLED') {
               const fresh = await lockedTx.salesOrder.findUnique({
                 where: { id },
-                select: { withdrawalApprovedAt: true, status: true },
+                select: { withdrawalApprovedAt: true, status: true, isQuote: true },
               })
+              const freshQuoteRefusal = quoteStatusMoveRefused(fresh?.isQuote === true, targetStatus)
+              if (freshQuoteRefusal) throw new PermanentStatusTransitionError(freshQuoteRefusal)
               // Permit only what the state machine itself would permit from
               // the CURRENT status. That allows a post-dispatch return to
               // finish (SHIPPED -> COMPLETED/DELIVERED) while refusing every
@@ -3109,6 +3212,8 @@ export async function createRefund(
     if (!isInternal) {
       await requirePermission('sales.refund')
     }
+    // o3d-ngmt.16: a quote has nothing to refund (it takes no payment and is never invoiced).
+    if ((await db.salesOrder.findUnique({ where: { id: orderId }, select: { isQuote: true } }))?.isQuote) return { success: false, error: QUOTE_ACTION_REFUSAL('it cannot be refunded') }
     // o3d-n8p (Codex): chargeback and externalRefundId are provenance-bearing and have material effects —
     // chargeback suppresses restock + COGS reversal, and externalRefundId occupies the globally unique Woo
     // replay key. They must come only from the trusted internal entry points (Woo sync, chargeback poller),
@@ -3124,6 +3229,9 @@ export async function createRefund(
     // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
     const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
+    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending.
+    const deletePendingForRefund = await pendingDeletionError(orderId)
+    if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
     let returnReasonId: string | null = null
     if (options?.returnReasonId) {
       const reason = await db.returnReason.findFirst({ where: { id: options.returnReasonId, active: true }, select: { id: true } })
@@ -4163,12 +4271,19 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       // SO-to-PO pegging: the order's pegs go with its lines (FK cascade); record their end first.
       await recordPegsRemovedWithLines(tx, { salesOrderLineIds: (await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true } })).map((l) => l.id) }, session.user.id ?? null)
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
+      // Supporting documents go with the order (the rows would cascade; the stored names are taken here so the files can be removed after the commit).
+      const attachmentFiles = await deleteSalesOrderAttachmentsInTx(tx, [id])
       await tx.salesOrder.delete({ where: { id } })
-      return { so, released }
+      return { so, released, attachmentFiles }
     }, { maxWait: 5000, timeout: 20000 })
 
     if ('error' in outcome) return { success: false, error: outcome.error }
     const { so, released } = outcome
+    try {
+      await drainOrderAttachmentFileDeletions()
+    } catch (fileError) {
+      console.error('Failed to remove attachment files of a deleted sales order', fileError)
+    }
 
     // Post-commit side effects: the stock sync mirrors the released reservations to the
     // storefront. Never fail the (already committed) delete on a sync error.
@@ -4218,6 +4333,9 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
+    // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned.
+    const deletePendingForPaid = await pendingDeletionError(id)
+    if (deletePendingForPaid) return { success: false, error: deletePendingForPaid }
     // audit-mmvp: lock the order row (same FOR UPDATE pattern as addPayment) so a
     // concurrent addPayment/markSalesOrderPaid can't both observe paidAt=null,
     // both flip it, and both run the warn/generate block — double-warning the
@@ -4225,6 +4343,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
     // lock makes exactly one caller see the unpaid→paid transition.
     const locked = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, id)
+      await assertNotQuoteUnderLock(tx, id, 'it cannot be marked paid')
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
@@ -4365,10 +4484,12 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
           externalOrderNumber: true,
           orderNumber: true,
           invoiceNumber: true,
+          isQuote: true,
           shoppingLinks: { select: { connector: true } },
         },
       })
       if (!so) throw new Error('Order not found')
+      if (so.isQuote) throw new Error('A quote is not invoiced: convert it to an order and confirm the order first.')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
       // o3d-k26m.1: for a storefront that supplies its own invoice number, this column is where
       // that number is recorded — minting into it posts the order to the ledger under a number
@@ -4454,6 +4575,7 @@ export async function addPayment(input: {
     const baseCurrency = await getBaseCurrencyCode()
     const txResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, input.orderId)
+      await assertNotQuoteUnderLock(tx, input.orderId, 'no payment can be recorded against it')
       const so = await tx.salesOrder.findUnique({
         where: { id: input.orderId },
         select: {
@@ -4471,6 +4593,9 @@ export async function addPayment(input: {
         },
       })
       if (!so) return { error: 'Order not found' }
+      // o3d-ngmt.21: no receipt against an invoice whose delete is pending (read under the order lock the delete request also takes).
+      const deletePending = await pendingDeletionError(input.orderId, tx)
+      if (deletePending) return { error: deletePending }
       // A CANCELLED order can still receive a receipt: money really does arrive for orders that were
       // cancelled (a bank transfer in flight, a customer who paid late), and an operator must be able to
       // record it. What happens to it afterwards is decided by WHEN it was paid against the database-minted

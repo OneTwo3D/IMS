@@ -88,6 +88,8 @@ export type ErasureCounts = {
   /** Accounting sync rows whose error text was replaced by the fixed marker. */
   accountingErrorsScrubbed: number
   notifications: number
+  /** Supporting documents (attachment rows) of the erased sales orders, deleted with their files. */
+  orderAttachmentsDeleted: number
 }
 
 /**

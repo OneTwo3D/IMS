@@ -103,6 +103,14 @@ npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1                         
 npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 -> tests/db/**
 ```
 
+`npm run test:db` also runs ONE FILE AT A TIME (`--test-concurrency=1`). The files in `tests/db/` share
+one database and several mutate rows no file owns (the `settings` plugin and account-mapping rows, tax rates,
+the xero token row) inside transactions that roll back at the end. Run in parallel they take those row locks
+in different orders and fail each other with `40P01 deadlock detected`, with a fingerprint test seeing another
+file's write, and with the reset tests' `pg_terminate_backend` signalling a connection a neighbour was using.
+Measured on a scratch cluster over the 15 settings-writing files at concurrency 15: 12 failures in 5 runs;
+serial, none. `tests/db-tier-serial.test.ts` pins the flag.
+
 A third, **opt-in and explicitly invoked** file lives outside every glob: `tests/manual/`. Nothing
 collects it, so it can drive real server actions against a real database without making `test:unit`
 need one.

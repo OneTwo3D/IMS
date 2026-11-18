@@ -15,6 +15,7 @@ import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
 import { assertMintsoftOrderClient, mergedParts as mintsoftMergedParts, requireMintsoftClientId } from './orders'
+import { readShopIossNumber } from '@/lib/domain/accounting/shop-ioss-number'
 import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema'
 
 /**
@@ -128,7 +129,11 @@ export function parseDefaultCourierId(raw: string | null | undefined): number | 
   return Number.isInteger(id) && id > 0 ? id : null
 }
 
-export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, includeItems = true): Record<string, unknown> {
+export function buildPushPayload(
+  input: WmsOrderPushInput,
+  courier: CourierOption,
+  includeItems = true,
+): Record<string, unknown> {
   const a = input.shippingAddress
   const payload: Record<string, unknown> = {
     OrderNumber: input.orderNumber,
@@ -156,6 +161,9 @@ export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOptio
   // with includeItems=false, and a Mintsoft order's VAT number may be immutable once
   // created — don't risk an amend rejection by re-sending it.
   if (includeItems && input.vatNumber) payload.VATNumber = input.vatNumber
+  // The shop's own IOSS number (resolved at create time by pushMintsoftOrder, only behind the setting and only for IOSS-stamped orders):
+  // create payload only, like the VAT number.
+  if (includeItems && input.iossNumber) payload.IOSSNumber = input.iossNumber
   if (includeItems) {
     // The order-update endpoint (NewOrder) ignores items, so creates send them here and
     // amendments are reconciled separately via the /Items sub-resource endpoints
@@ -404,6 +412,10 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // never start a lifecycle we cannot finish.
   const clientId = await getPushClientId('Mintsoft order push')
   const settings = await getMintsoftSettings()
+  // The IOSS number is resolved HERE from the current shop setting (not from a copy stored on the order), for IOSS-stamped orders only, so an
+  // operator's change or clear applies to every order not yet created in Mintsoft. A cleared/invalid setting sends no IOSSNumber.
+  const iossNumber = settings.mintsoft_send_ioss_number === 'true' && input.iossStamped ? await readShopIossNumber() : null
+  if (iossNumber) input = { ...input, iossNumber }
   // Courier selection: a configured shipping-service → CourierServiceId mapping
   // wins; else pass the name through for the WMS to resolve; else (no service on
   // the order at all) fall straight to the configured default id if one is set.

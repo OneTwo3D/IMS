@@ -2,6 +2,7 @@
  * Bidirectional product sync between WooCommerce and IMS.
  */
 
+import { readWcHsCodeMirror } from './hs-code-mirror'
 import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
 import { readWcProductPushDecision } from './product-push-gate'
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
@@ -64,7 +65,8 @@ import {
   PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE,
 } from '@/lib/products/type-transforms'
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
-import type { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
+import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 import { storeWcProductContent } from './product-content'
 
@@ -579,27 +581,54 @@ function asTrimmedString(value: unknown): string | null {
 // fallback, see customs-fields.ts). Policy: WC wins when present.
 // When WC supplies a differing value we overwrite IMS (so re-classifications/corrections
 // propagate); when WC omits the field (native and every fallback) we preserve the existing IMS
-// value (never null it).
+// value. The one exception is an EXPLICIT clear (the native key present with null/''), which nulls the IMS value.
 // Inputs are expected already-trimmed (see asTrimmedString / toIsoCountryCode at the call
 // site); an empty string is treated as absent via truthiness.
 export const WC_TRADE_FIELDS = ['hsCode', 'countryOfOrigin', 'customsDescription'] as const
 export type WcTradeField = (typeof WC_TRADE_FIELDS)[number]
 export type WcTradeSnapshot = Record<WcTradeField, string | null>
-export type WcTradeFieldChange = { field: WcTradeField; from: string | null; to: string }
+export type WcTradeFieldChange = { field: WcTradeField; from: string | null; to: string | null }
 
+/**
+ * `cleared` names the fields WooCommerce EXPLICITLY emptied (see extractWcCustomsFields): only those set IMS to null, and
+ * only when IMS holds a value. A field that is merely absent or unusable is in neither `incoming` nor `cleared`, so the IMS
+ * value is preserved. A usable incoming value always wins over a clear.
+ */
 export function resolveWcTradeFieldUpdates(
   existing: WcTradeSnapshot,
   incoming: WcTradeSnapshot,
+  cleared: readonly WcTradeField[] = [],
 ): WcTradeFieldChange[] {
   const changes: WcTradeFieldChange[] = []
   for (const field of WC_TRADE_FIELDS) {
     const next = incoming[field]
-    // WC value absent/empty -> preserve IMS; present and different -> overwrite.
-    if (next && next !== existing[field]) {
-      changes.push({ field, from: existing[field], to: next })
+    // WC value absent/empty -> preserve IMS; present and different -> overwrite; explicitly cleared -> null.
+    if (next) {
+      if (next !== existing[field]) changes.push({ field, from: existing[field], to: next })
+    } else if (cleared.includes(field) && existing[field]) {
+      changes.push({ field, from: existing[field], to: null })
     }
   }
   return changes
+}
+
+/**
+ * Fields a variation clears: the merged value is still empty, nothing present-but-unusable was supplied by the variation
+ * OR its parent, and the VARIATION's own native value is empty and its own cleared-fields meta lists it.
+ */
+export function resolveVariationCleared(
+  own: { cleared: readonly WcTradeField[]; rejected: readonly WcRejectedCustomsValue[] },
+  parent: { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
+  merged: WcTradeSnapshot,
+): WcTradeField[] {
+  return WC_TRADE_FIELDS.filter(
+    (f) =>
+      merged[f] === null
+      && !own.rejected.some((r) => r.field === f)
+      && !parent.rejected?.some((r) => r.field === f)
+      // Only the variation's OWN marker counts: a parent-only marker says nothing about a value set on the variation itself.
+      && own.cleared.includes(f),
+  )
 }
 
 /**
@@ -870,6 +899,8 @@ export async function syncWcProductToIms(
     const customsDescriptionAttr = customs.customsDescription
     const customsWarnings: string[] = []
 
+    const hsCodeMirror = readWcHsCodeMirror(wcProduct)
+
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
 
@@ -1036,6 +1067,7 @@ export async function syncWcProductToIms(
               customsDescription: existing.customsDescription,
             },
             { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
+            customs.cleared,
           )
 
           /**
@@ -1081,6 +1113,11 @@ export async function syncWcProductToIms(
 
             for (const change of changes) {
               updateData[change.field] = change.to
+            }
+
+            // The WooCommerce tariff codes (pa_us_hs_code, _dutify_hs_codes) follow WooCommerce, a removed code clears; never touches `hsCode`.
+            for (const [field, value] of Object.entries(hsCodeMirror)) {
+              updateData[field] = value === null && field === 'wcDutifyHsCodes' ? Prisma.DbNull : value
             }
 
             // Category — link to mirrored IMS category for the deepest WC category
@@ -1233,6 +1270,8 @@ export async function syncWcProductToIms(
               lifecycleStatus,
               type: productType,
               hsCode: hsCodeAttr,
+              wcUsHsCode: hsCodeMirror.wcUsHsCode ?? null,
+              ...(hsCodeMirror.wcDutifyHsCodes ? { wcDutifyHsCodes: hsCodeMirror.wcDutifyHsCodes } : {}),
               countryOfOrigin: originIso ?? DEFAULT_COUNTRY_OF_ORIGIN,
               customsDescription: customsDescriptionAttr,
               externalProductId: BigInt(wcProduct.id),
@@ -1388,7 +1427,7 @@ export async function syncWcProductToIms(
         action: 'wc_trade_fields_updated',
         tag: 'sync',
         description: `WC trade fields updated on ${syncedSku}: ${tradeChanges
-          .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to}`)
+          .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to ?? '∅ (cleared in WooCommerce)'}`)
           .join(', ')}`,
       })
     }
@@ -1857,7 +1896,7 @@ async function applyVariations(
    * parent's in view context, but a payload that omits them (older WooCommerce, an attribute-only
    * store, a legacy-description meta that lives on the parent) falls back to these per field.
    */
-  parentCustoms: WcCustomsFields,
+  parentCustoms: WcCustomsFields & { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
   /** Collects customs warnings (unusable WC values, defaulted origin) for the caller to record. */
   customsWarnings: string[],
 ): Promise<WcProductStructureConflict[]> {
@@ -1931,6 +1970,10 @@ async function applyVariations(
       countryOfOrigin: ownCustoms.countryOfOrigin ?? parentCustoms.countryOfOrigin,
       customsDescription: ownCustoms.customsDescription ?? parentCustoms.customsDescription,
     }
+
+    // Cleared only when the variation itself is explicitly emptied (or has no value of its own and the parent is), and
+    // nothing inherited from the parent fills the field: a variation inheriting a populated parent is never cleared.
+    const variantCleared = resolveVariationCleared(ownCustoms, parentCustoms, variantCustoms)
 
     const existing = existingBySku.get(sku)
     customsWarnings.push(
@@ -2037,6 +2080,7 @@ async function applyVariations(
           customsDescription: existing.customsDescription ?? null,
         },
         variantCustoms,
+        variantCleared,
       )) {
         updateData[change.field] = change.to
       }

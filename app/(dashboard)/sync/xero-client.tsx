@@ -225,6 +225,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const attachPdfKey = settingKey('sync_attach_pdf')
   const dailyBatchKey = settingKey('daily_batch_enabled')
   const paymentPollingKey = settingKey('payment_polling_enabled')
+  const documentDeleteKey = settingKey('document_delete_enabled')
 
   // Handle OAuth redirect query params
   useEffect(() => {
@@ -1114,6 +1115,26 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               <div>
                 <span className="text-sm font-medium">Payment Polling</span>
                 <p className="text-[11px] text-muted-foreground">Poll Xero every 15 minutes for paid invoices (manual orders) and paid bills (purchase orders).</p>
+              </div>
+            </label>
+          </Card>
+
+          {/* Deleting synced documents (o3d-ngmt.21) */}
+          <Card className="p-6 space-y-4">
+            <div>
+              <h3 className="text-base font-semibold">Deleting synced documents</h3>
+              <p className="text-xs text-muted-foreground mt-0.5">Lets an operator delete an invoice or bill that IMS itself created in {connectorLabel}, from the document&apos;s page.</p>
+            </div>
+            <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+              <input
+                type="checkbox"
+                checked={s[documentDeleteKey] === 'true'}
+                onChange={e => handleField(documentDeleteKey, e.target.checked ? 'true' : 'false')}
+                className="h-4 w-4 accent-primary mt-0.5"
+              />
+              <div>
+                <span className="text-sm font-medium">Allow deleting synced invoices and bills</span>
+                <p className="text-[11px] text-muted-foreground">Off by default. The original number is freed first by adding a random suffix, then the document is deleted (draft or submitted) or voided (authorised, no payments). Refused when the document has payments or credit notes, is dated in a locked period, or was not created by IMS. Every write to {connectorLabel} goes through the normal outbound queue and its hold.</p>
               </div>
             </label>
           </Card>
