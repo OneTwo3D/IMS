@@ -175,7 +175,8 @@ export async function listProducts(params: {
   sort?: SortField
   dir?: SortDir
 }): Promise<ProductListResult> {
-  await requireInternalUser()
+  const session = await requireInternalUser()
+  const canSeePrices = hasPermission(session.user.role, 'inventory.prices')
   const page = Math.max(1, params.page ?? 1)
   const pageSize = params.pageSize ?? 50
   const sortField = params.sort ?? 'sku'
@@ -313,9 +314,9 @@ export async function listProducts(params: {
     heightCm: p.heightCm?.toString() ?? null,
     depthCm: p.depthCm?.toString() ?? null,
     imageUrl: p.imageUrl ?? p.parent?.imageUrl ?? null,
-    salesPriceBase: p.salesPriceBase?.toString() ?? null,
-    salePriceBase: p.salePriceBase?.toString() ?? null,
-    priceRange,
+    salesPriceBase: canSeePrices ? p.salesPriceBase?.toString() ?? null : null,
+    salePriceBase: canSeePrices ? p.salePriceBase?.toString() ?? null : null,
+    priceRange: canSeePrices ? priceRange : null,
     salesPriceTaxInclusive: p.salesPriceTaxInclusive,
     taxCategory: p.taxCategory,
     stockUnit: p.stockUnit,
@@ -351,7 +352,8 @@ export async function listProducts(params: {
 }
 
 export async function getProduct(id: string): Promise<ProductDetail | null> {
-  await requireInternalUser()
+  const session = await requireInternalUser()
+  const canSeePrices = hasPermission(session.user.role, 'inventory.prices')
   const categoryNodes = await listProductCategoryNodes()
   const categoryPathById = new Map(categoryNodes.map((n) => [n.id, n.path] as const))
   const [p, activeOrderLines, inTransferLines, openPoLines] = await Promise.all([
@@ -534,9 +536,9 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     heightCm: p.heightCm?.toString() ?? null,
     depthCm: p.depthCm?.toString() ?? null,
     imageUrl: p.imageUrl ?? p.parent?.imageUrl ?? null,
-    salesPriceBase: p.salesPriceBase?.toString() ?? null,
-    salePriceBase: p.salePriceBase?.toString() ?? null,
-    priceRange: p.type === 'VARIABLE' && p.variants.length > 0 ? (() => {
+    salesPriceBase: canSeePrices ? p.salesPriceBase?.toString() ?? null : null,
+    salePriceBase: canSeePrices ? p.salePriceBase?.toString() ?? null : null,
+    priceRange: canSeePrices && p.type === 'VARIABLE' && p.variants.length > 0 ? (() => {
       const prices = p.variants.map((v) => Number(v.salesPriceBase)).filter((n) => n > 0)
       if (!prices.length) return null
       return { min: Math.min(...prices).toFixed(2), max: Math.max(...prices).toFixed(2) }
@@ -573,8 +575,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       heightCm: v.heightCm?.toString() ?? null,
       depthCm: v.depthCm?.toString() ?? null,
       imageUrl: v.imageUrl ?? p.imageUrl ?? null,
-      salesPriceBase: v.salesPriceBase?.toString() ?? null,
-      salePriceBase: v.salePriceBase?.toString() ?? null,
+      salesPriceBase: canSeePrices ? v.salesPriceBase?.toString() ?? null : null,
+      salePriceBase: canSeePrices ? v.salePriceBase?.toString() ?? null : null,
       priceRange: null,
       salesPriceTaxInclusive: v.salesPriceTaxInclusive,
       taxCategory: v.taxCategory,
@@ -697,6 +699,7 @@ export async function createProduct(
   formData: FormData
 ): Promise<ProductFormState> {
   const session = await requirePermission('inventory.edit')
+  const canEditPrices = hasPermission(session.user.role, 'inventory.prices')
   const raw = {
     sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
@@ -792,10 +795,11 @@ export async function createProduct(
         countryOfOrigin: data.countryOfOrigin || null,
         customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
-        salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
-        salePriceBase: data.salePriceBase ? data.salePriceBase : null,
-        salesPriceTaxInclusive: data.salesPriceTaxInclusive,
-        taxCategory: data.taxCategory,
+        // inventory.prices gates the price and tax-category fields: without it a new product starts unpriced.
+        salesPriceBase: canEditPrices && data.salesPriceBase ? data.salesPriceBase : null,
+        salePriceBase: canEditPrices && data.salePriceBase ? data.salePriceBase : null,
+        salesPriceTaxInclusive: canEditPrices ? data.salesPriceTaxInclusive : false,
+        taxCategory: canEditPrices ? data.taxCategory : 'STANDARD',
         stockUnit: data.stockUnit,
         oversellAllowed: data.oversellAllowed,
         imageUrl: data.imageUrl || null,
@@ -859,6 +863,7 @@ export async function updateProduct(
   formData: FormData
 ): Promise<ProductFormState> {
   const session = await requirePermission('inventory.edit')
+  const canEditPrices = hasPermission(session.user.role, 'inventory.prices')
   const raw = {
     sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
@@ -1043,10 +1048,14 @@ export async function updateProduct(
         countryOfOrigin: data.countryOfOrigin || null,
         customsDescription: data.customsDescription || null,
         weight: data.weight ? data.weight : null,
-        salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
-        salePriceBase: data.salePriceBase ? data.salePriceBase : null,
-        salesPriceTaxInclusive: data.salesPriceTaxInclusive,
-        taxCategory: data.taxCategory,
+        // inventory.prices gates the price and tax-category fields: without it the stored values are left
+        // untouched whatever the form submitted.
+        ...(canEditPrices ? {
+          salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
+          salePriceBase: data.salePriceBase ? data.salePriceBase : null,
+          salesPriceTaxInclusive: data.salesPriceTaxInclusive,
+          taxCategory: data.taxCategory,
+        } : {}),
         stockUnit: data.stockUnit,
         oversellAllowed: data.oversellAllowed,
         imageUrl: data.imageUrl || null,

@@ -86,6 +86,14 @@ export const ATTEMPT_SETTLED_VOID_BASIS = 'attempt_settled_not_posted'
 export const HELD_SHADOW_VOID_BASIS = 'held_shadow'
 
 /**
+ * The DOCUMENT this event posted was deleted by an operator in IMS and the ledger together (o3d-ngmt.21): the ledger voided or deleted it and IMS
+ * unwound its own records. The document is gone for good, so no later attempt may take this event back to PENDING; it is deliberately absent
+ * from REVIVABLE_VOID_BASES. A replacement document is a different document with its own events. Written by
+ * lib/domain/accounting/document-delete-service.ts only.
+ */
+export const DOCUMENT_DELETED_VOID_BASIS = 'document_deleted'
+
+/**
  * May a NEW LIVE ATTEMPT take a VOID mirrored event back to PENDING?
  *
  * ONE DEFINITION, read two ways: the SQL predicate in `reviveMirroredEventForNewAttempt` is built

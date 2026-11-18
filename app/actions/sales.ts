@@ -1,5 +1,6 @@
 'use server'
 
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
@@ -184,6 +185,7 @@ import {
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
+import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { SHOP_DESYNC_WARNING, paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal, type SalesOrderEditInput } from '@/lib/domain/sales/order-edit-affordance'
 import { RETURN_EXCHANGE_OFF_REFUSAL, RETURN_EXCHANGE_SETTING_KEY, exchangeRequestRefusal, resolveReturnExchangeBlock, returnExchangeEnabledFromSetting, returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
@@ -3456,6 +3458,9 @@ export async function createRefund(
     // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
     const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
+    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending.
+    const deletePendingForRefund = await pendingDeletionError(orderId)
+    if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
     let returnReasonId: string | null = null
     if (options?.returnReasonId) {
       const reason = await db.returnReason.findFirst({ where: { id: options.returnReasonId, active: true }, select: { id: true } })
@@ -4534,12 +4539,19 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       // SO-to-PO pegging: the order's pegs go with its lines (FK cascade); record their end first.
       await recordPegsRemovedWithLines(tx, { salesOrderLineIds: (await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true } })).map((l) => l.id) }, session.user.id ?? null)
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
+      // Supporting documents go with the order (the rows would cascade; the stored names are taken here so the files can be removed after the commit).
+      const attachmentFiles = await deleteSalesOrderAttachmentsInTx(tx, [id])
       await tx.salesOrder.delete({ where: { id } })
-      return { so, released }
+      return { so, released, attachmentFiles }
     }, { maxWait: 5000, timeout: 20000 })
 
     if ('error' in outcome) return { success: false, error: outcome.error }
     const { so, released } = outcome
+    try {
+      await drainOrderAttachmentFileDeletions()
+    } catch (fileError) {
+      console.error('Failed to remove attachment files of a deleted sales order', fileError)
+    }
 
     // Post-commit side effects: the stock sync mirrors the released reservations to the
     // storefront. Never fail the (already committed) delete on a sync error.
@@ -4589,6 +4601,9 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
+    // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned.
+    const deletePendingForPaid = await pendingDeletionError(id)
+    if (deletePendingForPaid) return { success: false, error: deletePendingForPaid }
     // audit-mmvp: lock the order row (same FOR UPDATE pattern as addPayment) so a
     // concurrent addPayment/markSalesOrderPaid can't both observe paidAt=null,
     // both flip it, and both run the warn/generate block — double-warning the
@@ -4842,6 +4857,9 @@ export async function addPayment(input: {
         },
       })
       if (!so) return { error: 'Order not found' }
+      // o3d-ngmt.21: no receipt against an invoice whose delete is pending (read under the order lock the delete request also takes).
+      const deletePending = await pendingDeletionError(input.orderId, tx)
+      if (deletePending) return { error: deletePending }
       // A CANCELLED order can still receive a receipt: money really does arrive for orders that were
       // cancelled (a bank transfer in flight, a customer who paid late), and an operator must be able to
       // record it. What happens to it afterwards is decided by WHEN it was paid against the database-minted

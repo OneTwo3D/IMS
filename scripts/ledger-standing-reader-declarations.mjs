@@ -15,6 +15,16 @@
 // slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question.
 
 export const DECLARATIONS = [
+  { key: "lib/domain/accounting/document-delete-service.ts::lateActivityOn::where-admits-synced#1", class: "GUARD",
+    reason: "o3d-ngmt.21: the unwind's re-check under the document's lock: a bill payment queued, running or synced since the delete was requested stops the unwind (the bill is paid in the ledger sense); a cancelled row is not a payment." },
+  { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#1", class: "GUARD",
+    reason: "o3d-ngmt.21: the ownership proof for a sales invoice delete. A delete is offered only when a SYNCED create row with no settlement basis (a connector confirmation, never an operator assertion) names the very document id; a shadow or asserted row proves nothing about who created the document and refuses the delete." },
+  { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#2", class: "GUARD",
+    reason: "o3d-ngmt.21: refuses a supplier bill delete when any bill payment row is queued, running or synced for the bill; a payment IMS sent (or is sending) blocks the delete, and a cancelled row is not a payment." },
+  { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#3", class: "GUARD",
+    reason: "o3d-ngmt.21: the ownership proof for a supplier bill delete, as for a sales invoice: a connector-confirmed SYNCED create row naming the bill's document id." },
+  { key: "lib/domain/accounting/document-delete-service.ts::voidDocumentEvents::ae-posted-query#1", class: "GUARD",
+    reason: "o3d-ngmt.21: voids the mirrored events that posted the deleted document, matched on the ledger's document id; every POSTED basis is voided alike because the document itself is gone, so the post basis is not read." },
   { key: "app/api/credit-note/[id]/route.ts::GET::where-excludes-cancelled#1", class: "DISPLAY",
     reason: "Chooses which credit-note sync row's PAYLOAD the credit-note PDF prints: the latest row that is not CANCELLED (a CANCELLED row, a shadow included, was never sent). It reads the payload as queued; it makes no claim about whether the ledger holds the document and sends nothing." },
   { key: "app/api/credit-note/[id]/route.ts::GET::where-admits-synced#1", class: "DISPLAY",
