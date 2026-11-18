@@ -77,7 +77,7 @@ test('the bill is posted and written back between the read and the lock: the edi
     assert.equal(created.success, true, String(created.error))
     const po = await db.purchaseOrder.findUniqueOrThrow({ where: { reference: tag }, select: { id: true, lines: { select: { id: true } } } })
     await db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
-    const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+    const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', allowDuplicateInvoiceNumber: true, lines: [{ kind: 'product', poLineId: po.lines[0]!.id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
     assert.equal(bill.success, true, String(bill.error))
     const invoice = await db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
 

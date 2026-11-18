@@ -12,7 +12,7 @@ import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
  * completed orders (C and D): D 66.7% (A) and C 100% (C).
  */
 
-mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) } })
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined } })
 
 const status = { A: 'PENDING_PAYMENT', B: 'ALLOCATED', C: 'SHIPPED', D: 'COMPLETED', X: 'DRAFT', Y: 'PENDING_PAYMENT', Z: 'CANCELLED' } as const

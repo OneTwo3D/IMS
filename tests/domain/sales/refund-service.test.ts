@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { numberingFake } from '../../helpers/numbering-fake.ts'
 import { shadowEvidenceFake, type FakeShadowRecord } from '../../helpers/shadow-evidence-fake'
 import test from 'node:test'
 
@@ -423,13 +424,16 @@ function baseState(overrides: Partial<State> = {}): State {
 }
 
 function createClient(state: State): RefundServiceClient {
+  const numbering = numberingFake()
   // This in-memory Prisma mock is intentionally scoped to refund-service unit
   // tests. It models transaction rollback and the two shipment read shapes used
   // by refund creation: physical SHIPPED rows for restocking and journaled rows
   // for accounting reversal snapshots.
   const client = {
-    $queryRaw: (query: unknown) => shadowEvidenceFake(state.shadowRecords ?? []).queryRaw(query),
-    $executeRaw: async () => {
+    $queryRaw: (query: unknown, ...rest: unknown[]) => numbering.isNumbering(query, ...rest) ? numbering.queryRaw(query, ...rest) : shadowEvidenceFake(state.shadowRecords ?? []).queryRaw(query),
+    $executeRaw: async (query: unknown, ...rest: unknown[]) => {
+      // The credit note counter's statements are the numbering module's own; only the refund service's locks are counted.
+      if (numbering.isNumbering(query, ...rest)) return numbering.executeRaw(query, ...rest)
       state.executeRawCalls += 1
       return 0
     },
@@ -658,7 +662,12 @@ function createClient(state: State): RefundServiceClient {
       // Filters on whatever keys the caller supplied. The refund service queries this three
       // ways: by {orderId, externalRefundId} (external replay), by {orderId, chargeback} and
       // by {orderId} alone (the o3d-6oyu.18 cross-path conflict guard).
-      findFirst: async ({ where }: { where: { orderId?: string; externalRefundId?: number; chargeback?: boolean } }) => {
+      findFirst: async ({ where }: { where: { orderId?: string; externalRefundId?: number; chargeback?: boolean; creditNoteNumber?: string } }) => {
+        // The numbering module's uniqueness probe: is this credit note number already on a refund?
+        if (where.creditNoteNumber !== undefined) {
+          const taken = state.refunds.find((row) => row.creditNoteNumber === where.creditNoteNumber)
+          return taken ? { id: taken.id } : null
+        }
         const refund = state.refunds.find((row) => (
           (where.orderId === undefined || row.orderId === where.orderId) &&
           (where.externalRefundId === undefined || row.externalRefundId === where.externalRefundId) &&
@@ -2858,6 +2867,8 @@ test('createSalesOrderRefund rejects refund quantities beyond remaining order qu
   assert.deepEqual(result, {
     success: false,
     error: 'Refund qty 1 for product product-1 exceeds remaining refundable qty 0.00',
+    // an over-quantity refusal is a quarantine outcome (the shop-originated caller parks the refund for an operator)
+    quarantine: true,
   })
 })
 

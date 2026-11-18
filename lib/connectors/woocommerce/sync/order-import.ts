@@ -38,7 +38,7 @@ import type { WcFullOrder, SyncResult } from './types'
 import { surfaceWcOrderEditDrift } from './order-edit-drift'
 import { drainDeferredWcOrderDivergences, rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
 import {
-  mapWcAddress, upsertCustomer, mapWcLineItems,
+  mapWcAddress, upsertCustomer, mapWcLineItems, logWcUnmatchedLines,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
   type MappedLine,
@@ -3908,6 +3908,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       }
       throw error
     }
+
+    // The order now exists: only here is the unmatched-line warning logged (a refused import must not consume its dedupe key).
+    await logWcUnmatchedLines(mappedLines, { orderId: wcOrder.id, orderNumber: wcOrder.number, salesOrderId: so.id })
 
     if (customerErasedDuringImport) {
       // Recorded without any identity: the order id, the customer's surrogate id, and what was done.
