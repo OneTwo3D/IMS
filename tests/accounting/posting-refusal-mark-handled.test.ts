@@ -366,9 +366,9 @@ for (const [label, overrides] of [
     const row = refusal('r36', 'landed_cost_cogs_journal', { type: 'COGS_JOURNAL' })
     refusals.push(row)
     syncRows.push(sync('s-blocking', row, overrides), sync('s-clean', row))
-    assert.equal(accountingSyncRowIsProvablyUnsent({ settlementBasis: null, abandonedBeforeRemoteCall: null, ...syncRows[0]! }), false,
+    assert.equal(accountingSyncRowIsProvablyUnsent({ settlementBasis: null, abandonedBeforeRemoteCall: null, remoteAttemptedAt: null, attemptStampingCustodyAt: null, ...syncRows[0]! }), false,
       'the predicate itself refuses this row')
-    assert.equal(accountingSyncRowIsProvablyUnsent({ settlementBasis: null, abandonedBeforeRemoteCall: null, ...syncRows[1]! }), true,
+    assert.equal(accountingSyncRowIsProvablyUnsent({ settlementBasis: null, abandonedBeforeRemoteCall: null, remoteAttemptedAt: null, attemptStampingCustodyAt: null, ...syncRows[1]! }), true,
       'and accepts the clean control, so the case above is not refused for an unrelated reason')
     const before = JSON.stringify({ syncRows, refusals })
 

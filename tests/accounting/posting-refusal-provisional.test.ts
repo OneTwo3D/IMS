@@ -382,14 +382,31 @@ test('[o3d-j625 r10] a kind this build no longer knows comes back as null, never
 test('[o3d-j625 r10] the accounting-sync cron reconciles claims BEFORE any connector gate', async () => {
   const { readFileSync } = await import('node:fs')
   const source = readFileSync(`${process.cwd()}/app/api/cron/accounting-sync/route.ts`, 'utf8')
-  const handler = source.slice(source.indexOf('export async function GET'))
-  const reconcileAt = handler.indexOf('await reconcileProvisionalRefusals()')
-  const firstGateAt = handler.indexOf('isIntegrationPluginEnabled(')
-  assert.ok(reconcileAt !== -1, 'PRECONDITION: the route reconciles provisional refusals at all')
-  assert.ok(firstGateAt !== -1, 'PRECONDITION: the route still has a connector gate to be before')
-  assert.ok(reconcileAt < firstGateAt,
+  // o3d-6t1qh (3): asserted by PARSING. Comparing the two text offsets proved nothing about nesting or an
+  // early return between them: `reconcileAt < firstGateAt` held with the call inside a branch.
+  const { functionBody, performsUnconditionally, topLevelIndex, isCallTo, canExitEarly } = await import('./ast-structure')
+  const { body } = functionBody(source, 'GET')
+  const reconcileAt = topLevelIndex(body, (node) => isCallTo(node, 'reconcileProvisionalRefusals'))
+  const gateAt = topLevelIndex(body, (node) => isCallTo(node, 'isIntegrationPluginEnabled'))
+  assert.ok(reconcileAt !== -1, 'PRECONDITION: the route reconciles provisional refusals at the top level of the handler')
+  assert.ok(gateAt !== -1, 'PRECONDITION: the route still has a connector gate to be before')
+  assert.ok(
+    performsUnconditionally(body.statements[reconcileAt], 'reconcileProvisionalRefusals'),
+    'the reconciler must run on every tick: it is nested inside a branch, try or short-circuit of the handler',
+  )
+  assert.ok(reconcileAt < gateAt,
     'the reconciler must run on every tick: the refusals it settles are largely the ones raised because no '
     + 'connector is enabled, which is precisely when every branch below returns "skipped"')
+  // Anything between the top of the handler and the reconciler that can return is either the request gate
+  // (auth, rate limit, maintenance) or a bug; none may mention a connector.
+  const connectorNames = ['isIntegrationPluginEnabled', 'isAccountingConnectorConnected', 'getActiveAccountingConnector']
+  for (const statement of body.statements.slice(0, reconcileAt)) {
+    if (!canExitEarly(statement)) continue
+    assert.ok(
+      !connectorNames.some((name) => isCallTo(statement, name) || statement.getText().includes(name)),
+      `a connector-dependent early exit precedes the reconciler: ${statement.getText().slice(0, 80)}`,
+    )
+  }
 })
 
 /**
