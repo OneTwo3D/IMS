@@ -74,7 +74,22 @@ function shipment(id: string, snapshot: unknown, opts: { qty?: number; cogsBatch
 
 const tx = {
   shipment: {
-    findMany: async () => shipments,
+    // Honours the window arguments the batch passes (o3d-f3a8): the id-in re-read, the notIn
+    // exclusion of earlier passes and `take`. Calls without them get the whole list, as before.
+    findMany: async (args?: { where?: { id?: { in?: string[] }; AND?: Array<{ id?: { notIn?: string[] }; orderId?: { notIn?: string[] } }> }; take?: number }) => {
+      const where = args?.where
+      // A shipment this run already stamped journaled is no longer a candidate (the real where-clause says so).
+      let rows = where?.AND || args?.take ? shipments.filter((row) => !shipmentUpdates.some((u) => u.id === row.id && u.data.shipmentJournalDate !== undefined)) : shipments
+      const inIds: string[] | undefined = where?.id?.in
+      if (inIds) rows = rows.filter((row) => inIds.includes(row.id))
+      for (const clause of where?.AND ?? []) {
+        const notIn: string[] | undefined = clause.id?.notIn
+        if (notIn) rows = rows.filter((row) => !notIn.includes(row.id))
+        const orderNotIn: string[] | undefined = clause.orderId?.notIn
+        if (orderNotIn) rows = rows.filter((row) => !orderNotIn.includes(row.orderId as string))
+      }
+      return args?.take ? rows.slice(0, args.take) : rows
+    },
     update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
       shipmentUpdates.push({ id: where.id, data })
       return { id: where.id }
@@ -301,4 +316,91 @@ test('o3d-sidy L1: the refusal survives the status-reason cap — it is FIRST in
   assert.equal(detail.group, 'B')
   assert.equal(detail.shipmentId, 'neg')
   assert.deepEqual(detail.negativeEntries.map((entry) => entry.costLayerId), ['cl-neg'])
+})
+
+// o3d-f3a8 M-1 — refused shipments at the front of the window must not starve healthy ones.
+const negSnapshot = [{ costLayerId: 'cl-neg', qty: '1.000000', unitCostBase: '-6.000000' }]
+const okSnapshot = [{ costLayerId: 'cl-ok', qty: '1.000000', unitCostBase: '5.000000' }]
+const withBatchLimit = async (limit: number, fn: () => Promise<void>) => {
+  const before = process.env.XERO_DAILY_BATCH_LIMIT
+  process.env.XERO_DAILY_BATCH_LIMIT = String(limit)
+  try { await fn() } finally {
+    if (before === undefined) delete process.env.XERO_DAILY_BATCH_LIMIT
+    else process.env.XERO_DAILY_BATCH_LIMIT = before
+  }
+}
+
+test('o3d-f3a8 M-1: batchLimit refused shipments at the front of the window do not starve the healthy ones behind them', async () => {
+  await withBatchLimit(2, async () => {
+    reset([
+      shipment('neg1', negSnapshot, { cogsBatchAmount: -6 }),
+      shipment('neg2', negSnapshot, { cogsBatchAmount: -6 }),
+      shipment('ok3', okSnapshot, { cogsBatchAmount: 5 }),
+      shipment('ok4', okSnapshot, { cogsBatchAmount: 5 }),
+    ])
+    const result = await runDailyBatchSync()
+    assert.equal(stamped('neg1'), false)
+    assert.equal(stamped('neg2'), false)
+    assert.equal(stamped('ok3'), true, `healthy shipment behind the refused block is journaled: ${JSON.stringify(result.errors)}`)
+    assert.equal(stamped('ok4'), true)
+  })
+})
+
+test('o3d-f3a8 L-6: three or more passes, each excluding every shipment refused so far', async () => {
+  await withBatchLimit(1, async () => {
+    reset([
+      shipment('neg1', negSnapshot, { cogsBatchAmount: -6 }),
+      shipment('neg2', negSnapshot, { cogsBatchAmount: -6 }),
+      shipment('neg3', negSnapshot, { cogsBatchAmount: -6 }),
+      shipment('ok4', okSnapshot, { cogsBatchAmount: 5 }),
+    ])
+    const result = await runDailyBatchSync()
+    assert.equal(stamped('ok4'), true, `reached on the 4th pass: ${JSON.stringify(result.errors)}`)
+    assert.equal(refusalFor(result.errors, 'SO-neg1').length, 1, 'each refused shipment is refused once, not once per pass')
+    assert.equal(refusalFor(result.errors, 'SO-neg2').length, 1)
+    assert.equal(refusalFor(result.errors, 'SO-neg3').length, 1)
+  })
+})
+
+test('o3d-f3a8 L-6: later passes never journal more than batchLimit shipments in total', async () => {
+  await withBatchLimit(2, async () => {
+    reset([
+      shipment('neg1', negSnapshot, { cogsBatchAmount: -6 }),
+      shipment('ok2', okSnapshot, { cogsBatchAmount: 5 }),
+      shipment('ok3', okSnapshot, { cogsBatchAmount: 5 }),
+      shipment('ok4', okSnapshot, { cogsBatchAmount: 5 }),
+    ])
+    await runDailyBatchSync()
+    const journaled = ['ok2', 'ok3', 'ok4'].filter(stamped)
+    assert.equal(journaled.length, 2, `exactly the batch limit, not one more: ${journaled}`)
+  })
+})
+
+test('o3d-f3a8 R1: a later pass never journals a later shipment of an order an earlier pass left unjournaled', async () => {
+  await withBatchLimit(1, async () => {
+    const x1 = shipment('x1', negSnapshot, { cogsBatchAmount: -6 })
+    const x2 = shipment('x2', okSnapshot, { cogsBatchAmount: 5 })
+    x2.orderId = x1.orderId // S2 of the same order, just beyond pass 1's window
+    reset([x1, x2, shipment('ok3', okSnapshot, { cogsBatchAmount: 5 })])
+    await runDailyBatchSync()
+    assert.equal(stamped('x1'), false)
+    assert.equal(stamped('x2'), false, 'the failed order is skipped as a unit, not journaled past its stuck shipment')
+    assert.equal(stamped('ok3'), true, 'other orders are still reached')
+  })
+})
+
+test('o3d-f3a8 R1: passes are bounded, and the bound is reported with the time the lock was held', async () => {
+  await withBatchLimit(1, async () => {
+    reset([
+      ...[1, 2, 3, 4, 5, 6, 7].map((n) => shipment(`neg${n}`, negSnapshot, { cogsBatchAmount: -6 })),
+      shipment('ok8', okSnapshot, { cogsBatchAmount: 5 }),
+    ])
+    const result = await runDailyBatchSync()
+    assert.equal(stamped('ok8'), false, 'a refused backlog is not walked one shipment per pass without end')
+    const refused = result.errors.filter((e) => /negative/i.test(e)).length
+    assert.ok(refused <= 10, `at most 5 refusals per mode, not the whole backlog: ${refused}`)
+    const bound = activity.find((entry) => entry.action === 'daily_batch_group_b_pass_bound_reached')
+    assert.ok(bound, 'the bound is reported')
+    assert.equal(typeof (bound!.metadata as { lockHeldMs: number }).lockHeldMs, 'number')
+  })
 })

@@ -10,8 +10,9 @@ import test from 'node:test'
  * file at a time. Dropping the flag brings those CI flakes back.
  */
 test('npm run test:db runs the shared-database tier one file at a time', () => {
+  // test:db is the census wrapper (scripts/run-db-tier.mjs), which owns the runner arguments.
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')) as { scripts: Record<string, string> }
-  const script = pkg.scripts['test:db']
-  assert.ok(script, 'package.json has a test:db script')
-  assert.match(script, /--test-concurrency=1(\s|$)/, 'test:db must pass --test-concurrency=1')
+  assert.equal(pkg.scripts['test:db'], 'node scripts/run-db-tier.mjs', 'test:db runs the wrapper')
+  const wrapper = readFileSync(join(__dirname, '..', 'scripts', 'run-db-tier.mjs'), 'utf8')
+  assert.match(wrapper, /'--test-concurrency=1'/, 'the wrapper must pass --test-concurrency=1')
 })

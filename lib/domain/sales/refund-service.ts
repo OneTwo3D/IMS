@@ -48,6 +48,7 @@ import {
   postedCreditNoteTotalCheck,
   priceRefundTaxIdentity,
   priceSnapshottedTaxIdentity,
+  orderDiscountReversalRateRefusal,
   type PostedCreditNoteLeg,
 } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
@@ -79,7 +80,7 @@ import {
   proveJournalPosting,
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
-import { journalNetMovement, journalNetsReadable } from '@/lib/domain/accounting/journal-account-nets'
+import { journalNetMovement, journalNetsReadable, unearnedReversalDebit } from '@/lib/domain/accounting/journal-account-nets'
 import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { findDurableShadowRecords, shadowRecordNamesSyncLog } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -2064,9 +2065,9 @@ async function stageRefundAccountingReversals(
     // Unearned Revenue again. Unknown withholds this refund's unearned reversal altogether (the safe
     // direction: it can only under-reverse, leaving a visible liability) and the refund says so.
     const unreadableUnearnedReversalRows = priorUnearnedReversedRows
-      .filter((row) => journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') == null)
+      .filter((row) => unearnedReversalDebit(row, settings.unearnedRevenueAccount) == null)
     const priorUnearnedReversed = priorUnearnedReversedRows
-      .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
+      .reduce((sum, row) => sum + (unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0), 0)
     if (unreadableUnearnedReversalRows.length > 0) {
       await tx.activityLog.create({
         data: {
@@ -3031,12 +3032,12 @@ async function stageRefundAccountingReversals(
     const sweepUnprovenRefundIds: string[] = []
     for (const row of priorUnearnedReversedRows) {
       if (row.referenceType === 'SalesOrderRefund') continue
-      sweepPriorReversed += journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0
+      sweepPriorReversed += unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
       const rowsTotal = priorUnearnedReversedRows
         .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id)
-        .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
+        .reduce((sum, row) => sum + (unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0), 0)
       const rowCount = priorUnearnedReversedRows
         .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id).length
       if (priorRefund.unearnedReversedAmount != null) {
@@ -5177,7 +5178,19 @@ export async function createSalesOrderRefund(
         // netted into the same order total the shipping residue is read out of — so it cannot be
         // checked one leg at a time. On a chargeback it is checked together with shipping below
         // (Codex r8 #5), which is the one shape where IMS holds the pair's combined VAT.
-        if (lineKind === 'discount') continue
+        if (lineKind === 'discount') {
+          // o3d-hqvrp.323: the server-derived order-discount reversal of a PUBLIC refund (priced as 'shipping': both post under the order default's code; never caller-supplied, and not the chargeback pair, which is checked together with shipping below): its posting rate must be the rate the order's discount was charged at.
+          if (input.deriveSaleLineNetsFromStoredBalance && !input.chargeback && !creditsNothing(refundLine)) {
+            const discountLabel = 'The order discount reversal'
+            const pricedDiscount = priceRefundTaxIdentity({ kind: 'shipping', orderDefaultTaxType, reverseChargeSalesTaxType, rateByTaxType: postingRates, label: discountLabel })
+            // A default code that cannot be priced is not refused here: the leg is left to the cumulative ceiling and the post-time refusal, as before.
+            if (pricedDiscount.ok) {
+              const rateRefusal = orderDiscountReversalRateRefusal({ postedRate: pricedDiscount.vatRate, chargedRate: so.taxRatePercent, label: discountLabel })
+              if (rateRefusal) return refuse(rateRefusal)
+            }
+          }
+          continue
+        }
         const linkedLine = refundLine.lineId ? salesLineMoneyById.get(refundLine.lineId) : undefined
         // The net THIS money came off, in the order's currency — the same figure the refund line is
         // stored at, so a stated VAT is priced against the amount it was stated for.
@@ -5379,6 +5392,19 @@ export async function createSalesOrderRefund(
       if (input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign)) frozenGross = input.statedGrossForeign
       else if (complete) frozenGross = gross.toDecimalPlaces(currencyMinorUnits(so.currency), 4).toNumber()
     }
+    // o3d-hqvrp.321: EVERY refund records the rate of each line's tax code as of now (the scheme freeze above is the same figure where it ran), so the credit-note history never re-prices a posted line from a tax table edited since.
+    // The rate each line's tax code carries now. A line whose code cannot be priced stores none (the history then says estimated); the table read itself is allowed to fail normally, as every other read in this transaction.
+    let postedLineRates: Array<string | null>
+    if (frozenRates !== null) postedLineRates = frozenRates
+    else {
+      const postedIndex = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      postedLineRates = refundLines.map((refundLine) => {
+        const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
+        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind).accountingTaxType
+        const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: postedIndex, label: 'refund line' }) : null
+        return priced !== null && priced.ok ? priced.rate.toString() : null
+      })
+    }
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
         orderId: input.orderId,
@@ -5472,6 +5498,7 @@ export async function createSalesOrderRefund(
           accountingTaxType: taxIdentity.accountingTaxType,
           reverseCharge: taxIdentity.reverseCharge,
           lineKind,
+          postedTaxRate: postedLineRates[refundLineIndex] ?? null,
           ...(refundLine.chargedTaxForeign != null && Number.isFinite(refundLine.chargedTaxForeign) ? { chargedTaxForeign: Math.round(Math.abs(refundLine.chargedTaxForeign) * 10000) / 10000 } : {}),
           ...(schemeSnapshot?.scheme === true ? { postingTaxType: schemeSnapshot.postingTaxType, schemeTaxRateValue: frozenRates?.[refundLineIndex] ?? null } : {}),
         },

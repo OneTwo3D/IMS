@@ -22,6 +22,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { endOfBusinessDateUtc, isMissingFxRateError, type FxMissingReason } from '@/lib/currencies/fx-lookup'
 import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { businessDateYmd } from '@/lib/business-date'
+import { refundCreditsAsGross, REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 
 type JournalLine = {
   accountCode: string
@@ -409,12 +410,26 @@ export function receivableOutstanding(order: {
   totalBase: unknown
   currency: string
   payments: Array<{ amount: unknown; currency: string }>
-  refunds: Array<{ totalForeign: unknown }>
+  /** `totalsBasis` / `totalBase` / `lines` are what lets a NET credit be read as its VAT-inclusive equivalent (o3d-cr517); absent = read `totalForeign` as it stands. */
+  refunds: Array<{ totalForeign: unknown } & Partial<TurnoverRefund>>
 }): { outstandingForeign: number; bookedBase: number } {
   const paid = order.payments.reduce((sum, payment) => (
     payment.currency === order.currency ? addMoney(sum, payment.amount as never) : sum
   ), toDecimal(0))
-  const credited = order.refunds.reduce((sum, refund) => addMoney(sum, refund.totalForeign as never), toDecimal(0))
+  // o3d-cr517: the order total is GROSS (VAT-inclusive) but a NET-basis refund's `totalForeign` is ex-VAT, so subtracting it left the
+  // refunded VAT in the receivable. A NET credit that can be placed exactly is taken as its gross equivalent (the same reading the
+  // aging reports use), in the order currency (see below); a credit that cannot be placed,
+  // or a legacy/GROSS one, is read as it stands, exactly as before.
+  const credited = order.refunds.reduce((sum, refund) => {
+    const refundBase = toDecimal(refund.totalBase as never)
+    if (refund.totalsBasis === 'NET' && refundBase.gt(0)) {
+      const placed = refundCreditsAsGross([{ totalBase: refund.totalBase, totalsBasis: 'NET', lines: refund.lines }])
+      // Grossed up in the ORDER's currency: the refund's own foreign total scaled by gross/net, so no base rounding and no order-level
+      // ratio is involved (a fully refunded order leaves nothing outstanding even in a high-ratio currency).
+      if (placed.bound === 'exact') return addMoney(sum, multiplyMoney(refund.totalForeign as never, placed.credit as never).div(refundBase) as never)
+    }
+    return addMoney(sum, refund.totalForeign as never)
+  }, toDecimal(0))
   const outstandingForeign = roundAccountingMoney(subtractMoney(subtractMoney(order.totalForeign as never, paid), credited))
   if (outstandingForeign < 0.01) return { outstandingForeign: 0, bookedBase: 0 }
   // Prorate the stored base by the outstanding share (one fxRate per order).
@@ -460,7 +475,7 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
         where: { refundId: null },
         select: { amount: true, currency: true },
       },
-      refunds: { select: { totalForeign: true } },
+      refunds: { select: { totalForeign: true, ...REFUND_TURNOVER_SELECT.select } },
     },
   })
 

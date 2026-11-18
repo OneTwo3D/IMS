@@ -5804,38 +5804,26 @@ test('[o3d-noka] the dump, the publication and the prune name the DESCRIPTOR, an
   }
 })
 
-test('[o3d-noka] scripts/backup.sh is exempt from the rule ONLY while it cannot reach an installed tree', () => {
+test('[o3d-lnbn] scripts/backup.sh stays deleted: no second, ungated reader of the root-side dump, publish and prune', () => {
   /**
-   * THE SECOND READER, DECLARED RATHER THAN FORGOTTEN. scripts/backup.sh performs the same sequence
-   * this change constrained — `mkdir -p "$1"`, a root-side `gzip >` at a predictable name, an
-   * `ln -sf` at `latest.sql.gz` and a `find … -delete` prune — into a directory an operator names as
-   * its FIRST ARGUMENT, and it does not go through the gate.
-   *
-   * IT IS EXEMPT BECAUSE IT CANNOT RUN, and that is a precondition rather than an opinion: its
-   * hardcoded ${APP_NAME} is not the installed one, so ${APP_DIR}/.env does not exist and it exits
-   * before its first write; nothing in install.sh schedules it. THIS TEST FAILS THE MOMENT THAT
-   * STOPS BEING TRUE, which is the only honest way to carry an exemption — repair its paths and the
-   * gate has to come with them (o3d-noka follow-up).
+   * scripts/backup.sh repeated the sequence o3d-noka constrained in update.sh (`mkdir -p "$1"`, a
+   * root-side `gzip >` at a predictable name, `ln -sf` at latest.sql.gz, `find ... -delete`) into a
+   * directory named by its first argument with nothing validating the ancestry, and it was exempt
+   * only while its hardcoded APP_NAME kept it from reaching an installed tree. It was unwired and
+   * the application has its own backup route (app/api/cron/backup, app/api/backup/create) plus
+   * update.sh's pre-migration dump, so it was deleted rather than gated. Bringing a file of that
+   * name back, or any tracked shell script that repeats the sequence ungated, has to come with the
+   * gate (open_root_owned_ancestry).
    */
-  const backupSh = readFileSync(join(REPO, 'scripts/backup.sh'), 'utf8')
-  // The VALUE, read the same way out of both files, and both reads are asserted to have found
-  // something — a regex that matched nothing would make this exemption unconditional.
-  const appName = (source: string) => /^(?:readonly )?APP_NAME="([^"]*)"$/m.exec(source)?.[1]
-  assert.ok(appName(backupSh), 'precondition: scripts/backup.sh must assign APP_NAME')
-  assert.ok(appName(INSTALL_SH), 'precondition: scripts/install.sh must assign APP_NAME')
-  const reaches = appName(backupSh) === appName(INSTALL_SH)
-  const gated = /open_root_owned_ancestry/.test(backupSh)
-  assert.ok(!reaches || gated,
-    'scripts/backup.sh now resolves the same ${APP_NAME} as install.sh, so it can read an installed '
-    + '.env and reach its root-side dump, publish and prune. Give it open_root_owned_ancestry (or the '
-    + 'equivalent) before making it reachable: it writes as root into a directory named by its first '
-    + 'argument, with nothing validating the ancestry — o3d-noka.')
-  // NOT VACUOUS: the sequence this is about is still in that file, so the exemption is about a real
-  // reader rather than a file that no longer does any of it.
-  assert.match(backupSh, /^mkdir -p "\$\{BACKUP_DIR\}"$/m, 'precondition: backup.sh still prepares its directory by name')
-  assert.match(backupSh, /gzip -9 > "\$\{BACKUP_FILE\}"/, 'precondition: and still redirects a root-side dump into it')
-  assert.match(backupSh, /find "\$\{BACKUP_DIR\}" -name "backup-\*\.sql\.gz" -mtime/, 'precondition: and still prunes inside it')
-  assert.equal(gated, false, 'precondition: and is not gated, which is what this test is carrying')
+  assert.equal(existsSync(join(REPO, 'scripts/backup.sh')), false, 'scripts/backup.sh must not come back')
+  const listed = spawnSync('git', ['ls-files', '*.sh'], { cwd: REPO, encoding: 'utf8' })
+  assert.equal(listed.status, 0)
+  for (const file of listed.stdout.split('\n').filter(Boolean)) {
+    const source = readFileSync(join(REPO, file), 'utf8')
+    const dumpsIntoNamedDir = /gzip -9 > "\$\{BACKUP_FILE\}"/.test(source) && /find "\$\{BACKUP_DIR\}" -name "backup-\*\.sql\.gz"/.test(source)
+    assert.ok(!dumpsIntoNamedDir || /open_root_owned_ancestry/.test(source),
+      `${file} repeats the unconstrained root-side dump/prune sequence without the ancestry gate (o3d-noka, o3d-lnbn)`)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -7857,4 +7845,49 @@ test('[o3d-secops] the shared refusal does not claim the run has changed nothing
     const source = readFileSync(join(REPO, script), 'utf8')
     assert.equal(shellFunction(source, 'refuse_symlinked_root'), helper, `${script} has drifted`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kg9v: the recursive ownership change over ${APP_DIR} is aimed at `.`, never at the operand.
+// ---------------------------------------------------------------------------
+
+function chownAppRootTree(root: string): { status: number; output: string } {
+  const start = CUTOVER_NS_LIB.indexOf('chown_app_root_tree() {')
+  assert.notEqual(start, -1, 'scripts/lib/cutover-namespace.sh must define chown_app_root_tree()')
+  const end = CUTOVER_NS_LIB.indexOf('\n}\n', start)
+  const fn = CUTOVER_NS_LIB.slice(start, end + 3)
+  const me = `${process.getuid?.() ?? 0}`
+  const run = spawnSync('bash', ['-c', `set -euo pipefail\n${fn}\n# one account in this harness: keep the flags, re-own to the caller's own uid:gid\nchown() { local flags=$1; shift 2; command chown \"$flags\" \"$(id -u):$(id -g)\" \"$@\"; }\nchown_app_root_tree "$1" "${me}" "the application directory"`, 'bash', root],
+    { encoding: 'utf8' })
+  return { status: run.status ?? -1, output: `${run.stdout}${run.stderr}` }
+}
+
+test('[o3d-kg9v] no root-side `chown -R` is aimed at the ${APP_DIR} operand in install.sh or update.sh', () => {
+  for (const [name, source] of [['install.sh', INSTALL_SH], ['update.sh', UPDATE_SH]] as const) {
+    const code = source.split('\n').filter((l) => l.trim() !== '' && !l.trim().startsWith('#'))
+    const bad = code.filter((l) => /\bchown\s+-R\b/.test(l) && /"\$\{APP_DIR\}"/.test(l))
+    assert.deepEqual(bad, [], `${name} must hand ${'${APP_DIR}'} over through chown_app_root_tree(), which acts on a descriptor`)
+    assert.match(source, /chown_app_root_tree "\$\{APP_DIR\}"/, `${name} must use chown_app_root_tree`)
+  }
+})
+
+test('[o3d-kg9v] chown_app_root_tree refuses a link at the root and re-owns a real tree through `.`', (t) => {
+  const base = createTempDirSync('ims-kg9v-', t)
+  const real = join(base, 'real')
+  const secret = join(base, 'elsewhere')
+  mkdirSync(real)
+  mkdirSync(join(real, 'sub'))
+  writeFileSync(join(real, 'sub', 'f'), 'x')
+  mkdirSync(secret)
+  writeFileSync(join(secret, 'victim'), 'x')
+  const ok = chownAppRootTree(real)
+  assert.equal(ok.status, 0, ok.output)
+  // The same name as a LINK: the old `chown -R <operand>` followed it; this must refuse and touch nothing.
+  const link = join(base, 'app')
+  symlinkSync(secret, link)
+  const before = statSync(join(secret, 'victim')).ctimeMs
+  const refused = chownAppRootTree(link)
+  assert.notEqual(refused.status, 0, 'a symbolic link at the application root must be refused')
+  assert.match(refused.output, /not a directory/)
+  assert.equal(statSync(join(secret, 'victim')).ctimeMs, before, 'and nothing behind the link was touched')
 })
