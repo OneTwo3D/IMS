@@ -209,7 +209,14 @@ export async function applyStockAdjustment({
 
   // A replay must not release anybody's reservation: its first submission already did (or needed to),
   // and the release would commit for an adjustment that now writes nothing.
+  //
+  // The key is CLAIMED first, under a transaction-scoped advisory lock: two concurrent submissions with the
+  // same key serialise here, so the loser only reads after the winner has committed, finds its movement and
+  // returns the replay BEFORE it can release anything. Its transaction therefore never writes a release for
+  // an adjustment that wrote nothing. (Taken before any sales_orders / stock_levels lock, and only ever
+  // contended by the same key, so it cannot join a lock cycle.)
   if (idempotencyKey) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`stock-adjustment-key:${idempotencyKey}`}, 0))`
     const replay = await findReplayedAdjustment()
     if (replay) return replay
   }

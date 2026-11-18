@@ -160,3 +160,23 @@ test('[db] a replayed adjustment with the flag on releases nothing and writes no
     assert.equal(await tx.activityLog.count({ where: { entityId: fx.orderId, action: 'allocation_released' } }), 1, 'one audited release, not two')
   })
 })
+
+test('[db] two CONCURRENT submissions of one adjustment release once: the loser rolls back, claiming the key first (PR 1017 r2 MEDIUM 3)', { skip }, async () => {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  const { db } = await import('../../lib/db')
+  // Committed fixture (two real transactions must see it); unique suffixes keep it apart from every other test.
+  const fx = await db.$transaction((tx: Tx) => seedReservedStock(tx))
+  const token = `tok-${randomUUID()}`
+  const submit = () => db.$transaction(
+    (tx: Tx) => applyStockAdjustment({ tx, productId: fx.a, warehouseId: fx.wh, qty: -4, note: 'damaged', releaseReservedForRemoval: true, idempotencyToken: token }),
+    { timeout: 60_000, maxWait: 30_000 },
+  )
+  const [one, two] = await Promise.all([submit(), submit()])
+
+  assert.equal(one.movementId, two.movementId, 'both submissions resolve to the one movement')
+  assert.equal(await db.stockMovement.count({ where: { productId: fx.a, type: 'ADJUSTMENT' } }), 1)
+  const alloc = await db.orderAllocation.findFirst({ where: { orderId: fx.orderId } })
+  assert.equal(alloc?.qty.toFixed(4), '6.0000', 'released once (10 -> 6), not twice')
+  assert.equal(await db.activityLog.count({ where: { entityId: fx.orderId, action: 'allocation_released' } }), 1, 'one audited release')
+})

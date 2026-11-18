@@ -30,6 +30,8 @@ type RefundNettingMarks = {
 }
 
 export type RefundLineForNetting = {
+  /** The refund line's id: what a RETURN_INBOUND movement is attributed to (its idempotency key carries it). */
+  id?: string
   salesOrderLineId: string | null
   productId: string | null
   qty: Prisma.Decimal | number | string
@@ -38,7 +40,7 @@ export type RefundLineForNetting = {
 }
 
 type NettingClient = {
-  stockMovement: { findMany: (args: never) => Promise<Array<{ referenceId: string | null; productId: string; qty: unknown }>> }
+  stockMovement: { findMany: (args: never) => Promise<Array<{ referenceId: string | null; productId: string; qty: unknown; idempotencyKey?: string | null }>> }
   salesOrderLine: { findMany: (args: never) => Promise<Array<{ id: string; productId: string | null; fulfillmentRequirements: unknown }>> }
   shipmentLine: { findMany: (args: never) => Promise<Array<{ lineId: string; productId: string; qty: unknown }>> }
 }
@@ -63,13 +65,24 @@ export async function netRefundLinesForDemand<T extends RefundLineForNetting>(
   const movements = measurableRefundIds.length > 0
     ? await c.stockMovement.findMany({
       where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: { in: measurableRefundIds } },
-      select: { referenceId: true, productId: true, qty: true },
+      select: { referenceId: true, productId: true, qty: true, idempotencyKey: true },
     } as never)
     : []
+  // Each movement is attributed to ITS refund line (the refund service writes one per refund line and
+  // component, keyed with the line id), so one line can never take another line's return. A movement whose
+  // key carries no line id (legacy) falls into a per-(refund, product) pool that only unattributed lines draw on.
+  const REFUND_MOVEMENT_LINE = /:line:([^:]+):warehouse:/
+  const markedLineIds = new Set(marked.map((line) => line.id).filter((id): id is string => !!id))
   const budget = new Map<string, Prisma.Decimal>()
-  const budgetKey = (refundId: string, productId: string) => `${refundId}|${productId}`
+  const attributedLines = new Set<string>()
+  const budgetKey = (scope: string, productId: string) => `${scope}|${productId}`
   for (const movement of movements) {
-    const k = budgetKey(movement.referenceId ?? '', movement.productId)
+    const refundLineId = movement.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1]
+    const attributed = !!refundLineId && markedLineIds.has(refundLineId)
+    if (attributed) attributedLines.add(refundLineId as string)
+    const k = attributed
+      ? budgetKey(`line:${refundLineId}`, movement.productId)
+      : budgetKey(`refund:${movement.referenceId ?? ''}`, movement.productId)
     budget.set(k, (budget.get(k) ?? new Prisma.Decimal(0)).add(toDecimal(movement.qty as never)))
   }
 
@@ -98,8 +111,9 @@ export async function netRefundLinesForDemand<T extends RefundLineForNetting>(
   // Units of each order line already credited as "returned" by an earlier refund (the shipped cap is cumulative).
   const returnedByLine = new Map<string, Prisma.Decimal>()
 
-  // Stable order, so the shared per-(refund, product) budget is drawn down reproducibly.
-  const ordered = [...marked].sort((a, b) => (a.refundId ?? '').localeCompare(b.refundId ?? ''))
+  // Stable order (refund, then line id), so the cumulative shipped cap and the legacy pool are drawn down reproducibly.
+  const ordered = [...marked].sort((a, b) =>
+    (a.refundId ?? '').localeCompare(b.refundId ?? '') || (a.id ?? '').localeCompare(b.id ?? ''))
   const netByLine = new Map<T, Prisma.Decimal>()
   for (const line of ordered) {
     const qty = toDecimal(line.qty as never)
@@ -112,15 +126,19 @@ export async function netRefundLinesForDemand<T extends RefundLineForNetting>(
     let cameBackUnits = qty
     let anyRequirement = false
     let shippedUnits: Prisma.Decimal | null = null
+    const budgetScope = line.id && attributedLines.has(line.id) ? `line:${line.id}` : `refund:${line.refundId ?? ''}`
+    const isKit = perUnit.size > 1 || [...perUnit.values()].some((factor) => !factor.eq(1))
     for (const [componentId, factor] of perUnit) {
       if (!factor.gt(0)) continue
       anyRequirement = true
-      const available = budget.get(budgetKey(line.refundId ?? '', componentId)) ?? new Prisma.Decimal(0)
+      const available = budget.get(budgetKey(budgetScope, componentId)) ?? new Prisma.Decimal(0)
       cameBackUnits = Prisma.Decimal.min(cameBackUnits, available.div(factor))
       const shipped = (shippedByLineProduct.get(budgetKey(lineId, componentId)) ?? new Prisma.Decimal(0)).div(factor)
       shippedUnits = shippedUnits === null ? shipped : Prisma.Decimal.min(shippedUnits, shipped)
     }
     if (!anyRequirement) cameBackUnits = new Prisma.Decimal(0)
+    // A kit comes back in whole kits.
+    if (isKit) cameBackUnits = cameBackUnits.floor()
     // At most what actually shipped, across every refund on the line.
     const shippedRoom = (shippedUnits ?? new Prisma.Decimal(0)).sub(returnedByLine.get(lineId) ?? new Prisma.Decimal(0))
     cameBackUnits = Prisma.Decimal.min(cameBackUnits, shippedRoom)
@@ -128,7 +146,7 @@ export async function netRefundLinesForDemand<T extends RefundLineForNetting>(
     returnedByLine.set(lineId, (returnedByLine.get(lineId) ?? new Prisma.Decimal(0)).add(cameBackUnits))
     for (const [componentId, factor] of perUnit) {
       if (!factor.gt(0)) continue
-      const k = budgetKey(line.refundId ?? '', componentId)
+      const k = budgetKey(budgetScope, componentId)
       budget.set(k, (budget.get(k) ?? new Prisma.Decimal(0)).sub(cameBackUnits.mul(factor)))
     }
     netByLine.set(line, Prisma.Decimal.max(new Prisma.Decimal(0), qty.sub(cameBackUnits)))
@@ -141,6 +159,7 @@ export async function netRefundLinesForDemand<T extends RefundLineForNetting>(
 }
 
 export type NettedRefundLine = {
+  id: string
   salesOrderLineId: string | null
   productId: string | null
   qty: Prisma.Decimal | number | string
@@ -161,6 +180,7 @@ export async function loadNettedRefundLines(client: unknown, where: unknown): Pr
   const rows = await (client as RefundLineReader).salesOrderRefundLine.findMany({
     where,
     select: {
+      id: true,
       salesOrderLineId: true,
       productId: true,
       qty: true,
