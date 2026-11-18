@@ -2824,6 +2824,8 @@ model SalesOrderRefundLine {
   schemeTaxRateValue Decimal? @db.Decimal(9, 6) @map("scheme_tax_rate_value")
   /// The VAT the source STATED it returned on this line (a WooCommerce refund states it per refunded line), in the order's currency. NULL when nothing was stated (a manual refund) and on every older row. Read only by the per-target refund balance, which holds a fee line's cumulative refunded VAT to the VAT the order line bore.
   chargedTaxForeign Decimal? @db.Decimal(18, 4) @map("charged_tax_foreign")
+  /// The VAT rate (a fraction, 0.2 = 20%) of the line's tax code AT THE MOMENT THE REFUND WAS CREATED, for every refund (schemeTaxRateValue above is the scheme-only freeze and marks a refund as a scheme one, so it cannot carry this). The credit-note history shows VAT and gross from this, so editing a tax mapping afterwards cannot change what a posted credit note displays. NULL when the code could not be priced then and on every older row: the display falls back to the current table and says the figure is estimated.
+  postedTaxRate Decimal? @db.Decimal(9, 6) @map("posted_tax_rate")
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)

@@ -3921,6 +3921,41 @@
    "count": 2,
    "class": "single-inode",
    "reason": "non-recursive rm -f on one named path, inside the directory db_pg_dump_through_url() made itself with mktemp -d a few lines above (the libpq service file that stands in for a connection string on a command line); the directory is then removed with rmdir, which refuses a directory that is not empty"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `chown -R \"${APP_USER}:${APP_USER}\" \"${APP_DIR}\"` DEREFERENCES ITS OPERAND: a link at the name",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# and make the change of `.` with `-h`. coreutils' chown then walks with fts and fchownat relative to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "echo \"${root} — ${what} — is a ${entry%%|*}, not a directory, so its ownership was not changed: a recursive chown through it would re-own whatever it points at.\" >&2; exit 1; }",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo) -- 'chown' appears only inside the operator message"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chown -Rh \"${owner}:${owner}\" .",
+   "count": 1,
+   "class": "definition",
+   "reason": "the recursive chown inside the body of chown_app_root_tree (o3d-kg9v), whose two calls are census rows each behind privileged_spare_running_tree: it refuses a root that is not a real directory, steps into it, proves the directory it stands in is the entry it examined (type and dev:ino), and its operand is `.`, which cannot be a link"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chown_app_root_tree() {",
+   "count": 1,
+   "class": "definition",
+   "reason": "the definition of a helper the census classifies; its calls are census rows"
   }
  ]
 }

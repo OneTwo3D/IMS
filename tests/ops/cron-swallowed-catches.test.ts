@@ -106,7 +106,6 @@ const JUSTIFIED: Record<string, { count: number; reason: string }> = {
   "lib/connectors/woocommerce/sync/erasure-sweep-lease.ts::tryAcquireWcErasureSweepLease": { count: 1, reason: "lock or connection cleanup: a failed unlock destroys the connection (which releases every session lock), or the socket is already gone" },
   "lib/db/post-remote-persist.ts::writeStderrLine": { count: 1, reason: "last-resort reporter fallback" },
   "lib/db/post-remote-persist.ts::reportUnrecordedRemoteWrite": { count: 2, reason: "the last-resort reporter must never throw: it falls back, and there is nothing left to try" },
-  "lib/domain/accounting/back-reference-sweep.ts::stampDeferral": { count: 1, reason: "the row can legitimately be gone (retention, a connector switch): nothing to record and nothing to retry" },
   "lib/domain/accounting/back-reference-sweep.ts::warnAndDefer": { count: 1, reason: "the row can legitimately be gone (retention, a connector switch): nothing to record and nothing to retry" },
   "lib/domain/accounting/back-reference-sweep.ts::repairAccountingBackReferences": { count: 3, reason: "the rotating cursor could not be read or saved (the sweep restarts from the oldest row) and a follow-up enqueue deferred to the next sweep with an activity-log entry; the row stays PENDING" },
   "lib/connectors/woocommerce/sync/invoice-note.ts::pushInvoiceNoteToWc": { count: 2, reason: "an admin-only storefront note: best effort by design, at most once per ledger invoice id" },

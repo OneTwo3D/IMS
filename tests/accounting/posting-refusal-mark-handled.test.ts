@@ -343,6 +343,47 @@ for (const [label, overrides] of [
 }
 
 /**
+ * o3d-36inm - EACH TERM OF `provablyUnsent` IS LOAD-BEARING, AND A BLOCKED MARK WRITES NOTHING.
+ *
+ * The fail-closed argument (o3d-j625 r12) rests on one predicate: a row is cancellable only if it is PENDING,
+ * never claimed (revision 0), proven never attempted, and its ledger standing is LIVE_WORK (no document id,
+ * no operator basis). Every other row is BLOCKING and the action returns `may_be_posted` without writing. The
+ * loop above drives rows that happen to fail SEVERAL terms at once (a SYNCED row also has an id and a
+ * claimed revision), so dropping any single term of the predicate left every one of them red-free. Each
+ * case below satisfies EVERY term but one, so each is the only thing standing between the mark and a
+ * cancel-and-suppress over a row that may already have posted. A clean sibling rides along in every case
+ * to show that a refused mark cancels nothing it could otherwise have reached.
+ */
+for (const [label, overrides] of [
+  ['PROCESSING at revision 0 with no id (only the STATUS term refuses it)', { status: 'PROCESSING' }],
+  ['PENDING and claimed before, otherwise clean (only the REVISION term refuses it)', { attemptRevision: 1 }],
+  ['PENDING at revision 0 carrying an external id (only the LEDGER-STANDING term refuses it)', { externalTransactionId: 'XJ-9' }],
+  ['PENDING at revision 0 carrying an unrecognised settlement basis (only the LEDGER-STANDING term refuses it)', { settlementBasis: 'something_this_build_never_wrote' }],
+  ['PENDING at revision 0 with an attempt record (only the NEVER-ATTEMPTED-PROOF term refuses it)', { remoteAttemptedAt: new Date('2026-09-02T00:00:00Z') }],
+] as const) {
+  test(`[o3d-36inm] may_be_posted and NO WRITE when exactly one term of provablyUnsent fails: ${label}`, async () => {
+    const { accountingSyncRowIsProvablyUnsent } = await import('@/lib/domain/accounting/posting-mark-handled')
+    const row = refusal('r36', 'landed_cost_cogs_journal', { type: 'COGS_JOURNAL' })
+    refusals.push(row)
+    syncRows.push(sync('s-blocking', row, overrides), sync('s-clean', row))
+    assert.equal(accountingSyncRowIsProvablyUnsent({ settlementBasis: null, abandonedBeforeRemoteCall: null, remoteAttemptedAt: null, attemptStampingCustodyAt: null, ...syncRows[0]! }), false,
+      'the predicate itself refuses this row')
+    assert.equal(accountingSyncRowIsProvablyUnsent({ settlementBasis: null, abandonedBeforeRemoteCall: null, remoteAttemptedAt: null, attemptStampingCustodyAt: null, ...syncRows[1]! }), true,
+      'and accepts the clean control, so the case above is not refused for an unrelated reason')
+    const before = JSON.stringify({ syncRows, refusals })
+
+    const result = await mark('r36')
+
+    assert.equal(ok(result), false)
+    assert.match(errorOf(result), /may already have posted this/)
+    assert.equal(JSON.stringify({ syncRows, refusals }), before, 'no sync row and no refusal row was written')
+    assert.equal(syncRows.find((r) => r.id === 's-clean')!.status, 'PENDING', 'the clean sibling was not cancelled')
+    assert.deepEqual(mirrorWrites, [], 'and no accounting-event mirror was voided')
+    assert.ok(!activity.some((entry) => entry.action === 'accounting_posting_refusal_marked_handled'), 'and no mark was logged')
+  })
+}
+
+/**
  * o3d-1e7sl (G5, slice 1c of o3d-f709) - THE MARK-HANDLED GUARD READS THE LEDGER-STANDING MODULE, ONE ROW PER STANDING.
  *
  * "May IMS already have posted this, or be posting it now?" is asked of every sync row under the posting key.

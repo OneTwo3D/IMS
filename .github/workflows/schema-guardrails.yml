@@ -194,16 +194,12 @@ jobs:
   # So this tier is NOT held back from `test:unit` as a block: 101 of its 147 tests execute there,
   # and 46 skip. docs/development.md carries the same census per file, with the counts.
   #
-  # The lesson is not "count the files again": a prose census goes stale silently, and this one is
-  # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and
-  # WITHDRAWN — it answered a syntactic question (does this source text read a gate?) about an
-  # open space (the ways a program can read an environment variable), and two implementations of
-  # it passed shapes their authors had not thought of while reporting healthy. o3d-dzsd carries
-  # the replacement, which is a RUNTIME property: after the tier runs, require every collected
-  # file to have executed at least one test and reported no skips. Until then, a NEW gated file
-  # in tests/db/ that invents a variable this job does not set will skip itself green, exactly as
-  # RUN_DB_RETENTION_TESTS did — the `REQUIRE_` tripwire below protects the pair that exists, not
-  # the next one. Review is what catches it.
+  # The lesson is not "count the files again": a prose census goes stale silently. What enforces it
+  # now is MECHANICAL and answers a RUNTIME question: `npm run test:db` runs scripts/run-db-tier.mjs,
+  # whose skip census (scripts/db-tier-census.mjs) fails the run unless every file in tests/db/ executed
+  # at least one test and skipped none. A NEW gated file that invents a variable this job does not set, or
+  # an edit that drops or renames the RUN_/REQUIRE_ pair, therefore turns this job red instead of skipping
+  # green. Two earlier SYNTACTIC guards were withdrawn for asking whether source text reads a gate.
   #
   # WHY A SIBLING JOB AND NOT MORE STEPS ON `fresh-db-drift`. Both were available; the deciding
   # facts are about the DATABASE and about what a red job means.
@@ -291,10 +287,10 @@ jobs:
             exit 1
           fi
           echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
-      # `test:db` sets RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second is the
-      # tripwire for this job: if an edit ever drops the first, every suite gated on it refuses to
-      # load instead of skipping into a green run again. That covers THIS pair only. Nothing stops the NEXT
-      # gate arriving without either half — see the comment above the job, and o3d-dzsd.
+      # `test:db` is scripts/run-db-tier.mjs: it sets RUN_DB_RETENTION_TESTS=1 and REQUIRE_DB_RETENTION_TESTS=1,
+      # runs tests/db/**, and then fails the run if any file executed nothing or skipped a test (the one
+      # named exception is in scripts/db-tier-census.mjs). The census, not the variable pair, is what stops a
+      # gate from hiding.
       - name: Run the DB-backed regression suites
         env:
           # Scoped to THIS step. The steps above are migrating and generating against the same

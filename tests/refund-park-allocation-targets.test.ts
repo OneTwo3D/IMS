@@ -123,6 +123,7 @@ mock.module('@/lib/domain/integrations/outbox-admin', {
   namedExports: {
     IntegrationOutboxAdminError: class extends Error {},
     listIntegrationOutboxAdminRows: async () => ({ rows: [], total: 0 }),
+    toAdminIntegrationOutboxRow: (row: unknown) => row,
     replayIntegrationOutboxAdminRow: async () => ({ success: true }),
   },
 })

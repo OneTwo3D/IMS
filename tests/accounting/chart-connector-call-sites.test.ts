@@ -331,7 +331,21 @@ test('[o3d-j625 SITE 1: the sales invoice] the row is routed by the SAME setting
   // `settings.salesAccount` onto every line, `settings.shippingAccount` and `settings.discountAccount`
   // onto the shipping and discount lines. Routing by any OTHER object's connector would satisfy the
   // census above and still be the defect.
-  const fn = source[1].slice(source[1].indexOf('async function queueSalesInvoiceForOrder'))
+  // o3d-6t1qh (2): BOUNDED to the function's own body, over comment/string-blanked code. This used to slice
+  // from the declaration to END OF FILE, so `settings.salesAccount` etc. read in the refund/credit-note
+  // builder further down satisfied every assertion even if this function read another object.
+  const blanked = blankNonCode(source[1])
+  const declAt = blanked.indexOf('async function queueSalesInvoiceForOrder')
+  assert.ok(declAt >= 0, 'queueSalesInvoiceForOrder is no longer declared in app/actions/sales.ts')
+  const paramsAt = blanked.indexOf('(', declAt)
+  const afterParams = paramsAt + balancedFrom(blanked, paramsAt).length
+  const bodyAt = blanked.indexOf('{', afterParams)
+  assert.ok(bodyAt > 0, 'could not locate the body of queueSalesInvoiceForOrder')
+  const fn = balancedFrom(blanked, bodyAt)
+  assert.ok(
+    fn.length > 200 && fn.length < blanked.length / 2 && !fn.includes('openRefundAccountingObligationLedger('),
+    `the slice must be exactly this function's body, not a span running into later functions (got ${fn.length} chars)`,
+  )
   for (const code of ['salesAccount', 'shippingAccount', 'discountAccount']) {
     assert.ok(
       fn.includes(`${chartObject}.${code}`),
