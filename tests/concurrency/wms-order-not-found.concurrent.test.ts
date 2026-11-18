@@ -16,9 +16,11 @@ import { Prisma } from '../../app/generated/prisma/client'
  */
 const skip = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
 
-type Script = { fetch: 'absent' | 'found' | 'throw'; probe: 'MISSING' | 'AMBIGUOUS' | 'FOUND' | 'throw' }
+type Script = { fetch: 'absent' | 'found' | 'throw'; probe: 'MISSING' | 'AMBIGUOUS' | 'FOUND' | 'throw'; /** What reading the stored warehouse ORDER ID answers (default: the warehouse's own 404). */ byId?: 'NOT_FOUND' | 'EXISTS' | 'throw' }
 const scripts = new Map<string, Script>()
 const fetchCalls = new Map<string, number>()
+const byIdCalls: string[] = []
+let connectorReadsById = true
 const foundStatus = (reference: string) => ({
   externalOrderId: `W-${reference}`, externalOrderNumber: reference, status: 'NEW', statusLabel: 'New', isSplit: false, partCount: null, isMerged: false,
   mergedOrderNumbers: [] as string[], deepLinkUrl: null, tracking: [] as Array<{ trackingNumber: string; carrier: string }>,
@@ -32,6 +34,15 @@ if (!skip) {
     namedExports: {
       getWmsConnectorDef: () => ({ label: 'Mintsoft' }),
       getWmsConnector: () => ({
+        ...(connectorReadsById ? {
+          probeOrderAmendable: async (externalOrderId: string, expectedNumber: string | null) => {
+            byIdCalls.push(`${externalOrderId}|${expectedNumber}`)
+            const script = [...scripts.entries()].find(([reference]) => `W-${reference}` === externalOrderId)?.[1]
+            if (script?.byId === 'throw') throw new Error('Mintsoft is unreachable')
+            if (script?.byId === 'EXISTS') return { amendable: true as const }
+            return { amendable: false as const, status: 'NOT_FOUND' }
+          },
+        } : {}),
         fetchOrderStatus: async (reference: string) => {
           fetchCalls.set(reference, (fetchCalls.get(reference) ?? 0) + 1)
           const script = scripts.get(reference)
@@ -89,6 +100,8 @@ async function cleanup(d: Deps, orders: Array<{ id: string; reference: string }>
   await d.db.wmsOrderPushLink.deleteMany({ where: { orderId: { in: ids } } })
   await d.db.shoppingOrderLink.deleteMany({ where: { orderId: { in: ids } } })
   await d.db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+  connectorReadsById = true
+  byIdCalls.length = 0
   for (const order of orders) { scripts.delete(order.reference); fetchCalls.delete(order.reference) }
   await setSwitch(d, null)
 }
@@ -263,4 +276,42 @@ test('SWITCH OFF (the default): nothing changes. The order is probed and recorde
   const before = polls(order.reference)
   await sweepOnce(d)
   assert.equal(polls(order.reference), before + 1)
+})
+
+test('REGRESSION: an order renamed away from its number (Search misses it, the stored warehouse id still finds it) is never marked NOTFOUND and stays polled', { skip }, async (t) => {
+  const d = await setup()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
+  scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING', byId: 'EXISTS' })
+  for (let i = 0; i < d.sweep.WMS_NOT_FOUND_THRESHOLD + 3; i++) await sweepOnce(d)
+  const snapshot = await snapshotOf(d, order.id)
+  assert.notEqual(snapshot?.status, 'NOTFOUND')
+  assert.equal(snapshot?.notFoundStrikes, 0, 'present under its id: no strike')
+  assert.equal((await tasksOf(d, order.id)).length, 0)
+  assert.equal(polls(order.reference), d.sweep.WMS_NOT_FOUND_THRESHOLD + 3, 'still polled')
+  assert.ok(byIdCalls.every((call) => call.startsWith(`W-${order.reference}|`)), 'the stored warehouse id is what was read')
+  // It was one miss short of the mark before the id said otherwise: an id 404 afterwards starts the count from zero.
+  scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING', byId: 'NOT_FOUND' })
+  await sweepOnce(d)
+  assert.equal((await snapshotOf(d, order.id))?.notFoundStrikes, 1)
+})
+
+test('REGRESSION: a failed by-id read, or a connector that cannot read by id, never counts a strike (absence is confirmed by identity or not at all)', { skip }, async (t) => {
+  const d = await setup()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
+  scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING', byId: 'NOT_FOUND' })
+  await sweepOnce(d); await sweepOnce(d)
+  assert.equal((await snapshotOf(d, order.id))?.notFoundStrikes, 2)
+  scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING', byId: 'throw' })
+  for (let i = 0; i < 4; i++) await sweepOnce(d)
+  assert.equal((await snapshotOf(d, order.id))?.notFoundStrikes, 2, 'neither counted nor reset')
+  assert.notEqual((await snapshotOf(d, order.id))?.status, 'NOTFOUND')
+  connectorReadsById = false
+  for (let i = 0; i < 4; i++) await sweepOnce(d)
+  assert.equal((await snapshotOf(d, order.id))?.notFoundStrikes, 2)
+  assert.notEqual((await snapshotOf(d, order.id))?.status, 'NOTFOUND')
+  assert.equal((await tasksOf(d, order.id)).length, 0)
 })

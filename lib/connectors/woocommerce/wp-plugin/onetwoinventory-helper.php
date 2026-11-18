@@ -319,7 +319,8 @@ add_action('rest_api_init', function () {
     register_rest_route(OTI_FX_NAMESPACE, '/order/(?P<order_id>\d+)/trackship-refire', [
         'methods'             => 'POST',
         // Same HMAC-of-raw-body check as the other signed routes (the verifier is generic).
-        'permission_callback' => 'oti_verify_fx_signature',
+        // Its own verifier: the signature binds method, path (so the order id), body and a timestamp, and the nonce in the body is single-use.
+        'permission_callback' => 'oti_verify_trackship_refire_signature',
         'callback'            => 'oti_handle_trackship_refire',
         'args'                => [
             'order_id' => [
@@ -694,10 +695,60 @@ if (!function_exists('oti_handle_partial_shipment')) {
 // How long a `pending_trackship` row counts as proof of a shipment: TrackShip inserts it at once and finishes from a background job, so a row
 // that stays pending past this is taken to have lost that job and the parcel is treated as missing again.
 const OTI_TS_PENDING_GRACE = 3600;
+// A tracking number despatched longer ago than this is never re-registered: the parcel has arrived, and TrackShip would e-mail the customer about it.
+const OTI_TS_WINDOW = 604800;
+// How far the signed timestamp may be from this server's clock, in seconds. A signed request is also single-use inside that window (the nonce).
+const OTI_TS_REPLAY_WINDOW = 300;
+
+if (!function_exists('oti_verify_trackship_refire_signature')) {
+    /**
+     * Signature of the TrackShip re-fire route: HMAC-SHA256, hex, of "timestamp \n METHOD \n path \n raw body" with the shared secret, header
+     * X-OTI-Signature, timestamp in X-OTI-Timestamp. The body is JSON {order_id, ts, nonce}: the order id must equal the one in the URL, ts must equal
+     * the header, and a nonce is accepted once (a transient kept for twice the window). A captured request cannot be pointed at another order, nor
+     * re-sent. (The older signed routes sign the body only; that is a separate matter and is not changed here.)
+     */
+    function oti_verify_trackship_refire_signature(WP_REST_Request $request)
+    {
+        $secret = get_option(OTI_FX_SECRET_OPT, '');
+        if (!is_string($secret) || $secret === '') {
+            return new WP_Error('oti_fx_no_secret', 'onetwoInventory shared secret not configured', ['status' => 401]);
+        }
+        $signature = $request->get_header('x-oti-signature');
+        $ts_header = $request->get_header('x-oti-timestamp');
+        if (!$signature || !$ts_header || !ctype_digit((string) $ts_header)) {
+            return new WP_Error('oti_ts_missing_sig', 'Missing signature or timestamp', ['status' => 401]);
+        }
+        $timestamp = (int) $ts_header;
+        if (abs(time() - $timestamp) > OTI_TS_REPLAY_WINDOW) {
+            return new WP_Error('oti_ts_stale', 'Timestamp outside the replay window', ['status' => 401]);
+        }
+        $order_id = absint($request['order_id']);
+        $body = (string) $request->get_body();
+        $path = '/wp-json/oti/v1/order/' . $order_id . '/trackship-refire';
+        $expected = hash_hmac('sha256', $timestamp . "\n" . strtoupper($request->get_method()) . "\n" . $path . "\n" . $body, $secret);
+        if (!hash_equals($expected, (string) $signature)) {
+            return new WP_Error('oti_ts_bad_sig', 'Invalid signature', ['status' => 401]);
+        }
+        $payload = json_decode($body, true);
+        if (!is_array($payload) || (int) ($payload['order_id'] ?? 0) !== $order_id || (int) ($payload['ts'] ?? 0) !== $timestamp) {
+            return new WP_Error('oti_ts_bad_body', 'Body does not match the signed request', ['status' => 401]);
+        }
+        $nonce = isset($payload['nonce']) ? (string) $payload['nonce'] : '';
+        if (!preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
+            return new WP_Error('oti_ts_no_nonce', 'Missing nonce', ['status' => 401]);
+        }
+        $key = 'oti_tsn_' . md5($nonce);
+        if (get_transient($key) !== false) {
+            return new WP_Error('oti_ts_replayed', 'Request already used', ['status' => 401]);
+        }
+        set_transient($key, 1, 2 * OTI_TS_REPLAY_WINDOW);
+        return true;
+    }
+}
 
 if (!function_exists('oti_handle_trackship_refire')) {
     /**
-     * POST /wp-json/oti/v1/order/{id}/trackship-refire   (signed, body ignored)
+     * POST /wp-json/oti/v1/order/{id}/trackship-refire   (signed: see oti_verify_trackship_refire_signature)
      *
      * Answers one of, always HTTP 200 unless the request itself is wrong:
      *   result 'covered'         TrackShip holds a shipment for every tracking number on the order; nothing was fired.
@@ -706,6 +757,7 @@ if (!function_exists('oti_handle_trackship_refire')) {
      *   result 'not_eligible'    something was missing but TrackShip's own gate (`is_order_shipped`) refused the order right now
      *                            (not in a trigger status, or no tracking visible); nothing was fired.
      *   result 'no_tracking'     the order carries no tracking number; nothing to register.
+     *   result 'outside_window'  a tracking number that TrackShip lacks was despatched more than 7 days ago; nothing fired (the parcel has arrived).
      *   result 'trackship_inactive'  TrackShip is not installed or not ready (HTTP 503); nothing was fired.
      *   404 oti_ts_not_found     no such order.
      *
@@ -773,9 +825,17 @@ if (!function_exists('oti_handle_trackship_refire')) {
             // nothing else touches), not from the order's modified time, which any unrelated save bumps.
             $now = time();
             $missing = 0;
+            $outside = 0;
             foreach ($items as $item) {
                 $num = isset($item['tracking_number']) ? trim((string) $item['tracking_number']) : '';
                 if ($num === '') {
+                    continue;
+                }
+                $shipped_at = isset($item['date_shipped']) ? (int) $item['date_shipped'] : 0;
+                $is_missing = !isset($status_by_number[$num])
+                    || ($status_by_number[$num] === 'pending_trackship' && $shipped_at > 0 && ($now - $shipped_at) > OTI_TS_PENDING_GRACE);
+                if ($is_missing && $shipped_at > 0 && ($now - $shipped_at) > OTI_TS_WINDOW) {
+                    $outside++;
                     continue;
                 }
                 if (!isset($status_by_number[$num])) {
@@ -788,6 +848,10 @@ if (!function_exists('oti_handle_trackship_refire')) {
                         $missing++;
                     }
                 }
+            }
+            // Firing is order-wide, so one missing number past the window refuses the whole order: it would re-submit an old parcel.
+            if ($outside > 0) {
+                return new WP_REST_Response(['ok' => true, 'result' => 'outside_window', 'missing' => $missing + $outside], 200);
             }
             if ($missing === 0) {
                 return new WP_REST_Response(['ok' => true, 'result' => 'covered', 'missing' => 0], 200);

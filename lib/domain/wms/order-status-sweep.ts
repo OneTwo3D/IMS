@@ -39,6 +39,8 @@ export const PUSH_ERRORS_DISPLAY_CAP = 20
 export const WMS_NOT_FOUND_THRESHOLD = 3
 /** The snapshot status of an order the sweep stopped polling. */
 export const WMS_STATUS_NOT_FOUND = 'NOTFOUND'
+/** What the connector's by-id read answers when the warehouse itself returned 404 for the stored warehouse order id. */
+const WMS_BY_ID_NOT_FOUND = 'NOT_FOUND'
 /**
  * The switch for all of the NOTFOUND behaviour. OFF BY DEFAULT: only an explicit `true` turns it on. While it is off the sweep behaves exactly as it did
  * before NOTFOUND existed (probe, record "confirmed absent", keep polling), counts no strike, marks nothing and raises no task. An unreadable setting is off.
@@ -194,7 +196,7 @@ export async function runWmsOrderStatusSweep(
       id: true,
       orderNumber: true,
       // Whether the warehouse is EXPECTED to hold this order (IMS pushed it and the push is settled): only then is an absent answer a strike.
-      wmsOrderPush: { select: { externalOrderId: true, state: true } },
+      wmsOrderPush: { select: { externalOrderId: true, externalOrderNumber: true, state: true } },
       shoppingLinks: {
         where: { connector: lookupConnector },
         select: { externalOrderNumber: true },
@@ -316,7 +318,24 @@ export async function runWmsOrderStatusSweep(
       let strikes: number | null = null
       if (!notFoundEnabled) strikes = null
       else if (status) strikes = 0
-      else if (notFoundReason === WMS_LOOKUP_CONFIRMED_ABSENT) strikes = pushedExternalId !== '' ? priorStrikes + 1 : null
+      else if (notFoundReason === WMS_LOOKUP_CONFIRMED_ABSENT && pushedExternalId !== '') {
+        // A strike needs the absence confirmed BY IDENTITY, not by the number lookup alone: a warehouse rename can take the original number out of
+        // Search while the order still exists under the id IMS stored. The id is read directly; only the warehouse's own 404 for that id (the marker
+        // the delete guard trusts, plus this) counts. Present under the id (any status, merged or renamed): the order is there, so the count resets.
+        // A read that failed, or a connector that cannot read by id, proves nothing: no strike, count left as it is.
+        if (!connector.probeOrderAmendable) strikes = null
+        else {
+          try {
+            const byId = await connector.probeOrderAmendable(pushedExternalId, order.wmsOrderPush?.externalOrderNumber ?? reference)
+            strikes = !byId.amendable && byId.status === WMS_BY_ID_NOT_FOUND ? priorStrikes + 1 : 0
+          } catch {
+            // A failed by-id read proves nothing (no strike, count left as it is), but it is a failed read: counted, and the read-sync stamp is withheld.
+            strikes = null
+            probeFailures += 1
+            unresolvedReads += 1
+          }
+        }
+      }
       else if (notFoundReason === WMS_LOOKUP_AMBIGUOUS || notFoundReason === WMS_LOOKUP_PRESENT_NO_STATUS) strikes = 0
       const markNotFound = !status && strikes !== null && strikes >= WMS_NOT_FOUND_THRESHOLD
 

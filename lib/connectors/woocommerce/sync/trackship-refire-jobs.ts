@@ -140,6 +140,21 @@ async function hasUnsettledJob(orderId: string): Promise<boolean> {
 class LostRaceError extends Error {}
 
 /**
+ * Is the order STILL one a look may be sent for, read from IMS now: not erased, still shipped, despatched inside the window, still linked to the
+ * storefront. Asked again at send time, because a job that waited (retries, a Replay from Sync exceptions) can outlive the window the scan judged it in,
+ * and re-registering a parcel that has arrived would e-mail the customer about a delivery they already had.
+ */
+export async function trackshipRefireOrderStillEligible(orderId: string, now: Date = new Date()): Promise<boolean> {
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { status: true, erasedAt: true, shippedAt: true, shipments: { where: { status: 'SHIPPED' }, select: { shippedAt: true } }, shoppingLinks: { where: { connector: CONNECTOR }, select: { id: true }, take: 1 } },
+  })
+  if (!order || order.erasedAt !== null || !(SHIPPED_STATUSES as readonly string[]).includes(order.status) || order.shoppingLinks.length === 0) return false
+  const shipped = despatchedAt(order)
+  return shipped !== null && shipped.getTime() >= now.getTime() - TRACKSHIP_REFIRE_WINDOW_MS
+}
+
+/**
  * Queue the look that is due for one state row, in one transaction with the row's move to the next look. Compare-and-set on the attempt count, so
  * two scanners cannot queue the same look. A shadow (the hold) writes its record, queues nothing and moves the row only by the first back-off,
  * so a held tick does not scan the same order every five minutes and the order is looked at again once the hold lifts.
@@ -313,6 +328,12 @@ async function attemptWcTrackshipRefire(orderId: string): Promise<AttemptVerdict
     return { kind: 'done' }
   }
 
+  // The window, the order's status and its erasure marker, re-read at SEND time: an expired or ineligible job is settled without a request.
+  if (!(await trackshipRefireOrderStillEligible(orderId))) {
+    await db.trackshipRefireState.updateMany({ where: { orderId, status: 'ACTIVE' }, data: { status: 'EXPIRED', lastResult: 'window-closed' } })
+    return { kind: 'done' }
+  }
+
   const outcome = await postTrackshipRefire(link.externalOrderId)
   const now = new Date()
   switch (outcome.kind) {
@@ -341,6 +362,9 @@ async function attemptWcTrackshipRefire(orderId: string): Promise<AttemptVerdict
       return { kind: 'done' }
     case 'order-gone':
       await db.trackshipRefireState.updateMany({ where: { orderId, status: 'ACTIVE' }, data: { status: 'EXPIRED', lastResult: RESULT.orderGone } })
+      return { kind: 'done' }
+    case 'outside-window':
+      await db.trackshipRefireState.updateMany({ where: { orderId, status: 'ACTIVE' }, data: { status: 'EXPIRED', lastResult: 'window-closed' } })
       return { kind: 'done' }
     case 'failed':
       return { kind: 'retry', reason: outcome.error }
@@ -450,7 +474,8 @@ export async function runWcTrackshipRefireJobs(options: WcTrackshipRefireRunOpti
         mayStillSend: async () => (await currentOutboxRowBeforeCutoff(job)) === null,
         // Asked again immediately before the POST: the sweep is still switched on and the order is still waiting for a look.
         stillWanted: async () => (await isTrackshipRefireEnabled())
-          && (await db.trackshipRefireState.count({ where: { orderId, status: 'ACTIVE' } })) === 1,
+          && (await db.trackshipRefireState.count({ where: { orderId, status: 'ACTIVE' } })) === 1
+          && (await trackshipRefireOrderStillEligible(orderId)),
       }
       const verdict = await runInWriteLedger(ledger, () => runWithWcAttemptFence(fence, () => attemptWcTrackshipRefire(orderId)))
       switch (verdict.kind) {

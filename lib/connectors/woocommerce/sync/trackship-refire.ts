@@ -18,7 +18,7 @@
  * Off unless `trackship_refire_enabled` is `true`. The WRITE is an outbox job (trackship-refire-jobs.ts); this module holds the pieces that are
  * pure or do the one HTTP call.
  */
-import { createHmac } from 'node:crypto'
+import { createHmac, randomBytes } from 'node:crypto'
 
 import { getSettingValue, getSettingValues } from '@/lib/settings-store'
 import { connectorFetch } from '@/lib/security/connector-fetch'
@@ -66,6 +66,8 @@ export type TrackshipRefireOutcome =
   | { kind: 'no-tracking' }
   /** The storefront has no such order any more. Nothing more will be asked. */
   | { kind: 'order-gone' }
+  /** The storefront refused: a tracking number of the order was despatched more than 7 days ago. Nothing fired, nothing more will be asked. */
+  | { kind: 'outside-window' }
   /** Nothing reached TrackShip and nothing changed: held, not configured, plugin missing or too old, TrackShip not ready, or a transport error. The caller retries. */
   | { kind: 'failed'; error: string; held: boolean }
 
@@ -82,6 +84,7 @@ export function classifyTrackshipRefireResponse(status: number, body: unknown): 
       case 'fired': return { kind: 'fired', missing }
       case 'not_eligible': return { kind: 'not-eligible', missing }
       case 'no_tracking': return { kind: 'no-tracking' }
+      case 'outside_window': return { kind: 'outside-window' }
       default: return { kind: 'failed', held: false, error: 'The storefront answered the TrackShip re-fire with a result IMS does not know, so nothing is recorded as done.' }
     }
   }
@@ -98,9 +101,21 @@ export function classifyTrackshipRefireResponse(status: number, body: unknown): 
   return { kind: 'failed', held: false, error: `The storefront answered the TrackShip re-fire with HTTP ${status}.` }
 }
 
-/** The signature the helper plugin checks: HMAC-SHA256 of the raw body with the shared secret, hex. */
-export function signTrackshipRefireBody(body: string, secret: string): string {
-  return createHmac('sha256', secret).update(body).digest('hex')
+/** The replay window the helper plugin enforces on the signed timestamp, in seconds (kept in step with OTI_TS_REPLAY_WINDOW in the plugin). */
+export const TRACKSHIP_REFIRE_REPLAY_WINDOW_S = 300
+
+/** The path the route is served at, which is part of what is signed. */
+export function trackshipRefirePath(orderId: string): string {
+  return `/wp-json/oti/v1/order/${orderId}/trackship-refire`
+}
+
+/**
+ * The signature the helper plugin checks: HMAC-SHA256, hex, of `timestamp \n METHOD \n path \n body` with the shared secret. The signed text carries
+ * the order id (in the path and in the body), the method and a timestamp, and the body a random nonce the plugin remembers, so a captured request
+ * cannot be pointed at another order, re-sent after the replay window, or re-sent inside it.
+ */
+export function signTrackshipRefire(input: { timestamp: number; orderId: string; body: string }, secret: string): string {
+  return createHmac('sha256', secret).update(`${input.timestamp}\nPOST\n${trackshipRefirePath(input.orderId)}\n${input.body}`).digest('hex')
 }
 
 /**
@@ -119,8 +134,11 @@ export async function postTrackshipRefire(externalOrderId: string): Promise<Trac
   const hold = wooEgressHold()
   if (hold.held) return { kind: 'failed', held: true, error: hold.queuedNotice }
 
-  const body = '{}'
-  const endpoint = `${validated.normalizedUrl}/wp-json/oti/v1/order/${encodeURIComponent(externalOrderId)}/trackship-refire`
+  // A storefront order id is a positive integer; anything else is never put into a signed path.
+  if (!/^[1-9]\d{0,17}$/.test(externalOrderId)) return { kind: 'failed', held: false, error: 'The storefront order id is not a number, so nothing was sent.' }
+  const timestamp = Math.floor(Date.now() / 1000)
+  const body = JSON.stringify({ order_id: Number(externalOrderId), ts: timestamp, nonce: randomBytes(16).toString('hex') })
+  const endpoint = `${validated.normalizedUrl}${trackshipRefirePath(externalOrderId)}`
   // The attempt fence's last question (deadline, row ownership, cut-off, still wanted), asked immediately before the send. It THROWS when the
   // attempt may not write, and that reaches the runner (a retry carrying the fence's own message), so it sits outside the try below.
   await assertWcAttemptMayWrite()
@@ -129,7 +147,7 @@ export async function postTrackshipRefire(externalOrderId: string): Promise<Trac
     const timeout = AbortSignal.timeout(REFIRE_TIMEOUT_MS)
     const res = await connectorFetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-OTI-Signature': signTrackshipRefireBody(body, secret) },
+      headers: { 'Content-Type': 'application/json', 'X-OTI-Timestamp': String(timestamp), 'X-OTI-Signature': signTrackshipRefire({ timestamp, orderId: externalOrderId, body }, secret) },
       body,
       signal: attemptSignal ? AbortSignal.any([timeout, attemptSignal]) : timeout,
     }, { connectorName: 'WooCommerce' })

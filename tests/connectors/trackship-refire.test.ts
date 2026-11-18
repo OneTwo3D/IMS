@@ -65,6 +65,7 @@ test('the storefront answer maps to a closed outcome vocabulary', async () => {
   assert.deepEqual(c(200, { result: 'fired', missing: 2 }), { kind: 'fired', missing: 2 })
   assert.deepEqual(c(200, { result: 'not_eligible', missing: 1 }), { kind: 'not-eligible', missing: 1 })
   assert.deepEqual(c(200, { result: 'no_tracking' }), { kind: 'no-tracking' })
+  assert.deepEqual(c(200, { result: 'outside_window' }), { kind: 'outside-window' })
   assert.deepEqual(c(404, { code: 'oti_ts_not_found' }), { kind: 'order-gone' })
   assert.equal(c(200, { result: 'something-new' }).kind, 'failed', 'an unknown result is never recorded as done')
   assert.equal(c(200, null).kind, 'failed')
@@ -82,7 +83,42 @@ test('an allowed send is ONE signed POST to the companion plugin route for that 
     assert.equal(calls.length, 1)
     assert.equal(calls[0]!.method, 'POST')
     assert.equal(calls[0]!.url, `${ORIGIN}/wp-json/oti/v1/order/4242/trackship-refire`)
-    assert.equal(calls[0]!.headers['X-OTI-Signature'], createHmac('sha256', SECRET).update(calls[0]!.body).digest('hex'), 'HMAC-SHA256 of the raw body with the shared secret')
+    const sent = JSON.parse(calls[0]!.body) as { order_id: number; ts: number; nonce: string }
+    assert.equal(sent.order_id, 4242, 'the body names the order')
+    assert.match(sent.nonce, /^[0-9a-f]{32}$/)
+    assert.equal(calls[0]!.headers['X-OTI-Timestamp'], String(sent.ts))
+    assert.equal(
+      calls[0]!.headers['X-OTI-Signature'],
+      createHmac('sha256', SECRET).update(`${sent.ts}\nPOST\n/wp-json/oti/v1/order/4242/trackship-refire\n${calls[0]!.body}`).digest('hex'),
+      'HMAC-SHA256 of timestamp, method, path (the order id) and the raw body',
+    )
+    assert.ok(Math.abs(sent.ts - Date.now() / 1000) < 5)
+  })
+})
+
+test('REGRESSION: the signature binds the order id, the method, the timestamp and the body, so a captured request cannot be pointed at another order', async () => {
+  const { signTrackshipRefire } = await import('@/lib/connectors/woocommerce/sync/trackship-refire')
+  const base = { timestamp: 1_700_000_000, orderId: '4242', body: '{"order_id":4242,"ts":1700000000,"nonce":"aa"}' }
+  const sig = signTrackshipRefire(base, SECRET)
+  assert.notEqual(sig, signTrackshipRefire({ ...base, orderId: '4243' }, SECRET), 'another order id (path) signs differently')
+  assert.notEqual(sig, signTrackshipRefire({ ...base, timestamp: base.timestamp + 1 }, SECRET), 'another timestamp signs differently')
+  assert.notEqual(sig, signTrackshipRefire({ ...base, body: '{}' }, SECRET), 'another body signs differently')
+  assert.notEqual(signTrackshipRefire(base, SECRET), signTrackshipRefire(base, 'other-secret'))
+})
+
+test('two sends of the same order carry different nonces', async () => {
+  await withEnv(GRANTED, async () => {
+    const { postTrackshipRefire } = await import('@/lib/connectors/woocommerce/sync/trackship-refire')
+    await postTrackshipRefire('7'); await postTrackshipRefire('7')
+    assert.notEqual((JSON.parse(calls[0]!.body) as { nonce: string }).nonce, (JSON.parse(calls[1]!.body) as { nonce: string }).nonce)
+  })
+})
+
+test('a storefront order id that is not a positive integer is never put in a signed path', async () => {
+  await withEnv(GRANTED, async () => {
+    const { postTrackshipRefire } = await import('@/lib/connectors/woocommerce/sync/trackship-refire')
+    for (const id of ['', '0', '12/../9', '1;2', '-5', 'abc']) assert.equal((await postTrackshipRefire(id)).kind, 'failed', id)
+    assert.equal(calls.length, 0)
   })
 })
 

@@ -341,3 +341,55 @@ test('a switch turned off while a job waits: the job is settled without a reques
     assert.equal((await stateOf(d, order.id))?.lastResult ?? null, null)
   })
 })
+
+test('REGRESSION: a job that waited past the 7 day window is settled at SEND time without a request (retries, or a Replay from Sync exceptions)', { skip }, async (t) => {
+  const d = await setup()
+  const order = await seedOrder(d, 6 * DAY + 23 * HOUR)
+  t.after(() => cleanup(d, [order.id]))
+  await setSwitch(d, 'true')
+  await withEnv(LIVE, async () => {
+    // The scan judged it inside the window and queued the look; nothing is sent yet.
+    await d.jobs.enqueueTrackshipRefires({ orderIds: [order.id] })
+    assert.equal((await jobsFor(d, order.id)).length, 1)
+    // The job waits (a failing store, a parked row replayed later); the order's despatch is now more than 7 days old.
+    await d.db.salesOrder.update({ where: { id: order.id }, data: { shippedAt: new Date(Date.now() - 7 * DAY - HOUR) } })
+    const run = await d.jobs.runWcTrackshipRefireJobs({ idempotencyKeys: keysFor(d, [order.id]) })
+    assert.deepEqual([run.claimed, run.succeeded], [1, 1])
+    assert.equal(requests.length, 0, 'nothing sent after the window')
+    const state = await stateOf(d, order.id)
+    assert.equal(state?.status, 'EXPIRED')
+    assert.equal(state?.lastResult, 'window-closed')
+  })
+})
+
+test('REGRESSION: an order that was erased, or is no longer shipped, is settled at send time without a request', { skip }, async (t) => {
+  const d = await setup()
+  const erased = await seedOrder(d)
+  const cancelled = await seedOrder(d)
+  t.after(() => cleanup(d, [erased.id, cancelled.id]))
+  await setSwitch(d, 'true')
+  await withEnv(LIVE, async () => {
+    await d.jobs.enqueueTrackshipRefires({ orderIds: [erased.id, cancelled.id] })
+    await d.db.salesOrder.update({ where: { id: erased.id }, data: { erasedAt: new Date() } })
+    await d.db.salesOrder.update({ where: { id: cancelled.id }, data: { status: 'CANCELLED' } })
+    const run = await d.jobs.runWcTrackshipRefireJobs({ idempotencyKeys: keysFor(d, [erased.id, cancelled.id]) })
+    assert.deepEqual([run.claimed, run.succeeded], [2, 2])
+    assert.equal(requests.length, 0)
+  })
+})
+
+test('the storefront refusing an order past the window (outside_window) closes it: no further asks', { skip }, async (t) => {
+  const d = await setup()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order.id]))
+  await setSwitch(d, 'true')
+  await withEnv(LIVE, async () => {
+    reply = () => json({ ok: true, result: 'outside_window', missing: 1 })
+    await tickFor(d, [order.id])
+    assert.equal(requests.length, 1)
+    assert.equal((await stateOf(d, order.id))?.status, 'EXPIRED')
+    await makeDue(d, order.id)
+    await tickFor(d, [order.id])
+    assert.equal(requests.length, 1)
+  })
+})
