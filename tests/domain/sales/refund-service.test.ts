@@ -2856,6 +2856,8 @@ test('createSalesOrderRefund rejects refund quantities beyond remaining order qu
   assert.deepEqual(result, {
     success: false,
     error: 'Refund qty 1 for product product-1 exceeds remaining refundable qty 0.00',
+    // an over-quantity refusal is a quarantine outcome (the shop-originated caller parks the refund for an operator)
+    quarantine: true,
   })
 })
 
