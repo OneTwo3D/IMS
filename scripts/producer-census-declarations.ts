@@ -180,6 +180,8 @@ export const DECLARATIONS: readonly Declaration[] = [
   d('app/actions/sales.ts::updateSalesOrder::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of the products an edit of a confirmed order re-reserved (after the edit commits).'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+    'Asks the shopping facade to push the stock of the products whose unshipped allocation was released when the order was closed as shipped, completed or delivered (after the closing commits).'),
+  d('app/actions/sales.ts::applySalesOrderStatusTransition::enqueueStockSync#2', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of the products a draft finalisation just allocated (after the finalisation commits).'),
   d('app/actions/purchase-orders.ts::queuePurchaseOrderEmail::queueEmail#1', 'internal', 'supplier-purchase-order-email', 'operator-action', 'not-applicable',
     'Operator button (Confirm & Send PO, Email PO): queues the purchase order PDF e-mail to the supplier on the local outbox.'),

@@ -10,6 +10,7 @@ import { canViewDashboardCostFigures } from '@/lib/security/dashboard-cost-redac
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
+import { getSettingValue } from '@/lib/settings-store'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -114,10 +115,15 @@ export async function adjustStock(
   let logSku = ''
   let logWarehouseName = ''
 
+  // o3d-hqvrp.80 (flag, off by default): a removal into reserved stock releases the newest orders'
+  // allocations in the same transaction instead of being refused.
+  const releaseReservedForRemoval = qtyNum < 0 && (await getSettingValue('stock_adjustment_release_reserved')) === 'true'
+
   try {
     await db.$transaction(async (tx) => {
       const applied = await applyStockAdjustment({
         tx,
+        releaseReservedForRemoval,
         productId,
         warehouseId,
         qty: qtyNum,
@@ -258,12 +264,18 @@ export async function bulkAdjustStock(
   // getAccountingSettings() inside the transaction loop). The reason name is resolved
   // per line inside applyStockAdjustment.
   const accountingSettings = await getAccountingSettings()
+  // o3d-hqvrp.80 (flag, off by default). A one-line batch only: a longer one would take sales-order
+  // locks after an earlier line's stock-level lock, against the sales_orders -> stock_levels order.
+  const releaseReservedForRemoval = valid.length === 1
+    && valid[0].qty < 0
+    && (await getSettingValue('stock_adjustment_release_reserved')) === 'true'
 
   try {
     await db.$transaction(async (tx) => {
       for (const line of valid) {
         await applyStockAdjustment({
           tx,
+          releaseReservedForRemoval,
           productId: line.productId,
           warehouseId: line.warehouseId,
           qty: line.qty,

@@ -2666,6 +2666,14 @@ export async function applySalesOrderStatusTransition(
       }, STOCK_TX_OPTIONS)
       previousStatusForLog = transitionResult.previousStatus
       orderUpdated = true
+      // o3d-hqvrp.79: the closing released unshipped reservation; the storefront is owed the stock.
+      if (transitionResult.releasedProductIds.length > 0) {
+        try {
+          await enqueueStockSync(transitionResult.releasedProductIds, 'IMS_CHANGE')
+        } catch (syncError) {
+          console.error(syncError)
+        }
+      }
       if (isDraftFinalization && finalisationAllocation) {
         // After the commit: the activity of the allocation attempt and the storefront stock sync it owes (as autoAllocateOrder does).
         const committedAllocation = finalisationAllocation as Awaited<ReturnType<typeof allocateSalesOrder>>
