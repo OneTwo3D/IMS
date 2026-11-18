@@ -12,6 +12,7 @@ import {
 } from '@/lib/domain/inventory/stock-movement-value'
 import { manualStockAdjustmentMovementKey } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { businessDateYmd } from '@/lib/business-date'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 
 // Extracted from app/actions/stock.ts (6oyu.1) so non-action callers — the WMS
 // stock-sync align-down path runs from a cron job — can post an adjustment
@@ -369,11 +370,11 @@ export async function applyStockAdjustment({
       // No enqueue ran (there was no journal to build), so there is no answer to forward: the outstanding row is
       // recorded directly, in the caller's transaction, under the key the journal would have been queued under.
       const unmapped = !accountCode ? 'reason_account' : 'inventory_account'
-      const remedy = !accountCode
+      const remedy = withHandPostSafety(!accountCode
         ? 'The adjustment has no reason, or its reason has no account, so no journal was built. Inventory in the '
           + 'ledger no longer matches IMS by the value of this adjustment. Post the journal by hand.'
         : 'No inventory account is mapped, so no journal was built. Inventory in the ledger no longer matches IMS '
-          + 'by the value of this adjustment. Post the journal by hand.'
+          + 'by the value of this adjustment. Post the journal by hand.')
       await recordAccountingPostingRefusal(
         tx as unknown as PostingRefusalClient,
         accountingPostingKey(journalIdentity),
