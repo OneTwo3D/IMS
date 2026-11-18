@@ -316,8 +316,11 @@ test('cancelPendingSalesInvoiceSyncForOrder voids the not-yet-posted mirrored ev
   await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
 
   // Only PENDING/FAILED (un-posted) mirror events are selected.
-  const findWhere = calls.eventFindMany[0].where as { status: { in: string[] }; sourceEntityId: string; type: { in: string[] } }
-  assert.deepEqual(findWhere.status.in, ['PENDING', 'FAILED'])
+  // o3d-9u0f: ...plus a VOID event whose basis is revivable (an earlier NOT_POSTED settlement), which a cancellation re-stamps.
+  const findWhere = calls.eventFindMany[0].where as { OR: Array<{ status: string | { in: string[] }; voidBasis?: unknown }>; sourceEntityId: string; type: { in: string[] } }
+  assert.deepEqual(findWhere.OR[0].status, { in: ['PENDING', 'FAILED'] })
+  assert.equal(findWhere.OR[1].status, 'VOID')
+  assert.ok(findWhere.OR[1].voidBasis, 'the VOID arm is limited to revivable bases')
   assert.equal(findWhere.sourceEntityId, 'order-1')
 
   // They are terminalised to VOID with the external id cleared, and an audit log is written per event.
@@ -525,8 +528,8 @@ test('cancelPendingSalesInvoiceSyncForOrder does not clobber an event a worker p
     accountingEvent: {
       findMany: async ({ where }: { where: { status?: unknown } }) => {
         const status = (where as { status?: { in?: string[] } | string }).status
-        // First call (select PENDING/FAILED) returns the event; the post-update VOID re-read finds none.
-        if (status && typeof status === 'object' && 'in' in status) {
+        // First call (select PENDING/FAILED, or the revivable VOID arm) returns the event; the post-update VOID re-read finds none.
+        if ((where as { OR?: unknown }).OR || (status && typeof status === 'object' && 'in' in status)) {
           return [{ id: 'event-1', type: 'SALES_INVOICE', sourceEntityType: 'SalesOrder', sourceEntityId: 'order-1' }]
         }
         return []
@@ -543,8 +546,8 @@ test('cancelPendingSalesInvoiceSyncForOrder does not clobber an event a worker p
 
   // The VOID update was attempted with the status predicate, but nothing was voided and nothing logged.
   assert.equal(eventUpdateMany.length, 1)
-  const updateWhere = eventUpdateMany[0].where as { status: { in: string[] } }
-  assert.deepEqual(updateWhere.status.in, ['PENDING', 'FAILED'])
+  const updateWhere = eventUpdateMany[0].where as { OR: Array<{ status: string | { in: string[] } }> }
+  assert.deepEqual(updateWhere.OR[0].status, { in: ['PENDING', 'FAILED'] })
   assert.equal(eventLogCreateMany.length, 0)
 })
 

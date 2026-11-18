@@ -1646,12 +1646,18 @@ export async function voidMirroredAccountingEventsForOrder(
   const types = params.types.filter(isMirrorableAccountingSyncType)
   if (types.length === 0 || !params.referenceId.trim()) return
 
+  // o3d-9u0f: a cancellation also re-stamps a VOID event whose basis is REVIVABLE (an operator settled one attempt NOT_POSTED earlier). That void
+  // said "one attempt was retired, a later live attempt may take this back" about a document whose ORDER is now cancelled and must never exist.
+  // A cancellation retires the document whatever an earlier settlement said about one attempt. An attempt-only void has nothing to add over it.
+  const voidableWhere = params.attemptOnly
+    ? { status: { in: ['PENDING', 'FAILED'] } }
+    : { OR: [{ status: { in: ['PENDING', 'FAILED'] } }, { status: 'VOID', voidBasis: { in: [...REVIVABLE_VOID_BASES] } }] }
   const events = await client.accountingEvent.findMany({
     where: {
       type: { in: types },
       sourceEntityType: params.referenceType,
       sourceEntityId: params.referenceId,
-      status: { in: ['PENDING', 'FAILED'] },
+      ...voidableWhere,
     },
     select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true },
   })
@@ -1663,7 +1669,7 @@ export async function voidMirroredAccountingEventsForOrder(
   // the rows we actually voided, so only those get an audit log.
   const voidableIds = events.map((event) => event.id)
   const updated = await client.accountingEvent.updateMany({
-    where: { id: { in: voidableIds }, status: { in: ['PENDING', 'FAILED'] } },
+    where: { id: { in: voidableIds }, ...voidableWhere },
     // o3d-11rf r2: THIS VOID RETIRES THE DOCUMENT, not an attempt. The order is cancelled, so no
     // later enqueue may take these events back to PENDING — and the enqueue side can only refuse
     // that if the row says so. Recorded here rather than inferred from the audit action below,

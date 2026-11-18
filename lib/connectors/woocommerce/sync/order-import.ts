@@ -1907,7 +1907,11 @@ type HeldReleaseOrderRef = {
 export const HELD_SALES_INVOICE_SHADOWED_MESSAGE = (invoiceNumber: string): string =>
   `Closed as a shadow: WooCommerce assigned invoice number ${invoiceNumber}, but writes to the ledger are held on this installation, so IMS recorded the sales invoice as a shadow instead of queueing it. IMS did not send it, and this does not say whether the ledger's owner has written it: check the ledger before acting.`
 
-export type HeldSalesInvoiceReleaseOutcome = 'no-hold' | 'released' | 'unreadable' | 'not-queued' | 'shadowed' | 'read-failed'
+/** The closing note of a hold whose release the enqueue answered `handled-by-hand`: a human posted the invoice, so there is nothing left to queue. */
+export const HELD_SALES_INVOICE_HANDLED_MESSAGE = (invoiceNumber: string): string =>
+  `Closed as handled by hand: WooCommerce assigned invoice number ${invoiceNumber}, and this invoice was already posted or marked handled by hand in the ledger, so IMS queued nothing.`
+
+export type HeldSalesInvoiceReleaseOutcome = 'no-hold' | 'released' | 'unreadable' | 'not-queued' | 'shadowed' | 'handled' | 'read-failed'
 
 /** Keep the hold PENDING, but stop it claiming to be waiting for a number that has already arrived. */
 async function noteHeldReleaseFailure(rowId: string, message: string): Promise<void> {
@@ -2678,6 +2682,19 @@ async function releaseHeldWcSalesInvoice(
     return 'shadowed'
   }
 
+  // HANDLED BY HAND. The enqueue answered `queued: true` WITHOUT a write because a human posted this invoice (or marked its row handled).
+  // The re-read below would find no row and read that as "NOTHING will post", re-raise the refusal and leave the hold PENDING for ever,
+  // once per sweep, after the operator did exactly what the remedy asked. The hold is closed, with its own words.
+  if (enqueueOutcome.outcome?.reason === 'handled-by-hand') {
+    await db.shoppingSyncLog.update({
+      where: { id: row.id },
+      data: { errorMessage: HELD_SALES_INVOICE_HANDLED_MESSAGE(invoiceNumber), syncedAt: new Date(), status: 'SYNCED' },
+    }).catch((error) => {
+      console.error(`[wc-import] the held sales invoice for ${orderId} was handled by hand but the queue row could not be closed:`, error)
+    })
+    return 'handled'
+  }
+
   // The enqueue can no-op silently — see the note above. A row that is not there was not queued,
   // and marking the hold "released" would strand the invoice with nothing left saying so.
   let queued: { id: string } | null = null
@@ -2931,7 +2948,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
       { logFailure: false },
     )
     if (outcome === 'released') result.released++
-    else if (outcome === 'unreadable' || outcome === 'shadowed') result.closed++
+    else if (outcome === 'unreadable' || outcome === 'shadowed' || outcome === 'handled') result.closed++
     else if (outcome === 'read-failed') readFailures++
     else if (outcome === 'not-queued') {
       result.stillStuck++
