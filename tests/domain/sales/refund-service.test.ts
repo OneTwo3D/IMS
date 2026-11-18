@@ -481,6 +481,8 @@ function createClient(state: State): RefundServiceClient {
         throw error
       }
     },
+    // The manual-refund status gate counts the order's recorded payments; the fixture orders are SHIPPED, which the gate never refuses, so none is needed.
+    payment: { count: async () => 0 },
     organisation: {
       findFirst: async () => ({ baseCurrency: state.baseCurrency ?? 'GBP' }),
     },
@@ -1417,7 +1419,7 @@ test('a public refund line that is not a line of the order is refused', async ()
     reason: 'ghost', creditNotePrefix: 'CN-', enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
   })
   assert.equal(result.success, false)
-  assert.match(result.success === false ? result.error : '', /not a line of this order/)
+  assert.match(result.success === false ? result.error : '', /names an order line that does not belong to this order/)
   assert.equal(state.refunds.length, 0)
 })
 
