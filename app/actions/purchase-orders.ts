@@ -134,6 +134,7 @@ import {
   logLandedCostCreditFloorActivities,
   queueLandedCostAdjustmentJournals,
   readLandedCostChartBeforeTx,
+  tryReadLandedCostChartBeforeTx,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
@@ -2402,7 +2403,7 @@ export async function advancePoStatus(
     // Minimum gross margin (o3d-hqvrp.380): placing the order is the commitment, so it is checked inside the transaction below, under the
     // PO row lock, from the stored line costs and values read through that transaction.
     // o3d-d0gog: the close-short revaluation inside the transaction needs the chart; read it first, over the pool.
-    const closeChart = targetStatus === 'CLOSED' ? await readLandedCostChartBeforeTx() : undefined
+    const closeChart = targetStatus === 'CLOSED' ? await tryReadLandedCostChartBeforeTx() : undefined
     const result = await db.$transaction(async (tx) => {
       // Closing a GOODS order may reallocate the unreceived freight share onto the received units (close-short), which revalues
       // cost layers: it takes the whole revaluation scope first, which includes the order row.

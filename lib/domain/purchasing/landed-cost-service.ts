@@ -161,6 +161,28 @@ export class LandedCostChartUnreadableError extends Error {
   }
 }
 
+/**
+ * The same read, as a VALUE: for an operation that only SOMETIMES revalues (PO close, PO cancel). A read failure must not
+ * block the ones that revalue nothing, so the failure is carried to the branch that needs the chart, which calls
+ * {@link chartOrThrow} (fail closed there, before the revaluation writes anything).
+ */
+export type LandedCostChartRead =
+  | { ok: true; chart: AccountingSettings }
+  | { ok: false; error: LandedCostChartUnreadableError }
+
+export async function tryReadLandedCostChartBeforeTx(): Promise<LandedCostChartRead> {
+  try {
+    return { ok: true, chart: await getAccountingSettings() }
+  } catch (error) {
+    return { ok: false, error: error instanceof LandedCostChartUnreadableError ? error : new LandedCostChartUnreadableError(error) }
+  }
+}
+
+export function chartOrThrow(read: LandedCostChartRead): AccountingSettings {
+  if (!read.ok) throw read.error
+  return read.chart
+}
+
 export async function readLandedCostChartBeforeTx(): Promise<AccountingSettings> {
   try {
     return await getAccountingSettings()

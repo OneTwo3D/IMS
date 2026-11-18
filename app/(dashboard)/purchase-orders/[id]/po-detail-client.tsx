@@ -1707,10 +1707,16 @@ function EditFreightCostsDialog({
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
-  const [awaitingFingerprint, setAwaitingFingerprint] = useState<string | null>(null)
+  // After a successful save the dialog closes once the refreshed order arrives (its fingerprint differs from the one the dialog
+  // opened with) or after a short timeout, whichever is first, so a reopen never carries the stale lines and the dialog never sticks.
+  const [saved, setSaved] = useState(false)
+  const [openedFingerprint] = useState(() => po.freightCostLinesFingerprint)
   useEffect(() => {
-    if (awaitingFingerprint && po.freightCostLinesFingerprint === awaitingFingerprint) onClose()
-  }, [awaitingFingerprint, po.freightCostLinesFingerprint, onClose])
+    if (!saved) return
+    if (po.freightCostLinesFingerprint !== openedFingerprint) { onClose(); return }
+    const timer = setTimeout(onClose, 3000)
+    return () => clearTimeout(timer)
+  }, [saved, po.freightCostLinesFingerprint, openedFingerprint, onClose])
 
   const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
   const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
@@ -1729,8 +1735,6 @@ function EditFreightCostsDialog({
   // credit is therefore NOT editable here: it is listed read-only and sent back to the server unchanged (saving
   // replaces the order's lines, so leaving it out would silently delete it).
   const lockedLines = po.freightCostLines.filter((cl) => cl.amountForeign <= 0)
-  // What this dialog loaded; the server refuses the save if another operator changed the lines since (o3d-aks9m).
-  const [openedFingerprint] = useState(() => po.freightCostLinesFingerprint)
   const [costLines, setCostLines] = useState<FreightCostEditLine[]>(() => {
     if (po.freightCostLines.length > 0) {
       return po.freightCostLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
@@ -1790,13 +1794,7 @@ function EditFreightCostsDialog({
       )
       if (result.success) {
         router.refresh()
-        // Do not close (and so allow a reopen) until the refreshed order has landed: a dialog reopened on the OLD prop
-        // would carry the old lines and fingerprint and refuse, or worse resubmit, the operator's own save.
-        if (result.costLinesFingerprint && result.costLinesFingerprint !== po.freightCostLinesFingerprint) {
-          setAwaitingFingerprint(result.costLinesFingerprint)
-        } else {
-          onClose()
-        }
+        setSaved(true)
       } else {
         setError(result.error ?? 'Failed to update costs')
       }
@@ -1900,7 +1898,7 @@ function EditFreightCostsDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button onClick={handleSave} disabled={isPending || awaitingFingerprint !== null}>
+          <Button onClick={handleSave} disabled={isPending || saved}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Update &amp; Recalculate
           </Button>

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import type { PurchaseOrderStatus } from '@/app/generated/prisma/client'
+import { LandedCostChartUnreadableError } from '@/lib/domain/purchasing/landed-cost-service'
 import { cancelPurchaseOrderService, type CancelPurchaseOrderServiceDeps } from '@/lib/domain/purchasing/cancellation-service'
 
 /**
@@ -33,7 +34,7 @@ test('freight cancellation reads the chart before the transaction opens and hand
       return { revalidatePoIds: [], auditRunIds: [], cogsAdjustments: [], inventoryTransitAdjustments: [], warnings: [] }
     },
     queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
-    readAccountingChart: async () => { order.push('chart-read'); return chart },
+    readAccountingChart: async () => { order.push('chart-read'); return { ok: true, chart } },
   } as unknown as CancelPurchaseOrderServiceDeps
 
   const result = await cancelPurchaseOrderService('frt-1', deps)
@@ -43,25 +44,31 @@ test('freight cancellation reads the chart before the transaction opens and hand
   assert.equal(seenOptions!.accountingSettings, chart, 'the recalculation is handed that chart, not left to read its own')
 })
 
-test('an UNREADABLE chart fails closed: the cancellation is refused before any transaction or write, so no delta can post twice', async () => {
-  let txOpened = false
+test('an UNREADABLE chart fails a FREIGHT cancellation (it always revalues) before the revaluation runs', async () => {
   let recalculated = false
+  const po = { status: 'PO_SENT' as PurchaseOrderStatus, reference: 'FRT-1' }
+  const tx = {
+    $queryRaw: async () => [],
+    purchaseOrder: {
+      findUnique: async () => ({ status: po.status, reference: po.reference, type: 'FREIGHT', invoices: [], supplierCreditNotes: [] }),
+      update: async () => ({ id: 'frt-1' }),
+    },
+  }
   const deps = {
-    findPurchaseOrderFast: async () => ({ status: 'PO_SENT', reference: 'FRT-1' }),
-    transaction: async () => { txOpened = true; return {} },
+    findPurchaseOrderFast: async () => ({ status: po.status, reference: po.reference }),
+    transaction: async (fn: (t: never) => unknown) => fn(tx as never),
     logActivity: async () => undefined,
     retirePurchaseOrderLocked: async () => { throw new Error('unused') },
     recalculateLandedCosts: async () => { recalculated = true; return {} },
     queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
-    readAccountingChart: async () => { throw new Error('connection terminated') },
+    readAccountingChart: async () => ({ ok: false, error: new LandedCostChartUnreadableError(new Error('connection terminated')) }),
   } as unknown as CancelPurchaseOrderServiceDeps
 
   const result = await cancelPurchaseOrderService('frt-1', deps)
 
   assert.equal(result.success, false)
-  assert.match(String(result.error), /connection terminated|could not be read/)
-  assert.equal(txOpened, false, 'nothing is written')
-  assert.equal(recalculated, false)
+  assert.match(String(result.error), /could not be read/)
+  assert.equal(recalculated, false, 'the revaluation never ran, so nothing can post twice')
 })
 
 test('the pre-transaction chart read throws a named error instead of returning null', () => {
@@ -73,10 +80,11 @@ test('the pre-transaction chart read throws a named error instead of returning n
 
 test('census: every in-transaction revaluation caller supplies the chart, and the walk never reads it over the pool when given one', () => {
   const actions = readFileSync('app/actions/purchase-orders.ts', 'utf8')
-  assert.equal((actions.match(/readLandedCostChartBeforeTx\(\)/g) ?? []).length, 3, 'createFreightPo, updateFreightPoCosts and the close action')
+  assert.equal((actions.match(/[^y]readLandedCostChartBeforeTx\(\)/g) ?? []).length, 2, 'createFreightPo and updateFreightPoCosts (both always revalue)')
   assert.match(actions, /reason: 'freight_purchase_order_created',[^}]*accountingSettings: landedChart/)
   assert.match(actions, /reason: 'freight_purchase_order_costs_updated',[^}]*accountingSettings: landedChart/)
   assert.match(actions, /retirePurchaseOrderLocked\(tx, id, 'close', undefined, closeChart\)/)
+  assert.match(actions, /closeChart = targetStatus === 'CLOSED' \? await tryReadLandedCostChartBeforeTx\(\)/, 'a close reads the chart as a value: a failure is fatal only where it revalues')
 
   const service = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
   assert.equal((service.match(/options\.accountingSettings/g) ?? []).length >= 6, true, 'both recalculation paths forward the chart to propagation and to every shipment refresh')

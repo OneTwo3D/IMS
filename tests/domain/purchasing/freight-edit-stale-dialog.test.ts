@@ -63,10 +63,11 @@ test('census: the action checks the dialog fingerprint under the lock, and the d
   assert.match(dialog, /openedFingerprint,\n\s*\)/, 'the dialog passes what it loaded')
 })
 
-test('the save returns the fresh fingerprint and the dialog stays open until the refreshed order carries it', () => {
+test('the save returns the fresh fingerprint and the dialog closes on refresh or timeout', () => {
   const action = readFileSync('app/actions/purchase-orders.ts', 'utf8')
   assert.match(action, /return \{ success: true, costLinesFingerprint \}/)
   const dialog = readFileSync('app/(dashboard)/purchase-orders/[id]/po-detail-client.tsx', 'utf8')
-  assert.match(dialog, /setAwaitingFingerprint\(result\.costLinesFingerprint\)/)
-  assert.match(dialog, /po\.freightCostLinesFingerprint === awaitingFingerprint\) onClose\(\)/)
+  assert.match(dialog, /setSaved\(true\)/)
+  assert.match(dialog, /po\.freightCostLinesFingerprint !== openedFingerprint\) \{ onClose\(\)/, 'closes when the refreshed order arrives')
+  assert.match(dialog, /setTimeout\(onClose, 3000\)/, 'or after a short timeout, so it never sticks')
 })

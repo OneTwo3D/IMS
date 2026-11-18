@@ -77,13 +77,11 @@ import {
   journalRowProvesAmount,
   proveAllocationDebitPosting,
   proveJournalPosting,
-  resolveAllocatedReliefPosting as resolveAllocatedReliefPostingShared,
   unprovedJournalClause,
-  type AllocatedReliefVerdict,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
 import { journalNetMovement, journalNetsReadable } from '@/lib/domain/accounting/journal-account-nets'
 import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
-import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
+import { findDurableShadowRecords, shadowRecordNamesSyncLog } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
@@ -2221,19 +2219,106 @@ async function stageRefundAccountingReversals(
     // any refusal, so the finding stands until a human resolves it. It does NOT withhold the
     // reversal — an assumption is not a refusal, and treating it as one would strand the very
     // pre-column and post-retention cases these columns were added to survive.
-    // o3d-efyx: the verdict and its resolver now live beside `proveAllocationDebitPosting` (single definition, shared with
-    // the orphaned-allocation reverser). This is a thin binding to this refund's connector and account.
-    const resolveAllocatedReliefPosting = (record: {
+    type AllocatedReliefVerdict =
+      | { kind: 'posted' }
+      | { kind: 'none' }
+      | { kind: 'assumed'; reason: string }
+      | { kind: 'unresolved'; reason: string }
+
+
+    // Resolves a relief record that names its own journal — Group B stamps the row's id, connector
+    // and account on the shipment. `recorded` is the pounds the record claims.
+    const resolveAllocatedReliefPosting = async (record: {
       syncLogId: string | null
       connector: string | null
       accountCode: string | null
       subject: string
       recorded: number
-    }): Promise<AllocatedReliefVerdict> => resolveAllocatedReliefPostingShared(
-      tx,
-      { activeConnector: params.activeConnector ?? null, allocatedInventoryAccount: settings.allocatedInventoryAccount },
-      record,
-    )
+    }): Promise<AllocatedReliefVerdict> => {
+      if (record.recorded <= 0) return { kind: 'none' }
+      if (!record.syncLogId) {
+        if (record.recorded < 0.005) return { kind: 'none' }
+        return {
+          kind: 'unresolved',
+          reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief but names no journal, so whether that credit was ever raised — and in which ledger — cannot be established`,
+        }
+      }
+      if (params.activeConnector && record.connector && record.connector !== params.activeConnector) {
+        return {
+          kind: 'unresolved',
+          reason: `${record.subject} credited Allocated Inventory on ${record.connector}, but this reversal would be raised on ${params.activeConnector} — relief in one ledger cannot be netted against a debit in another`,
+        }
+      }
+      if (record.accountCode && record.accountCode !== settings.allocatedInventoryAccount) {
+        return {
+          kind: 'unresolved',
+          reason: `${record.subject} credited account ${record.accountCode}, but Allocated Inventory is configured as ${settings.allocatedInventoryAccount} today, so that relief did not touch the account this reversal would credit`,
+        }
+      }
+      const journal = await tx.accountingSyncLog.findUnique({
+        where: { id: record.syncLogId },
+        select: { connector: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
+      })
+      // Deleted by retention once terminal: read as the recorded amount, the least destructive of
+      // the two readings left — but ASSUMED, not proved (o3d-o97 r6). Retention deletes SYNCED and
+      // CANCELLED rows alike, so this absence is equally consistent with a relief that never
+      // posted; counting it silently is how a refusal that was standing becomes a resolution.
+      if (!journal) {
+        // A journal that WAS a shadow also expires with retention, but the durable shadow record keeps naming it: that absence is not "settled or
+        // abandoned, counted from the record", it is a posting IMS never sent, so the refusal that stood while the row existed must go on standing.
+        if (await shadowRecordNamesSyncLog(tx, record.syncLogId)) {
+          return {
+            kind: 'unresolved',
+            reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief under a journal IMS recorded as a SHADOW instead of sending (the row has since expired, the shadow record has not), so whether that credit reached any ledger cannot be established`,
+          }
+        }
+        return {
+          kind: 'assumed',
+          reason: `${record.subject}'s £${record.recorded.toFixed(2)} of Allocated Inventory relief was counted from its own record because the journal it names is no longer on record (retention) — retention deletes cancelled journals as well as settled ones, so whether those pounds ever reached the account is not established`,
+        }
+      }
+      // o3d-o97 r5: the ROW's own connector, not just the stamp beside the amount. The stamp is
+      // written by the same statement as the figure and can only be as right as that writer was;
+      // the row is the ledger's own record of which books it was raised into.
+      if (params.activeConnector && journal.connector && journal.connector !== params.activeConnector) {
+        return {
+          kind: 'unresolved',
+          reason: `the journal that was to credit Allocated Inventory £${record.recorded.toFixed(2)} for ${record.subject} was raised on ${journal.connector}, but this reversal would be raised on ${params.activeConnector} — a credit in one set of books cannot be netted against a debit in another`,
+        }
+      }
+      // o3d-o97 r5 — AND NOW WHAT IT CREDITED, from its own lines. Group B's journal covers a WHOLE
+      // DAY, so the lines give the batch's total CR to Allocated Inventory, not this shipment's
+      // share; the share is the recorded figure, and the journal BOUNDS it. Two ways to fail:
+      const proof = proveJournalPosting([journal], settings.allocatedInventoryAccount, 'credit')
+      // Payload compacted off a settled row (backReferenceEvidenceCompactedAt): the same position
+      // as a row retention deleted, resolved the same way — the recorded amount stands, and says
+      // that it stands on the record rather than on the journal (o3d-o97 r6).
+      if (proof.kind === 'illegible') {
+        return {
+          kind: 'assumed',
+          reason: `${record.subject}'s £${record.recorded.toFixed(2)} of Allocated Inventory relief was counted from its own record because its journal has settled but its lines have been compacted off the row, so what that journal actually credited to ${settings.allocatedInventoryAccount} cannot be read`,
+        }
+      }
+      if (proof.kind === 'unproved') {
+        return {
+          kind: 'unresolved',
+          reason: `the journal that was to credit Allocated Inventory £${record.recorded.toFixed(2)} for ${record.subject} is ${unprovedJournalClause(proof)} — whether those pounds moved is not established, and guessing either way moves real money`,
+        }
+      }
+      if (proof.amount <= 0) {
+        return {
+          kind: 'unresolved',
+          reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief, but the journal it names credits nothing to ${settings.allocatedInventoryAccount} — the record and the journal disagree about what was relieved, so how much of the A2 debit is open cannot be established`,
+        }
+      }
+      if (record.recorded > proof.amount + 0.005) {
+        return {
+          kind: 'unresolved',
+          reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief, more than the £${proof.amount.toFixed(2)} its journal credited to ${settings.allocatedInventoryAccount} in total — a share cannot exceed the batch it came from, so that figure cannot be netted against the A2 debit`,
+        }
+      }
+      return { kind: 'posted' }
+    }
 
     // o3d-o97 r3 — THE ALLOCATED CONTRA THIS ORDER'S PRIOR REFUNDS RELIEVED, and — separately —
     // whether that is KNOWN at all.
