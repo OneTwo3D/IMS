@@ -2083,6 +2083,11 @@ export function classifyRegisteredPaymentAgainstListing(
    * It is read ONLY beside a standing `paidWithoutLedgerReceipt`. See the coverage guard below.
    */
   documentTotal: Decimal | null = null,
+  /**
+   * o3d-89mc — the caller ASKED the coverage question and the total could not be read (a stored non-finite value, or the order row did not
+   * come back). Distinct from `documentTotal` null, which is "not asking". Beside a standing marker it withholds.
+   */
+  documentTotalUnreadable: boolean = false,
 ): RegisteredPaymentVerdict {
   const undecided: string[] = []
   const posted: string[] = []
@@ -2226,6 +2231,15 @@ export function classifyRegisteredPaymentAgainstListing(
   // IT IS SELF-DISCHARGING, which is what stops it becoming a permanent withholding. The marker is a
   // property of the order, not of this read: the receipt that completes the cover clears it at the
   // write site, and this guard then does not run at all.
+  //
+  // o3d-89mc — AN UNREADABLE TOTAL IS A REFUSAL, NOT AN ABSENCE OF THE GUARD. `documentTotal` null means "the caller is not asking" (a bill, an
+  // older caller), and for those the guard stays off. A caller that DID ask and could not read the number says so with `documentTotalUnreadable`:
+  // standing the guard down there let control fall into the admitting arms below (LEDGER_DID_NOT_LIST_PAYMENTS, GONE) - less evidence, more
+  // destructive action. Coverage that cannot be established is withheld, exactly as an unreadable registration amount is. Reported as
+  // REGISTRATION_UNDECIDED over the posted registrations, since there is no total to put in PART_COVERED_OFF_LEDGER.
+  if (paidWithoutLedgerReceipt && documentTotalUnreadable) {
+    return { verdict: 'REGISTRATION_UNDECIDED', entryIds: postedRows.map((row) => row.id) }
+  }
   if (paidWithoutLedgerReceipt && documentTotal != null) {
     const covered = sumRegisteredAmounts(postedRows)
     if (covered === null || !coversDocumentTotal(covered, documentTotal)) {

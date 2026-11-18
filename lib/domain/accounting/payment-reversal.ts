@@ -233,8 +233,8 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
     for (const order of orders) {
       const total = finiteDecimalOrNull(order.totalForeign)
       // An unreadable total is NOT zero and not "no opinion about coverage": leaving it out of the map
-      // makes `documentTotal` null below, which turns the guard off — the round-6 behaviour — and that
-      // is the only honest thing to do with a number that cannot be read.
+      // makes `documentTotal` null below and flags it unreadable, and the classifier WITHHOLDS beside a
+      // standing off-ledger marker (o3d-89mc): a number that cannot be read is a refusal, never a guard switched off.
       if (total !== null) documentTotals.set(order.id, { total, currency: order.currency })
     }
   }
@@ -329,6 +329,8 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       // o3d-psrx r7 (Codex HIGH 1): and WHAT THAT PAID FLAG IS FOR. Null for a bill and for any order
       // whose total could not be read, which leaves the verdict exactly as round 6 reached it.
       documentTotals.get(doc.id)?.total ?? null,
+      // o3d-89mc: a SALES document whose total could not be read is a refusal to decide coverage, not a guard that stands down.
+      params.referenceType === 'SalesOrder' && !documentTotals.has(doc.id),
     ))
   }
   return out
