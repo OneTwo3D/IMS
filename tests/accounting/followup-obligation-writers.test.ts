@@ -819,7 +819,10 @@ test('[o3d-9kek r10 f1] the OUTBOX Xero writer claims and releases it the same w
 
   const result = await runViaOutbox()
 
-  assert.equal(result.succeeded, 1, 'the outbox loop must have processed the row, not skipped it')
+  // At least the row itself: the drain claims job by job, so the follow-up job this post enqueues is already due and is
+  // claimed later in the SAME run (it was left for the next run when the batch was claimed up front). That is incidental;
+  // what this test pins is that the row was posted through the outbox loop, which the job's status below proves.
+  assert.ok(result.succeeded >= 1, 'the outbox loop must have processed the row, not skipped it')
   assert.equal(subjectOutboxJob()?.status, 'SUCCEEDED', 'and it really went through the outbox, not the direct loop')
   assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany')
   assert.ok(
@@ -909,7 +912,7 @@ test('[o3d-nepa r3] the OUTBOX loop announces it too — that is the loop produc
 
   const result = await runViaOutbox()
 
-  assert.equal(result.succeeded, 1)
+  assert.ok(result.succeeded >= 1) // the row itself; its follow-up job may be claimed later in the same drain
   assert.equal(subjectOutboxJob()?.status, 'SUCCEEDED', 'the outbox loop, not the direct one')
   assert.ok(discardWarning(), 'the same warning, from the loop that handles nearly every row')
   assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0)

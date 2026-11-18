@@ -9,7 +9,8 @@ import test, { mock } from 'node:test'
 
 process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'true'
 
-type ClaimOptions = { limit?: number; claimLimit?: number; excludeIds?: string[] }
+type ClaimOptions = { limit?: number; claimLimit?: number; excludeIds?: string[]; wooAccountingJobIds?: readonly string[] }
+let wooIdReads = 0
 const claimCalls: ClaimOptions[] = []
 const outboxCalls: string[] = []
 
@@ -59,6 +60,7 @@ mock.module('@/lib/connectors/xero/outbox', {
 mock.module('@/lib/domain/integrations/outbox', {
   namedExports: {
     INTEGRATION_OUTBOX_STATUS: { PENDING: 'PENDING', PROCESSING: 'PROCESSING', SUCCEEDED: 'SUCCEEDED', RETRYABLE_FAILED: 'RETRYABLE_FAILED', PERMANENT_FAILED: 'PERMANENT_FAILED' },
+    wooAccountingPostJobIds: async () => { wooIdReads++; return [] },
     claimIntegrationOutboxWork: async (options: ClaimOptions) => {
       claimCalls.push({ limit: options.limit, claimLimit: options.claimLimit, excludeIds: [...(options.excludeIds ?? [])] })
       // The real claim honours claimLimit and excludeIds; a stub that ignored them would hand out the whole batch.
@@ -78,9 +80,12 @@ async function load() {
 test('each job is claimed on its own, when its attempt begins', async () => {
   claimCalls.length = 0
   outboxCalls.length = 0
+  wooIdReads = 0
   const drain = await load()
 
   const result = await drain()
+
+  assert.equal(wooIdReads, 1, 'the unbounded WooCommerce-job-id query runs once per drain, not once per claim (o3d-jvup3)')
 
   assert.equal(result.failed, 3)
   assert.ok(claimCalls.length >= 3)

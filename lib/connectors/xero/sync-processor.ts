@@ -155,6 +155,7 @@ import {
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
+  wooAccountingPostJobIds,
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
@@ -4626,6 +4627,8 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
   // by the next drain as a dead worker's. Each job is now claimed only when its attempt is about to start, and the drain stops
   // claiming once its wall-clock budget is spent; what it did not reach stays queued for the next tick.
   const attempted: string[] = []
+  // ONE READ OF THE WOOCOMMERCE-WRITING JOB IDS FOR THE WHOLE DRAIN (o3d-jvup3), not one unbounded query per claim.
+  const wooAccountingJobIds = await wooAccountingPostJobIds(new Date())
   while (attempted.length < MAX_PER_RUN) {
     if (clock() - startedAt > budgetMs) break
     const claimedJobs = await claimIntegrationOutboxWork({
@@ -4634,6 +4637,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
       limit: MAX_PER_RUN,
       claimLimit: 1,
       excludeIds: attempted,
+      wooAccountingJobIds,
       workerId: XERO_ACCOUNTING_WORKER_ID,
       staleLockMs: CLAIM_STALE_MS,
       maxAttempts: MAX_RETRIES,
