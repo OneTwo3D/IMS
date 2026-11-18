@@ -344,3 +344,15 @@ test('freight PO: the schema has no rate field (a stray one is stripped) and cre
   assert.match(body, /resolvePurchaseOrderFxRateToBase\(db, \{ currency: input\.currency/)
   assert.ok(!/input\.fxRateToBase/.test(body))
 })
+
+test('cost line kind: untagged rows are byte-identical to before; SHIPPING persists; anything else is refused', async () => {
+  const { buildFreightCostLineRows, FreightCostLinesSchema } = await import('@/lib/domain/purchasing/freight-cost-lines')
+  const base = { description: 'Freight', amountForeign: 10, vatable: false, distributionMethod: 'BY_VALUE' }
+  const untagged = buildFreightCostLineRows(FreightCostLinesSchema.parse([base]), 1, 0).rows[0]!
+  assert.equal('kind' in untagged, false)
+  const nullTag = buildFreightCostLineRows(FreightCostLinesSchema.parse([{ ...base, kind: null }]), 1, 0).rows[0]!
+  assert.equal('kind' in nullTag, false)
+  const tagged = buildFreightCostLineRows(FreightCostLinesSchema.parse([{ ...base, kind: 'SHIPPING' }]), 1, 0).rows[0]!
+  assert.equal(tagged.kind, 'SHIPPING')
+  assert.equal(FreightCostLinesSchema.safeParse([{ ...base, kind: 'DUTY' }]).success, false)
+})

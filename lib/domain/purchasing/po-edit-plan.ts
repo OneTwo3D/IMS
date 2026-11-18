@@ -87,6 +87,7 @@ export type PoEditCostLineFact = {
   amountBase: number
   vatable: boolean
   distributionMethod: string
+  kind?: 'SHIPPING' | null
 }
 
 export type PoEditFacts = {
@@ -145,7 +146,7 @@ export async function readPoEditFacts(tx: Prisma.TransactionClient, id: string):
         orderBy: { id: 'asc' },
       },
       freightCostLines: {
-        select: { id: true, description: true, amountForeign: true, amountBase: true, vatable: true, distributionMethod: true },
+        select: { id: true, description: true, amountForeign: true, amountBase: true, vatable: true, distributionMethod: true, kind: true },
         orderBy: { id: 'asc' },
       },
       landedCostLinks: {
@@ -190,6 +191,7 @@ export async function readPoEditFacts(tx: Prisma.TransactionClient, id: string):
     amountBase: Number(c.amountBase),
     vatable: c.vatable,
     distributionMethod: c.distributionMethod,
+    kind: c.kind,
   }))
   const hasCostLines = costLines.some((c) => c.amountBase !== 0)
     || po.landedCostLinks.some((link) => link.freightPO.freightCostLines.some((c) => Number(c.amountBase) !== 0))
@@ -311,11 +313,11 @@ export function unitCostMatchesStored(requestedNet: number, stored: number): boo
 }
 
 export function normaliseCostLinesForCompare(
-  lines: ReadonlyArray<{ description?: string | null; amountForeign: number; vatable: boolean; distributionMethod: string }>,
+  lines: ReadonlyArray<{ description?: string | null; amountForeign: number; vatable: boolean; distributionMethod: string; kind?: string | null }>,
 ): string[] {
   return lines
     .filter((l) => l.amountForeign > 0)
-    .map((l) => `${(l.description || 'Additional cost').trim()}|${(Math.round(l.amountForeign * 100) / 100).toFixed(2)}|${l.vatable ? 1 : 0}|${l.distributionMethod}`)
+    .map((l) => `${(l.description || 'Additional cost').trim()}|${(Math.round(l.amountForeign * 100) / 100).toFixed(2)}|${l.vatable ? 1 : 0}|${l.distributionMethod}${l.kind ? `|${l.kind}` : ''}`)
     .sort()
 }
 
