@@ -1,6 +1,6 @@
 'use server'
 
-import { priceUnpricedReturnRows } from '@/lib/domain/sales/return-restock-cost'
+import { priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -5628,6 +5628,7 @@ export async function restockMintsoftReturnInboxItem(
           select: {
             id: true,
             code: true,
+            name: true,
             active: true,
           },
         }),
@@ -5675,14 +5676,27 @@ export async function restockMintsoftReturnInboxItem(
         if (receipt.expectationIds.length > 0) rows = receipt.rows
       }
 
+      // A row no expectation priced has no unit cost; give it one so the units enter with a cost layer.
+      const pricedRows = await priceUnpricedReturnRows(tx, warehouse.id, rows)
+      const alreadyBooked = await tx.stockMovement.count({
+        where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: item.id, toWarehouseId: warehouse.id },
+      })
       const returnedRows = await applyReturnInboundStockTx(tx, {
         referenceType: 'WmsReturnsInbox',
         referenceId: item.id,
         warehouseId: warehouse.id,
-        // A row no expectation priced has no unit cost; give it one so the units enter with a cost layer.
-        rows: await priceUnpricedReturnRows(tx, warehouse.id, rows),
+        rows: pricedRows,
         note: 'Mintsoft return restock',
       })
+      // The value that pricing added is journalled in this transaction (Dr Inventory / Cr COGS), so the GL ties to the layers.
+      if (alreadyBooked === 0) {
+        await queueReturnRestockValueJournal(tx, {
+          inboxId: item.id,
+          warehouse: { id: warehouse.id, code: warehouse.code, name: warehouse.name },
+          originalRows: rows,
+          pricedRows,
+        })
+      }
 
       await tx.wmsReturnsInbox.update({
         where: { id: item.id },

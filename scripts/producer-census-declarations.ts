@@ -469,6 +469,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'The one INSERT of an integration-outbox row; each registry operation is declared at its own enqueue caller.'),
   d('lib/domain/inventory/stock-adjustment-apply.ts::applyStockAdjustment::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
     'Queues INVENTORY_ADJUSTMENT for a stock adjustment.'),
+  d('lib/domain/sales/return-restock-cost.ts::queueReturnRestockValueJournal::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
+    'Queues INVENTORY_ADJUSTMENT for the inventory value a returns-inbox restock adds (Dr Inventory / Cr COGS).'),
   d('lib/domain/purchasing/landed-cost-journal-outbox.ts::scheduleLandedCostJournalOutbox::enqueueIntegrationOutbox#1', 'internal', 'landed-cost-adjustment-journal', 'queue-producer', 'not-applicable',
     'Internal backstop whose effect is a sync-log row, which meets the Xero seam.'),
   d('lib/domain/purchasing/landed-cost-service.ts::queueLandedCostAdjustmentJournals::queueAccountingSyncTx#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
