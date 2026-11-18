@@ -824,6 +824,7 @@ model Product {
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
   syncMark         ProductSyncMark?
+  customsClears    ProductCustomsClear[]
   shoppingLinks    ShoppingProductLink[]
   wmsProductLinks  WmsProductLink[]
   wmsBundleLinks   WmsBundleLink[]
@@ -3891,6 +3892,20 @@ model ProductSyncMark {
 
   @@index([createdAt])
   @@map("product_sync_marks")
+}
+
+/// A customs field (hsCode / countryOfOrigin / customsDescription) that was EMPTIED on a product (value -> nothing). Written by a database
+/// trigger on `products` so every write path records it, and removed when the field is populated again or once the warehouse copy is
+/// verified empty. This, not an unset field, is the only evidence that the warehouse copy should be cleared.
+model ProductCustomsClear {
+  productId String
+  field     String
+  createdAt DateTime @default(now())
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([productId, field])
+  @@map("product_customs_clears")
 }
 
 model StockSyncJob {

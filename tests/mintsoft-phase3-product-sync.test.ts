@@ -335,36 +335,52 @@ test('isMintsoftProductEligible excludes parent and archived products', () => {
 
 const clearCandidate = { hsCode: null, countryOfOrigin: null, customsDescription: null }
 
-test('resolveMintsoftCustomsClears: empty IMS fields clear when Mintsoft holds or may hold a value', () => {
+const ALL_IMS_MARKED = ['hsCode', 'countryOfOrigin', 'customsDescription']
+
+test('resolveMintsoftCustomsClears: only MARKED (populated -> empty) fields clear, when Mintsoft holds or may hold a value', () => {
   assert.deepEqual(
-    productSync.resolveMintsoftCustomsClears(clearCandidate, undefined),
+    productSync.resolveMintsoftCustomsClears(clearCandidate, undefined, ALL_IMS_MARKED),
     ['customsDescription', 'commodityCode', 'countryOfManufacture'],
   )
   assert.deepEqual(
     productSync.resolveMintsoftCustomsClears(clearCandidate, {
       CustomsDescription: 'Old', CommodityCode: { Code: '85011099' }, CountryOfManufacture: { Code: 'CN' },
-    }),
-    ['customsDescription', 'commodityCode', 'countryOfManufacture'],
+    }, ['countryOfOrigin']),
+    ['countryOfManufacture'],
   )
 })
 
-test('resolveMintsoftCustomsClears: nothing to clear when Mintsoft is already empty, or IMS holds a value', () => {
+test('resolveMintsoftCustomsClears: an UNSET origin (no marker) never clears, even though Mintsoft holds the CN default', () => {
+  const remote = { CustomsDescription: 'Old', CommodityCode: { Code: '85011099' }, CountryOfManufacture: { Code: 'CN' }, CountryOfManufactureId: 44 }
+  assert.deepEqual(productSync.resolveMintsoftCustomsClears(clearCandidate, remote, []), [])
+  assert.deepEqual(productSync.resolveMintsoftCustomsClears(clearCandidate, undefined, []), [])
+})
+
+test('resolveMintsoftCustomsClears: nothing to clear when Mintsoft is already empty, or IMS holds a value again', () => {
   assert.deepEqual(
-    productSync.resolveMintsoftCustomsClears(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: { Code: '' } }),
+    productSync.resolveMintsoftCustomsClears(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: { Code: '' } }, ALL_IMS_MARKED),
     [],
   )
   assert.deepEqual(
     productSync.resolveMintsoftCustomsClears(
       { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'Motor' },
       { CustomsDescription: 'Old', CommodityCode: { Code: '1' }, CountryOfManufacture: { Code: 'CN' } },
+      ALL_IMS_MARKED,
     ),
     [],
   )
-  // An unusable but present IMS value is not empty: it never clears.
   assert.deepEqual(
-    productSync.resolveMintsoftCustomsClears({ hsCode: '123', countryOfOrigin: 'Atlantis', customsDescription: 'x' }, undefined),
+    productSync.resolveMintsoftCustomsClears({ hsCode: '123', countryOfOrigin: 'Atlantis', customsDescription: 'x' }, undefined, ALL_IMS_MARKED),
     [],
   )
+})
+
+test('markers are settled once Mintsoft is known empty, and kept while a value remains or the record is unknown', () => {
+  const settled = productSync.resolveSettledCustomsMarkers
+  assert.deepEqual(settled(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ALL_IMS_MARKED)
+  assert.deepEqual(settled(clearCandidate, { CustomsDescription: 'Old', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ['hsCode', 'countryOfOrigin'])
+  assert.deepEqual(settled(clearCandidate, undefined, ALL_IMS_MARKED), [])
+  assert.equal(productSync.IMS_FIELD_OF_WMS_CLEAR.countryOfManufacture, 'countryOfOrigin')
 })
 
 test('the clear request is a full update body with the one field erased and never carries a cleared barcode', () => {

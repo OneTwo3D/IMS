@@ -1,6 +1,7 @@
 ### Cleared customs data now clears in Mintsoft
 
-- A customs field (HS code, country of origin, customs description) that WooCommerce explicitly empties is now emptied in IMS and logged on the product. A field the store omits, sends invalid, or that a variation inherits from a filled parent still keeps the IMS value.
-- A customs field that is empty in IMS is now cleared in Mintsoft when an existing product is updated, as a separate request so a Mintsoft refusal cannot fail the update (it is retried on the next run). A blank country of origin is still declared as China on create, but no longer on update. Barcodes are never cleared.
-- A clear counts only when a read-back of the Mintsoft product shows the field empty; otherwise it is retried next run. The clear format has not been verified against the live API.
-- No migration.
+- A customs field (HS code, country of origin, customs description) that WooCommerce empties is now emptied in IMS and logged on the product, but only when the store's hs-code-woo plugin has also recorded it as cleared (`_customs_cleared_fields`). An empty value alone, a missing field, an invalid value, or a variation inheriting a filled parent changes nothing.
+- When a customs field that had a value is emptied in IMS (any route: product editor, CSV edit, WooCommerce import), IMS records it and clears that field in Mintsoft on the next update, as a separate request so a Mintsoft refusal cannot fail the update. The record is dropped once a read-back shows the field empty in Mintsoft, or when the field is filled again; otherwise it is retried next run. A field that was merely never filled is never cleared. Barcodes are never cleared.
+- A blank country of origin is still declared as China when a product is created in Mintsoft, but an update no longer re-declares it.
+- The Mintsoft clear format has not been verified against the live API.
+- Migration: adds the `product_customs_clears` table and a trigger on `products` that maintains it.
