@@ -173,6 +173,13 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     notPersonal: ['connector', 'externalReturnId', 'sku', 'reference', 'resolvedBy'],
     retained: {},
   },
+  // Sales-order custom field values (product values are not personal and are not linked to an order). The text and JSON an operator types
+  // into an order's custom fields can be about the person, so both are erased: the erasure DELETES every value row of the order.
+  CustomFieldValue: {
+    erased: ['valueText', 'valueJson'],
+    notPersonal: ['id'],
+    retained: {},
+  },
 }
 
 // Reached from an erased order's return by the inbox row id / the order id, not by a foreign key (named in the schema test).
