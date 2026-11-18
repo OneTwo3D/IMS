@@ -346,7 +346,7 @@ async function attemptWcTrackshipRefire(orderId: string): Promise<AttemptVerdict
       await db.trackshipRefireState.updateMany({ where: { orderId, status: 'ACTIVE' }, data: { lastResult: RESULT.fired, nextAttemptAt: new Date(now.getTime() + wait) } })
       await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'trackship_refired', tag: 'sync', level: 'INFO',
-        description: `TrackShip had no shipment for ${outcome.missing} tracking number${outcome.missing === 1 ? '' : 's'} on this order, so the storefront was asked to register ${outcome.missing === 1 ? 'it' : 'them'} again (look ${state.attempts}). The next look is in ${Math.round(wait / 60_000)} minutes.`,
+        description: `TrackShip had no shipment for ${outcome.missing} tracking number${outcome.missing === 1 ? '' : 's'} on this order, so IMS asked the storefront to re-submit ${outcome.missing === 1 ? 'it' : 'them'} to TrackShip (look ${state.attempts}). The next look is in ${Math.round(wait / 60_000)} minutes.`,
         resolveUser: false,
       }).catch(() => {})
       if (state.attempts === TRACKSHIP_REFIRE_ALERT_ATTEMPTS) await warnStuck(orderId, state.attempts)
@@ -459,8 +459,8 @@ export async function runWcTrackshipRefireJobs(options: WcTrackshipRefireRunOpti
         action: dead ? 'trackship_refire_dead_lettered' : 'trackship_refire_retry',
         tag: 'sync', level: dead ? 'ERROR' : 'WARNING',
         description: dead
-          ? `Asking the storefront to register the tracking of order ${orderId} with TrackShip again gave up after ${WC_TRACKSHIP_REFIRE_MAX_ATTEMPTS} attempts (${error}). Fix the cause, then Replay it from Sync exceptions; the replay asks the storefront what TrackShip holds first.`
-          : `Asking the storefront to register the tracking of order ${orderId} with TrackShip again will be retried (attempt ${job.attempts + 1} of ${WC_TRACKSHIP_REFIRE_MAX_ATTEMPTS}): ${error}`,
+          ? `The TrackShip re-submission for order ${orderId} gave up after ${WC_TRACKSHIP_REFIRE_MAX_ATTEMPTS} attempts (${error}). Fix the cause, then Replay it from Sync exceptions; the replay asks the storefront what TrackShip holds first.`
+          : `The TrackShip re-submission for order ${orderId} will be retried (attempt ${job.attempts + 1} of ${WC_TRACKSHIP_REFIRE_MAX_ATTEMPTS}): ${error}`,
         resolveUser: false,
       }).catch(() => {})
     }
