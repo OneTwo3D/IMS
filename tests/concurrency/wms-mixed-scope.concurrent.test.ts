@@ -175,6 +175,16 @@ test('markWmsScopeDirtyInTx flags the order\'s link; recordMixedScopeOutcome ver
     if (next) await d.record.recordMixedScopeOutcome(d.db, fx.orderId, next, new Date())
     const bumped = await d.db.wmsOrderPushLink.findUnique({ where: { id: fx.linkId }, select: { scopeVersion: true } })
     assert.equal(bumped?.scopeVersion, 2)
+    // Q2 is FROZEN at the first send: the own warehouse shipping later changes neither the shipping carried nor the hash.
+    const link2 = await d.db.wmsOrderPushLink.findUnique({ where: { id: fx.linkId }, select: { scopeShippingCarried: true, scopeHash: true } })
+    assert.equal(link2?.scopeShippingCarried, true)
+    await d.db.shipment.create({ data: { orderId: fx.orderId, warehouseId: fx.ownId, status: 'SHIPPED', shippedAt: new Date() } })
+    const frozen = await d.loader.loadMixedScopeForOrder(d.db, fx.orderId, fx.wmsId)
+    assert.equal(frozen?.mode === 'MIXED' && frozen.shippingMinor, 500)
+    assert.equal(frozen?.mode === 'MIXED' && frozen.hash, link2?.scopeHash)
+    const recorded = await d.loader.loadRecordedScopeForOrder(d.db, fx.orderId)
+    assert.equal(recorded?.mode, 'MIXED')
+    assert.equal(recorded?.mode === 'MIXED' && recorded.lines.length, 2)
   } finally { await clean(d, fx) }
 })
 

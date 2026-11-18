@@ -6,7 +6,7 @@ import {
 } from './create-replay-policy'
 import { wmsCreateIneligibleRefusal, wmsPaidBeforeCreateFloor, WMS_PRE_CUTOVER_NOTICE } from './create-eligibility'
 import { wmsCreateObligationFloor, wmsProducerHold } from '@/lib/connectors/wms/producer-seam'
-import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference, WMS_CANCELLABLE_ORDER_WHERE } from './order-push-sweep'
+import { wmsCreateOutcomeIsAmbiguous, wmsPushOrderReference, WMS_CANCELLABLE_LINK_WHERE } from './order-push-sweep'
 
 /**
  * ONE READER FOR "MAY THIS PUSH BE RE-OPENED?", SHARED BY THE CONTROL AND THE ACTION (o3d-2k5r r5).
@@ -326,7 +326,7 @@ export const WMS_PUSH_NOTICE_WHERE = {
   dispatchUnresolvedAt: null,
   OR: [
     { holdNoticeAt: { not: null }, order: { status: 'ON_HOLD' as const } },
-    { cancelNoticeAt: { not: null }, order: WMS_CANCELLABLE_ORDER_WHERE },
+    { cancelNoticeAt: { not: null }, OR: WMS_CANCELLABLE_LINK_WHERE.OR },
     // A change IMS could not send to a merged warehouse order: stays until an operator acknowledges it.
     { amendNoticeAt: { not: null } },
   ],

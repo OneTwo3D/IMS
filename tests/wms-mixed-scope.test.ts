@@ -128,3 +128,35 @@ test('fee lines are never sent and lines with no stock requirement stay with the
   if (scope.mode !== 'MIXED') return
   assert.deepEqual(scope.lines.map((l) => l.sku), ['SKU-a', 'SKU-s'])
 })
+
+test('Q2 is frozen: a recorded shippingCarried decision survives another warehouse shipping later (same lines, same hash)', () => {
+  const before = computeMixedScope(input({}))
+  const after = computeMixedScope(input({ shippingCarried: true, shipments: [{ id: 's', warehouseId: O, status: 'SHIPPED' }] }))
+  assert.equal(before.mode === 'MIXED' && after.mode === 'MIXED' && before.hash, after.mode === 'MIXED' && after.hash)
+  const notCarried = computeMixedScope(input({ shippingCarried: false }))
+  assert.equal(notCarried.mode === 'MIXED' && notCarried.shippingMinor, 0)
+})
+
+test('part VAT is weighted by the ORDERED quantity: a refunded unit\'s VAT belongs to no part', () => {
+  // line a: ordered 2, VAT 400, 1 refunded, the remaining unit allocated to W; b elsewhere
+  const scope = computeMixedScope(input({
+    lines: [line('a', { refundedQty: 1 }), line('b')],
+    allocations: [{ lineId: 'a', productId: 'p-a', warehouseId: W, qty: '1' }, { lineId: 'b', productId: 'p-b', warehouseId: O, qty: '2' }],
+    money: { discountMinor: 0, shippingMinor: 0, totalVatMinor: 800 },
+    shippingCarried: false,
+  }))
+  assert.equal(scope.mode === 'MIXED' && scope.vatMinor, 200)
+})
+
+test('a zero-quantity allocation row or an empty shipment in another warehouse does not make an order mixed', () => {
+  const all = computeMixedScope(input({
+    allocations: [{ lineId: 'a', productId: 'p-a', warehouseId: W, qty: '2' }, { lineId: 'b', productId: 'p-b', warehouseId: W, qty: '2' }, { lineId: 'a', productId: 'p-a', warehouseId: O, qty: '0.0000' }],
+    shipments: [{ id: 'e', warehouseId: O, status: 'PENDING', lineCount: 0 }],
+  }))
+  assert.deepEqual(all, { mode: 'FULL' })
+})
+
+test('a part never carries negative VAT (a credit-type fee line can make the residual negative)', () => {
+  const scope = computeMixedScope(input({ money: { discountMinor: 0, shippingMinor: 500, totalVatMinor: 100 } }))
+  assert.equal(scope.mode === 'MIXED' && scope.vatMinor, 0)
+})

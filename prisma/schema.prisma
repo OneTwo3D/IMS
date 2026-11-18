@@ -4458,6 +4458,8 @@ model WmsOrderPushLink {
   scopeDiscountMinor    Int?      @map("scope_discount_minor")
   scopeShippingMinor    Int?      @map("scope_shipping_minor")
   scopeVatMinor         Int?      @map("scope_vat_minor")
+  /// Q2, decided ONCE when the part is first sent and frozen: whether the part carries the order's shipping (and the VAT not on a goods line). Null until a part is sent.
+  scopeShippingCarried  Boolean?  @map("scope_shipping_carried")
   /// The warehouse's part of the order has despatched and been applied in IMS: dispatch polling stops and the order is never cancelled in the warehouse.
   despatchSettledAt     DateTime? @map("despatch_settled_at")
   createdAt           DateTime          @default(now())

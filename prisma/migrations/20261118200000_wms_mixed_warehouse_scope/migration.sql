@@ -12,6 +12,7 @@ ALTER TABLE "wms_order_push_links" ADD COLUMN "scope_frozen_reason" TEXT;
 ALTER TABLE "wms_order_push_links" ADD COLUMN "scope_discount_minor" INTEGER;
 ALTER TABLE "wms_order_push_links" ADD COLUMN "scope_shipping_minor" INTEGER;
 ALTER TABLE "wms_order_push_links" ADD COLUMN "scope_vat_minor" INTEGER;
+ALTER TABLE "wms_order_push_links" ADD COLUMN "scope_shipping_carried" BOOLEAN;
 ALTER TABLE "wms_order_push_links" ADD COLUMN "despatch_settled_at" TIMESTAMP(3);
 
 CREATE TABLE "wms_order_push_scope_lines" (

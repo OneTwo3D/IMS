@@ -29,6 +29,7 @@ const EXEMPT: Record<string, string> = {
   'lib/connectors/xero/daily-sync.ts::runDailyBatchSync': 'stamps the accounting batch amount on allocation rows; no quantity or warehouse moves',
   'lib/cost-layers.ts::refreshShipmentCogsForCostLayerChange': 'rewrites the COGS amount of a shipment after a landed-cost revaluation; no quantity, warehouse or status moves',
   'lib/domain/erasure/erase-personal-data.ts::eraseOrdersPersonalDataInTx': 'nulls the tracking number of an erased order\'s shipments; the warehouse order is never amended for an erased order',
+  'lib/domain/sales/allocation-service.ts::runAllocation': 'the one unmarked write here only re-stamps fulfillmentGraphVersion on rows of an UNCHANGED allocation set (the changed-set branch marks the scope dirty)',
   'lib/domain/sales/allocation-service.ts::refileAccountedRecordsForScope': 'rewrites the cost-layer snapshot carried on an allocation row; the quantity and warehouse are untouched',
   'lib/domain/sales/allocation-service.ts::resetAllocationAccountingIfStaged': 'clears the cost-layer snapshot and posted basis on allocation rows; the quantity and warehouse are untouched',
 }
@@ -46,22 +47,25 @@ function functionName(node: ts.Node): string {
   return '<module>'
 }
 
-function containsMark(node: ts.Node): boolean {
-  let found = false
-  const visit = (child: ts.Node): void => {
-    if (found) return
-    if (ts.isCallExpression(child) && ts.isIdentifier(child.expression) && child.expression.text === 'markWmsScopeDirtyInTx') { found = true; return }
-    ts.forEachChild(child, visit)
-  }
-  visit(node)
-  return found
+function isMarkerStatement(statement: ts.Statement): boolean {
+  if (!ts.isExpressionStatement(statement)) return false
+  let expression: ts.Expression = statement.expression
+  if (ts.isAwaitExpression(expression)) expression = expression.expression
+  return ts.isCallExpression(expression) && ts.isIdentifier(expression.expression) && expression.expression.text === 'markWmsScopeDirtyInTx'
 }
 
-/** An enclosing function (any level) that contains a marker call. */
+/**
+ * The marker must be a STATEMENT of a block the write is nested in (the write's own block, or any block above it up to its function): a marker inside a
+ * different branch (`if (a) { mark } else { write }`) does not excuse the write, and neither does a marker in a sibling function.
+ */
 function markedAbove(node: ts.Node): boolean {
   let current: ts.Node | undefined = node.parent
   while (current) {
-    if ((ts.isFunctionDeclaration(current) || ts.isFunctionExpression(current) || ts.isArrowFunction(current) || ts.isMethodDeclaration(current)) && containsMark(current)) return true
+    if (ts.isBlock(current) && current.statements.some(isMarkerStatement)) return true
+    if (ts.isFunctionDeclaration(current) || ts.isFunctionExpression(current) || ts.isArrowFunction(current) || ts.isMethodDeclaration(current)) {
+      // An expression-bodied arrow has no block; stop at the function boundary either way.
+      return false
+    }
     current = current.parent
   }
   return false
@@ -86,6 +90,13 @@ function scan(): Site[] {
       if (ts.isTaggedTemplateExpression(node) && /\$(executeRaw|queryRaw)/.test(node.tag.getText())) {
         const sql = node.template.getText()
         if (RAW_TABLES.test(sql) && RAW_WRITE.test(sql) && !/\bSELECT\b[^;]*\bFOR UPDATE\b/i.test(sql.replace(/\n/g, ' ')) ) {
+          sites.push({ key: `${file}::${functionName(node)}`, file, line: source.getLineAndCharacterOfPosition(node.getStart()).line + 1, marked: markedAbove(node) })
+        }
+      }
+      // The unsafe raw forms take a plain string: scan the call's text.
+      if (ts.isCallExpression(node) && /\$(executeRawUnsafe|queryRawUnsafe)$/.test(node.expression.getText())) {
+        const sql = node.arguments.map((arg) => arg.getText()).join(' ')
+        if (RAW_TABLES.test(sql) && RAW_WRITE.test(sql)) {
           sites.push({ key: `${file}::${functionName(node)}`, file, line: source.getLineAndCharacterOfPosition(node.getStart()).line + 1, marked: markedAbove(node) })
         }
       }

@@ -31,7 +31,7 @@ function deps(overrides: Partial<WmsDispatchSweepDeps>): WmsDispatchSweepDeps {
   }
 }
 
-test('a scope mismatch is pending, not an error: nothing is counted against the link, a HIGH refusal is recorded and the watermark is held', async () => {
+test('a scope mismatch is pending, not an error: nothing is counted against the link, a HIGH refusal is recorded', async () => {
   const errors: string[] = []
   const refusals: Array<{ gate: string; severity: string; permanence: string; action: string }> = []
   const { counters, logs } = await runWmsDispatchSweepCore(deps({
@@ -57,13 +57,22 @@ test('any other apply failure is still an error (control)', async () => {
   assert.equal(counters.errors, 1)
 })
 
+test('the reconcile and probe selectors honour a settled link (source-level pin)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const text = readFileSync(new URL('../lib/domain/wms/dispatch-sweep.ts', import.meta.url), 'utf8')
+  for (const name of ['async listReconcileCandidates', 'async probeControlLinks']) {
+    const body = text.slice(text.indexOf(name), text.indexOf(name) + 1200)
+    assert.match(body, /despatchSettledAt: null/, name)
+  }
+})
+
 test('polling stops once the warehouse part is settled: the candidate query excludes a settled link', () => {
   assert.equal(dispatchCandidateWhere('mintsoft').despatchSettledAt, null)
 })
 
-test('the outcome holds the delta watermark (the despatch must stay in the next window until it is applied)', async () => {
+test('the outcome does NOT hold the connector-wide delta watermark (one stuck order must never block the others)', async () => {
   const outcome = await reconcileOneOrder(deps({ applyDispatch: async () => ({ success: false, error: 'the units differ', refusal: 'wms_scope_mismatch' }) }), { linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' })
   assert.equal(outcome.action, 'pending')
-  assert.equal(outcome.holdWatermark, true)
+  assert.equal(outcome.holdWatermark, undefined)
   assert.equal(outcome.unresolved, undefined, 'not unresolved: no drift cohort, no quarantine')
 })

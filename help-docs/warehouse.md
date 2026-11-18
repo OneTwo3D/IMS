@@ -157,19 +157,20 @@ Warnings are added to the task and the badge: an **EU destination** needs the cu
 
 ### Orders split across warehouses (off by default)
 
-**Off by default** (setting `wms_mixed_warehouse_push_enabled`; only `true` turns it on). While it is off, nothing described here happens: IMS pushes the whole order to Mintsoft, and a Mintsoft despatch for an order that also holds another warehouse's shipments is refused (the order shows under Exceptions) until the order is reallocated to the Mintsoft warehouse or the other warehouse's shipment is shipped by hand.
+**Off by default** (setting `wms_mixed_warehouse_push_enabled`; only `true` turns it on). While it is off, nothing described here happens for new orders: IMS pushes the whole order to Mintsoft, and a Mintsoft despatch for an order that also holds another warehouse's shipments is refused (the order shows under Exceptions) until the order is reallocated to the Mintsoft warehouse or the other warehouse's shipment is shipped by hand.
 
 When it is on, an order IMS has allocated to more than one warehouse is handled one part at a time:
 
 - **Mintsoft is sent only its own part.** Only the units allocated to the Mintsoft warehouse go to Mintsoft. A kit goes whole or not at all: a kit whose parts are allocated to different warehouses is refused (**Order change not applied in the warehouse**, HIGH) and you reallocate it to one warehouse. An order with nothing allocated to the Mintsoft warehouse is not sent, and says why.
-- **Held until every unit is allocated.** While any unit of the order is still unallocated (or on backorder), nothing is sent or changed in Mintsoft.
-- **Money is split in pence.** The discount is shared by the value each part sends. **Shipping and its VAT go with whichever part ships first**: Mintsoft's part carries all of it unless a shipment in another warehouse has already shipped, in which case Mintsoft's part carries none. The parts always add up to the order exactly.
+- **Held until every unit is allocated.** While any unit of the order is still unallocated (or on backorder), the first push waits, and the lines on an order already sent are not changed in Mintsoft. This gates the lines only: a change of address, service or notes still reaches Mintsoft on the lines it already holds. A hold on an order already sent shows under Exceptions.
+- **Nothing left for Mintsoft.** If every unit is moved to another warehouse, the Mintsoft order is cancelled while it is still New (a later one cannot be cancelled by IMS: you get a warehouse query task).
+- **Money is split in pence.** The discount is shared by the value each part sends. **Shipping and its VAT go with whichever part ships first**: this is decided once, when Mintsoft's part is first sent: it carries all of it unless a shipment in another warehouse had already shipped, in which case it carries none. A later shipment by the other warehouse does not change it. The parts always add up to the order exactly.
 - **Allocation changes reach Mintsoft.** Changing an allocation or a shipment re-works the part. While the Mintsoft order is still **New**, it is amended. Once it is past New it is not changed: the change shows under Exceptions as **Order change not applied in the warehouse** (HIGH) and you apply it in Mintsoft by hand.
-- **A Mintsoft despatch ships only Mintsoft's shipments.** The other warehouse's shipments stay open, the order is not marked Shipped and WooCommerce is not told it is complete until every shipment has shipped. The despatch is applied once. If the units IMS holds for Mintsoft no longer match what was sent, nothing is shipped and **Despatch does not match the part sent to the warehouse** (HIGH) is raised; fix the allocation or shipments and it is applied on the next pass.
+- **A Mintsoft despatch ships only Mintsoft's shipments.** The other warehouse's shipments stay open, the order is not marked Shipped and WooCommerce is not told it is complete until every shipment has shipped. The despatch is applied once. If the units IMS holds for Mintsoft no longer match what was sent, nothing is shipped and **Despatch does not match the part sent to the warehouse** (HIGH) is raised; to clear it, ship the warehouse's shipment(s) for the order in IMS by hand (the despatch then records itself), or reallocate so the order matches what was sent. It never holds up other orders.
 - **A WooCommerce "completed" for such an order is ignored while Mintsoft's part is open.** Nothing is shipped, and the order shows under Exceptions as a refused completion until the order is fulfilled.
 - **Once Mintsoft's part has despatched**, IMS stops polling the order and never cancels it in Mintsoft (for example when the order is fully refunded afterwards).
 
-A single-warehouse order is sent exactly as before, whether the setting is on or off.
+A single-warehouse order is sent and amended exactly as before, whether the setting is on or off. **Turning the setting off** does not undo orders already sent as a part: they keep being amended and despatched as a part (the whole order is never sent to them).
 
 ### Holds, cancels and merged orders
 

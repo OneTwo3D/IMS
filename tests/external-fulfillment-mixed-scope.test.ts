@@ -37,7 +37,7 @@ const dbMock = {
       state.applications.push({ ...data })
     },
   },
-  salesOrder: { findUnique: async () => ({ ...state.order }), findFirst: async () => ({ ...state.order }) },
+  salesOrder: { findUnique: async () => ({ ...state.order, shipFromWarehouseId: 'wh-wms' }), findFirst: async () => ({ ...state.order }) },
   salesOrderLine: { findMany: async () => [] },
   shipmentLine: { findMany: async () => [] },
   salesOrderRefundLine: { findMany: async () => [] },
@@ -62,7 +62,7 @@ const OWN_SHIPMENT = { id: 'shp-own', status: 'PENDING', warehouseId: 'wh-own', 
 function reset() {
   state.flag = true
   state.order = { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', status: 'ALLOCATED' }
-  state.link = { id: 'link-1', scopeMode: 'MIXED', scopeVersion: 2, pushWarehouseId: 'wh-wms', despatchSettledAt: null, state: 'SYNCED' }
+  state.link = { id: 'link-1', scopeMode: 'MIXED', scopeVersion: 2, pushWarehouseId: 'wh-wms', despatchSettledAt: null, scopeFrozenAt: null, state: 'SYNCED' }
   state.scopeLines = [{ orderLineId: 'l1', quantity: '1.0000' }]
   state.currentScope = { mode: 'MIXED', lines: [{ lineId: 'l1', quantity: 1 }] }
   state.shipments = [{ ...WMS_SHIPMENT }, { ...OWN_SHIPMENT }]
@@ -94,12 +94,12 @@ test('a replayed scoped despatch is a no-op (idempotency key and settled link)',
   await apply('mintsoft')
   state.transitions = []
   const again = await apply('mintsoft')
-  assert.deepEqual(again, { success: true })
+  assert.deepEqual(again, { success: true, noop: true })
   assert.deepEqual(state.transitions, [])
   assert.equal(state.applications.length, 1)
   // even with the settled stamp lost, the application row alone stops a second apply
   state.link = { ...(state.link as Row), despatchSettledAt: null }
-  assert.deepEqual(await apply('mintsoft'), { success: true })
+  assert.deepEqual(await apply('mintsoft'), { success: true, noop: true })
   assert.deepEqual(state.transitions, [])
 })
 
@@ -179,9 +179,10 @@ test('once the warehouse part is settled, a storefront completion proceeds as be
   assert.equal(state.transitions.at(-1)?.[1], 'SHIPPED')
 })
 
-test('FLAG OFF: behaviour is development\'s - a mixed order\'s despatch is refused as foreign shipments, and a storefront echo is not ignored', async () => {
+test('FLAG OFF, link NOT pushed as a part: behaviour is development\'s - refused as foreign shipments; a storefront echo is not ignored', async () => {
   reset()
   state.flag = false
+  state.link = { ...(state.link as Row), scopeMode: null }
   const refused = await apply('mintsoft')
   assert.equal((refused as { refusal?: string }).refusal, 'wms_other_warehouse_shipments')
   assert.deepEqual(state.transitions, [])
@@ -190,9 +191,70 @@ test('FLAG OFF: behaviour is development\'s - a mixed order\'s despatch is refus
   assert.deepEqual(echo, { success: true })
 })
 
+test('FLAG OFF, link pushed as a part: the despatch is still scoped (the link\'s data decides, so a rollback cannot ship the whole order)', async () => {
+  reset()
+  state.flag = false
+  assert.deepEqual(await apply('mintsoft'), { success: true })
+  assert.deepEqual(state.transitions.filter(([, target]) => target === 'SHIPPED').map(([id]) => id), ['shp-wms'])
+})
+
+test('a settled part is a no-op even with the flag off and however the link is recorded (no second apply, no repeated event)', async () => {
+  reset()
+  state.flag = false
+  state.link = { ...(state.link as Row), scopeMode: null, despatchSettledAt: new Date() }
+  const result = await apply('mintsoft')
+  assert.deepEqual(result, { success: true, noop: true })
+  assert.deepEqual(state.transitions, [])
+})
+
+test('the way out of a mismatch: every warehouse shipment already shipped by hand records the despatch and settles the link', async () => {
+  reset()
+  state.currentScope = { mode: 'HOLD' }
+  state.shipments = [{ ...WMS_SHIPMENT, status: 'SHIPPED' }, { ...OWN_SHIPMENT }]
+  assert.deepEqual(await apply('mintsoft'), { success: true })
+  assert.equal(state.applications.length, 1)
+  assert.deepEqual(state.transitions, [])
+  assert.ok(state.link?.despatchSettledAt instanceof Date)
+})
+
+test('the mismatch text names the real fix', async () => {
+  reset()
+  state.currentScope = { mode: 'MIXED', lines: [{ lineId: 'l1', quantity: 2 }] }
+  const result = await apply('mintsoft')
+  assert.match((result as { error?: string }).error ?? '', /ship the warehouse's shipment\(s\) for the order in IMS by hand/)
+})
+
+test('a FROZEN link recorded FULL is guarded against double shipping while a warehouse shipment is open', async () => {
+  reset()
+  state.link = { ...(state.link as Row), scopeMode: 'FULL', scopeFrozenAt: new Date() }
+  const result = await apply('mintsoft')
+  assert.equal((result as { refusal?: string }).refusal, 'wms_scope_mismatch')
+  assert.deepEqual(state.transitions, [])
+})
+
+test('a link recorded FULL whose order is now split (flag on) is refused while a warehouse shipment is open', async () => {
+  reset()
+  state.link = { ...(state.link as Row), scopeMode: 'FULL' }
+  state.currentScope = { mode: 'MIXED', lines: [{ lineId: 'l1', quantity: 1 }] }
+  const result = await apply('mintsoft')
+  assert.equal((result as { refusal?: string }).refusal, 'wms_scope_mismatch')
+  state.currentScope = { mode: 'FULL' }
+  state.shipments = [{ ...WMS_SHIPMENT }]
+  assert.deepEqual(await apply('mintsoft'), { success: true }, 'a still-FULL order ships normally')
+})
+
+test('an order held in IMS (not ready) with a MIXED link does not bypass the scoped path', async () => {
+  reset()
+  state.order.status = 'ON_HOLD'
+  const result = await apply('mintsoft')
+  assert.equal((result as { refusal?: string }).refusal, 'order_not_ready_to_ship')
+  assert.deepEqual(state.transitions, [])
+})
+
 test('a link that is not MIXED (FULL or unscoped) is the ordinary path even with the flag on', async () => {
   reset()
   state.link = { ...(state.link as Row), scopeMode: 'FULL' }
+  state.currentScope = { mode: 'FULL' }
   state.shipments = [{ ...WMS_SHIPMENT }]
   assert.deepEqual(await apply('mintsoft'), { success: true })
   assert.equal(state.applications.length, 0)

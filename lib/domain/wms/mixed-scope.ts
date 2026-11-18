@@ -38,7 +38,7 @@ export type ScopeLineInput = {
 }
 
 export type ScopeAllocationInput = { lineId: string; productId: string; warehouseId: string; qty: string | number }
-export type ScopeShipmentInput = { id: string; warehouseId: string; status: string }
+export type ScopeShipmentInput = { id: string; warehouseId: string; status: string; /** Lines the shipment holds; an empty shipment moves no goods and does not make the order mixed. Absent reads as non-empty. */ lineCount?: number }
 
 export type ScopeOrderMoney = {
   /** Order-level amounts in minor units. */
@@ -162,6 +162,11 @@ export type ComputeMixedScopeInput = {
   allocations: ScopeAllocationInput[]
   shipments: ScopeShipmentInput[]
   money: ScopeOrderMoney
+  /**
+   * Q2 FROZEN: whether the part carries the shipping, as decided when the part was FIRST sent (null/absent: decide now from the shipments). A later ship by
+   * another warehouse never changes it, so a part with unchanged lines keeps its hash and is never amended or frozen for money alone.
+   */
+  shippingCarried?: boolean | null
   /** 10^minorUnits of the order currency, to turn the minor figures back into major units exactly as the full push does. */
   minorFactor: number
 }
@@ -173,8 +178,9 @@ function roundHalfUp(value: number): number {
 export function computeMixedScope(input: ComputeMixedScopeInput): MixedScope {
   const { wmsWarehouseId } = input
   const otherWarehouses = new Set<string>()
-  for (const alloc of input.allocations) if (alloc.warehouseId !== wmsWarehouseId) otherWarehouses.add(alloc.warehouseId)
-  for (const shipment of input.shipments) if (shipment.warehouseId !== wmsWarehouseId) otherWarehouses.add(shipment.warehouseId)
+  // A zero-quantity allocation row or an empty shipment moves no goods: it does not make a single-warehouse order mixed.
+  for (const alloc of input.allocations) if (alloc.warehouseId !== wmsWarehouseId && toNumber(alloc.qty) > EPS) otherWarehouses.add(alloc.warehouseId)
+  for (const shipment of input.shipments) if (shipment.warehouseId !== wmsWarehouseId && (shipment.lineCount === undefined || shipment.lineCount > 0)) otherWarehouses.add(shipment.warehouseId)
   // A single-warehouse order is not this module's business.
   if (otherWarehouses.size === 0) return { mode: 'FULL' }
 
@@ -231,9 +237,11 @@ export function computeMixedScope(input: ComputeMixedScopeInput): MixedScope {
     goodsVatAll += line.vatMinor
     // Net per part, fractional minor units (only used as apportionment weight for the discount).
     units.forEach((qty, index) => { partNet[index] += (line.netMinor * qty) / ordered })
-    // The line's VAT split across parts by units, exactly, in whole minor units.
-    const vatShares = apportionMinor(line.vatMinor, units)
-    vatShares.forEach((share, index) => { partVat[index] += share })
+    // The line's VAT split across parts by units OF THE ORDERED QUANTITY, exactly, in whole minor units: the last bucket is the units in no part (refunded),
+    // whose VAT belongs to no part.
+    const unitsInParts = units.reduce((a, b) => a + b, 0)
+    const vatShares = apportionMinor(line.vatMinor, [...units, Math.max(0, ordered - unitsInParts)])
+    vatShares.slice(0, units.length).forEach((share, index) => { partVat[index] += share })
     if (units[0] > 0) wmsLines.push({ line, qty: units[0] })
   }
 
@@ -258,11 +266,12 @@ export function computeMixedScope(input: ComputeMixedScopeInput): MixedScope {
   const discountShares = apportionMinor(input.money.discountMinor, partNet)
   // Q2: shipping, and the VAT that is not on a goods line, go with whichever part ships first.
   const otherShipped = input.shipments.some((shipment) => shipment.warehouseId !== wmsWarehouseId && shipment.status === 'SHIPPED')
-  const shippingCarried = !otherShipped
+  const shippingCarried = input.shippingCarried ?? !otherShipped
   const residualVat = input.money.totalVatMinor - goodsVatAll
-  const vatMinor = partVat[0] + (shippingCarried ? residualVat : 0)
+  // A part never carries negative VAT (a credit-type fee line can make the residual negative) and never a discount above the net it sends.
+  const vatMinor = Math.max(0, partVat[0] + (shippingCarried ? residualVat : 0))
   const shippingMinor = shippingCarried ? input.money.shippingMinor : 0
-  const discountMinor = discountShares[0]
+  const discountMinor = Math.min(discountShares[0], Math.max(0, Math.round(partNet[0])))
 
   const canonical = JSON.stringify({
     lines: sentLines.map((line) => [line.lineId, line.sku, line.quantity]),

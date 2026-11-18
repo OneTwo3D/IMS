@@ -1225,15 +1225,16 @@ async function reconcileSplitOrder(
 /**
  * The outcome of a despatch IMS could not apply. A SCOPE MISMATCH (mixed-warehouse order: the part sent no longer matches IMS's allocation or shipments) is not a
  * connector or apply failure: it is a condition a person fixes in IMS, so it is NOT an error (not counted, never dead-lettered, never read by the systemic
- * breaker). The link stays a fully polled candidate, the watermark is held so the despatch is re-applied once the order is put right, and a standing HIGH row
- * names it on Sync > Exceptions. Every other failure is an error, as before.
+ * breaker). The link stays a fully polled candidate, and a standing HIGH row
+ * names it on Sync > Exceptions. Every other failure is an error, as before. The delta watermark is NOT held for it (see below): it must never block other orders.
  */
 function applyFailureOutcome(result: { error?: string; refusal?: string }, fallback: string): WmsDispatchOutcome {
   if (result.refusal === 'wms_scope_mismatch') {
     return {
       action: 'pending',
       reason: result.error ?? 'The despatch does not match the part sent to the warehouse',
-      holdWatermark: true,
+      // NOT holdWatermark: a mismatch can last for ever (a person fixes it in IMS) and pinning the connector-wide delta watermark for one order would degrade the
+      // sweep for the whole estate. The link stays a fully polled candidate (the reconcile pass re-reads it every tick) and its standing HIGH row is the trace.
       refusal: {
         action: 'WMS_DESPATCH_SCOPE',
         gate: 'WMS_SCOPE_MISMATCH',
@@ -3035,6 +3036,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           // dead-lettered one is — its record cannot be read, so re-polling it every
           // tick only pins the watermark. It comes back when an operator acts.
           dispatchUnresolvedAt: null,
+          // The warehouse's part is settled (mixed-warehouse scope): nothing left to observe, so it is not re-read from the warehouse.
+          despatchSettledAt: null,
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
         select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -3105,7 +3108,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         tracking,
         ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true, ...(options.fence ? { shipFence: options.fence } : {}) } : {}),
       })
-      if (result.success) {
+      if (result.success && !('noop' in result && result.noop)) {
         await recordWmsMutationEvent({
           connector: connectorId, direction: 'INBOUND', action: 'dispatch_applied', outcome: 'SUCCEEDED',
           entityType: 'SALES_ORDER', entityId: orderId,
@@ -3422,6 +3425,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           externalOrderNumber: { not: null },
           dispatchDeadLetteredAt: null,
           dispatchUnresolvedAt: null,
+          despatchSettledAt: null,
           id: { notIn: excludeLinkIds },
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },

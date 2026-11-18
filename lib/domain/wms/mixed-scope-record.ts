@@ -14,7 +14,7 @@ import type { MixedScope } from '@/lib/domain/wms/mixed-scope'
  */
 export async function recordMixedScopeOutcome(client: typeof db, orderId: string, scope: MixedScope, readAt: Date): Promise<void> {
   await client.$transaction(async (tx) => {
-    const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true, scopeMode: true, scopeVersion: true, scopeHash: true, scopeFrozenAt: true, scopeFrozenReason: true } })
+    const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true, scopeMode: true, scopeVersion: true, scopeHash: true, scopeFrozenAt: true, scopeFrozenReason: true, scopeShippingCarried: true } })
     if (!link) return
     if (scope.mode === 'HOLD') {
       await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { scopeCheckedAt: readAt } })
@@ -43,6 +43,8 @@ export async function recordMixedScopeOutcome(client: typeof db, orderId: string
           scopeDiscountMinor: scope.mode === 'MIXED' ? scope.discountMinor : null,
           scopeShippingMinor: scope.mode === 'MIXED' ? scope.shippingMinor : null,
           scopeVatMinor: scope.mode === 'MIXED' ? scope.vatMinor : null,
+          // Q2 frozen at the first send: never re-decided by a later scope.
+          ...(scope.mode === 'MIXED' && link.scopeShippingCarried === null ? { scopeShippingCarried: scope.shippingCarried } : {}),
         },
       })
       if (scope.mode === 'MIXED' && changed) {
@@ -52,6 +54,19 @@ export async function recordMixedScopeOutcome(client: typeof db, orderId: string
         })
       }
     }
+    await tx.wmsOrderPushLink.updateMany({ where: { id: link.id, scopeDirtyAt: { lte: readAt } }, data: { scopeDirtyAt: null } })
+  })
+}
+
+/**
+ * A scope change the warehouse could not take because its order is past NEW (Q5): the link is frozen and escalated. The dirty mark is cleared only if it was
+ * set at or before `readAt`, so a reallocation made while the amendment was in flight is still seen.
+ */
+export async function freezeScopeNotNew(client: typeof db, orderId: string, readAt: Date, at: Date): Promise<void> {
+  await client.$transaction(async (tx) => {
+    const link = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
+    if (!link) return
+    await tx.wmsOrderPushLink.update({ where: { id: link.id }, data: { scopeFrozenAt: at, scopeFrozenReason: 'NOT_NEW', scopeCheckedAt: at } })
     await tx.wmsOrderPushLink.updateMany({ where: { id: link.id, scopeDirtyAt: { lte: readAt } }, data: { scopeDirtyAt: null } })
   })
 }
