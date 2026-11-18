@@ -40,7 +40,7 @@ export async function netUnpricedReturnRowsAgainstRefunds(
 ): Promise<{ rows: RefundReturnRow[]; coveredQty: number }> {
   const out: RefundReturnRow[] = []
   let coveredQty = 0
-  const refunds = await tx.salesOrderRefund.findMany({ where: { orderId: params.orderId }, select: { id: true } })
+  const refunds = await tx.salesOrderRefund.findMany({ where: { orderId: params.orderId, deletedAt: null }, select: { id: true } })
   const refundIds = refunds.map((r) => r.id)
   for (const row of params.rows) {
     if (row.unitCostBase != null || !(row.qty > 0)) {

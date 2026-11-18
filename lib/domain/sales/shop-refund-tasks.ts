@@ -178,7 +178,7 @@ export async function confirmShopRefundSettlement(
   }
   const taken = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: input.wcRefundId }, select: { id: true } })
   if (taken) return { ok: false, error: `WooCommerce refund ${input.wcRefundId} is already recorded in IMS. Nothing was changed.` }
-  const linked = await tx.salesOrderRefund.updateMany({ where: { id: input.imsRefundId, orderId: input.orderId, externalRefundId: null }, data: { externalRefundId: input.wcRefundId } })
+  const linked = await tx.salesOrderRefund.updateMany({ where: { id: input.imsRefundId, orderId: input.orderId, deletedAt: null, externalRefundId: null }, data: { externalRefundId: input.wcRefundId } })
   if (linked.count === 0) return { ok: false, error: 'That IMS refund changed while it was being linked. Nothing was changed.' }
   const done = await tx.wmsOperatorTask.updateMany({ where: { id: open.taskId, status: 'OPEN' }, data: { status: 'DONE', doneAt: input.now ?? new Date(), doneBy: input.userId } })
   if (done.count === 0) throw new Error('The refund task was resolved by someone else while the WooCommerce refund was being linked; nothing was changed.')

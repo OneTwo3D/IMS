@@ -397,7 +397,8 @@ export function describeAttemptUndecidedRefusal(
   const unprovenCancellation = undecided.some((row) => row.status === 'CANCELLED' && (row.settlementBasis ?? null) === null)
   const unprovenNote = unprovenCancellation
     ? '\n\nOne of these entries was retired (cancelled) without any record that it was retired before an attempt was made, so IMS '
-      + 'cannot say it never reached the accounting system. A payment may still be there, so it does not free this receipt for deletion.'
+      + 'cannot say it never reached the accounting system. A payment may still be there, so it does not free this receipt for deletion. '
+      + 'If you have checked the invoice and no payment was ever there, an administrator can record that it never existed.'
     : ''
   const canRetry = undecided.some((row) => row.status === 'FAILED' || row.status === 'PENDING')
   const anyFailed = undecided.some((row) => (UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes(row.status))

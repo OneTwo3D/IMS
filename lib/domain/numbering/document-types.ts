@@ -79,6 +79,7 @@ export const DOCUMENT_TYPE_SPECS: Readonly<Record<NumberedDocumentType, Document
     prefixKey: 'cn_prefix',
     defaultSegments: (prefix) => [...lit(prefix), { kind: 'year4' }, { kind: 'lit', text: '-' }, { kind: 'seq', pad: 5 }],
     uniqueness: 'application',
+    // soft-delete exception: numbering counts deleted refunds so a credit note number is never reused.
     exists: async (tx, value) => (await tx.salesOrderRefund.findFirst({ where: { creditNoteNumber: value }, select: { id: true } })) !== null,
     listStartingWith: async (tx, prefix) => (await tx.salesOrderRefund.findMany({ where: { creditNoteNumber: { startsWith: prefix } }, select: { creditNoteNumber: true } }))
       .map((r) => r.creditNoteNumber ?? ''),

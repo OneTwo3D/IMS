@@ -6286,6 +6286,7 @@ export async function retrySalesOrderRefundAccounting(
         where: { id: input.refundId },
         select: {
           id: true,
+          deletedAt: true,
           orderId: true,
           returnWarehouseId: true,
           // Decided once at creation: the retry stages the same treatment even if the switch has moved.
@@ -6355,7 +6356,8 @@ export async function retrySalesOrderRefundAccounting(
           },
         },
       })
-      if (!refund) return { success: false, error: 'Refund not found' }
+      // SOFT DELETE: a deleted refund is closed; a retry would re-stage its credit note and journals.
+      if (!refund || refund.deletedAt) return { success: false, error: 'Refund not found' }
       if (!refund.accountingRetryRequired) {
         return { success: false, error: 'No failed refund accounting action is pending for this refund' }
       }

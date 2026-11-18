@@ -109,6 +109,7 @@ export async function loadCurrentInvoicePdf(orderId: string, options: { includeW
  * `refundId` MUST belong to `orderId`: a refund of another order is never read through this one.
  */
 export async function loadCurrentCreditNotePdf(orderId: string, refundId: string): Promise<Buffer | null> {
+  // soft-delete exception: the credit-note PDF of a deleted refund stays retrievable for audit.
   const refund = await db.salesOrderRefund.findFirst({ where: { id: refundId, orderId }, select: { creditNoteNumber: true } })
   if (!refund) return null
   const current = await db.salesOrderInvoiceDocument.findFirst({

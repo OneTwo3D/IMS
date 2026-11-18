@@ -294,6 +294,7 @@ export async function scrubActivityLogIdentity(
  * The posting gate (resolveSalesPostContact) covers any post that happens after the erasure whatever the payload says.
  */
 export async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClient, orderIds: string[]): Promise<number> {
+  // soft-delete exception: erasure covers every refund row, deleted or not (personal data is kept on the row).
   const refunds = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
   const refIds = [...orderIds, ...refunds.map((r) => r.id)]
   const scope = { referenceType: { in: ['SalesOrder', 'SalesOrderRefund'] }, referenceId: { in: refIds } }
@@ -505,6 +506,7 @@ async function eraseUnderLocksInTx(
   input.outcome.warehouse = warehouse
   // The operator notice commits WITH the record or the erasure rolls back (see warehouse-obligations.ts).
   await recordOpenWarehouseOrdersNoticeInTx(tx, warehouse, input.requestId)
+  // soft-delete exception: erasure covers every refund row, deleted or not.
   const refundRows = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
   // The linked customer's ledger contact id: read for an ORDER erasure too (the customer stays live and `before` is null), under the locks already held, so a contact
   // the ledger holds for the person is never recorded as "nothing held".

@@ -480,3 +480,49 @@ test('analytics: the Returns report and the figure reads exclude the deleted ref
     await rig.appDb.$disconnect()
   }
 })
+
+test('soft delete: a deleted refund cannot be deleted, retried or paid again, and its units and money count nowhere', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  try {
+    await enable(rig)
+    const refundId = await recordRefund(rig, w, 2)
+    assert.equal((await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId } })).refundStatus, 'FULL')
+    await seedPostedCreditNote(rig, refundId, { status: 'PENDING', id: null })
+    const first = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'entered in error' })
+    assert.equal(first.success, true, first.success ? '' : first.error)
+    assert.ok((await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refundId } })).deletedAt)
+
+    // NOT MUTATED AGAIN: a second delete is the idempotent no-op (no second stock reversal, no second activity row)...
+    const stockBefore = Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity)
+    const activityBefore = await rig.db.activityLog.count({ where: { entityId: w.orderId, action: 'refund_deleted' } })
+    const second = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'again' })
+    assert.ok(second.success && second.alreadyDeleted)
+    assert.equal(Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity), stockBefore)
+    assert.equal(await rig.db.activityLog.count({ where: { entityId: w.orderId, action: 'refund_deleted' } }), activityBefore)
+    // ...an accounting retry refuses it...
+    const { retrySalesOrderRefundAccounting } = await import('@/lib/domain/sales/refund-service')
+    const retry = await retrySalesOrderRefundAccounting(rig.db as never, { refundId, accountingSettings: {} as never })
+    assert.equal(retry.success, false)
+    // ...and a refund payment cannot be recorded against it.
+    const { addPayment } = await import('@/app/actions/sales')
+    const paid = await addPayment({ orderId: w.orderId, refundId, amount: 100, currency: 'GBP', method: 'BANK', paidAt: new Date().toISOString() } as never).catch((e: unknown) => ({ success: false, error: String(e) }))
+    assert.equal((paid as { success?: boolean }).success, false)
+    assert.equal(await rig.db.payment.count({ where: { refundId } }), 0)
+
+    // NOT COUNTED: the order reads as unrefunded, the whole quantity is refundable again, and the refund report omits it.
+    assert.equal((await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId } })).refundStatus, 'NONE')
+    const { getRefundStats } = await import('@/app/actions/sales-stats')
+    assert.equal((await getRefundStats()).filter((row) => row.orderId === w.orderId).length, 0)
+    const again = await rig.createSalesOrderRefund(rig.db, {
+      orderId: w.orderId,
+      lines: [{ lineId: w.lineId, productId: w.productId, description: 'rd', qty: 2, totalBase: 200 }],
+      reason: 'real return', returnWarehouseId: w.returnsId, creditNotePrefix: w.prefix,
+    })
+    assert.equal(again.success, true, again.success ? '' : again.error)
+  } finally {
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
