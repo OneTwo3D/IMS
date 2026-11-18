@@ -8,6 +8,8 @@ import { parseCsv } from '@/lib/csv'
 import { ProductType, type Prisma, type ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { applyCustomFieldValues, loadActiveDefinitions } from '@/lib/custom-fields/values-service'
+import { CUSTOM_FIELD_CSV_PREFIX, parseCustomFieldValue } from '@/lib/custom-fields/values'
 import {
   SYSTEM_IMPORT,
   withSystemActor,
@@ -306,6 +308,22 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
   const suppliers = await db.supplier.findMany({ select: { id: true, name: true } })
   const supplierIds = new Set(suppliers.map((supplier) => supplier.id))
   const supplierIdByName = new Map(suppliers.map((supplier) => [supplier.name.trim().toLocaleLowerCase('en-US'), supplier.id]))
+
+  // Custom field columns (`cf:<key>`): matched to the ACTIVE product fields by key, case-insensitively. A column for a key that is not an
+  // active product field is reported once and ignored. A blank cell means "leave this value unchanged", like every other column; it never clears.
+  const customFieldDefinitions = await loadActiveDefinitions(db, 'PRODUCT')
+  const customFieldByHeader = new Map<string, (typeof customFieldDefinitions)[number]>()
+  const unknownCustomFieldHeaders = new Set<string>()
+  for (const header of new Set(rows.flatMap((row) => Object.keys(row)))) {
+    if (!header.toLowerCase().startsWith(CUSTOM_FIELD_CSV_PREFIX)) continue
+    const definition = customFieldDefinitions.find((d) => d.key === header.slice(CUSTOM_FIELD_CSV_PREFIX.length).trim().toLowerCase())
+    if (definition) customFieldByHeader.set(header, definition)
+    else unknownCustomFieldHeaders.add(header)
+  }
+  for (const header of unknownCustomFieldHeaders) {
+    result.errors.push(`Column "${header}" is not a custom field that is switched on for products, so it was ignored.`)
+  }
+  const customFieldRows: { lineNum: number; sku: string; productId: string; cells: Record<string, string> }[] = []
 
   // Track rows with components to process in second pass
   // o3d-w998: the immutable product id is captured AT ENQUEUE, not resolved from `skuToId`
@@ -889,6 +907,17 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
           componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr })
         }
       }
+
+      // Custom field cells, applied after the product rows (third pass). Blank cells are skipped: they mean "unchanged".
+      if (customFieldByHeader.size > 0) {
+        const cells: Record<string, string> = {}
+        for (const [header, definition] of customFieldByHeader) {
+          const cell = row[header]
+          if (typeof cell === 'string' && cell.trim() !== '') cells[definition.id] = cell
+        }
+        const customFieldProductId = skuToId.get(sku)
+        if (Object.keys(cells).length > 0 && customFieldProductId) customFieldRows.push({ lineNum, sku, productId: customFieldProductId, cells })
+      }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
       result.errors.push(`Row ${lineNum} (${sku}): ${msg}`)
@@ -1127,6 +1156,32 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push(`Components for ${cr.sku}: ${msg}`)
       }
+    }
+  }
+
+  // Pass 3: custom field values. A value that does not parse (or is not one of a dropdown's choices) is reported for its row; the product
+  // itself has already been created or updated and keeps its other values. A preview only validates.
+  // The acting user for the audit rows is read only when there is something to write (a system-actor import has no session).
+  const customFieldActorId = !preview && customFieldRows.length > 0 && system?.systemImportToken !== SYSTEM_IMPORT
+    ? ((await (await import('@/lib/auth')).auth())?.user?.id ?? null)
+    : null
+  for (const cf of customFieldRows) {
+    try {
+      if (preview) {
+        for (const [definitionId, cell] of Object.entries(cf.cells)) {
+          const definition = customFieldDefinitions.find((d) => d.id === definitionId)!
+          const parsed = parseCustomFieldValue(definition, cell)
+          if (!parsed.ok) result.errors.push(`Row ${cf.lineNum} (${cf.sku}): ${parsed.error} The custom fields on this row were not changed.`)
+        }
+        continue
+      }
+      const applied = await db.$transaction(
+        (tx) => applyCustomFieldValues(tx, { entity: 'PRODUCT', entityId: cf.productId, changes: cf.cells, userId: customFieldActorId, source: 'csv' }),
+        { maxWait: 5000, timeout: 20000 },
+      )
+      if (!applied.ok) result.errors.push(`Row ${cf.lineNum} (${cf.sku}): ${applied.error} The custom fields on this row were not changed.`)
+    } catch (e: unknown) {
+      result.errors.push(`Row ${cf.lineNum} (${cf.sku}): custom fields: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 

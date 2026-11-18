@@ -23,6 +23,8 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { documentDeleteUiStates } from '@/lib/domain/accounting/document-delete-service'
+import { getCustomFieldCardData } from '@/app/actions/custom-fields'
+import { CustomFieldsCard } from '@/components/custom-fields/custom-fields-card'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { getSalesOrderPegs } from '@/app/actions/pegging'
 import { SoDetailClient } from './so-detail-client'
@@ -76,6 +78,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   })
 
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
+  const customFields = await getCustomFieldCardData('SALES_ORDER', id)
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
   // o3d-ngmt.21: the Delete control for a synced invoice — shown only for a user who may process sales, with the switch on, and for a document that reached Xero.
   const invoiceDeleteState = (await documentDeleteUiStates('SALES_INVOICE', [so.id], hasPermission(session.user.role, 'sales.process')))[so.id]
@@ -113,6 +116,11 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         editForm={editForm}
         invoiceDeleteState={invoiceDeleteState}
         pegs={pegs}
+      />
+      <CustomFieldsCard
+        key={JSON.stringify(customFields.fields.map((f) => [f.id, f.value, f.label, f.options]))}
+        data={customFields}
+        canEdit={hasPermission(session.user.role, 'sales.create')}
       />
     </div>
   )

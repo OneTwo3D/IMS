@@ -11,8 +11,8 @@ import { config } from 'dotenv'
  *      over-EUR-150 "Import Duty" and a legacy untaxed fee beside taxable goods, persists the order-level components, and
  *      the stored totals equal WooCommerce's.
  *   2. An EXISTING order (imported before the kind/component columns existed) is UPDATED by a later delivery: the update
- *      path rebuilds no lines, so the lines keep their stored kind (null) and amounts, and only the order-level
- *      components are refreshed from the delivery.
+ *      path rebuilds no lines, so the lines keep their stored kind (null) and amounts, and the order-level
+ *      components follow the delivery (WooCommerce's own results, mirrored).
  */
 
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
@@ -158,7 +158,7 @@ test('[wclc fees] a new import mirrors taxed and untaxed fee lines, persists kin
   assert.equal(Math.round(documentTotal * 100) / 100, 189.5, 'the invoice totals what WooCommerce charged')
 })
 
-test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines AND its components exactly as stored', { skip }, async (t) => {
+test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines, and its components FOLLOW WooCommerce', { skip }, async (t) => {
   const db = await loadDb()
   const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const id = `WFL-${process.pid}-${randomUUID()}`
@@ -177,8 +177,10 @@ test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines 
       lines: { create: [{ description: 'EU Duty', sku: '', qty: 1, unitPriceForeign: 9, unitPriceBase: 9, totalForeign: 9, totalBase: 9 }] },
     },
   })
-  // The components split the lines stored with them, and the update rebuilds no lines: a delivery carrying different
-  // components, or none, changes neither the lines nor the stored split.
+  // The update rebuilds no lines (an edit that moves them is surfaced, not applied). The components are WooCommerce's own results and follow it
+  // (owner decision D5, resync on edit): a later delivery's values replace the stored ones, and a delivery that reports none clears them.
+  const expected = [['9', '40.38', '2'], [null, null, null]] as const
+  let step = 0
   for (const meta of [
     [{ id: 1, key: '_wclc_duty_component', value: '9.00' }, { id: 2, key: '_wclc_tax_component', value: '40.38' }, { id: 3, key: '_wclc_handling_component', value: '2.00' }],
     [],
@@ -188,9 +190,8 @@ test('[wclc fees] an EXISTING order updated by a later delivery keeps its lines 
     assert.equal(after.lines.length, 1, 'no line was added or rebuilt')
     assert.equal(after.lines[0]!.wclcFeeKind, null, 'the stored line keeps its (null) kind')
     assert.equal(after.lines[0]!.totalForeign.toString(), '9')
-    assert.equal(after.wclcDutyComponent?.toString(), '7', 'the stored duty component is untouched')
-    assert.equal(after.wclcTaxComponent?.toString(), '1', 'the stored tax component is untouched')
-    assert.equal(after.wclcHandlingComponent, null, 'no handling component appears from a later delivery')
+    assert.deepEqual([after.wclcDutyComponent?.toString() ?? null, after.wclcTaxComponent?.toString() ?? null, after.wclcHandlingComponent?.toString() ?? null], expected[step])
+    step += 1
   }
 })
 
