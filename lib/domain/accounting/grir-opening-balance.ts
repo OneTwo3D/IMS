@@ -2,7 +2,8 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { grirJournalDate, loadGrirPoValuation, writeGrirMovement } from '@/lib/domain/accounting/grir-subledger-movement'
 import { loadPurchaseOrderLineLandedQty, requirePoLineLandedQty } from '@/lib/domain/inventory/po-line-landed-quantity'
-import { GRIR_BALANCE_SOURCE_TYPES } from '@/lib/domain/accounting/grir-subledger-movement'
+import { GRIR_BALANCE_SOURCE_TYPES, allocateReturnCredit, loadBilledUnitBaseByLine } from '@/lib/domain/accounting/grir-subledger-movement'
+import { resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
 /**
@@ -14,6 +15,11 @@ import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decima
  * written as one OPENING_BALANCE row at the PO goods unit cost: so a line received before deployment and billed in part afterwards (live rows: -5)
  * gets the missing +10, and a line the ledger already tracks completely gets nothing. The key carries the line and the quantity
  * (`grir:opening:<poLineId>:<qty>`), and a second run finds expected = live, so it plans nothing; replaying an old plan upserts onto the same key.
+ *
+ * HISTORICAL RETURN CREDITS count: a POSTED return-generated supplier credit note that has no GR/IR row (it was posted before the sub-ledger) already cleared
+ * billed-and-returned goods, so its quantity is ADDED BACK into the expected position, allocated by the SAME function the live writer uses
+ * (`allocateReturnCredit`, per line, capped by the credit's net at the bill's unit price), oldest first. Its net is the credit's gross scaled by the bill's
+ * net/gross ratio; a reverse-charge credit is taken at its stored amount, which is the one approximation.
  *
  * The plan is computed by the one function both the dry run and the write use, so the dry run reports exactly what a real run would write.
  */
@@ -43,7 +49,7 @@ export type GrirOpeningPlan = {
   totalBaseDelta: string
 }
 
-type OpeningClient = Pick<Prisma.TransactionClient, 'purchaseOrder' | 'purchaseOrderLine' | 'purchaseInvoiceLine' | 'grirSubledgerMovement' | 'purchaseReceipt' | 'wmsAsnLineMap'>
+type OpeningClient = Pick<Prisma.TransactionClient, 'purchaseOrder' | 'purchaseOrderLine' | 'purchaseInvoiceLine' | 'grirSubledgerMovement' | 'purchaseReceipt' | 'wmsAsnLineMap' | 'supplierCreditNote'>
 
 const FREIGHT_ORDER_TYPE = 'FREIGHT'
 
@@ -82,6 +88,7 @@ export async function planGrirOpeningBalance(client: OpeningClient = db, options
     }
   }
 
+  const billedUnit = await loadBilledUnitBaseByLine(client, lineIds)
   const rows: GrirOpeningPlanRow[] = []
   let alreadyTracked = 0
   let settled = 0
@@ -89,11 +96,40 @@ export async function planGrirOpeningBalance(client: OpeningClient = db, options
   for (const order of orders) {
     const valuation = await loadGrirPoValuation(client, order.id)
     const landed = await loadPurchaseOrderLineLandedQty(client as never, order.lines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })))
+    // Historical return credits: posted, return-generated, and not yet in the sub-ledger.
+    const notes = await client.supplierCreditNote.findMany({
+      where: { poId: order.id, isReturnGenerated: true, status: 'POSTED' },
+      select: { id: true, amountBase: true, postedAt: true, createdAt: true, purchaseInvoice: { select: { subtotalForeign: true, taxForeign: true } } },
+      orderBy: [{ postedAt: 'asc' }, { id: 'asc' }],
+    })
+    const covered = new Set((notes.length === 0 ? [] : await client.grirSubledgerMovement.findMany({
+      where: { sourceType: { in: ['SUPPLIER_CREDIT_NOTE', 'BILL_PRICE_VARIANCE'] }, sourceRef: { in: notes.map((note) => note.id) } },
+      select: { sourceRef: true },
+    })).map((row) => row.sourceRef))
+    const creditedByLine = new Map<string, Decimal>()
+    for (const note of notes) {
+      if (covered.has(note.id)) continue
+      const allocation = allocateReturnCredit(order.lines.map((line) => {
+        const expectedBeforeCredit = requirePoLineLandedQty(landed, line.id).qty.sub(line.qtyReturned).sub(billedByLine.get(line.id) ?? 0)
+        const credited = creditedByLine.get(line.id) ?? toDecimal(0)
+        return {
+          id: line.id,
+          billedNotReceived: expectedBeforeCredit.neg().sub(credited).gt(0) ? expectedBeforeCredit.neg().sub(credited) : toDecimal(0),
+          returnedNotCredited: toDecimal(line.qtyReturned).sub(credited),
+          billedUnitBase: billedUnit.get(line.id) ?? toDecimal(0),
+        }
+      }), resolveSupplierCreditNoteTransitBase({
+        grossBase: toDecimal(note.amountBase).toNumber(),
+        billSubtotalForeign: Number(note.purchaseInvoice?.subtotalForeign ?? 0),
+        billTaxForeign: Number(note.purchaseInvoice?.taxForeign ?? 0),
+      }))
+      for (const [lineId, qty] of allocation) creditedByLine.set(lineId, (creditedByLine.get(lineId) ?? toDecimal(0)).add(qty))
+    }
     for (const line of order.lines) {
       const received = requirePoLineLandedQty(landed, line.id).qty
       const returned = toDecimal(line.qtyReturned)
       const billed = billedByLine.get(line.id) ?? toDecimal(0)
-      const expected = received.sub(returned).sub(billed)
+      const expected = received.sub(returned).sub(billed).add(creditedByLine.get(line.id) ?? 0)
       const live = liveByLine.get(line.id) ?? toDecimal(0)
       const openQty = expected.sub(live)
       if (openQty.isZero()) { if (expected.isZero()) settled += 1; else alreadyTracked += 1; continue }

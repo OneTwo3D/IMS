@@ -38,7 +38,7 @@ export const GRIR_PRICE_VARIANCE_SOURCE_TYPE = 'BILL_PRICE_VARIANCE' as const
 export type GrirBalanceSourceType = (typeof GRIR_BALANCE_SOURCE_TYPES)[number]
 export type GrirSourceType = GrirBalanceSourceType | typeof GRIR_PRICE_VARIANCE_SOURCE_TYPE
 
-export type GrirClient = Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrder' | 'purchaseOrderLine'>
+export type GrirClient = Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrder' | 'purchaseOrderLine' | 'purchaseInvoiceLine'>
 
 /** UTC date-only midnight, as the transit sub-ledger normalises its journal date (the reclass window is a date window). */
 export function grirJournalDate(value: Date | string): Date {
@@ -225,11 +225,56 @@ export async function recordGrirSupplierReturn(
   }
 }
 
+export type GrirCreditAllocationLine = {
+  id: string
+  /** Quantity still billed and not received on the line (never negative). */
+  billedNotReceived: Decimal
+  /** Quantity returned and not yet credited. */
+  returnedNotCredited: Decimal
+  /** The bill's unit price in base currency (billed total / billed quantity); 0 = unknown, which applies no money cap. */
+  billedUnitBase: Decimal
+}
+
+/**
+ * THE ONE ALLOCATION of a return credit note to order lines, used by the live writer and by the stage opening balance so the two cannot disagree: per
+ * line (by id), the quantity cleared is the smallest of billed-not-received, returned-not-credited and what the credit's NET still pays for at the bill's
+ * unit price (`remaining net / billed unit price`). A credit that covers only part of the returned quantity (a capacity-limited credit) therefore clears
+ * only that part; the rest stays for a later note.
+ */
+export function allocateReturnCredit(lines: ReadonlyArray<GrirCreditAllocationLine>, netBase: DecimalInput): Map<string, Decimal> {
+  const out = new Map<string, Decimal>()
+  let budget = toDecimal(netBase)
+  for (const line of [...lines].sort((a, b) => (a.id < b.id ? -1 : 1))) {
+    let qty = Prisma.Decimal.min(line.billedNotReceived, line.returnedNotCredited)
+    if (qty.lte(0)) continue
+    if (line.billedUnitBase.gt(0)) {
+      if (budget.lte(0)) continue
+      qty = Prisma.Decimal.min(qty, roundQuantity(budget.div(line.billedUnitBase), 6))
+      if (qty.lte(0)) continue
+      budget = budget.sub(qty.mul(line.billedUnitBase))
+    }
+    out.set(line.id, qty)
+  }
+  return out
+}
+
+/** Each order line's billed unit price in base currency (billed total / billed quantity), from the bills' goods lines. */
+export async function loadBilledUnitBaseByLine(client: Pick<Prisma.TransactionClient, 'purchaseInvoiceLine'>, poLineIds: string[]): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>()
+  if (poLineIds.length === 0) return out
+  const rows = await client.purchaseInvoiceLine.groupBy({ by: ['poLineId'], where: { poLineId: { in: poLineIds } }, _sum: { qtyBilled: true, totalBase: true } })
+  for (const row of rows) {
+    const qty = toDecimal(row._sum.qtyBilled)
+    if (row.poLineId && qty.gt(0)) out.set(row.poLineId, toDecimal(row._sum.totalBase).div(qty))
+  }
+  return out
+}
+
 /**
  * A RETURN-GENERATED SUPPLIER CREDIT NOTE: the supplier crediting back goods that were billed and then returned. Valued like the return it answers:
  * the credited quantity at the PO goods unit cost, per line, so a line that was received, billed, returned and credited nets to exactly zero
  * whatever price the bill carried. The credited quantity of a line is what is still BILLED NOT RECEIVED on it (a negative net quantity), capped by the
- * quantity returned and not yet credited (so a prepaid bill ahead of receipt is never cleared by a credit). The difference between the credit's NET
+ * quantity returned and not yet credited AND by what this credit's net pays for at the bill's unit price (`allocateReturnCredit`) (so a prepaid bill ahead of receipt is never cleared by a credit). The difference between the credit's NET
  * (`netBase`, the figure its transit row carries, which carries the bill's price and any FX difference) and the PO-valued credit is a
  * BILL_PRICE_VARIANCE reversal (negative = the credit gives back price difference), so it never reaches the balance. A credit with nothing to clear
  * writes only the variance.
@@ -253,20 +298,23 @@ export async function recordGrirReturnCreditNote(
     netQty.set(row.poLineId, (netQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
     if (row.sourceType === 'SUPPLIER_CREDIT_NOTE') creditedQty.set(row.poLineId, (creditedQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
   }
+  const billedUnit = await loadBilledUnitBaseByLine(client, lines.map((line) => line.id))
+  const allocation = allocateReturnCredit(lines.map((line) => ({
+    id: line.id,
+    billedNotReceived: Prisma.Decimal.max(0, (netQty.get(line.id) ?? new Prisma.Decimal(0)).neg()),
+    returnedNotCredited: toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0),
+    billedUnitBase: billedUnit.get(line.id) ?? new Prisma.Decimal(0),
+  })), input.netBase)
   let poValued = new Prisma.Decimal(0)
-  for (const line of lines.slice().sort((a, b) => (a.id < b.id ? -1 : 1))) {
-    const billedNotReceived = (netQty.get(line.id) ?? new Prisma.Decimal(0)).neg()
-    const returnedNotCredited = toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0)
-    const qty = Prisma.Decimal.min(billedNotReceived, returnedNotCredited)
-    if (qty.lte(0)) continue
-    const value = roundQuantity(qty.mul(unitCostFor(valuation, line.id)), 6)
+  for (const [lineId, qty] of allocation) {
+    const value = roundQuantity(qty.mul(unitCostFor(valuation, lineId)), 6)
     poValued = poValued.add(value)
     await writeGrirMovement(client, {
       sourceType: 'SUPPLIER_CREDIT_NOTE',
       sourceRef: input.creditNoteId,
-      idempotencyKey: `grir:credit-note:${input.creditNoteId}:${line.id}`,
+      idempotencyKey: `grir:credit-note:${input.creditNoteId}:${lineId}`,
       poId: input.poId,
-      poLineId: line.id,
+      poLineId: lineId,
       supplierId: input.supplierId,
       qtyDelta: qty,
       baseDelta: value,

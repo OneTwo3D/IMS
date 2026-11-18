@@ -205,6 +205,64 @@ test('a returned-and-credited line nets to exactly zero when the bill carried a 
   assert.equal((await balance(po2.id)).toNumber(), 0, 'received 10, returned 4, billed 6: settled with no credit needed')
 })
 
+// [mutation: clear the whole returned quantity whatever the credit note covers]
+test('a capacity-limited return credit clears only what its net pays for; the rest waits for a later note', async () => {
+  const { returnPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const { recordGrirReturnCreditNote } = await import('@/lib/domain/accounting/grir-subledger-movement')
+  const po = await seedPo(10, 12)
+  assert.equal((await receive(po, 10)).success, true)
+  assert.equal((await bill(po, 10, 12)).success, true)
+  assert.equal((await returnPurchaseOrder(po.id, [{ poLineId: po.lineId, qtyReturned: 4, warehouseId }], 'faulty')).success, true)
+  assert.equal((await balance(po.id)).toNumber(), -48)
+  const credit = (id: string, netBase: number) => recordGrirReturnCreditNote(s.db, { poId: po.id, supplierId, creditNoteId: id, netBase, journalDate: '2026-11-17', at: new Date() })
+  await credit('cn-a', 24)
+  assert.equal((await balance(po.id)).toNumber(), -24, 'a 24 credit pays for 2 of the 4 returned units')
+  assert.equal(Number((await byType(po.id, 'SUPPLIER_CREDIT_NOTE'))[0]!.qtyDelta), 2)
+  await credit('cn-b', 100)
+  assert.equal((await balance(po.id)).toNumber(), 0, 'the later note clears the remaining 2 and no more')
+  assert.equal((await byType(po.id, 'SUPPLIER_CREDIT_NOTE')).reduce((t, r) => t + Number(r.qtyDelta), 0), 4, 'never more than the returned quantity')
+})
+
+// [mutation: leave posted pre-ledger return credits out of the expected quantity]
+test('the opening balance adds back historical return credits: received and billed 10, returned and credited 4, opens +6 not +10 and no false negative', async () => {
+  const { planGrirOpeningBalance, applyGrirOpeningBalance } = await import('@/lib/domain/accounting/grir-opening-balance')
+  const po = await seedPo(10, 12)
+  await s.db.purchaseOrderLine.update({ where: { id: po.lineId }, data: { qtyReceived: '10', qtyReturned: '4' } })
+  await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PARTIALLY_RETURNED' } })
+  const invoice = await s.db.purchaseInvoice.create({
+    data: {
+      poId: po.id, invoiceDate: new Date('2026-10-01'), subtotalForeign: 120, subtotalBase: 120, totalForeign: 120, totalBase: 120, fxRateToBase: 1,
+      lines: { create: [{ poLineId: po.lineId, qtyBilled: 10, unitCostForeign: 12, totalForeign: 120, totalBase: 120 }] },
+    },
+    select: { id: true },
+  })
+  await s.db.supplierCreditNote.create({
+    data: { poId: po.id, purchaseInvoiceId: invoice.id, supplierId, amountForeign: 48, amountBase: 48, currency: 'GBP', fxRateToBase: 1, status: 'POSTED', postedAt: new Date('2026-10-05'), isReturnGenerated: true },
+  })
+  const plan = await planGrirOpeningBalance(s.db)
+  assert.equal(plan.rows.some((r) => r.poId === po.id), false, 'received 10 - returned 4 - billed 10 + credited 4 = 0: nothing to open, and no false -4')
+  // A partially credited historical return: only 2 of the 4 credited.
+  const po2 = await seedPo(10, 12)
+  await s.db.purchaseOrderLine.update({ where: { id: po2.lineId }, data: { qtyReceived: '10', qtyReturned: '4' } })
+  await s.db.purchaseOrder.update({ where: { id: po2.id }, data: { status: 'PARTIALLY_RETURNED' } })
+  const invoice2 = await s.db.purchaseInvoice.create({
+    data: {
+      poId: po2.id, invoiceDate: new Date('2026-10-01'), subtotalForeign: 120, subtotalBase: 120, totalForeign: 120, totalBase: 120, fxRateToBase: 1,
+      lines: { create: [{ poLineId: po2.lineId, qtyBilled: 10, unitCostForeign: 12, totalForeign: 120, totalBase: 120 }] },
+    },
+    select: { id: true },
+  })
+  await s.db.supplierCreditNote.create({
+    data: { poId: po2.id, purchaseInvoiceId: invoice2.id, supplierId, amountForeign: 24, amountBase: 24, currency: 'GBP', fxRateToBase: 1, status: 'POSTED', postedAt: new Date('2026-10-05'), isReturnGenerated: true },
+  })
+  const plan2 = await planGrirOpeningBalance(s.db)
+  const row = plan2.rows.find((r) => r.poId === po2.id)!
+  assert.equal(row.openQty, '-2', 'billed 10, retained 6, credited 2: 2 still billed-not-received')
+  await applyGrirOpeningBalance(plan2, { asOf: '2026-11-17', client: s.db })
+  assert.equal((await balance(po2.id)).toNumber(), -24)
+  assert.equal((await planGrirOpeningBalance(s.db)).rows.some((r) => r.poId === po2.id), false, 'idempotent')
+})
+
 // [mutation: make the row key random instead of per source event]
 test('a replayed source event records exactly once (the unique key is the source event)', async () => {
   const { recordGrirReceipt, recordGrirSupplierReturn } = await import('@/lib/domain/accounting/grir-subledger-movement')
