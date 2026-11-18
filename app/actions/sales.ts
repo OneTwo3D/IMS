@@ -1,5 +1,6 @@
 'use server'
 
+import { businessDateYmd } from '@/lib/business-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
@@ -2082,7 +2083,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     currency: so.currency,
     // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
     // their own daily rate (which causes 1-3 % drift on multi-currency
@@ -2877,7 +2878,7 @@ async function queueRefundAccountingActions(input: {
     creditNoteNumber: input.creditNoteNumber ?? undefined,
     contactName: cnContactName,
     contactEmail: orderForCN?.customer?.email ?? undefined,
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
     lines: input.lines.map((line) => ({
@@ -4897,7 +4898,7 @@ export async function addPayment(input: {
               referenceType: 'Payment',
               referenceId: txResult.paymentId,
               payload: {
-                date: txResult.paidAt.toISOString().slice(0, 10),
+                date: businessDateYmd(txResult.paidAt),
                 reference: getSalesOrderReference(txResult.so),
                 narration: `Realised FX ${realised.outcome} on customer payment ${getSalesOrderReference(txResult.so)}`,
                 lines,
