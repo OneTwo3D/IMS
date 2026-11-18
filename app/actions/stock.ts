@@ -6,9 +6,11 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
+import { canViewDashboardCostFigures } from '@/lib/security/dashboard-cost-redaction'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
+import { getSettingValue } from '@/lib/settings-store'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -113,10 +115,15 @@ export async function adjustStock(
   let logSku = ''
   let logWarehouseName = ''
 
+  // o3d-hqvrp.80 (flag, off by default): a removal into reserved stock releases the newest orders'
+  // allocations in the same transaction instead of being refused.
+  const releaseReservedForRemoval = qtyNum < 0 && (await getSettingValue('stock_adjustment_release_reserved')) === 'true'
+
   try {
     await db.$transaction(async (tx) => {
       const applied = await applyStockAdjustment({
         tx,
+        releaseReservedForRemoval,
         productId,
         warehouseId,
         qty: qtyNum,
@@ -257,12 +264,18 @@ export async function bulkAdjustStock(
   // getAccountingSettings() inside the transaction loop). The reason name is resolved
   // per line inside applyStockAdjustment.
   const accountingSettings = await getAccountingSettings()
+  // o3d-hqvrp.80 (flag, off by default). A one-line batch only: a longer one would take sales-order
+  // locks after an earlier line's stock-level lock, against the sales_orders -> stock_levels order.
+  const releaseReservedForRemoval = valid.length === 1
+    && valid[0].qty < 0
+    && (await getSettingValue('stock_adjustment_release_reserved')) === 'true'
 
   try {
     await db.$transaction(async (tx) => {
       for (const line of valid) {
         await applyStockAdjustment({
           tx,
+          releaseReservedForRemoval,
           productId: line.productId,
           warehouseId: line.warehouseId,
           qty: line.qty,
@@ -818,8 +831,11 @@ export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Pr
  * it is intentionally left as Number() math (4ve5: verified display-only, no drift
  * risk). Anything that posts to accounting must use the Decimal engine instead.
  */
-export async function getAvgCogsMap(): Promise<Record<string, number>> {
-  await requireInternalUser()
+export async function getAvgCogsMap(): Promise<Record<string, number> | null> {
+  const session = await requireInternalUser()
+  // Unit costs are the Gross Margin report's data: the sales-order form's COGS/margin estimate is for the roles
+  // that may read that report. `null` tells the form to hide the estimate, not to show a zero cost.
+  if (!canViewDashboardCostFigures(session.user.role)) return null
   const layers = await db.costLayer.findMany({
     where: { remainingQty: { gt: 0 } },
     select: { productId: true, remainingQty: true, unitCostBase: true },

@@ -14,6 +14,7 @@ import { randomBytes } from 'crypto'
 import { headers } from 'next/headers'
 import { db } from '@/lib/db'
 import { getSession } from '@/lib/auth/server'
+import { FreshAuthRequiredError, freshAuthFailureResult, requireFreshAuthSession } from '@/lib/auth/session-gates'
 import { logActivity } from '@/lib/activity-log'
 import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { getPublicAppUrl } from '@/lib/public-app-url'
@@ -34,6 +35,26 @@ async function getVerifiedSession() {
   if (!session?.user?.id) return null
   if (session.user.totpEnabled && !session.user.totpVerified) return null
   return session
+}
+
+/**
+ * Enrolling a passkey is a persistent-access grant, so on top of the fully
+ * authenticated session it needs a recent re-authentication (step-up): a stolen
+ * session cookie must not be able to plant its own authenticator. A stale session
+ * gets the structured `fresh_auth_required` result the client turns into the
+ * step-up dialog and a retry.
+ */
+async function getFreshVerifiedSession() {
+  const session = await getVerifiedSession()
+  if (!session?.user?.id) return { session: null, failure: null }
+  try {
+    requireFreshAuthSession(session)
+  } catch (error) {
+    const failure = error instanceof FreshAuthRequiredError ? freshAuthFailureResult(error) : null
+    if (failure) return { session: null, failure }
+    throw error
+  }
+  return { session, failure: null }
 }
 
 async function getPasskeyOriginConfig(): Promise<{ rpId: string; origin: string } | { error: string }> {
@@ -59,7 +80,8 @@ async function getChallenge(key: string): Promise<string | null> {
 // --- Registration ---
 
 export async function getPasskeyRegistrationOptions() {
-  const session = await getVerifiedSession()
+  const { session, failure } = await getFreshVerifiedSession()
+  if (failure) return failure
   if (!session?.user?.id) return { error: 'Unauthorized' }
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }
@@ -95,7 +117,8 @@ export async function verifyPasskeyRegistration(
   response: RegistrationResponseJSON,
   name?: string,
 ) {
-  const session = await getVerifiedSession()
+  const { session, failure } = await getFreshVerifiedSession()
+  if (failure) return failure
   if (!session?.user?.id) return { error: 'Unauthorized' }
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }

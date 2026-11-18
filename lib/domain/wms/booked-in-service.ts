@@ -9,6 +9,8 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import {
   buildBookedInDryRun,
+  bookedInDeltaIsActionable,
+  bookedInLineIsComplete,
   isTransferUsableForWmsReceipt,
   reconcileBookedInQuantities,
   resolveManualReceiptPool,
@@ -61,6 +63,7 @@ import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floo
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
 import {
   isTransferLineFullyLanded,
@@ -75,6 +78,7 @@ import {
   lockWmsAsnLineMaps,
   lockWmsAsnMaps,
 } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { businessDateYmd } from '@/lib/business-date'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -649,8 +653,10 @@ export async function processBookedInEvent(
           }
         })
 
+      // o3d-b8x0f: the delta must clear WMS_RECEIPT_QTY_EPSILON, the same threshold the dry run uses for
+      // wouldCreateReceipt / wouldCreateCostLayer, so apply never writes what the review image says it won't.
       const actionableLines = candidateLines
-        .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
+        .filter((line) => bookedInDeltaIsActionable(line.currentReceivedQty, Number(line.lastProcessedReceivedQty)))
 
       // o3d-h66s — EVERY CANDIDATE LINE, NOT JUST THE ACTIONABLE ONES: THE READ'S SCOPE MUST EQUAL
       // THE JUDGEMENT'S SCOPE.
@@ -1227,6 +1233,16 @@ export async function processBookedInEvent(
                 },
               })
 
+              // GR/IR accrual: the same units the layer above carries, at the PO goods unit cost, keyed on the stock movement's own key so a replayed
+              // book-in (which the movement's unique key already refused) records nothing. In this transaction, whether or not Xero posting is on.
+              await recordGrirReceipt(tx, {
+                poId,
+                sourceRef: lockedEvent.id,
+                keyBase: wmsPurchaseReceiptMovementKey({ asnLineMapId: receiptLine.asnLineMapId, receiptEventId: lockedEvent.id }),
+                at: now,
+                lines: [{ poLineId: poLine.id, qty: receiptLine.stockQtyToAdd }],
+              })
+
               // o3d-8f0p6: accumulated HERE, beside the layer it is the value of, and deliberately
               // NOT from `receiptLine.qtyReceived`. `qtyReceived` includes `coveredBySnapshotQty` —
               // quantity a prior WMS stock-sync snapshot already brought into stock and already
@@ -1390,7 +1406,7 @@ export async function processBookedInEvent(
           // are one decision, and no remap can commit between this read and this transaction's COMMIT.
           const accounts = await accountsForPosting(accountingConnector)
           const payload = {
-            date: now.toISOString().slice(0, 10),
+            date: businessDateYmd(now),
             reference: `Receipt: ${po.reference}`,
             narration: `Stock receipt for PO ${po.reference} via WMS ASN ${lockedEvent.externalAsnId}`,
             lines: [
@@ -1726,7 +1742,7 @@ export async function processBookedInEvent(
           lastProcessedReceivedQty: true,
         },
       })
-      const asnClosed = refreshedLines.every((line) => Number(line.lastProcessedReceivedQty) >= Number(line.expectedQty))
+      const asnClosed = refreshedLines.every((line) => bookedInLineIsComplete(Number(line.lastProcessedReceivedQty), Number(line.expectedQty)))
       const asnStatusAfter = asnClosed ? 'BOOKED_IN' : 'PARTIALLY_BOOKED_IN'
 
       await tx.wmsAsnMap.update({

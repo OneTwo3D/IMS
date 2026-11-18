@@ -479,6 +479,7 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Discounts Given | Revenue / Expense | Order-level discounts |
 | Purchases | Direct Cost | Default account for purchase bills |
 | Stock in Transit | Asset | Goods ordered but not yet received, and (when refund returns are held in transit) refunded goods not yet back |
+| GR/IR (goods received, not invoiced) | Liability / Current liability | Clearing account the daily batch moves goods received but not yet billed into, out of Stock in Transit. Used only while **GR/IR accrual posting** is switched on; must differ from Stock in Transit |
 | Inventory Asset | Asset | Stock on hand (available) |
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch (stock on an order that ships before it is paid goes straight from Inventory to COGS and never passes through here) |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
@@ -930,6 +931,23 @@ When enabled, the nightly cron job runs three groups in sequence:
 
 Group A1 reads each order's subtotal, shipping and discount to work out how much revenue to defer, and it reads them before it opens the transaction that writes the journal. If any of those orders changes in that window — in practice only the one-off WooCommerce coupon backfill does this — the whole group is **refused rather than posted**, because the journal it had prepared would no longer match the orders it names. Nothing is staged and no order is marked as deferred, so the next night's run simply recalculates from the corrected figures. The refusal appears in the run's errors and as an `accounting_daily_batch_stale_order_discount` entry in the activity log, naming each affected order and both amounts. The same applies to the QuickBooks daily batch.
 
+### GR/IR accrual posting (goods received, not invoiced)
+
+IMS keeps a **GR/IR sub-ledger** (see Purchasing) that accrues with every receipt, bill, bill edit, supplier return and return credit note. **Posting it to Xero is off by default.** The setting is **GR/IR accrual posting** (`grir_xero_posting_enabled`, Settings > Accounting > Xero > Sub-Ledger), and the account is **GR/IR** (`xero_grir_account`). While the switch is off the daily batch reads nothing, stages nothing and consumes nothing, and the sub-ledger and the GR/IR report keep accruing; nothing reaches Xero.
+
+IMS already posts a receipt as **DR Inventory / CR Stock in Transit** and a bill as **DR Stock in Transit / CR Accounts Payable**, and Stock in Transit already nets the two to zero. What was missing is the separation: goods received before the bill leave a **credit** hidden in Stock in Transit. Posting Inventory DR / GR/IR CR on receipt and GR/IR DR / AP CR on the bill **on top** would count the stock and the liability twice, so the switch adds a **reclass** instead. When it is on and the Daily Batch is on, each run takes every GR/IR movement not yet consumed, groups it by journal date (a date in a locked period is moved to the first open day, and the run waits while the lock reaches today, exactly like the other groups), and stages one **GR/IR reclass** journal per date for the net:
+
+- net **received not billed** rose: **DR Stock in Transit / CR GR/IR**
+- net fell (a bill, a return): **DR GR/IR / CR Stock in Transit**
+
+Together with the receipt and bill journals that is exactly Inventory DR / GR/IR CR on receipt and GR/IR DR / AP CR on the bill, and Stock in Transit is left holding only what is genuinely in transit (billed, not received) and freight. Each journal is also recorded in the transit sub-ledger (source `GRIR_RECLASS`), so the Stock in Transit reconciliation keeps tying out; the reconciliation pack's transit schedule counts it as its own leg. The movements a journal was built from are stamped with its reference in the same step, so no movement is ever posted twice, and a day that nets to nothing posts no journal.
+
+- **Freight and landed cost** are not in GR/IR; they follow the Stock in Transit path as before. **A price difference** between a bill and the order is not in GR/IR either (see Purchasing); it stays on Stock in Transit.
+- **It goes through the same write seam and hold as every Xero posting.** With the producer hold enforced, the journal is recorded as a shadow (status Cancelled, never posted by IMS), nothing is queued, and the transit sub-ledger records nothing, because the ledger did not move. The movements behind a shadowed journal are **not consumed** (unlike the sales batches), so they post on the first run after the hold is lifted.
+- If the switch is on but Stock in Transit or the GR/IR account is not mapped, the run says so in its errors and consumes nothing; the movements wait.
+- Switching it on later posts the movements accrued since the sub-ledger began (their net is the open balance), dated by the day each happened.
+- A journal Xero rejects is retried like any other daily batch journal. A journal an operator cancels is not rebuilt, as for the other batches.
+
 ### Payment Polling
 
 When enabled, the IMS polls Xero every 15 minutes for:
@@ -1240,6 +1258,27 @@ order is re-saved without changes.
 If the active accounting connector is QuickBooks (not Xero), IMS records a
 `sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
 behaviour is symmetric with the purchase bill path.
+
+### Deleting a synced invoice or bill (off by default)
+
+An invoice or supplier bill that IMS itself pushed to Xero can be deleted in IMS and Xero together, with its reference number freed for a replacement. The setting **Allow deleting synced invoices and bills** (**Integrations → Xero → Deleting synced documents**) is **off by default**; while it is off no Delete button is shown and nothing described here happens.
+
+When it is on, the **Delete invoice** button (sales order page) and **Delete bill** button (purchase order page) appear for people who can already edit that document (`sales.process` for an invoice, `purchasing.invoice` for a bill). Confirming queues one `SALES_INVOICE_DELETE` or `PURCHASE_INVOICE_DELETE` entry in the normal Xero queue, so every write goes through the same outbound queue and the same outbound-write hold as every other Xero write. While writes to Xero are held, IMS tells the operator so, queues nothing, and changes nothing in IMS or Xero.
+
+**What Xero is sent, in this order:**
+
+1. The document's number (and Reference, when it has one) is changed to `<number>-DEL-<6 random characters>` (for example `INV-1001-DEL-K7M2QX`), which frees `INV-1001` for a replacement. Xero keeps the number of a voided or deleted document reserved, which is why the number is changed first.
+2. The document's status is set to **DELETED** (a draft or submitted document) or **VOIDED** (an authorised document with no payments or credit applied).
+
+The suffix is chosen once, when the delete is queued. IMS reads the document in Xero before each attempt, so a retry after the second write failed sees the number already changed and makes only the status write; it never adds a second suffix. A document already voided or deleted is treated as done.
+
+**What IMS does, when Xero has confirmed:** an invoice's order loses its invoice number, date and Xero link (so the order reads as not invoiced and no longer holds the number), the invoice's accounting events are voided, and its stored PDF copies are withdrawn (they are kept, as statutory records are). A bill and its lines are removed (a snapshot is kept on the deletion record), the purchase order's invoiced marker is cleared when no other bill remains, and the Stock in Transit sub-ledger movement the bill recorded is reversed by an equal and opposite movement. An activity-log entry is written when the delete is requested and when it completes. Until Xero confirms, IMS is unchanged, and an edit sent to the document in the meantime is refused.
+
+**When the delete is refused** (the page shows the reason in place of the button; every one of these tells the operator to remove the blocking items in the accounting system first, where that is the remedy):
+
+Payments (a receipt on the invoice, an order held as paid, a payment on the bill); credit notes (a refund or credit note on the invoice, a supplier credit note on the bill); a document dated on or before the imported Xero books lock date; a document IMS did not create (raised by another system during the parallel run, or linked by hand; for an invoice the invoice-number ownership check must also show Xero holds the number under that very document); another posting or a delete still queued for it. At the moment of the delete IMS also reads Xero: a payment, credit note or allocation IMS did not know about, a different document type or a different number changes nothing and reports why.
+
+Refund and credit-note deletion is not part of this. After a delete, a replacement invoice that is identical in content to the deleted one can still be treated as already posted by the posting dedupe; raise the replacement with a changed line or reference.
 
 ### Cancelling an order while its invoice is posting
 
@@ -3022,6 +3061,7 @@ Take the posting for hand posting first and hold that claim while you work: ever
 |---|---|---|
 | An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing | Hold the hand-post claim, then: check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): if the current version is there, do not post again; if only an earlier version is there, apply the update to it (do not raise a second document); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
 | A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded | Hold the hand-post claim, then: check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| A DELETE of a synced invoice or bill (SALES_INVOICE_DELETE, PURCHASE_INVOICE_DELETE) - the work is removing the document, not posting it | Hold the hand-post claim, then: check the ledger for the document: if it is already deleted or voided, do not repeat it; only if it still exists, first change its number (add a suffix such as -DEL-ABC123) so the original number is free, then delete it if it is a draft or submitted, or void it if it is authorised and has no payments or credit applied. | Only once the document is deleted or voided in the ledger. |
 | Any other posting (no earlier document can exist) | Hold the hand-post claim, then: check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
 | The posting type is not known where the text is shown | Hold the hand-post claim, then: identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type. | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->

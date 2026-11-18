@@ -181,3 +181,19 @@ test('[fresh build] any accounting field that differs names its path', () => {
   t((d) => { d._postingMode = 'draft' }, '_postingMode')
   t((d) => { d.lines.push({ description: 'x', quantity: 1, unitAmount: 1, accountCode: '200', taxType: 'NONE', discountAmount: undefined }) }, 'lines \\(2 entries parked, 3 now\\)')
 })
+
+// A hold parked BEFORE the invoice date moved to the London day carries the UTC day of an order created 23:30 UTC in BST.
+test('[fresh build] a hold parked on the UTC day of an order created 23:30 UTC in BST is not changed; any other date still is', () => {
+  const created = new Date('2026-07-14T23:30:00Z')
+  const utcDay = created.toISOString().slice(0, 10)
+  const londonDay = '2026-07-15'
+  const accepted = [utcDay, londonDay]
+  const parkedLegacy = { ...freshDoc(), date: utcDay, _paymentDate: '2026-07-14T23:30:00' }
+  const freshNow = { ...freshDoc(), date: londonDay, _paymentDate: '2026-07-14T23:30:00' }
+  assert.match(heldFreshBuildDifference(parkedLegacy, freshNow) ?? '', /at date$/, 'without the accepted days the legacy hold is refused')
+  assert.equal(heldFreshBuildDifference(parkedLegacy, freshNow, accepted), null)
+  assert.equal(heldFreshBuildDifference({ ...parkedLegacy, date: londonDay }, freshNow, accepted), null)
+  assert.match(heldFreshBuildDifference({ ...parkedLegacy, date: '2026-07-13' }, freshNow, accepted) ?? '', /at date$/)
+  // Everything else is still compared.
+  assert.match(heldFreshBuildDifference(parkedLegacy, { ...freshNow, shippingAmount: 11 }, accepted) ?? '', /at shippingAmount$/)
+})

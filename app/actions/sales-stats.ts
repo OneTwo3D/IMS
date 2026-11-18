@@ -659,7 +659,8 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,
     }
-  }).filter((row) => row.dueAmount > 0.01)
+  // An indeterminate zero balance (an unplaceable credit valued at 0) is possibly owed, not settled: keep it, flagged by dueBound.
+  }).filter((row) => row.dueAmount > 0.01 || row.dueBound === 'indeterminate')
 }
 
 // ---------------------------------------------------------------------------

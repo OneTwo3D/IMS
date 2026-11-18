@@ -51,6 +51,9 @@ import { reservedSettingKeyRefusal } from '@/lib/domain/settings/reserved-settin
  *     the registry's `legacyEnabledKey` for the `backup` cron job AND the row `/api/cron/backup`
  *     gates itself on, so the switch is a crontab line, and a generic save never reconciled the
  *     crontab. `cron_backup_enabled` and the crontab rewrite belong to the same save.
+ *   • the backup target (S3 endpoint / SFTP server / credentials / encryption switch) —
+ *     `saveBackupTargetSettings` in `app/actions/backup.ts`, behind a fresh-authentication gate,
+ *     because it decides where the database dump is sent (o3d-hqvrp.6).
  *   • the FX schedule — `cron_fx_rates_enabled` / `cron_fx_rates_schedule`, via `saveCronJobSettings`.
  *     `fx_schedule_enabled` and `fx_schedule_interval_hours` had NO reader anywhere in the
  *     application; the panel that offered them is gone rather than rewired, so those two keys are
@@ -63,8 +66,7 @@ import { reservedSettingKeyRefusal } from '@/lib/domain/settings/reserved-settin
  * every allowlisted key against the cron registry's canonical and legacy enablement keys, so a
  * scheduler control cannot be re-listed here by someone reasoning only from "a screen offers it".
  *
- * SECRETS ARE ON THIS LIST, DELIBERATELY. The backup S3/SFTP credentials and the TrackShip API key
- * are secrets, and they are allowlisted because THIS SCREEN IS THEIR WRITER — there is no other path
+ * SECRETS ARE ON THIS LIST, DELIBERATELY. The TrackShip API key is a secret, and they are allowlisted because THIS SCREEN IS THEIR WRITER — there is no other path
  * that stores them, so refusing them here would simply break the panel. They are unlike the
  * WooCommerce credentials in the one way that matters: `saveWcCredentials` exists, it does work a
  * generic upsert cannot (validation, fresh authentication, the sync lock, the version bump), and
@@ -82,21 +84,6 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
     'activity_log_retention_info',
     'activity_log_retention_warning',
     'activity_log_retention_error',
-  ],
-  'components/settings/backup-remote-settings.tsx': [
-    'backup_s3_endpoint',
-    'backup_s3_region',
-    'backup_s3_bucket',
-    'backup_s3_access_key',
-    'backup_s3_secret_key',
-    'backup_s3_prefix',
-    'backup_sftp_host',
-    'backup_sftp_port',
-    'backup_sftp_user',
-    'backup_sftp_password',
-    'backup_sftp_private_key',
-    'backup_sftp_host_fingerprint',
-    'backup_sftp_path',
   ],
   'components/settings/data-retention.tsx': [
     'retention_sales_orders_months',
@@ -118,6 +105,7 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
   'components/settings/financial-year-start.tsx': ['financial_year_start'],
   'components/settings/invoice-trigger.tsx': ['invoice_trigger'],
   'components/settings/landed-cost-method.tsx': ['default_landed_cost_method'],
+  'components/settings/return-exchange.tsx': ['return_exchange_enabled'],
 }
 
 export { PREFERENCE_KEYS_BY_SCREEN }

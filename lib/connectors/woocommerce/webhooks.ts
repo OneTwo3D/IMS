@@ -882,6 +882,30 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
   // is the same cross-store write the import fence exists to prevent, arriving by a second
   // door, so the refusal has to cover both.
   const origin = await judgeWcDeliveryOrigin(originAttestation)
+  // o3d-h5b79: header-only evidence (`store-header:`) is HELD, as for orders and refunds. X-WC-Webhook-Source sits
+  // outside the HMAC, so a signed body replayed with a forged header must not pass as the bound store, and a header
+  // naming another store is not proof of foreignness either. 503 so the inbox retries and then dead-letters visibly.
+  if (origin.scope === 'header' && (origin.verdict === 'same-store' || origin.verdict === 'foreign-store')) {
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_product_webhook_held',
+      tag: 'sync',
+      level: 'ERROR',
+      description: `WooCommerce product webhook for ${productPayload.sku} is held: the only thing naming its store is `
+        + 'the X-WC-Webhook-Source header, which is not covered by the signature, so it does not prove who sent it. '
+        + 'Nothing was imported and no stock was corrected. It is retried and then appears under Sync > Exceptions.',
+      metadata: {
+        externalId: productPayload.id,
+        sku: productPayload.sku,
+        verdict: origin.verdict,
+        originAttestation: origin.attestation,
+        deliveryStore: origin.deliveryStore,
+        boundStore: origin.boundStore,
+        originScope: origin.scope,
+      },
+    })
+    return NextResponse.json({ ok: false, held: true, error: 'Delivery held: sending store could not be proven exactly' }, { status: 503 })
+  }
   if (origin.verdict === 'foreign-store' || origin.verdict === 'unproven') {
     // ACKNOWLEDGED, not retried. The payload was captured at receipt and is frozen: no retry
     // can make a store-A body describe store B, so all ~24 attempts would reach this identical
@@ -1181,7 +1205,7 @@ export async function handleWcWebhook(
   const originAttestation = readWcDeliveryOrigin(
     request,
     parsed.value,
-    resource === 'products' ? 'trusted' : 'header-unsigned',
+    resource === 'products' ? 'header-unsigned-containment' : 'header-unsigned',
   )
 
   const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(

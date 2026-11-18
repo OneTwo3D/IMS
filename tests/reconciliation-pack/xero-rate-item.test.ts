@@ -376,6 +376,19 @@ test('A PAYMENT IMS POSTED AT 1.25, WITH A 1.30 ROW ARRIVING LATER THAT DAY: Xer
   assert.deepEqual([equal.summary?.imsPosted, equal.summary?.postedTableNotChecked, equal.summary?.equal], [1, 1, 1])
 })
 
+// A BST EVENING: the payment is dated on the LONDON day, so the same-day rule (importer and R16) is judged on London days, not UTC days.
+// [mutation: receiptOnOrderDay / postedReceiptOnOrderDay back on the UTC day]
+test('R16 same-day rule on a BST evening: the order rate only when the order and the posted payment are the same LONDON day', async () => {
+  const day10 = [{ currency: 'EUR', rate: '1.4', fetchedAt: '2026-09-10T06:00:00.000Z', manualOverride: false }]
+  const receipt = (date: string, rate: string, xero: number, orderCreatedAt: string) => context({ payments: [paymentRow({ n: 1, date, currency: 'EUR', rate: xero })] }, { ims: { rows: day10, posted: [postedRow(1, 'INVOICE_PAYMENT', { rate, orderRate: '1.2', wooReceipt: true, orderCreatedAt, date })] } }).ctx
+  // (a) created 22:30 UTC 9 Sep (23:30 London 9 Sep), paid 23:10 UTC (00:10 London 10 Sep): different London days, so the receipt is posted on 10 Sep at the payment-day table rate.
+  assert.equal((await runXeroRateItem('R16', receipt('2026-09-10', '1.4', 0.714286, '2026-09-09T22:30:00.000Z'))).outcome, 'pass', 'table rate on the later London day')
+  const orderRate = await runXeroRateItem('R16', receipt('2026-09-10', '1.2', 0.833333, '2026-09-09T22:30:00.000Z'))
+  assert.deepEqual([orderRate.outcome, [...orderRate.reasons].sort()], ['fail', ['DIFFERENCES', 'IMS_POSTED_RATE_NOT_TABLE_RATE']], 'the order rate is not the receipt rate across London midnight')
+  // (b) created 23:30 UTC 10 Sep (00:30 London 11 Sep), paid 00:10 UTC 11 Sep: the same London day, so the order rate.
+  assert.equal((await runXeroRateItem('R16', receipt('2026-09-11', '1.2', 0.833333, '2026-09-10T23:30:00.000Z'))).outcome, 'pass', 'the order rate on the same London day')
+})
+
 // [mutation: the table check removed / the table rule widened to accept any rate / the order rate alternative dropped]
 test('A POSTED RATE THAT IS NOT THE TABLE RATE under the record\'s date rule is IMS_POSTED_RATE_NOT_TABLE_RATE; the stored rate and the table rate are listed', async () => {
   // A storefront invoice: the order rate must be a central rate in force on the order's day (1.25 from 06:00, 1.30 from 18:00).

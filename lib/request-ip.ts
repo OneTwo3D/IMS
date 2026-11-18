@@ -88,32 +88,64 @@ function parseEnvList(name: string): string[] {
     .filter(Boolean)
 }
 
-const trustedProxyIps = new Set(
-  parseEnvList('TRUSTED_PROXY_IPS')
-    .map((entry) => normalizeIp(entry))
-    .filter((entry): entry is string => !!entry),
-)
+type TrustedProxyConfig = {
+  key: string
+  ips: Set<string>
+  ranges: TrustedProxyRange[]
+}
 
-const trustedProxyRanges = parseEnvList('TRUSTED_PROXY_CIDRS')
-  .map((entry) => parseTrustedProxyRange(entry))
-  .filter((entry): entry is TrustedProxyRange => !!entry)
+let cachedConfig: TrustedProxyConfig | null = null
+
+/**
+ * Read lazily (and re-read when the env value changes) rather than at import time, so
+ * a test or a late-loaded env file cannot leave a stale answer behind.
+ */
+function trustedProxyConfig(): TrustedProxyConfig {
+  const ipsRaw = process.env.TRUSTED_PROXY_IPS ?? ''
+  const cidrsRaw = process.env.TRUSTED_PROXY_CIDRS ?? ''
+  const key = `${ipsRaw}\u0000${cidrsRaw}`
+  if (cachedConfig?.key === key) return cachedConfig
+  cachedConfig = {
+    key,
+    ips: new Set(
+      parseEnvList('TRUSTED_PROXY_IPS')
+        .map((entry) => normalizeIp(entry))
+        .filter((entry): entry is string => !!entry),
+    ),
+    ranges: parseEnvList('TRUSTED_PROXY_CIDRS')
+      .map((entry) => parseTrustedProxyRange(entry))
+      .filter((entry): entry is TrustedProxyRange => !!entry),
+  }
+  return cachedConfig
+}
 
 function isTrustedProxy(ip: string): boolean {
-  if (trustedProxyIps.has(ip)) return true
+  const config = trustedProxyConfig()
+  if (config.ips.has(ip)) return true
   const parsed = parseIpToBigInt(ip)
-  return trustedProxyRanges.some((range) => (
+  return config.ranges.some((range) => (
     range.family === parsed.family && (parsed.value & range.mask) === range.network
   ))
 }
 
 /**
  * True when trusted-proxy resolution is configured (TRUSTED_PROXY_IPS or
- * TRUSTED_PROXY_CIDRS is set). When false, `getClientIp` cannot distinguish real
- * clients from the fronting proxy, so per-IP throttling would collapse every
- * client onto one key — callers should skip per-IP caps in that case.
+ * TRUSTED_PROXY_CIDRS is set). When false, `getClientIp` ignores forwarding headers
+ * altogether (see below), so per-IP throttling would collapse every client onto one
+ * key - callers should skip per-IP caps in that case.
  */
 export function isTrustedProxyConfigured(): boolean {
-  return trustedProxyIps.size > 0 || trustedProxyRanges.length > 0
+  const config = trustedProxyConfig()
+  return config.ips.size > 0 || config.ranges.length > 0
+}
+
+/**
+ * Escape hatch for a proxied deployment that has not configured TRUSTED_PROXY_* yet:
+ * restores the old behaviour of believing the right-most X-Forwarded-For entry. Only
+ * safe when the app port is reachable solely through that proxy. Off by default.
+ */
+function legacyForwardedForEnabled(): boolean {
+  return /^(1|true|yes|on)$/i.test((process.env.LEGACY_UNTRUSTED_FORWARDED_FOR ?? '').trim())
 }
 
 function getForwardedChain(headers: HeaderSource): string[] {
@@ -125,6 +157,14 @@ function getForwardedChain(headers: HeaderSource): string[] {
 
 /**
  * Resolve the original client IP from proxy headers.
+ *
+ * Forwarding headers are client-controlled unless the request provably came through
+ * our own proxy. Node does not expose the socket peer to route handlers, so "came
+ * through our proxy" is established by configuration: with no TRUSTED_PROXY_IPS /
+ * TRUSTED_PROXY_CIDRS set, X-Forwarded-For and X-Real-IP are ignored and null is
+ * returned (callers fall back to 'unknown' / skip per-IP caps) instead of letting a
+ * client that reaches the port directly choose its own IP. Set
+ * LEGACY_UNTRUSTED_FORWARDED_FOR=true to keep the old behaviour while migrating.
  *
  * Security contract:
  * - The reverse proxy in front of the app must strip/replace any incoming
@@ -139,6 +179,8 @@ function getForwardedChain(headers: HeaderSource): string[] {
  * to `X-Real-IP` when present.
  */
 export function getClientIp(headers: HeaderSource): string | null {
+  if (!isTrustedProxyConfigured() && !legacyForwardedForEnabled()) return null
+
   const forwardedChain = getForwardedChain(headers)
   if (forwardedChain.length > 0) {
     for (let index = forwardedChain.length - 1; index >= 0; index -= 1) {

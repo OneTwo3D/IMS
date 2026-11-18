@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
 import { refusedCreditNoteError as refusedCreditNoteErrorOf } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { composeFinalBeforePost, creditNoteBeforePost, euCreditNoteSchemePostingRefusal, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
@@ -63,6 +64,8 @@ import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describe
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
+import { parseXeroDeleteTarget, runXeroDocumentDelete } from './document-delete'
+import { completeAccountingDocumentDeletion, pendingDocumentDeletionRefusal, recordDeletionTargetStatus } from '@/lib/domain/accounting/document-delete-service'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
@@ -3849,6 +3852,12 @@ const POST_EFFECT_DOCUMENT_UPDATE = {
     + 'Xero if the change should not stand; there is nothing to void or credit-note.',
 } as const
 
+const POST_EFFECT_DOCUMENT_DELETE = {
+  effect: 'RENUMBERED an existing Xero document and then DELETED or VOIDED it',
+  remedy: 'The document was renumbered (its original number is free again) and then removed from the ledger. If it should still exist, '
+    + 'raise a replacement; a voided or deleted document cannot be restored. If only the renumber landed, the document is still live '
+    + 'under its suffixed number: retry this row to finish the delete, or restore the number by hand.',
+} as const
 const POST_EFFECT_DOCUMENT_VOID = {
   effect: 'VOIDED a sales credit note in Xero',
   remedy: 'The credit note named above was set to Voided because its refund was deleted in IMS. Nothing new was created. If it should still stand, re-create it in Xero by hand; there is nothing to void or reverse.',
@@ -3862,6 +3871,8 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   PURCHASE_CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
   SALES_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
   PURCHASE_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  SALES_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
+  PURCHASE_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
   INVOICE_PAYMENT: POST_EFFECT_PAYMENT,
   BILL_PAYMENT: POST_EFFECT_PAYMENT,
   COGS_JOURNAL: POST_EFFECT_JOURNAL,
@@ -3876,6 +3887,7 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   DAILY_BATCH_INVENTORY_RECONCILIATION: POST_EFFECT_JOURNAL,
   DAILY_BATCH_COGS_RECONCILIATION: POST_EFFECT_JOURNAL,
   DAILY_BATCH_TRANSIT_RECONCILIATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_GRIR_RECLASS: POST_EFFECT_JOURNAL,
   UNEARNED_REV_REVERSAL: POST_EFFECT_JOURNAL,
   // Added by the compiler, not by hand: this Record is exhaustive over AccountingSyncType on
   // purpose (o3d-e2mz r4), so a type merged since — o3d-0i5y's allocation reversal — fails the
@@ -6315,6 +6327,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
       }
+      const salesDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (salesDeleting) return { success: false, error: salesDeleting }
       // Same cancelled-order backstop as the create: don't modify an external receivable for an order
       // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
@@ -6383,6 +6397,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for PURCHASE_INVOICE_UPDATE' }
       }
+      const billDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (billDeleting) return { success: false, error: billDeleting }
       const supplier = referenceType === 'PurchaseOrder'
         ? await db.purchaseOrder.findUnique({
             where: { id: referenceId },
@@ -6403,6 +6419,23 @@ export async function processClaimedEntry(
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
       return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
+    }
+
+    case 'SALES_INVOICE_DELETE':
+    case 'PURCHASE_INVOICE_DELETE': {
+      // o3d-ngmt.21: free the document's number, then DELETE or VOID it. Read first, so a retry after the number was already changed makes
+      // only the status write and never appends a second suffix; every write fences on the lease like every other remote mutation here.
+      const parsed = parseXeroDeleteTarget(type, payload as Record<string, unknown>)
+      if (!parsed.ok) return { success: false, error: parsed.error }
+      const deleteTarget = parsed.target
+      const run = await runXeroDocumentDelete(deleteTarget, {
+        fence: (step) => lease.fenceBeforeRemoteWrite(step),
+        idempotencyKey: (step) => buildXeroIdempotencyKey(entryId, step, payload),
+      })
+      if (run.kind === 'fenced') return run.result
+      if (run.kind === 'failed') return { success: false, error: run.error }
+      await recordDeletionTargetStatus(deleteTarget.invoiceId, run.status)
+      return { success: true, externalId: deleteTarget.invoiceId, externalRevisionAt: run.externalRevisionAt }
     }
 
     case 'INVOICE_PAYMENT': {
@@ -6942,6 +6975,7 @@ export async function processClaimedEntry(
     case 'DAILY_BATCH_INVENTORY_RECONCILIATION':
     case 'DAILY_BATCH_COGS_RECONCILIATION':
     case 'DAILY_BATCH_TRANSIT_RECONCILIATION':
+    case 'DAILY_BATCH_GRIR_RECLASS':
     case 'UNEARNED_REV_REVERSAL':
     // o3d-0i5y r9: the orphaned-allocation reversal. A plain manual journal like every other type
     // in this group — the amount is decided (and evidenced) at staging time, not here.
@@ -7123,6 +7157,12 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
+  // o3d-ngmt.21: a confirmed delete is not a back-reference at all — it UNWINDS the link. The unwind is idempotent and keyed on the ledger's
+  // document id, so a failure here is retried by the same follow-up path as a failed back-reference, from the id already stored on the row.
+  if (type === 'SALES_INVOICE_DELETE' || type === 'PURCHASE_INVOICE_DELETE') {
+    await completeAccountingDocumentDeletion(externalId)
+    return
+  }
   // audit-H3: do NOT swallow failures here. The external id is already persisted
   // on the sync row (externalTransactionId) before this runs, and the caller's
   // catch marks the row for retry so the next pass re-applies the back-reference
@@ -8291,7 +8331,7 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // Resolved HERE rather than left undefined for processEntry to fill from the wall
     // clock. An unset date made the allocation body differ on every execution, so a
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
-    date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+    date: (payload.date as string | undefined)?.slice(0, 10) || businessDateYmd(new Date()),
     sourceEntryId: entryId,
   }, { from: 'postedRow', record: origin })
 }

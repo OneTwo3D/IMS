@@ -146,6 +146,7 @@ test('admin sidebar analytics items group reports under expected section heading
         '/analytics/ar-aging',
         '/analytics/ap-aging',
         '/analytics/fx-gain-loss',
+        '/analytics/grir',
       ],
     },
   ])

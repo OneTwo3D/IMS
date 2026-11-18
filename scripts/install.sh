@@ -10220,6 +10220,8 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     export WC_STORE_URL="${WC_STORE_URL}"
     export WC_CONSUMER_KEY="${WC_CONSUMER_KEY}"
     export WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}"
+    # o3d-djqf1: lets the seed write email_smtp_pass as ciphertext.
+    export SETTINGS_ENCRYPTION_KEY="${SETTINGS_ENCRYPTION_KEY}"
     "$@"
   )
   }

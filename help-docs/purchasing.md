@@ -28,7 +28,7 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 
 ### Line margin (internal)
 
-When you hold the **inventory.prices** permission (Admin, Manager, Finance), the PO create/edit form shows a **Margin (internal)** column and an **Order margin** summary under the lines. It is read-only: it shows you what the entered price would earn so you can reconsider the price or the sales price; it does not block, warn-and-stop or require approval, and it cannot change a sales price.
+When you hold the **inventory.prices** permission (Admin, Manager, Finance), the PO create/edit form shows a **Margin (internal)** column and an **Order margin** summary under the lines. It shows you what the entered price would earn so you can reconsider the price or the sales price. On its own it does not block anything; a minimum margin (below) can warn or block, and the sales price can be edited from the column.
 
 - **Sales price used:** the product's default list price (not the sale price), ex-VAT, in the base currency. A price stored VAT-inclusive has VAT removed using the product's sales VAT rate for the company's home country. If none is configured the line shows "—" instead of guessing.
 - **Cost used:** the unit price you entered, ex-VAT, after the line discount, per stock unit (purchase units are converted), converted to the base currency at the order's exchange rate. It is the **plain unit price, not landed cost**: freight, duty and other additional costs are not included.
@@ -36,6 +36,27 @@ When you hold the **inventory.prices** permission (Admin, Manager, Finance), the
 - **Lines without a number:** a line with no sales price, no quantity or price yet, or no exchange rate (it shows "Rate unavailable", never a rate of 1) shows "—" with the reason and is left out of the order total.
 - **Order margin:** the total margin % and amount over the lines that have a sales price, and how many lines were left out.
 - **Internal only:** the margin is never shown in the supplier portal, a quote request (RFQ) view, the PO PDF or a supplier email, and users without the permission do not see the column.
+
+### Minimum margin (warn or block)
+
+An administrator can set a minimum gross margin in **Settings > Purchasing > Minimum Margin** (see Settings). Until one is set, nothing changes. When one is set:
+
+- **Which minimum applies:** the most specific one: the product's own, then its parent product's (for a variation), then its category's (the nearest category up the tree that has one), then the global minimum.
+- **Warn mode:** a line below its minimum shows an amber "Below the N% minimum (warning)" under its margin. Saving and sending are not affected.
+- **Block mode:** the line shows a red "blocked without an override note" and the form asks for an **override note**. The server refuses to **save** the order, or to **confirm and send** it, while any line is below its minimum, unless a note of at least 5 characters is entered. The refusal names the SKUs. On a draft that is already saved, press **Confirm and send**; if it is refused a note box appears and **Confirm and send with override** places the order.
+- **The override is recorded:** an accepted override is written to the order's activity (action "margin_override") with the note, the lines and their margins, who entered it and when, in the same step as the save or send, so it cannot be saved without the record. Only someone holding **inventory.prices** can override.
+- **Unknown is never blocked:** a line whose margin is unavailable (no sales price, no price entered, no exchange rate) shows "Margin unknown: not checked" and is never warned or blocked.
+- **What is checked:** the server recomputes each line from the cost it is about to store (the same plain unit price, ex-VAT, after discount, in base currency) against the product's list price ex-VAT. It does not trust the figures on screen. A line left as it was on an order that has been received against is not re-checked; lines you add or reprice are. Imported historical orders are not assessed.
+- **Equal passes:** a margin exactly at the minimum is fine; only a lower margin is below it.
+
+### Adjusting the sales price from the margin column
+
+With **inventory.prices**, each line's margin cell has **Edit sales price**. Enter the new **ex-VAT** list price (the "sells" figure) and save:
+
+- It changes that product's default list price through the normal product update, and the activity log records the old and new price and who changed it. The shop (WooCommerce) and the warehouse (Mintsoft) only receive it through the normal product sync, never directly from this screen; if that sync is not ready the price is still saved and the sync retries.
+- A product that stores its price VAT-inclusive keeps doing so: the ex-VAT price you enter is converted with the product's sales VAT rate. If no rate is configured the edit is refused.
+- A variation is priced on its own; the parent and the other variations are not touched. A variable parent product has no price of its own, so it cannot be edited here: set the price on its variations.
+- The margin is recomputed from the new price straight away.
 
 ### FX rate
 
@@ -224,6 +245,8 @@ If the supplier was billed for more than was received (a prepaid supplier), clos
 
 An order whose lines have an **open warehouse ASN** (being created, open, partly booked in, or booked in but not yet reconciled) cannot be closed or cancelled. The message names the SKUs and ASN numbers. Book the goods in through the ASN (**Recheck booked-in**) or retire the ASN first, then close the order. This keeps the warehouse from receiving goods against an order that no longer expects them. Warehouse (Mintsoft) ASN handling is described in [Warehouse (Mintsoft)](warehouse.md).
 
+If the close or cancel is refused because stock the warehouse sync brought in is "not yet booked into this order" and the ASN has already been retired, **Recheck booked-in** has nothing to re-drive. Press **Reconcile warehouse receipt** in the close dialog: it folds that stock into the order's received quantity so it can be returned and the order closed. It adds no stock, cost or accounting entry (the warehouse sync already did), and is refused while the order still has an open ASN.
+
 ### Idempotent cancellation
 
 Cancelling a PO that is already CANCELLED is a no-op: the system returns success without writing duplicate activity log entries. It is safe to retry a cancellation after a transient error.
@@ -266,6 +289,17 @@ quantity remains a hard cap either way.
 Note: if a prepaid PO is later received short (paid 100, received 90), the over-paid delta is not
 yet flagged automatically — reconcile manually until the prepaid reconciliation alert ships.
 
+### GR/IR: goods received, not yet billed
+
+Every receipt, bill, bill edit, supplier return and return-generated supplier credit note also writes a row in IMS's **GR/IR sub-ledger**, in the same step as the event itself, so a receipt is never recorded without its accrual and a failed receipt leaves none:
+
+- **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (the goods part of the value the stock layer carries; freight is not included).
+- **Billing** lowers it by the billed quantity at the **same purchase-order unit cost**. If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; it stays on Stock in Transit as it always has, and is shown per order in **Analytics > GR/IR**.
+- **Editing a bill** moves it by the change in the billed quantity.
+- **A supplier return** lowers it by the returned quantity at the order's unit cost. If those goods were already billed, the order shows as billed-not-received until the return-generated supplier credit note is posted. The credit note clears it at the same order unit cost as the return (per line, for the quantity billed and returned), so a returned-and-credited line nets to zero whatever price the bill carried; the difference between the credit and that value is a price-difference reversal, not GR/IR.
+
+Receiving and billing the same quantity nets to zero whichever comes first. Nothing here is posted to Xero unless **GR/IR accrual posting** is switched on (Settings > Accounting > Xero; see Xero Accounting Sync). Stage can load an opening balance for goods received before the sub-ledger existed (it fills the gap between what the order lines say and what the sub-ledger already holds, so a line billed after deployment is completed too) with `npm run grir:opening-balance -- --dry-run` (then without `--dry-run`); production gets none.
+
 ### Editing an unpaid bill
 
 Unpaid bills can be edited from the PO detail page. Headers (number, dates, notes, supplier
@@ -297,6 +331,10 @@ message. See the Xero sync docs for retry semantics.
 
 Paid bills cannot be edited. Reverse the payment first if a correction is required.
 
+
+### Deleting a bill that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), a bill that IMS itself created in Xero shows a **Delete bill** button on the purchase order page for people who can edit bills. It renames the Xero bill with a random `-DEL-` suffix so the original supplier number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it. When Xero confirms, the bill and its lines are removed from IMS, the purchase order is no longer marked as invoiced if no other bill remains, and the Stock in Transit movement the bill recorded is reversed. A paid bill, a bill with supplier credit notes, one dated in a locked period, or one created by another system (for example Qoblex) is refused with the reason shown. See [Xero sync](xero-sync.md) for the full rules.
 
 ### Supplier credit notes
 

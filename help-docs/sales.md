@@ -12,6 +12,7 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
 - **Filter by invoicing** — the **Invoicing** filter shows orders that are **Not invoiced**, **Partially invoiced** or **Fully invoiced** (pick one or several). It is separate from the status filter and combines with it. Picking an invoicing state includes Completed and Delivered orders, because a shipped order that was never invoiced is exactly what it is for; archived orders stay hidden unless you tick **Include archived**. See [Invoicing state](#invoicing-state).
+- **Quotes tab** — the **Quotes** button above the search shows only quotations (see [Quotations](#quotations)); **All orders** goes back. A quote carries a **Quote** badge, and an **Expired** badge once its validity date has passed.
 - **Filter by a custom field** — when [custom fields](#custom-fields-on-orders) exist for orders, a drop-down lists every text field that has fixed choices, and every yes / no field, with each choice. Pick one to see only the orders holding that value (for example *Process stage: Pack*). Orders that have no value for the field are not matched by any choice. The filter is in the address, so it combines with search, status and the other filters and can be bookmarked.
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
@@ -51,6 +52,8 @@ To create a new order manually:
 
 A Draft can be changed afterwards with **Edit order** (see *Editing an order* below).
 
+The order form shows an estimated **COGS** per line, **Est. COGS** and **Est. Margin** to Admin, Manager and Finance users only; other roles do not see unit costs.
+
 The **Ship From** warehouse is pre-selected with your default warehouse (the first warehouse if none is marked default); change it if the order ships from elsewhere. The stock figures beside each product are for the selected warehouse.
 
 **VAT and "Incl. VAT".** The order has one default VAT rate and one setting for whether the prices you type include VAT. If prices include VAT, choose the order's default VAT rate: the VAT is taken out of the prices you typed, the order totals are what you typed, and the invoice goes to the accounting system as VAT-inclusive at those same prices. Ticking **Incl. VAT** while the default rate is **No VAT** and a line carries VAT (from its product's tax category or a rate you chose on the line) is refused, because the prices could be read two ways: choose the default rate, or untick **Incl. VAT** and enter net prices. The **Incl. VAT** box is always shown, even when the rate is **No VAT**. A draft saved earlier in that state cannot be moved out of Draft; cancel it and create a new order. Clones made and shipped before this was fixed have no invoice and need one raising by hand.
@@ -74,6 +77,25 @@ WooCommerce orders always enter the IMS as **Processing**. When WooCommerce mark
 ### Duty and tax from WooCommerce
 
 WooCommerce works out duty, import VAT and the delivery terms; IMS **never recalculates them**. For a WooCommerce order the order page shows a read-only **Duty and tax** panel, labelled "from WooCommerce", with what the store reported: the **IOSS number** and **delivery term** (IOSS_DDP or DDP) IMS recorded from the order's EU VAT treatment, the **duty**, **import VAT** and (when there is one) **handling fee** the store recorded, and any **customs value per unit** set on an order line in WooCommerce. A value the store did not report is simply not shown, and the panel does not appear when there is nothing to show. These values cannot be edited in IMS. When the order is edited in WooCommerce they follow on the next order update; if the store removes one, it disappears here too. Orders imported before this feature show nothing until WooCommerce next updates them.
+
+## Quotations
+
+A **quote** is an offer you send a customer before they order. In IMS a quote is a **Draft** order with a quote flag, a validity date and (once sent) the time it was queued for sending. It is not a new status, so every rule that applies to a Draft applies to it unchanged:
+
+- **It reserves no stock.** A quote is never allocated, exactly like a Draft. Stock you quote is still available to everyone else.
+- **It is not sent to the warehouse**, not invoiced, and not mirrored to WooCommerce.
+- **Prices are held on the quote only for show.** Nothing is recalculated when the quote is converted.
+- WooCommerce orders are never quotes.
+
+**Creating a quote.** On **New Sales Order**, fill in the order as usual, set **Quote valid until** (it starts 30 days ahead) and click **Save as quote** instead of Save as Draft. The date must be a real date that is not in the past. A quote can be changed with **Edit quote** (its date too); an order that is not a quote cannot be turned into one, and a quote cannot be saved as a live order.
+
+**The quote document.** The order's **Quote PDF** (the ⋮ menu) is the sales order document with a **QUOTE** heading and the line "Valid until ...". It prints no payment terms. Its wording comes from **Settings > Company > Documents > Quote**: until you save one it uses a built-in default that states this is a quotation, not an order or an invoice.
+
+**Sending a quote.** Download the PDF and send it yourself, or switch on **Settings > Company > Documents > Email quotes to customers** (off by default). With it on a quote shows **Send quote**, which puts a branded email with the quote PDF on the same email queue as order confirmations. It is **queued, not sent at that moment**: the queue delivers it under your SMTP settings and the suppression list, so an installation with no SMTP configured mails nobody. An expired quote cannot be sent (edit its date first). The detail page shows when the quote was queued. Switching the setting off also stops a quote already waiting in the queue: it ends Failed with the reason and nothing is sent.
+
+**Converting a quote to an order.** **Convert to order** clears the quote flag in one click. The order is then an ordinary **Draft** with the same lines and prices; you confirm it through the usual flow (**Process**), which allocates stock and queues the invoice. A quote cannot be processed, put on hold or invoiced before it is converted (it can be cancelled). If the validity date has passed, IMS asks for a note saying why the prices still stand; the note is added to the order's internal notes, and converting without one is refused.
+
+**Cloning** a quote makes an ordinary Draft, not a quote.
 
 ## Customer Turnover
 
@@ -218,6 +240,12 @@ When not all products are in stock, you can ship what's available now and fulfil
 Services and fees on an order (a delivery charge, for example) never need a shipment, so they never hold an order back: the order moves to **Shipped** once every physical item has shipped.
 
 **Dispatching from the app.** A shipment of an order that is still a **Draft**, **On Hold** (for any reason) or **Pending payment** cannot be dispatched: nothing is recorded and no stock is taken, and the message tells you what to do next (finalise the draft, release the hold, or record the payment). If the order is **Processing**, dispatching the last shipment moves the order to **Shipped** in the same step, and an "Order shipped from a non-fulfilment status" warning is added to its activity log. The dispatch and the order change are saved together: if the order cannot be moved, the dispatch is not recorded at all.
+
+**A held order does not move.** While an order is **On Hold**, **Confirm allocations** (Create Shipments) is refused, so it can no longer lift the hold by moving the order to Allocated, and its shipments cannot be moved on through Picking or Packed in the app (the message says to release the hold first). A progress report from the warehouse is still recorded, because it describes what has physically happened.
+
+**A return of goods that already shipped does not cancel the rest.** If part of a line has shipped and some of those shipped units come back (a refund that restocks them, or a chargeback), the units still to send stay owed: the remainder can still be packed, dispatched and counted, and the order is not closed as complete. A refund that returned nothing (for example the cancellation of units that never shipped) still reduces what is owed.
+
+**Closing an order gives back its unshipped reservation.** When an order is set to **Shipped**, **Completed** or **Delivered** while its allocation is larger than what shipped (for example after you close it short), the unshipped part of the allocation is released and the stock becomes available again. What a picked or packed shipment still holds is kept. If the release cannot be made the status change still goes through and the allocation is left as it was.
 
 **Despatches reported by the warehouse (Mintsoft).** The goods have already left, so IMS records what it can. If the order is **On Hold** or **Pending payment** and already has shipments, the shipments are marked shipped and stock and cost are booked as normal, but the order itself is left exactly as it is (it is not marked Shipped, the hold is not released, nothing is sent to the storefront), and an administrator gets a "Despatch on an order that is not ready to ship" notice and an activity-log warning. Review the order, release or finalise it, then set it to Shipped if it should be closed. If the order is a **Draft**, or has no shipment yet, IMS does not record the despatch (doing so would finalise the draft or lift the hold): it appears as a stuck despatch under **Sync > Exceptions** for you to decide what to do.
 
@@ -408,6 +436,20 @@ When you record a refund in IMS on an order that came from WooCommerce, IMS book
 - **If the amount differs from every open IMS refund,** no Confirm button is offered: look at the refund in WooCommerce and, if it is a separate refund, use Record manually on that row. If it was meant to pay an IMS refund for a different amount, check the credit note and the refund first; recording it would credit the same money twice. If several IMS refunds have the same amount, each has its own Confirm button, so you name the one it settles.
 - A refund that **began in WooCommerce** is imported as it always was. A full or partial refund in IMS never changes the WooCommerce order status.
 
+### Exchanges inside a return (switched off by default)
+
+A customer swapping an item no longer needs a refund plus a brand new order. With **Exchanges inside a return** switched on (**Settings > Sales**; the `return_exchange_enabled` setting, off by default), the refund dialog has a **Replace the returned items (exchange)** section. You choose the replacement products, the quantity and the price (it starts at the product's list price in the order's currency and price basis; overwrite it). The dialog prices the replacement as the order would (VAT per line) and shows the **credit note** total, the **replacement** total and the difference.
+
+**What it records.** The return side is exactly the refund of today: refund lines, stock back, cost reversal and the credit note. The replacement items are added as **new lines on the same order**, each marked on the order page as *Replaces <credit note number>*, and from there they are ordinary lines: stock is reserved for them (the returned units' reservation is given back in the same step), they are picked and shipped by the normal flow, and the order's posted accounting invoice is updated through the usual queued update (while the outbound write hold is on, the update is recorded as held and nothing is sent). The order's total goes up by the replacement, and the credit note comes off, so the customer's balance nets off. The Refunds section shows a recap of what was returned and what replaced it.
+
+**Money: nothing moves by itself.** An even exchange moves no customer money in IMS. If the replacement is worth more or less than the credit note, the dialog (and the result) says **Customer owes X** or **Refund X**. IMS does not charge or refund that difference: record the payment with **Add payment** when it arrives, or pay the difference out with the existing refund actions. A replacement worth nothing against a return of the whole order is refused: the order would end up fully refunded and hold no demand, so the replacement could not ship. An order whose payment is only recorded as a paid flag (no payment rows) is still held as paid for the larger total, so the difference is yours to settle by hand.
+
+**Where it is allowed.** Only where IMS can still add lines: the same rules as editing a confirmed order. The exchange section is not offered (and the dialog says why) when the order is a draft, cancelled, closed or erased, **has been dispatched** (the warehouse can no longer amend a dispatched order: record the return as a refund and raise a new order for the replacement), is fully refunded already, has a shipment that is picked or packed, has an invoice that is queued but not posted yet, a fee line from the shop, or an order the warehouse is already picking; or when the daily accounting batch has already booked the order's revenue or allocated inventory ahead of dispatch. For an order already sent to the warehouse, IMS first asks the warehouse whether its order is still open for changes; if it is not, or cannot be read, nothing is recorded (*AMENDMENT_NOT_APPLIED*). Recording an exchange needs the permissions to refund, to edit orders and to process (allocate) them. Earlier refunds on the order do not block it.
+
+**An order that came from WooCommerce.** IMS does not add lines in WooCommerce: the replacement exists only in IMS. The dialog shows the same warning as editing the order (WooCommerce keeps the original, so the two no longer match) and you must tick it; without the confirmation nothing is recorded. The order is marked *edited in IMS*, and the WooCommerce lines as they were are kept so a later WooCommerce change is still reported. As for any refund you record in IMS on a shop order, a **Refund in WooCommerce** task is raised for the credit note.
+
+**Deleting.** A refund that came with an exchange cannot be deleted here (its replacement lines are reserved, shipped or invoiced on the strength of it); correct it with a new entry instead. The returns analytics show exchanges apart (see *Analytics & Reports*).
+
 ### Deleting a refund recorded in error
 
 A refund an operator recorded in IMS by mistake can be deleted, and the delete undoes exactly what that refund did. **It is off by default**: an administrator switches it on with the `refund_delete_enabled` setting (the value `true`). While it is off the order page shows no delete control.
@@ -550,6 +592,10 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
 
+### Deleting an invoice that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), an invoice that IMS itself created in Xero shows a **Delete invoice** button on the order page for people who can process sales. It renames the Xero invoice with a random `-DEL-` suffix so the original number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it, and clears the invoice number and link from the order when Xero confirms. If the invoice has payments, refunds or credit notes, is dated in a locked period, was created by another system or is already being deleted, the page shows the reason instead. See [Xero sync](xero-sync.md) for the full rules.
+
 ### Editing an order
 
 **A Draft order can be edited.** Open the order and press **Edit order**: the same form you used to create it opens pre-filled, and you can change the customer, addresses, lines, quantities, prices, discounts, shipping, VAT basis, warehouse, delivery date and notes. **Save changes** re-prices the whole order exactly as creating it would (the same rounding, VAT and exchange-rate rules; a foreign-currency order is re-priced at today's table rate and refused if that rate is missing), replaces the lines, and keeps the order number, the status (still Draft) and the activity history, which records the edit with the old and new totals. An order that was saved with separate fee rows shows their sum as part of **Shipping** when you edit it. The order's external order number is not editable.
@@ -560,7 +606,7 @@ Invoices can be generated either manually or automatically. The trigger for auto
 
 **What WooCommerce does to an order you edited here.** Normally an order update from WooCommerce writes its addresses, notes and shipping label back onto the IMS order. Once you have edited an order here (after the warning above), IMS marks it **edited in IMS** and WooCommerce's copy of those fields no longer overwrites your edit, so a corrected delivery address is not put back to the original by the next WooCommerce update. The order number, the VAT number and the paid state still follow WooCommerce, and IMS no longer reports the difference your edit made as "edited in WooCommerce after import" (see *WooCommerce*). The mark is permanent for that order; if you want the order to follow WooCommerce again, change it in WooCommerce and create a fresh order here.
 
-**After dispatch only addresses and notes can be edited.** Once any shipment has left (the order is Shipped, Completed, or partly shipped), **Edit order** becomes **Edit addresses & notes**: change the billing and shipping addresses and the customer and private notes. Lines, prices and totals cannot change; to change what was sent use **Refund** (or add a line to a new order). The same WooCommerce warning applies to an order that came from the shop. A **Delivered** (closed), **Cancelled** or personal-data-erased order cannot be edited at all.
+**After dispatch only addresses and notes can be edited.** Once any shipment has left (the order is Shipped, Completed, or partly shipped), **Edit order** becomes **Edit addresses & notes**: change the billing and shipping addresses and the customer and private notes. Lines, prices and totals cannot change; to change what was sent use **Refund** (or add a line to a new order). To swap an item before dispatch, an exchange can be recorded with the return (see *Exchanges inside a return*). The same WooCommerce warning applies to an order that came from the shop. A **Delivered** (closed), **Cancelled** or personal-data-erased order cannot be edited at all.
 
 **Edit order is disabled, with the reason shown when you hover it, when** the order is cancelled, delivered or erased, or when something an edit would orphan exists: refunds or return expectations against its lines, a shipment that is already picked or packed (use **Reopen for repack**, or cancel the order), an invoice that is queued for the accounting system but not yet posted (try again shortly: the edit would have to change a document that has not been sent), an order the warehouse is already picking, or a fee line from the shop (duty, handling) that the order form cannot represent. A confirmed order that has a payment or store credit recorded (or is marked paid) can still be edited, but only if the new total and currency are exactly the old ones (swap an item for one of the same price, correct an address); a change that moves the total is refused and nothing is written. A **Draft** is still disabled once it has stock allocated, a shipment, a posted accounting invoice, a warehouse push, a payment, store credit, an invoice number or document, an accounting entry, a refund or return expectation. The server applies the same rule and refuses the edit if anything changed since the page was drawn; if someone else saved the order after you opened the form, your save is refused with a "changed by someone else, reload" message instead of overwriting their change. If the stock for the new lines cannot be reserved, or the new total would no longer match the posted invoice, the whole edit is refused and the order is exactly as it was.
 
@@ -630,7 +676,7 @@ This means the taxable base column in the report shows the net amount in both ca
 
 ## Documents
 
-Three PDF documents are available for each sales order:
+Three PDF documents are available for each sales order (a quote has its own, the **Quote PDF**, see [Quotations](#quotations)):
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically

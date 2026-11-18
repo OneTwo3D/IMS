@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import path from 'path'
 import { logActivity } from '@/lib/activity-log'
-import { requireApiAdmin } from '@/lib/auth/server'
+import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { BackupArtifactUploadError, uploadBackupArtifactsToTarget } from '@/lib/backup-remote'
 import { backupManifestPath } from '@/lib/backup-manifest'
@@ -9,7 +9,7 @@ import { backupManifestPath } from '@/lib/backup-manifest'
 const BACKUP_DIR = getBackupDir()
 
 export async function POST(req: NextRequest) {
-  const session = await requireApiAdmin()
+  const session = await requireApiFreshAdmin()
   if (session instanceof NextResponse) return session
 
   const { filename, target } = await req.json() as { filename: string; target: 's3' | 'sftp' }

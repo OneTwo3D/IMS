@@ -1,4 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { businessDateYmd } from '@/lib/business-date'
+import { parseBatchDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import type { db } from '@/lib/db'
 import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { queueAccountingSyncTxWithOutcome } from '@/lib/accounting'
@@ -16,6 +18,7 @@ import {
   IMS_RECORDED_REFUND_SOURCE,
   REFUND_DELETE_SETTING,
   creditNoteDay,
+  refundDeleteCounterDate,
   isOnOrBeforeLockDate,
   refundDeleteEnabledFromSetting,
   refundDeleteRefusals,
@@ -166,6 +169,7 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
       totalsBasis: true,
       payments: { select: { id: true } },
       returnExpectation: { select: { id: true } },
+      exchangeLines: { select: { id: true }, take: 1 },
       order: {
         select: {
           id: true,
@@ -198,6 +202,8 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
 
   if (refund.payments.length > 0) refusals.push(refundDeleteRefusals.creditNoteSettled(refund.payments.length))
   if (refund.returnExpectation !== null || refund.returnInTransit) refusals.push(refundDeleteRefusals.inTransitReturn())
+  // A refund that came with an exchange has replacement lines on the order pointing at it: they hold stock and sit on the invoice, so the refund is not taken out from under them.
+  if (refund.exchangeLines.length > 0) refusals.push(refundDeleteRefusals.exchangeRefund())
   if (refund.accountingRetryRequired) refusals.push(refundDeleteRefusals.accountingUnfinished())
   if (refund.deferralAdjustmentRef !== null) refusals.push(refundDeleteRefusals.journalUnsupported('revenue through a daily-batch deferral adjustment'))
   if (refund.allocatedReliefAmount !== null && toDecimal(refund.allocatedReliefAmount).gt(0)) refusals.push(refundDeleteRefusals.journalUnsupported('allocated inventory'))
@@ -379,6 +385,9 @@ function recordedCogsBase(payload: Record<string, unknown>): number | null {
   return credit > 0 ? credit : null
 }
 
+/** The credit note's own payload day when it names one (the void is never dated before the note it voids), else null. */
+const creditNoteOwnDay = (payload: unknown): string | null => { const d = payloadRecord(payload).date; return typeof d === 'string' ? parseBatchDay(d) : null }
+
 const COGS_REVERSAL_KEY = (refundId: string): string => `sales-order-refund:${refundId}:cogs-reversal`
 
 export async function deleteSalesOrderRefund(
@@ -386,7 +395,8 @@ export async function deleteSalesOrderRefund(
   input: { refundId: string; actorUserId: string | null; reason: string | null; now?: Date; /** Set by the void worker once the ledger has confirmed the void: the second phase of deleting a refund whose credit note was posted. */ voidConfirmed?: { syncLogId: string } },
 ): Promise<RefundDeleteResult> {
   const now = input.now ?? new Date()
-  const today = now.toISOString().slice(0, 10)
+  // The BUSINESS (London) day: the refund's credit note and COGS reversal are dated on it (businessDateYmd(now) at refund time), so a counter dated on the UTC day could land before what it counters.
+  const today = businessDateYmd(now)
   try {
     return await inTransaction(client, async (tx): Promise<RefundDeleteResult> => {
       // The order is found without a lock only to know WHICH row to lock; every decision below is taken under it.
@@ -426,7 +436,7 @@ export async function deleteSalesOrderRefund(
           chartConnector: connector,
           documentConnector: connector,
           connector,
-          payload: { creditNoteId: plan.creditNote.ledgerId, creditNoteNumber: plan.creditNote.number, date: today, _refundDelete: { actorUserId: input.actorUserId, reason: input.reason } },
+          payload: { creditNoteId: plan.creditNote.ledgerId, creditNoteNumber: plan.creditNote.number, date: refundDeleteCounterDate(creditNoteOwnDay(plan.creditNote.row?.payload), now), _refundDelete: { actorUserId: input.actorUserId, reason: input.reason } },
         })
         if (!outcome.queued && outcome.reason !== 'already-queued') throw new RefundDeleteRefused([refundDeleteRefusals.accountingNotQueued('credit note void', outcome.reason)])
         await tx.activityLog.create({
@@ -469,6 +479,8 @@ export async function deleteSalesOrderRefund(
           await voidMirroredAccountingEventsForOrder(tx, { types: ['COGS_REVERSAL'], referenceType: 'SalesOrderRefund', referenceId: refund.id, reason: 'refund deleted' })
           if (base !== null) await recordCogsSubledgerMovement(tx, { sourceType: 'REFUND_REVERSAL', sourceRef: refund.id, idempotencyKey: `${COGS_REVERSAL_KEY(refund.id)}:refund-delete`, baseDelta: base, journalDate: originalDate })
         } else {
+          // Never dated before what it counters: the later of the original's own day and today's business day.
+          const counterDate = refundDeleteCounterDate(originalDate, now)
           const lines = swappedLines(payload)
           if (!lines) throw new RefundDeleteRefused([refundDeleteRefusals.accountingUncertain('COGS reversal')])
           if (!isRegisteredAccountingConnector(row.connector)) throw new RefundDeleteRefused([refundDeleteRefusals.accountingUncertain('COGS reversal')])
@@ -480,7 +492,7 @@ export async function deleteSalesOrderRefund(
             chartConnector: row.connector,
             connector: 'xero',
             payload: {
-              date: today,
+              date: counterDate,
               reference: `COGS reversal removed: ${refund.creditNoteNumber ?? refund.id}`,
               narration: `Refund ${refund.creditNoteNumber ?? refund.id} was deleted: its COGS reversal is reversed`,
               lines,
@@ -488,7 +500,7 @@ export async function deleteSalesOrderRefund(
           })
           if (!outcome.queued && outcome.reason !== 'already-queued') throw new RefundDeleteRefused([refundDeleteRefusals.accountingNotQueued('COGS reversal journal', outcome.reason)])
           counterJournalQueued = true
-          if (base !== null && outcome.reason !== 'shadowed') await recordCogsSubledgerMovement(tx, { sourceType: 'REFUND_REVERSAL', sourceRef: refund.id, idempotencyKey: `${COGS_REVERSAL_KEY(refund.id)}:refund-delete`, baseDelta: base, journalDate: today })
+          if (base !== null && outcome.reason !== 'shadowed') await recordCogsSubledgerMovement(tx, { sourceType: 'REFUND_REVERSAL', sourceRef: refund.id, idempotencyKey: `${COGS_REVERSAL_KEY(refund.id)}:refund-delete`, baseDelta: base, journalDate: counterDate })
         }
         ;(reversal.subledger as unknown[]).push({ key: `${COGS_REVERSAL_KEY(refund.id)}:refund-delete`, baseDelta: base })
         ;(reversal.retired as unknown[]).push({ syncLogId: row.id, type: 'COGS_REVERSAL', how: plan.cogs.disposition })

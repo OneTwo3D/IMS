@@ -1,5 +1,7 @@
 'use server'
 
+import { businessDateYmd } from '@/lib/business-date'
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
@@ -116,6 +118,7 @@ import { toIsoCountryCode } from '@/lib/countries'
 import {
   buildChargebackRefundLines,
   createSalesOrderRefund,
+  type ReturnExchangeHook,
   recordRefundCogsReversalFromSync,
   recordRefundTransitFromSync,
   retrySalesOrderRefundAccounting,
@@ -185,8 +188,13 @@ import {
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
 import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
-import { paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal } from '@/lib/domain/sales/order-edit-affordance'
+import { SHOP_DESYNC_WARNING, paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal, type SalesOrderEditInput } from '@/lib/domain/sales/order-edit-affordance'
+import { RETURN_EXCHANGE_OFF_REFUSAL, RETURN_EXCHANGE_SETTING_KEY, exchangeRequestRefusal, resolveReturnExchangeBlock, returnExchangeEnabledFromSetting, returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
+import { hasPermission } from '@/lib/permissions'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
+import { isQuoteExpired, quoteDateToYmd, quoteStatusMoveRefused, quoteYmdToDate, validateQuoteInput } from '@/lib/domain/sales/sales-quote'
+import { quoteTodayYmd } from '@/lib/sales-quote-clock'
+import { QUOTE_ACTION_REFUSAL, assertNotQuoteUnderLock } from '@/lib/domain/sales/sales-quote-guard'
 import { filterableCustomFields, resolveCustomFieldListFilter, type FilterableCustomField } from '@/lib/custom-fields/filter'
 import { loadActiveDefinitions } from '@/lib/custom-fields/values-service'
 
@@ -236,6 +244,8 @@ export type SoLineRow = {
   taxRatePercent: number | null
   /** Short label for the rate (e.g. "REDUCED 5%"). Null when no per-line rate. */
   taxRateName: string | null
+  /** The refund this line is the replacement for (an exchange recorded during a return), or null for an ordinary line. */
+  exchangeForRefundId: string | null
 }
 
 export type SoRow = {
@@ -250,6 +260,14 @@ export type SoRow = {
   status: SoStatus
   /// Hidden from the default operational list by data retention; still searchable and still counted by reports.
   archived: boolean
+  /// o3d-ngmt.16: a quotation (a draft with the flag). Never true for a storefront order.
+  isQuote: boolean
+  /// The last day the quote's prices stand (YYYY-MM-DD); kept after the quote is converted.
+  quoteValidUntil: string | null
+  /// When the quote was last queued to the customer by email.
+  quoteSentAt: string | null
+  /// Set by the list / detail reads: the quote's validity date has passed. Always false for an order that is not a quote.
+  quoteExpired: boolean
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
   /// Whether an invoice exists for the order (orthogonal to `status`; a cancelled order keeps it). lib/domain/sales/invoicing-state.ts.
   invoicingState: InvoicingState
@@ -420,6 +438,12 @@ export type CreateSoInput = {
    * PROCESSING, etc.) at which point the accounting invoice is queued.
    */
   isDraft?: boolean
+  /**
+   * o3d-ngmt.16: save the draft as a QUOTATION. A quote is a draft with a flag, so it reserves nothing, is not allocated, invoiced or sent to the warehouse. Requires `isDraft` and a validity date (YYYY-MM-DD).
+   * Editing a quote must repeat `isQuote: true`; an order cannot be turned into a quote.
+   */
+  isQuote?: boolean
+  quoteValidUntil?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +562,9 @@ async function refreshDraftOrderFxAtFinalization(
 const SO_SELECT = {
   id: true,
   archived: true,
+  isQuote: true,
+  quoteValidUntil: true,
+  quoteSentAt: true,
   externalOrderNumber: true,
   shoppingLinks: {
     select: { connector: true, externalOrderId: true },
@@ -610,6 +637,9 @@ const SO_SELECT = {
 function mapSoRow(so: {
   id: string
   archived: boolean
+  isQuote: boolean
+  quoteValidUntil: Date | null
+  quoteSentAt: Date | null
   externalOrderNumber: string | null
   shoppingLinks: { connector: string; externalOrderId: string }[]
   orderNumber: string | null
@@ -720,6 +750,10 @@ function mapSoRow(so: {
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
     archived: so.archived,
+    isQuote: so.isQuote,
+    quoteValidUntil: quoteDateToYmd(so.quoteValidUntil),
+    quoteSentAt: so.quoteSentAt?.toISOString() ?? null,
+    quoteExpired: false,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
     invoicingState: so.invoicingState as InvoicingState,
     withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
@@ -783,6 +817,7 @@ function mapLine(l: {
   totalBase: unknown
   cogsBase: unknown
   taxRateId?: string | null
+  exchangeForRefundId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
   product?: { imageUrl: string | null; type?: ProductType; oversellAllowed?: boolean; parent?: { imageUrl: string | null } | null } | null
 }): SoLineRow {
@@ -808,6 +843,7 @@ function mapLine(l: {
     taxRateId: l.taxRateId ?? l.taxRate?.id ?? null,
     taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null,
     taxRateName: l.taxRate?.name ?? null,
+    exchangeForRefundId: l.exchangeForRefundId ?? null,
   }
 }
 
@@ -826,6 +862,8 @@ export type SoListParams = {
   showCompleted?: boolean
   /** Include archived orders in the default view. */
   includeArchived?: boolean
+  /** The Quotes tab: only quotations (drafts carrying the quote flag). */
+  quotes?: boolean
   /** Filter by a custom field (a dropdown or yes / no field): its key and the chosen value. Unknown keys and values are ignored. */
   customFieldKey?: string
   customFieldValue?: string
@@ -868,6 +906,7 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     invoicing: normaliseStatuses(params.invoicing, SO_INVOICING_FILTERS),
     showCompleted: params.showCompleted === true,
     includeArchived: params.includeArchived === true,
+    quotesOnly: params.quotes === true,
     ...(customFieldFilter ? { customField: customFieldFilter } : {}),
   }
   const where = buildSalesOrderListWhere(filter)
@@ -909,6 +948,8 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     return row
   })
   await Promise.all(rows.map(attachShipmentOutstanding))
+  const quoteToday = await quoteTodayYmd()
+  for (const row of rows) row.quoteExpired = isQuoteExpired(row, quoteToday)
   return {
     ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q),
     customFieldFilters: filterableCustomFields(customFieldDefinitions),
@@ -980,6 +1021,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
           cogsBase: true,
           taxRateId: true,
+          exchangeForRefundId: true,
           taxRate: { select: { id: true, name: true, rate: true, taxCategory: true, accountingTaxType: true, reverseCharge: true } },
           product: { select: { imageUrl: true, type: true, oversellAllowed: true, parent: { select: { imageUrl: true } } } },
         },
@@ -1070,6 +1112,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
 
   const detailRow = mapSoRow(so)
   await attachShipmentOutstanding(detailRow)
+  detailRow.quoteExpired = isQuoteExpired(detailRow, await quoteTodayYmd())
 
   const decimalText = (value: { toString(): string } | null | undefined) => (value == null ? null : value.toString())
   const wooDutyTax: WooDutyTaxMirror = {
@@ -1384,6 +1427,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     const inputError = validateSalesOrderInput(input)
     if (inputError) return { success: false, error: inputError }
     const externalOrderNumber = input.externalOrderNumber?.trim() || null
+    const quote = validateQuoteInput({ isQuote: input.isQuote, isDraft: input.isDraft, quoteValidUntil: input.quoteValidUntil }, await quoteTodayYmd())
+    if (!quote.ok) return { success: false, error: quote.error }
+    if (quote.isQuote && externalOrderNumber) return { success: false, error: 'A quote has no external order number: a storefront order is never a quote.' }
     if (externalOrderNumber) {
       const existing = await db.salesOrder.findFirst({
         where: { externalOrderNumber },
@@ -1430,6 +1476,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
           externalOrderNumber,
           orderNumber,
           status: initialStatus,
+          isQuote: quote.isQuote,
+          quoteValidUntil: quote.quoteValidUntil ? quoteYmdToDate(quote.quoteValidUntil) : null,
           customerId: input.customerId || null,
           taxRateName: input.taxRateName || null,
           ...salesOrderHeaderData(input, prepared),
@@ -1495,8 +1543,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       action: 'created',
       tag: 'sales',
       level: 'INFO',
-      description: `Created sales order ${mapped.displayOrderNumber}`,
-      metadata: { orderNumber: mapped.displayOrderNumber, totalBase: mapped.totalBase, currency: mapped.currency },
+      description: quote.isQuote ? `Created quote ${mapped.displayOrderNumber} (valid until ${quote.quoteValidUntil})` : `Created sales order ${mapped.displayOrderNumber}`,
+      metadata: { orderNumber: mapped.displayOrderNumber, totalBase: mapped.totalBase, currency: mapped.currency, ...(quote.isQuote ? { quote: true, quoteValidUntil: quote.quoteValidUntil } : {}) },
     })
     return postCommitWarnings.length > 0 ? { success: true, order: mapped, postCommitWarnings } : { success: true, order: mapped }
   } catch (e) {
@@ -1537,6 +1585,8 @@ export type UpdateSalesOrderResult = { success: boolean; order?: SoRow; error?: 
 const EDIT_GUARD_SELECT = {
   id: true,
   status: true,
+  isQuote: true,
+  quoteValidUntil: true,
   erasedAt: true,
   accountingInvoiceId: true,
   orderNumber: true,
@@ -1554,6 +1604,50 @@ const EDIT_GUARD_SELECT = {
   wmsOrderPush: { select: { id: true, externalOrderId: true } },
   wcLineBaseline: true,
 } as const
+
+/**
+ * Everything the edit rule needs to know about an order, read under the order's row lock: the guard row's own columns and the counts the rule asks (accounting rows, a queued-but-unposted invoice, productless fee lines, committed and shipped
+ * shipments). One reader for the confirmed-order edit and for the exchange inside a return, so both ask the rule the same question.
+ */
+async function readOrderEditGateInput(
+  tx: Prisma.TransactionClient,
+  id: string,
+  current: Prisma.SalesOrderGetPayload<{ select: typeof EDIT_GUARD_SELECT }>,
+): Promise<{ gate: SalesOrderEditInput; committedShipments: number; shippedShipments: number }> {
+  const [accountingSyncLogs, unpostedInvoices, productlessLines, committedShipments, shippedShipments] = await Promise.all([
+    tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id } }),
+    // An invoice queued (or failed) and not yet posted: its payload is the order as it was, so it must not be left to go out stale under an edit.
+    tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id, type: 'SALES_INVOICE', externalTransactionId: null, status: { in: ['PENDING', 'PROCESSING', 'FAILED'] } } }),
+    tx.salesOrderLine.count({ where: { orderId: id, productId: null } }),
+    tx.shipment.count({ where: { orderId: id, status: { not: 'PENDING' } } }),
+    tx.shipment.count({ where: { orderId: id, status: 'SHIPPED' } }),
+  ])
+  return {
+    committedShipments,
+    shippedShipments,
+    gate: {
+      status: current.status,
+      allocations: current._count.allocations,
+      shipments: current._count.shipments,
+      committedShipments,
+      shippedShipments,
+      accountingInvoiceId: current.accountingInvoiceId,
+      wmsPush: current.wmsOrderPush !== null,
+      hasExternalSource: current._count.shoppingLinks > 0,
+      erased: current.erasedAt !== null,
+      payments: current._count.payments,
+      paid: current.paidAt !== null || current.unregisteredPaidAt !== null,
+      storeCreditForeign: Number(current.storeCreditForeign),
+      invoiceRecords: current._count.invoiceDocuments + (current.invoiceNumber ? 1 : 0),
+      accountingSyncLogs,
+      refunds: current._count.refunds,
+      refundStatus: current.refundStatus,
+      returnExpectations: current._count.returnExpectations,
+      invoiceNotPosted: unpostedInvoices > 0,
+      productlessLines,
+    },
+  }
+}
 
 /** Staleness of the form the operator is editing from: refused when the order was saved since the form read it. */
 function staleEditRefusal(current: { updatedAt: Date }, expectedUpdatedAt: string): string | null {
@@ -1596,6 +1690,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
     const prepared = await prepareSalesOrderWrite(input, confirmedEdit ? { pinnedFxRate: Number(preRead.fxRateToBase) } : undefined)
     if (!prepared.ok) return { success: false, error: prepared.error }
     const lineData = prepared.model.lines
+    const editToday = await quoteTodayYmd()
     const actingUserId = session.user.id ?? null
 
     // THE WAREHOUSE GATE (the one the amendment pass asks): an order already pushed to the warehouse is edited only while the warehouse order can still be amended. Read before the transaction (a remote read does not
@@ -1621,36 +1716,15 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       const isDraft = current.status === 'DRAFT'
       // The status moved between the unlocked read that chose the pricing and this lock: the edit was priced for the other kind of order.
       if (isDraft === confirmedEdit) return { error: 'This order was changed by someone else since you opened it. Close this form and reload the order before editing again.' } as const
-      const [accountingSyncLogs, unpostedInvoices, productlessLines, committedShipments, shippedShipments] = await Promise.all([
-        tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id } }),
-        // An invoice queued (or failed) and not yet posted: its payload is the order as it was, so it must not be left to go out stale under an edit.
-        tx.accountingSyncLog.count({ where: { referenceType: 'SalesOrder', referenceId: id, type: 'SALES_INVOICE', externalTransactionId: null, status: { in: ['PENDING', 'PROCESSING', 'FAILED'] } } }),
-        tx.salesOrderLine.count({ where: { orderId: id, productId: null } }),
-        tx.shipment.count({ where: { orderId: id, status: { not: 'PENDING' } } }),
-        tx.shipment.count({ where: { orderId: id, status: 'SHIPPED' } }),
-      ])
-      const block = resolveSalesOrderEditBlock({
-        status: current.status,
-        allocations: current._count.allocations,
-        shipments: current._count.shipments,
-        committedShipments,
-        shippedShipments,
-        accountingInvoiceId: current.accountingInvoiceId,
-        wmsPush: current.wmsOrderPush !== null,
-        hasExternalSource: current._count.shoppingLinks > 0,
-        erased: current.erasedAt !== null,
-        payments: current._count.payments,
-        paid: current.paidAt !== null || current.unregisteredPaidAt !== null,
-        storeCreditForeign: Number(current.storeCreditForeign),
-        invoiceRecords: current._count.invoiceDocuments + (current.invoiceNumber ? 1 : 0),
-        accountingSyncLogs,
-        refunds: current._count.refunds,
-        refundStatus: current.refundStatus,
-        returnExpectations: current._count.returnExpectations,
-        invoiceNotPosted: unpostedInvoices > 0,
-        productlessLines,
-      })
+      const { gate: editGate } = await readOrderEditGateInput(tx, id, current)
+      const block = resolveSalesOrderEditBlock(editGate)
       if (block) return { error: block.reason } as const
+      // Whether the order is a quote is decided by creating it and by converting it, never by an edit: an edit repeats the flag it was opened with, and may move the validity date.
+      if (Boolean(input.isQuote) !== current.isQuote) {
+        return { error: current.isQuote ? 'This is a quote: keep it a quote while editing, or convert it with Convert to order.' : 'An order cannot be turned into a quote.' } as const
+      }
+      const editedQuote = validateQuoteInput({ isQuote: input.isQuote, isDraft: true, quoteValidUntil: input.quoteValidUntil }, editToday, { allowPastDate: quoteDateToYmd(current.quoteValidUntil) })
+      if (!editedQuote.ok) return { error: editedQuote.error } as const
       // The warehouse order the gate was read for must still be the order's: a push that happened (or a link that moved) since is an answer about something else.
       if (!isDraft && (current.wmsOrderPush?.externalOrderId ?? null) !== wmsGateOrderId) {
         return { error: 'The warehouse order for this sales order changed while the edit was being checked. Reload the order and edit it again. Nothing was changed.' } as const
@@ -1704,6 +1778,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
           customerId: input.customerId || null,
           taxRateName: input.taxRateName || null,
           ...salesOrderHeaderData(input, prepared),
+          ...(editedQuote.isQuote ? { quoteValidUntil: quoteYmdToDate(editedQuote.quoteValidUntil!) } : {}),
           // An edit that clears an address clears it (create simply leaves the column unset).
           billingAddress: (input.billingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
           shippingAddress: (input.shippingAddress ?? Prisma.DbNull) as Prisma.InputJsonValue,
@@ -1794,7 +1869,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       action: 'updated',
       tag: 'sales',
       level: 'INFO',
-      description: `${outcome.isDraft ? 'Edited draft' : 'Edited confirmed'} sales order ${mapped.displayOrderNumber}`,
+      description: mapped.isQuote ? `Edited quote ${mapped.displayOrderNumber}` : `${outcome.isDraft ? 'Edited draft' : 'Edited confirmed'} sales order ${mapped.displayOrderNumber}`,
       metadata: {
         orderNumber: mapped.displayOrderNumber,
         previousTotalForeign: previous.totalForeign,
@@ -2033,7 +2108,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     currency: so.currency,
     // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
     // their own daily rate (which causes 1-3 % drift on multi-currency
@@ -2301,6 +2376,7 @@ export async function applySalesOrderStatusTransition(
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        isQuote: true,
         archived: true,
         shipFromWarehouseId: true,
         // audit-s3en/45kd: detect a paid (full or partial), uninvoiced order being cancelled.
@@ -2320,6 +2396,9 @@ export async function applySalesOrderStatusTransition(
       },
     })
     if (!so) return { success: false, error: 'Order not found' }
+    // o3d-ngmt.16: a quote is a draft that cannot leave the draft state (bar cancelling) until it is converted, whoever asks: re-checked under the lock below.
+    const quoteRefusal = quoteStatusMoveRefused(so.isQuote, targetStatus)
+    if (quoteRefusal) return { success: false, error: quoteRefusal, permanent: true }
     // audit-M-o2c: an archived order is filed away — block MANUAL status edits.
     // Automated data-pushes still apply: the WooCommerce force-sync
     // (INTERNAL_STATUS_TRANSITION_BYPASS) and the sessionless delivery cron
@@ -2507,8 +2586,10 @@ export async function applySalesOrderStatusTransition(
             if (targetStatus !== 'CANCELLED') {
               const fresh = await lockedTx.salesOrder.findUnique({
                 where: { id },
-                select: { withdrawalApprovedAt: true, status: true },
+                select: { withdrawalApprovedAt: true, status: true, isQuote: true },
               })
+              const freshQuoteRefusal = quoteStatusMoveRefused(fresh?.isQuote === true, targetStatus)
+              if (freshQuoteRefusal) throw new PermanentStatusTransitionError(freshQuoteRefusal)
               // Permit only what the state machine itself would permit from
               // the CURRENT status. That allows a post-dispatch return to
               // finish (SHIPPED -> COMPLETED/DELIVERED) while refusing every
@@ -2585,6 +2666,14 @@ export async function applySalesOrderStatusTransition(
       }, STOCK_TX_OPTIONS)
       previousStatusForLog = transitionResult.previousStatus
       orderUpdated = true
+      // o3d-hqvrp.79: the closing released unshipped reservation; the storefront is owed the stock.
+      if (transitionResult.releasedProductIds.length > 0) {
+        try {
+          await enqueueStockSync(transitionResult.releasedProductIds, 'IMS_CHANGE')
+        } catch (syncError) {
+          console.error(syncError)
+        }
+      }
       if (isDraftFinalization && finalisationAllocation) {
         // After the commit: the activity of the allocation attempt and the storefront stock sync it owes (as autoAllocateOrder does).
         const committedAllocation = finalisationAllocation as Awaited<ReturnType<typeof allocateSalesOrder>>
@@ -2822,7 +2911,7 @@ async function queueRefundAccountingActions(input: {
     creditNoteNumber: input.creditNoteNumber ?? undefined,
     contactName: cnContactName,
     contactEmail: orderForCN?.customer?.email ?? undefined,
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
     lines: input.lines.map((line) => ({
@@ -3109,6 +3198,235 @@ async function loadRefundAuditContext(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Exchanges inside a return (Return exchanges)
+// ---------------------------------------------------------------------------
+
+export type ReturnExchangeRequest = {
+  /** The replacement items: product, quantity and the price the operator set (on the order's own price basis: gross when the order's prices include VAT). */
+  lines: { productId: string; qty: number; unitPriceForeign: number; taxRateId?: string | null }[]
+  /** The operator confirmed the warning that an order from the shop is not changed in the shop by the replacement lines. REQUIRED, and exactly `true`, for an order with a shopping link. */
+  acknowledgeShopDesync?: boolean
+}
+
+/** What the order page needs to offer (or explain the absence of) the exchange section of the refund dialog. */
+export type ReturnExchangeOffer = {
+  /** The `return_exchange_enabled` switch. */
+  enabled: boolean
+  /** Whether the person may record one: refund, edit and process permissions together (adding lines and reserving stock are what the exchange does besides the refund). */
+  permitted: boolean
+  /** True when the section is offered: switched on, permitted and no gate blocks it. */
+  offered: boolean
+  /** Why it is not offered, in operator wording (null when it is, or when it is simply switched off). */
+  blockedReason: string | null
+  /** An order from the shop: the exchange does not reach the shop, so the operator must acknowledge that. */
+  needsShopAcknowledgement: boolean
+  shopDesyncWarning: string
+}
+
+export type ReturnExchangePreview = {
+  success: boolean
+  error?: string
+  /** One entry per replacement line, in the order sent: net, VAT and gross in the order's currency. */
+  lines?: { productId: string; net: number; vat: number; gross: number }[]
+  /** What the replacement lines are worth together, VAT included, in the order's currency. */
+  replacementGross?: number
+}
+
+async function readReturnExchangeEnabled(): Promise<boolean> {
+  const row = await db.setting.findUnique({ where: { key: RETURN_EXCHANGE_SETTING_KEY }, select: { value: true } })
+  return returnExchangeEnabledFromSetting(row?.value)
+}
+
+const EXCHANGE_BOOKED_AHEAD_SELECT = { revenueDeferredDate: true, inventoryAllocatedDate: true } as const
+
+function exchangeBookedAhead(row: { revenueDeferredDate: Date | null; inventoryAllocatedDate: Date | null }): boolean {
+  return row.revenueDeferredDate !== null || row.inventoryAllocatedDate !== null
+}
+
+type PreparedWriteOk = Extract<Awaited<ReturnType<typeof prepareSalesOrderWrite>>, { ok: true }>
+type PreparedReturnExchange = {
+  prepared: PreparedWriteOk
+  currency: string
+  pinnedFxRate: number
+  taxRateName: string | null
+  replacementGross: number
+}
+
+/**
+ * The replacement lines priced by the SAME builder an order's lines are (prepareSalesOrderWrite: tax rate per line from the product's category and the destination, the order's default rate, the order's price basis), at the
+ * rate the order was booked at. No shipping, fee or order discount: the totals it returns are exactly what the replacement lines add to the order. Writes nothing.
+ */
+async function prepareReturnExchange(orderId: string, request: { lines: ReturnExchangeRequest['lines'] }): Promise<({ ok: true } & PreparedReturnExchange) | { ok: false; error: string }> {
+  const shapeRefusal = exchangeRequestRefusal(request.lines)
+  if (shapeRefusal) return { ok: false, error: shapeRefusal }
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { id: true, customerName: true, currency: true, fxRateToBase: true, taxRateName: true, taxRatePercent: true, pricesIncludeVat: true, billingAddress: true, shippingAddress: true },
+  })
+  if (!order) return { ok: false, error: 'Order not found' }
+  const products = await db.product.findMany({ where: { id: { in: request.lines.map((l) => l.productId) } }, select: { id: true, sku: true, name: true, type: true } })
+  const byId = new Map(products.map((p) => [p.id, p]))
+  for (const line of request.lines) {
+    const product = byId.get(line.productId)
+    if (!product) return { ok: false, error: 'A replacement product was not found. Nothing was recorded.' }
+    if (product.type === 'VARIABLE' || product.type === 'NON_INVENTORY') return { ok: false, error: `${product.sku} cannot be a replacement item: choose a stocked product or a variant. Nothing was recorded.` }
+  }
+  const pinnedFxRate = Number(order.fxRateToBase)
+  const input: CreateSoInput = {
+    customerName: order.customerName ?? 'Customer',
+    currency: order.currency,
+    billingAddress: order.billingAddress ?? undefined,
+    shippingAddress: order.shippingAddress ?? undefined,
+    taxRateName: order.taxRateName ?? undefined,
+    taxRateValue: Number(order.taxRatePercent ?? 0),
+    pricesIncludeVat: order.pricesIncludeVat ?? false,
+    lines: request.lines.map((line) => {
+      const product = byId.get(line.productId)!
+      return { productId: product.id, sku: product.sku, description: product.name, qty: line.qty, unitPriceForeign: line.unitPriceForeign, taxRateId: line.taxRateId ?? null }
+    }),
+  }
+  const prepared = await prepareSalesOrderWrite(input, { pinnedFxRate })
+  if (!prepared.ok) return { ok: false, error: `${prepared.error}. Nothing was recorded.` }
+  return { ok: true, prepared, currency: order.currency, pinnedFxRate, taxRateName: order.taxRateName, replacementGross: prepared.model.totals.totalForeign }
+}
+
+/**
+ * Whether the refund dialog may offer an exchange for this order, from the stored order (no warehouse call: that gate is asked when the exchange is recorded). The page uses it to show the section, or the reason there is none.
+ */
+export async function getReturnExchangeOffer(orderId: string): Promise<ReturnExchangeOffer> {
+  const session = await requirePermission('sales.refund')
+  const enabled = await readReturnExchangeEnabled()
+  const permitted = hasPermission(session.user.role, 'sales.create') && hasPermission(session.user.role, 'sales.process')
+  const off = { enabled, permitted, offered: false, blockedReason: null, needsShopAcknowledgement: false, shopDesyncWarning: SHOP_DESYNC_WARNING }
+  if (!enabled) return off
+  const current = await db.salesOrder.findUnique({ where: { id: orderId }, select: { ...EDIT_GUARD_SELECT, ...EXCHANGE_BOOKED_AHEAD_SELECT } })
+  if (!current) return { ...off, blockedReason: 'Order not found' }
+  const { gate } = await readOrderEditGateInput(db as unknown as Prisma.TransactionClient, orderId, current)
+  const block = resolveReturnExchangeBlock({ ...gate, accountingBookedAhead: exchangeBookedAhead(current) })
+  if (block) return { ...off, blockedReason: block.reason }
+  if (!permitted) return { ...off, blockedReason: returnExchangeRefusals.needsRefundPermission }
+  return { ...off, offered: true, needsShopAcknowledgement: current._count.shoppingLinks > 0 }
+}
+
+/** What the replacement lines would add to the order (net, VAT, gross per line), for the dialog's recap and its difference. Read only. */
+export async function previewReturnExchange(orderId: string, lines: ReturnExchangeRequest['lines']): Promise<ReturnExchangePreview> {
+  try {
+    await requirePermission('sales.refund')
+    if (!(await readReturnExchangeEnabled())) return { success: false, error: RETURN_EXCHANGE_OFF_REFUSAL }
+    const prepared = await prepareReturnExchange(orderId, { lines })
+    if (!prepared.ok) return { success: false, error: prepared.error }
+    return {
+      success: true,
+      lines: prepared.prepared.model.lines.map((line) => ({ productId: line.productId, net: line.totalForeign, vat: line.taxForeign, gross: roundDecimalNumber(toDecimal(line.totalForeign).add(line.taxForeign), 4) })),
+      replacementGross: prepared.replacementGross,
+    }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/** The replacement lines were added in this transaction (set by the hook below, read by createRefund for its follow-ups). */
+type AppliedExchange = { lineCount: number; productIds: string[]; replacementGross: number; reserve: boolean; shopLinked: boolean }
+
+function buildReturnExchangeHook(args: {
+  orderId: string
+  prepared: PreparedReturnExchange
+  acknowledgeShopDesync: boolean | undefined
+  wmsGateOrderId: string | null
+  actingUserId: string | null
+  onApplied: (applied: AppliedExchange) => void
+}): ReturnExchangeHook {
+  const { orderId, prepared } = args
+  const lineData = prepared.prepared.model.lines
+  let checked: Prisma.SalesOrderGetPayload<{ select: typeof EDIT_GUARD_SELECT }> | null = null
+  return {
+    async check(tx) {
+      // The rates the replacement lines rest on are locked first (the lock order of lib/tax/writable-tax-rate.ts); a rate a re-key retired is resolved to its replacement.
+      await lockOrderNamedTaxRate(tx, prepared.taxRateName, { lineRateIds: lineData.map((l) => l.taxRateId), allowMissing: prepared.prepared.orderDefaultRate === null })
+      await resolveLinesTaxRates(tx, lineData)
+      const current = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { ...EDIT_GUARD_SELECT, ...EXCHANGE_BOOKED_AHEAD_SELECT } })
+      if (!current) return 'Order not found'
+      if (current.currency !== prepared.currency || Number(current.fxRateToBase) !== prepared.pinnedFxRate) return returnExchangeRefusals.rateChanged
+      const { gate } = await readOrderEditGateInput(tx, orderId, current)
+      const block = resolveReturnExchangeBlock({ ...gate, accountingBookedAhead: exchangeBookedAhead(current) })
+      if (block) return block.reason
+      // The warehouse order the amend gate was read for must still be the order's.
+      if ((current.wmsOrderPush?.externalOrderId ?? null) !== args.wmsGateOrderId) return returnExchangeRefusals.warehouseMoved
+      const desyncRefusal = shopDesyncAcknowledgementRefusal(current._count.shoppingLinks > 0, args.acknowledgeShopDesync)
+      if (desyncRefusal) return desyncRefusal
+      checked = current
+      return null
+    },
+    async apply(tx, context) {
+      const current = checked
+      if (!current) throw new Error('The exchange was applied before it was checked')
+      const totals = prepared.prepared.model.totals
+      const shopLinked = current._count.shoppingLinks > 0
+      // The WooCommerce-facing lines and total BEFORE the first IMS change to the lines, so the "edited in WooCommerce after import" comparison keeps running against what the store holds (as the order edit does).
+      const existingLines = shopLinked && current.wcLineBaseline === null
+        ? await tx.salesOrderLine.findMany({ where: { orderId }, select: { externalLineItemId: true, qty: true, sku: true } })
+        : []
+      for (const line of lineData) {
+        await tx.salesOrderLine.create({ data: { orderId, ...line, exchangeForRefundId: context.refundId } })
+      }
+      // The totals move by exactly what the lines add (no shipping, fee or discount is in them), in both currencies.
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: {
+          subtotalForeign: { increment: totals.subtotalForeign },
+          taxForeign: { increment: totals.taxForeign },
+          totalForeign: { increment: totals.totalForeign },
+          subtotalBase: { increment: totals.subtotalBase },
+          taxBase: { increment: totals.taxBase },
+          totalBase: { increment: totals.totalBase },
+          ...(shopLinked ? { editedInImsAt: new Date() } : {}),
+          ...(shopLinked && current.wcLineBaseline === null
+            ? { wcLineBaseline: { totalForeign: Number(current.totalForeign), lines: existingLines.filter((l) => l.externalLineItemId !== null).map((l) => ({ externalLineItemId: l.externalLineItemId, qty: Number(l.qty), sku: l.sku })) } as Prisma.InputJsonValue }
+            : {}),
+        },
+      })
+      // A fully reserved order has unreserved demand now: it steps back to PROCESSING, and the reservation made after the commit promotes it again.
+      if (current.status === 'ALLOCATED') await tx.salesOrder.updateMany({ where: { id: orderId, status: 'ALLOCATED' }, data: { status: 'PROCESSING' } })
+      // THE POSTED INVOICE: its update is queued in this transaction through the same path (and producer-side hold) the order edit uses. An invoice not yet posted needs none (an invoice queued but unposted refused the exchange above).
+      if (current.accountingInvoiceId) {
+        let outcome: { queued: boolean; reason?: string } | null = null
+        await queueSalesInvoiceForOrder(orderId, { client: tx as unknown as typeof db, updateInTx: true, onUpdateOutcome: (o) => { outcome = o } })
+        const recorded = outcome as { queued: boolean; reason?: string } | null
+        if (recorded === null) throw new SalesInvoiceNotQueuedError('the update of the posted invoice was not attempted (the invoice belongs to another accounting connector than the active one, or the active connector cannot update invoices)')
+        assertInvoiceQueuedOrNotOwed(recorded)
+      }
+      await logActivityInTransaction(tx, {
+        userId: args.actingUserId,
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'return_exchange_recorded',
+        tag: 'audit',
+        level: 'INFO',
+        description: `Recorded an exchange on sales order ${getSalesOrderReference(current)}: ${lineData.length} replacement line(s) added for credit note ${context.creditNoteNumber}`
+          + (shopLinked ? '; the operator acknowledged that the replacement lines do not reach WooCommerce' : ''),
+        metadata: {
+          refundId: context.refundId,
+          creditNoteNumber: context.creditNoteNumber,
+          replacementLines: lineData.map((l) => ({ productId: l.productId, sku: l.sku, qty: l.qty, totalForeign: l.totalForeign })),
+          replacementTotalForeign: totals.totalForeign,
+          currency: current.currency,
+          shopDesyncAcknowledged: shopLinked ? args.acknowledgeShopDesync === true : null,
+          invoiceUpdateQueued: current.accountingInvoiceId ? true : false,
+        },
+      })
+      args.onApplied({
+        lineCount: lineData.length,
+        productIds: lineData.map((l) => l.productId),
+        replacementGross: totals.totalForeign,
+        reserve: current._count.allocations > 0 || ['PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED'].includes(current.status),
+        shopLinked,
+      })
+      return { addedNetBase: totals.subtotalBase }
+    },
+  }
+}
+
 export async function createRefund(
   orderId: string,
   lines: RefundRequestLine[],
@@ -3136,6 +3454,11 @@ export async function createRefund(
     eas182StatedTaxForeign?: number
     /** The structured return reason (a configured ReturnReason id), one per refund. Optional. An unknown or inactive id is refused for an operator and ignored for an internal caller (which resolves it itself). */
     returnReasonId?: string | null
+    /**
+     * AN EXCHANGE recorded with this return (switch `return_exchange_enabled`): replacement items added as NEW LINES ON THE SAME ORDER, each linked to this refund, in the refund's own transaction. The return side is the refund of today.
+     * Operator only (an internal caller is refused). Nothing is charged or refunded for a difference: the order's total simply carries the replacement and the credit note carries the return.
+     */
+    exchange?: ReturnExchangeRequest
   },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
@@ -3151,11 +3474,39 @@ export async function createRefund(
   recordedNetForeign?: number
   conflict?: RefundCreationConflict
   quarantine?: true
+  /** Set when an exchange was recorded: what the replacement lines added to the order (VAT included, order currency). The caller compares it with the credit note to show the difference; IMS charges and refunds nothing. */
+  exchange?: { lineCount: number; replacementGrossForeign: number }
 }> {
   try {
     const isInternal = options?.internalBypassToken === INTERNAL_ACTION_BYPASS
     if (!isInternal) {
       await requirePermission('sales.refund')
+    }
+    // o3d-ngmt.16: a quote has nothing to refund (it takes no payment and is never invoiced).
+    if ((await db.salesOrder.findUnique({ where: { id: orderId }, select: { isQuote: true } }))?.isQuote) return { success: false, error: QUOTE_ACTION_REFUSAL('it cannot be refunded') }
+    // AN EXCHANGE: prepared (priced, gated on the warehouse) before the refund transaction; the transaction re-checks every gate under the order lock.
+    let exchangeHook: ReturnExchangeHook | undefined
+    let appliedExchange: AppliedExchange | null = null
+    if (options?.exchange) {
+      if (isInternal) return { success: false, error: returnExchangeRefusals.internalCaller }
+      // Adding lines and reserving their stock are what an exchange does besides the refund: it needs the permissions of both (the refund permission was asked above).
+      const exchangeSession = await requirePermission('sales.create')
+      await requirePermission('sales.process')
+      if (!(await readReturnExchangeEnabled())) return { success: false, error: RETURN_EXCHANGE_OFF_REFUSAL }
+      if (!lines.some((line) => line.qty > 0 && (line.lineKind ?? 'sale') === 'sale')) return { success: false, error: returnExchangeRefusals.notReturnSide }
+      const preparedExchange = await prepareReturnExchange(orderId, options.exchange)
+      if (!preparedExchange.ok) return { success: false, error: preparedExchange.error }
+      // THE WAREHOUSE GATE (the one the amendment pass asks): the replacement lines reach a pushed order only while the warehouse order can still be amended. Read before the transaction (a remote read does not belong under the order lock).
+      const wmsGate = await resolveOrderEditWmsGate(orderId, 'lines')
+      if (!wmsGate.ok) return { success: false, error: wmsGate.error }
+      exchangeHook = buildReturnExchangeHook({
+        orderId,
+        prepared: preparedExchange,
+        acknowledgeShopDesync: options.exchange.acknowledgeShopDesync,
+        wmsGateOrderId: wmsGate.externalOrderId,
+        actingUserId: exchangeSession.user.id ?? null,
+        onApplied: (applied) => { appliedExchange = applied },
+      })
     }
     // o3d-n8p (Codex): chargeback and externalRefundId are provenance-bearing and have material effects —
     // chargeback suppresses restock + COGS reversal, and externalRefundId occupies the globally unique Woo
@@ -3172,6 +3523,9 @@ export async function createRefund(
     // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
     const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
+    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending.
+    const deletePendingForRefund = await pendingDeletionError(orderId)
+    if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
     let returnReasonId: string | null = null
     if (options?.returnReasonId) {
       const reason = await db.returnReason.findFirst({ where: { id: options.returnReasonId, active: true }, select: { id: true } })
@@ -3242,6 +3596,7 @@ export async function createRefund(
       ...(accountingSettings?.connector === 'xero' && await isAccountingSyncTypeEnabledFor('xero', 'SALES_INVOICE')
         ? { euVatSchemeSnapshot: true, ...(isInternal && options?.statedGrossForeign != null ? { statedGrossForeign: options.statedGrossForeign } : {}), ...(isInternal && options?.eas182StatedTaxForeign != null ? { eas182StatedTaxForeign: options.eas182StatedTaxForeign } : {}) }
         : {}),
+      ...(exchangeHook ? { exchange: exchangeHook } : {}),
     })
     if (!refundResult.success) return refundResult
 
@@ -3315,6 +3670,40 @@ export async function createRefund(
         log: logActivity,
       },
     )
+
+    // THE EXCHANGE'S FOLLOW-UPS (after the commit): reserve stock for the replacement lines (the allocator also gives back the returned units' reservation in the same pass) and push the storefront stock of every product it touched.
+    // A reservation that does not complete leaves the replacement on backorder, which is reported (never silent) and picked up by the reallocation sweep; the exchange itself is committed.
+    const exchangeDone = appliedExchange as AppliedExchange | null
+    const exchangeWarnings: string[] = []
+    if (exchangeDone) {
+      let syncProductIds: string[] = [...exchangeDone.productIds]
+      if (exchangeDone.reserve) {
+        try {
+          const { autoAllocateOrder } = await import('./allocation')
+          const allocation = await autoAllocateOrder(orderId, { refuseIfCommittedShipmentsExist: true })
+          if (!allocation.success) exchangeWarnings.push(`stock was NOT reserved for the replacement items (${allocation.error ?? 'no stock was available'}); they wait for stock`)
+          else if ((allocation.unallocatedQty ?? 0) > 0) exchangeWarnings.push(`${allocation.unallocatedQty} replacement unit(s) could not be reserved and are on backorder`)
+          syncProductIds = [...new Set([...syncProductIds, ...(allocation.syncProductIds ?? [])])]
+        } catch (allocationError) {
+          exchangeWarnings.push(`stock was NOT reserved for the replacement items (${String(allocationError)})`)
+        }
+      }
+      try {
+        await enqueueStockSync(syncProductIds, 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+        exchangeWarnings.push('the storefront stock update for the exchange could not be queued; stock levels in the shop may lag until the next stock sync')
+      }
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'return_exchange',
+        tag: 'sales',
+        level: 'INFO',
+        description: `Exchange recorded with the return on order ${refundResult.refundOrderRef}: ${exchangeDone.lineCount} replacement line(s)`,
+        metadata: { orderNumber: refundResult.refundOrderRef, refundId: refundResult.createdRefund.id, creditNoteNumber: refundResult.creditNoteNumber, replacementLines: exchangeDone.lineCount, shopLinked: exchangeDone.shopLinked },
+      })
+    }
 
     // o3d-67y (Codex r8): an unmatched external refund quantity (positive-qty sale line with no persisted
     // sales-order-line link) cannot be released — allocation ignores it — but the order still holds a
@@ -3487,12 +3876,16 @@ export async function createRefund(
       }
     }
 
+    const exchangeWarning = exchangeWarnings.length > 0 ? exchangeWarnings.join('; ') : undefined
     return {
       success: true,
-      warning: accountingWarning,
+      warning: [accountingWarning, exchangeWarning].filter(Boolean).join('; ') || undefined,
       recordedNetForeign: Math.round(refundResult.createdRefundLines.reduce((sum, line) => sum + line.totalForeign, 0) * 10000) / 10000,
+      ...(exchangeDone ? { exchange: { lineCount: exchangeDone.lineCount, replacementGrossForeign: exchangeDone.replacementGross } } : {}),
     }
   } catch (e) {
+    if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
+    if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The exchange would leave the order's invoice out of step with its total, so nothing was recorded: ${e.message}` }
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the
       // winning refund could belong to a different order. Only report idempotent success when the existing
@@ -4273,6 +4666,9 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
+    // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned.
+    const deletePendingForPaid = await pendingDeletionError(id)
+    if (deletePendingForPaid) return { success: false, error: deletePendingForPaid }
     // audit-mmvp: lock the order row (same FOR UPDATE pattern as addPayment) so a
     // concurrent addPayment/markSalesOrderPaid can't both observe paidAt=null,
     // both flip it, and both run the warn/generate block — double-warning the
@@ -4280,6 +4676,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
     // lock makes exactly one caller see the unpaid→paid transition.
     const locked = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, id)
+      await assertNotQuoteUnderLock(tx, id, 'it cannot be marked paid')
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
@@ -4420,10 +4817,12 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
           externalOrderNumber: true,
           orderNumber: true,
           invoiceNumber: true,
+          isQuote: true,
           shoppingLinks: { select: { connector: true } },
         },
       })
       if (!so) throw new Error('Order not found')
+      if (so.isQuote) throw new Error('A quote is not invoiced: convert it to an order and confirm the order first.')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
       // o3d-k26m.1: for a storefront that supplies its own invoice number, this column is where
       // that number is recorded — minting into it posts the order to the ledger under a number
@@ -4509,6 +4908,7 @@ export async function addPayment(input: {
     const baseCurrency = await getBaseCurrencyCode()
     const txResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, input.orderId)
+      await assertNotQuoteUnderLock(tx, input.orderId, 'no payment can be recorded against it')
       const so = await tx.salesOrder.findUnique({
         where: { id: input.orderId },
         select: {
@@ -4526,6 +4926,9 @@ export async function addPayment(input: {
         },
       })
       if (!so) return { error: 'Order not found' }
+      // o3d-ngmt.21: no receipt against an invoice whose delete is pending (read under the order lock the delete request also takes).
+      const deletePending = await pendingDeletionError(input.orderId, tx)
+      if (deletePending) return { error: deletePending }
       // A CANCELLED order can still receive a receipt: money really does arrive for orders that were
       // cancelled (a bank transfer in flight, a customer who paid late), and an operator must be able to
       // record it. What happens to it afterwards is decided by WHEN it was paid against the database-minted
@@ -4827,7 +5230,7 @@ export async function addPayment(input: {
               referenceType: 'Payment',
               referenceId: txResult.paymentId,
               payload: {
-                date: txResult.paidAt.toISOString().slice(0, 10),
+                date: businessDateYmd(txResult.paidAt),
                 reference: getSalesOrderReference(txResult.so),
                 narration: `Realised FX ${realised.outcome} on customer payment ${getSalesOrderReference(txResult.so)}`,
                 lines,

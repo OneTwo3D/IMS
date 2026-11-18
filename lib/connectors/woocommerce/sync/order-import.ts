@@ -2,6 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
 import { readWcLineCustomsUnitValue } from './duty-tax-mirror'
 import { mirrorIossFromRegime } from './duty-tax-regime-mirror'
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
@@ -2212,7 +2213,7 @@ async function buildFreshWcSalesInvoice(p: {
     : null
   const core = {
     currency,
-    date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+    date: businessDateYmd(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
     currencyRateToBase: usableStoredFxRate(stored?.fxRateToBase)?.toNumber(),
     _postingMode: 'submitted',
     _paymentMethod: wcOrder.payment_method || undefined,
@@ -2311,6 +2312,9 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
 
   // A FRESH BUILD of the document from the order as it is now, by the importer's own pieces (the shared tax resolution, `reconcileWcDocumentWithOrder`, `buildWcInvoiceCore`) and, for a treated hold, the treatment's read-only preview (the order's existing stamp
   // is used only if it still agrees with the fresh decision). Nothing is written. A refusal of any of them is the hold's reason; otherwise the parked payload is compared with it on every accounting-relevant field, and that comparison is the authority.
+  // A hold parked before the invoice date moved to the London business day carries the UTC day of the order's creation: accept that day as well as the London one (see heldFreshBuildDifference).
+  const createdInstant = parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)
+  const acceptedParkedDates = [createdInstant.toISOString().slice(0, 10), businessDateYmd(createdInstant)]
   const buildFresh = (client: Prisma.TransactionClient, withTreatment: boolean) => buildFreshWcSalesInvoice({ client, orderId, wcOrder, inputs: { currency, mappedLines, coupons, amounts, settings, accounts }, chart, withTreatment })
 
   // The whole check of a TREATED hold, reading through `client` (the caller's order-locked transaction): the parked payload against the order, and the regime re-resolved from the current facts against what was parked and the order's stamp.
@@ -2346,7 +2350,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     // THE AUTHORITY: the parked payload against a fresh build of the same document from the order as it is now, treatment included (see buildFresh). The checks above are diagnostics for the common causes.
     const fresh = await buildFresh(client, true)
     if (!fresh.ok) return fresh.reason
-    const freshDifference = heldFreshBuildDifference(parked.accountingPayload, fresh.payload)
+    const freshDifference = heldFreshBuildDifference(parked.accountingPayload, fresh.payload, acceptedParkedDates)
     // The policy the verified decision was just made under (the fresh build's one settings read): the release records it, so the payload carries the settings in force and the poster's check passes.
     if (freshDifference === null) verifiedPolicy.value = fresh.policy
     return freshDifference
@@ -2402,7 +2406,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   // The authority for an untreated hold: the parked payload against a fresh build of the document (before the treatment) from the order as it is now.
   const freshUntreated = await buildFresh(db, false)
   if (!freshUntreated.ok) return await refuse(freshUntreated.reason)
-  const freshDifference = heldFreshBuildDifference(parkedPayload, freshUntreated.payload)
+  const freshDifference = heldFreshBuildDifference(parkedPayload, freshUntreated.payload, acceptedParkedDates)
   if (freshDifference !== null) return await refuseChanged(freshDifference)
   const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = parkedPayload
   void _marker
@@ -4116,7 +4120,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: payloadAnonymised ? undefined : (wcOrder.billing.email || undefined),
-          date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+          date: businessDateYmd(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
           currency,
           // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.

@@ -3,9 +3,11 @@
 import { INVOICING_STATE_CLASS, INVOICING_STATE_LABELS } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
 import { useRouter } from 'next/navigation'
-import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
+import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical, ArrowRightLeft } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
+import { DeleteSyncedDocument } from '@/components/accounting/delete-synced-document'
+import type { DocumentDeleteUiState } from '@/lib/domain/accounting/document-delete-service'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
@@ -23,10 +25,11 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import {
   updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
   updateSalesOrderNotes, updateSalesOrderAddressesAndNotes, generateInvoiceNumber,
-  addPayment, deletePayment, reverseLedgerPayment, releaseWithdrawalHold,
-  type SoDetail, type SoStatus,
+  addPayment, deletePayment, reverseLedgerPayment, releaseWithdrawalHold, previewReturnExchange,
+  type ReturnExchangeOffer, type ReturnExchangePreview, type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
+import { convertQuoteToOrder, sendQuoteEmail } from '@/app/actions/sales-quotes'
 import { deleteRefund, getRefundDeleteEligibility, type RefundDeleteEligibility } from '@/app/actions/refund-delete'
 import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
@@ -42,6 +45,7 @@ import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
 import { SHOP_DESYNC_WARNING, resolveSalesOrderEditBlock, resolveSalesOrderEditScope } from '@/lib/domain/sales/order-edit-affordance'
+import { exchangeDifference, exchangeDifferenceLabel, exchangeLineBadge, type ExchangeCatalogueRow } from '@/lib/domain/sales/return-exchange'
 import { SoFormDialog } from '../so-form'
 import { PeggedBadge, SoPegsCard } from '@/components/sales/so-pegs-card'
 import type { SalesOrderPegRow } from '@/app/actions/pegging'
@@ -60,6 +64,7 @@ import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
 import { countryName, formatCountryDisplay } from '@/lib/countries'
+import { businessDateYmd } from '@/lib/business-date'
 
 type WarehouseInfo = { id: string; code: string; name: string }
 
@@ -130,8 +135,16 @@ type Props = {
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   /** audit-H2: order is fully paid but its trigger won't auto-generate an invoice. */
   paidWithoutInvoice: boolean
+  /** The Settings switch behind Send quote (sales_quote_email_enabled). Off: a quote offers a PDF download only. */
+  quoteEmailEnabled?: boolean
   /** The catalogue the Edit order dialog needs; loaded by the page only for a DRAFT (the only status that can be edited). */
   editForm?: Omit<ComponentProps<typeof SoFormDialog>, 'order' | 'onClose' | 'warehouses' | 'currencies'>
+  /** Whether the refund dialog may record an exchange for this order (null for a person who cannot refund). */
+  exchangeOffer?: ReturnExchangeOffer | null
+  /** The replacement products the refund dialog searches; empty unless the exchange is offered. */
+  exchangeCatalogue?: ExchangeCatalogueRow[]
+  /** o3d-ngmt.21: whether to offer deleting the synced invoice, or why not. Undefined = nothing to show. */
+  invoiceDeleteState?: DocumentDeleteUiState
   /** SO-to-PO pegging: this order's live pegs. */
   pegs?: SalesOrderPegRow[]
 }
@@ -197,12 +210,13 @@ function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number
 // ---------------------------------------------------------------------------
 // Refund dialog
 // ---------------------------------------------------------------------------
-function RefundDialog({ order, warehouses, returnReasons, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; returnReasons: ReturnReason[]; sym: string; onClose: () => void }) {
+function RefundDialog({ order, warehouses, returnReasons, sym, exchangeOffer, exchangeCatalogue, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; returnReasons: ReturnReason[]; sym: string; exchangeOffer: ReturnExchangeOffer | null; exchangeCatalogue: ExchangeCatalogueRow[]; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [reason, setReason] = useState('')
   const [returnReasonId, setReturnReasonId] = useState('')
-  const [returnWhId, setReturnWhId] = useState(warehouses[0]?.id ?? '')
+  // Nothing has shipped yet (the only orders that can take an exchange): there is no stock to return, and the server refuses a return warehouse before the order has shipped.
+  const [returnWhId, setReturnWhId] = useState(order.shipmentStatuses.includes('SHIPPED') ? (warehouses[0]?.id ?? '') : '')
   const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0 })))
   const [error, setError] = useState('')
   const [warning, setWarning] = useState('')
@@ -210,21 +224,54 @@ function RefundDialog({ order, warehouses, returnReasons, sym, onClose }: { orde
   const moneyOrder = moneyViewOrderOf(order)
   const request = buildRefundRequest(moneyOrder, refundLines.map((l) => ({ lineId: l.id, qty: l.qtyRefund })))
   const totalRefund = request.total
+  // EXCHANGE: replacement items recorded with the return (only when the order page offered it).
+  const exchangeOffered = exchangeOffer?.offered === true
+  const [exchangeOn, setExchangeOn] = useState(false)
+  const [exchangeLines, setExchangeLines] = useState<Array<{ productId: string; sku: string; name: string; qty: number; unitPrice: number }>>([])
+  const [exchangeSearch, setExchangeSearch] = useState('')
+  const [exchangePreview, setExchangePreview] = useState<ReturnExchangePreview | null>(null)
+  const [exchangeAcknowledged, setExchangeAcknowledged] = useState(false)
+  const exchangePayload = exchangeLines.map((l) => ({ productId: l.productId, qty: l.qty, unitPriceForeign: l.unitPrice }))
+  const exchangePayloadKey = JSON.stringify(exchangePayload)
+  useEffect(() => {
+    if (!exchangeOn || exchangePayload.length === 0 || exchangePayload.some((l) => !(l.qty > 0))) { setExchangePreview(null); return }
+    let cancelled = false
+    const timer = setTimeout(() => { previewReturnExchange(order.id, exchangePayload).then((result) => { if (!cancelled) setExchangePreview(result) }).catch(() => { if (!cancelled) setExchangePreview({ success: false, error: 'The replacement could not be priced just now.' }) }) }, 300)
+    return () => { cancelled = true; clearTimeout(timer) }
+    // exchangePayloadKey stands for exchangePayload's content
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exchangeOn, exchangePayloadKey, order.id])
+  const difference = exchangeOn && exchangePreview?.success && exchangePreview.replacementGross != null
+    ? exchangeDifference({ replacementGross: exchangePreview.replacementGross, creditNoteGross: totalRefund.gross })
+    : null
+  const exchangeMatches = exchangeSearch.trim().length < 2 ? [] : exchangeCatalogue.filter((p) => !exchangeLines.some((l) => l.productId === p.id) && `${p.sku} ${p.name}`.toLowerCase().includes(exchangeSearch.trim().toLowerCase())).slice(0, 8)
   function handleConfirm() {
     setError('')
     setWarning('')
     const toRefund = refundLines.filter((l) => l.qtyRefund > 0)
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
+    if (exchangeOn) {
+      if (exchangeLines.length === 0) { setError('Add at least one replacement item, or switch the exchange off'); return }
+      if (exchangeLines.some((l) => !(l.qty > 0))) { setError('Every replacement item needs a quantity above zero'); return }
+      if (exchangeOffer?.needsShopAcknowledgement && !exchangeAcknowledged) { setError('Confirm that the replacement items do not reach WooCommerce'); return }
+    }
     startTransition(async () => {
-      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined, returnReasonId ? { returnReasonId } : undefined)
+      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined, {
+        ...(returnReasonId ? { returnReasonId } : {}),
+        ...(exchangeOn ? { exchange: { lines: exchangePayload, ...(exchangeOffer?.needsShopAcknowledgement ? { acknowledgeShopDesync: exchangeAcknowledged } : {}) } } : {}),
+      })
       if (result.success) {
         router.refresh()
         // The server cuts the refund again under the order lock; if what it recorded differs from this preview, show the server's figure.
         const drift = result.recordedNetForeign != null && Math.abs(result.recordedNetForeign - request.total.net) > 0.005
         const driftNote = drift ? `The refund was recorded at ${formatMoney(result.recordedNetForeign!, sym)} net, not the ${formatMoney(request.total.net, sym)} previewed (an earlier refund landed first). The credit note shows the recorded figures.` : ''
-        if (result.warning || drift) {
-          setWarning([driftNote, result.warning].filter(Boolean).join(' '))
+        // The exchange result keeps the dialog open with the difference stated: IMS charges and refunds nothing, so the operator is told what is left to settle.
+        const exchangeNote = result.exchange
+          ? `Exchange recorded: ${result.exchange.lineCount} replacement line(s) added to this order. ${exchangeDifferenceLabel(exchangeDifference({ replacementGross: result.exchange.replacementGrossForeign, creditNoteGross: totalRefund.gross }), (amount) => formatMoney(amount, sym))}`
+          : ''
+        if (result.warning || drift || exchangeNote) {
+          setWarning([exchangeNote, driftNote, result.warning].filter(Boolean).join(' '))
         } else {
           onClose()
         }
@@ -274,6 +321,66 @@ function RefundDialog({ order, warehouses, returnReasons, sym, onClose }: { orde
           <span className="text-xs text-muted-foreground">Net {formatMoney(totalRefund.net, sym)} + VAT {formatMoney(totalRefund.vat, sym)}</span>
           <span className="font-medium">Credit note total (incl. VAT): {formatMoney(totalRefund.gross, sym)}</span>
         </div>
+        {exchangeOffer?.enabled && !exchangeOffered && exchangeOffer.blockedReason && (
+          <p className="text-xs text-muted-foreground" data-testid="exchange-blocked-reason">{exchangeOffer.blockedReason}</p>
+        )}
+        {exchangeOffered && (
+          <div className="space-y-3 rounded-md border p-3" data-testid="exchange-section">
+            <label className="flex items-center gap-2 text-sm font-medium cursor-pointer">
+              <input type="checkbox" checked={exchangeOn} onChange={(e) => setExchangeOn(e.target.checked)} />
+              Replace the returned items (exchange)
+            </label>
+            {exchangeOn && (
+              <div className="space-y-3">
+                <p className="text-xs text-muted-foreground">The replacement items are added as new lines on this same order, linked to this refund, and are reserved, shipped and invoiced as usual. The credit note and the replacement net off; IMS does not charge or refund a difference.</p>
+                <div className="relative">
+                  <Input placeholder="Search a replacement product (SKU or name)…" value={exchangeSearch} onChange={(e) => setExchangeSearch(e.target.value)} className="h-8 text-sm" />
+                  {exchangeMatches.length > 0 && (
+                    <div className="absolute z-10 mt-1 w-full rounded-md border bg-background shadow">
+                      {exchangeMatches.map((p) => (
+                        <button type="button" key={p.id} className="block w-full px-3 py-1.5 text-left text-sm hover:bg-muted" onClick={() => { setExchangeLines((prev) => [...prev, { productId: p.id, sku: p.sku, name: p.name, qty: 1, unitPrice: p.defaultUnitPrice }]); setExchangeSearch('') }}>
+                          <span className="font-mono text-xs text-muted-foreground">{p.sku}</span> {p.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {exchangeLines.length > 0 && (
+                  <Table className="rounded-md border"><TableHeader className="bg-muted/50"><TableRow>
+                    <TableHead className="text-xs">Replacement</TableHead>
+                    <TableHead className="text-xs text-right w-24">Qty</TableHead>
+                    <TableHead className="text-xs text-right w-32">Unit price ({sym}, {order.amountsIncludeVat ? 'incl.' : 'excl.'} VAT)</TableHead>
+                    <TableHead className="text-xs text-right w-28">Total incl. VAT ({sym})</TableHead>
+                    <TableHead className="w-8" />
+                  </TableRow></TableHeader><TableBody>
+                    {exchangeLines.map((l, index) => (
+                      <TableRow key={l.productId}>
+                        <TableCell className="text-sm"><span className="font-mono text-xs text-muted-foreground">{l.sku}</span> {l.name}</TableCell>
+                        <TableCell><Input type="number" min={0} step={1} value={l.qty} onChange={(e) => { const q = Number(e.target.value) || 0; setExchangeLines((prev) => prev.map((x) => x.productId === l.productId ? { ...x, qty: q } : x)) }} className="h-7 text-sm text-right w-20 ml-auto font-mono" /></TableCell>
+                        <TableCell><Input type="number" min={0} step={0.01} value={l.unitPrice} onChange={(e) => { const price = Number(e.target.value) || 0; setExchangeLines((prev) => prev.map((x) => x.productId === l.productId ? { ...x, unitPrice: price } : x)) }} className="h-7 text-sm text-right w-28 ml-auto font-mono" /></TableCell>
+                        <TableCell className="text-right font-mono text-xs">{exchangePreview?.success && exchangePreview.lines?.[index] ? formatMoney(exchangePreview.lines[index].gross, sym) : '…'}</TableCell>
+                        <TableCell><button type="button" aria-label={`Remove ${l.sku}`} className="text-muted-foreground hover:text-foreground" onClick={() => setExchangeLines((prev) => prev.filter((x) => x.productId !== l.productId))}>×</button></TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody></Table>
+                )}
+                {exchangePreview && !exchangePreview.success && <p className="text-sm text-destructive">{exchangePreview.error}</p>}
+                {exchangePreview?.success && exchangePreview.replacementGross != null && (
+                  <div className="flex flex-col items-end gap-0.5 text-sm" data-testid="exchange-recap">
+                    <span className="text-xs text-muted-foreground">Returned (credit note): {formatMoney(totalRefund.gross, sym)} · Replacement: {formatMoney(exchangePreview.replacementGross, sym)}</span>
+                    {difference && <span className="font-medium" data-testid="exchange-difference">{exchangeDifferenceLabel(difference, (amount) => formatMoney(amount, sym))}</span>}
+                  </div>
+                )}
+                {exchangeOffer?.needsShopAcknowledgement && (
+                  <label className="flex items-start gap-2 text-xs cursor-pointer" data-testid="exchange-shop-desync">
+                    <input type="checkbox" className="mt-0.5" checked={exchangeAcknowledged} onChange={(e) => setExchangeAcknowledged(e.target.checked)} />
+                    <span>{exchangeOffer.shopDesyncWarning}</span>
+                  </label>
+                )}
+              </div>
+            )}
+          </div>
+        )}
         {warning && (
           <Alert>
             <AlertTriangle className="h-4 w-4" />
@@ -441,7 +548,7 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
   const [method, setMethod] = useState('')
   const [reference, setReference] = useState('')
   const [notes, setNotes] = useState('')
-  const [paidAt, setPaidAt] = useState(new Date().toISOString().slice(0, 10))
+  const [paidAt, setPaidAt] = useState(businessDateYmd(new Date()))
   const [error, setError] = useState('')
 
   function handleSave() {
@@ -1129,7 +1236,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, pegs = [] }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1196,7 +1303,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
 
   const hasShipments = shipments.length > 0
   // Filter out Delivered action if delivery tracking is not enabled
-  const nextActions = nextStatusActions(so.status, deliveryTrackingEnabled).map((a) => ({ ...a, icon: STATUS_ACTION_ICON[a.target] ?? Package }))
+  // A quote is a draft that cannot be processed until it is converted (the server refuses the move too), so it offers Convert to order instead of Process.
+  const nextActions = (so.isQuote ? [] : nextStatusActions(so.status, deliveryTrackingEnabled)).map((a) => ({ ...a, icon: STATUS_ACTION_ICON[a.target] ?? Package }))
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   // o3d-0zy: predict the o3d-5r8 delete refusal instead of letting the operator walk into it. Every
@@ -1234,7 +1342,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
   // Reads the orthogonal refundStatus so it keeps working once a partial refund no
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
-  const canRefund = (['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && so.refundStatus !== 'FULL') || so.refundStatus === 'PARTIAL'
+  // An undispatched order is refundable here only to record an exchange (the one return that keeps the order alive), and only when the exchange is offered for it.
+  const canRefund = (['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && so.refundStatus !== 'FULL') || so.refundStatus === 'PARTIAL' || exchangeOffer?.offered === true
   const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
   // o3d-ngmt.22: whether each refund can be deleted, asked of the server (which owns every rule). Nothing is asked, and no control shown, unless the refund
   // permission is held and there is a refund; the server answers `enabled: false` while the switch is off.
@@ -1422,6 +1531,35 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
     })
   }
 
+  function handleConvertQuote() {
+    setError('')
+    let overrideNote: string | undefined
+    if (so.quoteExpired) {
+      const note = window.prompt(`This quote expired on ${so.quoteValidUntil}. To convert it anyway, say why its prices still stand:`)
+      if (note === null) return
+      if (!note.trim()) { setError('A note is needed to convert an expired quote.'); return }
+      overrideNote = note.trim()
+    } else if (!confirm('Convert this quote to an order? It stays a draft (prices unchanged) until you confirm it.')) {
+      return
+    }
+    startTransition(async () => {
+      const result = await convertQuoteToOrder(so.id, overrideNote ? { overrideNote } : undefined)
+      if (result.success) router.refresh()
+      else setError(result.error ?? 'Failed to convert the quote')
+    })
+  }
+
+  function handleSendQuote() {
+    setError('')
+    startTransition(async () => {
+      const result = await sendQuoteEmail(so.id)
+      if (result.success) {
+        alert(result.alreadyQueued ? 'This quote is already queued for sending.' : 'Quote queued for ' + so.customerEmail + '. It is sent by the email queue, not instantly.')
+        router.refresh()
+      } else setError(result.error ?? 'Failed to queue the quote email')
+    })
+  }
+
   function handleEmailInvoice() {
     setError('')
     startTransition(async () => {
@@ -1436,8 +1574,17 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
       {/* Status + Actions */}
       <div className="flex flex-wrap items-center gap-2">
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[so.status]}`}>
-          {STATUS_LABELS[so.status]}
+          {so.isQuote ? 'Quote' : STATUS_LABELS[so.status]}
         </span>
+        {so.isQuote && (
+          <span className="text-sm text-muted-foreground">
+            {so.quoteValidUntil ? `Valid until ${so.quoteValidUntil}` : 'No validity date'}
+            {so.quoteSentAt ? `, queued for sending ${formatDateTime(so.quoteSentAt)}` : ''}
+          </span>
+        )}
+        {so.quoteExpired && (
+          <span className="inline-flex items-center rounded-full border border-red-300 bg-red-50 px-2 py-0.5 text-xs font-medium text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200">Expired</span>
+        )}
         {(() => {
           const fulfilment = summariseFulfilment(so.status, shipments.map((sh) => sh.status), so.shipmentOutstandingQty)
           return fulfilment ? (
@@ -1548,6 +1695,19 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             </Button>
           )}
 
+          {/* Quote: the one click that makes it an order (a draft the operator then confirms), and the optional email. */}
+          {so.isQuote && hasPermission(currentUserRole, 'sales.create') && (
+            <Button size="sm" onClick={handleConvertQuote} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <ArrowRightLeft className="h-4 w-4 mr-1" />}
+              Convert to order
+            </Button>
+          )}
+          {so.isQuote && quoteEmailEnabled && so.customerEmail && hasPermission(currentUserRole, 'sales.process') && (
+            <Button size="sm" variant="outline" onClick={handleSendQuote} disabled={isPending}>
+              <Mail className="h-4 w-4 mr-1" />Send quote
+            </Button>
+          )}
+
           {/* Workflow */}
           {nextActions.map((a) => (
             <Button key={a.target} size="sm" onClick={() => handleStatusChange(a.target)} disabled={isPending}>
@@ -1560,7 +1720,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
               manual/unset trigger (paidWithoutInvoice), show ONLY the amber chip
               — suppress the plain generate button and the pending-sync chip so
               there is a single, unambiguous affordance. */}
-          {accountingAvailable && !so.invoiceNumber && !accountingSyncEnabled && !paidWithoutInvoice && (
+          {accountingAvailable && !so.isQuote && !so.invoiceNumber && !accountingSyncEnabled && !paidWithoutInvoice && (
             <Button variant="outline" size="sm" onClick={handleGenerateInvoice} disabled={isPending}>
               <FileText className="h-4 w-4 mr-1" />Generate Invoice
             </Button>
@@ -1596,7 +1756,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             // The reason lives on the wrapper, not the button: a disabled button swallows pointer events in several browsers.
             <span title={editBlock?.reason} className="inline-flex">
               <Button variant="outline" size="sm" onClick={() => (editScope.scope === 'ADDRESS_NOTES' ? setShowAddresses(true) : setShowEdit(true))} disabled={isPending || editScope.scope === 'NONE' || (editScope.scope === 'FULL' && !editForm)} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
-                <Pencil className="h-4 w-4 mr-1" />{editScope.scope === 'ADDRESS_NOTES' ? 'Edit addresses & notes' : 'Edit order'}
+                <Pencil className="h-4 w-4 mr-1" />{editScope.scope === 'ADDRESS_NOTES' ? 'Edit addresses & notes' : so.isQuote ? 'Edit quote' : 'Edit order'}
               </Button>
               {editBlock && <span id="edit-order-blocked-reason" className="sr-only">{editBlock.reason}</span>}
             </span>
@@ -1657,7 +1817,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem onClick={() => window.open(`/api/sales-order/${so.id}`, '_blank')}>
-                <FileText className="h-4 w-4 mr-1.5" />Order PDF
+                <FileText className="h-4 w-4 mr-1.5" />{so.isQuote ? 'Quote PDF' : 'Order PDF'}
               </DropdownMenuItem>
               {accountingAvailable && so.invoiceNumber && (
                 <DropdownMenuItem onClick={() => window.open(`/api/invoice/${so.id}`, '_blank')}>
@@ -1670,7 +1830,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                 </DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
-              {so.customerEmail && (
+              {so.customerEmail && !so.isQuote && (
                 <DropdownMenuItem onClick={handleEmailOrder} disabled={isPending}>
                   <Mail className="h-4 w-4 mr-1.5" />Email Order
                 </DropdownMenuItem>
@@ -1860,7 +2020,15 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                   <TableCell className="w-12 px-2 py-1">
                     {line.productId && <ProductThumb productId={line.productId} imageUrl={line.imageUrl} name={line.description} />}
                   </TableCell>
-                  <TableCell className="px-4">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}{pegs.some((peg) => peg.salesOrderLineId === line.id) && <PeggedBadge />}</TableCell>
+                  <TableCell className="px-4">
+                    {line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}
+                    {pegs.some((peg) => peg.salesOrderLineId === line.id) && <PeggedBadge />}
+                    {line.exchangeForRefundId && (
+                      <span data-testid="exchange-line-badge" className="ml-2 inline-flex items-center rounded-sm border border-emerald-300 bg-emerald-50 px-1 py-0 text-[10px] font-medium text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950 dark:text-emerald-200">
+                        {exchangeLineBadge(so.refunds.find((r) => r.id === line.exchangeForRefundId)?.creditNoteNumber ?? null)}
+                      </span>
+                    )}
+                  </TableCell>
                   <TableCell className="px-4 text-right tabular-nums">{line.qty}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{formatMoney(line.unitPriceForeign, sym)}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}</TableCell>
@@ -2036,6 +2204,11 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                figure below is IMS's own arithmetic and will happily read "Settled" while the accounting
                invoice is still outstanding — that gap is exactly what this line names. */
             <p className="px-4 pt-2 text-[11px] text-red-700 dark:text-red-300">{settlement.detail}</p>
+          )}
+          {invoiceDeleteState?.show && (
+            <div className="px-4 pt-2">
+              <DeleteSyncedDocument kind="SALES_INVOICE" documentId={so.id} state={invoiceDeleteState} />
+            </div>
           )}
           {so.paymentRemovedForeign != null && so.paymentRemovedForeign > 0 && (
             <p className="px-4 pt-2 text-[11px] text-amber-800 dark:text-amber-300" data-testid="payment-removed-notice">
@@ -2220,6 +2393,11 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                 <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>
               {r.returnReasonName && <p className="text-xs"><span className="text-muted-foreground">Return reason:</span> {r.returnReasonName}</p>}
+              {so.lines.some((l) => l.exchangeForRefundId === r.id) && (
+                <p className="text-xs" data-testid="exchange-recap-refund">
+                  <span className="text-muted-foreground">Exchange:</span> returned {r.lines.filter((rl) => rl.qty > 0).map((rl) => `${rl.qty} × ${rl.description}`).join(', ')}; replaced with {so.lines.filter((l) => l.exchangeForRefundId === r.id).map((l) => `${l.qty} × ${l.description}`).join(', ')}
+                </p>
+              )}
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <Table className="text-xs">
                 <TableHeader>
@@ -2304,7 +2482,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
 
       {/* Dialogs */}
       {deleteTarget && <DeleteRefundDialog refund={deleteTarget} onClose={() => setDeleteTarget(null)} />}
-      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} onClose={() => setShowRefund(false)} />}
+      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} exchangeOffer={exchangeOffer} exchangeCatalogue={exchangeCatalogue} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
       {showAddresses && editScope.scope === 'ADDRESS_NOTES' && <AddressesDialog order={so} onClose={() => setShowAddresses(false)} />}
       {showEdit && editForm && editScope.scope === 'FULL' && (

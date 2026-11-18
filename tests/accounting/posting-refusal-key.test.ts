@@ -104,6 +104,17 @@ const CASES: Record<string, Case> = {
   SALES_INVOICE: doc('SALES_INVOICE', 'SalesOrder'),
   SALES_INVOICE_UPDATE: doc('SALES_INVOICE_UPDATE', 'SalesOrder'),
   PURCHASE_INVOICE: doc('PURCHASE_INVOICE', 'PurchaseInvoice'),
+  // o3d-ngmt.21: one delete per LEDGER document; the document id in the payload is the discriminator, and a retry carries the same id.
+  SALES_INVOICE_DELETE: {
+    a: { type: 'SALES_INVOICE_DELETE', referenceType: 'SalesOrder', referenceId: 'so-1', idempotencyKey: 'document-delete:inv-A', payload: { accountingInvoiceId: 'inv-A' } },
+    b: { type: 'SALES_INVOICE_DELETE', referenceType: 'SalesOrder', referenceId: 'so-1', idempotencyKey: 'document-delete:inv-B', payload: { accountingInvoiceId: 'inv-B' } },
+    retryOfA: { type: 'SALES_INVOICE_DELETE', referenceType: 'SalesOrder', referenceId: 'so-1', idempotencyKey: 'document-delete:inv-A', payload: { accountingInvoiceId: 'inv-A' } },
+  },
+  PURCHASE_INVOICE_DELETE: {
+    a: { type: 'PURCHASE_INVOICE_DELETE', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', idempotencyKey: 'document-delete:bill-A', payload: { accountingInvoiceId: 'bill-A' } },
+    b: { type: 'PURCHASE_INVOICE_DELETE', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', idempotencyKey: 'document-delete:bill-B', payload: { accountingInvoiceId: 'bill-B' } },
+    retryOfA: { type: 'PURCHASE_INVOICE_DELETE', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', idempotencyKey: 'document-delete:bill-A', payload: { accountingInvoiceId: 'bill-A' } },
+  },
   // purchase-invoice-update-sync.ts: two bills on ONE purchase order — the review's counter-example.
   PURCHASE_INVOICE_UPDATE: {
     a: { type: 'PURCHASE_INVOICE_UPDATE', referenceType: 'PurchaseOrder', referenceId: 'po-1', idempotencyKey: 'upd:A:h1', payload: { accountingInvoiceId: 'xero-bill-A' } },
@@ -157,6 +168,7 @@ const CASES: Record<string, Case> = {
   DAILY_BATCH_INVENTORY_RECONCILIATION: doc('DAILY_BATCH_INVENTORY_RECONCILIATION', 'DailyBatch'),
   DAILY_BATCH_COGS_RECONCILIATION: doc('DAILY_BATCH_COGS_RECONCILIATION', 'DailyBatch'),
   DAILY_BATCH_TRANSIT_RECONCILIATION: doc('DAILY_BATCH_TRANSIT_RECONCILIATION', 'DailyBatch'),
+  DAILY_BATCH_GRIR_RECLASS: doc('DAILY_BATCH_GRIR_RECLASS', 'DailyBatch'),
   STOCK_ALLOCATION: doc('STOCK_ALLOCATION', 'SalesOrder'),
 }
 

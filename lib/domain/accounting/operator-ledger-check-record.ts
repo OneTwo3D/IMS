@@ -44,6 +44,7 @@ import {
 } from './operator-ledger-check'
 import { OPERATOR_ASSERTION_SETTLEMENT_BASIS } from './sync-row-settlement'
 import { claimsToHavePosted } from './ledger-standing'
+import { businessDateYmd } from '@/lib/business-date'
 
 export type OperatorLedgerCheckTx = Pick<
   Prisma.TransactionClient,
@@ -235,7 +236,7 @@ export async function previewOperatorLedgerCheck(
         id: receipt.id,
         amount: receipt.amount.toFixed(),
         currency: receipt.currency,
-        paidAt: receipt.paidAt.toISOString().slice(0, 10),
+        paidAt: businessDateYmd(receipt.paidAt),
         method: receipt.method,
       })),
   }

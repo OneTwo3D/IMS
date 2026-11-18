@@ -4027,6 +4027,8 @@ export async function createMintsoftPurchaseOrderAsn(
           // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
           // before any receipt has been applied, would close the very populations that would otherwise
           // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          // INVARIANT: BOOKED_IN written here means "the warehouse says so", NOT "IMS has the receipt". It stays
+          // in the incoming-stock arm while closedAt is null (lib/domain/wms/asn-awaiting-units.ts); keep it null.
           closedAt: null,
         },
       })
@@ -4225,6 +4227,16 @@ export async function createMintsoftPurchaseOrderAsn(
       }
     }
 
+    // o3d-gwh4: an `existing` row left BOOKED_IN with closedAt still NULL is the state a failed booked-in reconciliation leaves (the row is
+    // kept mapped on purpose so no duplicate goes out). Pressing create again must RETRY that reconciliation, not report "already exists".
+    // This never creates an ASN: it re-reads the ASN IMS already holds and re-drives the booked-in recheck for it.
+    if (outcome.kind === 'existing' && outcome.status === 'BOOKED_IN') {
+      replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(
+        { ...outcome, remoteStatusName: 'booked in' },
+        { poId: parsedId.data },
+      )
+    }
+
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${parsedId.data}`)
     revalidatePath('/sync')
@@ -4234,7 +4246,7 @@ export async function createMintsoftPurchaseOrderAsn(
       externalAsnId: outcome.externalAsnId,
       message:
         outcome.kind === 'existing'
-          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this purchase order.`
+          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this purchase order.${replayWarning ? ` ${replayWarning}` : ''}`
           : outcome.kind === 'recovered'
             ? `Recovered Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`
             : `Created Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`,
@@ -5236,6 +5248,8 @@ export async function createMintsoftTransferAsn(
           // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
           // before any receipt has been applied, would close the very populations that would otherwise
           // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          // INVARIANT: BOOKED_IN written here means "the warehouse says so", NOT "IMS has the receipt". It stays
+          // in the incoming-stock arm while closedAt is null (lib/domain/wms/asn-awaiting-units.ts); keep it null.
           closedAt: null,
         },
       })
@@ -5426,6 +5440,16 @@ export async function createMintsoftTransferAsn(
       }
     }
 
+    // o3d-gwh4: an `existing` row left BOOKED_IN with closedAt still NULL is the state a failed booked-in reconciliation leaves (the row is
+    // kept mapped on purpose so no duplicate goes out). Pressing create again must RETRY that reconciliation, not report "already exists".
+    // This never creates an ASN: it re-reads the ASN IMS already holds and re-drives the booked-in recheck for it.
+    if (outcome.kind === 'existing' && outcome.status === 'BOOKED_IN') {
+      replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(
+        { ...outcome, remoteStatusName: 'booked in' },
+        { transferId: parsedId.data },
+      )
+    }
+
     revalidatePath('/stock-control/transfers')
     revalidatePath('/sync')
 
@@ -5434,7 +5458,7 @@ export async function createMintsoftTransferAsn(
       externalAsnId: outcome.externalAsnId,
       message:
         outcome.kind === 'existing'
-          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this transfer.`
+          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this transfer.${replayWarning ? ` ${replayWarning}` : ''}`
           : outcome.kind === 'recovered'
             ? `Recovered Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`
             : `Created Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`,

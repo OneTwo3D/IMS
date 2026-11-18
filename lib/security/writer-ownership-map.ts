@@ -80,6 +80,11 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: ['SALES_INVOICE_UPDATE'],
     note: 'As sales.invoice.',
   }),
+  row('xero', 'sales.invoice-delete', { P1: 'xeroom', P2: 'xeroom' }, {
+    obligationTime: 'required',
+    accountingSyncTypes: ['SALES_INVOICE_DELETE'],
+    note: 'As sales.invoice: the writer that owns a sales invoice owns its removal, so IMS shadows the delete too (and the document-delete action refuses an invoice IMS did not itself create).',
+  }),
   row('xero', 'sales.credit-note', { P1: 'xeroom', P2: 'xeroom' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['CREDIT_NOTE'],
@@ -100,6 +105,11 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'required',
     accountingSyncTypes: ['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE'],
     note: 'Owner answer 2026-10-09: Qoblex writes bills into Xero natively (its own Xero integration) today; IMS owns from P2.',
+  }),
+  row('xero', 'purchase.bill-delete', { P1: 'qoblex-native', P2: 'IMS' }, {
+    obligationTime: 'required',
+    accountingSyncTypes: ['PURCHASE_INVOICE_DELETE'],
+    note: 'As purchase.bill: whoever writes the bill writes its removal (o3d-ngmt.21); IMS owns it from P2.',
   }),
   row('xero', 'purchase.bill-payment', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',
@@ -129,6 +139,7 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: [
       'DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B',
       'DAILY_BATCH_INVENTORY_RECONCILIATION', 'DAILY_BATCH_COGS_RECONCILIATION', 'DAILY_BATCH_TRANSIT_RECONCILIATION',
+      'DAILY_BATCH_GRIR_RECLASS',
     ],
     note: 'Owner answer 2026-10-09: Qoblex does the daily batches natively in Xero today; IMS owns from P2. The obligation time is the batch date. Whether IMS\'s batches are correct on top of invoices posted by Xeroom is an open accountant question.',
   }),
@@ -265,6 +276,10 @@ export const WRITER_OWNERSHIP_MAP = [
   row('customer-email', 'invoice', { P1: 'woocommerce-native', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
     note: 'Mapped only (as despatch): WooCommerce in P1, IMS in P2 (owner answers 2026-10-09).',
+  }),
+  row('customer-email', 'quote', { P1: 'IMS', P2: 'IMS' }, {
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. A sales quotation exists only in IMS (the storefront has no quote), so IMS is the sender in P1 and P2: customer e-mail comes from IMS. Enforced by its own setting `sales_quote_email_enabled` (default off), read when the e-mail is queued and again at send time, not by the producer hold.',
   }),
 ] as const satisfies readonly OwnershipRow[]
 
