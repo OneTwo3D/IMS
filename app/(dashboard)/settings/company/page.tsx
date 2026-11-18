@@ -11,6 +11,7 @@ import {
 } from '@/app/actions/company'
 import { getCurrencies } from '@/app/actions/currencies'
 import { authorizePage } from '@/lib/auth/server'
+import { getPoApprovalThresholdSetting } from '@/app/actions/purchase-orders'
 import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
 import { isSalesQuoteEmailEnabled } from '@/lib/sales-quote-email'
 import { CompanySettingsClient } from './company-client'
@@ -26,7 +27,7 @@ export default async function CompanySettingsPage() {
   if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
   const session = gate.session
-  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled, quoteEmailEnabled] = await Promise.all([
+  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled, poApproval, quoteEmailEnabled] = await Promise.all([
     getOrganisation(),
     getBaseCurrencySettings(),
     getNumberingFormats(),
@@ -37,6 +38,7 @@ export default async function CompanySettingsPage() {
     getCurrencies(false),
     isPurchaseOrderEmailEnabled(),
     isSalesQuoteEmailEnabled(),
+    getPoApprovalThresholdSetting(),
   ])
 
   return (
@@ -52,6 +54,8 @@ export default async function CompanySettingsPage() {
       testEmailDefault={session.user.email}
       purchaseOrderEmailEnabled={poEmailEnabled}
       salesQuoteEmailEnabled={quoteEmailEnabled}
+      poApprovalThreshold={poApproval.value}
+      baseCurrency={poApproval.baseCurrency}
     />
   )
 }

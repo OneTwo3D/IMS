@@ -1386,6 +1386,18 @@ model PurchaseOrder {
   rfqSentAt       DateTime?
   poSentAt        DateTime?
 
+  /// The user who created the order (null for imported and pre-approval-workflow orders). The approval gate refuses this user approving it.
+  createdById     String?
+  /// Purchase-order approval (setting `po_approval_threshold_base`). Plain ids, no FK, like the other createdBy columns: a deleted user leaves the
+  /// record intact and the activity log carries the name.
+  approvedById    String?
+  approvedAt      DateTime?
+  /// What was approved: the ex-VAT base total, the supplier and the currency at approval time. An approval is valid only while the order still
+  /// matches this snapshot (see lib/domain/purchasing/po-approval.ts).
+  approvedTotalBase  Decimal?          @db.Decimal(18, 4)
+  approvedSupplierId String?
+  approvedCurrency   String?
+
   archived        Boolean            @default(false)
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
