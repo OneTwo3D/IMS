@@ -27,6 +27,7 @@ const state = {
   /** The status the dispatch transaction finds UNDER THE LOCK; null means it is promotable. */
   lockedStatus: null as string | null,
   notifyOk: true,
+  markerOk: true,
   /** Which admins the bell reaches (ids absent from the list fail to persist). */
   admins: ['admin-1'] as string[],
   failingAdmins: [] as string[],
@@ -35,7 +36,14 @@ const state = {
 }
 
 mock.module('@/lib/activity-log', {
-  namedExports: { logActivity: async (entry: Row) => { state.activity.push(entry); state.persistedActivity.push(entry) } },
+  namedExports: {
+    logActivity: async (entry: Row) => { state.activity.push(entry); state.persistedActivity.push(entry) },
+    logActivityPersisted: async (entry: Row) => {
+      if (!state.markerOk) return false
+      state.activity.push(entry); state.persistedActivity.push(entry)
+      return true
+    },
+  },
 })
 
 mock.module('@/lib/db', {
@@ -99,6 +107,7 @@ function reset() {
   state.persistedActivity = []
   state.lockedStatus = null
   state.notifyOk = true
+  state.markerOk = true
   state.admins = ['admin-1']
   state.failingAdmins = []
   state.allocationCount = 1
@@ -272,7 +281,9 @@ test('SHP-H1: a failed bell notice leaves no marker, so the next tick raises the
 
   const first = await apply()
 
-  assert.deepEqual(first, { success: true, despatchedWhileNotReady: 'ON_HOLD' })
+  assert.equal(first.success, false, 'a failed notice is a retryable failure, not a quiet success')
+  assert.equal((first as { refusal?: string; permanent?: boolean }).refusal, 'despatch_review_not_recorded')
+  assert.equal((first as { permanent?: boolean }).permanent, false)
   assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), false, 'no marker while the notice is unwritten')
 
   // Next tick: the shipment is recorded, nothing left to transition; the bell now works.
@@ -294,8 +305,9 @@ test('SHP-H1: the review marker is written only when EVERY admin notice persiste
   state.admins = ['admin-1', 'admin-2']
   state.failingAdmins = ['admin-2']
 
-  await apply()
+  const partial = await apply()
 
+  assert.equal(partial.success, false)
   assert.equal(state.notifications.length, 1, 'one notice persisted, one did not')
   assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), false, 'so the retry must raise it again')
 })
@@ -321,4 +333,31 @@ test('SHP-H1: a despatch the storefront already completed enqueues no completion
   await apply({ storefrontAlreadyCompleted: true })
 
   assert.equal(state.transitions[0].options?.storefrontCompletion, false)
+})
+
+test('o3d-hqvrp.330: zero active admins is not a persisted review; no marker, retryable failure', async () => {
+  reset()
+  state.orderStatus = 'ON_HOLD'
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+  state.lockedStatus = 'ON_HOLD'
+  state.admins = []
+
+  const result = await apply()
+
+  assert.equal(result.success, false)
+  assert.equal((result as { refusal?: string }).refusal, 'despatch_review_not_recorded')
+  assert.equal(state.persistedActivity.some((row) => row.action === 'external_despatch_recorded_order_not_ready'), false)
+})
+
+test('o3d-hqvrp.330: a failed marker write is a retryable failure, so the notice is not silently repeated as success', async () => {
+  reset()
+  state.orderStatus = 'ON_HOLD'
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }]
+  state.lockedStatus = 'ON_HOLD'
+  state.markerOk = false
+
+  const result = await apply()
+
+  assert.equal(result.success, false)
+  assert.equal((result as { refusal?: string }).refusal, 'despatch_review_not_recorded')
 })

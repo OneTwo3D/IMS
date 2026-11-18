@@ -83,16 +83,16 @@ export const apiRouteAuthPolicy = {
     reason: 'Mintsoft receipt review inspection and approval require requireApiFreshAdmin; approval also requires a same-origin mutation header and is logged.',
   },
   '/api/backup/create': {
-    access: 'admin',
-    reason: 'Backup creation is restricted through requireApiAdmin.',
+    access: 'admin-fresh',
+    reason: 'Backup creation (a full database dump) is restricted through requireApiFreshAdmin.',
   },
   '/api/backup/restore': {
     access: 'admin-fresh',
     reason: 'Backup restore is restricted through requireApiFreshAdmin plus restore confirmation checks.',
   },
   '/api/backup/upload-remote': {
-    access: 'admin',
-    reason: 'Remote backup upload is restricted through requireApiAdmin.',
+    access: 'admin-fresh',
+    reason: 'Remote backup upload is restricted through requireApiFreshAdmin.',
   },
   '/api/cron/accounting-daily-batch': {
     access: 'cron-secret',
