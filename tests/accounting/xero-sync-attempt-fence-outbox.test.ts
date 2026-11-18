@@ -103,7 +103,9 @@ mock.module('@/lib/domain/integrations/outbox', {
       RETRYABLE_FAILED: 'RETRYABLE_FAILED',
       PERMANENT_FAILED: 'PERMANENT_FAILED',
     },
-    claimIntegrationOutboxWork: async () => [JOB],
+    // One job, handed out once per drain: the drain claims job by job and passes what it already attempted.
+    wooAccountingPostJobIds: async () => [],
+    claimIntegrationOutboxWork: async (options: { excludeIds?: string[] }) => (options.excludeIds?.includes(JOB.id) ? [] : [JOB]),
     markIntegrationOutboxSuccess: async () => { outboxCalls.push('success') },
     markIntegrationOutboxRetryableFailure: async () => { outboxCalls.push('retry') },
     markIntegrationOutboxPermanentFailure: async () => { outboxCalls.push('permanent') },

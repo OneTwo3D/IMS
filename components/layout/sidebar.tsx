@@ -47,6 +47,7 @@ function getSettingsChildren(accountingIntegrationEnabled: boolean) {
     { href: '/settings/company', label: 'Company' },
     { href: '/settings/inventory', label: 'Inventory' },
     { href: '/settings/sales', label: 'Sales' },
+    { href: '/settings/custom-fields', label: 'Custom fields' },
     { href: '/settings/purchasing', label: 'Purchasing' },
     ...(accountingIntegrationEnabled ? [{ href: '/settings/accounting', label: 'Accounting' }] : []),
     { href: '/settings/users', label: 'Users' },

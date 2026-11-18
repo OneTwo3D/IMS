@@ -724,6 +724,12 @@ model Product {
   barcode         String?     @unique
   mpn             String?
   hsCode          String?
+  /// MIRRORED from the WooCommerce product attribute `pa_us_hs_code` (the US tariff code). IMS never writes `hsCode` from it and
+  /// never edits this column by hand: the Woo product import owns it. Null when WooCommerce carries none.
+  wcUsHsCode      String?     @map("wc_us_hs_code")
+  /// MIRRORED from the WooCommerce product meta `_dutify_hs_codes`: destination ISO-2 country to the tariff code captured for it
+  /// ({"US": "3921905050", "CA": "..."}). Owned by the Woo product import; separate from the IMS-owned `hsCode`.
+  wcDutifyHsCodes Json?       @map("wc_dutify_hs_codes")
   countryOfOrigin String?     // 2-letter ISO code
   customsDescription String?  // free-text goods description for customs paperwork
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
@@ -788,6 +794,7 @@ model Product {
   stockLevels     StockLevel[]
   locationStockBuffers LocationStockBuffer[]
   reorderThresholdOverrides ReorderThresholdOverride[]
+  customFieldValues CustomFieldValue[]
   costLayers      CostLayer[]
   inventorySnapshots InventorySnapshot[]
   inventoryReservationSnapshots InventoryReservationSnapshot[]
@@ -824,6 +831,7 @@ model Product {
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
   syncMark         ProductSyncMark?
+  customsClears    ProductCustomsClear[]
   shoppingLinks    ShoppingProductLink[]
   wmsProductLinks  WmsProductLink[]
   wmsBundleLinks   WmsBundleLink[]
@@ -1379,6 +1387,18 @@ model PurchaseOrder {
   rfqSentAt       DateTime?
   poSentAt        DateTime?
 
+  /// The user who created the order (null for imported and pre-approval-workflow orders). The approval gate refuses this user approving it.
+  createdById     String?
+  /// Purchase-order approval (setting `po_approval_threshold_base`). Plain ids, no FK, like the other createdBy columns: a deleted user leaves the
+  /// record intact and the activity log carries the name.
+  approvedById    String?
+  approvedAt      DateTime?
+  /// What was approved: the ex-VAT base total, the supplier and the currency at approval time. An approval is valid only while the order still
+  /// matches this snapshot (see lib/domain/purchasing/po-approval.ts).
+  approvedTotalBase  Decimal?          @db.Decimal(18, 4)
+  approvedSupplierId String?
+  approvedCurrency   String?
+
   archived        Boolean            @default(false)
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
@@ -1390,6 +1410,7 @@ model PurchaseOrder {
   invoices        PurchaseInvoice[]
   returns         PurchaseReturn[]
   supplierCreditNotes SupplierCreditNote[]
+  attachments     OrderAttachment[]
 
   // Landed cost links — this PO as primary
   landedCostLinks LandedCostLink[]   @relation("PrimaryPO")
@@ -1857,6 +1878,13 @@ model SalesOrder {
   wclcDutyComponent     Decimal?  @db.Decimal(18, 4) @map("wclc_duty_component")
   wclcTaxComponent      Decimal?  @db.Decimal(18, 4) @map("wclc_tax_component")
   wclcHandlingComponent Decimal?  @db.Decimal(18, 4) @map("wclc_handling_component")
+  /// The shop's own IOSS number (setting `shop_ioss_number`), stored only on an order whose EU VAT stamp (`euVatRegime`) is IOSS.
+  /// Read from the stamp, never decided here; null otherwise. Sent on the Mintsoft create push only when `mintsoft_send_ioss_number`
+  /// is on. Not personal data (the shop's own number).
+  iossNumber            String?   @map("ioss_number")
+  /// IOSS_DDP when the order's EU VAT stamp is IOSS, DDP when it is DDP, null otherwise (DDU_DAP is never inferred). Read from the
+  /// stamp, never decided here. Informational.
+  deliveryTerm          String?   @map("delivery_term")
   billingAddress    Json?
   shippingAddress   Json?
 
@@ -2168,11 +2196,14 @@ model SalesOrder {
   customer          Customer?        @relation(fields: [customerId], references: [id])
   shipFromWarehouse Warehouse?       @relation("ShipFromWarehouse", fields: [shipFromWarehouseId], references: [id])
   lines             SalesOrderLine[]
+  customFieldValues CustomFieldValue[]
   refunds           SalesOrderRefund[]
   returnExpectations ReturnExpectation[]
   invoiceDocuments  SalesOrderInvoiceDocument[]
+  attachments       OrderAttachment[]
   invoiceDocumentFetches InvoiceDocumentFetchState[]
   invoiceStorePublication InvoiceStorePublication?
+  trackshipRefireState    TrackshipRefireState?
   payments          Payment[]
   paymentRemovals   PaymentRemovalReconciliation[]
   allocations       OrderAllocation[]
@@ -2202,6 +2233,9 @@ model SalesOrderLine {
   /// Null on every goods line and on any fee line that carries no wclc marker. Identifies a fee line without
   /// inferring it from an empty SKU.
   wclcFeeKind     String?    @map("wclc_fee_kind")
+  /// MIRRORED from the line item meta `_wc_label_customs_unit_value`: the operator-set per-unit customs value override, in the
+  /// ORDER currency, exactly as WooCommerce holds it. Null when the line carries none (or an unusable one). Never recomputed.
+  wcCustomsUnitValue Decimal? @db.Decimal(18, 6) @map("wc_customs_unit_value")
   description     String
   sku             String?
   qty             Decimal    @db.Decimal(12, 4)
@@ -2459,6 +2493,48 @@ enum InvoiceDocumentFetchStatus {
 ///
 /// This table is the READ side only. It does not write `SalesOrder.accountingInvoiceId` (the ledger document
 /// may be one IMS did not post, and that column drives payment polling and updates).
+/// A supporting document (supplier quote, proforma, packing list, customer PO, email) attached to ONE purchase order OR ONE sales order.
+/// Exactly one of purchase_order_id / sales_order_id is set (a CHECK constraint in the migration enforces it). The bytes live in the private upload
+/// root under order-attachments/<storedName>; the row is the only thing that names the file, and every read goes by this row's id, never by a name.
+/// Soft delete (deletedAt): a deleted row is hidden and its download is refused; the file stays on disk (an operator can recover it) until an erasure or a purge removes it. A sales order's
+/// attachments can hold customer personal data, so a personal-data erasure DELETES the rows and files of the erased orders.
+/// Not pushed to Xero in v1 (the ledger's attachment path is untouched).
+model OrderAttachment {
+  id               String    @id @default(cuid())
+  purchaseOrderId  String?   @map("purchase_order_id")
+  salesOrderId     String?   @map("sales_order_id")
+  /// The name the uploader's browser sent. Shown and offered as the download name after sanitising; never used to locate the file.
+  originalFilename String    @map("original_filename")
+  /// Random, server-chosen file name inside the attachments directory (a uuid plus the extension of the verified type).
+  storedName       String    @unique @map("stored_name")
+  mimeType         String    @map("mime_type")
+  byteSize         Int       @map("byte_size")
+  sha256           String
+  /// The staff user who uploaded it. A plain id (no foreign key) so removing a user never touches the document record.
+  uploadedByUserId String    @map("uploaded_by_user_id")
+  uploadedAt       DateTime  @default(now()) @map("uploaded_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  salesOrder    SalesOrder?    @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderId, deletedAt])
+  @@index([salesOrderId, deletedAt])
+  @@map("order_attachments")
+}
+
+/// FILES OWED A DELETION: the stored names of order-attachment files whose rows were deleted (a personal-data erasure, a deleted draft order). Written in the SAME
+/// transaction as the row deletion, so a crash or a failed unlink can never leave a file with no record pointing at it; a retryable drain removes the file and then
+/// the entry. An UPLOAD reserves its file name here BEFORE the file is written, due 15 minutes ahead (queuedAt is the DUE time; the drain takes only due entries), and the
+/// row insert deletes the reservation in its own transaction: a rejected or crashed upload leaves a reservation that becomes due and is drained. A stored name is a random uuid and identifies no one.
+model OrderAttachmentFileDeletion {
+  storedName String   @id @map("stored_name")
+  queuedAt   DateTime @default(now()) @map("queued_at")
+  attempts   Int      @default(0)
+
+  @@map("order_attachment_file_deletions")
+}
+
 model SalesOrderInvoiceDocument {
   id                 String              @id @default(cuid())
   orderId            String              @map("order_id")
@@ -3893,6 +3969,20 @@ model ProductSyncMark {
   @@map("product_sync_marks")
 }
 
+/// A customs field (hsCode / countryOfOrigin / customsDescription) that was EMPTIED on a product (value -> nothing). Written by a database
+/// trigger on `products` so every write path records it, and removed when the field is populated again or once the warehouse copy is
+/// verified empty. This, not an unset field, is the only evidence that the warehouse copy should be cleared.
+model ProductCustomsClear {
+  productId String
+  field     String
+  createdAt DateTime @default(now())
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([productId, field])
+  @@map("product_customs_clears")
+}
+
 model StockSyncJob {
   connector   String
   productId   String
@@ -4105,6 +4195,12 @@ model WmsOrderStatusSnapshot {
   // Last WMS status successfully pushed to the storefront (G4). Decoupled from `status`
   // so a failed storefront push isn't masked by the cached-status change gate — it retries.
   wcPushedStatus      String?
+  /// CONSECUTIVE status-sweep lookups that found the warehouse order genuinely absent (a 404 and a presence probe that agreed, for an order IMS has
+  /// pushed). Reset by any lookup that finds the order (or finds it merged or ambiguous); left alone by a lookup that failed. At the threshold the
+  /// snapshot becomes NOTFOUND and the sweep stops polling the order. A counter only: no personal data.
+  notFoundStrikes     Int      @default(0)
+  /// When the snapshot became NOTFOUND (the sweep no longer polls it). Null while the order is still polled.
+  notFoundAt          DateTime?
 
   order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -4305,6 +4401,8 @@ enum WmsOperatorTaskReason {
   SHOP_REFUND_DUE
   /// An IMS amendment the warehouse order could not take because it was already past NEW: a person applies the change in the warehouse by hand.
   AMENDMENT_NOT_APPLIED
+  /// The status sweep found the warehouse order absent on several consecutive polls, marked it NOTFOUND and stopped polling it: a person checks it in the warehouse.
+  ORDER_NOT_FOUND
 }
 
 enum WmsOperatorTaskStatus {
@@ -4334,6 +4432,34 @@ model WcStockDirtyOrder {
 
   @@index([syncVersion, checkedAt, releasedAt, id], map: "wc_stock_dirty_orders_refresh_idx")
   @@map("wc_stock_dirty_orders")
+}
+
+/// Per-order state of the TrackShip re-fire sweep (setting `trackship_refire_enabled`, default off). One row per shipped, tracked storefront order
+/// inside the re-fire window. `attempts` counts the re-fires asked of the storefront; `nextAttemptAt` is the exponential back-off (capped) until
+/// the next one. COVERED: the storefront reported a TrackShip shipment for every tracking number. EXPIRED: the order left the re-fire window or
+/// the storefront no longer has it, so nothing more is asked. Order and tracking facts only: no personal data.
+enum TrackshipRefireStatus {
+  ACTIVE
+  COVERED
+  EXPIRED
+}
+
+model TrackshipRefireState {
+  id            String                @id @default(cuid())
+  orderId       String                @unique @map("order_id")
+  status        TrackshipRefireStatus @default(ACTIVE)
+  attempts      Int                   @default(0)
+  nextAttemptAt DateTime              @map("next_attempt_at")
+  lastAttemptAt DateTime?             @map("last_attempt_at")
+  /// The storefront's answer to the last re-fire, in a fixed vocabulary (never remote free text).
+  lastResult    String?               @map("last_result")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+
+  order         SalesOrder            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt], map: "trackship_refire_states_due_idx")
+  @@map("trackship_refire_states")
 }
 
 model WmsOperatorTask {
@@ -5705,4 +5831,74 @@ model PaymentRemovalReconciliation {
 
   @@index([orderId])
   @@map("payment_removal_reconciliations")
+}
+
+/// Operator-defined fields for products (variants included: each variant is a Product row and carries its own values) and
+/// for sales orders. One definition model serves both entities. `key` is the immutable slug used in CSV columns
+/// (`cf:<key>`) and list filters; `namespace` groups fields on screen. `options` is a JSON array of allowed strings, used only
+/// by STRING fields (a dropdown). The type cannot change once any value exists (see lib/custom-fields/definitions.ts).
+enum CustomFieldEntity {
+  PRODUCT
+  SALES_ORDER
+}
+
+enum CustomFieldType {
+  STRING
+  NUMBER
+  DECIMAL
+  BOOLEAN
+  DATE
+  DATETIME
+  JSON
+  LINK
+}
+
+model CustomFieldDefinition {
+  id        String            @id @default(cuid())
+  entity    CustomFieldEntity
+  namespace String
+  key       String
+  label     String
+  type      CustomFieldType
+  options   Json?
+  required  Boolean           @default(false)
+  sortOrder Int               @default(0)
+  active    Boolean           @default(true)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  values CustomFieldValue[]
+
+  @@unique([entity, key])
+  @@index([entity, active, sortOrder])
+  @@map("custom_field_definitions")
+}
+
+/// One typed value of one definition on one product OR one sales order (a CHECK enforces exactly one of the two). Typed columns, one
+/// filled per row (a CHECK enforces that too, and the definition's type decides which): STRING and LINK use valueText, NUMBER and
+/// DECIMAL use valueDecimal, BOOLEAN valueBoolean, DATE valueDate, DATETIME valueDateTime, JSON valueJson. A blank value has no row.
+/// Sales-order values can hold personal data (free text), so they are erased with the order (lib/domain/erasure).
+model CustomFieldValue {
+  id            String    @id @default(cuid())
+  definitionId  String
+  productId     String?
+  salesOrderId  String?
+  valueText     String?
+  valueDecimal  Decimal?  @db.Decimal(28, 10)
+  valueBoolean  Boolean?
+  valueDate     DateTime? @db.Date
+  valueDateTime DateTime?
+  valueJson     Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  definition CustomFieldDefinition @relation(fields: [definitionId], references: [id], onDelete: Restrict)
+  product    Product?              @relation(fields: [productId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder?           @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([definitionId, productId])
+  @@unique([definitionId, salesOrderId])
+  @@index([productId])
+  @@index([salesOrderId])
+  @@map("custom_field_values")
 }

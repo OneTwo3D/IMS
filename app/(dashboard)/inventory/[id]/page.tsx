@@ -21,6 +21,8 @@ import { LocationBuffer } from '@/components/inventory/location-buffer'
 import { getLocationBuffers } from '@/app/actions/location-buffer'
 import { WarehouseReorderThresholds } from '@/components/inventory/warehouse-reorder-thresholds'
 import { getWarehouseReorderThresholds } from '@/app/actions/reorder-thresholds'
+import { CustomFieldsCard } from '@/components/custom-fields/custom-fields-card'
+import { getCustomFieldCardData } from '@/app/actions/custom-fields'
 import { getSession } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
@@ -88,6 +90,7 @@ export default async function ProductDetailPage({
   const canEditInventory = session ? hasPermission(session.user.role, 'inventory.edit') : false
   const locationBuffers = holdsOwnStock ? await getLocationBuffers(id) : null
   const reorderThresholds = holdsOwnStock ? await getWarehouseReorderThresholds(id) : null
+  const customFields = await getCustomFieldCardData('PRODUCT', id)
 
   const [productOptions, suppliers, productComponents, kitStock, hsProposal] = await Promise.all([
     product.type === 'VARIABLE' ? getProductOptions(id) : Promise.resolve([]),
@@ -491,6 +494,13 @@ export default async function ProductDetailPage({
           {reorderThresholds && (
             <WarehouseReorderThresholds key={JSON.stringify(reorderThresholds.warehouses)} data={reorderThresholds} canEdit={canEditInventory} />
           )}
+
+          <CustomFieldsCard
+            key={JSON.stringify(customFields.fields.map((f) => [f.id, f.value, f.label, f.options]))}
+            data={customFields}
+            canEdit={canEditInventory}
+            note={product.type === 'VARIANT' || product.type === 'VARIABLE' ? 'A variant keeps its own values: nothing is inherited from the parent product.' : undefined}
+          />
 
           {/* FIFO cost layers */}
           {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && product.type !== 'KIT' && (

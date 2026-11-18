@@ -12,6 +12,7 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
 - **Filter by invoicing** — the **Invoicing** filter shows orders that are **Not invoiced**, **Partially invoiced** or **Fully invoiced** (pick one or several). It is separate from the status filter and combines with it. Picking an invoicing state includes Completed and Delivered orders, because a shipped order that was never invoiced is exactly what it is for; archived orders stay hidden unless you tick **Include archived**. See [Invoicing state](#invoicing-state).
+- **Filter by a custom field** — when [custom fields](#custom-fields-on-orders) exist for orders, a drop-down lists every text field that has fixed choices, and every yes / no field, with each choice. Pick one to see only the orders holding that value (for example *Process stage: Pack*). Orders that have no value for the field are not matched by any choice. The filter is in the address, so it combines with search, status and the other filters and can be bookmarked.
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
 - **Refund state** — an order's refund state is separate from its stage (see [Order Statuses](#order-statuses)). On the list it shows in the **Invoice** column as **Part. Refunded** or **Refunded**.
@@ -26,6 +27,16 @@ Tick the box at the start of a row to select an order, or the box in the header 
 - **Print packing slips** opens one combined PDF with a slip per selected order (each starting on a new page), drawn exactly as the order page's packing slip. Draft and cancelled orders get no slip; a closing "Not printed" page lists them.
 
 Each order runs on its own, one after another, using the same checks and permissions as its single-order button, so one order failing never stops the others and nothing is rolled back. When Allocate or Advance finishes, a result panel lists every selected order as **Done**, **Skipped** (with the reason) or **Failed** (with what to do), with totals at the top. You need the **sales.process** permission (Admin, Manager and Warehouse roles) to run Allocate and Advance; printing needs only sales access. At most 100 orders can be selected for one action; a page holds 50.
+
+## Custom fields on orders
+
+If your company has set up order fields in **Settings > Custom fields**, a **Custom fields** card appears at the bottom of the order page, grouped by the field's group name. Use it to record things IMS has no column for, such as a process stage or an internal reference, without a software change. Values are validated on the server by the field's type (text, dropdown choice, whole or decimal number, yes / no, date, date and time in UTC, JSON, link) and nothing is saved if any value is refused.
+
+- **Who can change them.** The permission that lets you edit an order's notes (create sales orders). Anyone with sales access can read them. Changes are written to the **Activity Log**, which names the fields that changed but never their values.
+- **Orders from WooCommerce start with no values.** Nothing is filled in automatically when an order is imported; operators enter them in IMS. They are not read back from the store.
+- **Internal only.** Custom field values are never sent to WooCommerce, Mintsoft or Xero, and do not appear on invoices or other documents.
+- **Personal data.** A free-text field can hold something about the customer. Custom field values on an order are **erased** with the order when the customer or order is erased (see [Personal-data erasure](erasure.md)), and an erased order can no longer be given values.
+- **Hidden fields.** When an administrator hides a field it disappears from the card and the list filter, but its values are kept and return if the field is shown again.
 
 ## Creating a Sales Order
 
@@ -59,6 +70,10 @@ When WooCommerce sync is configured, orders are imported automatically into the 
 WooCommerce orders always enter the IMS as **Processing**. When WooCommerce marks an order as **completed**, the IMS treats that as the external dispatch signal: it auto-allocates stock, creates shipment rows if needed, advances those shipments through the internal `PICKING -> PACKED -> SHIPPED` workflow, and stores any tracking information received from WooCommerce. See the **WooCommerce Integration** guide for details on sync configuration.
 
 **EU withdrawal requests.** If your store uses the EU order-withdrawal button plugin, a customer's request puts the order **On Hold** in IMS and shows a **Withdrawal hold** badge on the order. While it is held, IMS does not send the order to the warehouse. If the request is approved the order is cancelled. If it is rejected, the hold is deliberately **kept**, because a rejection only moves the storefront order back to its earlier status, and releasing it automatically would put goods back on the pick line. When you are satisfied, use **Release withdrawal hold** on the order (it asks you to confirm); the order stays On Hold, and moving it back to Processing then sends it to the warehouse again. Once an order has shipped, a withdrawal is a return, not a hold. See [WooCommerce](woocommerce.md#eu-withdrawal-requests).
+
+### Duty and tax from WooCommerce
+
+WooCommerce works out duty, import VAT and the delivery terms; IMS **never recalculates them**. For a WooCommerce order the order page shows a read-only **Duty and tax** panel, labelled "from WooCommerce", with what the store reported: the **IOSS number** and **delivery term** (IOSS_DDP or DDP) IMS recorded from the order's EU VAT treatment, the **duty**, **import VAT** and (when there is one) **handling fee** the store recorded, and any **customs value per unit** set on an order line in WooCommerce. A value the store did not report is simply not shown, and the panel does not appear when there is nothing to show. These values cannot be edited in IMS. When the order is edited in WooCommerce they follow on the next order update; if the store removes one, it disappears here too. Orders imported before this feature show nothing until WooCommerce next updates them.
 
 ## Customer Turnover
 
@@ -622,6 +637,17 @@ Three PDF documents are available for each sales order:
 - **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu for every order that is not a Draft or Cancelled, and from a **Packing slip** button on each shipment card (from Pending onwards, so it can be printed to pick from). The shipment button prints only that parcel. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
+
+## Attachments
+
+Every sales order page has an **Attachments** card under the order, for documents that belong to it: a customer's purchase order, an email thread, a proof of delivery or a photo of damage.
+
+- **Upload** -- Anyone who can create or process sales orders (administrators, managers and warehouse users) sees an **Upload** button. Accepted: PDF, images (PNG, JPEG, GIF, WebP), CSV, Excel (.xlsx), Word (.docx) and email (.eml, .msg), up to **20 MB** each. IMS checks the content of the file, not just its name, and refuses a file that is not what its name says.
+- **Download** -- Anyone who can view sales orders sees the list and a **Download** button. A file always downloads; it is never opened in the browser.
+- **Delete** -- The **Delete** button asks you to confirm. A deleted attachment disappears from the list and cannot be downloaded; the file is kept on the server and the row is only marked deleted.
+- **They can hold personal data.** A customer's purchase order or an email can carry a name, address or phone number. When a customer is erased (**GDPR Anonymise**, or WooCommerce anonymising an order that IMS mirrors) every attachment of their orders is **deleted for good**, deleted ones included, together with its file. An anonymised order takes no new attachment. Attachments do not go to WooCommerce, Mintsoft or Xero. See [Personal-data erasure](erasure.md).
+- Deleting a draft order deletes its attachments too.
+- **Backups:** the files are in the server's upload folder (`UPLOAD_STORAGE_DIR`, under `order-attachments`), not in the database; a database backup does not contain them. After a restore, an attachment whose file was not restored shows in the list but fails to download. See [Backup & Restore](backup-restore.md).
 
 ## Other Actions
 

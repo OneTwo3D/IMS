@@ -345,6 +345,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'The publication scan queues the My Account invoice flag job for each stored, servable document (off unless wc_invoice_document_enabled).'),
   d('lib/connectors/woocommerce/sync/invoice-document-jobs.ts::attemptWcInvoiceDocumentPublish::publishInvoiceDocumentFlagToWc#1', 'woocommerce', 'order.invoice-document', 'drain', 'required',
     'The invoice publication drain writes the My Account flag through the fenced attempt.'),
+  d('lib/connectors/woocommerce/sync/trackship-refire-jobs.ts::scheduleWcTrackshipRefire::enqueueIntegrationOutbox#1', 'woocommerce', 'order.trackship-refire', 'queue-producer', 'not-applicable',
+    'Enqueues woocommerce/trackship.refire for a shipped, tracked order TrackShip may hold no shipment for: off unless trackship_refire_enabled; a shadow writes a record, no row, and does not spend the look.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::scheduleWcOrderCompletion::enqueueIntegrationOutbox#1', 'woocommerce', 'order.status', 'queue-producer', 'required',
     'Enqueues woocommerce/order.complete inside the shipping transaction.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::processWcOrderCompletionJobs::pushOrderDeliveryMetadata#1', 'woocommerce', 'order.tracking', 'facade', 'required',

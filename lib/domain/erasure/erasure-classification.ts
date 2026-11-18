@@ -37,7 +37,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   // wcLineBaseline (JSON): WooCommerce line item ids, quantities, SKUs and the order total taken at the first IMS line edit. Product and money figures only: no name, address, email or free text.
   SalesOrder: {
     erased: ['customerName', 'customerEmail', 'customerVatNumber', 'billingAddress', 'shippingAddress', 'notes', 'internalNotes', 'trackingNumber'],
-    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
+    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
     retained: {
       invoiceNumber: 'issued invoice number, statutory record',
       accountingInvoiceId: 'ledger document id, statutory record',
@@ -125,6 +125,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       storedPath: 'the issued invoice / credit note PDF is a statutory record, kept six years',
     },
   },
+  // lastResult is a fixed vocabulary written by IMS (covered, fired, not-eligible, no-tracking, order-gone, window-closed), never remote free text.
+  TrackshipRefireState: { erased: [], notPersonal: ['id', 'orderId', 'lastResult'], retained: {} },
   InvoiceStorePublication: { erased: [], notPersonal: ['noteInvoiceId', 'noteStoreId', 'flagDocumentId'], retained: {} },
   InvoiceDocumentFetchState: { erased: [], notPersonal: ['subjectKey', 'lastError', 'leaseHolder'], retained: {} },
   ReturnExpectation: { erased: [], notPersonal: ['reference', 'transitJournalKey'], retained: {} },
@@ -168,9 +170,25 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     notPersonal: ['id', 'connector', 'orderId', 'externalOrderId', 'queryText', 'payload', 'contentHash', 'doneBy'],
     retained: {},
   },
+  // Supporting documents attached to an order. A SALES order's attachment can hold the customer's personal data in its CONTENT (a customer purchase order, an
+  // email, a proof of address), which cannot be redacted, so an erasure DELETES the rows (live and soft-deleted) and the files of the erased orders
+  // (deleteSalesOrderAttachmentsInTx + removeOrderAttachmentFiles). The original file name can carry a name and goes with the row. A PURCHASE order's
+  // attachments are supplier-side commercial documents, not personal data of a customer, and are not reached by an erasure (a purchase order has no customer link).
+  OrderAttachment: {
+    erased: ['originalFilename'],
+    notPersonal: ['id', 'storedName', 'mimeType', 'sha256', 'uploadedByUserId'],
+    retained: {},
+  },
   WmsReturnsInbox: {
     erased: ['reason', 'rawPayload', 'resolutionNote'],
     notPersonal: ['connector', 'externalReturnId', 'sku', 'reference', 'resolvedBy'],
+    retained: {},
+  },
+  // Sales-order custom field values (product values are not personal and are not linked to an order). The text and JSON an operator types
+  // into an order's custom fields can be about the person, so both are erased: the erasure DELETES every value row of the order.
+  CustomFieldValue: {
+    erased: ['valueText', 'valueJson'],
+    notPersonal: ['id'],
     retained: {},
   },
 }
