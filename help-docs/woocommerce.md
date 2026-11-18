@@ -101,7 +101,7 @@ were *Blocked*, and the completion message says so. Fix the cause (for a tax rat
 **Tax Rates** tab) and the recheck imports the order by itself; nothing needs to be modified in
 WooCommerce and nothing needs pressing in IMS. The recheck looks at up to 50 queued orders every
 15 minutes, so a large backlog clears over several runs (about 1,000 orders in 5 hours); the
-**Sync > Exceptions** section title shows how many blocked orders are still waiting. The same rule applies to the ongoing
+**Sync > Exceptions** section title shows how many blocked orders are still waiting. Orders held back only because of their status (for example abandoned checkouts and failed or cancelled unpaid orders) are dropped from this recheck after 30 days (`WC_ADMISSION_REFUSAL_TTL_DAYS`); if such an order later reaches an imported status, WooCommerce sends it again and it imports normally. A recheck row for an order that no longer exists in WooCommerce is retired after three checks. Blocked orders are never expired. The same rule applies to the ongoing
 sync and to webhooks: a blocked order is recorded once, does not make every sweep fail again, and
 does not keep being fetched as an error. If a block cannot be recorded, the import is held exactly
 as described above.

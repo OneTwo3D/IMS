@@ -4198,7 +4198,7 @@ export async function createSalesOrderRefund(
           // check cannot tell two lines of one product apart, so a line is never refunded above its own units.
           const remainingQty = qty - (takenQty.get(id) ?? 0)
           if (refundLine.qty > remainingQty + 1e-9) {
-            return { error: `Refund qty ${refundLine.qty} for "${orderLine.description}" exceeds the ${Math.max(0, remainingQty)} still refundable on that line.` } as const
+            return { error: `Refund qty ${refundLine.qty} for "${orderLine.description}" exceeds the ${Math.max(0, remainingQty)} still refundable on that line.`, quarantine: true as const } as const
           }
           const foreign = refundableNet({
             line: { qty, net: refundBoundaryNumber(orderLine.totalForeign) },
@@ -4729,7 +4729,7 @@ export async function createSalesOrderRefund(
     // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
     // is pounds of headroom) so N partial refunds can't creep over.
     if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, netOrderTotal)) {
-      return { error: 'Refund total would exceed order total' } as const
+      return { error: 'Refund total would exceed order total', quarantine: true as const } as const
     }
 
     const existingRefundLines = await tx.salesOrderRefundLine.findMany({
@@ -4746,7 +4746,7 @@ export async function createSalesOrderRefund(
       const priorNetForeign = existingRefundLines.reduce((sum, line) => sum + refundBoundaryNumber(line.totalForeign), 0)
       const newNetForeign = refundLines.reduce((sum, line) => sum + storedForeign(line), 0)
       if (priorNetForeign + newNetForeign > netPaidForeign + 0.005) {
-        return { error: 'Refund total would exceed what the order was paid in its own currency.' } as const
+        return { error: 'Refund total would exceed what the order was paid in its own currency.', quarantine: true as const } as const
       }
       // Earlier refunds are valued line by line at the rate each was posted at. A line whose rate cannot be established is valued conservatively:
       // a positive credit at the HIGHER of the blended rate and the order's highest line rate, a reversal (negative) at no VAT at all.
@@ -4765,7 +4765,7 @@ export async function createSalesOrderRefund(
       }, 0)
       const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null, storedForeign(line))), 0)
       if (priorGrossForeign + newGrossForeign > paidForeign + 0.005) {
-        return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}` } as const
+        return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}`, quarantine: true as const } as const
       }
     }
 
@@ -4841,7 +4841,7 @@ export async function createSalesOrderRefund(
       const alreadyRefunded = refundedQtyByProduct.get(refundLine.productId) ?? 0
       const remainingRefundable = originalQty - alreadyRefunded
       if (refundLine.qty > remainingRefundable + 0.001) {
-        return { error: `Refund qty ${refundLine.qty} for product ${refundLine.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}` } as const
+        return { error: `Refund qty ${refundLine.qty} for product ${refundLine.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}`, quarantine: true as const } as const
       }
     }
 

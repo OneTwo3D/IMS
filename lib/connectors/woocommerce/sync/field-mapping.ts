@@ -291,14 +291,52 @@ export async function mapWcLineItems(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   _fxRate: number,
 ): Promise<MappedLine[]> {
-  // Build SKU→product lookup
-  const skus = lineItems.map((l) => l.sku).filter(Boolean)
-  const products = skus.length > 0
-    ? await db.product.findMany({ where: { sku: { in: skus } }, select: { id: true, sku: true } })
+  // Build the SKU→product lookup. WooCommerce SKUs are matched trimmed (product sync stores them
+  // trimmed) and, failing an exact hit, case-insensitively. products_sku_key is a case-sensitive
+  // unique index, so two IMS SKUs may differ only by case: a case-insensitive hit is bound ONLY when
+  // it is the single candidate. With two or more the line is left unbound and flagged, never guessed.
+  // A line with no SKU, or whose SKU names nothing in IMS, falls back to the WooCommerce id
+  // (variation id first, then product id) held in Product.externalProductId.
+  const trimmedSkus = lineItems.map((l) => (l.sku ?? '').trim())
+  const skus = [...new Set(trimmedSkus.filter(Boolean))]
+  const wcIds = [...new Set(lineItems.flatMap((l) => [l.variation_id, l.product_id])
+    .filter((id): id is number => Number.isSafeInteger(id) && id > 0))]
+  const or: Array<Record<string, unknown>> = [
+    ...skus.map((sku) => ({ sku: { equals: sku, mode: 'insensitive' as const } })),
+    ...(wcIds.length > 0 ? [{ externalProductId: { in: wcIds.map((id) => BigInt(id)) } }] : []),
+  ]
+  const products = or.length > 0
+    ? await db.product.findMany({ where: { OR: or }, select: { id: true, sku: true, externalProductId: true } })
     : []
-  const skuMap = new Map(products.map((p) => [p.sku.toUpperCase(), p.id]))
+  const exactSku = new Map<string, string>()
+  const foldedSku = new Map<string, string[]>()
+  const byWcId = new Map<string, string>()
+  for (const p of products) {
+    exactSku.set(p.sku, p.id)
+    const key = p.sku.toUpperCase()
+    foldedSku.set(key, [...(foldedSku.get(key) ?? []), p.id])
+    if (p.externalProductId != null) byWcId.set(String(p.externalProductId), p.id)
+  }
+  const ambiguousSkus = new Set<string>()
+  const resolveProductId = (item: WcLineItem): string | null => {
+    const sku = (item.sku ?? '').trim()
+    if (sku) {
+      const exact = exactSku.get(sku)
+      if (exact) return exact
+      const folded = foldedSku.get(sku.toUpperCase()) ?? []
+      if (folded.length === 1) return folded[0]
+      if (folded.length > 1) { ambiguousSkus.add(sku); return null }
+    }
+    for (const id of [item.variation_id, item.product_id]) {
+      if (Number.isSafeInteger(id) && id > 0) {
+        const hit = byWcId.get(String(id))
+        if (hit) return hit
+      }
+    }
+    return null
+  }
 
-  return lineItems.map((item) => {
+  const mapped = lineItems.map((item) => {
     const subtotal = parseFloat(item.subtotal) || 0  // before discount
     const total = parseFloat(item.total) || 0        // after discount
     const qty = item.quantity
@@ -308,8 +346,8 @@ export async function mapWcLineItems(
     const externalTaxRateId = item.taxes?.[0]?.id ?? null
 
     return {
-      productId: item.sku ? (skuMap.get(item.sku.toUpperCase()) ?? null) : null,
-      sku: item.sku || `wc-${item.product_id}`,
+      productId: resolveProductId(item),
+      sku: (item.sku ?? '').trim() || `wc-${item.product_id}`,
       description: item.name,
       qty,
       unitPriceForeign: roundDecimalNumber(unitPrice, 6),
@@ -321,6 +359,27 @@ export async function mapWcLineItems(
       wcCustomsUnitValue: readWcLineCustomsUnitValue(item),
     }
   })
+
+  // Unbound lines reserve no stock and read as fully allocated, so say so at import time.
+  const unbound = mapped.filter((m) => m.productId === null)
+  if (unbound.length > 0) {
+    try {
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: null,
+        tag: 'sync',
+        action: 'wc_order_line_unmatched',
+        level: 'WARNING',
+        description: `${unbound.length} WooCommerce order line(s) matched no IMS product and will reserve no stock: ${unbound.map((m) => m.sku).join(', ')}`
+          + (ambiguousSkus.size > 0 ? `. Ambiguous (differ only by case in IMS, not bound): ${[...ambiguousSkus].join(', ')}` : ''),
+        metadata: { connector: 'woocommerce', skus: unbound.map((m) => m.sku), ambiguousSkus: [...ambiguousSkus] },
+        resolveUser: false,
+      })
+    } catch (e) {
+      console.error('[woocommerce] failed to log unmatched order lines', e)
+    }
+  }
+  return mapped
 }
 
 export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {

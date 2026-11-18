@@ -190,6 +190,19 @@ export function wcBlockedOrderQueueWhere(): Prisma.ShoppingSyncLogWhereInput {
   }
 }
 
+/** Consecutive 404s on the by-id read after which a refusal row is retired as a deleted order. */
+export const WC_ADMISSION_REFUSAL_GONE_RETIRE_ATTEMPTS = 3
+
+/** Days a status-only refusal may stay pending before it is retired (WC_ADMISSION_REFUSAL_TTL_DAYS, default 30). */
+export function wcAdmissionRefusalTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const days = Number(env.WC_ADMISSION_REFUSAL_TTL_DAYS)
+  return (Number.isFinite(days) && days > 0 ? days : 30) * 86_400_000
+}
+
+function isWcStatusOnlyRefusal(reason: WcAdmissionRefusalReason): boolean {
+  return reason === 'status_not_admitted' || reason === 'status_not_mapped'
+}
+
 export function isWcAdmissionRefusalPayload(payload: unknown): payload is WcAdmissionRefusalPayload {
   return typeof payload === 'object'
     && payload !== null
@@ -395,19 +408,26 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
     // a fixed prefix and starve every refusal behind it (the failure Codex r12 found in the
     // withdrawal sweep, which solves it the same way with `lastCheckedAt`).
     orderBy: { createdAt: 'asc' },
-    take: Math.min(Math.max(limit, 1), 250),
+    // Retirements below cost no WooCommerce read, so the window is wider than the live-read budget
+    // (`limit`): rows that expire or are gone must not take a slot from one that can still import.
+    take: 250,
     select: { id: true, payload: true, externalId: true },
   })
 
   const result: WcAdmissionRefusalDrainResult = {
-    scanned: rows.length, imported: 0, stillRefused: 0, unresolved: 0, failed: 0, retired: 0,
+    scanned: 0, imported: 0, stillRefused: 0, unresolved: 0, failed: 0, retired: 0,
   }
   if (rows.length === 0) return result
+  const liveReadBudget = Math.min(Math.max(limit, 1), 250)
+  let liveReads = 0
+  const expiryCutoffMs = Date.now() - wcAdmissionRefusalTtlMs()
 
   const { importWcOrder } = await import('./order-import')
   const { importWcOrderGuarded } = await import('./withdrawal')
 
   for (const row of rows) {
+    if (liveReads >= liveReadBudget) break
+    result.scanned++
     const payload = isWcAdmissionRefusalPayload(row.payload) ? row.payload : null
     const externalOrderId = payload?.externalOrderId ?? row.externalId
     if (!externalOrderId) {
@@ -415,6 +435,21 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
       result.retired++
       continue
     }
+    // EXPIRY. An order refused only for its STATUS (not selected / not mapped) that has stayed that
+    // way for the whole TTL is an abandoned checkout, a failed payment or an unpaid cancellation,
+    // not a pending decision. Left for ever it grows the queue without bound and slows every other
+    // row's recheck linearly. Retiring it loses nothing: if the order ever reaches an admitted status
+    // WooCommerce sends order.updated and the ordinary gated importer takes it. Guard blocks and
+    // currency refusals are NEVER expired, because an operator still has to act on them.
+    if (payload && isWcStatusOnlyRefusal(payload.reason)) {
+      const refusedAtMs = Date.parse(payload.refusedAt)
+      if (Number.isFinite(refusedAtMs) && refusedAtMs <= expiryCutoffMs) {
+        await resolveRefusalRow(row.id, `Expired: still not importable by status ("${payload.status}") after ${Math.round(wcAdmissionRefusalTtlMs() / 86_400_000)} day(s); a later status change re-delivers the order`)
+        result.retired++
+        continue
+      }
+    }
+    liveReads++
 
     // Rotate BEFORE the work, so a row that throws still moves to the back of the queue.
     await db.shoppingSyncLog.update({
@@ -429,7 +464,14 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
 
     const read = await readLiveWcOrder(externalOrderId)
     if ('gone' in read) {
-      result.unresolved++
+      // A 404 on the third consecutive attempt is a deleted order: it will never import, and left in
+      // the queue it would rotate for ever (and keep one live read per sweep for nothing).
+      if ((payload?.attempts ?? 0) + 1 >= WC_ADMISSION_REFUSAL_GONE_RETIRE_ATTEMPTS) {
+        await resolveRefusalRow(row.id, 'The order no longer exists in WooCommerce (404 on repeated checks)')
+        result.retired++
+      } else {
+        result.unresolved++
+      }
       continue
     }
     if ('failed' in read) {
