@@ -82,6 +82,12 @@ enum PurchaseOrderType {
   FREIGHT    // secondary PO linked to goods PO (e.g. FedEx, customs)
 }
 
+/// What a cost line IS, where it matters to a rule. Only SHIPPING today: the buyer's own shipping estimate, which a supplier-quoted shipping REPLACES
+/// (supplier_quote_shipping_landed_enabled). NULL = untagged (every line that existed before, and every other cost).
+enum FreightCostKind {
+  SHIPPING
+}
+
 enum LandedCostMethod {
   BY_VALUE
   BY_WEIGHT
@@ -1592,6 +1598,7 @@ model FreightCostLine {
   vatable            Boolean          @default(false)
   distributionMethod LandedCostMethod @default(BY_VALUE)
   sortOrder          Int              @default(0)
+  kind               FreightCostKind?
 
   po                 PurchaseOrder    @relation(fields: [poId], references: [id])
   invoiceLines       PurchaseInvoiceLine[]

@@ -13,7 +13,8 @@ import { sessionAccessDenial } from '@/lib/auth/session-state'
 import { applyHeaderOrderDiscount, resolveHeaderOrderDiscountForeign } from '@/lib/domain/purchasing/order-discount'
 import { calcRequotedLineAmounts } from '@/lib/domain/purchasing/quote-line-amounts'
 import { SUPPLIER_QUOTABLE_STATUSES, SUPPLIER_RFQ_VIEWABLE_STATUSES, supplierSentPurchaseOrderWhere } from '@/lib/domain/purchasing/supplier-portal-visibility'
-import { planQuotedShipping, SUPPLIER_QUOTE_SHIPPING_SETTING_KEY } from '@/lib/domain/purchasing/quote-shipping'
+import { planQuotedShipping, SUPPLIER_QUOTE_SHIPPING_SETTING_KEY, SUPPLIER_QUOTED_SHIPPING_DESCRIPTION, type RefusedShippingReplace } from '@/lib/domain/purchasing/quote-shipping'
+import { readPoEditFacts } from '@/lib/domain/purchasing/po-edit-plan'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -315,6 +316,8 @@ export async function submitSupplierQuote(
     const supplierRef = sanitizeSupplierRef(safeData.supplierRef)
     if (!supplierRef) return { success: false, error: 'Supplier reference is required' }
 
+    // Set inside the transaction when a buyer's Shipping line could not be replaced; reported after it commits.
+    const quoteOutcome: { refusedShippingReplace: RefusedShippingReplace | null } = { refusedShippingReplace: null }
     const po = await db.$transaction(async (tx) => {
       await tx.$queryRaw`
         SELECT id
@@ -393,15 +396,20 @@ export async function submitSupplierQuote(
       if (landQuotedShipping) {
         const costLines = await tx.freightCostLine.findMany({
           where: { poId },
-          select: { id: true, description: true, amountForeign: true, vatable: true },
+          select: { id: true, description: true, amountForeign: true, vatable: true, kind: true, _count: { select: { invoiceLines: true } } },
           orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
         })
+        // Goods already landed against the order are only looked up when a buyer SHIPPING line could be replaced.
+        const hasBuyerShipping = costLines.some((c) => c.kind === 'SHIPPING' && c.description !== SUPPLIER_QUOTED_SHIPPING_DESCRIPTION)
+        const landed = hasBuyerShipping ? ((await readPoEditFacts(tx, poId))?.anyLanded ?? false) : false
         quotedShippingPlan = planQuotedShipping({
           shippingForeign,
           fxRateToBase: effectiveFxRate,
           vatRate: lockedPo.taxRatePercent ?? 0,
-          costLines,
+          costLines: costLines.map(({ _count, ...c }) => ({ ...c, billed: _count.invoiceLines > 0 })),
+          landed,
         })
+        quoteOutcome.refusedShippingReplace = quotedShippingPlan.refusedReplace
         if (quotedShippingPlan.deleteIds.length > 0) {
           await tx.freightCostLine.deleteMany({ where: { id: { in: quotedShippingPlan.deleteIds }, poId } })
         }
@@ -478,6 +486,15 @@ export async function submitSupplierQuote(
       description: `Supplier submitted quote for ${po.reference} — ref: ${supplierRef}`,
       metadata: { supplierRef, shippingCost: safeData.shippingCost },
     })
+    const refusedShippingReplace = quoteOutcome.refusedShippingReplace
+    if (refusedShippingReplace) {
+      // A visible, operator-facing refusal row: the buyer's Shipping line was kept beside the supplier's (it is billed or landed).
+      await logActivity({
+        entityType: 'PURCHASE_ORDER', entityId: poId, action: 'supplier_quote_shipping_replace_refused', tag: 'purchase', level: 'WARNING',
+        description: `${po.reference}: ${refusedShippingReplace.message}`,
+        metadata: { reason: refusedShippingReplace.reason, costLineIds: refusedShippingReplace.lineIds },
+      })
+    }
     return { success: true }
   } catch (e) {
     if (e instanceof SupplierPortalAccessError) return { success: false, error: 'RFQ not found or not accessible' }

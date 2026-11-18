@@ -1,6 +1,0 @@
-### Customs clears: refill race, variations, and what Mintsoft can clear
-
-- A customs clear is re-checked immediately before it is sent to Mintsoft: the marker row is locked and the clear goes only while the same marker is current and the IMS field is still empty. A field refilled between planning and sending is no longer cleared; a refill that races the request waits for it.
-- The WooCommerce import now records, per variation, which customs fields were inherited from the parent. When WooCommerce clears a parent's field (hs-code-woo marks only the parent), the variations that held that value by inheritance are cleared in IMS too; a variation with its own value is untouched, and variations imported before this release are left alone until their next import. A variation counts as inheriting a value that equals its parent's.
-- Live Mintsoft test: only the commodity code can be blanked through the API. A cleared customs description or country of origin is never sent; it is recorded once as "Mintsoft cannot clear this field via the API — clear it in Mintsoft by hand" (the description's marker is then settled, the origin's is kept so the China default is not re-declared) and is not retried. A "Nothing to update/add" answer to a clear counts as not applied.
-- Migration: adds `products.customsInherited` (empty for every existing row).
