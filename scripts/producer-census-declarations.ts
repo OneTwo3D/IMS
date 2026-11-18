@@ -235,6 +235,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/wc-sync.ts::createWcWebhooks::wcPost#1', 'woocommerce', 'webhooks', 'seam', 'not-applicable',
     'Operator button: registers the WooCommerce webhooks.'),
+  d('app/actions/wc-sync.ts::createWcWebhooks::wcPut#1', 'woocommerce', 'webhooks', 'seam', 'not-applicable',
+    'Operator button: writes the current secret onto an already registered webhook (same seam hold and egress barrier as the create).'),
   d('app/actions/wc-sync.ts::probeFxHelperPluginAction::probeFxHelperPlugin#1', 'woocommerce', 'fx-rates', 'seam', 'not-applicable',
     'Operator button: probe the FX helper plugin, which POSTs a test request.'),
   d('app/actions/wc-sync.ts::pushFxRatesToWcNow::pushCurrentFxRatesToWc#1', 'woocommerce', 'fx-rates', 'seam', 'not-applicable',

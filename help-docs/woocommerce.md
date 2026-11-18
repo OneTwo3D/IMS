@@ -278,6 +278,10 @@ Webhooks deliver order changes to One Two Inventory in real-time, rather than wa
    - `order.updated` — syncs status changes and refunds
    - `product.updated` — syncs product changes
 
+**Rotating the webhook secret.** Saving a new secret keeps the old one valid for **48 hours**, because every webhook already registered in WooCommerce keeps signing with the secret it was created with. After saving, click **Setup Webhooks in WooCommerce** again: it now also writes the new secret onto the existing webhooks (it no longer skips them), and once that has run nothing signs with the old secret. The helper plugin needs the new secret as well. After 48 hours only the current secret is accepted, so a webhook still signing with the old one is refused again.
+
+A delivery that keeps failing inside IMS (24 attempts) is not retried by WooCommerce, which was already told it arrived. It is shown under **Sync > Exceptions** as a dead-lettered store webhook delivery, where **Replay** re-queues it with its original payload.
+
 Webhook deliveries are stored as soon as they arrive and processed within moments, rather than waiting for the next five-minute run of the **WooCommerce Webhook Inbox** job (that job stays as the backstop and drains anything left over). Deliveries received while sync is switched off are kept and imported once sync is back on, so nothing is lost across a pause.
 
 Once the first webhook is verified, the sync page shows a "Last received" timestamp and the
@@ -840,7 +844,7 @@ Stock sync and order allocation use warehouses marked with **Sync to Store**:
 | Issue | Solution |
 |---|---|
 | Orders not importing | Check that order sync is enabled, the initial import is complete, and the relevant WC statuses are selected |
-| Webhooks not received | Verify the webhook secret matches in both systems. Check the Sync Log for entries. Try "Setup Webhooks" again. |
+| Webhooks not received | Verify the webhook secret matches in both systems (after a rotation, re-run "Setup Webhooks"; the old secret is accepted for 48 hours only). Check the Sync Log for entries. Try "Setup Webhooks" again. |
 | Wrong tax on imported orders | Import tax rates from WooCommerce and verify the mappings on the Tax Rates tab |
 | Stock not updating in WC | Ensure stock sync is enabled and at least one warehouse has **Sync to Store** checked |
 | Duplicate orders | Order import is idempotent — duplicates are skipped. Check the Sync Log for SKIPPED entries. |

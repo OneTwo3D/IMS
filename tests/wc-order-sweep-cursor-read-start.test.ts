@@ -13,7 +13,7 @@ const T0 = Date.parse('2026-11-14T10:00:00.000Z')
 const state = {
   settings: new Map<string, string>(),
   /** Every `modified_after` the sweep asked WooCommerce for, with the stand-in clock's reading. */
-  reads: [] as Array<{ modifiedAfter: string | undefined; at: number }>,
+  reads: [] as Array<{ modifiedAfter: string | undefined; at: number; datesAreGmt?: string }>,
   /** A hook run on the FINAL (empty-page) read, i.e. between the last read and the commit. */
   onEmptyPage: null as null | (() => void),
 }
@@ -32,7 +32,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
       // The cancellation backstop (o3d-hqvrp.82) reads cancelled/trash orders; it has its own test, so these sweep tests see no extra read.
       if (path === '/orders' && (params?.status === 'cancelled' || params?.status === 'trash')) return { data: [], totalPages: 1, totalItems: 0 }
       if (path === '/orders') {
-        state.reads.push({ modifiedAfter: params.modified_after, at: Date.now() })
+        state.reads.push({ modifiedAfter: params.modified_after, at: Date.now(), datesAreGmt: params.dates_are_gmt })
         state.onEmptyPage?.()
       }
       return { data: [], totalPages: 1, totalItems: 0 }
@@ -151,4 +151,12 @@ test('laterCursor and wcPullCursorCandidate are pure', async () => {
   assert.equal(laterCursor('garbage', '2026-01-01T00:00:00.000Z'), '2026-01-01T00:00:00.000Z')
   assert.equal(laterCursor('2026-02-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'), '2026-02-01T00:00:00.000Z')
   assert.equal(laterCursor('2026-01-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z'), '2026-02-01T00:00:00.000Z')
+})
+
+test('o3d-hqvrp.87: every windowed order read says the bound is GMT (dates_are_gmt), not site-local', async () => {
+  reset()
+  await poll()
+  assert.ok(state.reads.length > 0, 'precondition: the sweep read orders')
+  for (const read of state.reads) assert.equal(read.datesAreGmt, 'true')
+  mock.timers.reset()
 })

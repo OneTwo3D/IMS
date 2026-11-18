@@ -1,0 +1,6 @@
+### WooCommerce inbound: ordering, GMT window, first-seen completed orders, secret rotation (woocommerce)
+- A retried or replayed delivery that is older than the order's stored WooCommerce modified time no longer overwrites the address, notes, shipping method or VAT number a newer delivery applied. The stored modified time now follows each applied delivery.
+- The order poll and cancellation backstop send `dates_are_gmt=true`, so the `modified_after` window is compared in GMT rather than the store's local time. (The cursor already starts at the run's read start; the offset paging of the order walk is unchanged.)
+- An order first seen as `completed`, mapped to SHIPPED/DELIVERED/COMPLETED, or `refunded` no longer has stock reserved for it; `refunded` imports with a FULL refund disposition so it is not pushed to the warehouse.
+- Saving a new webhook secret keeps the previous one valid for 48 hours (stored encrypted), and "Setup Webhooks" now writes the current secret onto existing webhooks, so rotating the secret no longer silently refuses every delivery. Signature checks are otherwise unchanged.
+- Help docs: dead-lettered store webhook deliveries are visible and replayable under Sync > Exceptions (already the case); the rotation steps are documented.
