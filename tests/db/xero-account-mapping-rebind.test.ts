@@ -258,7 +258,7 @@ test('o3d-6thk1 (real tables): the HOLD is persisted, and a token row created wh
  * sync toggle, stamp, hold.
  */
 type Post = { chart: number; taxTypes: number; rcTypes: number; drift: number; payMap: number; roles: number; sync: string | undefined; stamp: 'prev' | 'new' | undefined; hold: boolean }
-const KEPT_ALL = (mapped: boolean): Pick<Post, 'taxTypes' | 'rcTypes' | 'payMap' | 'roles'> => mapped ? { taxTypes: 2, rcTypes: 2, payMap: 1, roles: 18 } : { taxTypes: 0, rcTypes: 0, payMap: 0, roles: 0 }
+const KEPT_ALL = (mapped: boolean): Pick<Post, 'taxTypes' | 'rcTypes' | 'payMap' | 'roles'> => mapped ? { taxTypes: 2, rcTypes: 2, payMap: 1, roles: 19 } : { taxTypes: 0, rcTypes: 0, payMap: 0, roles: 0 }
 const BRANCHES: Array<{ name: string; previous: 'stamp' | 'token' | 'unknown' | 'hold'; mapped: boolean; to: 'same' | 'other'; kind: string; expect: Post }> = [
   { name: 'known same (stamp), mapped', previous: 'stamp', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 3, sync: 'true', stamp: 'prev', hold: false } },
   { name: 'known same (token row), mapped', previous: 'token', mapped: true, to: 'same', kind: 'none', expect: { chart: 1, ...KEPT_ALL(true), drift: 3, sync: 'true', stamp: 'prev', hold: false } },
@@ -327,7 +327,7 @@ test('o3d-6thk1 (real tables): EVERY branch x EVERY store, table-driven', { skip
     assert.equal(observed.pre.chart, 1, `${branch.name}: PRECONDITION: a chart is cached`)
     assert.equal(observed.pre.drift, 3, `${branch.name}: PRECONDITION: a drift snapshot exists`)
     assert.equal(observed.pre.sync, 'true', `${branch.name}: PRECONDITION: sync is on`)
-    assert.equal(observed.pre.roles, branch.mapped ? 18 : 0, `${branch.name}: PRECONDITION: mapping ${branch.mapped ? 'present' : 'absent'}`)
+    assert.equal(observed.pre.roles, branch.mapped ? 19 : 0, `${branch.name}: PRECONDITION: mapping ${branch.mapped ? 'present' : 'absent'}`)
     assert.equal(observed.outcome.kind, branch.kind, `${branch.name}: outcome`)
     assert.deepEqual(observed.post, branch.expect, `${branch.name}: post-state of every store`)
   }
