@@ -3914,6 +3914,27 @@ function stagedAReversal(syncs: RefundAccountingSyncRequest[]): boolean {
   return syncs.some((sync) => sync.type === 'COGS_REVERSAL' || sync.type === 'UNEARNED_REV_REVERSAL')
 }
 
+/** Statuses in which an operator-typed refund is refused: no sale has been booked, so there is nothing to return and no invoice to credit. */
+const MANUAL_REFUND_REFUSED_STATUSES: ReadonlySet<string> = new Set(['DRAFT', 'PENDING_PAYMENT'])
+
+export function manualRefundStatusRefusal(status: string): string | null {
+  if (MANUAL_REFUND_REFUSED_STATUSES.has(status)) {
+    return status === 'DRAFT'
+      ? 'A draft order has not been booked, so it cannot be refunded. Cancel or delete the draft instead.'
+      : 'This order is still waiting for payment, so it cannot be refunded. Cancel the order instead.'
+  }
+  return null
+}
+
+/** The first refund line whose order-line id is not one of the order's own lines, or null. */
+export function refundLinesNotOnOrder<T extends { lineId?: string | null; description?: string | null }>(
+  refundLines: ReadonlyArray<T>,
+  orderLines: ReadonlyArray<{ id: string }>,
+): T | null {
+  const ids = new Set(orderLines.map((l) => l.id))
+  return refundLines.find((l) => l.lineId != null && !ids.has(l.lineId)) ?? null
+}
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
@@ -4124,6 +4145,15 @@ export async function createSalesOrderRefund(
       },
     })
     if (!so) return { error: 'Order not found' } as const
+
+    // Every refund line that names an order line must name one of THIS order's lines: a foreign id would be stored as-is and pollute per-line refunded quantities. Pure tightening for every caller.
+    const foreignLine = refundLinesNotOnOrder(refundLines, so.lines)
+    if (foreignLine) return { error: `Refund line "${foreignLine.description ?? foreignLine.lineId}" names an order line that does not belong to this order.` } as const
+    // An operator-typed (manual) refund needs a booked sale: a draft or an order still waiting for payment has nothing to return and no invoice to credit. Internal callers (storefront, chargeback) are unchanged.
+    if (input.deriveSaleLineNetsFromStoredBalance) {
+      const stateRefusal = manualRefundStatusRefusal(so.status)
+      if (stateRefusal) return { error: stateRefusal } as const
+    }
 
     // o3d-q0x56.8 - THE ORDER'S BOOKED RATE, OR A REFUSAL. Never 1 for a missing one: a foreign order with no usable
     // stored rate would have had every refund line converted one-for-one. A credit note reverses what was booked, so
