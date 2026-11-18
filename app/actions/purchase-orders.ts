@@ -95,6 +95,13 @@ import {
   validatePurchaseInvoiceLineLimits,
   type PurchaseInvoiceInputLine,
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
+import {
+  assertNoDuplicateSupplierBill,
+  DuplicateSupplierInvoiceNumberError,
+  normalizeSupplierInvoiceNumber,
+  PurchaseBillStatusRefusal,
+  purchaseOrderBillStatusRefusal,
+} from '@/lib/domain/purchasing/bill-guards'
 import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
   billChangedSinceRead,
@@ -3866,6 +3873,8 @@ export type CreateInvoiceInput = {
   notes?: string
   supplierInvoiceUrl?: string
   lines: InvoiceLineInput[]
+  /** Bill again although this supplier already has a bill under the same supplier invoice number. */
+  allowDuplicateInvoiceNumber?: boolean
 }
 
 export type UpdateInvoiceLineInput = {
@@ -3975,7 +3984,7 @@ async function billTaxCodeRefusal(lineTaxRates: ReadonlyArray<{ description: str
 export async function createInvoice(
   poId: string,
   input: CreateInvoiceInput,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; duplicateInvoiceNumber?: boolean }> {
   try {
     await requirePermission('purchasing.invoice')
     const po = await db.purchaseOrder.findUnique({
@@ -4025,6 +4034,9 @@ export async function createInvoice(
       },
     })
     if (!po) return { success: false, error: 'PO not found' }
+    // Only an order that has been placed and not cancelled is billed (CLOSED stays billable: a late supplier invoice for goods received before the close).
+    const statusRefusal = purchaseOrderBillStatusRefusal(po.status, po.reference)
+    if (statusRefusal) return { success: false, error: statusRefusal }
 
     // Split inputs into product vs cost lines.
     const productInputs = input.lines.filter(
@@ -4159,6 +4171,9 @@ export async function createInvoice(
       const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
         where: { id: poId },
         select: {
+          status: true,
+          reference: true,
+          supplierId: true,
           fxRateToBase: true,
           type: true,
           taxRatePercent: true,
@@ -4178,6 +4193,14 @@ export async function createInvoice(
             select: { id: true, description: true, amountForeign: true, vatable: true },
           },
         },
+      })
+      // The status was read before the lock: a cancel that committed in between must refuse the bill too.
+      const lockedStatusRefusal = purchaseOrderBillStatusRefusal(lockedPo.status, lockedPo.reference)
+      if (lockedStatusRefusal) throw new PurchaseBillStatusRefusal(lockedStatusRefusal)
+      await assertNoDuplicateSupplierBill(tx, {
+        supplierId: lockedPo.supplierId,
+        invoiceNumber: normalizeSupplierInvoiceNumber(input.invoiceNumber),
+        override: input.allowDuplicateInvoiceNumber === true,
       })
       // The tax and the accounting payload above were computed BEFORE this lock from the order and its cost lines as
       // they were then. A freight edit that committed in between keeps the cost-line ids, so the id checks alone pass
@@ -4212,7 +4235,7 @@ export async function createInvoice(
         select: { id: true },
         data: {
           poId,
-          invoiceNumber: input.invoiceNumber || null,
+          invoiceNumber: normalizeSupplierInvoiceNumber(input.invoiceNumber),
           invoiceDate,
           dueDate: input.dueDate ? new Date(input.dueDate) : null,
           subtotalForeign: invoiceCalculation.subtotalForeign,
@@ -4359,6 +4382,8 @@ export async function createInvoice(
 
     return { success: true }
   } catch (e) {
+    if (e instanceof PurchaseBillStatusRefusal) return { success: false, error: e.message }
+    if (e instanceof DuplicateSupplierInvoiceNumberError) return { success: false, error: e.message, duplicateInvoiceNumber: true }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: poId,

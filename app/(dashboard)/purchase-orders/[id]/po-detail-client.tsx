@@ -947,13 +947,14 @@ function BillDialog({
     }
   }
 
-  function handleConfirm() {
+  function handleConfirm(allowDuplicateInvoiceNumber = false) {
     setError('')
     if (!hasAnySelection) { setError('Select at least one line'); return }
     if (!invoiceDate) { setError('Invoice date is required'); return }
 
     startTransition(async () => {
       const result = await createInvoice(po.id, {
+        allowDuplicateInvoiceNumber: allowDuplicateInvoiceNumber || undefined,
         invoiceNumber: invoiceNumber || undefined,
         invoiceDate,
         dueDate: dueDate || undefined,
@@ -979,6 +980,10 @@ function BillDialog({
       if (result.success) {
         router.refresh()
         onClose()
+      } else if (result.duplicateInvoiceNumber) {
+        // A bill with this supplier invoice number already exists for the supplier: bill again only on an explicit confirmation.
+        if (window.confirm(`${result.error ?? 'Duplicate supplier invoice number.'}\n\nCreate this bill anyway?`)) handleConfirm(true)
+        else setError(result.error ?? 'Duplicate supplier invoice number')
       } else {
         setError(result.error ?? 'Failed to create bill')
       }
@@ -1230,7 +1235,7 @@ function BillDialog({
               Next
             </Button>
           ) : (
-            <Button onClick={handleConfirm} disabled={isPending}>
+            <Button onClick={() => handleConfirm()} disabled={isPending}>
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
               Confirm Bill
             </Button>
@@ -2129,7 +2134,7 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
   const hasBillableProduct = po.lines.some((l) => l.qty - l.qtyBilled > 0)
   const hasBillableCost = po.freightCostLines.some((c) => c.amountForeign - c.amountBilled > 0)
   const hasBillableItems = hasBillableProduct || hasBillableCost
-  const canBill = ['PO_SENT', 'SHIPPED', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status) && hasBillableItems
+  const canBill = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED', 'CLOSED'].includes(po.status) && hasBillableItems
   const canCancel = ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status)
   const receivedQtyTotal = po.lines.reduce((sum, l) => sum + l.qtyReceived, 0)
   const orderedQtyTotal = po.lines.reduce((sum, l) => sum + l.qty, 0)

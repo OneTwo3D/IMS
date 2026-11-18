@@ -266,6 +266,25 @@ quantity remains a hard cap either way.
 Note: if a prepaid PO is later received short (paid 100, received 90), the over-paid delta is not
 yet flagged automatically — reconcile manually until the prepaid reconciliation alert ships.
 
+### Which orders can be billed
+
+A bill can be created against an order that has been placed with the supplier: **PO Sent**, **Shipped**,
+**Partially Received**, **Received**, **Invoiced**, **Partially Returned**, **Returned** and **Closed**.
+A **Draft**, **RFQ Sent** or **Quote Received** order has not been placed, and a **Cancelled** order has been
+retired, so none of them can be billed (the server refuses it, not only the button). **Closed** stays billable
+on purpose: closing a part-received order keeps the goods that arrived, and the supplier's invoice for them often
+arrives after the close. The received-quantity cap still applies, so only received, un-returned, not-yet-billed
+goods and unbilled cost lines can be billed.
+
+Repeating the same line twice in one bill counts both entries against the cap, the same as two separate bills.
+
+### Duplicate supplier invoice numbers
+
+A bill is refused when the same supplier already has a bill with the same **Invoice number** (compared
+ignoring case and surrounding spaces, across all of that supplier's orders). The message names the order the
+existing bill is on. If it really is a second bill under that number, confirm the prompt to create it anyway.
+A bill with no invoice number is never checked. Editing an existing bill's number is not checked.
+
 ### Editing an unpaid bill
 
 Unpaid bills can be edited from the PO detail page. Headers (number, dates, notes, supplier
