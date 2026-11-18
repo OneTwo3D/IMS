@@ -137,3 +137,33 @@ test('moving the SFTP host clears the stored credential that was not re-entered 
   assert.equal(state.written.size, 0)
   state.stored = new Map()
 })
+
+test('enabling backup encryption is refused without a usable key, and with an invalid dedicated key; allowed with one', async () => {
+  const { saveBackupTargetSettings } = await import('../../app/actions/backup.ts')
+  state.fresh = true
+  const saved = { b: process.env.BACKUP_ENCRYPTION_KEY, s: process.env.SETTINGS_ENCRYPTION_KEY, e: process.env.ENCRYPTION_KEY }
+  try {
+    delete process.env.BACKUP_ENCRYPTION_KEY
+    delete process.env.SETTINGS_ENCRYPTION_KEY
+    delete process.env.ENCRYPTION_KEY
+    state.writes = 0
+    const none = await saveBackupTargetSettings({ backup_remote_encryption_enabled: 'true' })
+    assert.equal(none.success, false)
+    assert.match(none.error ?? '', /needs a key/)
+    process.env.BACKUP_ENCRYPTION_KEY = 'bad'
+    const bad = await saveBackupTargetSettings({ backup_remote_encryption_enabled: 'true' })
+    assert.equal(bad.success, false)
+    assert.match(bad.error ?? '', /not a valid/)
+    assert.equal(state.writes, 0)
+    // Turning it OFF never needs a key.
+    delete process.env.BACKUP_ENCRYPTION_KEY
+    assert.equal((await saveBackupTargetSettings({ backup_remote_encryption_enabled: 'false' })).success, true)
+    process.env.BACKUP_ENCRYPTION_KEY = 'b2'.repeat(32)
+    assert.equal((await saveBackupTargetSettings({ backup_remote_encryption_enabled: 'true' })).success, true)
+  } finally {
+    for (const [k, v] of [['BACKUP_ENCRYPTION_KEY', saved.b], ['SETTINGS_ENCRYPTION_KEY', saved.s], ['ENCRYPTION_KEY', saved.e]] as const) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})

@@ -6,6 +6,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { freshAuthFailureResult, requireAdmin, requireFreshAdmin, requireFreshPermission } from '@/lib/auth/server'
 import { getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import { BACKUP_ENCRYPTION_SETTING, resolveBackupEncryptionKey } from '@/lib/backup-encryption'
 import { BACKUP_TARGET_SETTING_KEYS, credentialsFollowChangedTarget, sftpCredentialsToClear, validateBackupTargetValues } from '@/lib/domain/settings/backup-target-input'
 import { logActivity } from '@/lib/activity-log'
 import { getBackupDir } from '@/lib/backup-storage'
@@ -119,6 +120,20 @@ export async function saveBackupTargetSettings(
 
   const invalid = validateBackupTargetValues(values)
   if (invalid) return { success: false, error: invalid }
+
+  // Never switch encryption on without a usable key: every upload would then fail while local
+  // retention keeps pruning older copies.
+  if (values[BACKUP_ENCRYPTION_SETTING] === 'true') {
+    let keyError: string | null = null
+    try {
+      if (!resolveBackupEncryptionKey()) {
+        keyError = 'Backup encryption needs a key in the server environment: set BACKUP_ENCRYPTION_KEY (or SETTINGS_ENCRYPTION_KEY), then enable it. Nothing was changed.'
+      }
+    } catch (error) {
+      keyError = `${error instanceof Error ? error.message : String(error)} Nothing was changed.`
+    }
+    if (keyError) return { success: false, error: keyError }
+  }
 
   const currentRaw = await getSettingValues([...BACKUP_TARGET_SETTING_KEYS])
   const current: Record<string, string> = {}
