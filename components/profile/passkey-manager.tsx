@@ -12,12 +12,14 @@ import {
   deletePasskey,
   renamePasskey,
 } from '@/app/actions/passkey'
+import { isFreshAuthFailure, useStepUpReauth } from '@/components/auth/use-step-up-reauth'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 type PasskeyEntry = { id: string; name: string; createdAt: Date }
 
 export function PasskeyManager() {
   const formatDateTime = useFormatDateTime()
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
   const [passkeys, setPasskeys] = useState<PasskeyEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [isPending, startTransition] = useTransition()
@@ -32,12 +34,22 @@ export function PasskeyManager() {
   async function handleRegister() {
     setMsg(null)
     try {
-      const result = await getPasskeyRegistrationOptions()
+      let result = await getPasskeyRegistrationOptions()
+      // A stale session must re-authenticate first (step-up), then retry once.
+      if (isFreshAuthFailure(result)) {
+        if (!(await promptReauth())) return
+        result = await getPasskeyRegistrationOptions()
+      }
+      if (isFreshAuthFailure(result)) { setMsg({ text: 'Re-authentication required.', isError: true }); return }
       if ('error' in result) { setMsg({ text: result.error!, isError: true }); return }
 
       const credential = await startRegistration({ optionsJSON: result.options! })
       const name = `Passkey ${passkeys.length + 1}`
-      const verify = await verifyPasskeyRegistration(credential, name)
+      let verify = await verifyPasskeyRegistration(credential, name)
+      if (isFreshAuthFailure(verify)) {
+        if (!(await promptReauth())) return
+        verify = await verifyPasskeyRegistration(credential, name)
+      }
 
       if (verify.error) { setMsg({ text: verify.error, isError: true }); return }
 
@@ -73,6 +85,7 @@ export function PasskeyManager() {
 
   return (
     <div className="space-y-3">
+      {stepUpDialog}
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm font-medium">Passkeys</p>
