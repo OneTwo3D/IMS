@@ -324,7 +324,8 @@ Full system backup and restore functionality is available for administrator-led 
 
 Backups can be uploaded to remote storage to keep them off the application server:
 
-1. On the **Storage** tab, fill in the **S3 Compatible Storage** card (endpoint (blank for AWS S3), region, bucket, access key, secret key, optional path prefix) or the **SFTP Server** card (host, port, username, password or private key, **Host Fingerprint** (required, it pins the server's identity so a wrong host is refused) and remote path) and save it. Changing an S3 endpoint or the SFTP host or fingerprint changes where backups are sent, so check the values first.
+1. On the **Storage** tab, fill in the **S3 Compatible Storage** card (endpoint (blank for AWS S3), region, bucket, access key, secret key, optional path prefix) or the **SFTP Server** card (host, port, username, password or private key, **Host Fingerprint** (required, it pins the server's identity so a wrong host is refused) and remote path) and save it. Changing an S3 endpoint or the SFTP host or fingerprint changes where backups are sent, so check the values first. Saving the Storage settings, creating a backup and uploading one all ask you to **Confirm it's you**; when you change the S3 endpoint/bucket or the SFTP host, port or user you must also re-enter the secret key, password or private key.
+   - **Encrypt backups before upload** (Storage tab, off by default): uploads the SQL backup as an encrypted `.sql.enc`. The key lives in the server environment (`BACKUP_ENCRYPTION_KEY`, else `SETTINGS_ENCRYPTION_KEY`), not in the backup; keep a copy in your secret store, because an encrypted backup cannot be restored without it. To restore, decrypt it first with `scripts/decrypt-backup.ts` (see `docs/backup-restore.md`), then use **Restore from File**.
 2. On the **Scheduler** tab, set **Auto-upload** to **S3** or **SFTP**. Every scheduled backup then uploads both the `.sql` and `.manifest.json` files.
 
 For a backup you made by hand, use the cloud icon (**Upload to S3**) or the server icon (**Upload via SFTP**) on its row.
@@ -381,7 +382,7 @@ This means an admin viewing the activity log can see who did what but not see se
 
 ## System Settings
 
-**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
+**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history; the same read-only notes are open to every internal role (not supplier-portal users) at **Help > What's New** (`/help/releases`), which is where the What's New notification links), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
 
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
   - Each plugin has a switch, and **Save & Apply** at the bottom saves the selection and updates the scheduler's crontab to match. If the selection saves but the crontab could not be updated, an amber message says so and tells you what to do; the selection itself is kept.
@@ -466,7 +467,7 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/fx-rates` | Fetch exchange rates from frankfurter.dev (the ECB rates) and replay any WooCommerce orders waiting for a rate. With the Aelia FX source (not yet switched on) it would read them from the store instead | Daily at 07:00 | On |
 | `/api/cron/wc-reconcile` | WooCommerce backup reconciliation of orders and products and stock catch-up | Hourly | On |
 | `/api/cron/wc-withdrawal-sweep` | Re-check every order IMS refused (EU withdrawal requests, orders held back by the status selection or an unmapped status) against the live store | Every 15 min | On |
-| `/api/cron/shopping-webhook-inbox` | Process stored WooCommerce webhook events and retry queued "completed" pushes | Every 5 min | On |
+| `/api/cron/shopping-webhook-inbox` | Process stored WooCommerce webhook events, retry queued "completed" pushes, and (only when `trackship_refire_enabled` is `true`) re-register shipped orders TrackShip holds no shipment for | Every 5 min | On |
 | `/api/cron/accounting-sync` | Drain the pending accounting sync queue | Every 5 min | On |
 | `/api/cron/accounting-payment-poll` | Detect paid invoices and bills in Xero | Every 15 min | On |
 | `/api/cron/accounting-payment-reconcile` | Slow backlog check of every linked invoice and bill against its current Xero status (report only unless switched to apply) | Daily at 03:00 | On |

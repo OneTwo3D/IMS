@@ -63,6 +63,8 @@ import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describe
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
+import { parseXeroDeleteTarget, runXeroDocumentDelete } from './document-delete'
+import { completeAccountingDocumentDeletion, pendingDocumentDeletionRefusal, recordDeletionTargetStatus } from '@/lib/domain/accounting/document-delete-service'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
@@ -155,6 +157,7 @@ import {
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
+  wooAccountingPostJobIds,
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
@@ -3848,6 +3851,12 @@ const POST_EFFECT_DOCUMENT_UPDATE = {
     + 'Xero if the change should not stand; there is nothing to void or credit-note.',
 } as const
 
+const POST_EFFECT_DOCUMENT_DELETE = {
+  effect: 'RENUMBERED an existing Xero document and then DELETED or VOIDED it',
+  remedy: 'The document was renumbered (its original number is free again) and then removed from the ledger. If it should still exist, '
+    + 'raise a replacement; a voided or deleted document cannot be restored. If only the renumber landed, the document is still live '
+    + 'under its suffixed number: retry this row to finish the delete, or restore the number by hand.',
+} as const
 const POST_EFFECT_DOCUMENT_VOID = {
   effect: 'VOIDED a sales credit note in Xero',
   remedy: 'The credit note named above was set to Voided because its refund was deleted in IMS. Nothing new was created. If it should still stand, re-create it in Xero by hand; there is nothing to void or reverse.',
@@ -3861,6 +3870,8 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   PURCHASE_CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
   SALES_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
   PURCHASE_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  SALES_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
+  PURCHASE_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
   INVOICE_PAYMENT: POST_EFFECT_PAYMENT,
   BILL_PAYMENT: POST_EFFECT_PAYMENT,
   COGS_JOURNAL: POST_EFFECT_JOURNAL,
@@ -4606,51 +4617,64 @@ export async function completeSettledOutboxJobUnlessIncidentFiled(
   return { verdict: 'RETRACTED', evidence: filedSince }
 }
 
-async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
+/**
+ * How long one drain keeps CLAIMING new jobs (o3d-40i5e). Half the lease: a job claimed at the very end of the budget still has
+ * the larger part of its own lease for its attempt, and the next tick picks up what was left.
+ */
+export const XERO_DRAIN_CLAIM_BUDGET_MS = Math.floor(CLAIM_STALE_MS / 2)
+
+export async function processPendingXeroSyncViaOutbox(options: { now?: () => number; drainBudgetMs?: number } = {}): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
+  const clock = options.now ?? (() => Date.now())
+  const startedAt = clock()
+  const budgetMs = options.drainBudgetMs ?? XERO_DRAIN_CLAIM_BUDGET_MS
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
   await ensureXeroOutboxForPendingSyncLogs(MAX_PER_RUN, staleClaimCutoff)
-  const jobs = await claimIntegrationOutboxWork({
-    connector: XERO_OUTBOX_CONNECTOR,
-    operation: XERO_ACCOUNTING_POST_OPERATION,
-    limit: MAX_PER_RUN,
-    workerId: XERO_ACCOUNTING_WORKER_ID,
-    staleLockMs: CLAIM_STALE_MS,
-    maxAttempts: MAX_RETRIES,
-  })
 
-  const jobWork: Array<{ job: IntegrationOutboxRow; syncLogId: string }> = []
-  for (const job of jobs) {
+  // CLAIM -> ATTEMPT -> MARK, ONE JOB AT A TIME (o3d-40i5e). A batch claimed up front stamps every job with the same `lockedAt`
+  // while they are posted one after another, so a job at the back could age past the lease before its attempt began and be taken
+  // by the next drain as a dead worker's. Each job is now claimed only when its attempt is about to start, and the drain stops
+  // claiming once its wall-clock budget is spent; what it did not reach stays queued for the next tick.
+  const attempted: string[] = []
+  // ONE READ OF THE WOOCOMMERCE-WRITING JOB IDS FOR THE WHOLE DRAIN (o3d-jvup3), not one unbounded query per claim.
+  const wooAccountingJobIds = await wooAccountingPostJobIds(new Date())
+  while (attempted.length < MAX_PER_RUN) {
+    if (clock() - startedAt > budgetMs) break
+    const claimedJobs = await claimIntegrationOutboxWork({
+      connector: XERO_OUTBOX_CONNECTOR,
+      operation: XERO_ACCOUNTING_POST_OPERATION,
+      limit: MAX_PER_RUN,
+      claimLimit: 1,
+      excludeIds: attempted,
+      wooAccountingJobIds,
+      workerId: XERO_ACCOUNTING_WORKER_ID,
+      staleLockMs: CLAIM_STALE_MS,
+      maxAttempts: MAX_RETRIES,
+    })
+    const job = claimedJobs[0]
+    if (!job) break
+    attempted.push(job.id)
     if (!job.lockedAt) {
       result.failed++
       continue
     }
 
+    let syncLogId: string
     try {
-      jobWork.push({ job, syncLogId: parseXeroAccountingOutboxPayload(job).accountingSyncLogId })
+      syncLogId = parseXeroAccountingOutboxPayload(job).accountingSyncLogId
     } catch (error) {
       await markXeroOutboxPermanent(job, error instanceof Error ? error.message : String(error))
       result.failed++
       continue
     }
-  }
 
-  const entries = jobWork.length > 0
-    ? await db.accountingSyncLog.findMany({
-        where: { id: { in: [...new Set(jobWork.map((work) => work.syncLogId))] } },
-      })
-    : []
-  const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
-  // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). One taken here answers with the world as it
-  // was before this run made a single Xero call, and the incident the doors below guard against is filed
-  // by ANOTHER worker while this one is on the wire. Each door asks at the moment it decides — see
-  // completeSettledOutboxJobUnlessIncidentFiled.
-  const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, entries)
-  const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, entries)
+    const entry = await db.accountingSyncLog.findUnique({ where: { id: syncLogId } })
+    // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). Each door asks at the moment it decides - see
+    // completeSettledOutboxJobUnlessIncidentFiled.
+    const blockedPaymentEntryIds = entry ? await findInvoicePaymentsBlockedByEarlierLiveLogs(db, [entry]) : new Set<string>()
+    const blockedUpdateEntryIds = entry ? await findInvoiceUpdatesBlockedByPendingCreate(db, [entry]) : new Set<string>()
 
-  for (const { job, syncLogId } of jobWork) {
-    const entry = entriesById.get(syncLogId)
     if (!entry) {
       await markXeroOutboxPermanent(job, `Accounting sync log ${syncLogId} was not found`)
       result.failed++
@@ -6301,6 +6325,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
       }
+      const salesDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (salesDeleting) return { success: false, error: salesDeleting }
       // Same cancelled-order backstop as the create: don't modify an external receivable for an order
       // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
@@ -6369,6 +6395,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for PURCHASE_INVOICE_UPDATE' }
       }
+      const billDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (billDeleting) return { success: false, error: billDeleting }
       const supplier = referenceType === 'PurchaseOrder'
         ? await db.purchaseOrder.findUnique({
             where: { id: referenceId },
@@ -6389,6 +6417,23 @@ export async function processClaimedEntry(
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
       return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
+    }
+
+    case 'SALES_INVOICE_DELETE':
+    case 'PURCHASE_INVOICE_DELETE': {
+      // o3d-ngmt.21: free the document's number, then DELETE or VOID it. Read first, so a retry after the number was already changed makes
+      // only the status write and never appends a second suffix; every write fences on the lease like every other remote mutation here.
+      const parsed = parseXeroDeleteTarget(type, payload as Record<string, unknown>)
+      if (!parsed.ok) return { success: false, error: parsed.error }
+      const deleteTarget = parsed.target
+      const run = await runXeroDocumentDelete(deleteTarget, {
+        fence: (step) => lease.fenceBeforeRemoteWrite(step),
+        idempotencyKey: (step) => buildXeroIdempotencyKey(entryId, step, payload),
+      })
+      if (run.kind === 'fenced') return run.result
+      if (run.kind === 'failed') return { success: false, error: run.error }
+      await recordDeletionTargetStatus(deleteTarget.invoiceId, run.status)
+      return { success: true, externalId: deleteTarget.invoiceId, externalRevisionAt: run.externalRevisionAt }
     }
 
     case 'INVOICE_PAYMENT': {
@@ -7109,6 +7154,12 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
+  // o3d-ngmt.21: a confirmed delete is not a back-reference at all — it UNWINDS the link. The unwind is idempotent and keyed on the ledger's
+  // document id, so a failure here is retried by the same follow-up path as a failed back-reference, from the id already stored on the row.
+  if (type === 'SALES_INVOICE_DELETE' || type === 'PURCHASE_INVOICE_DELETE') {
+    await completeAccountingDocumentDeletion(externalId)
+    return
+  }
   // audit-H3: do NOT swallow failures here. The external id is already persisted
   // on the sync row (externalTransactionId) before this runs, and the caller's
   // catch marks the row for retry so the next pass re-applies the back-reference

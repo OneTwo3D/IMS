@@ -10,6 +10,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createSalesOrder, updateSalesOrder, type SoDetail } from '@/app/actions/sales'
+import { DEFAULT_QUOTE_VALIDITY_DAYS, addDaysYmd, ymdInZone } from '@/lib/domain/sales/sales-quote'
 import { createCustomer, type CustomerRow, type AddressData } from '@/app/actions/customers'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
@@ -35,7 +36,7 @@ type Props = {
   taxRates: TaxRateRow[]
   customers: CustomerRow[]
   stockLevels: Record<string, Record<string, StockLevelEntry>>
-  avgCogs: Record<string, number>
+  avgCogs: Record<string, number> | null
   users: UserOption[]
   currentUserName: string
   companyHomeCountry?: string | null
@@ -220,6 +221,11 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   // Pre-select the default warehouse (falls back to the first one).
   const [warehouseId, setWarehouseId] = useState(
     order ? (order.shipFromWarehouseId ?? '') : (warehouses.find((w) => w.isDefault)?.id ?? warehouses[0]?.id ?? ''),
+  )
+  // A quote is a draft with a validity date (o3d-ngmt.16). Editing a quote keeps it a quote; a new order may be saved as one.
+  const editingQuote = order?.isQuote === true
+  const [quoteValidUntil, setQuoteValidUntil] = useState(
+    order?.quoteValidUntil ?? addDaysYmd(ymdInZone(new Date(), Intl.DateTimeFormat().resolvedOptions().timeZone), DEFAULT_QUOTE_VALIDITY_DAYS),
   )
   const [expectedDelivery, setExpectedDelivery] = useState(order?.expectedDelivery ? order.expectedDelivery.slice(0, 10) : '')
   const [salesRep, setSalesRep] = useState(order ? (order.salesRep ?? currentUserName) : currentUserName)
@@ -551,7 +557,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   // fees + total VAT. Earlier code double-counted shipping/fees VAT by
   // adding it both via totalVat and separately.
   const grandTotal = lineSubtotal + shippingNet + feesNet + totalVat
-  const totalCogs = lines.reduce((s, l) => s + l.qty * (avgCogs[l.productId] ?? 0), 0)
+  const totalCogs = lines.reduce((s, l) => s + l.qty * (avgCogs?.[l.productId] ?? 0), 0)
   const totalLineDiscounts = lines.reduce((s, l) => s + parseDiscount(l.discount, l.qty * l.unitPrice), 0)
   const totalAllDiscounts = totalLineDiscounts + orderDiscountAmount
 
@@ -561,8 +567,9 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     return p.sku.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
   }).slice(0, 20)
 
-  function handleSubmit(isDraft: boolean = false, shopDesyncAcknowledged: boolean = false) {
+  function handleSubmit(isDraft: boolean = false, shopDesyncAcknowledged: boolean = false, asQuote: boolean = false) {
     setError('')
+    if (asQuote && !quoteValidUntil) { setError('Enter the date the quote is valid until'); return }
     if (!customerId && !customerName.trim()) { setError('Select or enter a customer'); return }
     if (!lines.length) { setError('Add at least one product'); return }
     if (fxBlocksSubmit(fx)) { setError(fx?.state === 'missing' ? fx.message : 'The exchange rate is still loading'); return }
@@ -599,6 +606,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         orderDiscountForeign: orderDiscountAmount,
         orderDiscountStr: orderDiscount || undefined,
         isDraft,
+        ...(asQuote ? { isQuote: true, quoteValidUntil } : {}),
         lines: lines.map((l) => {
           const gross = l.qty * l.unitPrice
           const disc = parseDiscount(l.discount, gross)
@@ -649,7 +657,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     <Dialog open onOpenChange={() => {}}>
       <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw]">
         <DialogHeader>
-          <DialogTitle>{editing ? (editingConfirmed ? 'Edit Order' : 'Edit Draft Order') : 'New Sales Order'}</DialogTitle>
+          <DialogTitle>{editing ? (editingQuote ? 'Edit Quote' : editingConfirmed ? 'Edit Order' : 'Edit Draft Order') : 'New Sales Order'}</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-6">
@@ -701,6 +709,12 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                   {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code} — {w.name}</option>))}
                 </select>
               </div>
+              {(!editing || editingQuote) && (
+                <div className="space-y-1.5">
+                  <Label>{editingQuote ? 'Quote valid until' : 'Quote valid until (Save as quote only)'}</Label>
+                  <Input type="date" value={quoteValidUntil} onChange={(e) => setQuoteValidUntil(e.target.value)} className="h-9 text-sm" />
+                </div>
+              )}
               <div className="space-y-1.5">
                 <Label>Delivery Date</Label>
                 <Input type="date" value={expectedDelivery} onChange={(e) => setExpectedDelivery(e.target.value)} className="h-9 text-sm" />
@@ -765,7 +779,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     <TableHead className="text-xs text-center w-24">Discount</TableHead>
                     <TableHead className="text-xs text-center w-32">VAT</TableHead>
                     <TableHead className="text-xs text-right w-24">Total ({sym})</TableHead>
-                    <TableHead className="text-xs text-right w-20">COGS ({baseCurrency.code})</TableHead>
+                    {avgCogs !== null && <TableHead className="text-xs text-right w-20">COGS ({baseCurrency.code})</TableHead>}
                     <TableHead className="w-8" />
                   </TableRow>
                 </TableHeader>
@@ -775,7 +789,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     const grossTotal = line.qty * line.unitPrice
                     const discAmount = parseDiscount(line.discount, grossTotal)
                     const lineTotal = grossTotal - discAmount
-                    const cogs = (avgCogs[line.productId] ?? 0) * line.qty
+                    const cogs = (avgCogs?.[line.productId] ?? 0) * line.qty
                     return (
                       <TableRow key={line.key}>
                         <TableCell>
@@ -825,7 +839,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                           </div>
                         </TableCell>
                         <TableCell className="text-right font-mono text-xs">{money(lineTotal)}</TableCell>
-                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</TableCell>
+                        {avgCogs !== null && <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</TableCell>}
                         <TableCell>
                           <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
                             <X className="h-4 w-4" />
@@ -983,6 +997,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                       {currency !== baseCurrency.code && <span className="text-muted-foreground font-normal ml-2">({fxRate === null ? '—' : formatMoney(grandTotal / fxRate, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>}
                     </span>
                   </div>
+                  {avgCogs !== null && (
+                    <>
                   <div className="flex justify-between text-muted-foreground border-t pt-1">
                     <span>Est. COGS</span>
                     <span className="font-mono">{formatMoney(totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
@@ -991,6 +1007,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     <span>Est. Margin</span>
                     <span className="font-mono">{fxRate === null ? '—' : formatMoney((lineSubtotal / fxRate) - totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
                   </div>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -1002,7 +1020,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
           {editing ? (
-            <Button onClick={() => handleSubmit(true)} disabled={isPending || fxBlocksSubmit(fx)}>
+            <Button onClick={() => handleSubmit(true, false, editingQuote)} disabled={isPending || fxBlocksSubmit(fx)}>
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
               Save changes
             </Button>
@@ -1011,6 +1029,10 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
               <Button variant="outline" onClick={() => handleSubmit(true)} disabled={isPending || fxBlocksSubmit(fx)}>
                 {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                 Save as Draft
+              </Button>
+              <Button variant="outline" onClick={() => handleSubmit(true, false, true)} disabled={isPending || fxBlocksSubmit(fx)} title="A quote reserves no stock and is not sent to the warehouse or invoiced; convert it to an order when the customer accepts.">
+                {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                Save as quote
               </Button>
               <Button onClick={() => handleSubmit(false)} disabled={isPending || fxBlocksSubmit(fx)}>
                 {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}

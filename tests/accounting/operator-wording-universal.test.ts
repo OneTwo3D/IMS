@@ -255,8 +255,10 @@ test('[o3d-1e7sl Codex r10] the drift guard: the reused-key types the instructio
 })
 
 test('[o3d-1e7sl Codex r10] per posting type: every state variation renders the SAME action and the SAME Mark-as-handled condition on every surface', () => {
-  const TYPES: Array<[string | undefined, 'update' | 'payment' | 'conditional' | 'untyped']> = [
+  const TYPES: Array<[string | undefined, 'update' | 'payment' | 'delete' | 'conditional' | 'untyped']> = [
     ['SALES_INVOICE_UPDATE', 'update'], ['PURCHASE_INVOICE_UPDATE', 'update'], ['BILL_PAYMENT', 'payment'],
+    // o3d-ngmt.21: removing a document is its own flow; "post it if absent" would be the opposite of the step.
+    ['SALES_INVOICE_DELETE', 'delete'], ['PURCHASE_INVOICE_DELETE', 'delete'],
     ['SALES_INVOICE', 'conditional'], ['STOCK_RECEIPT', 'conditional'], [undefined, 'untyped'],
   ]
   const PLAIN = /post it in the ledger now|Then post it,|only once it is posted/i
@@ -306,6 +308,7 @@ test('[o3d-1e7sl Codex r10] per posting type: every state variation renders the 
           if (name === 'claim dialog' || name.endsWith('row')) assert.match(text, /identify the posting type before any ledger work/i, `${where}: ${name}`)
         }
         if (flow === 'conditional') assert.doesNotMatch(text, /CURRENT payment|apply the update|register THIS/, `${where}: ${name}`)
+        if (flow === 'delete') assert.doesNotMatch(text, /CURRENT payment|apply the update|register THIS|post it ONLY if it is absent/, `${where}: ${name}: a delete is never told to post the document`)
         if (flow === 'update' || flow === 'payment') {
           for (const clause of text.split(/(?<=[.;])\s+/).filter((c) => /do not post again/i.test(c))) assert.match(clause, /if the current (version|payment) is there/i, `${where}: ${name}: "do not post again" only under the CURRENT condition: ${clause}`)
         }
@@ -540,7 +543,6 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/accounting.ts', prefix: 'It was answered as "this connector does not post this type"', verdict: 'DESCRIPTION', why: 'states what the queue answered; nothing to follow' },
   { file: 'lib/connectors/accounting-settlement-probe.ts', prefix: 'This entry will retry once that attempt is readable', verdict: 'DESCRIPTION', why: 'states IMS own retry behaviour' },
   { file: 'lib/connectors/woocommerce/sync/order-completion-jobs.ts', prefix: 'Replay it: the retry re-reads the order first', verdict: 'NON_ACCOUNTING', why: 'WooCommerce order-completion write-back, no ledger posting' },
-  { file: 'lib/connectors/woocommerce/sync/product-sync.ts', prefix: 'Resolve the duplicate SKU / barcode', verdict: 'NON_ACCOUNTING', why: 'WooCommerce product-structure conflict' },
   { file: 'lib/connectors/xero/daily-sync.ts', prefix: 'Daily batch DAILY_BATCH_GROUP_B not recreated', verdict: 'DESCRIPTION', why: 'states why the rebuild was refused' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'There is nothing that would stop a re-post.', verdict: 'DESCRIPTION', why: 'states a hazard; the instruction beside it is CHECK XERO first' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'CHECK XERO before re-queueing', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check, before any re-queue' },

@@ -152,11 +152,38 @@ export type WmsProductDto = {
   raw?: Record<string, unknown> | null
 }
 
+/**
+ * The customs fields an IMS-side clear may erase in a WMS. Deliberately has NO barcode / EAN / UPC member: identifiers are
+ * never cleared, so no caller can even express it.
+ */
+export type WmsClearableProductField = 'customsDescription' | 'commodityCode' | 'countryOfManufacture'
+
+/** What happened to the explicit clears of an UPDATE. A rejected clear never fails the update that carried it. */
+export type WmsProductClearOutcome = {
+  cleared: WmsClearableProductField[]
+  rejected: { field: WmsClearableProductField; message: string }[]
+  /** Not sent: the claim made immediately before the request found the clear no longer wanted (the field was refilled, or the marker was replaced). Not a failure: nothing is retried. */
+  skipped: { field: WmsClearableProductField; reason: string }[]
+  /** Not sent: the WMS has no API way to clear this field. Never retried; an operator clears it by hand. */
+  unsupported: WmsClearableProductField[]
+}
+
+/**
+ * Taken around each clear request: runs `send` only while the caller can still stand behind the clear, holding whatever
+ * lock keeps that true until `send` settles. `claimed: false` means the clear was not wanted any more and nothing was sent.
+ */
+export type WmsClearClaim = <T>(
+  field: WmsClearableProductField,
+  send: () => Promise<T>,
+) => Promise<{ claimed: true; value: T } | { claimed: false; reason: string }>
+
 export type WmsProductRef = {
   externalId: string
   sku: string
   barcode: string | null
   raw: Record<string, unknown> | null
+  /** Present only when the upsert asked for clears (see WmsUpsertProductOptions.clearFields). */
+  clearOutcome?: WmsProductClearOutcome
 }
 
 export type WmsReturnRecord = {
@@ -275,6 +302,14 @@ export type WmsUpsertProductOptions = {
   omitBarcode?: boolean
   /** Leave the WMS's UPC (MPN) field out of the write. Only meaningful, and only sent, when the identifier split is on. */
   omitMpn?: boolean
+  /**
+   * Customs fields to ERASE in the WMS, each sent as its own follow-up request after the update so a WMS refusal of one
+   * clear cannot fail the update or the other clears. UPDATE only: ignored without an externalProductId (a create has
+   * nothing to clear). Barcode/EAN/UPC are not clearable.
+   */
+  clearFields?: WmsClearableProductField[]
+  /** Wraps each clear request so a clear planned earlier is re-verified immediately before it is sent. Absent: every clear is sent as planned. */
+  clearClaim?: WmsClearClaim
 }
 
 /**

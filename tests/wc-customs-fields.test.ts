@@ -17,7 +17,7 @@ test('native fields win over attributes', () => {
     customs_description: 'stepper motor',
     attributes: [attr('HS Code', '11111111'), attr('Country of Origin', 'DE'), attr('Customs Description', 'old text')],
   })
-  assert.deepEqual(r, { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'stepper motor', rejected: [] })
+  assert.deepEqual(r, { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'stepper motor', rejected: [], cleared: [] })
 })
 
 test('description falls back to legacy meta when native and attribute are empty', () => {
@@ -62,16 +62,16 @@ test('variation attributes carry a singular `option`', () => {
       { name: 'customs_description', option: 'plastic bracket' },
     ],
   })
-  assert.deepEqual(r, { hsCode: '3926909090', countryOfOrigin: 'CN', customsDescription: 'plastic bracket', rejected: [] })
+  assert.deepEqual(r, { hsCode: '3926909090', countryOfOrigin: 'CN', customsDescription: 'plastic bracket', rejected: [], cleared: [] })
 })
 
 test('nothing supplied yields nulls', () => {
-  assert.deepEqual(extractWcCustomsFields({}), { hsCode: null, countryOfOrigin: null, customsDescription: null, rejected: [] })
+  assert.deepEqual(extractWcCustomsFields({}), { hsCode: null, countryOfOrigin: null, customsDescription: null, rejected: [], cleared: [] })
 })
 
 test('variation in view context: the inherited parent value reads like a native value', () => {
   const variation = { customs_commodity_code: '85011099', customs_country_of_origin: 'CN', customs_description: 'inherited', attributes: [] }
-  assert.deepEqual(extractWcCustomsFields(variation), { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'inherited', rejected: [] })
+  assert.deepEqual(extractWcCustomsFields(variation), { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'inherited', rejected: [], cleared: [] })
 })
 
 test('unmappable native origin falls back to a valid attribute', () => {
@@ -129,4 +129,57 @@ test('warnings: rejected values and a defaulted origin on a new row', () => {
   assert.match(w[0], /Atlantis/)
   assert.match(w[1], /default CN/)
   assert.deepEqual(productSync.describeWcCustomsWarnings('SKU1', [], { isNewRow: false, resolvedOrigin: null }), [])
+})
+
+// ---- explicit clears (WooCommerce emptied the native field AND hs-code-woo recorded it) ----
+
+const clearedMeta = (value: unknown) => [{ key: '_customs_cleared_fields', value }]
+const ALL_MARKED = { commodity_code: '2026-11-18T10:00:00Z', country_of_origin: '2026-11-18T10:00:00Z', description: '2026-11-18T10:00:00Z' }
+
+test('empty native value + cleared-fields meta is CLEARED (object or JSON string meta)', () => {
+  const empty = { customs_commodity_code: null, customs_country_of_origin: '', customs_description: '  ' }
+  assert.deepEqual(extractWcCustomsFields({ ...empty, meta_data: clearedMeta(ALL_MARKED) }).cleared, ['hsCode', 'countryOfOrigin', 'customsDescription'])
+  assert.deepEqual(extractWcCustomsFields({ ...empty, meta_data: clearedMeta(JSON.stringify(ALL_MARKED)) }).cleared, ['hsCode', 'countryOfOrigin', 'customsDescription'])
+  assert.deepEqual(extractWcCustomsFields({ ...empty, meta_data: clearedMeta({ country_of_origin: '2026-11-18T10:00:00Z' }) }).cleared, ['countryOfOrigin'])
+})
+
+test('empty native value WITHOUT the cleared-fields meta is unknown (never-populated reads the same), not cleared', () => {
+  const empty = { customs_commodity_code: null, customs_country_of_origin: '', customs_description: null }
+  assert.deepEqual(extractWcCustomsFields(empty).cleared, [])
+  assert.deepEqual(extractWcCustomsFields({ ...empty, meta_data: [] }).cleared, [])
+  assert.deepEqual(extractWcCustomsFields({ ...empty, meta_data: clearedMeta('not json') }).cleared, [])
+  assert.deepEqual(extractWcCustomsFields({ ...empty, meta_data: clearedMeta({}) }).cleared, [])
+})
+
+test('native key ABSENT is unknown even if the meta lists it', () => {
+  assert.deepEqual(extractWcCustomsFields({ meta_data: clearedMeta(ALL_MARKED) }).cleared, [])
+})
+
+test('a populated native value is never cleared, whatever the meta says (the field was set again)', () => {
+  const r = extractWcCustomsFields({ customs_commodity_code: '85011099', meta_data: clearedMeta(ALL_MARKED) })
+  assert.equal(r.hsCode, '85011099')
+  assert.deepEqual(r.cleared, [])
+})
+
+test('an attribute or legacy-meta value keeps the field from being cleared', () => {
+  const r = extractWcCustomsFields({
+    customs_commodity_code: null,
+    customs_description: '',
+    attributes: [attr('hs_code', '85011099')],
+    meta_data: [{ key: '_customs_description_legacy', value: 'Old text' }, ...clearedMeta(ALL_MARKED)],
+  })
+  assert.equal(r.hsCode, '85011099')
+  assert.equal(r.customsDescription, 'Old text')
+  assert.deepEqual(r.cleared, [])
+})
+
+test('a present-but-invalid fallback value is not a clear', () => {
+  const r = extractWcCustomsFields({ customs_commodity_code: '', attributes: [attr('hs_code', '850110')], meta_data: clearedMeta(ALL_MARKED) })
+  assert.deepEqual(r.rejected, [{ field: 'hsCode', value: '850110' }])
+  assert.deepEqual(r.cleared, [])
+})
+
+test('an invalid native value is rejected, never cleared', () => {
+  const r = extractWcCustomsFields({ customs_country_of_origin: 'Atlantis', meta_data: clearedMeta(ALL_MARKED) })
+  assert.deepEqual(r.cleared, [])
 })

@@ -83,7 +83,8 @@ type RestoreTokenPayload = {
   userId: string
   sessionVersion: number | null
   sessionAuthTime: number | null
-  clientIp: string
+  /** null when no trustworthy client IP could be resolved: the token is then bound to the session alone. */
+  clientIp: string | null
 }
 
 function isTruthy(value: string | undefined): boolean {
@@ -118,8 +119,10 @@ function restoreTokenClientIp(request?: Pick<NextRequest, 'headers'> | null): st
 }
 
 function restoreTokenPayload(session: RestoreSession, request?: Pick<NextRequest, 'headers'> | null): RestoreTokenPayload | null {
+  // Bind to the client IP when one is known; otherwise (no trusted proxy configured) fall back to the
+  // session binding (user, sessionVersion, sessionAuthTime) and the short token TTL rather than
+  // making restore unavailable.
   const clientIp = restoreTokenClientIp(request)
-  if (!clientIp) return null
   return {
     userId: session.user.id,
     sessionVersion: session.user.sessionVersion ?? null,
@@ -137,14 +140,14 @@ function parseRestoreTokenPayload(value: string | null): RestoreTokenPayload | n
   try {
     const parsed = JSON.parse(value) as Partial<RestoreTokenPayload>
     if (!parsed || typeof parsed !== 'object') return null
-    if (typeof parsed.userId !== 'string' || typeof parsed.clientIp !== 'string') return null
+    if (typeof parsed.userId !== 'string' || (parsed.clientIp !== null && typeof parsed.clientIp !== 'string')) return null
     if (parsed.sessionVersion !== null && typeof parsed.sessionVersion !== 'number') return null
     if (parsed.sessionAuthTime !== null && typeof parsed.sessionAuthTime !== 'number') return null
     return {
       userId: parsed.userId,
       sessionVersion: parsed.sessionVersion ?? null,
       sessionAuthTime: parsed.sessionAuthTime ?? null,
-      clientIp: parsed.clientIp,
+      clientIp: parsed.clientIp ?? null,
     }
   } catch {
     return null

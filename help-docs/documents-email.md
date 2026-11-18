@@ -125,6 +125,8 @@ When you email a document (e.g. sending a purchase order to a supplier or an inv
 
 Emails are sent server-side using nodemailer via your configured SMTP settings (see **Settings > Company > Email/SMTP**) rather than by opening a mailto link in your browser. The email buttons on sales orders and invoices do **not** reach SMTP themselves — they add the email to the outbox described under [The Email Queue](#the-email-queue) below, and the background job is what connects to your SMTP server. The following email functions are available:
 
+The saved SMTP password is shown masked and is only ever used with the server it was saved for. If you change the SMTP host, port, user or security, re-enter the password before sending a test email or saving.
+
 - **sendSalesOrderEmail** — queues the sales order PDF for delivery to the customer
 - **sendInvoiceEmail** — queues the invoice PDF for delivery to the customer
 

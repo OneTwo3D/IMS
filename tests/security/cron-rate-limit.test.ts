@@ -25,6 +25,10 @@ import { getAllCronJobs } from '@/lib/cron-registry'
 import { PACK_SCHEDULE_SLUG } from '@/lib/reconciliation-pack/schedule-constants'
 import { MemoryRateLimitBackend } from '@/lib/security/rate-limit-memory'
 
+// Forwarding headers are only believed when a trusted proxy is configured (lib/request-ip.ts); these tests
+// exercise the "verified source IP" path, so configure one.
+process.env.TRUSTED_PROXY_IPS = '10.255.255.1'
+
 function defaultScheduleOf(job: string): string {
   return getAllCronJobs().find((j) => j.slug === job)!.defaultSchedule
 }

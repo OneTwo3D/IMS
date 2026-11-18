@@ -658,7 +658,8 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,
     }
-  }).filter((row) => row.dueAmount > 0.01)
+  // An indeterminate zero balance (an unplaceable credit valued at 0) is possibly owed, not settled: keep it, flagged by dueBound.
+  }).filter((row) => row.dueAmount > 0.01 || row.dueBound === 'indeterminate')
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +682,9 @@ export async function getSavedViews(): Promise<SavedView[]> {
 }
 
 export async function saveView(view: SavedView): Promise<void> {
+  // Saved views are shared by everyone; a write needs more than the read-only `analytics` permission.
   await requirePermission('analytics')
+  await requirePermission('purchasing.create')
   const views = await getSavedViews()
   const existing = views.findIndex((v) => v.id === view.id)
   if (existing >= 0) views[existing] = view; else views.push(view)
@@ -696,7 +699,9 @@ export async function saveView(view: SavedView): Promise<void> {
 }
 
 export async function deleteView(viewId: string): Promise<void> {
+  // Saved views are shared by everyone; a write needs more than the read-only `analytics` permission.
   await requirePermission('analytics')
+  await requirePermission('purchasing.create')
   const views = await getSavedViews()
   const deleted = views.find((v) => v.id === viewId)
   await db.setting.upsert({ where: { key: 'sales_stats_views' }, create: { key: 'sales_stats_views', value: JSON.stringify(views.filter((v) => v.id !== viewId)) }, update: { value: JSON.stringify(views.filter((v) => v.id !== viewId)) } })

@@ -65,7 +65,7 @@ function expectedReleaseNotification(): ReleaseRow {
     type: 'info',
     title: `What's New in ${CURRENT_RELEASE.version}`,
     message: CURRENT_RELEASE.userMessage,
-    actionUrl: '/settings/system?tab=releases',
+    actionUrl: '/help/releases',
   }
 }
 
@@ -125,4 +125,10 @@ test('the current release mirrors its changelog operator actions when it has any
   }
   const older = RELEASES.find((r) => r.version === '2.0.0')
   assert.ok(older && older.operatorActions === undefined)
+})
+
+test('the release notification links to a page every role can open, not the admin-only settings tab', () => {
+  // o3d-hqvrp.324: the notice is broadcast to all users; /settings/system needs the admin-only settings permission.
+  assert.equal(expectedReleaseNotification().actionUrl, '/help/releases')
+  assert.notEqual(expectedReleaseNotification().actionUrl, '/settings/system?tab=releases')
 })

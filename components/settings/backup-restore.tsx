@@ -68,7 +68,10 @@ export function BackupRestore() {
     setMsg(null)
     setCreating(true)
     try {
-      const res = await fetch('/api/backup/create', { method: 'POST' })
+      let res = await fetch('/api/backup/create', { method: 'POST' })
+      if (res.status === 403 && (await res.clone().json().catch(() => ({})))?.code === 'fresh_auth_required' && (await promptReauth())) {
+        res = await fetch('/api/backup/create', { method: 'POST' })
+      }
       if (res.ok) {
         // Download the file
         const blob = await res.blob()
@@ -191,12 +194,17 @@ export function BackupRestore() {
     setUploading(`${filename}-${target}`)
     setMsg(null)
     try {
-      const res = await fetch('/api/backup/upload-remote', {
+      const send = () => fetch('/api/backup/upload-remote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename, target }),
       })
-      const data = await res.json()
+      let res = await send()
+      let data = await res.json().catch(() => ({}))
+      if (res.status === 403 && data?.code === 'fresh_auth_required' && (await promptReauth())) {
+        res = await send()
+        data = await res.json().catch(() => ({}))
+      }
       if (res.ok) {
         setMsg({ text: `Uploaded to ${data.destination}`, isError: false })
       } else {
