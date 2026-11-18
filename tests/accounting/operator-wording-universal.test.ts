@@ -543,7 +543,6 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/accounting.ts', prefix: 'It was answered as "this connector does not post this type"', verdict: 'DESCRIPTION', why: 'states what the queue answered; nothing to follow' },
   { file: 'lib/connectors/accounting-settlement-probe.ts', prefix: 'This entry will retry once that attempt is readable', verdict: 'DESCRIPTION', why: 'states IMS own retry behaviour' },
   { file: 'lib/connectors/woocommerce/sync/order-completion-jobs.ts', prefix: 'Replay it: the retry re-reads the order first', verdict: 'NON_ACCOUNTING', why: 'WooCommerce order-completion write-back, no ledger posting' },
-  { file: 'lib/connectors/woocommerce/sync/product-sync.ts', prefix: 'Resolve the duplicate SKU / barcode', verdict: 'NON_ACCOUNTING', why: 'WooCommerce product-structure conflict' },
   { file: 'lib/connectors/xero/daily-sync.ts', prefix: 'Daily batch DAILY_BATCH_GROUP_B not recreated', verdict: 'DESCRIPTION', why: 'states why the rebuild was refused' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'There is nothing that would stop a re-post.', verdict: 'DESCRIPTION', why: 'states a hazard; the instruction beside it is CHECK XERO first' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'CHECK XERO before re-queueing', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check, before any re-queue' },

@@ -2692,8 +2692,8 @@ export async function syncAllWcProducts(
       + `${permanentConflictSkus.join(', ')}. The sync cursor was advanced past them so the rest of `
       + 'the catalogue keeps syncing. Resolve the duplicate SKU / barcode / WooCommerce id, or the '
       + 'product-structure conflict on /sync/exceptions. Each later run re-fetches these products by id '
-      + '(a bounded number per run) and imports them once the conflict is gone, so no re-save in '
-      + 'WooCommerce is needed.',
+      + '(a bounded number per run) and imports them once the conflict is gone, with no '
+      + 'change needed on the WooCommerce side.',
     metadata: { mode, skus: permanentConflictSkus, permanentErrors: result.permanentErrors },
   }
 
@@ -2744,7 +2744,7 @@ export async function syncAllWcProducts(
     // `wc_product_conflict_overflow` (written with the list, under its lock) and named in this ERROR.
     const unlistedNames = unlistedConflicts.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')
     const message = `The list of buried WooCommerce products is full (${MAX_STORED_PERMANENT_CONFLICTS}), so ${unlistedConflicts.length} new product(s) with a conflict cannot be re-attempted automatically `
-      + `(${unlistedNames}). The product sync carries on; re-save these products in WooCommerce after fixing them. They are kept in the setting wc_product_conflict_overflow.`
+      + `(${unlistedNames}). The product sync carries on. These products stay listed until their conflicts are fixed. They are kept in the setting wc_product_conflict_overflow.`
     await logActivity({
       entityType: 'SYNC', action: 'wc_product_conflict_list_full', tag: 'sync', level: 'ERROR',
       description: message,
