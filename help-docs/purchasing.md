@@ -298,6 +298,10 @@ message. See the Xero sync docs for retry semantics.
 Paid bills cannot be edited. Reverse the payment first if a correction is required.
 
 
+### Deleting a bill that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), a bill that IMS itself created in Xero shows a **Delete bill** button on the purchase order page for people who can edit bills. It renames the Xero bill with a random `-DEL-` suffix so the original supplier number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it. When Xero confirms, the bill and its lines are removed from IMS, the purchase order is no longer marked as invoiced if no other bill remains, and the Stock in Transit movement the bill recorded is reversed. A paid bill, a bill with supplier credit notes, one dated in a locked period, or one created by another system (for example Qoblex) is refused with the reason shown. See [Xero sync](xero-sync.md) for the full rules.
+
 ### Supplier credit notes
 
 The **Supplier credit notes** card at the bottom of a PO that has a bill lists every credit note recorded against the order, each marked **DRAFT** or **POSTED**.

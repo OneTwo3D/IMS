@@ -40,6 +40,7 @@ mock.module('@/lib/domain/accounting/posted-document-discount', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      accountingDocumentDeletion: { findFirst: async () => null }, // o3d-ngmt.21: no delete is pending
       salesOrderRefund: { findFirst: async () => null },
       salesOrder: { findUnique: async () => state.order },
       accountingEvent: { findFirst: async () => null },

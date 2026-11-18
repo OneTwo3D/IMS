@@ -18,6 +18,7 @@ import { computePurchaseOrderOverBilling } from '@/lib/domain/purchasing/purchas
 import { computePrepaidReconciliation } from '@/lib/domain/purchasing/prepaid-reconciliation'
 import { getSession } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { documentDeleteUiStates } from '@/lib/domain/accounting/document-delete-service'
 import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
 import { listOrderAttachments, canEditOrderAttachments, canViewOrderAttachments } from '@/lib/domain/order-attachments'
 import { OrderAttachmentsCard } from '@/components/orders/order-attachments-card'
@@ -63,6 +64,8 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
     ...po.invoices.map((invoice) => ({ referenceType: 'PurchaseInvoice', referenceId: invoice.id })),
   ])
 
+  // o3d-ngmt.21: the Delete control for each synced bill — only for a user who may edit bills, with the switch on, and for a bill that reached Xero.
+  const billDeleteStates = await documentDeleteUiStates('PURCHASE_BILL', po.invoices.map((invoice) => invoice.id), !!session && hasPermission(session.user.role, 'purchasing.invoice'))
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
@@ -101,7 +104,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} canApprove={!!session && hasPermission(session.user.role, 'purchasing.approve')} currentUserId={session?.user.id} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} canApprove={!!session && hasPermission(session.user.role, 'purchasing.approve')} currentUserId={session?.user.id} billDeleteStates={billDeleteStates} />
       <PoPegsCard pegs={pegs} lineLabels={pegLineLabels} />
       <OrderAttachmentsCard kind="purchase" orderId={po.id} attachments={attachments} canEdit={canEditAttachments} />
     </div>

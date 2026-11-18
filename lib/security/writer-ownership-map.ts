@@ -80,6 +80,11 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: ['SALES_INVOICE_UPDATE'],
     note: 'As sales.invoice.',
   }),
+  row('xero', 'sales.invoice-delete', { P1: 'xeroom', P2: 'xeroom' }, {
+    obligationTime: 'required',
+    accountingSyncTypes: ['SALES_INVOICE_DELETE'],
+    note: 'As sales.invoice: the writer that owns a sales invoice owns its removal, so IMS shadows the delete too (and the document-delete action refuses an invoice IMS did not itself create).',
+  }),
   row('xero', 'sales.credit-note', { P1: 'xeroom', P2: 'xeroom' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['CREDIT_NOTE'],
@@ -100,6 +105,11 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'required',
     accountingSyncTypes: ['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE'],
     note: 'Owner answer 2026-10-09: Qoblex writes bills into Xero natively (its own Xero integration) today; IMS owns from P2.',
+  }),
+  row('xero', 'purchase.bill-delete', { P1: 'qoblex-native', P2: 'IMS' }, {
+    obligationTime: 'required',
+    accountingSyncTypes: ['PURCHASE_INVOICE_DELETE'],
+    note: 'As purchase.bill: whoever writes the bill writes its removal (o3d-ngmt.21); IMS owns it from P2.',
   }),
   row('xero', 'purchase.bill-payment', { P1: 'qoblex-native', P2: 'IMS' }, {
     obligationTime: 'required',

@@ -550,6 +550,10 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
 
+### Deleting an invoice that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), an invoice that IMS itself created in Xero shows a **Delete invoice** button on the order page for people who can process sales. It renames the Xero invoice with a random `-DEL-` suffix so the original number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it, and clears the invoice number and link from the order when Xero confirms. If the invoice has payments, refunds or credit notes, is dated in a locked period, was created by another system or is already being deleted, the page shows the reason instead. See [Xero sync](xero-sync.md) for the full rules.
+
 ### Editing an order
 
 **A Draft order can be edited.** Open the order and press **Edit order**: the same form you used to create it opens pre-filled, and you can change the customer, addresses, lines, quantities, prices, discounts, shipping, VAT basis, warehouse, delivery date and notes. **Save changes** re-prices the whole order exactly as creating it would (the same rounding, VAT and exchange-rate rules; a foreign-currency order is re-priced at today's table rate and refused if that rate is missing), replaces the lines, and keeps the order number, the status (still Draft) and the activity history, which records the edit with the old and new totals. An order that was saved with separate fee rows shows their sum as part of **Shipping** when you edit it. The order's external order number is not editable.

@@ -1241,6 +1241,27 @@ If the active accounting connector is QuickBooks (not Xero), IMS records a
 `sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
 behaviour is symmetric with the purchase bill path.
 
+### Deleting a synced invoice or bill (off by default)
+
+An invoice or supplier bill that IMS itself pushed to Xero can be deleted in IMS and Xero together, with its reference number freed for a replacement. The setting **Allow deleting synced invoices and bills** (**Integrations → Xero → Deleting synced documents**) is **off by default**; while it is off no Delete button is shown and nothing described here happens.
+
+When it is on, the **Delete invoice** button (sales order page) and **Delete bill** button (purchase order page) appear for people who can already edit that document (`sales.process` for an invoice, `purchasing.invoice` for a bill). Confirming queues one `SALES_INVOICE_DELETE` or `PURCHASE_INVOICE_DELETE` entry in the normal Xero queue, so every write goes through the same outbound queue and the same outbound-write hold as every other Xero write. While writes to Xero are held, IMS tells the operator so, queues nothing, and changes nothing in IMS or Xero.
+
+**What Xero is sent, in this order:**
+
+1. The document's number (and Reference, when it has one) is changed to `<number>-DEL-<6 random characters>` (for example `INV-1001-DEL-K7M2QX`), which frees `INV-1001` for a replacement. Xero keeps the number of a voided or deleted document reserved, which is why the number is changed first.
+2. The document's status is set to **DELETED** (a draft or submitted document) or **VOIDED** (an authorised document with no payments or credit applied).
+
+The suffix is chosen once, when the delete is queued. IMS reads the document in Xero before each attempt, so a retry after the second write failed sees the number already changed and makes only the status write; it never adds a second suffix. A document already voided or deleted is treated as done.
+
+**What IMS does, when Xero has confirmed:** an invoice's order loses its invoice number, date and Xero link (so the order reads as not invoiced and no longer holds the number), the invoice's accounting events are voided, and its stored PDF copies are withdrawn (they are kept, as statutory records are). A bill and its lines are removed (a snapshot is kept on the deletion record), the purchase order's invoiced marker is cleared when no other bill remains, and the Stock in Transit sub-ledger movement the bill recorded is reversed by an equal and opposite movement. An activity-log entry is written when the delete is requested and when it completes. Until Xero confirms, IMS is unchanged, and an edit sent to the document in the meantime is refused.
+
+**When the delete is refused** (the page shows the reason in place of the button; every one of these tells the operator to remove the blocking items in the accounting system first, where that is the remedy):
+
+Payments (a receipt on the invoice, an order held as paid, a payment on the bill); credit notes (a refund or credit note on the invoice, a supplier credit note on the bill); a document dated on or before the imported Xero books lock date; a document IMS did not create (raised by another system during the parallel run, or linked by hand; for an invoice the invoice-number ownership check must also show Xero holds the number under that very document); another posting or a delete still queued for it. At the moment of the delete IMS also reads Xero: a payment, credit note or allocation IMS did not know about, a different document type or a different number changes nothing and reports why.
+
+Refund and credit-note deletion is not part of this. After a delete, a replacement invoice that is identical in content to the deleted one can still be treated as already posted by the posting dedupe; raise the replacement with a changed line or reference.
+
 ### Cancelling an order while its invoice is posting
 
 Cancelling a sales order retires any invoice work still queued for it, so the ledger never receives
@@ -3022,6 +3043,7 @@ Take the posting for hand posting first and hold that claim while you work: ever
 |---|---|---|
 | An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing | Hold the hand-post claim, then: check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): if the current version is there, do not post again; if only an earlier version is there, apply the update to it (do not raise a second document); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
 | A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded | Hold the hand-post claim, then: check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| A DELETE of a synced invoice or bill (SALES_INVOICE_DELETE, PURCHASE_INVOICE_DELETE) - the work is removing the document, not posting it | Hold the hand-post claim, then: check the ledger for the document: if it is already deleted or voided, do not repeat it; only if it still exists, first change its number (add a suffix such as -DEL-ABC123) so the original number is free, then delete it if it is a draft or submitted, or void it if it is authorised and has no payments or credit applied. | Only once the document is deleted or voided in the ledger. |
 | Any other posting (no earlier document can exist) | Hold the hand-post claim, then: check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
 | The posting type is not known where the text is shown | Hold the hand-post claim, then: identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type. | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->

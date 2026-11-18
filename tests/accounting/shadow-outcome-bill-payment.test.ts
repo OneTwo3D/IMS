@@ -80,6 +80,7 @@ function transactionClient(pending: Array<() => void>) {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      accountingDocumentDeletion: { findFirst: async () => null }, // o3d-ngmt.21: no delete is pending
       purchaseInvoice: { findUnique: async () => state.invoice },
       // COMMIT ONLY ON SUCCESS. A double that applied writes as they happened could not tell a rollback
       // from a committed PAID bill, and the whole finding is about which of the two a refusal produces.
