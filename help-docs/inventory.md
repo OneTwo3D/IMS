@@ -30,7 +30,7 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
 - **SKU**, **Name**, **Type**, **Status** (the lifecycle status) — visible by default
 - **Parent SKU**, **Barcode**, **MPN**, **Category**, **Dimensions**, **Weight** — hidden by default
 - **Preferred Supplier** — the supplier auto-recorded from the most recent purchase order (hidden by default; see [Preferred Supplier](#preferred-supplier))
-- **Regular Price** (visible by default), **Sale Price**, **Tax Incl.** — pricing columns
+- **Regular Price** (visible by default), **Sale Price**, **Tax Incl.** — pricing columns. Prices and tax category are only shown and editable for roles holding the price permission (Admin, Manager, Finance); Warehouse users see them blank, cannot change them on the product form, and a CSV import containing price values is refused for them.
 - **Stock** — total on-hand quantity (visible by default)
 - **Allocated** — quantity reserved by active sales or manufacturing orders (amber when > 0; hidden by default)
 - **Available** — on hand minus allocated (red when negative; hidden by default)

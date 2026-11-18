@@ -8,6 +8,7 @@ import { parseCsv } from '@/lib/csv'
 import { ProductType, type Prisma, type ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import { applyCustomFieldValues, loadActiveDefinitions } from '@/lib/custom-fields/values-service'
 import { CUSTOM_FIELD_CSV_PREFIX, parseCustomFieldValue } from '@/lib/custom-fields/values'
 import {
@@ -285,6 +286,22 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
   const text = await validated.file.text()
   const parsed = parseCsv(text)
   const { rows, dropped } = capRows(parsed)
+
+  // inventory.prices gates every price column. The import runs under inventory.edit, so a user without
+  // inventory.prices must not be able to set prices (which push to WooCommerce) through the file; refuse the
+  // whole file rather than silently dropping the columns. The system actor has no session and is trusted.
+  if (system?.systemImportToken !== SYSTEM_IMPORT) {
+    const session = await requirePermission('inventory.edit')
+    if (!hasPermission(session.user.role, 'inventory.prices') && rows.some((r) => hasCsvValue(
+      r, 'salesPriceBase', 'salespricegbp', 'salePriceBase', 'salepricegbp', 'salesPriceTaxInclusive', 'salespricetaxinclusive',
+    ))) {
+      const error = 'Price columns need the inventory.prices permission. Remove the price columns from the file and re-upload.'
+      const denied = { created: 0, updated: 0, skipped: 0, errors: [error] }
+      return preview
+        ? buildImportPreviewResult(0, denied, 0, error)
+        : createCsvImportExecutionResult({ ...denied, error, success: false })
+    }
+  }
 
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
   if (dropped > 0) {

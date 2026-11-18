@@ -681,7 +681,9 @@ export async function getSavedViews(): Promise<SavedView[]> {
 }
 
 export async function saveView(view: SavedView): Promise<void> {
+  // Saved views are shared by everyone; a write needs more than the read-only `analytics` permission.
   await requirePermission('analytics')
+  await requirePermission('purchasing.create')
   const views = await getSavedViews()
   const existing = views.findIndex((v) => v.id === view.id)
   if (existing >= 0) views[existing] = view; else views.push(view)
@@ -696,7 +698,9 @@ export async function saveView(view: SavedView): Promise<void> {
 }
 
 export async function deleteView(viewId: string): Promise<void> {
+  // Saved views are shared by everyone; a write needs more than the read-only `analytics` permission.
   await requirePermission('analytics')
+  await requirePermission('purchasing.create')
   const views = await getSavedViews()
   const deleted = views.find((v) => v.id === viewId)
   await db.setting.upsert({ where: { key: 'sales_stats_views' }, create: { key: 'sales_stats_views', value: JSON.stringify(views.filter((v) => v.id !== viewId)) }, update: { value: JSON.stringify(views.filter((v) => v.id !== viewId)) } })
