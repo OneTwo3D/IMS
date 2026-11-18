@@ -1,0 +1,5 @@
+### Owner decisions: no-duplicate customer emails, soft refund delete, ghost payment assertion, refund adopts restocked return
+- Customer emails (confirmation, invoice, dispatch, quotation) are now single-send: a lost final SMTP response ends the email FAILED with an operator warning that it "may not have been delivered", never a retry that could duplicate it.
+- Refund delete (still OFF behind `refund_delete_enabled`) is now a soft delete: new nullable `deleted_at`, `deleted_by_id`, `delete_reason` columns on `sales_order_refunds`; readers skip deleted refunds, the tombstone keeps the lines, the Xero credit-note cascade is unchanged.
+- An ADMIN can assert that a retired (unstamped CANCELLED) payment registration never existed in Xero: audit row (who, when, why) plus the pre-call stamp, which frees the receipt for deletion.
+- With returns-in-transit ON, a refund adopts an already-restocked returns-inbox arrival for the same order and product (new `adopted_returns_inbox_ids` column): no new expectation, stock-in or transit debit.

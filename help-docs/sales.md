@@ -471,7 +471,7 @@ A refund an operator recorded in IMS by mistake can be deleted, and the delete u
 
 A warehouse query the refund raised for an order already pushed to the warehouse is **not** withdrawn (IMS writes nothing to the warehouse): raise a follow-up query there if the warehouse acted on it.
 
-The refund row is removed; a record of the deletion (who, when, why, the credit note number and what was reversed) is kept, and the order's activity log shows *refund_deleted*.
+The delete is a **soft delete**: the refund is marked deleted and hidden everywhere (the order's refund list, refund totals and status, analytics, accounting checks), but its record is kept for audit, including its lines. A record of the deletion (who, when, why, the credit note number and what was reversed) is kept as well, and the order's activity log shows *refund_deleted*. A deleted refund cannot be deleted, retried or paid again, and the credit-note cascade to the accounting system is unchanged.
 
 **When it is refused** (always with the reason in plain words, and nothing is changed):
 
@@ -733,3 +733,11 @@ Deleting in any of these cases would strand the external document with nothing i
 **On the order screen, Delete is greyed out once the refusal is predictable.** The order page knows about the accounting leg, so it disables the button and puts the reason (and the remedy) in its tooltip rather than letting you press it and read a refusal: "an accounting invoice is queued — cancel the order instead" while the invoice is only queued, and "finance has to raise a credit note or reversal" once one has actually been posted. The button stays visible, greyed, so the action is still discoverable. The other blockers in the list — the WMS push link, a daily batch, refunds and payments — are only known to the server, so those still come back as a refusal message when you press Delete.
 
 The check, the allocation release and the delete all run under a single lock on the order row, and the posting workers claim their work under that same lock before making a remote call — so no worker can start posting an order in the window between the check and the delete.
+
+### A refund adopts a return the warehouse already restocked
+
+With **returns in transit** switched on, a refund normally books its returned goods as *Stock in Transit* until they arrive. If the warehouse has **already restocked** that return (a Returns inbox arrival marked Restocked for the same order and product), the refund **adopts** it instead: it links to the arrival and creates no return expectation, no second stock-in and no transit entry for those units, so the goods are counted once. The order's activity log shows *refund_adopted_returns_inbox*. Adoption happens only when every returned product on the refund is fully covered by restocked arrivals not already adopted by an earlier refund; a partly covered refund behaves as before.
+
+### Asserting a retired payment registration never existed (administrators)
+
+A receipt whose payment registration was retired without a record that it was never sent cannot be deleted: IMS cannot tell whether a payment reached the accounting system. If you have checked the invoice there and no payment was ever registered, an **administrator** can use **Record that it never existed** under the refusal on the receipt, giving a reason (at least 10 characters). IMS records an audit entry with who, when and why, and the receipt can then be deleted. IMS does not check the accounting system: this is an administrator's word, and applies only to that retired entry (never to one carrying a payment reference).
