@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createCipheriv, randomBytes } from 'node:crypto'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -62,6 +63,42 @@ function maskEmail(value) {
   const [local, domain] = value.split('@')
   if (local.length <= 2) return `${local[0] ?? '*'}*@${domain}`
   return `${local.slice(0, 2)}***@${domain}`
+}
+
+// o3d-djqf1. A standalone copy of the settings-encryption format in lib/security/encrypted-settings.ts and the
+// key parse in lib/security/encryption-key.ts: this file is copied to hosts without the application tree
+// (see provisioningClient), so it cannot import them. tests/scripts/provision-instance-seed.test.ts round-trips
+// the output through the application's own decryptSettingValue, which is what keeps the two from drifting.
+const ENCRYPTED_SETTING_PREFIX = 'enc:setting:v1:'
+
+function parseAesEncryptionKey(raw) {
+  const trimmed = (raw ?? '').trim()
+  if (!trimmed) return null
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    const hex = Buffer.from(trimmed, 'hex')
+    if (hex.length === 32) return hex
+  }
+  const base64 = Buffer.from(trimmed, 'base64')
+  if (base64.length === 32) return base64
+  const utf8 = Buffer.from(trimmed, 'utf8')
+  return utf8.length === 32 ? utf8 : null
+}
+
+/**
+ * The value to store for a SENSITIVE setting: ciphertext when SETTINGS_ENCRYPTION_KEY (or the legacy
+ * ENCRYPTION_KEY) is usable, otherwise the plaintext unchanged (the application's read path encrypts a
+ * plaintext row once a key is present, and `scripts/cli.ts migrate-encrypted-settings` sweeps the rest).
+ */
+/** @param {string} key @param {string} plaintext @param {Record<string, string | undefined>} [env] */
+export function encryptSettingValueForSeed(key, plaintext, env = process.env) {
+  if (!plaintext) return plaintext
+  const encryptionKey = parseAesEncryptionKey(env.SETTINGS_ENCRYPTION_KEY ?? env.ENCRYPTION_KEY)
+  if (!encryptionKey) return plaintext
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', encryptionKey, iv)
+  cipher.setAAD(Buffer.from(`setting:${key}`, 'utf8'))
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
+  return `${ENCRYPTED_SETTING_PREFIX}${Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64')}`
 }
 
 async function upsertSetting(db, key, value) {
@@ -290,7 +327,12 @@ async function main() {
       await upsertSetting(db, 'email_smtp_host', smtp.host)
       await upsertSetting(db, 'email_smtp_port', smtp.port)
       await upsertSetting(db, 'email_smtp_user', smtp.user)
-      await upsertSetting(db, 'email_smtp_pass', smtp.pass)
+      // o3d-djqf1: a SENSITIVE_SETTING_KEY, so ciphertext at rest whenever the key is available here.
+      if (smtp.pass && !encryptSettingValueForSeed('email_smtp_pass', 'x').startsWith(ENCRYPTED_SETTING_PREFIX)) {
+        console.log('[WARN] SETTINGS_ENCRYPTION_KEY is not available to this script; the SMTP password is stored in '
+          + 'plaintext until the application first reads it. Run `scripts/cli.ts migrate-encrypted-settings` once the key is set.')
+      }
+      await upsertSetting(db, 'email_smtp_pass', encryptSettingValueForSeed('email_smtp_pass', smtp.pass))
       await upsertSetting(db, 'email_smtp_secure', smtp.secure)
       await upsertSetting(db, 'email_from_name', smtp.fromName)
       await upsertSetting(db, 'email_from_email', smtp.fromEmail)

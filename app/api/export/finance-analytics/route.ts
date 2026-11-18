@@ -6,6 +6,7 @@ import {
   getArAgingReport,
   getCurrencySummaryReport,
   getFxGainLossReport,
+  getGrirReport,
   getVatReport,
   type FinanceAnalyticsFilters,
 } from '@/lib/domain/finance/finance-period-analytics'
@@ -18,6 +19,7 @@ const EXPORT_COLUMNS: Record<string, string[]> = {
   'ar-aging': ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate'],
   'ap-aging': ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate'],
   'currency-summary': ['currency', 'salesDocumentCount', 'salesForeign', 'salesBase', 'arOutstandingForeign', 'arOutstandingBase', 'arOutstandingBound', 'purchaseDocumentCount', 'purchasesForeign', 'purchasesBase', 'apOutstandingForeign', 'apOutstandingBase'],
+  'grir': ['supplierName', 'poReference', 'poStatus', 'receivedNotBilledBase', 'receivedNotBilledQty', 'billedNotReceivedBase', 'billedNotReceivedQty', 'creditNotesBase', 'netBase', 'priceVarianceBase', 'oldestOpenDate', 'ageDays'],
   'fx-gain-loss': ['side', 'settlementId', 'documentId', 'reference', 'partyName', 'currency', 'paidAt', 'amountForeign', 'bookedRateToBase', 'settlementRateToBase', 'bookedBase', 'settlementBase', 'gainLossBase', 'outcome', 'notComputableReason', 'controlAccount', 'fxGainLossAccount'],
 }
 
@@ -94,6 +96,12 @@ export async function GET(req: NextRequest) {
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['fx-gain-loss']), `fx-gain-loss-${date}.csv`)
+    }
+    case 'grir': {
+      const report = await getGrirReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
+      const oversized = rejectOversizedExport(report.pageInfo.totalRows)
+      if (oversized) return oversized
+      return csvResponse(toCsv(report.rows, EXPORT_COLUMNS['grir']), `grir-${date}.csv`)
     }
     default:
       return NextResponse.json({ error: 'Unknown finance analytics export type' }, { status: 400 })

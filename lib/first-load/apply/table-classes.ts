@@ -137,6 +137,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   tax_rate_components: { kind: 'RUNNER_WRITES', reason: 'components of the tax rates: written only with a purchase tax rate the suppliers step imports from the stored Xero list (db/tax-import.ts)' },
   tax_rates: { kind: 'RUNNER_WRITES', reason: 'tax rates: the target brings its own (checked by the tax rails); the suppliers step may ADD a purchase rate imported from the stored Xero list when a supplier\'s purchase tax type has none (db/tax-import.ts)' },
   transit_subledger_movements: { kind: 'MUST_BE_EMPTY', reason: 'in-transit ledger' },
+  grir_subledger_movements: { kind: 'MUST_BE_EMPTY', reason: 'goods-received-not-invoiced ledger' },
   users: { kind: 'CONFIG_ALLOWED', reason: 'operator accounts' },
   warehouses: { kind: 'CONFIG_ALLOWED', reason: 'the warehouses the load needs; configuration (their profile is checked by a rail)' },
   wc_order_divergence_rechecks: { kind: 'MUST_BE_EMPTY', reason: 'deferred WooCommerce-vs-IMS comparisons awaiting a refund: runtime state a first load starts empty' },
