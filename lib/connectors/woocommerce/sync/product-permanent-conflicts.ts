@@ -9,8 +9,8 @@
  * one Setting, and fetched DIRECTLY by id at the start of each run, in addition to the `modified_after`
  * window.
  *
- * Bounded twice: the list holds at most MAX_STORED_PERMANENT_CONFLICTS ids (the longest-buried drop first,
- * and the drop is logged), and one run re-attempts at most MAX_PERMANENT_CONFLICT_REATTEMPTS of them,
+ * Bounded twice: the list holds at most MAX_STORED_PERMANENT_CONFLICTS ids (a full list never evicts: a new conflict
+ * that does not fit holds the product cursor and is reported), and one run re-attempts at most MAX_PERMANENT_CONFLICT_REATTEMPTS of them,
  * least recently attempted first so every id gets its turn. What a run did NOT re-attempt is logged by the
  * caller: a bound that stays quiet reads as "covered everything".
  */
@@ -97,13 +97,13 @@ export type PermanentConflictDelta = {
   failed: Array<{ id: number; error: string }>
 }
 
-/** Pure: the list after a delta, bounded. `dropped` is whatever the bound pushed out. */
+/** Pure: the list after a delta, bounded. `rejected` is any NEW conflict that did not fit: an entry already stored is never evicted. */
 export function applyPermanentConflictDelta(
   current: PermanentConflict[],
   delta: PermanentConflictDelta,
   nowIso: string,
   maxStored: number = MAX_STORED_PERMANENT_CONFLICTS,
-): { items: PermanentConflict[]; dropped: PermanentConflict[] } {
+): { items: PermanentConflict[]; rejected: Array<{ id: number; sku: string }> } {
   const attempted = new Set(delta.attempted)
   const failed = new Map(delta.failed.map((entry) => [entry.id, entry.error]))
   const byId = new Map<number, PermanentConflict>()
@@ -121,16 +121,20 @@ export function applyPermanentConflictDelta(
     if (existing.conflictAt && Date.parse(existing.conflictAt) > Date.parse(removal.at)) continue
     byId.delete(removal.id)
   }
+  const rejected: Array<{ id: number; sku: string }> = []
   for (const entry of delta.add) {
     const existing = byId.get(entry.id)
-    byId.set(entry.id, existing
-      ? { ...existing, sku: entry.sku || existing.sku, conflictAt: nowIso }
-      : { id: entry.id, sku: entry.sku, since: nowIso, lastAttemptAt: null, conflictAt: nowIso })
+    if (existing) {
+      byId.set(entry.id, { ...existing, sku: entry.sku || existing.sku, conflictAt: nowIso })
+    } else if (byId.size < maxStored) {
+      byId.set(entry.id, { id: entry.id, sku: entry.sku, since: nowIso, lastAttemptAt: null, conflictAt: nowIso })
+    } else {
+      // NEVER EVICT: an entry that is stored is a product the cursor will not revisit, and so is this one. The caller must
+      // not advance the cursor past a conflict that could not be listed.
+      rejected.push(entry)
+    }
   }
-  const all = [...byId.values()]
-  if (all.length <= maxStored) return { items: all, dropped: [] }
-  const byAge = [...all].sort((a, b) => Date.parse(b.since) - Date.parse(a.since))
-  return { items: byAge.slice(0, maxStored), dropped: byAge.slice(maxStored) }
+  return { items: [...byId.values()], rejected }
 }
 
 export async function readPermanentConflicts(): Promise<PermanentConflict[]> {
@@ -142,18 +146,18 @@ export async function readPermanentConflicts(): Promise<PermanentConflict[]> {
  * Apply a delta under a transaction-scoped lock on the Setting, re-reading inside it: the poll and the
  * reconcile can overlap, and a read-modify-write outside the lock would lose the other's entries.
  */
-export async function recordPermanentConflictDelta(delta: PermanentConflictDelta): Promise<{ dropped: PermanentConflict[] }> {
-  if (delta.add.length === 0 && delta.remove.length === 0 && delta.attempted.length === 0 && delta.failed.length === 0) return { dropped: [] }
+export async function recordPermanentConflictDelta(delta: PermanentConflictDelta): Promise<{ rejected: Array<{ id: number; sku: string }> }> {
+  if (delta.add.length === 0 && delta.remove.length === 0 && delta.attempted.length === 0 && delta.failed.length === 0) return { rejected: [] }
   return db.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${PERMANENT_CONFLICTS_SETTING}))`
     const row = await tx.setting.findUnique({ where: { key: PERMANENT_CONFLICTS_SETTING } })
-    const { items, dropped } = applyPermanentConflictDelta(parsePermanentConflicts(row?.value), delta, new Date().toISOString())
+    const { items, rejected } = applyPermanentConflictDelta(parsePermanentConflicts(row?.value), delta, new Date().toISOString())
     const value = JSON.stringify(items)
     await tx.setting.upsert({
       where: { key: PERMANENT_CONFLICTS_SETTING },
       create: { key: PERMANENT_CONFLICTS_SETTING, value },
       update: { value },
     })
-    return { dropped }
+    return { rejected }
   })
 }

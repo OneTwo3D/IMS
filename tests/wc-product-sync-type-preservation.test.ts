@@ -3381,10 +3381,32 @@ test('only a bounded number is re-attempted per run, least recently attempted fi
   assert.match(String(deferred!.description), /5 of 25/)
 })
 
-test('the stored list is bounded: the longest-buried drop first and the drop is logged', async () => {
+test('the stored list never evicts: a new conflict that does not fit is rejected, existing entries stay', async () => {
   const { applyPermanentConflictDelta } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
   const current = [1, 2, 3].map((i) => entry(i, { since: `2026-0${i}-01T00:00:00.000Z` }))
-  const { items, dropped } = applyPermanentConflictDelta(current, { add: [{ id: 9, sku: 'NEW' }], remove: [], attempted: [], failed: [] }, '2026-11-18T00:00:00.000Z', 3)
-  assert.deepEqual(items.map((i) => i.id).sort(), [2, 3, 9])
-  assert.deepEqual(dropped.map((i) => i.id), [1])
+  const { items, rejected } = applyPermanentConflictDelta(current, { add: [{ id: 9, sku: 'NEW' }, { id: 2, sku: 'SKU-2' }], remove: [], attempted: [], failed: [] }, '2026-11-18T00:00:00.000Z', 3)
+  assert.deepEqual(items.map((i) => i.id).sort(), [1, 2, 3])
+  assert.deepEqual(rejected.map((i) => i.id), [9])
+})
+
+test('a full list holds the product cursor for a new permanent conflict it cannot record, and raises an ERROR', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  const { MAX_STORED_PERMANENT_CONFLICTS } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
+  resetState()
+  seedCursorRun()
+  const full = Array.from({ length: MAX_STORED_PERMANENT_CONFLICTS }, (_, i) => entry(1000 + i))
+  settingValues.set(CONFLICTS_KEY, JSON.stringify(full))
+  // The buried ones still conflict (their direct fetch finds nothing: 404 drops them is NOT wanted here), so make them fail transiently.
+  for (const item of full) productById[`/products/${item.id}`] = { error: 'WC API error: 503 unavailable' }
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  productPages = { '1': [variableProduct() as unknown as Row] }
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  assert.equal(result.errors.length, 1, 'the unlistable conflict is an error, so the cursor is held')
+  assert.deepEqual(state.settingUpserts.filter((key) => key === CURSOR), [], 'cursor NOT advanced past a product that is not on the list')
+  assert.equal(listed().length, MAX_STORED_PERMANENT_CONFLICTS)
+  assert.ok(!listed().some((item) => item.id === 77), 'nothing was evicted to make room')
+  const loud = state.activity.find((a) => a.action === 'wc_product_conflict_list_full')
+  assert.ok(loud)
+  assert.equal(loud!.level, 'ERROR')
+  assert.match(String(loud!.description), /PARENT-SKU/)
 })

@@ -12,6 +12,7 @@ import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
 import {
   MAX_PERMANENT_CONFLICT_REATTEMPTS,
+  MAX_STORED_PERMANENT_CONFLICTS,
   readPermanentConflicts,
   recordPermanentConflictDelta,
   selectPermanentConflictReattempts,
@@ -2524,7 +2525,7 @@ export async function syncAllWcProducts(
         // Still buried: already reported when it was first buried, so not re-announced every run.
         conflictDelta.attempted.push(entry.id)
       } else {
-        noteRetryFailure(entry, retried.error)
+        noteRetryFailure(entry, retried.error ?? 'import failed')
       }
     }
     if (notAttempted.length > 0) {
@@ -2692,13 +2693,19 @@ export async function syncAllWcProducts(
 
   // Record the burials and the recoveries BEFORE the cursor moves past them, so a burial that is
   // not on the list never has its cursor advanced (a failed write throws and the cursor stays).
-  const { dropped: droppedConflicts } = await recordPermanentConflictDelta(conflictDelta)
-  if (droppedConflicts.length > 0) {
+  const { rejected: unlistedConflicts } = await recordPermanentConflictDelta(conflictDelta)
+  if (unlistedConflicts.length > 0) {
+    // The list is FULL and never evicts, so these products cannot be remembered for re-attempt. Advancing the cursor past
+    // them would bury them with no way back, so the cursor is HELD: the next run reads the same window and lists them as
+    // soon as room frees up (a fixed product leaves the list on its next re-attempt).
+    const unlistedNames = unlistedConflicts.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')
+    const message = `The list of buried WooCommerce products is full (${MAX_STORED_PERMANENT_CONFLICTS}), so ${unlistedConflicts.length} new product(s) with a conflict could not be recorded for automatic re-attempt `
+      + `(${unlistedNames}) and the product sync cursor is held back so they are not lost. Resolve the conflicts on the products already listed (the list shrinks as they import), or re-save them in WooCommerce.`
+    result.errors.push(message)
     await logActivity({
-      entityType: 'SYNC', action: 'wc_product_conflict_list_full', tag: 'sync', level: 'WARNING',
-      description: `The list of buried WooCommerce products is full: ${droppedConflicts.length} longest-buried product(s) are no longer re-attempted automatically `
-        + `(${droppedConflicts.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')}). Re-save them in WooCommerce after fixing them.`,
-      metadata: { mode, droppedIds: droppedConflicts.slice(0, 50).map((item) => item.id) },
+      entityType: 'SYNC', action: 'wc_product_conflict_list_full', tag: 'sync', level: 'ERROR',
+      description: message,
+      metadata: { mode, unlistedIds: unlistedConflicts.slice(0, 50).map((item) => item.id) },
       resolveUser: false,
     })
   }
