@@ -313,6 +313,8 @@ export async function resolveLineTaxRateBatch<L extends { id: string; productCat
     usedFor: TaxUsedFor
     orderDefault: ResolveContext['orderDefault']
   },
+  // A caller INSIDE a transaction passes its `tx`: reading through the pooled client from in there needs a second connection.
+  client: Pick<typeof db, 'taxRate'> = db,
 ): Promise<Map<string, ResolvedTaxRate>> {
   const result = new Map<string, ResolvedTaxRate>()
   if (lines.length === 0) return result
@@ -324,7 +326,7 @@ export async function resolveLineTaxRateBatch<L extends { id: string; productCat
   const distinctCategories = Array.from(new Set(lines.map((l) => l.productCategory)))
   const categoriesWithStandard = Array.from(new Set<TaxCategory>([...distinctCategories, 'STANDARD']))
 
-  const rows = await db.taxRate.findMany({
+  const rows = await client.taxRate.findMany({
     where: {
       active: true,
       usedFor: { in: usedForIn },

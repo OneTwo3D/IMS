@@ -731,7 +731,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/purchase-orders/[id]/po-detail-client.tsx',
-    figures: ['showMargin'],
+    figures: ['margin', 'marginOverrideNote', 'showMargin'],
     treatment: 'not-refund-sensitive',
     reason:
       'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
@@ -745,7 +745,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/purchase-orders/po-form.tsx',
-    figures: ['marginAmount', 'marginByKey', 'marginPct', 'marginRequestKey', 'showMargin'],
+    figures: ['margin', 'marginAmount', 'marginByKey', 'marginOverrideNote', 'marginPct', 'marginRequestKey', 'showMargin'],
     treatment: 'not-refund-sensitive',
     reason:
       'Renders the PO margin column and order margin box. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
@@ -765,18 +765,53 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Server action computing the PO margin preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
   },
   {
+    file: 'app/actions/po-margin-threshold.ts',
+    figures: ['getPoMarginThresholdSettings', 'listCategoriesForMarginOverride', 'margin', 'savePoMarginThresholdSettings', 'searchProductsForMarginOverride'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Settings actions that read and write the minimum margin percentages; `margin` is the word in names and comments, nothing is computed from sales. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'app/actions/purchase-orders.ts',
+    figures: ['amendMarginRows', 'enforceMargin', 'margin', 'marginCtx', 'marginOverride', 'marginOverrideNote', 'netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Calls the server-side guard when a purchase order is created, edited or placed and carries the override note. Also `netTotal`: the net amount of a SUPPLIER credit note under the reverse-charge plan (converted to base for the transit posting), a purchase-side ledger amount that customer refunds of past sales never enter. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/margin-threshold-constants.ts',
+    figures: ['marginBlockMessageForDisplay'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Operator wording for the block refusal. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/margin-threshold-guard.ts',
+    figures: ['loadMarginGuardContext', 'margin', 'marginPct', 'margin_override', 'recordMarginOverride', 'loadMarginGuardContextUnderLock'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Server-side enforcement: recomputes each line margin from the stored cost and records an accepted override on the order. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/margin-threshold.ts',
+    figures: ['hasAnyMarginThreshold', 'margin', 'marginPct', 'normaliseMinMarginPct', 'parseMarginThresholdSettings', 'po_min_margin_threshold', 'resolveMinimumMarginPct', 'validateMarginThresholdInput'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Pure Decimal resolution of the applicable minimum (product, parent product, category, global) and the warn or block decision. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'components/settings/po-margin-threshold.tsx',
+    figures: ['poMarginMode'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Settings screen for the minimum margin; `poMarginMode` is a radio group name. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
     file: 'lib/domain/purchasing/line-margin.ts',
     figures: ['computeLineMargin', 'computePoMarginTotal', 'margin', 'marginAmount', 'marginPct'],
     treatment: 'not-refund-sensitive',
     reason:
       'Pure margin computation for the PO preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
-  },
-  {
-    file: 'app/actions/purchase-orders.ts',
-    figures: ['netTotal'],
-    treatment: 'not-refund-sensitive',
-    reason:
-      '`netTotal` is the net amount of a SUPPLIER credit note under the reverse-charge plan (the PO action converts it to base for the transit posting). It is a purchase-side ledger amount; customer refunds of past sales never enter it.',
   },
   {
     file: 'lib/domain/purchasing/supplier-credit-note.ts',

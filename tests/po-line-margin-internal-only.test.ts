@@ -9,7 +9,11 @@ import { hasPermission } from '@/lib/permissions'
 // invariants in the repo's usual style: the margin modules may only be imported by the PO form and the
 // action that serves it, and every supplier-facing path is scanned for any mention.
 
-const MARGIN_NEEDLES = ['line-margin', 'purchase-order-margin', 'previewPoLineMargins', 'computeLineMargin', 'computePoMarginTotal', 'Margin (internal)']
+const MARGIN_NEEDLES = [
+  'line-margin', 'purchase-order-margin', 'previewPoLineMargins', 'computeLineMargin', 'computePoMarginTotal', 'Margin (internal)',
+  // o3d-hqvrp.380 / .381: the minimum-margin threshold and the list-price edit are as internal as the margin itself.
+  'margin-threshold', 'po-margin-threshold', 'marginOverrideNote', 'product-list-price', 'updateProductListPrice', 'list-price-edit',
+]
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -65,7 +69,15 @@ test('only the PO form and its gated action import the margin modules', () => {
     .sort()
   // Reorder Planning's forecast money reuses the list-price / VAT-stripping rule (resolveExVatListPrice). Its only
   // consumers are the internal report and its CSV, both gated on inventory.prices.
-  assert.deepEqual(importers, ['app/(dashboard)/purchase-orders/po-form.tsx', 'lib/domain/inventory/reorder-forecast-money.ts'])
+  // The minimum-margin guard and its pure module, and the list-price edit, read the same margin rules (o3d-hqvrp.380 / .381). The guard
+  // is reached by the PO create / edit / place actions, which are not supplier-facing render paths (the scans above cover those).
+  assert.deepEqual(importers, [
+    'app/(dashboard)/purchase-orders/po-form.tsx',
+    'app/actions/product-list-price.ts',
+    'lib/domain/inventory/reorder-forecast-money.ts',
+    'lib/domain/purchasing/margin-threshold-guard.ts',
+    'lib/domain/purchasing/margin-threshold.ts',
+  ])
   const actionImports = read('app/actions/purchase-order-margin.ts')
   assert.match(actionImports, /from '@\/lib\/domain\/purchasing\/line-margin'/)
 })
@@ -89,4 +101,23 @@ test('the PO screens pass showMargin from inventory.prices and the form defaults
     assert.match(read(page), /hasPermission\(session\.user\.role, 'inventory\.prices'\)/, page)
   }
   assert.match(read('app/(dashboard)/purchase-orders/po-form.tsx'), /showMargin = false/)
+})
+
+test('the threshold settings action and the list-price edit are gated before they read anything', () => {
+  const settings = read('app/actions/po-margin-threshold.ts')
+  for (const fn of ['getPoMarginThresholdSettings', 'searchProductsForMarginOverride', 'listCategoriesForMarginOverride', 'savePoMarginThresholdSettings']) {
+    const start = settings.indexOf(`export async function ${fn}`)
+    assert.ok(start > 0, fn)
+    const body = settings.slice(start)
+    assert.ok(body.indexOf("requirePermission('settings.company')") < body.indexOf('db.') || body.indexOf('db.') < 0, fn)
+    assert.ok(body.indexOf("requirePermission('settings.company')") > 0, fn)
+  }
+  const edit = read('app/actions/product-list-price.ts')
+  assert.ok(edit.indexOf("requirePermission('inventory.prices')") > 0)
+})
+
+test('the threshold never reaches a supplier: the supplier portal and PDF/email sources do not read the setting key', () => {
+  for (const f of supplierFacing) {
+    assert.ok(!read(f).includes('po_min_margin_threshold'), `${rel(f)} must not read the minimum-margin setting`)
+  }
 })
