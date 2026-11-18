@@ -188,6 +188,32 @@ export async function applyStockAdjustment({
     }
   }
 
+  // The key is unique, so a plain read answers "was this already applied?" without the stock-level lock.
+  const findReplayedAdjustment = async (): Promise<AppliedStockAdjustment | null> => {
+    if (!idempotencyKey) return null
+    const existing = await tx.stockMovement.findUnique({
+      where: { idempotencyKey },
+      select: { id: true },
+    })
+    if (!existing) return null
+    const [product, warehouse] = await Promise.all([
+      tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
+      tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
+    ])
+    return {
+      movementId: existing.id,
+      productSku: product?.sku ?? productId,
+      warehouseName: warehouse?.name ?? warehouseId,
+    }
+  }
+
+  // A replay must not release anybody's reservation: its first submission already did (or needed to),
+  // and the release would commit for an adjustment that now writes nothing.
+  if (idempotencyKey) {
+    const replay = await findReplayedAdjustment()
+    if (replay) return replay
+  }
+
   // o3d-hqvrp.80: sales_orders are locked BEFORE stock_levels everywhere, so the release for a removal that
   // would cut into reserved units runs before this transaction takes the stock-level lock.
   if (releaseReservedForRemoval && qty < 0) {
@@ -211,21 +237,8 @@ export async function applyStockAdjustment({
   // re-submissions serialise here, so a duplicate carrying the same key sees the
   // first submission's committed movement and returns it instead of double-booking.
   if (idempotencyKey) {
-    const existing = await tx.stockMovement.findUnique({
-      where: { idempotencyKey },
-      select: { id: true },
-    })
-    if (existing) {
-      const [product, warehouse] = await Promise.all([
-        tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
-        tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
-      ])
-      return {
-        movementId: existing.id,
-        productSku: product?.sku ?? productId,
-        warehouseName: warehouse?.name ?? warehouseId,
-      }
-    }
+    const replay = await findReplayedAdjustment()
+    if (replay) return replay
   }
 
   // ig58: pre-flight availability check against the locked row, before any

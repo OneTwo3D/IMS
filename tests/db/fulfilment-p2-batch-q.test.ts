@@ -142,3 +142,21 @@ test('[db] with the flag, a removal that free stock already covers releases noth
     assert.equal(await reserved(tx, fx.a, fx.wh), '10.0000')
   })
 })
+
+test('[db] a replayed adjustment with the flag on releases nothing and writes nothing (PR 1017 r1 MEDIUM 2)', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seedReservedStock(tx)
+    const args = { tx, productId: fx.a, warehouseId: fx.wh, qty: -4, note: 'damaged', releaseReservedForRemoval: true, idempotencyToken: `tok-${randomUUID()}` }
+
+    const first = await applyStockAdjustment(args)
+    assert.equal(await rowQty(tx, fx.orderId), '6.0000', 'the first submission released 4 and removed 4')
+
+    // Same token and payload again: on-hand is now 6 and all 6 reserved, so a naive release would fire.
+    const replay = await applyStockAdjustment(args)
+
+    assert.equal(replay.movementId, first.movementId, 'the earlier result is returned')
+    assert.equal(await rowQty(tx, fx.orderId), '6.0000', 'the replay released nothing further')
+    assert.equal(await reserved(tx, fx.a, fx.wh), '6.0000')
+    assert.equal(await tx.activityLog.count({ where: { entityId: fx.orderId, action: 'allocation_released' } }), 1, 'one audited release, not two')
+  })
+})

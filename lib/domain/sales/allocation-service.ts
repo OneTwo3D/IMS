@@ -61,7 +61,7 @@ import { applyPegCapsToStockMap, applyPegHoldsToStockMap, evaluateOrderPegsInTx,
 import { LEDGER_STANDING_SELECT, isShadowedObligation, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { withSavepoint } from '@/lib/db/savepoint'
-import { netRefundLinesForDemand } from '@/lib/domain/sales/refund-demand-netting'
+import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
@@ -2336,16 +2336,7 @@ export async function trimUnshippedAllocationsForRefundTx(
       graph,
     ),
   }))
-  const refundLines = await netRefundLinesForDemand(tx, await tx.salesOrderRefundLine.findMany({
-    where: { refund: { orderId: params.orderId } },
-    select: {
-      salesOrderLineId: true,
-      productId: true,
-      qty: true,
-      refundId: true,
-      refund: { select: { returnWarehouseId: true, chargeback: true, accountingRetryRequired: true } },
-    },
-  }))
+  const refundLines = await loadNettedRefundLines(tx, { refund: { orderId: params.orderId } })
   const refundedByLine = new Map<string, Prisma.Decimal>()
   for (const refundLine of refundLines) {
     if (!refundLine.salesOrderLineId) continue
@@ -3652,16 +3643,7 @@ export async function allocateSalesOrder(
     // Refunded quantities are no longer outstanding demand — a refund on a not-yet-
     // shipped order removes those units from what needs allocating. Only ever reduces
     // demand, so it is safe for every status (already-shipped lines clamp to 0).
-    const refundLines = await netRefundLinesForDemand(tx, await tx.salesOrderRefundLine.findMany({
-      where: { refund: { orderId } },
-      select: {
-        salesOrderLineId: true,
-        productId: true,
-        qty: true,
-        refundId: true,
-        refund: { select: { returnWarehouseId: true, chargeback: true, accountingRetryRequired: true } },
-      },
-    }))
+    const refundLines = await loadNettedRefundLines(tx, { refund: { orderId } })
     const refundedByLine = new Map<string, Prisma.Decimal>()
     for (const refundLine of refundLines) {
       if (!refundLine.salesOrderLineId) continue

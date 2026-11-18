@@ -112,6 +112,7 @@ type State = {
     refundId?: string
     returnWarehouseId?: string | null
     chargeback?: boolean
+    accountingRetryRequired?: boolean
   }>
   /** o3d-hqvrp.77: RETURN_INBOUND movements that measure what a restocking refund brought back. */
   returnMovements?: Array<{ referenceId: string; productId: string; qty: number }>
@@ -361,7 +362,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           productId: refundLine.productId,
           qty: refundLine.qty,
           refundId: refundLine.refundId ?? 'refund-x',
-          refund: { returnWarehouseId: refundLine.returnWarehouseId ?? null, chargeback: refundLine.chargeback ?? false, accountingRetryRequired: false },
+          refund: { returnWarehouseId: refundLine.returnWarehouseId ?? null, chargeback: refundLine.chargeback ?? false, accountingRetryRequired: refundLine.accountingRetryRequired ?? false },
         })),
     },
     shipment: {
@@ -3434,4 +3435,84 @@ test('findOrderShipmentShortfall still owes the unshipped units after a return o
 
   assert.ok(shortfall, 'the order is not complete: 2 units were never sent')
   assert.equal(shortfall[0].outstandingQty, 2)
+})
+
+// ---------------------------------------------------------------------------------------------
+// PR 1017 review round 1: the "returned" part of a refund is measured and capped at what shipped
+// ---------------------------------------------------------------------------------------------
+
+function orderTenWithShipped(shippedQty: number, packedQty: number, refund: {
+  qty: number
+  returnWarehouseId?: string | null
+  chargeback?: boolean
+  accountingRetryRequired?: boolean
+  movementQty?: number
+}) {
+  return baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 }],
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'sl-a', shipmentId: 'shipment-a', lineId: 'line-1', productId: 'product-1', qty: shippedQty },
+      { id: 'sl-b', shipmentId: 'shipment-b', lineId: 'line-1', productId: 'product-1', qty: packedQty },
+    ],
+    refundLines: [{
+      orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: refund.qty, refundId: 'refund-1',
+      returnWarehouseId: refund.returnWarehouseId ?? null, chargeback: refund.chargeback, accountingRetryRequired: refund.accountingRetryRequired,
+    }],
+    returnMovements: refund.movementQty ? [{ referenceId: 'refund-1', productId: 'product-1', qty: refund.movementQty }] : [],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 12, reservedQty: packedQty }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 12, unitCostBase: 5 }],
+  })
+}
+
+test('a return movement larger than what shipped only offsets the shipped units; the rest still cancels (PR 1017 r1 HIGH 1)', async () => {
+  // 10 ordered, 4 shipped, 6 packed. Refund of 6 with a restock of 6: at most the 4 shipped units came
+  // back, so 2 are a cancellation and only 4 units remain to ship; the packed 6 is over that.
+  const state = orderTenWithShipped(4, 6, { qty: 6, returnWarehouseId: 'warehouse-1', movementQty: 6 })
+
+  const result = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-b', targetStatus: 'SHIPPED' })
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /packed before the refund/)
+})
+
+test('a full chargeback still stops a packed shipment being dispatched (PR 1017 r1 HIGH 2)', async () => {
+  // 10 ordered, 8 shipped, 2 packed; the chargeback refunds all 10. The customer kept nothing back
+  // to net, so the whole 10 cancels demand and the packed 2 must not go out.
+  const state = orderTenWithShipped(8, 2, { qty: 10, chargeback: true })
+
+  const result = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-b', targetStatus: 'SHIPPED' })
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /packed before the refund/)
+})
+
+test('a restock still awaiting its accounting retry returns nothing yet, so its units cancel demand (PR 1017 r1 MEDIUM 1)', async () => {
+  // One refund of 5 (2 shipped units back + 3 never shipped); staging failed, so no RETURN_INBOUND has
+  // committed. Only committed movements count as returned, so the whole 5 cancels: 10 - 5 - 2 = 3 left,
+  // and the packed 8 is refused.
+  const state = orderTenWithShipped(2, 8, { qty: 5, returnWarehouseId: 'warehouse-1', accountingRetryRequired: true })
+
+  const result = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-b', targetStatus: 'SHIPPED' })
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /packed before the refund/)
+})
+
+test('every demand reader loads refund lines through the ONE shared netting (PR 1017 r1 HIGH 2)', async () => {
+  const { readFileSync } = await import('node:fs')
+  for (const file of [
+    'lib/domain/sales/shipment-service.ts',
+    'lib/domain/sales/allocation-service.ts',
+    'lib/fulfillment/order-allocation-coverage.ts',
+  ]) {
+    const source = readFileSync(file, 'utf8')
+    assert.ok(!source.includes('netRefundLinesForDemand'), `${file} must not net refund lines itself`)
+    assert.ok(!/salesOrderRefundLine\.findMany/.test(source), `${file} must load refund lines via loadNettedRefundLines`)
+    assert.ok(source.includes('loadNettedRefundLines('), `${file} must use loadNettedRefundLines`)
+  }
 })
