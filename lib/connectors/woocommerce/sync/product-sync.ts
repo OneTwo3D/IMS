@@ -66,6 +66,8 @@ import {
 } from '@/lib/products/type-transforms'
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
 import { Prisma } from '@/app/generated/prisma/client'
+import { WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { runWithWcAttemptFence } from '../attempt-fence'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 import { storeWcProductContent } from './product-content'
@@ -2288,9 +2290,157 @@ export function buildImsToWcProductPayload(product: {
   return updateData
 }
 
-export async function pushImsProductToWc(
+type PushImsProductToWcResult = {
+  success: boolean
+  error?: string
+  skipped?: boolean
+  warning?: string
+  /** A retry cannot help: the failure came AFTER WooCommerce accepted the PUT (a verification failure), or is a rejection or a configuration gap that repeats identically (4xx PUT, no SKU, no parent mapping). */
+  permanent?: boolean
+}
+
+/** The `recordKind` of the open record a failed IMS-to-WooCommerce product push leaves for the retry sweep. */
+export const WC_PRODUCT_PUSH_RETRY_KIND = 'product_push_retry'
+/** The `recordKind` of an open record for a push that failed AFTER a successful PUT. Visible in the sync log, never retried by the sweep. */
+export const WC_PRODUCT_PUSH_PERMANENT_KIND = 'product_push_failed'
+/** A failed push is retried for this long after it first failed; after that the FAILED row stays for an operator. */
+const WC_PRODUCT_PUSH_RETRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+/** Per-product backoff: 1h after the first failure, then doubling (2h, 4h, ...), never past the retry window itself. */
+const WC_PRODUCT_PUSH_BACKOFF_BASE_MS = 60 * 60 * 1000
+/** A PUT answer that can never succeed on a retry: a 4xx rejection (not a timeout 408 or a rate limit 429). 5xx and transport errors stay retryable. */
+export function isPermanentWcPutRejection(error: string | undefined): boolean {
+  const status = /^WC API PUT error: (\d{3})\b/.exec(error ?? '')
+  if (!status) return false
+  const code = Number(status[1])
+  return code >= 400 && code < 500 && code !== 408 && code !== 429
+}
+
+/** The floor for one retry's time box, so a retry that starts at the very end of the budget is still not cut off before it can send. */
+const WC_PRODUCT_PUSH_RETRY_MIN_TIMEOUT_MS = 5_000
+
+export function nextProductPushRetryDelayMs(failures: number): number {
+  const exponent = Math.min(Math.max(failures, 1) - 1, 20)
+  return Math.min(WC_PRODUCT_PUSH_BACKOFF_BASE_MS * 2 ** exponent, WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
+}
+
+type PushRetryState = { attempts: number; lastAttemptAt: string; nextDueAt: string }
+
+function readPushRetryState(payload: unknown): Partial<PushRetryState> {
+  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return {}
+  const raw = payload as Record<string, unknown>
+  return {
+    ...(typeof raw.attempts === 'number' ? { attempts: raw.attempts } : {}),
+    ...(typeof raw.lastAttemptAt === 'string' ? { lastAttemptAt: raw.lastAttemptAt } : {}),
+    ...(typeof raw.nextDueAt === 'string' ? { nextDueAt: raw.nextDueAt } : {}),
+  }
+}
+
+/**
+ * Push one IMS product to WooCommerce. A failure (an error answer, a timeout, a thrown error) is no longer dropped: it leaves ONE open FAILED
+ * ShoppingSyncLog row per product (recorded under a per-product lock, so concurrent failures cannot leave two). A failure BEFORE a successful
+ * PUT is picked up by `retryFailedWcProductPushes` with exponential backoff; a failure AFTER the PUT (a verification failure) is recorded as a
+ * permanent, visible row and never sent again. A later success closes the row. A push the settings or the hold skipped touches nothing.
+ */
+export async function pushImsProductToWc(productId: string): Promise<PushImsProductToWcResult> {
+  const result = await pushImsProductToWcOnce(productId)
+  if (result.skipped) return result
+  try {
+    if (result.success) {
+      await db.shoppingSyncLog.updateMany({
+        where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: { in: [WC_PRODUCT_PUSH_RETRY_KIND, WC_PRODUCT_PUSH_PERMANENT_KIND] }, status: 'FAILED' },
+        data: { status: 'SYNCED', syncedAt: new Date() },
+      })
+    } else {
+      await recordFailedProductPush(productId, result)
+    }
+  } catch (bookkeepingError) {
+    // Recording must never turn a push result into a throw for the caller.
+    console.error('[wc-product-push] could not record the push outcome', bookkeepingError)
+  }
+  return result
+}
+
+async function recordFailedProductPush(productId: string, result: PushImsProductToWcResult): Promise<void> {
+  const errorMessage = (result.error ?? 'unknown error').slice(0, 2000)
+  const recordKind = result.permanent ? WC_PRODUCT_PUSH_PERMANENT_KIND : WC_PRODUCT_PUSH_RETRY_KIND
+  await db.$transaction(async (tx) => {
+    // Two failures for one product (the save path and the sweep) take turns here, so the second sees the first's row and updates it.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE}::int4, hashtext(${productId}))`
+    const open = await tx.shoppingSyncLog.findFirst({
+      where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: { in: [WC_PRODUCT_PUSH_RETRY_KIND, WC_PRODUCT_PUSH_PERMANENT_KIND] }, status: 'FAILED' },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, payload: true },
+    })
+    const now = Date.now()
+    const attempts = (readPushRetryState(open?.payload).attempts ?? 0) + 1
+    const state: PushRetryState = {
+      attempts,
+      lastAttemptAt: new Date(now).toISOString(),
+      nextDueAt: new Date(now + nextProductPushRetryDelayMs(attempts)).toISOString(),
+    }
+    if (open) {
+      await tx.shoppingSyncLog.update({ where: { id: open.id }, data: { errorMessage, recordKind, payload: state } })
+      return
+    }
+    await tx.shoppingSyncLog.create({
+      data: { direction: 'TO_CONNECTOR', status: 'FAILED', entityType: 'Product', entityId: productId, errorMessage, recordKind, payload: state },
+    })
+  })
+}
+
+/**
+ * Push again the products whose last push failed before a successful PUT, in the order they come due (backoff per product: 1h, 2h, 4h, ...
+ * capped at 7 days). Goes through `retry` (the caller's pushProductMetadata) so the settings gate and the producer hold apply exactly as for
+ * the first attempt. Stops starting new pushes at `deadlineAt`; the rest wait for the next pass. Returns counts only.
+ */
+export async function retryFailedWcProductPushes(
+  retry: (productId: string) => Promise<{ success: boolean; skipped?: boolean }>,
+  options?: { limit?: number; now?: number; deadlineAt?: number },
+): Promise<{ retried: number; resolved: number; remaining: number; deferred: number }> {
+  const now = options?.now ?? Date.now()
+  const since = new Date(now - WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
+  const rows = await db.shoppingSyncLog.findMany({
+    where: { connector: 'woocommerce', entityType: 'Product', recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED', createdAt: { gte: since }, entityId: { not: null } },
+    orderBy: { createdAt: 'asc' },
+    select: { entityId: true, payload: true, createdAt: true },
+    take: 1000,
+  })
+  const due = new Map<string, number>()
+  for (const row of rows) {
+    if (row.entityId == null || due.has(row.entityId)) continue
+    const state = readPushRetryState(row.payload)
+    const dueAt = state.nextDueAt ? Date.parse(state.nextDueAt) : Number.NEGATIVE_INFINITY
+    if (!Number.isNaN(dueAt) && dueAt > now) continue
+    due.set(row.entityId, Number.isNaN(dueAt) ? Number.NEGATIVE_INFINITY : dueAt)
+  }
+  const ordered = [...due.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id)
+  const ids = ordered.slice(0, options?.limit ?? 50)
+  let resolved = 0
+  let retried = 0
+  for (const id of ids) {
+    if (options?.deadlineAt != null && Date.now() >= options.deadlineAt) break
+    retried++
+    try {
+      // Time-box the whole retry (its GET, re-read and PUT) to what is left of the budget: the ambient signal is folded into every
+      // WooCommerce request, so one slow store cannot run a single retry minutes past the budget.
+      const remaining = options?.deadlineAt != null ? options.deadlineAt - Date.now() : Number.POSITIVE_INFINITY
+      const outcome = Number.isFinite(remaining)
+        ? await runWithWcAttemptFence(
+            { signal: AbortSignal.timeout(Math.max(remaining, WC_PRODUCT_PUSH_RETRY_MIN_TIMEOUT_MS)), stillOwned: async () => true },
+            () => retry(id),
+          )
+        : await retry(id)
+      if (outcome.success && !outcome.skipped) resolved++
+    } catch (error) {
+      console.error('[wc-product-push] retry threw', error)
+    }
+  }
+  return { retried, resolved, remaining: retried - resolved, deferred: ordered.length - retried }
+}
+
+async function pushImsProductToWcOnce(
   productId: string,
-): Promise<{ success: boolean; error?: string; skipped?: boolean; warning?: string }> {
+): Promise<PushImsProductToWcResult> {
   try {
     // The writer re-checks on its own, whatever the caller did: `wc_sync_product_enabled` and
     // `wc_sync_product_direction` decide whether IMS may write to the live product at all. A read
@@ -2317,7 +2467,7 @@ export async function pushImsProductToWc(
         parent: { select: { sku: true, externalProductId: true } },
       },
     })
-    if (!product?.sku) return { success: false, error: 'Product has no SKU' }
+    if (!product?.sku) return { success: false, permanent: true, error: 'Product has no SKU' }
 
     const updateData = buildImsToWcProductPayload(product)
 
@@ -2330,7 +2480,7 @@ export async function pushImsProductToWc(
     if (product.parent?.sku) {
       const parentWcId = product.parent?.externalProductId != null ? Number(product.parent.externalProductId) : null
       if (!parentWcId || !product.parent?.sku) {
-        return { success: false, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
+        return { success: false, permanent: true, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
       }
 
       let variationId = product.externalProductId != null ? Number(product.externalProductId) : null
@@ -2466,15 +2616,15 @@ export async function pushImsProductToWc(
     }
 
     const { data: putData, error: putError } = await wcPut(putPath, updateData, creds)
-    if (putError) return { success: false, error: putError }
+    if (putError) return { success: false, ...(isPermanentWcPutRejection(putError) ? { permanent: true } : {}), error: putError }
     if (expectedMpn && wcResponseConfirmsMpn(putData, expectedMpn.key, expectedMpn.mpn) === false) {
       // A plugin filter can reject a meta write and still answer 200: do not call that a success.
-      return { success: false, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }
+      return { success: false, permanent: true, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }
     }
     if (expectedGuidCleared) {
       const stored = (putData as { global_unique_id?: unknown } | null)?.global_unique_id
       if (typeof stored === 'string' && stored.trim() !== '') {
-        return { success: false, error: 'WooCommerce accepted the request but did not clear the stale GTIN field' }
+        return { success: false, permanent: true, error: 'WooCommerce accepted the request but did not clear the stale GTIN field' }
       }
     }
 

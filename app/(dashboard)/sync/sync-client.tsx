@@ -13,6 +13,7 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   createShoppingWebhooks,
+  revokePreviousShoppingWebhookSecret,
   resetShoppingProductIdCache,
   pushShoppingFxRatesNow,
   saveShoppingConnectorCredentials,
@@ -329,11 +330,13 @@ function WebhookSecretField({
   onChange,
   hadSecretOnLoad,
   onSave,
+  onRevokePrevious,
 }: {
   value: string
   onChange: (v: string) => void
   hadSecretOnLoad: boolean
   onSave: (secret: string) => Promise<void>
+  onRevokePrevious: () => Promise<{ success: boolean; error?: string }>
 }) {
   // freshlyGenerated tracks whether the user just generated a secret in this session
   const [freshlyGenerated, setFreshlyGenerated] = useState(false)
@@ -343,6 +346,8 @@ function WebhookSecretField({
   const [setupingWebhooks, setSetupingWebhooks] = useState(false)
   const [webhookResult, setWebhookResult] = useState<string | null>(null)
   const [webhookError, setWebhookError] = useState(false)
+  const [revoking, setRevoking] = useState(false)
+  const [revokeResult, setRevokeResult] = useState<{ text: string; isError: boolean } | null>(null)
   // A configured secret is never sent to the client, so presence comes from the
   // load-time flag; `value` is only non-empty when freshly generated this session.
   const hasSecret = !!value || hadSecretOnLoad
@@ -378,6 +383,20 @@ function WebhookSecretField({
       setWebhookResult(String(e))
     } finally {
       setSetupingWebhooks(false)
+    }
+  }
+
+  async function handleRevokePrevious() {
+    if (!window.confirm('Revoke the previous webhook secret now? Webhooks that still sign with the old secret will be refused immediately. Run "Setup Webhooks in WooCommerce" first if you have not, unless the old secret leaked.')) return
+    setRevoking(true)
+    setRevokeResult(null)
+    try {
+      const result = await onRevokePrevious()
+      setRevokeResult(result.success ? { text: 'The previous secret is revoked.', isError: false } : { text: result.error ?? 'Could not revoke the previous secret.', isError: true })
+    } catch (e) {
+      setRevokeResult({ text: String(e), isError: true })
+    } finally {
+      setRevoking(false)
     }
   }
 
@@ -459,6 +478,16 @@ function WebhookSecretField({
             {saving ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <KeyRound className="h-3.5 w-3.5 mr-1" />}
             {saving ? 'Saving...' : 'Regenerate Secret'}
           </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={handleRevokePrevious} disabled={revoking}>
+              {revoking ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <KeyRound className="h-3.5 w-3.5 mr-1" />}
+              {revoking ? 'Revoking...' : 'Revoke previous secret now'}
+            </Button>
+            <span className="text-xs text-muted-foreground">After a rotation the old secret stays valid for 48 hours. Use this if the old secret leaked.</span>
+            {revokeResult && (
+              <span className={`text-xs ${revokeResult.isError ? 'text-destructive' : 'text-green-600'}`}>{revokeResult.text}</span>
+            )}
+          </div>
         </div>
       ) : (
         <div className="space-y-2">
@@ -1193,6 +1222,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
               onSave={async (secret) => {
                 await withStepUp(() => saveShoppingSyncSettings({ wc_webhook_secret: secret }))
               }}
+              onRevokePrevious={() => withStepUp(() => revokePreviousShoppingWebhookSecret())}
             />
             <EnvOverrideNotice
               overrides={

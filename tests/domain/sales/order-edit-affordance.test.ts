@@ -137,7 +137,7 @@ test('the server action and the order page both go through the helpers (one rule
   assert.match(page, /SHOP_DESYNC_WARNING/)
   // Webhook policy (b): the importer's update path reads the marker and guards each field the IMS edit can set.
   const importer = await readFile('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
-  assert.match(importer, /select: \{ erasedAt: true, editedInImsAt: true \}/)
+  assert.match(importer, /select: \{ erasedAt: true, editedInImsAt: true, externalUpdatedAt: true \}/)
   assert.match(importer, /const keepImsEdit = erasure\?\.editedInImsAt != null/)
   assert.match(importer, /\.\.\.\(!keepImsEdit && Array\.isArray\(wcOrder\.shipping_lines\)/)
   assert.match(importer, /\.\.\.\(erased \|\| keepImsEdit\s*\?\s*\{\}/)

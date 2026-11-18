@@ -2,6 +2,7 @@
 
 import {
   createWcWebhooks,
+  revokePreviousWcWebhookSecret,
   deleteShoppingTaxRateMapping as deleteShoppingTaxRateMappingImpl,
   getWcActivePaymentGateways,
   getWcCredentials,
@@ -98,6 +99,10 @@ export async function upsertShoppingStatusMapping(externalStatus: string, imsSta
 
 export async function getShoppingSyncLogs(limit = 50): Promise<ShoppingSyncLogRow[]> {
   return getShoppingSyncLogsImpl(limit)
+}
+
+export async function revokePreviousShoppingWebhookSecret() {
+  return revokePreviousWcWebhookSecret()
 }
 
 export async function createShoppingWebhooks() {
