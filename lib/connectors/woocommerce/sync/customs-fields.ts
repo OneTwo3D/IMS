@@ -23,6 +23,25 @@ export type WcCustomsFields = {
   customsDescription: string | null
 }
 
+export type WcCustomsField = keyof WcCustomsFields
+
+const NATIVE_KEYS: Record<WcCustomsField, 'customs_commodity_code' | 'customs_country_of_origin' | 'customs_description'> = {
+  hsCode: 'customs_commodity_code',
+  countryOfOrigin: 'customs_country_of_origin',
+  customsDescription: 'customs_description',
+}
+
+/**
+ * True only when the payload CARRIES the native key and it is an explicit null or blank string. An absent key (or
+ * undefined) is "unknown", not "cleared". Anything else (a value, a number, an object) is not a clear.
+ */
+function nativeKeyExplicitlyEmpty(source: WcCustomsSource, field: WcCustomsField): boolean {
+  const key = NATIVE_KEYS[field]
+  if (!Object.prototype.hasOwnProperty.call(source, key)) return false
+  const value = source[key]
+  return value === null || (typeof value === 'string' && value.trim() === '')
+}
+
 const LEGACY_DESCRIPTION_META_KEY = '_customs_description_legacy'
 
 function trimmed(value: unknown): string | null {
@@ -83,7 +102,14 @@ function firstUsable(
   return null
 }
 
-export function extractWcCustomsFields(source: WcCustomsSource): WcCustomsFields & { rejected: WcRejectedCustomsValue[] } {
+/**
+ * `cleared` lists the fields WooCommerce explicitly emptied: the native key is present with null/'' and NO other source
+ * (attribute, legacy meta) supplied a usable value or a present-but-unusable one. Distinct from a null field that is merely
+ * unknown (key absent) or rejected (present but invalid): both of those keep the IMS value, only `cleared` erases it.
+ */
+export function extractWcCustomsFields(
+  source: WcCustomsSource,
+): WcCustomsFields & { rejected: WcRejectedCustomsValue[]; cleared: WcCustomsField[] } {
   const rejected: WcRejectedCustomsValue[] = []
   const hsCode = firstUsable(
     'hsCode',
@@ -116,5 +142,12 @@ export function extractWcCustomsFields(source: WcCustomsSource): WcCustomsFields
     (raw) => clampCustomsDescription(raw) || null,
     rejected,
   )
-  return { hsCode, countryOfOrigin, customsDescription, rejected }
+  const resolved: WcCustomsFields = { hsCode, countryOfOrigin, customsDescription }
+  const cleared = (Object.keys(NATIVE_KEYS) as WcCustomsField[]).filter(
+    (field) =>
+      resolved[field] === null
+      && !rejected.some((r) => r.field === field)
+      && nativeKeyExplicitlyEmpty(source, field),
+  )
+  return { ...resolved, rejected, cleared }
 }

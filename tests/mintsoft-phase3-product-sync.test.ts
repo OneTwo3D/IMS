@@ -330,3 +330,73 @@ test('isMintsoftProductEligible excludes parent and archived products', () => {
     false,
   )
 })
+
+// ---- clearing customs data in Mintsoft (never barcodes) ----
+
+const clearCandidate = { hsCode: null, countryOfOrigin: null, customsDescription: null }
+
+test('resolveMintsoftCustomsClears: empty IMS fields clear when Mintsoft holds or may hold a value', () => {
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(clearCandidate, undefined),
+    ['customsDescription', 'commodityCode', 'countryOfManufacture'],
+  )
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(clearCandidate, {
+      CustomsDescription: 'Old', CommodityCode: { Code: '85011099' }, CountryOfManufacture: { Code: 'CN' },
+    }),
+    ['customsDescription', 'commodityCode', 'countryOfManufacture'],
+  )
+})
+
+test('resolveMintsoftCustomsClears: nothing to clear when Mintsoft is already empty, or IMS holds a value', () => {
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: { Code: '' } }),
+    [],
+  )
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(
+      { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'Motor' },
+      { CustomsDescription: 'Old', CommodityCode: { Code: '1' }, CountryOfManufacture: { Code: 'CN' } },
+    ),
+    [],
+  )
+  // An unusable but present IMS value is not empty: it never clears.
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears({ hsCode: '123', countryOfOrigin: 'Atlantis', customsDescription: 'x' }, undefined),
+    [],
+  )
+})
+
+test('the clear request is a full update body with the one field erased and never carries a cleared barcode', () => {
+  const dto = {
+    sku: 'SKU-C', name: 'Widget', customsDescription: null, barcode: null, commodityCode: null, countryOfManufacture: null,
+    weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null,
+  }
+  for (const field of ['customsDescription', 'commodityCode', 'countryOfManufacture'] as const) {
+    const req = client.buildMintsoftProductClearRequest(dto, field, { externalProductId: '42' })
+    const body = JSON.parse(req.body)
+    assert.equal(req.method, 'POST')
+    assert.equal(body.ID, 42)
+    assert.equal(body.SKU, 'SKU-C')
+    assert.ok(Object.prototype.hasOwnProperty.call(body, client.MINTSOFT_CLEAR_WIRE[field].key))
+    assert.ok(!('EAN' in body) && !('UPC' in body), 'no identifier key at all when the IMS barcode is empty')
+  }
+  assert.throws(() => client.buildMintsoftProductClearRequest(dto, 'barcode' as never, { externalProductId: '42' }))
+  assert.throws(() => client.buildMintsoftProductClearRequest(dto, 'customsDescription', {}))
+})
+
+test('barcode / EAN / UPC are only ever sent when non-empty, on update, create and clear requests', () => {
+  const empty = {
+    sku: 'S', name: 'N', customsDescription: null, barcode: '', mpn: '', commodityCode: null, countryOfManufacture: null,
+    weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null,
+  }
+  for (const options of [{ externalProductId: '7' }, {}] as const) {
+    const body = JSON.parse(client.buildMintsoftProductUpsertRequest(empty, options).body)
+    assert.ok(!('EAN' in body) && !('UPC' in body))
+  }
+  const full = { ...empty, barcode: '5012345678900', mpn: 'MPN-1' }
+  const body = JSON.parse(client.buildMintsoftProductUpsertRequest(full, { externalProductId: '7' }).body)
+  assert.equal(body.EAN, '5012345678900')
+  const omitted = JSON.parse(client.buildMintsoftProductUpsertRequest(full, { externalProductId: '7', omitBarcode: true, omitMpn: true }).body)
+  assert.ok(!('EAN' in omitted) && !('UPC' in omitted))
+})

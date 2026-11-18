@@ -570,24 +570,32 @@ function asTrimmedString(value: unknown): string | null {
 // fallback, see customs-fields.ts). Policy: WC wins when present.
 // When WC supplies a differing value we overwrite IMS (so re-classifications/corrections
 // propagate); when WC omits the field (native and every fallback) we preserve the existing IMS
-// value (never null it).
+// value. The one exception is an EXPLICIT clear (the native key present with null/''), which nulls the IMS value.
 // Inputs are expected already-trimmed (see asTrimmedString / toIsoCountryCode at the call
 // site); an empty string is treated as absent via truthiness.
 export const WC_TRADE_FIELDS = ['hsCode', 'countryOfOrigin', 'customsDescription'] as const
 export type WcTradeField = (typeof WC_TRADE_FIELDS)[number]
 export type WcTradeSnapshot = Record<WcTradeField, string | null>
-export type WcTradeFieldChange = { field: WcTradeField; from: string | null; to: string }
+export type WcTradeFieldChange = { field: WcTradeField; from: string | null; to: string | null }
 
+/**
+ * `cleared` names the fields WooCommerce EXPLICITLY emptied (see extractWcCustomsFields): only those set IMS to null, and
+ * only when IMS holds a value. A field that is merely absent or unusable is in neither `incoming` nor `cleared`, so the IMS
+ * value is preserved. A usable incoming value always wins over a clear.
+ */
 export function resolveWcTradeFieldUpdates(
   existing: WcTradeSnapshot,
   incoming: WcTradeSnapshot,
+  cleared: readonly WcTradeField[] = [],
 ): WcTradeFieldChange[] {
   const changes: WcTradeFieldChange[] = []
   for (const field of WC_TRADE_FIELDS) {
     const next = incoming[field]
-    // WC value absent/empty -> preserve IMS; present and different -> overwrite.
-    if (next && next !== existing[field]) {
-      changes.push({ field, from: existing[field], to: next })
+    // WC value absent/empty -> preserve IMS; present and different -> overwrite; explicitly cleared -> null.
+    if (next) {
+      if (next !== existing[field]) changes.push({ field, from: existing[field], to: next })
+    } else if (cleared.includes(field) && existing[field]) {
+      changes.push({ field, from: existing[field], to: null })
     }
   }
   return changes
@@ -1027,6 +1035,7 @@ export async function syncWcProductToIms(
               customsDescription: existing.customsDescription,
             },
             { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
+            customs.cleared,
           )
 
           /**
@@ -1379,7 +1388,7 @@ export async function syncWcProductToIms(
         action: 'wc_trade_fields_updated',
         tag: 'sync',
         description: `WC trade fields updated on ${syncedSku}: ${tradeChanges
-          .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to}`)
+          .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to ?? '∅ (cleared in WooCommerce)'}`)
           .join(', ')}`,
       })
     }
@@ -1848,7 +1857,7 @@ async function applyVariations(
    * parent's in view context, but a payload that omits them (older WooCommerce, an attribute-only
    * store, a legacy-description meta that lives on the parent) falls back to these per field.
    */
-  parentCustoms: WcCustomsFields,
+  parentCustoms: WcCustomsFields & { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
   /** Collects customs warnings (unusable WC values, defaulted origin) for the caller to record. */
   customsWarnings: string[],
 ): Promise<WcProductStructureConflict[]> {
@@ -1922,6 +1931,12 @@ async function applyVariations(
       countryOfOrigin: ownCustoms.countryOfOrigin ?? parentCustoms.countryOfOrigin,
       customsDescription: ownCustoms.customsDescription ?? parentCustoms.customsDescription,
     }
+
+    // Cleared only when the variation itself is explicitly emptied (or has no value of its own and the parent is), and
+    // nothing inherited from the parent fills the field: a variation inheriting a populated parent is never cleared.
+    const variantCleared = WC_TRADE_FIELDS.filter(
+      (f) => variantCustoms[f] === null && !parentCustoms.rejected?.some((r) => r.field === f) && (ownCustoms.cleared.includes(f) || parentCustoms.cleared?.includes(f)),
+    )
 
     const existing = existingBySku.get(sku)
     customsWarnings.push(
@@ -2028,6 +2043,7 @@ async function applyVariations(
           customsDescription: existing.customsDescription ?? null,
         },
         variantCustoms,
+        variantCleared,
       )) {
         updateData[change.field] = change.to
       }

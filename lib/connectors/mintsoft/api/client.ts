@@ -1,7 +1,7 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from './auth-no-login'
 import { BUNDLE_CLAIM_CHANGED_TEXT } from '../sync/bundle-create-outcome'
-import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDeleteResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDeleteResult, WmsClearableProductField, WmsProductClearOutcome, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   readMintsoftAsnItemExpectedQuantity,
   readMintsoftAsnItemLineIdentity,
@@ -310,6 +310,38 @@ export async function fetchMintsoftReturns(since: Date): Promise<WmsReturnRecord
     .filter((item): item is WmsReturnRecord => Boolean(item))
 }
 
+/**
+ * How Mintsoft is told to ERASE a customs field. CONTRACT STATUS: NOT VERIFIED against Mintsoft (it was not called to
+ * write this; the repository holds no capture of a cleared product). The values are the most plausible for the field's
+ * shape: a string field is blanked, an object field (`{ Code }`) is nulled. Each clear is sent as its own request, so a
+ * rejection is contained and reported rather than failing the update. Adjust here once a read-only capture and one
+ * granted, controlled update confirm the real behaviour. There is no barcode entry, on purpose.
+ */
+export const MINTSOFT_CLEAR_WIRE: Readonly<Record<WmsClearableProductField, { key: string; value: '' | null; verified: false }>> = {
+  customsDescription: { key: 'CustomsDescription', value: '', verified: false },
+  commodityCode: { key: 'CommodityCode', value: null, verified: false },
+  countryOfManufacture: { key: 'CountryOfManufacture', value: null, verified: false },
+}
+
+/**
+ * The follow-up request that erases one customs field of an existing product. It carries the same body the update does
+ * (so it can never be read as a partial replace that blanks other fields; barcode only when non-empty and not omitted)
+ * with the one cleared field set explicitly.
+ */
+export function buildMintsoftProductClearRequest(
+  product: WmsProductDto,
+  field: WmsClearableProductField,
+  options: WmsUpsertProductOptions,
+): { path: string; method: 'POST'; body: string } {
+  const externalProductId = options.externalProductId?.trim()
+  if (!externalProductId) throw new Error('A Mintsoft clear needs an existing product id')
+  const wire = MINTSOFT_CLEAR_WIRE[field]
+  if (!wire) throw new Error(`${String(field)} cannot be cleared in Mintsoft`)
+  const payload = buildMintsoftProductPayload(product, options.omitBarcode ?? false, options.omitMpn ?? false)
+  const id = /^\d+$/.test(externalProductId) ? Number.parseInt(externalProductId, 10) : externalProductId
+  return { path: '/api/Product', method: 'POST', body: JSON.stringify({ ID: id, ...payload, [wire.key]: wire.value }) }
+}
+
 function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolean, omitMpn: boolean): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     SKU: product.sku,
@@ -598,6 +630,10 @@ export async function upsertMintsoftProduct(
     throw new Error(result.error)
   }
 
+  const clearOutcome = externalProductId && options?.clearFields?.length
+    ? await sendMintsoftProductClears(product, options.clearFields, { ...options, externalProductId })
+    : undefined
+
   const normalized = normalizeMintsoftProduct(result.data)
   if (!normalized) {
     const fetched = externalProductId
@@ -606,10 +642,34 @@ export async function upsertMintsoftProduct(
     if (!fetched) {
       throw new Error('Mintsoft product upsert succeeded but no product details were returned')
     }
-    return fetched
+    return clearOutcome ? { ...fetched, clearOutcome } : fetched
   }
 
-  return normalized
+  return clearOutcome ? { ...normalized, clearOutcome } : normalized
+}
+
+/** One request per field, each caught: a refusal of one clear must not fail the update that already succeeded. */
+async function sendMintsoftProductClears(
+  product: WmsProductDto,
+  fields: WmsClearableProductField[],
+  options: WmsUpsertProductOptions,
+): Promise<WmsProductClearOutcome> {
+  const outcome: WmsProductClearOutcome = { cleared: [], rejected: [] }
+  for (const field of new Set(fields)) {
+    try {
+      const request = buildMintsoftProductClearRequest(product, field, options)
+      const result = await mintsoftRequest<unknown>(request.path, { method: request.method, body: request.body })
+      if (result.error) throw new Error(result.error)
+      const body = result.data as { Success?: unknown; Message?: unknown } | null
+      if (body && typeof body === 'object' && body.Success === false) {
+        throw new Error(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
+      }
+      outcome.cleared.push(field)
+    } catch (error) {
+      outcome.rejected.push({ field, message: error instanceof Error ? error.message : 'Mintsoft clear failed' })
+    }
+  }
+  return outcome
 }
 
 /**

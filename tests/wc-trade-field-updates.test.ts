@@ -64,3 +64,35 @@ test('only the fields WC actually supplies are changed', () => {
   )
   assert.deepEqual(changes, [{ field: 'hsCode', from: '90200000', to: '90211000' }])
 })
+
+// ---- explicit clears ----
+
+const HELD = { hsCode: '90211000', countryOfOrigin: 'CN', customsDescription: 'Cotton widget' }
+
+test('an explicit WC clear nulls the IMS value', () => {
+  const changes = productSync.resolveWcTradeFieldUpdates(HELD, EMPTY, ['hsCode', 'customsDescription'])
+  assert.deepEqual(changes, [
+    { field: 'hsCode', from: '90211000', to: null },
+    { field: 'customsDescription', from: 'Cotton widget', to: null },
+  ])
+})
+
+test('without a clear, an absent/invalid WC value changes nothing (key absent, or rejected)', () => {
+  assert.deepEqual(productSync.resolveWcTradeFieldUpdates(HELD, EMPTY, []), [])
+  assert.deepEqual(productSync.resolveWcTradeFieldUpdates(HELD, EMPTY), [])
+})
+
+test('a clear of an already-empty IMS field is no change', () => {
+  assert.deepEqual(productSync.resolveWcTradeFieldUpdates(EMPTY, EMPTY, ['hsCode']), [])
+})
+
+test('a usable incoming value beats a clear for the same field', () => {
+  const changes = productSync.resolveWcTradeFieldUpdates(HELD, { ...EMPTY, hsCode: '90219000' }, ['hsCode'])
+  assert.deepEqual(changes, [{ field: 'hsCode', from: '90211000', to: '90219000' }])
+})
+
+test('a variation inheriting a populated parent is not cleared (inherited value fills the field)', () => {
+  // variation's own value empty + cleared, but the parent supplies the code: the merged snapshot carries it.
+  const changes = productSync.resolveWcTradeFieldUpdates(HELD, { ...HELD, hsCode: '90211000' }, [])
+  assert.deepEqual(changes, [])
+})
