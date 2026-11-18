@@ -52,6 +52,8 @@ export const PRODUCT_SYNC_CANDIDATE_SELECT = {
   // Read for the parity setting only (a variation inherits its parent's name base, weight and dimensions); unused while it is off.
   parent: { select: { name: true, weight: true, widthCm: true, heightCm: true, depthCm: true } },
   content: { select: { shortDescription: true, longDescription: true, images: true } },
+  // Customs fields emptied in IMS (value -> nothing): the only evidence that Mintsoft's copy is to be cleared.
+  customsClears: { select: { field: true } },
   wmsProductLinks: {
     where: { connector: 'mintsoft' },
     select: {
@@ -91,6 +93,8 @@ export type ProductSyncCandidate = {
   lifecycleStatus: ProductLifecycleStatus
   parent?: { name: string; weight: Prisma.Decimal | null; widthCm: Prisma.Decimal | null; heightCm: Prisma.Decimal | null; depthCm: Prisma.Decimal | null } | null
   content?: { shortDescription: string | null; longDescription: string | null; images: Prisma.JsonValue } | null
+  /** Customs fields emptied in IMS; absent on a candidate built without the relation (none). */
+  customsClears?: Array<{ field: string }>
   wmsProductLinks: Array<{
     id: string
     externalProductId: string
@@ -310,7 +314,8 @@ export function resolveSettledCustomsMarkers(
 ): string[] {
   if (!remoteRaw) return []
   const pending = new Set(resolveMintsoftCustomsClears(product, remoteRaw, marked).map((f) => IMS_FIELD_OF_WMS_CLEAR[f]))
-  return marked.filter((m) => !pending.has(m as never))
+  // The origin marker is never settled here: while the origin stays blank it also stops the CN default being re-declared.
+  return marked.filter((m) => m !== 'countryOfOrigin' && !pending.has(m as never))
 }
 
 export function hashMintsoftProductDto(product: WmsProductDto): string {
@@ -828,7 +833,7 @@ async function syncOneMintsoftProduct(
     existingLinkMatchesSku: authoritativeLookup.existingLinkMatchesSku,
   })
   const markedFields = earlyExternalProductId
-    ? (await db.productCustomsClear.findMany({ where: { productId: context.product.id }, select: { field: true } })).map((m) => m.field)
+    ? (context.product.customsClears ?? []).map((m) => m.field)
     : []
   const remoteRawForClears = authoritative ? (authoritative.raw ?? {}) : undefined
   const clearFields = earlyExternalProductId ? resolveMintsoftCustomsClears(context.product, remoteRawForClears, markedFields) : []
@@ -837,9 +842,12 @@ async function syncOneMintsoftProduct(
   if (settledMarkers.length > 0) {
     await db.productCustomsClear.deleteMany({ where: { productId: context.product.id, field: { in: settledMarkers } } })
   }
-  // The CN default is declared on a CREATE only. An update with a blank origin leaves Mintsoft's field alone (it never
-  // overwrites what Mintsoft holds with the default, which would also undo a clear); it is erased only when marked above.
-  if (earlyExternalProductId && !trimToNull(context.product.countryOfOrigin)) dto = { ...dto, countryOfManufacture: null }
+  // An origin the operator CLEARED (marked, still blank) is not re-declared as the CN default on an update, which would undo the
+  // clear. An origin that was merely never set keeps the CN default exactly as before. This marker is kept after the clear
+  // is verified (see resolveSettledCustomsMarkers) and goes only when the origin is filled again.
+  if (earlyExternalProductId && markedFields.includes('countryOfOrigin') && !trimToNull(context.product.countryOfOrigin)) {
+    dto = { ...dto, countryOfManufacture: null }
+  }
 
   // Customs discrepancies (HS/CN code + country of origin) are reconciled HERE — BEFORE any barcode-related
   // early return — so a barcode conflict can never suppress them and leave a legacy issue unreported (Codex
@@ -1102,7 +1110,7 @@ async function syncOneMintsoftProduct(
   if (verifiedCleared.length > 0) {
     // Verified empty by the read-back: the marker is spent.
     await db.productCustomsClear.deleteMany({
-      where: { productId: context.product.id, field: { in: verifiedCleared.map((f) => IMS_FIELD_OF_WMS_CLEAR[f]) } },
+      where: { productId: context.product.id, field: { in: verifiedCleared.filter((f) => f !== 'countryOfManufacture').map((f) => IMS_FIELD_OF_WMS_CLEAR[f]) } },
     })
   }
   const rejectedClears = synced.clearOutcome?.rejected ?? []

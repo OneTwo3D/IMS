@@ -377,8 +377,8 @@ test('resolveMintsoftCustomsClears: nothing to clear when Mintsoft is already em
 
 test('markers are settled once Mintsoft is known empty, and kept while a value remains or the record is unknown', () => {
   const settled = productSync.resolveSettledCustomsMarkers
-  assert.deepEqual(settled(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ALL_IMS_MARKED)
-  assert.deepEqual(settled(clearCandidate, { CustomsDescription: 'Old', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ['hsCode', 'countryOfOrigin'])
+  assert.deepEqual(settled(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ['hsCode', 'customsDescription'])
+  assert.deepEqual(settled(clearCandidate, { CustomsDescription: 'Old', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ['hsCode'])
   assert.deepEqual(settled(clearCandidate, undefined, ALL_IMS_MARKED), [])
   assert.equal(productSync.IMS_FIELD_OF_WMS_CLEAR.countryOfManufacture, 'countryOfOrigin')
 })
