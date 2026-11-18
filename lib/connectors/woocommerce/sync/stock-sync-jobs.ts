@@ -25,6 +25,7 @@ import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-
 import { wooDrainHold } from '../producer-egress'
 import { runWithWcAttemptFence } from '../attempt-fence'
 import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
+import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW } from './order-status-claim-gate'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
@@ -364,6 +365,9 @@ export async function processQueuedWcStockSyncJobs(options?: {
   productIds?: string[]
   limit?: number
   migrateLegacy?: boolean
+  /** Test seams: the clock the drain budget and the claims read, and the budget itself. */
+  clock?: () => Date
+  drainBudgetMs?: number
 }): Promise<{ processed: number; synced: number; failed: number; errors: string[]; held?: true }> {
   const limit = options?.limit ?? 25
   const productIds = options?.productIds !== undefined ? [...new Set(options.productIds)] : undefined
@@ -378,16 +382,29 @@ export async function processQueuedWcStockSyncJobs(options?: {
     await migrateLegacyWcStockSyncJobs(productIds, limit)
   }
 
-  const jobs = await claimIntegrationOutboxWork({
-    connector: WC_STOCK_SYNC_CONNECTOR,
-    operation: WC_STOCK_SYNC_OPERATION,
-    idempotencyKeys: productIds?.map(wcStockSyncIdempotencyKey),
-    limit,
-    workerId: WC_STOCK_SYNC_WORKER_ID,
-    maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
-  })
+  // CLAIM -> ATTEMPT -> MARK, ONE JOB AT A TIME (same shape as the order-status drains): each job is claimed only when its attempt is
+  // about to start, so a job at the back of a 25-row drain cannot age past the lease while it waits, and the drain stops claiming once
+  // its wall-clock budget is spent.
+  const clock = options?.clock ?? (() => new Date())
+  const startedAt = clock().getTime()
+  const budgetMs = options?.drainBudgetMs ?? WC_DRAIN_CLAIM_BUDGET_MS
+  const attempted: string[] = []
 
-  for (const job of jobs) {
+  while (attempted.length < limit) {
+    if (clock().getTime() - startedAt > budgetMs) break
+    const [job] = await claimIntegrationOutboxWork({
+      connector: WC_STOCK_SYNC_CONNECTOR,
+      operation: WC_STOCK_SYNC_OPERATION,
+      idempotencyKeys: productIds?.map(wcStockSyncIdempotencyKey),
+      limit: WC_DRAIN_SCAN_WINDOW,
+      claimLimit: 1,
+      excludeIds: attempted,
+      workerId: WC_STOCK_SYNC_WORKER_ID,
+      maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+      now: clock(),
+    })
+    if (!job) break
+    attempted.push(job.id)
     summary.processed++
     if (!job.lockedAt) {
       summary.failed++

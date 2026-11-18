@@ -292,12 +292,17 @@ function redirectMethod(method: string, status: number): string {
   return method
 }
 
-function headersForRedirect(headers: Headers, from: URL, to: URL, methodChangedToGet: boolean): Headers {
+// Connector credentials travel in vendor-specific headers (ms-apikey), not only Authorization. None may follow a redirect
+// onto another origin.
+const CROSS_ORIGIN_CREDENTIAL_HEADERS = ['ms-apikey', 'x-api-key', 'api-key', 'apikey', 'x-auth-token', 'x-e2e-secret']
+
+export function headersForRedirect(headers: Headers, from: URL, to: URL, methodChangedToGet: boolean): Headers {
   const next = new Headers(headers)
   if (from.origin !== to.origin) {
     next.delete('authorization')
     next.delete('cookie')
     next.delete('proxy-authorization')
+    for (const name of CROSS_ORIGIN_CREDENTIAL_HEADERS) next.delete(name)
   }
   if (methodChangedToGet) {
     next.delete('content-length')
@@ -466,6 +471,10 @@ export async function connectorFetch(
         throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
       }
 
+      // A 307/308 replays the body; a body (e.g. a login POST with a username and password) never goes to another origin.
+      if (body != null && nextUrl.origin !== url.origin && redirectMethod(method, response.status) === method) {
+        throw new Error(`${options.connectorName} answered with a cross-origin redirect (HTTP ${response.status}); the request body was not replayed to the new origin.`)
+      }
       const nextMethod = redirectMethod(method, response.status)
       const methodChangedToGet = nextMethod !== method && nextMethod === 'GET'
       headers = headersForRedirect(headers, url, nextUrl, methodChangedToGet)
