@@ -102,11 +102,21 @@ export async function planGrirOpeningBalance(client: OpeningClient = db, options
       select: { id: true, amountBase: true, postedAt: true, createdAt: true, purchaseInvoice: { select: { subtotalForeign: true, taxForeign: true } } },
       orderBy: [{ postedAt: 'asc' }, { id: 'asc' }],
     })
-    const covered = new Set((notes.length === 0 ? [] : await client.grirSubledgerMovement.findMany({
+    // o3d-o35oo: a credit note the sub-ledger already tracks still reduced the position the SOURCE data implies (the goods it cleared are
+    // billed-and-returned and credited), and its quantity is already in `liveByLine`. Leaving it out of the expected quantity while the live
+    // rows carry it made a received-10, billed-10, returned-4, credited-4 line (return and credit both recorded after the sub-ledger started)
+    // expect -4 against a live 0 and open another -4. Its credited quantity is therefore read off its OWN rows (exact, not re-allocated) and
+    // seeds the per-line credited quantity; only untracked notes are allocated below.
+    const trackedRows = notes.length === 0 ? [] : await client.grirSubledgerMovement.findMany({
       where: { sourceType: { in: ['SUPPLIER_CREDIT_NOTE', 'BILL_PRICE_VARIANCE'] }, sourceRef: { in: notes.map((note) => note.id) } },
-      select: { sourceRef: true },
-    })).map((row) => row.sourceRef))
+      select: { sourceRef: true, sourceType: true, poLineId: true, qtyDelta: true },
+    })
+    const covered = new Set(trackedRows.map((row) => row.sourceRef))
     const creditedByLine = new Map<string, Decimal>()
+    for (const row of trackedRows) {
+      if (row.sourceType !== 'SUPPLIER_CREDIT_NOTE' || !row.poLineId) continue
+      creditedByLine.set(row.poLineId, (creditedByLine.get(row.poLineId) ?? toDecimal(0)).add(toDecimal(row.qtyDelta)))
+    }
     for (const note of notes) {
       if (covered.has(note.id)) continue
       const allocation = allocateReturnCredit(order.lines.map((line) => {

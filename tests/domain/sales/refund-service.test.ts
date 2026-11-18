@@ -11257,3 +11257,20 @@ test('an order-level reversal with no lines and no summary makes the Allocated I
     /no readable lines and no preserved account summary/,
   )
 })
+
+test('a prior UNEARNED_REV_REVERSAL posted under a since re-mapped unearned account is still netted (o3d-nz0e0)', async () => {
+  // The £40 reversal debited the OLD code '2099'; the unearned account is '2100' today. Filtering the lines on the CURRENT code read 0 and the
+  // refund debited the whole £100 deferral again.
+  const state = unearnedDeferralStateWithPriorReversal({
+    payload: {
+      lines: [
+        { accountCode: '2099', description: 'Unearned revenue reversal: SO-1', debit: 40 },
+        { accountCode: '4000', description: 'Unearned revenue reversal: SO-1', credit: 40 },
+      ],
+    },
+    payloadAccountNets: null,
+  })
+  const result = await fullUnearnedRefund(state)
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebitOf(result), 60, 'the £100 deferral less the £40 the old-code journal reversed')
+})

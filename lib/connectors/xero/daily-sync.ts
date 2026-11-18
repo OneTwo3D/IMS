@@ -105,6 +105,7 @@ import {
   countedUnearnedReversalRows,
   describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
+  durableUnearnedReversalTopUp,
   unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
@@ -136,6 +137,7 @@ import { refreshXeroBooksLockDate } from '@/lib/connectors/xero/books-lock-date'
 import { businessDateYmd } from '@/lib/business-date'
 import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
+import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
 export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
@@ -1954,8 +1956,14 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       const refunds = await tx.salesOrderRefund.findMany({
         where: { orderId: { in: orderIds } },
-        select: { id: true, orderId: true },
+        select: { id: true, orderId: true, unearnedReversedAmount: true, accountingRetryRequired: true },
       })
+      // o3d-fk9py: a refund whose journal was only shadowed (never sent) is not proof the reversal reached the ledger.
+      const shadowedRefundIds = new Set(
+        refunds.length === 0 ? [] : (await findDurableShadowRecords(tx, 'xero', [{ subjectType: 'SalesOrderRefund', exactIds: refunds.map((refund) => refund.id), operations: ['inventory.journals'] }])).map((record) => record.subjectId),
+      )
+      const refundsByOrder = new Map<string, Array<(typeof refunds)[number] & { shadowed: boolean }>>()
+      for (const refund of refunds) refundsByOrder.set(refund.orderId, [...(refundsByOrder.get(refund.orderId) ?? []), { ...refund, shadowed: shadowedRefundIds.has(refund.id) }])
       const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
       // o3d-3la07 (M5, D3: REPORT-ONLY). The netting below still sums exactly the PENDING / PROCESSING /
       // SYNCED rows it always did (`countedUnearnedReversalRows`); the read is widened by the CANCELLED
@@ -1975,7 +1983,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         },
         select: { id: true, referenceType: true, referenceId: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
       })
-      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown }>>()
+      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown; refundId?: string | null }>>()
       const reversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
       for (const sync of reversalSyncs) {
         const targetOrderId = sync.referenceType === 'SalesOrder'
@@ -1989,7 +1997,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       for (const [targetOrderId, allRows] of reversalStandingRowsByOrder) {
         reversalSyncsByOrder.set(
           targetOrderId,
-          countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload, payloadAccountNets: sync.payloadAccountNets })),
+          countedUnearnedReversalRows(allRows).map((sync) => ({
+            payload: sync.payload,
+            payloadAccountNets: sync.payloadAccountNets,
+            refundId: sync.referenceType === 'SalesOrderRefund' ? sync.referenceId : null,
+          })),
         )
       }
 
@@ -2100,9 +2112,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         ), 0)
         // scjz.68: subtract deferred revenue a refund credit note already reversed
         // out of the unearned account so the true-up never re-recognizes it.
-        const postedUnearnedReversal = sumPostedUnearnedReversal(
-          reversalSyncsByOrder.get(orderId) ?? [],
-          settings.xero_unearned_revenue_account,
+        // o3d-fk9py: plus what earlier refunds durably recorded that retention has since erased from the sync rows.
+        const postedUnearnedReversal = round2(
+          sumPostedUnearnedReversal(reversalSyncsByOrder.get(orderId) ?? [], settings.xero_unearned_revenue_account)
+          + durableUnearnedReversalTopUp(reversalSyncsByOrder.get(orderId) ?? [], refundsByOrder.get(orderId) ?? [], settings.xero_unearned_revenue_account),
         )
         // o3d-oyur (Codex r2 HIGH): a counted reversal with no readable lines and no compaction summary moved an UNKNOWN amount.
         // The true-up (which recognises the whole remaining deferral) is withheld rather than risk debiting it twice.
