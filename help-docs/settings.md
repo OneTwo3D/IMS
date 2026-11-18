@@ -355,7 +355,7 @@ This means an admin viewing the activity log can see who did what but not see se
 
 ## System Settings
 
-**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
+**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history; the same read-only notes are open to every internal role (not supplier-portal users) at **Help > What's New** (`/help/releases`), which is where the What's New notification links), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
 
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
   - Each plugin has a switch, and **Save & Apply** at the bottom saves the selection and updates the scheduler's crontab to match. If the selection saves but the crontab could not be updated, an amber message says so and tells you what to do; the selection itself is kept.

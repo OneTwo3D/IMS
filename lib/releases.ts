@@ -473,7 +473,7 @@ export async function ensureCurrentReleaseNotificationInStore(
   const release = CURRENT_RELEASE
   const id = getReleaseNotificationId(release.version)
   const title = `What's New in ${release.version}`
-  const actionUrl = '/settings/system?tab=releases'
+  const actionUrl = '/help/releases'
   const desired = {
     id,
     userId: null,
