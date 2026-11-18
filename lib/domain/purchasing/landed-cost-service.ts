@@ -145,12 +145,28 @@ export type LandedCostRevaluationOptions = {
 type DecimalInput = Prisma.Decimal | number | string
 
 /**
- * o3d-d0gog: READ THE CHART BEFORE THE TRANSACTION OPENS, for `LandedCostRevaluationOptions.accountingSettings`.
- * Same answer the lazy in-walk read gave (`null` when it cannot be read, so the delta stays in the caller's COGS
- * journal), but taken over the pool while no transaction connection is held.
+ * o3d-d0gog: READ THE CHART BEFORE THE TRANSACTION OPENS, for `LandedCostRevaluationOptions.accountingSettings`,
+ * over the pool while no transaction connection is held.
+ *
+ * FAILS CLOSED. An unreadable chart used to become `null`, which every downstream branch read as "no chart, so leave
+ * the delta in the caller's COGS journal". For an UN-journaled shipment that was wrong: its cost snapshot is already
+ * rewritten, so the daily batch posts the same delta again and COGS is double-posted. "No connector switched on" is a
+ * readable answer (`connector: null` on the returned settings); "could not read" is not, and refuses the whole
+ * operation here, before any write, with a message the caller reports to the operator.
  */
-export async function readLandedCostChartBeforeTx(): Promise<AccountingSettings | null> {
-  return getAccountingSettings().catch(() => null)
+export class LandedCostChartUnreadableError extends Error {
+  constructor(cause: unknown) {
+    super(`The accounting settings could not be read, so the landed-cost revaluation was not started and nothing was changed. Try again; if it persists check the database connection. (${cause instanceof Error ? cause.message : String(cause)})`)
+    this.name = 'LandedCostChartUnreadableError'
+  }
+}
+
+export async function readLandedCostChartBeforeTx(): Promise<AccountingSettings> {
+  try {
+    return await getAccountingSettings()
+  } catch (error) {
+    throw new LandedCostChartUnreadableError(error)
+  }
 }
 
 /**

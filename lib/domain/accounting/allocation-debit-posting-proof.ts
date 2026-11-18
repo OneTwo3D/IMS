@@ -62,6 +62,7 @@
  * caller can reach for the other's answer by accident.
  */
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import {
   extractPayloadNetMovement,
   journalNetMovement,
@@ -146,63 +147,193 @@ export function allocationOpenBalance(debit: DecimalInput, relieved: DecimalInpu
 }
 
 /**
- * o3d-efyx: THE OTHER TWO RELIEF SOURCES AGAINST THE ALLOCATED-INVENTORY CONTRA, as the ORDER RECORDS them.
+ * o3d-efyx: THE OTHER TWO RELIEF SOURCES AGAINST THE ALLOCATED-INVENTORY CONTRA, each PROVED against its journal.
  *
  * The orphaned-allocation reverser used to cap its credit at `allocationBatchAmount` less
- * `allocationReversalAmount`: what A2 debited, less what earlier reversals credited back. The refund knows
- * two more sources against the same contra: Group B's `Shipment.allocatedReliefAmount` for every JOURNALED
- * shipment (credited when the units dispatched) and every prior refund's `SalesOrderRefund.allocatedReliefAmount`.
- * A reversal that ignores them can credit units whose debit Group B (or a refund) already took out: the OVER-credit
- * direction, which moves money that was never there.
+ * `allocationReversalAmount`. The refund knows two more sources against the same contra: Group B's
+ * `Shipment.allocatedReliefAmount` for every JOURNALED shipment and every prior refund's
+ * `SalesOrderRefund.allocatedReliefAmount`. A reversal that ignores them can credit units whose debit was already
+ * relieved (the over-credit direction).
  *
- * ONE definition of "open balance" is {@link allocationOpenBalance}; this adds the two missing terms using only the
- * durable recorded columns (the refund additionally PROVES each against its journal, which needs the sync log and
- * its retention rules and does not belong in a per-shrink reverser). Where a recorded figure is absent but the
- * relief must have happened (a journaled shipment with no recorded relief; a refund that claimed allocation units
- * with none recorded), the answer is `unresolved` and the caller raises NOTHING and reports: under-reversing leaves
- * a visible standing debit, over-reversing hides one.
+ * A RECORDED FIGURE IS NOT A POSTING. Group B writes the amount even when its journal raised no CR Allocated line or
+ * was cancelled, and a refund records the credit it intends before its journal posts. So a figure is subtracted ONLY
+ * when its journal is PROVED to have credited the account ({@link resolveAllocatedReliefPosting}, the verdict the
+ * refund uses, single-sourced here). Anything short of proved (unresolved, or "assumed" from a record whose journal
+ * retention has deleted) is UNKNOWN, and the caller withholds the reversal: counting it would under-credit and
+ * leave a permanent debit, ignoring it would over-credit.
  */
-export type RecordedAllocatedRelief =
+export type AllocatedReliefVerdict =
+  | { kind: 'posted' }
+  | { kind: 'none' }
+  | { kind: 'assumed'; reason: string }
+  | { kind: 'unresolved'; reason: string }
+
+export type AllocatedReliefClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | '$queryRaw'>
+
+/**
+ * Resolves a relief record that names its own journal (Group B stamps the row's id, connector and account on the
+ * shipment). `recorded` is the pounds the record claims. Lifted verbatim from refund-service so there is ONE definition.
+ */
+export async function resolveAllocatedReliefPosting(
+  tx: AllocatedReliefClient,
+  target: { activeConnector: string | null; allocatedInventoryAccount: string },
+  record: {
+    syncLogId: string | null
+    connector: string | null
+    accountCode: string | null
+    subject: string
+    recorded: number
+  },
+): Promise<AllocatedReliefVerdict> {
+  if (record.recorded <= 0) return { kind: 'none' }
+  if (!record.syncLogId) {
+    if (record.recorded < 0.005) return { kind: 'none' }
+    return {
+      kind: 'unresolved',
+      reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief but names no journal, so whether that credit was ever raised — and in which ledger — cannot be established`,
+    }
+  }
+  if (target.activeConnector && record.connector && record.connector !== target.activeConnector) {
+    return {
+      kind: 'unresolved',
+      reason: `${record.subject} credited Allocated Inventory on ${record.connector}, but this reversal would be raised on ${target.activeConnector} — relief in one ledger cannot be netted against a debit in another`,
+    }
+  }
+  if (record.accountCode && record.accountCode !== target.allocatedInventoryAccount) {
+    return {
+      kind: 'unresolved',
+      reason: `${record.subject} credited account ${record.accountCode}, but Allocated Inventory is configured as ${target.allocatedInventoryAccount} today, so that relief did not touch the account this reversal would credit`,
+    }
+  }
+  const journal = await tx.accountingSyncLog.findUnique({
+    where: { id: record.syncLogId },
+    select: { connector: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
+  })
+  if (!journal) {
+    const { shadowRecordNamesSyncLog } = await import('@/lib/domain/outbound-shadow/durable-evidence')
+    if (await shadowRecordNamesSyncLog(tx as never, record.syncLogId)) {
+      return {
+        kind: 'unresolved',
+        reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief under a journal IMS recorded as a SHADOW instead of sending (the row has since expired, the shadow record has not), so whether that credit reached any ledger cannot be established`,
+      }
+    }
+    return {
+      kind: 'assumed',
+      reason: `${record.subject}'s £${record.recorded.toFixed(2)} of Allocated Inventory relief was counted from its own record because the journal it names is no longer on record (retention) — retention deletes cancelled journals as well as settled ones, so whether those pounds ever reached the account is not established`,
+    }
+  }
+  if (target.activeConnector && journal.connector && journal.connector !== target.activeConnector) {
+    return {
+      kind: 'unresolved',
+      reason: `the journal that was to credit Allocated Inventory £${record.recorded.toFixed(2)} for ${record.subject} was raised on ${journal.connector}, but this reversal would be raised on ${target.activeConnector} — a credit in one set of books cannot be netted against a debit in another`,
+    }
+  }
+  const proof = proveJournalPosting([journal], target.allocatedInventoryAccount, 'credit')
+  if (proof.kind === 'illegible') {
+    return {
+      kind: 'assumed',
+      reason: `${record.subject}'s £${record.recorded.toFixed(2)} of Allocated Inventory relief was counted from its own record because its journal has settled but its lines have been compacted off the row, so what that journal actually credited to ${target.allocatedInventoryAccount} cannot be read`,
+    }
+  }
+  if (proof.kind === 'unproved') {
+    return {
+      kind: 'unresolved',
+      reason: `the journal that was to credit Allocated Inventory £${record.recorded.toFixed(2)} for ${record.subject} is ${unprovedJournalClause(proof)} — whether those pounds moved is not established, and guessing either way moves real money`,
+    }
+  }
+  if (proof.amount <= 0) {
+    return {
+      kind: 'unresolved',
+      reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief, but the journal it names credits nothing to ${target.allocatedInventoryAccount} — the record and the journal disagree about what was relieved, so how much of the A2 debit is open cannot be established`,
+    }
+  }
+  if (record.recorded > proof.amount + 0.005) {
+    return {
+      kind: 'unresolved',
+      reason: `${record.subject} records £${record.recorded.toFixed(2)} of Allocated Inventory relief, more than the £${proof.amount.toFixed(2)} its journal credited to ${target.allocatedInventoryAccount} in total — a share cannot exceed the batch it came from, so that figure cannot be netted against the A2 debit`,
+    }
+  }
+  return { kind: 'posted' }
+}
+
+export type ProvedAllocatedRelief =
   | { kind: 'resolved'; groupB: Decimal; priorRefunds: Decimal }
   | { kind: 'unresolved'; reason: string }
 
-export function recordedAllocatedRelief(order: {
-  shipments?: ReadonlyArray<{
-    id: string
-    allocatedReliefAmount: DecimalInput | null
-    cogsRelievedFromInventoryAt?: Date | null
-  }> | null
-  refunds?: ReadonlyArray<{
-    id: string
-    allocatedReliefAmount: DecimalInput | null
-    lines?: ReadonlyArray<{ costLayerSnapshot: unknown }> | null
-  }> | null
-}, claimsAllocationUnits: (costLayerSnapshot: unknown) => boolean): RecordedAllocatedRelief {
+export async function proveRecordedAllocatedRelief(
+  tx: AllocatedReliefClient,
+  order: {
+    shipments?: ReadonlyArray<{
+      id: string
+      allocatedReliefAmount: DecimalInput | null
+      allocatedReliefSyncLogId?: string | null
+      allocatedReliefConnector?: string | null
+      allocatedReliefAccountCode?: string | null
+      cogsRelievedFromInventoryAt?: Date | null
+    }> | null
+    refunds?: ReadonlyArray<{
+      id: string
+      allocatedReliefAmount: DecimalInput | null
+      lines?: ReadonlyArray<{ costLayerSnapshot: unknown }> | null
+    }> | null
+  },
+  target: { activeConnector: string | null; allocatedInventoryAccount: string },
+  claimsAllocationUnits: (costLayerSnapshot: unknown) => boolean,
+): Promise<ProvedAllocatedRelief> {
   let groupB = toDecimal(0)
   for (const shipment of order.shipments ?? []) {
-    if (shipment.allocatedReliefAmount != null) {
-      groupB = groupB.add(toDecimal(shipment.allocatedReliefAmount))
-      continue
+    if (shipment.allocatedReliefAmount == null) {
+      // Costed straight out of Inventory: never drew on an allocation pin, so it relieved none.
+      if (shipment.cogsRelievedFromInventoryAt) continue
+      // Known limit: a journaled shipment from before the relief column existed is withheld (the refund derives it from snapshots).
+      return {
+        kind: 'unresolved',
+        reason: `journaled shipment ${shipment.id} records no Allocated Inventory relief, so how much Group B already credited cannot be established`,
+      }
     }
-    // Costed straight out of Inventory: never drew on an allocation pin, so it relieved none.
-    if (shipment.cogsRelievedFromInventoryAt) continue
-    return {
-      kind: 'unresolved',
-      reason: `journaled shipment ${shipment.id} records no Allocated Inventory relief, so how much Group B already credited cannot be established`,
-    }
+    const recorded = toDecimal(shipment.allocatedReliefAmount).toNumber()
+    const verdict = await resolveAllocatedReliefPosting(tx, target, {
+      syncLogId: shipment.allocatedReliefSyncLogId ?? null,
+      connector: shipment.allocatedReliefConnector ?? null,
+      accountCode: shipment.allocatedReliefAccountCode ?? null,
+      subject: `shipment ${shipment.id}`,
+      recorded,
+    })
+    if (verdict.kind === 'none') continue
+    if (verdict.kind === 'posted') { groupB = groupB.add(toDecimal(recorded)); continue }
+    return { kind: 'unresolved', reason: verdict.reason }
   }
   let priorRefunds = toDecimal(0)
   for (const refund of order.refunds ?? []) {
-    if (refund.allocatedReliefAmount != null) {
-      priorRefunds = priorRefunds.add(toDecimal(refund.allocatedReliefAmount))
+    const claims = (refund.lines ?? []).some((line) => claimsAllocationUnits(line.costLayerSnapshot))
+    if (refund.allocatedReliefAmount == null) {
+      if (claims) {
+        return {
+          kind: 'unresolved',
+          reason: `refund ${refund.id} claimed allocated units but records no Allocated Inventory relief, so how much it already credited cannot be established`,
+        }
+      }
       continue
     }
-    if ((refund.lines ?? []).some((line) => claimsAllocationUnits(line.costLayerSnapshot))) {
+    const recorded = toDecimal(refund.allocatedReliefAmount).toNumber()
+    if (recorded <= 0) continue
+    const rows = await tx.accountingSyncLog.findMany({
+      where: {
+        type: 'UNEARNED_REV_REVERSAL',
+        referenceType: 'SalesOrderRefund',
+        referenceId: refund.id,
+        ...(target.activeConnector ? { connector: target.activeConnector } : {}),
+      },
+      select: { connector: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
+    })
+    const proof = proveJournalPosting(rows as JournalProofRow[], target.allocatedInventoryAccount, 'credit', { excludeProvenNotPosted: true })
+    if (proof.kind !== 'proved') {
       return {
         kind: 'unresolved',
-        reason: `refund ${refund.id} claimed allocated units but records no Allocated Inventory relief, so how much it already credited cannot be established`,
+        reason: `refund ${refund.id} records £${recorded.toFixed(2)} of Allocated Inventory relief but its reversal journal ${proof.kind === 'illegible' ? 'has no readable lines' : `is ${unprovedJournalClause(proof)}`}, so whether that credit reached the ledger is not established`,
       }
     }
+    priorRefunds = priorRefunds.add(toDecimal(proof.amount))
   }
   return { kind: 'resolved', groupB, priorRefunds }
 }

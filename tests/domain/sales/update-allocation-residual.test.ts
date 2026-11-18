@@ -71,7 +71,7 @@ const state = {
     allocationBatchAccountCode: '631' as string | null,
     allocationReversalAmount: null as number | null,
     /** o3d-efyx: the other relief sources the reverser nets: journaled shipments' Group B relief and refunds' relief. */
-    shipments: [] as Array<{ id: string; allocatedReliefAmount: number | null; cogsRelievedFromInventoryAt?: Date | null }>,
+    shipments: [] as Array<{ id: string; allocatedReliefAmount: number | null; allocatedReliefSyncLogId?: string | null; allocatedReliefConnector?: string | null; allocatedReliefAccountCode?: string | null; cogsRelievedFromInventoryAt?: Date | null }>,
     refunds: [] as Array<{ id: string; allocatedReliefAmount: number | null; lines: Array<{ costLayerSnapshot: unknown }> }>,
     /**
      * o3d-i0o6 r3: the PASS HISTORY behind the amount. The three columns above describe the LATEST
@@ -95,6 +95,8 @@ const state = {
     connector: 'xero' as string | null,
     payload: { lines: [{ accountCode: '631', debit: 500 }, { accountCode: '630', credit: 500 }] } as unknown,
   }],
+  /** o3d-efyx: true while an earlier withheld reversal for the order is outstanding in the inbox. */
+  openRefusal: false,
   stockLevels: [] as StockLevelRow[],
   allocations: [] as AllocationRow[],
   shipmentLines: [] as ShipmentLineRow[],
@@ -217,11 +219,25 @@ mock.module('@/lib/accounting', {
       accountingSyncRows.push({ ...params, connector: params.connector ?? 'xero' })
       return true
     },
+    accountingPostingKey: (params: { type: string; referenceType: string; referenceId: string; payload?: Record<string, unknown> }) => ({
+      type: params.type, referenceType: params.referenceType, referenceId: params.referenceId, scope: `reversal:${String(params.payload?._reversalToken ?? '')}`,
+    }),
     isAccountingSyncTypeEnabled: async () => true,
     isDailyBatchPostingEnabled: async () => true,
     // o3d-i0o6: the ledger the reversal would be raised on — the reverser refuses when it cannot be
     // established, because a credit may not land in books A2's debit was never in.
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }),
+  },
+})
+
+/** o3d-efyx: the exception-inbox rows the reverser records for a WITHHELD reversal. */
+const owedRefusals: Array<{ key: { type: string; referenceType: string; referenceId: string }; record: { reason: string; kind: string | null } }> = []
+mock.module('@/lib/domain/accounting/posting-refusal-inbox', {
+  namedExports: {
+    recordAccountingPostingRefusal: async (_client: unknown, key: { type: string; referenceType: string; referenceId: string }, record: { reason: string; kind: string | null }) => {
+      owedRefusals.push({ key, record })
+      return { recorded: true }
+    },
   },
 })
 
@@ -289,6 +305,10 @@ const tx = {
   // wrote and really honours the `_reversalToken` JSON-path filter, so the answer is decided in
   // production rather than hardcoded here.
   accountingSyncLog: {
+    // o3d-efyx: a prior refund's own reversal journal(s), found by (type, reference).
+    findMany: async ({ where }: { where: { type?: string; referenceType?: string; referenceId?: string } }) => state.accountingSyncLogs
+      .filter((row) => (row as { type?: string }).type === where.type && (row as { referenceId?: string }).referenceId === where.referenceId)
+      .map((row) => ({ settlementBasis: null, abandonedBeforeRemoteCall: null, externalTransactionId: null, ...row })),
     findFirst: async ({ where }: {
       where: {
         connector?: string
@@ -327,6 +347,9 @@ const tx = {
       state.txActivity.push(data)
       return data
     },
+  },
+  accountingPostingRefusal: {
+    findFirst: async () => (state.openRefusal ? { id: 'open-1' } : null),
   },
   salesOrder: {
     // o3d-i0o6: served from the fixture. TWO different reads land here — the un-stage's
@@ -698,6 +721,8 @@ function seedLines(qty: number) {
   state.order.allocationReversalAmount = null
   state.order.shipments = []
   state.order.refunds = []
+  state.openRefusal = false
+  owedRefusals.length = 0
   state.accountingSyncLogs.length = 0
   state.accountingSyncLogs.push({
     id: 'a2-log-1',
@@ -1738,11 +1763,26 @@ function seedTenAtFour() {
   state.shipmentLines = []
 }
 
-test('o3d-efyx: the reversal is capped by Group B relief of journaled shipments, not only by prior reversals', async () => {
-  // A2 debited £40. A journaled shipment's Group B already credited £30 of it, so only £10 is open. Shrinking to 6
-  // orphans £16 of record: crediting £16 would take £6 out of an account that no longer holds it.
+/** A Group B journal that really credited `credit` pounds to 631, and the shipment that names it. */
+function seedGroupB(relief: number, journal: { status?: string; credit?: number } | null = {}) {
+  if (journal) {
+    state.accountingSyncLogs.push({
+      id: 'gb-1',
+      status: journal.status ?? 'SYNCED',
+      connector: 'xero',
+      payload: { lines: [{ accountCode: '630', debit: 500 }, { accountCode: '631', credit: journal.credit ?? 500 }] },
+    })
+  }
+  state.order.shipments = [{
+    id: 'ship-1', allocatedReliefAmount: relief,
+    allocatedReliefSyncLogId: 'gb-1', allocatedReliefConnector: 'xero', allocatedReliefAccountCode: '631',
+  }]
+}
+
+test('o3d-efyx: the reversal is capped by PROVED Group B relief of journaled shipments, not only by prior reversals', async () => {
+  // A2 debited £40. A journaled shipment's Group B journal (SYNCED, CR 631) credited £30 of it, so only £10 is open.
   seedTenAtFour()
-  state.order.shipments = [{ id: 'ship-1', allocatedReliefAmount: 30 }]
+  seedGroupB(30)
   const { updateAllocation } = await loadAction()
 
   const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
@@ -1752,8 +1792,43 @@ test('o3d-efyx: the reversal is capped by Group B relief of journaled shipments,
   assert.equal(state.txActivity.some((entry) => entry.action === 'allocation_reversal_capped'), true)
 })
 
-test('o3d-efyx: the reversal is capped by a prior refund\'s relief too', async () => {
+test('o3d-efyx: relief recorded for a CANCELLED Group B journal is unproved, so NOTHING is netted or reversed, and it is owed', async () => {
+  // The review scenario: a recorded £40 whose journal never posted must not shrink the cap (an under-credit that leaves
+  // a permanent debit) nor be ignored (an over-credit). Unknown means withhold, and record it as outstanding.
   seedTenAtFour()
+  seedGroupB(40, { status: 'CANCELLED' })
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(queuedAccountingSyncs.length, 0)
+  assert.equal(state.txActivity.some((entry) => entry.action === 'allocation_reversal_unproved'), true)
+  assert.equal(owedRefusals.length, 1, 'the withheld reversal is recorded in the exception inbox, not only the activity log')
+  assert.equal(owedRefusals[0].key.type, 'ALLOCATION_REVERSAL')
+  assert.equal(owedRefusals[0].key.referenceId, 'order-1')
+  assert.equal(owedRefusals[0].record.kind, 'allocation_reversal')
+})
+
+test('o3d-efyx: Group B relief whose journal was swept by retention is only ASSUMED, so the reversal is withheld', async () => {
+  seedTenAtFour()
+  seedGroupB(10, null)
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(queuedAccountingSyncs.length, 0)
+  assert.equal(owedRefusals.length, 1)
+})
+
+test('o3d-efyx: the reversal is capped by a prior refund\'s PROVED relief too', async () => {
+  seedTenAtFour()
+  state.accountingSyncLogs.push({
+    id: 'rf-1', status: 'SYNCED', connector: 'xero',
+    payload: { lines: [{ accountCode: '631', credit: 35 }, { accountCode: '630', debit: 35 }] },
+    type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: 'refund-1',
+  } as never)
   state.order.refunds = [{ id: 'refund-1', allocatedReliefAmount: 35, lines: [] }]
   const { updateAllocation } = await loadAction()
 
@@ -1763,9 +1838,9 @@ test('o3d-efyx: the reversal is capped by a prior refund\'s relief too', async (
   assert.deepEqual(reversalLines(), [['630', 5, null], ['631', null, 5]], 'capped at the £5 still open')
 })
 
-test('o3d-efyx: Group B relief that leaves nothing open raises no reversal and reports it', async () => {
+test('o3d-efyx: Group B relief that leaves nothing open raises no reversal', async () => {
   seedTenAtFour()
-  state.order.shipments = [{ id: 'ship-1', allocatedReliefAmount: 40 }]
+  seedGroupB(40)
   const { updateAllocation } = await loadAction()
 
   const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
@@ -1775,7 +1850,7 @@ test('o3d-efyx: Group B relief that leaves nothing open raises no reversal and r
   assert.equal(state.txActivity.some((entry) => entry.action === 'allocation_reversal_unproved'), true)
 })
 
-test('o3d-efyx: a journaled shipment that records no relief cannot be netted, so NOTHING is reversed and it is reported', async () => {
+test('o3d-efyx: a journaled shipment that records no relief cannot be netted, so NOTHING is reversed, and it is owed', async () => {
   seedTenAtFour()
   state.order.shipments = [{ id: 'ship-legacy', allocatedReliefAmount: null }]
   const { updateAllocation } = await loadAction()
@@ -1786,9 +1861,23 @@ test('o3d-efyx: a journaled shipment that records no relief cannot be netted, so
   assert.equal(queuedAccountingSyncs.length, 0)
   const entry = state.txActivity.find((row) => row.action === 'allocation_reversal_unproved')
   assert.match(String(entry?.description), /ship-legacy/)
+  assert.equal(owedRefusals.length, 1)
 })
 
-test('o3d-efyx (control): with no Group B or refund relief the full £16 is still reversed', async () => {
+test('o3d-efyx: while an earlier withheld reversal is still outstanding, a later automatic reversal is withheld too (no double credit of a hand post)', async () => {
+  seedTenAtFour()
+  state.openRefusal = true
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(queuedAccountingSyncs.length, 0)
+  assert.equal(owedRefusals.length, 1)
+  assert.equal(owedRefusals[0].record.reason, 'earlier_reversal_outstanding')
+})
+
+test('o3d-efyx (control): with zero Group B relief the full £16 is still reversed and nothing is owed', async () => {
   seedTenAtFour()
   state.order.shipments = [{ id: 'ship-1', allocatedReliefAmount: 0 }]
   const { updateAllocation } = await loadAction()
@@ -1797,6 +1886,7 @@ test('o3d-efyx (control): with no Group B or refund relief the full £16 is stil
 
   assert.equal(result.success, true, result.error)
   assert.deepEqual(reversalLines(), [['630', 16, null], ['631', null, 16]])
+  assert.equal(owedRefusals.length, 0)
 })
 
 test('o3d-0i5y r10: the reversal is valued at what A2 POSTED, never at a pin a revaluation rewrote', async () => {

@@ -43,6 +43,34 @@ test('freight cancellation reads the chart before the transaction opens and hand
   assert.equal(seenOptions!.accountingSettings, chart, 'the recalculation is handed that chart, not left to read its own')
 })
 
+test('an UNREADABLE chart fails closed: the cancellation is refused before any transaction or write, so no delta can post twice', async () => {
+  let txOpened = false
+  let recalculated = false
+  const deps = {
+    findPurchaseOrderFast: async () => ({ status: 'PO_SENT', reference: 'FRT-1' }),
+    transaction: async () => { txOpened = true; return {} },
+    logActivity: async () => undefined,
+    retirePurchaseOrderLocked: async () => { throw new Error('unused') },
+    recalculateLandedCosts: async () => { recalculated = true; return {} },
+    queueLandedCostAdjustmentJournals: async () => ({ owed: 0 }),
+    readAccountingChart: async () => { throw new Error('connection terminated') },
+  } as unknown as CancelPurchaseOrderServiceDeps
+
+  const result = await cancelPurchaseOrderService('frt-1', deps)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /connection terminated|could not be read/)
+  assert.equal(txOpened, false, 'nothing is written')
+  assert.equal(recalculated, false)
+})
+
+test('the pre-transaction chart read throws a named error instead of returning null', () => {
+  const service = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
+  const body = service.slice(service.indexOf('export async function readLandedCostChartBeforeTx'), service.indexOf('export async function readLandedCostChartBeforeTx') + 300)
+  assert.match(body, /throw new LandedCostChartUnreadableError\(error\)/)
+  assert.doesNotMatch(body, /catch\(\(\) => null\)/)
+})
+
 test('census: every in-transaction revaluation caller supplies the chart, and the walk never reads it over the pool when given one', () => {
   const actions = readFileSync('app/actions/purchase-orders.ts', 'utf8')
   assert.equal((actions.match(/readLandedCostChartBeforeTx\(\)/g) ?? []).length, 3, 'createFreightPo, updateFreightPoCosts and the close action')

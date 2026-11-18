@@ -212,14 +212,21 @@ export const FREIGHT_EDIT_STALE_MESSAGE =
  * content-based (id, description, 4dp amount, vatable, method), not a timestamp, so an unrelated change to the
  * order (status, notes) does not make a dialog stale.
  */
-export function freightCostLinesFingerprint(lines: Array<{
-  id: string
-  description: string
-  amountForeign: Prisma.Decimal | number | string
-  vatable: boolean
-  distributionMethod: string
-}>): string {
-  return [...lines]
+export function freightCostLinesFingerprint(
+  lines: Array<{
+    id: string
+    description: string
+    amountForeign: Prisma.Decimal | number | string
+    vatable: boolean
+    distributionMethod: string
+  }>,
+  /**
+   * The order's VAT, which the same dialog edits: a stale dialog sends its loaded rate back explicitly, so without this
+   * it would undo another operator's rate change (and the payable total with it) with the lines unchanged.
+   */
+  header: { taxRatePercent: Prisma.Decimal | number | string | null; taxForeign: Prisma.Decimal | number | string },
+): string {
+  const rows = [...lines]
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
     .map((line) => [
       line.id,
@@ -228,16 +235,21 @@ export function freightCostLinesFingerprint(lines: Array<{
       line.vatable ? '1' : '0',
       line.distributionMethod,
     ].join('\u001f'))
-    .join('\u001e')
+  const rate = header.taxRatePercent == null || new Prisma.Decimal(header.taxRatePercent).lte(0)
+    ? 'none'
+    : new Prisma.Decimal(header.taxRatePercent).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toFixed(6)
+  const tax = new Prisma.Decimal(header.taxForeign).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP).toFixed(4)
+  return [`vat:${rate}:${tax}`, ...rows].join('\u001e')
 }
 
 /** Throws `FreightEditRefusedError` when the dialog's fingerprint no longer matches the stored lines. Undefined = no check (legacy caller). */
 export function assertFreightEditNotStale(
   stored: Parameters<typeof freightCostLinesFingerprint>[0],
+  header: Parameters<typeof freightCostLinesFingerprint>[1],
   expectedFingerprint: string | undefined,
 ): void {
   if (expectedFingerprint === undefined) return
-  if (freightCostLinesFingerprint(stored) !== expectedFingerprint) throw new FreightEditRefusedError(FREIGHT_EDIT_STALE_MESSAGE)
+  if (freightCostLinesFingerprint(stored, header) !== expectedFingerprint) throw new FreightEditRefusedError(FREIGHT_EDIT_STALE_MESSAGE)
 }
 
 export type FreightCostLinePlan =

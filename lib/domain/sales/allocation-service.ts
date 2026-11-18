@@ -46,7 +46,7 @@ import {
   type RetiredPendingShipment,
 } from '@/lib/domain/sales/pending-shipment-reconciliation'
 import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
-import { allocationOpenBalance, proveAllocationDebitPosting, recordedAllocatedRelief } from '@/lib/domain/accounting/allocation-debit-posting-proof'
+import { allocationOpenBalance, proveAllocationDebitPosting, proveRecordedAllocatedRelief } from '@/lib/domain/accounting/allocation-debit-posting-proof'
 import {
   assertNoSalesInvoicePostingInFlight,
   cancelPendingSalesInvoiceSyncForOrder,
@@ -1201,7 +1201,14 @@ export async function reverseOrphanedAllocationPosting(
       // `recordedAllocatedRelief`): every JOURNALED shipment's Group B relief and every refund's.
       shipments: {
         where: { shipmentJournalDate: { not: null } },
-        select: { id: true, allocatedReliefAmount: true, cogsRelievedFromInventoryAt: true },
+        select: {
+          id: true,
+          allocatedReliefAmount: true,
+          allocatedReliefSyncLogId: true,
+          allocatedReliefConnector: true,
+          allocatedReliefAccountCode: true,
+          cogsRelievedFromInventoryAt: true,
+        },
       },
       refunds: {
         select: { id: true, allocatedReliefAmount: true, lines: { select: { costLayerSnapshot: true } } },
@@ -1257,6 +1264,10 @@ export async function reverseOrphanedAllocationPosting(
           + `${snapshotAmount.toFixed(2)} by hand if the debit is real and in these books.`),
       },
     })
+    await recordWithheldAllocationReversal(tx, {
+      orderId, orderRef, activeConnector, amount: snapshotAmount, reason: 'debit_unproved', why: proof.reason,
+      handPost: `Post CR ${settings.allocatedInventoryAccount} / DR ${settings.inventoryAccount} £${snapshotAmount.toFixed(2)} by hand if the debit is real and in these books`,
+    })
     return
   }
 
@@ -1269,11 +1280,14 @@ export async function reverseOrphanedAllocationPosting(
   // o3d-efyx: AND NET OF GROUP B'S AND THE REFUNDS' RELIEF, which the first version of this bound left out. An
   // order with a journaled shipment that is then un-staged can orphan units whose debit Group B already
   // credited; the reversal would credit them again. The figure is the ONE `allocationOpenBalance` the refund uses.
-  const recordedRelief = recordedAllocatedRelief(
+  const recordedRelief = await proveRecordedAllocatedRelief(
+    tx,
     { shipments: order?.shipments, refunds: order?.refunds },
+    { activeConnector, allocatedInventoryAccount: settings.allocatedInventoryAccount },
     (snapshot) => parseCostLayerSnapshot(snapshot).some((entry) => entry.source === 'allocation'),
   )
   if (recordedRelief.kind === 'unresolved') {
+    const handPost = `Post CR ${settings.allocatedInventoryAccount} / DR ${settings.inventoryAccount} £${snapshotAmount.toFixed(2)} by hand if the debit is real and still open`
     await tx.activityLog.create({
       data: {
         entityType: 'SALES_ORDER',
@@ -1285,9 +1299,40 @@ export async function reverseOrphanedAllocationPosting(
           withLedgerCheck(`Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
           + `${orderRef} carrying £${snapshotAmount.toFixed(2)} of recorded Group A2 basis, but NO Allocated `
           + `Inventory reversal was raised: ${recordedRelief.reason}. Crediting without it could credit units whose `
-          + `debit was already relieved. Post CR ${settings.allocatedInventoryAccount} / DR ${settings.inventoryAccount} `
-          + `£${snapshotAmount.toFixed(2)} by hand if the debit is real and still open.`),
+          + `debit was already relieved. ${handPost}.`),
       },
+    })
+    await recordWithheldAllocationReversal(tx, {
+      orderId, orderRef, activeConnector, amount: snapshotAmount, reason: 'relief_unproved', why: recordedRelief.reason, handPost,
+    })
+    return
+  }
+  // o3d-efyx: an earlier withheld reversal on this order is still OUTSTANDING (nobody has marked it handled). If the
+  // operator posted it by hand, `allocationReversalAmount` does not know, so a further automatic credit could be a
+  // second credit of the same pounds. Withhold this one too, and record it, until the open item is closed.
+  const openWithheld = await tx.accountingPostingRefusal?.findFirst({
+    where: { type: 'ALLOCATION_REVERSAL', referenceType: 'SalesOrder', referenceId: orderId, resolvedAt: null },
+    select: { id: true },
+  })
+  if (openWithheld) {
+    const handPost = `Post CR ${settings.allocatedInventoryAccount} / DR ${settings.inventoryAccount} £${snapshotAmount.toFixed(2)} by hand if the debit is real and still open`
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_unproved',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          withLedgerCheck(`Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
+          + `${orderRef} carrying £${snapshotAmount.toFixed(2)} of recorded Group A2 basis, but NO Allocated `
+          + `Inventory reversal was raised: an earlier reversal for this order is still outstanding in the exception `
+          + `inbox, and a hand post of it is not known to IMS, so a further automatic credit could repeat it. ${handPost}.`),
+      },
+    })
+    await recordWithheldAllocationReversal(tx, {
+      orderId, orderRef, activeConnector, amount: snapshotAmount, reason: 'earlier_reversal_outstanding',
+      why: 'an earlier withheld reversal on this order is still outstanding', handPost,
     })
     return
   }
@@ -1423,6 +1468,44 @@ export async function reverseOrphanedAllocationPosting(
       ).toNumber(),
     },
   })
+}
+
+/**
+ * o3d-efyx: A WITHHELD REVERSAL IS OWED, NOT ONLY LOGGED. The trim commits regardless, so the orphaned units' A2 debit
+ * stays in Allocated Inventory; an Activity row alone is not an outstanding record. This writes it to the exception inbox
+ * (ALLOCATION_REVERSAL / SalesOrder, keyed by a fresh `reversal:<token>`) through the caller's transaction, under a savepoint,
+ * so it commits with the trim. It never throws: a failed record must not roll back the allocation edit.
+ */
+async function recordWithheldAllocationReversal(
+  tx: Prisma.TransactionClient,
+  params: { orderId: string; orderRef: string; activeConnector: string; amount: number; reason: string; why: string; handPost: string },
+): Promise<void> {
+  try {
+    const { accountingPostingKey } = await import('@/lib/accounting')
+    const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+    const { withSavepoint } = await import('@/lib/db/savepoint')
+    await recordAccountingPostingRefusal(
+      tx as never,
+      accountingPostingKey({
+        type: 'ALLOCATION_REVERSAL',
+        referenceType: 'SalesOrder',
+        referenceId: params.orderId,
+        payload: { _reversalToken: randomUUID() },
+      }),
+      {
+        kind: 'allocation_reversal',
+        chartConnector: params.activeConnector,
+        activeConnector: params.activeConnector,
+        reason: params.reason,
+        committed: `the re-allocation of order ${params.orderRef} is saved and £${params.amount.toFixed(2)} of Group A2 Allocated Inventory debit for the units that left is still standing`,
+        remedy: `${params.why}. ${params.handPost}, then mark this row handled. Do not also expect IMS to raise it: nothing retries a withheld reversal, and while this row is open IMS withholds further automatic reversals on this order so a hand post is not credited twice.`,
+        detail: { amount: params.amount, why: params.why },
+      } as never,
+      { withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn) },
+    )
+  } catch {
+    /* the Activity row above stands; a failed inbox write must not undo the allocation edit */
+  }
 }
 
 /**

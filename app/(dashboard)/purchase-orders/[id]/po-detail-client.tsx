@@ -1707,6 +1707,10 @@ function EditFreightCostsDialog({
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
+  const [awaitingFingerprint, setAwaitingFingerprint] = useState<string | null>(null)
+  useEffect(() => {
+    if (awaitingFingerprint && po.freightCostLinesFingerprint === awaitingFingerprint) onClose()
+  }, [awaitingFingerprint, po.freightCostLinesFingerprint, onClose])
 
   const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
   const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
@@ -1786,7 +1790,13 @@ function EditFreightCostsDialog({
       )
       if (result.success) {
         router.refresh()
-        onClose()
+        // Do not close (and so allow a reopen) until the refreshed order has landed: a dialog reopened on the OLD prop
+        // would carry the old lines and fingerprint and refuse, or worse resubmit, the operator's own save.
+        if (result.costLinesFingerprint && result.costLinesFingerprint !== po.freightCostLinesFingerprint) {
+          setAwaitingFingerprint(result.costLinesFingerprint)
+        } else {
+          onClose()
+        }
       } else {
         setError(result.error ?? 'Failed to update costs')
       }
@@ -1890,7 +1900,7 @@ function EditFreightCostsDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button onClick={handleSave} disabled={isPending}>
+          <Button onClick={handleSave} disabled={isPending || awaitingFingerprint !== null}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Update &amp; Recalculate
           </Button>
