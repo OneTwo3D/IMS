@@ -210,6 +210,8 @@ export type SoStatus =
 
 export type SoLineRow = {
   id: string
+  /** Per-unit customs value override mirrored from WooCommerce (`_wc_label_customs_unit_value`), order currency, as a decimal string; null when none. Read-only. */
+  wcCustomsUnitValue?: string | null
   productId: string | null
   sku: string
   imageUrl: string | null
@@ -305,7 +307,18 @@ export type SoRow = {
   shipmentOutstandingQty: number | null
 }
 
+/** What WooCommerce reported for duty and tax on this order, mirrored as stored and shown read-only. Decimal amounts are strings in the ORDER currency. */
+export type WooDutyTaxMirror = {
+  iossNumber: string | null
+  deliveryTerm: string | null
+  dutyComponent: string | null
+  taxComponent: string | null
+  handlingComponent: string | null
+}
+
 export type SoDetail = SoRow & {
+  /** The duty/tax results mirrored from WooCommerce; null when the order carries none of them. */
+  wooDutyTax?: WooDutyTaxMirror | null
   /** The linked customer, so the edit form can pre-select it. */
   customerId: string | null
   /** The order's version as loaded: the edit form sends it back and the edit is refused if the order moved since. */
@@ -746,6 +759,7 @@ function mapSoRow(so: {
 
 function mapLine(l: {
   id: string
+  wcCustomsUnitValue?: { toString(): string } | null
   productId: string | null
   sku: string | null
   description: string
@@ -765,6 +779,7 @@ function mapLine(l: {
 }): SoLineRow {
   return {
     id: l.id,
+    wcCustomsUnitValue: l.wcCustomsUnitValue == null ? null : l.wcCustomsUnitValue.toString(),
     productId: l.productId,
     sku: l.sku ?? '',
     imageUrl: l.product?.imageUrl ?? l.product?.parent?.imageUrl ?? null,
@@ -930,8 +945,14 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       updatedAt: true,
       billingAddress: true,
       shippingAddress: true,
+      iossNumber: true,
+      deliveryTerm: true,
+      wclcDutyComponent: true,
+      wclcTaxComponent: true,
+      wclcHandlingComponent: true,
       lines: {
         select: {
+          wcCustomsUnitValue: true,
           id: true, productId: true, sku: true, description: true,
           qty: true, unitPriceForeign: true, unitPriceBase: true, discountStr: true, discountAmount: true,
           taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
@@ -1028,8 +1049,19 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
   const detailRow = mapSoRow(so)
   await attachShipmentOutstanding(detailRow)
 
+  const decimalText = (value: { toString(): string } | null | undefined) => (value == null ? null : value.toString())
+  const wooDutyTax: WooDutyTaxMirror = {
+    iossNumber: so.iossNumber,
+    deliveryTerm: so.deliveryTerm,
+    dutyComponent: decimalText(so.wclcDutyComponent),
+    taxComponent: decimalText(so.wclcTaxComponent),
+    handlingComponent: decimalText(so.wclcHandlingComponent),
+  }
+  const hasWooDutyTax = Object.values(wooDutyTax).some((v) => v !== null) || so.lines.some((l) => l.wcCustomsUnitValue != null)
+
   return {
     ...detailRow,
+    wooDutyTax: hasWooDutyTax ? wooDutyTax : null,
     settlement,
     customerId: so.customerId,
     updatedAt: so.updatedAt.toISOString(),
