@@ -311,16 +311,34 @@ export async function fetchMintsoftReturns(since: Date): Promise<WmsReturnRecord
 }
 
 /**
- * How Mintsoft is told to ERASE a customs field. CONTRACT STATUS: NOT VERIFIED against Mintsoft (it was not called to
- * write this; the repository holds no capture of a cleared product). The values are the most plausible for the field's
- * shape: mirrors the live sync (woocommerce-mintsoft-sync): the string is blanked and an object field is sent as `{ Code: '' }`. Each clear is sent as its own request, so a
- * rejection is contained and reported rather than failing the update. Adjust here once a read-only capture and one
- * granted, controlled update confirm the real behaviour. There is no barcode entry, on purpose.
+ * How Mintsoft is told to ERASE a customs field. CONTRACT STATUS: tested live 2026-11-18 on one product (restored identical
+ * afterwards). `POST /api/Product` blanks CommodityCode with `{ Code: '' }` (verified). CustomsDescription (`''` or null) and every
+ * CountryOfManufacture form tried answer `Success: true, "Product Successfully Updated! Nothing to update/add"` and change
+ * nothing, so those two are `unsupported`: never POSTed, and an operator clears them in Mintsoft by hand. Each supported
+ * clear is sent as its own request, so a rejection is contained and reported rather than failing the update. There is no
+ * barcode entry, on purpose.
  */
-export const MINTSOFT_CLEAR_WIRE: Readonly<Record<WmsClearableProductField, { key: string; value: '' | { Code: '' }; verified: false }>> = {
-  customsDescription: { key: 'CustomsDescription', value: '', verified: false },
-  commodityCode: { key: 'CommodityCode', value: { Code: '' }, verified: false },
-  countryOfManufacture: { key: 'CountryOfManufacture', value: { Code: '' }, verified: false },
+export type MintsoftClearWire =
+  | { key: string; value: '' | { Code: '' }; verified: boolean; unsupported?: undefined }
+  | { key: string; unsupported: true; verified: false; value?: undefined }
+
+export const MINTSOFT_CLEAR_WIRE: Readonly<Record<WmsClearableProductField, MintsoftClearWire>> = {
+  // Live test 2026-11-18: POST /api/Product with { CustomsDescription: '' } or null answers Success=true "Nothing to update/add" and changes nothing.
+  customsDescription: { key: 'CustomsDescription', unsupported: true, verified: false },
+  // Live test 2026-11-18: { CommodityCode: { Code: '' } } blanks the code.
+  commodityCode: { key: 'CommodityCode', value: { Code: '' }, verified: true },
+  // Live test 2026-11-18: every CountryOfManufacture form tried answers "Nothing to update/add" and changes nothing.
+  countryOfManufacture: { key: 'CountryOfManufacture', unsupported: true, verified: false },
+}
+
+/** True when Mintsoft has an API way to clear the field. An unsupported field is never POSTed. */
+export function mintsoftCanClear(field: WmsClearableProductField): boolean {
+  return MINTSOFT_CLEAR_WIRE[field]?.unsupported !== true
+}
+
+/** Mintsoft answers Success=true with this message when a POST changed nothing: for a clear that is "not applied". */
+export function isMintsoftNothingToUpdate(message: unknown): boolean {
+  return typeof message === 'string' && /nothing to update/i.test(message)
 }
 
 /**
@@ -358,6 +376,7 @@ export function buildMintsoftProductClearRequest(
   if (!externalProductId) throw new Error('A Mintsoft clear needs an existing product id')
   const wire = MINTSOFT_CLEAR_WIRE[field]
   if (!wire) throw new Error(`${String(field)} cannot be cleared in Mintsoft`)
+  if (wire.unsupported) throw new Error(`${String(field)} cannot be cleared through the Mintsoft API`)
   const payload = buildMintsoftProductPayload(product, options.omitBarcode ?? false, options.omitMpn ?? false)
   const id = /^\d+$/.test(externalProductId) ? Number.parseInt(externalProductId, 10) : externalProductId
   return { path: '/api/Product', method: 'POST', body: JSON.stringify({ ID: id, ...payload, [wire.key]: wire.value }) }
@@ -669,22 +688,53 @@ export async function upsertMintsoftProduct(
   return clearOutcome ? { ...normalized, clearOutcome } : normalized
 }
 
-/** One request per field, each caught: a refusal of one clear must not fail the update that already succeeded. */
-async function sendMintsoftProductClears(
+/** What the clear sender talks to Mintsoft through; the defaults are the real client, a test passes its own. */
+export type MintsoftClearTransport = {
+  post: (path: string, init: { method: 'POST'; body: string }) => Promise<{ data: unknown; error?: string | null }>
+  readBack: (externalProductId: string) => Promise<Record<string, unknown> | null>
+}
+
+const MINTSOFT_CLEAR_TRANSPORT: MintsoftClearTransport = {
+  post: (path, init) => mintsoftRequest<unknown>(path, init),
+  readBack: async (externalProductId) => (await fetchMintsoftProduct(externalProductId))?.raw ?? null,
+}
+
+/**
+ * One request per field, each caught: a refusal of one clear must not fail the update that already succeeded. A field Mintsoft
+ * cannot clear is reported `unsupported` and never POSTed. Each request runs inside the caller's claim, which re-verifies the
+ * clear is still wanted (a refill between planning and sending skips it).
+ */
+export async function sendMintsoftProductClears(
   product: WmsProductDto,
   fields: WmsClearableProductField[],
   options: WmsUpsertProductOptions,
+  transport: MintsoftClearTransport = MINTSOFT_CLEAR_TRANSPORT,
 ): Promise<WmsProductClearOutcome> {
-  const outcome: WmsProductClearOutcome = { cleared: [], rejected: [] }
+  const outcome: WmsProductClearOutcome = { cleared: [], rejected: [], skipped: [], unsupported: [] }
   const sent: WmsClearableProductField[] = []
   for (const field of new Set(fields)) {
-    try {
+    if (!mintsoftCanClear(field)) {
+      outcome.unsupported.push(field)
+      continue
+    }
+    const post = async (): Promise<void> => {
       const request = buildMintsoftProductClearRequest(product, field, options)
-      const result = await mintsoftRequest<unknown>(request.path, { method: request.method, body: request.body })
+      const result = await transport.post(request.path, { method: request.method, body: request.body })
       if (result.error) throw new Error(result.error)
       const body = result.data as { Success?: unknown; Message?: unknown } | null
-      if (body && typeof body === 'object' && body.Success === false) {
-        throw new Error(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
+      if (body && typeof body === 'object') {
+        if (body.Success === false) {
+          throw new Error(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
+        }
+        // Success with "Nothing to update/add" is Mintsoft saying it changed nothing: the clear was not applied.
+        if (isMintsoftNothingToUpdate(body.Message)) throw new Error('clear not applied (Mintsoft reported nothing to update)')
+      }
+    }
+    try {
+      const claimed = options.clearClaim ? await options.clearClaim(field, post) : (await post(), { claimed: true as const })
+      if (!claimed.claimed) {
+        outcome.skipped.push({ field, reason: claimed.reason })
+        continue
       }
       sent.push(field)
     } catch (error) {
@@ -692,12 +742,12 @@ async function sendMintsoftProductClears(
     }
   }
   if (sent.length === 0) return outcome
-  // A POST without an error does not prove the clear worked (the wire format is unverified): read the product back and
-  // count a field cleared only when Mintsoft shows it empty.
+  // A POST without an error does not prove the clear worked: read the product back and count a field cleared only when
+  // Mintsoft shows it empty.
   let raw: Record<string, unknown> | null = null
   let readBackError: string | null = null
   try {
-    raw = (await fetchMintsoftProduct(options.externalProductId as string))?.raw ?? null
+    raw = await transport.readBack(options.externalProductId as string)
   } catch (error) {
     // Carried into every sent field's rejection below: an unverifiable clear is a retryable failure, never a silent success.
     readBackError = error instanceof Error ? error.message : 'Mintsoft read-back failed'

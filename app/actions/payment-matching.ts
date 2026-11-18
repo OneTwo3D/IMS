@@ -13,6 +13,7 @@ import {
   type PaymentMatchingMode,
 } from '@/lib/domain/accounting/payment-matching'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { businessDateYmd } from '@/lib/business-date'
 
 /**
  * SYNC > PAYMENT MATCHING: what the customer-payment matching pass (lib/domain/accounting/payment-matching.ts) decided for each receipt that was never registered in Xero.
@@ -79,7 +80,7 @@ export async function getPaymentMatchingOverview(): Promise<PaymentMatchingOverv
     currency: r.currency,
     amountDue: r.amountDue === null ? null : r.amountDue.toFixed(2),
     accountingInvoiceId: r.accountingInvoiceId,
-    paymentDate: r.paymentDate ? r.paymentDate.toISOString().slice(0, 10) : null,
+    paymentDate: r.paymentDate ? businessDateYmd(r.paymentDate) : null,
     lastEvaluatedAt: r.lastEvaluatedAt.toISOString(),
     attempts: r.attempts,
   }))

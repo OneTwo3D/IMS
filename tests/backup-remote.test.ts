@@ -17,6 +17,7 @@ test('uploadBackupArtifactsToTarget cleans up uploaded SQL when manifest upload 
       }
       return { destination: `s3://bucket/${filename}` }
     },
+    encryptionEnabled: async () => false,
     async remove(filename, target) {
       calls.push(`remove:${target}:${filename}`)
     },

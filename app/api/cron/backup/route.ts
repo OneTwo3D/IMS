@@ -154,32 +154,45 @@ export async function GET(request: Request) {
         }
       }
 
-      // Cleanup: remove old backups beyond retention
+      // Cleanup: remove old backups beyond retention, BUT only when no remote upload failed. If a
+      // target is configured and the upload failed, the local copies may be the only ones: keep them
+      // until an off-site copy succeeds.
       let deleted = 0
       let cleanupError: string | null = null
-      try {
-        const files = await readdir(BACKUP_DIR)
-        const backups: { name: string; mtime: Date }[] = []
-        for (const f of files) {
-          if (!f.endsWith('.sql') && !f.endsWith('.dump')) continue
-          const s = await stat(path.join(BACKUP_DIR, f))
-          backups.push({ name: f, mtime: s.mtime })
-        }
-        backups.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
-
-        const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
-
-        for (let i = 0; i < backups.length; i++) {
-          const shouldDelete = i >= maxBackups || backups[i].mtime.getTime() < cutoff
-          if (shouldDelete) {
-            await unlink(path.join(BACKUP_DIR, backups[i].name))
-            deleted++
+      if (uploadError) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          tag: 'system',
+          action: 'scheduled_backup',
+          level: 'WARNING',
+          description: `Local backup retention skipped: the remote upload to ${autoUploadTarget} failed, so existing local copies are kept until an off-site copy succeeds`,
+        })
+      } else {
+        try {
+          const files = await readdir(BACKUP_DIR)
+          const backups: { name: string; mtime: Date }[] = []
+          for (const f of files) {
+            if (!f.endsWith('.sql') && !f.endsWith('.dump')) continue
+            const s = await stat(path.join(BACKUP_DIR, f))
+            backups.push({ name: f, mtime: s.mtime })
           }
+          backups.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+
+          const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+
+          for (let i = 0; i < backups.length; i++) {
+            const shouldDelete = i >= maxBackups || backups[i].mtime.getTime() < cutoff
+            if (shouldDelete) {
+              await unlink(path.join(BACKUP_DIR, backups[i].name))
+              deleted++
+            }
+          }
+        } catch (error) {
+          // The backup itself is fine, but old copies were not purged, so the folder keeps growing: reported, not dropped.
+          cleanupError = 'Old backups could not be purged'
+          console.error('[backup] retention cleanup failed', error)
         }
-      } catch (error) {
-        // The backup itself is fine, but old copies were not purged, so the folder keeps growing: reported, not dropped.
-        cleanupError = 'Old backups could not be purged'
-        console.error('[backup] retention cleanup failed', error)
+
       }
 
       await logActivity({

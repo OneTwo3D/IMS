@@ -32,6 +32,7 @@ import {
   type Decimal,
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
+import { businessDateYmd } from '@/lib/business-date'
 
 /**
  * Preview & history for the Xero daily batch sub-ledger.
@@ -670,7 +671,7 @@ export async function getXeroDailyBatchHistory(
     }
     const date = typeof payload.date === 'string' && payload.date
       ? payload.date.slice(0, 10)
-      : row.createdAt.toISOString().slice(0, 10)
+      : businessDateYmd(row.createdAt)
     let day = byDate.get(date)
     if (!day) {
       day = { date, a1: null, a2: null, b: null }

@@ -27,8 +27,12 @@ export default async function ReturnsAnalyticsPage({ searchParams }: { searchPar
     { key: 'valueNet', label: 'Net-basis credit', align: 'right', render: (row) => row.refundValueNetBasis, footer: report.totals.refundValueNetBasis },
     { key: 'valueGross', label: 'Gross-basis credit', align: 'right', render: (row) => row.refundValueGrossBasis, footer: report.totals.refundValueGrossBasis },
     { key: 'valueUnknown', label: 'Unproven-basis credit', align: 'right', render: (row) => row.refundValueUnknownBasis, footer: report.totals.refundValueUnknownBasis },
+    { key: 'exchanged', label: 'Exchanged', align: 'right', render: (row) => row.exchangedQty, footer: report.totals.exchangedQty },
+    { key: 'exchangedValue', label: 'Exchanged refund value', align: 'right', render: (row) => row.exchangedRefundValueBase ?? RETURNS_MIXED_BASIS_MARKER, footer: report.totals.exchangedRefundValueBase },
+    { key: 'lostValue', label: 'Lost refund value', align: 'right', render: (row) => row.lostRefundValueBase ?? RETURNS_MIXED_BASIS_MARKER, footer: report.totals.lostRefundValueBase },
     { key: 'shipped', label: 'Shipped', align: 'right', render: (row) => row.shippedQty },
     { key: 'rate', label: 'Return rate', align: 'right', render: (row) => `${row.returnRatePct}%` },
+    { key: 'rateExcl', label: 'Return rate excl. exchanges', align: 'right', render: (row) => `${row.returnRateExcludingExchangesPct}%` },
   ]
 
   const reasonColumns: Array<SalesAnalyticsColumn<ReturnsByReasonRow>> = [
@@ -53,11 +57,15 @@ export default async function ReturnsAnalyticsPage({ searchParams }: { searchPar
       rowKey={(row, index) => `${row.productId ?? row.sku}:${row.customerName}:${row.reason}:${index}`}
       columns={columns}
       summary={[
-        { label: 'Refund value', value: report.totals.refundValueBase, tone: 'warning' },
+        { label: 'Lost refund value (not exchanged)', value: report.totals.lostRefundValueBase, tone: 'warning' },
+        { label: 'Exchanged refund value', value: report.totals.exchangedRefundValueBase },
+        { label: 'Refund value (all credit)', value: report.totals.refundValueBase },
         { label: 'Net-basis credit', value: report.totals.refundValueNetBasis },
         { label: 'Gross-basis credit', value: report.totals.refundValueGrossBasis },
         { label: 'Unproven-basis credit', value: report.totals.refundValueUnknownBasis },
         { label: 'Returned qty', value: report.totals.returnedQty },
+        { label: 'Exchanged qty', value: report.totals.exchangedQty },
+        { label: 'Replacement qty', value: report.totals.replacementQty },
         { label: 'Rows', value: report.pageInfo.totalRows.toLocaleString() },
       ]}
       notices={report.notices}

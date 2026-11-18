@@ -37,6 +37,16 @@ class Harness {
   warnings: Array<{ stream: ReadSyncStreamId | 'scheduler' | 'liveness-anchor'; description: string }> = []
   failDelivery = false
   failActivityWrite = false
+  /** Reads that went straight to the unbounded client instead of a bounded transaction. */
+  unboundedReads = 0
+  /** Statements run on a transaction client, in order (the server-side timeout is SET LOCAL). */
+  executed: string[] = []
+  /** The client the alarm handed to readInputs. */
+  inputsClient: unknown = null
+  /** Runs after every settings read, bounded or not: lets a test have a rival commit between this run's read and its write. */
+  afterRead: (() => void) | null = null
+  /** The transaction clients this harness has opened. */
+  openedTx: unknown[] = []
   /** Called inside the claim transaction after the claim won and before delivery: lets a test interleave a rival run. */
   afterClaim: (() => Promise<void>) | null = null
   private pendingDelivered: Harness['delivered'] = []
@@ -50,11 +60,17 @@ class Harness {
 
   db: ReadSyncAlarmDb = {
     setting: {
-      findMany: async ({ where }) => where.key.in.filter((key) => this.settings.has(key)).map((key) => ({ key, value: this.settings.get(key)! })),
+      findMany: async ({ where }) => {
+        this.unboundedReads += 1
+        const rows = where.key.in.filter((key) => this.settings.has(key)).map((key) => ({ key, value: this.settings.get(key)! }))
+        this.afterRead?.()
+        return rows
+      },
       upsert: async ({ where, create, update }) => {
         this.settings.set(where.key, this.settings.has(where.key) ? update.value : create.value)
       },
       deleteMany: async ({ where }) => {
+        this.unboundedReads += 1
         this.settings.delete(where.key)
       },
       updateMany: async ({ where, data }) => {
@@ -68,8 +84,13 @@ class Harness {
       this.pendingDelivered = []
       this.pendingWarnings = []
       const tx: ReadSyncAlarmTx = {
+        $executeRawUnsafe: async (sql: string) => { this.executed.push(sql) },
         setting: {
-          findMany: async ({ where }) => where.key.in.filter((key) => this.settings.has(key)).map((key) => ({ key, value: this.settings.get(key)! })),
+          findMany: async ({ where }) => {
+            const rows = where.key.in.filter((key) => this.settings.has(key)).map((key) => ({ key, value: this.settings.get(key)! }))
+            this.afterRead?.()
+            return rows
+          },
           deleteMany: async ({ where }) => { this.settings.delete(where.key) },
           createMany: async ({ data }) => {
             let count = 0
@@ -83,6 +104,7 @@ class Harness {
           },
         },
       }
+      this.openedTx.push(tx)
       try {
         const value = await fn(tx)
         this.delivered.push(...this.pendingDelivered)
@@ -102,7 +124,8 @@ class Harness {
     return runReadSyncLivenessAlarm({
       db: this.db,
       now,
-      readInputs: async () => this.build(now),
+      readCrontab: async () => ({ resolved: true as const, text: '' }),
+      readInputs: async (client) => { this.inputsClient = client; return this.build(now) },
       notifyAdmins: async (_tx, title, message, actionUrl) => {
         if (this.failDelivery) throw new Error('no active ADMIN users to notify')
         this.pendingDelivered.push({ title, message, actionUrl })
@@ -247,13 +270,8 @@ test('[claim] a run that lost the claim to a rival delivers nothing (conditional
   const harness = new Harness((at) => inputs({}, { 'xero-tax-rates': ago(100 * HOUR) }, at))
   const key = readSyncAlertedSettingKey('xero-tax-rates')
   const stale = `stale:${ago(100 * HOUR).toISOString()}`
-  const realFindMany = harness.db.setting.findMany
-  harness.db.setting.findMany = async (args) => {
-    const rows = await realFindMany(args)
-    // The rival commits its claim AFTER this run has read the (empty) state.
-    harness.settings.set(key, stale)
-    return rows
-  }
+  // The rival commits its claim AFTER this run has read the (empty) state.
+  harness.afterRead = () => { harness.settings.set(key, stale) }
   const result = await harness.run()
   console.log(`precondition: rival row=${harness.settings.get(key)} delivered=${harness.delivered.length} alerted=${JSON.stringify(result.alerted)}`)
   assert.deepEqual(result.alerted, [])
@@ -264,12 +282,7 @@ test('[claim] a run that lost the claim to a rival delivers nothing (conditional
   // The same race over an UPDATE (a renewed breach): the rival moved the row between read and claim.
   const h2 = new Harness((at) => inputs({}, { 'xero-tax-rates': ago(100 * HOUR) }, at))
   h2.settings.set(key, 'stale:2026-01-01T00:00:00.000Z')
-  const read2 = h2.db.setting.findMany
-  h2.db.setting.findMany = async (args) => {
-    const rows = await read2(args)
-    h2.settings.set(key, stale)
-    return rows
-  }
+  h2.afterRead = () => { h2.settings.set(key, stale) }
   const r2 = await h2.run()
   assert.deepEqual(r2.alerted, [])
   assert.equal(h2.delivered.length, 0)
@@ -315,13 +328,10 @@ test('[anchor] an unparsable first-evaluation anchor is replaced ONCE, reported 
 test('[anchor] a rival that replaced the bad anchor first wins: this run writes nothing and uses the rival\'s value', async () => {
   const harness = new Harness((at) => inputs({}, { 'xero-tax-rates': null }, at))
   harness.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, 'not a time')
-  const real = harness.db.setting.findMany
   let reads = 0
-  harness.db.setting.findMany = async (args) => {
-    const rows = await real(args)
+  harness.afterRead = () => {
     reads += 1
     if (reads === 1) harness.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, new Date(NOW.getTime() - 2 * HOUR).toISOString())
-    return rows
   }
   await harness.run()
   assert.equal(harness.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING), new Date(NOW.getTime() - 2 * HOUR).toISOString())
@@ -349,4 +359,20 @@ test('[anchor] a FUTURE first-evaluation anchor (even year 275760) is invalid: r
   await kept.run()
   assert.equal(kept.settings.get(READ_SYNC_FIRST_EVALUATED_SETTING), skewed)
   assert.equal(kept.warnings.filter((w) => w.stream === 'liveness-anchor').length, 0)
+})
+
+test('[bounded reads] the alarm reads its inputs and breach stamps inside a bounded transaction, never on the bare client', async () => {
+  const harness = new Harness((at) => inputs({}, { 'xero-tax-rates': null }, at))
+  harness.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, new Date(NOW.getTime() - 1000 * HOUR).toISOString())
+  const result = await harness.run()
+  assert.deepEqual(result.alerted, ['xero-tax-rates'])
+  assert.equal(harness.unboundedReads, 0, 'no settings read bypasses the bounded transaction')
+  assert.ok(harness.openedTx.includes(harness.inputsClient), 'readInputs is handed the transaction client')
+  assert.ok(harness.executed.length > 0 && harness.executed.every((sql) => /^SET LOCAL statement_timeout = \d+$/.test(sql)), 'each transaction sets a server-side statement timeout')
+  // Healing deletes the stamp: also bounded.
+  const healed = new Harness((at) => inputs({}, {}, at))
+  healed.settings.set(READ_SYNC_FIRST_EVALUATED_SETTING, new Date(NOW.getTime() - 1000 * HOUR).toISOString())
+  healed.settings.set(readSyncAlertedSettingKey('xero-tax-rates'), 'never')
+  await healed.run()
+  assert.equal(healed.unboundedReads, 0)
 })

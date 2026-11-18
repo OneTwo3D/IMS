@@ -7,7 +7,7 @@ import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 import { currentInvoiceIsWithdrawn, loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
-import { orderDocumentMoney, drawTotalsRows } from '@/lib/pdf-order-money'
+import { orderDocumentMoney, drawTotalsRows, invoiceLineVatDetail } from '@/lib/pdf-order-money'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { invoiceDocumentIdentity } from '@/lib/pdf-order-money'
 import { formatMoney } from '@/lib/utils'
@@ -33,7 +33,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       lines: {
         select: {
           description: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true, taxForeign: true,
-          taxRate: { select: { rate: true } },
+          taxRate: { select: { rate: true, reverseCharge: true } },
         },
       },
     },
@@ -111,16 +111,18 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const { view, totalsRows } = orderDocumentMoney(so)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230, wrap: true },
+    { label: 'Description', width: 190, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
+    { label: 'VAT rate', width: 40, align: 'right' },
     { label: `${view.vatIsAdditional ? 'VAT' : 'incl. VAT'} (${sym})`, width: 55, align: 'right' },
     { label: `Total ${view.basisLabel} (${sym})`, width: 75, align: 'right' },
   ]
 
+  const vatDetail = invoiceLineVatDetail(so.lines)
   const rows = so.lines.map((l, i) => [
     String(i + 1), l.description + (l.sku ? ` (${l.sku})` : ''), String(Number(l.qty)),
-    Number(l.unitPriceForeign).toFixed(2), Number(l.taxForeign).toFixed(2), view.lines[i].total.toFixed(2),
+    Number(l.unitPriceForeign).toFixed(2), vatDetail.rateCells[i], Number(l.taxForeign).toFixed(2), view.lines[i].total.toFixed(2),
   ])
 
   drawTable(doc, columns, rows, branding)
@@ -130,6 +132,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   if (doc.y + 90 > 780) doc.addPage()
   // Totals
   drawTotalsRows(doc, totalsRows, money, columns)
+  if (vatDetail.reverseChargeNote) doc.font('Helvetica-Bold').fontSize(8).fillColor('#444').text(vatDetail.reverseChargeNote, 50, doc.y + 6, { width: 495 })
   const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
   const vW = columns[columns.length - 1].width
   const lW = 80

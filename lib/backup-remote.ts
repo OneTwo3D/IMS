@@ -1,6 +1,13 @@
 import { createHash } from 'crypto'
-import { readFile } from 'fs/promises'
+import { mkdtemp, readFile, rm } from 'fs/promises'
+import os from 'os'
 import path from 'path'
+import {
+  BACKUP_ENCRYPTED_SUFFIX,
+  BACKUP_ENCRYPTION_SETTING,
+  encryptBackupFile,
+  isBackupEncryptionEnabledValue,
+} from '@/lib/backup-encryption'
 import { getSettingValues } from '@/lib/settings-store'
 
 export type BackupUploadTarget = 's3' | 'sftp'
@@ -33,6 +40,15 @@ export type BackupArtifactUploadResult = {
 export type BackupArtifactTransferOps = {
   upload: typeof uploadBackupToTarget
   remove: typeof deleteBackupFromTarget
+  /** Whether the SQL file is encrypted before upload. Defaults to the stored setting (off unless 'true'). */
+  encryptionEnabled?: () => Promise<boolean>
+  /** Encrypts srcPath into destPath. Defaults to AES-256-GCM with the environment key. */
+  encryptFile?: (srcPath: string, destPath: string) => Promise<void>
+}
+
+async function isEncryptionEnabled(): Promise<boolean> {
+  const settings = await getSettingValues([BACKUP_ENCRYPTION_SETTING])
+  return isBackupEncryptionEnabledValue(settings.get(BACKUP_ENCRYPTION_SETTING))
 }
 
 export async function uploadBackupArtifactsToTarget(
@@ -46,7 +62,40 @@ export async function uploadBackupArtifactsToTarget(
     remove: deleteBackupFromTarget,
   },
 ): Promise<BackupArtifactUploadResult> {
-  const backupResult = await ops.upload(backupFilePath, backupFilename, target)
+  const encrypt = await (ops.encryptionEnabled ?? isEncryptionEnabled)()
+  let uploadPath = backupFilePath
+  let remoteBackupFilename = backupFilename
+  let tmpDir: string | null = null
+  try {
+    if (encrypt) {
+      // Encrypt BEFORE anything is sent, so a missing key fails the upload without a plaintext copy
+      // having left the machine. The temporary ciphertext is removed in the finally below.
+      tmpDir = await mkdtemp(path.join(os.tmpdir(), 'ims-backup-enc-'))
+      remoteBackupFilename = `${backupFilename}${BACKUP_ENCRYPTED_SUFFIX}`
+      uploadPath = path.join(tmpDir, remoteBackupFilename)
+      await (ops.encryptFile ?? encryptBackupFile)(backupFilePath, uploadPath)
+    }
+    return await uploadArtifacts(uploadPath, remoteBackupFilename, manifestFilePath, manifestFilename, target, ops, encrypt)
+  } finally {
+    if (tmpDir) await rm(tmpDir, { recursive: true, force: true })
+  }
+}
+
+async function uploadArtifacts(
+  backupFilePath: string,
+  backupFilename: string,
+  manifestFilePath: string,
+  manifestFilename: string,
+  target: BackupUploadTarget,
+  ops: BackupArtifactTransferOps,
+  encrypted: boolean,
+): Promise<BackupArtifactUploadResult> {
+  const backupResult = await ops.upload(
+    backupFilePath,
+    backupFilename,
+    target,
+    encrypted ? 'application/octet-stream' : undefined,
+  )
   try {
     const manifestResult = await ops.upload(manifestFilePath, manifestFilename, target, 'application/json')
     return {

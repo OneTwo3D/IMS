@@ -148,6 +148,7 @@ Found at **Settings > Custom fields** (needs the company settings permission). A
 
 - **Purchase units** — define units of measure with conversion factors (e.g. 1 case = 12 units)
 - **Landed cost distribution method** — choose how landed costs are allocated across purchase order lines
+- **Minimum margin** — the lowest gross margin a purchase order line may have, against the product's list price ex-VAT (Admin only). Set a **global minimum %** (0 to 99.99), and optionally a different minimum for individual **categories** and **products**; the most specific one wins (product, then its parent product, then category, then global). Choose **Warn** (the line is marked on the PO form) or **Block** (the server refuses to save or send the order until an override note is entered; the note is recorded on the order with who and when). Leave everything empty for no minimum, which is the default and changes nothing. A line whose margin cannot be worked out is never blocked. Internal only: see Purchasing, "Minimum margin (warn or block)".
 - **Purchase order approval threshold** — **Settings > Company > Documents**. An amount in base currency (ex VAT). A goods purchase order at or above it must be approved by a user holding the `purchasing.approve` permission (Administrators and Managers; never the order's creator) before it can be sent or emailed to the supplier. Blank or 0 (the default) means no approval is needed. See [Purchasing](purchasing.md#purchase-order-approval).
 
 ## Accounting Settings
@@ -297,7 +298,8 @@ Full system backup and restore functionality is available for administrator-led 
 
 Backups can be uploaded to remote storage to keep them off the application server:
 
-1. On the **Storage** tab, fill in the **S3 Compatible Storage** card (endpoint (blank for AWS S3), region, bucket, access key, secret key, optional path prefix) or the **SFTP Server** card (host, port, username, password or private key, **Host Fingerprint** (required, it pins the server's identity so a wrong host is refused) and remote path) and save it. Changing an S3 endpoint or the SFTP host or fingerprint changes where backups are sent, so check the values first.
+1. On the **Storage** tab, fill in the **S3 Compatible Storage** card (endpoint (blank for AWS S3), region, bucket, access key, secret key, optional path prefix) or the **SFTP Server** card (host, port, username, password or private key, **Host Fingerprint** (required, it pins the server's identity so a wrong host is refused) and remote path) and save it. Changing an S3 endpoint or the SFTP host or fingerprint changes where backups are sent, so check the values first. Saving the Storage settings, creating a backup and uploading one all ask you to **Confirm it's you**; when you change the S3 endpoint/bucket or the SFTP host, port or user you must also re-enter the secret key, password or private key.
+   - **Encrypt backups before upload** (Storage tab, off by default): uploads the SQL backup as an encrypted `.sql.enc`. The key lives in the server environment (`BACKUP_ENCRYPTION_KEY`, else `SETTINGS_ENCRYPTION_KEY`), not in the backup; keep a copy in your secret store, because an encrypted backup cannot be restored without it. To restore, decrypt it first with `scripts/decrypt-backup.ts` (see `docs/backup-restore.md`), then use **Restore from File**.
 2. On the **Scheduler** tab, set **Auto-upload** to **S3** or **SFTP**. Every scheduled backup then uploads both the `.sql` and `.manifest.json` files.
 
 For a backup you made by hand, use the cloud icon (**Upload to S3**) or the server icon (**Upload via SFTP**) on its row.
@@ -354,7 +356,7 @@ This means an admin viewing the activity log can see who did what but not see se
 
 ## System Settings
 
-**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
+**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history; the same read-only notes are open to every internal role (not supplier-portal users) at **Help > What's New** (`/help/releases`), which is where the What's New notification links), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
 
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
   - Each plugin has a switch, and **Save & Apply** at the bottom saves the selection and updates the scheduler's crontab to match. If the selection saves but the crontab could not be updated, an amber message says so and tells you what to do; the selection itself is kept.

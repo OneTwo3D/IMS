@@ -5,7 +5,7 @@ import { mkdir } from 'fs/promises'
 import path from 'path'
 import { Readable } from 'stream'
 import { logActivity } from '@/lib/activity-log'
-import { requireApiAdmin } from '@/lib/auth/server'
+import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { db as prisma } from '@/lib/db'
 import { writeBackupManifestForFile } from '@/lib/backup-manifest'
@@ -24,7 +24,7 @@ function getDbConfig() {
 }
 
 export async function POST() {
-  const session = await requireApiAdmin()
+  const session = await requireApiFreshAdmin()
   if (session instanceof NextResponse) return session
 
   const dbConfig = getDbConfig()

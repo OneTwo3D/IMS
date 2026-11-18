@@ -6,7 +6,7 @@
  * overstates March margin and leaves the inventory/COGS reconciliations comparing a subledger dated by
  * event with a ledger dated by batch run.
  *
- * THE RULE. A journal is dated the day of the EVENT it records, in UTC like every other batch date:
+ * THE RULE. A journal is dated the day of the EVENT it records, on the BUSINESS (London) day (see `businessDay`):
  *
  *   Group A1 (revenue deferral)          the day the order was PAID
  *   Group A2 (inventory reclassification) the later of the day it was paid and the day its stock was allocated
@@ -28,6 +28,8 @@
  * a later run. With no lock date known the event date is used as is.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
+
 const DAY = /^(\d{4})-(\d{2})-(\d{2})$/
 
 /** The UTC calendar day (`YYYY-MM-DD`) of an instant, or null when absent or invalid. */
@@ -36,6 +38,18 @@ export function utcDay(value: Date | string | null | undefined): string | null {
   const date = value instanceof Date ? value : new Date(value)
   if (Number.isNaN(date.getTime())) return null
   return date.toISOString().slice(0, 10)
+}
+
+/**
+ * The BUSINESS (Europe/London) calendar day of an instant, or null when absent or invalid. EVERY event day of the batch (paid, shipped, allocated, refunded) is read
+ * on this day, so the deferral, the reclassification, the recognition and the COGS agree with the invoice, the receipt and the refund's own legs, which are dated on it
+ * too (a payment at 23:30 UTC in BST is the next London day). The run's own day is the London day as well, so no event day is ever after it.
+ */
+export function businessDay(value: Date | string | null | undefined): string | null {
+  if (value == null) return null
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return businessDateYmd(date)
 }
 
 /** `YYYY-MM-DD` that is a real calendar date, or null. Anything else is refused rather than guessed at. */

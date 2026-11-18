@@ -5,6 +5,7 @@ import {
   getArAgingReport,
   getCurrencySummaryReport,
   getFxGainLossReport,
+  getGrirReport,
   getVatReport,
   type FinanceAnalyticsFilters,
   type FinanceAnalyticsReport,
@@ -81,4 +82,8 @@ export function loadCurrencySummaryReportForPage(filters: FinanceAnalyticsFilter
 
 export function loadFxGainLossReportForPage(filters: FinanceAnalyticsFilters, load = getFxGainLossReport) {
   return loadFinanceAnalyticsReportForPage(filters, load, financeAnalyticsEmptyTotals.fxGainLoss)
+}
+
+export function loadGrirReportForPage(filters: FinanceAnalyticsFilters, load = getGrirReport) {
+  return loadFinanceAnalyticsReportForPage(filters, load, financeAnalyticsEmptyTotals.grir)
 }

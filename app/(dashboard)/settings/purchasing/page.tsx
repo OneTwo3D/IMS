@@ -1,11 +1,13 @@
 import { AccessDenied } from '@/components/auth/access-denied'
 import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
-import { PackageOpen, Ship } from 'lucide-react'
+import { PackageOpen, Percent, Ship } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { getSetting, getPurchaseUnits } from '@/app/actions/settings'
 import { PurchaseUnitsTable } from '@/components/settings/purchase-units-table'
 import { LandedCostMethodSetting } from '@/components/settings/landed-cost-method'
+import { PoMarginThresholdSetting } from '@/components/settings/po-margin-threshold'
+import { getPoMarginThresholdSettings, listCategoriesForMarginOverride } from '@/app/actions/po-margin-threshold'
 
 export const metadata: Metadata = { title: 'Purchasing Settings' }
 
@@ -17,9 +19,11 @@ export default async function PurchasingSettingsPage() {
   const gate = await authorizePage('settings.company')
   if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
-  const [purchaseUnits, landedCostMethod] = await Promise.all([
+  const [purchaseUnits, landedCostMethod, marginThreshold, marginCategories] = await Promise.all([
     getPurchaseUnits(false),
     getSetting('default_landed_cost_method'),
+    getPoMarginThresholdSettings(),
+    listCategoriesForMarginOverride(),
   ])
 
   return (
@@ -52,6 +56,19 @@ export default async function PurchasingSettingsPage() {
           purchase order line items. This can be overridden per PO.
         </p>
         <LandedCostMethodSetting currentMethod={landedCostMethod ?? 'BY_VALUE'} />
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Percent className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-base font-semibold">Minimum Margin</h2>
+        </div>
+        <p className="text-sm text-muted-foreground mb-4">
+          Set the lowest gross margin a purchase order line may have, against the product&apos;s list price ex-VAT.
+          Lines below it are flagged on the order form, and in block mode the order cannot be saved or sent without an
+          override note. Internal only: margins are never shown to suppliers.
+        </p>
+        <PoMarginThresholdSetting initial={marginThreshold} categories={marginCategories} />
       </Card>
     </div>
   )

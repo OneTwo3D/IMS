@@ -40,9 +40,10 @@ export function readWcDeliveryOrigin(
    * Orders and refunds pass `'header-unsigned'`, which also lets a plain-permalink `?rest_route=` self-link
    * yield the exact site root (products keep recording it as containment): they move money, and a header outside the HMAC is
    * not proof of the sender, so header-only evidence is recorded as such (`store-header:`) and the
-   * handler holds it. Products keep the plain `store:` encoding they always had.
+   * handler holds it. Products pass `'header-unsigned-containment'` (o3d-h5b79): the same header-only
+   * encoding and hold, but a plain-permalink self-link keeps being recorded as containment, as before.
    */
-  headerEvidence: 'trusted' | 'header-unsigned' = 'trusted',
+  headerEvidence: 'trusted' | 'header-unsigned' | 'header-unsigned-containment' = 'trusted',
 ): string {
   const restRoot = readPayloadRestRoot(payload, headerEvidence === 'header-unsigned')
   if (restRoot) {
@@ -57,7 +58,7 @@ export function readWcDeliveryOrigin(
   }
 
   const header = request.headers.get('x-wc-webhook-source')
-  return headerEvidence === 'header-unsigned' ? attestWebhookOriginFromUnsignedHeader(header) : attestWebhookOrigin(header)
+  return headerEvidence !== 'trusted' ? attestWebhookOriginFromUnsignedHeader(header) : attestWebhookOrigin(header)
 }
 
 /**

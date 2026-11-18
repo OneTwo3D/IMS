@@ -12,7 +12,7 @@ import { ReportRowLimitAlert, REPORT_NOT_COMPUTED_TEXT } from './report-row-limi
 import { hasSourceLimitNotice, withoutSourceLimitNotices } from '@/lib/security/source-scan-error'
 import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
 
-export type FinanceAnalyticsReportKey = 'vat' | 'ar-aging' | 'ap-aging' | 'fx-gain-loss' | 'currency-summary'
+export type FinanceAnalyticsReportKey = 'vat' | 'ar-aging' | 'ap-aging' | 'fx-gain-loss' | 'currency-summary' | 'grir'
 
 export type FinanceAnalyticsFilterValues = {
   dateFrom?: string

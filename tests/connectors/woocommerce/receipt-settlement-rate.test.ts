@@ -66,14 +66,17 @@ test('a base-currency receipt stores no settlement rate, whatever the dates', as
   assert.equal(await resolve({ paid: '2026-10-25T10:00:00', currency: 'gbp', rows: [] }), null)
 })
 
-test('the day rule is the UTC calendar date of date_paid_gmt (no zone suffix is read as UTC, not the server zone)', async () => {
+test('the day rule is the LONDON business day of date_paid_gmt (no zone suffix is read as UTC, not the server zone)', async () => {
   assert.equal(parseWcGmtInstant('2026-10-20T23:30:00').toISOString(), '2026-10-20T23:30:00.000Z')
   assert.equal(parseWcGmtInstant('2026-10-20T23:30:00Z').toISOString(), '2026-10-20T23:30:00.000Z')
-  // order at 23:50 UTC on the 20th, paid 23:59:59 the same UTC day: same day, order rate
+  // order at 23:50 UTC on the 20th = 00:50 BST on the 21st; paid 23:59:59 UTC the 20th: same London day, order rate
   const lateOrder = new Date('2026-10-20T23:50:00Z')
   assert.equal(await resolve({ paid: '2026-10-20T23:59:59', ordered: lateOrder }), 1.25)
-  // paid 00:00:01 UTC the next day (11 seconds later, a different business day, though the same day in UTC-1): payment-date rate
-  assert.equal(await resolve({ paid: '2026-10-21T00:00:01', ordered: lateOrder }), 1.31)
+  // paid 00:00:01 UTC the 21st is a different UTC day but the SAME London day (01:00 BST on the 21st): the order rate, as the invoice and the payment are dated together
+  assert.equal(await resolve({ paid: '2026-10-21T00:00:01', ordered: lateOrder }), 1.25)
+  assert.equal(await resolve({ paid: '2026-10-21T22:59:59', ordered: lateOrder }), 1.25)
+  // paid 23:00:01 UTC the 21st is 00:00:01 BST on the 22nd: a different business day, payment-date rate
+  assert.equal(await resolve({ paid: '2026-10-21T23:00:01', ordered: lateOrder }), 1.31)
 })
 
 test('an unreadable payment date is refused as foreign_payment_missing_rate', async () => {

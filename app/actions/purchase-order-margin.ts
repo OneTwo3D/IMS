@@ -3,7 +3,18 @@
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
-import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
+import { hasPermission } from '@/lib/permissions'
+import { loadListPriceFacts } from '@/lib/domain/purchasing/list-price-facts'
+import { getSettingValue } from '@/lib/settings-store'
+import {
+  MARGIN_THRESHOLD_SETTING_KEY,
+  assessLineAgainstMinimum,
+  hasAnyMarginThreshold,
+  parseMarginThresholdSettings,
+  resolveMinimumMarginPct,
+  type LineThresholdAssessment,
+  type MarginThresholdMode,
+} from '@/lib/domain/purchasing/margin-threshold'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   computeLineMargin,
@@ -42,48 +53,43 @@ export type PoLineMarginRow = {
   result: LineMarginResult
   /** Open-layer average landed cost per unit, base currency; null when no stock is held. */
   currentCostBase: string | null
+  /** The line against its minimum margin (o3d-hqvrp.380): 'none' when no minimum applies, 'unknown' when the margin is unavailable. */
+  threshold: LineThresholdAssessment
+  /** o3d-hqvrp.381: the list price can be edited from the margin column (needs inventory.edit as well as inventory.prices). False for a variable parent, which is priced by its variations. */
+  listPriceEditable: boolean
+  /** The list price is stored VAT-inclusive; the edit still takes the ex-VAT price the column shows. */
+  listPriceStoredVatInclusive: boolean
 }
 
 export type PoMarginPreview =
-  | { success: true; lines: PoLineMarginRow[]; total: PoMarginTotal }
+  | {
+      success: true
+      lines: PoLineMarginRow[]
+      total: PoMarginTotal
+      /** null when no minimum is configured anywhere: the form shows nothing extra. */
+      thresholdMode: MarginThresholdMode | null
+    }
   | { success: false; error: string }
 
 export async function previewPoLineMargins(rawInput: z.input<typeof inputSchema>): Promise<PoMarginPreview> {
-  await requirePermission('inventory.prices')
+  const session = await requirePermission('inventory.prices')
+  const mayEditPrice = hasPermission(session.user.role, 'inventory.edit')
   const parsed = inputSchema.safeParse(rawInput)
   if (!parsed.success) return { success: false, error: 'Invalid margin request' }
   const { lines, pricesIncludeVat, fxRate } = parsed.data
-  if (lines.length === 0) return { success: true, lines: [], total: computePoMarginTotal([]) }
+  if (lines.length === 0) return { success: true, lines: [], total: computePoMarginTotal([]), thresholdMode: null }
 
   const productIds = [...new Set(lines.map((l) => l.productId))]
-  const [products, org, layers] = await Promise.all([
-    db.product.findMany({
-      where: { id: { in: productIds } },
-      select: { id: true, salesPriceBase: true, salesPriceTaxInclusive: true, taxCategory: true },
-    }),
-    db.organisation.findFirst({ select: { country: true } }),
+  const [facts, thresholdRaw, layers] = await Promise.all([
+    loadListPriceFacts(productIds),
+    getSettingValue(MARGIN_THRESHOLD_SETTING_KEY),
     db.costLayer.findMany({
       where: { productId: { in: productIds }, remainingQty: { gt: 0 } },
       select: { productId: true, remainingQty: true, unitCostBase: true },
     }),
   ])
-  const byId = new Map(products.map((p) => [p.id, p]))
-
-  // Sales VAT rate per product, only needed to strip VAT from an inclusive stored price. The company's
-  // home country is the destination; same resolver the sales-order screen uses.
-  const rateByProduct = new Map<string, { value: number; matched: string }>()
-  const needVat = products.filter((p) => p.salesPriceTaxInclusive && p.salesPriceBase != null)
-  if (needVat.length > 0) {
-    const resolved = await resolveLineTaxRateBatch(
-      needVat.map((p) => ({ id: p.id, productCategory: p.taxCategory })),
-      {
-        destinationCountry: org?.country ?? null,
-        usedFor: 'SALES',
-        orderDefault: { id: null, name: null, rate: 0, accountingTaxType: null },
-      },
-    )
-    for (const [id, r] of resolved) rateByProduct.set(id, { value: r.taxRateValue, matched: r.matched })
-  }
+  const threshold = parseMarginThresholdSettings(thresholdRaw)
+  const thresholdActive = hasAnyMarginThreshold(threshold)
 
   const costAgg = new Map<string, { value: ReturnType<typeof toDecimal>; qty: ReturnType<typeof toDecimal> }>()
   for (const l of layers) {
@@ -94,8 +100,7 @@ export async function previewPoLineMargins(rawInput: z.input<typeof inputSchema>
   }
 
   const rows: PoLineMarginRow[] = lines.map((l) => {
-    const p = byId.get(l.productId)
-    const vat = p ? rateByProduct.get(p.id) : undefined
+    const f = facts.get(l.productId)
     const result = computeLineMargin({
       qty: l.qty,
       unitCost: l.unitCost,
@@ -104,17 +109,28 @@ export async function previewPoLineMargins(rawInput: z.input<typeof inputSchema>
       taxRate: l.taxRate,
       pricesIncludeVat,
       fxRate,
-      salesPrice: p?.salesPriceBase ?? null,
-      salesPriceTaxInclusive: p?.salesPriceTaxInclusive ?? false,
-      // A 'fallback' match means no configured sales rate: refuse rather than strip an invented 0%.
-      salesVatRate: vat && vat.matched !== 'fallback' ? vat.value : null,
+      salesPrice: f?.salesPrice ?? null,
+      salesPriceTaxInclusive: f?.salesPriceTaxInclusive ?? false,
+      // The facts loader leaves the rate null on a 'fallback' match: refuse rather than strip an invented 0%.
+      salesVatRate: f?.salesVatRate ?? null,
     })
+    const minimum = thresholdActive && f
+      ? resolveMinimumMarginPct(threshold, { productId: f.productId, parentId: f.parentId, categoryChain: f.categoryChain })
+      : null
     const agg = costAgg.get(l.productId)
     return {
       key: l.key,
       result,
       currentCostBase: agg && agg.qty.gt(0) ? agg.value.div(agg.qty).toDecimalPlaces(4).toFixed() : null,
+      threshold: assessLineAgainstMinimum(result, minimum),
+      listPriceEditable: mayEditPrice && !!f && f.type !== 'VARIABLE',
+      listPriceStoredVatInclusive: f?.salesPriceTaxInclusive ?? false,
     }
   })
-  return { success: true, lines: rows, total: computePoMarginTotal(rows.map((r) => r.result)) }
+  return {
+    success: true,
+    lines: rows,
+    total: computePoMarginTotal(rows.map((r) => r.result)),
+    thresholdMode: thresholdActive ? threshold.mode : null,
+  }
 }
