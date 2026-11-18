@@ -1,3 +1,4 @@
+import { withMintsoftNoLogin } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { enqueueMintsoftBookedInRecheckForAsn, sweepUnprocessedMintsoftBookedInEvents } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
@@ -26,11 +27,11 @@ export async function GET(request: Request) {
   // and the sweep then processes what it created. Hosted here rather than on the watchdog because
   // this job is `defaultEnabled: true` and runs every five minutes, so the recovery holds on an
   // installation that has configured nothing.
-  const recheck = await runPostMaintenanceBookedInRecheck('mintsoft', {
+  const recheck = await withMintsoftNoLogin(() => runPostMaintenanceBookedInRecheck('mintsoft', {
     recheckAsn: (externalAsnId, options) => enqueueMintsoftBookedInRecheckForAsn(externalAsnId, options),
-  })
+  }))
 
-  const result = await sweepUnprocessedMintsoftBookedInEvents()
+  const result = await withMintsoftNoLogin(() => sweepUnprocessedMintsoftBookedInEvents())
   const body = { ...result, postMaintenanceRecheck: recheck }
   return cronResultResponse(body, { outcomeClass: cronOutcome('mintsoft-webhook-sweeper', body) })
 }

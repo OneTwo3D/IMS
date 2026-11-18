@@ -24,7 +24,7 @@ The **CSV** button on a report downloads the filtered result as **data rows only
 
 | Report group | Roles |
 |---|---|
-| Sales Statistics, Product Profitability, Inventory Report | Admin, Manager, Finance, Read-only |
+| Sales Statistics, Product Profitability, Inventory Report | Admin, Manager, Finance |
 | Purchase Statistics (page, data and its CSV exports) and the Purchasing reports (Open POs, Supplier Performance, Purchase Price Variance, Spend, Lead Times) | Admin, Manager, Finance |
 | Stock Position reports | Admin, Manager, Finance, Read-only, Warehouse |
 | Stock Movement Ledger, Stock Adjustments, Stock Transfers, Stock Counts | Admin, Manager, Finance, Warehouse |

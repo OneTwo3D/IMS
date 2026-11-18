@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { assertOverviewAnalyticsAccess } from '@/lib/security/overview-analytics-access'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { REFUND_TURNOVER_SELECT, type TurnoverBound } from '@/lib/domain/sales/customer-turnover'
@@ -110,7 +111,7 @@ export type SalesStatSummary = {
 }
 
 export async function getProductSalesStats(dateFrom?: string, dateTo?: string): Promise<{ rows: SalesStatRow[]; summary: SalesStatSummary }> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -341,7 +342,7 @@ export type ShipmentRow = {
 }
 
 export async function getShipments(dateFrom?: string, dateTo?: string): Promise<ShipmentRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -396,7 +397,7 @@ export type DetailRow = {
 }
 
 export async function getDetails(dateFrom?: string, dateTo?: string): Promise<DetailRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -454,7 +455,7 @@ export type InvoiceRow = {
 }
 
 export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promise<InvoiceRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -532,7 +533,7 @@ export type RefundRow = {
 }
 
 export async function getRefundStats(dateFrom?: string, dateTo?: string): Promise<RefundRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -614,7 +615,7 @@ export type CustomerAgingRow = {
 }
 
 export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const orders = await db.salesOrder.findMany({
     // Paid orders are not excluded in the query: receivableBalance (one arithmetic shared with AR Aging and the
     // Invoices tab) decides what is still owed, including orders held as paid with no Payment row.

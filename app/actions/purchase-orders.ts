@@ -1,5 +1,6 @@
 'use server'
 
+import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { businessDateYmd } from '@/lib/business-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
@@ -109,6 +110,13 @@ import {
   validatePurchaseInvoiceLineLimits,
   type PurchaseInvoiceInputLine,
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
+import {
+  assertNoDuplicateSupplierBill,
+  DuplicateSupplierInvoiceNumberError,
+  normalizeSupplierInvoiceNumber,
+  PurchaseBillStatusRefusal,
+  purchaseOrderBillStatusRefusal,
+} from '@/lib/domain/purchasing/bill-guards'
 import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
   billChangedSinceRead,
@@ -472,13 +480,19 @@ const ReceiptLineInputSchema = z.object({
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function makeReference(): Promise<string> {
-  const now = new Date()
-  const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
-  const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
+/**
+ * The next purchase order reference, from the purchase order pattern (Settings → Company → Numbering). Call it inside the
+ * transaction that writes the order: a counter pattern holds its row lock until that transaction ends. The configured
+ * prefix is only what the default pattern starts with.
+ */
+async function makeReference(poPrefix: string): Promise<string> {
+  return mintCommittedDocumentNumber((run) => db.$transaction(run), 'purchase_order', { fallbackPrefix: poPrefix })
+}
+
+/** The prefix the default purchase order pattern starts with. Read BEFORE a transaction opens: it takes a second connection. */
+async function readPoPrefix(): Promise<string> {
   const { getNumberingFormats } = await import('./company')
-  const { po_prefix } = await getNumberingFormats()
-  return `${po_prefix}${ymd}-${rand}`
+  return (await getNumberingFormats()).po_prefix
 }
 
 const PO_SELECT = {
@@ -1567,8 +1581,12 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       marginOverride = outcome.override
     }
 
-    const poReference = input.reference || await makeReference()
-    const po = await db.$transaction(async (tx) => {
+    const poPrefix = input.reference ? '' : await readPoPrefix()
+    // A reference the numbering pattern gives is minted in a transaction of its own, committed first, so the numbering lock is never held across this order's transaction (a failed create leaves a gap in the sequence).
+    const po = await retryWhenNumberTaken(async () => {
+    const poReference = input.reference || await makeReference(poPrefix)
+    return db.$transaction(async (tx) => {
+    if (!input.reference) await claimDocumentNumber(tx, 'purchase_order', poReference)
     // A line's supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused, under the row share lock the apply waits on (lib/tax/writable-tax-rate.ts).
     await resolveLinesTaxRates(tx, lineData)
     const created = await tx.purchaseOrder.create({
@@ -1610,6 +1628,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       await recordMarginOverride(tx, { poId: created.id, reference: poReference, userId: session.user.id ?? null, verb: 'save', note: marginOverride.note, below: marginOverride.below })
     }
     return created
+    })
     })
 
     const postCommitWarnings: string[] = []
@@ -4010,6 +4029,8 @@ export type CreateInvoiceInput = {
   notes?: string
   supplierInvoiceUrl?: string
   lines: InvoiceLineInput[]
+  /** Bill again although this supplier already has a bill under the same supplier invoice number. */
+  allowDuplicateInvoiceNumber?: boolean
 }
 
 export type UpdateInvoiceLineInput = {
@@ -4119,7 +4140,7 @@ async function billTaxCodeRefusal(lineTaxRates: ReadonlyArray<{ description: str
 export async function createInvoice(
   poId: string,
   input: CreateInvoiceInput,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; duplicateInvoiceNumber?: boolean }> {
   try {
     await requirePermission('purchasing.invoice')
     const po = await db.purchaseOrder.findUnique({
@@ -4169,6 +4190,9 @@ export async function createInvoice(
       },
     })
     if (!po) return { success: false, error: 'PO not found' }
+    // Only an order that has been placed and not cancelled is billed (CLOSED stays billable: a late supplier invoice for goods received before the close).
+    const statusRefusal = purchaseOrderBillStatusRefusal(po.status, po.reference)
+    if (statusRefusal) return { success: false, error: statusRefusal }
 
     // Split inputs into product vs cost lines.
     const productInputs = input.lines.filter(
@@ -4303,6 +4327,9 @@ export async function createInvoice(
       const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
         where: { id: poId },
         select: {
+          status: true,
+          reference: true,
+          supplierId: true,
           fxRateToBase: true,
           type: true,
           taxRatePercent: true,
@@ -4322,6 +4349,14 @@ export async function createInvoice(
             select: { id: true, description: true, amountForeign: true, vatable: true },
           },
         },
+      })
+      // The status was read before the lock: a cancel that committed in between must refuse the bill too.
+      const lockedStatusRefusal = purchaseOrderBillStatusRefusal(lockedPo.status, lockedPo.reference)
+      if (lockedStatusRefusal) throw new PurchaseBillStatusRefusal(lockedStatusRefusal)
+      await assertNoDuplicateSupplierBill(tx, {
+        supplierId: lockedPo.supplierId,
+        invoiceNumber: normalizeSupplierInvoiceNumber(input.invoiceNumber),
+        override: input.allowDuplicateInvoiceNumber === true,
       })
       // The tax and the accounting payload above were computed BEFORE this lock from the order and its cost lines as
       // they were then. A freight edit that committed in between keeps the cost-line ids, so the id checks alone pass
@@ -4356,7 +4391,7 @@ export async function createInvoice(
         select: { id: true },
         data: {
           poId,
-          invoiceNumber: input.invoiceNumber || null,
+          invoiceNumber: normalizeSupplierInvoiceNumber(input.invoiceNumber),
           invoiceDate,
           dueDate: input.dueDate ? new Date(input.dueDate) : null,
           subtotalForeign: invoiceCalculation.subtotalForeign,
@@ -4515,6 +4550,8 @@ export async function createInvoice(
 
     return { success: true }
   } catch (e) {
+    if (e instanceof PurchaseBillStatusRefusal) return { success: false, error: e.message }
+    if (e instanceof DuplicateSupplierInvoiceNumberError) return { success: false, error: e.message, duplicateInvoiceNumber: true }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: poId,
@@ -6111,14 +6148,18 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
     const costLineData = built.rows
 
-    const freightReference = await makeReference()
     // Create the freight PO + landed-cost links AND run the initial recalc in ONE
     // transaction: if the recalc fails (e.g. a linked primary is CLOSED ->
     // throws, or a lock timeout), the freight PO and its LandedCostLinks roll back
     // too, so we never leave 'linked but unapplied' freight with no retry path
     // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
-    const { po, landedResult } = await db.$transaction(
+    const freightPrefix = await readPoPrefix()
+    // The reference is minted in a transaction of its own, committed first, so the numbering lock is never held across the landed-cost recalculation below (a failed create leaves a gap in the sequence).
+    const { po, landedResult } = await retryWhenNumberTaken(async () => {
+    const freightReference = await makeReference(freightPrefix)
+    return db.$transaction(
       async (tx) => {
+        await claimDocumentNumber(tx, 'purchase_order', freightReference)
         // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): this transaction used to lock NOTHING before
         // `recalculateLandedCosts` rewrote the primaries' lines, their cost layers and every snapshot
         // naming them. Lock the scope FIRST — before the freight order and its links are inserted, so
@@ -6162,6 +6203,7 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
       },
       STOCK_TX_OPTIONS,
     )
+    })
 
     // Revalidate linked primary POs
     for (const pid of landedResult.revalidatePoIds) {

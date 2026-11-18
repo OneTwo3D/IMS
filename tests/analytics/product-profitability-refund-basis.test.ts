@@ -19,7 +19,7 @@ const verdictOf = (fy: ProfitabilityFyFigures) => linear.classifyLinearFigureBou
  */
 
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) },
 })
 
 const NOW = new Date()

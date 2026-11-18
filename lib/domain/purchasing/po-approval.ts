@@ -151,12 +151,22 @@ export type PoApprovalGateDb = PoApprovalDb & {
  * THE SEND GATE. Called by every path that moves an order to PO_SENT or emails it. Pass the transaction client of a transaction that
  * already holds the order's row lock (status advance) so the facts read here cannot change before the status write; the email paths pass
  * the pool (an approval cannot be raced into validity by them: the delivery-time check re-reads it again).
+ *
+ * `rendered` is for the email paths, which attach a document rendered EARLIER than this check: the facts (total, supplier, currency) the
+ * document was rendered from. The order is then also judged on those, against the live approval, so an edit that lowered the live order
+ * after a dearer version was rendered cannot let the dearer document through on the cheaper order's say-so.
  */
-export async function assertPoApprovedForSend(db: PoApprovalGateDb, poId: string): Promise<void> {
+export type PoRenderedFacts = Pick<PoApprovalFacts, 'type' | 'supplierId' | 'currency' | 'totalBase' | 'taxBase'>
+
+export async function assertPoApprovedForSend(db: PoApprovalGateDb, poId: string, rendered?: PoRenderedFacts): Promise<void> {
   const threshold = await readApprovalThreshold(db)
   if (!threshold) return
   const facts = await db.purchaseOrder.findUnique({ where: { id: poId }, select: PO_APPROVAL_FACTS_SELECT })
   if (!facts) return
   const state = evaluatePoApproval(facts, threshold)
   if (state.required && !state.approved) throw new PoApprovalRequiredError()
+  if (rendered) {
+    const renderedState = evaluatePoApproval({ ...facts, ...rendered }, threshold)
+    if (renderedState.required && !renderedState.approved) throw new PoApprovalRequiredError()
+  }
 }

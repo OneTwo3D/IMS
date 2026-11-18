@@ -1,3 +1,4 @@
+import { withMintsoftNoLogin } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
@@ -42,7 +43,7 @@ export async function GET(request: Request) {
 
   const results = []
   for (const binding of dueBindings) {
-    results.push(await runStockSyncForBinding(binding.id, 'cron'))
+    results.push(await withMintsoftNoLogin(() => runStockSyncForBinding(binding.id, 'cron')))
   }
 
   const body = {
