@@ -10,6 +10,7 @@ import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { getSettingValue } from '@/lib/settings-store'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
@@ -1318,6 +1319,7 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
   )
   if (!taxValidation.success) return { ok: false as const, error: taxValidation.error }
 
+  const apportionDiscountTax = (await getSettingValue('sales_order_discount_tax_apportion_enabled')) === 'true'
   const model = buildSalesOrderWriteModel({
     fxRate,
     vatRate,
@@ -1325,6 +1327,8 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
     shippingForeign: input.shippingForeign,
     fees: input.fees,
     orderDiscountForeign: input.orderDiscountForeign,
+    // OFF unless an operator enables it: the invoice still posts the discount on the header rate, so the apportioned tax is only for a deployment whose posting follows it (see changelog).
+    apportionDiscountTax,
     lines: input.lines.map((l, idx) => ({ input: l, rate: lineResolved[idx].taxRateValue, taxRateId: lineResolved[idx].taxRateId })),
   })
   return { ok: true as const, fxRate, vatRate, inclVat, model, lineResolved, taxValidation, destCountry, productCategoryById, orderDefaultRate }
@@ -2482,7 +2486,13 @@ export async function applySalesOrderStatusTransition(
     if (targetStatus === 'CANCELLED') {
       const cancellation = await db.$transaction(async (tx) => {
         storefrontStatusPush = null // a retried callback must not inherit an aborted attempt's job
-        const result = await cancelSalesOrderFulfillmentState(tx, { orderId: id, data, bypass: bypassPermission })
+        const result = await cancelSalesOrderFulfillmentState(tx, {
+          orderId: id,
+          data,
+          bypass: bypassPermission,
+          // The storefront (BYPASS) and the sessionless withdrawal handler (AUTH_ONLY) are automated sources of truth; only an operator's own cancel is refused for a posted invoice.
+          automated: bypassPermission || authOnly,
+        })
         // o3d-6ldlj: the durable cancel push commits WITH the cancellation (order row locked by
         // cancelSalesOrderFulfillmentState; the outbox row is a leaf). No WooCommerce I/O, no pooled query here.
         storefrontStatusPush = await scheduleManualStatusPush(tx, {

@@ -520,6 +520,14 @@ From **Analytics > Reorder Planning** (the standalone Reorder Forecast page has 
 Lifecycle exclusions apply: only Draft and Active products are planned. EOL and Archived products are skipped.
 
 
+### Tagging your shipping estimate
+
+On a purchase order's **Additional costs**, each cost line has a **Shipping** tick. Tick it on the line that is your own estimate of the shipping. It changes nothing on its own: the line is distributed as landed cost like any other, and lines that existed before the tick was added stay untagged.
+
+A setting for supplier-quoted shipping (**supplier_quote_shipping_landed_enabled**) is **off by default**, so by default a supplier's quote does not touch your cost lines. Once an administrator turns it on, shipping the supplier quotes on a requote becomes a **Supplier quoted shipping** cost line (it is landed and can be billed), and it **replaces** the line you ticked as Shipping, so shipping is counted once. Lines you did not tick are never replaced, whatever they are called. A later requote replaces the previous supplier-quoted line. If you ticked no line, the supplier's shipping is added.
+
+If your Shipping line has **already been billed**, or goods have **already been received** against the order, it is not replaced. Both lines stay on the order and a warning, "supplier_quote_shipping_replace_refused", is written to the order's activity log explaining why, so you can correct one by hand.
+
 ## Supplier Portal
 
 Suppliers with user accounts (SUPPLIER role) can access a dedicated portal to:

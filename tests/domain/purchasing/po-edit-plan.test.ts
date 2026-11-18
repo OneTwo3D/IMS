@@ -210,3 +210,10 @@ test('header discount: a line-value change is refused once stock has landed, and
   assert.equal(headerDiscountAmendRefusal({ ...base, headerDiscountForeign: 0 }), null)
   assert.equal(headerDiscountAmendRefusal({ ...base, lineMoneyChanged: false }), null)
 })
+
+test('retagging a cost line as Shipping is a change to the cost lines; an untagged line compares as before', () => {
+  const line = { description: 'Carriage', amountForeign: 10, vatable: false, distributionMethod: 'BY_VALUE' }
+  assert.deepEqual(normaliseCostLinesForCompare([line]), ['Carriage|10.00|0|BY_VALUE'])
+  assert.deepEqual(normaliseCostLinesForCompare([{ ...line, kind: null }]), ['Carriage|10.00|0|BY_VALUE'])
+  assert.deepEqual(normaliseCostLinesForCompare([{ ...line, kind: 'SHIPPING' }]), ['Carriage|10.00|0|BY_VALUE|SHIPPING'])
+})

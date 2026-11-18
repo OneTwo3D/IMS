@@ -51,7 +51,11 @@ import { proveAllocationDebitPosting } from '@/lib/domain/accounting/allocation-
 import {
   assertNoSalesInvoicePostingInFlight,
   cancelPendingSalesInvoiceSyncForOrder,
+  cancelWithPostedInvoiceMessage,
+  cancelledWithPostedInvoiceTaskText,
+  findPostedSalesInvoiceSync,
 } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { raiseWmsOperatorTask } from '@/lib/domain/wms/operator-tasks'
 import { PermanentStatusTransitionError, STATUS_GUARD_REFUSAL_PREFIX } from '@/lib/domain/sales/status-transition-errors'
 import {
   validateManualSalesOrderStatusTransition,
@@ -2518,7 +2522,14 @@ export async function cancelSalesOrderFulfillmentState(
   input: {
     orderId: string
     data?: Prisma.SalesOrderUpdateInput
+    /** Skips the lifecycle state machine (a storefront force-sync). */
     bypass?: boolean
+    /**
+     * The cancel is driven by an automated source of truth (the storefront's own cancel, an approved EU withdrawal), not by an operator
+     * choosing to cancel. Such a cancel cannot be refused for a posted invoice without dead-lettering it: it lands and is flagged with a
+     * durable operator task. Only a manual operator cancel (neither flag) is refused. Implied by `bypass`.
+     */
+    automated?: boolean
   },
 ): Promise<{
   previousStatus: string
@@ -2532,9 +2543,22 @@ export async function cancelSalesOrderFulfillmentState(
   await lockSalesOrder(tx, input.orderId)
   const lockedOrder = await tx.salesOrder.findUnique({
     where: { id: input.orderId },
-    select: { status: true },
+    select: { status: true, refundStatus: true },
   })
   if (!lockedOrder) throw new Error('Order not found')
+
+  // o3d-hqvrp.41: an invoice that already reached the ledger is not voided or credited by a cancellation,
+  // and the deferral and allocation journals behind it stay too. A manual cancel is refused until the order
+  // has been refunded in full (the credit note is the accounting reversal). A cancel driven by the storefront
+  // (`bypass`) or by an approved withdrawal (`automated`) is the source of truth and cannot be refused without
+  // dead-lettering, so it proceeds and raises a durable operator task for the credit note.
+  let postedInvoiceAtCancel: Awaited<ReturnType<typeof findPostedSalesInvoiceSync>> = null
+  if (lockedOrder.refundStatus !== 'FULL') {
+    postedInvoiceAtCancel = await findPostedSalesInvoiceSync(tx, input.orderId)
+    if (postedInvoiceAtCancel && !input.bypass && !input.automated) {
+      throw new PermanentStatusTransitionError(cancelWithPostedInvoiceMessage(postedInvoiceAtCancel))
+    }
+  }
 
   // o3d-7o0: REFUSE WHILE AN INVOICE POST IS ON THE WIRE, under the row lock just taken and BEFORE any
   // write. The processor's PROCESSING claim is the posting intent, and `guardCancelledSalesOrderInvoice`
@@ -2668,6 +2692,36 @@ export async function cancelSalesOrderFulfillmentState(
   // Retire any still-pending SALES_INVOICE accounting work in the SAME transaction, so the real-time
   // sync drain cannot post an ACCREC invoice for this now-cancelled, never-shipped order (o3d-5rs).
   await cancelPendingSalesInvoiceSyncForOrder(tx, input.orderId, new Date())
+
+  if (postedInvoiceAtCancel) {
+    const orderRow = await tx.salesOrder.findUnique({
+      where: { id: input.orderId },
+      select: { orderNumber: true, externalOrderNumber: true },
+    })
+    const orderLabel = orderRow?.orderNumber ?? orderRow?.externalOrderNumber ?? input.orderId
+    // A DURABLE task on the order, not just an activity row: a cancelled order drops out of the standing invariants, so nothing else would
+    // ever say that a receivable is still open. One task per (order, invoice): a repeated cancel does not raise a second.
+    await raiseWmsOperatorTask(tx, {
+      connector: postedInvoiceAtCancel.connector,
+      orderId: input.orderId,
+      externalOrderId: postedInvoiceAtCancel.id,
+      reason: 'CANCELLED_POSTED_INVOICE',
+      queryText: cancelledWithPostedInvoiceTaskText(postedInvoiceAtCancel, orderLabel),
+      dedupeBasis: `cancelled-posted-invoice:${input.orderId}:${postedInvoiceAtCancel.id}`,
+      payload: { orderNumber: orderRow?.orderNumber ?? null, externalOrderNumber: postedInvoiceAtCancel.id },
+    })
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: input.orderId,
+        action: 'cancelled_with_posted_invoice',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: cancelledWithPostedInvoiceTaskText(postedInvoiceAtCancel, orderLabel),
+        metadata: { syncLogId: postedInvoiceAtCancel.id, invoiceConnector: postedInvoiceAtCancel.connector },
+      },
+    })
+  }
 
   return {
     previousStatus: lockedOrder.status,

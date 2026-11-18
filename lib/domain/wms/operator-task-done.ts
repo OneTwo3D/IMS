@@ -102,6 +102,8 @@ export async function completeWmsOperatorTask(params: {
         ? `Operator task done for order ${orderLabel} on warehouse order ${task.externalOrderId}: every recorded line was verified gone${settled ? ' and the warehouse link was closed as cancelled' : '; the warehouse link had already moved on, so it was not changed'}.`
         : task.reason === 'SHOP_REFUND_DUE'
           ? `Operator task done for order ${orderLabel}: Refund in WooCommerce, marked done by a person. IMS wrote nothing to WooCommerce.`
+          : task.reason === 'CANCELLED_POSTED_INVOICE'
+            ? `Operator task done for order ${orderLabel}: the posted invoice (${task.externalOrderId}) was credited by hand, marked done by a person. IMS did not check the ledger.`
           : `Operator task done for order ${orderLabel} on warehouse order ${task.externalOrderId}: the query was raised in the warehouse's system.`,
       metadata: { taskId, connector: task.connector, reason: task.reason, externalOrderId: task.externalOrderId, ...(partial ? { linkSettled: settled } : {}) },
     })

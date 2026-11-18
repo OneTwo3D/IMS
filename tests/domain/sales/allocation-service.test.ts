@@ -372,6 +372,8 @@ type MemoryState = {
    * behind its back. Undefined — the default — means nothing is in flight.
    */
   syncPostingClaim?: { id: string; connector: string; type: string; processingStartedAt: Date | null }
+  /** o3d-hqvrp.41: a SALES_INVOICE row that reached the ledger (carries the connector's document id). */
+  postedInvoiceSync?: { id: string; connector: string; type: string }
 }
 
 function decimalLikeToNumber(value: number | { toNumber(): number } | undefined): number {
@@ -395,6 +397,7 @@ const writeCounts = { allocationCreates: 0, allocationDeletes: 0, allocationUpda
  * written after the rows it describes have already gone.
  */
 const activityLogWrites: Array<Record<string, unknown>> = []
+const operatorTaskWrites: Array<Record<string, unknown>> = []
 /**
  * o3d-0i5y r11: what the LOCKED re-read of the order's allocation rows sees, keyed
  * `lineId|warehouseId|productId`.
@@ -417,6 +420,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
   writeCounts.allocationDeletes = 0
   writeCounts.allocationUpdateManys = 0
   activityLogWrites.length = 0
+  operatorTaskWrites.length = 0
   txWriteOrder.length = 0
   txStatements.length = 0
   // Cleared per client, so a fixture that models a mid-flight revaluation cannot leak into the next
@@ -921,6 +925,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
         }
       }) => {
         const where = args?.where ?? {}
+        if ((where as { AND?: unknown }).AND !== undefined) return state.postedInvoiceSync ?? null
         if (where.payload == null) return state.syncPostingClaim ?? null
         const found = accountingSyncRows.find((row) => {
           // o3d-i0o6: the connector is part of the predicate when the caller asks for it. A double
@@ -948,6 +953,18 @@ function createClient(state: MemoryState): AllocationServiceClient {
       findUnique: async ({ where }: { where: { id: string } }) => {
         const row = (state.accountingSyncLogs ?? []).find((candidate) => candidate.id === where.id)
         return row ? { settlementBasis: null, abandonedBeforeRemoteCall: null, externalTransactionId: null, ...row } : null
+      },
+    },
+    // The durable operator task a storefront cancel of an order with a posted invoice raises (deduplicated on its content hash, like the real table).
+    wmsOperatorTask: {
+      createMany: async ({ data }: { data: Array<Record<string, unknown>> }) => {
+        let count = 0
+        for (const row of data) {
+          if (operatorTaskWrites.some((existing) => existing.contentHash === row.contentHash && existing.orderId === row.orderId)) continue
+          operatorTaskWrites.push(row)
+          count += 1
+        }
+        return { count }
       },
     },
     accountingEvent: {
@@ -1689,6 +1706,100 @@ test('cancelSalesOrderFulfillmentState refuses a partially-shipped order with a 
     /Cannot cancel an order with a dispatched shipment/,
   )
   assert.equal(state.order.status, 'ALLOCATED')
+})
+
+test('o3d-hqvrp.41: a manual cancel of an order with a POSTED invoice is refused, permanently, and changes nothing', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }],
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+
+  const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
+
+  assert.match(String(error?.message), /already posted to xero \(sync-9\).*Refund the order in full first/)
+  assert.equal(isPermanentStatusTransitionError(error), true)
+  assert.equal(state.order.status, 'ALLOCATED')
+  assert.equal(state.stockLevels[0].reservedQty, 3)
+  assert.equal(state.allocations?.length, 1)
+})
+
+test('o3d-hqvrp.41: a storefront-driven cancel (bypass) still lands but records a WARNING naming the posted invoice', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1', bypass: true })
+
+  assert.equal(state.order.status, 'CANCELLED')
+  const warning = activityLogWrites.find((row) => row.action === 'cancelled_with_posted_invoice')
+  assert.ok(warning, 'a cancelled_with_posted_invoice activity is written')
+  assert.equal(warning.level, 'WARNING')
+  assert.match(String(warning.description), /sync-9/)
+  // A durable operator task on the order, not just an activity row; the remedy offers only steps that exist (a cancelled order cannot be refunded).
+  assert.equal(operatorTaskWrites.length, 1)
+  assert.equal(operatorTaskWrites[0].reason, 'CANCELLED_POSTED_INVOICE')
+  assert.equal(operatorTaskWrites[0].orderId, 'order-1')
+  assert.match(String(operatorTaskWrites[0].queryText), /credit note against it in xero by hand/)
+  assert.doesNotMatch(String(operatorTaskWrites[0].queryText), /refund the order/i)
+  assert.doesNotMatch(String(warning.description), /refund the order/i)
+})
+
+test('o3d-hqvrp.41: an AUTOMATED cancel (approved EU withdrawal, no bypass) is never refused for a posted invoice: it lands and raises the task', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1', automated: true })
+
+  assert.equal(state.order.status, 'CANCELLED')
+  assert.equal(operatorTaskWrites.length, 1)
+  assert.equal(operatorTaskWrites[0].reason, 'CANCELLED_POSTED_INVOICE')
+})
+
+test('o3d-hqvrp.41: a repeated storefront cancel does not raise a second task for the same invoice', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1', bypass: true })
+  state.order.status = 'ALLOCATED'
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1', bypass: true })
+  assert.equal(operatorTaskWrites.length, 1)
+})
+
+test('o3d-hqvrp.41: a WooCommerce invoice number with no proven ledger row is NOT a posted invoice', async () => {
+  const state = baseState({ order: { ...baseState().order, status: 'ALLOCATED' } })
+  Object.assign(state.order, { invoiceNumber: 'INV-0042', shoppingLinks: [{ connector: 'woocommerce' }] })
+  const client = createClient(state)
+  const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
+  assert.doesNotMatch(String(error?.message ?? ''), /already posted/)
+})
+
+test('o3d-hqvrp.41: an invoice number IMS minted itself (no external connector) is not evidence of a posted invoice', async () => {
+  const state = baseState({ order: { ...baseState().order, status: 'ALLOCATED' } })
+  Object.assign(state.order, { invoiceNumber: 'INV-0042', shoppingLinks: [] })
+  const client = createClient(state)
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+  assert.equal(state.order.status, 'CANCELLED')
+})
+
+test('o3d-hqvrp.41: a fully refunded order with a posted invoice may be cancelled (the credit note is the reversal)', async () => {
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED', refundStatus: 'FULL' },
+    postedInvoiceSync: { id: 'sync-9', connector: 'xero', type: 'SALES_INVOICE' },
+  })
+  const client = createClient(state)
+
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+  assert.equal(state.order.status, 'CANCELLED')
 })
 
 test('o3d-7o0: cancelSalesOrderFulfillmentState REFUSES while an invoice post is on the wire', async () => {
