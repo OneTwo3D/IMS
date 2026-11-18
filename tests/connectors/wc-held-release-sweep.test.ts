@@ -375,7 +375,7 @@ test('a hold whose order is gone is FAILED, so it cannot sit at the head of the 
   assert.equal(second.scanned, 0)
 })
 
-test('the sweep is WIRED to the reconcile cron — an unreached sweep is not a driver', () => {
+test('the sweep is WIRED to the reconcile cron — an unreached sweep is not a driver', async () => {
   // The r7 lesson from o3d-batch-payidx: a guard that inspects nothing passes unconditionally.
   // This one reads the call itself, in the function the cron route invokes.
   // Comments are STRIPPED FIRST. A scan that reads the raw source passes just as happily when the
@@ -392,9 +392,26 @@ test('the sweep is WIRED to the reconcile cron — an unreached sweep is not a d
   )
   // Not behind the order-poll branch: a hold stuck behind a disconnected accounting connector must
   // be retried whether or not WooCommerce order polling is due.
-  const call = body.indexOf('await retryHeldWcSalesInvoiceReleases(')
-  const reconcileDue = body.indexOf('reconcileDue')
-  assert.ok(call > 0 && (reconcileDue < 0 || call > body.indexOf('results.orders')), 'the sweep must run on its own')
+  //
+  // o3d-6t1qh (3): asserted by PARSING, not by comparing text offsets. The old check
+  // (`call > body.indexOf('results.orders')`) was true by position - `results.orders` is first assigned
+  // inside the poll branch above the call - so moving the call INTO that branch still passed. Here the
+  // call must be an unconditional TOP-LEVEL statement of runWcReconcile, with nothing before it that can
+  // return or throw out of the function.
+  const { functionBody, performsUnconditionally, topLevelIndex, isCallTo, canExitEarly } = await import('../accounting/ast-structure')
+  const { body: reconcileBody } = functionBody(src, 'runWcReconcile')
+  const callAt = topLevelIndex(reconcileBody, (node) => isCallTo(node, 'retryHeldWcSalesInvoiceReleases'))
+  assert.ok(callAt >= 0, 'the sweep is called from the top level of runWcReconcile at all')
+  assert.ok(
+    performsUnconditionally(reconcileBody.statements[callAt], 'retryHeldWcSalesInvoiceReleases'),
+    'the sweep must run on its own: it is nested inside a branch, loop, try or short-circuit of runWcReconcile',
+  )
+  const before = reconcileBody.statements.slice(0, callAt)
+  assert.ok(before.length > 0, 'PRECONDITION: the order sweep and backstop precede it, so "nothing before it can exit" is not vacuous')
+  assert.ok(
+    !before.some((statement) => canExitEarly(statement)),
+    'a return or throw before the sweep would skip it on some passes',
+  )
   const route = withoutComments(readFileSync('app/api/cron/wc-reconcile/route.ts', 'utf8'))
   assert.match(route, /runWcReconcile\(\)/, 'and the cron route must be what runs it')
 })

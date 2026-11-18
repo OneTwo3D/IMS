@@ -143,13 +143,43 @@ test('scheduleLandedCostJournalOutbox is a no-op for a zero-delta recalc', async
 // function of the adjustment alone: so a journal refused by ANY caller (the direct ones schedule the outbox
 // too) is raised again by the outbox under the same key — which is why r7 made these `retried` kinds whose
 // mark-handled suppresses exactly that key (review H-B).
+// o3d-6t1qh (1): this used to compute `landedCostAdjustmentIdempotencyKey` twice over the same literal and
+// compare the results - a self-comparison no implementation could fail, and the outbox was never invoked.
+// It now runs the REAL path: the adjustment is enqueued by `scheduleLandedCostJournalOutbox`, the stored row
+// is drained by `processLandedCostJournalOutbox`, and the keys of the postings the DRAIN hands to the journal
+// builder are compared with the keys the DIRECT call derives from the original adjustment.
 test('[o3d-j625 r6 H4] the outbox retry raises the SAME landed-cost postings', async () => {
   const { landedCostAdjustmentIdempotencyKey } = await import('@/lib/domain/purchasing/landed-cost-service')
   const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
-  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', freightPoId: null, eventKey: 'recalc-1', totalDelta: 12.5 } as never
-  for (const [kind, type] of [['cogs', 'COGS_JOURNAL'], ['inventory', 'STOCK_IN_TRANSIT']] as const) {
-    const first = accountingPostingKey({ type, referenceType: 'PurchaseOrder', referenceId: 'po-1', idempotencyKey: landedCostAdjustmentIdempotencyKey(kind, adj) })
-    const retry = accountingPostingKey({ type, referenceType: 'PurchaseOrder', referenceId: 'po-1', idempotencyKey: landedCostAdjustmentIdempotencyKey(kind, adj) })
-    assert.deepEqual(retry, first, `${type}: a retry of the same adjustment is the same posting`)
-  }
+  const original = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', freightPoId: null, eventKey: 'recalc-1', totalDelta: 12.5 }
+  const postingsOf = (a: typeof original) => ({
+    cogs: accountingPostingKey({ type: 'COGS_JOURNAL', referenceType: 'PurchaseOrder', referenceId: a.primaryPoId, idempotencyKey: landedCostAdjustmentIdempotencyKey('cogs', a as never) }),
+    transit: accountingPostingKey({ type: 'STOCK_IN_TRANSIT', referenceType: 'PurchaseOrder', referenceId: a.primaryPoId, idempotencyKey: landedCostAdjustmentIdempotencyKey('inventory', a as never) }),
+  })
+  const direct = postingsOf(original)
+
+  // ENQUEUE through the real scheduler, capturing what is stored.
+  const created: Array<{ data: Record<string, unknown> }> = []
+  const tx = { integrationOutbox: { create: async (args: { data: Record<string, unknown> }) => { created.push(args); return { id: 'o1', ...args.data } }, findUnique: async () => null } } as never
+  await scheduleLandedCostJournalOutbox(tx, { inventoryTransitAdjustments: [original], cogsAdjustments: [original], auditRunIds: ['run-1'] })
+  assert.equal(created.length, 1, 'the recalc really was enqueued')
+
+  // DRAIN the stored payload through the real processor, capturing what it hands the journal builder.
+  const handed: Array<Parameters<LandedCostOutboxDrainDeps['queueJournals']>[0]> = []
+  const { deps } = makeDeps({ jobs: [makeJob(JSON.parse(JSON.stringify(created[0].data.payloadJson)))] })
+  deps.queueJournals = async (result) => { handed.push(result); return { owed: 0 } }
+  assert.deepEqual(await processLandedCostJournalOutbox(deps), { claimed: 1, succeeded: 1, failed: 0 })
+  assert.equal(handed.length, 1, 'the drain really did invoke the journal builder')
+  assert.equal(handed[0].cogsAdjustments.length, 1)
+  assert.equal(handed[0].inventoryTransitAdjustments.length, 1)
+
+  const retriedCogs = postingsOf(handed[0].cogsAdjustments[0] as never).cogs
+  const retriedTransit = postingsOf(handed[0].inventoryTransitAdjustments[0] as never).transit
+  assert.deepEqual(retriedCogs, direct.cogs, 'COGS_JOURNAL: the retry is the same posting as the direct call')
+  assert.deepEqual(retriedTransit, direct.transit, 'STOCK_IN_TRANSIT: the retry is the same posting as the direct call')
+
+  // The comparison has teeth: the two kinds must not collide, and a DIFFERENT adjustment is a different posting.
+  assert.notDeepEqual(direct.cogs, direct.transit, 'COGS_JOURNAL and STOCK_IN_TRANSIT never share a posting key')
+  assert.notDeepEqual(postingsOf({ ...original, eventKey: 'recalc-2' }).cogs, direct.cogs, 'another recalc is another posting')
+  assert.notDeepEqual(postingsOf({ ...original, totalDelta: 13 }).transit, direct.transit, 'another amount is another posting')
 })
