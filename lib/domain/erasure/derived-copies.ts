@@ -67,6 +67,7 @@ const errorDirty = (a: string) => Prisma.raw(`${a}."errorMessage" IS NOT NULL AN
 export async function scrubAccountingDerivedCopiesInTx(tx: Client, orderIds: string[]): Promise<DerivedCopyCounts> {
   if (orderIds.length === 0) return { ...EMPTY_DERIVED_COPY_COUNTS }
   // soft-delete exception: derived copies of a deleted refund are erased too.
+  // soft-delete exception (erasure): includes soft-deleted refunds on purpose, they still carry the customer's personal data.
   const refundIds = (await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })).map((r) => r.id)
   const eventScope = scope('e', 'sourceEntityType', 'sourceEntityId', orderIds, refundIds)
   const logScope = scope('e', 'sourceEntityType', 'sourceEntityId', orderIds, refundIds)

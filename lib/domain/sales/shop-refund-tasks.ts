@@ -176,6 +176,7 @@ export async function confirmShopRefundSettlement(
   if (!shopRefundAmountEquals(open, input.orderCurrency, input.amountForeign)) {
     return { ok: false, error: `That IMS refund (${open.creditNoteNumber ?? open.refundId}) is not for this WooCommerce refund's amount, so it cannot be confirmed as settled by it. Nothing was changed.` }
   }
+  // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
   const taken = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: input.wcRefundId }, select: { id: true } })
   if (taken) return { ok: false, error: `WooCommerce refund ${input.wcRefundId} is already recorded in IMS. Nothing was changed.` }
   const linked = await tx.salesOrderRefund.updateMany({ where: { id: input.imsRefundId, orderId: input.orderId, deletedAt: null, externalRefundId: null }, data: { externalRefundId: input.wcRefundId } })

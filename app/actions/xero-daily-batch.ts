@@ -364,6 +364,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
   const bShippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
   const bRefundedUnshippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
   if (bOrderIds.length > 0) {
+    // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
     const bRefunds = await db.salesOrderRefund.findMany({
       where: { orderId: { in: bOrderIds } },
       select: { id: true, orderId: true },

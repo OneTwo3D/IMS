@@ -2821,6 +2821,7 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     const refundSweep = await syncRefundsForOrder(Number(orderLink.externalOrderId))
 
     const refundLanded = row.externalId
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       ? await db.salesOrderRefund.findFirst({
           where: { externalRefundId: Number(row.externalId), orderId: row.entityId },
           select: { id: true },
@@ -2853,6 +2854,7 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     } else if (row.externalId) {
       // o3d-7yf: the refund did not land for THIS order. If a refund with this id exists on ANOTHER order,
       // this is a cross-order anomaly — fail closed WITHOUT resolving the clicked park with a foreign refund.
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       const foreignRefund = await db.salesOrderRefund.findFirst({
         where: { externalRefundId: Number(row.externalId), orderId: { not: row.entityId } },
         select: { orderId: true },
@@ -3014,6 +3016,7 @@ export async function recordRefundParkManually(
 
     // externalRefundId is GLOBALLY unique. If the refund has meanwhile landed — here or on another order
     // — raising a second credit note for it would double-credit, so fail closed instead.
+    // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
     const alreadyLanded = await db.salesOrderRefund.findFirst({
       where: { externalRefundId },
       select: { orderId: true, creditNoteNumber: true },
@@ -3772,6 +3775,7 @@ export async function recoverRefundSyncPark(
     // The refund as IMS currently records it, wherever it landed. Read again INSIDE the transaction
     // under the per-refund lock — this copy only lets a refusal be reported before WooCommerce is
     // asked and before any lock is taken.
+    // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
     const landedBefore = await db.salesOrderRefund.findFirst({
       where: { externalRefundId },
       select: { orderId: true },
@@ -3848,6 +3852,7 @@ export async function recoverRefundSyncPark(
       // Re-read under the lock. Between the WooCommerce fetch above and this transaction the refund
       // may have landed — on this park's order (the park is then a leftover, not a foreign one) or on
       // another. Both are refusals with their own remedy, not something to write through.
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId }, select: { orderId: true } })
       const lateRefusal = assertion.outcome === 'REASSIGN'
         ? refuseReassign({ park, externalRefundId, targetEvidence: evidence, targetOrderId, landedOnOrderId: landed?.orderId ?? null })

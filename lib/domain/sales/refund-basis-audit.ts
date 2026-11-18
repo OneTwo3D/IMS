@@ -445,7 +445,7 @@ export async function collectRefundBasisRows(
 ): Promise<RefundBasisRows> {
   const sourceRowLimit = Math.max(1, Math.floor(options.sourceRowLimit ?? DEFAULT_SOURCE_ROW_LIMIT))
   const rows = await client.salesOrder.findMany({
-    where: { refunds: { some: {} } },
+    where: { refunds: { some: { deletedAt: null } } },
     orderBy: { id: 'asc' },
     take: sourceRowLimit + 1,
     select: {

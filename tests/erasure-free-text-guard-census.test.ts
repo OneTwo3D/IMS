@@ -68,6 +68,8 @@ const WRITERS: Record<string, Record<string, number>> = {
     'lib/connectors/xero/daily-sync.ts': 1,
     // Sets `externalRefundId` (a WooCommerce refund id) when a person confirms a storefront refund settles an IMS refund: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
     'lib/domain/sales/shop-refund-tasks.ts': 1,
+    // The soft delete marks the row (`deletedAt`, `deletedById`, `deleteReason`); the reason is the operator's own text, retained like the refund reason, and carries no customer detail by contract. Pinned all the same.
+    'lib/domain/sales/refund-delete-service.ts': 1,
   },
 }
 

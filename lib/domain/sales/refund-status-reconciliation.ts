@@ -209,7 +209,7 @@ export async function collectRefundStatusReconciliationRows(
     where: {
       OR: [
         { refundStatus: { not: 'NONE' } },
-        { refunds: { some: {} } },
+        { refunds: { some: { deletedAt: null } } },
       ],
     },
     orderBy: { id: 'asc' },

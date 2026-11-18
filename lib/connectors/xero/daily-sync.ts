@@ -1909,6 +1909,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         shipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
       )
 
+      // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
       const refunds = await tx.salesOrderRefund.findMany({
         where: { orderId: { in: orderIds } },
         select: { id: true, orderId: true },

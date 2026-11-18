@@ -3910,6 +3910,7 @@ export async function createRefund(
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the
       // winning refund could belong to a different order. Only report idempotent success when the existing
       // refund is on THIS order; otherwise the loser would be marked synced while its refund lives elsewhere.
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       const winner = await db.salesOrderRefund.findFirst({ where: { externalRefundId: options.externalRefundId }, select: { orderId: true } })
       if (winner && winner.orderId !== orderId) {
         return { success: false, error: `A refund with external id ${options.externalRefundId} already exists on a different order; refusing to dedupe it here.` }
@@ -3973,7 +3974,7 @@ export async function raiseChargebackForReversedOrder(
   // sweep re-queues the credit note; once it succeeds the flag clears and a later
   // poll returns the benign "already exists".
   const existingChargeback = await db.salesOrderRefund.findFirst({
-    where: { orderId, chargeback: true },
+    where: { orderId, chargeback: true, deletedAt: null }, // a soft-deleted chargeback is not the order's chargeback
     select: { id: true, accountingRetryRequired: true },
   })
   if (existingChargeback) {
@@ -4003,7 +4004,7 @@ export async function raiseChargebackForReversedOrder(
       externalOrderNumber: true,
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
       shipments: { select: { status: true, shipmentJournalDate: true } },
-      refunds: { select: { id: true } },
+      refunds: { where: { deletedAt: null }, select: { id: true } }, // a soft-deleted refund is not a prior refund
     },
   })
   if (!order) return { raised: false, error: 'Order not found' }

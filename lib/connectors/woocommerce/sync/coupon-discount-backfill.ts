@@ -1223,7 +1223,7 @@ async function readLockedEvidence(tx: Prisma.TransactionClient, orderId: string)
       // not — and either one means a remedy derived from the invoice alone may re-bill a refunded
       // customer.
       refundStatus: true,
-      refunds: { select: { id: true, accountingCreditNoteId: true } },
+      refunds: { where: { deletedAt: null }, select: { id: true, accountingCreditNoteId: true } },
       lines: { select: { discountAmount: true } },
       shoppingLinks: {
         where: { connector: 'woocommerce' },
@@ -1974,7 +1974,7 @@ export async function revalidateWcCouponHandoff(
       revenueDeferredBatchRef: true,
       unearnedRevenueAmount: true,
       refundStatus: true,
-      refunds: { select: { id: true, accountingCreditNoteId: true } },
+      refunds: { where: { deletedAt: null }, select: { id: true, accountingCreditNoteId: true } },
     },
   })
   if (!order) {

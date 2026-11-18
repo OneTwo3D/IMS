@@ -1418,7 +1418,7 @@ async function processDeltaChunk(
           // orders (which never have an externalRefundId), leaving that path unchanged.
           wasHandledByRecentWcRefund: async (orderId) => {
             const wcRefund = await db.salesOrderRefund.findFirst({
-              where: { orderId, externalRefundId: { not: null }, createdAt: { gte: windowStart } },
+              where: { orderId, externalRefundId: { not: null }, createdAt: { gte: windowStart }, deletedAt: null },
               select: { id: true },
             })
             return wcRefund != null

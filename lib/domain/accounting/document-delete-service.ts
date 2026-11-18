@@ -91,6 +91,7 @@ export async function loadDocumentDeleteCandidate(
     const [payments, refunds, openRows, createRow, pending] = await Promise.all([
       client.payment.count({ where: { orderId: order.id } }),
       // soft-delete exception: a deleted refund still has a credit note in the ledger, so it keeps blocking an order delete.
+      // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
       client.salesOrderRefund.count({ where: { orderId: order.id } }),
       client.accountingSyncLog.findMany({
         where: { referenceType: 'SalesOrder', referenceId: order.id, type: { in: [...SALES_OPEN_TYPES] }, status: { in: [...OPEN_STATUSES] } },
@@ -518,6 +519,7 @@ async function lateActivityOn(tx: Client, deletion: { kind: string; documentId: 
     const [payments, refunds, order] = await Promise.all([
       tx.payment.count({ where: { orderId: deletion.documentId } }),
       // soft-delete exception: as above, a deleted refund keeps blocking an order delete.
+      // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
       tx.salesOrderRefund.count({ where: { orderId: deletion.documentId } }),
       tx.salesOrder.findUnique({ where: { id: deletion.documentId }, select: { paidAt: true } }),
     ])

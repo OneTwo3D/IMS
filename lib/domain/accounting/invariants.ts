@@ -1130,7 +1130,7 @@ export async function collectAccountingInvariantRows(
           { revenueDeferredDate: retainedDateFilter },
           { inventoryAllocatedDate: retainedDateFilter },
           { shipments: { some: { shipmentJournalDate: retainedDateFilter } } },
-          { refunds: { some: retentionCutoff ? { refundedAt: { gte: retentionCutoff } } : {} } },
+          { refunds: { some: retentionCutoff ? { refundedAt: { gte: retentionCutoff }, deletedAt: null } : { deletedAt: null } } },
         ],
         // NB: the revenue_posted_without_payment invariant (scjz.72) only evaluates
         // orders collected by the retention window above — i.e. recent reversed

@@ -457,6 +457,7 @@ export async function deleteSalesOrderRefund(
         return { success: true, pending: true, alreadyDeleted: false, orderId: plan.orderId, creditNoteNumber: plan.creditNote.number, productIds: [], voidQueued: true, counterJournalQueued: false }
       }
 
+      // soft-delete exception: the delete itself reads the refund row it is about to mark.
       const refund = await tx.salesOrderRefund.findUniqueOrThrow({
         where: { id: plan.refundId },
         select: { id: true, orderId: true, creditNoteNumber: true, accountingCreditNoteId: true, totalBase: true, totalForeign: true },
