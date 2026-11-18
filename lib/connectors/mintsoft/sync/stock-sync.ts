@@ -71,6 +71,7 @@ import {
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import {
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
   computeLandedCostForPendingLines,
@@ -2033,6 +2034,15 @@ export async function applyMintsoftAlignmentForProduct(params: {
         // `wms-purchase-receipt:<poId>:<eventId>` nor `purchase-receipt:<poId>:<receiptRef>`; and
         // because the movement id is fresh per allocation, one sweep crediting two ASN lines of one
         // order posts two journals for two disjoint quantities rather than one merged amount.
+        // GR/IR accrual: the same units the layer above carries, at the PO goods unit cost, keyed on this allocation's movement so a replay records
+        // nothing. In this transaction, whether or not Xero posting is on.
+        await recordGrirReceipt(tx, {
+          poId: purchaseCost.poId,
+          sourceRef: purchaseCost.poId,
+          keyBase: `wms-align-up:${candidate.id}:${movement.id}`,
+          at: now,
+          lines: [{ poLineId: candidate.sourceLineId, qty: allocation.qty }],
+        })
         const receiptValueBase = multiplyMoney(toDecimal(allocation.qty), toDecimal(unitCostBase))
         if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
           const amount = roundQuantity(receiptValueBase, 2).toNumber()

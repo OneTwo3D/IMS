@@ -134,6 +134,7 @@ const INLINE_SITES: Array<{ types: string[]; file: string; pattern: RegExp }> = 
   { types: ['DAILY_BATCH_INVENTORY_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Inventory reconciliation/ },
   { types: ['DAILY_BATCH_COGS_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `COGS reconciliation/ },
   { types: ['DAILY_BATCH_TRANSIT_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Transit reconciliation/ },
+  { types: ['DAILY_BATCH_GRIR_RECLASS'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: group\.date,\n\s*reference: `GR\/IR reclass/ },
   { types: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: (?:plan\.)?group\.date,/ },
 ]
 
@@ -348,7 +349,7 @@ const POSTING_PATH_FIELD: Record<string, 'date' | 'paymentDate'> = {
   PURCHASE_INVOICE: 'date', PURCHASE_INVOICE_UPDATE: 'date', COGS_JOURNAL: 'date', INVENTORY_ADJUSTMENT: 'date', SALES_INVOICE: 'date', SALES_INVOICE_UPDATE: 'date', SALES_INVOICE_DELETE: 'date', PURCHASE_INVOICE_DELETE: 'date',
   INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', CREDIT_NOTE_VOID: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
   STOCK_RECEIPT: 'date', COGS_REVERSAL: 'date', DAILY_BATCH_REVENUE_DEFERRAL: 'date', DAILY_BATCH_INVENTORY_ALLOC: 'date', DAILY_BATCH_GROUP_B: 'date',
-  DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', UNEARNED_REV_REVERSAL: 'date',
+  DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', DAILY_BATCH_GRIR_RECLASS: 'date', UNEARNED_REV_REVERSAL: 'date',
   ALLOCATION_REVERSAL: 'date', BILL_PAYMENT: 'paymentDate', MANUFACTURING_JOURNAL: 'date', MANUFACTURING_RECLASS: 'date',
 }
 
