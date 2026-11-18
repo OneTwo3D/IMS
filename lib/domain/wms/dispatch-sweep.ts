@@ -154,7 +154,8 @@ export function cancelledOrderDespatchedReason(orderNumber: string | null | unde
 }
 
 export const DISPATCH_POLLED_ORDER_WHERE = [
-  { order: { status: { notIn: [...POST_DISPATCH_STATUSES] } } },
+  // `partialDespatchAppliedAt`: the warehouse's part of a mixed-warehouse order was applied; it has nothing more to report, so it is no longer re-read.
+  { order: { status: { notIn: [...POST_DISPATCH_STATUSES] } }, partialDespatchAppliedAt: null },
   { cancelNoticeAt: { not: null }, order: { status: 'CANCELLED' as const } },
 ]
 
@@ -3079,11 +3080,19 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         tracking,
         ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true, ...(options.fence ? { shipFence: options.fence } : {}) } : {}),
       })
-      if (result.success) {
+      // A mixed-warehouse order (owner ruling 2026-11-18): only this warehouse's shipments were shipped; the order stays open for the others. That is a
+      // SUCCESS (never counted as a dispatch failure). The link is stamped below and no longer polled, so this runs once; a re-apply that shipped nothing new
+      // (a race with the stamp) is not recorded again as a mutation event.
+      const partial = result.success ? result.partialWarehouse : undefined
+      // Its warehouse's part is applied: stamp the link so the sweep stops re-reading live Mintsoft for an order that has nothing more to report.
+      if (partial) await db.wmsOrderPushLink.updateMany({ where: { orderId, connector: connectorId, partialDespatchAppliedAt: null }, data: { partialDespatchAppliedAt: new Date() } })
+      if (result.success && !(partial && partial.shippedShipmentCount === 0)) {
         await recordWmsMutationEvent({
           connector: connectorId, direction: 'INBOUND', action: 'dispatch_applied', outcome: 'SUCCEEDED',
           entityType: 'SALES_ORDER', entityId: orderId,
-          summary: `WMS despatch applied to order ${orderBefore?.orderNumber ?? orderId} — shipment marked SHIPPED`,
+          summary: partial
+            ? `WMS despatch applied to order ${orderBefore?.orderNumber ?? orderId} — ${partial.shippedShipmentCount} shipment(s) in the despatching warehouse marked SHIPPED; ${partial.openShipmentIds.length} shipment(s) in another warehouse left open`
+            : `WMS despatch applied to order ${orderBefore?.orderNumber ?? orderId} — shipment marked SHIPPED`,
           before: { orderStatus: orderBefore?.status ?? null },
           after: { shipmentStatus: 'SHIPPED', tracking: tracking.map((entry) => ({ trackingNumber: entry.trackingNumber, shippingService: entry.shippingService ?? null })) },
           triggeredBy: 'dispatch-sweep',

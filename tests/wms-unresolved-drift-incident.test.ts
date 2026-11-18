@@ -69,8 +69,9 @@ test('[o3d-bjc.12] isolation eligibility is the SWEEP\'s predicate, not an appro
   // recorded is no longer a dispatch candidate — quarantining it would invent
   // an exception for an order nobody is waiting on.
   // ...except an IMS-CANCELLED order whose link carries a cancel notice: the warehouse could not cancel it, so it is still polled for despatch.
+  // ...and not one whose warehouse part of a mixed-warehouse order is already applied (nothing more to read).
   assert.deepEqual(where.OR, [
-    { order: { status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] } } },
+    { order: { status: { notIn: ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] } }, partialDespatchAppliedAt: null },
     { cancelNoticeAt: { not: null }, order: { status: 'CANCELLED' } },
   ])
   assert.deepEqual(where.state, { in: ['SYNCED', 'MERGED'] })
