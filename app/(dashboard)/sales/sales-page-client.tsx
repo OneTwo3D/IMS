@@ -26,7 +26,7 @@ type Props = {
   taxRates: TaxRateRow[]
   customers: CustomerRow[]
   stockLevels: Record<string, Record<string, StockLevelEntry>>
-  avgCogs: Record<string, number>
+  avgCogs: Record<string, number> | null
   users: UserOption[]
   currentUserName: string
   companyHomeCountry?: string | null

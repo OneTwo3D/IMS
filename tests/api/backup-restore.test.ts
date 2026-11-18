@@ -9,6 +9,10 @@ import test from 'node:test'
 
 import { NextRequest, NextResponse } from 'next/server'
 
+// The restore token is bound to the client IP, which is only resolved from forwarding headers when a
+// trusted proxy is configured (lib/request-ip.ts).
+process.env.TRUSTED_PROXY_IPS = '10.255.255.1'
+
 // Route-handler unit tests run through `npm run test:unit`
 // (`node --import tsx --test`), matching the existing explicit `.ts`
 // imports used by API route tests in this repository.
@@ -32,7 +36,7 @@ function restoreTokenPayload(overrides: Partial<{
   userId: string
   sessionVersion: number | null
   sessionAuthTime: number | null
-  clientIp: string
+  clientIp: string | null
 }> = {}): string {
   return JSON.stringify({
     userId: 'admin-1',
@@ -328,7 +332,7 @@ test('production restore code issuance removes the one-time token when email del
   assert.equal(calls.deleteToken, 1)
 })
 
-test('restore code issuance rejects requests without a verifiable client IP', async () => {
+test('restore code issuance without a verifiable client IP binds the token to the session alone (restore stays available)', async () => {
   const { deps, calls } = baseDeps({
     env: {
       ...productionEnv(),
@@ -340,10 +344,46 @@ test('restore code issuance rejects requests without a verifiable client IP', as
   const response = await handler(restoreGetRequest({}))
   const body = await responseJson(response)
 
-  assert.equal(response.status, 400)
-  assert.equal(body.error, 'Cannot issue restore token without verifiable client IP.')
-  assert.equal(calls.setToken, 0)
-  assert.equal(calls.mailer, 0)
+  assert.equal(response.status, 200)
+  assert.equal(body.success, true)
+  assert.equal(calls.setToken, 1)
+  assert.equal(calls.mailer, 1)
+  const bound = JSON.parse(calls.setTokenArgs[0].value) as Record<string, unknown>
+  assert.equal(bound.clientIp, null)
+  assert.equal(bound.userId, 'admin-1')
+  assert.equal(bound.sessionVersion, adminSession.user.sessionVersion)
+  assert.ok(calls.setTokenArgs[0].ttlMs > 0 && calls.setTokenArgs[0].ttlMs <= 5 * 60_000, 'short TTL')
+})
+
+test('restore POST accepts a session-bound (no-IP) token when no client IP resolves, and rejects it from another session', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-noip-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const noIpRequest = () => new NextRequest('https://ims.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: { origin: 'https://ims.example.test' },
+      body: existingBackupBody('backup.sql'),
+    })
+    const ok = baseDeps({
+      backupDir: root,
+      env: { ...productionEnv(), ALLOW_DATABASE_RESTORE: 'true' },
+      consumeRestoreToken: async () => restoreTokenPayload({ clientIp: null }),
+    })
+    const accepted = await createBackupRestorePostHandler(ok.deps)(noIpRequest())
+    assert.equal(accepted.status, 200)
+    assert.equal(ok.calls.runRestore, 1)
+
+    const other = baseDeps({
+      backupDir: root,
+      env: { ...productionEnv(), ALLOW_DATABASE_RESTORE: 'true' },
+      consumeRestoreToken: async () => restoreTokenPayload({ clientIp: null, sessionAuthTime: 1_771_234_568_000 }),
+    })
+    const rejected = await createBackupRestorePostHandler(other.deps)(noIpRequest())
+    assert.equal(rejected.status, 400)
+    assert.equal(other.calls.runRestore, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('restore code issuance stores a two-minute session and IP bound token payload', async () => {
