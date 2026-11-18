@@ -603,7 +603,7 @@ export function resolveWcTradeFieldUpdates(
 
 /**
  * Fields a variation clears: the merged value is still empty, nothing present-but-unusable was supplied by the variation
- * OR its parent, and the variation or the parent explicitly emptied it.
+ * OR its parent, and the VARIATION's own native value is empty and its own cleared-fields meta lists it.
  */
 export function resolveVariationCleared(
   own: { cleared: readonly WcTradeField[]; rejected: readonly WcRejectedCustomsValue[] },
@@ -615,7 +615,8 @@ export function resolveVariationCleared(
       merged[f] === null
       && !own.rejected.some((r) => r.field === f)
       && !parent.rejected?.some((r) => r.field === f)
-      && (own.cleared.includes(f) || Boolean(parent.cleared?.includes(f))),
+      // Only the variation's OWN marker counts: a parent-only marker says nothing about a value set on the variation itself.
+      && own.cleared.includes(f),
   )
 }
 
