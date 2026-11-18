@@ -5246,7 +5246,7 @@ if ! $NO_GIT; then
     privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
-    chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+    chown_app_root_tree "${APP_DIR}" "${APP_USER}" "the application directory" || die "The ownership of ${APP_DIR} could not be set; the reason is above."
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing app directory."
   fi
