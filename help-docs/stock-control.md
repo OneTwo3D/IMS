@@ -26,7 +26,7 @@ At **Stock Control > Stock Adjustments**, click **New Adjustment** to adjust sev
 
 Saving the same batch twice by accident (a double click or a retry) does not book it twice.
 
-The page also offers **Import Opening Stock** (a CSV of `sku`, `warehouseCode`, `qty` and `unitCostBase`; each product and warehouse can have opening stock applied only once), a stock-levels export with warehouse and "Include bundles" options, and a CSV **Template**, **Export** and **Import** for adjustments. Below the buttons the history lists every adjustment; use the pencil on a row to change its quantity or note.
+The page also offers **Import Opening Stock** (a CSV of `sku`, `warehouseCode`, `qty` and `unitCostBase`; each product and warehouse can have opening stock applied only once), a stock-levels export with warehouse and "Include bundles" options, and a CSV **Template**, **Export** and **Import** for adjustments. Below the buttons the history lists every adjustment; use the pencil on a row to change its quantity or note. A valued adjustment that has no reason (every row of an adjustments CSV import, which has no reason column), a reason with no account, or no mapped inventory account cannot post a journal: with Xero sync and the inventory-adjustment sync type on, it appears in the exception inbox as a stock adjustment journal to post by hand. Nothing is raised while Xero sync or that sync type is off.
 
 ### Adjustment Reasons
 

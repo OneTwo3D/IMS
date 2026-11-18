@@ -23,7 +23,7 @@ import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidB
 import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
-import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type RefusedActionInput } from '@/lib/domain/refused-actions'
+import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type AmendmentLineChange, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
 import { runSystemicPass, type SystemicFailureStore } from './systemic-failure'
@@ -877,6 +877,9 @@ const RESET_DISPATCH_FAILURES = {
 /** How many open serious amendment refusals one sweep re-reads from the warehouse (one read-only fetch each). */
 export const AMENDMENT_VERIFY_BATCH = 10
 
+/** The amendment gates whose intent carries lines the warehouse's own lines can be compared with. The unbuildable gate has none and is never verified here. */
+const VERIFIABLE_AMEND_GATES = ['WMS_ORDER_NOT_NEW', 'WMS_ORDER_NOT_AMENDABLE'] as const
+
 export const AMEND_LEASE_TTL_MS = 10 * 60_000
 
 /** Where the held create pass's walk stands (a Setting). Cleared when a page comes back short. */
@@ -1221,7 +1224,7 @@ export interface WmsOrderPushPort {
    */
   openAmendmentRefusals?(connector: string, limit: number): Promise<Array<{ orderId: string; externalOrderId: string; lines: Array<{ sku: string; quantity: number }> }>>
   /** Close this order's open refusals of one action: the action later succeeded. */
-  resolveRefusedActions?(orderId: string, action: RefusedActionInput['action']): Promise<void>
+  resolveRefusedActions?(orderId: string, action: RefusedActionInput['action'], gate?: string | readonly string[]): Promise<void>
   /** Live links with a courier-fallback task due and not yet recorded. */
   courierTasksDue?(connector: string, limit: number): Promise<Array<{ orderId: string; externalOrderId: string; externalOrderNumber: string | null; orderNumber: string | null; service: string; pushedAt?: Date | null; courierTaskEpisode?: Date | null }>>
   /** Persist the courier due-marker for this order and service BEFORE an amendment call, only while none is set. True when this call set it. */
@@ -1444,6 +1447,58 @@ export async function runWmsOrderPushSweepCore(
         // The same intent is one task; a changed intent (different lines) is a new one.
         dedupeBasis: `amend:${JSON.stringify(input.lines.map((line) => [line.sku, Number(line.quantity)]).sort())}`,
       })
+    }
+  }
+
+  /**
+   * Record an amendment IMS could not build (see the amendment pass). Retryable: it clears itself when the order builds again. Never throws.
+   * SEVERITY FOLLOWS WHAT CHANGED, not the bare fact that the order was touched:
+   *   - a removed delivery street is a change to the address: HIGH.
+   *   - a withheld store-credit review (or any other cause): the lines IMS would send are compared with the lines recorded on the warehouse order. Differing
+   *     or unreadable lines: HIGH. Identical lines: nothing the warehouse picks has changed, so a store-credit review (an expected, separately queued state)
+   *     raises NO row, and any other cause is LOW. A plain updatedAt bump with no buildable difference therefore never raises a HIGH row.
+   */
+  const recordUnbuildableAmendment = async (link: { id: string; order: { id: string; orderNumber: string | null; lines?: unknown } }, order: OrderForPush, error: unknown): Promise<void> => {
+    if (!port.recordRefusedAction) return
+    try {
+      const message = error instanceof Error ? error.message : ''
+      let severity: 'HIGH' | 'LOW' = 'HIGH'
+      if (message !== NO_DELIVERY_STREET_REASON) {
+        let lineChange: AmendmentLineChange = 'UNKNOWN'
+        try {
+          const wanted = buildLines(order.lines, refundedQtyByLine(order)).map((line) => ({ sku: line.sku, quantity: Number(line.quantity) }))
+          const recorded = port.readOrderItems ? await port.readOrderItems(link.id).catch(() => null) : null
+          lineChange = classifyAmendmentLineChange(wanted, recorded)
+        } catch {
+          lineChange = 'UNKNOWN'
+        }
+        if (lineChange === 'UNCHANGED') {
+          if (message === STORE_CREDIT_PUSH_WITHHELD_REASON) return
+          severity = 'LOW'
+        }
+      }
+      await port.recordRefusedAction({
+        entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
+        entityId: link.order.id,
+        action: 'WMS_ORDER_AMEND',
+        gate: 'WMS_AMEND_UNBUILDABLE',
+        permanence: 'RETRYABLE',
+        severity,
+        intent: { orderNumber: link.order.orderNumber ?? null } as unknown as Prisma.InputJsonValue,
+        detail: `IMS could not build this order's change for the warehouse, so nothing was sent and the warehouse order may be out of date: ${scrubWmsError(error, 'unknown reason')}`,
+        now: now(),
+      })
+    } catch (recordError) {
+      console.error('[wms-order-push] could not record an unbuildable amendment', recordError)
+    }
+  }
+
+  /** The order builds again: the unbuildable row (and only that gate) is closed, whatever the connector then answers. The outcome's own row or gate takes over. Never throws. */
+  const closeUnbuildableAmendment = async (orderId: string): Promise<void> => {
+    try {
+      await port.resolveRefusedActions?.(orderId, 'WMS_ORDER_AMEND', 'WMS_AMEND_UNBUILDABLE')
+    } catch (resolveError) {
+      console.error('[wms-order-push] could not close an unbuildable amendment', resolveError)
     }
   }
 
@@ -3397,7 +3452,7 @@ export async function runWmsOrderPushSweepCore(
         for (const open of await port.openAmendmentRefusals(connectorId, AMENDMENT_VERIFY_BATCH)) {
           const held = await connector.fetchOrderItemRefs(open.externalOrderId).catch(() => null)
           if (!held || held.length === 0) continue
-          if (classifyAmendmentLineChange(open.lines, held.map((item) => ({ sku: item.sku, quantity: Number(item.quantity) }))) === 'UNCHANGED') await port.resolveRefusedActions(open.orderId, 'WMS_ORDER_AMEND')
+          if (classifyAmendmentLineChange(open.lines, held.map((item) => ({ sku: item.sku, quantity: Number(item.quantity) }))) === 'UNCHANGED') await port.resolveRefusedActions(open.orderId, 'WMS_ORDER_AMEND', VERIFIABLE_AMEND_GATES)
         }
       } catch (error) {
         console.error('[wms-order-push] could not verify the unapplied amendments', error)
@@ -3461,7 +3516,19 @@ export async function runWmsOrderPushSweepCore(
           amendOrder = { ...link.order, ...current } as typeof link.order
         }
         amendService = amendOrder.shippingService
-        const input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
+        let input: WmsOrderPushInput
+        try {
+          input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
+        } catch (buildError) {
+          // THE CHANGE CANNOT EVEN BE BUILT (a store-credit review, a removed street, a line with no SKU): nothing is sent and the link stays due, so it
+          // is retried every sweep. That used to leave only a lastError on a SYNCED link, which no one looks at while the warehouse works from stale
+          // data. It is now a standing refused-action row on Sync > Exceptions (one row however often it repeats; it ages into an alert, and closes
+          // when a later amendment is applied). Best effort: a failure to record never hides the build error, which still fails this link as before.
+          await recordUnbuildableAmendment(link, amendOrder, buildError)
+          throw buildError
+        }
+        // It builds: any standing unbuildable row is no longer true, whether or not the warehouse then takes the change.
+        await closeUnbuildableAmendment(link.order.id)
         // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
         // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
         // amendment or a failed cleanup therefore always leaves them untrusted. If the mark cannot be written, nothing is sent.
@@ -3796,6 +3863,8 @@ export async function runWmsOrderPushSweepCore(
           await port.updateLink(link.id, gate.release
             ? { state: 'HELD', cancelledAt: confirmed ? ts : null, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null }
             : { state: 'DEAD_LETTER', cancelledAt: null, lastError: gate.guidance, lastAttemptAt: ts, reconcileCheckedAt: null })
+          // An order on hold leaves the amendment pass (and is re-created from a fresh build on release): an unbuildable-change row can no longer be acted on.
+          await closeUnbuildableAmendment(link.orderId)
           if (gate.release) result.held += 1
           else result.deadLettered += 1
           await audit({
@@ -4741,7 +4810,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           SELECT r.id, l."externalOrderId" AS external_order_id
             FROM refused_actions r
             JOIN wms_order_push_links l ON l."orderId" = r.entity_id AND l.connector = ${connector} AND l.state::text = 'SYNCED' AND l."externalOrderId" IS NOT NULL
-           WHERE r.entity_type = ${REFUSED_ACTION_ENTITY_SALES_ORDER} AND r.action = 'WMS_ORDER_AMEND' AND r.resolved_at IS NULL AND r.severity = 'HIGH'
+           WHERE r.entity_type = ${REFUSED_ACTION_ENTITY_SALES_ORDER} AND r.action = 'WMS_ORDER_AMEND' AND r.gate IN ('WMS_ORDER_NOT_NEW', 'WMS_ORDER_NOT_AMENDABLE') AND r.resolved_at IS NULL AND r.severity = 'HIGH'
            ORDER BY r.last_verified_at ASC NULLS FIRST, r.id ASC
            LIMIT ${limit}
              FOR UPDATE OF r SKIP LOCKED
@@ -4756,8 +4825,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         return lines.length > 0 ? [{ orderId: row.entity_id, externalOrderId: row.external_order_id, lines }] : []
       })
     },
-    async resolveRefusedActions(orderId, action) {
-      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action }, 'ACTION_SUCCEEDED')
+    async resolveRefusedActions(orderId, action, gate) {
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action, ...(gate ? { gate } : {}) }, 'ACTION_SUCCEEDED')
     },
     async courierTasksDue(connector, limit) {
       const rows = await db.wmsOrderPushLink.findMany({

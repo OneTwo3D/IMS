@@ -38,16 +38,32 @@ function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-async function expandDependentKitIds(productIds: string[]): Promise<string[]> {
+const MAX_DEPENDENT_KIT_DEPTH = 10
+
+/**
+ * Every KIT that contains one of `productIds` as a component, at any nesting depth (a gift box holding a kit that holds the
+ * changed component is stale too). Breadth-first and bounded: a kit cycle adds nothing new and the depth is capped.
+ */
+export async function expandDependentKitIds(productIds: string[]): Promise<string[]> {
   if (productIds.length === 0) return []
-  const rows = await db.productComponent.findMany({
-    where: {
-      componentId: { in: productIds },
-      product: { lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES }, type: 'KIT' },
-    },
-    select: { productId: true },
-  })
-  return rows.map((row) => row.productId)
+  const found = new Set<string>()
+  let frontier = [...new Set(productIds)]
+  for (let depth = 0; depth < MAX_DEPENDENT_KIT_DEPTH && frontier.length > 0; depth++) {
+    const rows = await db.productComponent.findMany({
+      where: {
+        componentId: { in: frontier },
+        product: { lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES }, type: 'KIT' },
+      },
+      select: { productId: true },
+    })
+    frontier = []
+    for (const row of rows) {
+      if (found.has(row.productId)) continue
+      found.add(row.productId)
+      frontier.push(row.productId)
+    }
+  }
+  return [...found]
 }
 
 async function expandProductScope(productIds: string[]): Promise<string[]> {
