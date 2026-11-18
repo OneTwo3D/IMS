@@ -104,7 +104,10 @@ export function LoginForm({ turnstileSiteKey, sessionMessage }: LoginFormProps) 
     resetTurnstile()
 
     if (result?.error) {
-      setError('Invalid email or password.')
+      const wait = /^login_wait_(\d+)$/.exec(result.code ?? '')
+      setError(wait
+        ? `Too many sign-in attempts. Try again in ${wait[1]} second${wait[1] === '1' ? '' : 's'}.`
+        : 'Invalid email or password.')
       return
     }
 

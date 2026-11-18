@@ -3,7 +3,7 @@
 import { INVOICING_STATE_CLASS, INVOICING_STATE_LABELS } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
 import { useRouter } from 'next/navigation'
-import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
+import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical, ArrowRightLeft } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { WmsOrderStatusChip } from '@/components/sales/wms-order-status-chip'
 import { DeleteSyncedDocument } from '@/components/accounting/delete-synced-document'
@@ -29,6 +29,7 @@ import {
   type ReturnExchangeOffer, type ReturnExchangePreview, type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
+import { convertQuoteToOrder, sendQuoteEmail } from '@/app/actions/sales-quotes'
 import { deleteRefund, getRefundDeleteEligibility, type RefundDeleteEligibility } from '@/app/actions/refund-delete'
 import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
@@ -133,6 +134,8 @@ type Props = {
   rejectedAccountingSyncs: RejectedAccountingDocumentUpdateWarning[]
   /** audit-H2: order is fully paid but its trigger won't auto-generate an invoice. */
   paidWithoutInvoice: boolean
+  /** The Settings switch behind Send quote (sales_quote_email_enabled). Off: a quote offers a PDF download only. */
+  quoteEmailEnabled?: boolean
   /** The catalogue the Edit order dialog needs; loaded by the page only for a DRAFT (the only status that can be edited). */
   editForm?: Omit<ComponentProps<typeof SoFormDialog>, 'order' | 'onClose' | 'warehouses' | 'currencies'>
   /** Whether the refund dialog may record an exchange for this order (null for a person who cannot refund). */
@@ -1232,7 +1235,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1299,7 +1302,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
 
   const hasShipments = shipments.length > 0
   // Filter out Delivered action if delivery tracking is not enabled
-  const nextActions = nextStatusActions(so.status, deliveryTrackingEnabled).map((a) => ({ ...a, icon: STATUS_ACTION_ICON[a.target] ?? Package }))
+  // A quote is a draft that cannot be processed until it is converted (the server refuses the move too), so it offers Convert to order instead of Process.
+  const nextActions = (so.isQuote ? [] : nextStatusActions(so.status, deliveryTrackingEnabled)).map((a) => ({ ...a, icon: STATUS_ACTION_ICON[a.target] ?? Package }))
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   // o3d-0zy: predict the o3d-5r8 delete refusal instead of letting the operator walk into it. Every
@@ -1526,6 +1530,35 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
     })
   }
 
+  function handleConvertQuote() {
+    setError('')
+    let overrideNote: string | undefined
+    if (so.quoteExpired) {
+      const note = window.prompt(`This quote expired on ${so.quoteValidUntil}. To convert it anyway, say why its prices still stand:`)
+      if (note === null) return
+      if (!note.trim()) { setError('A note is needed to convert an expired quote.'); return }
+      overrideNote = note.trim()
+    } else if (!confirm('Convert this quote to an order? It stays a draft (prices unchanged) until you confirm it.')) {
+      return
+    }
+    startTransition(async () => {
+      const result = await convertQuoteToOrder(so.id, overrideNote ? { overrideNote } : undefined)
+      if (result.success) router.refresh()
+      else setError(result.error ?? 'Failed to convert the quote')
+    })
+  }
+
+  function handleSendQuote() {
+    setError('')
+    startTransition(async () => {
+      const result = await sendQuoteEmail(so.id)
+      if (result.success) {
+        alert(result.alreadyQueued ? 'This quote is already queued for sending.' : 'Quote queued for ' + so.customerEmail + '. It is sent by the email queue, not instantly.')
+        router.refresh()
+      } else setError(result.error ?? 'Failed to queue the quote email')
+    })
+  }
+
   function handleEmailInvoice() {
     setError('')
     startTransition(async () => {
@@ -1540,8 +1573,17 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
       {/* Status + Actions */}
       <div className="flex flex-wrap items-center gap-2">
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[so.status]}`}>
-          {STATUS_LABELS[so.status]}
+          {so.isQuote ? 'Quote' : STATUS_LABELS[so.status]}
         </span>
+        {so.isQuote && (
+          <span className="text-sm text-muted-foreground">
+            {so.quoteValidUntil ? `Valid until ${so.quoteValidUntil}` : 'No validity date'}
+            {so.quoteSentAt ? `, queued for sending ${formatDateTime(so.quoteSentAt)}` : ''}
+          </span>
+        )}
+        {so.quoteExpired && (
+          <span className="inline-flex items-center rounded-full border border-red-300 bg-red-50 px-2 py-0.5 text-xs font-medium text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200">Expired</span>
+        )}
         {(() => {
           const fulfilment = summariseFulfilment(so.status, shipments.map((sh) => sh.status), so.shipmentOutstandingQty)
           return fulfilment ? (
@@ -1652,6 +1694,19 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             </Button>
           )}
 
+          {/* Quote: the one click that makes it an order (a draft the operator then confirms), and the optional email. */}
+          {so.isQuote && hasPermission(currentUserRole, 'sales.create') && (
+            <Button size="sm" onClick={handleConvertQuote} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <ArrowRightLeft className="h-4 w-4 mr-1" />}
+              Convert to order
+            </Button>
+          )}
+          {so.isQuote && quoteEmailEnabled && so.customerEmail && hasPermission(currentUserRole, 'sales.process') && (
+            <Button size="sm" variant="outline" onClick={handleSendQuote} disabled={isPending}>
+              <Mail className="h-4 w-4 mr-1" />Send quote
+            </Button>
+          )}
+
           {/* Workflow */}
           {nextActions.map((a) => (
             <Button key={a.target} size="sm" onClick={() => handleStatusChange(a.target)} disabled={isPending}>
@@ -1664,7 +1719,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
               manual/unset trigger (paidWithoutInvoice), show ONLY the amber chip
               — suppress the plain generate button and the pending-sync chip so
               there is a single, unambiguous affordance. */}
-          {accountingAvailable && !so.invoiceNumber && !accountingSyncEnabled && !paidWithoutInvoice && (
+          {accountingAvailable && !so.isQuote && !so.invoiceNumber && !accountingSyncEnabled && !paidWithoutInvoice && (
             <Button variant="outline" size="sm" onClick={handleGenerateInvoice} disabled={isPending}>
               <FileText className="h-4 w-4 mr-1" />Generate Invoice
             </Button>
@@ -1700,7 +1755,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             // The reason lives on the wrapper, not the button: a disabled button swallows pointer events in several browsers.
             <span title={editBlock?.reason} className="inline-flex">
               <Button variant="outline" size="sm" onClick={() => (editScope.scope === 'ADDRESS_NOTES' ? setShowAddresses(true) : setShowEdit(true))} disabled={isPending || editScope.scope === 'NONE' || (editScope.scope === 'FULL' && !editForm)} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
-                <Pencil className="h-4 w-4 mr-1" />{editScope.scope === 'ADDRESS_NOTES' ? 'Edit addresses & notes' : 'Edit order'}
+                <Pencil className="h-4 w-4 mr-1" />{editScope.scope === 'ADDRESS_NOTES' ? 'Edit addresses & notes' : so.isQuote ? 'Edit quote' : 'Edit order'}
               </Button>
               {editBlock && <span id="edit-order-blocked-reason" className="sr-only">{editBlock.reason}</span>}
             </span>
@@ -1761,7 +1816,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem onClick={() => window.open(`/api/sales-order/${so.id}`, '_blank')}>
-                <FileText className="h-4 w-4 mr-1.5" />Order PDF
+                <FileText className="h-4 w-4 mr-1.5" />{so.isQuote ? 'Quote PDF' : 'Order PDF'}
               </DropdownMenuItem>
               {accountingAvailable && so.invoiceNumber && (
                 <DropdownMenuItem onClick={() => window.open(`/api/invoice/${so.id}`, '_blank')}>
@@ -1774,7 +1829,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                 </DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
-              {so.customerEmail && (
+              {so.customerEmail && !so.isQuote && (
                 <DropdownMenuItem onClick={handleEmailOrder} disabled={isPending}>
                   <Mail className="h-4 w-4 mr-1.5" />Email Order
                 </DropdownMenuItem>

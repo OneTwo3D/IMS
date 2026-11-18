@@ -33,7 +33,7 @@ import { getCustomerAnalyticsReport, getSalesAnalyticsReport, type SalesFulfillm
 
 mock.module('@/lib/auth/server', {
   namedExports: {
-    requirePermission: async () => ({ user: { id: 'u1' } }),
+    requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
     requireInternalUser: async () => ({ user: { id: 'u1' } }),
     requireApiAuth: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
   },

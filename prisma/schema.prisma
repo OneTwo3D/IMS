@@ -1919,6 +1919,15 @@ model SalesOrder {
   shipFromWarehouseId String?
   expectedDelivery  DateTime?
   salesRep          String?
+  /// o3d-ngmt.16: a QUOTATION is a DRAFT with this flag set, not a status of its own. Nothing downstream is told: every rule that already
+  /// applies to a draft (not pushed to the warehouse, not allocated, no stock reserved, no invoice queued, not mirrored to the storefront)
+  /// applies to a quote unchanged. Cleared by converting the quote to an order; the order stays a plain DRAFT until the operator confirms it.
+  /// WooCommerce imports never set it (the column default is false and no importer names it).
+  isQuote           Boolean    @default(false) @map("is_quote")
+  /// The last day the quoted prices stand (a calendar date, no time zone). NULL on every order that is not a quote, and kept after conversion as the record of what was offered.
+  quoteValidUntil   DateTime?  @map("quote_valid_until") @db.Date
+  /// When the quote was last queued to the customer by email (queued, not delivered: the outbox owns delivery). NULL: never sent from IMS.
+  quoteSentAt       DateTime?  @map("quote_sent_at")
   shippedAt         DateTime?
   trackingNumber    String?
   discountStr       String?    // order-level discount input e.g. "10%" or "5.00"

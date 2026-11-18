@@ -54,6 +54,7 @@ test('the edit writers in customers.ts are conditional updateMany calls, never a
 const ORDER_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'app/actions/allocation.ts': { writers: 2, verdict: 'refuses (updateShipmentTracking: shipment + order tracking, one transaction under the order lock)' },
   'app/actions/sales.ts': { writers: 3, verdict: 'refuses (updateSalesOrderNotes, updateSalesOrderAddressesAndNotes: both read erasedAt under the order lock) / despatch (status transition to SHIPPED with a tracking number)' },
+  'app/actions/sales-quotes.ts': { writers: 1, verdict: 'refuses (convertQuoteToOrder: reads erasedAt under the order lock before it appends the expired-quote note to the internal notes)' },
   'lib/connectors/woocommerce/sync/order-import.ts': { writers: 2, verdict: 'marker-guard (update path) / payment note row, not customer data' },
   'lib/domain/erasure/erase-personal-data.ts': { writers: 2, verdict: 'erasure' },
   'lib/domain/sales/shipment-service.ts': { writers: 3, verdict: 'despatch' },

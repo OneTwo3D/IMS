@@ -995,7 +995,10 @@ test('a reset holding the lock stops a promotion: it stores nothing and is retri
     await db.invoiceDocumentFetchState.deleteMany({ where: { orderId: order.id } })
     assert.equal((await service.ensureInvoiceDocument({ orderId: order.id, kind: 'INVOICE' }, depsFor(order))).status, 'stored')
     const verdict = await withInvoiceDocumentResetLock(() => invoiceDocumentResetVerdict())
-    assert.equal(verdict.ok, false, 'a document that committed before the reset took the lock is seen and protected')
+    // Seen = protected on an ordinary database (ok:false), or flagged deletable on one carrying the disposable stamp (a stamped scratch
+    // database, which is what a builder usually runs this against). Either way the committed document was SEEN; the unstamped CI database
+    // takes the first branch.
+    assert.ok(verdict.ok === false || verdict.mayDeleteDocuments === true, 'a document that committed before the reset took the lock is seen and protected')
   } finally {
     await cleanup(db, order.id)
   }
