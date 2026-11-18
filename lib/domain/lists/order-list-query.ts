@@ -84,6 +84,8 @@ export type SoListFilter = {
   includeArchived?: boolean
   /** The Quotes tab: only quotations (o3d-ngmt.16). Combines with search and the other filters. */
   quotesOnly?: boolean
+  /** Only orders whose custom field (by definition id) holds this value. Resolved from the list address by lib/custom-fields/filter.ts. */
+  customField?: { definitionId: string; valueText?: string; valueBoolean?: boolean }
 }
 
 /** What the default view is hiding, so the page can say so. */
@@ -126,6 +128,10 @@ export function buildSalesOrderListWhere(filter: SoListFilter): Prisma.SalesOrde
         { shipments: { some: { trackingNumber: ci(q) } } },
       ],
     })
+  }
+  if (filter.customField) {
+    const { definitionId, valueText, valueBoolean } = filter.customField
+    and.push({ customFieldValues: { some: { definitionId, ...(valueText !== undefined ? { valueText } : {}), ...(valueBoolean !== undefined ? { valueBoolean } : {}) } } })
   }
   return and.length ? { AND: and } : {}
 }
