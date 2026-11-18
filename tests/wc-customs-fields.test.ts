@@ -17,7 +17,7 @@ test('native fields win over attributes', () => {
     customs_description: 'stepper motor',
     attributes: [attr('HS Code', '11111111'), attr('Country of Origin', 'DE'), attr('Customs Description', 'old text')],
   })
-  assert.deepEqual(r, { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'stepper motor', rejected: [], cleared: [] })
+  assert.deepEqual(r, { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'stepper motor', rejected: [], cleared: [], nativeEmpty: [] })
 })
 
 test('description falls back to legacy meta when native and attribute are empty', () => {
@@ -62,16 +62,16 @@ test('variation attributes carry a singular `option`', () => {
       { name: 'customs_description', option: 'plastic bracket' },
     ],
   })
-  assert.deepEqual(r, { hsCode: '3926909090', countryOfOrigin: 'CN', customsDescription: 'plastic bracket', rejected: [], cleared: [] })
+  assert.deepEqual(r, { hsCode: '3926909090', countryOfOrigin: 'CN', customsDescription: 'plastic bracket', rejected: [], cleared: [], nativeEmpty: [] })
 })
 
 test('nothing supplied yields nulls', () => {
-  assert.deepEqual(extractWcCustomsFields({}), { hsCode: null, countryOfOrigin: null, customsDescription: null, rejected: [], cleared: [] })
+  assert.deepEqual(extractWcCustomsFields({}), { hsCode: null, countryOfOrigin: null, customsDescription: null, rejected: [], cleared: [], nativeEmpty: [] })
 })
 
 test('variation in view context: the inherited parent value reads like a native value', () => {
   const variation = { customs_commodity_code: '85011099', customs_country_of_origin: 'CN', customs_description: 'inherited', attributes: [] }
-  assert.deepEqual(extractWcCustomsFields(variation), { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'inherited', rejected: [], cleared: [] })
+  assert.deepEqual(extractWcCustomsFields(variation), { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'inherited', rejected: [], cleared: [], nativeEmpty: [] })
 })
 
 test('unmappable native origin falls back to a valid attribute', () => {
@@ -182,4 +182,11 @@ test('a present-but-invalid fallback value is not a clear', () => {
 test('an invalid native value is rejected, never cleared', () => {
   const r = extractWcCustomsFields({ customs_country_of_origin: 'Atlantis', meta_data: clearedMeta(ALL_MARKED) })
   assert.deepEqual(r.cleared, [])
+})
+
+test('nativeEmpty lists the native keys that are present and empty, with or without the cleared-fields meta', () => {
+  const r = extractWcCustomsFields({ customs_commodity_code: null, customs_country_of_origin: '  ', customs_description: 'Motor' })
+  assert.deepEqual(r.nativeEmpty, ['hsCode', 'countryOfOrigin'])
+  assert.deepEqual(r.cleared, [])
+  assert.deepEqual(extractWcCustomsFields({}).nativeEmpty, [], 'an absent key proves nothing')
 })

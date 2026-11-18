@@ -615,11 +615,13 @@ export function resolveWcTradeFieldUpdates(
 /**
  * Fields a variation clears: the merged value is still empty, nothing present-but-unusable was supplied by the variation
  * OR its parent, and EITHER the VARIATION's own native value is empty and its own cleared-fields meta lists it, OR the
- * parent's cleared-fields meta lists it and the variation held that value by inheritance (`inherited`, what the previous
- * import recorded). A variation with a value of its own is never touched by a parent clear.
+ * parent's cleared-fields meta lists it, the variation held that value by inheritance (`inherited`, what the previous
+ * import recorded) AND the variation's own native key is present and empty (`own.nativeEmpty`: WooCommerce's view of an
+ * inheriting variation shows the parent's cleared value; an absent key proves nothing). A variation with a value of its own
+ * is never touched by a parent clear.
  */
 export function resolveVariationCleared(
-  own: { cleared: readonly WcTradeField[]; rejected: readonly WcRejectedCustomsValue[] },
+  own: { cleared: readonly WcTradeField[]; rejected: readonly WcRejectedCustomsValue[]; nativeEmpty?: readonly WcTradeField[] },
   parent: { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
   merged: WcTradeSnapshot,
   inherited: readonly string[] = [],
@@ -629,8 +631,22 @@ export function resolveVariationCleared(
       merged[f] === null
       && !own.rejected.some((r) => r.field === f)
       && !parent.rejected?.some((r) => r.field === f)
-      && (own.cleared.includes(f) || (Boolean(parent.cleared?.includes(f)) && inherited.includes(f))),
+      && (own.cleared.includes(f) || (Boolean(parent.cleared?.includes(f)) && inherited.includes(f) && Boolean(own.nativeEmpty?.includes(f)))),
   )
+}
+
+/**
+ * What the previous import recorded as inherited, with a fallback for a row whose record is empty (a row that predates the
+ * record, or never imported with it): a field counts as inherited only when the variation's IMS value equals the PARENT's IMS
+ * value as it stood before this import. A recorded list is used as it is.
+ */
+export function resolveInheritedHistory(
+  recorded: readonly string[],
+  variationBefore: WcTradeSnapshot,
+  parentBefore: WcTradeSnapshot | null,
+): string[] {
+  if (recorded.length > 0 || !parentBefore) return [...recorded]
+  return WC_TRADE_FIELDS.filter((f) => variationBefore[f] !== null && variationBefore[f] === parentBefore[f])
 }
 
 /**
@@ -1367,6 +1383,9 @@ export async function syncWcProductToIms(
             ...await applyVariations(
               tx, variations, productId, wcProduct.name, imsCategoryId, structurallyTransformed, customs,
               customsWarnings,
+              existing
+                ? { hsCode: existing.hsCode ?? null, countryOfOrigin: existing.countryOfOrigin ?? null, customsDescription: existing.customsDescription ?? null }
+                : null,
             ),
           )
         }
@@ -1921,6 +1940,8 @@ async function applyVariations(
   parentCustoms: WcCustomsFields & { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
   /** Collects customs warnings (unusable WC values, defaulted origin) for the caller to record. */
   customsWarnings: string[],
+  /** The parent's IMS customs values BEFORE this import wrote them (null for a parent created by it): the fallback that decides what a variation with no inheritance record held. */
+  parentImsBefore: WcTradeSnapshot | null,
 ): Promise<WcProductStructureConflict[]> {
   const conflicts: WcProductStructureConflict[] = []
   const entries = variations
@@ -1997,8 +2018,13 @@ async function applyVariations(
     // that value by inheritance (recorded on the previous import). Nothing inherited may still fill the field, and a variation
     // with a value of its own is never cleared by its parent.
     const existing = existingBySku.get(sku)
-    const variantCleared = resolveVariationCleared(ownCustoms, parentCustoms, variantCustoms, existing?.customsInherited ?? [])
-    const variantInherited = resolveVariationInherited(ownCustoms, parentCustoms, existing?.customsInherited ?? [], variantCleared)
+    const inheritedBefore = resolveInheritedHistory(
+      existing?.customsInherited ?? [],
+      { hsCode: existing?.hsCode ?? null, countryOfOrigin: existing?.countryOfOrigin ?? null, customsDescription: existing?.customsDescription ?? null },
+      parentImsBefore,
+    )
+    const variantCleared = resolveVariationCleared(ownCustoms, parentCustoms, variantCustoms, inheritedBefore)
+    const variantInherited = resolveVariationInherited(ownCustoms, parentCustoms, inheritedBefore, variantCleared)
     customsWarnings.push(
       ...describeWcCustomsWarnings(sku, ownCustoms.rejected, {
         isNewRow: !existing,
