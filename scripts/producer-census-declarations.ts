@@ -359,6 +359,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Enqueues woocommerce/trackship.refire for a shipped, tracked order TrackShip may hold no shipment for: off unless trackship_refire_enabled; a shadow writes a record, no row, and does not spend the look.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::scheduleWcOrderCompletion::enqueueIntegrationOutbox#1', 'woocommerce', 'order.status', 'queue-producer', 'required',
     'Enqueues woocommerce/order.complete inside the shipping transaction.'),
+  d('lib/connectors/woocommerce/sync/tracking-reconcile.ts::defaultPushTracking::pushOrderDeliveryMetadata#1', 'woocommerce', 'order.tracking', 'facade', 'required',
+    'The tracking reconcile sweep re-pushes lost tracking through the shopping facade, behind its own off-by-default setting.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::processWcOrderCompletionJobs::pushOrderDeliveryMetadata#1', 'woocommerce', 'order.tracking', 'facade', 'required',
     'Pushes tracking metadata for an order through the shopping facade.'),
   d('lib/connectors/woocommerce/sync/order-completion-jobs.ts::processWcOrderCompletionJobs::pushSalesOrderStatus#1', 'woocommerce', 'order.status', 'drain', 'required',

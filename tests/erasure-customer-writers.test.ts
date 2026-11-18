@@ -100,6 +100,7 @@ const SYNC_LOG_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'lib/connectors/woocommerce/sync/product-sync.ts': { writers: 4, verdict: 'no-identity (products)' },
   'lib/connectors/woocommerce/sync/refund-sync.ts': { writers: 6, verdict: 'raw-woo (refund parks carry the raw refund and its free-text reason)' },
   'lib/connectors/woocommerce/sync/stock-sync.ts': { writers: 2, verdict: 'no-identity (stock)' },
+  'lib/connectors/woocommerce/sync/tracking-reconcile.ts': { writers: 1, verdict: 'raw-woo (verification mark: reconcileTrackingItems carries the order tracking numbers; same family as the outbound tracking items, same unmet raw-payload scrub obligation)' },
   'lib/connectors/woocommerce/sync/tracking-sync.ts': { writers: 4, verdict: 'raw-woo (outbound tracking items carry tracking numbers)' },
   'lib/domain/sales/refund-service.ts': { writers: 1, verdict: 'no-identity (status updateMany)' },
 }
