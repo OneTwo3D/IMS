@@ -180,6 +180,7 @@ import {
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantities'
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import { billNetPayableBase, billNetPayableForeign } from '@/lib/domain/purchasing/bill-net-payable'
 import { computeReturnCreditNoteDraft } from '@/lib/domain/purchasing/return-credit-note'
 import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
 import { checkReceiptLocations, refuseRestrictedDestination } from '@/lib/domain/purchasing/po-warehouse-eligibility'
@@ -952,6 +953,8 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               unitCostForeign: true,
               totalForeign: true,
               totalBase: true,
+              taxRateValue: true,
+              taxReverseCharge: true,
               poLine: {
                 select: {
                   productId: true,
@@ -1164,6 +1167,8 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       taxBase: Number(inv.taxBase),
       totalForeign: Number(inv.totalForeign),
       totalBase: Number(inv.totalBase),
+      // What is owed to the supplier: the stored total less the VAT the bill accounts for itself on reverse-charge lines (equal to the total when it has none).
+      netPayableForeign: billNetPayableForeign(inv, po.currency).toNumber(),
       notes: inv.notes,
       supplierInvoiceUrl: inv.supplierInvoiceUrl,
       accountingInvoiceId: inv.accountingInvoiceId ?? null,
@@ -1179,7 +1184,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
         // o3d-4ozd: the STORED total, not a `Number` of it. `PurchaseInvoice.totalForeign` is
         // `Decimal(18, 4)`, and converting it here collapsed the very difference the band below is
         // meant to measure — an exact tolerance over two doubles that already agree decides nothing.
-        totalForeign: inv.totalForeign,
+        totalForeign: billNetPayableForeign(inv, po.currency),
         // o3d-6yho (3 of 3): the part/over settlement band is half one minor unit of the PO's own
         // currency — a bill stated in a three- or four-decimal currency was being judged against a
         // half-penny, which reads several whole minor units of shortfall as fully settled.
@@ -3769,7 +3774,7 @@ export async function returnPurchaseOrder(
         select: {
           id: true, invoiceNumber: true, totalBase: true,
           subtotalForeign: true, totalForeign: true, fxRateToBase: true, createdAt: true,
-          lines: { select: { poLineId: true, qtyBilled: true, totalBase: true, totalForeign: true } },
+          lines: { select: { poLineId: true, qtyBilled: true, totalBase: true, totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
         },
       })
       const overBillingComputed = computePurchaseOrderOverBilling({
@@ -3809,6 +3814,8 @@ export async function returnPurchaseOrder(
             invoiceId: inv.id,
             subtotalForeign: inv.subtotalForeign,
             totalForeign: inv.totalForeign,
+            // What is owed to the supplier: the credit's ceiling and gross-up (a reverse-charge bill's stored total includes VAT it accounts for itself).
+            netPayableForeign: billNetPayableForeign(inv, po.currency),
             fxRateToBase: inv.fxRateToBase,
             alreadyCreditedForeign: allCreditedByInvoice.get(inv.id) ?? 0,
             alreadyReturnCreditedForeign: returnCreditedByInvoice.get(inv.id) ?? 0,
@@ -5243,6 +5250,8 @@ export async function markBillPaid(
         fxRateToBase: true,
         paidAt: true,
         accountingInvoiceId: true,
+        // The reverse-charge lines decide the NET PAYABLE (lib/domain/purchasing/bill-net-payable.ts): the stored total carries VAT the bill accounts for itself.
+        lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
         // o3d-j625 r3 (Codex HIGH 2): AND WHOSE BILL THAT ID IS. The id survives a connector switch and
         // carries no provenance of its own, so the bank account's chart cannot speak for it.
         accountingInvoiceConnector: true,
@@ -5266,7 +5275,10 @@ export async function markBillPaid(
     const account = accounts.find((a) => a.id === input.bankAccountId)
     if (!account) return { success: false, error: 'Unknown bank account' }
 
-    const paymentAmount = input.amountForeign ?? Number(invoice.totalForeign)
+    // A full payment is what is OWED to the supplier (the net payable), not the stored total, which includes any reverse-charge VAT the bill accounts for itself.
+    const netPayableForeign = billNetPayableForeign(invoice, invoice.po.currency)
+    const netPayableBase = billNetPayableBase(invoice, invoice.po.currency)
+    const paymentAmount = input.amountForeign ?? netPayableForeign.toNumber()
     const paymentDate = new Date(input.paymentDate)
     const baseCurrency = await getBaseCurrencyCode()
     // o3d-q0x56.4 / .16 - THE SETTLEMENT RATE IS RESOLVED BEFORE THE FIRST WRITE, AND A MISSING ONE REFUSES.
@@ -5576,8 +5588,8 @@ export async function markBillPaid(
           // Booked base for the settled portion = stored totalBase prorated by the
           // settled foreign share, so realised FX measures against the real AP
           // carrying value rather than a re-derived figure (cogs-audit scjz.55).
-          bookedBase: Number(invoice.totalForeign) > 0
-            ? multiplyMoney(invoice.totalBase, paymentAmount).div(toDecimal(invoice.totalForeign)).toNumber()
+          bookedBase: netPayableForeign.gt(0)
+            ? multiplyMoney(netPayableBase, paymentAmount).div(netPayableForeign).toNumber()
             : undefined,
         })
         const lines = buildRealisedFxJournal({
