@@ -5,7 +5,7 @@ import { outstandingPoValueBase } from '@/lib/domain/purchasing/outstanding-po-v
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { getSetting } from '@/app/actions/settings'
 import { requirePermission } from '@/lib/auth/server'
-import { canViewDashboardCostFigures, redactDashboardCostFigures } from '@/lib/security/dashboard-cost-redaction'
+import { canViewDashboardCostFigures, projectTopProduct, redactDashboardCostFigures } from '@/lib/security/dashboard-cost-redaction'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
@@ -655,6 +655,7 @@ export async function getDashboardData(
     previous_period: 'Previous Period', previous_year: 'Previous Year', previous_fy: 'Previous FY',
   }
 
-  const visible = costFiguresVisible ? { kpi, chartData, topProducts } : redactDashboardCostFigures({ kpi, chartData, topProducts })
+  const safeTopProducts = topProducts.map(projectTopProduct) as TopProduct[]
+  const visible = costFiguresVisible ? { kpi, chartData, topProducts: safeTopProducts } : redactDashboardCostFigures({ kpi, chartData, topProducts: safeTopProducts })
   return { ...visible, recentOrders, incomingPOs, periodLabel: periodLabels[period], compLabel: compLabels[compareMode], costFiguresVisible }
 }

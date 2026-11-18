@@ -307,6 +307,7 @@ test('SEC-M15: a Read-only user gets no COGS, profit, margin or inventory value 
     assert.equal(admin.kpi.cogsCurrent, 40)
     assert.equal(admin.kpi.marginCurrent, 60)
     assert.equal(admin.topProducts[0].marginPct, 60)
+    assert.ok(!('totalCogs' in admin.topProducts[0]), 'working fields never ship, even to Admin')
 
     for (const role of ['READONLY', 'WAREHOUSE']) {
       ROLE = role
@@ -319,6 +320,22 @@ test('SEC-M15: a Read-only user gets no COGS, profit, margin or inventory value 
       assert.ok(d.chartData.every((c) => c.cogs === 0 && c.marginPct === 0 && c.compCogs === 0 && c.compMarginPct === 0), role)
       assert.ok(d.topProducts.every((t) => t.marginPct === 0), role)
       assert.equal(d.kpi.netSalesCurrent, 100, 'sales figures are not cost data and stay')
+      // Allowlist check: no cost-bearing key, at any depth, reaches a restricted role (40 is the order's COGS).
+      const costKey = /cogs|totalcogs|profit|margin|inventoryvalue|unitcost/i
+      const seen: string[] = []
+      const walk = (v: unknown, path: string) => {
+        if (Array.isArray(v)) return v.forEach((x, i) => walk(x, `${path}[${i}]`))
+        if (v && typeof v === 'object') {
+          for (const [k, x] of Object.entries(v)) {
+            if (costKey.test(k) && !(typeof x === 'number' && x === 0) && !(typeof x === 'string' && x === 'exact')) seen.push(`${path}.${k}=${String(x)}`)
+            walk(x, `${path}.${k}`)
+          }
+        }
+      }
+      walk({ kpi: d.kpi, chartData: d.chartData, topProducts: d.topProducts, recentOrders: d.recentOrders, incomingPOs: d.incomingPOs }, role)
+      assert.deepEqual(seen, [], role)
+      assert.ok(d.topProducts.length > 0)
+      assert.ok(d.topProducts.every((t) => !('totalCogs' in t) && !('refundsGrossBasisPositive' in t)), role)
     }
   } finally {
     ROLE = 'ADMIN'
