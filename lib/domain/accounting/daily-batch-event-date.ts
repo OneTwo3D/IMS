@@ -28,6 +28,8 @@
  * a later run. With no lock date known the event date is used as is.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
+
 const DAY = /^(\d{4})-(\d{2})-(\d{2})$/
 
 /** The UTC calendar day (`YYYY-MM-DD`) of an instant, or null when absent or invalid. */
@@ -36,6 +38,18 @@ export function utcDay(value: Date | string | null | undefined): string | null {
   const date = value instanceof Date ? value : new Date(value)
   if (Number.isNaN(date.getTime())) return null
   return date.toISOString().slice(0, 10)
+}
+
+/**
+ * The BUSINESS (Europe/London) calendar day of an instant, or null when absent or invalid. The day an order was PAID is read on this day, so the
+ * deferral, the reclassification and the recognition agree with the invoice and the receipt, which are dated on it too (a payment at 23:30 UTC
+ * in BST is the next London day). Shipment, allocation and refund event days stay on the UTC day.
+ */
+export function businessDay(value: Date | string | null | undefined): string | null {
+  if (value == null) return null
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return businessDateYmd(date)
 }
 
 /** `YYYY-MM-DD` that is a real calendar date, or null. Anything else is refused rather than guessed at. */

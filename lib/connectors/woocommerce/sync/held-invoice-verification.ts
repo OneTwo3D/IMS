@@ -198,7 +198,14 @@ const firstDifference = (parked: unknown, fresh: unknown, path: string): string 
   return parked === fresh ? null : path
 }
 
-export function heldFreshBuildDifference(parked: Record<string, unknown>, fresh: Record<string, unknown>): string | null {
+/**
+ * `acceptedParkedDates`: the days a parked invoice's `date` may legitimately hold besides the one the fresh build derived now. The invoice date moved from the UTC day to the
+ * London business day of the order's creation; a hold parked BEFORE that change carries the UTC day, which differs for an order created 23:00-23:59 UTC in BST. The caller passes
+ * the UTC day and the London day of the same instant: a parked date equal to either is the same document, and the release sends the PARKED payload, so it keeps the parked date.
+ * Everything else is still compared. (`_paymentDate` needs nothing: the payload keeps the order's raw payment stamp, and the day is read from it when the receipt is queued.)
+ */
+export function heldFreshBuildDifference(parked: Record<string, unknown>, fresh: Record<string, unknown>, acceptedParkedDates: readonly string[] = []): string | null {
+  if (typeof parked.date === 'string' && acceptedParkedDates.includes(parked.date)) fresh = { ...fresh, date: parked.date }
   const keep = (payload: Record<string, unknown>): Record<string, unknown> => {
     const out: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(payload)) if (!FRESH_COMPARE_EXCLUDED.has(key)) out[key] = (RATE_KEYS as readonly string[]).includes(key) && typeof value === 'number' ? Math.round(value * 1e8) / 1e8 : value

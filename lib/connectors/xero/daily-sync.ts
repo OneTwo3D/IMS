@@ -130,7 +130,8 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 
 import { XERO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { refreshXeroBooksLockDate } from '@/lib/connectors/xero/books-lock-date'
-import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, utcDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { businessDateYmd } from '@/lib/business-date'
+import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, utcDay, businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
@@ -1571,7 +1572,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   try {
     const settings = await getXeroSettings()
     const baseCurrency = await getBaseCurrencyCode()
-    const today = new Date().toISOString().slice(0, 10)
+    // The run's day is the BUSINESS day, like the paid days it is compared with (an event day after the run's date is clamped to it).
+    const today = businessDateYmd(new Date())
     // ACC-H11: journals are dated by their EVENT, not by the run. `lockDate` is the operator-declared last
     // locked day in Xero (empty = none); an event on or before it is dated the first open day instead of
     // being back-dated into the locked period. See lib/domain/accounting/daily-batch-event-date.ts.
@@ -2165,7 +2167,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const processedShipments = shipments.filter((shipment) => shipmentResults.has(shipment.id))
       const groupBDay = (shipment: (typeof shipments)[number]): string | null => laterDay(
         utcDay(shipment.shippedAt ?? shipment.createdAt),
-        utcDay(shipment.order.paidAt),
+        businessDay(shipment.order.paidAt),
       )
       // ACC-H12: a shipment of an order that is not deferred yet is costed on its own journal, dated the day the
       // goods left (there is no payment to wait for), so its group never mixes with the ordinary ones.
@@ -2488,7 +2490,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const orderById = new Map(orders.map((order) => [order.id, order]))
       const a1Dated = groupByPostingDate(
         orderDeferrals,
-        (deferral) => utcDay(orderById.get(deferral.orderId)?.paidAt),
+        (deferral) => businessDay(orderById.get(deferral.orderId)?.paidAt),
         dateContext,
       )
       if (a1Dated.deferred.length > 0) throw new Error('A1: an order has no open posting day although the lock-blocks-run check passed')
@@ -2522,7 +2524,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       type RefundAdjustmentRow = { orderId: string; refundId: string | null; amount: number; day: string | null }
       const adjustmentRows: RefundAdjustmentRow[] = []
       for (const order of orders) {
-        const paidDay = utcDay(order.paidAt)
+        const paidDay = businessDay(order.paidAt)
         for (const adjustment of preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenueOf(order))) {
           // ACC-H12: only the part of a refund that came out of deferred revenue is adjusted against Unearned.
           if (!(adjustment.deferredPart > 0)) continue
@@ -2957,7 +2959,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // allocated weeks after payment lands on the day the stock arrived. Each date is its own journal with
         // its own reference; each order is stamped with the journal that carries ITS pounds.
         const a2OrderDay = (order: (typeof accepted)[number]): string | null => laterDay(
-          utcDay(order.paidAt),
+          businessDay(order.paidAt),
           ...order.allocations
             .filter((alloc) => allocationSnapshots.has(alloc.id))
             .map((alloc) => utcDay(alloc.createdAt)),
