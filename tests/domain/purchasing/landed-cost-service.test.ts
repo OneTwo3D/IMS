@@ -425,6 +425,35 @@ test('propagateLandedCostToOutputs cascades a component cost change through nest
   assert.equal(inv.toString(), '1.6')
 })
 
+test('o3d-4uo5d: a floored source credit then its reversal leaves the output exactly where it started, and never negative', async () => {
+  // The source layer is floored at ZERO by the allocation (cost 1 -> credit of 3 -> 0), so the delta propagated is the
+  // layer's own FLOORED change (-1), never the unfloored -3. The output follows each contribution exactly, so the credit
+  // and its reversal cancel (no over/undervaluation) and the output cannot go below the sum of its non-negative inputs.
+  const state: Record<string, { unitCostBase: string; receivedQty: string; remainingQty: string }> = {
+    'out-1': { unitCostBase: '1', receivedQty: '1', remainingQty: '1' },
+  }
+  const tx = {
+    costLayer: {
+      findUnique: async ({ where }: { where: { id: string } }) => ({ ...state[where.id] }),
+      update: async ({ where, data }: { where: { id: string }; data: { unitCostBase: unknown } }) => {
+        state[where.id] = { ...state[where.id], unitCostBase: String(data.unitCostBase) }
+      },
+    },
+    costLayerSourceLine: { update: async () => ({}) },
+  }
+  const deps = noopDeps({
+    getDependentOutputSourceLines: async (_tx, id) => id === 'comp-1' ? [{ sourceLineId: 's1', outputCostLayerId: 'out-1', qty: toDecimal(1) }] : [],
+    getManufacturingConsumedQtyForCostLayer: async () => toDecimal(0),
+  })
+  const run = (delta: number) => propagateLandedCostToOutputs(
+    tx as never, deps, 'comp-1', toDecimal(delta), () => {}, new Set(), 1, 'run', new Date('2026-06-20T00:00:00.000Z'),
+  )
+  await run(-1)
+  assert.equal(state['out-1'].unitCostBase, '0', 'floored credit: the output absorbs exactly the source layer\'s floored drop')
+  await run(1)
+  assert.equal(state['out-1'].unitCostBase, '1', 'the reversal restores it exactly')
+})
+
 test('propagateLandedCostToOutputs accumulates BOTH paths of a diamond BOM (audit-e7h8)', async () => {
   // Diamond: comp-1 (+1/unit) feeds out-1 AND out-2 (each qty 1, each received 1
   // → unitDelta 1); out-1 and out-2 BOTH feed out-3 (each qty 1, received 1).

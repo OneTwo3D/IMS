@@ -131,9 +131,65 @@ export type LandedCostRevaluationOptions = {
    * missing from the map is treated as landed 0.
    */
   landedQtyBasis?: ReadonlyMap<string, DecimalInput>
+  /**
+   * o3d-d0gog: THE CHART, READ BY THE CALLER BEFORE ITS TRANSACTION OPENED. `getAccountingSettings()` is a
+   * POOLED read; resolved lazily inside the revaluation it took a second connection while the transaction
+   * held one (the o3d-5qad5 nested-pool shape), and its `.catch(() => null)` made an exhausted pool read as
+   * "no chart", i.e. no COGS_REVERSAL queued. A caller inside an interactive transaction passes the chart it
+   * read first (`null` = it could not be read, exactly what the swallowed catch used to mean). Left
+   * undefined, the walk still resolves it lazily over the pool (callers with no surrounding transaction).
+   */
+  accountingSettings?: AccountingSettings | null
 }
 
 type DecimalInput = Prisma.Decimal | number | string
+
+/**
+ * o3d-d0gog: READ THE CHART BEFORE THE TRANSACTION OPENS, for `LandedCostRevaluationOptions.accountingSettings`,
+ * over the pool while no transaction connection is held.
+ *
+ * FAILS CLOSED. An unreadable chart used to become `null`, which every downstream branch read as "no chart, so leave
+ * the delta in the caller's COGS journal". For an UN-journaled shipment that was wrong: its cost snapshot is already
+ * rewritten, so the daily batch posts the same delta again and COGS is double-posted. "No connector switched on" is a
+ * readable answer (`connector: null` on the returned settings); "could not read" is not, and refuses the whole
+ * operation here, before any write, with a message the caller reports to the operator.
+ */
+export class LandedCostChartUnreadableError extends Error {
+  constructor(cause: unknown) {
+    super(`The accounting settings could not be read, so the landed-cost revaluation was not started and nothing was changed. Try again; if it persists check the database connection. (${cause instanceof Error ? cause.message : String(cause)})`)
+    this.name = 'LandedCostChartUnreadableError'
+  }
+}
+
+/**
+ * The same read, as a VALUE: for an operation that only SOMETIMES revalues (PO close, PO cancel). A read failure must not
+ * block the ones that revalue nothing, so the failure is carried to the branch that needs the chart, which calls
+ * {@link chartOrThrow} (fail closed there, before the revaluation writes anything).
+ */
+export type LandedCostChartRead =
+  | { ok: true; chart: AccountingSettings }
+  | { ok: false; error: LandedCostChartUnreadableError }
+
+export async function tryReadLandedCostChartBeforeTx(): Promise<LandedCostChartRead> {
+  try {
+    return { ok: true, chart: await getAccountingSettings() }
+  } catch (error) {
+    return { ok: false, error: error instanceof LandedCostChartUnreadableError ? error : new LandedCostChartUnreadableError(error) }
+  }
+}
+
+export function chartOrThrow(read: LandedCostChartRead): AccountingSettings {
+  if (!read.ok) throw read.error
+  return read.chart
+}
+
+export async function readLandedCostChartBeforeTx(): Promise<AccountingSettings> {
+  try {
+    return await getAccountingSettings()
+  } catch (error) {
+    throw new LandedCostChartUnreadableError(error)
+  }
+}
 
 /**
  * Every quantity a cost layer's raw consumedQty must be netted against before the
@@ -619,7 +675,7 @@ export async function propagateLandedCostToOutputs(
         revaluationContext: revaluationContext
           ? { ...revaluationContext, source: 'landed_cost_output_propagation' }
           : undefined,
-        ...(chart ? { accountingSettings: chart } : {}),
+        ...(chart !== undefined ? { accountingSettings: chart } : {}),
       })
       outputShipmentRevalDelta = shipmentRefresh.cogsRevaluationDelta
       await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, outputCostLayerId)
@@ -1482,7 +1538,7 @@ export async function recalculateLandedCosts(
             inTransitResidue.push(...audit.inTransitResidue)
             propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
           },
-          new Set(), 1, recalcRunId, revaluedAt, revaluationContext,
+          new Set(), 1, recalcRunId, revaluedAt, revaluationContext, options.accountingSettings,
         )
 
         let affectedRefundSnapshots = 0
@@ -1490,7 +1546,7 @@ export async function recalculateLandedCosts(
         let affectedSalesOrderLines = 0
         if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
           affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true })
+          const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true, ...(options.accountingSettings !== undefined ? { accountingSettings: options.accountingSettings } : {}) })
           affectedShipments = shipmentRefresh.shipmentsUpdated
           // audit-3aph: the shipment path now owns the COGS revaluation for sold
           // goods (COGS_REVERSAL now / daily batch later), so remove it from the
@@ -1828,7 +1884,7 @@ export async function recalculateDirectLandedCosts(
           inTransitResidue.push(...audit.inTransitResidue)
           propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
         },
-        new Set(), 1, recalcRunId, revaluedAt, revaluationContext,
+        new Set(), 1, recalcRunId, revaluedAt, revaluationContext, options.accountingSettings,
       )
 
       let affectedRefundSnapshots = 0
@@ -1836,7 +1892,7 @@ export async function recalculateDirectLandedCosts(
       let affectedSalesOrderLines = 0
       if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
         affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true })
+        const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true, ...(options.accountingSettings !== undefined ? { accountingSettings: options.accountingSettings } : {}) })
         affectedShipments = shipmentRefresh.shipmentsUpdated
         // audit-3aph: shipment path owns the sold-goods COGS revaluation — remove
         // it from the COGS_JOURNAL to avoid double-posting COGS for sold units.

@@ -45,6 +45,7 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      wmsOrderPushLink: { findUnique: async () => null },
       salesOrder: {
         findUnique: async () => ({ ...state.order }),
         findFirst: async () => ({ ...state.order }),

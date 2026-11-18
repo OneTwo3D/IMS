@@ -186,6 +186,9 @@ export function dispatchCandidateWhere(connectorId: string) {
     // dead-lettered one is — its record cannot be read, so re-polling it every
     // tick only pins the watermark. It comes back when an operator acts.
     dispatchUnresolvedAt: null,
+    // Mixed-warehouse scope: the warehouse's part has been despatched and applied (null for every link while the feature is off), so there is nothing left to
+    // observe: polling stops, instead of re-reading the warehouse for ever while the OTHER warehouse's part is still to ship.
+    despatchSettledAt: null,
     OR: DISPATCH_POLLED_ORDER_WHERE,
   }
 }
@@ -477,7 +480,7 @@ export type WmsDispatchSweepDeps = {
      * ordinary stock-level sync for the stock the shipment consumed (owner ruling: IMS is the stock master after cutover).
      */
     options?: { storefrontAlreadyCompleted?: boolean; fence?: PreCutoverFence },
-  ): Promise<{ success: boolean; error?: string }>
+  ): Promise<{ success: boolean; error?: string; refusal?: string }>
   /**
    * Fresh, READ-ONLY verification of a part despatched before the storefront went live. Asked only when the push for a part
    * was shadowed with the reason `obligation_before_cutoff`. It reads the order from the store it is CURRENTLY linked to
@@ -1215,10 +1218,34 @@ async function reconcileSplitOrder(
   }
   const storefrontAlreadyCompleted = mergedAlreadyCompleted || (recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length)
   const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(fence ? { fence } : {}) } : undefined)
-  if (!result.success) {
-    return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
-  }
+  if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed after all parts despatched')
   return { action: 'dispatched', reason: `All ${totalParts} parts despatched` }
+}
+
+/**
+ * The outcome of a despatch IMS could not apply. A SCOPE MISMATCH (mixed-warehouse order: the part sent no longer matches IMS's allocation or shipments) is not a
+ * connector or apply failure: it is a condition a person fixes in IMS, so it is NOT an error (not counted, never dead-lettered, never read by the systemic
+ * breaker). The link stays a fully polled candidate, and a standing HIGH row
+ * names it on Sync > Exceptions. Every other failure is an error, as before. The delta watermark is NOT held for it (see below): it must never block other orders.
+ */
+function applyFailureOutcome(result: { error?: string; refusal?: string }, fallback: string): WmsDispatchOutcome {
+  if (result.refusal === 'wms_scope_mismatch') {
+    return {
+      action: 'pending',
+      reason: result.error ?? 'The despatch does not match the part sent to the warehouse',
+      // NOT holdWatermark: a mismatch can last for ever (a person fixes it in IMS) and pinning the connector-wide delta watermark for one order would degrade the
+      // sweep for the whole estate. The link stays a fully polled candidate (the reconcile pass re-reads it every tick) and its standing HIGH row is the trace.
+      refusal: {
+        action: 'WMS_DESPATCH_SCOPE',
+        gate: 'WMS_SCOPE_MISMATCH',
+        permanence: 'RETRYABLE',
+        severity: 'HIGH',
+        intent: {} as never,
+        detail: 'The warehouse despatched this mixed-warehouse order, but the part IMS sent it no longer matches the order\'s allocation and shipments, so nothing was shipped in IMS.',
+      },
+    }
+  }
+  return { action: 'error', reason: result.error ?? fallback }
 }
 
 /**
@@ -1431,9 +1458,7 @@ export async function reconcileOneOrder(
   if (decision.action === 'verify') decision = await settleOrderLevelVerify(deps, candidate.orderId, status.tracking)
   if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
   const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(decision.fence ? { fence: decision.fence } : {}) } : undefined)
-  if (!result.success) {
-    return { action: 'error', reason: result.error ?? 'Dispatch apply failed' }
-  }
+  if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed')
   return { action: 'dispatched', reason: status.status || 'DESPATCHED' }
 }
 
@@ -2926,6 +2951,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // dead-lettered one is — its record cannot be read, so re-polling it every
             // tick only pins the watermark. It comes back when an operator acts.
             dispatchUnresolvedAt: null,
+            despatchSettledAt: null,
             OR: DISPATCH_POLLED_ORDER_WHERE,
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -2956,6 +2982,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // dead-lettered one is — its record cannot be read, so re-polling it every
             // tick only pins the watermark. It comes back when an operator acts.
             dispatchUnresolvedAt: null,
+            despatchSettledAt: null,
             OR: DISPATCH_POLLED_ORDER_WHERE,
           },
           select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -3009,6 +3036,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           // dead-lettered one is — its record cannot be read, so re-polling it every
           // tick only pins the watermark. It comes back when an operator acts.
           dispatchUnresolvedAt: null,
+          // The warehouse's part is settled (mixed-warehouse scope): nothing left to observe, so it is not re-read from the warehouse.
+          despatchSettledAt: null,
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
         select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
@@ -3079,7 +3108,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         tracking,
         ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true, ...(options.fence ? { shipFence: options.fence } : {}) } : {}),
       })
-      if (result.success) {
+      if (result.success && !('noop' in result && result.noop)) {
         await recordWmsMutationEvent({
           connector: connectorId, direction: 'INBOUND', action: 'dispatch_applied', outcome: 'SUCCEEDED',
           entityType: 'SALES_ORDER', entityId: orderId,
@@ -3396,6 +3425,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           externalOrderNumber: { not: null },
           dispatchDeadLetteredAt: null,
           dispatchUnresolvedAt: null,
+          despatchSettledAt: null,
           id: { notIn: excludeLinkIds },
           order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
         },
