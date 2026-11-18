@@ -11,7 +11,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { ProductLink } from '@/components/inventory/product-link'
 import type { KpiSummary, ChartPoint, TopProduct, RecentOrder, IncomingPO, Period, CompareMode } from '@/app/actions/dashboard'
 import { getDashboardData } from '@/app/actions/dashboard'
-import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import { boundSuffix, bridgeTooltipNote, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { OnboardingBanner } from '@/components/layout/onboarding-banner'
@@ -279,11 +279,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
     // printed one anyway.
     const bound: DerivedFigureBound = point ? (isComp ? point.compNetSalesBound : point.netSalesBound) : 'exact'
     const amount = fmtBaseFull(Number(value))
-    const note = bound === 'upper'
-      ? ' ≤ (upper bound — refunds not on the net basis are not subtracted)'
-      : bound === 'indeterminate'
-        ? ' ? (direction not established — some credit this bucket could not subtract is negative)'
-        : ''
+    const note = bridgeTooltipNote(bound)
     return [`${amount}${note}`, isComp ? compLabel : periodLabel]
   }
   const marginTooltipFormatter = (value: unknown, name: unknown, item?: { payload?: ChartPoint }): [string, string] =>
