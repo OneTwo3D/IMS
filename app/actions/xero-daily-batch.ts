@@ -14,6 +14,7 @@ import {
   countedUnearnedReversalRows,
   describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
+  durableUnearnedReversalTopUp,
   unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
@@ -358,7 +359,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
   const bPartialOrderIds = new Set(
     bShipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
   )
-  const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown }>>()
+  const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown; refundId?: string | null }>>()
+  const bRefundsByOrder = new Map<string, Array<{ id: string; unearnedReversedAmount: unknown }>>()
   const bReversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
   const unearnedReversalWarnings: string[] = []
   const bShippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
@@ -366,8 +368,9 @@ async function computePreview(): Promise<DailyBatchPreview> {
   if (bOrderIds.length > 0) {
     const bRefunds = await db.salesOrderRefund.findMany({
       where: { orderId: { in: bOrderIds } },
-      select: { id: true, orderId: true },
+      select: { id: true, orderId: true, unearnedReversedAmount: true },
     })
+    for (const refund of bRefunds) bRefundsByOrder.set(refund.orderId, [...(bRefundsByOrder.get(refund.orderId) ?? []), refund])
     const bRefundIdToOrderId = new Map(bRefunds.map((refund) => [refund.id, refund.orderId]))
     // o3d-3la07 (M6, D3: REPORT-ONLY): the same read width and the same counted set as the cron's
     // netting (see runDailyBatchSync), so the preview matches what posts AND says what the cron says.
@@ -396,7 +399,11 @@ async function computePreview(): Promise<DailyBatchPreview> {
     for (const [targetOrderId, allRows] of bReversalStandingRowsByOrder) {
       bReversalSyncsByOrder.set(
         targetOrderId,
-        countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload, payloadAccountNets: sync.payloadAccountNets })),
+        countedUnearnedReversalRows(allRows).map((sync) => ({
+          payload: sync.payload,
+          payloadAccountNets: sync.payloadAccountNets,
+          refundId: sync.referenceType === 'SalesOrderRefund' ? sync.referenceId : null,
+        })),
       )
     }
     if (bPartialOrderIds.size > 0) {
@@ -457,9 +464,10 @@ async function computePreview(): Promise<DailyBatchPreview> {
     const recognizedPreviously = order.shipments.reduce((sum, shipment) => (
       shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
     ), 0)
-    const postedUnearnedReversal = sumPostedUnearnedReversal(
-      bReversalSyncsByOrder.get(orderId) ?? [],
-      bSettings.xero_unearned_revenue_account,
+    // o3d-fk9py: mirrors the cron - the durable per-refund figure tops up rows retention has erased.
+    const postedUnearnedReversal = round2(
+      sumPostedUnearnedReversal(bReversalSyncsByOrder.get(orderId) ?? [], bSettings.xero_unearned_revenue_account)
+      + durableUnearnedReversalTopUp(bReversalSyncsByOrder.get(orderId) ?? [], bRefundsByOrder.get(orderId) ?? [], bSettings.xero_unearned_revenue_account),
     )
     const unearnedReport = describeUnearnedReversalReport(
       getSalesOrderReference({ id: orderId, ...order }),

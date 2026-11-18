@@ -3,10 +3,12 @@ import test from 'node:test'
 
 import {
   sumPostedUnearnedReversal,
+  durableUnearnedReversalTopUp,
   unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
 } from '@/lib/domain/accounting/deferred-trueup'
+import { unearnedReversalDebit } from '@/lib/domain/accounting/journal-account-nets'
 
 // --- sumPostedUnearnedReversal ---
 
@@ -129,4 +131,38 @@ test('a dispatched shipment held in a later batch window blocks the true-up', ()
   ]
   assert.equal(batchContainsFinalUnjournaledShipment(shipments, new Set(['s1'])), false)
   assert.equal(batchContainsFinalUnjournaledShipment(shipments, new Set(['s1', 's2'])), true)
+})
+
+// --- o3d-fk9py: durable per-refund figure ---
+
+test('o3d-fk9py: a refund whose sync row retention erased is still netted from its durable column', () => {
+  // no readable rows at all: the sync-row-only sum is 0, which let the true-up re-recognise the 30 the refund took
+  assert.equal(sumPostedUnearnedReversal([], 'UNEARNED'), 0)
+  assert.equal(durableUnearnedReversalTopUp([], [{ id: 'r1', unearnedReversedAmount: 30 }], 'UNEARNED'), 30)
+})
+
+test('o3d-fk9py: a still-readable row is never counted twice, and the larger source wins per refund', () => {
+  const rows = [{ refundId: 'r1', payload: { lines: [{ accountCode: 'UNEARNED', debit: 30 }] } }]
+  assert.equal(durableUnearnedReversalTopUp(rows, [{ id: 'r1', unearnedReversedAmount: 30 }], 'UNEARNED'), 0)
+  assert.equal(durableUnearnedReversalTopUp(rows, [{ id: 'r1', unearnedReversedAmount: 45 }], 'UNEARNED'), 15)
+  assert.equal(durableUnearnedReversalTopUp(rows, [{ id: 'r1', unearnedReversedAmount: 10 }], 'UNEARNED'), 0)
+})
+
+test('o3d-fk9py: a NULL column (pre-column refund) adds nothing; other refunds rows do not offset this one', () => {
+  const rows = [{ refundId: 'r2', payload: { lines: [{ accountCode: 'UNEARNED', debit: 50 }] } }]
+  assert.equal(durableUnearnedReversalTopUp(rows, [{ id: 'r1', unearnedReversedAmount: null }], 'UNEARNED'), 0)
+  assert.equal(durableUnearnedReversalTopUp(rows, [{ id: 'r1', unearnedReversedAmount: 20 }, { id: 'r2', unearnedReversedAmount: 50 }], 'UNEARNED'), 20)
+})
+
+test('o3d-nz0e0: a reversal posted under a since re-mapped unearned account is read by its label, not by the current code', () => {
+  const row = { payload: { lines: [
+    { accountCode: '2099', description: 'Unearned revenue reversal: SO-1', debit: 40 },
+    { accountCode: '4000', description: 'Unearned revenue reversal: SO-1', credit: 40 },
+    { accountCode: '1500', description: 'Allocation reversal: SO-1', debit: 12 },
+  ] } }
+  assert.equal(unearnedReversalDebit(row, 'UNEARNED'), 40)
+  assert.equal(sumPostedUnearnedReversal([row], 'UNEARNED'), 40)
+  // unlabelled legacy payload and compacted rows fall back to the account-code read
+  assert.equal(unearnedReversalDebit({ payload: { lines: [{ accountCode: 'UNEARNED', debit: 7 }] } }, 'UNEARNED'), 7)
+  assert.equal(unearnedReversalDebit({ payload: {}, payloadAccountNets: null }, 'UNEARNED'), null)
 })

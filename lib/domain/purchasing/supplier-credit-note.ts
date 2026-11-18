@@ -613,10 +613,14 @@ export function decidePurchaseCreditNotePost(input: {
       action: 'refuse',
       retryable: false,
       reason:
-        withLedgerCheck(`NOTHING WAS SENT. The ledger already holds ${lookup.claims.length} credit notes numbered ${number} `
+        // o3d-n0o5f: the ledger HOLDS these documents - that is what the refusal states - so the generic "act only if it is absent"
+        // preamble (withLedgerCheck) would tell the operator not to do the very repair this message is for. The check comes first
+        // and the repair follows once the duplicate is confirmed.
+        `NOTHING WAS SENT. The ledger already holds ${lookup.claims.length} credit notes numbered ${number} `
         + `(${lookup.claims.map((c) => `${c.creditNoteId} ${c.status}`).join(', ')}). That number is minted from `
         + `this credit note's primary key, so every one of them is a duplicate of THIS credit note and payables `
-        + `is understated by all but one. Void the extras in Xero, then retry so IMS links the survivor.`),
+        + `is understated by all but one. Check them in Xero first; once you have confirmed they are all copies of this credit note, `
+        + `void the extras in Xero (keep one), then retry so IMS links the survivor.`,
     }
   }
 

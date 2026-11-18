@@ -79,7 +79,7 @@ import {
   proveJournalPosting,
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
-import { journalNetMovement, journalNetsReadable } from '@/lib/domain/accounting/journal-account-nets'
+import { journalNetMovement, journalNetsReadable, unearnedReversalDebit } from '@/lib/domain/accounting/journal-account-nets'
 import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { findDurableShadowRecords, shadowRecordNamesSyncLog } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -2064,9 +2064,9 @@ async function stageRefundAccountingReversals(
     // Unearned Revenue again. Unknown withholds this refund's unearned reversal altogether (the safe
     // direction: it can only under-reverse, leaving a visible liability) and the refund says so.
     const unreadableUnearnedReversalRows = priorUnearnedReversedRows
-      .filter((row) => journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') == null)
+      .filter((row) => unearnedReversalDebit(row, settings.unearnedRevenueAccount) == null)
     const priorUnearnedReversed = priorUnearnedReversedRows
-      .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
+      .reduce((sum, row) => sum + (unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0), 0)
     if (unreadableUnearnedReversalRows.length > 0) {
       await tx.activityLog.create({
         data: {
@@ -3031,12 +3031,12 @@ async function stageRefundAccountingReversals(
     const sweepUnprovenRefundIds: string[] = []
     for (const row of priorUnearnedReversedRows) {
       if (row.referenceType === 'SalesOrderRefund') continue
-      sweepPriorReversed += journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0
+      sweepPriorReversed += unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
       const rowsTotal = priorUnearnedReversedRows
         .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id)
-        .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
+        .reduce((sum, row) => sum + (unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0), 0)
       const rowCount = priorUnearnedReversedRows
         .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id).length
       if (priorRefund.unearnedReversedAmount != null) {

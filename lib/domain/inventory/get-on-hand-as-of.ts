@@ -65,6 +65,8 @@ export type OnHandAsOfClient = Pick<
   PrismaClient,
   'inventorySnapshot' | 'stockMovement' | 'stockLevel' | 'costLayer' | 'costLayerRevaluation'
 > & {
+  /** o3d-cr517: optional so a client without the run table (a narrow test double) falls back to the UTC-midnight anchor. */
+  inventorySnapshotRun?: Pick<PrismaClient['inventorySnapshotRun'], 'findUnique'>
   $queryRaw?: PrismaClient['$queryRaw']
   $transaction?: PrismaClient['$transaction']
 }
@@ -583,6 +585,19 @@ function rowsFromState(state: OnHandState, options: { excludeZero?: boolean } = 
     ))
 }
 
+/**
+ * o3d-cr517: THE INSTANT A SNAPSHOT WAS TAKEN AT, which is where replay from it must start (or stop, in reverse).
+ *
+ * Daily snapshots are labelled by LONDON business day and their run records `cutoffAt` = London midnight, which is 23:00 UTC during BST.
+ * Anchoring every snapshot at UTC midnight replayed from (or reversed to) a point an hour away from the snapshot's real state, so
+ * as-of positions were an hour off all summer. The run's own `cutoffAt` is used; a snapshot with no run row or no cutoff (an older
+ * row) keeps the UTC-midnight anchor it always had.
+ */
+async function snapshotAnchorInstant(client: OnHandAsOfClient, snapshotDate: Date): Promise<Date> {
+  const run = await client.inventorySnapshotRun?.findUnique({ where: { snapshotDate }, select: { cutoffAt: true } })
+  return run?.cutoffAt ?? startOfNextUtcDay(snapshotDate)
+}
+
 async function findPriorSnapshotDate(client: OnHandAsOfClient, asOfDay: Date): Promise<Date | null> {
   const row = await client.inventorySnapshot.findFirst({
     where: { snapshotDate: { lte: asOfDay } },
@@ -875,12 +890,13 @@ export async function getOnHandAsOf(options: {
     : { gt: asOf }
   const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay)
   if (priorSnapshotDate) {
+    const priorAnchor = await snapshotAnchorInstant(client, priorSnapshotDate)
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
     const replay = await replayMovements(
       client,
       state,
       filters,
-      { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound },
+      { gte: priorAnchor, ...asOfUpperBound },
       'forward',
       options.signal,
     )
@@ -889,7 +905,7 @@ export async function getOnHandAsOf(options: {
     // value, not cost-layer revaluations), and (b) the loaded snapshot row itself
     // persisted stale at write (backfilled from a later basis or missing-value).
     // Tracked separately so reports give the right reason (scjz.43/.48).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound })
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { gte: priorAnchor, ...asOfUpperBound })
     const staleSnapshotCount = await countUnreliableSnapshots(client, priorSnapshotDate, filters)
     return buildResult({
       asOf,
@@ -906,12 +922,13 @@ export async function getOnHandAsOf(options: {
 
   const futureSnapshotDate = await findFutureSnapshotDate(client, asOfDay)
   if (futureSnapshotDate) {
+    const futureAnchor = await snapshotAnchorInstant(client, futureSnapshotDate)
     const state = await loadSnapshotState(client, futureSnapshotDate, filters)
     const replay = await replayMovements(
       client,
       state,
       filters,
-      { ...asOfLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) },
+      { ...asOfLowerBound, lt: futureAnchor },
       'reverse',
       options.signal,
     )
@@ -920,7 +937,7 @@ export async function getOnHandAsOf(options: {
     // revaluation. Flag revaluations in (asOf, futureSnapshotDate], plus a future
     // snapshot row itself flagged stale at write (backfilled from a later basis) —
     // either makes the reversed-to-asOf basis not point-in-time (scjz.43/.48).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) })
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: futureAnchor })
     const staleSnapshotCount = await countUnreliableSnapshots(client, futureSnapshotDate, filters)
     return buildResult({
       asOf,

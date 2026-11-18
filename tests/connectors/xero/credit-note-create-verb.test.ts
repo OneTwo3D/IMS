@@ -154,7 +154,10 @@ test('the ledger holding TWO documents under our number refuses and says payable
 
   assert.equal(result.success, false)
   assert.match(result.error ?? '', /already holds 2 credit notes numbered SCN-scn-2/)
-  assert.match(result.error ?? '', /Void the extras in Xero/)
+  assert.match(result.error ?? '', /void the extras in Xero/)
+  // o3d-n0o5f: the repair is for a duplicate the ledger HOLDS, so it must not be preceded by the "act only if it is absent" preamble.
+  assert.doesNotMatch(result.error ?? '', /act only if it is absent/)
+  assert.match(result.error ?? '', /Check them in Xero first; once you have confirmed/)
   assert.deepEqual(calls, [])
 })
 
