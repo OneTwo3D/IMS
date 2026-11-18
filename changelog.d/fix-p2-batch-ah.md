@@ -1,0 +1,4 @@
+### Xero daily batch: earlier A2 passes now checked, Group B no longer starves, deferral warning race closed
+- The accounting invariant and the reconciliation report now ask about every Group A2 batch an order contributed to, not just the latest pass, so an earlier pass whose journal or event went missing is reported (each finding names its batch reference; passes older than the retention window are not asked about).
+- Group B now makes further passes within a run when shipments were refused or skipped at the front of its window, so a block of refused shipments no longer stops healthy ones being journaled. Group A2 and Group B cap the exclusion list at 5,000 per run, and A2 re-checks the batch lock at the start of every pass. Posting and batch keys are unchanged for anything already queued.
+- A back-reference sweep that loses a race with a settlement no longer warns about, or re-stamps, the settled row.

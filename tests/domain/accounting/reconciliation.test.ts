@@ -2601,3 +2601,52 @@ test('[shadow evidence] an orphan-sweep row (CANCELLED, no HELD_SHADOW basis) is
   assert.ok(codes.includes('terminal_refunded_order_missing_credit_note_evidence'))
   assert.ok(!codes.includes('terminal_refunded_order_credit_note_held_shadow'))
 })
+
+// o3d-gzfm: the reconciliation ask covered only the LATEST A2 pass's batch.
+test('o3d-gzfm: an EARLIER A2 pass with no mirrored event is reported; a mirrored one is neither missing nor an orphan', () => {
+  const EARLIER_A2 = 'A2-2026-04-20-0ddba115'
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    allocationBatchPasses: [
+      { amount: 5, syncLogId: 'log-early', connector: 'xero', accountCode: '631', batchRef: EARLIER_A2, at: '2026-04-20T01:00:00.000Z' },
+      { amount: 5, syncLogId: 'log-late', connector: 'xero', accountCode: '631', batchRef: A2_REF, at: '2026-04-24T01:00:00.000Z' },
+    ],
+  }
+  const noEvent = (r: AccountingReconciliationRows) => evaluateAccountingReconciliationRows(r)
+    .filter((f) => f.code === 'source_order_inventory_allocation_without_event')
+  const missing = noEvent(rows)
+  assert.equal(missing.length, 1, 'the earlier pass is reported')
+  assert.equal((missing[0].details as { batchReferenceId?: string }).batchReferenceId, EARLIER_A2)
+
+  // Mirrored: no finding, and the event is not an orphan (its key joined the source keys).
+  const mirrored = {
+    ...rows,
+    accountingEvents: [
+      ...rows.accountingEvents,
+      { ...rows.accountingEvents.find((e) => e.type === 'DAILY_BATCH_INVENTORY_ALLOC')!, id: 'event-early', sourceEntityId: EARLIER_A2 },
+    ],
+  }
+  const findings = evaluateAccountingReconciliationRows(mirrored)
+  assert.equal(findings.filter((f) => f.code === 'source_order_inventory_allocation_without_event').length, 0)
+  assert.equal(
+    findings.filter((f) => /without_source|orphan/i.test(f.code) && JSON.stringify(f).includes(EARLIER_A2)).length,
+    0,
+    'the earlier pass\'s healthy event is not reported as an orphan',
+  )
+})
+
+test('o3d-gzfm: an earlier A2 pass dated before the window start is not asked about', () => {
+  const rows = persistedRefRows()
+  rows.historicalBatchCutoff = new Date('2026-04-22T00:00:00.000Z')
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    allocationBatchPasses: [
+      { amount: 5, syncLogId: 'log-early', connector: 'xero', accountCode: '631', batchRef: 'A2-2026-04-20-0ddba115', at: '2026-04-20T01:00:00.000Z' },
+    ],
+  }
+  assert.equal(
+    evaluateAccountingReconciliationRows(rows).filter((f) => f.code === 'source_order_inventory_allocation_without_event').length,
+    0,
+  )
+})

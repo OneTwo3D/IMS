@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
+import { allocationDebitRecreateTargets } from '@/lib/domain/accounting/allocation-debit-passes'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
 import { SHADOWED_OBLIGATION_WHERE, isShadowedObligation, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
@@ -54,6 +55,9 @@ type SalesOrderAccountingRow = {
   inventoryAllocatedDate: Date | string | null
   // o3d-0qoo: the exact A2 batch referenceId (pairs with inventoryAllocatedDate).
   inventoryAllocatedBatchRef?: string | null
+  // o3d-gzfm: the pass history (`SalesOrder.allocationBatchPasses`). The ref above is the LATEST pass's;
+  // an earlier pass is only visible here. Optional for pure-evaluator fixtures; absent = one batch.
+  allocationBatchPasses?: unknown
   allocationBatchAmount: DecimalLike
   shipments: Array<{
     id: string
@@ -204,6 +208,11 @@ type AccountingSyncLogRow = {
 }
 
 export type AccountingInvariantRows = {
+  /**
+   * o3d-gzfm: start of the sync-log retention window the rows were read over. An earlier A2 pass whose
+   * batch is dated before it is not asked about (its log may have been pruned). Optional: absent = no bound.
+   */
+  historicalBatchCutoff?: Date | null
   salesOrders: SalesOrderAccountingRow[]
   postedShipments: ShipmentAccountingRow[]
   syncLogs: AccountingSyncLogRow[]
@@ -756,28 +765,45 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     }
 
     if (hasA2) {
-      const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
-        syncLogIndex,
-        'A2',
-        'DAILY_BATCH_INVENTORY_ALLOC',
-        order.inventoryAllocatedBatchRef,
-        order.inventoryAllocatedDate,
-      )
+      // o3d-gzfm: ask about EVERY A2 batch the order contributed to, not just the latest pass's stamp.
+      // The first target is the current stamp (unchanged); the rest come from the pass history and are
+      // bounded by the retention window. Each finding carries its batch reference so two findings on
+      // one order are distinguishable.
+      const targets = order.allocationBatchPasses == null
+        ? [{ batchRef: order.inventoryAllocatedBatchRef ?? null, stagedAt: order.inventoryAllocatedDate }]
+        : allocationDebitRecreateTargets({
+          allocationBatchAmount: null,
+          allocationBatchPasses: order.allocationBatchPasses,
+          inventoryAllocatedBatchRef: order.inventoryAllocatedBatchRef?.trim() || null,
+          inventoryAllocatedDate: null,
+        }, { retentionCutoff: rows.historicalBatchCutoff ?? null }).map((target, index) => ({
+          batchRef: target.batchRef,
+          stagedAt: index === 0 ? order.inventoryAllocatedDate : target.stagedAt,
+        }))
+      for (const target of targets) {
+        const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
+          syncLogIndex,
+          'A2',
+          'DAILY_BATCH_INVENTORY_ALLOC',
+          target.batchRef,
+          target.stagedAt,
+        )
 
-      if (!hasSyncEvidence) {
-        findings.push({
-          severity: 'warning',
-          code: 'sales_order_inventory_allocation_without_sync_evidence',
-          orderId: order.id,
-          message: `Sales order ${label} has A2 inventory allocation but no live daily batch sync evidence`,
-          details: {
-            status: order.status,
-            inventoryAllocatedDate: order.inventoryAllocatedDate,
-            expectedReferenceId,
-            referenceSource,
-            allocationBatchAmount: decimalToNumber(order.allocationBatchAmount),
-          },
-        })
+        if (!hasSyncEvidence) {
+          findings.push({
+            severity: 'warning',
+            code: 'sales_order_inventory_allocation_without_sync_evidence',
+            orderId: order.id,
+            message: `Sales order ${label} has A2 inventory allocation but no live daily batch sync evidence`,
+            details: {
+              status: order.status,
+              inventoryAllocatedDate: order.inventoryAllocatedDate,
+              expectedReferenceId,
+              referenceSource,
+              allocationBatchAmount: decimalToNumber(order.allocationBatchAmount),
+            },
+          })
+        }
       }
     }
 
@@ -1154,6 +1180,7 @@ export async function collectAccountingInvariantRows(
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
         inventoryAllocatedBatchRef: true,
+        allocationBatchPasses: true,
         allocationBatchAmount: true,
         shipments: {
           select: {
@@ -1315,7 +1342,7 @@ export async function collectAccountingInvariantRows(
     }) as unknown as Promise<ReversalNeverRecordedRefundRow[]>,
   ])
 
-  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds }
+  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds, historicalBatchCutoff: retentionCutoff }
 }
 
 /**

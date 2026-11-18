@@ -4295,6 +4295,31 @@ test('[o3d-3ix5] a warning that was NOT persisted does not buy an interval of si
   )
 })
 
+test('[o3d-32vm] a sweep that loses the race to a settlement stays silent and leaves the settled row alone', async () => {
+  // Run A read the marker and decided the row is overdue; run B settles it (checkedAt set, marker
+  // cleared) before A writes. A must not warn about a healthy row nor restart its clock.
+  const harness = makeStarvedHarness()
+  const clock = fakeClock()
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.ok(harness.store.syncRows[0].backReferenceDeferredSinceAt)
+
+  clock.advance(BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS + 1000)
+  const settledAt = clock.now()
+  harness.raceAfterProbe = (rows) => {
+    rows[0].backReferenceCheckedAt = settledAt
+    rows[0].backReferenceFollowUpsPendingAt = null
+    rows[0].backReferenceDeferredSinceAt = null
+  }
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+
+  assert.equal(
+    harness.activities.filter((entry) => entry.action === 'xero_backreference_settlement_deferred').length,
+    0,
+    'the row was settled by the winner; a warning naming it is spurious',
+  )
+  assert.equal(harness.store.syncRows[0].backReferenceDeferredSinceAt, null, 'and no stale marker is re-stamped on a settled row')
+})
+
 test('[o3d-3ix5] settling the row ENDS the run — the next deferral starts a fresh one', async () => {
   // Without the clear, a row that was contended once and then settled would carry a start time for
   // ever, and its NEXT deferral — months later, and on its own a healthy overlap — would be reported

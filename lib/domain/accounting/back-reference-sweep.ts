@@ -1152,9 +1152,16 @@ export async function repairAccountingBackReferences(
     }
     if (observedAt.getTime() - deferredSince.getTime() < BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS) return
 
-    // WARNING FIRST, STAMP SECOND — the same asymmetry `warnAndDefer` documents. Moving the marker
-    // forward is what suppresses the next interval's warning, so doing it before the warning is
-    // confirmed can lose the only notification; doing it after can at worst repeat one.
+    // CLAIM FIRST, WARN SECOND, UNDO ON FAILURE (o3d-32vm). The decision above was made on a marker
+    // value read earlier, and an overlapping run can settle the row (markChecked clears the marker
+    // and sets checkedAt) before this one writes. So the decision is turned into ONE conditional
+    // write whose WHERE still carries the marker value it was made on, and a run that lost the race
+    // updates zero rows and stays silent — no warning about a settled row, no restarted clock.
+    // The cost is that the marker now moves BEFORE the warning, which `warnAndDefer` avoids because
+    // a moved marker suppresses the next interval. So when the warning is not persisted the claim is
+    // handed back (itself compare-and-set), and the row stays due exactly as before.
+    if (!(await stampDeferral(fence.id, observedAt, deferredSince))) return
+
     const persisted = await deps.logActivity({
       entityType: 'SYSTEM',
       action: `${prefix}_backreference_settlement_deferred`,
@@ -1179,21 +1186,27 @@ export async function repairAccountingBackReferences(
     })
     if (!persisted) {
       console.error(`${prefix}: settlement deferral warning was not persisted; leaving the marker where it is`, fence.id)
-      return
+      await stampDeferral(fence.id, deferredSince, observedAt)
     }
-    await stampDeferral(fence.id, observedAt, deferredSince)
   }
 
-  const stampDeferral = async (id: string, observedAt: Date, previous: Date | null) => {
+  /**
+   * Compare-and-set the deferral marker from `previous` to `next`. Returns whether this call moved
+   * it: false means the row settled, vanished, or another run moved the marker first, and the
+   * caller must say nothing (o3d-32vm).
+   */
+  const stampDeferral = async (id: string, next: Date, previous: Date | null): Promise<boolean> => {
     try {
-      await deps.db.accountingSyncLog.update({
-        where: { id },
-        data: { backReferenceDeferredSinceAt: observedAt },
+      const { count } = await deps.db.accountingSyncLog.updateMany({
+        where: { id, backReferenceCheckedAt: null, backReferenceDeferredSinceAt: previous },
+        data: { backReferenceDeferredSinceAt: next },
       })
+      return count === 1
     } catch (stampError) {
       // The row can legitimately be gone — retention, or a connector switch cancelling it — between
       // the candidate read and here. Nothing to record, and nothing to retry.
       console.error(`${prefix}: could not record the settlement deferral`, id, previous, stampError)
+      return false
     }
   }
 

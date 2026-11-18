@@ -3196,12 +3196,14 @@ short is the defect they exist to prevent:
 
 - **Group A2** — an order whose allocated or dispatched units would be reclassified at a negative
   cost is not reclassified. The other orders in the batch are reclassified as normal, and the
-  journal is built from them alone. Note that **one negative cost layer holds back every order that
-  would take stock from it**, not only as many units as it holds: each refused order gives its units
-  back, so the next order in line reaches the same layer and is refused too, until the cost is
-  corrected. Refused orders do not hold up the orders queued behind them — the batch looks past them
-  in the same run.
-- **Group B** — an order whose shipment would be journaled at a negative cost is not journaled.
+  journal is built from them alone. Note that **one negative cost layer can hold back several
+  orders that would take stock from it**: A2 rebuilds its cost layers from the database on every
+  pass and every run (a refusal does not reduce what a layer holds), so whether a given order is
+  refused depends on its position in the queue and on the daily batch limit
+  (`XERO_DAILY_BATCH_LIMIT`), not simply on the cost being corrected. Refused orders do not hold up
+  the orders queued behind them: the batch looks past them in the same run, up to a cap of 5,000
+  refused orders per run, and the rest wait for the next run.
+- **Group B** — an order whose shipment would be journaled at a negative cost is not journaled. Its shipments no longer crowd out the others: when a pass leaves shipments unjournaled and more are waiting, the run makes another pass that skips them (same 5,000 cap), so healthy shipments behind a block of refused ones still post.
 - **Rebuilding a lost Group B journal** — only when a Group B journal is genuinely **missing**
   (never for one that is already posted or queued): a batch holding a shipment whose total COGS was
   revalued below zero is not rebuilt. This check sees each shipment's total, not the cost of each
