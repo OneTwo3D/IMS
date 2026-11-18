@@ -4040,6 +4040,14 @@ model ProductCustomsClear {
   productId String
   field     String
   createdAt DateTime @default(now())
+  /// Short compare-and-set lease around the warehouse clear request (no row lock or transaction is held across the HTTP call): the
+  /// token of the run that holds it and when it took it. A lease older than the lease length is taken over.
+  claimToken String?
+  claimedAt  DateTime?
+  /// Clear requests started for this marker. Past the cap the clear is left to the operator (an open discrepancy) instead of retried forever.
+  attempts   Int      @default(0)
+  /// Clear requests that ended with no answer or no proof (timeout, network error, failed read-back): a separate, higher cap than `attempts`, so a long outage does not hand the clear to the operator but a clear that never gets through eventually does.
+  unverifiedAttempts Int @default(0)
 
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
 
@@ -4762,6 +4770,7 @@ enum WmsDiscrepancyCategory {
   BARCODE_BACKFILLED_FROM_WMS
   INVALID_HS_CODE
   INVALID_COUNTRY_OF_ORIGIN
+  CUSTOMS_CLEAR_MANUAL
 }
 
 enum WmsDiscrepancyStatus {

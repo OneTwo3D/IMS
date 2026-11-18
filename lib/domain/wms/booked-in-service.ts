@@ -31,7 +31,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   derivePurchaseOrderReceiptStatus,
@@ -61,6 +61,7 @@ import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floo
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
 import {
@@ -1374,8 +1375,10 @@ export async function processBookedInEvent(
         // of that clearing account are listed at transit-subledger-movement.ts:20-35 and none of them
         // is a transfer). The manual transfer receipt agrees — app/actions/transfers.ts queues no
         // accounting sync at all — so posting nothing here is parity, not a second hole.
-        if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
-          const amount = roundQuantity(receiptValueBase, 2).toNumber()
+        // Gate on the ROUNDED amount: a sub-half-penny receipt value rounds to 0.00 and owes no journal.
+        const receiptJournalValue = receiptJournalAmount(receiptValueBase)
+        if (accountingConnector && accountingSettings.syncEnabled && receiptJournalValue != null) {
+          const amount = receiptJournalValue
           // o3d-8f0p6 r2/r4: the codes come from THIS transaction, under the lock taken above, pinned
           // to the SAME connector the enqueue below is pinned to — so the mapping and the queued row
           // are one decision, and no remap can commit between this read and this transaction's COMMIT.

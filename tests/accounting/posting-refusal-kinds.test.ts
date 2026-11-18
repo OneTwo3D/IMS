@@ -308,6 +308,7 @@ const MANUAL_PRODUCERS: Record<string, Record<string, number>> = {
   sales_invoice_order: { 'app/actions/sales.ts': 2, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
   sales_invoice_import: { 'app/actions/sales.ts': 2, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
   stock_adjustment_journal: { 'lib/domain/inventory/stock-adjustment-apply.ts': 1 },
+  returns_inbox_restock_journal: { 'lib/domain/sales/return-restock-cost.ts': 1 },
   // RETIRED: cancelling a part-received order no longer reverses stock or queues a journal (it closes short), so nothing
   // raises INVENTORY_ADJUSTMENT/PurchaseOrder any more. The kind stays declared so a row already in the inbox is still markable.
   purchase_order_cancellation_reversal: {},
