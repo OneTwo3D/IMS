@@ -252,7 +252,7 @@ function pullStep(source: string): string {
   return lines.slice(start, end + 1).join('\n')
 }
 
-const MUTATING = ['mktemp', 'chown', 'rsync', 'rm', 'mv', 'cp', 'mkdir', 'chmod', 'copy_tree_into_new_dir', 'git-clone', 'git-fetch', 'git-reset', 'ln', 'tee']
+const MUTATING = ['mktemp', 'chown', 'chown_app_root_tree', 'rsync', 'rm', 'mv', 'cp', 'mkdir', 'chmod', 'copy_tree_into_new_dir', 'git-clone', 'git-fetch', 'git-reset', 'ln', 'tee']
 
 function pullRig(source: string, dry: 'true' | 'false', opts: { cutGuard?: boolean } = {}): { calls: string[]; status: number; out: string } {
   const callsDir = createTempDirSync('ims-pull-rig-')
@@ -292,8 +292,8 @@ test('dry run: the pull step of a checkout WITHOUT .git performs no write of any
   const real = pullRig(UPDATE, 'false')
   const verbs = (c: string[]) => c.map((l) => l.slice(5).split(' ')[0])
   console.log(`  control (real run, no .git): ${JSON.stringify(verbs(real.calls))}`)
-  assert.ok(verbs(real.calls).includes('rsync') && verbs(real.calls).includes('git-clone') && verbs(real.calls).includes('chown'),
-    'precondition: the rig sees the clone, the rsync --delete and the chown when the run is real')
+  assert.ok(verbs(real.calls).includes('rsync') && verbs(real.calls).includes('git-clone') && verbs(real.calls).includes('chown_app_root_tree'),
+    'precondition: the rig sees the clone, the rsync --delete and the ownership change (chown_app_root_tree) when the run is real')
   assert.ok(real.calls.some((c) => c.includes('rsync -a --delete')), 'and the rsync is the destructive one')
 
   const dry = pullRig(UPDATE, 'true')
