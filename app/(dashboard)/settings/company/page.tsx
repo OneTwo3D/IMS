@@ -27,7 +27,7 @@ export default async function CompanySettingsPage() {
   if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
   const session = gate.session
-  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled, poApproval, quoteEmailEnabled] = await Promise.all([
+  const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies, poEmailEnabled, quoteEmailEnabled, poApproval] = await Promise.all([
     getOrganisation(),
     getBaseCurrencySettings(),
     getNumberingFormats(),
