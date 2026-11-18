@@ -402,3 +402,33 @@ test('o3d-hl8l r6: with no restore anywhere near it, the pass still drains exact
   assert.equal(result.attempted, 2)
   assert.equal(state.settings.has(WMS_BOOKED_IN_RECHECK_DUE_KEY), false)
 })
+
+test('a re-check that RESOLVES with a failed count keeps the marker (an expired key in no-login mode never throws)', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-REFUSED' })]
+  const resolvingDeps = {
+    // The real callback catches its own processing failure and returns counters.
+    recheckAsn: async () => ({ processed: 0, duplicates: 0, pending: 0, requiresReview: 0, failed: 1, created: true }),
+  }
+
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', resolvingDeps)
+
+  assert.equal(result.failed, 1)
+  assert.equal(result.drained, false)
+  assert.deepEqual(state.deletedKeys, [])
+  assert.equal(state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY), '2026-07-20T10:00:00.000Z')
+})
+
+test('a re-check that resolves with failed 0 still drains the marker', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-OK' })]
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const result = await runPostMaintenanceBookedInRecheck('mintsoft', {
+    recheckAsn: async () => ({ processed: 1, failed: 0 }),
+  })
+  assert.equal(result.failed, 0)
+  assert.equal(result.drained, true)
+})

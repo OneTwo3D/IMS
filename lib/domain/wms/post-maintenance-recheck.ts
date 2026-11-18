@@ -54,7 +54,7 @@ export type PostMaintenanceRecheckResult = {
   skipped: boolean
   /** Open ASNs the pass attempted. */
   attempted: number
-  /** Attempts that threw; the marker is kept so they are retried. */
+  /** Attempts that threw or whose callback reported failures; the marker is kept so they are retried. */
   failed: number
   /** True when the marker was cleared (every open ASN was attempted this tick). */
   drained: boolean
@@ -151,9 +151,17 @@ export async function runPostMaintenanceBookedInRecheck(
     }
     attempted += 1
     try {
-      await deps.recheckAsn(asn.externalAsnId, {
+      const outcome = await deps.recheckAsn(asn.externalAsnId, {
         reason: `automatic re-check after maintenance window ended ${windowEndedAt}`,
       })
+      // A callback that RESOLVES can still report that it did not do the work: the booked-in processor
+      // catches its own failures (an expired key in no-login mode, a WMS error) and returns a `failed`
+      // counter. That is an attempt that did not recover the ASN, so it keeps the marker exactly as a throw does.
+      const reportedFailures = (outcome as { failed?: unknown } | null | undefined)?.failed
+      if (typeof reportedFailures === 'number' && reportedFailures > 0) {
+        failed += 1
+        console.error(`[wms-post-maintenance-recheck] re-check reported ${reportedFailures} failure(s) for ${asn.externalAsnId}`)
+      }
     } catch (error) {
       failed += 1
       console.error(`[wms-post-maintenance-recheck] re-check failed for ${asn.externalAsnId}:`, error)

@@ -19,6 +19,7 @@ import {
 } from './asn-reconciliation'
 import { loadManualReceiptPools, requireManualReceiptPool } from '@/lib/domain/wms/manual-receipt-pool'
 import { enqueueStockSync } from '@/lib/shopping'
+import { isWmsLoginRefusal } from '@/lib/domain/wms/no-login-scope'
 import { classifyStockEnqueueFailure } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
   isStockMovementIdempotencyConflict,
@@ -152,6 +153,8 @@ export type ProcessMintsoftBookedInResult =
     eventId: string
     externalAsnId: string | null
     error: string
+    /** The unattended read declined to log in (stored key expired): not a processing fault, and not counted toward dead-lettering. */
+    loginRefused?: true
   }
 
 export type ProcessMintsoftBookedInEventOptions = {
@@ -166,6 +169,27 @@ function formatReceiptReference(externalAsnId: string, poReference: string): str
 
 async function markEventFailed(eventId: string, error: string): Promise<void> {
   await scheduleWebhookRetry(eventId, 'failed', error)
+}
+
+/** How long an event waits after a no-login refusal before the sweeper tries again. */
+export const LOGIN_REFUSED_RETRY_DELAY_MS = 30 * 60 * 1000
+
+/**
+ * A scheduled read that declined to log in (username/password mode, stored key expired) learned nothing about
+ * the event, so it must not spend the event's retry budget: eight such ticks would dead-letter a receipt that is
+ * perfectly processable once a key exists. The event stays in the retry ladder at its current attempt count and
+ * is tried again later; an operator-visible warning says what to do.
+ */
+async function markEventLoginRefused(eventId: string, message: string, now = new Date()): Promise<void> {
+  await db.wmsInboundReceiptEvent.update({
+    where: { id: eventId },
+    data: {
+      processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.failedRetry,
+      nextRetryAt: new Date(now.getTime() + LOGIN_REFUSED_RETRY_DELAY_MS),
+      deadLetteredAt: null,
+      lastError: message,
+    },
+  })
 }
 
 async function markEventPending(eventId: string, reason: string): Promise<void> {
@@ -1919,6 +1943,26 @@ export async function processBookedInEvent(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft booked-in processing failed'
+    if (isWmsLoginRefusal(error)) {
+      await markEventLoginRefused(event.id, message)
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: event.id,
+        tag: 'sync',
+        action: 'mintsoft_booked_in_key_expired',
+        level: 'WARNING',
+        description: `Mintsoft key expired, run a manual sync to refresh it. Booked-in processing for ASN ${event.externalAsnId} is waiting and will retry; it has not been counted as a failed attempt.`,
+        metadata: { externalAsnId: event.externalAsnId },
+        resolveUser: false,
+      })
+      return {
+        status: 'failed',
+        eventId: event.id,
+        externalAsnId: event.externalAsnId,
+        error: message,
+        loginRefused: true,
+      }
+    }
     await markEventFailed(event.id, message)
     await logActivity({
       entityType: 'SYNC',
