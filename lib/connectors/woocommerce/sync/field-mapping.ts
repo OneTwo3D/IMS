@@ -289,11 +289,45 @@ function mapWcTaxClassToCategory(taxClass: string | null | undefined): TaxCatego
 /** Order+line keys already warned about in this process, so a re-import or update does not repeat the warning. */
 const wcUnmatchedLineLogged = new Set<string>()
 
+/** Lines left unbound because their SKU differs from several IMS SKUs only by case. */
+const wcAmbiguousSkuLines = new WeakSet<object>()
+
+/**
+ * Warn that lines matched no IMS product and reserve no stock. Call ONLY once the order is actually
+ * created (after the create transaction commits): a refused or guard-blocked import must not record the
+ * dedupe key, or the warning for the real import is hidden. The key is recorded after the log write.
+ */
+export async function logWcUnmatchedLines(
+  mapped: MappedLine[],
+  order: { orderId: number | string; orderNumber?: string | null; salesOrderId?: string | null },
+): Promise<void> {
+  const unbound = mapped.filter((m) => m.productId === null && !wcUnmatchedLineLogged.has(`${order.orderId}:${m.externalLineItemId}`))
+  if (unbound.length === 0) return
+  const ambiguousSkus = [...new Set(unbound.filter((m) => wcAmbiguousSkuLines.has(m)).map((m) => m.sku))]
+  try {
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: order.salesOrderId ?? null,
+      tag: 'sync',
+      action: 'wc_order_line_unmatched',
+      level: 'WARNING',
+      description: `WooCommerce order #${order.orderNumber || order.orderId}: ${unbound.length} line(s) matched no IMS product and will reserve no stock: ${unbound.map((m) => m.sku).join(', ')}`
+        + (ambiguousSkus.length > 0 ? `. Ambiguous (differ only by case in IMS, not bound): ${ambiguousSkus.join(', ')}` : ''),
+      metadata: { connector: 'woocommerce', orderId: String(order.orderId), skus: unbound.map((m) => m.sku), ambiguousSkus },
+      resolveUser: false,
+    })
+    for (const m of unbound) {
+      if (wcUnmatchedLineLogged.size >= 5000) wcUnmatchedLineLogged.clear()
+      wcUnmatchedLineLogged.add(`${order.orderId}:${m.externalLineItemId}`)
+    }
+  } catch (e) {
+    console.error('[woocommerce] failed to log unmatched order lines', e)
+  }
+}
+
 export async function mapWcLineItems(
   lineItems: WcLineItem[],
   _fxRate: number,
-  /** Pass only from the import commit point: the unmatched-line warning is logged then, once per order and line. */
-  logUnmatchedFor?: { orderId: number | string; orderNumber?: string | null },
 ): Promise<MappedLine[]> {
   // Build the SKU→product lookup. WooCommerce SKUs are matched trimmed (product sync stores them
   // trimmed) and, failing an exact hit, case-insensitively. products_sku_key is a case-sensitive
@@ -321,7 +355,7 @@ export async function mapWcLineItems(
     foldedSku.set(key, [...(foldedSku.get(key) ?? []), p.id])
     if (p.externalProductId != null) byWcId.set(String(p.externalProductId), p.id)
   }
-  const ambiguousSkus = new Set<string>()
+  const ambiguousItems = new Set<WcLineItem>()
   const resolveProductId = (item: WcLineItem): string | null => {
     const sku = (item.sku ?? '').trim()
     if (sku) {
@@ -329,7 +363,7 @@ export async function mapWcLineItems(
       if (exact) return exact
       const folded = foldedSku.get(sku.toUpperCase()) ?? []
       if (folded.length === 1) return folded[0]
-      if (folded.length > 1) { ambiguousSkus.add(sku); return null }
+      if (folded.length > 1) { ambiguousItems.add(item); return null }
     }
     // A variation line binds ONLY to its variation. Its VARIABLE parent is not stockable, so
     // falling back to `product_id` would bind the line to a product that reserves nothing and whose
@@ -366,31 +400,7 @@ export async function mapWcLineItems(
     }
   })
 
-  // Unbound lines reserve no stock and read as fully allocated, so say so at import time.
-  const unbound = logUnmatchedFor
-    ? mapped.filter((m) => m.productId === null && !wcUnmatchedLineLogged.has(`${logUnmatchedFor.orderId}:${m.externalLineItemId}`))
-    : []
-  if (logUnmatchedFor && unbound.length > 0) {
-    for (const m of unbound) {
-      if (wcUnmatchedLineLogged.size >= 5000) wcUnmatchedLineLogged.clear()
-      wcUnmatchedLineLogged.add(`${logUnmatchedFor.orderId}:${m.externalLineItemId}`)
-    }
-    try {
-      await logActivity({
-        entityType: 'SYNC',
-        entityId: null,
-        tag: 'sync',
-        action: 'wc_order_line_unmatched',
-        level: 'WARNING',
-        description: `WooCommerce order #${logUnmatchedFor.orderNumber || logUnmatchedFor.orderId}: ${unbound.length} line(s) matched no IMS product and will reserve no stock: ${unbound.map((m) => m.sku).join(', ')}`
-          + (ambiguousSkus.size > 0 ? `. Ambiguous (differ only by case in IMS, not bound): ${[...ambiguousSkus].join(', ')}` : ''),
-        metadata: { connector: 'woocommerce', orderId: String(logUnmatchedFor.orderId), skus: unbound.map((m) => m.sku), ambiguousSkus: [...ambiguousSkus] },
-        resolveUser: false,
-      })
-    } catch (e) {
-      console.error('[woocommerce] failed to log unmatched order lines', e)
-    }
-  }
+  lineItems.forEach((item, i) => { if (ambiguousItems.has(item)) wcAmbiguousSkuLines.add(mapped[i]) })
   return mapped
 }
 

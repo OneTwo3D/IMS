@@ -87,6 +87,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
 mock.module('@/lib/connectors/woocommerce/sync/field-mapping', {
   namedExports: {
     mapWcAddress: () => ({}),
+    logWcUnmatchedLines: async () => {},
     upsertCustomer: async () => 'cust-1',
     // A line marked `blocked` carries WooCommerce rate id 5 (unmapped until the operator maps it); any other line carries rate 6 (always mapped).
     mapWcLineItems: async (items: Array<{ blocked?: boolean }>) => items.map((item, index) => ({

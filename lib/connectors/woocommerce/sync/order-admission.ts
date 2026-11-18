@@ -166,6 +166,8 @@ export type WcAdmissionRefusalPayload = {
    * (every check), is what retires a row for a deleted order.
    */
   consecutiveGone?: number
+  /** ISO time of the first 404 in the current consecutive run; retirement also needs WC_ADMISSION_REFUSAL_GONE_MIN_SPAN_MS since it. */
+  firstGoneAt?: string
 }
 
 export function wcAdmissionRefusalQueueWhere(externalOrderId?: string): Prisma.ShoppingSyncLogWhereInput {
@@ -197,6 +199,9 @@ export function wcBlockedOrderQueueWhere(): Prisma.ShoppingSyncLogWhereInput {
 
 /** Consecutive 404s on the by-id read after which a refusal row is retired as a deleted order. */
 export const WC_ADMISSION_REFUSAL_GONE_RETIRE_ATTEMPTS = 3
+
+/** The consecutive 404s must also span this long (first to latest): a short outage must never retire a row. */
+export const WC_ADMISSION_REFUSAL_GONE_MIN_SPAN_MS = 86_400_000
 
 /** Days a status-only refusal may stay pending before it is retired (WC_ADMISSION_REFUSAL_TTL_DAYS, default 30). */
 export function wcAdmissionRefusalTtlMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -431,6 +436,8 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
   if (rows.length === 0) return result
   const liveReadBudget = Math.min(Math.max(limit, 1), 250)
   let liveReads = 0
+  let reachableReads = 0
+  const goneReads: Array<{ id: string; payload: WcAdmissionRefusalPayload | null }> = []
   const expiryCutoffMs = Date.now() - wcAdmissionRefusalTtlMs()
 
   const { importWcOrder } = await import('./order-import')
@@ -480,28 +487,16 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
       // Any non-404 answer breaks the run: a transient 404 must never add up with old ones.
       await db.shoppingSyncLog.update({
         where: { id: row.id },
-        data: { payload: JSON.parse(JSON.stringify({ ...payload, attempts: payload.attempts + 1, consecutiveGone: 0 })) as Prisma.InputJsonValue },
+        data: { payload: JSON.parse(JSON.stringify({ ...payload, attempts: payload.attempts + 1, consecutiveGone: 0, firstGoneAt: undefined })) as Prisma.InputJsonValue },
       }).catch(() => {})
     }
     if ('gone' in read) {
-      // Only CONSECUTIVE 404s count. The third in a row on a status-only row is a deleted order: it
-      // will never import, and left in the queue it would rotate for ever. A guard-block or currency
-      // row is never retired on a 404 alone; it stays for the operator.
-      const gone = previousGone + 1
-      if (payload) {
-        await db.shoppingSyncLog.update({
-          where: { id: row.id },
-          data: { payload: JSON.parse(JSON.stringify({ ...payload, attempts: payload.attempts + 1, consecutiveGone: gone })) as Prisma.InputJsonValue },
-        }).catch(() => {})
-      }
-      if (payload && isWcGoneRetirableRefusal(payload.reason) && gone >= WC_ADMISSION_REFUSAL_GONE_RETIRE_ATTEMPTS) {
-        await resolveRefusalRow(row.id, 'The order no longer exists in WooCommerce (404 on repeated checks)')
-        result.retired++
-      } else {
-        result.unresolved++
-      }
+      // A 404 is only evidence about the ORDER if the store answered something else in this pass, so
+      // it is judged after the loop (see below), never here.
+      goneReads.push({ id: row.id, payload })
       continue
     }
+    reachableReads++
     if ('failed' in read) {
       result.failed++
       continue
@@ -564,6 +559,38 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
     } catch (e) {
       result.failed++
       console.error(`[wc-admission-refusal-drain] ${externalOrderId}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  if (goneReads.length > 0) {
+    if (reachableReads === 0) {
+      // Every read of the pass answered 404: that is the store (plugin, permalinks, REST disabled), not
+      // deleted orders. Nothing advances and the rows stay as they are.
+      result.unresolved += goneReads.length
+      console.warn(`[wc-admission-refusal-drain] all ${goneReads.length} order read(s) in this pass answered 404; treating it as a store-wide outage, no 404 counters advanced`)
+    } else {
+      const nowMs = Date.now()
+      for (const g of goneReads) {
+        const p = g.payload
+        const previousGone = p?.consecutiveGone ?? 0
+        const parsedFirst = p?.firstGoneAt ? Date.parse(p.firstGoneAt) : NaN
+        const firstGoneMs = previousGone > 0 && Number.isFinite(parsedFirst) ? parsedFirst : nowMs
+        const gone = previousGone + 1
+        if (p) {
+          await db.shoppingSyncLog.update({
+            where: { id: g.id },
+            data: { payload: JSON.parse(JSON.stringify({ ...p, attempts: p.attempts + 1, consecutiveGone: gone, firstGoneAt: new Date(firstGoneMs).toISOString() })) as Prisma.InputJsonValue },
+          }).catch(() => {})
+        }
+        if (p && isWcGoneRetirableRefusal(p.reason)
+          && gone >= WC_ADMISSION_REFUSAL_GONE_RETIRE_ATTEMPTS
+          && nowMs - firstGoneMs >= WC_ADMISSION_REFUSAL_GONE_MIN_SPAN_MS) {
+          await resolveRefusalRow(g.id, 'The order no longer exists in WooCommerce (404 on repeated checks over 24h+)')
+          result.retired++
+        } else {
+          result.unresolved++
+        }
+      }
     }
   }
 
