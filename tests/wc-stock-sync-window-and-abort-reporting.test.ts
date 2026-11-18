@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { isPermanentWindowError, manualProgressErrors } from '@/lib/connectors/woocommerce/sync/stock-sync'
+import { classifyMappingPersistError, isPermanentWindowError, manualProgressErrors } from '@/lib/connectors/woocommerce/sync/stock-sync'
 
 /**
  * o3d-hqvrp.101: a catalogue-shaped (permanent) error must not hold the daily reconcile window; a transient one still must.
@@ -31,4 +31,18 @@ test('the rebind abort notice leads the 20 errors the manual screen shows', () =
   assert.equal(shown.length, 20)
   assert.equal(shown[0], notice)
   assert.deepEqual(manualProgressErrors({ errors: ['a', 'b'] }), ['a', 'b'])
+})
+
+test('only a P2002 unique violation is a collision (permanent); timeouts and connection errors keep their message and hold the window', () => {
+  const p2002 = Object.assign(new Error('Unique constraint failed on the fields: (`external_product_id`)'), { code: 'P2002' })
+  const collision = classifyMappingPersistError(p2002)
+  assert.equal(collision.reason, 'collision')
+  assert.equal(isPermanentWindowError(`externalProductId collision: could not persist 1 for IMS product p (SKU s): ${collision.error}`), true)
+  for (const code of ['P2024', 'P1001', 'P1017', 'P2034', undefined]) {
+    const transient = classifyMappingPersistError(Object.assign(new Error('Timed out fetching a new connection from the connection pool'), { code }))
+    assert.equal(transient.reason, 'error', String(code))
+    // The call site words a non-collision error "mapping persist failed: ...", which must hold the window.
+    assert.equal(isPermanentWindowError(`mapping persist failed: could not persist 1 for IMS product p (SKU s): ${transient.error}`), false, String(code))
+  }
+  assert.equal(classifyMappingPersistError('socket hang up').reason, 'error')
 })

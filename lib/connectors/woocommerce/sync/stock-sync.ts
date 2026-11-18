@@ -204,6 +204,7 @@ async function persistMappingIfVersionMatches(
   | { ok: true }
   | { ok: false; reason: 'version_changed' }
   | { ok: false; reason: 'mapping_changed' }
+  | { ok: false; reason: 'collision'; error: string }
   | { ok: false; reason: 'error'; error: string }
 > {
   try {
@@ -231,8 +232,17 @@ async function persistMappingIfVersionMatches(
       return { ok: true as const }
     })
   } catch (e) {
-    return { ok: false as const, reason: 'error' as const, error: String(e) }
+    return classifyMappingPersistError(e)
   }
+}
+
+/**
+ * Only a real unique-constraint violation (Prisma P2002: another product already holds this externalProductId) is a collision, and so
+ * permanent. A pool timeout, dropped connection, deadlock or statement timeout is transient: it keeps its own message and holds the window.
+ */
+export function classifyMappingPersistError(e: unknown): { ok: false; reason: 'collision' | 'error'; error: string } {
+  const code = e && typeof e === 'object' ? (e as { code?: unknown }).code : undefined
+  return { ok: false, reason: code === 'P2002' ? 'collision' : 'error', error: String(e) }
 }
 
 type MappingInvalidationLog = {
@@ -1171,9 +1181,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         result.errors.push(
           `WooCommerce mapping for ${p.sku} (IMS ${p.id}) was claimed by another sync while resolving it; left as-is`,
         )
-      } else {
+      } else if (outcome.reason === 'collision') {
         result.errors.push(
           `externalProductId collision: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
+        )
+      } else {
+        // A transient failure (timeout, connection, deadlock): its own message, so it holds the reconcile window and is retried.
+        result.errors.push(
+          `mapping persist failed: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
         )
       }
     }
