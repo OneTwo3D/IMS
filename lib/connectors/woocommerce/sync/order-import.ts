@@ -33,6 +33,7 @@ import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import { surfaceWcOrderEditDrift } from './order-edit-drift'
+import { drainDeferredWcOrderDivergences, rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
@@ -1394,6 +1395,8 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   // delivery whose total or currency disagrees with IMS already left its own durable obligation row (paid-block, retried until the two agree):
   // the total is not surfaced a second time then, so one disagreement is one row.
   await surfaceWcOrderEditDrift(orderId, wcOrder, { ignoreTotal: outcome.blocked })
+  // READ-ONLY and behind `wc_order_divergence_detection_enabled` (off by default): reports price, shipping, discount and tax differences too, net of refunds. Writes nothing to the order; never throws.
+  await surfaceWcOrderDivergence(orderId, wcOrder)
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
@@ -5119,6 +5122,7 @@ export async function syncNewWcOrders(
           // nothing here is re-driven by anything else. Recorded as an error so the cursor is HELD
           // and the next run re-reads this order from the first page (o3d-ecbj r5).
           const refundSweep = await syncRefundsForOrder(order.id)
+          await rerunDeferredWcOrderDivergence(order)
           if (!refundSweep.complete) {
             result.errors.push(
               `syncRefundsForOrder #${order.id}: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`,
@@ -5151,6 +5155,9 @@ export async function syncNewWcOrders(
     ? await walkOrders(statuses, lastSync)
     : { endedOnEmptyPage: false, page: 1 }
   const { endedOnEmptyPage, page } = walked
+  // Comparisons deferred for an unrecorded refund are resolved here in EVERY mode, the ordinary poll included (it sweeps no refunds): the deferral is a durable row, so this is a retry that survives a restart,
+  // and it runs before the cursor below can advance. It never throws and never holds the cursor.
+  await drainDeferredWcOrderDivergences()
 
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a

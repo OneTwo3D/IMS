@@ -39,7 +39,7 @@ test('schema requests customs_description and the prompt states the rules (no ne
   assert.ok(args.output_config.format.schema.required.includes('customs_description'))
   assert.ok('customs_description' in args.output_config.format.schema.properties)
   assert.match(args.system, /article \+ key attribute/)
-  assert.match(args.system, /50 characters/)
+  assert.match(args.system, /35 characters/)
 })
 
 test('parse without the field tolerated (null)', async () => {
@@ -48,7 +48,7 @@ test('parse without the field tolerated (null)', async () => {
   assert.equal(result.customsDescription, null)
 })
 
-test('parse clamps an over-long model description to 50 chars', async () => {
+test('parse clamps an over-long model description to 35 chars', async () => {
   const long = 'precision brass nozzle for high temperature 3D printer hotend extruder assembly'
   const { client } = fakeClient({ cn_code: '85011099', confidence: 90, reasoning: 'r', customs_description: long })
   const result = await buildAnthropicClassify(client)(INPUT, 'm', { thinking: false })

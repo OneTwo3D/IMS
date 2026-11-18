@@ -437,6 +437,7 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/accounting-fx-revaluation` | Unrealised FX on open AR/AP | Daily | Not in the Scheduler list; schedule it from the server's own cron if you use accounting |
 | `/api/cron/delivery-status` | Tracking provider polling | Every 15 min | On |
 | `/api/cron/refund-reservation-release` | Safety net that releases stock reservations for refunded units | Every 15 min | On |
+| `/api/cron/product-sync-marks` | Sends the shop and warehouse sync owed by products edited by CSV, 25 products per run | Every 5 min | On |
 | `/api/cron/reallocation-sweep` | Re-run allocation for processing orders left short | Every 15 min | On |
 | `/api/cron/invariant-check` | Scheduled data-integrity check (see below) | Daily at 04:00 | On |
 | `/api/cron/read-sync-liveness` | Hourly check that every read feed that keeps IMS current (store order sweep, warehouse despatch poll and status refresh, account balance snapshots, tax rates, chart refresh) has succeeded recently; alerts administrators once per breach | Hourly (at :25) | On |

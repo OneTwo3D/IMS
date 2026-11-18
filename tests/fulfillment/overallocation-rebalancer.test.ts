@@ -443,6 +443,8 @@ const tx = {
       return { count: doomed.length }
     },
   },
+  // SO-to-PO pegging: the release order asks which orders are pegged; none are in these scenarios.
+  salesOrderLinePeg: { findMany: async () => [] },
   orderAllocation: {
     // Honours BOTH shapes production asks for: the release loop's
     // `{ productId, warehouseId, order: { status: { in } } }` scan, and the reconciler's

@@ -1,0 +1,3 @@
+### Fixed
+- WooCommerce product import now validates native customs values before they replace anything: an origin IMS cannot map, a commodity code of fewer than 8 digits (WooCommerce allows 6; 8-14 digits are accepted and stored in full) or a description that clamps to nothing is ignored in favour of the next source (legacy attribute, legacy meta), and otherwise treated as absent so the existing IMS value is kept.
+- A new product or variation with no usable origin still gets the China default, and the import now records a warning in the product activity log (as it does for any ignored customs value).

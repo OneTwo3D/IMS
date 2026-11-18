@@ -823,6 +823,7 @@ model Product {
   shipmentLines    ShipmentLine[]
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
+  syncMark         ProductSyncMark?
   shoppingLinks    ShoppingProductLink[]
   wmsProductLinks  WmsProductLink[]
   wmsBundleLinks   WmsBundleLink[]
@@ -1446,6 +1447,7 @@ model PurchaseOrderLine {
   taxRate         TaxRate?         @relation(fields: [taxRateId], references: [id])
   receiptLines    PurchaseReceiptLine[]
   returnLines     PurchaseReturnLine[]
+  pegs            SalesOrderLinePeg[]
   invoiceLines    PurchaseInvoiceLine[]
   costLayers      CostLayer[]
 
@@ -2246,6 +2248,7 @@ model SalesOrderLine {
   product         Product?   @relation(fields: [productId], references: [id])
   taxRate         TaxRate?   @relation(fields: [taxRateId], references: [id])
   allocations     OrderAllocation[]
+  pegs            SalesOrderLinePeg[]
   shipmentLines   ShipmentLine[]
   refundLines     SalesOrderRefundLine[]
 
@@ -3883,6 +3886,25 @@ model StockSyncState {
   @@map("stock_sync_states")
 }
 
+/// Products edited in bulk (Edit by CSV) whose storefront and warehouse sync is still owed. Written in the SAME transaction as the
+/// edit, drained by the product-sync-marks cron in small batches, so a large edit never pushes to a vendor inside the request. A row
+/// is deleted once its sync has been handed over; a re-edit resets it. `claimedAt` is the drain's lease, `attempts` bounds retries.
+model ProductSyncMark {
+  productId         String    @id
+  storefrontPending Boolean   @default(true)
+  warehousePending  Boolean   @default(true)
+  attempts          Int       @default(0)
+  claimedAt         DateTime?
+  lastError         String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @default(now())
+
+  product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@map("product_sync_marks")
+}
+
 model StockSyncJob {
   connector   String
   productId   String
@@ -4406,6 +4428,45 @@ model RefusedAction {
   @@unique([entityType, entityId, action, gate], map: "refused_actions_key")
   @@index([resolvedAt, severity, firstSeenAt], map: "refused_actions_open_idx")
   @@map("refused_actions")
+}
+
+/// A WooCommerce order and the IMS order disagree (lines, prices, shipping, discount, tax or total), found READ-ONLY by the order.updated path while
+/// `wc_order_divergence_detection_enabled` is on. One row per order: it is reopened when a later delivery disagrees again and closed (resolvedAt) when a
+/// later delivery matches. Nothing is ever written to the order, WooCommerce or the warehouse because of it. Carries SKUs, quantities and amounts only.
+model WcOrderDivergence {
+  id                  String    @id @default(cuid())
+  /// The IMS sales order id (no foreign key, so the row outlives a deleted order, like RefusedAction).
+  orderId             String    @unique @map("order_id")
+  externalOrderId     String    @map("external_order_id")
+  /// The storefront order number, for display.
+  externalOrderNumber String?   @map("external_order_number")
+  /// The field-level differences: [{ field, label, sku?, woocommerce, ims }]. SKUs, quantities and amounts only; built by IMS, never copied from a payload's free text.
+  differences         Json
+  /// Hash of the differences: the same difference seen again refreshes lastSeenAt instead of rewriting the row.
+  fingerprint         String
+  seenCount           Int       @default(1) @map("seen_count")
+  firstSeenAt         DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt          DateTime  @default(now()) @map("last_seen_at")
+  /// Set when a later delivery matched the IMS order again (or the order ended). A later difference starts a new episode on the same row.
+  resolvedAt          DateTime? @map("resolved_at")
+  resolution          String?
+
+  @@index([resolvedAt, firstSeenAt], map: "wc_order_divergences_open_idx")
+  @@map("wc_order_divergences")
+}
+
+/// A divergence comparison deferred because the payload names a refund IMS has not recorded yet. One row per order; removed by any later comparison that completes, and dropped after an attempt or age cap.
+model WcOrderDivergenceRecheck {
+  id              String   @id @default(cuid())
+  /// The IMS sales order id (no foreign key, like WcOrderDivergence).
+  orderId         String   @unique @map("order_id")
+  externalOrderId String   @map("external_order_id")
+  deferredAt      DateTime @default(now()) @map("deferred_at")
+  attempts        Int      @default(0)
+  lastAttemptAt   DateTime @default(now()) @map("last_attempt_at")
+
+  @@index([lastAttemptAt], map: "wc_order_divergence_rechecks_attempt_idx")
+  @@map("wc_order_divergence_rechecks")
 }
 
 // ---------------------------------------------------------------------------
@@ -5362,6 +5423,56 @@ model OrderAllocation {
   @@index([productId, warehouseId])
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "order_allocations_costLayerSnapshot_gin_idx")
   @@map("order_allocations")
+}
+
+/// Why a sales-order-line peg stopped applying. A peg is never deleted by IMS: it ends, with a reason, and every end is
+/// also written to the activity log. (Deleting either line cascades the row away; those removals are logged first.)
+enum SalesOrderLinePegEndReason {
+  FULLY_ALLOCATED
+  SALES_ORDER_CANCELLED
+  SALES_LINE_REMOVED
+  SALES_ORDER_ADVANCED
+  PURCHASE_ORDER_CANCELLED
+  PURCHASE_LINE_REMOVED
+  PURCHASE_LINE_RECEIVED_ELSEWHERE
+  REMOVED_BY_USER
+}
+
+/// Pegging: stock received on a purchase-order line is held for, and allocated to, one sales-order line first. IMS-internal
+/// allocation ordering only: nothing is sent to any connector. Many pegs may share a purchase-order line (one per
+/// customer order) and a sales-order line may be pegged to several purchase-order lines; one live peg per pair (partial
+/// unique index in the migration, not expressible here).
+/// `receivedQty` is the part of `qty` that has landed on the purchase-order line and been earmarked for this peg (oldest peg
+/// first); `allocatedQty` is the part of that the order has actually absorbed. `receivedQty - allocatedQty` is the hold
+/// other orders' allocation must leave alone. `seenLandedQty` is the line's landed quantity when `receivedQty` was last
+/// refreshed, so the refresh is idempotent whichever receipt path (manual, ASN alignment, WMS book-in) landed the units.
+/// `receivedByWarehouse` / `seenLandedByWarehouse` split the same two figures by the warehouse the units actually landed in
+/// (`{ "<warehouseId>": "<qty>" }`, key "" = landed with no recorded warehouse); the scalars are their sums. Holds and allocation
+/// caps are applied in the warehouse the stock is in.
+model SalesOrderLinePeg {
+  id                  String    @id @default(cuid())
+  salesOrderLineId    String
+  purchaseOrderLineId String
+  qty                 Decimal   @db.Decimal(12, 4)
+  receivedQty         Decimal   @default(0) @db.Decimal(12, 4)
+  allocatedQty        Decimal   @default(0) @db.Decimal(12, 4)
+  /// The sales-order line's allocation when the peg was made: what the order already had from other stock.
+  baselineAllocatedQty Decimal  @default(0) @db.Decimal(12, 4)
+  seenLandedQty       Decimal   @default(0) @db.Decimal(12, 4)
+  receivedByWarehouse Json      @default("{}")
+  seenLandedByWarehouse Json    @default("{}")
+  createdAt           DateTime  @default(now())
+  createdById         String?
+  endedAt             DateTime?
+  endReason           SalesOrderLinePegEndReason?
+  endedById           String?
+
+  salesOrderLine      SalesOrderLine    @relation(fields: [salesOrderLineId], references: [id], onDelete: Cascade)
+  purchaseOrderLine   PurchaseOrderLine @relation(fields: [purchaseOrderLineId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderLineId])
+  @@index([salesOrderLineId])
+  @@map("sales_order_line_pegs")
 }
 
 /// A shipment groups allocated lines from one warehouse

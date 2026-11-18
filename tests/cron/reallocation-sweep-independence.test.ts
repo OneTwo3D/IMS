@@ -17,6 +17,7 @@ import test, { mock } from 'node:test'
 const calls: string[] = []
 let allocationThrows: boolean | Error = false
 let markerThrows = false
+let pegSweep: () => Promise<{ checked: number; ended: number; errors: number }> = async () => ({ checked: 0, ended: 0, errors: 0 })
 /** The budget the route handed the marker sweep, so "bounded wall time" is observable. */
 let markerOptions: { budgetMs?: number } | undefined
 
@@ -40,6 +41,9 @@ mock.module('@/lib/fulfillment/reallocation-sweep', {
       return { scanned: 3, needing: 0, allocated: 0, skipped: 0, errors: 0, hasRemainder: false, nextCursor: '', cursorPersisted: true }
     },
   },
+})
+mock.module('@/lib/fulfillment/peg-allocator', {
+  namedExports: { sweepPegsAndRelease: () => pegSweep() },
 })
 mock.module('@/lib/fulfillment/pre-fulfilment-reallocation', {
   namedExports: {
@@ -68,6 +72,7 @@ function reset() {
   calls.length = 0
   allocationThrows = false
   markerThrows = false
+  pegSweep = async () => ({ checked: 0, ended: 0, errors: 0 })
   markerOptions = undefined
 }
 
@@ -137,4 +142,20 @@ test('a thrown hold is held (200) only when nothing was sent; a refusal at a red
   reset()
   allocationThrows = new OutboundWriteHeldError(refusal, 1)
   assert.equal((await runRoute()).status, 500)
+})
+
+test('a failing peg pass does not skip the other passes and is reported; its hand-on errors make the run failed', async () => {
+  reset()
+  pegSweep = async () => { throw new Error('peg pass exploded') }
+  let out = await runRoute()
+  assert.deepEqual(calls, ['allocation', 'markers'], 'the other passes still run')
+  assert.equal(out.status, 500)
+  assert.match(String((out.body.failures as Record<string, string>).pegSweep), /peg pass exploded/)
+
+  reset()
+  pegSweep = async () => ({ checked: 4, ended: 2, errors: 1 })
+  out = await runRoute()
+  assert.equal(out.status, 500, 'a peg release that failed for an order is counted in `errors`')
+  assert.equal(out.body.errors, 1)
+  assert.equal(out.body.pegsEnded, 2)
 })

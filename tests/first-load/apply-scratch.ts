@@ -1,5 +1,5 @@
 /**
- * A scratch PostgreSQL cluster of its own (loopback, private port, under the scratch root, /var/tmp unless IMS_SCRATCH_ROOT names a RAM disk), migrated and seeded, with the target configuration a first load needs: the warehouses the synthetic
+ * A scratch PostgreSQL cluster of its own (loopback, private port, under the scratch root: IMS_SCRATCH_ROOT, else the TMPDIR the run started with), migrated and seeded, with the target configuration a first load needs: the warehouses the synthetic
  * manifest declares, a purchase tax rate, a stored EUR rate, and WooCommerce configured and enabled (so an effect the system actor fails to suppress would leave an outbox row).
  *
  * Shared by the verification and command-line tests. Not a `.test.ts` file. It touches no other cluster and no role of one.

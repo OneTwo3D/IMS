@@ -22,6 +22,7 @@ import { getShopRefundDueForSalesOrder } from '@/app/actions/shop-refund-tasks'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { getSalesOrderPegs } from '@/app/actions/pegging'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -56,6 +57,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   if (!so) notFound()
+  const pegs = await getSalesOrderPegs(id)
   // audit-H2: a fully-paid order whose trigger won't auto-generate an invoice.
   const paidWithoutInvoice = shouldWarnPaidWithoutInvoice({
     becamePaid: Boolean(so.paidAt),
@@ -105,6 +107,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         rejectedAccountingSyncs={rejectedAccountingSyncs}
         paidWithoutInvoice={paidWithoutInvoice}
         editForm={editForm}
+        pegs={pegs}
       />
     </div>
   )

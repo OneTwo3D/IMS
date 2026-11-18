@@ -396,7 +396,7 @@ The **Products** tab controls bidirectional product synchronisation.
 - **Product content** (see below): short description, long description and the picture references
 - Weight and dimensions (length, width, height)
 - GTIN/barcode from WooCommerce's `global_unique_id` field (only written if the IMS barcode field is empty)
-- HS code and country of origin from WC product attributes (only written if the IMS fields are empty)
+- HS code, country of origin and customs description from WooCommerce's native customs fields, falling back to the older product attributes per field (a store value replaces a differing IMS value; a blank store value never clears IMS)
 - **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). If the store marks a **primary category** (the SEO plugins Yoast and Rank Math record one), the product is linked to that category, provided it is one of the product's own categories and has been mirrored; otherwise it is linked to its **deepest** WC category. Variations take the category of their parent product. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable — or the category list cannot be read to its end — the product's existing category link is left alone rather than wiped or linked to a partial tree.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 
@@ -544,6 +544,17 @@ The system handles this two ways:
 **To unblock a blocked order:** import the missing tax rates from WC, ensure the relevant country + category combination resolves, the blocked order is then imported by the recheck, which handles up to 50 orders every 15 minutes (it clears from Sync > Exceptions when it imports). You do not need to retry it by hand.
 
 The Sales Settings page surfaces recent fallback events as a widget so you can spot misconfigurations early.
+
+### Reporting orders edited in WooCommerce (flag, default OFF)
+
+The edit list above notices a changed line, quantity or total. Turning on `wc_order_divergence_detection_enabled` (**Sync > Orders > Report orders edited in WooCommerce**, off by default) adds a fuller, read-only comparison each time WooCommerce reports an update to an order IMS already holds. With it off nothing changes.
+
+- **What is compared:** each line (matched on the WooCommerce line id) for SKU, quantity and unit price excluding tax, plus items added or removed in WooCommerce; then shipping, discount, tax total and order total (including tax), all in the order's currency.
+- **Refunds are taken out, not reported.** An item or quantity that WooCommerce shows as gone, and that IMS has already refunded in full for that line, is one event handled by the refund, so it is not listed as an edit (its share of the tax, discount and total is taken off the IMS side before comparing). If the update names a refund that IMS has not recorded yet, the comparison waits for the next update, so a refund is never held up or mistaken for an edit.
+- **Rounding:** a difference of up to half a penny (half of the currency's smallest unit) is rounding and is ignored; a one-penny difference is listed. Where a refund explains only part of a line, one whole penny is tolerated.
+- **What is not compared:** cancelled or erased orders, an order whose currency differs, the discount on an order that carries store credit (or was imported before discounts were allocated to lines), and any figure the update does not state.
+- **Where it shows:** Sync > Exceptions, **WooCommerce orders that no longer match IMS**, one row per order with a link to it and one line per difference naming the field, for example "Quantity of RED-M changed in WooCommerce: WooCommerce 3, IMS 2". A WARNING `wc_order_diverged` is written to the order's activity log when a new difference appears. The row closes itself when a later update matches the IMS order again.
+- **It only reports.** IMS changes nothing: not the order or its lines, not WooCommerce, not the warehouse, and the order is not queued for the warehouse because of it. Check the order, decide which side is right, and tell the warehouse yourself if it already holds the order. If the report cannot be written the update is still imported normally.
 
 ### Pending FX retry queue
 

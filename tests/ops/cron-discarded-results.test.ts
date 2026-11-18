@@ -28,7 +28,6 @@ const JUSTIFIED: Record<string, string> = {
   handBackUnsentTransportRefusal: 'hands a lease back after a transport refusal that sent nothing (`abandoned` says the hand-back did not release a row): the sync log row keeps its state and the sweeps read it; the call sites count the refusal as held',
   uploadBackupArtifactsToTarget: 'its failures THROW (BackupArtifactUploadError) and the backup route catches them into `uploadError`; the success value only carries `orphanCleanupAttempted: false`',
   autoAllocateOrder: 'best-effort allocation after a payment advanced an order: the reallocation sweep re-attempts unallocated orders every run, and its own failures are in that route\'s result',
-  runMintsoftProductSyncForProduct: 'the single-product wrapper behind the product screens (not a cron path, reached through the WMS registry import); the verify cron reads its own run results',
   queueRefundStockCorrections: 'in the WooCommerce webhook handler (a delivery, not a cron run; the open obligation is retried by the reconcile cron, which now folds this call\'s `failed` count into its result)',
   syncWcRefund: 'in the WooCommerce refund webhook handler: a delivery answered to the store, retried by the inbox and by the reconcile; not a cron result',
 }
