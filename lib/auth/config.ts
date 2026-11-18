@@ -5,7 +5,7 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
-import { clearLoginThrottle, loginAttemptAllowed, recordLoginFailure } from '@/lib/auth/login-throttle'
+import { beginLoginAttempt, LoginThrottledError } from '@/lib/auth/login-throttle'
 import { getClientIp, isTrustedProxyConfigured } from '@/lib/request-ip'
 import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
 import {
@@ -22,6 +22,22 @@ const loginSchema = z.object({
 const DUMMY_BCRYPT_HASH = '$2b$12$Q7QxTQqR0p6vJY9Yx1m8JOkjH3J0mD6G4jY6YtV2v0mL4YvM1gM9S'
 
 const nowSeconds = () => Math.floor(Date.now() / 1000)
+
+const findLoginUser = (email: string) => db.user.findUnique({
+  where: { email },
+  select: {
+    id: true,
+    email: true,
+    name: true,
+    passwordHash: true,
+    role: true,
+    supplierId: true,
+    pictureUrl: true,
+    totpEnabled: true,
+    active: true,
+    sessionVersion: true,
+  },
+})
 
 const getSessionRevalidationUser = cache(async (userId: string) => db.user.findUnique({
   where: { id: userId },
@@ -177,42 +193,26 @@ export const authConfig: NextAuthConfig = {
           if (!turnstileVerified) return null
         }
 
-        // Fail closed so a rate-limit backend outage cannot silently disable
-        // brute-force protection. See lib/auth/login-throttle.ts for the three buckets.
-        const allowed = await loginAttemptAllowed({
+        // Per-account cooldown + one in-flight check per account + failed-attempt IP slowdown; none of it
+        // refuses a correct password beyond the short cooldown. See lib/auth/login-throttle.ts.
+        const attempt = await beginLoginAttempt({
           email: parsed.data.email,
           clientIp,
           ipIsTrustworthy: isTrustedProxyConfigured(),
         })
-        if (!allowed) return null
+        if (!attempt.allowed) throw new LoginThrottledError(attempt.retryAfterSec)
 
-        const user = await db.user.findUnique({
-          where: { email: parsed.data.email },
-          select: {
-            id: true,
-            email: true,
-            name: true,
-            passwordHash: true,
-            role: true,
-            supplierId: true,
-            pictureUrl: true,
-            totpEnabled: true,
-            active: true,
-            sessionVersion: true,
-          },
-        })
-
-        const passwordHash = user?.passwordHash ?? DUMMY_BCRYPT_HASH
-        const passwordMatch = await bcrypt.compare(
-          parsed.data.password,
-          passwordHash,
-        )
-        if (!user || !user.active || !passwordMatch) {
-          await recordLoginFailure({ email: parsed.data.email })
-          return null
+        let outcome: 'success' | 'failure' = 'failure'
+        let user: Awaited<ReturnType<typeof findLoginUser>>
+        try {
+          user = await findLoginUser(parsed.data.email)
+          const passwordHash = user?.passwordHash ?? DUMMY_BCRYPT_HASH
+          const passwordMatch = await bcrypt.compare(parsed.data.password, passwordHash)
+          if (user && user.active && passwordMatch) outcome = 'success'
+        } finally {
+          await attempt.finish(outcome)
         }
-
-        await clearLoginThrottle(parsed.data.email, clientIp)
+        if (outcome !== 'success' || !user) return null
 
         return {
           id: user.id,

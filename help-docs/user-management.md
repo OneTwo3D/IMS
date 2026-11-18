@@ -137,7 +137,7 @@ The login page provides two ways to sign in:
 - **Email and password** — the standard login form, followed by a TOTP prompt if two-factor authentication is enabled. **Forgot password?** is next to the password box (see [Forgotten Password](#forgotten-password)).
 - **Sign in with Passkey** — a single button that triggers your browser's passkey flow
 
-Repeated failed sign-ins for the same email from the same address are blocked for 15 minutes; wait and try again. If your session ended (you were signed out by an administrator's change, or it expired) the login page says so above the form. Some installations also show a bot check on the form.
+After several failed sign-ins for the same email the page asks you to wait a few seconds before the next try (the wait grows with each further failure, up to 15 minutes). Wait for it and sign in with the correct password as normal; nobody is locked out. If your session ended (you were signed out by an administrator's change, or it expired) the login page says so above the form. Some installations also show a bot check on the form.
 
 
 ## User Administration (Settings > Users)
