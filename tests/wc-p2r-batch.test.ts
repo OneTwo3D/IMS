@@ -1,0 +1,283 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+
+/**
+ * P2 batch R (WooCommerce inbound): per-event claim stamp, SKU matching, admission-queue expiry.
+ * Everything is in memory; nothing touches the network or a database.
+ */
+
+type Row = Record<string, unknown> & { id: string }
+
+const logged: Array<Record<string, unknown>> = []
+const products: Array<{ id: string; sku: string; externalProductId: bigint | null }> = []
+let findManyWhere: unknown = null
+let syncLogs: Row[] = []
+let live: 'gone' | 'failed' = 'gone'
+// Order ids whose by-id read answers a non-404 error (proof the store is reachable) whatever `live` says.
+const reachableIds = new Set<string>()
+const warnings: string[] = []
+
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async (e: Record<string, unknown>) => { logged.push(e) } } })
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      product: {
+        findMany: async ({ where }: { where: unknown }) => {
+          findManyWhere = where
+          // Emulates Postgres: `equals` + mode insensitive, or an externalProductId in-list.
+          const or = (where as { OR: Array<{ sku?: { equals: string }; externalProductId?: { in: bigint[] } }> }).OR
+          return products.filter((p) => or.some((c) => {
+            if (c.sku) return p.sku.toLowerCase() === String(c.sku.equals).toLowerCase()
+            if (c.externalProductId) return p.externalProductId !== null && c.externalProductId.in.includes(p.externalProductId)
+            return false
+          }))
+        },
+      },
+      shoppingSyncLog: {
+        findMany: async () => syncLogs.filter((r) => r.status === 'PENDING'),
+        update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+          const row = syncLogs.find((r) => r.id === where.id)!
+          Object.assign(row, data)
+          return row
+        },
+      },
+    },
+  },
+})
+mock.module('@/lib/connectors/woocommerce/api', {
+  namedExports: { wcFetch: async (path: string) => (reachableIds.has(path.split('/').pop()!) ? { data: null, error: 'HTTP 503' } : live === 'gone' ? { data: null, error: 'HTTP 404 not found' } : { data: null, error: 'HTTP 503' }) },
+})
+mock.module('@/lib/connectors/woocommerce/sync/order-import', { namedExports: { importWcOrder: async () => ({ success: false }) } })
+mock.module('@/lib/connectors/woocommerce/sync/withdrawal', { namedExports: { importWcOrderGuarded: async () => ({ outcome: 'unresolved' }) } })
+
+const line = (over: Record<string, unknown>) => ({
+  id: 1, name: 'x', product_id: 10, variation_id: 0, quantity: 1, tax_class: '', subtotal: '10', subtotal_tax: '0',
+  total: '10', total_tax: '0', taxes: [], meta_data: [], sku: '', price: 10, ...over,
+})
+
+test('o3d-hqvrp.90: SKU is matched trimmed and case-insensitively', async () => {
+  const { mapWcLineItems } = await import('../lib/connectors/woocommerce/sync/field-mapping.ts')
+  products.length = 0
+  products.push({ id: 'p-abc', sku: 'ABC-01', externalProductId: null })
+  const [mapped] = await mapWcLineItems([line({ sku: ' abc-01 ' }) as never], 1)
+  assert.equal(mapped.productId, 'p-abc')
+  assert.equal(mapped.sku, 'abc-01')
+  assert.ok(findManyWhere)
+})
+
+test('o3d-hqvrp.90: two IMS SKUs differing only by case never bind by folding', async () => {
+  const { mapWcLineItems, logWcUnmatchedLines } = await import('../lib/connectors/woocommerce/sync/field-mapping.ts')
+  products.length = 0
+  products.push({ id: 'p-upper', sku: 'ABC-01', externalProductId: BigInt(5) }, { id: 'p-lower', sku: 'abc-01', externalProductId: BigInt(6) })
+  logged.length = 0
+  const mapped = await mapWcLineItems([
+    line({ id: 1, sku: 'Abc-01', product_id: 5 }) as never, // ambiguous: not bound, even though the WC id names p-upper
+    line({ id: 2, sku: 'abc-01' }) as never, // exact hit wins
+    line({ id: 3, sku: 'ABC-01' }) as never,
+  ], 1)
+  assert.equal(mapped[0].productId, null)
+  assert.equal(mapped[1].productId, 'p-lower')
+  assert.equal(mapped[2].productId, 'p-upper')
+  await logWcUnmatchedLines(mapped, { orderId: 7001, orderNumber: '7001' })
+  assert.equal(logged.length, 1)
+  assert.match(String(logged[0].description), /Ambiguous.*Abc-01/)
+})
+
+test('o3d-hqvrp.90: no SKU or an unknown SKU falls back to the WooCommerce id (variation first)', async () => {
+  const { mapWcLineItems, logWcUnmatchedLines } = await import('../lib/connectors/woocommerce/sync/field-mapping.ts')
+  products.length = 0
+  products.push({ id: 'p-parent', sku: 'PARENT', externalProductId: BigInt(10) }, { id: 'p-var', sku: 'VAR', externalProductId: BigInt(11) })
+  logged.length = 0
+  const mapped = await mapWcLineItems([
+    line({ id: 1, sku: '', product_id: 10, variation_id: 11 }) as never,
+    line({ id: 2, sku: 'RENAMED-IN-WC', product_id: 10 }) as never,
+    line({ id: 3, sku: 'NOPE', product_id: 99 }) as never,
+  ], 1)
+  assert.deepEqual(mapped.map((m) => m.productId), ['p-var', 'p-parent', null])
+  assert.equal(logged.length, 0, 'mapping alone never warns')
+  await logWcUnmatchedLines(mapped, { orderId: 7002, orderNumber: '7002' })
+  assert.equal(logged.length, 1, 'the unmatched line is flagged once the order is created')
+  assert.match(String(logged[0].description), /#7002/)
+  // The same order touched again (re-import, update) does not warn again; a mapping call with no order ref never warns.
+  await logWcUnmatchedLines(await mapWcLineItems([line({ id: 3, sku: 'NOPE', product_id: 99 }) as never], 1), { orderId: 7002, orderNumber: '7002' })
+  assert.equal(logged.length, 1, 'logged once per order and line')
+})
+
+test('a variation line never binds to its VARIABLE parent when the variation is unmapped', async () => {
+  const { mapWcLineItems, logWcUnmatchedLines } = await import('../lib/connectors/woocommerce/sync/field-mapping.ts')
+  products.length = 0
+  products.push({ id: 'p-parent', sku: 'PARENT', externalProductId: BigInt(10) })
+  logged.length = 0
+  const mapped = await mapWcLineItems([line({ id: 1, sku: '', product_id: 10, variation_id: 55 }) as never], 1)
+  assert.equal(mapped[0].productId, null)
+  await logWcUnmatchedLines(mapped, { orderId: 7003, orderNumber: '7003' })
+  assert.equal(logged.length, 1, 'the unbound variation line is logged')
+})
+
+function refusalRow(id: string, over: { reason?: string; refusedAt: string; attempts?: number }): Row {
+  return {
+    id, status: 'PENDING', externalId: id,
+    payload: {
+      queue: 'wc_admission_refusal', connector: 'woocommerce', externalOrderId: id, externalOrderNumber: id,
+      status: 'pending', configured: ['processing'], currency: 'GBP', reason: over.reason ?? 'status_not_admitted',
+      refusedAt: over.refusedAt, attempts: over.attempts ?? 0,
+    },
+  }
+}
+
+test('o3d-hqvrp.93: expired status-only refusals are retired without a WooCommerce read; guard blocks are kept', async () => {
+  const { drainWcOrderAdmissionRefusals, WC_ADMISSION_REFUSAL_QUEUE } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  const old = new Date(Date.now() - 40 * 86_400_000).toISOString()
+  const fresh = new Date(Date.now() - 1 * 86_400_000).toISOString()
+  syncLogs = [
+    refusalRow('old-status', { refusedAt: old }),
+    refusalRow('old-guard', { refusedAt: old, reason: 'tax_rate_unmapped' }),
+    refusalRow('fresh-status', { refusedAt: fresh }),
+  ]
+  for (const r of syncLogs) (r.payload as Record<string, unknown>).queue = WC_ADMISSION_REFUSAL_QUEUE
+  live = 'failed'
+  const result = await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs.find((r) => r.id === 'old-status')!.status, 'SYNCED')
+  assert.equal(syncLogs.find((r) => r.id === 'old-guard')!.status, 'PENDING')
+  assert.equal(syncLogs.find((r) => r.id === 'fresh-status')!.status, 'PENDING')
+  assert.equal(result.retired, 1)
+  assert.equal(result.failed, 2, 'only the two live rows cost a read')
+})
+
+const DAY = 86_400_000
+const queue = async () => (await import('../lib/connectors/woocommerce/sync/order-admission.ts')).WC_ADMISSION_REFUSAL_QUEUE
+/** A fresh row that answers 503 (store reachable) so a pass is not an all-404 pass. */
+async function reachableRow(): Promise<Row> {
+  const r = refusalRow('reach', { refusedAt: new Date().toISOString() })
+  ;(r.payload as Record<string, unknown>).queue = await queue()
+  reachableIds.add('reach')
+  return r
+}
+function goneRow(id: string, over: { reason?: string; consecutiveGone?: number; firstGoneAt?: string } = {}): Row {
+  const r = refusalRow(id, { refusedAt: new Date().toISOString(), reason: over.reason })
+  Object.assign(r.payload as Record<string, unknown>, { consecutiveGone: over.consecutiveGone, firstGoneAt: over.firstGoneAt })
+  return r
+}
+async function withQueue(rows: Row[]): Promise<void> {
+  const q = await queue()
+  for (const r of rows) (r.payload as Record<string, unknown>).queue = q
+  syncLogs = rows
+}
+
+test('o3d-hqvrp.93: an order deleted in WooCommerce is retired on its third 404 once they span 24h', async () => {
+  const { drainWcOrderAdmissionRefusals } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  reachableIds.clear()
+  await withQueue([goneRow('gone-1'), await reachableRow()])
+  live = 'gone'
+  for (let run = 0; run < 3; run++) await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'PENDING', 'three 404s inside 24h do not retire')
+  assert.equal((syncLogs[0].payload as { consecutiveGone: number }).consecutiveGone, 3)
+  const first = (syncLogs[0].payload as { firstGoneAt: string }).firstGoneAt
+  assert.ok(first, 'the first-404 time is stored')
+  // Backdate the first 404 past 24h: the next 404 retires.
+  ;(syncLogs[0].payload as Record<string, unknown>).firstGoneAt = new Date(Date.now() - DAY - 60_000).toISOString()
+  const last = await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'SYNCED')
+  assert.equal(last.retired, 1)
+})
+
+test('o3d-hqvrp.93: an all-404 pass (store-wide outage) advances no counter and retires nothing', async () => {
+  const { drainWcOrderAdmissionRefusals } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  reachableIds.clear()
+  const old = new Date(Date.now() - 3 * DAY).toISOString()
+  await withQueue([goneRow('a', { consecutiveGone: 2, firstGoneAt: old }), goneRow('b', { consecutiveGone: 2, firstGoneAt: old, reason: 'status_not_mapped' })])
+  live = 'gone'
+  const warn = mock.method(console, 'warn', (m: string) => { warnings.push(String(m)) })
+  warnings.length = 0
+  const result = await drainWcOrderAdmissionRefusals(50)
+  warn.mock.restore()
+  assert.equal(result.retired, 0)
+  assert.deepEqual(syncLogs.map((r) => r.status), ['PENDING', 'PENDING'])
+  assert.deepEqual(syncLogs.map((r) => (r.payload as { consecutiveGone: number }).consecutiveGone), [2, 2], 'no counter advanced')
+  assert.equal(warnings.length, 1, 'one warning for the pass')
+  // The same rows with one reachable read in the pass DO retire.
+  await withQueue([...syncLogs, await reachableRow()])
+  const next = await drainWcOrderAdmissionRefusals(50)
+  assert.equal(next.retired, 2)
+})
+
+test('o3d-hqvrp.93: one transient 404 after earlier checks does not retire; guard rows are never retired on 404', async () => {
+  const { drainWcOrderAdmissionRefusals } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  reachableIds.clear()
+  const old = new Date(Date.now() - 3 * DAY).toISOString()
+  await withQueue([
+    refusalRow('seen-before', { refusedAt: new Date().toISOString(), attempts: 5 }),
+    goneRow('guard', { reason: 'tax_rate_unmapped', consecutiveGone: 5, firstGoneAt: old }),
+    await reachableRow(),
+  ])
+  live = 'gone'
+  await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'PENDING', 'first 404 after many checks must not retire')
+  // A non-404 answer resets the run (and its first-404 time).
+  reachableIds.add('seen-before')
+  await drainWcOrderAdmissionRefusals(50)
+  assert.equal((syncLogs[0].payload as { consecutiveGone: number }).consecutiveGone, 0)
+  reachableIds.delete('seen-before')
+  // Two 404s, then a backdated first time: still only two in a row.
+  await drainWcOrderAdmissionRefusals(50)
+  await drainWcOrderAdmissionRefusals(50)
+  ;(syncLogs[0].payload as Record<string, unknown>).firstGoneAt = old
+  assert.equal(syncLogs[0].status, 'PENDING', 'two 404s, a break, then two more is not three in a row')
+  await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'SYNCED', 'three consecutive 404s spanning 24h retire')
+  assert.equal(syncLogs[1].status, 'PENDING', 'a guard-block row is never retired on 404 alone')
+})
+
+test('o3d-hqvrp.93: status_not_mapped refusals do not expire', async () => {
+  const { drainWcOrderAdmissionRefusals, WC_ADMISSION_REFUSAL_QUEUE } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  syncLogs = [refusalRow('old-mapped', { refusedAt: new Date(Date.now() - 90 * 86_400_000).toISOString(), reason: 'status_not_mapped' })]
+  ;(syncLogs[0].payload as Record<string, unknown>).queue = WC_ADMISSION_REFUSAL_QUEUE
+  live = 'failed'
+  const result = await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'PENDING')
+  assert.equal(result.retired, 0)
+})
+
+test('o3d-hqvrp.93: rows past the live-read budget are not touched', async () => {
+  const { drainWcOrderAdmissionRefusals, WC_ADMISSION_REFUSAL_QUEUE } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  const now = new Date().toISOString()
+  syncLogs = ['a', 'b', 'c'].map((id) => refusalRow(id, { refusedAt: now }))
+  for (const r of syncLogs) (r.payload as Record<string, unknown>).queue = WC_ADMISSION_REFUSAL_QUEUE
+  live = 'failed'
+  const result = await drainWcOrderAdmissionRefusals(2)
+  assert.equal(result.scanned, 2)
+  assert.equal(result.failed, 2)
+})
+
+test('o3d-hqvrp.86: each event in a batch is claimed with its own clock, not the batch start', async () => {
+  const { processPendingShoppingWebhookEvents } = await import('../lib/jobs/shopping/process-shopping-webhook-events.ts')
+  const claims: Array<{ now: number; stale: number }> = []
+  const rows = ['e1', 'e2'].map((id) => ({
+    id, connector: 'woocommerce', resource: 'orders', externalEventId: null, topic: 'order.updated', payloadHash: id,
+    payloadJson: {}, originAttestation: 'unproven:not-applicable', status: 'pending', attempts: 1, claimGeneration: 1,
+    nextAttemptAt: null, processedAt: null, lastError: null, receivedAt: new Date(), updatedAt: new Date(),
+  }))
+  const repository = {
+    findDueEvents: async () => rows.map((r) => ({ id: r.id })),
+    claimEvent: async (id: string, now: Date, stale: Date) => {
+      claims.push({ now: now.getTime(), stale: stale.getTime() })
+      return rows.find((r) => r.id === id)!
+    },
+    markProcessed: async () => true,
+    markFailed: async () => true,
+    markDeadLetter: async () => true,
+  }
+  await processPendingShoppingWebhookEvents({
+    repository: repository as never,
+    connector: 'woocommerce',
+    connectorLabel: 'WooCommerce',
+    logPrefix: '[test]',
+    processPayload: async () => {
+      await new Promise((r) => setTimeout(r, 40)) // the first event is slow
+      return Response.json({ ok: true })
+    },
+  } as never)
+  assert.equal(claims.length, 2)
+  assert.ok(claims[1].now - claims[0].now >= 30, 'the second claim is stamped when it happens')
+  assert.equal(claims[1].stale - claims[0].stale, claims[1].now - claims[0].now, 'and its stale cutoff moves with it')
+})

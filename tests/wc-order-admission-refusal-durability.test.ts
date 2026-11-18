@@ -171,6 +171,7 @@ mock.module('@/lib/connectors/woocommerce/sync/order-status', {
 mock.module('@/lib/connectors/woocommerce/sync/field-mapping', {
   namedExports: {
     mapWcAddress: () => ({}),
+    logWcUnmatchedLines: async () => {},
     upsertCustomer: async () => 'cust-1',
     mapWcLineItems: async () => [],
     mapWcOrderDiscount: () => ({ discountStr: null, discountAmount: 0 }),

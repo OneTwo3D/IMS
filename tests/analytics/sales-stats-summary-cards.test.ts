@@ -22,7 +22,7 @@ import { mountClientComponent } from '@/tests/fixtures/render-client-component'
  */
 
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) },
 })
 
 type OrderRefund = { totalsBasis: string | null; lines: { productId: string | null; qty: number; totalBase: number }[] }

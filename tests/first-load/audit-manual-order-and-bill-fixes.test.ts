@@ -565,7 +565,7 @@ async function seedBill() {
   assert.equal(created.success, true, String(created.error))
   const po = await s.db.purchaseOrder.findUniqueOrThrow({ where: { reference: ref }, select: { id: true } })
   await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
-  const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', lines: [{ kind: 'product', poLineId: (await s.db.purchaseOrderLine.findFirstOrThrow({ where: { poId: po.id }, select: { id: true } })).id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', allowDuplicateInvoiceNumber: true, lines: [{ kind: 'product', poLineId: (await s.db.purchaseOrderLine.findFirstOrThrow({ where: { poId: po.id }, select: { id: true } })).id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
   assert.equal(bill.success, true, String(bill.error))
   const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
   return { poId: po.id, invoice }
