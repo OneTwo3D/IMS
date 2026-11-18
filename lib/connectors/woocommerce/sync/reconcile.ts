@@ -10,6 +10,19 @@ import { pushStockToWc } from './stock-sync'
 const ORDER_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
 const PRODUCT_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
 const STOCK_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
+/**
+ * A daily cron fires at the same time each day, but the stamp it compares against is written a little BEFORE (the order and product
+ * cursors are the read-start less an overlap) or AFTER (the stock stamp is the end of the pass) the previous run's start. Compared
+ * against an exact 24 hours, a run that started seconds to minutes short of a day after the last stamp was "not due", and the next
+ * chance was a day later: an effective cadence of up to 48 hours. A run within this slack of the interval is due.
+ */
+export const RECONCILE_DUE_TOLERANCE_MS = 60 * 60 * 1000
+
+/** Whether a reconcile with this stamp (an ISO time, or nothing) is due at `nowMs`; a missing or unreadable stamp is due. */
+export function isReconcileDue(lastStamp: string | null | undefined, nowMs: number, intervalMs: number): boolean {
+  const lastTs = lastStamp ? Date.parse(lastStamp) : Number.NaN
+  return !Number.isFinite(lastTs) || (nowMs - lastTs) >= intervalMs - RECONCILE_DUE_TOLERANCE_MS
+}
 // The forceAll stock reconcile reads WooCommerce for every candidate, about 0.13 s each on the stage catalogue, while the proxy
 // in front of the app cuts a cron request at 60 s. It therefore works through the catalogue in id-ordered windows, saves the
 // cursor after each, and stops starting windows once the request has used this much of its time. The next run continues.
@@ -67,8 +80,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
     results.orders = await syncNewWcOrders({ mode: 'poll' })
   } else {
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_order_reconcile_at' } })
-    const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN
-    const reconcileDue = !Number.isFinite(lastReconcileTs) || (Date.now() - lastReconcileTs) >= ORDER_RECONCILE_INTERVAL_MS
+    const reconcileDue = isReconcileDue(lastReconcile?.value, Date.now(), ORDER_RECONCILE_INTERVAL_MS)
 
     results.orders = reconcileDue
       ? await syncNewWcOrders({ mode: 'reconcile' })
@@ -107,8 +119,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
         results.products = await syncAllWcProducts({ mode: 'poll' })
       } else {
         const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_product_reconcile_at' } })
-        const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN
-        const reconcileDue = !Number.isFinite(lastReconcileTs) || (Date.now() - lastReconcileTs) >= PRODUCT_RECONCILE_INTERVAL_MS
+        const reconcileDue = isReconcileDue(lastReconcile?.value, Date.now(), PRODUCT_RECONCILE_INTERVAL_MS)
 
         results.products = reconcileDue
           ? await syncAllWcProducts({ mode: 'reconcile' })
@@ -138,8 +149,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
     }
     const queued = await processQueuedWcStockSyncJobs({ limit: 100 })
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_stock_daily_reconcile_at' } })
-    const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN
-    const reconcileDue = !Number.isFinite(lastReconcileTs) || (Date.now() - lastReconcileTs) >= STOCK_RECONCILE_INTERVAL_MS
+    const reconcileDue = isReconcileDue(lastReconcile?.value, Date.now(), STOCK_RECONCILE_INTERVAL_MS)
 
     // A pass that was cut short by the request budget carries on from its cursor on the next run, whether or not 24 hours have
     // passed: the daily stamp is only written when the pass reaches the end of the catalogue.

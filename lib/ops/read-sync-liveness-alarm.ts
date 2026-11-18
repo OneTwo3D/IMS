@@ -28,7 +28,7 @@ import {
   type ReadSyncStreamId,
 } from './read-sync-liveness-constants'
 import { parseReadSyncStamp, READ_SYNC_FUTURE_TOLERANCE_MS } from './read-sync-liveness'
-import { assembleReadSyncReport, type ReadSyncInputs } from './read-sync-status'
+import { assembleReadSyncReport, readCrontabForReport, type ReadSyncInputs } from './read-sync-status'
 
 export type ReadSyncAlarmLogEntry = {
   stream: ReadSyncStreamId | 'scheduler' | 'liveness-anchor'
@@ -63,7 +63,10 @@ export type ReadSyncAlarmDb = {
 export type ReadSyncAlarmDeps = {
   db: ReadSyncAlarmDb
   now: Date
-  readInputs: () => Promise<ReadSyncInputs>
+  /** Reads the inputs on the BOUNDED client it is handed; the crontab was read before, outside any transaction. */
+  readInputs: (client: ReadSyncAlarmTx, crontab: Awaited<ReturnType<typeof readCrontabForReport>>) => Promise<ReadSyncInputs>
+  /** The crontab is a child process (its own kill timer applies), so it is read outside the transaction. Overridable for tests. */
+  readCrontab?: () => Promise<Awaited<ReturnType<typeof readCrontabForReport>>>
   /** Deliver to every active admin inside the claim transaction; must THROW when nobody can be told. */
   notifyAdmins: (tx: ReadSyncAlarmTx, title: string, message: string, actionUrl: string) => Promise<void>
   /** Write the WARNING activity entry INSIDE the claim transaction; must THROW if it cannot, so the claim rolls back and the breach is retried. */
@@ -125,12 +128,20 @@ export const ALARM_TRANSACTION_BOUNDS = { maxWait: 5_000, timeout: 15_000 } as c
 
 export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise<ReadSyncAlarmResult> {
   const { db, now } = deps
-  const inputs = await deps.readInputs()
+  // The crontab is a child process: read it first, outside any transaction (its own kill timer applies).
+  const crontab = await (deps.readCrontab ?? readCrontabForReport)()
+  // EVERY database read of the evaluation (the inputs and the stored breach stamps) runs in ONE short transaction
+  // with a server-side statement timeout and bounded acquisition, so a stalled statement errors out and the job
+  // fails visibly instead of waiting for ever without evaluating or notifying.
+  const stampKeys = [READ_SYNC_FIRST_EVALUATED_SETTING, ...READ_SYNC_STREAMS.filter((def) => !ALARMED_ELSEWHERE.has(def.id)).map((def) => readSyncAlertedSettingKey(def.id))]
+  const { inputs, stored } = await withStatementTimeout(db, ALARM_STATEMENT_TIMEOUT_MS, async (tx) => {
+    const inputs = await deps.readInputs(tx, crontab)
+    const rows = await tx.setting.findMany({ where: { key: { in: stampKeys } }, select: { key: true, value: true } })
+    return { inputs, stored: new Map(rows.map((row) => [row.key, row.value])) }
+  })
   const report = assembleReadSyncReport(inputs, now)
 
   const entries = report.entries.filter((entry) => !ALARMED_ELSEWHERE.has(entry.stream))
-  const stampKeys = [READ_SYNC_FIRST_EVALUATED_SETTING, ...entries.map((entry) => readSyncAlertedSettingKey(entry.stream))]
-  const stored = new Map((await db.setting.findMany({ where: { key: { in: stampKeys } }, select: { key: true, value: true } })).map((row) => [row.key, row.value]))
 
   // The first-evaluation anchor is written once and never moved, with ONE exception: a stored value that
   // is not a time is replaced - once, by a compare-and-set on the bad value - and reported. Overwriting it
@@ -162,7 +173,7 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
       trackedSince = now
     } else {
       // Another run replaced it first: use what it persisted; never write again here.
-      const reread = await db.setting.findMany({ where: { key: { in: [READ_SYNC_FIRST_EVALUATED_SETTING] } }, select: { key: true, value: true } })
+      const reread = await withStatementTimeout(db, ALARM_STATEMENT_TIMEOUT_MS, (tx) => tx.setting.findMany({ where: { key: { in: [READ_SYNC_FIRST_EVALUATED_SETTING] } }, select: { key: true, value: true } }))
       const rival = parseReadSyncStamp(reread[0]?.value)
       trackedSince = rival !== null && rival.getTime() <= now.getTime() + READ_SYNC_FUTURE_TOLERANCE_MS ? rival : now
     }
@@ -176,7 +187,7 @@ export async function runReadSyncLivenessAlarm(deps: ReadSyncAlarmDeps): Promise
     const stampKey = readSyncAlertedSettingKey(entry.stream)
     if (entry.state === 'fresh' || entry.state === 'off') {
       // Healed or switched off: forget the breach so a renewed one alerts again.
-      if (stored.has(stampKey)) await db.setting.deleteMany({ where: { key: stampKey } })
+      if (stored.has(stampKey)) await withStatementTimeout(db, ALARM_STATEMENT_TIMEOUT_MS, (tx) => tx.setting.deleteMany({ where: { key: stampKey } }))
       continue
     }
     const maxAgeMs = entry.maxAgeMs as number
@@ -256,5 +267,5 @@ export async function liveAlarmDelivery(): Promise<Pick<ReadSyncAlarmDeps, 'db' 
 /** The real wiring of the alarm job. */
 export async function runReadSyncLivenessAlarmLive(now: Date = new Date()): Promise<ReadSyncAlarmResult> {
   const { readReadSyncInputs } = await import('./read-sync-status')
-  return runReadSyncLivenessAlarm({ ...(await liveAlarmDelivery()), now, readInputs: readReadSyncInputs })
+  return runReadSyncLivenessAlarm({ ...(await liveAlarmDelivery()), now, readInputs: (client, crontab) => readReadSyncInputs({ client, crontab }) })
 }

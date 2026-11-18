@@ -11,6 +11,15 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
+import {
+  MAX_PERMANENT_CONFLICT_REATTEMPTS,
+  MAX_STORED_PERMANENT_CONFLICTS,
+  readPermanentConflicts,
+  recordPermanentConflictDelta,
+  selectPermanentConflictReattempts,
+  PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD,
+  type PermanentConflictDelta,
+} from './product-permanent-conflicts'
 import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
 import { isPermanentProductSyncConflict, WcVariationLimitExceededError } from './product-sync-errors'
@@ -2516,6 +2525,66 @@ export async function syncAllWcProducts(
 
   await reportProgress('Preparing WooCommerce product import...', 0)
 
+  // THE WAY BACK for a buried product. The walk below reads by `modified_after`, so a product buried
+  // by an earlier run is only found again if WooCommerce touches it; an IMS-side fix does not. Re-attempt a
+  // bounded number of the ids recorded as buried, fetched directly, IN ADDITION to the window. Skipped on a
+  // full import (no cursor): that walk covers every product anyway.
+  const conflictDelta: PermanentConflictDelta = { add: [], remove: [], attempted: [], failed: [] }
+  const stuckRetries: string[] = []
+  const noteRetryFailure = (entry: { id: number; sku: string; attempts?: number }, error: string) => {
+    // A failing re-attempt is recorded on its own id and NEVER held against the product cursor: the window walk is
+    // what the cursor describes, and one stuck id must not stop every later change being picked up.
+    conflictDelta.failed.push({ id: entry.id, error })
+    if ((entry.attempts ?? 0) + 1 >= PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD) stuckRetries.push(`${entry.sku || `id ${entry.id}`} (${(entry.attempts ?? 0) + 1} attempts: ${error.slice(0, 100)})`)
+  }
+  const recoveredSkus: string[] = []
+  const storedConflicts = await readPermanentConflicts()
+  const storedConflictIds = new Set(storedConflicts.map((item) => item.id))
+  if (modifiedAfter && storedConflicts.length > 0) {
+    const { chosen, notAttempted } = selectPermanentConflictReattempts(storedConflicts)
+    for (const entry of chosen) {
+      const { creds: retryCreds, syncVersion: retryVersion } = await snapshotProductSyncContext()
+      const { data: fetched, error: fetchError } = await wcFetch(`/products/${entry.id}`, {}, retryCreds)
+      if (fetchError) {
+        if (/^WC API error: 404\b/.test(fetchError)) {
+          // Gone from WooCommerce: nothing left to import, so nothing left to keep re-attempting.
+          conflictDelta.remove.push({ id: entry.id, at: new Date().toISOString() })
+        } else {
+          noteRetryFailure(entry, fetchError)
+        }
+        continue
+      }
+      const fetchedProduct = fetched as WcFullProduct | null
+      if (!fetchedProduct || !fetchedProduct.sku) {
+        // A product with no SKU is skipped by the main loop too: it cannot be imported, so stop carrying it.
+        conflictDelta.remove.push({ id: entry.id, at: new Date().toISOString() })
+        continue
+      }
+      const retried = await syncWcProductToIms(fetchedProduct, retryVersion)
+      if (retried.success) {
+        result.synced++
+        conflictDelta.remove.push({ id: entry.id, at: new Date().toISOString() })
+        recoveredSkus.push(fetchedProduct.sku)
+      } else if (retried.permanent) {
+        // Still buried: already reported when it was first buried, so not re-announced every run.
+        conflictDelta.attempted.push(entry.id)
+      } else {
+        noteRetryFailure(entry, retried.error ?? 'import failed')
+      }
+    }
+    if (notAttempted.length > 0) {
+      // A bound that stays quiet reads as "covered everything".
+      await logActivity({
+        entityType: 'SYNC', action: 'wc_product_conflict_reattempt_deferred', tag: 'sync', level: 'WARNING',
+        description: `${notAttempted.length} of ${storedConflicts.length} buried WooCommerce product(s) were NOT re-attempted this run `
+          + `(at most ${MAX_PERMANENT_CONFLICT_REATTEMPTS} per run; least recently attempted go first, so later runs reach them). `
+          + `Not re-attempted: ${notAttempted.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')}${notAttempted.length > 20 ? `, and ${notAttempted.length - 20} more` : ''}.`,
+        metadata: { mode, notAttemptedIds: notAttempted.slice(0, 50).map((item) => item.id), stored: storedConflicts.length },
+        resolveUser: false,
+      })
+    }
+  }
+
   // THE CEILING, NOT THE HEADER. `totalPages` is progress text from here on: a store that sends an
   // empty or absent `x-wp-totalpages` used to end this walk after page one with NO error, and the
   // cursor below advanced past every product it never asked for (o3d-xnwu).
@@ -2573,6 +2642,7 @@ export async function syncAllWcProducts(
       processedProducts++
       if (r.success) {
         result.synced++
+        if (storedConflictIds.has(product.id)) conflictDelta.remove.push({ id: product.id, at: new Date().toISOString() })
       } else if (r.permanent) {
         // The SAME classification the webhook path acts on (o3d-gtk). Re-importing this payload
         // reaches the identical conflict, so it must not hold the cursor — but it is not swallowed
@@ -2580,6 +2650,7 @@ export async function syncAllWcProducts(
         // `PERMANENT_CONFLICT:`-prefixed FAILED row in the sync log written by syncWcProductToIms.
         result.permanentErrors.push(`SKU ${product.sku}: ${r.error}`)
         permanentConflictSkus.push(product.sku)
+        conflictDelta.add.push({ id: product.id, sku: product.sku })
       } else {
         result.errors.push(`SKU ${product.sku}: ${r.error}`)
       }
@@ -2620,9 +2691,9 @@ export async function syncAllWcProducts(
       + `${result.permanentErrors.length} product(s) and never will without an operator: `
       + `${permanentConflictSkus.join(', ')}. The sync cursor was advanced past them so the rest of `
       + 'the catalogue keeps syncing. Resolve the duplicate SKU / barcode / WooCommerce id, or the '
-      + 'product-structure conflict on /sync/exceptions — then re-save the product in WooCommerce so '
-      + 'it restamps date_modified and the next poll picks it up, because a fix made only in IMS '
-      + 'leaves nothing for the cursor to find.',
+      + 'product-structure conflict on /sync/exceptions. Each later run re-fetches these products by id '
+      + '(a bounded number per run) and imports them once the conflict is gone, with no '
+      + 'change needed on the WooCommerce side.',
     metadata: { mode, skus: permanentConflictSkus, permanentErrors: result.permanentErrors },
   }
 
@@ -2635,10 +2706,9 @@ export async function syncAllWcProducts(
   // SKUs at all, and half of the remedies are IMS-side (clear the IMS product's external mapping,
   // resolve the structure conflict on /sync/exceptions) — those do not move WooCommerce's
   // `date_modified`, so the fixed product is not re-imported until WooCommerce next touches it.
-  // The ERROR line above therefore names that step explicitly. This is the same property the
-  // webhook path has had since o3d-gtk, and the automatic re-drive is filed as a follow-up; it is
-  // not a reason to keep the cursor pinned, because a pinned cursor re-reads the WHOLE catalogue
-  // every cycle for ever and still never imports the conflicted product.
+  // The bounded re-attempt list at the top of the run is the way back; the ERROR line above says so.
+  // The webhook path has the same property. It is not a reason to keep the cursor pinned, because a
+  // pinned cursor re-reads the WHOLE catalogue every cycle for ever and still never imports the conflicted product.
   // A WALK THAT NEVER ENDED IS AN ERROR, AND IT LANDS IN `errors` SO THE CURSOR IS HELD (o3d-xnwu).
   // Not in `permanentErrors`: nothing about the catalogue is established by a truncated read, so
   // nothing may be buried. `break` on a fetch error above already pushed its own error, so this
@@ -2661,6 +2731,39 @@ export async function syncAllWcProducts(
       level: 'ERROR',
       description: result.errors[result.errors.length - 1],
       metadata: { mode, cursorKey, modifiedAfter, pagesRead: page - 1, ceiling: MAX_WC_PAGE_WALK_PAGES },
+      resolveUser: false,
+    })
+  }
+
+  // Record the burials and the recoveries BEFORE the cursor moves past them, so a burial that is
+  // not on the list never has its cursor advanced (a failed write throws and the cursor stays).
+  const { rejected: unlistedConflicts } = await recordPermanentConflictDelta(conflictDelta)
+  if (unlistedConflicts.length > 0) {
+    // The list is FULL (a bound that is not expected to be reached). It never evicts, and it never holds the cursor
+    // either: holding it would re-read a growing window for ever. The overflowing products are recorded durably in
+    // `wc_product_conflict_overflow` (written with the list, under its lock) and named in this ERROR.
+    const unlistedNames = unlistedConflicts.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')
+    const message = `The list of buried WooCommerce products is full (${MAX_STORED_PERMANENT_CONFLICTS}), so ${unlistedConflicts.length} new product(s) with a conflict cannot be re-attempted automatically `
+      + `(${unlistedNames}). The product sync carries on. These products stay listed until their conflicts are fixed. They are kept in the setting wc_product_conflict_overflow.`
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_conflict_list_full', tag: 'sync', level: 'ERROR',
+      description: message,
+      metadata: { mode, unlistedIds: unlistedConflicts.slice(0, 50).map((item) => item.id) },
+      resolveUser: false,
+    })
+  }
+  if (stuckRetries.length > 0) {
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_conflict_reattempt_stuck', tag: 'sync', level: 'WARNING',
+      description: `${stuckRetries.length} buried WooCommerce product(s) have failed their automatic re-attempt ${PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD} or more times in a row for a reason that may clear by itself (a store or database error), so they are still not imported: ${stuckRetries.slice(0, 10).join('; ')}. The product sync itself is not held back by them.`,
+      metadata: { mode, count: stuckRetries.length },
+      resolveUser: false,
+    })
+  }
+  if (recoveredSkus.length > 0) {
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_conflict_recovered', tag: 'sync', level: 'INFO',
+      description: `Imported ${recoveredSkus.length} previously buried WooCommerce product(s) on re-attempt: ${recoveredSkus.slice(0, 20).join(', ')}.`,
       resolveUser: false,
     })
   }
