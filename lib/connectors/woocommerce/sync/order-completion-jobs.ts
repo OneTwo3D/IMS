@@ -84,6 +84,22 @@ export async function scheduleWcOrderCompletion(
   return key
 }
 
+/** IMS statuses at which a dispatched order still wants its storefront completed (SHIPPED, or already advanced past it). */
+const COMPLETION_WANTED_IMS_STATUSES: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
+
+/**
+ * The row says the order WAS shipped when it committed, not that it still is: an operator may have reopened or
+ * un-shipped it while the job waited out a WooCommerce outage. Returns null when completion is still wanted, else the
+ * reason it is superseded (the caller sends nothing to WooCommerce and succeeds, as the cancel and hold jobs do).
+ */
+async function completionSupersededReason(orderId: string): Promise<string | null> {
+  const { db } = await import('@/lib/db')
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+  if (!order) return 'the order no longer exists in IMS'
+  if (COMPLETION_WANTED_IMS_STATUSES.has(String(order.status))) return null
+  return `the order is now ${String(order.status)} in IMS, not SHIPPED`
+}
+
 export type WcOrderCompletionRunSummary = {
   claimed: number
   succeeded: number
@@ -258,6 +274,16 @@ export async function processWcOrderCompletionJobs(options?: {
       }
       const retryReason = await runInWriteLedger(ledger, () => runWithWcAttemptFence(fence, async (): Promise<string | null> => {
         // The facade, not the connector: it owns "is a storefront connector runnable at all".
+        // (0) IMS RE-READ, before any WooCommerce request: superseded is a SUCCESS that sends nothing.
+        const supersededBefore = await completionSupersededReason(orderId)
+        if (supersededBefore !== null) {
+          await logActivity({
+            entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_superseded', tag: 'sync', level: 'INFO',
+            description: `The WooCommerce completion for order ${orderId} was dropped: ${supersededBefore}. This attempt sent nothing to WooCommerce.`,
+            resolveUser: false,
+          }).catch(() => {})
+          return null
+        }
         const { pushOrderDeliveryMetadata, pushSalesOrderStatus } = await import('@/lib/shopping')
 
         // (a) Tracking FIRST so WooCommerce's completed email carries it. A failed or thrown tracking push is a
@@ -274,6 +300,17 @@ export async function processWcOrderCompletionJobs(options?: {
         }
         if (trackingError !== null) {
           return `tracking push failed, completion held back so the customer email carries it: ${trackingError}`
+        }
+
+        // IMS may have moved on while the tracking push was in flight: re-check before the status write.
+        const supersededAfter = await completionSupersededReason(orderId)
+        if (supersededAfter !== null) {
+          await logActivity({
+            entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_superseded', tag: 'sync', level: 'INFO',
+            description: `The WooCommerce completion for order ${orderId} was dropped before the status write: ${supersededAfter}.`,
+            resolveUser: false,
+          }).catch(() => {})
+          return null
         }
 
         // (b) The status, behind a fresh GET + eligibility classification on every attempt. The GET is made

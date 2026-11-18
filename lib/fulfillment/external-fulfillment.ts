@@ -75,6 +75,7 @@ export type ExternalFulfillmentRefusal =
   | 'order_not_ready_to_ship'
   | 'shipment_status_transition_failed'
   | 'despatch_review_not_recorded'
+  | 'wms_other_warehouse_shipments'
 
 export type ExternalFulfillmentOutcome =
   | {
@@ -738,9 +739,38 @@ export async function applyExternalFulfillmentUpdate(
 
   const shipments = await db.shipment.findMany({
     where: { orderId: order.id, status: { not: update.targetShipmentStatus } },
-    select: { id: true, status: true },
+    select: { id: true, status: true, warehouseId: true },
     orderBy: { createdAt: 'asc' },
   })
+
+  // o3d-hqvrp.78: A WMS DISPATCH IS EVIDENCE ABOUT THE WMS WAREHOUSE ONLY. The WMS order is created for the order's ship-from
+  // warehouse, but allocation can place part (or all) of the order in another warehouse, and driving that shipment to SHIPPED
+  // would take stock out of a warehouse the goods never left while the WMS warehouse stays overstated. A shipment IMS holds in
+  // a different warehouse is therefore never driven by the WMS: the dispatch is refused (retryable, visible on the sync
+  // exceptions inbox) until an operator reallocates the order to the WMS warehouse or ships the other warehouse by hand.
+  if (update.targetShipmentStatus === 'SHIPPED' && isWmsConnectorId(update.source)) {
+    const wmsOrder = await db.salesOrder.findUnique({ where: { id: order.id }, select: { shipFromWarehouseId: true } })
+    const wmsWarehouseId = wmsOrder?.shipFromWarehouseId ?? null
+    const foreign = wmsWarehouseId
+      ? shipments.filter((shipment) => shipment.warehouseId && shipment.warehouseId !== wmsWarehouseId)
+      : []
+    if (foreign.length > 0) {
+      const error = `${update.source} despatched order ${orderRef}, but IMS holds ${foreign.length} unshipped shipment(s) in a warehouse other than the one `
+        + `${update.source} serves, so the despatch was not applied to them (the goods did not leave that warehouse). Reallocate the order to the `
+        + 'WMS warehouse or ship the other warehouse by hand, then replay the despatch.'
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: 'external_fulfillment_other_warehouse_shipments',
+        tag: 'sync',
+        level: 'WARNING',
+        description: error,
+        metadata: { source: update.source, wmsWarehouseId, shipmentIds: foreign.map((shipment) => shipment.id), warehouseIds: [...new Set(foreign.map((shipment) => shipment.warehouseId))] },
+        resolveUser: false,
+      })
+      return refuseExternalFulfillment('wms_other_warehouse_shipments', error)
+    }
+  }
 
   // The unreleased status the dispatch transaction itself found under the order lock (set only when it recorded without promoting).
   let lockedNotReadyStatus: string | null = null

@@ -1029,7 +1029,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Order reconciliation — drift (${data.summary.orderReconcileDrift})`}
-            detail="Findings from the latest scheduled IMS-vs-WMS order reconciliation. NOT_PUSHED: eligible order never reached the WMS (check the push cron). MISSING_IN_WMS: the WMS lost the order — re-push it. ACTIVE_AFTER_CANCEL: a cancelled order is still live in the WMS and may ship — cancel it there. CANCELLED_IN_WMS: the warehouse cancelled (or deleted, voided, rejected) an order IMS still treats as live, so it will never ship — IMS changed nothing; ask the warehouse, then cancel or refund the order in IMS."
+            detail="Findings from the latest scheduled IMS-vs-WMS order reconciliation. NOT_PUSHED: eligible order never reached the WMS (check the push cron). MISSING_IN_WMS: the WMS lost the order — re-push it. ACTIVE_AFTER_CANCEL: a cancelled order is still live in the WMS and may ship — cancel it there. CANCELLED_IN_WMS: the warehouse cancelled (or deleted, voided, rejected) an order IMS still treats as live, so it will never ship — IMS changed nothing; ask the warehouse, then cancel or refund the order in IMS. DESPATCH_QTY_MISMATCH: the warehouse despatched different quantities than IMS booked — IMS changed nothing; check what physically left and adjust stock if the booking is wrong."
             shown={data.orderReconcileDrift.length}
             total={data.summary.orderReconcileDrift}
           />

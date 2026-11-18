@@ -131,9 +131,27 @@ type Deps = Awaited<ReturnType<typeof loadDeps>>
 const runId = `zvec15-${process.pid}-${randomUUID()}`
 let sequence = 0
 
-/** A committed completion row, exactly as the shipment transaction leaves it. */
-async function seedRow(deps: Deps, label: string) {
-  const orderId = `${runId}-${label}-${sequence++}`
+const seededOrderIds: string[] = []
+
+/** A committed completion row, exactly as the shipment transaction leaves it, for a real SHIPPED order (the job re-reads IMS, o3d-hqvrp.103). */
+async function seedRow(deps: Deps, label: string, orderStatus = 'SHIPPED') {
+  const { Prisma } = await import('@/app/generated/prisma/client')
+  const order = await deps.db.salesOrder.create({
+    data: {
+      orderNumber: `${runId}-${label}-${sequence++}`,
+      status: orderStatus as never,
+      currency: 'GBP',
+      fxRateToBase: new Prisma.Decimal('1'),
+      subtotalForeign: new Prisma.Decimal('10'),
+      totalForeign: new Prisma.Decimal('10'),
+      subtotalBase: new Prisma.Decimal('10'),
+      taxBase: new Prisma.Decimal('0'),
+      totalBase: new Prisma.Decimal('10'),
+    },
+    select: { id: true },
+  })
+  const orderId = order.id
+  seededOrderIds.push(orderId)
   const key = deps.wcOrderCompletionIdempotencyKey(orderId, new Date(1_760_000_000_000 + sequence))
   await deps.enqueueIntegrationOutbox({
     connector: 'woocommerce',
@@ -145,7 +163,11 @@ async function seedRow(deps: Deps, label: string) {
   return { orderId, key }
 }
 const rowOf = (deps: Deps, key: string) => deps.db.integrationOutbox.findUniqueOrThrow({ where: { idempotencyKey: key } })
-const cleanup = (deps: Deps) => deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: { contains: runId } } })
+const cleanup = async (deps: Deps) => {
+  for (const id of seededOrderIds.splice(0)) await deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: { contains: id } } })
+  await deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: { contains: runId } } })
+  await deps.db.salesOrder.deleteMany({ where: { orderNumber: { startsWith: runId } } })
+}
 
 test('o3d-zvec.15 (arm 7): a transient read failure is RETRIED on the clock and then completes — tracking before status each time', { skip }, async (t) => {
   const deps = await loadDeps()
@@ -567,4 +589,18 @@ test('o3d-zvec.15 (round 3): park + Replay while a worker is paused completes EX
   assert.equal(wc.puts, 1, 'exactly one PUT in total: the paused worker was refused')
   assert.equal(aRun.claimed, 1)
   assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED', 'and its late result did not disturb the settled row')
+})
+
+test('o3d-hqvrp.103: an order IMS reopened or un-shipped while the job waited is SUPERSEDED: success, ZERO WooCommerce requests', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  resetWc()
+  const { orderId, key } = await seedRow(deps, 'reopened', 'PROCESSING')
+  const summary = await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], now: new Date() })
+  assert.equal(summary.claimed, 1, 'precondition: the row was claimed')
+  assert.equal(summary.succeeded, 1, 'superseded is a success')
+  assert.equal(wc.gets + wc.puts, 0, 'nothing was sent to WooCommerce')
+  assert.deepEqual(wc.events, [], 'not even the tracking push')
+  assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
+  assert.ok(activity.some((a) => a.action === 'wc_completion_superseded' && a.entityId === orderId), 'and it says why')
 })

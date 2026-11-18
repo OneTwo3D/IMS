@@ -35,6 +35,7 @@ export type { WmsStatusBinding } from '@/lib/domain/wms/status-binding'
 import { unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { runSystemicPass, type SystemicFailureStore } from '@/lib/domain/wms/systemic-failure'
 import { createDbSystemicFailureStore } from '@/lib/domain/wms/systemic-failure-store'
+import { compareDespatchedQuantities, describeDespatchQuantityMismatch, WMS_DESPATCH_QTY_MISMATCH_CATEGORY } from '@/lib/domain/wms/despatch-quantity-compare'
 import { isWmsTerminalNonDespatchStatus, WMS_TERMINAL_NON_DESPATCH_CATEGORY } from '@/lib/domain/wms/terminal-status'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
@@ -546,6 +547,12 @@ export type WmsDispatchSweepDeps = {
    * a failure is logged and the sweep goes on. `clearWmsTerminalNonDespatch` closes the exception when the order is later despatched.
    */
   recordWmsTerminalNonDespatch?(candidate: WmsDispatchCandidate, wmsStatus: string): Promise<void>
+  /**
+   * o3d-hqvrp.115: called AFTER a despatch was applied, with the quantities the WMS reports it despatched. Compares them with what IMS
+   * booked and raises an exception for an operator when they differ (clearing an earlier one when they agree). Detection only: it never
+   * changes the booking. Optional: absent, nothing is compared (test doubles).
+   */
+  recordDespatchQuantities?(candidate: WmsDispatchCandidate, wmsItems: Array<{ sku: string; qty: number }>): Promise<void>
   clearWmsTerminalNonDespatch?(orderId: string): Promise<void>
   /**
    * Record the refused-or-stalled action an outcome carries (an idempotent upsert), and close it when the order later despatches or the cause is
@@ -1055,6 +1062,8 @@ async function reconcileSplitOrder(
   // line items can't become a partial shipment — don't let it count toward completion
   // (that would ship the IMS order with a part never recorded).
   let allRecorded = true
+  // Every despatched part's items as the WMS reports them, for the final comparison with what IMS books (o3d-hqvrp.115).
+  const despatchedPartItems: Array<{ sku: string; qty: number }> = []
   // Parts whose storefront record was VERIFIED by a fresh read (pre-cutover) rather than written by this sweep.
   let verifiedPreCutoverParts = 0
   // The fresh read happens at most once per order per sweep: the first shadowed pre-cutover part asks, the rest reuse the answer.
@@ -1085,6 +1094,7 @@ async function reconcileSplitOrder(
         allRecorded = false
         continue
       }
+      despatchedPartItems.push(...items)
       // The cancel intent is re-read IMMEDIATELY BEFORE each storefront write, so a cancel or refund that committed since the check at the
       // top of this order is honoured for every part not yet pushed. What remains is the window between this read and the POST itself: an
       // inter-system limit that cannot be closed from inside IMS (see docs/mintsoft.md).
@@ -1217,6 +1227,13 @@ async function reconcileSplitOrder(
   const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(fence ? { fence } : {}) } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
+  }
+  if (recordPartials && deps.recordDespatchQuantities && despatchedPartItems.length > 0) {
+    try {
+      await deps.recordDespatchQuantities(candidate, despatchedPartItems)
+    } catch (error) {
+      console.error('[wms-dispatch] despatch quantity comparison failed:', error instanceof Error ? error.message : error)
+    }
   }
   return { action: 'dispatched', reason: `All ${totalParts} parts despatched` }
 }
@@ -1433,6 +1450,16 @@ export async function reconcileOneOrder(
   const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(decision.fence ? { fence: decision.fence } : {}) } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed' }
+  }
+  // o3d-hqvrp.115: what the warehouse says it despatched against what IMS has just booked. A READ of the despatched order's items, made
+  // once per applied despatch; a failure here is never a failure of the despatch (it is already booked).
+  if (deps.recordDespatchQuantities && candidate.externalOrderId) {
+    try {
+      const wmsItems = await deps.fetchPartItems(candidate.externalOrderId)
+      if (wmsItems.length > 0) await deps.recordDespatchQuantities(candidate, wmsItems)
+    } catch (error) {
+      console.error('[wms-dispatch] despatch quantity comparison failed:', error instanceof Error ? error.message : error)
+    }
   }
   return { action: 'dispatched', reason: status.status || 'DESPATCHED' }
 }
@@ -3292,6 +3319,36 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         type: 'error',
         title: 'Order cancelled in the warehouse',
         message: `Order ${order.orderNumber ?? candidate.orderId} is ${shown} in the WMS but still live in IMS. Review it in the sync exception inbox.`,
+        actionUrl: '/sync/exceptions',
+      })))
+    },
+    async recordDespatchQuantities(candidate, wmsItems) {
+      const lines = await db.shipmentLine.findMany({
+        where: { shipment: { orderId: candidate.orderId } },
+        select: { qty: true, product: { select: { sku: true } } },
+      })
+      const imsLines = lines.map((line) => ({ sku: line.product.sku ?? '', qty: Number(line.qty) }))
+      const mismatches = compareDespatchedQuantities(wmsItems, imsLines)
+      const where = { orderId: candidate.orderId, category: WMS_DESPATCH_QTY_MISMATCH_CATEGORY, status: 'OPEN' }
+      if (mismatches.length === 0) {
+        await db.wmsOrderDiscrepancy.updateMany({ where, data: { status: 'RESOLVED', resolvedAt: new Date() } })
+        return
+      }
+      const order = await db.salesOrder.findUnique({ where: { id: candidate.orderId }, select: { orderNumber: true } })
+      const detail = describeDespatchQuantityMismatch(connectorId, order?.orderNumber ?? candidate.orderId, mismatches)
+      const updated = await db.wmsOrderDiscrepancy.updateMany({ where, data: { detail, externalOrderNumber: candidate.externalOrderNumber, lastSeenAt: new Date() } })
+      if (updated.count > 0) return
+      await db.wmsOrderDiscrepancy.create({ data: { connector: connectorId, orderId: candidate.orderId, category: WMS_DESPATCH_QTY_MISMATCH_CATEGORY, detail, externalOrderNumber: candidate.externalOrderNumber } })
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: candidate.orderId, action: 'wms_despatch_quantity_mismatch', tag: 'sync', level: 'WARNING',
+        description: detail, metadata: { connector: connectorId, mismatches }, resolveUser: false,
+      })
+      const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+      await Promise.all(admins.map((admin) => notify({
+        userId: admin.id,
+        type: 'error',
+        title: 'Warehouse despatched different quantities than IMS booked',
+        message: `Order ${order?.orderNumber ?? candidate.orderId}: ${detail} Review it in the sync exception inbox.`,
         actionUrl: '/sync/exceptions',
       })))
     },
