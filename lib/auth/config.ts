@@ -5,7 +5,7 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
-import { clearLoginThrottle, loginAttemptAllowed } from '@/lib/auth/login-throttle'
+import { clearLoginThrottle, loginAttemptAllowed, recordLoginFailure } from '@/lib/auth/login-throttle'
 import { getClientIp, isTrustedProxyConfigured } from '@/lib/request-ip'
 import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
 import {
@@ -207,7 +207,10 @@ export const authConfig: NextAuthConfig = {
           parsed.data.password,
           passwordHash,
         )
-        if (!user || !user.active || !passwordMatch) return null
+        if (!user || !user.active || !passwordMatch) {
+          await recordLoginFailure({ email: parsed.data.email })
+          return null
+        }
 
         await clearLoginThrottle(parsed.data.email, clientIp)
 

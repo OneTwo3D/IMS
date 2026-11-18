@@ -6,6 +6,8 @@ import test, { mock } from 'node:test'
  *   consumes any rate-limit budget or looks at a code.
  * - /api/auth/totp-setup (stage + confirm) refuses a session whose last sign-in is stale.
  */
+process.env.SETTINGS_ENCRYPTION_KEY ??= 'a1'.repeat(32)
+
 type TestSession = { user: Record<string, unknown> } | null
 const state: { session: TestSession; dbCalls: number; rateCalls: number } = { session: null, dbCalls: 0, rateCalls: 0 }
 
