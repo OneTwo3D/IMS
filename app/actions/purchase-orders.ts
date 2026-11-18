@@ -133,6 +133,8 @@ import {
   freightPoContributesLandedCost,
   logLandedCostCreditFloorActivities,
   queueLandedCostAdjustmentJournals,
+  readLandedCostChartBeforeTx,
+  tryReadLandedCostChartBeforeTx,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
@@ -146,6 +148,8 @@ import {
   FreightNetCreditError,
   freightTotalIsNegative,
   planFreightCostLineEdit,
+  assertFreightEditNotStale,
+  freightCostLinesFingerprint,
   resolveFreightEditTaxRate,
   FreightCostLinesSchema,
   type CreateFreightPoInput as CreateFreightPoInputShape,
@@ -369,6 +373,7 @@ export type PoDetail = PoRow & {
   returns: PoReturn[]
   invoices: InvoiceRow[]
   supplierCreditNotes: SupplierCreditNoteRow[]
+  freightCostLinesFingerprint: string
   freightCostLines: { id: string; description: string; amountForeign: number; amountBase: number; amountBilled: number; vatable: boolean; distributionMethod: string; kind: 'SHIPPING' | null }[]
   linkedFreightPos: {
     linkId: string
@@ -1217,6 +1222,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       recordedAt: cn.recordedAt.toISOString(),
       postedAt: cn.postedAt?.toISOString() ?? null,
     })),
+    freightCostLinesFingerprint: freightCostLinesFingerprint(po.freightCostLines ?? [], { taxRatePercent: po.taxRatePercent != null ? Number(po.taxRatePercent) : null, taxForeign: Number(po.taxForeign ?? 0) }),
     freightCostLines: (po.freightCostLines ?? []).map((cl) => ({
       id: cl.id,
       description: cl.description,
@@ -2396,6 +2402,8 @@ export async function advancePoStatus(
     const session = await requirePermission('purchasing.create')
     // Minimum gross margin (o3d-hqvrp.380): placing the order is the commitment, so it is checked inside the transaction below, under the
     // PO row lock, from the stored line costs and values read through that transaction.
+    // o3d-d0gog: the close-short revaluation inside the transaction needs the chart; read it first, over the pool.
+    const closeChart = targetStatus === 'CLOSED' ? await tryReadLandedCostChartBeforeTx() : undefined
     const result = await db.$transaction(async (tx) => {
       // Closing a GOODS order may reallocate the unreceived freight share onto the received units (close-short), which revalues
       // cost layers: it takes the whole revaluation scope first, which includes the order row.
@@ -2416,7 +2424,7 @@ export async function advancePoStatus(
       // received stock and its cost stay, the unreceived balance is dropped). A live warehouse ASN refuses. Read and written
       // under the row lock taken above, so a receipt cannot land between the facts and the status write.
       if (targetStatus === 'CLOSED') {
-        const retired = await retirePurchaseOrderLocked(tx, id, 'close')
+        const retired = await retirePurchaseOrderLocked(tx, id, 'close', undefined, closeChart)
         return { existing, changed: true, preferredSupplierUpdate: { productIds: [], updatedCount: 0 }, retired }
       }
 
@@ -6169,6 +6177,8 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     // too, so we never leave 'linked but unapplied' freight with no retry path
     // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
     const freightPrefix = await readPoPrefix()
+    // o3d-d0gog: the chart for the revaluation inside the transaction, read before any transaction connection is held.
+    const landedChart = await readLandedCostChartBeforeTx()
     // The reference is minted in a transaction of its own, committed first, so the numbering lock is never held across the landed-cost recalculation below (a failed create leaves a gap in the sequence).
     const { po, landedResult } = await retryWhenNumberTaken(async () => {
     const freightReference = await makeReference(freightPrefix)
@@ -6213,6 +6223,7 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
           triggeredById: session.user.id,
           reason: 'freight_purchase_order_created',
           scheduleAdjustmentJournals: true, // audit-grob durable backstop
+          accountingSettings: landedChart,
         })
         return { po, landedResult }
       },
@@ -6352,7 +6363,8 @@ export async function updateFreightPoCosts(
   freightPoId: string,
   rawCostLines: FreightCostLineInput[],
   rawTaxRateValue?: number,
-): Promise<{ success: boolean; error?: string }> {
+  expectedCostLinesFingerprint?: string,
+): Promise<{ success: boolean; error?: string; /** The fingerprint of the lines and VAT as now stored, for the dialog's next save. */ costLinesFingerprint?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
     // The same boundary createFreightPo applies (shape, finiteness, the four methods, the net-subtotal
@@ -6367,7 +6379,9 @@ export async function updateFreightPoCosts(
     }
     const costLines = parsedLines.data
     const taxRateValue = taxRateParse.data
-    const { reference, landedResult } = await db.$transaction(async (tx) => {
+    // o3d-d0gog: the chart for the revaluation inside the transaction, read before any transaction connection is held.
+    const landedChart = await readLandedCostChartBeforeTx()
+    const { reference, landedResult, costLinesFingerprint } = await db.$transaction(async (tx) => {
       // ─── o3d-6nd55 r3 (Codex round-3 HIGH): THE PARENT ORDERS BEFORE THEIR COST ROWS ───
       //
       // THE DEADLOCK THIS CLOSES. This transaction used to delete `freight_cost_lines` and only THEN
@@ -6408,6 +6422,9 @@ export async function updateFreightPoCosts(
           invoiceLines: { select: { id: true }, take: 1 },
         },
       })
+      // o3d-aks9m: a dialog opened before another operator's edit would replace their lines. The lines read here are
+      // under the order lock, so comparing them with what the dialog loaded is race-free.
+      assertFreightEditNotStale(storedLines, { taxRatePercent: po.taxRatePercent, taxForeign: po.taxForeign }, expectedCostLinesFingerprint)
       // THE TAX RATE (a fraction, 0.2). Not passing one means KEEP the stored rate, never zero it. An order that
       // never recorded a rate is NOT inferred from what was charged: if it was charged VAT the caller must say
       // the rate (see resolveFreightEditTaxRate).
@@ -6480,8 +6497,17 @@ export async function updateFreightPoCosts(
         triggeredById: session.user.id,
         reason: 'freight_purchase_order_costs_updated',
         scheduleAdjustmentJournals: true, // audit-grob durable backstop
+        accountingSettings: landedChart,
       })
-      return { reference: po.reference, landedResult }
+      const finalLines = await tx.freightCostLine.findMany({
+        where: { poId: freightPoId },
+        select: { id: true, description: true, amountForeign: true, vatable: true, distributionMethod: true },
+      })
+      const costLinesFingerprint = freightCostLinesFingerprint(finalLines, {
+        taxRatePercent: effectiveRate.gt(0) ? effectiveRate : null,
+        taxForeign,
+      })
+      return { reference: po.reference, landedResult, costLinesFingerprint }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
@@ -6516,7 +6542,7 @@ export async function updateFreightPoCosts(
       })
     }
 
-    return { success: true }
+    return { success: true, costLinesFingerprint }
   } catch (e) {
     await logActivity({
       entityType: 'PURCHASE_ORDER',
