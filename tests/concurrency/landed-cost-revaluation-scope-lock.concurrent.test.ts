@@ -489,7 +489,8 @@ test('o3d-nrl4 PR A: the landed-cost revaluation scope lock', { skip }, async (t
         assert.equal(layerFree, true, 'updateFreightPoCosts holds no layer while waiting for the transfer')
         await holder.query('COMMIT')
         const result = await running
-        assert.deepEqual(result, { success: true })
+        assert.equal(result.success, true, String(result.error))
+        assert.equal(typeof result.costLinesFingerprint, 'string', 'the action returns the stored lines fingerprint for the next dialog save')
         assert.equal(await layerUnitCost(world.layerId), BASE_UNIT + 30 / LINE_QTY)
       } finally {
         await holder.query('ROLLBACK').catch(() => {})
