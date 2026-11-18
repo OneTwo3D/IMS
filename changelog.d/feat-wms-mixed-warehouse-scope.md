@@ -1,0 +1,3 @@
+### Fulfilment
+
+- Orders allocated across several warehouses can now be sent to the warehouse (Mintsoft) as only its own part, and despatched part by part (behind the setting `wms_mixed_warehouse_push_enabled`, off by default). With the setting off nothing changes: the whole order is sent and a despatch for a mixed order is still refused. With it on, the warehouse is sent only the units allocated to its warehouse (a kit goes whole or not at all), the discount, shipping and VAT are split in pence (shipping goes with whichever part ships first), a change to the allocation amends the warehouse order while it is still New, and a warehouse despatch ships only that part. A single-warehouse order is sent byte-for-byte as before.
