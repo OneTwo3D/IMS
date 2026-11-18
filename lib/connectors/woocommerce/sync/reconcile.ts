@@ -28,6 +28,8 @@ export function isReconcileDue(lastStamp: string | null | undefined, nowMs: numb
 // cursor after each, and stops starting windows once the request has used this much of its time. The next run continues.
 const STOCK_RECONCILE_CHUNK_SIZE = 150
 const STOCK_RECONCILE_REQUEST_BUDGET_MS = 20_000
+/** The slice of that budget kept back for the product-push retry sweep: stock windows stop starting once only this much is left, so the sweep runs on every pass, including the ones that continue a multi-run reconcile. */
+const PRODUCT_PUSH_RETRY_RESERVE_MS = 3_000
 export const STOCK_RECONCILE_CURSOR_KEY = 'wc_stock_daily_reconcile_cursor'
 
 function formatCursor(afterId: string, version: string): string {
@@ -225,7 +227,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
               create: { key: STOCK_RECONCILE_CURSOR_KEY, value: formatCursor(cursor, settingsVersion) },
               update: { value: formatCursor(cursor, settingsVersion) },
             })
-            if (Date.now() - startedAt < STOCK_RECONCILE_REQUEST_BUDGET_MS) continue
+            if (Date.now() - startedAt < STOCK_RECONCILE_REQUEST_BUDGET_MS - PRODUCT_PUSH_RETRY_RESERVE_MS) continue
             results.stock = {
               queued,
               sync: stock,

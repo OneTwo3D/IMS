@@ -2438,7 +2438,7 @@ async function resolveSkusInParallel(
   errors: { sku: string; error: string }[]
   totalAttempts: number
   failedAttempts: number
-  /** Parents left out of this pass (over the variation cap, or a variation page that failed). Their variants are neither errors nor unmatched. */
+  /** Parents left out of this pass (over the variation cap only; page and transport errors stay in `errors`). Their variants are neither errors nor unmatched. */
   skippedParents: { parentSku: string; skus: string[]; reason: string }[]
 }> {
   const skippedParents: { parentSku: string; skus: string[]; reason: string }[] = []
@@ -2524,11 +2524,16 @@ async function resolveSkusInParallel(
         continue
       }
 
-      const firstRead = allVariations === undefined
       allVariations ??= await fetchAllVariationsOfParent(parentWcId, creds)
       const variationLookup = allVariations
       if (variationLookup.error) {
-        if (firstRead && !variationLookup.overCap) failedAttempts++
+        if (!variationLookup.overCap) {
+          // A page or transport error is transient: report it per SKU exactly as before, so a SALE outbox job stays queued
+          // (shouldRetainJob keys on errors) and the reconcile window is held. Only the deterministic over-cap case is skipped.
+          failedAttempts++
+          for (const product of batch) errors.push({ sku: product.sku, error: variationLookup.error })
+          continue
+        }
         if (!skipped) {
           skipped = { parentSku, skus: [], reason: variationLookup.error }
           skippedParents.push(skipped)

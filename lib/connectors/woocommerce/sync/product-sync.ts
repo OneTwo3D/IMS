@@ -66,6 +66,8 @@ import {
 } from '@/lib/products/type-transforms'
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
 import { Prisma } from '@/app/generated/prisma/client'
+import { WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { runWithWcAttemptFence } from '../attempt-fence'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 import { storeWcProductContent } from './product-content'
@@ -2267,7 +2269,7 @@ type PushImsProductToWcResult = {
   error?: string
   skipped?: boolean
   warning?: string
-  /** The failure happened AFTER WooCommerce accepted the PUT (a verification failure). Sending the same PUT again cannot help and can overwrite store-side edits. */
+  /** A retry cannot help: the failure came AFTER WooCommerce accepted the PUT (a verification failure), or is a rejection or a configuration gap that repeats identically (4xx PUT, no SKU, no parent mapping). */
   permanent?: boolean
 }
 
@@ -2279,8 +2281,16 @@ export const WC_PRODUCT_PUSH_PERMANENT_KIND = 'product_push_failed'
 const WC_PRODUCT_PUSH_RETRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 /** Per-product backoff: 1h after the first failure, then doubling (2h, 4h, ...), never past the retry window itself. */
 const WC_PRODUCT_PUSH_BACKOFF_BASE_MS = 60 * 60 * 1000
-/** Namespace of the per-product advisory lock that serialises recording an outcome (one open row per product). */
-const WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE = 0x57_43_50 // 'WCP'
+/** A PUT answer that can never succeed on a retry: a 4xx rejection (not a timeout 408 or a rate limit 429). 5xx and transport errors stay retryable. */
+export function isPermanentWcPutRejection(error: string | undefined): boolean {
+  const status = /^WC API PUT error: (\d{3})\b/.exec(error ?? '')
+  if (!status) return false
+  const code = Number(status[1])
+  return code >= 400 && code < 500 && code !== 408 && code !== 429
+}
+
+/** The floor for one retry's time box, so a retry that starts at the very end of the budget is still not cut off before it can send. */
+const WC_PRODUCT_PUSH_RETRY_MIN_TIMEOUT_MS = 5_000
 
 export function nextProductPushRetryDelayMs(failures: number): number {
   const exponent = Math.min(Math.max(failures, 1) - 1, 20)
@@ -2385,7 +2395,15 @@ export async function retryFailedWcProductPushes(
     if (options?.deadlineAt != null && Date.now() >= options.deadlineAt) break
     retried++
     try {
-      const outcome = await retry(id)
+      // Time-box the whole retry (its GET, re-read and PUT) to what is left of the budget: the ambient signal is folded into every
+      // WooCommerce request, so one slow store cannot run a single retry minutes past the budget.
+      const remaining = options?.deadlineAt != null ? options.deadlineAt - Date.now() : Number.POSITIVE_INFINITY
+      const outcome = Number.isFinite(remaining)
+        ? await runWithWcAttemptFence(
+            { signal: AbortSignal.timeout(Math.max(remaining, WC_PRODUCT_PUSH_RETRY_MIN_TIMEOUT_MS)), stillOwned: async () => true },
+            () => retry(id),
+          )
+        : await retry(id)
       if (outcome.success && !outcome.skipped) resolved++
     } catch (error) {
       console.error('[wc-product-push] retry threw', error)
@@ -2423,7 +2441,7 @@ async function pushImsProductToWcOnce(
         parent: { select: { sku: true, externalProductId: true } },
       },
     })
-    if (!product?.sku) return { success: false, error: 'Product has no SKU' }
+    if (!product?.sku) return { success: false, permanent: true, error: 'Product has no SKU' }
 
     const updateData = buildImsToWcProductPayload(product)
 
@@ -2436,7 +2454,7 @@ async function pushImsProductToWcOnce(
     if (product.parent?.sku) {
       const parentWcId = product.parent?.externalProductId != null ? Number(product.parent.externalProductId) : null
       if (!parentWcId || !product.parent?.sku) {
-        return { success: false, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
+        return { success: false, permanent: true, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
       }
 
       let variationId = product.externalProductId != null ? Number(product.externalProductId) : null
@@ -2572,7 +2590,7 @@ async function pushImsProductToWcOnce(
     }
 
     const { data: putData, error: putError } = await wcPut(putPath, updateData, creds)
-    if (putError) return { success: false, error: putError }
+    if (putError) return { success: false, ...(isPermanentWcPutRejection(putError) ? { permanent: true } : {}), error: putError }
     if (expectedMpn && wcResponseConfirmsMpn(putData, expectedMpn.key, expectedMpn.mpn) === false) {
       // A plugin filter can reject a meta write and still answer 200: do not call that a success.
       return { success: false, permanent: true, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }

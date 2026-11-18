@@ -183,6 +183,7 @@ test('a parent over the 2,000-variation cap is skipped and reported, not a windo
   for (let page = 1; page <= 20; page++) variationPages[`50:${page}`] = fullPage(page)
   const result = await run()
   assert.deepEqual(result.errors, [], 'no error: the reconcile window must be able to advance')
+  assert.notEqual(result.aborted, true, 'the window is handled, so the pass advances')
   assert.equal(result.skippedParents?.length, 1)
   assert.match(result.skippedParents?.[0] ?? '', /PAR/)
   assert.equal(result.unmatched, 0, 'the skipped variant is not counted unmatched either')
@@ -190,18 +191,38 @@ test('a parent over the 2,000-variation cap is skipped and reported, not a windo
   assert.equal(updates().some((u) => u.id === 2000), false)
 })
 
-test('a variation page that keeps failing skips the parent for the pass, without a window error (o3d-hqvrp.104)', async () => {
+test('a variation page error on a SALE job stays an error, so the job stays queued and retries (o3d-hqvrp.104)', async () => {
   reset()
   candidates = [variant('v1', 'V1'), product('s1', 'S9', BigInt(9))]
   levels = [
-    { productId: 'v1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
+    { productId: 'v1', warehouseId: 'w1', quantity: 0, reservedQty: 0 },
     { productId: 's1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
   ]
   failVariationPage = '1'
+  const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
+  const { shouldRetainJob } = await import('@/lib/connectors/woocommerce/sync/stock-sync-jobs')
+  const saved = process.env[OUTBOUND_GRANT_ENV.woocommerce]
+  process.env[OUTBOUND_GRANT_ENV.woocommerce] = ORIGIN
+  let result: Awaited<ReturnType<typeof pushStockToWc>>
+  try {
+    result = await pushStockToWc({ productIds: ['v1'] })
+  } finally {
+    if (saved === undefined) delete process.env[OUTBOUND_GRANT_ENV.woocommerce]
+    else process.env[OUTBOUND_GRANT_ENV.woocommerce] = saved
+  }
+  assert.ok(result.errors.some((e) => /502/.test(e)), 'the page error is reported per SKU')
+  assert.equal(result.skippedParents, undefined, 'a transient page error is not a skipped parent')
+  assert.equal(shouldRetainJob(result, { force: false, reason: 'IMS_CHANGE' }), true, 'the SALE job stays queued')
+})
+
+test('a variation page error during a reconcile pass holds the window with the error (o3d-hqvrp.104)', async () => {
+  reset()
+  candidates = [variant('v1', 'V1')]
+  levels = [{ productId: 'v1', warehouseId: 'w1', quantity: 5, reservedQty: 0 }]
+  failVariationPage = '1'
   const result = await run()
-  assert.deepEqual(result.errors, [])
-  assert.equal(result.skippedParents?.length, 1)
-  assert.ok(updates().some((u) => u.id === 9))
+  assert.ok(result.errors.length > 0)
+  assert.equal(result.skippedParents, undefined)
 })
 
 test('a parent\'s variation list is read once per parent, not once per 100-variant batch (o3d-hqvrp.104)', async () => {

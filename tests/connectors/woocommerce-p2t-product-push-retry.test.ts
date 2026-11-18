@@ -215,3 +215,38 @@ test('a skipped push (settings forbid it) records nothing (o3d-hqvrp.106)', asyn
   assert.equal(r.skipped, true)
   assert.equal(logs.length, 0)
 })
+
+test('a 4xx PUT rejection is permanent (product_push_failed); 408, 429, 5xx and network errors stay retryable (o3d-hqvrp.106)', async () => {
+  const { pushImsProductToWc, WC_PRODUCT_PUSH_RETRY_KIND, WC_PRODUCT_PUSH_PERMANENT_KIND } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  const cases: Array<[string, string]> = [
+    ['WC API PUT error: 400 Bad Request', WC_PRODUCT_PUSH_PERMANENT_KIND],
+    ['WC API PUT error: 404 Not Found', WC_PRODUCT_PUSH_PERMANENT_KIND],
+    ['WC API PUT error: 409 Conflict', WC_PRODUCT_PUSH_PERMANENT_KIND],
+    ['WC API PUT error: 408 Request Timeout', WC_PRODUCT_PUSH_RETRY_KIND],
+    ['WC API PUT error: 429 Too Many Requests', WC_PRODUCT_PUSH_RETRY_KIND],
+    ['WC API PUT error: 503 Service Unavailable', WC_PRODUCT_PUSH_RETRY_KIND],
+    ['TypeError: fetch failed', WC_PRODUCT_PUSH_RETRY_KIND],
+  ]
+  for (const [error, kind] of cases) {
+    setup()
+    wcError = null
+    putError = error
+    const r = await pushImsProductToWc('p1')
+    assert.equal(r.success, false)
+    assert.equal(logs[0].recordKind, kind, error)
+  }
+})
+
+test('each retry runs under a time box taken from the remaining budget (o3d-hqvrp.106)', async () => {
+  setup()
+  const { retryFailedWcProductPushes, WC_PRODUCT_PUSH_RETRY_KIND } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  const { currentWcAttemptSignal } = await import('@/lib/connectors/woocommerce/attempt-fence')
+  logs = [{ id: nextId++, entityId: 'a', status: 'FAILED', errorMessage: 'x', recordKind: WC_PRODUCT_PUSH_RETRY_KIND, createdAt: new Date(), payload: null }]
+  let signal: AbortSignal | undefined
+  await retryFailedWcProductPushes(async () => { signal = currentWcAttemptSignal(); return { success: true } }, { deadlineAt: Date.now() + 10_000 })
+  assert.ok(signal, 'the retry runs with an ambient abort signal')
+  assert.equal(signal.aborted, false)
+  let unbounded: AbortSignal | undefined = signal
+  await retryFailedWcProductPushes(async () => { unbounded = currentWcAttemptSignal(); return { success: true } })
+  assert.equal(unbounded, undefined, 'no deadline, no time box')
+})
