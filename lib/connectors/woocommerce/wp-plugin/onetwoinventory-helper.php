@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -26,6 +26,10 @@
  *   1b. Warehouse (WMS) Status — renders the live WMS order status that IMS pushes
  *      onto the WC order as `_oti_wms_*` meta: an order-edit meta box + an orders-list
  *      "Warehouse" column. Read-only; WMS-neutral.
+ *   2b. Incumbent Plugins — GET-only signed endpoint GET /wp-json/oti/v1/incumbents reports, as three
+ *      booleans, whether the legacy bridge plugin, the Xeroom invoicing plugin and the
+ *      IOSS/Xero plugin are ACTIVE on this site, so IMS can refuse to claim ownership of a writeback
+ *      while another writer is still switched on. It writes nothing, anywhere.
  *   3. Partial-Shipment Receiver — signed REST endpoint
  *      POST /wp-json/oti/v1/order/{id}/partial-shipment that IMS posts each
  *      despatched part of a split fulfilment to (WMS-neutral: Mintsoft or any future WMS,
@@ -293,6 +297,12 @@ add_action('rest_api_init', function () {
         'permission_callback' => 'oti_verify_fx_signature',
         'callback'            => 'oti_handle_aelia_rates_read',
     ]);
+    // READ ONLY: whether the incumbent writer plugins are active. Same HMAC check as the other signed routes.
+    register_rest_route(OTI_FX_NAMESPACE, '/incumbents', [
+        'methods'             => 'GET',
+        'permission_callback' => 'oti_verify_fx_signature',
+        'callback'            => 'oti_handle_incumbents_read',
+    ]);
     register_rest_route(OTI_FX_NAMESPACE, '/invoice-pdf/(?P<order_id>\d+)', [
         'methods'             => 'GET',
         'permission_callback' => 'oti_can_download_invoice_pdf',
@@ -397,6 +407,51 @@ if (!function_exists('oti_aelia_last_update_iso')) {
             return [gmdate('Y-m-d\TH:i:s\Z', $ts), $key];
         }
         return [null, null];
+    }
+}
+
+if (!function_exists('oti_handle_incumbents_read')) {
+    /**
+     * GET /wp-json/oti/v1/incumbents. READ ONLY: reads the list of active plugins and nothing else.
+     *
+     * A plugin counts as active when its slug (folder, or file name of a single-file plugin) EXACTLY equals the incumbent's slug in the
+     * site's active_plugins option, the network's active_sitewide_plugins (multisite) or the must-use plugins. Only booleans leave
+     * the site: no plugin name, path or version is returned.
+     */
+    function oti_handle_incumbents_read(WP_REST_Request $request)
+    {
+        $active = get_option('active_plugins', []);
+        $active = is_array($active) ? array_values($active) : [];
+        if (function_exists('is_multisite') && is_multisite()) {
+            $network = get_site_option('active_sitewide_plugins', []);
+            if (is_array($network)) $active = array_merge($active, array_keys($network));
+        }
+        // EXACT plugin slugs (the folder name, or the file name of a single-file plugin). A site with a differently named copy adds it
+        // through the filter. A loose name match is not used: an unrelated add-on whose name merely contains one of these words must not read as active.
+        $slugs = apply_filters('oti_incumbent_plugin_slugs', [
+            'legacy_bridge' => ['woo-mintsoft'],
+            'xeroom'        => ['xeroom'],
+            'ioss_xero'     => ['o3d-ioss-xero'],
+        ]);
+        $slug_of = static function ($basename) {
+            $basename = (string) $basename;
+            $slash = strpos($basename, '/');
+            return $slash === false ? preg_replace('/\.php$/', '', $basename) : substr($basename, 0, $slash);
+        };
+        $present = [];
+        foreach ($active as $basename) $present[$slug_of($basename)] = true;
+        // Must-use plugins are always active.
+        if (function_exists('wp_get_mu_plugins')) {
+            foreach (wp_get_mu_plugins() as $path) $present[$slug_of(basename((string) $path))] = true;
+        }
+        $out = [];
+        foreach (['legacy_bridge', 'xeroom', 'ioss_xero'] as $name) {
+            $out[$name] = false;
+            foreach ((isset($slugs[$name]) && is_array($slugs[$name])) ? $slugs[$name] : [] as $slug) {
+                if (is_string($slug) && $slug !== '' && isset($present[$slug])) { $out[$name] = true; break; }
+            }
+        }
+        return new WP_REST_Response(['ok' => true, 'schema' => 1, 'active' => $out]);
     }
 }
 

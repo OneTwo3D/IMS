@@ -18,7 +18,7 @@ registerCronJobs([
     module: 'system',
     moduleLabel: 'System',
     label: 'Writers Coexistence Check',
-    description: 'Hourly record of the writers:check report: whether IMS and another writer could both write one destination operation in the current phase. Read-only: it reads the environment and IMS\'s own database, makes no call to any connected system, and keeps the report in the activity log. The run is red unless the verdict is ok.',
+    description: 'Hourly record of the writers:check report: whether IMS and another writer could both write one destination operation in the current phase. Read-only: it reads the environment and IMS\'s own database, makes one signed read-only GET per run to the connected WooCommerce store (the helper plugin\'s plugin-status route, no write), and keeps the report in the activity log. The run is red unless the verdict is ok.',
     defaultSchedule: '40 * * * *',
     defaultEnabled: false,
   },

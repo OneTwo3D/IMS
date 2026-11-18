@@ -48,6 +48,8 @@ function inputs(overrides: Partial<WritersCheckInputs> = {}): WritersCheckInputs
     evidence: cleanEvidence(),
     evidenceUnrecorded: 0,
     unknownEvidenceKinds: 0,
+    // These arms are about the map and the order evidence; the storefront's plugin report is tested in writers-check-incumbent-plugins.test.ts.
+    incumbentPlugins: { state: 'read', active: { legacy_bridge: false, xeroom: false, ioss_xero: false } },
     ...overrides,
   }
 }
