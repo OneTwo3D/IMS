@@ -36,8 +36,8 @@ const EXPECTATION: MintsoftAsnExpectation = {
   reference: 'PO-1',
   externalWarehouseId: '6',
   lines: [
-    { sourceLineId: 'line-a', expectedQty: 10, externalProductId: '71' },
-    { sourceLineId: 'line-b', expectedQty: 2.5, externalProductId: '72' },
+    { sourceLineId: 'line-a', expectedQty: 10 },
+    { sourceLineId: 'line-b', expectedQty: 2.5 },
   ],
 }
 
@@ -52,8 +52,6 @@ const CASES: ReadonlyArray<{ kind: MintsoftAsnDifference['kind']; asn: WmsAsnRef
   { kind: 'same', asn: row('PO-1', 6, OURS) },
   { kind: 'reference', asn: row('PO-2', 6, OURS) },
   { kind: 'lineIdentityUnreadable', asn: row('PO-1', 6, [OURS[0]!, { ID: 2, SourceLineId: null, QuantityExpected: 2.5 }]) },
-  // o3d-66ca1: a warehouse-made ASN quoting our PO number: every SourceLineId NULL, other goods.
-  { kind: 'unkeyedItemsDiffer', asn: row('PO-1', 6, [{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }]) },
   { kind: 'linesUnrelated', asn: row('PO-1', 6, [{ ID: 1, SourceLineId: 'line-y', QuantityExpected: 10 }, { ID: 2, SourceLineId: 'line-z', QuantityExpected: 2.5 }]) },
   { kind: 'linesOverlap', asn: row('PO-1', 6, [OURS[0]!, { ID: 2, SourceLineId: 'line-z', QuantityExpected: 2.5 }]) },
   { kind: 'quantityUnreadable', asn: row('PO-1', 6, [OURS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 'two and a half' }]) },
@@ -97,8 +95,6 @@ test('proof of absence: the WHOLE table of difference kind x what IMS has alread
     ['same', false, false, false],
     ['reference', true, true, true],
     ['lineIdentityUnreadable', false, false, false],
-    // o3d-66ca1: determinate without the map, like a different reference.
-    ['unkeyedItemsDiffer', true, true, true],
     ['linesUnrelated', true, true, true],
     // ROUND 7's fix, in one cell: an overlapping line set is proof of absence ONLY for an ASN IMS has
     // already recorded. Unmapped is the lost-response shape; unknown is a map that could not be read, and
@@ -113,7 +109,7 @@ test('proof of absence: the WHOLE table of difference kind x what IMS has alread
   // And the two summaries that matter, derived from the table rather than restated: nothing is proof of
   // absence on an UNREADABLE map that is not already proof without the map at all...
   const withoutTheMap = table.filter(([, proof]) => proof[1] || proof[2]).map(([kind]) => kind)
-  assert.deepEqual(withoutTheMap, ['reference', 'unkeyedItemsDiffer', 'linesUnrelated'])
+  assert.deepEqual(withoutTheMap, ['reference', 'linesUnrelated'])
   // …and the map can only ever ADD to what is proof, never take away.
   for (const [kind, proof] of table) {
     assert.ok(!(proof[1] && !proof[0]), `${kind}: mapped is never less permissive than unmapped`)
@@ -216,42 +212,21 @@ test('nothing outside the rule can conclude that no ASN exists', () => {
 })
 
 /**
- * o3d-66ca1 (owner decision Q7, narrowed by Codex R1 on #1002): a row quoting our POReference whose items
- * ALL carry a null SourceLineId is a warehouse-made ASN only when its PRODUCT SET is disjoint from ours.
- * Everything else refuses, because it may be our own ASN edited at the warehouse or already cover the units.
+ * o3d-66ca1: NOT FIXED, deliberately. A row quoting our POReference whose items ALL carry a null SourceLineId
+ * (a warehouse-made ASN) can never be proven not-ours from its content: a lost create followed by a
+ * product-link change would defeat any item-set proof (Codex R1/R2 on #1002). It refuses, whatever it holds.
  */
-test('an all-unkeyed row is provably not ours only when its products are disjoint from ours', () => {
-  const kindOf = (items: Item[], expectation: MintsoftAsnExpectation = EXPECTATION) =>
-    compareMintsoftAsnAgainstExpectation(row('PO-1', 6, items), expectation).kind
-  // disjoint products, whatever the count or quantities
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }]), 'unkeyedItemsDiffer')
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 10 }, { ID: 2, SourceLineId: null, ProductId: 901, QuantityExpected: 2.5 }]), 'unkeyedItemsDiffer')
-  // SAME product, DIFFERENT quantity (Codex R1 HIGH): may be our ASN edited, or already cover the units
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 5 }, { ID: 2, SourceLineId: null, ProductId: 900, QuantityExpected: 1 }]), 'lineIdentityUnreadable')
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 99 }, { ID: 2, SourceLineId: null, ProductId: 72, QuantityExpected: 2.5 }]), 'lineIdentityUnreadable')
-  // a different count that still shares a product
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 10 }]), 'lineIdentityUnreadable')
-  // exactly ours
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 10 }, { ID: 2, SourceLineId: null, ProductId: 72, QuantityExpected: 2.5 }]), 'lineIdentityUnreadable')
-  // a product id missing or unreadable on the remote side
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, QuantityExpected: 4 }]), 'lineIdentityUnreadable')
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }, { ID: 2, SourceLineId: null, QuantityExpected: 4 }]), 'lineIdentityUnreadable')
-  // a product id missing on OUR side
-  const noProducts: MintsoftAsnExpectation = { ...EXPECTATION, lines: EXPECTATION.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.expectedQty })) }
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }], noProducts), 'lineIdentityUnreadable')
-  const oneMissing: MintsoftAsnExpectation = { ...EXPECTATION, lines: [EXPECTATION.lines[0]!, { sourceLineId: 'line-b', expectedQty: 2.5 }] }
-  assert.equal(kindOf([{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }], oneMissing), 'lineIdentityUnreadable')
-  // a MIX of keyed and unkeyed items is a degraded row, not a UI one: still refuses
-  assert.equal(kindOf([{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 10 }, { ID: 2, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }]), 'lineIdentityUnreadable')
-})
-
-test('the creation verdict is absenceProven for a PO-reference collision with a warehouse-made ASN', () => {
-  const warehouseMade = row('PO-1', 6, [{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }])
-  const verdict = decideMintsoftAsnCreation([warehouseMade], { ...EXPECTATION, mapKnowledge: { kind: 'readable', mappedExternalAsnIds: new Set() } })
-  assert.equal(verdict.kind, 'absenceProven')
-  const lookalike = row('PO-1', 6, [{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 10 }, { ID: 2, SourceLineId: null, ProductId: 72, QuantityExpected: 2.5 }])
-  assert.equal(decideMintsoftAsnCreation([lookalike], { ...EXPECTATION, mapKnowledge: { kind: 'readable', mappedExternalAsnIds: new Set() } }).kind, 'refused')
-  // Codex R1: a warehouse-made ASN for the SAME product at a different quantity must refuse creation
-  const sameProductOtherQty = row('PO-1', 6, [{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 5 }])
-  assert.equal(decideMintsoftAsnCreation([sameProductOtherQty], { ...EXPECTATION, mapKnowledge: { kind: 'readable', mappedExternalAsnIds: new Set() } }).kind, 'refused')
+test('an all-unkeyed row quoting our reference always refuses, whatever products and quantities it holds', () => {
+  const unkeyed: Item[][] = [
+    [{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }],
+    [{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 10 }, { ID: 2, SourceLineId: null, ProductId: 901, QuantityExpected: 2.5 }],
+    [{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 5 }],
+    [{ ID: 1, SourceLineId: null, QuantityExpected: 4 }],
+  ]
+  for (const items of unkeyed) {
+    const asn = row('PO-1', 6, items)
+    assert.equal(compareMintsoftAsnAgainstExpectation(asn, EXPECTATION).kind, 'lineIdentityUnreadable')
+    const verdict = decideMintsoftAsnCreation([asn], { ...EXPECTATION, mapKnowledge: { kind: 'readable', mappedExternalAsnIds: new Set() } })
+    assert.equal(verdict.kind, 'refused')
+  }
 })

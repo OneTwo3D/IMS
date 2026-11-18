@@ -3800,11 +3800,7 @@ export async function createMintsoftPurchaseOrderAsn(
       externalWarehouseId: reservation.externalWarehouseId,
       // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation (o3d-papk: the branded
       // outstanding reading becomes a plain number here, and only here).
-      lines: reservation.lines.map((line) => ({
-        sourceLineId: line.sourceLineId,
-        expectedQty: line.outstanding.qtyNumber,
-        externalProductId: line.externalProductId,
-      })),
+      lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.outstanding.qtyNumber })),
       // o3d-bhvu round 7 / o3d-54al: an ASN IMS has ALREADY MAPPED is a partial it recorded, not what a lost
       // create left behind, and that is the only thing that tells the two apart.
       mapKnowledge: await readMintsoftAsnMapKnowledge(remoteAsns),
@@ -5005,11 +5001,7 @@ export async function createMintsoftTransferAsn(
       externalWarehouseId: reservation.externalWarehouseId,
       // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation (o3d-zzgp: the branded
       // outstanding reading becomes a plain number here, and only here).
-      lines: reservation.lines.map((line) => ({
-        sourceLineId: line.sourceLineId,
-        expectedQty: line.outstanding.qtyNumber,
-        externalProductId: line.externalProductId,
-      })),
+      lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.outstanding.qtyNumber })),
       // o3d-bhvu round 7 / o3d-54al: an ASN IMS has ALREADY MAPPED is a partial it recorded, not what a lost
       // create left behind, and that is the only thing that tells the two apart.
       mapKnowledge: await readMintsoftAsnMapKnowledge(remoteAsns),

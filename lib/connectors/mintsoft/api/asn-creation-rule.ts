@@ -46,15 +46,7 @@ export type MintsoftAsnExpectation = {
   reference: string
   /** Mintsoft's warehouse ID the reservation is for. */
   externalWarehouseId: string
-  lines: ReadonlyArray<{
-    sourceLineId: string
-    expectedQty: number
-    /**
-     * Mintsoft's ProductId for the line. Needed only to tell a row that carries NO source line ids at all
-     * (a warehouse-made ASN) apart from ours by a DISJOINT product set; absent, such a row refuses.
-     */
-    externalProductId?: string
-  }>
+  lines: ReadonlyArray<{ sourceLineId: string; expectedQty: number }>
 }
 
 /**
@@ -148,13 +140,6 @@ export type MintsoftAsnDifference =
   | { kind: 'same' }
   | { kind: 'reference'; remoteReference: string | null }
   | { kind: 'lineIdentityUnreadable' }
-  /**
-   * Every item on the row has NO usable SourceLineId (the shape of an ASN made in the Mintsoft UI: the key
-   * is there and null), and its PRODUCT set is disjoint from ours (no ProductId in common). IMS
-   * always sends a SourceLineId and Mintsoft returns it verbatim, so such a row can only be ours if it
-   * holds exactly our items; one that does not is a warehouse-made ASN that merely quotes our reference.
-   */
-  | { kind: 'unkeyedItemsDiffer'; remoteItemCount: number }
   /** Readable, and it shares NO source line with the reservation: another consignment entirely. */
   | { kind: 'linesUnrelated'; missingSourceLineIds: string[]; remoteItemCount: number }
   /**
@@ -173,7 +158,6 @@ export const MINTSOFT_ASN_DIFFERENCE_KINDS = [
   'same',
   'reference',
   'lineIdentityUnreadable',
-  'unkeyedItemsDiffer',
   'linesUnrelated',
   'linesOverlap',
   'quantityUnreadable',
@@ -224,37 +208,6 @@ function roundingCouldExplain(expectedQty: number, remoteQty: number | null | un
   return Math.abs(remoteQty - expectedQty) < 1
 }
 
-function rawProductId(item: unknown): string | null {
-  const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : null
-  const value = record?.ProductId
-  if (typeof value === 'string' && value.trim()) return value.trim()
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
-  return null
-}
-
-/**
- * Could a row whose items carry NO SourceLineId overlap the goods we are about to send? Answers `true`
- * ("refuse") unless the row's PRODUCT SET is DISJOINT from ours: no product appears on both sides. Item
- * count and quantities play no part (Codex R1 HIGH on #1002): a warehouse-made ASN for the same product
- * with a different quantity may be our own ASN edited at the warehouse, or a delivery that already covers
- * these units, and creating another would have the warehouse expecting both. Any ProductId missing or
- * unreadable on either side, or an empty item set, answers `true`.
- */
-function unkeyedItemSetCouldBeOurs(items: unknown[], expectation: MintsoftAsnExpectation): boolean {
-  if (items.length === 0 || expectation.lines.length === 0) return true
-  const ours = new Set<string>()
-  for (const line of expectation.lines) {
-    const id = line.externalProductId?.trim()
-    if (!id) return true
-    ours.add(id)
-  }
-  for (const item of items) {
-    const productId = rawProductId(item)
-    if (productId == null || ours.has(productId)) return true
-  }
-  return false
-}
-
 /**
  * IS THIS REMOTE ASN THE ONE EXPECTED, AND IF NOT, HOW NOT?
  *
@@ -277,12 +230,9 @@ export function compareMintsoftAsnAgainstExpectation(
 
   const items = remoteItems(asn)
   if (items?.some((item) => readMintsoftAsnItemLineIdentity(item).kind === 'unreadable')) {
-    // ALL items unkeyed (and at least one): a warehouse-made row can be told from ours by its item set
-    // (o3d-66ca1). A MIX of keyed and unkeyed items stays unreadable: that is a degraded row, not a UI one.
-    if (items.every((item) => readMintsoftAsnItemLineIdentity(item).kind === 'unreadable')
-      && !unkeyedItemSetCouldBeOurs(items, expectation)) {
-      return { kind: 'unkeyedItemsDiffer', remoteItemCount: items.length }
-    }
+    // A warehouse-made ASN (every SourceLineId null) quoting our reference refuses too (o3d-66ca1): it can
+    // never be proven not-ours from its content (a lost create plus a later product-link change would
+    // defeat any such proof), so only an operator can say so.
     return { kind: 'lineIdentityUnreadable' }
   }
 
@@ -351,13 +301,6 @@ export function isProofThatMintsoftAsnIsNotThisOne(
       // both creators put the reservation's reference in. Another reference is another purchase order or
       // transfer: determinate, and the only reason the tenant-wide scan is affordable at all. Needs no map:
       // a create for THIS reference cannot have produced a row carrying another one.
-      return true
-    case 'unkeyedItemsDiffer':
-      // o3d-66ca1 (owner decision Q7). The row quotes OUR reference but none of its items carries a source
-      // line id, which an ASN IMS sent always does (Mintsoft returns it verbatim, proven live 2026-09-24),
-      // and its products are disjoint from ours: a warehouse-made ASN against the same PO number. Not a lost create.
-      // The identity rule is untouched for any row that carries a SourceLineId, and a row whose items DO
-      // match ours stays `lineIdentityUnreadable` and refuses.
       return true
     case 'linesUnrelated':
       // Every identity on the row was READABLE (that is checked first), so the item set is known exactly,
@@ -433,9 +376,6 @@ export function describeMintsoftAsnDifference(
     case 'lineIdentityUnreadable':
       return 'it carries an item whose SourceLineId cannot be read (absent, null or blank), so its lines '
         + 'cannot be told apart from the ones that were sent'
-    case 'unkeyedItemsDiffer':
-      return 'it carries no SourceLineId on any item (a warehouse-made ASN) and its items are not the ones that '
-        + `were sent (sent ${expectation.lines.length} item(s), it holds ${difference.remoteItemCount})`
     case 'linesUnrelated':
       return (difference.missingSourceLineIds.length > 0
         ? `it carries none of the source lines that were sent (not ${difference.missingSourceLineIds.join(', ')})`

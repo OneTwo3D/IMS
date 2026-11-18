@@ -250,7 +250,6 @@ function refusalFor(
     case 'same':
     case 'reference':
     case 'linesUnrelated':
-    case 'unkeyedItemsDiffer':
       // Ruled out or adopted before this point. Refusing rather than falling through to "create" keeps the
       // rule true of a difference kind added later that nobody wired up here.
       return new Error(
