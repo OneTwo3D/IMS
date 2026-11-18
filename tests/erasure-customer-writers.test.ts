@@ -252,8 +252,7 @@ test('both manual order creators lock and re-read the customer inside the create
   const src = readFileSync(new URL('../app/actions/sales.ts', import.meta.url), 'utf8')
   const start = src.indexOf('export async function createSalesOrder')
   const create = src.slice(start, start + 24000)
-  // The order number is minted between the lock and the write (the numbering row lock is taken AFTER the customer lock in every writer, so the two can never wait on each other in a cycle).
-  assert.match(create, /lockCustomerForOrderLink\(tx, input\.customerId\)\s*(?:\/\/[^\n]*\s*)*const orderNumber = await mintRequiredDocumentNumber\(tx, 'sales_order', \{ fallbackPrefix: numbering\.so_prefix \}\)\s*return tx\.salesOrder\.create\(/)
+  assert.match(create, /lockCustomerForOrderLink\(tx, input\.customerId\)\s*return tx\.salesOrder\.create\(/)
   assert.match(create, /instanceof CustomerAnonymisedError\) return \{ success: false, error: e\.message \}/)
   const clone = src.slice(src.indexOf('export async function cloneSalesOrder'))
   assert.match(clone, /lockCustomerForOrderLink\(tx, so\.customerId\)\s*await lockSalesOrder\(tx, id\)[\s\S]*return tx\.salesOrder\.create\(/)

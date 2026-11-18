@@ -7,6 +7,10 @@
  * that rolls back hands its number back. A pattern with no counter ({RAND:n} only, the default for sales and
  * purchase orders) takes the same lock: two creates drawing the same random text must not both find it free.
  *
+ * The lock lasts to the end of the transaction it is taken in. Sales orders and purchase orders therefore mint in a transaction of their own,
+ * committed first (`mintCommittedDocumentNumber`), because their own transaction does pooled work after the number is known; credit notes and
+ * shipments mint inside the document's transaction.
+ *
  * THE COUNTER RESTARTS WITH ITS PERIOD. A pattern carrying {YYYY} counts per year, {MM} per month, {DD} per day,
  * and none per ever (see `scopeKeyFor`). When the period has changed, the counter is seeded from the highest number
  * already issued in the new period (and, for credit notes, the counter the code kept before patterns existed), so a
@@ -203,6 +207,53 @@ export async function mintDocumentNumber(tx: Tx, type: NumberedDocumentType, opt
     return candidate
   }
   throw new DocumentNumberingError('PATTERN_EXHAUSTED', `Refused to number this ${spec.label.toLowerCase()}: the next ${MAX_SKIPS + 1} numbers of the pattern are all taken already. Reset the counter past the numbers in use (Settings > Company > Numbering).`)
+}
+
+/**
+ * MINT IN A TRANSACTION OF ITS OWN, COMMITTED BEFORE THE DOCUMENT'S TRANSACTION OPENS.
+ *
+ * The row lock of `mintDocumentNumber` is held to the end of the transaction it runs in. A document transaction does a great deal after the
+ * number is minted (an order queues its invoice, which reads settings through the shared client), and every create that is waiting for the lock
+ * holds a pooled connection while it waits: enough concurrent creates exhaust the pool, and the holder, needing one more connection, never gets it.
+ * So a document that does pooled work in its transaction mints here instead: the lock is held for the mint alone, which uses nothing but its own
+ * transaction, and the document's transaction takes no numbering lock at all.
+ *
+ * THE TRADE-OFF, STATED: the counter has advanced when this returns. If the document's transaction then fails, that number is never used and the
+ * sequence has a gap. A gap is harmless for the documents that use this (sales orders, purchase orders); it is not used for credit notes, whose
+ * numbers must be gapless and which mint inside their own transaction.
+ *
+ * TWO MINTS CAN DRAW THE SAME RANDOM TEXT, because the first number is not in any table until its document is written. So the document's
+ * transaction CLAIMS the number first (`claimDocumentNumber`): a lock on that one number, then the same uniqueness probe. A taken number is refused
+ * with `DocumentNumberTakenError`, and `retryWhenNumberTaken` mints again. A counter pattern never hits this: its counter moved past the number.
+ */
+export type TxRunner = <T>(run: (tx: Tx) => Promise<T>) => Promise<T>
+
+export async function mintCommittedDocumentNumber(runTx: TxRunner, type: NumberedDocumentType, options: MintOptions = {}): Promise<string> {
+  return runTx((tx) => mintRequiredDocumentNumber(tx, type, options))
+}
+
+export class DocumentNumberTakenError extends Error {
+  constructor(type: NumberedDocumentType, value: string) {
+    super(`The ${DOCUMENT_TYPE_SPECS[type].label.toLowerCase()} number ${value} was taken by another document while this one was being saved.`)
+    this.name = 'DocumentNumberTakenError'
+  }
+}
+
+/** First statement of a document transaction that wrote its number with `mintCommittedDocumentNumber`. */
+export async function claimDocumentNumber(tx: Tx, type: NumberedDocumentType, value: string): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`document_number:${type}:${value}`}))`
+  if (await DOCUMENT_TYPE_SPECS[type].exists(tx, value)) throw new DocumentNumberTakenError(type, value)
+}
+
+/** Run `attempt` (mint, then the document's transaction) again with a fresh number when the number it minted was taken. */
+export async function retryWhenNumberTaken<T>(attempt: () => Promise<T>, tries = 5): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await attempt()
+    } catch (e) {
+      if (!(e instanceof DocumentNumberTakenError) || i >= tries) throw e
+    }
+  }
 }
 
 /** `mintDocumentNumber` for a type that always has a number (every type but a shipment). */

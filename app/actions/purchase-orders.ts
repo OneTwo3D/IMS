@@ -1,6 +1,6 @@
 'use server'
 
-import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
+import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -452,8 +452,8 @@ const ReceiptLineInputSchema = z.object({
  * transaction that writes the order: a counter pattern holds its row lock until that transaction ends. The configured
  * prefix is only what the default pattern starts with.
  */
-async function makeReference(tx: Prisma.TransactionClient, poPrefix: string): Promise<string> {
-  return mintRequiredDocumentNumber(tx, 'purchase_order', { fallbackPrefix: poPrefix })
+async function makeReference(poPrefix: string): Promise<string> {
+  return mintCommittedDocumentNumber((run) => db.$transaction(run), 'purchase_order', { fallbackPrefix: poPrefix })
 }
 
 /** The prefix the default purchase order pattern starts with. Read BEFORE a transaction opens: it takes a second connection. */
@@ -1502,10 +1502,13 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       }))
 
     const poPrefix = input.reference ? '' : await readPoPrefix()
-    const po = await db.$transaction(async (tx) => {
+    // A reference the numbering pattern gives is minted in a transaction of its own, committed first, so the numbering lock is never held across this order's transaction (a failed create leaves a gap in the sequence).
+    const po = await retryWhenNumberTaken(async () => {
+    const poReference = input.reference || await makeReference(poPrefix)
+    return db.$transaction(async (tx) => {
+    if (!input.reference) await claimDocumentNumber(tx, 'purchase_order', poReference)
     // A line's supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused, under the row share lock the apply waits on (lib/tax/writable-tax-rate.ts).
     await resolveLinesTaxRates(tx, lineData)
-    const poReference = input.reference || await makeReference(tx, poPrefix)
     return tx.purchaseOrder.create({
       data: {
         reference: poReference,
@@ -1539,6 +1542,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         }),
       },
       select: PO_SELECT,
+    })
     })
     })
 
@@ -5743,8 +5747,12 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     // too, so we never leave 'linked but unapplied' freight with no retry path
     // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
     const freightPrefix = await readPoPrefix()
-    const { po, landedResult } = await db.$transaction(
+    // The reference is minted in a transaction of its own, committed first, so the numbering lock is never held across the landed-cost recalculation below (a failed create leaves a gap in the sequence).
+    const { po, landedResult } = await retryWhenNumberTaken(async () => {
+    const freightReference = await makeReference(freightPrefix)
+    return db.$transaction(
       async (tx) => {
+        await claimDocumentNumber(tx, 'purchase_order', freightReference)
         // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): this transaction used to lock NOTHING before
         // `recalculateLandedCosts` rewrote the primaries' lines, their cost layers and every snapshot
         // naming them. Lock the scope FIRST — before the freight order and its links are inserted, so
@@ -5752,7 +5760,7 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
         await lockLandedCostRevaluationScope(tx, { primaryPoIds: input.primaryPoIds })
         const po = await tx.purchaseOrder.create({
           data: {
-            reference: await makeReference(tx, freightPrefix),
+            reference: freightReference,
             type: 'FREIGHT',
             supplierId: input.supplierId,
             currency: input.currency,
@@ -5788,6 +5796,7 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
       },
       STOCK_TX_OPTIONS,
     )
+    })
 
     // Revalidate linked primary POs
     for (const pid of landedResult.revalidatePoIds) {

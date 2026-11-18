@@ -141,7 +141,7 @@ import {
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
-import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
+import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
 import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
 import {
@@ -1383,7 +1383,12 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
     // order is finalised later (e.g. moved to PENDING_PAYMENT), the invoice
     // will be queued via updateSalesOrderStatus.
     const initialStatus = input.isDraft ? 'DRAFT' : 'PENDING_PAYMENT'
-    const so = await db.$transaction(async (tx) => {
+    // The number is minted in a transaction of its own, committed first, so the numbering lock is never held while this order's transaction queues its invoice through pooled connections.
+    // A failed create leaves a gap in the sequence (see mintCommittedDocumentNumber).
+    const so = await retryWhenNumberTaken(async () => {
+    const orderNumber = await mintCommittedDocumentNumber((run) => db.$transaction(run), 'sales_order', { fallbackPrefix: numbering.so_prefix })
+    return db.$transaction(async (tx) => {
+      await claimDocumentNumber(tx, 'sales_order', orderNumber)
       if (externalOrderNumber) {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`sales_orders.external_order_number:${externalOrderNumber}`}))`
         const existing = await tx.salesOrder.findFirst({
@@ -1401,8 +1406,6 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       await resolveLinesTaxRates(tx, lineData)
       // An erased customer is never linked to a new order (lock + re-read; see lib/domain/erasure/customer-link.ts).
       await lockCustomerForOrderLink(tx, input.customerId)
-      // Minted LAST, right before the write: a counter pattern holds its row lock until this transaction ends.
-      const orderNumber = await mintRequiredDocumentNumber(tx, 'sales_order', { fallbackPrefix: numbering.so_prefix })
       return tx.salesOrder.create({
         data: {
           externalOrderNumber,
@@ -1425,6 +1428,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
         return written
       })
     }, STOCK_TX_OPTIONS)
+    })
 
     const postCommitWarnings: string[] = []
     await logSalesOrderTaxWarnings(so, input, prepared)
@@ -4025,7 +4029,11 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     // refuses (the central lookup's "Missing <base> FX rate ..."); the base currency is 1.
     const fxRate = await resolveFxRateToBase(db, so.currency, await getBaseCurrencyCode(), new Date())
     const cloneNameWasActive = so.taxRateName ? (await db.taxRate.findFirst({ where: { name: so.taxRateName, active: true }, select: { id: true } })) !== null : false
-    const clone = await db.$transaction(async (tx) => {
+    // Numbered in a transaction of its own, committed first (see createSalesOrder); a failed clone leaves a gap.
+    const clone = await retryWhenNumberTaken(async () => {
+    ref = await mintCommittedDocumentNumber((run) => db.$transaction(run), 'sales_order', { fallbackPrefix: 'SO-' })
+    return db.$transaction(async (tx) => {
+    await claimDocumentNumber(tx, 'sales_order', ref)
     // A clone copies the source order's customer link AND its identity fields. Customer lock first (the erasure's order), then
     // the source order's lock; an erased customer or an erased source order is refused, never copied.
     await lockCustomerForOrderLink(tx, so.customerId)
@@ -4038,7 +4046,6 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     await lockOrderNamedTaxRate(tx, so.taxRateName, { lineRateIds: so.lines.map((l) => l.taxRateId), allowMissing: !cloneNameWasActive })
     const cloneRates = await resolveWritableTaxRateIds(tx, so.lines.map((l) => l.taxRateId))
     // A clone is numbered like any manual order. It has always started from "SO-" whatever the configured prefix, so the default keeps doing that; a pattern set in Settings applies to it like to every other manual order.
-    ref = await mintRequiredDocumentNumber(tx, 'sales_order', { fallbackPrefix: 'SO-' })
     return tx.salesOrder.create({
       data: {
         orderNumber: ref,
@@ -4088,6 +4095,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
           })),
         },
       },
+    })
     })
     })
 

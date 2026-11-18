@@ -27,7 +27,11 @@ mock.module('@/lib/domain/inventory/replenishment-reports', {
   },
 })
 // The reference is minted by the numbering module in the same transaction as the order; its own tests cover it. Here it is a fixed value.
-mock.module('@/lib/domain/numbering/mint', { namedExports: { mintRequiredDocumentNumber: async () => 'PO-20260101-TEST' } })
+mock.module('@/lib/domain/numbering/mint', { namedExports: {
+  mintCommittedDocumentNumber: async () => 'PO-20260101-TEST',
+  claimDocumentNumber: async () => undefined,
+  retryWhenNumberTaken: async (attempt: () => Promise<unknown>) => attempt(),
+} })
 const fakeDb: Record<string, unknown> = {
   $transaction: async (run: (tx: unknown) => Promise<unknown>) => run(fakeDb),
 }

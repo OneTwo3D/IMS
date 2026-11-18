@@ -16,6 +16,7 @@ import { config } from 'dotenv'
  *   arm 6  a period with documents in it is seeded from them; the credit-note counter the old code kept is carried over
  *   arm 7  a pattern with no counter is locked too, so concurrent random draws never collide ({RAND:1}); a shipment has no number until a pattern is set
  *   arm 9  credit notes numbered by an old-writer simulation and the new mint at the same time never repeat, and the legacy yearly counter is kept in step
+ *   arm 10 concurrent creates beyond a small connection pool finish with unique numbers when the number is minted in its own transaction, and no numbering lock is held while a document transaction does other work (the old shape is shown to hold it)
  *   arm 8  the uniqueness probe of every type runs against the real schema
  *
  * Nothing here reaches a network: WooCommerce, Mintsoft and Xero are not involved.
@@ -249,4 +250,89 @@ test('arm 9: a rolling deploy: old-writer and new-writer credit notes interleave
   const legacy = await w.db.setting.findUnique({ where: { key: `document_counter:credit_note:${year}` }, select: { value: true } })
   assert.equal(Number(legacy?.value), all.length, 'the yearly counter the old code reads stays in step')
   await w.db.setting.deleteMany({ where: { key: `document_counter:credit_note:${year}` } })
+})
+
+/** A client with a deliberately small pool and a short wait for a connection, so starvation shows as an error instead of a hang. */
+async function smallPoolClient(max: number) {
+  const [{ PrismaClient }, { PrismaPg }] = await Promise.all([import('@/app/generated/prisma/client'), import('@prisma/adapter-pg')])
+  return new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL!, max, connectionTimeoutMillis: 4000 }) })
+}
+
+test('arm 10: twelve concurrent creates on a pool of three finish, with unique numbers, when the number is minted in its own transaction', { skip: !RUN }, async () => {
+  const s = fresh()
+  const small = await smallPoolClient(3)
+  try {
+    for (const pattern of [`${s}-{SEQ}`, `${s}-{RAND:2}`]) {
+      await setPattern('sales_order', pattern)
+      const numbers = await Promise.all(Array.from({ length: 12 }, () => w.mint.retryWhenNumberTaken(async () => {
+        const orderNumber = await w.mint.mintCommittedDocumentNumber((run) => small.$transaction(run), 'sales_order')
+        return small.$transaction(async (tx) => {
+          await w.mint.claimDocumentNumber(tx, 'sales_order', orderNumber)
+          await tx.salesOrder.create({ data: order(orderNumber) })
+          return orderNumber
+        })
+      })))
+      assert.equal(new Set(numbers).size, 12, `${pattern}: ${numbers.join(' ')}`)
+    }
+  } finally {
+    await small.$disconnect()
+  }
+})
+
+/** Resolves true when `p` settles inside `ms`, false when it is still pending. */
+const settlesWithin = (p: Promise<unknown>, ms: number) => Promise.race([p.then(() => true, () => true), new Promise<boolean>((r) => setTimeout(() => r(false), ms))])
+
+test('arm 10b: while a document transaction is open and doing other work, no numbering lock is held: another number is minted at once', { skip: !RUN }, async () => {
+  const s = fresh()
+  for (const pattern of [`${s}-{SEQ}`, `${s}-{RAND:3}`]) {
+    await setPattern('sales_order', pattern)
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    let claimed!: () => void
+    const inWork = new Promise<void>((r) => { claimed = r })
+    const first = w.db.$transaction(async (tx) => {
+      const number = await w.mint.mintCommittedDocumentNumber((run) => w.db.$transaction(run), 'sales_order')
+      await w.mint.claimDocumentNumber(tx, 'sales_order', number)
+      await tx.salesOrder.create({ data: order(number) })
+      claimed()
+      await gate // the rest of the order's work: queuing its invoice, through pooled connections
+      return number
+    })
+    await inWork
+    const second = w.mint.mintCommittedDocumentNumber((run) => w.db.$transaction(run), 'sales_order')
+    assert.equal(await settlesWithin(second, 3000), true, `${pattern}: a second mint waited on the open document transaction`)
+    release()
+    assert.notEqual(await first, await second)
+  }
+})
+
+test('arm 10c: the old shape, the number minted inside the document transaction, holds the lock across that work (what the committed mint avoids)', { skip: !RUN }, async () => {
+  const s = fresh()
+  await setPattern('sales_order', `${s}-{SEQ}`)
+  let release!: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  let minted!: () => void
+  const inWork = new Promise<void>((r) => { minted = r })
+  const first = w.db.$transaction(async (tx) => {
+    const number = await w.mint.mintRequiredDocumentNumber(tx, 'sales_order')
+    minted()
+    await gate
+    return number
+  })
+  await inWork
+  const second = w.db.$transaction((tx) => w.mint.mintRequiredDocumentNumber(tx, 'sales_order'))
+  assert.equal(await settlesWithin(second, 1500), false, 'the second mint is blocked behind the open transaction')
+  release()
+  assert.notEqual(await first, await second)
+})
+
+test('arm 10d: a number another document already holds is refused at the claim, and the retry mints a fresh one', { skip: !RUN }, async () => {
+  const s = fresh()
+  await setPattern('sales_order', `${s}-{SEQ}`)
+  await w.db.salesOrder.create({ data: order(`${s}-1`) })
+  await assert.rejects(() => w.db.$transaction((tx) => w.mint.claimDocumentNumber(tx, 'sales_order', `${s}-1`)), (e: unknown) => e instanceof w.mint.DocumentNumberTakenError)
+  let calls = 0
+  const result = await w.mint.retryWhenNumberTaken(async () => { calls++; if (calls < 3) throw new w.mint.DocumentNumberTakenError('sales_order', 'x'); return 'done' })
+  assert.deepEqual([result, calls], ['done', 3])
+  await assert.rejects(() => w.mint.retryWhenNumberTaken(async () => { throw new w.mint.DocumentNumberTakenError('sales_order', 'x') }, 2), w.mint.DocumentNumberTakenError)
 })
