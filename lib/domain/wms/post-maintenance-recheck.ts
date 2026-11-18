@@ -99,6 +99,27 @@ async function isMaintenanceModeOn(): Promise<boolean> {
   return row?.value === 'true'
 }
 
+const RECHECK_CURSOR_KEY = 'wms_booked_in_recheck_cursor'
+
+type RecheckCursor = { after: string | null; owed: boolean }
+
+async function readCursor(windowEndedAt: string): Promise<RecheckCursor> {
+  const row = await db.setting.findUnique({ where: { key: RECHECK_CURSOR_KEY } })
+  if (!row?.value) return { after: null, owed: false }
+  try {
+    const parsed = JSON.parse(row.value) as { w?: string; after?: string | null; owed?: boolean }
+    if (parsed.w !== windowEndedAt) return { after: null, owed: false }
+    return { after: typeof parsed.after === 'string' ? parsed.after : null, owed: parsed.owed === true }
+  } catch {
+    return { after: null, owed: false }
+  }
+}
+
+async function writeCursor(windowEndedAt: string, cursor: RecheckCursor): Promise<void> {
+  const value = JSON.stringify({ w: windowEndedAt, after: cursor.after, owed: cursor.owed })
+  await db.setting.upsert({ where: { key: RECHECK_CURSOR_KEY }, create: { key: RECHECK_CURSOR_KEY, value }, update: { value } })
+}
+
 export type PostMaintenanceRecheckDeps = {
   recheckAsn: (externalAsnId: string, options: { reason: string; respectRetryDelay?: boolean }) => Promise<unknown>
 }
@@ -122,15 +143,18 @@ export async function runPostMaintenanceBookedInRecheck(
   // Open ASNs only, and NOT the ones that were never verifiably created in the WMS — a synthetic
   // external id has nothing to re-read, so a re-check would fetch a shipment that does not exist.
   // Same exclusion, and the same reason, as the watchdog's overdue query.
+  // A KEYSET CURSOR, persisted across ticks. Always taking the first page would starve every ASN beyond it for as
+  // long as the first page keeps failing or waiting (an expired key does exactly that): the pass never got past them.
+  // The cursor is tied to the window it was written for, so a new window starts from the beginning.
+  const cursor = await readCursor(windowEndedAt)
   const openAsns = await db.wmsAsnMap.findMany({
     where: {
       connector: connectorId,
       closedAt: null,
       status: { notIn: ['CREATE_PENDING', 'CREATE_IN_FLIGHT'] },
+      ...(cursor.after ? { externalAsnId: { gt: cursor.after } } : {}),
     },
-    // Oldest first: if the page truncates, the ASNs that have been waiting longest go first rather
-    // than whichever the planner happened to return.
-    orderBy: { createdAt: 'asc' },
+    orderBy: { externalAsnId: 'asc' },
     take: pageSize + 1,
     select: { externalAsnId: true },
   })
@@ -180,7 +204,17 @@ export async function runPostMaintenanceBookedInRecheck(
   // Keep the marker when anything is still owed — a truncated page, an attempt that threw, or a
   // window that reopened. The next tick repeats the pass; a re-check of an ASN with nothing
   // outstanding books nothing in, so repeating is cheap and losing an ASN is not.
-  const complete = !truncated && failed === 0 && deferred === 0 && !reopened
+  const owedThisPass = cursor.owed || failed > 0 || deferred > 0
+  // Drain only when a FULL pass (every page, from the start) found nothing outstanding.
+  const complete = !truncated && !owedThisPass && !reopened
+  if (!reopened) {
+    if (truncated) {
+      await writeCursor(windowEndedAt, { after: candidates[candidates.length - 1]!.externalAsnId, owed: owedThisPass })
+    } else if (owedThisPass) {
+      // End of the list with work still owed: the next tick starts a fresh pass from the beginning.
+      await writeCursor(windowEndedAt, { after: null, owed: false })
+    }
+  }
   let drained = false
   let refusal: PostMaintenanceRecheckResult['refusal'] = reopened ? 'window_reopened' : undefined
   if (complete) {

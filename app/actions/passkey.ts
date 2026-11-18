@@ -148,10 +148,10 @@ export async function verifyPasskeyRegistration(
 // each call stores its challenge under its OWN random ceremony key. A shared key (the old `auth:discoverable`
 // or `auth:<email>`) let any unauthenticated caller overwrite and so invalidate every login in flight.
 //
-// Because each call now writes its own row, issuance is bounded: a per-IP rate limit, a cap on outstanding
-// (unexpired) ceremonies, and expired ones are pruned on issue.
+// Because each call now writes its own row, issuance is bounded by the per-IP rate limit below (at most that many rows
+// per IP per TTL) and expired ones are pruned on issue. There is deliberately NO global cap on outstanding ceremonies:
+// anonymous callers could fill it and lock every user out of passkey sign-in.
 const PASSKEY_CEREMONY_TTL_MS = 5 * 60_000
-const PASSKEY_MAX_OUTSTANDING_CEREMONIES = 1000
 const PASSKEY_ISSUE_IP_MAX = 30
 // Without trusted-proxy resolution every client collapses onto the proxy's address, so the per-IP bucket is
 // really a global one and must be wide enough not to lock a whole office out.
@@ -176,12 +176,6 @@ export async function getPasskeyAuthenticationOptions() {
   await db.oneTimeToken.deleteMany({
     where: { key: { startsWith: PASSKEY_CHALLENGE_KEY_PREFIX }, expiresAt: { lt: now } },
   })
-  const outstanding = await db.oneTimeToken.count({
-    where: { key: { startsWith: PASSKEY_CHALLENGE_KEY_PREFIX }, expiresAt: { gte: now } },
-  })
-  if (outstanding >= PASSKEY_MAX_OUTSTANDING_CEREMONIES) {
-    return { error: 'Sign-in is busy. Please try again in a few minutes.' }
-  }
   const challengeKey = `auth:${randomBytes(16).toString('hex')}`
 
   const options = await generateAuthenticationOptions({

@@ -4,7 +4,7 @@ import test, { mock } from 'node:test'
 /**
  * Passkey challenge issuance is public. Each call stores its challenge under its own ceremony key, so an
  * anonymous caller cannot invalidate a login in flight; and because each call writes a row, issuance is bounded
- * (per-IP rate limit, cap on outstanding ceremonies, expired rows pruned on issue).
+ * (per-IP rate limit, expired rows pruned on issue; deliberately no global cap, which would be a lockout).
  */
 process.env.TRUSTED_PROXY_IPS = '10.0.0.1'
 
@@ -67,15 +67,13 @@ test('issuance is rate limited per IP, and another IP is unaffected', async () =
   assert.ok('challengeKey' in (await issue()), 'a different IP has its own bucket')
 })
 
-test('outstanding ceremonies are capped, and expired rows are pruned on every issue', async () => {
+test('there is no global cap: many outstanding ceremonies from other IPs never lock a new user out; expired rows are pruned on issue', async () => {
   currentIp = '203.0.113.30'
   pruneCalls.length = 0
-  forcedOutstanding = 1000
-  const refused = await issue()
-  assert.ok('error' in refused)
-  assert.equal(pruneCalls.length, 1, 'prune ran before the count')
+  forcedOutstanding = 5000 // a huge pile of outstanding rows from elsewhere
+  const result = await issue()
+  assert.ok('challengeKey' in result, 'issuance must not depend on how many ceremonies other callers hold')
+  assert.equal(pruneCalls.length, 1, 'prune ran on issue')
   assert.match(JSON.stringify(pruneCalls[0]), /passkey_challenge:auth:/)
   forcedOutstanding = null
-  currentIp = '203.0.113.31'
-  assert.ok('challengeKey' in (await issue()))
 })
