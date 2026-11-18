@@ -2,6 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 
 import { db } from '@/lib/db'
+import { wmsAsnAwaitingUnitsWhere } from '@/lib/domain/wms/asn-awaiting-units'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   loadPurchaseOrderLineOutstandingQty,
@@ -17,8 +18,9 @@ import {
 const OPEN_PO_STATUSES = INCOMING_PO_STATUSES
 const OPEN_PRODUCTION_STATUSES = ['DRAFT', 'IN_PROGRESS'] as const
 // Only WMS-confirmed ASNs count as incoming stock. Pre-confirmation create states
-// can dead-letter indefinitely and should not block EOL auto-archive forever.
-const OPEN_WMS_ASN_STATUSES = ['OPEN', 'PARTIALLY_BOOKED_IN'] as const
+// can dead-letter indefinitely and should not block EOL auto-archive forever. BOOKED_IN with
+// closedAt null still counts: the warehouse status is written before the receipt is applied
+// (see lib/domain/wms/asn-awaiting-units.ts).
 
 export type ProductIncomingStockBreakdown = {
   purchaseOrders: string
@@ -90,7 +92,7 @@ export async function getProductIncomingStock(
     client.wmsAsnLineMap.findMany({
       where: {
         productId,
-        asn: { status: { in: [...OPEN_WMS_ASN_STATUSES] } },
+        asn: wmsAsnAwaitingUnitsWhere(),
       },
       // `sourceType`/`sourceLineId` so an ASN row that MIRRORS a transfer line this
       // function is already counting can be told apart from one that stands alone

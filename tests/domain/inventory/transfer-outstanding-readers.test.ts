@@ -70,12 +70,12 @@ function makeAsnDelegate(rows: AsnRow[], openRows: AsnRow[] = rows) {
           sourceType?: string
           sourceLineId?: { in: string[] } | string
           productId?: string
-          asn?: { status: { in: string[] } }
+          asn?: { OR: [{ status: { in: string[] } }, { status: string; closedAt: null }] }
         }
       }) => {
         const where = args.where
         if (where.asn) {
-          readerLookups.push(where.asn.status.in)
+          readerLookups.push(where.asn.OR[0].status.in)
           return openRows.map((row) => ({
             sourceType: row.sourceType,
             sourceLineId: row.sourceLineId,

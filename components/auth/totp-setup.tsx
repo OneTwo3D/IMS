@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label'
 import { Alert } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Loader2, ShieldCheck, ShieldOff } from 'lucide-react'
+import { useStepUpReauth } from '@/components/auth/use-step-up-reauth'
 
 type Step = 'idle' | 'setup' | 'confirm' | 'disable'
 
@@ -23,11 +24,23 @@ export function TotpSetup({ enabled }: TotpSetupProps) {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [success, setSuccess] = useState('')
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+
+  // Setup endpoints answer 403 fresh_auth_required for a stale session: re-authenticate
+  // via the step-up dialog and retry the request once.
+  async function fetchWithStepUp(input: string, init?: RequestInit): Promise<Response> {
+    const first = await fetch(input, init)
+    if (first.status !== 403) return first
+    const body = await first.clone().json().catch(() => null)
+    if (body?.code !== 'fresh_auth_required') return first
+    if (!(await promptReauth())) return first
+    return fetch(input, init)
+  }
 
   async function startSetup() {
     setLoading(true)
     setError('')
-    const res = await fetch('/api/auth/totp-setup')
+    const res = await fetchWithStepUp('/api/auth/totp-setup')
     const data = await res.json()
     setLoading(false)
     if (!res.ok) { setError(data.error); return }
@@ -39,7 +52,7 @@ export function TotpSetup({ enabled }: TotpSetupProps) {
   async function confirmSetup() {
     setLoading(true)
     setError('')
-    const res = await fetch('/api/auth/totp-setup', {
+    const res = await fetchWithStepUp('/api/auth/totp-setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code }),
@@ -73,6 +86,7 @@ export function TotpSetup({ enabled }: TotpSetupProps) {
 
   return (
     <div className="rounded-lg border p-6 space-y-4">
+      {stepUpDialog}
       <div className="flex items-center justify-between">
         <h2 className="font-semibold">Two-factor authentication</h2>
         <Badge variant={enabled ? 'default' : 'secondary'}>

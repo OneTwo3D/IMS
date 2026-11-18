@@ -3914,14 +3914,17 @@ function stagedAReversal(syncs: RefundAccountingSyncRequest[]): boolean {
   return syncs.some((sync) => sync.type === 'COGS_REVERSAL' || sync.type === 'UNEARNED_REV_REVERSAL')
 }
 
-/** Statuses in which an operator-typed refund is refused: no sale has been booked, so there is nothing to return and no invoice to credit. */
-const MANUAL_REFUND_REFUSED_STATUSES: ReadonlySet<string> = new Set(['DRAFT', 'PENDING_PAYMENT'])
-
-export function manualRefundStatusRefusal(status: string): string | null {
-  if (MANUAL_REFUND_REFUSED_STATUSES.has(status)) {
-    return status === 'DRAFT'
-      ? 'A draft order has not been booked, so it cannot be refunded. Cancel or delete the draft instead.'
-      : 'This order is still waiting for payment, so it cannot be refunded. Cancel the order instead.'
+/**
+ * An operator-typed refund needs a booked sale. A DRAFT never has one. A PENDING_PAYMENT order is refused only while it carries no recorded payment, receipt (`paidAt`) or invoice:
+ * `addPayment` never moves an order's status, so a confirmed order can hold real money while still PENDING_PAYMENT, and that money must stay refundable (cancelling it would be terminal and unrefundable).
+ */
+export function manualRefundStatusRefusal(
+  status: string,
+  booked: { hasPayment: boolean; hasInvoice?: boolean; paidAt?: Date | null } = { hasPayment: false },
+): string | null {
+  if (status === 'DRAFT') return 'A draft order has not been booked, so it cannot be refunded. Delete the draft instead.'
+  if (status === 'PENDING_PAYMENT' && !booked.hasPayment && !booked.hasInvoice && !booked.paidAt) {
+    return 'This order is still waiting for payment and has no recorded payment or receipt, so there is nothing to refund. Delete the order if it was created in error; if a payment has been received, record it first.'
   }
   return null
 }
@@ -4096,6 +4099,8 @@ export async function createSalesOrderRefund(
         externalOrderNumber: true,
         orderNumber: true,
         status: true,
+        paidAt: true,
+        invoiceNumber: true,
         refundStatus: true,
         fxRateToBase: true,
         totalBase: true,
@@ -4151,7 +4156,8 @@ export async function createSalesOrderRefund(
     if (foreignLine) return { error: `Refund line "${foreignLine.description ?? foreignLine.lineId}" names an order line that does not belong to this order.` } as const
     // An operator-typed (manual) refund needs a booked sale: a draft or an order still waiting for payment has nothing to return and no invoice to credit. Internal callers (storefront, chargeback) are unchanged.
     if (input.deriveSaleLineNetsFromStoredBalance) {
-      const stateRefusal = manualRefundStatusRefusal(so.status)
+      const paymentRows = await tx.payment.count({ where: { orderId: input.orderId, refundId: null } })
+      const stateRefusal = manualRefundStatusRefusal(so.status, { hasPayment: paymentRows > 0, hasInvoice: !!so.invoiceNumber, paidAt: so.paidAt })
       if (stateRefusal) return { error: stateRefusal } as const
     }
 

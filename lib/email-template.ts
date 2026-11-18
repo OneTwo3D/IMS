@@ -3,7 +3,7 @@ import type { Branding } from '@/lib/pdf'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { formatDateTime } from '@/lib/format-datetime'
 
-export type EmailTemplateType = 'invoice' | 'sales_order' | 'purchase_order' | 'rfq' | 'credit_note' | 'packing_slip' | 'manufacturing_order'
+export type EmailTemplateType = 'invoice' | 'sales_order' | 'quote' | 'purchase_order' | 'rfq' | 'credit_note' | 'packing_slip' | 'manufacturing_order'
 
 type EmailData = {
   recipientName: string
@@ -41,6 +41,18 @@ const SAMPLE_DATA: Record<EmailTemplateType, EmailData> = {
       'Thank you for your order SO-2026-00107.',
       'We\'re processing your order and will notify you once it has been dispatched.',
       'Your order total is £533.49.',
+    ],
+  },
+  quote: {
+    recipientName: 'John Smith',
+    recipientEmail: 'john@acme-mfg.co.uk',
+    reference: 'SO-2026-00108',
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }),
+    subject: 'Quotation SO-2026-00108',
+    bodyLines: [
+      'Thank you for your enquiry. Please find our quotation SO-2026-00108 attached, for £533.49.',
+      'The prices in this quotation are valid until 31 December 2026.',
+      'If you would like to go ahead, or have any questions, please reply to this email.',
     ],
   },
   purchase_order: {
