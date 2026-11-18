@@ -95,6 +95,27 @@ export class SalesInvoiceExtraNotMappedError extends SalesInvoiceDoesNotReconcil
   }
 }
 
+/**
+ * A reverse-charge line with no reverse-charge sales tax type configured (o3d-hqvrp.53). The swap is what moves the line off
+ * its taxable code; with the setting empty the line would keep that code and the ledger would add VAT that the reconciliation
+ * models at 0%. Refused rather than posted on the wrong code. Still a reconciliation refusal, so every caller that refuses a mismatch refuses this.
+ */
+export class SalesInvoiceReverseChargeSwapNotSetError extends SalesInvoiceDoesNotReconcileError {
+  constructor(currency: string) {
+    super({ expected: 0, orderTotal: 0, difference: 0 }, currency)
+    this.message = 'This order has a reverse-charge line, but no reverse-charge sales tax type is set in the accounting settings, so the line would post on its taxable code and the ledger would add VAT to it. It was not queued and the order was not moved or saved. The reverse-charge sales tax type is set under Settings, Accounting.'
+    this.name = 'SalesInvoiceReverseChargeSwapNotSetError'
+  }
+}
+
+/** True when any line is reverse-charge and the swap setting is empty. */
+export function reverseChargeSwapMissing(
+  lines: ReadonlyArray<{ taxRate?: { reverseCharge?: boolean | null } | null }>,
+  reverseChargeSalesTaxType: string | null | undefined,
+): boolean {
+  return !reverseChargeSalesTaxType?.trim() && lines.some((l) => l.taxRate?.reverseCharge === true)
+}
+
 /** The accounting queue declined the invoice (`reason`): inside the transaction that moves the order this rolls everything back. Not a reconciliation mismatch, so not a subclass. */
 export class SalesInvoiceNotQueuedError extends Error {
   constructor(public readonly reason: string) {

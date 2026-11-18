@@ -1969,6 +1969,7 @@ function reconcileWcDocumentWithOrder(
   resolution: Awaited<ReturnType<typeof resolveWcOrderTaxResolution>>,
   shippingForeign: ReturnType<typeof mapWcShipping>['shippingForeign'],
   currency: string,
+  reverseChargeSalesTaxType: string | null | undefined,
 ) {
   const { wcResolvedById, lineTaxResolved, accountingTaxType, taxRateValue, orderDefaultTaxRateId } = resolution
   const orderMoneyDigits = currencyMinorUnits(currency)
@@ -2013,8 +2014,14 @@ function reconcileWcDocumentWithOrder(
         .map((d) => `${d.label}: document ${d.modelledTax.toFixed(orderMoneyDigits)} vs WooCommerce ${d.reportedTax.toFixed(orderMoneyDigits)}`)
         .join('; ')
     : null
-  const unreconciledReason = [taxMismatchReason, rateMoneyRefusal].filter((r): r is string => r !== null).join(' ') || null
-  const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles && rateMoneyRefusal === null
+  // o3d-hqvrp.53: the reconciliation above models a reverse-charge line at 0%, but with no reverse-charge sales
+  // tax type configured the document would keep the line's TAXABLE code, so Xero would add VAT the model assumed
+  // away. Stamp the document (held, not posted) instead of posting it on the wrong code.
+  const reverseChargeSwapRefusal = !reverseChargeSalesTaxType && lineTaxResolved.some((l, idx) => mappedLines[idx] && l?.reverseCharge)
+    ? `Order ${wcOrder.number} has a reverse-charge line but no reverse-charge sales tax type is configured, so the line would post on its taxable code while the reconciliation models it at 0%. Set the reverse-charge sales tax type in the accounting settings.`
+    : null
+  const unreconciledReason = [taxMismatchReason, rateMoneyRefusal, reverseChargeSwapRefusal].filter((r): r is string => r !== null).join(' ') || null
+  const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles && rateMoneyRefusal === null && reverseChargeSwapRefusal === null
   return { shippingTax, documentTaxReconciliation, rateMoneyRefusal, documentTotalsToTheOrder, taxMismatchReason, unreconciledReason }
 }
 
@@ -2202,7 +2209,7 @@ async function buildFreshWcSalesInvoice(p: {
   const { currency, mappedLines, coupons, amounts, settings, accounts } = p.inputs
   const resolution = await resolveWcOrderTaxResolution(wcOrder, mappedLines)
   const shippingForeign = mapWcShipping(wcOrder).shippingForeign
-  const rec = reconcileWcDocumentWithOrder(wcOrder, mappedLines, resolution, shippingForeign, currency)
+  const rec = reconcileWcDocumentWithOrder(wcOrder, mappedLines, resolution, shippingForeign, currency, settings.reverseChargeSalesTaxType)
   const types = await resolveWcInvoiceTaxTypes({ wcOrder, mappedLines, resolution, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, shippingForeign, currency })
   const ratesNow = await currentTaxRates(db, [...resolution.lineTaxResolved.map((r) => r.taxRateId), rec.shippingTax.taxRateId, resolution.orderDefaultTaxRateId])
   // What Xero also reads, derived as the importer derives it: the invoice date and the payment method and date from the order; the exchange-rate stamp from the order's STORED rate, and the receipt's identity and settlement rate from the receipt
@@ -2370,7 +2377,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   }
 
   if (marker?.applied === true && UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
-    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency)
+    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency, settings.reverseChargeSalesTaxType)
     return now.unreconciledReason !== null ? await refuse(`the document still does not total the order: ${now.unreconciledReason}`) : await refuseChanged('it was held and treated while its tax did not reconcile, and now does')
   }
   if (marker?.applied === true) {
@@ -2385,7 +2392,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   // then the stamp is removed and the payment legs are rebuilt as the importer builds them for a document that totals the order, and the checks and the treatment below run on that payload. A marker is never carried into a release.
   let parkedPayload: Record<string, unknown> = held.accountingPayload
   if (UNRECONCILED_TAX_PAYLOAD_KEY in held.accountingPayload) {
-    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency)
+    const now = reconcileWcDocumentWithOrder(wcOrder, mappedLines, await resolveWcOrderTaxResolution(wcOrder, mappedLines), mapWcShipping(wcOrder).shippingForeign, currency, settings.reverseChargeSalesTaxType)
     if (now.unreconciledReason !== null) return await refuse(`the document still does not total the order: ${now.unreconciledReason}`)
     // A hold treated while it carried the stamp cannot be un-treated: it needs its invoice rebuilt.
     if (marker?.applied === true) return await refuseChanged('it was held and treated while its tax did not reconcile, and now does')
@@ -3603,7 +3610,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // one, and an absent field threw a bare TypeError out of `currencyMinorUnits` here rather than
     // refusing anywhere an operator could see it.
     const orderMoneyDigits = currencyMinorUnits(currency)
-    const { shippingTax, documentTaxReconciliation, rateMoneyRefusal, documentTotalsToTheOrder, unreconciledReason } = reconcileWcDocumentWithOrder(wcOrder, mappedLines, taxResolution, shippingForeign, currency)
+    const reverseChargeSalesTaxTypeNow = (await (await import('@/lib/accounting')).getAccountingSettings()).reverseChargeSalesTaxType
+    const { shippingTax, documentTaxReconciliation, rateMoneyRefusal, documentTotalsToTheOrder, unreconciledReason } = reconcileWcDocumentWithOrder(wcOrder, mappedLines, taxResolution, shippingForeign, currency, reverseChargeSalesTaxTypeNow)
 
     // GBP conversions
     const subtotalBase = divideRoundedNumber(subtotalForeign, fxRate, 4)

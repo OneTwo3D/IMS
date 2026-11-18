@@ -135,7 +135,7 @@ import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExt
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import { matchContinuedOrderLines } from '@/lib/domain/sales/order-edit-lines'
 import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -2053,6 +2053,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   if (!so) return
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return
+  if (reverseChargeSwapMissing(so.lines, settings.reverseChargeSalesTaxType)) throw new SalesInvoiceReverseChargeSwapNotSetError(so.currency)
   const multiComponentRateNames = multiComponentTaxRateNames(so.lines)
   if (multiComponentRateNames.length > 0 && !options?.checkOnly) {
     await logActivity({

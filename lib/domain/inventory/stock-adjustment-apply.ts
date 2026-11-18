@@ -1,7 +1,9 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { queueAccountingSyncTxWithOutcome, getAccountingSettings } from '@/lib/accounting'
 import { withSavepoint } from '@/lib/db/savepoint'
-import type { PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { logActivity } from '@/lib/activity-log'
+import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost, lockStockLevelRow } from '@/lib/cost-layers'
 import { assertStockAdjustmentFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
@@ -303,6 +305,54 @@ export async function applyStockAdjustment({
     tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
   ])
 
+  // o3d-hqvrp.47: a valued adjustment with NO account to post against (no reason, a reason with no account,
+  // or no inventory account mapped) changed the cost layers and posted nothing, silently. Record the owed
+  // posting the way every other refused producer does, so the ledger gap shows in the exception inbox.
+  // Only when an accounting connector is active: with none, nothing is owed (the same `not-configured` rule).
+  // The one identity of this movement's journal: the enqueue below and the owed-posting row both take it.
+  const journalIdentity = { type: 'INVENTORY_ADJUSTMENT' as const, referenceType: 'StockMovement', referenceId: movement.id }
+  const adjustmentValueBase = isAddition
+    ? Math.abs(qty) * (additionUnitCost ?? 0)
+    : (removalCostBase ?? 0)
+  const adjustmentHasValue = qty !== 0 && Math.round(Math.abs(adjustmentValueBase) * 100) !== 0
+  if (adjustmentHasValue) {
+    const unmappedSettings = providedSettings ?? await getAccountingSettings()
+    if (unmappedSettings.connector && (!accountCode || !unmappedSettings.inventoryAccount)) {
+      // No enqueue ran (there was no journal to build), so there is no answer to forward: the outstanding row is
+      // recorded directly, in the caller's transaction, under the key the journal would have been queued under.
+      const unmapped = !accountCode ? 'reason_account' : 'inventory_account'
+      const postingDescription = `the inventory adjustment journal for ${product?.sku ?? productId} at ${warehouse?.name ?? warehouseId}`
+      const remedy = !accountCode
+        ? 'The adjustment has no reason, or its reason has no account, so no journal was built. Inventory in the '
+          + 'ledger no longer matches IMS by the value of this adjustment. Post the journal by hand.'
+        : 'No inventory account is mapped, so no journal was built. Inventory in the ledger no longer matches IMS '
+          + 'by the value of this adjustment. Post the journal by hand.'
+      await recordAccountingPostingRefusal(
+        tx as unknown as PostingRefusalClient,
+        accountingPostingKey(journalIdentity),
+        {
+          kind: 'stock_adjustment_journal',
+          chartConnector: unmappedSettings.connector,
+          activeConnector: unmappedSettings.connector,
+          reason: `unmapped_${unmapped}`,
+          committed: 'the stock movement and its cost layers are written in IMS',
+          remedy,
+          detail: { movementId: movement.id, productId, warehouseId, unmapped },
+        },
+        { withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn) },
+      )
+      await logActivity({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: movement.id,
+        action: 'inventory_adjustment_journal_not_queued',
+        tag: 'accounting',
+        level: 'ERROR',
+        description: `NOTHING WAS QUEUED for ${postingDescription}: ${remedy}`,
+        metadata: { movementId: movement.id, productId, warehouseId, unmapped },
+      }).catch(() => { /* a report that cannot be written must not fail the adjustment */ })
+    }
+  }
+
   if (accountCode) {
     const settings = providedSettings ?? await getAccountingSettings()
     // Value the GL journal at the value the movement/cost-layer actually booked so
@@ -331,9 +381,7 @@ export async function applyStockAdjustment({
       // outstanding posting, or a queued journal, for a stock movement that never existed. Written through
       // `tx`, the sync row and the refusal row share the movement's fate.
       const enqueued = await queueAccountingSyncTxWithOutcome(tx, {
-        type: 'INVENTORY_ADJUSTMENT',
-        referenceType: 'StockMovement',
-        referenceId: movement.id,
+        ...journalIdentity,
         payload: journal as unknown as Record<string, unknown>,
         // o3d-j625: `inventoryAccountCode` on the journal is `settings.inventoryAccount`. The window is
         // wider here than at a single call site, because `providedSettings` is read ONCE for a whole

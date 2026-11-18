@@ -304,8 +304,8 @@ test('o3d-jit6 r4 (MEDIUM): what is posted is the body that was validated, froze
     Narration: 'COGS',
     Date: '2026-08-22',
     JournalLines: [
-      { LineAmount: 40, AccountCode: '310', Description: 'COGS' },
-      { LineAmount: -40, AccountCode: '630', Description: 'Inventory' },
+      { LineAmount: 40, AccountCode: '310', Description: 'COGS', TaxType: 'NONE' },
+      { LineAmount: -40, AccountCode: '630', Description: 'Inventory', TaxType: 'NONE' },
     ],
     Status: 'POSTED',
   })
