@@ -43,22 +43,14 @@ export const EVIDENCE_CONTESTS: Readonly<Record<WritersCheckEvidenceKey, readonl
 }
 
 /**
- * Which destination operations each ACTIVE incumbent plugin contests, as the storefront's helper plugin reports it (GET /oti/v1/incumbents).
- * A plugin being switched on while IMS can write one of these is a double claim whatever the ownership map says: this is the check that
- * refuses a claim of ownership while the legacy bridge is still running, before any customer sees a duplicate email.
+ * Which writer name in the ownership map each incumbent plugin (as the storefront's helper plugin reports it, GET /oti/v1/incumbents) is.
+ * The operations an active plugin contests are DERIVED from the map (see `incumbentPluginContests` in lib/ops/writers-check.ts), not listed here.
  */
-export const INCUMBENT_PLUGIN_CONTESTS: Readonly<Record<'legacy_bridge' | 'xeroom' | 'ioss_xero', readonly string[]>> = {
-  legacy_bridge: [
-    'mintsoft.order.create',
-    'woocommerce.order.status',
-    'woocommerce.order.tracking',
-    'woocommerce.order.partial-shipment',
-    'woocommerce.order.wms-status-meta',
-    'woocommerce.product.meta',
-  ],
-  xeroom: ['woocommerce.order.invoice-note', 'woocommerce.order.invoice-document'],
-  ioss_xero: ['woocommerce.order.invoice-note', 'woocommerce.order.invoice-document'],
-}
+export const INCUMBENT_PLUGIN_MAP_OWNER = {
+  legacy_bridge: 'woo-mintsoft-plugin',
+  xeroom: 'xeroom',
+  ioss_xero: 'o3d-ioss-xero',
+} as const
 
 /** Rows IMS must never own in any phase (the incumbent keeps SALES invoicing for good): an `IMS` owner here is a defect in the map. */
 export const IMS_FORBIDDEN_OWNERSHIP_ROWS: readonly string[] = [
@@ -100,14 +92,14 @@ export const WRITERS_CHECK_CANNOT_SEE: readonly string[] = [
   'what Qoblex, Aelia, an operator working by hand or a Mintsoft channel writes: they leave no evidence IMS reads, so for their operations only the ownership map and IMS\'s own switches are checked',
   'an order whose evidence write did not finish: the import does not wait for it, so a write that timed out and could not log that it did, or that was still running when the process stopped, leaves no trace',
   'anything that changes after the report was taken: the check is a snapshot that detects a shared destination, it does not stop either writer, so only the periodic record narrows the gap',
-  'Xero documents that IMS never tried to post under (no new Xero call is made: the check reads only IMS\'s own database and environment)',
+  'Xero documents that IMS never tried to post under (no new Xero call is made)',
 ]
 
 export const WRITERS_CHECK_BLOCK_ID = 'writers-check' as const
 
 export function renderWritersCheckDocBlock(): string {
   return [
-    `\`${WRITERS_CHECK_COMMAND} [-- --window-days N] [-- --json]\` is the coexistence interlock: it fails (non-zero) when two writers claim one destination operation in the current phase. It is read-only: it reads the environment and IMS's own database, makes no call to Xero, Mintsoft or WooCommerce, and writes nothing. For every operation in the ownership map it works out whether IMS could write it right now (the operation's settings, the plugin switch and the destination's grant all on, and, for a destination named in the enforcement variable, a producer decision that is not SHADOW), and compares that with the owner the map gives for the installation's current phase and with the incumbent evidence IMS holds. It fails when IMS can write an operation that another writer owns (an operation reached only by an operator button is a warning, stated in the report, while the map gives it to the operator, and fails like any other once the map gives it to another writer) (or that nobody has decided: an \`unknown\` owner), when the ownership map gives IMS an operation it must never own (the Xero sales documents), and when IMS can create a Mintsoft order while orders paid since the live-from instant still carry the bridge plugin's warehouse-order id. Evidence older than the live-from instant, or (with no instant) older than the window (default ${WRITERS_CHECK_DEFAULT_WINDOW_DAYS} days, \`--window-days\`), is not counted, nor is anything dated after the moment the report is taken, and an order with no readable paid time is reported but never counted, because IMS cannot create an unpaid order.`,
+    `\`${WRITERS_CHECK_COMMAND} [-- --window-days N] [-- --json]\` is the coexistence interlock: it fails (non-zero) when two writers claim one destination operation in the current phase. It is read-only and writes nothing: it reads the environment and IMS's own database, makes no call to Xero or Mintsoft, and makes ONE signed read-only GET to the connected WooCommerce store (the helper plugin's /oti/v1/incumbents route) to ask which incumbent plugins are active. The hourly scheduled job therefore makes that one call every hour; an installation that carries the production store URL and secret (a rehearsal or a clone) would make it to the LIVE store, so clear the WooCommerce URL or secret there. A store that cannot be asked, or an installation that does not ask, is reported as unreadable, never as inactive. For every operation in the ownership map it works out whether IMS could write it right now (the operation's settings, the plugin switch and the destination's grant all on, and, for a destination named in the enforcement variable, a producer decision that is not SHADOW), and compares that with the owner the map gives for the installation's current phase and with the incumbent evidence IMS holds. It fails when IMS can write an operation that another writer owns (an operation reached only by an operator button is a warning, stated in the report, while the map gives it to the operator, and fails like any other once the map gives it to another writer) (or that nobody has decided: an \`unknown\` owner), when the ownership map gives IMS an operation it must never own (the Xero sales documents), and when IMS can create a Mintsoft order while orders paid since the live-from instant still carry the bridge plugin's warehouse-order id. Evidence older than the live-from instant, or (with no instant) older than the window (default ${WRITERS_CHECK_DEFAULT_WINDOW_DAYS} days, \`--window-days\`), is not counted, nor is anything dated after the moment the report is taken, and an order with no readable paid time is reported but never counted, because IMS cannot create an unpaid order.`,
     '',
     renderWritersCheckExitTable(),
     '',

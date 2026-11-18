@@ -9,7 +9,8 @@ import { cronOutcome } from '@/lib/ops/cron-outcomes'
 export const runtime = 'nodejs'
 
 // Called by cron with Authorization: Bearer $CRON_SECRET. Read-only toward every vendor: it evaluates the environment and
-// IMS's own database and keeps the report in the activity log.
+// IMS's own database and keeps the report in the activity log; its one outbound call is a signed read-only GET to the
+// connected WooCommerce store's helper plugin, once per run (see readIncumbentPluginsFromWc).
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr

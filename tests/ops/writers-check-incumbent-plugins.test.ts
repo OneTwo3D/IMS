@@ -35,52 +35,66 @@ function inputs(overrides: Partial<WritersCheckInputs> = {}): WritersCheckInputs
   }
 }
 
-test('precondition: with the plugins reported inactive the live WooCommerce installation is clean and IMS can write the writeback', () => {
-  const report = evaluateWritersCheck(inputs({ incumbentPlugins: { state: 'read', active: NONE } }))
+const ALL_PLUGINS = { legacy_bridge: true, xeroom: true, ioss_xero: true }
+const MINTSOFT_LIVE_ENV = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', MINTSOFT_WRITES_LIVE_FROM: CUTOFF, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'mintsoft' }
+const WOO_SETTINGS = new Map([['wc_stock_sync_enabled', 'true'], ['wc_invoice_document_enabled', 'true'], ['trackship_refire_enabled', 'true']])
+const subjects = (report: ReturnType<typeof evaluateWritersCheck>, code: string) => report.findings.filter((f) => f.code === code).map((f) => f.subject).sort()
+
+test('P1 (nothing granted): the map gives IMS nothing the plugins write, so every plugin ACTIVE is clean', () => {
+  const report = evaluateWritersCheck(inputs({ env: {}, settings: WOO_SETTINGS, incumbentPlugins: { state: 'read', active: ALL_PLUGINS } }))
   assert.equal(report.verdict, 'ok')
-  for (const key of ['woocommerce.order.tracking', 'woocommerce.order.partial-shipment', 'woocommerce.order.wms-status-meta']) {
-    assert.equal(report.operations.find((op) => op.key === key)?.imsCanWrite, true, key)
-  }
+  assert.deepEqual(report.findings, [])
 })
 
-test('the legacy bridge reported ACTIVE while IMS can write partial shipments, tracking and status meta is a double claim (fails without the check)', () => {
-  const report = evaluateWritersCheck(inputs({ incumbentPlugins: { state: 'read', active: { ...NONE, legacy_bridge: true } } }))
+test('P2 WooCommerce: the bridge ACTIVE contests exactly the rows the map moves from the bridge to IMS (derived, not listed)', () => {
+  const clean = evaluateWritersCheck(inputs({ settings: WOO_SETTINGS, incumbentPlugins: { state: 'read', active: NONE } }))
+  assert.equal(clean.verdict, 'ok', 'precondition: with the plugins inactive the same installation is clean')
+  for (const key of ['woocommerce.order.tracking', 'woocommerce.order.partial-shipment', 'woocommerce.order.status', 'woocommerce.order.trackship-refire', 'woocommerce.product.meta']) {
+    assert.equal(clean.operations.find((op) => op.key === key)?.imsCanWrite, true, `precondition: IMS can write ${key}`)
+  }
+  const report = evaluateWritersCheck(inputs({ settings: WOO_SETTINGS, incumbentPlugins: { state: 'read', active: { ...NONE, legacy_bridge: true } } }))
   assert.equal(report.verdict, 'double-claim')
   assert.equal(report.exitCode, 1)
-  const subjects = report.findings.filter((f) => f.code === 'incumbent-plugin-active-vs-ims-writer').map((f) => f.subject)
-  for (const key of ['woocommerce.order.tracking', 'woocommerce.order.partial-shipment', 'woocommerce.order.status', 'woocommerce.order.wms-status-meta']) {
-    assert.ok(subjects.includes(key), `${key} in ${JSON.stringify(subjects)}`)
-  }
+  assert.deepEqual(subjects(report, 'incumbent-plugin-active-vs-ims-writer'), [
+    'woocommerce.order.partial-shipment', 'woocommerce.order.status', 'woocommerce.order.tracking', 'woocommerce.order.trackship-refire', 'woocommerce.product.meta',
+  ])
+  // The WMS-status meta is IMS-only (P1 owner nobody): the bridge never writes it, so it is not contested. Stock is Qoblex's in P1: not the bridge's.
+  assert.ok(!report.findings.some((f) => f.subject === 'woocommerce.order.wms-status-meta' || f.subject === 'woocommerce.stock'))
 })
 
-test('the Xeroom or IOSS plugin active contests the invoice note and invoice document', () => {
-  for (const plugin of ['xeroom', 'ioss_xero'] as const) {
-    const settings = new Map([['wc_stock_sync_enabled', 'true'], ['wc_invoice_document_enabled', 'true']])
-    const report = evaluateWritersCheck(inputs({ settings, incumbentPlugins: { state: 'read', active: { ...NONE, [plugin]: true } } }))
-    assert.equal(report.verdict, 'double-claim', plugin)
-    assert.ok(report.findings.some((f) => f.subject === 'woocommerce.order.invoice-document'), plugin)
-  }
+test('P2 Mintsoft: the bridge ACTIVE contests Mintsoft order creation, and only when Mintsoft is in P2', () => {
+  const live = evaluateWritersCheck(inputs({ env: MINTSOFT_LIVE_ENV, pluginEnabled: { woocommerce: true, mintsoft: true, xero: false }, incumbentPlugins: { state: 'read', active: { ...NONE, legacy_bridge: true } } }))
+  assert.equal(live.operations.find((op) => op.key === 'mintsoft.order.create')?.imsCanWrite, true)
+  assert.equal(live.verdict, 'double-claim')
+  assert.ok(subjects(live, 'incumbent-plugin-active-vs-ims-writer').includes('mintsoft.order.create'))
+  const p1 = evaluateWritersCheck(inputs({ env: {}, pluginEnabled: { woocommerce: true, mintsoft: true, xero: false }, incumbentPlugins: { state: 'read', active: { ...NONE, legacy_bridge: true } } }))
+  assert.equal(p1.verdict, 'ok')
 })
 
-test('an active plugin is harmless while IMS is HELD (no grant): nothing is claimed', () => {
-  const report = evaluateWritersCheck(inputs({ env: {}, incumbentPlugins: { state: 'read', active: { legacy_bridge: true, xeroom: true, ioss_xero: true } } }))
+test('P2: Xeroom and IOSS/Xero stay ACTIVE by design and never fail the check on the invoice note or document', () => {
+  const settings = new Map([...WOO_SETTINGS, ['xero_sync_enabled', 'true']])
+  const report = evaluateWritersCheck(inputs({ settings, pluginEnabled: { woocommerce: true, mintsoft: false, xero: true }, incumbentPlugins: { state: 'read', active: { ...NONE, xeroom: true, ioss_xero: true } } }))
+  assert.equal(report.operations.find((op) => op.key === 'woocommerce.order.invoice-document')?.imsCanWrite, true, 'precondition: IMS can write the invoice document')
   assert.equal(report.verdict, 'ok')
-  assert.equal(report.findings.length, 0)
+  assert.deepEqual(subjects(report, 'incumbent-plugin-active-vs-ims-writer'), [])
+  assert.ok(!report.findings.some((f) => /deactivate/i.test(f.message)))
 })
 
-test('FAIL CLOSED: an unreadable answer is unreadable (exit 2) while IMS can write what the plugins contest, and only a warning while it cannot', () => {
-  const live = evaluateWritersCheck(inputs({ incumbentPlugins: { state: 'unreadable', reason: 'HTTP 404' } }))
-  assert.equal(live.verdict, 'unreadable')
-  assert.equal(live.exitCode, 2)
-  assert.equal(live.findings.find((f) => f.code === 'incumbent-plugin-unreadable')?.severity, 'fail')
-  const held = evaluateWritersCheck(inputs({ env: {}, incumbentPlugins: { state: 'unreadable', reason: 'HTTP 404' } }))
-  assert.equal(held.verdict, 'ok')
-  assert.equal(held.findings.find((f) => f.code === 'incumbent-plugin-unreadable')?.severity, 'warn')
-})
-
-test('not asked (absent or not-probed) claims nothing', () => {
-  assert.equal(evaluateWritersCheck(inputs()).verdict, 'ok')
-  assert.equal(evaluateWritersCheck(inputs({ incumbentPlugins: { state: 'not-probed', reason: 'off' } })).verdict, 'ok')
+test('FAIL CLOSED: unreadable AND not-probed are errors while IMS can write a contested operation, and warnings while it cannot', () => {
+  for (const reading of [{ state: 'unreadable', reason: 'HTTP 404' }, { state: 'not-probed', reason: 'WooCommerce URL or webhook secret not configured' }] as const) {
+    const live = evaluateWritersCheck(inputs({ settings: WOO_SETTINGS, incumbentPlugins: reading }))
+    assert.equal(live.verdict, 'unreadable', reading.state)
+    assert.equal(live.exitCode, 2)
+    assert.equal(live.findings.find((f) => f.code === 'incumbent-plugin-unreadable')?.severity, 'fail')
+    const held = evaluateWritersCheck(inputs({ env: {}, incumbentPlugins: reading }))
+    assert.equal(held.verdict, 'ok')
+    assert.equal(held.findings.find((f) => f.code === 'incumbent-plugin-unreadable')?.severity, 'warn')
+  }
+  // Mintsoft in P2 with the WooCommerce plugin off: the bridge cannot be asked, and that is not "inactive".
+  const mintsoftOnly = evaluateWritersCheck(inputs({ env: MINTSOFT_LIVE_ENV, pluginEnabled: { woocommerce: false, mintsoft: true, xero: false }, incumbentPlugins: { state: 'not-probed', reason: 'the WooCommerce plugin is off' } }))
+  assert.equal(mintsoftOnly.verdict, 'unreadable')
+  // Absent is the same as not asked.
+  assert.equal(evaluateWritersCheck(inputs({ settings: WOO_SETTINGS })).verdict, 'unreadable')
 })
 
 test('classifier: only the exact schema-1 shape is a reading', () => {
@@ -141,4 +155,8 @@ test('plugin source pin (no PHP runner in CI): the route is GET-only, signed, an
   assert.doesNotMatch(handler, /update_option|add_option|delete_option|update_site_option|wp_remote_|\$wpdb|file_put_contents/)
   assert.match(handler, /legacy_bridge/)
   assert.match(php, /Version:\s+1\.5\.0/)
+  assert.match(handler, /'woo-mintsoft'/, 'exact slugs')
+  assert.doesNotMatch(handler, /preg_match\(\$pattern/, 'no loose name match')
+  assert.match(handler, /active_sitewide_plugins/)
+  assert.match(handler, /wp_get_mu_plugins/)
 })

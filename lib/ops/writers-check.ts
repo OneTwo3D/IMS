@@ -6,7 +6,7 @@ import { producerSeamVerdict, readProducerEnforcement } from '@/lib/security/pro
 import { WRITER_OWNERSHIP_MAP, type OwnershipRow } from '@/lib/security/writer-ownership-map'
 import {
   EVIDENCE_CONTESTS,
-  INCUMBENT_PLUGIN_CONTESTS,
+  INCUMBENT_PLUGIN_MAP_OWNER,
   IMS_FORBIDDEN_OWNERSHIP_ROWS,
   INCUMBENT_EVIDENCE_KINDS,
   INCUMBENT_EVIDENCE_UNRECORDED_ACTION,
@@ -25,7 +25,7 @@ import {
  * THE COEXISTENCE INTERLOCK: DO TWO WRITERS CLAIM ONE DESTINATION OPERATION IN THE CURRENT PHASE?
  *
  * Read-only. The decision is pure (`evaluateWritersCheck`): it is handed the environment, the clock, the settings IMS holds and
- * the incumbent evidence IMS already keeps, and makes no call to any vendor. The reader at the foot is the one part that touches
+ * the incumbent evidence IMS already keeps, and makes no call to any vendor except the one read-only helper-plugin GET at the reader (readIncumbentPluginsFromWc). The reader at the foot is the one part that touches
  * the database.
  *
  * For each operation in the ownership map it answers one question: COULD IMS WRITE THIS RIGHT NOW? Yes only when the operation's
@@ -292,6 +292,31 @@ function exitFor(verdict: WritersCheckVerdict): number {
   return WRITERS_CHECK_EXIT_CODES.find((row) => row.name === name)!.code
 }
 
+/**
+ * The operations an ACTIVE incumbent plugin contests in the phase each operation is in, derived from the ownership map: rows whose owner in that phase is IMS
+ * and that the plugin owned in P1 (so the plugin writes it today). Two exceptions, both from the map:
+ *  - a plugin that owns a row IMS must never own (IMS_FORBIDDEN_OWNERSHIP_ROWS) in that phase stays active BY DESIGN, so it is not asked to stand down (Xeroom owns sales invoicing in P1 and P2);
+ *  - a plugin the map gives no row to contests nothing.
+ */
+export function incumbentPluginContests(
+  map: readonly OwnershipRow[],
+  plugin: keyof typeof INCUMBENT_PLUGIN_MAP_OWNER,
+  operations: ReadonlyArray<{ key: string; phase: 'P1' | 'P2' }>,
+): string[] {
+  const label = INCUMBENT_PLUGIN_MAP_OWNER[plugin]
+  const phaseOf = new Map(operations.map((op) => [op.key, op.phase]))
+  const out: string[] = []
+  for (const row of map) {
+    const key = `${row.destination}.${row.operation}`
+    const phase = phaseOf.get(key)
+    if (!phase) continue
+    if (row.owners[phase] !== 'IMS' || row.owners.P1 !== label) continue
+    const staysActiveByDesign = map.some((other) => (IMS_FORBIDDEN_OWNERSHIP_ROWS as readonly string[]).includes(`${other.destination}.${other.operation}`) && other.owners[phase] === label)
+    if (!staysActiveByDesign) out.push(key)
+  }
+  return out
+}
+
 export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckReport {
   const map = inputs.map ?? (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])
   const findings: WritersCheckFinding[] = []
@@ -412,24 +437,26 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
       }
     }
   }
-  // 4b. The storefront's own report of which incumbent plugins are active (helper plugin 1.5.0+).
-  const pluginsRead = inputs.incumbentPlugins
-  if (pluginsRead?.state === 'read') {
-    for (const [plugin, contested] of Object.entries(INCUMBENT_PLUGIN_CONTESTS)) {
-      if (pluginsRead.active[plugin as keyof typeof pluginsRead.active] !== true) continue
-      for (const key of contested) {
-        if (writable.get(key) !== true) continue
+  // 4b. The storefront's own report of which incumbent plugins are active (helper plugin 1.5.0+). What a plugin contests comes from the map, per phase.
+  const pluginsRead = inputs.incumbentPlugins ?? { state: 'not-probed' as const, reason: 'not asked' }
+  const contestedBy = (plugin: keyof typeof INCUMBENT_PLUGIN_MAP_OWNER): string[] =>
+    incumbentPluginContests(map, plugin, operations).filter((key) => writable.get(key) === true)
+  if (pluginsRead.state === 'read') {
+    for (const plugin of Object.keys(INCUMBENT_PLUGIN_MAP_OWNER) as Array<keyof typeof INCUMBENT_PLUGIN_MAP_OWNER>) {
+      if (pluginsRead.active[plugin] !== true) continue
+      for (const key of contestedBy(plugin)) {
         findings.push({
           code: 'incumbent-plugin-active-vs-ims-writer', severity: 'fail', subject: key,
-          message: `The storefront reports the ${plugin} plugin as ACTIVE while IMS can write ${key}: two writers would write one thing. Deactivate the plugin or hold IMS before claiming ownership.`,
+          message: `The storefront reports the ${plugin} plugin as ACTIVE, the ownership map gives ${key} to IMS in the current phase, and IMS can write it: two writers would write one thing. Stop that plugin's writer for this operation (or hold IMS) before claiming ownership.`,
         })
       }
     }
-  } else if (pluginsRead?.state === 'unreadable') {
-    const atRisk = [...new Set(Object.values(INCUMBENT_PLUGIN_CONTESTS).flat())].filter((key) => writable.get(key) === true)
+  } else {
+    // Not answered (unreadable) or never asked (not-probed: the storefront plugin is off, or its URL or secret is unset): neither is evidence that the plugins are off.
+    const atRisk = [...new Set((Object.keys(INCUMBENT_PLUGIN_MAP_OWNER) as Array<keyof typeof INCUMBENT_PLUGIN_MAP_OWNER>).flatMap(contestedBy))]
     findings.push({
       code: 'incumbent-plugin-unreadable', severity: atRisk.length > 0 ? 'fail' : 'warn', subject: null,
-      message: `Whether the incumbent plugins are active could not be established (${pluginsRead.reason})${atRisk.length > 0 ? `, and IMS can write ${atRisk.join(', ')}` : ''}.`,
+      message: `Whether the incumbent plugins are active could not be established (${pluginsRead.state}: ${pluginsRead.reason})${atRisk.length > 0 ? `, and IMS can write ${atRisk.join(', ')}` : ''}.`,
     })
   }
 
@@ -459,7 +486,7 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
     evidence: evidenceRead,
     evidenceUnrecorded: inputs.evidenceUnrecorded,
     unknownEvidenceKinds: inputs.unknownEvidenceKinds ?? null,
-    incumbentPlugins: pluginsRead ?? { state: 'not-probed', reason: 'not asked' },
+    incumbentPlugins: pluginsRead,
     findings,
     canSee: WRITERS_CHECK_CAN_SEE,
     cannotSee: WRITERS_CHECK_CANNOT_SEE,

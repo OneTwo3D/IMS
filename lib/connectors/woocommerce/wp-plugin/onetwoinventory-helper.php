@@ -414,8 +414,8 @@ if (!function_exists('oti_handle_incumbents_read')) {
     /**
      * GET /wp-json/oti/v1/incumbents. READ ONLY: reads the list of active plugins and nothing else.
      *
-     * A plugin counts as active when its basename (folder/file.php) matches the incumbent's name pattern in the
-     * site's active_plugins option or, on multisite, the network's active_sitewide_plugins. Only booleans leave
+     * A plugin counts as active when its slug (folder, or file name of a single-file plugin) EXACTLY equals the incumbent's slug in the
+     * site's active_plugins option, the network's active_sitewide_plugins (multisite) or the must-use plugins. Only booleans leave
      * the site: no plugin name, path or version is returned.
      */
     function oti_handle_incumbents_read(WP_REST_Request $request)
@@ -426,20 +426,29 @@ if (!function_exists('oti_handle_incumbents_read')) {
             $network = get_site_option('active_sitewide_plugins', []);
             if (is_array($network)) $active = array_merge($active, array_keys($network));
         }
-        $patterns = [
-            'legacy_bridge' => '/mint[-_]?soft/i',
-            'xeroom'       => '/xeroom/i',
-            'ioss_xero'    => '/ioss[-_]?xero/i',
-        ];
+        // EXACT plugin slugs (the folder name, or the file name of a single-file plugin). A site with a differently named copy adds it
+        // through the filter. A loose name match is not used: an unrelated add-on whose name merely contains one of these words must not read as active.
+        $slugs = apply_filters('oti_incumbent_plugin_slugs', [
+            'legacy_bridge' => ['woo-mintsoft'],
+            'xeroom'        => ['xeroom'],
+            'ioss_xero'     => ['o3d-ioss-xero'],
+        ]);
+        $slug_of = static function ($basename) {
+            $basename = (string) $basename;
+            $slash = strpos($basename, '/');
+            return $slash === false ? preg_replace('/\.php$/', '', $basename) : substr($basename, 0, $slash);
+        };
+        $present = [];
+        foreach ($active as $basename) $present[$slug_of($basename)] = true;
+        // Must-use plugins are always active.
+        if (function_exists('wp_get_mu_plugins')) {
+            foreach (wp_get_mu_plugins() as $path) $present[$slug_of(basename((string) $path))] = true;
+        }
         $out = [];
-        foreach ($patterns as $name => $pattern) {
+        foreach (['legacy_bridge', 'xeroom', 'ioss_xero'] as $name) {
             $out[$name] = false;
-            foreach ($active as $basename) {
-                // Never match this plugin itself (its basename contains neither name, but be explicit).
-                if (is_string($basename) && strpos($basename, 'onetwoinventory') === false && preg_match($pattern, $basename) === 1) {
-                    $out[$name] = true;
-                    break;
-                }
+            foreach ((isset($slugs[$name]) && is_array($slugs[$name])) ? $slugs[$name] : [] as $slug) {
+                if (is_string($slug) && $slug !== '' && isset($present[$slug])) { $out[$name] = true; break; }
             }
         }
         return new WP_REST_Response(['ok' => true, 'schema' => 1, 'active' => $out]);
