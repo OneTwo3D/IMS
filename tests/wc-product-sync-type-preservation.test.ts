@@ -165,6 +165,12 @@ let nextId = 1
 let variationPages: Record<string, Row[]> = {}
 /** Pages served for GET /products — only the bulk-cursor test needs a non-empty one. */
 let productPages: Record<string, Row[]> = {}
+/** GET /products/<id> answers, keyed by the full path; an `error` string makes the fetch fail. */
+let productById: Record<string, { data?: Row; error?: string }> = {}
+/** Every `Setting` row a test pre-seeds or the code under test writes (the cursor and the buried-products list). */
+const settingValues = new Map<string, string>()
+/** Every GET path the connector asked for, in order. */
+const fetchedPaths: string[] = []
 
 function wcVariation(id: number, sku: string, option: string): Row {
   return {
@@ -185,6 +191,12 @@ function wcVariation(id: number, sku: string, option: string): Row {
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
     wcFetch: async (path: string, params: Record<string, string> = {}) => {
+      fetchedPaths.push(path)
+      if (/^\/products\/\d+$/.test(path)) {
+        const answer = productById[path]
+        if (!answer) return { data: null, totalPages: 0, totalItems: 0, error: `WC API error: 404 not found` }
+        return answer.error ? { data: null, totalPages: 0, totalItems: 0, error: answer.error } : { data: answer.data, totalPages: 1, totalItems: 1, error: null }
+      }
       const page = params.page ?? '1'
       if (path.includes('/variations')) {
         return { data: variationPages[page] ?? [], totalPages: 1, totalItems: 0, error: null }
@@ -773,14 +785,15 @@ const txClient = {
     },
   },
   setting: {
-    upsert: async ({ where }: { where: { key: string } }) => {
+    upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => {
       state.settingUpserts.push(where.key)
+      settingValues.set(where.key, create.value)
       return {}
     },
     // No rows => credentials null and version '0', which findUnique agrees with, so the
     // credential-rebind fence (o3d-mlc7) is a consistent no-op here.
     findMany: async () => [],
-    findUnique: async () => null,
+    findUnique: async ({ where }: { where: { key: string } }) => (settingValues.has(where.key) ? { key: where.key, value: settingValues.get(where.key) } : null),
   },
   $executeRaw: cursorRaw((key) => { state.settingUpserts.push(key) }, async () => 1),
 }
@@ -899,6 +912,9 @@ function resetState() {
   beforeConflictsRecorded = null
   nextId = 1
   productPages = {}
+  productById = {}
+  settingValues.clear()
+  fetchedPaths.length = 0
   variationPages = {
     '1': [wcVariation(111, 'VAR-1', 'Red'), wcVariation(112, 'VAR-2', 'Blue')],
   }
@@ -3212,4 +3228,116 @@ test('[round 3] a walk that DOES reach an empty page advances the cursor and esc
 
   assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'))
   assert.deepEqual(state.activity.filter((entry) => entry.action === 'wc_product_sync_ceiling_stall'), [])
+})
+
+// ---------------------------------------------------------------------------
+// The way back for a buried product: the bounded re-attempt list.
+// ---------------------------------------------------------------------------
+
+const CONFLICTS_KEY = 'wc_product_permanent_conflicts'
+const CURSOR = 'last_wc_product_reconcile_at'
+const listed = () => JSON.parse(settingValues.get(CONFLICTS_KEY) ?? '[]') as Array<{ id: number; sku: string; since: string; lastAttemptAt: string | null }>
+const entry = (id: number, extra: Partial<{ sku: string; since: string; lastAttemptAt: string | null }> = {}) => ({ id, sku: `SKU-${id}`, since: '2026-01-01T00:00:00.000Z', lastAttemptAt: null, ...extra })
+
+/** A run that has a cursor and a local catalogue, so it reads `modified_after` and a buried id is NOT in that window. */
+function seedCursorRun() {
+  settingValues.set(CURSOR, '2026-11-01T00:00:00.000Z')
+  state.products.push(imsRow({ id: 'ims-other', sku: 'OTHER-SKU', name: 'Other' }))
+}
+
+test('a product buried by the bulk sync is recorded in the bounded re-attempt list', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  productPages = { '1': [variableProduct() as unknown as Row] }
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  assert.deepEqual(listed().map((item) => [item.id, item.sku]), [[77, 'PARENT-SKU']])
+})
+
+test('a buried product whose conflict was fixed in IMS is imported by id on the next run and leaves the list', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  seedCursorRun()
+  settingValues.set(CONFLICTS_KEY, JSON.stringify([entry(77, { sku: 'PARENT-SKU' })]))
+  productPages = {} // nothing modified since the cursor: only the direct fetch can find it
+  productById = { '/products/77': { data: variableProduct() as unknown as Row } }
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  assert.equal(result.synced, 1, 'the buried product was re-attempted and imported')
+  assert.ok(fetchedPaths.includes('/products/77'))
+  assert.deepEqual(listed(), [], 'dropped the moment it succeeds')
+  assert.ok(state.activity.some((a) => a.action === 'wc_product_conflict_recovered'))
+  assert.ok(state.settingUpserts.includes(CURSOR), 'the cursor still advances')
+})
+
+test('a buried product that still conflicts stays listed, is stamped, and is not re-announced as a new burial', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  seedCursorRun()
+  settingValues.set(CONFLICTS_KEY, JSON.stringify([entry(77, { sku: 'PARENT-SKU' })]))
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  productById = { '/products/77': { data: variableProduct() as unknown as Row } }
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  assert.equal(result.synced, 0)
+  assert.deepEqual(result.errors, [])
+  assert.equal(listed().length, 1)
+  assert.equal(listed()[0].since, '2026-01-01T00:00:00.000Z', 'keeps when it was first buried')
+  assert.ok(listed()[0].lastAttemptAt, 'stamped so the next run takes others first')
+  assert.deepEqual(state.activity.filter((a) => a.action === 'wc_product_sync_permanent_conflicts'), [], 'no daily repeat of the ERROR line')
+  assert.ok(state.settingUpserts.includes(CURSOR))
+})
+
+test('a TRANSIENT failure on a re-attempt holds the cursor exactly as in the main loop, and keeps the id', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  for (const failure of ['fetch', 'import'] as const) {
+    resetState()
+    seedCursorRun()
+    settingValues.set(CONFLICTS_KEY, JSON.stringify([entry(77, { sku: 'PARENT-SKU' })]))
+    if (failure === 'fetch') productById = { '/products/77': { error: 'WC API error: 503 unavailable' } }
+    else {
+      productById = { '/products/77': { data: variableProduct() as unknown as Row } }
+      state.throwForSku.set('PARENT-SKU', new Error('connection terminated unexpectedly'))
+    }
+    const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+    assert.equal(result.errors.length, 1, failure)
+    assert.deepEqual(state.settingUpserts.filter((key) => key === CURSOR), [], `${failure}: cursor held`)
+    assert.equal(listed().length, 1, `${failure}: id kept`)
+  }
+})
+
+test('a buried product that no longer exists in WooCommerce (404) leaves the list', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  seedCursorRun()
+  settingValues.set(CONFLICTS_KEY, JSON.stringify([entry(77, { sku: 'PARENT-SKU' })]))
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(listed(), [])
+})
+
+test('only a bounded number is re-attempted per run, least recently attempted first, and the rest are LOGGED', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  const { MAX_PERMANENT_CONFLICT_REATTEMPTS } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
+  resetState()
+  seedCursorRun()
+  const total = MAX_PERMANENT_CONFLICT_REATTEMPTS + 5
+  // ids 1..total; the first five were attempted most recently, so they are the ones left out.
+  const items = Array.from({ length: total }, (_, i) => entry(i + 1, { lastAttemptAt: i < 5 ? '2026-11-17T00:00:00.000Z' : '2026-11-10T00:00:00.000Z' }))
+  settingValues.set(CONFLICTS_KEY, JSON.stringify(items))
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+  void result
+  const byId = fetchedPaths.filter((path) => /^\/products\/\d+$/.test(path))
+  assert.equal(byId.length, MAX_PERMANENT_CONFLICT_REATTEMPTS)
+  assert.ok(!byId.some((path) => ['/products/1', '/products/2', '/products/3', '/products/4', '/products/5'].includes(path)))
+  const deferred = state.activity.find((a) => a.action === 'wc_product_conflict_reattempt_deferred')
+  assert.ok(deferred, 'what was not re-attempted is said out loud')
+  assert.equal(deferred!.level, 'WARNING')
+  assert.match(String(deferred!.description), /5 of 25/)
+})
+
+test('the stored list is bounded: the longest-buried drop first and the drop is logged', async () => {
+  const { applyPermanentConflictDelta } = await import('@/lib/connectors/woocommerce/sync/product-permanent-conflicts')
+  const current = [1, 2, 3].map((i) => entry(i, { since: `2026-0${i}-01T00:00:00.000Z` }))
+  const { items, dropped } = applyPermanentConflictDelta(current, { add: [{ id: 9, sku: 'NEW' }], remove: [], attempted: [] }, '2026-11-18T00:00:00.000Z', 3)
+  assert.deepEqual(items.map((i) => i.id).sort(), [2, 3, 9])
+  assert.deepEqual(dropped.map((i) => i.id), [1])
 })
