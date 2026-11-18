@@ -3,6 +3,7 @@ import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { toIsoCountryCode } from '@/lib/countries'
+import { gateLegacyExportPrices } from '@/lib/products/legacy-export-price-gate'
 
 const HEADERS = [
   'productId', 'parentProductId',
@@ -108,5 +109,7 @@ export async function GET(req: Request) {
   })
 
   const filename = `products-${new Date().toISOString().slice(0, 10)}.csv`
-  return csvResponse(toCsv(rows, HEADERS), filename)
+  // Price columns stay in the header but are blank without inventory.prices (same gate as Edit-by-CSV).
+  const gated = gateLegacyExportPrices(rows, (permission) => hasPermission(session.user.role, permission))
+  return csvResponse(toCsv(gated, HEADERS), filename)
 }
