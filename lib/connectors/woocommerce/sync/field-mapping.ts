@@ -286,17 +286,21 @@ function mapWcTaxClassToCategory(taxClass: string | null | undefined): TaxCatego
   return knownWcTaxClassCategory(taxClass) ?? 'STANDARD'
 }
 
+/** Order+line keys already warned about in this process, so a re-import or update does not repeat the warning. */
+const wcUnmatchedLineLogged = new Set<string>()
+
 export async function mapWcLineItems(
   lineItems: WcLineItem[],
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   _fxRate: number,
+  /** Pass only from the import commit point: the unmatched-line warning is logged then, once per order and line. */
+  logUnmatchedFor?: { orderId: number | string; orderNumber?: string | null },
 ): Promise<MappedLine[]> {
   // Build the SKU→product lookup. WooCommerce SKUs are matched trimmed (product sync stores them
   // trimmed) and, failing an exact hit, case-insensitively. products_sku_key is a case-sensitive
   // unique index, so two IMS SKUs may differ only by case: a case-insensitive hit is bound ONLY when
   // it is the single candidate. With two or more the line is left unbound and flagged, never guessed.
   // A line with no SKU, or whose SKU names nothing in IMS, falls back to the WooCommerce id
-  // (variation id first, then product id) held in Product.externalProductId.
+  // (the variation id for a variation line, never its VARIABLE parent) held in Product.externalProductId.
   const trimmedSkus = lineItems.map((l) => (l.sku ?? '').trim())
   const skus = [...new Set(trimmedSkus.filter(Boolean))]
   const wcIds = [...new Set(lineItems.flatMap((l) => [l.variation_id, l.product_id])
@@ -327,11 +331,13 @@ export async function mapWcLineItems(
       if (folded.length === 1) return folded[0]
       if (folded.length > 1) { ambiguousSkus.add(sku); return null }
     }
-    for (const id of [item.variation_id, item.product_id]) {
-      if (Number.isSafeInteger(id) && id > 0) {
-        const hit = byWcId.get(String(id))
-        if (hit) return hit
-      }
+    // A variation line binds ONLY to its variation. Its VARIABLE parent is not stockable, so
+    // falling back to `product_id` would bind the line to a product that reserves nothing and whose
+    // cost can never be traced; the line stays unbound and is flagged instead.
+    const wcId = Number.isSafeInteger(item.variation_id) && item.variation_id > 0 ? item.variation_id : item.product_id
+    if (Number.isSafeInteger(wcId) && wcId > 0) {
+      const hit = byWcId.get(String(wcId))
+      if (hit) return hit
     }
     return null
   }
@@ -361,8 +367,14 @@ export async function mapWcLineItems(
   })
 
   // Unbound lines reserve no stock and read as fully allocated, so say so at import time.
-  const unbound = mapped.filter((m) => m.productId === null)
-  if (unbound.length > 0) {
+  const unbound = logUnmatchedFor
+    ? mapped.filter((m) => m.productId === null && !wcUnmatchedLineLogged.has(`${logUnmatchedFor.orderId}:${m.externalLineItemId}`))
+    : []
+  if (logUnmatchedFor && unbound.length > 0) {
+    for (const m of unbound) {
+      if (wcUnmatchedLineLogged.size >= 5000) wcUnmatchedLineLogged.clear()
+      wcUnmatchedLineLogged.add(`${logUnmatchedFor.orderId}:${m.externalLineItemId}`)
+    }
     try {
       await logActivity({
         entityType: 'SYNC',
@@ -370,9 +382,9 @@ export async function mapWcLineItems(
         tag: 'sync',
         action: 'wc_order_line_unmatched',
         level: 'WARNING',
-        description: `${unbound.length} WooCommerce order line(s) matched no IMS product and will reserve no stock: ${unbound.map((m) => m.sku).join(', ')}`
+        description: `WooCommerce order #${logUnmatchedFor.orderNumber || logUnmatchedFor.orderId}: ${unbound.length} line(s) matched no IMS product and will reserve no stock: ${unbound.map((m) => m.sku).join(', ')}`
           + (ambiguousSkus.size > 0 ? `. Ambiguous (differ only by case in IMS, not bound): ${[...ambiguousSkus].join(', ')}` : ''),
-        metadata: { connector: 'woocommerce', skus: unbound.map((m) => m.sku), ambiguousSkus: [...ambiguousSkus] },
+        metadata: { connector: 'woocommerce', orderId: String(logUnmatchedFor.orderId), skus: unbound.map((m) => m.sku), ambiguousSkus: [...ambiguousSkus] },
         resolveUser: false,
       })
     } catch (e) {

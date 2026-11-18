@@ -71,7 +71,7 @@ test('o3d-hqvrp.90: two IMS SKUs differing only by case never bind by folding', 
     line({ id: 1, sku: 'Abc-01', product_id: 5 }) as never, // ambiguous: not bound, even though the WC id names p-upper
     line({ id: 2, sku: 'abc-01' }) as never, // exact hit wins
     line({ id: 3, sku: 'ABC-01' }) as never,
-  ], 1)
+  ], 1, { orderId: 7001, orderNumber: '7001' })
   assert.equal(mapped[0].productId, null)
   assert.equal(mapped[1].productId, 'p-lower')
   assert.equal(mapped[2].productId, 'p-upper')
@@ -88,9 +88,24 @@ test('o3d-hqvrp.90: no SKU or an unknown SKU falls back to the WooCommerce id (v
     line({ id: 1, sku: '', product_id: 10, variation_id: 11 }) as never,
     line({ id: 2, sku: 'RENAMED-IN-WC', product_id: 10 }) as never,
     line({ id: 3, sku: 'NOPE', product_id: 99 }) as never,
-  ], 1)
+  ], 1, { orderId: 7002, orderNumber: '7002' })
   assert.deepEqual(mapped.map((m) => m.productId), ['p-var', 'p-parent', null])
   assert.equal(logged.length, 1, 'the unmatched line is flagged at import')
+  assert.match(String(logged[0].description), /#7002/)
+  // The same order touched again (re-import, update) does not warn again; a mapping call with no order ref never warns.
+  await mapWcLineItems([line({ id: 3, sku: 'NOPE', product_id: 99 }) as never], 1, { orderId: 7002, orderNumber: '7002' })
+  await mapWcLineItems([line({ id: 3, sku: 'NOPE', product_id: 99 }) as never], 1)
+  assert.equal(logged.length, 1, 'logged once per order and line')
+})
+
+test('a variation line never binds to its VARIABLE parent when the variation is unmapped', async () => {
+  const { mapWcLineItems } = await import('../lib/connectors/woocommerce/sync/field-mapping.ts')
+  products.length = 0
+  products.push({ id: 'p-parent', sku: 'PARENT', externalProductId: BigInt(10) })
+  logged.length = 0
+  const mapped = await mapWcLineItems([line({ id: 1, sku: '', product_id: 10, variation_id: 55 }) as never], 1, { orderId: 7003, orderNumber: '7003' })
+  assert.equal(mapped[0].productId, null)
+  assert.equal(logged.length, 1, 'the unbound variation line is logged')
 })
 
 function refusalRow(id: string, over: { reason?: string; refusedAt: string; attempts?: number }): Row {
@@ -134,6 +149,38 @@ test('o3d-hqvrp.93: an order deleted in WooCommerce is retired on its third 404,
   const third = await drainWcOrderAdmissionRefusals(50)
   assert.equal(syncLogs[0].status, 'SYNCED')
   assert.equal(third.retired, 1)
+})
+
+test('o3d-hqvrp.93: one transient 404 after earlier checks does not retire; guard rows are never retired on 404', async () => {
+  const { drainWcOrderAdmissionRefusals, WC_ADMISSION_REFUSAL_QUEUE } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  const now = new Date().toISOString()
+  syncLogs = [
+    refusalRow('seen-before', { refusedAt: now, attempts: 5 }),
+    refusalRow('guard', { refusedAt: now, attempts: 0, reason: 'tax_rate_unmapped' }),
+  ]
+  for (const r of syncLogs) (r.payload as Record<string, unknown>).queue = WC_ADMISSION_REFUSAL_QUEUE
+  live = 'gone'
+  await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'PENDING', 'first 404 after many checks must not retire')
+  live = 'failed' // a non-404 answer resets the run
+  await drainWcOrderAdmissionRefusals(50)
+  live = 'gone'
+  await drainWcOrderAdmissionRefusals(50)
+  await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'PENDING', 'two 404s, a break, then two more is not three in a row')
+  await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'SYNCED', 'three consecutive 404s retire')
+  assert.equal(syncLogs[1].status, 'PENDING', 'a guard-block row is never retired on 404 alone')
+})
+
+test('o3d-hqvrp.93: status_not_mapped refusals do not expire', async () => {
+  const { drainWcOrderAdmissionRefusals, WC_ADMISSION_REFUSAL_QUEUE } = await import('../lib/connectors/woocommerce/sync/order-admission.ts')
+  syncLogs = [refusalRow('old-mapped', { refusedAt: new Date(Date.now() - 90 * 86_400_000).toISOString(), reason: 'status_not_mapped' })]
+  ;(syncLogs[0].payload as Record<string, unknown>).queue = WC_ADMISSION_REFUSAL_QUEUE
+  live = 'failed'
+  const result = await drainWcOrderAdmissionRefusals(50)
+  assert.equal(syncLogs[0].status, 'PENDING')
+  assert.equal(result.retired, 0)
 })
 
 test('o3d-hqvrp.93: rows past the live-read budget are not touched', async () => {

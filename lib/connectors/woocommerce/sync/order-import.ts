@@ -3393,7 +3393,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
 
     // Line items (each one may carry its own externalTaxRateId)
     const mappedLines = [
-      ...(await mapWcLineItems(wcOrder.line_items, fxRate)),
+      ...(await mapWcLineItems(wcOrder.line_items, fxRate, { orderId: wcOrder.id, orderNumber: wcOrder.number })),
       ...mapWcFeeLines(wcOrder.fee_lines),
     ]
 

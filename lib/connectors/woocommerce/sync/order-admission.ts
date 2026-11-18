@@ -161,6 +161,11 @@ export type WcAdmissionRefusalPayload = {
   /** When the boundary FIRST turned this order away. Preserved across re-refusals. */
   refusedAt: string
   attempts: number
+  /**
+   * Consecutive by-id reads that answered 404. Reset by any other outcome. This, not `attempts`
+   * (every check), is what retires a row for a deleted order.
+   */
+  consecutiveGone?: number
 }
 
 export function wcAdmissionRefusalQueueWhere(externalOrderId?: string): Prisma.ShoppingSyncLogWhereInput {
@@ -199,7 +204,13 @@ export function wcAdmissionRefusalTtlMs(env: NodeJS.ProcessEnv = process.env): n
   return (Number.isFinite(days) && days > 0 ? days : 30) * 86_400_000
 }
 
-function isWcStatusOnlyRefusal(reason: WcAdmissionRefusalReason): boolean {
+/** Statuses a row may be EXPIRED for. `status_not_mapped` is excluded: an IMS-side mapping change can still admit it and fires no WooCommerce event. */
+function isWcExpirableRefusal(reason: WcAdmissionRefusalReason): boolean {
+  return reason === 'status_not_admitted'
+}
+
+/** Reasons a row may be retired on repeated 404s. Guard blocks and currency refusals need an operator, never a 404 alone. */
+function isWcGoneRetirableRefusal(reason: WcAdmissionRefusalReason): boolean {
   return reason === 'status_not_admitted' || reason === 'status_not_mapped'
 }
 
@@ -435,13 +446,14 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
       result.retired++
       continue
     }
-    // EXPIRY. An order refused only for its STATUS (not selected / not mapped) that has stayed that
-    // way for the whole TTL is an abandoned checkout, a failed payment or an unpaid cancellation,
-    // not a pending decision. Left for ever it grows the queue without bound and slows every other
-    // row's recheck linearly. Retiring it loses nothing: if the order ever reaches an admitted status
-    // WooCommerce sends order.updated and the ordinary gated importer takes it. Guard blocks and
-    // currency refusals are NEVER expired, because an operator still has to act on them.
-    if (payload && isWcStatusOnlyRefusal(payload.reason)) {
+    // EXPIRY. An order refused only because its status is not SELECTED that has stayed that way for
+    // the whole TTL is an abandoned checkout, a failed payment or an unpaid cancellation, not a
+    // pending decision. Left for ever it grows the queue without bound and slows every other row's
+    // recheck linearly. Widening the selection rewinds the sweep cursor, which is the backstop.
+    // `status_not_mapped`, guard blocks and currency refusals are NEVER expired: an operator's
+    // IMS-side change (a status mapping, a tax rate) can still admit them and fires no WooCommerce
+    // event, so an expired row would never be read again.
+    if (payload && isWcExpirableRefusal(payload.reason)) {
       const refusedAtMs = Date.parse(payload.refusedAt)
       if (Number.isFinite(refusedAtMs) && refusedAtMs <= expiryCutoffMs) {
         await resolveRefusalRow(row.id, `Expired: still not importable by status ("${payload.status}") after ${Math.round(wcAdmissionRefusalTtlMs() / 86_400_000)} day(s); a later status change re-delivers the order`)
@@ -463,10 +475,26 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
     }).catch(() => {})
 
     const read = await readLiveWcOrder(externalOrderId)
+    const previousGone = payload?.consecutiveGone ?? 0
+    if (payload && !('gone' in read) && previousGone !== 0) {
+      // Any non-404 answer breaks the run: a transient 404 must never add up with old ones.
+      await db.shoppingSyncLog.update({
+        where: { id: row.id },
+        data: { payload: JSON.parse(JSON.stringify({ ...payload, attempts: payload.attempts + 1, consecutiveGone: 0 })) as Prisma.InputJsonValue },
+      }).catch(() => {})
+    }
     if ('gone' in read) {
-      // A 404 on the third consecutive attempt is a deleted order: it will never import, and left in
-      // the queue it would rotate for ever (and keep one live read per sweep for nothing).
-      if ((payload?.attempts ?? 0) + 1 >= WC_ADMISSION_REFUSAL_GONE_RETIRE_ATTEMPTS) {
+      // Only CONSECUTIVE 404s count. The third in a row on a status-only row is a deleted order: it
+      // will never import, and left in the queue it would rotate for ever. A guard-block or currency
+      // row is never retired on a 404 alone; it stays for the operator.
+      const gone = previousGone + 1
+      if (payload) {
+        await db.shoppingSyncLog.update({
+          where: { id: row.id },
+          data: { payload: JSON.parse(JSON.stringify({ ...payload, attempts: payload.attempts + 1, consecutiveGone: gone })) as Prisma.InputJsonValue },
+        }).catch(() => {})
+      }
+      if (payload && isWcGoneRetirableRefusal(payload.reason) && gone >= WC_ADMISSION_REFUSAL_GONE_RETIRE_ATTEMPTS) {
         await resolveRefusalRow(row.id, 'The order no longer exists in WooCommerce (404 on repeated checks)')
         result.retired++
       } else {
