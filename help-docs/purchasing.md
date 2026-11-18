@@ -245,6 +245,8 @@ If the supplier was billed for more than was received (a prepaid supplier), clos
 
 An order whose lines have an **open warehouse ASN** (being created, open, partly booked in, or booked in but not yet reconciled) cannot be closed or cancelled. The message names the SKUs and ASN numbers. Book the goods in through the ASN (**Recheck booked-in**) or retire the ASN first, then close the order. This keeps the warehouse from receiving goods against an order that no longer expects them. Warehouse (Mintsoft) ASN handling is described in [Warehouse (Mintsoft)](warehouse.md).
 
+If the close or cancel is refused because stock the warehouse sync brought in is "not yet booked into this order" and the ASN has already been retired, **Recheck booked-in** has nothing to re-drive. Press **Reconcile warehouse receipt** in the close dialog: it folds that stock into the order's received quantity so it can be returned and the order closed. It adds no stock, cost or accounting entry (the warehouse sync already did), and is refused while the order still has an open ASN.
+
 ### Idempotent cancellation
 
 Cancelling a PO that is already CANCELLED is a no-op: the system returns success without writing duplicate activity log entries. It is safe to retry a cancellation after a transient error.
@@ -286,6 +288,17 @@ quantity remains a hard cap either way.
 
 Note: if a prepaid PO is later received short (paid 100, received 90), the over-paid delta is not
 yet flagged automatically — reconcile manually until the prepaid reconciliation alert ships.
+
+### GR/IR: goods received, not yet billed
+
+Every receipt, bill, bill edit, supplier return and return-generated supplier credit note also writes a row in IMS's **GR/IR sub-ledger**, in the same step as the event itself, so a receipt is never recorded without its accrual and a failed receipt leaves none:
+
+- **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (the goods part of the value the stock layer carries; freight is not included).
+- **Billing** lowers it by the billed quantity at the **same purchase-order unit cost**. If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; it stays on Stock in Transit as it always has, and is shown per order in **Analytics > GR/IR**.
+- **Editing a bill** moves it by the change in the billed quantity.
+- **A supplier return** lowers it by the returned quantity at the order's unit cost. If those goods were already billed, the order shows as billed-not-received until the return-generated supplier credit note is posted. The credit note clears it at the same order unit cost as the return (per line, for the quantity billed and returned), so a returned-and-credited line nets to zero whatever price the bill carried; the difference between the credit and that value is a price-difference reversal, not GR/IR.
+
+Receiving and billing the same quantity nets to zero whichever comes first. Nothing here is posted to Xero unless **GR/IR accrual posting** is switched on (Settings > Accounting > Xero; see Xero Accounting Sync). Stage can load an opening balance for goods received before the sub-ledger existed (it fills the gap between what the order lines say and what the sub-ledger already holds, so a line billed after deployment is completed too) with `npm run grir:opening-balance -- --dry-run` (then without `--dry-run`); production gets none.
 
 ### Editing an unpaid bill
 

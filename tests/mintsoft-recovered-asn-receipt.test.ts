@@ -616,6 +616,33 @@ test('o3d-bhvu r8: a booked-in recovery whose recheck THROWS fails closed', asyn
   assert.equal(result.success, false, 'a recheck that threw leaves no pending row, so it cannot be a warning')
 })
 
+test('o3d-gwh4: pressing create again after a failed booked-in reconciliation RETRIES it, and never creates a second ASN', async () => {
+  const { createMintsoftTransferAsn } = await loadActions()
+  seedTransfer()
+  recoveryRows = [remoteRow({ name: 'COMPLETE', id: 6 })]
+  // First press: the reconciliation cannot complete, so the creator fails visibly and leaves the row mapped BOOKED_IN, open.
+  recheckCredits = false
+  recheckResult = { processed: 0, duplicates: 0, pending: 0, requiresReview: 0, failed: 0, created: false }
+  const first = await createMintsoftTransferAsn(TRANSFER_ID, { autoCallback: false })
+  assert.equal(first.success, false, 'precondition: the first press failed visibly')
+  assert.equal(recheckCalls.length, 1, 'precondition: one recheck so far')
+  const mapped = adoptedMap()
+  assert.ok(mapped)
+  assert.equal(mapped.status, 'BOOKED_IN')
+  assert.equal(mapped.closedAt, null)
+
+  // Second press, the warehouse recheck now works. WAS: success with 'already exists' and no recheck, landed stayed 0.
+  recheckCredits = true
+  recheckResult = { processed: 1, duplicates: 0, pending: 0, requiresReview: 0, failed: 0, created: true }
+  const second = await createMintsoftTransferAsn(TRANSFER_ID, { autoCallback: false })
+
+  assert.equal(recheckCalls.length, 2, 'the second press must re-drive the booked-in recheck')
+  assert.equal(await landedNow(), 10, 'and the receipt must now be accounted for')
+  assert.equal(second.success, true, String(second.error))
+  assert.equal(createAsnCalls.length, 0, 'at no point may an ASN be pushed to Mintsoft')
+  assert.equal(asnMaps.filter((row) => row.sourceId === TRANSFER_ID).length, 1, 'and no second ASN row exists')
+})
+
 test('o3d-bhvu r8: an unreadable remote status is UNKNOWN, and unknown is not OPEN', async () => {
   const { createMintsoftTransferAsn } = await loadActions()
   for (const status of [

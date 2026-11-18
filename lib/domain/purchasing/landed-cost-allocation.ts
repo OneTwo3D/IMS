@@ -122,9 +122,17 @@ export function headerDiscountFactorForPo(po: {
   return subtotal.div(lineSum)
 }
 
+/**
+ * The goods part of a unit's cost: the line's `unitCostBase` after the order's header discount, with NO freight in it. The one definition the
+ * landed-cost allocation starts from and the GR/IR accrual values a receipt and a bill with, so the two cannot disagree about what the goods cost.
+ */
+export function goodsUnitCostAfterHeaderDiscount(unitCostBase: DecimalInput, headerDiscountFactor: DecimalInput | null | undefined): Prisma.Decimal {
+  const unit = decimal(unitCostBase)
+  return headerDiscountFactor == null ? unit : unit.mul(decimal(headerDiscountFactor))
+}
+
 function effectiveGoodsUnitCost(line: LandedAllocationLine): Prisma.Decimal {
-  const unit = decimal(line.unitCostBase)
-  return line.headerDiscountFactor == null ? unit : unit.mul(decimal(line.headerDiscountFactor))
+  return goodsUnitCostAfterHeaderDiscount(line.unitCostBase, line.headerDiscountFactor)
 }
 
 /** 0 = the order's own (direct) cost lines; 1 = the cost lines of the freight orders linked to it. */

@@ -129,6 +129,12 @@ export type ApplyStockAdjustmentInput = {
    * applies. Backed by StockMovement.idempotencyKey @unique.
    */
   idempotencyToken?: string | null
+  /**
+   * o3d-hqvrp.80: when a removal exceeds the AVAILABLE stock (it would cut into reserved units),
+   * release the newest orders' unshipped allocations first, in this transaction, instead of refusing.
+   * Off unless the caller passes it (the flag `stock_adjustment_release_reserved`, read by the action).
+   */
+  releaseReservedForRemoval?: boolean
 }
 
 export type AppliedStockAdjustment = {
@@ -149,6 +155,7 @@ export async function applyStockAdjustment({
   referenceType,
   referenceId,
   idempotencyToken,
+  releaseReservedForRemoval,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
   // 0tr0/r9y2: content-addressed key from the per-submission token + payload, so an
@@ -183,27 +190,64 @@ export async function applyStockAdjustment({
     }
   }
 
+  // The key is unique, so a plain read answers "was this already applied?" without the stock-level lock.
+  const findReplayedAdjustment = async (): Promise<AppliedStockAdjustment | null> => {
+    if (!idempotencyKey) return null
+    const existing = await tx.stockMovement.findUnique({
+      where: { idempotencyKey },
+      select: { id: true },
+    })
+    if (!existing) return null
+    const [product, warehouse] = await Promise.all([
+      tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
+      tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
+    ])
+    return {
+      movementId: existing.id,
+      productSku: product?.sku ?? productId,
+      warehouseName: warehouse?.name ?? warehouseId,
+    }
+  }
+
+  // A replay must not release anybody's reservation: its first submission already did (or needed to),
+  // and the release would commit for an adjustment that now writes nothing.
+  //
+  // The key is CLAIMED first, under a transaction-scoped advisory lock: two concurrent submissions with the
+  // same key serialise here, so the loser only reads after the winner has committed, finds its movement and
+  // returns the replay BEFORE it can release anything. Its transaction therefore never writes a release for
+  // an adjustment that wrote nothing. (Taken before any sales_orders / stock_levels lock, and only ever
+  // contended by the same key, so it cannot join a lock cycle.)
+  if (idempotencyKey) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`stock-adjustment-key:${idempotencyKey}`}, 0))`
+    const replay = await findReplayedAdjustment()
+    if (replay) return replay
+  }
+
+  // o3d-hqvrp.80: sales_orders are locked BEFORE stock_levels everywhere, so the release for a removal that
+  // would cut into reserved units runs before this transaction takes the stock-level lock.
+  if (releaseReservedForRemoval && qty < 0) {
+    const level = await tx.stockLevel.findUnique({
+      where: { productId_warehouseId: { productId, warehouseId } },
+      select: { quantity: true, reservedQty: true },
+    })
+    if (level && Number(level.quantity) - Number(level.reservedQty) < Math.abs(qty)) {
+      const { releaseReservationsForRemovalInTx } = await import('@/lib/fulfillment/overallocation-rebalancer')
+      await releaseReservationsForRemovalInTx(tx, { productId, warehouseId }, Math.abs(qty), {
+        source: 'stock_adjustment',
+        referenceId: productId,
+        referenceLabel: `stock adjustment (${qty})`,
+      })
+    }
+  }
+
   const locked = await lockStockLevelRow(tx, productId, warehouseId)
 
   // 0tr0: idempotency check UNDER the stock-level lock. Same-(product,warehouse)
   // re-submissions serialise here, so a duplicate carrying the same key sees the
   // first submission's committed movement and returns it instead of double-booking.
   if (idempotencyKey) {
-    const existing = await tx.stockMovement.findUnique({
-      where: { idempotencyKey },
-      select: { id: true },
-    })
-    if (existing) {
-      const [product, warehouse] = await Promise.all([
-        tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
-        tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
-      ])
-      return {
-        movementId: existing.id,
-        productSku: product?.sku ?? productId,
-        warehouseName: warehouse?.name ?? warehouseId,
-      }
-    }
+    const replay = await findReplayedAdjustment()
+    if (replay) return replay
   }
 
   // ig58: pre-flight availability check against the locked row, before any
