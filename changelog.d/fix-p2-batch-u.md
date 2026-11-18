@@ -1,0 +1,4 @@
+### Mintsoft order lifecycle: unbuildable changes
+
+- A change to an order that IMS cannot build for Mintsoft (for example a store-credit review or a removed delivery street) now appears on Sync > Exceptions as "Order change not applied in the warehouse", instead of only a note on the order link. It is raised only when something the warehouse acts on changed (lines, quantities or the delivery address); a store-credit review or a plain edit with the same lines raises nothing or a low-priority row. It clears as soon as the order builds again, and when the order goes on hold.
+- Already in place and covered by tests, no change here: cancelling an order Mintsoft has already cancelled, changes refused after NEW (exception row plus a warehouse query task), and the "already exists" dedupe verifying number, reference and live status before linking.
