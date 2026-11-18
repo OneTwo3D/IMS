@@ -34,6 +34,34 @@ A refused login after an HTTP 401 is a pure hold only when that 401 came straigh
 The grant above is the transport's permission. A second, earlier check decides whether IMS should PRODUCE a WooCommerce write at all: when `PRODUCER_HOLD_ENFORCED_DESTINATIONS` names `woocommerce`, a write is produced only once both `WC_WRITEBACK_ALLOWED_ORIGIN` and `WC_WRITES_LIVE_FROM` are in force and the ownership map says IMS owns that operation. Until then every WooCommerce write IMS would have made (stock, order completion, cancel and hold, tracking, partial shipments, the WMS-status note, product details, exchange rates, the FX helper check, webhook registration, the invoice note) is kept as a shadow record and nothing is queued or sent; the queue drains for stock, order completion, cancel and hold claim nothing and spend no attempts. Stock stays Qoblex's and exchange rates stay with the Aelia plugin until their live-from instant. The forced stock push also stays behind the "Push stock levels to WooCommerce" setting. Check the posture of an installation before and after switching anything on: with the hold on and no live-from instant, a stock change, a shipment or a button press must leave `integration_outbox` unchanged and add or count a row in `outbound_shadow_writes` with destination `woocommerce`. See "Producer-side hold" in the installation guide for the variables and `help-docs/woocommerce.md` for what an operator sees.
 
 
+### Single-writer cutover: handing WooCommerce writeback from the legacy bridge to IMS
+
+Exactly one writer may write partial shipments, tracking, order status and the WMS-status meta on a store at a time. While IMS and the legacy bridge (woo-mintsoft plugin) both write, customers get duplicate partial-shipment records and duplicate despatch emails, which cannot be taken back. Nothing here is executed by an agent; the operator runs each step and stops at the first failing check.
+
+The interlock is enforced in three places and is read by one command, `npm run writers:check` (exit 0 only when no two writers claim one operation):
+
+1. IMS side, produce: the producer hold (`PRODUCER_HOLD_ENFORCED_DESTINATIONS` names `woocommerce`) with the ownership map, so IMS produces a write only when it owns that operation and both `WC_WRITEBACK_ALLOWED_ORIGIN` and `WC_WRITES_LIVE_FROM` are set. Everything else is recorded as a shadow and nothing is sent.
+2. IMS side, send: the transport hold refuses any WooCommerce write the grant does not name, on every redirect hop.
+3. Storefront side: the onetwoInventory Helper plugin (1.5.0 or later) answers a signed read-only `GET /wp-json/oti/v1/incumbents` with whether the legacy bridge, Xeroom and IOSS/Xero plugins are active. `writers:check` fails (`incumbent-plugin-active-vs-ims-writer`) when IMS can write an operation an active plugin also writes, and fails closed (`incumbent-plugin-unreadable`, exit 2) when the storefront cannot be asked.
+
+Order of the switch (each step is reversible; see the rollback below):
+
+1. Confirm the baseline. Install helper plugin 1.5.0 or later on the store. Run `npm run writers:check`. It must be ok, with the incumbent plugins reported as ACTIVE and IMS able to write none of their operations (grant and live-from unset).
+2. Quiesce the incumbent. Deactivate the woo-mintsoft plugin on the store (the legacy Python bridge process too). Wait until no `_mintsoft_*` meta changes on new orders. Run `npm run writers:check`: the legacy_bridge line must read `inactive`.
+3. Grant IMS. Set `WC_WRITEBACK_ALLOWED_ORIGIN` to the store origin and `WC_WRITES_LIVE_FROM` to the instant from which IMS owns the writeback, in the environment of the one installation that owns this store, then restart it. Set both in the same change: exactly one of them leaves the installation held and `outbound:status` says so.
+4. Verify no double write. Run `npm run writers:check` (must be ok) and `npm run outbound:status`. Ship one test order that was created after the live-from instant. On that order check: exactly one partial-shipment row, exactly one tracking entry, exactly one despatch email in the mail log, and no `_mintsoft_*` meta written after the instant.
+5. Record the evidence (the check output, the order number and the three counts above) with the date and the operator.
+
+Stop condition: any non-zero exit from `writers:check`, a second partial-shipment row or a second despatch email on the test order. Stop, then roll back.
+
+Rollback (restores the previous single writer):
+
+1. Unset `WC_WRITEBACK_ALLOWED_ORIGIN` and `WC_WRITES_LIVE_FROM` on the IMS installation and restart it. IMS now shadows every WooCommerce write and sends nothing; queued stock, completion, cancel and hold rows stay queued and are not retried.
+2. Only then reactivate the woo-mintsoft plugin and bridge. Never reactivate the bridge while the IMS grant is still set: `writers:check` reports that as a double claim.
+3. Run `npm run writers:check` and confirm ok.
+
+What rollback does NOT undo: rows, emails and meta IMS already wrote while it was live (they stay on the store), and shadow records kept in `outbound_shadow_writes` (they are evidence, not work to replay). A duplicate customer email that was sent cannot be recalled.
+
 ## 1. WC → IMS product create/update
 
 1. Create or edit a product in WooCommerce with a stable SKU.

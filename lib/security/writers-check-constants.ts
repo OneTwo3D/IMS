@@ -42,6 +42,24 @@ export const EVIDENCE_CONTESTS: Readonly<Record<WritersCheckEvidenceKey, readonl
   XERO_FOREIGN_NUMBER: ['xero.sales.invoice'],
 }
 
+/**
+ * Which destination operations each ACTIVE incumbent plugin contests, as the storefront's helper plugin reports it (GET /oti/v1/incumbents).
+ * A plugin being switched on while IMS can write one of these is a double claim whatever the ownership map says: this is the check that
+ * refuses a claim of ownership while the legacy bridge is still running, before any customer sees a duplicate email.
+ */
+export const INCUMBENT_PLUGIN_CONTESTS: Readonly<Record<'legacy_bridge' | 'xeroom' | 'ioss_xero', readonly string[]>> = {
+  legacy_bridge: [
+    'mintsoft.order.create',
+    'woocommerce.order.status',
+    'woocommerce.order.tracking',
+    'woocommerce.order.partial-shipment',
+    'woocommerce.order.wms-status-meta',
+    'woocommerce.product.meta',
+  ],
+  xeroom: ['woocommerce.order.invoice-note', 'woocommerce.order.invoice-document'],
+  ioss_xero: ['woocommerce.order.invoice-note', 'woocommerce.order.invoice-document'],
+}
+
 /** Rows IMS must never own in any phase (the incumbent keeps SALES invoicing for good): an `IMS` owner here is a defect in the map. */
 export const IMS_FORBIDDEN_OWNERSHIP_ROWS: readonly string[] = [
   'xero.sales.invoice',
@@ -72,6 +90,7 @@ export const WRITERS_CHECK_CAN_SEE: readonly string[] = [
   'the ownership map and the phase each destination is in, from the grant and the live-from instant',
   'whether IMS itself could write each mapped operation right now: the settings, the plugin switches, the grant and the producer decision (a schedule being off is not counted as a barrier: the scheduled route does not check it and stays callable by an authenticated request)',
   'the bridge plugin\'s warehouse-order metas and the invoicing plugin\'s markers on storefront orders that IMS imported (kept at import, with the paid time, values never stored)',
+  'whether the bridge, invoicing and IOSS plugins are ACTIVE on the storefront, asked of the helper plugin (1.5.0 or later) by one signed read-only GET; a storefront that cannot be asked is reported as unreadable, never as inactive',
   'invoice numbers Xero reported as held by a document IMS does not own, at the moment IMS tried to post under them',
 ]
 
