@@ -2521,6 +2521,9 @@ model SalesOrderRefund {
   deletedAt       DateTime?  @map("deleted_at")
   deletedById     String?    @map("deleted_by_id")
   deleteReason    String?    @map("delete_reason")
+  /// o3d-iil0b: the returns-inbox arrival(s) this refund ADOPTED. The warehouse had already booked the return (status RESTOCKED, stock in), so the refund links to it and creates no
+  /// new stock movement, return expectation or stock-in-transit debit for the same units. Empty for every other refund.
+  adoptedReturnsInboxIds String[] @default([]) @map("adopted_returns_inbox_ids")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])

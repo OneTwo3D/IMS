@@ -97,6 +97,7 @@ async function cleanup(rig: Rig, fx: Awaited<ReturnType<typeof seed>> | undefine
   await rig.db.setting.deleteMany({ where: { key: SWITCH } }).catch(() => {})
   if (!fx) return
   const { db } = rig
+  await db.wmsReturnsInbox.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
   await db.returnExpectationLine.deleteMany({ where: { expectation: { orderId: fx.orderId } } }).catch(() => {})
   await db.returnExpectation.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
   await db.integrationOutbox.deleteMany({ where: { operation: 'refund.reservation-release', payloadJson: { path: ['orderId'], equals: fx.orderId } } }).catch(() => {})
@@ -261,6 +262,50 @@ test(
       assert.equal(seen.expectations.length, 0)
       assert.equal(seen.movements, 1, 'restocked at refund time, as before')
       assert.equal(seen.levels, 1)
+    } finally {
+      await cleanup(rig, fx)
+      await rig.db.$disconnect()
+      await rig.pool.end()
+    }
+  },
+)
+
+test(
+  'return expectation (o3d-iil0b): a refund ADOPTS a returns-inbox arrival already restocked for that order and product: it links, and books no expectation, movement or transit debit; the next refund, with nothing left to adopt, routes in transit',
+  { skip: process.env.RUN_DB_CONCURRENCY_TESTS !== '1' },
+  async () => {
+    const rig = await openRig()
+    const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+    let fx: Awaited<ReturnType<typeof seed>> | undefined
+    try {
+      fx = await seed(rig, suffix)
+      const seeded = fx
+      await rig.db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: 'true' }, update: { value: 'true' } })
+      // The warehouse booked the return first: a RESTOCKED inbox row and its RETURN_INBOUND movement for one unit.
+      const inbox = await rig.db.wmsReturnsInbox.create({
+        data: { connector: 'mintsoft', externalReturnId: `rxc-${suffix}`, orderId: seeded.orderId, productId: seeded.productId, qty: new rig.Prisma.Decimal('1'), warehouseId: seeded.returnsId, status: 'RESTOCKED' },
+        select: { id: true },
+      })
+      await rig.db.stockMovement.create({
+        data: { type: 'RETURN_INBOUND', productId: seeded.productId, toWarehouseId: seeded.returnsId, qty: new rig.Prisma.Decimal('1'), referenceType: 'WmsReturnsInbox', referenceId: inbox.id, unitCostBase: new rig.Prisma.Decimal('40'), totalValueBase: new rig.Prisma.Decimal('40') },
+      })
+      const first = await rig.createSalesOrderRefund(rig.db, refundInput(seeded, suffix, 5_000_000 + Math.floor(Math.random() * 900_000)))
+      assert.equal(first.success, true, `refund must succeed (${first.success ? '' : first.error})`)
+      const adopted = await rig.db.salesOrderRefund.findFirstOrThrow({ where: { orderId: seeded.orderId }, select: { id: true, returnInTransit: true, returnWarehouseId: true, adoptedReturnsInboxIds: true } })
+      assert.deepEqual(adopted.adoptedReturnsInboxIds, [inbox.id], 'linked to the arrival')
+      assert.equal(adopted.returnInTransit, false)
+      assert.equal(adopted.returnWarehouseId, null)
+      let seen = await observe(rig, seeded)
+      assert.equal(seen.expectations.length, 0, 'no new return expectation')
+      assert.equal(seen.movements, 1, 'only the warehouse\'s own RETURN_INBOUND: the refund booked no second stock-in')
+      assert.equal(await rig.db.activityLog.count({ where: { entityId: seeded.orderId, action: 'refund_adopted_returns_inbox' } }), 1)
+
+      // CONTROL: the arrival is used up, so a second refund adopts nothing and routes its goods in transit as before.
+      const second = await rig.createSalesOrderRefund(rig.db, refundInput(seeded, suffix, 5_900_000 + Math.floor(Math.random() * 90_000)))
+      assert.equal(second.success, true, `refund must succeed (${second.success ? '' : second.error})`)
+      seen = await observe(rig, seeded)
+      assert.equal(seen.expectations.length, 1, 'the unadopted refund keeps its expectation')
+      assert.equal(seen.refunds.filter((r) => r.returnInTransit).length, 1)
     } finally {
       await cleanup(rig, fx)
       await rig.db.$disconnect()

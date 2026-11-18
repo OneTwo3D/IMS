@@ -219,3 +219,45 @@ export async function queueReturnRestockValueJournal(
     }
   }
 }
+
+/**
+ * o3d-iil0b (owner decision 2026-11-18): A REFUND ADOPTS A RETURNS-INBOX ARRIVAL THAT IS ALREADY RESTOCKED for the same order and product.
+ *
+ * The warehouse booked the return first (inbox status RESTOCKED, a RETURN_INBOUND movement valued and journalled Dr Inventory / Cr the
+ * stock-gain reason). A refund that then restocked or routed the same units in transit would count them twice (Inventory plus Stock in
+ * Transit) and its expectation would never clear. Instead the refund LINKS to the arrival: no stock movement, no expectation, no transit debit.
+ *
+ * Available cover per product = units the order's RESTOCKED inbox rows put into stock, less the units earlier live refunds on the order already
+ * adopted. ALL-OR-NOTHING: the refund adopts only when every returned product is fully covered; a partly covered refund keeps today's behaviour
+ * (a limit, stated rather than guessed at). Returns the inbox ids linked, or null when nothing is adopted.
+ */
+export async function findRestockedInboxesToAdopt(
+  tx: Prisma.TransactionClient,
+  params: { orderId: string; lines: ReadonlyArray<{ productId?: string | null; qty: number }> },
+): Promise<string[] | null> {
+  const wanted = new Map<string, number>()
+  for (const line of params.lines) {
+    if (!line.productId || !(line.qty > 0)) continue
+    wanted.set(line.productId, (wanted.get(line.productId) ?? 0) + line.qty)
+  }
+  if (wanted.size === 0) return null
+  const linked = new Set<string>()
+  for (const [productId, qty] of wanted) {
+    const inboxes = await tx.wmsReturnsInbox.findMany({
+      where: { orderId: params.orderId, productId, status: 'RESTOCKED', erasedAt: null },
+      select: { id: true },
+    })
+    if (inboxes.length === 0) return null
+    const restocked = Number((await tx.stockMovement.aggregate({
+      where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: { in: inboxes.map((i) => i.id) }, productId },
+      _sum: { qty: true },
+    }))._sum.qty ?? 0)
+    const adoptedBefore = Number((await tx.salesOrderRefundLine.aggregate({
+      where: { productId, refund: { orderId: params.orderId, deletedAt: null, adoptedReturnsInboxIds: { isEmpty: false } } },
+      _sum: { qty: true },
+    }))._sum.qty ?? 0)
+    if (restocked - adoptedBefore < qty - 1e-9) return null
+    for (const inbox of inboxes) linked.add(inbox.id)
+  }
+  return [...linked]
+}
