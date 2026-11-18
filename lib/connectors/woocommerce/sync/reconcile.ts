@@ -59,6 +59,8 @@ export type WcReconcileResult = {
   refundStockCorrections?: { error: string }
   /** IMS-to-WooCommerce product pushes that failed earlier and were pushed again this pass. */
   productPushRetries?: { retried: number; resolved: number; remaining: number; deferred: number }
+  /** The product-push retry sweep itself threw (its queue read or the shopping import), so no retry outcome is known this pass. */
+  productPushRetrySweep?: { error: string }
   stock?: {
     queued: Awaited<ReturnType<typeof processQueuedWcStockSyncJobs>>
     sync?: Awaited<ReturnType<typeof pushStockToWc>>
@@ -95,6 +97,7 @@ async function retryProductPushesWithinBudget(results: WcReconcileResult, starte
     if (retries.retried > 0 || retries.deferred > 0) results.productPushRetries = retries
   } catch (error) {
     console.error('[wc-reconcile] retrying failed product pushes failed', error)
+    results.productPushRetrySweep = { error: error instanceof Error ? error.message : String(error) }
   }
 }
 

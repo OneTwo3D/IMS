@@ -203,7 +203,7 @@ export const cronOutcomes = {
   // failed: number (events that failed to process) and error texts, per connector tick and per drain
   'shopping-webhook-inbox': (r: ShoppingWebhookInboxCronResult) => from(r, counts(r, ['failed', 'deadLettered']), structural(r)),
   // error texts and lists in each section (orders, products, stock, queued pushes); held pushes are recognised by their text;
-  // refundStockCorrections.error (the queueing of open refund stock corrections threw); products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
+  // productPushRetrySweep.error (the product-push retry sweep threw); refundStockCorrections.error (the queueing of open refund stock corrections threw); products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
   // heldSalesInvoices.readError: the held-invoice release sweep could not read its queue or the orders behind it (a database read: never held)
   'wc-reconcile': (r: WcReconcileResult | Skip) =>
     from(r, structural(r), permanentLists(r, ['permanentErrors']), 'heldSalesInvoices' in r && r.heldSalesInvoices?.readError ? 'failed' : null),
