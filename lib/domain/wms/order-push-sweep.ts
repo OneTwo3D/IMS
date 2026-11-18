@@ -5,6 +5,8 @@ import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { STORE_CREDIT_PUSH_WITHHELD_REASON, storeCreditPushMustBeWithheld } from '@/lib/domain/wms/store-credit-push-guard'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import type { MixedScope } from '@/lib/domain/wms/mixed-scope'
+import { isMixedWarehousePushEnabled } from '@/lib/domain/wms/mixed-scope-flag'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { currencyMinorUnits, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -759,14 +761,17 @@ export function applyLinkCourierForm(
 export const ERASED_ORDER_PUSH_REASON =
   'This order\'s personal data has been erased, so it is not sent to the warehouse. Nothing was sent.'
 
-export function buildPushInput(order: OrderForPush, externalWarehouseId: string): WmsOrderPushInput {
+export function buildPushInput(order: OrderForPush, externalWarehouseId: string, scope?: MixedScope): WmsOrderPushInput {
   if (order.erasedAt) throw new Error(ERASED_ORDER_PUSH_REASON)
   const recipient = resolvePushRecipient(order)
   // Refuse BEFORE anything is claimed or sent: an empty street is not a destination (builds on local data only).
   if (!recipient.address.address1) throw new Error(NO_DELIVERY_STREET_REASON)
   // Refuse too when the discount may still contain store credit (a payment, never a discount): see the guard.
   if (storeCreditPushMustBeWithheld(order)) throw new Error(STORE_CREDIT_PUSH_WITHHELD_REASON)
-  return {
+  // MIXED-WAREHOUSE SCOPE (only ever passed while `wms_mixed_warehouse_push_enabled` is on). A scope that cannot be sent (unallocated units, a split kit,
+  // nothing allocated to this warehouse) is a local build failure like a missing SKU: nothing is claimed or sent. FULL / absent leaves the payload below untouched.
+  if (scope && scope.mode !== 'FULL' && scope.mode !== 'MIXED') throw new Error(scope.reason)
+  const input: WmsOrderPushInput = {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,
     externalWarehouseId,
@@ -784,6 +789,21 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
     discountExVat: num(order.discountAmount),
     discountVat: 0,
     lines: buildLines(order.lines, refundedQtyByLine(order)),
+  }
+  if (scope?.mode !== 'MIXED') return input
+  const minorFactor = 10 ** currencyMinorUnits(order.currency)
+  return {
+    ...input,
+    totalVat: scope.vatMinor / minorFactor,
+    shippingExVat: scope.shippingMinor / minorFactor,
+    discountExVat: scope.discountMinor / minorFactor,
+    lines: scope.lines.map((line) => ({
+      sku: line.sku,
+      quantity: line.quantity,
+      unitPriceExVat: line.unitPriceExVat,
+      unitPriceVat: line.unitPriceVat,
+      description: line.description,
+    })),
   }
 }
 
@@ -844,6 +864,11 @@ type LinkWrite = {
   lineSnapshotToken?: string | null
   amendLeaseOwner?: string | null
   amendLeaseExpiresAt?: Date | null
+  /** Mixed-warehouse scope bookkeeping (see WmsOrderPushLink). */
+  scopeDirtyAt?: Date | null
+  scopeCheckedAt?: Date | null
+  scopeFrozenAt?: Date | null
+  scopeFrozenReason?: string | null
 }
 
 /**
@@ -890,7 +915,7 @@ export const HELD_CREATE_CURSOR_KEY = 'wms_order_push_held_create_cursor'
 const toRemovalNoteItem = (item: Pick<WmsOrderItemRef, 'externalItemId' | 'sku' | 'quantity'>): RemovalNoteItem => ({ externalItemId: item.externalItemId, sku: item.sku, quantity: item.quantity })
 
 export type WmsPushCandidate = OrderForPush & { shipFromWarehouseId: string | null; pushAttempts: number }
-export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; courierTaskService?: string | null; courierTaskEpisode?: Date | null; pushedAt?: Date | null; courierForm?: string | null; courierFormName?: string | null; amendNoticeAt?: Date | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
+export type WmsPushUpdateLink = { id: string; externalOrderId: string | null; pushWarehouseId?: string | null; scopeMode?: 'FULL' | 'MIXED' | null; scopeHash?: string | null; scopeDirtyAt?: Date | null; scopeFrozenAt?: Date | null; scopeFrozenReason?: string | null; courierTaskService?: string | null; courierTaskEpisode?: Date | null; pushedAt?: Date | null; courierForm?: string | null; courierFormName?: string | null; amendNoticeAt?: Date | null; order: OrderForPush & { shipFromWarehouseId: string | null } }
 /**
  * o3d-92fu: a VALIDATION_FAILED link plus the order data the payload is rebuilt from.
  * `lastError` is carried so a re-run that fails for the SAME reason can re-stamp the
@@ -1082,6 +1107,16 @@ export interface WmsOrderPushPort {
    */
   verifiableLinks?(connector: string, limit: number): Promise<WmsPushVerifyLink[]>
   updatableLinks(connector: string, limit: number, changedNotBefore?: Date): Promise<WmsPushUpdateLink[]>
+  /**
+   * The part of the order the warehouse `wmsWarehouseId` serves (lib/domain/wms/mixed-scope.ts), or null while `wms_mixed_warehouse_push_enabled` is off.
+   * Optional: a port without it (every test double that predates the feature) sends the whole order, exactly as before.
+   */
+  loadMixedScope?(orderId: string, wmsWarehouseId: string): Promise<MixedScope | null>
+  /**
+   * Record the scope that was just SENT: the scope columns on the link, a new version and its line snapshot when it differs from the one recorded, and
+   * clear the dirty mark only when it was set before `readAt` (a change made while the scope was being sent stays dirty).
+   */
+  recordMixedScope?(orderId: string, scope: MixedScope, readAt: Date): Promise<void>
   /**
    * o3d-92fu — VALIDATION_FAILED links whose order is STILL create-eligible, so the
    * sweep can re-run the (purely local, zero-API-cost) payload build and put the order
@@ -1354,6 +1389,13 @@ export async function runWmsOrderPushSweepCore(
   const now = options?.now ?? (() => new Date())
   const registry = options?.registry
   const producerContext = options?.producerContext
+  // MIXED-WAREHOUSE SCOPE (see lib/domain/wms/mixed-scope.ts). Undefined while the feature is off or the port cannot read it: every build below is then
+  // exactly what it was before the feature existed. A read that FAILS is not "off": the caller skips the order this sweep rather than send the whole of
+  // what may be a mixed order.
+  const loadScope = async (orderId: string, warehouseId: string | null | undefined): Promise<MixedScope | undefined> => {
+    if (!port.loadMixedScope || !warehouseId) return undefined
+    return (await port.loadMixedScope(orderId, warehouseId)) ?? undefined
+  }
 
   // THE PRODUCER-SIDE HOLD (see lib/connectors/wms/producer-seam.ts). Every operation below that writes to the warehouse asks
   // the seam BEFORE it claims, records or calls anything, and a shadow answer changes no state: no claim, no link write, no
@@ -2187,8 +2229,15 @@ export async function runWmsOrderPushSweepCore(
         continue
       }
       const ts = now()
+      let revalidateScope: MixedScope | undefined
       try {
-        buildPushInput(link.order, externalWarehouseId)
+        revalidateScope = await loadScope(link.order.id, link.order.shipFromWarehouseId)
+      } catch (scopeError) {
+        console.error(`[wms-order-push] could not read the mixed-warehouse scope of ${link.order.id}: ${scrubWmsError(scopeError, 'read failed')}`)
+        continue
+      }
+      try {
+        buildPushInput(link.order, externalWarehouseId, revalidateScope)
       } catch (error) {
         const message = scrubWmsError(error, 'WMS order payload could not be built')
         // Re-stamp so the rotation moves on. Audited only when the REASON changed — a new
@@ -2490,8 +2539,15 @@ export async function runWmsOrderPushSweepCore(
       // Replay-safe connector — the SECOND key. The payload still has to BUILD (a re-queue whose
       // payload cannot be built would simply be parked again by the create pass's validation route
       // on the next tick) and the warehouse still has to say it holds no such order.
+      let ambiguousScope: MixedScope | undefined
       try {
-        buildPushInput(link.order, externalWarehouseId)
+        ambiguousScope = await loadScope(link.order.id, link.order.shipFromWarehouseId)
+      } catch (scopeError) {
+        console.error(`[wms-order-push] could not read the mixed-warehouse scope of ${link.order.id}: ${scrubWmsError(scopeError, 'read failed')}`)
+        continue
+      }
+      try {
+        buildPushInput(link.order, externalWarehouseId, ambiguousScope)
       } catch (error) {
         const message = `${scrubWmsError(error, 'WMS order payload could not be built')} (a previous create for this order was dispatched with no recorded outcome)`
         const restamped = await port
@@ -2616,6 +2672,17 @@ export async function runWmsOrderPushSweepCore(
       }
       const externalWarehouseId = order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
+      // The part of the order this warehouse serves (undefined: the whole order, as always). Read before the seam so a shadowed create records the
+      // payload that WOULD have been sent. `scopeReadAt` is the instant the read began: a later allocation change marks the scope dirty after it.
+      const scopeReadAt = now()
+      let scope: MixedScope | undefined
+      try {
+        scope = await loadScope(order.id, order.shipFromWarehouseId)
+      } catch (scopeError) {
+        console.error(`[wms-order-push] could not read the mixed-warehouse scope of ${order.id}: ${scrubWmsError(scopeError, 'read failed')}`)
+        result.failed += 1
+        continue
+      }
 
       // THE PRODUCER SEAM OF THE CREATE, BEFORE ANYTHING IS BUILT, CLAIMED OR PERSISTED. A shadow is not a claim and not a
       // failure: the link is not created, not stamped and not counted, the withdrawal fence is not consulted and no attempt is
@@ -2627,7 +2694,7 @@ export async function runWmsOrderPushSweepCore(
         operation: 'order.create',
         subjectType: 'SalesOrder',
         subjectId: order.id,
-        payload: () => buildPushInput(order, externalWarehouseId),
+        payload: () => buildPushInput(order, externalWarehouseId, scope),
         summary: { orderNumber: order.orderNumber ?? null, retries: order.pushAttempts },
         obligationAt: order.paidAt ?? order.createdAt ?? undefined,
         context: producerContext,
@@ -2670,7 +2737,7 @@ export async function runWmsOrderPushSweepCore(
       // call was ever made, which is what lets the delete guard let it go.
       let input: WmsOrderPushInput
       try {
-        input = buildPushInput(order, externalWarehouseId)
+        input = buildPushInput(order, externalWarehouseId, scope)
       } catch (error) {
         const message = scrubWmsError(error, 'WMS order payload could not be built')
         const before = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
@@ -2820,7 +2887,7 @@ export async function runWmsOrderPushSweepCore(
           continue
         }
         try {
-          input = buildPushInput({ ...order, ...current } as typeof order, externalWarehouseId)
+          input = buildPushInput({ ...order, ...current } as typeof order, externalWarehouseId, scope)
           if (current.shippingService !== undefined) pushService = current.shippingService
         } catch {
           await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
@@ -2890,7 +2957,8 @@ export async function runWmsOrderPushSweepCore(
           console.error(`[wms-order-push] component total check could not run for ${order.orderNumber ?? order.id}: ${scrubWmsError(error, 'check failed')}`)
         }
         // BOTH checks always run: a small component error must not hide a larger payload discrepancy.
-        const payloadPence = payloadTotalMismatchPence(order, input)
+        // A scoped payload is a PART of the order: the whole-order total check would flag every mixed order, so it does not run for one.
+        const payloadPence = scope?.mode === 'MIXED' ? null : payloadTotalMismatchPence(order, input)
         const totalMismatchPence = largerAdvisoryPence(componentPence, payloadPence)
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: components=${componentPence ?? 'ok'} payload=${payloadPence ?? 'ok'} (recording ${totalMismatchPence}; pushed, flagged for review)`)
@@ -2913,6 +2981,10 @@ export async function runWmsOrderPushSweepCore(
           await port.upsertCreatedLinkWithItems(order.id, createLinkData, updateLinkData, push.externalOrderId, push.items ?? null)
         } else {
           await port.upsertByOrder(order.id, createLinkData, updateLinkData)
+        }
+        // The scope that was just sent is recorded (best effort: a failure leaves the scope dirty/unrecorded and the amend pass re-sends the same part).
+        if (scope && port.recordMixedScope) {
+          await port.recordMixedScope(order.id, scope, scopeReadAt).catch((e) => console.error(`[wms-order-push] could not record the scope sent for ${order.id}: ${scrubWmsError(e, 'write failed')}`))
         }
         // o3d-6x66: the claim's withdrawal re-check committed BEFORE this
         // remote push, so a withdrawal landing in between still gets its order
@@ -3461,7 +3533,23 @@ export async function runWmsOrderPushSweepCore(
       }
     }
     for (const link of await (createFloor ? port.updatableLinks(connectorId, batchSize, createFloor) : port.updatableLinks(connectorId, batchSize))) {
-      const externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
+      let externalWarehouseId = link.order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(link.order.shipFromWarehouseId) : undefined
+      // MIXED-WAREHOUSE SCOPE: the part of the order the warehouse this link was created for serves. While the feature is off `scope` stays undefined and
+      // nothing below differs from before it existed. The warehouse order lives in the warehouse the link was PUSHED for, so a changed ship-from cannot
+      // send the amendment to a different warehouse id.
+      let scope: MixedScope | undefined
+      const scopeReadAt = now()
+      if (port.loadMixedScope && link.externalOrderId) {
+        const scopeWarehouseId = link.pushWarehouseId ?? link.order.shipFromWarehouseId
+        try {
+          scope = await loadScope(link.order.id, scopeWarehouseId)
+        } catch (scopeError) {
+          console.error(`[wms-order-push] could not read the mixed-warehouse scope of ${link.order.id}: ${scrubWmsError(scopeError, 'read failed')}`)
+          result.failed += 1
+          continue
+        }
+        if (scope && link.pushWarehouseId) externalWarehouseId = externalWarehouseByWarehouse.get(link.pushWarehouseId) ?? externalWarehouseId
+      }
       if (!externalWarehouseId || !link.externalOrderId) continue
 
       const ts = now()
@@ -3480,6 +3568,44 @@ export async function runWmsOrderPushSweepCore(
           await port.updateLink(link.id, { lastAttemptAt: ts, pushedAt: ts, lastError: ERASED_ORDER_PUSH_REASON })
           continue
         }
+        // MIXED-WAREHOUSE SCOPE DECISIONS (feature on only). The link is due either because the order changed since the push or because an allocation /
+        // shipment writer marked the scope dirty; the second is settled here by comparing the part IMS would send now with the part recorded.
+        let scopeChanged = false
+        if (scope) {
+          const dueByOrderChange = !link.scopeDirtyAt || (!!link.order.updatedAt && !!link.pushedAt && link.order.updatedAt > link.pushedAt)
+          if (scope.mode === 'HOLD') {
+            // Q1: units are still unallocated. Nothing is sent or changed in the warehouse; the check is recorded (the dirty mark cleared) and the order
+            // stays due by its own change, so a later allocation (which marks the scope dirty again) or the next sweep re-decides.
+            await port.recordMixedScope?.(link.order.id, scope, scopeReadAt)
+            continue
+          }
+          if (scope.mode === 'REFUSED' || scope.mode === 'EMPTY') {
+            // A split kit (Q4) or nothing allocated to this warehouse: nothing can be sent. Escalated HIGH for a person (reallocate the kit, or cancel in the
+            // warehouse); retryable, and closed below the moment the scope is sendable again.
+            await port.recordRefusedAction?.({
+              entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
+              entityId: link.order.id,
+              action: 'WMS_ORDER_AMEND',
+              gate: 'WMS_SCOPE_UNSENDABLE',
+              permanence: 'RETRYABLE',
+              severity: 'HIGH',
+              intent: { orderNumber: link.order.orderNumber ?? null, scope: scope.mode } as unknown as Prisma.InputJsonValue,
+              detail: `IMS could not work out what to send the warehouse for this mixed-warehouse order, so nothing was changed there: ${scope.reason}.`,
+              now: ts,
+            }).catch((e) => console.error('[wms-order-push] could not record an unsendable scope', e))
+            await port.recordMixedScope?.(link.order.id, scope, scopeReadAt)
+            continue
+          }
+          scopeChanged = scope.mode === 'MIXED'
+            ? link.scopeMode !== 'MIXED' || link.scopeHash !== scope.hash
+            : link.scopeMode === 'MIXED'
+          if (!dueByOrderChange && !scopeChanged) {
+            // Dirty, but the part sent is the part IMS would send now: nothing to amend.
+            await port.recordMixedScope?.(link.order.id, scope, scopeReadAt)
+            continue
+          }
+          if (link.scopeFrozenAt) await port.resolveRefusedActions?.(link.order.id, 'WMS_ORDER_AMEND', 'WMS_SCOPE_UNSENDABLE').catch(() => {})
+        }
         // The amendment asks before anything is built: a shadow touches no link (not even its error note), because the order
         // is amended from the same unchanged link on the sweep that may write.
         //
@@ -3493,7 +3619,7 @@ export async function runWmsOrderPushSweepCore(
           operation: 'order.amend',
           subjectType: 'SalesOrder',
           subjectId: link.order.id,
-          payload: () => buildPushInput(link.order, externalWarehouseId),
+          payload: () => buildPushInput(link.order, externalWarehouseId, scope),
           summary: { orderNumber: link.order.orderNumber ?? null },
           obligationAt: link.order.updatedAt ?? undefined,
           context: producerContext,
@@ -3520,7 +3646,7 @@ export async function runWmsOrderPushSweepCore(
         amendService = amendOrder.shippingService
         let input: WmsOrderPushInput
         try {
-          input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
+          input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId, scope), link)
         } catch (buildError) {
           // THE CHANGE CANNOT EVEN BE BUILT (a store-credit review, a removed street, a line with no SKU): nothing is sent and the link stays due, so it
           // is retried every sweep. That used to leave only a lastError on a SYNCED link, which no one looks at while the warehouse works from stale
@@ -3637,11 +3763,17 @@ export async function runWmsOrderPushSweepCore(
           ...(update.updated && link.amendNoticeAt ? { amendNoticeAt: null } : {}),
           // The accepted header POST carried WarehouseId, so the warehouse order now lives in the warehouse IMS built the amendment for:
           // stamped in the same write that records the outcome, or a despatch from it would read as foreign.
-          ...(update.updated ? { pushWarehouseId: link.order.shipFromWarehouseId ?? null } : {}),
+          ...(update.updated ? { pushWarehouseId: scope ? (link.pushWarehouseId ?? link.order.shipFromWarehouseId ?? null) : (link.order.shipFromWarehouseId ?? null) } : {}),
+          // A CHANGED scope the warehouse could not take (the order is past NEW): frozen, and escalated by the refused amendment recorded above (Q5).
+          // The scope on record stays what the warehouse holds; the dirty mark is cleared so the link is not re-selected for it every sweep.
+          ...(!update.updated && scopeChanged ? { scopeFrozenAt: ts, scopeFrozenReason: 'NOT_NEW', scopeDirtyAt: null, scopeCheckedAt: ts } : {}),
           lastError: settled.retryable ? 'Courier-fallback operator task not recorded; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
           ...settled.linkFields,
         })
         if (update.updated) result.updated += 1
+        if (update.updated && scope && port.recordMixedScope) {
+          await port.recordMixedScope(link.order.id, scope, scopeReadAt).catch((e) => console.error(`[wms-order-push] could not record the scope sent for ${link.order.id}: ${scrubWmsError(e, 'write failed')}`))
+        }
         await audit({
           action: 'order_update', outcome: update.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
           summary: update.updated
@@ -4471,6 +4603,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async updatableLinks(connector, limit, changedNotBefore) {
       // "order changed since push" is a two-column comparison Prisma can't express.
       const floorIso = changedNotBefore ? changedNotBefore.toISOString() : null
+      const scopeOn = await isMixedWarehousePushEnabled()
       const dueRows = await db.$queryRaw<Array<{ id: string }>>`
         SELECT l.id
         FROM wms_order_push_links l
@@ -4480,7 +4613,12 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           AND l."externalOrderId" IS NOT NULL
           AND o.status::text IN ('PROCESSING', 'ALLOCATED')
           AND o."refundStatus"::text <> 'FULL'
-          AND o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
+          AND (
+            o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
+            -- An allocation / shipment writer marked the scope dirty (only read while the mixed-warehouse feature is on; a change the warehouse
+            -- already refused as past NEW is frozen and not re-selected).
+            OR (${scopeOn}::boolean AND l.scope_dirty_at IS NOT NULL AND COALESCE(l.scope_frozen_reason, '') <> 'NOT_NEW')
+          )
           AND (${floorIso}::text IS NULL OR o."updatedAt" >= (${floorIso}::timestamptz AT TIME ZONE 'UTC'))
         ORDER BY o."updatedAt" ASC
         LIMIT ${limit}
@@ -4489,7 +4627,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (!dueIds.length) return []
       return db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
-        select: { id: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
+        select: { id: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, pushWarehouseId: true, scopeMode: true, scopeHash: true, scopeDirtyAt: true, scopeFrozenAt: true, scopeFrozenReason: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
       })
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
@@ -4719,6 +4857,15 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async readOrderObligationTimes(orderId) {
       return db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, createdAt: true } })
+    },
+    async loadMixedScope(orderId, wmsWarehouseId) {
+      if (!(await isMixedWarehousePushEnabled())) return null
+      const { loadMixedScopeForOrder } = await import('@/lib/domain/wms/mixed-scope-loader')
+      return loadMixedScopeForOrder(db, orderId, wmsWarehouseId)
+    },
+    async recordMixedScope(orderId, scope, readAt) {
+      const { recordMixedScopeOutcome } = await import('@/lib/domain/wms/mixed-scope-record')
+      await recordMixedScopeOutcome(db, orderId, scope, readAt)
     },
     async reloadOrderForPush(orderId) {
       return db.$transaction(async (tx) => {
