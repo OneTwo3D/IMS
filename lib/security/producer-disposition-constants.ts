@@ -15,10 +15,9 @@
  * none of them should need a database to read a sentence.
  */
 
-import type { WriterOwner } from './writer-ownership-map'
+import { LIVE_WRITER_STEPS, WRITER_OWNERSHIP_MAP, type LiveWriterStep, type OwnershipRow, type WriterOwner } from './writer-ownership-map'
 import { WRITERS_CHECK_BLOCK_ID, renderWritersCheckDocBlock } from './writers-check-constants'
 import {
-  OUTBOUND_CONNECTORS,
   OUTBOUND_CONNECTOR_LABEL,
   OUTBOUND_GRANT_ENV,
   type OutboundConnector,
@@ -44,6 +43,44 @@ export const PRODUCER_CUTOFF_ENV: Record<OutboundConnector, string> = {
   xero: 'XERO_WRITES_LIVE_FROM',
   mintsoft: 'MINTSOFT_WRITES_LIVE_FROM',
   woocommerce: 'WC_WRITES_LIVE_FROM',
+}
+
+/**
+ * The live-from instant is per SWITCHOVER STEP, not per destination: a row reads `PRODUCER_CUTOFF_ENV[row.step]`. The three steps carry the
+ * names of the three destinations whose incumbent each one retires (step M = Mintsoft = the bridge, which also wrote WooCommerce), so this
+ * record doubles as the step record. A row whose step is `never` is read against its own destination's variable and is never IMS-owned.
+ */
+export const PRODUCER_STEP_ENV: Record<LiveWriterStep, string> = {
+  mintsoft: PRODUCER_CUTOFF_ENV.mintsoft,
+  woocommerce: PRODUCER_CUTOFF_ENV.woocommerce,
+  xero: PRODUCER_CUTOFF_ENV.xero,
+}
+
+/** The live-from variable of step M, which governs the storefront despatch writeback (a connector-neutral name for the generic despatch layer). */
+export const DESPATCH_WRITEBACK_STEP_ENV = PRODUCER_STEP_ENV.mintsoft
+
+/** The human label of a step in a sentence. */
+export const PRODUCER_STEP_LABEL: Record<LiveWriterStep, string> = {
+  mintsoft: 'step M (Mintsoft, with the bridge\'s WooCommerce writeback)',
+  woocommerce: 'step W (WooCommerce stock, webhooks and customer e-mail)',
+  xero: 'step X (Xero and the invoice note)',
+}
+
+/**
+ * The steps whose rows write to a destination with IMS as the P2 owner, in the order the steps go live. These are the steps whose live-from
+ * instant puts the destination in its live phase: WooCommerce is written by all three steps, Mintsoft by step M alone, Xero by step X alone.
+ */
+export function liveStepsOfDestination(destination: OutboundConnector): LiveWriterStep[] {
+  const steps = new Set<LiveWriterStep>()
+  for (const row of WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]) {
+    if (row.destination === destination && row.step !== 'never' && row.owners.P2 === 'IMS') steps.add(row.step)
+  }
+  return LIVE_WRITER_STEPS.filter((step) => steps.has(step))
+}
+
+/** The live-from variables that can put a destination in its live phase. */
+export function destinationCutoffEnvNames(destination: OutboundConnector): string[] {
+  return liveStepsOfDestination(destination).map((step) => PRODUCER_STEP_ENV[step])
 }
 
 export const PRODUCER_CUTOFF_FORMAT = 'one UTC instant in ISO-8601 with an explicit Z, for example 2026-12-01T00:00:00Z'
@@ -168,12 +205,14 @@ export type ProducerAgreementState = (typeof PRODUCER_AGREEMENT_STATES)[number]
 export function producerAgreementText(connector: OutboundConnector, detail: 'cutoff_without_grant' | 'grant_without_cutoff' | 'unreadable' | 'agreed_held' | 'agreed_live'): string {
   const label = OUTBOUND_CONNECTOR_LABEL[connector]
   const grant = OUTBOUND_GRANT_ENV[connector]
-  const cutoff = PRODUCER_CUTOFF_ENV[connector]
+  // Writes to a destination go live with the first step whose rows write it, so the agreement is between the grant and those steps' variables.
+  const names = destinationCutoffEnvNames(connector)
+  const cutoff = names.length === 0 ? PRODUCER_CUTOFF_ENV[connector] : names.length === 1 ? names[0]! : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`
   switch (detail) {
     case 'agreed_held':
-      return `${label}: held. Neither ${grant} nor ${cutoff} is set, so the producer-side decision for every ${label} operation is SHADOW.`
+      return `${label}: held. Neither ${grant} nor ${names.length > 1 ? 'any of ' : ''}${cutoff} is set, so the producer-side decision for every ${label} operation is SHADOW.`
     case 'agreed_live':
-      return `${label}: ${grant} and ${cutoff} are both readable, so the producer-side decision is LIVE for the operations IMS owns from the live-from instant and SHADOW for the rest.`
+      return `${label}: ${grant} and ${names.length > 1 ? 'at least one of ' : ''}${cutoff} are both readable, so the producer-side decision is LIVE for the operations IMS owns from the live-from instant and SHADOW for the rest.`
     case 'cutoff_without_grant':
       return `${label}: INCONSISTENT. ${cutoff} is set but ${grant} is not, so the producer-side decision is SHADOW and the transport refuses ${label} writes. Set both or neither.`
     case 'grant_without_cutoff':
@@ -216,15 +255,15 @@ export const PRODUCER_DOC_BLOCK_CLOSE = (id: string) => `<!-- /producer-disposit
 
 export type ProducerDocBlockId = 'overview' | 'cutoffs' | 'enforcement' | 'retirement' | typeof WRITERS_CHECK_BLOCK_ID
 
-const CUTOFF_ROWS = OUTBOUND_CONNECTORS.map(
-  (connector) => `| \`${PRODUCER_CUTOFF_ENV[connector]}\` | ${OUTBOUND_CONNECTOR_LABEL[connector]} | ${PRODUCER_CUTOFF_FORMAT} |`,
+const CUTOFF_ROWS = LIVE_WRITER_STEPS.map(
+  (step) => `| \`${PRODUCER_STEP_ENV[step]}\` | ${PRODUCER_STEP_LABEL[step]} | ${PRODUCER_CUTOFF_FORMAT} |`,
 )
 
 export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
   overview: [
     `THE PRODUCER-SIDE HOLD IS ENFORCED ONLY FOR THE DESTINATIONS NAMED IN \`${PRODUCER_HOLD_ENFORCED_ENV}\`, WHICH IS UNSET BY DEFAULT. Unset, every producer queues work exactly as it did before the decision existed, and the only barrier is the outbound-write hold above, which reads a grant on its own: a destination whose grant is set permits the outbound writes through the transport whether or not the live-from variable below is set. Today the Xero producers, the WooCommerce producers and the Mintsoft producers consult the decision, and \`npm run outbound:status\` reports on it for every destination it is enforced for. The Xero producers are every place IMS creates an accounting sync log row and the direct tax-rate creation from Settings; the one sync log type whose destination is WooCommerce, the invoice note, follows the WooCommerce setting. The WooCommerce producers are every stock push (the queue, the daily reconcile, the manual push and a webhook correction), the order completion, cancel and hold jobs, tracking, partial shipments, the WMS-status meta, product metadata, FX rates and the FX helper probe, and the registration of webhooks. The Mintsoft producers are every place IMS creates, amends, holds or cancels a warehouse order (the order-push sweep, and the two operator buttons that re-arm a create), posts a note on a warehouse order (the sweep's notes and the refund note), upserts a product or sends its descriptions and picture, creates a bundle, or creates an ASN.`,
     '',
-    'For each destination and operation the decision is LIVE or SHADOW. It is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the destination is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is SHADOW when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for a destination exactly when the grant and the live-from instant are both in force, so a restored backup, a clone or a new checkout never inherits it. The decision itself reads the environment only: no database and no network call.',
+    'For each destination and operation the decision is LIVE or SHADOW. It is LIVE only when every one of these holds, and SHADOW otherwise: the outbound-write grant for the destination is readable; the live-from variable for the switchover step of the operation is set and readable; the current time is at or after it; the ownership map says IMS owns that operation in the installation phase that follows from the two; and the time of the business event is at or after the live-from instant (an operation whose ownership-map row requires that time is SHADOW when the producer does not supply it). A value that is absent, unreadable or inconsistent is never LIVE. There is no phase setting: an installation is in its live phase for an operation exactly when the grant of its destination and the live-from instant of its step are both in force, so a restored backup, a clone or a new checkout never inherits it. The decision itself reads the environment only: no database and no network call.',
     '',
     'A SHADOW is the record of what IMS would have written, kept instead of queuing the work; it is never delivered later. For Xero a shadow is a row in the accounting sync log that is CANCELLED with the settlement basis `HELD_SHADOW`, plus a row in `outbound_shadow_writes` (one per distinct piece of work, counting repeats). A shadow has no outbox job, is never given an accounting event, and has its own ledger standing (shadow, not sent by IMS) that is NOT proof the document is absent from Xero: it says nothing about whether the owner of the operation wrote it, so deleting, reversing or refunding over it is refused as unproven. A destination whose enforcement is on and whose grant and live-from instant are both unset therefore queues nothing new: every Xero write IMS would have produced becomes a shadow. For WooCommerce a shadow is the `outbound_shadow_writes` row alone (there is no sync log row): nothing is queued, no outbox job exists, nothing is sent, and the result the caller gets is its own `shadowed` outcome, which is not queued, not sent and not a failure to retry. A push the hold shadowed is never stamped as pushed (the stock echo-suppression record, the WMS-status record and the daily stock reconcile stamp are left alone), and an order that ships, cancels or goes on hold commits exactly as it would without the storefront job. The queue drains for WooCommerce stock, order completion and order cancel and hold stand down while the hold stands: they claim nothing and spend no attempt, so a job queued before enforcement was switched on stays as it is and is never sent. The transport helpers (the REST POST and PUT, the FX push and probe, the partial-shipment push) refuse as a last barrier. For Mintsoft a shadow is likewise the `outbound_shadow_writes` row alone: no order link is created, claimed, stamped or moved (the order is simply offered again on the next sweep), no ASN reservation or sync job is made, no product or bundle is marked as synced or claimed, and the result the caller gets is its own `shadowed` outcome, which is not created, not queued and not a failure to retry. The sweep passes that only re-open a create (releasing a held order, revalidating a failed one, re-queuing an unknown create) stand down while the warehouse is held, and a link that is waiting for its ownership to be proved, or is parked as an unknown create, is never turned into a shadow. Every Mintsoft write method needs a clearance that only the producer decision can give, and the Mintsoft transport refuses any write as a last barrier in the wording of the outbound-write hold, so a queue that recognises a hold spends no attempt on it and a held write cannot even renew a key.',
     '',
@@ -235,11 +274,11 @@ export const PRODUCER_DOC_BLOCKS: Record<ProducerDocBlockId, string> = {
     "Queued work that predates the instant is not left in the queues looking like work that is owed: `npm run retire:held-backlog` takes it out. It is a dry run unless given `--apply --confirm-database <identity>` (the server identity the dry run prints) and is for a scratch or development database, never a live installation. It retires a row as a SHADOW (an accounting sync row becomes CANCELLED with the settlement basis `HELD_SHADOW`; an outbox job becomes `SHADOWED`; a queued Mintsoft order link is removed, with a shadow record) only when the row itself proves that no attempt to send it was ever made: a sync row that was never claimed or retried and was queued in attempt-stamping custody (or a money row in custody with no remote attempt), with no document id and no create-dispatch marker; an outbox job that was never claimed or changed, or whose only recorded outcome is a refusal by the outbound-write hold; a Mintsoft link with no attempt, attempt time or error. For outbox jobs and Mintsoft links that proof also needs a durable history that a replay, a re-arm or a release cannot erase (the job's first-attempt stamp, the link's first-claim stamp, each written when the unit is first claimed, before any request can leave): a unit created before that history existed, or whose stamp is set, is parked, because its visible attempt counters may have been reset. A claim refused by the outbound-write hold withdraws its own stamp only when a count of the writes the transport dispatched in that claim (a completion sends tracking before its status) proves it sent nothing; a claim that sent anything, or ran outside the count, keeps the stamp and is parked. The database enforces that history for every writer, including an older binary during a rollback or a mixed-version deploy: a claim that does not stamp itself makes the row unknown (parked), and the tracked flag can never be switched back on by an update. The mirrored accounting event of a retired sync row is left untouched whenever another attempt at the same document is live or has an unverified outcome, whatever its status, and the retirement says so. Every other row is PARKED, not shadowed, with the text `outcome unknown: check <destination> before acting` (a sync row becomes FAILED, an outbox job PERMANENT_FAILED, a Mintsoft link AMBIGUOUS_CREATE), because the record cannot say it was never sent and IMS does not claim it. A row a worker holds right now is skipped and left for the next run. The command, its arguments and its exit codes are described in the section on retiring the held backlog.",
   ].join('\n'),
   cutoffs: [
-    '| Variable | Destination | Value |',
+    '| Variable | Switchover step | Value |',
     '|---|---|---|',
     ...CUTOFF_ROWS,
     '',
-    `Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable, and the decision for that destination is SHADOW. A destination needs its outbound-write grant as well as its live-from instant before the decision can be LIVE, and the ownership map decides which operations IMS may produce. A variable has an effect only for a destination named in \`${PRODUCER_HOLD_ENFORCED_ENV}\`.`,
+    `The live-from instant is per switchover STEP, not per destination: each operation in the ownership map names the step that moves it from its incumbent to IMS, and the decision for it reads that step's variable. The steps go live in the order M, W, X (an installation may not set a later step's instant while an earlier one is unset or later: \`npm run writers:check\` fails on it). Step M includes the WooCommerce order status, tracking, partial-shipment, product-meta, withdrawal-outcome and TrackShip operations, because the bridge that is retired at step M wrote them. A destination still needs its own outbound-write grant for any step that writes to it. Each variable names one instant. A date without a time, a time without the Z, an offset such as +01:00, precision finer than a millisecond, surrounding whitespace, a list or any other shape is unreadable, and the decision for that destination is SHADOW. An operation needs its destination's outbound-write grant as well as its step's live-from instant before the decision can be LIVE, and the ownership map decides which operations IMS may produce. A variable has an effect only for a destination named in \`${PRODUCER_HOLD_ENFORCED_ENV}\`.`,
   ].join('\n'),
   enforcement: [
     '| Variable | Value |',

@@ -6115,3 +6115,21 @@ model CustomFieldValue {
   @@index([salesOrderId])
   @@map("custom_field_values")
 }
+
+/// An owner or host confirmation that an incumbent writer has STOPPED (writers-check-constants.ts STEP_EVIDENCE, writer-attestation-constants.ts kinds).
+/// Append-only: a confirmation is never edited; the newest of a kind is the one in force. Written by `npm run writers:attest` and the ADMIN confirmation
+/// action, always with an activity-log entry. Read by `npm run writers:check` and by the setting writers that refuse to switch an IMS writer on first.
+model WriterAttestation {
+  id         String   @id @default(cuid())
+  /// A closed code (WRITER_ATTESTATION_KINDS).
+  kind       String
+  attestedAt DateTime @default(now()) @map("attested_at")
+  /// The user who confirmed (a User id, or `cli:<name>` for the command line).
+  userId     String   @map("user_id")
+  note       String   @default("")
+  /// Kind-specific evidence (a host status report, never a secret).
+  payload    Json     @default("{}")
+
+  @@index([kind, attestedAt], map: "writer_attestations_kind_attested_idx")
+  @@map("writer_attestations")
+}

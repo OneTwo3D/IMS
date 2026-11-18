@@ -368,11 +368,11 @@ test('the transport guard the report reads through refuses a non-GET and an off-
 // ---- the ownership row is pinned ---------------------------------------------------------------------------------
 
 // [mutation: the row removed, or P1/P2 changed -> red]
-test('the ownership row woocommerce.tax-rate is pinned: operator-manual at P1, IMS at P2, citing the 2026-10-25 ruling', () => {
+test('the ownership row woocommerce.tax-rate is pinned: operator-manual at P1 and P2 (owner answer Q5, 2026-11-18), citing the 2026-10-25 ruling', () => {
   const rows = WRITER_OWNERSHIP_MAP.filter((r) => r.destination === 'woocommerce' && r.operation === 'tax-rate')
   assert.equal(rows.length, 1)
   assert.equal(rows[0]!.owners.P1, 'operator-manual')
-  assert.equal(rows[0]!.owners.P2, 'IMS')
+  assert.equal(rows[0]!.owners.P2, 'operator-manual')
   assert.equal(rows[0]!.owners.P0, 'nobody')
   assert.ok(rows[0]!.note.includes('2026-10-25'))
   assert.equal(rows[0]!.obligationTime, 'not-applicable')

@@ -46,12 +46,12 @@ if (!skip) {
   })
 }
 
-const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM']
+const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM', 'MINTSOFT_WRITES_LIVE_FROM']
 const MIN = 60_000
 const HOUR = 60 * MIN
 const DAY = 24 * HOUR
 const iso = (date: Date) => date.toISOString().replace(/\.\d+Z$/, 'Z')
-const LIVE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(new Date(Date.now() - 60 * DAY)) }
+const LIVE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(new Date(Date.now() - 60 * DAY)), MINTSOFT_WRITES_LIVE_FROM: iso(new Date(Date.now() - 60 * DAY)) }
 const HELD = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' }
 
 async function withEnv<T>(values: Record<string, string>, fn: () => Promise<T>): Promise<T> {

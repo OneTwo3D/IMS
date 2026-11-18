@@ -16,6 +16,7 @@
 
 import {
   PRODUCER_HOLD_ENFORCED_ENV,
+  liveStepsOfDestination,
 } from './producer-disposition-constants'
 import { OUTBOUND_CONNECTORS, type OutboundConnector } from './outbound-write-hold-constants'
 import {
@@ -106,11 +107,23 @@ export function producerEgressVerdict(
   try {
     const enforcement = readProducerEnforcement(context.env ?? process.env)
     if (!enforcement.enforced || !enforcement.destinations.has(destination)) return { kind: 'legacy' }
-    // The phase does not depend on the operation, so any mapped operation of the destination reads it.
-    const probe = WRITER_OWNERSHIP_MAP.find((row) => row.destination === destination)
-    if (!probe) throw new Error(`no ownership-map row for ${destination}`)
-    const decision = explainProducerDisposition(destination, probe.operation as never, undefined, context)
-    return decision.phase === 'P2' ? { kind: 'open', decision } : { kind: 'held', decision }
+    // The phase is per switchover STEP: a destination is open when ANY step whose rows write to it is in its live phase (WooCommerce is written
+    // by steps M, W and X; its order completions go live with step M, long before its stock push). Each step is probed through one of its own
+    // IMS-owned rows. When several steps are live the decision with the EARLIEST live-from instant answers, so the writer-side cut-off floor never
+    // discards work that a step already live produced.
+    const decisions: ProducerDecision[] = []
+    for (const step of liveStepsOfDestination(destination)) {
+      const probe = WRITER_OWNERSHIP_MAP.find((row) => row.destination === destination && row.step === step && row.owners.P2 === 'IMS')
+      if (!probe) continue
+      decisions.push(explainProducerDisposition(destination, probe.operation as never, undefined, context))
+    }
+    if (decisions.length === 0) throw new Error(`no step-owned ownership-map row for ${destination}`)
+    const open = decisions.filter((decision) => decision.phase === 'P2')
+    if (open.length > 0) {
+      const earliest = open.reduce((best, next) => ((next.cutoff?.getTime() ?? Infinity) < (best.cutoff?.getTime() ?? Infinity) ? next : best))
+      return { kind: 'open', decision: earliest }
+    }
+    return { kind: 'held', decision: decisions[0]! }
   } catch {
     return {
       kind: 'held',

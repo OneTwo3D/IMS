@@ -141,7 +141,7 @@ test('MUTATION WOO-3 (a barrier row whose write is gone): red', () => {
 })
 
 test('MUTATION WOO-4 (a new WooCommerce operation in the ownership map that nothing governs): red', () => {
-  const extra: OwnershipRow = { destination: 'woocommerce', operation: 'order.refund-note', owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' }, obligationTime: 'not-applicable', note: 'fixture' }
+  const extra: OwnershipRow = { destination: 'woocommerce', operation: 'order.refund-note', owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' }, step: 'mintsoft', obligationTime: 'not-applicable', note: 'fixture' }
   const report = wooCensusFindings(input({ map: [...(WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]), extra] }))
   assert.equal(red(report, 'WOO-4', 'woocommerce.order.refund-note').length, 1, JSON.stringify(report.failures))
   // and a governed operation that loses its seam: drop the 'seam' declarations of one operation
@@ -226,7 +226,7 @@ test('TAX-RATE WRITER: the census governs woocommerce.tax-rate through applyWooT
   ])
   for (const key of keys) assert.ok(siteKeys.has(key), `the census sees ${key}`)
   const row = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).find((r) => r.destination === 'woocommerce' && r.operation === 'tax-rate')!
-  assert.deepEqual([row.owners.P1, row.owners.P2], ['operator-manual', 'IMS'])
+  assert.deepEqual([row.owners.P1, row.owners.P2], ['operator-manual', 'operator-manual'], 'owner answer Q5 (2026-11-18): the operator keeps it in P2 until the writer is built')
 })
 
 test('MUTATION WOO-1 (the tax-rate writer stops asking the seam): red, naming applyWooTaxPlan', () => {

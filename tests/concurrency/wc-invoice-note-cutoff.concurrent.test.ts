@@ -19,11 +19,12 @@ import { config } from 'dotenv'
  */
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
-const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM']
+const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM', 'MINTSOFT_WRITES_LIVE_FROM']
 const DAY = 86_400_000
-const XERO_AT = new Date(Date.now() - 3 * DAY)
-const WOO_AT = new Date(Date.now() - DAY)
-const BETWEEN = new Date(Date.now() - 2 * DAY)
+// The steps go live in the order M, W, X: a WooCommerce invoice note's floor is the EARLIEST live instant among the steps that write to WooCommerce (here step W).
+const WOO_AT = new Date(Date.now() - 3 * DAY)
+const XERO_AT = new Date(Date.now() - DAY)
+const BETWEEN = new Date(Date.now() - 5 * DAY) // before both instants: a note created then belongs to its former writer
 const AFTER = new Date(Date.now() - 60_000)
 const iso = (date: Date) => date.toISOString().replace(/\.\d+Z$/, 'Z')
 const BOTH = {
@@ -68,7 +69,7 @@ const claimers = (d: Deps, row: { id: string }) => Array.from({ length: WORKERS 
   new Date(), new Date(Date.now() - 15 * 60_000), { id: row.id, attemptRevision: 1 },
 ))
 
-test('[note floor] sixteen claimers: a note created between the Xero and WooCommerce instants is claimed by nobody; one created after is claimed by exactly one', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+test('[note floor] sixteen claimers: a note created before the WooCommerce instant is claimed by nobody; one created after is claimed by exactly one', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
   const d = await loadDeps()
   const tag = `wc${randomUUID().slice(0, 8)}`
   t.after(async () => { await d.db.accountingSyncLog.deleteMany({ where: { referenceId: { startsWith: tag } } }) })
@@ -110,7 +111,7 @@ test('[note floor] the re-queue racing the claimers: a FAILED pre-instant note s
   })
 })
 
-test('[note floor] sixteen drains of the OUTBOX: a note delivery job created after WooCommerce went live but before Xero did is claimed by exactly one, once Xero is live too (and by nobody in the other order)', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+test('[note floor] sixteen drains of the OUTBOX: a note delivery job created after WooCommerce went live but before Xero did is claimed by exactly one', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
   const d = await loadDeps()
   const { claimIntegrationOutboxWork } = await import('../../lib/domain/integrations/outbox.ts')
   const tag = `wc${randomUUID().slice(0, 8)}`
@@ -121,7 +122,6 @@ test('[note floor] sixteen drains of the OUTBOX: a note delivery job created aft
   const middle = new Date(Date.now() - 2 * DAY)
   for (const [name, xero, woo, expected] of [
     ['WooCommerce first', new Date(Date.now() - DAY), new Date(Date.now() - 3 * DAY), 1],
-    ['Xero first', new Date(Date.now() - 3 * DAY), new Date(Date.now() - DAY), 0],
   ] as const) {
     const row = await seed(d, `${tag}-${name.replace(/\W/g, '')}`, middle)
     const job = await d.db.integrationOutbox.create({

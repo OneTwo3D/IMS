@@ -351,6 +351,8 @@ const ALLOWLIST = [
   // connector's operations, switches and incumbent evidence (the bridge plugin's own meta keys) exactly as the map does.
   'lib/security/writers-check-constants.ts',
   'lib/ops/writers-check.ts',
+  'lib/ops/writers-check-step-evidence.ts',
+  'lib/security/producer-disposition.ts',
   'lib/domain/incumbent-evidence/classify.ts',
   'lib/ops/outbound-status.ts',
   // The first-load runner's pre-load rails ask, per connector, whether it is enabled with a credential that could write (one switch and one

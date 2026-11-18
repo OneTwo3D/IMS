@@ -549,6 +549,8 @@ Use **Push Stock Now** for an immediate sync. While it runs, a live count shows 
 
 **The stock catch-up works through the catalogue in windows.** It takes the products 150 at a time, in a fixed order, and stops for the run once about 20 seconds are used, then carries on from where it stopped on the next run. To let a large catalogue finish within a day, the **WooCommerce Reconcile** job now runs **hourly** instead of daily. On an installation that was set up before this change the old daily schedule stays until the schedule is saved: open **Settings > System > Scheduler** and press **Save & Apply** once. A window with any failed product is retried on the next run and logged as a `stock_reconcile_window` warning; the pass is only counted as done when the last window finishes cleanly. A rebind of the store or a reset of the cached product ids restarts the pass.
 
+Turning "Push stock levels to WooCommerce" on is refused until an administrator has recorded the owner's confirmation that the Qoblex stock push is stopped (the Owner confirmations page at `/sync/writer-confirmations`, administrators only). Two systems pushing stock would overwrite each other. Turning it off, or leaving it on when it already is, is not affected.
+
 The manual push runs against the **saved** setting: ticking "Push stock levels to WooCommerce" takes effect only after **Save Settings**. Until then the Push Stock Now button is blocked with a hint. If a push is refused server-side anyway (sync disabled, missing credentials, or no Sync-to-Store warehouses), it reports a red error — e.g. "Stock sync is disabled in settings — nothing was pushed" — rather than completing quietly.
 
 ## Tax Rates

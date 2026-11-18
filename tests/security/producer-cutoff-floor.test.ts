@@ -241,8 +241,9 @@ test('the recreate window is clamped to the cut-off: the later of the retention 
 // ---- Each accounting row is floored by the live-from instant of the destination it writes to (the WooCommerce invoice note) ----------
 
 const SHOP = 'https://shop.example.test'
-const XERO_AT = new Date('2026-12-01T00:00:00Z')
-const WOO_AT = new Date('2026-12-10T00:00:00Z')
+// The steps go live in the order M, W, X, so WooCommerce's instant (step W) is the earlier one; a destination's floor is the EARLIEST live step that writes to it.
+const WOO_AT = new Date('2026-12-01T00:00:00Z')
+const XERO_AT = new Date('2026-12-10T00:00:00Z')
 const LATER = new Date('2026-12-11T00:00:00Z')
 const bothLive = (extra: Record<string, string> = {}) => ({
   [PRODUCER_HOLD_ENFORCED_ENV]: 'xero,woocommerce',
@@ -252,30 +253,31 @@ const bothLive = (extra: Record<string, string> = {}) => ({
   [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString(),
   ...extra,
 })
-const BETWEEN = new Date('2026-12-05T00:00:00Z') // after the Xero instant, before the WooCommerce one
+const PRE_WOO = new Date('2026-11-15T00:00:00Z') // before the WooCommerce instant
+const BETWEEN = new Date('2026-12-05T00:00:00Z') // after the WooCommerce instant, before the Xero one
 
 test('the invoice note is floored by the WooCommerce instant, a Xero write by the Xero instant, and neither by the other', () => {
   const env = bothLive()
   assert.equal(xeroCutoffFloor({ env, now: LATER })?.toISOString(), XERO_AT.toISOString())
   assert.equal(wooAccountingCutoffFloor({ env, now: LATER })?.toISOString(), WOO_AT.toISOString())
-  // Created between the two instants: a note belongs to its former writer (refused); a Xero posting is past its own instant (not refused).
-  const note = xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'WC_INVOICE_NOTE' }, { env, now: LATER })
-  assert.match(String(note), /^Not sent by IMS: this was queued before writes to WooCommerce went live on this installation \(2026-12-10T00:00:00\.000Z\)/)
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'BILL_PAYMENT' }, { env, now: LATER }), null)
+  // Created between the two instants: a note is past WooCommerce's (earlier) instant (not refused); a Xero posting is before its own (refused).
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'WC_INVOICE_NOTE' }, { env, now: LATER }), null)
+  assert.match(String(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'BILL_PAYMENT' }, { env, now: LATER })), /writes to Xero went live/)
   assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER, type: 'WC_INVOICE_NOTE' }, { env, now: LATER }), null)
-  // Created before the Xero instant: a Xero posting is refused, with Xero's own sentence.
-  assert.match(String(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'BILL_PAYMENT' }, { env, now: LATER })), /writes to Xero went live/)
+  // Created before the WooCommerce instant: a note belongs to its former writer, with WooCommerce's sentence.
+  const note = xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'WC_INVOICE_NOTE' }, { env, now: LATER })
+  assert.match(String(note), /^Not sent by IMS: this was queued before writes to WooCommerce went live on this installation \(2026-12-01T00:00:00\.000Z\)/)
 })
 
 test('a note is not floored by the Xero instant alone, and a Xero posting is not floored by the WooCommerce instant alone', () => {
   const xeroOnly = live()
   assert.equal(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'WC_INVOICE_NOTE' }, { env: xeroOnly, now: NOW }), null, 'Xero is live, WooCommerce is not: the note has no floor')
   const wooOnly = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString() }
-  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'WC_INVOICE_NOTE' }, { env: wooOnly, now: LATER }), null)
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'BILL_PAYMENT' }, { env: wooOnly, now: LATER }), null)
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'WC_INVOICE_NOTE' }, { env: wooOnly, now: LATER }), null)
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'BILL_PAYMENT' }, { env: wooOnly, now: LATER }), null)
   assert.equal(accountingCutoffInForce({ env: wooOnly, now: LATER }), true, 'a WooCommerce-only floor still counts, so the guards that skip a read when no floor applies do not skip')
   assert.equal(accountingCutoffInForce({ env: {}, now: LATER }), false)
-  assert.equal(accountingCutoffInForce({ env: wooOnly, now: BETWEEN }), false, 'before the instant is reached there is no floor')
+  assert.equal(accountingCutoffInForce({ env: wooOnly, now: PRE_WOO }), false, 'before the instant is reached there is no floor')
 })
 
 test('a row whose type is unknown is refused if EITHER destination would refuse it (fail closed)', () => {
@@ -314,10 +316,10 @@ test('BOUNDARY: a row created at the instant the decision went live is not befor
 test('an explicit type the ownership map does not name is judged by BOTH floors: refused under WooCommerce-only enforcement, and by the WooCommerce clause of the fragment', () => {
   const wooOnly = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString() }
   const xeroOnly = live()
-  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'A_TYPE_NOBODY_MAPPED' }, { env: wooOnly, now: LATER }), null, 'WooCommerce-only: the unmapped type is refused by the WooCommerce floor')
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'A_TYPE_NOBODY_MAPPED' }, { env: wooOnly, now: LATER }), null, 'WooCommerce-only: the unmapped type is refused by the WooCommerce floor')
   assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'A_TYPE_NOBODY_MAPPED' }, { env: xeroOnly, now: NOW }), null, 'Xero-only: refused by the Xero floor')
   assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER, type: 'A_TYPE_NOBODY_MAPPED' }, { env: bothLive(), now: LATER }), null, 'created after both: sendable')
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'INVOICE_PDF' }, { env: wooOnly, now: LATER }), null, 'a PDF fetch still has no floor')
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'INVOICE_PDF' }, { env: wooOnly, now: LATER }), null, 'a PDF fetch still has no floor')
   // The fragment: every enum type the map does not name is in the WooCommerce clause as well as the Xero one.
   for (const type of UNMAPPED_SYNC_TYPES) assert.ok(WOO_FLOORED_TYPES.includes(type), `${type} is floored by WooCommerce too`)
   assert.ok(WOO_FLOORED_TYPES.includes('WC_INVOICE_NOTE'))

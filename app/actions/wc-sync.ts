@@ -1,5 +1,6 @@
 'use server'
 
+import { refuseGuardedSettingWithoutAttestation, type AttestationDb } from '@/lib/domain/writer-attestation/store'
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { lockStorefrontMappingWrites, repointStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { revalidatePath } from 'next/cache'
@@ -322,6 +323,12 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   // Cheap, local and specific, so it is decided before the remote currency probe and the
   // connection gate: an operator who unticked every status should be told that, not handed
   // whichever unrelated check happens to fail first.
+  // Turning the stock push ON needs the owner's confirmation that Qoblex's push is stopped (two writers would otherwise push stock).
+  const attestationRefusal = await refuseGuardedSettingWithoutAttestation(data, {
+    db: db as unknown as AttestationDb,
+    currentValue: (key) => getSettingValue(key),
+  })
+  if (attestationRefusal) return { success: false, error: attestationRefusal, code: 'writer_attestation_required' }
   const emptyStatusSelection = rejectEmptyWcOrderStatusSelection(data.wc_sync_order_statuses)
   if (emptyStatusSelection) {
     return { success: false, error: emptyStatusSelection, code: 'wc_no_order_statuses_selected' }

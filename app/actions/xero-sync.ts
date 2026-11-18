@@ -1,5 +1,6 @@
 'use server'
 
+import { refuseGuardedSettingWithoutAttestation, type AttestationDb } from '@/lib/domain/writer-attestation/store'
 import { xeroBeforeCutoffRefusal, xeroProducerSeamVerdict, xeroResolveObligationAt } from '@/lib/domain/accounting/xero-producer-seam'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
@@ -177,6 +178,13 @@ export async function saveXeroSettings(
     if (shouldFreshGateSecretWrite(data, 'xero_client_secret')) {
       await requireFreshXeroCredentialAdmin()
     }
+
+    // Turning the Xero live switch ON needs the owner's confirmation that Qoblex's own Xero posting is stopped.
+    const attestationRefusal = await refuseGuardedSettingWithoutAttestation(data, {
+      db: db as unknown as AttestationDb,
+      currentValue: (key) => getSettingValue(key),
+    })
+    if (attestationRefusal) return { success: false, error: attestationRefusal }
 
     // Only run the readiness gate when the user is *transitioning* sync from
     // OFF → ON. If sync is already enabled, allow any save to go through so the
