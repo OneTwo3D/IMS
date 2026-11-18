@@ -155,15 +155,15 @@ export async function recordRefusedAction(client: RawClient, input: RefusedActio
 /** Why a row was closed. */
 export type RefusedActionResolution = 'ACTION_SUCCEEDED' | 'NO_LONGER_NEEDED'
 
-/** Close every open refusal of this entity (and, when named, this action). Returns how many rows were closed. Safe to call when there is none. */
+/** Close every open refusal of this entity (and, when named, this action and gate). Returns how many rows were closed. Safe to call when there is none. */
 export async function resolveRefusedActions(
   client: Pick<Prisma.TransactionClient, 'refusedAction'>,
-  where: { entityType: string; entityId: string; action?: RefusedActionName },
+  where: { entityType: string; entityId: string; action?: RefusedActionName; gate?: string | readonly string[] },
   resolution: RefusedActionResolution,
   now: Date = new Date(),
 ): Promise<number> {
   const { count } = await client.refusedAction.updateMany({
-    where: { entityType: where.entityType, entityId: where.entityId, resolvedAt: null, ...(where.action ? { action: where.action } : {}) },
+    where: { entityType: where.entityType, entityId: where.entityId, resolvedAt: null, ...(where.action ? { action: where.action } : {}), ...(where.gate ? { gate: typeof where.gate === 'string' ? where.gate : { in: [...where.gate] } } : {}) },
     data: { resolvedAt: now, resolution },
   })
   return count

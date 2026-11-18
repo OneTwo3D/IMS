@@ -476,12 +476,7 @@ export type WmsDispatchSweepDeps = {
      * storefront data - no completion job, no tracking, no order note, no status. The one storefront effect that remains is IMS's
      * ordinary stock-level sync for the stock the shipment consumed (owner ruling: IMS is the stock master after cutover).
      */
-    options?: {
-      storefrontAlreadyCompleted?: boolean
-      fence?: PreCutoverFence
-      /** When the WMS says the goods left: the IMS shipment is dated with it, not with the time this apply runs. */
-      despatchedAt?: Date
-    },
+    options?: { storefrontAlreadyCompleted?: boolean; fence?: PreCutoverFence },
   ): Promise<{ success: boolean; error?: string }>
   /**
    * Fresh, READ-ONLY verification of a part despatched before the storefront went live. Asked only when the push for a part
@@ -823,41 +818,6 @@ export function strictLatestDespatchTime(
     if (latest === null || at.getTime() > latest.getTime()) latest = at
   }
   return latest
-}
-
-/**
- * THE INSTANT THE WAREHOUSE DESPATCHED, for dating the IMS shipment (so a late apply does not move a 23:50 despatch into the next month).
- * The latest of the entries that carry a despatch time, but ONLY when every such entry is an unambiguous instant
- * ({@link preciseDespatchInstant}); undated entries are skipped (they say nothing). Null (the apply then dates the shipment as it always did) when no
- * entry is dated, any dated one is imprecise, or the instant is in the future of `now` (clock skew or a wrong value: never post-dated).
- */
-export function despatchInstantForApply(
-  tracking: ReadonlyArray<{ despatchedAt?: string | null }>,
-  reading: ZonelessDespatchReading | undefined,
-  now: Date,
-): Date | null {
-  let latest: Date | null = null
-  for (const entry of tracking) {
-    if (!entry.despatchedAt) continue
-    const at = preciseDespatchInstant(entry.despatchedAt, { zoneless: reading })
-    if (at === null) return null
-    if (latest === null || at.getTime() > latest.getTime()) latest = at
-  }
-  if (latest === null || latest.getTime() > now.getTime()) return null
-  return latest
-}
-
-/** The apply options: undefined when nothing is set (the legacy call shape). */
-function dispatchApplyOptions(
-  storefrontAlreadyCompleted: boolean,
-  fence: PreCutoverFence | undefined,
-  despatchedAt: Date | null,
-): { storefrontAlreadyCompleted?: boolean; fence?: PreCutoverFence; despatchedAt?: Date } | undefined {
-  if (!storefrontAlreadyCompleted && despatchedAt === null) return undefined
-  return {
-    ...(storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(fence ? { fence } : {}) } : {}),
-    ...(despatchedAt !== null ? { despatchedAt } : {}),
-  }
 }
 
 /** True when a dispatched order or part has NO usable despatch time: no tracking entry at all, or an entry without one. */
@@ -1254,7 +1214,7 @@ async function reconcileSplitOrder(
     if (decision.fence) fence = decision.fence
   }
   const storefrontAlreadyCompleted = mergedAlreadyCompleted || (recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length)
-  const result = await deps.applyDispatch(candidate.orderId, aggregated, dispatchApplyOptions(storefrontAlreadyCompleted, fence, despatchInstantForApply(allTracking, deps.zonelessDespatchReading, (deps.clock ?? (() => new Date()))())))
+  const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(fence ? { fence } : {}) } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed after all parts despatched' }
   }
@@ -1470,7 +1430,7 @@ export async function reconcileOneOrder(
   let decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
   if (decision.action === 'verify') decision = await settleOrderLevelVerify(deps, candidate.orderId, status.tracking)
   if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
-  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), dispatchApplyOptions(decision.storefrontAlreadyCompleted, decision.fence, despatchInstantForApply(status.tracking, deps.zonelessDespatchReading, (deps.clock ?? (() => new Date()))())))
+  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(decision.fence ? { fence: decision.fence } : {}) } : undefined)
   if (!result.success) {
     return { action: 'error', reason: result.error ?? 'Dispatch apply failed' }
   }
@@ -3118,7 +3078,6 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         targetShipmentStatus: 'SHIPPED',
         tracking,
         ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true, ...(options.fence ? { shipFence: options.fence } : {}) } : {}),
-        ...(options?.despatchedAt ? { despatchedAt: options.despatchedAt } : {}),
       })
       if (result.success) {
         await recordWmsMutationEvent({
