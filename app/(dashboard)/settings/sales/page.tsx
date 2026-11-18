@@ -1,12 +1,13 @@
 import { AccessDenied } from '@/components/auth/access-denied'
 import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
-import { AlertTriangle, FileText, Mail, ShieldAlert, Truck } from 'lucide-react'
+import { AlertTriangle, FileText, Mail, Repeat2, ShieldAlert, Truck } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
 import { getRecentInvoicePdfTokenSecurityEvents, getRecentTaxRateFallbackEvents } from '@/app/actions/activity-log'
 import { InvoiceTriggerSetting } from '@/components/settings/invoice-trigger'
 import { DispatchEmailSetting } from '@/components/settings/dispatch-email'
+import { ReturnExchangeSetting } from '@/components/settings/return-exchange'
 import { DeliveryTrackingSettings } from '@/components/settings/delivery-tracking'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -25,6 +26,7 @@ export default async function SalesSettingsPage() {
   const [
     invoiceTrigger,
     dispatchEmailEnabled,
+    returnExchangeEnabled,
     trackingEnabled,
     trackingSource,
     trackshipKey,
@@ -35,6 +37,7 @@ export default async function SalesSettingsPage() {
   ] = await Promise.all([
     getSetting('invoice_trigger'),
     getSetting('dispatch_email_enabled'),
+    getSetting('return_exchange_enabled'),
     getSetting('delivery_tracking_enabled'),
     getSetting('delivery_tracking_source'),
     getSetting('trackship_api_key'),
@@ -75,6 +78,17 @@ export default async function SalesSettingsPage() {
           Send direct (non-storefront) customers a dispatch notification with tracking when their order ships.
         </p>
         <DispatchEmailSetting currentValue={dispatchEmailEnabled ?? 'false'} />
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Repeat2 className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-base font-semibold">Exchanges inside a return</h2>
+        </div>
+        <p className="text-sm text-muted-foreground mb-4">
+          Let the refund dialog record replacement items together with the return. They become new lines on the same order, linked to the refund.
+        </p>
+        <ReturnExchangeSetting currentValue={returnExchangeEnabled ?? 'false'} />
       </Card>
 
       {woocommerceEnabled && (

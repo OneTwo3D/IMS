@@ -166,6 +166,7 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
       totalsBasis: true,
       payments: { select: { id: true } },
       returnExpectation: { select: { id: true } },
+      exchangeLines: { select: { id: true }, take: 1 },
       order: {
         select: {
           id: true,
@@ -198,6 +199,8 @@ export async function evaluateRefundDeletion(client: RefundDeleteClient, refundI
 
   if (refund.payments.length > 0) refusals.push(refundDeleteRefusals.creditNoteSettled(refund.payments.length))
   if (refund.returnExpectation !== null || refund.returnInTransit) refusals.push(refundDeleteRefusals.inTransitReturn())
+  // A refund that came with an exchange has replacement lines on the order pointing at it: they hold stock and sit on the invoice, so the refund is not taken out from under them.
+  if (refund.exchangeLines.length > 0) refusals.push(refundDeleteRefusals.exchangeRefund())
   if (refund.accountingRetryRequired) refusals.push(refundDeleteRefusals.accountingUnfinished())
   if (refund.deferralAdjustmentRef !== null) refusals.push(refundDeleteRefusals.journalUnsupported('revenue through a daily-batch deferral adjustment'))
   if (refund.allocatedReliefAmount !== null && toDecimal(refund.allocatedReliefAmount).gt(0)) refusals.push(refundDeleteRefusals.journalUnsupported('allocated inventory'))

@@ -2281,10 +2281,15 @@ model SalesOrderLine {
   /// which is the only thing allowed to parse it and refuses rather than falling back when the
   /// payload is present but unreadable.
   fulfillmentRequirements Json? @map("fulfillment_requirements")
+  /// The refund this line is the REPLACEMENT for (an exchange recorded during a return, Return exchanges). NULL on every ordinary line and on every line written before the column existed.
+  /// The line is an ordinary order line in every other respect (allocation, shipment, invoice); this link only lets the order page, the returns analytics and the refund delete rule tell a
+  /// replacement from a sale. SetNull: the link never blocks or cascades into a refund (the refund delete rule refuses a refund that has replacement lines instead).
+  exchangeForRefundId String? @map("exchange_for_refund_id")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   product         Product?   @relation(fields: [productId], references: [id])
   taxRate         TaxRate?   @relation(fields: [taxRateId], references: [id])
+  exchangeForRefund SalesOrderRefund? @relation("RefundExchangeLines", fields: [exchangeForRefundId], references: [id], onDelete: SetNull)
   allocations     OrderAllocation[]
   pegs            SalesOrderLinePeg[]
   shipmentLines   ShipmentLine[]
@@ -2292,6 +2297,7 @@ model SalesOrderLine {
 
   @@index([orderId])
   @@index([productId])
+  @@index([exchangeForRefundId])
   @@map("sales_order_lines")
 }
 
@@ -2443,6 +2449,8 @@ model SalesOrderRefund {
   order           SalesOrder @relation(fields: [orderId], references: [id])
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])
   lines           SalesOrderRefundLine[]
+  /// The replacement lines added to the order for this refund (an exchange). Empty for every refund that is not part of one.
+  exchangeLines   SalesOrderLine[] @relation("RefundExchangeLines")
   payments        Payment[]
   returnExpectation ReturnExpectation?
   invoiceDocuments  SalesOrderInvoiceDocument[]
