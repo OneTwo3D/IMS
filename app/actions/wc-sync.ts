@@ -977,6 +977,26 @@ const WC_WEBHOOK_DEFS = [
   { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/woocommerce/products' },
 ] as const
 
+/**
+ * "Revoke previous secret now" (o3d-hqvrp.91): a rotation keeps the replaced secret valid for the grace window so existing
+ * webhooks do not fail. When the old secret LEAKED that window is the problem, so this clears it immediately. Same gate as
+ * writing the secret itself (sync permission plus a fresh admin sign-in).
+ */
+export async function revokePreviousWcWebhookSecret(): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
+  await requireSyncPermission()
+  try {
+    await requireFreshAdmin()
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
+    throw e
+  }
+  await db.setting.deleteMany({ where: { key: { in: [WC_WEBHOOK_SECRET_PREVIOUS_KEY, WC_WEBHOOK_SECRET_PREVIOUS_UNTIL_KEY] } } })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Revoked the previous WooCommerce webhook secret' })
+  revalidatePath('/sync')
+  return { success: true }
+}
+
 export async function createWcWebhooks(): Promise<{
   success: boolean
   created: number
@@ -1019,11 +1039,12 @@ export async function createWcWebhooks(): Promise<{
     if (isDuplicate) {
       alreadyExist++
       // o3d-hqvrp.91: an existing hook keeps the secret it was created with, so after a rotation
-      // push the current one to it (this is what ends the grace window's reliance on the old one).
-      const hookId = matching.find((wh) => wh.id !== undefined)?.id
-      if (hookId !== undefined) {
-        const { error: updateError } = await wcPut(`/webhooks/${hookId}`, { secret })
-        if (updateError) errors.push(`${def.topic}: could not update the secret on the existing webhook: ${updateError}`)
+      // push the current one to EVERY matching hook (a store can hold duplicates for one topic and URL; a hook left on the
+      // old secret would start failing silently when the grace window ends). Each failure is reported.
+      for (const hook of matching) {
+        if (hook.id === undefined) continue
+        const { error: updateError } = await wcPut(`/webhooks/${hook.id}`, { secret })
+        if (updateError) errors.push(`${def.topic}: could not update the secret on webhook ${hook.id}: ${updateError}`)
       }
       continue
     }

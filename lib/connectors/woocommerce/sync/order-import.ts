@@ -61,6 +61,7 @@ import {
   releasedSalesInvoiceQueueWhere,
 } from './held-sales-invoice'
 import { syncRefundsForOrder } from './refund-sync'
+import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { previewTreatedSalesInvoice, treatImportedSalesInvoice, type EuVatTreatmentAccounts } from './eu-vat-invoice-treatment'
@@ -73,7 +74,6 @@ import { readEuVatRegimeStamp } from '@/lib/domain/accounting/eu-vat-regime-stam
 import { EU_VAT_TREATMENT_PAYLOAD_KEY, routeFor } from '@/lib/domain/accounting/eu-vat-treatment'
 import { invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { wcImportRefundDisposition, wcImportShouldAutoAllocate } from './import-lifecycle'
 import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
@@ -1534,6 +1534,8 @@ async function updateExistingWcOrderCore(
     const storedModifiedAt = erasure?.externalUpdatedAt ?? null
     const staleDelivery = incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) && storedModifiedAt !== null && incomingModifiedAt.getTime() < storedModifiedAt.getTime()
     const keepImsEdit = erasure?.editedInImsAt != null || staleDelivery
+    // A stale delivery must not move the wclc split or the per-line customs values either (and so reports no drift against what it did not write).
+    if (staleDelivery) storedComponents = null
     // Recorded after the transaction (below). Only a delivery that still carries real identity counts: an anonymised delivery, or one whose placeholders
     // WooCommerce wrote, is the expected steady state and says nothing.
     repopulationRefused = erased && !isWcOrderAnonymised(wcOrder) && wcPayloadCarriesIdentity(wcOrder)
@@ -1564,7 +1566,7 @@ async function updateExistingWcOrderCore(
           : {}),
         // The wclc components FOLLOW WooCommerce on every delivery (stored as reported, never recomputed, D5; not personal data, so erased and
         // IMS-edited orders keep following them). No line or invoice is rebuilt from them (surfaceWcOrderEditDrift reports a moved split).
-        ...(Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
+        ...(!staleDelivery && Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
         ...(erased || keepImsEdit
           ? {}
           : {
@@ -1590,7 +1592,7 @@ async function updateExistingWcOrderCore(
       },
     })
     // The per-line customs value override follows WooCommerce too, matched on the WooCommerce line item id (the lines themselves are not rebuilt here).
-    if (Array.isArray(wcOrder.line_items)) {
+    if (!staleDelivery && Array.isArray(wcOrder.line_items)) {
       for (const item of wcOrder.line_items) {
         // A line item that carries no meta list says nothing about the override: leave the stored value alone.
         if (typeof item?.id !== 'number' || !Array.isArray(item.meta_data)) continue
@@ -3346,8 +3348,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // REFUNDED/PARTIALLY_REFUNDED as `status`. A refunded-at-import order keeps a base
     // lifecycle status plus a refundStatus; the allocation/invoice gates below still
     // key off the mapped imsStatus, and the refund records sync separately.
-    // `refunded` states a FULL refund although the built-in mapping reads it as PROCESSING (o3d-hqvrp.92); see import-lifecycle.ts.
-    const importRefundDisposition = wcImportRefundDisposition(statusReading.slug, imsStatus)
+    const importRefundDisposition = refundDispositionForStatus(imsStatus)
     const lifecycleStatus = importRefundDisposition === 'NONE' ? imsStatus : 'PROCESSING'
 
     // THE CURRENCY IS A FACT WOOCOMMERCE STATES, NOT ONE IMS SUPPLIES (r13). Placed HERE, above
@@ -3951,8 +3952,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
 
     // Auto-allocate stock (skip for terminal statuses, and for an order written as a DRAFT: a status the operator mapped to Draft holds no stock — allocation
     // declines a draft, it is allocated and invoiced when the order is finalised — and the import is acknowledged as completed without it)
-    // o3d-hqvrp.92: nor for an order first seen already past dispatch, or fully refunded (import-lifecycle.ts).
-    if (wcImportShouldAutoAllocate({ imsStatus, lifecycleStatus, refundDisposition: importRefundDisposition })) {
+    const TERMINAL_STATUSES = ['CANCELLED']
+    if (!TERMINAL_STATUSES.includes(imsStatus) && lifecycleStatus !== 'DRAFT') {
       const { autoAllocateOrder } = await import('@/app/actions/allocation')
       const allocation = await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
       if (!allocation.success && allocation.error !== 'No stock available for allocation') {
@@ -4864,7 +4865,7 @@ export async function sweepWcCancellations(modifiedAfter: string | null, result:
     let endedOnEmptyPage = false
     let unsupported = false
     while (page <= MAX_WC_PAGE_WALK_PAGES) {
-      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', ...(modifiedAfter ? { modified_after: modifiedAfter, dates_are_gmt: 'true' } : {}) })
+      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', ...(modifiedAfter ? { modified_after: modifiedAfter } : {}) })
       if (error || !Array.isArray(data)) {
         const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
         if (!required && isWcUnsupportedStatusRefusal(error)) {
@@ -5102,8 +5103,6 @@ export async function syncNewWcOrders(
       page: String(page),
       orderby: 'date',
       order: 'asc',
-      // modified_after is a GMT instant (the cursor is an ISO time): without this WooCommerce compares it with the SITE-LOCAL modified time (o3d-hqvrp.87).
-      dates_are_gmt: 'true',
     }
     if (modifiedAfter) params.modified_after = modifiedAfter
 

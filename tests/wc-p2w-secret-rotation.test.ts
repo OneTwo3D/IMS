@@ -20,6 +20,7 @@ async function mockSettings() {
   mock.module('@/lib/settings-store', { namedExports: { ...realSettings, getSettingValue: async (key: string) => stored.get(key) ?? null } })
   settingsMocked = true
 }
+const deletes: Array<{ where: { key: { in: string[] } } }> = []
 const upserts: Array<{ key: string; value: string }> = []
 const recorder = createRecordingDb((ctx: QueryContext) => {
   if (ctx.model === 'setting' && ctx.op === 'upsert') {
@@ -27,6 +28,7 @@ const recorder = createRecordingDb((ctx: QueryContext) => {
     upserts.push({ key: a.where.key, value: a.update.value })
     return {}
   }
+  if (ctx.model === 'setting' && ctx.op === 'deleteMany') { deletes.push(ctx.args[0] as { where: { key: { in: string[] } } }); return { count: 2 } }
   if (ctx.model === 'setting' && ctx.op === 'findMany') return []
   return null
 })
@@ -35,7 +37,10 @@ mock.module('@/lib/db', { namedExports: { db: recorder.db } })
 const puts: Array<{ path: string; body: unknown }> = []
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
-    wcFetch: async () => ({ data: [{ id: 41, topic: 'order.created', delivery_url: 'https://ims.example.test/api/webhooks/shopping/woocommerce/orders' }], totalPages: 1, totalItems: 1 }),
+    wcFetch: async () => ({ data: [
+      { id: 41, topic: 'order.created', delivery_url: 'https://ims.example.test/api/webhooks/shopping/woocommerce/orders' },
+      { id: 42, topic: 'order.created', delivery_url: 'https://ims.example.test/api/webhooks/shopping/woocommerce/orders' },
+    ], totalPages: 1, totalItems: 2 }),
     wcPost: async () => ({ data: {} }),
     wcPut: async (path: string, body: unknown) => { puts.push({ path, body }); return { data: {} } },
   },
@@ -71,6 +76,18 @@ test('Setup Webhooks pushes the current secret to a hook that already exists', a
   const { createWcWebhooks } = await import('@/app/actions/wc-sync')
   puts.length = 0
   try { await createWcWebhooks() } catch { /* the harness may lack the app URL or shadow seam; the PUT is what is asserted */ }
-  assert.equal(puts.length, 1, 'the existing hook was updated')
-  assert.deepEqual(puts[0], { path: '/webhooks/41', body: { secret: 'current-secret' } })
+  assert.deepEqual(puts, [
+    { path: '/webhooks/41', body: { secret: 'current-secret' } },
+    { path: '/webhooks/42', body: { secret: 'current-secret' } },
+  ], 'EVERY matching hook (duplicates included) gets the current secret')
+})
+
+test('Revoke previous secret now deletes the previous secret and its expiry at once', async () => {
+  await mockSettings()
+  const { revokePreviousWcWebhookSecret } = await import('@/app/actions/wc-sync')
+  deletes.length = 0
+  const result = await revokePreviousWcWebhookSecret()
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(deletes.length, 1)
+  assert.deepEqual([...deletes[0]!.where.key.in].sort(), ['wc_webhook_secret_previous', 'wc_webhook_secret_previous_until'])
 })
