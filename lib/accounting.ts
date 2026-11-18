@@ -15,6 +15,7 @@ import { ACCOUNTING_MAPPING_SETTING_KEYS, pinnedLedgerIsServicedUnderLock } from
 import { getSettingValues, type SettingValueReadClient } from '@/lib/settings-store'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { journalSentPennyImbalance } from '@/lib/domain/accounting/journal-balance'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { notConfiguredUnderPinnedLedgerFence } from '@/lib/domain/accounting/pinned-enqueue-fence'
@@ -1563,6 +1564,18 @@ export async function queueAccountingSyncTx(
   // Return false: no IMS GL counterpart posts, so callers stay consistent.
   if (isFxGainLossJournalSuppressed(context.connector, params.type)) {
     return answer({ queued: false, reason: 'not-configured' }, context.connector)
+  }
+
+  // o3d-hqvrp.59: a journal whose lines, rounded to the penny as the connector sends them, do not net to zero is
+  // refused HERE, after the not-configured verdicts (a disabled sync or type owes nothing) and before a row exists, instead of failing at the wire after a retry loop. `refused`: still owed.
+  const sentImbalance = journalSentPennyImbalance(params.payload)
+  if (sentImbalance !== null && sentImbalance !== 0) {
+    return answer({ queued: false, reason: 'refused' }, context.connector, {
+      reason: 'journal_unbalanced',
+      remedy:
+        `The journal for this posting does not balance after each line is rounded to the penny (the lines differ by ${(sentImbalance / 100).toFixed(2)}), `
+        + 'so it was not queued. Post the entry by hand with the rounding corrected.',
+    })
   }
 
   // o3d-q0x56.2 / .3 - A FOREIGN POSTING WITH NO USABLE IMS RATE IS NOT QUEUED (after the verdict: a type nobody posts is not owed). `refused`

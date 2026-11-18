@@ -720,7 +720,7 @@ test('[o3d-j625 r5 HIGH 4] the IN-TRANSACTION enqueue records its refusal when t
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
     // What the invoice-payment registration and the allocation trim now pass: their local state COMMITS
     // whatever this answers, so the debt is real and must be recorded — r4 recorded nothing on this path.
@@ -753,7 +753,7 @@ test('[o3d-j625 r5] the in-transaction enqueue records NOTHING when the caller d
 
   await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
   })
 
@@ -799,7 +799,7 @@ test('[o3d-j625 r5 M-14] a refusal row that cannot be WRITTEN does not abort the
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
     recordRefusalAsOutstanding: true,
   })
@@ -819,7 +819,7 @@ test('[o3d-j625 r5 M-14] a CLEAR that cannot be written does not abort the trans
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
   })
 
@@ -871,7 +871,7 @@ test('[o3d-j625 r6 H2] a second allocation-reversal TRIM queued does not clear t
   const trim = (token: string) => ({
     ...TX_REQUEST,
     type: 'ALLOCATION_REVERSAL' as const,
-    payload: { _reversalToken: token, lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { _reversalToken: token, lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
     recordRefusalAsOutstanding: true,
   })
@@ -895,7 +895,7 @@ test('[o3d-j625 r6 M2] an in-transaction enqueue that finds the posting ALREADY 
   const request = {
     ...TX_REQUEST,
     type: 'STOCK_RECEIPT' as const,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     idempotencyKey: 'purchase-receipt:po-1:GRN-2:h',
     chartConnector: settings.connector,
   }
@@ -924,7 +924,7 @@ test('[o3d-j625 r6 M4] an UNRESOLVED prior attempt refuses — and, when asked, 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
     type: 'STOCK_RECEIPT' as const,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     idempotencyKey: 'purchase-receipt:po-1:GRN-9:h',
     chartConnector: settings.connector,
     recordRefusalAsOutstanding: true,
@@ -952,7 +952,7 @@ test('[o3d-f709 M11, D1] a prior attempt an operator settled NOT_POSTED REFUSES 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
     type: 'STOCK_RECEIPT' as const,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     idempotencyKey: 'purchase-receipt:po-1:GRN-8:h',
     chartConnector: settings.connector,
     recordRefusalAsOutstanding: true,
@@ -979,7 +979,7 @@ test('[o3d-j625 r6 M4] a PINNED ledger the selection no longer services refuses 
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
     connector: 'xero',
     recordRefusalAsOutstanding: true,
@@ -999,7 +999,7 @@ test('[o3d-j625 r6 M4] CONTROL: the same refusals record nothing when the caller
   await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
     type: 'STOCK_RECEIPT' as const,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     idempotencyKey: 'purchase-receipt:po-1:GRN-9:h',
     chartConnector: settings.connector,
   })
@@ -1017,7 +1017,7 @@ test('[o3d-j625 r6 L1] the in-transaction answer carries the active connector an
 
   await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
     recordRefusalAsOutstanding: true,
     reportOutcome: (outcome) => { reported.outcome = outcome as unknown as Record<string, unknown> },
@@ -1057,7 +1057,7 @@ test('[o3d-j625 r7 H-B] refused → marked handled → the outbox drains → NOT
     referenceType: 'PurchaseOrder',
     referenceId: 'po-1',
     idempotencyKey: landedCostAdjustmentIdempotencyKey('cogs', adjustment as never),
-    payload: { lines: [{ accountCode: settings.cogsAccount, debit: 12.5 }] },
+    payload: { lines: [{ accountCode: settings.cogsAccount, debit: 12.5 }, { accountCode: settings.inventoryAccount, credit: 12.5 }] },
     chartConnector: settings.connector,
   })
 
