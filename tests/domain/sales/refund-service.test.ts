@@ -430,10 +430,10 @@ function createClient(state: State): RefundServiceClient {
   // by refund creation: physical SHIPPED rows for restocking and journaled rows
   // for accounting reversal snapshots.
   const client = {
-    $queryRaw: (query: unknown, ...rest: unknown[]) => numbering.isNumbering(query) ? numbering.queryRaw(query, ...rest) : shadowEvidenceFake(state.shadowRecords ?? []).queryRaw(query),
+    $queryRaw: (query: unknown, ...rest: unknown[]) => numbering.isNumbering(query, ...rest) ? numbering.queryRaw(query, ...rest) : shadowEvidenceFake(state.shadowRecords ?? []).queryRaw(query),
     $executeRaw: async (query: unknown, ...rest: unknown[]) => {
       // The credit note counter's statements are the numbering module's own; only the refund service's locks are counted.
-      if (numbering.isNumbering(query)) return numbering.executeRaw(query, ...rest)
+      if (numbering.isNumbering(query, ...rest)) return numbering.executeRaw(query, ...rest)
       state.executeRawCalls += 1
       return 0
     },

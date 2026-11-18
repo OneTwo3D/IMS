@@ -14,7 +14,8 @@ import { config } from 'dotenv'
  *   arm 4  a taken number is skipped; a run of 1001 taken numbers is refused instead of looping
  *   arm 5  a counter resets forward, and is refused at or below the highest number in use
  *   arm 6  a period with documents in it is seeded from them; the credit-note counter the old code kept is carried over
- *   arm 7  a pattern with no counter takes no lock and writes no counter row; a shipment has no number until a pattern is set
+ *   arm 7  a pattern with no counter is locked too, so concurrent random draws never collide ({RAND:1}); a shipment has no number until a pattern is set
+ *   arm 9  credit notes numbered by an old-writer simulation and the new mint at the same time never repeat, and the legacy yearly counter is kept in step
  *   arm 8  the uniqueness probe of every type runs against the real schema
  *
  * Nothing here reaches a network: WooCommerce, Mintsoft and Xero are not involved.
@@ -174,13 +175,13 @@ test('arm 6: a period holding documents is seeded from them; the old credit note
   await w.db.setting.deleteMany({ where: { key: `document_counter:credit_note:${year}` } })
 })
 
-test('arm 7: a pattern with no counter takes no row, and a shipment has no number until a pattern is set', { skip: !RUN }, async () => {
+test('arm 7: a random-only pattern is locked as well, and a shipment has no number until a pattern is set', { skip: !RUN }, async () => {
   await setPattern('sales_order', null)
   await setPattern('shipment', null)
   const so = await w.db.$transaction((tx) => w.mint.mintRequiredDocumentNumber(tx, 'sales_order', { fallbackPrefix: 'SO-', date: new Date(Date.UTC(2026, 10, 7)) }))
   assert.match(so, /^SO-20261107-[0-9A-Z]{4}$/)
   const rows = await w.db.$queryRaw<Array<{ document_type: string }>>`SELECT document_type FROM document_number_sequences WHERE document_type = 'sales_order'`
-  assert.equal(rows.length, 0, 'the random default writes no counter row and holds no lock')
+  assert.equal(rows.length, 1, 'the random default takes the counter row lock like every other pattern')
   assert.equal(await w.db.$transaction((tx) => w.mint.mintDocumentNumber(tx, 'shipment')), null)
   await w.db.$transaction((tx) => w.mint.setDocumentPattern(tx, 'shipment', 'SHP-{SEQ:6}', null))
   assert.match((await w.db.$transaction((tx) => w.mint.mintDocumentNumber(tx, 'shipment')))!, /^SHP-0000\d\d$/)
@@ -205,4 +206,47 @@ test('arm 8: the uniqueness probe of every document type runs against the real s
       assert.deepEqual(await spec.listStartingWith(tx, `NOPE-${randomUUID()}`), [], `${type}.listStartingWith`)
     })
   }
+})
+
+test('arm 7c: twelve concurrent creates on a one-character random pattern never share a number', { skip: !RUN }, async () => {
+  const s = fresh()
+  await setPattern('sales_order', `${s}-{RAND:1}`)
+  for (let round = 0; round < 5; round++) {
+    const tag = fresh()
+    await setPattern('sales_order', `${tag}-{RAND:1}`)
+    const numbers = await Promise.all(Array.from({ length: 12 }, () => mintSo()))
+    assert.equal(new Set(numbers).size, 12, `round ${round}: ${numbers.join(' ')}`)
+  }
+})
+
+/** The credit note writer of the code before patterns, verbatim in what it reads and writes: the advisory lock, the yearly Setting counter, the format. */
+async function oldWriterCreditNote(prefix: string): Promise<string> {
+  return w.db.$transaction(async (tx) => {
+    const year = new Date().getFullYear()
+    const counterKey = `document_counter:credit_note:${year}`
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${counterKey}))`
+    const row = await tx.setting.findUnique({ where: { key: counterKey }, select: { value: true } })
+    const current = row?.value ? Number.parseInt(row.value, 10) : 0
+    const next = Number.isFinite(current) && current >= 0 ? current + 1 : 1
+    await tx.setting.upsert({ where: { key: counterKey }, create: { key: counterKey, value: String(next) }, update: { value: String(next) } })
+    return `${prefix}${year}-${String(next).padStart(5, '0')}`
+  })
+}
+
+test('arm 9: a rolling deploy: old-writer and new-writer credit notes interleaved never repeat a number', { skip: !RUN }, async () => {
+  const s = fresh()
+  const year = new Date().getFullYear()
+  await setPattern('credit_note', null)
+  await w.db.setting.deleteMany({ where: { key: `document_counter:credit_note:${year}` } })
+  const newWriter = () => w.db.$transaction((tx) => w.mint.mintRequiredDocumentNumber(tx, 'credit_note', { fallbackPrefix: `${s}-` }))
+  const sequence: string[] = []
+  for (let i = 0; i < 4; i++) { sequence.push(await oldWriterCreditNote(`${s}-`)); sequence.push(await newWriter()) }
+  const concurrent = await Promise.all(Array.from({ length: 16 }, (_, i) => (i % 2 === 0 ? oldWriterCreditNote(`${s}-`) : newWriter())))
+  const all = [...sequence, ...concurrent]
+  assert.equal(new Set(all).size, all.length, 'no credit note number issued twice')
+  const counters = all.map((n) => Number(n.slice(`${s}-${year}-`.length))).sort((a, b) => a - b)
+  assert.deepEqual(counters, Array.from({ length: all.length }, (_, i) => i + 1), 'one gapless run across both writers')
+  const legacy = await w.db.setting.findUnique({ where: { key: `document_counter:credit_note:${year}` }, select: { value: true } })
+  assert.equal(Number(legacy?.value), all.length, 'the yearly counter the old code reads stays in step')
+  await w.db.setting.deleteMany({ where: { key: `document_counter:credit_note:${year}` } })
 })

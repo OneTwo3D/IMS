@@ -5,7 +5,7 @@
  * and the counter. A pattern with {SEQ} takes that row FOR UPDATE inside the caller's transaction, reads the
  * counter, advances it and writes the document, so two creates can never be handed the same number and a create
  * that rolls back hands its number back. A pattern with no counter ({RAND:n} only, the default for sales and
- * purchase orders) takes no lock at all: it reads the pattern and draws random text.
+ * purchase orders) takes the same lock: two creates drawing the same random text must not both find it free.
  *
  * THE COUNTER RESTARTS WITH ITS PERIOD. A pattern carrying {YYYY} counts per year, {MM} per month, {DD} per day,
  * and none per ever (see `scopeKeyFor`). When the period has changed, the counter is seeded from the highest number
@@ -164,6 +164,19 @@ export async function mintDocumentNumber(tx: Tx, type: NumberedDocumentType, opt
   let parsed = effectiveParsedPattern(type, unlocked?.pattern ?? null, prefix)
   if (parsed === null) return null
 
+  // THE ROW IS LOCKED FOR EVERY PATTERN, a random-only one included. Without it two concurrent creates can draw the same random text, both find
+  // it free, and both write it (sales order and credit note numbers have no database constraint to refuse the second). The lock is held until
+  // the caller's transaction ends, so the probe and the write are one step. The pattern is read AGAIN under the lock, because a save of the
+  // pattern takes the same lock and may have landed since the unlocked read.
+  //
+  // A credit note first takes the advisory lock the pre-pattern writer takes on its yearly counter, so during a rolling deploy an old and a new
+  // instance numbering credit notes at the same moment are serialised, and the legacy counter is kept in step (below).
+  const legacyYear = String(date.getFullYear())
+  const legacyKey = spec.legacyCounterKey?.(legacyYear)
+  if (legacyKey) await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${legacyKey}))`
+  const row = await lockSequence(tx, type)
+  parsed = effectiveParsedPattern(type, row.pattern, prefix)
+  if (parsed === null) return null
   if (!parsed.usesSeq) {
     for (let attempt = 0; attempt < MAX_RANDOM_TRIES; attempt++) {
       const candidate = renderPattern(parsed, { date, basis: spec.basis, rng: options.rng })
@@ -171,15 +184,11 @@ export async function mintDocumentNumber(tx: Tx, type: NumberedDocumentType, opt
     }
     throw new DocumentNumberingError('PATTERN_EXHAUSTED', `Could not find a free ${spec.label.toLowerCase()} number: the pattern's random part is too short for the numbers already issued. Add a counter, {SEQ}, to the pattern.`)
   }
-
-  // A counter: the row is locked from here to the end of the caller's transaction. The pattern is read AGAIN under the
-  // lock, because a save of the pattern takes the same lock and may have landed since the unlocked read.
-  const row = await lockSequence(tx, type)
-  parsed = effectiveParsedPattern(type, row.pattern, prefix)
-  if (parsed === null) return null
-  if (!parsed.usesSeq) return mintDocumentNumber(tx, type, options)
   const scopeKey = scopeKeyFor(parsed, date, spec.basis)
+  const keepsLegacyCounter = legacyKey !== undefined && scopeKey === legacyYear
   let counter = row.scope_key === scopeKey ? row.counter : await seedFor(tx, type, parsed, scopeKey)
+  // An instance still running the earlier code may have advanced the yearly counter since: never go below it.
+  if (keepsLegacyCounter) counter = Math.max(counter, await legacyCounter(tx, type, scopeKey))
 
   for (let skipped = 0; skipped <= MAX_SKIPS; skipped++) {
     counter += 1
@@ -187,6 +196,10 @@ export async function mintDocumentNumber(tx: Tx, type: NumberedDocumentType, opt
     const candidate = renderPattern(parsed, { date, basis: spec.basis, seq: counter, rng: options.rng })
     if (await spec.exists(tx, candidate)) continue
     await tx.$executeRaw`UPDATE document_number_sequences SET counter = ${counter}, scope_key = ${scopeKey}, updated_at = now() WHERE document_type = ${type}`
+    // Keep the counter the earlier code reads in step, until that counter is retired.
+    if (keepsLegacyCounter) {
+      await tx.setting.upsert({ where: { key: legacyKey }, create: { key: legacyKey, value: String(counter) }, update: { value: String(counter) } })
+    }
     return candidate
   }
   throw new DocumentNumberingError('PATTERN_EXHAUSTED', `Refused to number this ${spec.label.toLowerCase()}: the next ${MAX_SKIPS + 1} numbers of the pattern are all taken already. Reset the counter past the numbers in use (Settings > Company > Numbering).`)
