@@ -34,6 +34,8 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  *   - SUPPLIER_RETURN            — return reversal DR transit / CR inventory; +.
  *   - CUSTOMER_RETURN_IN_TRANSIT — a refund of shipped goods not yet back: the COGS reversal
  *                                  DR transit / CR COGS; + the dispatch-cost value of the units.
+ *   - GRIR_RECLASS              — the daily-batch GR/IR reclass (behind `grir_xero_posting_enabled`): DR transit / CR GR/IR when goods received
+ *                                  not billed rose, the reverse when it fell; signed. The sourceRef is the batch reference, no order.
  *
  * `baseDelta` is the signed base-currency transit movement at the highest precision
  * the source carries. Idempotent on `idempotencyKey` (the transit-affecting
@@ -51,6 +53,7 @@ export type TransitSubledgerMovementSource =
   | 'PURCHASE_ORDER_CANCEL'
   | 'SUPPLIER_RETURN'
   | 'CUSTOMER_RETURN_IN_TRANSIT'
+  | 'GRIR_RECLASS'
 
 type TransitSubledgerMovementClient = Pick<Prisma.TransactionClient, 'transitSubledgerMovement'>
 

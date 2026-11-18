@@ -215,7 +215,10 @@ async function applyProviderMappingIfEnabled(
   return items
 }
 
-export async function pushImsTrackingToWc(orderId: string): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
+export async function pushImsTrackingToWc(
+  orderId: string,
+  options: { skipWcStatuses?: readonly string[] } = {},
+): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
   const outbound = await buildOutboundTracking(orderId)
   if (!outbound.externalOrderId) return { success: true, skipped: true }
   if (outbound.items.length === 0) return { success: true, skipped: true }
@@ -247,6 +250,8 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
     }
 
     const wcOrder = currentOrder.data as WcFullOrder
+    // The reconcile sweep (tracking-reconcile.ts) leaves an order WooCommerce has already closed alone.
+    if (options.skipWcStatuses?.includes(wcOrder.status)) return { success: true, skipped: true }
     // Reassigned from `outbound.items` only when the AST provider mapping is on; every payload and log below uses `items`.
     const items = await applyProviderMappingIfEnabled(orderId, outbound, wcOrder.meta_data ?? [])
     const existingItems = readExistingTrackingItems(wcOrder.meta_data ?? [])

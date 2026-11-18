@@ -17,7 +17,7 @@ const state = {
   reportFilters: [] as unknown[],
 }
 
-mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) } })
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined } })
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/domain/purchasing/purchase-order-fx', { namedExports: { resolvePurchaseOrderFxRateToBase: async () => 1 } })

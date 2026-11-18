@@ -1,7 +1,7 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from './auth-no-login'
 import { BUNDLE_CLAIM_CHANGED_TEXT } from '../sync/bundle-create-outcome'
-import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDeleteResult, WmsClearableProductField, WmsProductClearOutcome, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDeleteResult, WmsClearableProductField, WmsClearClaim, WmsProductClearOutcome, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   readMintsoftAsnItemExpectedQuantity,
   readMintsoftAsnItemLineIdentity,
@@ -362,6 +362,18 @@ export function mintsoftFieldIsEmpty(raw: Record<string, unknown> | null | undef
   return emptyCode(raw.CountryOfManufacture) && (id == null || id === 0 || id === '0')
 }
 
+/** The value Mintsoft holds for a clearable field, as text; null when the field is empty or the record was not read. */
+export function mintsoftFieldValue(raw: Record<string, unknown> | null | undefined, field: WmsClearableProductField): string | null {
+  if (!raw || mintsoftFieldIsEmpty(raw, field)) return null
+  const value = field === 'customsDescription' ? raw.CustomsDescription : field === 'commodityCode' ? raw.CommodityCode : raw.CountryOfManufacture
+  if (typeof value === 'string') return value.trim() || null
+  if (value && typeof value === 'object') {
+    const code = (value as Record<string, unknown>).Code ?? (value as Record<string, unknown>).code
+    if (typeof code === 'string' && code.trim()) return code.trim()
+  }
+  return null
+}
+
 /**
  * The follow-up request that erases one customs field of an existing product. It carries the same body the update does
  * (so it can never be read as a partial replace that blanks other fields; barcode only when non-empty and not omitted)
@@ -690,12 +702,21 @@ export async function upsertMintsoftProduct(
 
 /** What the clear sender talks to Mintsoft through; the defaults are the real client, a test passes its own. */
 export type MintsoftClearTransport = {
-  post: (path: string, init: { method: 'POST'; body: string }) => Promise<{ data: unknown; error?: string | null }>
+  post: (path: string, init: { method: 'POST'; body: string }) => Promise<{ data: unknown; error?: string | null; held?: boolean }>
   readBack: (externalProductId: string) => Promise<Record<string, unknown> | null>
 }
 
+/** Mintsoft RESPONDED to the clear request and refused it (Success:false or an HTTP error status). */
+class MintsoftClearAnsweredError extends Error {}
+/** The outbound hold stopped the request before it left IMS. */
+class MintsoftClearHeldError extends Error {}
+
+/** Longest a single clear request may run (must stay well under the clear lease of 10 minutes). */
+export const MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS = 120_000
+
 const MINTSOFT_CLEAR_TRANSPORT: MintsoftClearTransport = {
-  post: (path, init) => mintsoftRequest<unknown>(path, init),
+  // A clear request is bounded well inside the 10 minute clear lease, so a lease can never expire under a request still in flight.
+  post: (path, init) => mintsoftRequest<unknown>(path, { ...init, signal: AbortSignal.timeout(MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS) }),
   readBack: async (externalProductId) => (await fetchMintsoftProduct(externalProductId))?.raw ?? null,
 }
 
@@ -710,35 +731,50 @@ export async function sendMintsoftProductClears(
   options: WmsUpsertProductOptions,
   transport: MintsoftClearTransport = MINTSOFT_CLEAR_TRANSPORT,
 ): Promise<WmsProductClearOutcome> {
-  const outcome: WmsProductClearOutcome = { cleared: [], rejected: [], skipped: [], unsupported: [] }
+  const outcome: WmsProductClearOutcome = { cleared: [], rejected: [], skipped: [], superseded: [], unsupported: [] }
   const sent: WmsClearableProductField[] = []
+  // Fields whose request answered "Nothing to update/add": no proof either way, so the read-back below decides.
+  const nothingToUpdate = new Set<WmsClearableProductField>()
   for (const field of new Set(fields)) {
     if (!mintsoftCanClear(field)) {
       outcome.unsupported.push(field)
       continue
     }
     const post = async (): Promise<void> => {
-      const request = buildMintsoftProductClearRequest(product, field, options)
+      // Built from a fresh read when the caller supplies one (it runs inside the claim, after the lease is held).
+      const request = buildMintsoftProductClearRequest(options.freshProduct ? await options.freshProduct() : product, field, options)
       const result = await transport.post(request.path, { method: request.method, body: request.body })
-      if (result.error) throw new Error(result.error)
+      if ((result as { held?: boolean }).held) throw new MintsoftClearHeldError(result.error ?? 'The outbound-write hold refused the request.')
+      // "failed with status N" is how the client words an HTTP response that was an error status: Mintsoft answered. Anything else
+      // (timeout, abort, connection error) proves nothing about whether it did.
+      if (result.error) throw (/with status \d{3}/.test(result.error) ? new MintsoftClearAnsweredError(result.error) : new Error(result.error))
       const body = result.data as { Success?: unknown; Message?: unknown } | null
       if (body && typeof body === 'object') {
         if (body.Success === false) {
-          throw new Error(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
+          throw new MintsoftClearAnsweredError(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
         }
-        // Success with "Nothing to update/add" is Mintsoft saying it changed nothing: the clear was not applied.
-        if (isMintsoftNothingToUpdate(body.Message)) throw new Error('clear not applied (Mintsoft reported nothing to update)')
+        // Success with "Nothing to update/add" is Mintsoft saying it changed nothing. That is also what it says when the field is
+        // already empty, so it is neither a failure nor proof: the read-back below counts the clear only if the field IS empty.
+        if (isMintsoftNothingToUpdate(body.Message)) nothingToUpdate.add(field)
       }
     }
     try {
-      const claimed = options.clearClaim ? await options.clearClaim(field, post) : (await post(), { claimed: true as const })
+      const claimed: Awaited<ReturnType<WmsClearClaim>> = options.clearClaim ? await options.clearClaim(field, post) : (await post(), { claimed: true as const, value: undefined })
       if (!claimed.claimed) {
-        outcome.skipped.push({ field, reason: claimed.reason })
+        outcome.skipped.push({ field, reason: claimed.reason, ...(claimed.retry ? { retry: true } : {}) })
+        continue
+      }
+      if (claimed.superseded) {
+        outcome.superseded.push({ field, reason: claimed.superseded })
         continue
       }
       sent.push(field)
     } catch (error) {
-      outcome.rejected.push({ field, message: error instanceof Error ? error.message : 'Mintsoft clear failed' })
+      outcome.rejected.push({
+        field,
+        message: error instanceof Error ? error.message : 'Mintsoft clear failed',
+        ...(error instanceof MintsoftClearAnsweredError ? { answered: true } : error instanceof MintsoftClearHeldError ? {} : { unverifiable: true }),
+      })
     }
   }
   if (sent.length === 0) return outcome
@@ -754,7 +790,7 @@ export async function sendMintsoftProductClears(
   }
   for (const field of sent) {
     if (raw && mintsoftFieldIsEmpty(raw, field)) outcome.cleared.push(field)
-    else outcome.rejected.push({ field, message: raw ? 'clear not applied' : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
+    else outcome.rejected.push({ field, ...(raw ? { answered: true } : { unverifiable: true }), message: raw ? (nothingToUpdate.has(field) ? 'clear not applied (Mintsoft reported nothing to update)' : 'clear not applied') : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
   }
   return outcome
 }

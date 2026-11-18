@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { hasPermission, type Role } from '../../../lib/permissions.ts'
+import { canAccessOverviewAnalytics } from '../../../lib/security/overview-analytics-access.ts'
 import {
   BASE_ANALYTICS_LINKS,
   getSidebarAnalyticsChildren,
@@ -40,7 +41,7 @@ test('sidebar report group links follow their canAccess rule for each role', () 
 
 test('base analytics links require analytics permission', () => {
   for (const role of ROLES) {
-    assertLinksMatchPermission(role, BASE_ANALYTICS_LINKS, hasPermission(role, 'analytics'))
+    assertLinksMatchPermission(role, BASE_ANALYTICS_LINKS, hasPermission(role, 'analytics') && canAccessOverviewAnalytics(role))
   }
 })
 
@@ -145,6 +146,7 @@ test('admin sidebar analytics items group reports under expected section heading
         '/analytics/ar-aging',
         '/analytics/ap-aging',
         '/analytics/fx-gain-loss',
+        '/analytics/grir',
       ],
     },
   ])

@@ -100,6 +100,7 @@ test('transitSchedule: needs the cycle date; reads the sub-ledger up to and incl
     asOf: '2026-10-19', coverageStart: '2026-01-01', preWatermark: ZERO_PRE,
     net: [{ poId: 'po1', sourceType: 'PURCHASE_BILL', net: '100.500000' }, { poId: 'po1', sourceType: 'STOCK_RECEIPT', net: '-40' }],
     customerReturns: '7.25',
+    grirReclass: '0',
     orders: [{ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', type: 'GOODS', createdAt: '2026-09-01T10:00:00.000Z' }],
     openOrders: [{ id: 'po1', reference: 'QBX-PO1', status: 'PO_SENT', type: 'GOODS', createdAt: '2026-09-01T10:00:00.000Z' }, { id: 'po9', reference: 'QBX-PO9', status: 'PO_SENT', type: 'GOODS', createdAt: '2026-10-01T00:00:00.000Z' }],
   })

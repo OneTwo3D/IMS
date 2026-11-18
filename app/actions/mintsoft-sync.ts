@@ -1,5 +1,6 @@
 'use server'
 
+import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -681,6 +682,8 @@ const MintsoftExternalAsnIdSchema = z.string().trim().min(1, 'ASN ID is required
 const MintsoftReturnRestockInputSchema = z.object({
   id: z.string().min(1, 'Return inbox item ID is required.'),
   warehouseId: z.string().min(1, 'Warehouse is required.'),
+  /** The adjustment reason whose GL account is credited for the value of units no refund covers. */
+  adjustmentReasonId: z.string().min(1).nullable().optional(),
 })
 const MintsoftCreatePurchaseOrderAsnInputSchema = z.object({
   packagingType: z.enum(['PARCEL', 'PALLET', 'CONTAINER']).nullable().optional(),
@@ -4227,6 +4230,16 @@ export async function createMintsoftPurchaseOrderAsn(
       }
     }
 
+    // o3d-gwh4: an `existing` row left BOOKED_IN with closedAt still NULL is the state a failed booked-in reconciliation leaves (the row is
+    // kept mapped on purpose so no duplicate goes out). Pressing create again must RETRY that reconciliation, not report "already exists".
+    // This never creates an ASN: it re-reads the ASN IMS already holds and re-drives the booked-in recheck for it.
+    if (outcome.kind === 'existing' && outcome.status === 'BOOKED_IN') {
+      replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(
+        { ...outcome, remoteStatusName: 'booked in' },
+        { poId: parsedId.data },
+      )
+    }
+
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${parsedId.data}`)
     revalidatePath('/sync')
@@ -4236,7 +4249,7 @@ export async function createMintsoftPurchaseOrderAsn(
       externalAsnId: outcome.externalAsnId,
       message:
         outcome.kind === 'existing'
-          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this purchase order.`
+          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this purchase order.${replayWarning ? ` ${replayWarning}` : ''}`
           : outcome.kind === 'recovered'
             ? `Recovered Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`
             : `Created Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`,
@@ -5430,6 +5443,16 @@ export async function createMintsoftTransferAsn(
       }
     }
 
+    // o3d-gwh4: an `existing` row left BOOKED_IN with closedAt still NULL is the state a failed booked-in reconciliation leaves (the row is
+    // kept mapped on purpose so no duplicate goes out). Pressing create again must RETRY that reconciliation, not report "already exists".
+    // This never creates an ASN: it re-reads the ASN IMS already holds and re-drives the booked-in recheck for it.
+    if (outcome.kind === 'existing' && outcome.status === 'BOOKED_IN') {
+      replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(
+        { ...outcome, remoteStatusName: 'booked in' },
+        { transferId: parsedId.data },
+      )
+    }
+
     revalidatePath('/stock-control/transfers')
     revalidatePath('/sync')
 
@@ -5438,7 +5461,7 @@ export async function createMintsoftTransferAsn(
       externalAsnId: outcome.externalAsnId,
       message:
         outcome.kind === 'existing'
-          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this transfer.`
+          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this transfer.${replayWarning ? ` ${replayWarning}` : ''}`
           : outcome.kind === 'recovered'
             ? `Recovered Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`
             : `Created Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`,
@@ -5590,6 +5613,7 @@ export async function restockMintsoftReturnInboxItem(
   let returnedProductIds: string[] = []
   let successMessage = 'Mintsoft return restocked.'
   let activityMetadata: MintsoftReturnRestockActivityMetadata | null = null
+  let partlyCoveredQty = 0
 
   // Pool read before the transaction: the ledger an arrival that clears a refund's Stock in Transit would post to.
   const receiptAccounting = await readReceiptAccounting()
@@ -5627,6 +5651,7 @@ export async function restockMintsoftReturnInboxItem(
           select: {
             id: true,
             code: true,
+            name: true,
             active: true,
           },
         }),
@@ -5674,13 +5699,42 @@ export async function restockMintsoftReturnInboxItem(
         if (receipt.expectationIds.length > 0) rows = receipt.rows
       }
 
+      // Units a refund already restocked (or whose expectation covers them) are not restocked or journalled again: the
+      // refund's own COGS reversal already credited them. Only the uncovered remainder is valued below.
+      if (item.orderId) {
+        const netted = await netUnpricedReturnRowsAgainstRefunds(tx, { inboxId: item.id, orderId: item.orderId, rows })
+        if (netted.coveredQty > 0) {
+          if (netted.rows.length === 0) {
+            throw new Error(
+              `These ${netted.coveredQty} unit${netted.coveredQty === 1 ? ' was' : 's were'} already restocked by the refund on this order. Mark the item Refunded only; it was not restocked again and nothing was valued or journalled.`,
+            )
+          }
+          partlyCoveredQty = netted.coveredQty
+        }
+        rows = netted.rows
+      }
+      // A row no expectation priced has no unit cost; give it one so the units enter with a cost layer.
+      const pricedRows = await priceUnpricedReturnRows(tx, warehouse.id, rows)
+      const alreadyBooked = await tx.stockMovement.count({
+        where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: item.id, toWarehouseId: warehouse.id },
+      })
       const returnedRows = await applyReturnInboundStockTx(tx, {
         referenceType: 'WmsReturnsInbox',
         referenceId: item.id,
         warehouseId: warehouse.id,
-        rows,
+        rows: pricedRows,
         note: 'Mintsoft return restock',
       })
+      // The value that pricing added is journalled in this transaction (Dr Inventory / Cr COGS), so the GL ties to the layers.
+      if (alreadyBooked === 0) {
+        await queueReturnRestockValueJournal(tx, {
+          inboxId: item.id,
+          warehouse: { id: warehouse.id, code: warehouse.code, name: warehouse.name },
+          originalRows: rows,
+          pricedRows,
+          adjustmentReasonId: data.adjustmentReasonId ?? null,
+        })
+      }
 
       await tx.wmsReturnsInbox.update({
         where: { id: item.id },
@@ -5688,12 +5742,12 @@ export async function restockMintsoftReturnInboxItem(
           status: 'RESTOCKED',
           warehouseId: warehouse.id,
           resolvedAt: new Date(),
-          resolutionNote: `Restocked ${qty} unit${qty === 1 ? '' : 's'} to ${warehouse.code}`,
+          resolutionNote: `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} to ${warehouse.code}${partlyCoveredQty > 0 ? `; ${partlyCoveredQty} already restocked by the refund` : ''}`,
         },
       })
 
       returnedProductIds = returnedRows.map((row) => row.productId)
-      successMessage = `Restocked ${qty} unit${qty === 1 ? '' : 's'} of ${item.sku ?? 'the product'} to ${warehouse.code}.`
+      successMessage = `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} of ${item.sku ?? 'the product'} to ${warehouse.code}.${partlyCoveredQty > 0 ? ` ${partlyCoveredQty} unit${partlyCoveredQty === 1 ? ' was' : 's were'} already covered by the refund's restock, so only the remainder was valued.` : ''}`
       activityMetadata = {
         inboxId: item.id,
         externalReturnId: item.externalReturnId,

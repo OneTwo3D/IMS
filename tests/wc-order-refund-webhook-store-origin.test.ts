@@ -231,10 +231,10 @@ for (const resource of ['orders', 'refunds'] as const) {
   })
 }
 
-test('products keep the plain store: encoding for header-only evidence (unchanged behaviour)', async () => {
+test('products record header-only evidence as unsigned too (o3d-h5b79)', async () => {
   reset()
   const attestation = await receive('products', JSON.stringify({ id: 1, sku: 'S' }), { 'x-wc-webhook-source': `${STORE_A}/` })
-  assert.equal(attestation, 'store:store-a.example.com')
+  assert.equal(attestation, 'store-header:store-a.example.com')
 })
 
 // --- an unreadable binding is checked BEFORE the evidence is judged ---------------------------------

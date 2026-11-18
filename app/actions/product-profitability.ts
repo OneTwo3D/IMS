@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { assertOverviewAnalyticsAccess } from '@/lib/security/overview-analytics-access'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
@@ -144,7 +145,7 @@ export async function getProductProfitability(): Promise<{
   rows: ProfitabilityRow[]
   summary: ProfitabilitySummary
 }> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
 
   // 1. Organisation FY settings
   const org = await db.organisation.findFirst({

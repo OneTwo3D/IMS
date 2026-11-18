@@ -1,0 +1,4 @@
+### Access and scheduled-job fixes (security, Mintsoft)
+- Sales Statistics, Inventory Report and Product Profitability, the forecast and statistics actions behind them, and the non-purchasing analytics CSV exports are now restricted to Admin, Manager and Finance, like every other analytics group. Read-only users no longer see these links or reach the data by URL. The Overview sidebar section follows the same rule.
+- Passkey sign-in: each challenge request now gets its own ceremony key, so requesting a challenge can no longer invalidate a sign-in already in progress.
+- Scheduled Mintsoft read jobs (stock sync, returns sync, product and bundle verify, order status, order reconcile, webhook sweeper) can no longer log in with a username and password and replace the tenant API key. They use the fixed API key or an unexpired stored key and otherwise decline with an explanation. Manual runs are unchanged.
