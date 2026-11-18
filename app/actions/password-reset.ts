@@ -16,6 +16,7 @@ import {
   PASSWORD_RESET_TTL_MS,
   buildPasswordResetUrl,
   generatePasswordResetToken,
+  passwordResetEmailAllowed,
   passwordResetTokenKey,
 } from '@/lib/auth/password-reset'
 
@@ -36,18 +37,14 @@ export async function requestPasswordReset(email: string): Promise<PasswordReset
   }
 
   const ip = getClientIp(await headers()) ?? 'unknown'
-  // Per-IP cap guards against email-bombing across many target addresses; the
-  // per-email+IP cap guards a single target. Either tripping → silent ack.
-  // The per-IP cap only means something when the client IP is trustworthy: with no
-  // trusted proxy configured every caller is 'unknown', and a shared bucket would let
-  // anyone block every user's password reset.
-  const ipLimit = ip === 'unknown'
-    ? { allowed: true }
-    : await checkRateLimit(`pwreset-ip:${ip}`, 20, 15 * 60_000, { failClosed: true })
-  const emailLimit = await checkRateLimit(`pwreset:${normalizedEmail}:${ip}`, 5, 15 * 60_000, { failClosed: true })
-  // Per-account cap whatever the source address (rotating IPs cannot bomb one mailbox).
-  const accountLimit = await checkRateLimit(`pwreset-acct:${normalizedEmail}`, 10, 60 * 60_000, { failClosed: true })
-  if (!ipLimit.allowed || !emailLimit.allowed || !accountLimit.allowed) return REQUEST_ACK
+  // Hard caps are per source IP (skipped when the IP is unknown); per address there is only a
+  // short cooldown, so nobody can block someone else's reset. See passwordResetEmailAllowed.
+  const allowed = await passwordResetEmailAllowed({
+    email: normalizedEmail,
+    ip,
+    limiter: (key, max, windowMs) => checkRateLimit(key, max, windowMs, { failClosed: true }),
+  })
+  if (!allowed) return REQUEST_ACK
 
   const user = await db.user.findFirst({
     where: { email: { equals: normalizedEmail, mode: 'insensitive' }, active: true },
