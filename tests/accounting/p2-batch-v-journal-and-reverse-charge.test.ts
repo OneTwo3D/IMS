@@ -11,8 +11,10 @@ test('journalSentPennyImbalance: balanced, imbalanced and non-journal payloads',
   assert.equal(journalSentPennyImbalance({ lines: [{ debit: 33.333 }, { debit: 33.333 }, { debit: 33.334 }, { credit: 100 }] }), -1)
   assert.equal(journalSentPennyImbalance({ lines: [{ unitAmount: 5, quantity: 1 }] }), null)
   assert.equal(journalSentPennyImbalance({}), null)
-  // Symmetric 3dp half-penny amounts: the wire's Math.round(12.345 * 100) is 1234 on both sides, so the wire sends it balanced and the enqueue must not refuse it.
-  assert.equal(journalSentPennyImbalance({ lines: [{ debit: 12.345 }, { credit: 12.345 }] }), 0)
+  // Exactly the wire's rounding: 1.005 * 100 is 100.49999999999999, so the wire sends +1.00 / -1.00 (balanced) and the enqueue must not refuse it (a pre-rounded check read it as 100.5 and did).
+  assert.equal(journalSentPennyImbalance({ lines: [{ debit: 1.005 }, { credit: 1.005 }] }), 0)
+  // 12.345 * 100 is exactly 1234.5: Math.round sends +12.35 / -12.34, which is genuinely out by a penny on the wire.
+  assert.equal(journalSentPennyImbalance({ lines: [{ debit: 12.345 }, { credit: 12.345 }] }), 1)
 })
 
 // o3d-hqvrp.53 — a reverse-charge line with the swap setting empty is refused.
