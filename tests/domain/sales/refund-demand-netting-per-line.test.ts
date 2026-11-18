@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { loadNettedRefundLines } from '../../../lib/domain/sales/refund-demand-netting'
-import { buildLines, withNettedRefunds } from '../../../lib/domain/wms/order-push-sweep'
 
 /**
  * Mocked only: an in-memory client. Nothing here reaches the database, the network or any warehouse.
@@ -57,19 +56,3 @@ for (const order of [['A', 'B'], ['B', 'A']]) {
     assert.deepEqual(cancelled, { A: 2, B: 0 })
   })
 }
-
-test('WMS push quantity uses the netted refund lines, so it equals IMS demand after a shipped-units return', async () => {
-  // Order line of 10, 8 shipped, 2 of the shipped units returned and refunded (restock): IMS still owes 2.
-  const one: Fx = {
-    shipped: [{ lineId: 'A', productId: 'P', qty: 8 }],
-    movements: [{ referenceId: 'R', productId: 'P', qty: 2, idempotencyKey: key('A') }],
-  }
-  const lines = [{ id: 'RL-A', salesOrderLineId: 'A', productId: 'P', qty: 2, refundId: 'R', refund }]
-  const [order] = await withNettedRefunds(client(one, lines), [{ id: 'O' }])
-  const refunded = new Map<string, number>()
-  for (const r of order.refunds) for (const l of r.lines) refunded.set(l.salesOrderLineId as string, Number(l.qty))
-  const [pushed] = buildLines([{ id: 'A', sku: 'SKU', qty: 10, taxForeign: 0, totalForeign: 100, description: 'x' }], refunded)
-  assert.equal(pushed.quantity, 10, 'no cancellation: the push asks for the full 10 (the warehouse nets its own 8 despatched), matching IMS demand of 2 still owed')
-  // The gross figure it used to send:
-  assert.equal(10 - 2, 8)
-})

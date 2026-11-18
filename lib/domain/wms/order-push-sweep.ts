@@ -29,7 +29,6 @@ import { proveMergeLineage } from './merge-lineage'
 import { runSystemicPass, type SystemicFailureStore } from './systemic-failure'
 import { createDbSystemicFailureStore } from './systemic-failure-store'
 import { flagDoublePostageForMergedLink } from './double-postage'
-import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import { recordWmsMutationEvent, type WmsMutationEventInput } from './mutation-audit'
 import {
   createWmsPushStateSchemaGate,
@@ -686,7 +685,6 @@ export const ORDER_PUSH_SELECT = {
   discountModel: true,
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true, wclcFeeKind: true, productId: true, externalLineItemId: true } },
-  // GROSS refund lines. A create replaces them with the netted lines (withNettedRefunds); an amendment keeps them (see AMEND GATE).
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
   paidAt: true,
   createdAt: true,
@@ -787,32 +785,6 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
     discountVat: 0,
     lines: buildLines(order.lines, refundedQtyByLine(order)),
   }
-}
-
-/**
- * AMEND GATE. An amendment of an order already pushed to the (LIVE) warehouse keeps the GROSS refund quantity (ordered minus
- * refunded), exactly as before netting existed. For a line with no SHIPPED shipment the netted and gross quantities are identical;
- * for a line that has shipped (a part-despatched order, or a return of despatched units) netting would RAISE the quantity sent to
- * an order the warehouse has already started, asking it to hold units it has despatched. So amends (the update pass and the
- * reload under its lock) never call this; only a CREATE does.
- *
- * Replace each order's `refunds` with its refund lines NETTED the way IMS demand is (loadNettedRefundLines): a
- * refund of goods that already shipped and came back is not a cancellation, so the push/amend quantity must not
- * subtract it, or the warehouse is told not to send units IMS still owes the customer.
- */
-export async function withNettedRefunds<T extends { id: string }>(
-  client: unknown,
-  orders: T[],
-): Promise<Array<T & { refunds: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }> }>> {
-  if (orders.length === 0) return []
-  const lines = await loadNettedRefundLines(client, { refund: { orderId: { in: orders.map((o) => o.id) } } })
-  const byOrder = new Map<string, Array<{ salesOrderLineId: string | null; qty: unknown }>>()
-  for (const line of lines) {
-    const list = byOrder.get(line.refund.orderId) ?? []
-    list.push({ salesOrderLineId: line.salesOrderLineId, qty: line.qty })
-    byOrder.set(line.refund.orderId, list)
-  }
-  return orders.map((order) => ({ ...order, refunds: [{ lines: byOrder.get(order.id) ?? [] }] }))
 }
 
 // Sum refunded quantity per sales-order line so the WMS payload can exclude it.
@@ -1306,8 +1278,7 @@ export interface WmsOrderPushPort {
    * lock in a short transaction at the push boundary. The core builds the payload it sends from THIS, not from the earlier list
    * read, and refuses an erased order. Absent: the caller uses its snapshot (test doubles). A rejection fails closed.
    */
-  /** `forAmend` keeps the GROSS refund lines (see AMEND GATE); a create (the default) gets them netted. */
-  reloadOrderForPush?(orderId: string, forAmend?: boolean): Promise<Partial<OrderForPush> | null>
+  reloadOrderForPush?(orderId: string): Promise<Partial<OrderForPush> | null>
   /**
    * The systemic-failure circuit breaker's state and incident (lib/domain/wms/systemic-failure.ts). Optional: a port without one
    * keeps the legacy behaviour (a record is parked the moment its retries run out), which is what test doubles get.
@@ -3478,7 +3449,7 @@ export async function runWmsOrderPushSweepCore(
         // that cannot be read left due (no pushedAt) so the next pass tries again.
         let amendOrder = link.order
         if (port.reloadOrderForPush) {
-          const current = await port.reloadOrderForPush(link.order.id, true).catch(() => undefined)
+          const current = await port.reloadOrderForPush(link.order.id).catch(() => undefined)
           if (current === undefined || current === null) {
             await port.updateLink(link.id, { lastAttemptAt: ts, lastError: 'Not sent by IMS: the order could not be re-read before the amendment.' })
             continue
@@ -4198,16 +4169,16 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         OR: [{ wmsOrderPush: { is: null } }, { wmsOrderPush: { state: 'PENDING_CREATE' as const } }],
       }
       const select = { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, wmsOrderPush: { select: { attempts: true } } }
-      const shape = async (rows: Array<{ id: string; wmsOrderPush: { attempts: number } | null } & Record<string, unknown>>) => (
-        (await withNettedRefunds(db, rows)).map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
+      const shape = (rows: Array<{ wmsOrderPush: { attempts: number } | null } & Record<string, unknown>>) => (
+        rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
       )
       if (rotation) {
         // Held walk: id order from the cursor. A short page ends the walk and the sweep clears the cursor, so the next tick starts at the head.
         const tail = await db.salesOrder.findMany({ where: { AND: [where, rotation.afterId ? { id: { gt: rotation.afterId } } : {}] }, select, take: limit, orderBy: { id: 'asc' } })
-        return (await shape(tail as never)) as never
+        return shape(tail as never) as never
       }
       const rows = await db.salesOrder.findMany({ where, select, take: limit, orderBy: { updatedAt: 'asc' } })
-      return shape(rows as never) as never
+      return rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
     },
     async claimForCreate(orderId, connector, attemptedAt, paidNotBefore) {
       // o3d-1izw — THE WRITE-SITE GUARD. This transaction is the one that mints AMBIGUOUS_CREATE,
@@ -4490,8 +4461,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // The TRUE total, so the sweep can say what it did not get to this tick.
         db.wmsOrderPushLink.count({ where }),
       ])
-      const netted = await withNettedRefunds(db, rows.map((row) => row.order))
-      return { links: rows.map((row, i) => ({ ...row, order: netted[i] })) as never, total }
+      return { links: rows, total }
     },
     async ambiguousCreateLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
       // o3d-2k5r r4. Same order predicate as createCandidates', for the reason revalidatableLinks
@@ -4522,8 +4492,7 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         }),
         db.wmsOrderPushLink.count({ where }),
       ])
-      const netted = await withNettedRefunds(db, rows.map((row) => row.order))
-      return { links: rows.map((row, i) => ({ ...row, order: netted[i] })) as never, total }
+      return { links: rows, total }
     },
     // o3d-bjc.8: PENDING_VERIFY is deliberately NOT cancellable or holdable.
     // The tempting argument is urgency — a cancelled order must not ship — but
@@ -4677,13 +4646,10 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async readOrderObligationTimes(orderId) {
       return db.salesOrder.findUnique({ where: { id: orderId }, select: { paidAt: true, createdAt: true } })
     },
-    async reloadOrderForPush(orderId, forAmend) {
+    async reloadOrderForPush(orderId) {
       return db.$transaction(async (tx) => {
         await lockSalesOrder(tx, orderId)
-        const reloaded = await tx.salesOrder.findUnique({ where: { id: orderId }, select: ORDER_PUSH_SELECT })
-        if (!reloaded) return null
-        if (forAmend) return reloaded as unknown as Partial<OrderForPush>
-        return (await withNettedRefunds(tx, [reloaded]))[0] as unknown as Partial<OrderForPush>
+        return tx.salesOrder.findUnique({ where: { id: orderId }, select: ORDER_PUSH_SELECT }) as Promise<Partial<OrderForPush> | null>
       })
     },
     async updateLinkIfCreateClaimOwned(orderId, stamp, data) {
