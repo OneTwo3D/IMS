@@ -2332,7 +2332,7 @@ function runInstallDeploySection(t: TestContext, opts: { appDir: string; localSo
   const end = install.indexOf('readonly DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"', start)
   assert.ok(start > 0 && end > start, 'install.sh section 9 must be liftable between its header and DEPLOY_META_FILE')
   const section = install.slice(start, end)
-  assert.ok(section.includes('chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"') && section.includes('"${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"'),
+  assert.ok(section.includes('chown_app_root_tree "${APP_DIR}" "${APP_USER}"') && section.includes('"${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"'),
     'precondition: the lifted section must contain the local copy and its recursive chown')
   const log = join(createTempDirSync('install-section9-', t), 'calls.log')
   const program = [
@@ -2341,6 +2341,7 @@ function runInstallDeploySection(t: TestContext, opts: { appDir: string; localSo
     'die() { echo "DIED: $*"; exit 3; }',
     'rsync() { echo "rsync $*" >> "${CALLS}"; }',
     'chown() { echo "chown $*" >> "${CALLS}"; }',
+    'chown_app_root_tree() { echo "chown -R $2:$2 $1" >> "${CALLS}"; }',
     'copy_tree_into_new_dir() { echo "copy_tree_into_new_dir $*" >> "${CALLS}"; }',
     'run_git_as_user() { echo "git $*" >> "${CALLS}"; }',
     'APP_USER=imsapp',
@@ -2396,7 +2397,7 @@ test('[o3d-z5be] update.sh refuses to copy into or chown an APP_DIR that holds t
   const end = update.indexOf(endMarker, start)
   assert.ok(start > 0 && end > start, 'update.sh\'s copy block must be liftable')
   const block = update.slice(start, end + endMarker.length)
-  assert.ok(block.includes('chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"'), 'precondition: the block holds the recursive chown')
+  assert.ok(block.includes('chown_app_root_tree "${APP_DIR}" "${APP_USER}"'), 'precondition: the block holds the recursive chown')
   const base = createTempDirSync('update-copy-', t)
   const run = (appDir: string, runningLib: string) => {
     const log = join(base, `calls-${Math.random().toString(36).slice(2)}.log`)
@@ -2407,6 +2408,7 @@ test('[o3d-z5be] update.sh refuses to copy into or chown an APP_DIR that holds t
       'info() { :; }; success() { :; }; die() { echo "DIED: $*"; exit 3; }',
       'rsync() { echo "rsync $*" >> "${CALLS}"; }',
       'chown() { echo "chown $*" >> "${CALLS}"; }',
+      'chown_app_root_tree() { echo "chown -R $2:$2 $1" >> "${CALLS}"; }',
       'copy_tree_into_new_dir() { echo "copy_tree_into_new_dir $*" >> "${CALLS}"; }',
       'run_git_as_user() { echo "git $*" >> "${CALLS}"; [[ "$*" == *rev-parse* ]] && echo 0123456789abcdef; return 0; }',
       'APP_USER=imsapp', 'GIT_REPO_URL=https://example.invalid/r.git', 'GIT_BRANCH=main',
@@ -2758,7 +2760,7 @@ function treeWide(words: string[], extra: ReadonlySet<string>, aliases: Readonly
       return certain(name)
     case 'useradd': case 'usermod':
       return hasFlag(args, /[md]/, /^--(create-home|home-dir)$/) ? certain(name) : null
-    case 'chown_state_tree': case 'copy_tree_into_new_dir':
+    case 'chown_state_tree': case 'chown_app_root_tree': case 'copy_tree_into_new_dir':
       return certain(name)
     case 'mv':
       return { name, kind: 'possible' }
@@ -3100,7 +3102,7 @@ function treeWideFunctions(source: string, wrappers: ReadonlyMap<string, Wrapper
  * `$'\x63hown'`, `printf -v c '%s' ch; ${c}own`), or written in another file (`. /etc/os-release`).
  */
 const BACKSTOP_WORDS = ['chown', 'chgrp', 'chmod', 'setfacl', 'rsync', 'rm', 'cp', 'mv', 'install', 'tar', 'ln', 'find',
-  'xargs', 'cpio', 'unzip', 'useradd', 'usermod', 'chown_state_tree', 'copy_tree_into_new_dir',
+  'xargs', 'cpio', 'unzip', 'useradd', 'usermod', 'chown_state_tree', 'chown_app_root_tree', 'copy_tree_into_new_dir',
   // r11 (review M1): the gaps the reviewer measured green. `[A-Za-z]*tar` and `[A-Za-z]*cp` catch the
   // prefixed forms (`bsdtar`, `gtar`, `scp`, `rcp`); measured, the cp prefix adds only `tcp` (3 lines).
   'scp', 'read-tree', 'stash', 'chattr', 'chcon', '[A-Za-z]+tar', '[A-Za-z]+cp']
@@ -3185,7 +3187,9 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
   const MKTEMP_LINE = /^\s*rm -rf "\$\{TMP_CLONE_DIR\}"$/
   const RSYNC_CLONE = /^rsync -a --delete(?:\s+--exclude='[^']+')+\s+"\$\{TMP_CLONE_WORKTREE%\/\}\/" "\$\{APP_DIR\}\/"$/
   const COPY_GIT = /^copy_tree_into_new_dir "\$\{TMP_CLONE_WORKTREE\}\/\.git" "\$\{APP_DIR\}\/\.git"$/
-  const CHOWN_APP = /^chown -R "\$\{APP_USER\}:\$\{APP_USER\}" "\$\{APP_DIR\}"$/
+  // o3d-kg9v: the application root is re-owned through chown_app_root_tree (an lstat-style type and dev:ino
+  // check, a step into the directory, then `chown -Rh .`), still behind the same running-tree guard.
+  const CHOWN_APP = /^chown_app_root_tree "\$\{APP_DIR\}" "\$\{APP_USER\}" "the application directory"$/
   const G = (target: string) => `privileged_spare_running_tree "${target}" `
   // `mktemp -d -t` honours TMPDIR, which the operator controls, so this says what is true: the run made
   // the directory itself, after its own entrypoint was already open (review LOW 11).
