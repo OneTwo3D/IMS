@@ -155,6 +155,7 @@ import {
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
+  wooAccountingPostJobIds,
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
@@ -4606,51 +4607,64 @@ export async function completeSettledOutboxJobUnlessIncidentFiled(
   return { verdict: 'RETRACTED', evidence: filedSince }
 }
 
-async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
+/**
+ * How long one drain keeps CLAIMING new jobs (o3d-40i5e). Half the lease: a job claimed at the very end of the budget still has
+ * the larger part of its own lease for its attempt, and the next tick picks up what was left.
+ */
+export const XERO_DRAIN_CLAIM_BUDGET_MS = Math.floor(CLAIM_STALE_MS / 2)
+
+export async function processPendingXeroSyncViaOutbox(options: { now?: () => number; drainBudgetMs?: number } = {}): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
+  const clock = options.now ?? (() => Date.now())
+  const startedAt = clock()
+  const budgetMs = options.drainBudgetMs ?? XERO_DRAIN_CLAIM_BUDGET_MS
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
   await ensureXeroOutboxForPendingSyncLogs(MAX_PER_RUN, staleClaimCutoff)
-  const jobs = await claimIntegrationOutboxWork({
-    connector: XERO_OUTBOX_CONNECTOR,
-    operation: XERO_ACCOUNTING_POST_OPERATION,
-    limit: MAX_PER_RUN,
-    workerId: XERO_ACCOUNTING_WORKER_ID,
-    staleLockMs: CLAIM_STALE_MS,
-    maxAttempts: MAX_RETRIES,
-  })
 
-  const jobWork: Array<{ job: IntegrationOutboxRow; syncLogId: string }> = []
-  for (const job of jobs) {
+  // CLAIM -> ATTEMPT -> MARK, ONE JOB AT A TIME (o3d-40i5e). A batch claimed up front stamps every job with the same `lockedAt`
+  // while they are posted one after another, so a job at the back could age past the lease before its attempt began and be taken
+  // by the next drain as a dead worker's. Each job is now claimed only when its attempt is about to start, and the drain stops
+  // claiming once its wall-clock budget is spent; what it did not reach stays queued for the next tick.
+  const attempted: string[] = []
+  // ONE READ OF THE WOOCOMMERCE-WRITING JOB IDS FOR THE WHOLE DRAIN (o3d-jvup3), not one unbounded query per claim.
+  const wooAccountingJobIds = await wooAccountingPostJobIds(new Date())
+  while (attempted.length < MAX_PER_RUN) {
+    if (clock() - startedAt > budgetMs) break
+    const claimedJobs = await claimIntegrationOutboxWork({
+      connector: XERO_OUTBOX_CONNECTOR,
+      operation: XERO_ACCOUNTING_POST_OPERATION,
+      limit: MAX_PER_RUN,
+      claimLimit: 1,
+      excludeIds: attempted,
+      wooAccountingJobIds,
+      workerId: XERO_ACCOUNTING_WORKER_ID,
+      staleLockMs: CLAIM_STALE_MS,
+      maxAttempts: MAX_RETRIES,
+    })
+    const job = claimedJobs[0]
+    if (!job) break
+    attempted.push(job.id)
     if (!job.lockedAt) {
       result.failed++
       continue
     }
 
+    let syncLogId: string
     try {
-      jobWork.push({ job, syncLogId: parseXeroAccountingOutboxPayload(job).accountingSyncLogId })
+      syncLogId = parseXeroAccountingOutboxPayload(job).accountingSyncLogId
     } catch (error) {
       await markXeroOutboxPermanent(job, error instanceof Error ? error.message : String(error))
       result.failed++
       continue
     }
-  }
 
-  const entries = jobWork.length > 0
-    ? await db.accountingSyncLog.findMany({
-        where: { id: { in: [...new Set(jobWork.map((work) => work.syncLogId))] } },
-      })
-    : []
-  const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
-  // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). One taken here answers with the world as it
-  // was before this run made a single Xero call, and the incident the doors below guard against is filed
-  // by ANOTHER worker while this one is on the wire. Each door asks at the moment it decides — see
-  // completeSettledOutboxJobUnlessIncidentFiled.
-  const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, entries)
-  const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, entries)
+    const entry = await db.accountingSyncLog.findUnique({ where: { id: syncLogId } })
+    // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). Each door asks at the moment it decides - see
+    // completeSettledOutboxJobUnlessIncidentFiled.
+    const blockedPaymentEntryIds = entry ? await findInvoicePaymentsBlockedByEarlierLiveLogs(db, [entry]) : new Set<string>()
+    const blockedUpdateEntryIds = entry ? await findInvoiceUpdatesBlockedByPendingCreate(db, [entry]) : new Set<string>()
 
-  for (const { job, syncLogId } of jobWork) {
-    const entry = entriesById.get(syncLogId)
     if (!entry) {
       await markXeroOutboxPermanent(job, `Accounting sync log ${syncLogId} was not found`)
       result.failed++

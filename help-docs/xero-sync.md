@@ -1383,6 +1383,12 @@ check — settle that entry as posted instead. A recorded check is **your assert
 verified, and it is logged against your account. IMS then registers the receipt again through the same
 checks, and checks the ledger once more immediately before the payment is sent.
 
+The same hold can meet a receipt's **first** post, when no earlier IMS attempt exists: the receipt is refused
+before anything is sent (*IMS could not establish what the accounting connector already holds*), and the entry
+becomes `FAILED`. That refusal now names the same remedy. Open the listed payment in Xero and, if it is not a
+payment for this receipt, record **Checked the ledger** on that entry (choose the receipt it belongs to); the
+entry's next automatic attempt reads the check.
+
 What a check does **not** do, by design:
 
 | Situation | What happens |
