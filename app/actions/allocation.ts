@@ -1,5 +1,6 @@
 'use server'
 
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -746,6 +747,8 @@ export async function updateAllocation(
       // row would hold. `newQty === 0` let 0.00004 through to a row Postgres stores as 0.0000 —
       // an allocation row claiming nothing, which every structural check then reads as a component
       // missing from the set — while the reservation moved by 0.00004.
+      // The allocation set is about to change: the warehouse's part of the order must be re-derived.
+      await markWmsScopeDirtyInTx(tx, locked.orderId)
       if (requestedQty.lte(0)) {
         await tx.orderAllocation.delete({ where: { id: allocationId } })
       } else {
@@ -1058,6 +1061,7 @@ export async function addAllocation(
         })
         qtyBeforeByLeaf.set(leafProductId, toDecimal(existing?.qty ?? 0))
 
+        await markWmsScopeDirtyInTx(tx, orderId)
         if (existing) {
           await tx.orderAllocation.update({
             where: { id: existing.id },

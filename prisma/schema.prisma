@@ -4451,9 +4451,33 @@ model WmsOrderPushLink {
   courierTaskEpisode    DateTime? @map("courier_task_episode")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
+  /// MIXED-WAREHOUSE SCOPE (feature flag `wms_mixed_warehouse_push_enabled`, off by default). Null scopeMode = the link predates the flag or was
+  /// pushed with the whole order (behaviour unchanged). FULL = single-warehouse, whole order sent. MIXED = only the units allocated to the
+  /// warehouse this link serves were sent; the snapshot of what was sent is in `scopeLines` at `scopeVersion`.
+  scopeMode             WmsPushScopeMode? @map("scope_mode")
+  /// Bumped each time a different scope is sent (create or amendment). 0 = no scope recorded.
+  scopeVersion          Int       @default(0) @map("scope_version")
+  /// Hash of the scope last sent (lines, quantities and the apportioned money), so an amend pass can tell "nothing changed" from "resend".
+  scopeHash             String?   @map("scope_hash")
+  /// Set by every writer of order allocations / shipment lines (markWmsScopeDirtyInTx); the amend pass recomputes the scope and clears it.
+  scopeDirtyAt          DateTime? @map("scope_dirty_at")
+  scopeCheckedAt        DateTime? @map("scope_checked_at")
+  /// The scope changed after the warehouse order left NEW (or the change cannot be sent): nothing is amended, the link is frozen and escalated.
+  scopeFrozenAt         DateTime? @map("scope_frozen_at")
+  scopeFrozenReason     String?   @map("scope_frozen_reason")
+  /// The apportioned money (minor units of the order currency) that went out with the scope: discount, shipping and VAT.
+  scopeDiscountMinor    Int?      @map("scope_discount_minor")
+  scopeShippingMinor    Int?      @map("scope_shipping_minor")
+  scopeVatMinor         Int?      @map("scope_vat_minor")
+  /// Q2, decided ONCE when the part is first sent and frozen: whether the part carries the order's shipping (and the VAT not on a goods line). Null until a part is sent.
+  scopeShippingCarried  Boolean?  @map("scope_shipping_carried")
+  /// The warehouse's part of the order has despatched and been applied in IMS: dispatch polling stops and the order is never cancelled in the warehouse.
+  despatchSettledAt     DateTime? @map("despatch_settled_at")
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
+  scopeLines          WmsOrderPushScopeLine[]
+  despatchApplications WmsDespatchApplication[]
   items               WmsOrderPushItem[]
   order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -4463,6 +4487,45 @@ model WmsOrderPushLink {
   @@index([connector, dispatchReconcileCheckedAt])
   @@index([connector, dispatchUnresolvedAt])
   @@map("wms_order_push_links")
+}
+
+enum WmsPushScopeMode {
+  FULL
+  MIXED
+}
+
+/// What a mixed-warehouse push sent, one row per order line and scope version (whole units: a kit is one unit, never its components).
+/// Immutable once written; a new scope is a new version.
+model WmsOrderPushScopeLine {
+  id           String   @id @default(cuid())
+  linkId       String   @map("link_id")
+  scopeVersion Int      @map("scope_version")
+  orderLineId  String   @map("order_line_id")
+  sku          String
+  quantity     Decimal  @db.Decimal(12, 4)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  link         WmsOrderPushLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+
+  @@unique([linkId, scopeVersion, orderLineId], map: "wms_scope_lines_link_version_line_key")
+  @@index([linkId])
+  @@map("wms_order_push_scope_lines")
+}
+
+/// One row per despatch applied for a link and scope version. The idempotency key makes a replayed despatch a no-op: the row is inserted in the
+/// same transaction that ships the warehouse's own shipments, so a second apply finds it and ships nothing.
+model WmsDespatchApplication {
+  id             String   @id @default(cuid())
+  linkId         String   @map("link_id")
+  scopeVersion   Int      @map("scope_version")
+  idempotencyKey String   @unique @map("idempotency_key")
+  shipmentIds    Json     @map("shipment_ids")
+  appliedAt      DateTime @default(now()) @map("applied_at")
+
+  link           WmsOrderPushLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+
+  @@index([linkId])
+  @@map("wms_despatch_applications")
 }
 
 /// The warehouse's own line ids for the order IMS pushed, read back right after the create (and after an amendment): one row per

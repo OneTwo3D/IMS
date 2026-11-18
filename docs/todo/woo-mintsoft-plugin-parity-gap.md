@@ -48,6 +48,22 @@ the legacy plugin/bridge when IMS owns writeback for a store. (This is why the c
 plugin uses neutral `_oti_wms_*` metas and its own lock name rather than re-coupling to the
 legacy `_mintsoft_*` keys.)
 
+## G5 manual check: does the AST despatch email fire? (owner, stage only)
+
+IMS writes `_wc_shipment_tracking_items` directly where the plugin called AST Pro's `add_tracking_item()`. Code cannot show whether AST Pro's email hook runs, so this is a one-off check on the STAGE store. Never run it against the live store. Owner decision D11: customer emails stay in WooCommerce, so the requirement is only that the WooCommerce despatch/completed email still arrives.
+
+1. Confirm stage has Advanced Shipment Tracking Pro active, its customer "Shipped / Completed" email enabled, and outgoing mail going to a mailbox you can read (use a test customer address you own, not a real customer).
+2. Place a TEST order on stage for a product that is NOT stocked in any Mintsoft warehouse (it shows as backorder, so Mintsoft will not dispatch it). Stage is wired to the live Mintsoft, so this is what stops a real parcel.
+3. Leave `wc_ast_provider_mapping_enabled` OFF for the first run, so the result is the baseline behaviour.
+4. Once the order is in IMS, record a despatch on it with a test tracking number and a courier from the table (for example Royal Mail), so IMS pushes tracking to WooCommerce and completes the order (o3d-zvec.15 path). Wait for the outbox to drain (Sync page shows no pending outbox rows for the order).
+5. In WooCommerce admin on stage, open the order: confirm the tracking item is on it, the status is Completed, and the order notes show the customer email being sent (or check the mail log / test mailbox). Record: email arrived yes/no, tracking link rendered yes/no.
+6. Repeat with `wc_ast_provider_mapping_enabled` ON on a second test order. Record whether the tracking link now renders as a link with the provider branding and whether the email still arrives.
+7. Cancel both test orders afterwards.
+
+Outcome:
+- Email arrives: close the bead as a documentation fix (change G5 to DONE here).
+- No email: IMS must trigger AST through the onetwoinventory-helper companion plugin (a new signed route, like partial-shipment and trackship-refire), as a follow-up bead. Keep the mapping setting off until then.
+
 ## Sequencing / status
 1. ✅ `q66in.1.5` split reconcile + G1 WC writeback (PRs #449, #450).
 2. ✅ G2 merge repoint / dual-sync (PR #450).

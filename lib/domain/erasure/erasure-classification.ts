@@ -151,7 +151,9 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   WmsOrderPushLink: {
     erased: ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'],
     // doublePostageDetail: order numbers, currency and amounts only (built by decideDoublePostage); no name, address or contact.
-    notPersonal: ['connector', 'courierForm', 'courierFormName', 'pushWarehouseId', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService', 'doublePostageDetail'],
+    notPersonal: ['connector', 'courierForm', 'courierFormName', 'pushWarehouseId', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService', 'doublePostageDetail',
+      // Mixed-warehouse scope: a mode, a version, a hash of the lines sent, stamps, a fixed-vocabulary freeze reason and minor-unit amounts. No person is named.
+      'scopeHash', 'scopeFrozenReason'],
     retained: {
       externalOrderId: 'the warehouse order id reconciles the order with the warehouse',
       externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',
@@ -161,6 +163,18 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     // The warehouse's own line ids with the SKU and quantity of each line: no person is named. Deleted with its link (cascade).
     erased: [],
     notPersonal: ['linkId', 'externalOrderId', 'externalItemId', 'sku'],
+    retained: {},
+  },
+  WmsOrderPushScopeLine: {
+    // The part of an order sent to the warehouse: the order line id, SKU and quantity of each line. No person is named. Deleted with its link (cascade).
+    erased: [],
+    notPersonal: ['linkId', 'orderLineId', 'sku'],
+    retained: {},
+  },
+  WmsDespatchApplication: {
+    // One row per applied warehouse despatch: an idempotency key built from IDs and the shipment ids shipped. No person is named. Deleted with its link (cascade).
+    erased: [],
+    notPersonal: ['linkId', 'idempotencyKey', 'shipmentIds'],
     retained: {},
   },
   WmsOperatorTask: {

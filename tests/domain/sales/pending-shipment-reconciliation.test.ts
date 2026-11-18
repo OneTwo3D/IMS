@@ -72,6 +72,7 @@ function client(fixture: { drafts: Draft[]; allocations: Allocation[]; committed
           return { count: before - state.drafts.length }
         },
       },
+      wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
       orderAllocation: {
         findMany: async () => {
           calls.orderAllocationReads += 1

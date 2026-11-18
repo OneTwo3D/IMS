@@ -1,3 +1,4 @@
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 import { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
@@ -266,6 +267,7 @@ export async function reconcilePendingShipments(
   })
 
   await client.shipment.deleteMany({ where: { id: { in: doomed.map((row) => row.id) } } })
+  await markWmsScopeDirtyInTx(client, orderId)
   return { retired: doomed, retainedCount }
 }
 
