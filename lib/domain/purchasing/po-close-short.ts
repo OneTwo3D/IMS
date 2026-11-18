@@ -28,6 +28,9 @@ import {
  * Nothing is written to a connector; nothing is posted to the ledger: an unreceived balance has no ledger footprint.
  */
 
+/** The refusal's lead-in, so the UI can offer the reconcile action beside it. */
+export const PO_UNRECONCILED_WMS_CREDIT_MARKER = 'not yet booked into this order'
+
 export type PoRetireIntent = 'close' | 'cancel'
 
 export class PoLiveAsnRefusedError extends Error {
@@ -157,7 +160,7 @@ export async function retirePurchaseOrderLocked(
     const names = unreconciled.map((l) => `${l.product?.sku ?? l.id} (${landedByLine.get(l.id)!.fromUnabsorbedWmsSnapshot.toNumber()})`).join(', ')
     throw new Error(
       `Cannot ${intent === 'cancel' ? 'cancel' : 'close'} ${po.reference}: ${names} ${unreconciled.length === 1 ? 'has' : 'have'} stock the warehouse sync brought in that is not yet booked into this order, `
-      + 'so it cannot be returned to the supplier from here. Reconcile the warehouse receipt first (use Recheck booked-in on the order once the warehouse has booked the goods in), then close the order.',
+      + 'so it cannot be returned to the supplier from here. Reconcile the warehouse receipt first (use Recheck booked-in on the order once the warehouse has booked the goods in; if the ASN was already retired, use Reconcile warehouse receipt in this dialog or on the order), then close the order.',
     )
   }
 

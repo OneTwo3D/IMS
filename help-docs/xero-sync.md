@@ -479,6 +479,7 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Discounts Given | Revenue / Expense | Order-level discounts |
 | Purchases | Direct Cost | Default account for purchase bills |
 | Stock in Transit | Asset | Goods ordered but not yet received, and (when refund returns are held in transit) refunded goods not yet back |
+| GR/IR (goods received, not invoiced) | Liability / Current liability | Clearing account the daily batch moves goods received but not yet billed into, out of Stock in Transit. Used only while **GR/IR accrual posting** is switched on; must differ from Stock in Transit |
 | Inventory Asset | Asset | Stock on hand (available) |
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch (stock on an order that ships before it is paid goes straight from Inventory to COGS and never passes through here) |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
@@ -929,6 +930,23 @@ When enabled, the nightly cron job runs three groups in sequence:
 **Refunds entered before the first run.** A refund recorded before an order's first batch run (a net refund, from this release's refund writer) is netted out of that order's revenue deferral, so a partial refund no longer leaves Unearned Revenue holding the refunded value. The deferral journal itself stays at the full amount on the day the order was paid, and each such refund is posted as its own adjustment (DR Unearned Revenue / CR Sales) dated the day of the refund (never before the payment), so a refund entered in a later period never changes an earlier period's journal. Each refund records the adjustment journal that netted it, so a lost adjustment is rebuilt exactly once by the missing-batch sweep and reported by the accounting checks (`refund_deferral_adjustment_without_sync_evidence`) until it is. Refunds recorded after the deferral keep using the refund reversal journals described above. A refund from before refunds were stored net is not netted (its tax-inclusive total cannot be subtracted from a tax-exclusive deferral) and is left for the lifecycle tie-out to report.
 
 Group A1 reads each order's subtotal, shipping and discount to work out how much revenue to defer, and it reads them before it opens the transaction that writes the journal. If any of those orders changes in that window — in practice only the one-off WooCommerce coupon backfill does this — the whole group is **refused rather than posted**, because the journal it had prepared would no longer match the orders it names. Nothing is staged and no order is marked as deferred, so the next night's run simply recalculates from the corrected figures. The refusal appears in the run's errors and as an `accounting_daily_batch_stale_order_discount` entry in the activity log, naming each affected order and both amounts. The same applies to the QuickBooks daily batch.
+
+### GR/IR accrual posting (goods received, not invoiced)
+
+IMS keeps a **GR/IR sub-ledger** (see Purchasing) that accrues with every receipt, bill, bill edit, supplier return and return credit note. **Posting it to Xero is off by default.** The setting is **GR/IR accrual posting** (`grir_xero_posting_enabled`, Settings > Accounting > Xero > Sub-Ledger), and the account is **GR/IR** (`xero_grir_account`). While the switch is off the daily batch reads nothing, stages nothing and consumes nothing, and the sub-ledger and the GR/IR report keep accruing; nothing reaches Xero.
+
+IMS already posts a receipt as **DR Inventory / CR Stock in Transit** and a bill as **DR Stock in Transit / CR Accounts Payable**, and Stock in Transit already nets the two to zero. What was missing is the separation: goods received before the bill leave a **credit** hidden in Stock in Transit. Posting Inventory DR / GR/IR CR on receipt and GR/IR DR / AP CR on the bill **on top** would count the stock and the liability twice, so the switch adds a **reclass** instead. When it is on and the Daily Batch is on, each run takes every GR/IR movement not yet consumed, groups it by journal date (a date in a locked period is moved to the first open day, and the run waits while the lock reaches today, exactly like the other groups), and stages one **GR/IR reclass** journal per date for the net:
+
+- net **received not billed** rose: **DR Stock in Transit / CR GR/IR**
+- net fell (a bill, a return): **DR GR/IR / CR Stock in Transit**
+
+Together with the receipt and bill journals that is exactly Inventory DR / GR/IR CR on receipt and GR/IR DR / AP CR on the bill, and Stock in Transit is left holding only what is genuinely in transit (billed, not received) and freight. Each journal is also recorded in the transit sub-ledger (source `GRIR_RECLASS`), so the Stock in Transit reconciliation keeps tying out; the reconciliation pack's transit schedule counts it as its own leg. The movements a journal was built from are stamped with its reference in the same step, so no movement is ever posted twice, and a day that nets to nothing posts no journal.
+
+- **Freight and landed cost** are not in GR/IR; they follow the Stock in Transit path as before. **A price difference** between a bill and the order is not in GR/IR either (see Purchasing); it stays on Stock in Transit.
+- **It goes through the same write seam and hold as every Xero posting.** With the producer hold enforced, the journal is recorded as a shadow (status Cancelled, never posted by IMS), nothing is queued, and the transit sub-ledger records nothing, because the ledger did not move. The movements behind a shadowed journal are **not consumed** (unlike the sales batches), so they post on the first run after the hold is lifted.
+- If the switch is on but Stock in Transit or the GR/IR account is not mapped, the run says so in its errors and consumes nothing; the movements wait.
+- Switching it on later posts the movements accrued since the sub-ledger began (their net is the open balance), dated by the day each happened.
+- A journal Xero rejects is retried like any other daily batch journal. A journal an operator cancels is not rebuilt, as for the other batches.
 
 ### Payment Polling
 

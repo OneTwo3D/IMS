@@ -2,7 +2,7 @@ import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
-import { getSalesOrder } from '@/app/actions/sales'
+import { getReturnExchangeOffer, getSalesOrder } from '@/app/actions/sales'
 import { getReturnReasons } from '@/app/actions/return-reasons'
 import { getWarehouses, getScopedStockLevelMap, getAvgCogsMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
@@ -27,6 +27,7 @@ import { documentDeleteUiStates } from '@/lib/domain/accounting/document-delete-
 import { getCustomFieldCardData } from '@/app/actions/custom-fields'
 import { CustomFieldsCard } from '@/components/custom-fields/custom-fields-card'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { buildExchangeCatalogue } from '@/lib/domain/sales/return-exchange'
 import { listOrderAttachments, canEditOrderAttachments, canViewOrderAttachments } from '@/lib/domain/order-attachments'
 import { OrderAttachmentsCard } from '@/components/orders/order-attachments-card'
 import { getSalesOrderPegs } from '@/app/actions/pegging'
@@ -92,6 +93,12 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   // o3d-ngmt.21: the Delete control for a synced invoice — shown only for a user who may process sales, with the switch on, and for a document that reached Xero.
   const invoiceDeleteState = (await documentDeleteUiStates('SALES_INVOICE', [so.id], hasPermission(session.user.role, 'sales.process')))[so.id]
 
+  // EXCHANGES INSIDE A RETURN: the refund dialog's replacement section. Asked only of a person who may refund; the catalogue is loaded only when the section is actually offered (switched on, permitted, no gate blocks it).
+  const exchangeOffer = hasPermission(session.user.role, 'sales.refund') ? await getReturnExchangeOffer(id) : null
+  const exchangeCatalogue = exchangeOffer?.offered
+    ? buildExchangeCatalogue((await listProducts({ pageSize: 1000, type: 'ALL', active: 'true' })).products, { pricesIncludeVat: so.pricesIncludeVat, taxRatePercent: so.taxRatePercent, fxRateToBase: so.fxRateToBase })
+    : []
+
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
@@ -124,6 +131,8 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         paidWithoutInvoice={paidWithoutInvoice}
         quoteEmailEnabled={quoteEmailEnabled}
         editForm={editForm}
+        exchangeOffer={exchangeOffer}
+        exchangeCatalogue={exchangeCatalogue}
         invoiceDeleteState={invoiceDeleteState}
         pegs={pegs}
       />

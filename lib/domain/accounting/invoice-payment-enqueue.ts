@@ -51,6 +51,7 @@ import { invoicePaymentReceiptId } from '@/lib/domain/accounting/operator-ledger
 import { loadLiveReceipts } from '@/lib/domain/accounting/payment-identity'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { isShadowedOutcome } from '@/lib/domain/accounting/enqueue-outcome'
+import { businessDateYmd } from '@/lib/business-date'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
@@ -1838,7 +1839,8 @@ export async function registerInvoicePaymentWithLedger(params: {
           // o3d-q0x56.2: IMS's own settlement rate for this receipt (1 base = X currency). Absent only for a base-currency receipt or a rate
           // IMS could not resolve - and a foreign receipt without it is refused by the enqueue below, never queued.
           ...(settlementRateForPayload !== undefined ? { settlementRateToBase: settlementRateForPayload } : {}),
-          paymentDate: params.paidAt.toISOString().slice(0, 10),
+          // The business (London) day, the day the realised-FX journal for this receipt is dated on (sales.ts).
+          paymentDate: businessDateYmd(params.paidAt),
           method: params.method ?? '',
           reference: params.reference ?? undefined,
           // Which local receipt this is, so deletePayment can retract exactly this row rather than any

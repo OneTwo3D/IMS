@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { shareLockOrderTaxRates } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -88,6 +89,7 @@ import { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
+import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -427,6 +429,27 @@ export type RefundAccountingSyncRequest = {
  * it to a clean no-op plus an operator-visible warning.
  */
 export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback'
+
+/**
+ * THE EXCHANGE HOOK OF A REFUND (Return exchanges). The refund transaction calls it twice, both under the order's row lock:
+ *   check  - before anything is written: whether replacement lines may be added to the order now (null) or the operator-wording refusal (nothing is created).
+ *   apply  - once the refund row exists: add the replacement lines linked to it, move the order's totals, queue the posted invoice's update. It returns the NET (ex-VAT) value it added to the order in the BASE currency,
+ *            because the refund is classified full or partial against the order total AFTER the replacement lines are on it: a return that is refunded in full but replaced is a partial refund of a larger order,
+ *            which keeps the order's demand, allocation and shipping alive (a fully refunded order holds none).
+ * A throw from either rolls the whole refund back.
+ */
+export type ReturnExchangeHook = {
+  check(tx: Prisma.TransactionClient): Promise<string | null>
+  apply(tx: Prisma.TransactionClient, context: { refundId: string; creditNoteNumber: string }): Promise<{ addedNetBase: number }>
+}
+
+/** Thrown inside the refund transaction to roll it back with an operator-wording message (the exchange would leave the order fully refunded). */
+class ReturnExchangeRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ReturnExchangeRefusedError'
+  }
+}
 
 export type CreateSalesOrderRefundResult =
   | { success: false; error: string; conflict?: RefundCreationConflict; quarantine?: true }
@@ -3504,7 +3527,7 @@ async function stageRefundAccountingReversals(
   // khdw: capture the COGS reversal's GL posting date once so it both drives the
   // journal payload and is persisted on the refund for the daily-batch reconciliation.
   if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
-    const cogsReversalJournalDate = new Date().toISOString().slice(0, 10)
+    const cogsReversalJournalDate = businessDateYmd(new Date())
     // Goods in transit are not in Inventory: the debit goes to Stock in Transit until they arrive (the inventory
     // sub-ledger is cost layers, and none exists for units that are not back). Only a refund that actually
     // returns stock is in transit (`returnWarehouseId`). A refund with nothing to return has no shipped cost
@@ -3626,7 +3649,7 @@ async function stageRefundAccountingReversals(
       // it and previously had nothing at all naming its chart.
       chartConnector: settings.connector,
       payload: {
-        date: new Date().toISOString().slice(0, 10),
+        date: businessDateYmd(new Date()),
         reference: hasUnearnedReversal
           ? `Unearned reversal: ${params.orderRef}`
           : `Allocation reversal: ${params.orderRef}`,
@@ -3914,6 +3937,30 @@ function stagedAReversal(syncs: RefundAccountingSyncRequest[]): boolean {
   return syncs.some((sync) => sync.type === 'COGS_REVERSAL' || sync.type === 'UNEARNED_REV_REVERSAL')
 }
 
+/**
+ * An operator-typed refund needs a booked sale. A DRAFT never has one. A PENDING_PAYMENT order is refused only while it carries no recorded payment, receipt (`paidAt`) or invoice:
+ * `addPayment` never moves an order's status, so a confirmed order can hold real money while still PENDING_PAYMENT, and that money must stay refundable (cancelling it would be terminal and unrefundable).
+ */
+export function manualRefundStatusRefusal(
+  status: string,
+  booked: { hasPayment: boolean; hasInvoice?: boolean; paidAt?: Date | null } = { hasPayment: false },
+): string | null {
+  if (status === 'DRAFT') return 'A draft order has not been booked, so it cannot be refunded. Delete the draft instead.'
+  if (status === 'PENDING_PAYMENT' && !booked.hasPayment && !booked.hasInvoice && !booked.paidAt) {
+    return 'This order is still waiting for payment and has no recorded payment or receipt, so there is nothing to refund. Delete the order if it was created in error; if a payment has been received, record it first.'
+  }
+  return null
+}
+
+/** The first refund line whose order-line id is not one of the order's own lines, or null. */
+export function refundLinesNotOnOrder<T extends { lineId?: string | null; description?: string | null }>(
+  refundLines: ReadonlyArray<T>,
+  orderLines: ReadonlyArray<{ id: string }>,
+): T | null {
+  const ids = new Set(orderLines.map((l) => l.id))
+  return refundLines.find((l) => l.lineId != null && !ids.has(l.lineId)) ?? null
+}
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
@@ -3989,6 +4036,8 @@ export async function createSalesOrderRefund(
     statedGrossForeign?: number
     /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across ALL its rate ids, set only when the refund carried tax on the EAS plugin's rate 182. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
     eas182StatedTaxForeign?: number
+    /** An exchange recorded with this return: replacement lines added to the SAME order, in this transaction, linked to this refund. Set only by the operator's refund action (never by an internal caller). */
+    exchange?: ReturnExchangeHook
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // THE ROW-SHAPE CHECKS RUN ON THE REQUEST AS SENT, before any filtering: a row the filter below would drop (a negative quantity with no money)
@@ -4075,6 +4124,8 @@ export async function createSalesOrderRefund(
         externalOrderNumber: true,
         orderNumber: true,
         status: true,
+        paidAt: true,
+        invoiceNumber: true,
         refundStatus: true,
         fxRateToBase: true,
         totalBase: true,
@@ -4125,6 +4176,16 @@ export async function createSalesOrderRefund(
     })
     if (!so) return { error: 'Order not found' } as const
 
+    // Every refund line that names an order line must name one of THIS order's lines: a foreign id would be stored as-is and pollute per-line refunded quantities. Pure tightening for every caller.
+    const foreignLine = refundLinesNotOnOrder(refundLines, so.lines)
+    if (foreignLine) return { error: `Refund line "${foreignLine.description ?? foreignLine.lineId}" names an order line that does not belong to this order.` } as const
+    // An operator-typed (manual) refund needs a booked sale: a draft or an order still waiting for payment has nothing to return and no invoice to credit. Internal callers (storefront, chargeback) are unchanged.
+    if (input.deriveSaleLineNetsFromStoredBalance) {
+      const paymentRows = await tx.payment.count({ where: { orderId: input.orderId, refundId: null } })
+      const stateRefusal = manualRefundStatusRefusal(so.status, { hasPayment: paymentRows > 0, hasInvoice: !!so.invoiceNumber, paidAt: so.paidAt })
+      if (stateRefusal) return { error: stateRefusal } as const
+    }
+
     // o3d-q0x56.8 - THE ORDER'S BOOKED RATE, OR A REFUSAL. Never 1 for a missing one: a foreign order with no usable
     // stored rate would have had every refund line converted one-for-one. A credit note reverses what was booked, so
     // no table rate is looked up in its place either. A base-currency order is 1 because `currency === base`.
@@ -4143,6 +4204,12 @@ export async function createSalesOrderRefund(
         return { error: `Refund not created: ${error.message}`, quarantine: true as const }
       }
       throw error
+    }
+
+    // AN EXCHANGE IS CHECKED BEFORE ANYTHING IS WRITTEN: under the order lock, the replacement lines may be added now, or the whole refund is refused (nothing created).
+    if (input.exchange) {
+      const refusal = await input.exchange.check(tx)
+      if (refusal) return { error: refusal } as const
     }
 
     // The itemised sale lines are cut from what each order line has LEFT, here, under the order lock (see deriveSaleLineNetsFromStoredBalance).
@@ -5345,6 +5412,12 @@ export async function createSalesOrderRefund(
       })
     }
 
+    // THE REPLACEMENT LINES GO ON THE ORDER NOW, before the refund is classified: a return that is replaced is a refund of a LARGER order. They are added (and the posted invoice's update queued) in this
+    // transaction, so the refund, its credit note and the exchange commit together or not at all.
+    const exchangeApplied = input.exchange
+      ? await input.exchange.apply(tx, { refundId: createdRefund.id, creditNoteNumber })
+      : null
+
     const totalRefundedNow = previouslyRefunded + totalBase
     // Chargebacks unwind recognised revenue on the NET (ex-VAT) basis: the refund
     // lines are stored net and the credit note grosses them back up via taxType to
@@ -5359,7 +5432,7 @@ export async function createSalesOrderRefund(
     // 0, so this is identical to the gross basis for them. Safe to use the net total unconditionally here:
     // an order with any legacy/unknown-basis refund was already blocked above (o3d-n8p), so at this point
     // every refund on the order is NET-basis.
-    const orderTotal = netOrderTotal
+    const orderTotal = netOrderTotal + (exchangeApplied?.addedNetBase ?? 0)
     // `newStatus` is the refund *classification* (drives the accounting reversal
     // treatment), NOT the order's lifecycle status — refund state is now the
     // orthogonal refundStatus dimension.
@@ -5369,7 +5442,12 @@ export async function createSalesOrderRefund(
     // A cancelled order has nothing to refund — preserve the prior reject (the old
     // status machine blocked CANCELLED → REFUNDED/PARTIALLY_REFUNDED).
     if (so.status === 'CANCELLED') {
+      if (exchangeApplied) throw new ReturnExchangeRefusedError('Cannot refund a cancelled order')
       return { error: 'Cannot refund a cancelled order' } as const
+    }
+    // A replaced return that STILL refunds the whole order (replacement worth nothing) would leave the order fully refunded: it would hold no demand and the replacement lines could not be shipped.
+    if (exchangeApplied && newStatus === 'REFUNDED') {
+      throw new ReturnExchangeRefusedError(returnExchangeRefusals.wouldFullyRefund)
     }
     // The lifecycle status is left untouched; only the refund disposition is written,
     // so an order can be e.g. Delivered + Fully refunded and keep flowing through
@@ -5536,6 +5614,7 @@ export async function createSalesOrderRefund(
     if (isRefundReturnSourceError(error)) {
       return { error: refundReturnSourceErrorMessage(error) } as const
     }
+    if (error instanceof ReturnExchangeRefusedError) return { error: error.message } as const
     throw error
   })
 

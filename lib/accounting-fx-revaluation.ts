@@ -21,6 +21,7 @@ import {
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { endOfBusinessDateUtc, isMissingFxRateError, type FxMissingReason } from '@/lib/currencies/fx-lookup'
 import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { businessDateYmd } from '@/lib/business-date'
 
 type JournalLine = {
   accountCode: string
@@ -194,7 +195,7 @@ export type SkippedRevaluation = {
 function asDateOnly(input?: Date | string): string {
   const date = input ? new Date(input) : new Date()
   if (Number.isNaN(date.getTime())) throw new Error('Invalid valuation date')
-  return date.toISOString().slice(0, 10)
+  return businessDateYmd(date)
 }
 
 function isActivePayload(value: unknown): value is RevaluationPayload {

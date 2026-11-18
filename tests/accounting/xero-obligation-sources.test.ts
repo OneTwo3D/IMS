@@ -118,22 +118,23 @@ test('REAL BUILDERS: the payload each exported producer builds carries the decla
  * under that type. (Extracting every one of them would be a money-path refactor for a date key.)
  */
 const INLINE_SITES: Array<{ types: string[]; file: string; pattern: RegExp }> = [
-  { types: ['STOCK_RECEIPT'], file: 'app/actions/purchase-orders.ts', pattern: /date: new Date\(\)\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Receipt: \$\{po\.reference\}`/ },
-  { types: ['STOCK_RECEIPT'], file: 'lib/connectors/mintsoft/sync/stock-sync.ts', pattern: /date: now\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Receipt: \$\{purchaseCost\.poReference\}`/ },
-  { types: ['STOCK_RECEIPT'], file: 'lib/domain/wms/booked-in-service.ts', pattern: /date: now\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Receipt: \$\{po\.reference\}`/ },
-  { types: ['STOCK_RECEIPT'], file: 'lib/domain/sales/return-expectation-receipt.ts', pattern: /date: params\.arrivedAt\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Return received: \$\{params\.expectation\.reference\}`/ },
-  { types: ['INVENTORY_ADJUSTMENT'], file: 'app/actions/purchase-orders.ts', pattern: /date: new Date\(\)\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: returnRef,/ },
+  { types: ['STOCK_RECEIPT'], file: 'app/actions/purchase-orders.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: `Receipt: \$\{po\.reference\}`/ },
+  { types: ['STOCK_RECEIPT'], file: 'lib/connectors/mintsoft/sync/stock-sync.ts', pattern: /date: businessDateYmd\(now\),\n\s*reference: `Receipt: \$\{purchaseCost\.poReference\}`/ },
+  { types: ['STOCK_RECEIPT'], file: 'lib/domain/wms/booked-in-service.ts', pattern: /date: businessDateYmd\(now\),\n\s*reference: `Receipt: \$\{po\.reference\}`/ },
+  { types: ['STOCK_RECEIPT'], file: 'lib/domain/sales/return-expectation-receipt.ts', pattern: /date: businessDateYmd\(params\.arrivedAt\),\n\s*reference: `Return received: \$\{params\.expectation\.reference\}`/ },
+  { types: ['INVENTORY_ADJUSTMENT'], file: 'app/actions/purchase-orders.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: returnRef,/ },
   { types: ['BILL_PAYMENT'], file: 'app/actions/purchase-orders.ts', pattern: /paymentDate: input\.paymentDate,/ },
-  { types: ['INVOICE_PAYMENT'], file: 'lib/domain/accounting/invoice-payment-enqueue.ts', pattern: /paymentDate: params\.paidAt\.toISOString\(\)\.slice\(0, 10\),/ },
+  { types: ['INVOICE_PAYMENT'], file: 'lib/domain/accounting/invoice-payment-enqueue.ts', pattern: /paymentDate: businessDateYmd\(params\.paidAt\),/ },
   { types: ['PURCHASE_CREDIT_NOTE_ALLOCATION'], file: 'lib/connectors/xero/sync-processor.ts', pattern: /date: \(payload\.date as string \| undefined\)\?\.slice\(0, 10\)/ },
-  { types: ['ALLOCATION_REVERSAL'], file: 'lib/domain/sales/allocation-service.ts', pattern: /date: new Date\(\)\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `Allocation reversal: \$\{orderRef\}`/ },
-  { types: ['MANUFACTURING_JOURNAL'], file: 'app/actions/manufacturing.ts', pattern: /date: now\.toISOString\(\)\.slice\(0, 10\),\n\s*reference,/ },
-  { types: ['MANUFACTURING_RECLASS'], file: 'app/actions/manufacturing.ts', pattern: /date: new Date\(\)\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: `MFG-RECLASS: \$\{po\.reference\}`/ },
+  { types: ['ALLOCATION_REVERSAL'], file: 'lib/domain/sales/allocation-service.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: `Allocation reversal: \$\{orderRef\}`/ },
+  { types: ['MANUFACTURING_JOURNAL'], file: 'app/actions/manufacturing.ts', pattern: /date: businessDateYmd\(now\),\n\s*reference,/ },
+  { types: ['MANUFACTURING_RECLASS'], file: 'app/actions/manufacturing.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: `MFG-RECLASS: \$\{po\.reference\}`/ },
   { types: ['COGS_REVERSAL'], file: 'lib/domain/sales/refund-service.ts', pattern: /date: cogsReversalJournalDate,/ },
-  { types: ['UNEARNED_REV_REVERSAL'], file: 'lib/domain/sales/refund-service.ts', pattern: /date: new Date\(\)\.toISOString\(\)\.slice\(0, 10\),\n\s*reference: hasUnearnedReversal/ },
+  { types: ['UNEARNED_REV_REVERSAL'], file: 'lib/domain/sales/refund-service.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: hasUnearnedReversal/ },
   { types: ['DAILY_BATCH_INVENTORY_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Inventory reconciliation/ },
   { types: ['DAILY_BATCH_COGS_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `COGS reconciliation/ },
   { types: ['DAILY_BATCH_TRANSIT_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Transit reconciliation/ },
+  { types: ['DAILY_BATCH_GRIR_RECLASS'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: group\.date,\n\s*reference: `GR\/IR reclass/ },
   { types: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: (?:plan\.)?group\.date,/ },
 ]
 
@@ -348,7 +349,7 @@ const POSTING_PATH_FIELD: Record<string, 'date' | 'paymentDate'> = {
   PURCHASE_INVOICE: 'date', PURCHASE_INVOICE_UPDATE: 'date', COGS_JOURNAL: 'date', INVENTORY_ADJUSTMENT: 'date', SALES_INVOICE: 'date', SALES_INVOICE_UPDATE: 'date', SALES_INVOICE_DELETE: 'date', PURCHASE_INVOICE_DELETE: 'date',
   INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', CREDIT_NOTE_VOID: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
   STOCK_RECEIPT: 'date', COGS_REVERSAL: 'date', DAILY_BATCH_REVENUE_DEFERRAL: 'date', DAILY_BATCH_INVENTORY_ALLOC: 'date', DAILY_BATCH_GROUP_B: 'date',
-  DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', UNEARNED_REV_REVERSAL: 'date',
+  DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', DAILY_BATCH_GRIR_RECLASS: 'date', UNEARNED_REV_REVERSAL: 'date',
   ALLOCATION_REVERSAL: 'date', BILL_PAYMENT: 'paymentDate', MANUFACTURING_JOURNAL: 'date', MANUFACTURING_RECLASS: 'date',
 }
 

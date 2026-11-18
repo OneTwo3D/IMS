@@ -68,7 +68,7 @@ export const SALES_ANALYTICS_EXPORTS: Record<SalesAnalyticsExportType, SalesAnal
     filename: 'returns',
     // o3d-iigc round 5: refundValueBase is null where the row mixes bases, so the basis and the
     // three per-basis buckets travel WITH it. A bare blank in a file is not an explanation.
-    columns: ['productId', 'sku', 'productName', 'customerName', 'reason', 'refundCount', 'returnedQty', 'refundValueBase', 'refundValueBasis', 'refundValueNetBasis', 'refundValueGrossBasis', 'refundValueUnknownBasis', 'shippedQty', 'returnRatePct'],
+    columns: ['productId', 'sku', 'productName', 'customerName', 'reason', 'refundCount', 'returnedQty', 'refundValueBase', 'refundValueBasis', 'refundValueNetBasis', 'refundValueGrossBasis', 'refundValueUnknownBasis', 'shippedQty', 'returnRatePct', 'exchangedQty', 'exchangedRefundValueBase', 'lostRefundValueBase', 'returnRateExcludingExchangesPct'],
     refundTreatment: RETURNS_MIXED_BASIS_NOTICE,
   },
   fulfillment: {

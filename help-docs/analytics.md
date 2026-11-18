@@ -199,6 +199,8 @@ All of this is stated in each report's own notices and repeated in the CSV expor
 
 Below the Returns report a **By return reason** table counts refunds and totals their credit per configured return reason (Settings > Inventory), for the same period. A refund counts once however many lines it has, and refunds with no reason are grouped as **Unspecified**. It follows the same basis rule: a reason whose credits mix bases shows the marker instead of one value, with the net, gross and unproven columns alongside.
 
+**Exchanges in the Returns report.** A return recorded with an exchange (see *Exchanges inside a return* in Sales Orders) is shown as returned **and** replaced, not as a lost sale. The report adds **Exchanged** (the returned units whose refund came with an exchange), **Exchanged refund value** (their credit) and **Lost refund value** (the credit that was not exchanged, i.e. the refund that really left), plus **Return rate excl. exchanges**; the summary cards show **Replacement qty** (the units added to the same orders as replacements) next to **Returned qty** and **Exchanged qty**, and the warning-coloured card is the lost refund value. **Refund value (all credit)** is still the whole credit, so the report reconciles to the credit notes. The replacement items sit on the same order, so the order's invoiced total and the revenue reports already include them and the credit note is netted against them as before: nothing else changes in the sales reports. The CSV export carries the same four columns. The lost and exchanged values follow the same basis rule as the rest of the report (a row that mixes bases shows the marker).
+
 The **Returns** report shows each credit on its own recorded basis. Where a row -- or the period -- mixes ex-VAT and VAT-inclusive credits, no single total is shown, because adding the two gives an amount on neither basis; the net-basis, gross-basis and unproven-basis columns carry the whole credit instead, and rows with no single stated value sort last rather than among the zeroes.
 
 ## Purchasing and Supplier Analytics
@@ -229,9 +231,14 @@ The Gross Margin and COGS reports use the same invoiced orders for revenue and c
 | **AR Aging** | Outstanding balances on invoiced sales orders (the same invoiced basis and invoice date as the revenue reports, so drafts, cancelled orders and orders with no invoice are not receivables) by customer and aging bucket (Current / 1–30 / 31–60 / 61–90 / 90+). |
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
 | **Currency Summary** | Sales, purchases, AR and AP grouped by document currency, with foreign and base-currency totals. |
+| **GR/IR** | The open goods accrual by supplier and purchase order, as of the end date: **received not billed**, **billed not received** (a prepaid supplier's bill ahead of the goods, or goods billed and then returned and not yet credited), the order's return credit notes, the net, the bills' price difference against the order, and the **age** in days of the oldest movement still open. See *GR/IR* below. |
 | **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
 
 Finance period-end reports are limited to finance and admin roles.
+
+### GR/IR report (goods received, not invoiced)
+
+**Analytics > GR/IR** lists, for each purchase order that still has a balance, what has been **received but not billed** and what has been **billed but not received**, in base currency, with the quantity, the date of the oldest movement still open and its age in days. A balance is cumulative: it is the position as of the end date you choose (the start date plays no part). Every figure is the **goods** value at the purchase order's own unit cost (after any order-level discount); freight and landed cost stay on the Stock in Transit path and are not in it. Received-not-billed and billed-not-received are added up per order line and never netted against each other, so one line's shortfall cannot hide another's. The **Price difference** column is what the supplier's bills charge over (or under) the order for the billed goods; it is shown beside the balance and is not part of it. The CSV export carries the same columns. The figures come from the GR/IR sub-ledger, which accrues with every receipt, bill, bill edit, supplier return and return credit note whether or not GR/IR posting to Xero is switched on.
 
 ### VAT report — reporting category dimension
 

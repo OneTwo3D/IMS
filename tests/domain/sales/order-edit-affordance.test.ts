@@ -122,7 +122,10 @@ test('the server action and the order page both go through the helpers (one rule
   const action = await readFile('app/actions/sales.ts', 'utf8')
   const page = await readFile('app/(dashboard)/sales/[id]/so-detail-client.tsx', 'utf8')
   const form = await readFile('app/(dashboard)/sales/so-form.tsx', 'utf8')
-  assert.match(action, /resolveSalesOrderEditBlock\(\{/)
+  // The edit and the exchange inside a return read the same gate input (readOrderEditGateInput), and both ask the rule.
+  assert.match(action, /resolveSalesOrderEditBlock\(editGate\)/)
+  assert.match(action, /readOrderEditGateInput\(tx, id, current\)/)
+  assert.match(action, /resolveReturnExchangeBlock\(\{ \.\.\.gate/)
   assert.match(action, /resolveSalesOrderAddressEditBlock\(\{/)
   assert.match(action, /shopDesyncAcknowledgementRefusal\(/)
   assert.match(page, /resolveSalesOrderEditBlock\(/)

@@ -31,6 +31,7 @@ import { createHash } from 'node:crypto'
 
 import { payloadExactAmount } from '@/lib/domain/accounting/registered-amount'
 import { compareDecimal, ledgerMatchEpsilon, subtractMoney, type Decimal } from '@/lib/domain/math/decimal'
+import { businessDateYmd } from '@/lib/business-date'
 
 /**
  * The mark IMS writes into the settlement it creates, so it can recognise its own work later.
@@ -372,7 +373,7 @@ export function moneyPostDateToSend(
 ): { ok: true; date: string } | { ok: false; reason: string } {
   const planned = moneyPostDate(type, payload)
   if (planned.kind === 'unsendable') return { ok: false, reason: planned.reason }
-  return { ok: true, date: planned.kind === 'pinned' ? planned.date : now.toISOString().slice(0, 10) }
+  return { ok: true, date: planned.kind === 'pinned' ? planned.date : businessDateYmd(now) }
 }
 
 /**
