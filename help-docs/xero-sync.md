@@ -734,6 +734,8 @@ is the one already recorded on the sales order:
 
 Two things follow from this, and both matter.
 
+A number is minted only when none is queued: if the order's invoice is already queued or posted, **Generate invoice number** (and the on-paid and on-shipped triggers) record the number that invoice was queued under instead of minting a second one, so the number on the PDF is the number in Xero.
+
 **One order, one number.** The create is an *update-or-create on `InvoiceNumber`*, so re-posting the
 same order replaces its own document instead of adding a second one. That property only holds while
 every route posts the *same* number for an order — which is why the number recorded on the sales
