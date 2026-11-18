@@ -6,7 +6,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { freshAuthFailureResult, requireAdmin, requireFreshAdmin, requireFreshPermission } from '@/lib/auth/server'
 import { getSettingValues, serializeSettingValue } from '@/lib/settings-store'
-import { BACKUP_TARGET_SETTING_KEYS, credentialsFollowChangedTarget, validateBackupTargetValues } from '@/lib/domain/settings/backup-target-input'
+import { BACKUP_TARGET_SETTING_KEYS, credentialsFollowChangedTarget, sftpCredentialsToClear, validateBackupTargetValues } from '@/lib/domain/settings/backup-target-input'
 import { logActivity } from '@/lib/activity-log'
 import { getBackupDir } from '@/lib/backup-storage'
 import { backupManifestPath } from '@/lib/backup-manifest'
@@ -126,8 +126,12 @@ export async function saveBackupTargetSettings(
   const moved = credentialsFollowChangedTarget(current, values)
   if (moved) return { success: false, error: moved }
 
+  const writeEntries: [string, string][] = [
+    ...entries,
+    ...sftpCredentialsToClear(current, values).map((k): [string, string] => [k, '']),
+  ]
   await db.$transaction(async (tx) => {
-    for (const [key, value] of entries) {
+    for (const [key, value] of writeEntries) {
       await tx.setting.upsert({
         where: { key },
         create: { key, value: serializeSettingValue(key, value) },
@@ -141,7 +145,7 @@ export async function saveBackupTargetSettings(
       entityType: 'SETTING',
       tag: 'settings',
       action: 'updated',
-      description: `Updated backup target settings: ${entries.map(([k]) => k).join(', ')}`,
+      description: `Updated backup target settings: ${writeEntries.map(([k]) => k).join(', ')}`,
     })
     revalidatePath('/settings', 'layout')
   } catch {

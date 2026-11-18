@@ -5,7 +5,7 @@ import { NextResponse } from 'next/server'
 // o3d-hqvrp.5 / .6: a plain (stale) admin session must not be able to dump the database, upload it
 // remotely, or repoint the backup target.
 
-const state = { pgDumpRuns: 0, uploads: 0, writes: 0, fresh: false }
+const state = { pgDumpRuns: 0, uploads: 0, writes: 0, fresh: false, stored: new Map<string, string>(), written: new Map<string, string>() }
 
 const staleResponse = () => NextResponse.json({ error: 'Re-authentication required', code: 'fresh_auth_required' }, { status: 403 })
 const adminSession = { user: { id: 'u1', role: 'ADMIN' } }
@@ -50,13 +50,13 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       $transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
-        fn({ setting: { upsert: async () => { state.writes += 1 } } }),
+        fn({ setting: { upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { state.writes += 1; state.written.set(where.key, create.value) } } }),
     },
   },
 })
 mock.module('@/lib/settings-store', {
   namedExports: {
-    getSettingValues: async () => new Map<string, string>(),
+    getSettingValues: async () => new Map(state.stored),
     serializeSettingValue: (_k: string, v: string) => v,
   },
 })
@@ -118,4 +118,22 @@ test('saveBackupTargetSettings saves with a fresh session, refuses foreign keys 
   assert.equal((await saveBackupTargetSettings({ backup_s3_endpoint: 'http://169.254.169.254/' })).success, false)
   assert.equal((await saveBackupTargetSettings({ backup_sftp_host: 'localhost' })).success, false)
   assert.equal(state.writes, 1)
+})
+
+test('moving the SFTP host clears the stored credential that was not re-entered (private key AND password)', async () => {
+  const { saveBackupTargetSettings } = await import('../../app/actions/backup.ts')
+  state.fresh = true
+  state.stored = new Map([['backup_sftp_host', 'a.example.com'], ['backup_sftp_password', 'pw'], ['backup_sftp_private_key', 'KEY']])
+  // Re-entering only the password must not leave the stored private key behind (upload prefers the key).
+  state.written = new Map()
+  const ok = await saveBackupTargetSettings({ backup_sftp_host: 'b.example.com', backup_sftp_password: 'newpw' })
+  assert.equal(ok.success, true)
+  assert.equal(state.written.get('backup_sftp_private_key'), '')
+  assert.equal(state.written.get('backup_sftp_password'), 'newpw')
+  // Re-entering nothing is refused outright and writes nothing.
+  state.written = new Map()
+  const refused = await saveBackupTargetSettings({ backup_sftp_host: 'c.example.com' })
+  assert.equal(refused.success, false)
+  assert.equal(state.written.size, 0)
+  state.stored = new Map()
 })

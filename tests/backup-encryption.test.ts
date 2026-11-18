@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { randomBytes } from 'node:crypto'
 
-import { decryptBackupFile, encryptBackupFile } from '../lib/backup-encryption.ts'
+import { decryptBackupFile, encryptBackupFile, resolveBackupEncryptionKey } from '../lib/backup-encryption.ts'
 import { uploadBackupArtifactsToTarget, type BackupArtifactTransferOps } from '../lib/backup-remote.ts'
 
 async function tmp() {
@@ -114,4 +114,22 @@ test('upload with encryption off is unchanged (plain SQL name)', async () => {
   const calls: string[] = []
   await uploadBackupArtifactsToTarget('/x/backup.sql', 'backup.sql', '/x/m.json', 'backup.sql.manifest.json', 's3', makeOps(calls, false))
   assert.deepEqual(calls, ['upload:backup.sql:application/sql:backup.sql', 'upload:backup.sql.manifest.json:application/json:m.json'])
+})
+
+test('a set-but-invalid BACKUP_ENCRYPTION_KEY is refused, never silently replaced by the settings key', () => {
+  const saved = { b: process.env.BACKUP_ENCRYPTION_KEY, s: process.env.SETTINGS_ENCRYPTION_KEY }
+  process.env.SETTINGS_ENCRYPTION_KEY = 'a1'.repeat(32)
+  try {
+    process.env.BACKUP_ENCRYPTION_KEY = 'too-short'
+    assert.throws(() => resolveBackupEncryptionKey(), /BACKUP_ENCRYPTION_KEY is set but is not a valid/)
+    delete process.env.BACKUP_ENCRYPTION_KEY
+    assert.equal(resolveBackupEncryptionKey()?.length, 32)
+    process.env.BACKUP_ENCRYPTION_KEY = 'b2'.repeat(32)
+    assert.equal(resolveBackupEncryptionKey()?.toString('hex'), 'b2'.repeat(32))
+  } finally {
+    for (const [k, v] of [['BACKUP_ENCRYPTION_KEY', saved.b], ['SETTINGS_ENCRYPTION_KEY', saved.s]] as const) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
 })

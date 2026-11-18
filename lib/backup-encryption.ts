@@ -29,7 +29,17 @@ const HEADER_LEN = MAGIC.length + SALT_LEN + IV_LEN
 const HKDF_INFO = 'ims-backup-encryption-v1'
 
 export function resolveBackupEncryptionKey(): Buffer | null {
-  return parseAesEncryptionKey(process.env.BACKUP_ENCRYPTION_KEY) ?? resolveAesEncryptionKey()
+  const dedicated = process.env.BACKUP_ENCRYPTION_KEY
+  if (dedicated !== undefined && dedicated.trim() !== '') {
+    // Set but unusable: refuse. Silently falling back to the settings key would encrypt under a key
+    // the operator did not choose and cannot recover from their records of BACKUP_ENCRYPTION_KEY.
+    const parsed = parseAesEncryptionKey(dedicated)
+    if (!parsed) {
+      throw new Error('BACKUP_ENCRYPTION_KEY is set but is not a valid 32-byte key (base64, 64-char hex, or raw 32 bytes). Fix or unset it; backups are not encrypted under a different key.')
+    }
+    return parsed
+  }
+  return resolveAesEncryptionKey()
 }
 
 function requireKey(): Buffer {
