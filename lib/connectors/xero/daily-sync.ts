@@ -139,6 +139,8 @@ import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
 export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
+/** Group B row-locks up to a whole batch window of orders and cost layers; Prisma's 5 s default would roll it back on one busy order. */
+export const GROUP_B_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 }
 const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
@@ -1748,6 +1750,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       candidateWindow.rows = candidateWindow.rows.filter((row) => groupBShipmentBelongsToPass(mode, row))
       if (candidateWindow.rows.length === 0) return 0
       const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
+      // Row-lock every order this window journals, in id order and BEFORE the cost-layer locks (the order every other
+      // writer in this domain uses, so no cycle). A refund stages its unearned reversal, which can sweep the whole
+      // remaining deferral, under the same lock; without it the two could each read the other's uncommitted state and
+      // both debit Unearned for the same remainder. Everything below (shipments, refunds, reversal rows) is read after
+      // the lock, so a refund that committed first is seen and one that comes later waits for this transaction.
+      await lockSalesOrders(tx, [...new Set(candidateWindow.rows.map((row) => row.orderId))].sort())
       const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates: candidateWindow.rows })
 
       const shipmentRows = await tx.shipment.findMany({
@@ -2494,7 +2502,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       }
 
       return processedShipmentCount
-    })
+    }, GROUP_B_TX_OPTIONS)
     if (groupBCount > 0) {
       result.groupB += groupBCount
     }

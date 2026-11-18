@@ -2482,7 +2482,13 @@ export async function applySalesOrderStatusTransition(
     if (targetStatus === 'CANCELLED') {
       const cancellation = await db.$transaction(async (tx) => {
         storefrontStatusPush = null // a retried callback must not inherit an aborted attempt's job
-        const result = await cancelSalesOrderFulfillmentState(tx, { orderId: id, data, bypass: bypassPermission })
+        const result = await cancelSalesOrderFulfillmentState(tx, {
+          orderId: id,
+          data,
+          bypass: bypassPermission,
+          // The storefront (BYPASS) and the sessionless withdrawal handler (AUTH_ONLY) are automated sources of truth; only an operator's own cancel is refused for a posted invoice.
+          automated: bypassPermission || authOnly,
+        })
         // o3d-6ldlj: the durable cancel push commits WITH the cancellation (order row locked by
         // cancelSalesOrderFulfillmentState; the outbox row is a leaf). No WooCommerce I/O, no pooled query here.
         storefrontStatusPush = await scheduleManualStatusPush(tx, {

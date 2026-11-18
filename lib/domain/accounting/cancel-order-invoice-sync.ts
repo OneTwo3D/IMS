@@ -1,4 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { lockOrderFirst, recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
@@ -103,6 +106,44 @@ export async function assertNoSalesInvoicePostingInFlight(
     + 'happened. Wait for the post to settle — at most 15 minutes — then cancel: if it posted, the cancellation '
     + 'will need an explicit credit note.',
   )
+}
+
+/**
+ * The invoice for an order that stands in the ledger, if one exists. Cancelling an order never touches it, so a cancellation of such an
+ * order leaves a receivable, its revenue deferral and its allocation journals standing in the ledger.
+ *
+ * WHAT COUNTS: an IMS SALES_INVOICE row that is a PROVEN LEDGER FACT (`PROVEN_LEDGER_FACT_WHERE`): the connector's own writeback or an operator
+ * release of a connector id, SYNCED or naming a document. A Xeroom-era invoice counts only through such a row. A WooCommerce invoice number is never
+ * evidence: the importer stores one on every numbered order, including ones IMS invoices itself and that never posted.
+ *
+ * WHAT DOES NOT: a FAILED row that merely carries an id, a row whose cancellation the connector VERIFIED, an operator-asserted or
+ * operator-settled NOT-posted row, and a HELD_SHADOW row.
+ */
+export async function findPostedSalesInvoiceSync(
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  orderId: string,
+): Promise<{ id: string; connector: string; type: string } | null> {
+  return tx.accountingSyncLog.findFirst({
+    where: {
+      referenceId: orderId,
+      type: { in: [...SALES_INVOICE_SYNC_TYPES] },
+      AND: [
+        PROVEN_LEDGER_FACT_WHERE,
+        { OR: [{ settlementBasis: null }, { settlementBasis: { not: VERIFIED_REVERSAL_SETTLEMENT_BASIS } }] },
+      ],
+    },
+    select: { id: true, connector: true, type: true },
+  })
+}
+
+/** What a MANUAL cancellation of an order with a posted invoice is told. Every step named here is one the operator can take. */
+export function cancelWithPostedInvoiceMessage(invoice: { connector: string; id: string }): string {
+  return `This order's invoice is already posted to ${invoice.connector} (${invoice.id}), and cancelling the order neither voids it nor credits it, so the receivable and its revenue deferral would stay in the ledger. Refund the order in full first (the refund raises the credit note), then cancel it.`
+}
+
+/** What the operator task for a STOREFRONT cancellation of an order with a posted invoice says. The order is already cancelled, and a cancelled order cannot be refunded in IMS. */
+export function cancelledWithPostedInvoiceTaskText(invoice: { connector: string; id: string }, orderNumber: string): string {
+  return withLedgerCheck(`Order ${orderNumber} was cancelled by the storefront while its invoice is posted to ${invoice.connector} (${invoice.id}). IMS raised no void or credit note and cannot refund a cancelled order, so the invoice must be credited: raise a credit note against it in ${invoice.connector} by hand. The order's revenue deferral and inventory allocation journals also stay in the ledger until they are reversed by hand.`)
 }
 
 /**
