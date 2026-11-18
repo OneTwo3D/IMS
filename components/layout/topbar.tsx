@@ -104,6 +104,7 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/settings/company', title: 'Company Settings' },
   { prefix: '/settings/inventory', title: 'Inventory Settings' },
   { prefix: '/settings/sales', title: 'Sales Settings' },
+  { prefix: '/settings/custom-fields', title: 'Custom Fields' },
   { prefix: '/settings/purchasing', title: 'Purchasing Settings' },
   { prefix: '/settings/accounting', title: 'Accounting Settings' },
   { prefix: '/settings/system', title: 'System Settings' },

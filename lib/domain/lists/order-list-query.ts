@@ -82,6 +82,8 @@ export type SoListFilter = {
   showCompleted?: boolean
   /** Show archived orders in the default view. Search always includes them. */
   includeArchived?: boolean
+  /** Only orders whose custom field (by definition id) holds this value. Resolved from the list address by lib/custom-fields/filter.ts. */
+  customField?: { definitionId: string; valueText?: string; valueBoolean?: boolean }
 }
 
 /** What the default view is hiding, so the page can say so. */
@@ -123,6 +125,10 @@ export function buildSalesOrderListWhere(filter: SoListFilter): Prisma.SalesOrde
         { shipments: { some: { trackingNumber: ci(q) } } },
       ],
     })
+  }
+  if (filter.customField) {
+    const { definitionId, valueText, valueBoolean } = filter.customField
+    and.push({ customFieldValues: { some: { definitionId, ...(valueText !== undefined ? { valueText } : {}), ...(valueBoolean !== undefined ? { valueBoolean } : {}) } } })
   }
   return and.length ? { AND: and } : {}
 }

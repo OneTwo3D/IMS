@@ -7,6 +7,7 @@ import { db } from '@/lib/db'
 import { PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { EmailKindDisabledError } from '@/lib/email-kind-disabled'
 import { PO_EMAIL_DISABLED_REASON, PO_EMAIL_SETTING_KEY } from '@/lib/domain/purchasing/po-document'
+import { assertPoApprovedForSend, PoApprovalRequiredError } from '@/lib/domain/purchasing/po-approval'
 import { renderEmailHtml } from '@/lib/email-template'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -38,6 +39,8 @@ export async function buildPurchaseOrderEmail(id: string) {
   const [po, status] = await Promise.all([loadPurchaseOrderDocument(id), db.purchaseOrder.findUnique({ where: { id }, select: { status: true } })])
   if (!po || !status) throw new Error('PO not found')
   if (UNSENDABLE_STATUSES.has(status.status)) throw new Error(`PO ${po.reference} is ${status.status}; the purchase order email is only sent for a confirmed order`)
+  // Checked at SEND time too: an order queued while approved and edited dearer since is not mailed.
+  await assertPoApprovedForSend(db, id)
   const to = po.supplier.email?.trim()
   if (!to) throw new Error('No supplier email address')
 
@@ -55,7 +58,7 @@ export async function buildPurchaseOrderEmail(id: string) {
       'Please confirm receipt and your expected delivery date at your earliest convenience, and quote the PO reference on all delivery notes and invoices.',
     ],
   }, 'purchase_order')
-  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }], sendGuard: purchaseOrderSendGuard, sendDeadlineMs: PO_SEND_DEADLINE_MS, singleSend: true }
+  return { to, subject, html, attachments: [{ filename: `PO-${po.reference}.pdf`, content: pdf }], sendGuard: purchaseOrderSendGuardFor(id), sendDeadlineMs: PO_SEND_DEADLINE_MS, singleSend: true }
 }
 
 /** The PO send's own deadline (the mailer closes the connection at it) and the guard's backstop race, both well below the transaction timeout. */
@@ -80,6 +83,36 @@ type GuardOutcome<T> = { refused: string; unknown?: undefined } | { unknown: str
  */
 export async function purchaseOrderSendGuard<T>(send: () => Promise<T>): Promise<GuardOutcome<T>> {
   return runUnderPoEmailSendLock(db, send)
+}
+
+/**
+ * The delivery guard for ONE order: the approval check, then the switch check and the send under the send lock.
+ *
+ * THE APPROVAL CHECK DOES NOT HOLD THE ORDER'S ROW ACROSS SMTP. A send can take up to the 60 s deadline, and holding a row lock that long would
+ * make every edit, receipt and status change on the order time out behind a slow mail server. So the check is its own SHORT transaction (a
+ * share lock on the row, released at commit, immediately before the send starts): it re-reads the order and compares it with the approval
+ * snapshot stored on the order itself (ex-VAT base total, supplier, currency, approvedAt), exactly as the send paths do.
+ *
+ * THE REMAINING WINDOW is the time between that commit and SMTP accepting the message (normally milliseconds). An edit that lands inside it
+ * clears the approval but cannot stop a message already being handed over. That is accepted and made visible instead: an edit to an order
+ * that has already been sent writes an `edited_after_send` warning to the order's activity ("sent before change"), and the next send of the
+ * order is refused until it is approved again.
+ */
+export function purchaseOrderSendGuardFor(poId: string) {
+  return async function guard<T>(send: () => Promise<T>): Promise<GuardOutcome<T>> {
+    const refusal = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR SHARE`
+      try {
+        await assertPoApprovedForSend(tx, poId)
+      } catch (e) {
+        if (e instanceof PoApprovalRequiredError) return `Not sent: ${e.message}`
+        throw e
+      }
+      return null
+    }, { timeout: 15_000, maxWait: 15_000 })
+    if (refusal) return { refused: refusal }
+    return runUnderPoEmailSendLock(db, send)
+  }
 }
 
 type LockableClient = {

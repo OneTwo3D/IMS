@@ -3,6 +3,7 @@
 import { PurchaseOrderEmailSetting } from '@/components/settings/purchase-order-email'
 import { DocumentNumberingPanel } from '@/components/settings/document-numbering'
 import type { DocumentNumberingOverview } from '@/app/actions/document-numbering'
+import { PoApprovalThresholdSetting } from '@/components/settings/po-approval-threshold'
 import { useState, useTransition, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import {
@@ -44,6 +45,8 @@ type Props = {
   currencies: CurrencyRow[]
   testEmailDefault: string
   purchaseOrderEmailEnabled: boolean
+  poApprovalThreshold: string
+  baseCurrency: string
 }
 
 const TABS = [
@@ -72,7 +75,7 @@ const SUPPORTED_TIMEZONES: string[] = _intl.supportedValuesOf
   ? _intl.supportedValuesOf('timeZone')
   : ['Europe/London', 'UTC']
 
-export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, documentNumbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault, purchaseOrderEmailEnabled }: Props) {
+export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, documentNumbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault, purchaseOrderEmailEnabled, poApprovalThreshold, baseCurrency }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [isEmailPending, startEmailTransition] = useTransition()
@@ -720,6 +723,14 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, docu
               Whether Confirm &amp; Send PO and Email PO send the PO PDF to the supplier. Off by default.
             </p>
             <PurchaseOrderEmailSetting currentValue={purchaseOrderEmailEnabled ? 'true' : 'false'} />
+          </Card>
+          <Card className="p-4">
+            <h3 className="text-sm font-semibold mb-1">Purchase order approval threshold</h3>
+            <p className="text-xs text-muted-foreground mb-3">
+              A goods purchase order whose total, ex VAT and in {baseCurrency}, is at or above this amount must be approved by a user with the purchase approval permission
+              (not the order&apos;s creator) before it can be sent to the supplier. Leave blank (or 0) for no approval gate. Blank by default.
+            </p>
+            <PoApprovalThresholdSetting currentValue={poApprovalThreshold} baseCurrency={baseCurrency} />
           </Card>
           {tpls.map((tpl) => {
             const isEditing = editingTpl === tpl.type

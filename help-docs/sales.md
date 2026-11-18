@@ -12,6 +12,7 @@ The sales order list is a paged overview of all orders (50 per page). Search, th
 - **Include archived** shows orders that data retention has archived (old Completed and Delivered orders). Archiving only hides an order from the default list; it is still searchable, and it changes nothing a report counts.
 - **Filter by status** to focus on orders at a specific stage
 - **Filter by invoicing** — the **Invoicing** filter shows orders that are **Not invoiced**, **Partially invoiced** or **Fully invoiced** (pick one or several). It is separate from the status filter and combines with it. Picking an invoicing state includes Completed and Delivered orders, because a shipped order that was never invoiced is exactly what it is for; archived orders stay hidden unless you tick **Include archived**. See [Invoicing state](#invoicing-state).
+- **Filter by a custom field** — when [custom fields](#custom-fields-on-orders) exist for orders, a drop-down lists every text field that has fixed choices, and every yes / no field, with each choice. Pick one to see only the orders holding that value (for example *Process stage: Pack*). Orders that have no value for the field are not matched by any choice. The filter is in the address, so it combines with search, status and the other filters and can be bookmarked.
 - **Export to CSV** for reporting or use in external tools
 - **Columns** — the **Status** column shows the order's stage. Use the column picker to add more, for example **Invoice** (Pending, Invoiced, Paid, or the refund state), **Stock Status**, **WMS Status** and **WMS Dispatch**. Your choice is remembered in your browser.
 - **Refund state** — an order's refund state is separate from its stage (see [Order Statuses](#order-statuses)). On the list it shows in the **Invoice** column as **Part. Refunded** or **Refunded**.
@@ -26,6 +27,16 @@ Tick the box at the start of a row to select an order, or the box in the header 
 - **Print packing slips** opens one combined PDF with a slip per selected order (each starting on a new page), drawn exactly as the order page's packing slip. Draft and cancelled orders get no slip; a closing "Not printed" page lists them.
 
 Each order runs on its own, one after another, using the same checks and permissions as its single-order button, so one order failing never stops the others and nothing is rolled back. When Allocate or Advance finishes, a result panel lists every selected order as **Done**, **Skipped** (with the reason) or **Failed** (with what to do), with totals at the top. You need the **sales.process** permission (Admin, Manager and Warehouse roles) to run Allocate and Advance; printing needs only sales access. At most 100 orders can be selected for one action; a page holds 50.
+
+## Custom fields on orders
+
+If your company has set up order fields in **Settings > Custom fields**, a **Custom fields** card appears at the bottom of the order page, grouped by the field's group name. Use it to record things IMS has no column for, such as a process stage or an internal reference, without a software change. Values are validated on the server by the field's type (text, dropdown choice, whole or decimal number, yes / no, date, date and time in UTC, JSON, link) and nothing is saved if any value is refused.
+
+- **Who can change them.** The permission that lets you edit an order's notes (create sales orders). Anyone with sales access can read them. Changes are written to the **Activity Log**, which names the fields that changed but never their values.
+- **Orders from WooCommerce start with no values.** Nothing is filled in automatically when an order is imported; operators enter them in IMS. They are not read back from the store.
+- **Internal only.** Custom field values are never sent to WooCommerce, Mintsoft or Xero, and do not appear on invoices or other documents.
+- **Personal data.** A free-text field can hold something about the customer. Custom field values on an order are **erased** with the order when the customer or order is erased (see [Personal-data erasure](erasure.md)), and an erased order can no longer be given values.
+- **Hidden fields.** When an administrator hides a field it disappears from the card and the list filter, but its values are kept and return if the field is shown again.
 
 ## Creating a Sales Order
 
