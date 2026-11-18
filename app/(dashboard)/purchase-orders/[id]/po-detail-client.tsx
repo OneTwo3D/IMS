@@ -1707,6 +1707,16 @@ function EditFreightCostsDialog({
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
+  // After a successful save the dialog closes once the refreshed order arrives (its fingerprint differs from the one the dialog
+  // opened with) or after a short timeout, whichever is first, so a reopen never carries the stale lines and the dialog never sticks.
+  const [saved, setSaved] = useState(false)
+  const [openedFingerprint] = useState(() => po.freightCostLinesFingerprint)
+  useEffect(() => {
+    if (!saved) return
+    if (po.freightCostLinesFingerprint !== openedFingerprint) { onClose(); return }
+    const timer = setTimeout(onClose, 3000)
+    return () => clearTimeout(timer)
+  }, [saved, po.freightCostLinesFingerprint, openedFingerprint, onClose])
 
   const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
   const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
@@ -1780,10 +1790,11 @@ function EditFreightCostsDialog({
         taxRateId === '__recorded' || taxRateId === '__unset'
           ? undefined
           : (purchaseTaxRates.find((t) => t.id === taxRateId)?.rate ?? 0),
+        openedFingerprint,
       )
       if (result.success) {
         router.refresh()
-        onClose()
+        setSaved(true)
       } else {
         setError(result.error ?? 'Failed to update costs')
       }
@@ -1887,7 +1898,7 @@ function EditFreightCostsDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button onClick={handleSave} disabled={isPending}>
+          <Button onClick={handleSave} disabled={isPending || saved}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Update &amp; Recalculate
           </Button>

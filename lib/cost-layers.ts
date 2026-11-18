@@ -32,7 +32,7 @@ import { businessDateYmd } from '@/lib/business-date'
 
 type TxClient = Prisma.TransactionClient
 type ShipmentCogsRevaluationSyncOptions = {
-  accountingSettings?: {
+  accountingSettings?: ({
     inventoryAccount?: string | null
     cogsAccount?: string | null
     /** Needed only with `offsetCostDeltaToTransit`. */
@@ -49,7 +49,7 @@ type ShipmentCogsRevaluationSyncOptions = {
      * connector was switched on", which writes nothing.
      */
     connector: AccountingConnectorId | null
-  }
+  }) | null
   queueAccountingSync?: typeof queueAccountingSyncTx
   /**
    * LATE LANDED COST ONLY. The cost change on units ALREADY SOLD is funded from Stock in Transit (the freight
@@ -347,7 +347,8 @@ async function queueShipmentCogsRevaluationSync(
   },
   options: ShipmentCogsRevaluationSyncOptions = {},
 ): Promise<boolean> {
-  const settings = options.accountingSettings ?? await getAccountingSettings().catch(() => null)
+  // null = the caller read the chart before its transaction and could not get it: do not read it again over the pool.
+  const settings = options.accountingSettings !== undefined ? options.accountingSettings : await getAccountingSettings().catch(() => null)
   if (!settings?.inventoryAccount || !settings.cogsAccount) return false
   // No transit account configured: cannot post the offset, so say "not posted here" and the caller keeps the
   // delta in its own COGS journal (which offsets the same transit account) rather than losing it.
