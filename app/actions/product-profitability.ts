@@ -4,9 +4,10 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { assertOverviewAnalyticsAccess } from '@/lib/security/overview-analytics-access'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
-import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { Prisma, type ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { refundLineBucket } from '@/lib/domain/sales/refund-basis-analytics'
+import { sumDecimalStrings } from '@/lib/domain/sales/decimal-string'
 import {
   linearFigureBoundFromUnplacedCredit,
   sumLinearFigureBounds,
@@ -45,6 +46,15 @@ export type ProfitabilityFyFigures = {
    * reported in the two fields below and left OUT of this figure rather than subtracted on a guess.
    */
   revenue: number
+  /**
+   * o3d-0868: THE EXACT `revenue` AND `profit`, as decimal strings. `revenue` and `profit` above are float64, which
+   * is exact only below 2^53 units of the last place; above ~9e13 a ceiling rounded from one can print BELOW the
+   * truth it bounds, and by then the precision is gone at the wire, not at the renderer. Every BOUNDED display (cell,
+   * footer, card, CSV, and the browser's filtered subtotal) therefore sums and rounds THESE, with no Number in
+   * between. The numbers stay for sorting, filtering and tone, where a ~1e-16 relative error cannot matter.
+   */
+  revenueExact: string
+  profitExact: string
   /** Basis-independent — no refund line reduces COGS — so it carries no bound of its own. */
   cogs: number
   /** `revenue - cogs`. Carries `bound` unchanged: COGS is fixed, so profit moves with revenue. */
@@ -218,6 +228,7 @@ export async function getProductProfitability(): Promise<{
    */
   type FyAgg = {
     revenue: number; cogs: number; qtySold: number
+    revenueExact: Prisma.Decimal; cogsExact: Prisma.Decimal
     refundsGrossBasis: number; refundsUnknownBasis: number
     refundsGrossBasisPositive: number; refundsUnknownBasisPositive: number
   }
@@ -227,13 +238,18 @@ export async function getProductProfitability(): Promise<{
       const orderDiscountAllocations = allocateOrderDiscountBase(order, order.lines)
       for (const [lineIndex, line] of order.lines.entries()) {
         if (!line.productId) continue
-        const agg = map.get(line.productId) ?? { revenue: 0, cogs: 0, qtySold: 0, refundsGrossBasis: 0, refundsUnknownBasis: 0, refundsGrossBasisPositive: 0, refundsUnknownBasisPositive: 0 }
+        const agg = map.get(line.productId) ?? { revenue: 0, cogs: 0, qtySold: 0, revenueExact: new Prisma.Decimal(0), cogsExact: new Prisma.Decimal(0), refundsGrossBasis: 0, refundsUnknownBasis: 0, refundsGrossBasisPositive: 0, refundsUnknownBasisPositive: 0 }
         agg.revenue += Number(line.totalBase)
         agg.cogs += Number(line.cogsBase ?? 0)
         agg.qtySold += Number(line.qty)
         // Add back line discount (already subtracted from totalBase)
-        agg.revenue += normalizeLineDiscountBase(order, line.discountAmount, line.taxRate?.rate)
+        const discountAddBack = normalizeLineDiscountBase(order, line.discountAmount, line.taxRate?.rate)
+        agg.revenue += discountAddBack
         agg.revenue -= orderDiscountAllocations[lineIndex] ?? 0
+        // The exact twin (o3d-0868): the stored decimals are added as decimals; only the two per-line discount
+        // helpers hand back a number, and that is a single line's figure, not a running total.
+        agg.revenueExact = agg.revenueExact.add(new Prisma.Decimal(line.totalBase)).add(new Prisma.Decimal(discountAddBack)).sub(new Prisma.Decimal(orderDiscountAllocations[lineIndex] ?? 0))
+        agg.cogsExact = agg.cogsExact.add(new Prisma.Decimal(line.cogsBase ?? 0))
         map.set(line.productId, agg)
       }
       // Subtract refunds.
@@ -254,7 +270,7 @@ export async function getProductProfitability(): Promise<{
             const placement = refundLineBucket(refund.totalsBasis, rl.totalBase)
             // The positive part is taken from the ENTRY, beside the signed bucket (o3d-la3n).
             const positive = Math.max(amount, 0)
-            if (placement.bucket === 'net') agg.revenue -= amount
+            if (placement.bucket === 'net') { agg.revenue -= amount; agg.revenueExact = agg.revenueExact.sub(new Prisma.Decimal(rl.totalBase)) }
             else if (placement.bucket === 'gross') { agg.refundsGrossBasis += amount; agg.refundsGrossBasisPositive += positive }
             else { agg.refundsUnknownBasis += amount; agg.refundsUnknownBasisPositive += positive }
             agg.qtySold -= Number(rl.qty)
@@ -282,8 +298,11 @@ export async function getProductProfitability(): Promise<{
   function fyFigures(agg: FyAgg | undefined): ProfitabilityFyFigures {
     const revenue = agg?.revenue ?? 0
     const cogs = agg?.cogs ?? 0
+    const revenueExact = agg?.revenueExact ?? new Prisma.Decimal(0)
     return {
       revenue,
+      revenueExact: revenueExact.toFixed(),
+      profitExact: revenueExact.sub(agg?.cogsExact ?? 0).toFixed(),
       cogs,
       profit: revenue - cogs,
       qtySold: agg?.qtySold ?? 0,
@@ -302,6 +321,8 @@ export async function getProductProfitability(): Promise<{
     const sum = (get: (f: ProfitabilityFyFigures) => number) => parts.reduce((s, f) => s + get(f), 0)
     return {
       revenue: sum((f) => f.revenue),
+      revenueExact: sumDecimalStrings(parts.map((f) => f.revenueExact)),
+      profitExact: sumDecimalStrings(parts.map((f) => f.profitExact)),
       cogs: sum((f) => f.cogs),
       profit: sum((f) => f.profit),
       qtySold: sum((f) => f.qtySold),
