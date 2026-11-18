@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { businessDateYmd } from '@/lib/business-date'
 import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
@@ -9,6 +10,7 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  *   - REFUND_REVERSAL       — refund COGS reversal (negative: COGS credited; 6dp)
  *   - SHIPMENT_REVALUATION  — cost-layer revaluation reverse+repost (signed; 2dp)
  *   - LANDED_COST_ADJUSTMENT — retrospective landed-cost COGS adjustment (signed; 2dp)
+ *   - MANUFACTURING_RECLASS  — retro manufacturing-cost reclass COGS leg (signed; 2dp, the amount the journal posts)
  *
  * Dispatch is recorded here (not read live from Shipment.cogsBatchAmount) BECAUSE
  * cogsBatchAmount is MUTATED in place by revaluation (cost-layers.ts) — reading it
@@ -25,6 +27,7 @@ export type CogsSubledgerMovementSource =
   | 'REFUND_REVERSAL'
   | 'SHIPMENT_REVALUATION'
   | 'LANDED_COST_ADJUSTMENT'
+  | 'MANUFACTURING_RECLASS'
 
 type CogsSubledgerMovementClient = Pick<Prisma.TransactionClient, 'cogsSubledgerMovement'>
 
@@ -35,7 +38,9 @@ type CogsSubledgerMovementClient = Pick<Prisma.TransactionClient, 'cogsSubledger
 // is > the closing midnight bound) and the day would perpetually flag. Date inputs
 // (dispatch passes `new Date()`) MUST be truncated to match the string callers.
 function toJournalDate(value: Date | string): Date {
-  const isoDay = (typeof value === 'string' ? value : value.toISOString()).slice(0, 10)
+  // A Date is a business-day (Europe/London) instant, the same calendar the journal it records is dated on. The UTC day was an
+  // hour (BST) or more away from it, so a midnight-crossing row landed in the wrong GL window.
+  const isoDay = typeof value === 'string' ? value.slice(0, 10) : businessDateYmd(value)
   return new Date(`${isoDay}T00:00:00.000Z`)
 }
 

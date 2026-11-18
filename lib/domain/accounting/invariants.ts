@@ -5,6 +5,7 @@ import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-re
 import { SHADOWED_OBLIGATION_WHERE, isShadowedObligation, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
+import { COGS_CROSS_CHECK_FLOWS, TRANSIT_CROSS_CHECK_FLOWS, crossCheckSubledgerAgainstQueuedJournals, type SubledgerCrossCheck } from '@/lib/domain/accounting/subledger-journal-cross-check'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import { reversalRecordVerdict } from '@/lib/domain/sales/refund-reversal-record'
 
@@ -1317,6 +1318,45 @@ export async function collectAccountingInvariantRows(
   return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds }
 }
 
+/**
+ * The finding for an inventory reconciliation, or null. A `flag` that is only the recurring-sweep cap (the residue is within the
+ * per-day limit, it recurs) is a warning with its own code and wording; any other `flag` is a gap beyond rounding tolerance, critical.
+ */
+export function inventoryGlReconciliationFinding(
+  inventoryReconciliation: Awaited<ReturnType<typeof loadInventoryGlReconciliation>>,
+): AccountingInvariantFinding | null {
+  if (!inventoryReconciliation.available || inventoryReconciliation.action !== 'flag') return null
+  if (inventoryReconciliation.recurringSweepCap) {
+    const cap = inventoryReconciliation.recurringSweepCap
+    return {
+      severity: 'warning',
+      code: 'inventory_recurring_residue_not_swept',
+      message: `Recurring small residue not swept (cap reached): the inventory subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) differs from the GL balance (${inventoryReconciliation.glBalance.toFixed(2)}) by ${inventoryReconciliation.delta.toFixed(2)}, within the ${inventoryReconciliation.sweepLimit.toFixed(2)} per-day limit, but sweeping it would take the net swept over the last 30 days to ${cap.projectedNet.toFixed(2)}, past the ${cap.cap.toFixed(2)} cap`,
+      details: {
+        balanceDate: inventoryReconciliation.balanceDate,
+        glBalance: inventoryReconciliation.glBalance,
+        subledgerValue: inventoryReconciliation.subledgerValue,
+        delta: inventoryReconciliation.delta,
+        sweepLimit: inventoryReconciliation.sweepLimit,
+        recurringSweepCap: cap,
+      },
+    }
+  }
+  return {
+    severity: 'critical',
+    code: 'inventory_gl_subledger_mismatch',
+    message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
+    details: {
+      balanceDate: inventoryReconciliation.balanceDate,
+      glProvenance: inventoryReconciliation.glProvenance ?? null,
+      glBalance: inventoryReconciliation.glBalance,
+      subledgerValue: inventoryReconciliation.subledgerValue,
+      delta: inventoryReconciliation.delta,
+      sweepLimit: inventoryReconciliation.sweepLimit,
+    },
+  }
+}
+
 export async function runAccountingInvariantReport(options: {
   client?: AccountingInvariantClient
 } = {}): Promise<AccountingInvariantReport> {
@@ -1331,21 +1371,8 @@ export async function runAccountingInvariantReport(options: {
   // rounding-difference sweep (scjz.60c-2). Degrades silently when the inventory
   // account is unmapped or no trial-balance snapshot exists yet.
   const inventoryReconciliation = await loadInventoryGlReconciliation()
-  if (inventoryReconciliation.available && inventoryReconciliation.action === 'flag') {
-    findings.push({
-      severity: 'critical',
-      code: 'inventory_gl_subledger_mismatch',
-      message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
-      details: {
-        balanceDate: inventoryReconciliation.balanceDate,
-        glProvenance: inventoryReconciliation.glProvenance ?? null,
-        glBalance: inventoryReconciliation.glBalance,
-        subledgerValue: inventoryReconciliation.subledgerValue,
-        delta: inventoryReconciliation.delta,
-        sweepLimit: inventoryReconciliation.sweepLimit,
-      },
-    })
-  }
+  const inventoryFinding = inventoryGlReconciliationFinding(inventoryReconciliation)
+  if (inventoryFinding) findings.push(inventoryFinding)
 
   // khdw: reconcile the GL COGS account to its IMS subledger period movement
   // (Σ dispatch cogsBatchAmount − Σ refund cogsReversalBase). Only a gap beyond the
@@ -1389,6 +1416,55 @@ export async function runAccountingInvariantReport(options: {
         delta: transitReconciliation.delta,
         sweepLimit: transitReconciliation.sweepLimit,
       },
+    })
+  }
+
+  // Independent of the GL: the journals as queued against what the sub-ledger recorded for the same window. A GL reconciliation that
+  // agrees proves the journal arrived with the sub-ledger's own figure; this names a sub-ledger gap (a posting site that records no row,
+  // a row with a different figure) that the GL comparison cannot tell from a ledger fault. A warning, as it is a diagnostic.
+  const crossCheckFailures: Array<{ code: string; label: string; window: { openingExclusive: string; closingInclusive: string }; error: string }> = []
+  for (const check of [
+    { reconciliation: cogsReconciliation, ledger: 'cogs' as const, flows: COGS_CROSS_CHECK_FLOWS, code: 'cogs_subledger_queued_journal_mismatch', label: 'COGS' },
+    { reconciliation: transitReconciliation, ledger: 'transit' as const, flows: TRANSIT_CROSS_CHECK_FLOWS, code: 'transit_subledger_queued_journal_mismatch', label: 'Transit' },
+  ]) {
+    const reconciliation = check.reconciliation
+    if (!reconciliation.available || !reconciliation.accountCode || !reconciliation.windowOpening) continue
+    let result: SubledgerCrossCheck
+    try {
+      result = await crossCheckSubledgerAgainstQueuedJournals({
+        accountCode: reconciliation.accountCode,
+        openingExclusive: reconciliation.windowOpening,
+        closingInclusive: reconciliation.balanceDate,
+        ...check.flows,
+      }, check.ledger)
+    } catch (err) {
+      // The cross-check is a diagnostic and must not fail the report, but a failure to run it is itself reported (never swallowed): carried out of the loop and raised as a finding below.
+      crossCheckFailures.push({ code: check.code, label: check.label, window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, error: err instanceof Error ? err.message : String(err) })
+      continue
+    }
+    if (result.inconclusive) {
+      findings.push({
+        severity: 'info',
+        code: `${check.code}_inconclusive`,
+        message: `The ${check.label} sub-ledger could not be compared with the queued journals: ${result.otherAccountJournalCount} journal(s) in the window carry lines for other accounts but not ${reconciliation.accountCode}, so the account was probably re-bound; the comparison resumes once the window is past it`,
+        details: { window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, ...result },
+      })
+      continue
+    }
+    if (result.agrees) continue
+    findings.push({
+      severity: 'warning',
+      code: check.code,
+      message: `The ${check.label} sub-ledger recorded ${result.ledgerNet.toFixed(2)} for the window, but the journals queued for the same window move the account by ${result.queuedNet.toFixed(2)} (a difference of ${result.delta.toFixed(2)} against a rounding allowance of ${result.tolerance.toFixed(2)}${result.unreadableJournalCount > 0 ? `; ${result.unreadableJournalCount} journal(s) could not be read${result.compactedJournalCount > 0 ? `, ${result.compactedJournalCount} of them compacted` : ''}` : ''}${result.notLiveJournalCount > 0 ? `; ${result.notLiveJournalCount} FAILED or cancelled journal(s) worth ${result.notLiveNet.toFixed(2)} are reported apart from the queued figure` : ''})`,
+      details: { window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, ...result },
+    })
+  }
+  for (const failure of crossCheckFailures) {
+    findings.push({
+      severity: 'info',
+      code: `${failure.code}_unavailable`,
+      message: `The ${failure.label} sub-ledger could not be compared with the queued journals: the check failed to run (${failure.error}), so this report says nothing about it`,
+      details: { window: failure.window },
     })
   }
 
