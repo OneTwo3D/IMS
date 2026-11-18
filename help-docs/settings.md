@@ -96,9 +96,11 @@ Use the **PDF preview** and **Email preview** buttons to see how your template l
 Found at **Settings > Inventory**, this section includes:
 
 - **Warehouses** — create and edit warehouses, default sales/returns warehouses, and store-sync eligibility when a shopping connector is enabled
+  - **Available in Purchase Orders** (on by default): turn it off for a location that must never receive bought-in stock, such as a dropship, quarantine or virtual location. A warehouse with it off is left out of the destination warehouse list on purchase orders and of the warehouse list in **Receive Goods**, and IMS refuses it as a destination or receipt location with a message naming the warehouse (this includes the draft POs made from Reorder Planning and imported purchase orders). The warehouse list shows an amber **Restricted** tag beside it. A purchase order that already points at the warehouse keeps working: you can still edit it with that destination left as it is, and you can still receive it into that warehouse, with a warning. Receipts that come from the warehouse system itself (a Mintsoft ASN book-in) are not affected by this setting, because the warehouse decides where those goods land. Existing warehouses are unchanged until you turn it off.
 - **Product Categories** — manage the reporting category tree. Add top-level categories or sub-categories under any node; rename inline; move a subtree under a new parent (cycles are prevented); delete a node to promote its children one level up and reassign its products to the parent. The same leaf name can be reused under different parents — for example `Apparel > T-Shirts` and `Promo > T-Shirts` are distinct. WooCommerce product sync mirrors the WC category tree into this list automatically, so connected stores stay in step without manual entry.
 - **Stock adjustment reasons** — define selectable reasons for manual stock adjustments
 - **Accounting mapping** — when an accounting connector is enabled, each adjustment reason can be linked to an account code
+- **Return reasons** — the list of reasons an operator can pick when processing a refund (for example *Arrived damaged*, *Wrong item sent*, *Changed mind*). Each reason has a name, a sort order and an Active flag, like the stock adjustment reasons. Needs the Settings permission. Names must be unique ignoring case. Set a reason **Inactive** to retire it: it leaves the refund dialog but keeps its history in the Returns report. A reason that refunds already use cannot be deleted. A WooCommerce refund whose reason text matches an **active** reason name (ignoring case and surrounding spaces) is mapped to it when it is imported; any other text is left unmapped. IMS never creates a reason by itself, and the free-text refund reason is never changed by this list.
 
 ## Sales Settings
 
@@ -369,7 +371,9 @@ This means an admin viewing the activity log can see who did what but not see se
   On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
   write its external id onto the order or bill, because everything that write needs survives
   compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment
-  registration, bill attachment). If the sweep repairs one of these rows — or if you retry one by hand
+  registration, bill attachment). A compacted **journal** also keeps the per-account net the Allocated
+  Inventory reversal proof reads, so it stays provable (see *Xero Sync*); a journal whose payload cannot be
+  read is left uncompacted and reported. If the sweep repairs one of these rows — or if you retry one by hand
   from the Accounting Sync page, which settles it against the id it already has rather than
   re-sending it — a WARNING is written to the activity log
   (`xero_backreference_followups_discarded`) naming the document, so you can check whether its PDF or
@@ -432,11 +436,12 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/accounting-fx-revaluation` | Unrealised FX on open AR/AP | Daily | Not in the Scheduler list; schedule it from the server's own cron if you use accounting |
 | `/api/cron/delivery-status` | Tracking provider polling | Every 15 min | On |
 | `/api/cron/refund-reservation-release` | Safety net that releases stock reservations for refunded units | Every 15 min | On |
+| `/api/cron/product-sync-marks` | Sends the shop and warehouse sync owed by products edited by CSV, 25 products per run | Every 5 min | On |
 | `/api/cron/reallocation-sweep` | Re-run allocation for processing orders left short | Every 15 min | On |
 | `/api/cron/invariant-check` | Scheduled data-integrity check (see below) | Daily at 04:00 | On |
 | `/api/cron/read-sync-liveness` | Hourly check that every read feed that keeps IMS current (store order sweep, warehouse despatch poll and status refresh, account balance snapshots, tax rates, chart refresh) has succeeded recently; alerts administrators once per breach | Hourly (at :25) | On |
 | `/api/cron/writers-check` | Hourly record of whether IMS and another system could both write the same thing; for the switchover only | Hourly (at :40) | Off |
-| `/api/cron/invoice-documents` | Fetch the customer invoice PDF from the ledger for storefront orders after a set start date | Every 15 min | Off |
+| `/api/cron/invoice-documents` | Fetch the customer invoice PDF from the ledger for storefront orders after a set start date, and for any historic order a customer has asked for (when on-demand fetch is on) | Every 15 min | Off |
 | `/api/cron/backup` | Database backup (also controlled from Backup & Restore) | Daily at 01:00 | Off until you switch it on |
 | `/api/cron/product-lifecycle-archive` | Auto-archive exhausted EOL products | Daily at 00:30 | On |
 | `/api/cron/recompute-product-lead-times` | Recompute each product's observed supplier lead time for Reorder Planning | Daily at 04:00 | On |

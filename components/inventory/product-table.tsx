@@ -10,6 +10,7 @@ import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
 } from '@/components/ui/table'
 import { PaginationBar } from '@/components/ui/pagination-bar'
+import { ProductCsvEditDialog } from '@/components/inventory/product-csv-edit-dialog'
 import { bulkDeleteProducts, bulkDeactivateProducts } from '@/app/actions/products'
 import { ALL_COLUMNS, STORAGE_KEY, COLS_CHANGED_EVENT, defaultVisibility } from '@/components/inventory/product-columns'
 import type { ColKey } from '@/components/inventory/product-columns'
@@ -63,6 +64,10 @@ type Props = {
   page: number
   pageSize: number
   searchParams: Record<string, string | undefined>
+  /** inventory.edit: shows Edit by CSV. */
+  canEdit?: boolean
+  /** inventory.prices: unlocks the price columns in Edit by CSV. */
+  canEditPrices?: boolean
 }
 
 const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
@@ -79,7 +84,7 @@ const STATUS_VARIANTS: Record<ProductLifecycleStatus, 'default' | 'secondary' | 
   ARCHIVED: 'outline',
 }
 
-export function ProductTable({ products, total, page, pageSize, searchParams }: Props) {
+export function ProductTable({ products, total, page, pageSize, searchParams, canEdit = false, canEditPrices = false }: Props) {
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const router = useRouter()
@@ -90,6 +95,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [bulkPending, setBulkPending] = useState(false)
   const [bulkMsg, setBulkMsg] = useState<string | null>(null)
+  const [csvEditOpen, setCsvEditOpen] = useState(false)
 
   const allPageIds = products.map((p) => p.id)
   const allSelected = allPageIds.length > 0 && allPageIds.every((id) => selectedIds.has(id))
@@ -285,6 +291,31 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
 
   return (
     <div className="space-y-3">
+      {canEdit && (
+        <div className="flex justify-end">
+          <Button size="sm" variant="outline" onClick={() => setCsvEditOpen(true)}>
+            Edit by CSV{selectedIds.size > 0 ? ` (${selectedIds.size} selected)` : ''}
+          </Button>
+        </div>
+      )}
+      {csvEditOpen && (
+        <ProductCsvEditDialog
+          open
+          onClose={() => setCsvEditOpen(false)}
+          selectedIds={[...selectedIds]}
+          filter={{
+            search: searchParams.search,
+            type: searchParams.type,
+            lifecycleStatus: searchParams.lifecycleStatus,
+            categoryId: searchParams.categoryId,
+            supplierId: searchParams.supplierId,
+          }}
+          filterTotal={total}
+          canEditPrices={canEditPrices}
+          onApplied={() => startTransition(() => router.refresh())}
+        />
+      )}
+
       {/* Bulk action bar */}
       {selectedIds.size > 0 && (
         <div className="flex flex-wrap items-center gap-3 px-3 py-2 rounded-lg border border-primary/30 bg-primary/5 text-sm">

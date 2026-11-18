@@ -913,6 +913,8 @@ export const OPERATION_SEMANTIC_BY_TYPE =
     // Renumbers and then deletes or voids a document that already stood in the ledger: the id returned is that document's.
     SALES_INVOICE_DELETE: 'UPDATE_DOCUMENT',
     PURCHASE_INVOICE_DELETE: 'UPDATE_DOCUMENT',
+    // o3d-ngmt.22: the void writes the status of a credit note that already stood and returns the id OF THAT DOCUMENT; nothing is created.
+    CREDIT_NOTE_VOID: 'UPDATE_DOCUMENT',
     // A PAYMENT id, applied against a document nobody created here.
     INVOICE_PAYMENT: 'APPLY_PAYMENT',
     BILL_PAYMENT: 'APPLY_PAYMENT',

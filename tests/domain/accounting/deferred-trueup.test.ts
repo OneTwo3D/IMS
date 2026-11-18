@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   sumPostedUnearnedReversal,
+  unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
 } from '@/lib/domain/accounting/deferred-trueup'
@@ -45,6 +46,15 @@ test('tolerates missing/!malformed payloads and rounds to 2dp', () => {
 
 test('empty list yields zero', () => {
   assert.equal(sumPostedUnearnedReversal([], 'UNEARNED'), 0)
+})
+
+test('o3d-oyur: a compacted row is read from its preserved account net; a row with neither lines nor summary is unreadable, not zero', () => {
+  const compacted = { payload: {}, payloadAccountNets: { version: 1, accounts: { UNEARNED: { credit: 0, debit: 30 } } } }
+  const legacy = { payload: {}, payloadAccountNets: null }
+  assert.equal(sumPostedUnearnedReversal([compacted], 'UNEARNED'), 30)
+  assert.equal(sumPostedUnearnedReversal([compacted, legacy], 'UNEARNED'), 30)
+  assert.deepEqual(unreadableUnearnedReversalRows([compacted, legacy]), [legacy])
+  assert.deepEqual(unreadableUnearnedReversalRows([compacted]), [])
 })
 
 // --- isFullyShippedNetOfRefunds ---

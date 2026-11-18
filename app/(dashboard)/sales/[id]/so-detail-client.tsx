@@ -1,5 +1,6 @@
 'use client'
 
+import { INVOICING_STATE_CLASS, INVOICING_STATE_LABELS } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
@@ -11,6 +12,8 @@ import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
 import { MergeCandidateBadge } from '@/components/sales/merge-candidate-badge'
+import { ShopRefundBadge } from '@/components/sales/shop-refund-badge'
+import type { ShopRefundBadgeView } from '@/app/actions/shop-refund-tasks'
 import type { MergeCandidateBadgeView } from '@/app/actions/wms-merge-candidates'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -21,11 +24,12 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import {
   updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
-  updateSalesOrderNotes, generateInvoiceNumber,
+  updateSalesOrderNotes, updateSalesOrderAddressesAndNotes, generateInvoiceNumber,
   addPayment, deletePayment, reverseLedgerPayment, releaseWithdrawalHold,
   type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
+import { deleteRefund, getRefundDeleteEligibility, type RefundDeleteEligibility } from '@/app/actions/refund-delete'
 import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
   deallocateOrder, confirmAllocations, updateAllocation, addAllocation,
@@ -39,12 +43,15 @@ import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
-import { resolveSalesOrderEditBlock } from '@/lib/domain/sales/order-edit-affordance'
+import { SHOP_DESYNC_WARNING, resolveSalesOrderEditBlock, resolveSalesOrderEditScope } from '@/lib/domain/sales/order-edit-affordance'
 import { SoFormDialog } from '../so-form'
+import { PeggedBadge, SoPegsCard } from '@/components/sales/so-pegs-card'
+import type { SalesOrderPegRow } from '@/app/actions/pegging'
 import { summariseFulfilment, FULFILMENT_TONE_CLASS } from '@/lib/domain/sales/fulfilment-summary'
 import { nextStatusActions } from '@/lib/domain/sales/status-flow'
 import { orderPackingSlipAvailable, packingSlipUrl } from '@/lib/domain/sales/packing-slip-scope'
 import { repackControlsFor } from '@/lib/domain/sales/repack-recovery-affordance'
+import type { ReturnReason } from '@/app/actions/return-reasons'
 import { buildRefundRequest, creditNoteAmounts, salesOrderMoneyView, type MoneyViewOrder } from '@/lib/domain/sales/sales-order-money-view'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
@@ -104,11 +111,14 @@ type AllocationPanelLine = {
 type Props = {
   order: SoDetail
   warehouses: WarehouseInfo[]
+  /** The active configured return reasons the refund dialog offers. */
+  returnReasons?: ReturnReason[]
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
   wmsOrderStatus?: WmsOrderStatusView | null
   wmsPushState?: WmsOrderPushStateView | null
   mergeCandidate?: MergeCandidateBadgeView | null
+  shopRefundDue?: ShopRefundBadgeView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -126,6 +136,8 @@ type Props = {
   editForm?: Omit<ComponentProps<typeof SoFormDialog>, 'order' | 'onClose' | 'warehouses' | 'currencies'>
   /** o3d-ngmt.21: whether to offer deleting the synced invoice, or why not. Undefined = nothing to show. */
   invoiceDeleteState?: DocumentDeleteUiState
+  /** SO-to-PO pegging: this order's live pegs. */
+  pegs?: SalesOrderPegRow[]
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -189,10 +201,11 @@ function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number
 // ---------------------------------------------------------------------------
 // Refund dialog
 // ---------------------------------------------------------------------------
-function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; sym: string; onClose: () => void }) {
+function RefundDialog({ order, warehouses, returnReasons, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; returnReasons: ReturnReason[]; sym: string; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [reason, setReason] = useState('')
+  const [returnReasonId, setReturnReasonId] = useState('')
   const [returnWhId, setReturnWhId] = useState(warehouses[0]?.id ?? '')
   const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0 })))
   const [error, setError] = useState('')
@@ -208,7 +221,7 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
     startTransition(async () => {
-      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined)
+      const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined, returnReasonId ? { returnReasonId } : undefined)
       if (result.success) {
         router.refresh()
         // The server cuts the refund again under the order lock; if what it recorded differs from this preview, show the server's figure.
@@ -228,6 +241,13 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
       <div className="space-y-4">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="space-y-1.5"><Label>Reason *</Label><Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Customer request" className="h-9 text-sm" /></div>
+          {returnReasons.length > 0 && (
+            <div className="space-y-1.5"><Label>Return reason</Label>
+              <select value={returnReasonId} onChange={(e) => setReturnReasonId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <option value="">No category</option>
+                {returnReasons.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
+              </select></div>
+          )}
           <div className="space-y-1.5"><Label>Return to Warehouse</Label>
             <select value={returnWhId} onChange={(e) => setReturnWhId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
               <option value="">No stock return</option>
@@ -310,8 +330,114 @@ function NotesDialog({ order, onClose }: { order: SoDetail; onClose: () => void 
 }
 
 // ---------------------------------------------------------------------------
+// Edit addresses and notes (the one edit a dispatched order allows)
+// ---------------------------------------------------------------------------
+const ADDRESS_FIELDS: Array<[string, string]> = [['line1', 'Address line 1'], ['line2', 'Address line 2'], ['city', 'City'], ['county', 'County / state'], ['postcode', 'Postcode'], ['country', 'Country']]
+
+function AddressFields({ title, value, onChange }: { title: string; value: Record<string, string>; onChange: (next: Record<string, string>) => void }) {
+  return (
+    <div className="space-y-2">
+      <h3 className="text-sm font-medium">{title}</h3>
+      {ADDRESS_FIELDS.map(([key, label]) => (
+        <div key={key} className="space-y-1">
+          <Label className="text-xs text-muted-foreground">{label}</Label>
+          <Input value={value[key] ?? ''} onChange={(e) => onChange({ ...value, [key]: e.target.value })} className="h-8 text-sm" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function AddressesDialog({ order, onClose }: { order: SoDetail; onClose: () => void }) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [billing, setBilling] = useState<Record<string, string>>({ ...((order.billingAddress ?? {}) as Record<string, string>) })
+  const [shipping, setShipping] = useState<Record<string, string>>({ ...((order.shippingAddress ?? {}) as Record<string, string>) })
+  const [notes, setNotes] = useState(order.notes ?? '')
+  const [internal, setInternal] = useState(order.internalNotes ?? '')
+  const [error, setError] = useState('')
+  const [confirmDesync, setConfirmDesync] = useState(false)
+  function save(acknowledged: boolean) {
+    if (order.hasExternalSource && !acknowledged) { setConfirmDesync(true); return }
+    startTransition(async () => {
+      const r = await updateSalesOrderAddressesAndNotes(order.id, { billingAddress: billing, shippingAddress: shipping, notes, internalNotes: internal }, order.updatedAt, order.hasExternalSource ? { acknowledgeShopDesync: acknowledged } : undefined)
+      if (r.success) { router.refresh(); onClose() } else setError(r.error ?? 'Failed')
+    })
+  }
+  return (
+    <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogHeader><DialogTitle>Edit addresses and notes</DialogTitle></DialogHeader>
+      <p className="text-xs text-muted-foreground">This order has been dispatched, so only its addresses and notes can change. Use Refund (or add a line) for a change to what was sent.</p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <AddressFields title="Billing address" value={billing} onChange={setBilling} />
+        <AddressFields title="Shipping address" value={shipping} onChange={setShipping} />
+      </div>
+      <div className="space-y-1.5"><Label>Customer Notes</Label>
+        <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" /></div>
+      <div className="space-y-1.5"><Label>Private Notes (internal only)</Label>
+        <Textarea value={internal} onChange={(e) => setInternal(e.target.value)} rows={2} className="text-sm resize-none" /></div>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      <DialogFooter>
+        <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+        <Button onClick={() => save(false)} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save</Button>
+      </DialogFooter>
+      {confirmDesync && (
+        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false}>
+          <DialogHeader><DialogTitle>This edit will not reach WooCommerce</DialogTitle></DialogHeader>
+          <p className="text-sm" data-testid="shop-desync-warning">{SHOP_DESYNC_WARNING}</p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDesync(false)}>Go back</Button>
+            <Button onClick={() => { setConfirmDesync(false); save(true) }}>Edit anyway</Button>
+          </DialogFooter>
+        </DialogContent></Dialog>
+      )}
+    </DialogContent></Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Add Payment dialog
 // ---------------------------------------------------------------------------
+// Delete refund dialog (o3d-ngmt.22). Shown only for a refund the server said is eligible; the server checks every rule again on confirm.
+function DeleteRefundDialog({ refund, onClose }: { refund: { id: string; creditNoteNumber: string | null }; onClose: () => void }) {
+  const router = useRouter()
+  const [reason, setReason] = useState('')
+  const [error, setError] = useState('')
+  const [isPending, startTransition] = useTransition()
+  function handleConfirm() {
+    setError('')
+    startTransition(async () => {
+      const result = await deleteRefund(refund.id, reason)
+      if (result.success) {
+        if (result.pending) alert('The credit note void has been queued. The refund and its stock stay as they are until the accounting system confirms the void; then the refund is removed. Check the sync page if it does not disappear.')
+        if (result.warning) alert(result.warning)
+        router.refresh()
+        onClose()
+      } else setError(result.error ?? 'Failed to delete the refund')
+    })
+  }
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open && !isPending) onClose() }}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>Delete refund{refund.creditNoteNumber ? ` ${refund.creditNoteNumber}` : ''}</DialogTitle></DialogHeader>
+        <div className="space-y-3 text-sm">
+          <p>Use this only for a refund that was recorded in error. It removes the refund and undoes exactly what it did: any stock it returned goes back out, its cost-of-sales entry is reversed, and the credit note is voided in the accounting system (queued, not sent immediately).</p>
+          <p className="text-muted-foreground">This cannot be undone. To refund the customer again, record a new refund.</p>
+          <div className="space-y-1">
+            <Label htmlFor="delete-refund-reason">Reason (optional, kept in the audit record)</Label>
+            <Textarea id="delete-refund-reason" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} rows={2} />
+          </div>
+          {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
+        </div>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button type="button" variant="destructive" onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Delete refund</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultAmount, onClose }: { orderId: string; refundId?: string; creditNoteNumber?: string; currency: string; defaultAmount?: number; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -1007,18 +1133,21 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, invoiceDeleteState }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, editForm, pegs = [], invoiceDeleteState }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showRefund, setShowRefund] = useState(false)
   const [showNotes, setShowNotes] = useState(false)
+  const [showAddresses, setShowAddresses] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
   const [showRefunds, setShowRefunds] = useState(false)
   const [showColPicker, setShowColPicker] = useState(false)
   const [showInvoice, setShowInvoice] = useState(false)
   const [showPayment, setShowPayment] = useState<{ refundId?: string; creditNoteNumber?: string } | null>(null)
+  const [deleteEligibility, setDeleteEligibility] = useState<RefundDeleteEligibility | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; creditNoteNumber: string | null } | null>(null)
   const [visibleCols, setVisibleCols] = useState<Set<OptCol>>(new Set())
   const [error, setError] = useState('')
   const { promptReauth, stepUpDialog } = useStepUpReauth()
@@ -1084,10 +1213,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     accountingSyncEnabled,
   })
   // The same rule the updateSalesOrder action applies, so a disabled Edit says why instead of letting the operator walk into the refusal.
-  const editBlock = resolveSalesOrderEditBlock({
+  const editInput = {
     status: so.status,
     allocations: allocations.length,
     shipments: shipments.length,
+    committedShipments: shipments.filter((shipment) => shipment.status !== 'PENDING').length,
+    shippedShipments: shipments.filter((shipment) => shipment.status === 'SHIPPED').length,
     accountingInvoiceId: so.accountingInvoiceId ?? null,
     wmsPush: so.wmsPush !== null,
     hasExternalSource: so.hasExternalSource,
@@ -1097,13 +1228,27 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     paid: so.paidAt !== null,
     storeCreditForeign: so.storeCreditForeign,
     invoiceRecords: so.invoiceNumber ? 1 : 0,
-  })
-  const canEditOrder = hasPermission(currentUserRole, 'sales.create')
+    productlessLines: so.lines.filter((l) => !l.productId).length,
+  }
+  const editBlock = resolveSalesOrderEditBlock(editInput)
+  // What the page offers: the full edit; only addresses and notes (a dispatched order); or nothing, with the reason.
+  const editScope = resolveSalesOrderEditScope(editInput)
+  // A confirmed edit re-reserves stock, so the server also asks for the permission to allocate (sales.process); a draft edit and an addresses-and-notes edit need only sales.create.
+  const canEditOrder = hasPermission(currentUserRole, 'sales.create') && (so.status === 'DRAFT' || editScope.scope === 'ADDRESS_NOTES' || hasPermission(currentUserRole, 'sales.process'))
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
   // Reads the orthogonal refundStatus so it keeps working once a partial refund no
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
   const canRefund = (['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && so.refundStatus !== 'FULL') || so.refundStatus === 'PARTIAL'
   const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
+  // o3d-ngmt.22: whether each refund can be deleted, asked of the server (which owns every rule). Nothing is asked, and no control shown, unless the refund
+  // permission is held and there is a refund; the server answers `enabled: false` while the switch is off.
+  const refundCount = so.refunds.length
+  useEffect(() => {
+    if (!canRetryRefundAccounting || refundCount === 0) { setDeleteEligibility(null); return }
+    let cancelled = false
+    getRefundDeleteEligibility(so.id).then((result) => { if (!cancelled) setDeleteEligibility(result) }).catch(() => { if (!cancelled) setDeleteEligibility(null) })
+    return () => { cancelled = true }
+  }, [so.id, refundCount, canRetryRefundAccounting])
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
   const committedByLine = calculateClientCoverageByLine(
@@ -1308,6 +1453,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             </span>
           ) : null
         })()}
+        <span
+          data-testid="invoicing-state-badge"
+          className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${INVOICING_STATE_CLASS[so.invoicingState]}`}
+          title="Whether an invoice exists for this order. Independent of the order status: a cancelled order keeps the state it had."
+        >
+          {INVOICING_STATE_LABELS[so.invoicingState]}
+        </span>
         {so.refundStatus !== 'NONE' && (
           <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${
             so.refundStatus === 'FULL'
@@ -1447,8 +1599,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {canEditOrder && (
             // The reason lives on the wrapper, not the button: a disabled button swallows pointer events in several browsers.
             <span title={editBlock?.reason} className="inline-flex">
-              <Button variant="outline" size="sm" onClick={() => setShowEdit(true)} disabled={isPending || editBlock !== null || !editForm} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
-                <Pencil className="h-4 w-4 mr-1" />Edit order
+              <Button variant="outline" size="sm" onClick={() => (editScope.scope === 'ADDRESS_NOTES' ? setShowAddresses(true) : setShowEdit(true))} disabled={isPending || editScope.scope === 'NONE' || (editScope.scope === 'FULL' && !editForm)} aria-describedby={editBlock ? 'edit-order-blocked-reason' : undefined}>
+                <Pencil className="h-4 w-4 mr-1" />{editScope.scope === 'ADDRESS_NOTES' ? 'Edit addresses & notes' : 'Edit order'}
               </Button>
               {editBlock && <span id="edit-order-blocked-reason" className="sr-only">{editBlock.reason}</span>}
             </span>
@@ -1469,6 +1621,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           {wmsPushState && (
             <span className="inline-flex items-center self-center">
               <WmsOrderPushChip orderId={so.id} push={wmsPushState} />
+            </span>
+          )}
+          {shopRefundDue && (
+            <span className="inline-flex items-center self-center">
+              <ShopRefundBadge view={shopRefundDue} />
             </span>
           )}
           {mergeCandidate && (
@@ -1682,7 +1839,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <TableCell className="w-12 px-2 py-1">
                     {line.productId && <ProductThumb productId={line.productId} imageUrl={line.imageUrl} name={line.description} />}
                   </TableCell>
-                  <TableCell className="px-4">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}</TableCell>
+                  <TableCell className="px-4">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}{pegs.some((peg) => peg.salesOrderLineId === line.id) && <PeggedBadge />}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums">{line.qty}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{formatMoney(line.unitPriceForeign, sym)}</TableCell>
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}</TableCell>
@@ -1788,6 +1945,14 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           </tfoot>
         </Table>
       </div>
+
+      {/* SO-to-PO pegging */}
+      <SoPegsCard
+        lines={so.lines.map((l) => ({ id: l.id, productId: l.productId, sku: l.sku, description: l.description, qty: l.qty }))}
+        pegs={pegs}
+        canPeg={hasPermission(currentUserRole, 'sales.process')}
+        pegOpen={['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED'].includes(so.status)}
+      />
 
       {/* Allocation Panel */}
       {showAllocations && (
@@ -2038,6 +2203,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 </div>
                 <span className="font-mono font-medium text-destructive" title={ESTIMATE_NOTE}>≈ -{money(creditNoteAmounts(moneyOrder, r).total.gross)}</span>
               </div>
+              {r.returnReasonName && <p className="text-xs"><span className="text-muted-foreground">Return reason:</span> {r.returnReasonName}</p>}
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <Table className="text-xs">
                 <TableHeader>
@@ -2091,6 +2257,17 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   ))}
                 </div>
               )}
+              {deleteEligibility?.enabled && deleteEligibility.refunds[r.id] && (
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {deleteEligibility.refunds[r.id].eligible ? (
+                    <Button variant="outline" size="sm" className="h-6 text-xs text-destructive" onClick={() => setDeleteTarget({ id: r.id, creditNoteNumber: r.creditNoteNumber })} disabled={isPending}>
+                      <Trash2 className="h-3 w-3 mr-1" />Delete refund
+                    </Button>
+                  ) : (
+                    <span className="text-xs text-muted-foreground" data-testid="refund-delete-refusal">Cannot be deleted: {deleteEligibility.refunds[r.id].refusals.map((refusal) => refusal.message).join(' ')}</span>
+                  )}
+                </div>
+              )}
               {accountingAvailable && (
                 <div className="flex flex-wrap items-center gap-1.5 pt-1">
                   <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
@@ -2110,9 +2287,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       )}
 
       {/* Dialogs */}
-      {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
+      {deleteTarget && <DeleteRefundDialog refund={deleteTarget} onClose={() => setDeleteTarget(null)} />}
+      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
-      {showEdit && editForm && editBlock === null && (
+      {showAddresses && editScope.scope === 'ADDRESS_NOTES' && <AddressesDialog order={so} onClose={() => setShowAddresses(false)} />}
+      {showEdit && editForm && editScope.scope === 'FULL' && (
         <SoFormDialog {...editForm} warehouses={warehouses} currencies={currencies} order={so} onClose={() => setShowEdit(false)} />
       )}
       {accountingAvailable && showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}

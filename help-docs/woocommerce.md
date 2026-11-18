@@ -170,6 +170,7 @@ With the initial import complete, new and updated WooCommerce orders are importe
   an order has to be invoiced in the ledger by hand
 - **A WooCommerce order that moved money on a tax rate IMS cannot use is not invoiced.** If the order used a WooCommerce tax rate that has no mapping, or is mapped to an IMS rate that is no longer active, the order still imports but its accounting invoice is refused (the failed entry under **Sync > Xero** names the rate ids) and no payment is registered against it. Map the rate on the **Tax Rates** tab, or reactivate the IMS rate, then re-import the order.
 - **A fee the shop charged no tax on stays untaxed.** A WooCommerce fee with no tax is sent to the accounting system as a no-tax line, also when the invoice is re-queued or cloned; it never picks up VAT from the order's default rate.
+- **An order you edited in IMS is no longer overwritten by the store.** An order update from WooCommerce normally writes its addresses, notes and shipping label onto the IMS order (and never rewrites the lines or total: a difference there is reported under Sync > Exceptions as *edited in WooCommerce after import*). When an operator edits an imported order in IMS (**Edit order**, or **Edit addresses & notes** after dispatch, each after the warning that WooCommerce keeps the original) the order is marked **edited in IMS**: later updates from WooCommerce no longer write those fields back over the edit, the difference your own edit made is not reported as *edited in WooCommerce after import* (IMS compares WooCommerce with the lines and total as they were before your first line edit), but a later change made in WooCommerce still is, and an address or notes edit hides nothing, and the order number, the VAT number and the paid state still follow WooCommerce. WooCommerce itself is never changed by an IMS edit. See *Editing an order* in Sales.
 - **A paid order whose total or currency differs from IMS is retried, then reported.** If WooCommerce says an order is paid but its total or currency does not match what IMS holds, no payment is recorded and a warning is logged. IMS now also keeps the delivery and retries it on every scheduled FX run, so correcting the IMS order records the payment without another webhook. After 60 retries it gives up, logs an ERROR and notifies the administrators.
 - The order number uses your configured WooCommerce prefix (e.g. `WC-1234`, set in Settings > Company > Document Numbering)
 - **The accounting invoice number comes from WooCommerce, not from IMS.** IMS reads `_wcpdf_invoice_number` — the number WooCommerce PDF Invoices & Packing Slips assigned and printed on the customer's PDF — and uses it *verbatim* as both the IMS invoice number and the `InvoiceNumber` on the Xero invoice. No prefix is added, so the Xero document, the customer's PDF and the WooCommerce order all carry the same number. The **Invoice Prefix** field for WooCommerce under Settings > Company > Document Numbering no longer affects it
@@ -349,6 +350,22 @@ Behavior notes:
 - Re-saving the same tracking is idempotent and does not intentionally create duplicate upstream entries
 - Reflected WooCommerce `order.updated` webhooks from IMS-originated status/tracking pushes are explicitly suppressed
 
+#### Tracking provider mapping (off by default)
+
+Advanced Shipment Tracking (AST) builds the customer's tracking link and branding from a provider slug such as `royal-mail`. By default IMS writes the courier's display name instead, which AST cannot resolve, so the link may show as plain text.
+
+Tick **Map couriers to tracking providers** under **Sync > WooCommerce > Order Sync** (setting `wc_ast_provider_mapping_enabled`) and the tracking item IMS writes carries the AST provider slug instead:
+
+- A courier in the warehouse courier table (Royal Mail, Parcelforce, Evri, DHL Express, UPS, Spring Global) is written with its slug. The name must match the table exactly, including capitals and brackets: there are no aliases and no partial matches.
+- An order the FedEx label plugin has labelled (it carries a `_fedex_tracking_number`) is written as **FedEx**, and an order forwarded to Click & Drop is written as **Royal Mail**, whatever courier name the warehouse reported. FedEx wins if an order has both. On an order with several shipments the label applies only to the shipment it identifies: the FedEx tracking number matches only that shipment's number, and a shipment with a table courier (for example UPS) keeps its own provider.
+- A courier that is not in the table (Palletline, Local Collection, anything new) is written exactly as before, and each one is counted in the activity log as `wc_tracking_provider_unmapped` with the courier name, so you can see what is missing. IMS never guesses a provider.
+
+If IMS cannot read the setting, it behaves as if it were unticked (the tracking is written as before and the failure is logged as `wc_tracking_provider_setting_unreadable`); tracking is never held up by it.
+
+With the box unticked (the default) nothing changes: the tracking written to WooCommerce is identical to what IMS wrote before this setting existed. Turning it on affects tracking written from then on; an order whose tracking was already written is rewritten with the slug the next time its tracking is pushed. Like every WooCommerce write, it goes through the outbox and is held while WooCommerce is shadowed.
+
+This does not change whether AST sends its own despatch email: that is checked separately on the stage store. Partial shipments go through the companion plugin's partial-shipment route, which records the tracking number only and carries no provider.
+
 ### EU withdrawal requests
 
 If your store uses the EU order-withdrawal button plugin, IMS follows its statuses (the defaults are `pending-wdraw` for a submitted request and `withdrawn` for an approved one; the names can be changed in settings if your plugin uses others):
@@ -379,7 +396,7 @@ The **Products** tab controls bidirectional product synchronisation.
 - **Product content** (see below): short description, long description and the picture references
 - Weight and dimensions (length, width, height)
 - GTIN/barcode from WooCommerce's `global_unique_id` field (only written if the IMS barcode field is empty)
-- HS code and country of origin from WC product attributes (only written if the IMS fields are empty)
+- HS code, country of origin and customs description from WooCommerce's native customs fields, falling back to the older product attributes per field (a store value replaces a differing IMS value; a blank store value never clears IMS)
 - **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). If the store marks a **primary category** (the SEO plugins Yoast and Rank Math record one), the product is linked to that category, provided it is one of the product's own categories and has been mirrored; otherwise it is linked to its **deepest** WC category. Variations take the category of their parent product. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable — or the category list cannot be read to its end — the product's existing category link is left alone rather than wiped or linked to a partial tree.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 
@@ -488,6 +505,7 @@ Stock levels are pushed from One Two Inventory to WooCommerce. Enable this in th
 - Available stock = on-hand quantity minus reserved quantity, less any **channel buffer** set for that product at that warehouse (never below 0), summed across all synced warehouses. With no buffer set anywhere the figures sent are exactly as before. See *Channel buffer* in the Inventory help. The buffer applies only to this push: the warehouse-system (Mintsoft) stock alignment and IMS order allocation use the real stock
 - **Include COGS** — optionally pushes the oldest FIFO cost layer unit cost to WooCommerce's native COGS field (requires WooCommerce 9.2+ or the WC COGS plugin)
 - Stock is pushed in batches of 100 products via the WC batch API
+- **Include estimated back-in-stock date** (Sync settings, **off** by default) — for a product whose pushed stock is 0, also writes the earliest date committed supply is due as the `_oti_eta_date` product meta (variations too), in the same push as the stock number. Nothing is sent for this while the setting is off. The date comes only from purchase orders that were sent, shipped or part-received (never a draft or quote) with units still to arrive, and from open warehouse ASNs: an ASN's expected arrival wins over the order's date where it has one, otherwise the line's own expected delivery, otherwise the order's. A **late** (past-dated) supplier date and an **undated** order are never shown: the meta is left empty, because no date is better than a wrong one. The meta is cleared as soon as stock is back, the supply is received or cancelled, or the date lapses (the hourly reconcile catches a lapse). Bundles and kits never carry a date. IMS only writes the meta; showing it on the product page needs the storefront side (see `docs/woocommerce-back-in-stock-date.md`). Turning the setting off stops further writes but does not remove meta already on the store. Like every WooCommerce write it is subject to the outbound write hold.
 
 Use **Push Stock Now** for an immediate sync. While it runs, a live count shows how far it has got (for example "Synced 300 of 1,200 products"), and any errors are counted beside it. Stock is still primarily event-driven from IMS changes, but the WooCommerce reconcile job also performs a forced stock catch-up and drains queued retry jobs as a safety net.
 
@@ -527,6 +545,17 @@ The system handles this two ways:
 
 The Sales Settings page surfaces recent fallback events as a widget so you can spot misconfigurations early.
 
+### Reporting orders edited in WooCommerce (flag, default OFF)
+
+The edit list above notices a changed line, quantity or total. Turning on `wc_order_divergence_detection_enabled` (**Sync > Orders > Report orders edited in WooCommerce**, off by default) adds a fuller, read-only comparison each time WooCommerce reports an update to an order IMS already holds. With it off nothing changes.
+
+- **What is compared:** each line (matched on the WooCommerce line id) for SKU, quantity and unit price excluding tax, plus items added or removed in WooCommerce; then shipping, discount, tax total and order total (including tax), all in the order's currency.
+- **Refunds are taken out, not reported.** An item or quantity that WooCommerce shows as gone, and that IMS has already refunded in full for that line, is one event handled by the refund, so it is not listed as an edit (its share of the tax, discount and total is taken off the IMS side before comparing). If the update names a refund that IMS has not recorded yet, the comparison waits for the next update, so a refund is never held up or mistaken for an edit.
+- **Rounding:** a difference of up to half a penny (half of the currency's smallest unit) is rounding and is ignored; a one-penny difference is listed. Where a refund explains only part of a line, one whole penny is tolerated.
+- **What is not compared:** cancelled or erased orders, an order whose currency differs, the discount on an order that carries store credit (or was imported before discounts were allocated to lines), and any figure the update does not state.
+- **Where it shows:** Sync > Exceptions, **WooCommerce orders that no longer match IMS**, one row per order with a link to it and one line per difference naming the field, for example "Quantity of RED-M changed in WooCommerce: WooCommerce 3, IMS 2". A WARNING `wc_order_diverged` is written to the order's activity log when a new difference appears. The row closes itself when a later update matches the IMS order again.
+- **It only reports.** IMS changes nothing: not the order or its lines, not WooCommerce, not the warehouse, and the order is not queued for the warehouse because of it. Check the order, decide which side is right, and tell the warehouse yourself if it already holds the order. If the report cannot be written the update is still imported normally.
+
 ### Pending FX retry queue
 
 WooCommerce orders in a currency for which IMS has no stored FX rate are queued rather than failed. The system writes a `PENDING` shoppingSyncLog row with the full order payload and a `wc_order_fx_pending` activity log entry.
@@ -541,6 +570,10 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 - **Monetary-only refunds** (no quantities) create a single refund line with the full amount and the WC refund reason
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
+
+**IMS-initiated refunds are not pushed to WooCommerce.** A refund recorded in IMS on a WooCommerce order creates no refund record, no status change, no order note and no money movement in WooCommerce. IMS raises one **Refund in WooCommerce** operator task (Sync > Exceptions) and shows a badge on the order; a person refunds the customer in WooCommerce. IMS never maps a refunded or partly refunded order to a WooCommerce status.
+
+**The matching WooCommerce refund is linked, not imported twice.** WooCommerce refunds are normally deduplicated by refund ID, but the refund a person makes later has a new ID. IMS writes no marker to WooCommerce, so on an order with an open Refund in WooCommerce task it cannot tell the refund a person made for an IMS refund from a separate refund that began in WooCommerce with the same amount. It therefore **never links on its own**: it records nothing and parks the WooCommerce refund, quarantined, with the figures (see Parked refunds below). On the parked row a person chooses **Confirm this WooCommerce refund settles IMS refund (credit note)** (one transaction under the refund and order locks: the WooCommerce refund ID is set on the IMS refund, the task and the row are resolved, an activity entry is written and **no second credit note is raised**), or records it as a separate refund as for any WooCommerce refund. Orders with no open task are imported as before. The optional order meta flag from the original design is not built; no WooCommerce write path was added.
 
 **WooCommerce restocks first.** WooCommerce raises its own stock for a refunded line inside the refund request, before IMS hears of it. IMS is the stock master, so once the `order.updated` delivery has applied a refund, IMS force-pushes its own absolute stock level for the refunded products (reason `IMS_CHANGE`, `force`), through the normal stock job: behind the producer seam and the outbound hold, so it is a recorded shadow while `woocommerce.stock` is not IMS's to write. It follows the refund sweep, so the level already reflects what the refund did in IMS; with refund-returns-in-transit on, the returned units are not back yet and WooCommerce is lowered to IMS's level until they arrive. The push cannot undo what WooCommerce already did at the moment of the refund (a flip to in-stock and any back-in-stock mail); only a store-side change (not restocking refunded items) prevents that. Backstops: the `product.updated` webhook correction and the stock reconcile. The reservation-release backstop pushes the released unshipped units the same way.
 
@@ -634,7 +667,10 @@ When an invoice is generated for a WooCommerce order, the system pushes invoice 
 
 - The invoice note and the link to the accounting invoice are written to the WooCommerce order **once per invoice**. A retry never adds a second note.
 - **Nothing is sent for a cancelled order.** If the order was cancelled in IMS, the invoice email and the WooCommerce invoice note are not queued when the invoice posts, and one that was queued before the cancellation is dropped as Cancelled when it comes to run (the reason is in the activity log). The invoice PDF copy is still saved.
-- **Showing the invoice in My Account is not yet switched on.** IMS can tell the storefront to show the stored invoice in the customer's My Account, but this is off (setting `wc_invoice_document_enabled`) and nothing is sent for it. The helper plugin shows the **Invoice** button only on an order whose `_ims_invoice_pdf_available` meta is `yes`, and only IMS's invoice publication writes that flag. While the setting is off, an order that was never published has no Invoice button, so do not point a customer at it; send the invoice by email instead. The download steps below apply once publication is switched on.
+- **Showing the invoice in My Account is not yet switched on.** IMS can tell the storefront to show the stored invoice in the customer's My Account, but this is off (setting `wc_invoice_document_enabled`) and nothing is sent for it. The helper plugin shows the **Invoice** button only on an order whose `_ims_invoice_pdf_available` meta is `yes`, and only IMS's invoice publication writes that flag. While the setting is off, an order that was never published has no Invoice button, so do not point a customer at it; send the invoice by email instead. The download steps below apply once publication is switched on. The order of switching things on at the switchover (IMS first, the old invoice plugin off right after, two buttons for a short while), the check list and the rollback (turn the setting off and clear the order meta) are in the **Customer invoice in My Account** runbook (`docs/ops/invoice-documents-switchover-runbook.md`).
+- **Orders from before IMS held an invoice.** About fourteen thousand older orders have no stored invoice. They are not fetched in advance: when a customer first asks for one, IMS queues the fetch and tells the plugin the invoice is **being prepared**; the next click, after the scheduled fetch has run (about a quarter of an hour), downloads it. IMS asks Xero at most a few hundred times a day for this, so a rush of customers is told to try again later rather than spending Xero's shared daily allowance. IMS writes nothing to those older orders in WooCommerce, so their Invoice button depends on the helper plugin showing it for orders that carry the old invoice number.
+- **Credit notes are their own document.** A customer can download the credit note of a refund of their own order (a separate download, never the invoice); a refund of another customer's order is refused. It is off until credit note documents are enabled.
+- **The invoice e-mail.** With publication switched on, the invoice e-mail attaches the same Xero PDF the customer downloads; with it off, it attaches the invoice IMS renders itself, as before.
 
 ### How customer PDF downloads work
 
@@ -650,12 +686,9 @@ This means the customer never sees a direct IMS URL, no reusable token leaves th
 
 ### Shared secret
 
-The HMAC signing key is the same value as the **WC webhook secret** (`wc_webhook_secret`). When you generate or rotate this secret in **Sync > WooCommerce > Orders**, paste the same value into the helper plugin's settings page (WP admin → Settings → OneTwoInventory Helper). The secret has two purposes:
+The customer PDF requests are signed with their **own** key, the invoice PDF secret (`wc_invoice_pdf_secret`), which is a different value from the **WC webhook secret** (`wc_webhook_secret`); never reuse the webhook secret for it. Paste the invoice PDF secret into the helper plugin's settings page (WP admin → Settings → onetwoInventory), next to the HTTPS base URL of IMS.
 
-1. Verifying incoming WC webhooks at IMS
-2. Signing outgoing PDF requests from the helper plugin to IMS
-
-Rotating this secret requires updating it in BOTH places — IMS and the WP helper plugin — or webhooks AND invoice PDF downloads will both break.
+Rotating it requires updating it in BOTH places, IMS and the WP helper plugin, or customer invoice and credit note downloads break. Webhooks are unaffected.
 
 ### Admin-only links
 

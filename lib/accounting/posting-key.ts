@@ -142,6 +142,8 @@ const SCOPE_RULES: Record<AccountingSyncType, ScopeRule> = {
   },
   // One refund per SalesOrderRefund / one supplier credit note per SupplierCreditNote.
   CREDIT_NOTE: DOCUMENT,
+  // o3d-ngmt.22: one void per deleted refund (the row is referenced by the deleted refund's id); a repeat is the same obligation.
+  CREDIT_NOTE_VOID: DOCUMENT,
   PURCHASE_CREDIT_NOTE: DOCUMENT,
   // One allocation per supplier credit note (the sweep enqueues at most one per note, against its bill).
   PURCHASE_CREDIT_NOTE_ALLOCATION: DOCUMENT,

@@ -45,7 +45,7 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
 
 ### CSV Export
 
-The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list), **Import CSV** and **New Product**.
+The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list), **Import CSV** and **New Product**. To change many existing products through a spreadsheet, select them and use **Edit by CSV**; see [Products: Edit by CSV](products.md).
 
 
 ## CSV Templates & Import Rules
@@ -189,7 +189,7 @@ Click **New Product** to open the product form. (On an existing product the **Sa
 | **MPN** | The manufacturer part number, for example `LN00000287`. It can contain letters, which a GTIN cannot, so it lives in its own field. See [Barcode versus MPN](#barcode-versus-mpn). |
 | **HS Code** | The Harmonised System / EU Combined Nomenclature code for customs declarations. For a code that reaches the warehouse it must be a declarable 8-digit 2026 EU CN code (see [HS Code Review](#hs-code-review)). |
 | **Country of Origin** | Pick the country where the product is manufactured from the list. Left blank, it is **not** stored as blank downstream: customs and the warehouse are sent **China (CN)** as the default, and the field says so. Choose a country to declare the true origin. |
-| **Customs Description** | A short goods description for customs paperwork. The warehouse accepts at most 50 characters, so longer text is shortened at a word boundary when it is sent. Use a plain product phrase, not a brand name or a word such as "parts". |
+| **Customs Description** | A short goods description for customs paperwork. WooCommerce's native customs-description field accepts at most 35 characters (the warehouse's own limit is 50), so longer text is shortened at a word boundary. Angle brackets, emoji and symbols such as the trademark sign are removed. Use a plain product phrase, not a brand name or a word such as "parts". |
 | **Weight** | Product weight in kg, used for shipping and landed cost calculations. |
 | **Dimensions** | Width, height, and depth in cm. |
 | **Cost Price** | The default purchase cost (overridden by FIFO layers once stock is received). |
@@ -329,7 +329,7 @@ Every product can carry three customs fields: **HS Code**, **Country of Origin**
 ### Where the customs fields come from
 
 - **Variants inherit from their parent.** When you generate variants (or Kit/BOM children) from a Variable product, each new child starts with the parent's HS code, country of origin and customs description. Change them on an individual variant afterwards if it differs. Children created earlier are not changed retroactively.
-- **WooCommerce import.** When the store supplies an HS code, country of origin or customs description for a product, the store's value wins and replaces the one in IMS if it differs. When the store leaves one blank, IMS keeps what it has. A customs description longer than 50 characters is shortened.
+- **WooCommerce import.** When the store supplies an HS code, country of origin or customs description for a product, the store's value wins and replaces the one in IMS if it differs. The store's native customs fields (commodity code, country of origin, description) are read first; where one is missing, the older HS code, country of origin and customs description product attributes are used, and for the description the previous longer text kept in the store's legacy customs-description field. When the store leaves one blank, IMS keeps what it has. A customs description longer than 35 characters is shortened. A store value IMS cannot use is ignored in favour of the next source and, if none is usable, treated as blank: an origin that is not a recognised country, an HS code of fewer than 8 digits, or a description with nothing left after cleaning. A new product left with no usable origin is created with China (CN) and a warning appears in its activity log. Variations imported from the store get the same fields, using the variation's own value and otherwise its parent's.
 - **Country of origin.** The field is a country picker. Blank means China is declared by default. If an old record holds an origin that is not a real country, the product form shows it as "invalid — choose a country" and will not save until you pick a real one. A bad origin that reaches the warehouse push is declared as China and raised as an open discrepancy until corrected.
 
 ### CN8 check before the warehouse push
@@ -376,10 +376,11 @@ The queue lists pending proposals, least confident first:
 | **Confidence** | A band (**high** 85 and over, **medium** 60 to 84, **low** below 60) and a 0 to 100 score. The score is IMS's own check of the code against the CN list, the product's category and its description, not just the AI's self-reported confidence. |
 | **Flags** | Why the score is what it is, for example an invalid format, a code not in the 2026 list, a superseded code, a category that does not match the code's heading, or a brand-only description. |
 | **Source** | Which classifier produced it (AI, escalated AI, or keyword fallback). |
+| **Customs description** | The proposed goods description. When the product has none, the AI writes one as "article + key attribute" in English (for example "brass nozzle, 3D printer extruder"), at most 50 characters, without filler words such as "parts" or "accessories". A brand-only or empty answer is rejected and the keyword rule's description is used instead (or none if no rule matches). If the product already has a customs description, that value is shown unchanged. |
 
 Click **Review** to open a proposal. Read the reasoning, edit the code if needed, add an optional review note, then choose **Approve** or **Reject**.
 
-- **Approve** writes the code to the product's HS Code. It is refused (with a message) unless the code you are approving, after your edit, is a declarable 8-digit 2026 CN8 with no blocking flag (invalid format, not in 2026, or superseded). Approving only sets the HS code; it does not change the customs description.
+- **Approve** writes the code to the product's HS Code. It is refused (with a message) unless the code you are approving, after your edit, is a declarable 8-digit 2026 CN8 with no blocking flag (invalid format, not in 2026, or superseded). Approving only sets the HS code; it does not change the customs description. The proposed customs description is a suggestion only: it is never written to the product by the classifier, and a description set by an operator or imported from WooCommerce is never replaced.
 - **Reject** leaves the product untouched and closes the proposal.
 - If someone else reviewed the same proposal first, you are told it was already reviewed.
 

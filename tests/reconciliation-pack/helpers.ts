@@ -9,7 +9,7 @@ import type { KeyPart } from '../../lib/reconciliation-pack/identity.ts'
 import { scratchRoot } from '../helpers/scratch-root'
 
 // Report directories must sit under ancestors only root or this account can modify; the unit runner's private
-// TMPDIR is group/other-writable, so these live under /var/tmp (a root-owned sticky directory).
+// TMPDIR is group/other-writable, so these live under scratchRoot() (IMS_SCRATCH_ROOT, else the original TMPDIR: a root-owned sticky directory).
 export function scratchDir(bases: string[], prefix = 'recon-pack-'): string {
   const dir = mkdtempSync(path.join(scratchRoot(), prefix))
   chmodSync(dir, 0o700)

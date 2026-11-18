@@ -35,6 +35,7 @@ mock.module('@/lib/db', {
       },
       supplier: { findUnique: async () => ({ currency: 'GBP' }) },
       supplierProduct: { findMany: async () => [] },
+      warehouse: { findMany: async () => [] }, // no warehouse is restricted (po-warehouse-eligibility)
     },
   },
 })

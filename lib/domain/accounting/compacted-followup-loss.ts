@@ -189,6 +189,7 @@ export const COMPACTION_FOLLOW_UP_LOSS: Record<AccountingSyncType, CompactedFoll
   // nobody had thought about. `compacted-followup-loss.test.ts` pins the relationship.
   // ---------------------------------------------------------------------------
   PURCHASE_INVOICE_UPDATE: NO_FOLLOW_UPS,
+  CREDIT_NOTE_VOID: NO_FOLLOW_UPS,
   SALES_INVOICE_UPDATE: NO_FOLLOW_UPS,
   SALES_INVOICE_DELETE: NO_FOLLOW_UPS,
   PURCHASE_INVOICE_DELETE: NO_FOLLOW_UPS,

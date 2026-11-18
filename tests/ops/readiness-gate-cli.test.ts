@@ -14,7 +14,7 @@ import { scratchRoot } from '../helpers/scratch-root'
 const ROOT = process.cwd()
 
 // Report directories must sit under ancestors only root or this account can modify (the gate refuses
-// otherwise), and the unit runner's private TMPDIR is group/other-writable, so these live under /var/tmp
+// otherwise), and the unit runner's private TMPDIR is group/other-writable, so these live under scratchRoot()
 // (a root-owned sticky directory, on disk) and are removed when the file finishes.
 const bases: string[] = []
 function scratchBase(prefix: string): string {

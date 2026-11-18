@@ -7,6 +7,7 @@ import { NextResponse } from 'next/server'
 import { GET as publicHealthGet } from '../../app/api/health/route.ts'
 import { handleInvoicePdfRoute } from '../../app/api/invoices/[id]/route.ts'
 import { handleShoppingInvoicePdfRoute } from '../../app/api/shopping/[connector]/invoice-pdf/route.ts'
+import { handleShoppingCreditNotePdfRoute } from '../../app/api/shopping/[connector]/credit-note-pdf/route.ts'
 import { handleRfqGet, handleRfqGetRequest } from '../../app/api/rfq/[id]/route.ts'
 import { POST as e2eNotificationsPost } from '../../app/api/e2e/notifications/route.ts'
 import {
@@ -406,6 +407,43 @@ test('public shopping invoice PDF route rejects unsigned requests before order l
           throw new Error('Nonce consumption should not be reached without a valid signature')
         },
         async loadInvoicePdf() {
+          throw new Error('PDF storage should not be reached without a valid signature')
+        },
+        async auditAttempt() {},
+      },
+    ),
+    403,
+  )
+})
+
+test('public shopping credit note PDF route rejects unsigned requests before order lookup', async () => {
+  assertRouteAccess('/api/shopping/[connector]/credit-note-pdf', 'public-webhook')
+
+  await expectStatus(
+    'shopping credit note without signature',
+    handleShoppingCreditNotePdfRoute(
+      nextApiRouteRequest('/api/shopping/woocommerce/credit-note-pdf', {
+        method: 'POST',
+        body: JSON.stringify({ connector: 'woocommerce', externalOrderId: '123', externalRefundId: '9' }),
+      }),
+      { connector: 'woocommerce' },
+      {
+        async getPluginEnabled() {
+          return true
+        },
+        async getSecret() {
+          return 'secret'
+        },
+        async findOrder() {
+          throw new Error('Order lookup should not be reached without a valid signature')
+        },
+        async findRefund() {
+          throw new Error('Refund lookup should not be reached without a valid signature')
+        },
+        async consumeNonce() {
+          throw new Error('Nonce consumption should not be reached without a valid signature')
+        },
+        async loadCreditNotePdf() {
           throw new Error('PDF storage should not be reached without a valid signature')
         },
         async auditAttempt() {},

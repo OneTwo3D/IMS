@@ -403,7 +403,9 @@ test('[o3d-1e7sl Codex r14] the help doc carries the generated blocks exactly on
     const a = doc.indexOf(begin)
     assert.equal(doc.slice(a, doc.indexOf(end, a) + end.length), text, 'the help doc disagrees with the generator - regenerate it')
   }
-  assert.ok(doc.split('\n').length < 3200, 'the help doc has not been duplicated')
+  // A duplicated regen would roughly double the page (and the begin markers above are counted exactly once).
+  // The ceiling sits well above the page's real size so ordinary growth does not trip it.
+  assert.ok(doc.split('\n').length < 5000, 'the help doc has not been duplicated')
   const walkAll = (dir: string): string[] => readdirSync(path.join(ROOT, dir)).flatMap((name) => {
     const rel = path.join(dir, name)
     if (name === 'generated' || name === 'node_modules' || name === '.next') return []
@@ -575,7 +577,10 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'credit note(s) {} in the ledger', verdict: 'DESCRIPTION', why: 'states which credit notes the ledger holds' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'no credit note of theirs recorded in the ledger', verdict: 'DESCRIPTION', why: 'states a fact about the ledger' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'IMS records refund(s) {}', verdict: 'DESCRIPTION', why: 'states what IMS holds' },
+  { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'credit note closed in the accounting system', verdict: 'DESCRIPTION', why: 'activity text stating what the delete did' },
+  { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'The credit note is closed in the accounting system, but', verdict: 'DESCRIPTION', why: 'states why phase 2 of the delete stopped' },
   { file: 'lib/connectors/xero/credit-notes.ts', prefix: 'Credit note not found in Xero for allocation', verdict: 'DESCRIPTION', why: 'error label' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'VOIDED a sales credit note in Xero', verdict: 'DESCRIPTION', why: 'states what the void posting did (the effect label of the post-effect table)' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the activity row for the lost claim could not be written', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the single-statement fallback write failed', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'created a DRAFT manual journal in Xero', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },

@@ -1,4 +1,0 @@
-### Customer identity email key and a read-only identity report (backend / ops)
-
-- **New: one rule for recognising a customer by email.** The identity key is the address NFC-normalised, trimmed and lower-cased; placeholders (`.invalid`), empty values and malformed addresses have no key. A looser key (plus-tag removed, gmail dots and the googlemail alias folded) exists for suggestions only and never merges anything. Nothing reads either key yet: no schema, page or importer change.
-- **New: `npm run crm:identity-report`.** A read-only report (one `REPEATABLE READ` `READ ONLY` transaction, counts only, no emails or names) of how the key would group today's customers, how many groups hold two or more WooCommerce customer ids, and how orders without a customer bucket. A run against production needs the owner's approval.

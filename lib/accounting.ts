@@ -120,6 +120,7 @@ const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   SALES_INVOICE: 'xero_sync_sales_invoice',
   SALES_INVOICE_UPDATE: 'xero_sync_sales_invoice',
   CREDIT_NOTE: 'xero_sync_credit_note',
+  CREDIT_NOTE_VOID: 'xero_sync_credit_note',
   PURCHASE_CREDIT_NOTE: 'xero_sync_purchase_credit_note',
   PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
   PURCHASE_INVOICE_UPDATE: 'xero_sync_purchase_invoice',

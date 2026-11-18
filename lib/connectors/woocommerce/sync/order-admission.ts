@@ -471,6 +471,8 @@ export async function drainWcOrderAdmissionRefusals(limit = 50): Promise<WcAdmis
         // non-2xx for); a refund that is merely still pending is an expected state (`unresolved`).
         const { syncRefundsForOrder } = await import('./refund-sync')
         const refunds = await syncRefundsForOrder(Number(externalOrderId))
+        const { rerunDeferredWcOrderDivergence } = await import('./order-divergence')
+        await rerunDeferredWcOrderDivergence(live)
         if (!refunds.complete) {
           result.failed++
           continue
