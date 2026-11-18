@@ -6,6 +6,7 @@ import type { PostingRefusalClient } from '@/lib/domain/accounting/posting-refus
 import { buildInventoryAdjustmentJournal } from '@/lib/domain/inventory/stock-adjustment-apply'
 import { getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 import type { RefundReturnRow } from '@/lib/domain/sales/refund-service'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
 /**
  * Layers whose cost an operator or a receipt stated: a purchase receipt line, a manual adjustment, opening stock, or a
@@ -220,6 +221,9 @@ export async function queueReturnRestockValueJournal(
   }
 }
 
+/** One returns-inbox arrival a refund adopts, and how many of its units. Recorded per refund, inbox row and quantity (`sales_order_refund_inbox_adoptions`). */
+export type InboxAdoption = { inboxId: string; qty: number }
+
 /**
  * o3d-iil0b (owner decision 2026-11-18): A REFUND ADOPTS A RETURNS-INBOX ARRIVAL THAT IS ALREADY RESTOCKED for the same order and product.
  *
@@ -227,37 +231,79 @@ export async function queueReturnRestockValueJournal(
  * stock-gain reason). A refund that then restocked or routed the same units in transit would count them twice (Inventory plus Stock in
  * Transit) and its expectation would never clear. Instead the refund LINKS to the arrival: no stock movement, no expectation, no transit debit.
  *
- * Available cover per product = units the order's RESTOCKED inbox rows put into stock, less the units earlier live refunds on the order already
- * adopted. ALL-OR-NOTHING: the refund adopts only when every returned product is fully covered; a partly covered refund keeps today's behaviour
- * (a limit, stated rather than guessed at). Returns the inbox ids linked, or null when nothing is adopted.
+ * WHAT IS LEFT TO ADOPT, per product: the units the order's RESTOCKED inbox rows put into stock, LESS EVERY EXISTING CLAIM ON THEM:
+ *   - units the order's return expectations already received (an arrival matched to an expectation is that expectation's, not free),
+ *   - units live refunds on the order already restocked themselves (the legacy restock-at-once refund's RETURN_INBOUND movements),
+ *   - units earlier live refunds already adopted, counted PER INBOX ROW (`sales_order_refund_inbox_adoptions`, so a row consumed in full is never adopted again
+ *     and a partly consumed row offers only what is left). A soft-deleted refund's adoptions release their units.
+ * Claims that are not tied to a row are charged against the oldest rows first, so what remains is a conservative, never an optimistic, figure.
+ *
+ * LOCK: the order row lock, taken here (it is re-entrant) and held by the caller to commit: the refund write that records the adoption runs under the
+ * same lock, and so does the inbox restock (it locks the order first), so two refunds racing for one arrival serialise and the second sees the first's claim.
+ *
+ * ALL-OR-NOTHING: the refund adopts only when every returned product is fully covered; a partly covered refund keeps today's behaviour (a limit, stated
+ * rather than guessed at). Returns the per-row quantities to record, or null when nothing is adopted.
  */
 export async function findRestockedInboxesToAdopt(
   tx: Prisma.TransactionClient,
   params: { orderId: string; lines: ReadonlyArray<{ productId?: string | null; qty: number }> },
-): Promise<string[] | null> {
+): Promise<InboxAdoption[] | null> {
   const wanted = new Map<string, number>()
   for (const line of params.lines) {
     if (!line.productId || !(line.qty > 0)) continue
     wanted.set(line.productId, (wanted.get(line.productId) ?? 0) + line.qty)
   }
   if (wanted.size === 0) return null
-  const linked = new Set<string>()
+  await lockSalesOrder(tx, params.orderId)
+  const adoptions = new Map<string, number>()
   for (const [productId, qty] of wanted) {
     const inboxes = await tx.wmsReturnsInbox.findMany({
       where: { orderId: params.orderId, productId, status: 'RESTOCKED', erasedAt: null },
       select: { id: true },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     })
     if (inboxes.length === 0) return null
-    const restocked = Number((await tx.stockMovement.aggregate({
-      where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: { in: inboxes.map((i) => i.id) }, productId },
+    const inboxIds = inboxes.map((i) => i.id)
+    const movementByInbox = new Map<string, number>()
+    for (const g of await tx.stockMovement.groupBy({
+      by: ['referenceId'],
+      where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: { in: inboxIds }, productId },
+      _sum: { qty: true },
+    })) movementByInbox.set(g.referenceId ?? '', Number(g._sum.qty ?? 0))
+    const adoptedByInbox = new Map<string, number>()
+    for (const g of await tx.salesOrderRefundInboxAdoption.groupBy({
+      by: ['inboxId'],
+      where: { inboxId: { in: inboxIds }, refund: { deletedAt: null } },
+      _sum: { qty: true },
+    })) adoptedByInbox.set(g.inboxId, Number(g._sum.qty ?? 0))
+    const free = inboxes.map((i) => ({ id: i.id, free: Math.max(0, (movementByInbox.get(i.id) ?? 0) - (adoptedByInbox.get(i.id) ?? 0)) }))
+
+    // Claims not tied to a row: expectation receipts and units live refunds restocked themselves, charged to the oldest rows first.
+    const receivedByExpectations = Number((await tx.returnExpectationLine.aggregate({
+      where: { productId, expectation: { orderId: params.orderId } },
+      _sum: { qtyReceived: true },
+    }))._sum.qtyReceived ?? 0)
+    const liveRefunds = await tx.salesOrderRefund.findMany({ where: { orderId: params.orderId, deletedAt: null }, select: { id: true } })
+    const restockedByRefunds = liveRefunds.length === 0 ? 0 : Number((await tx.stockMovement.aggregate({
+      where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: { in: liveRefunds.map((r) => r.id) }, productId },
       _sum: { qty: true },
     }))._sum.qty ?? 0)
-    const adoptedBefore = Number((await tx.salesOrderRefundLine.aggregate({
-      where: { productId, refund: { orderId: params.orderId, deletedAt: null, adoptedReturnsInboxIds: { isEmpty: false } } },
-      _sum: { qty: true },
-    }))._sum.qty ?? 0)
-    if (restocked - adoptedBefore < qty - 1e-9) return null
-    for (const inbox of inboxes) linked.add(inbox.id)
+    let claims = Math.max(0, receivedByExpectations) + Math.max(0, restockedByRefunds)
+    for (const row of free) {
+      const used = Math.min(row.free, claims)
+      row.free -= used
+      claims -= used
+    }
+
+    let need = qty
+    for (const row of free) {
+      if (need <= 1e-9) break
+      const take = Math.min(row.free, need)
+      if (take <= 1e-9) continue
+      adoptions.set(row.id, Math.round(((adoptions.get(row.id) ?? 0) + take) * 1e6) / 1e6)
+      need -= take
+    }
+    if (need > 1e-9) return null
   }
-  return [...linked]
+  return [...adoptions].map(([inboxId, qty]) => ({ inboxId, qty }))
 }

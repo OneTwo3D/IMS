@@ -91,9 +91,10 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
+    notPersonal: ['deletedById', 'id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
+      deleteReason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
     },
   },
   // o3d-ngmt.22: the record that a refund recorded in error was deleted. Keyed to its order by id only (no foreign key, so it outlives a deleted order). Ids, a credit note number,
@@ -105,6 +106,8 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       reason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
     },
   },
+  // o3d-iil0b: which returns-inbox arrival (and how many of its units) a refund adopted. Ids and a quantity only.
+  SalesOrderRefundInboxAdoption: { erased: [], notPersonal: ['refundId', 'inboxId'], retained: {} },
   // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
   CogsEntry: { erased: [], notPersonal: [], retained: {} },
   CostLayer: { erased: [], notPersonal: ['returnMovementId'], retained: {} },

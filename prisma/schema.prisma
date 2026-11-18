@@ -2521,13 +2521,11 @@ model SalesOrderRefund {
   deletedAt       DateTime?  @map("deleted_at")
   deletedById     String?    @map("deleted_by_id")
   deleteReason    String?    @map("delete_reason")
-  /// o3d-iil0b: the returns-inbox arrival(s) this refund ADOPTED. The warehouse had already booked the return (status RESTOCKED, stock in), so the refund links to it and creates no
-  /// new stock movement, return expectation or stock-in-transit debit for the same units. Empty for every other refund.
-  adoptedReturnsInboxIds String[] @default([]) @map("adopted_returns_inbox_ids")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])
   lines           SalesOrderRefundLine[]
+  inboxAdoptions  SalesOrderRefundInboxAdoption[]
   /// The replacement lines added to the order for this refund (an exchange). Empty for every refund that is not part of one.
   exchangeLines   SalesOrderLine[] @relation("RefundExchangeLines")
   payments        Payment[]
@@ -2541,6 +2539,24 @@ model SalesOrderRefund {
   @@index([returnReasonId])
   @@index([orderId, deletedAt])
   @@map("sales_order_refunds")
+}
+
+/// o3d-iil0b: a refund ADOPTING a returns-inbox arrival the warehouse had already restocked. One row per refund and inbox row, with the units adopted, so each arrival's
+/// consumption is known per row and quantity (a row consumed in full is never adopted again; a partly consumed one offers only what is left). Rows of a soft-deleted refund
+/// are ignored when counting. Written only by lib/domain/sales/refund-service.ts, under the order lock.
+model SalesOrderRefundInboxAdoption {
+  id        String   @id @default(cuid())
+  refundId  String   @map("refund_id")
+  inboxId   String   @map("inbox_id")
+  qty       Decimal  @db.Decimal(14, 6)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  refund SalesOrderRefund @relation(fields: [refundId], references: [id])
+  inbox  WmsReturnsInbox  @relation(fields: [inboxId], references: [id])
+
+  @@unique([refundId, inboxId])
+  @@index([inboxId])
+  @@map("sales_order_refund_inbox_adoptions")
 }
 
 /// Goods a refund sent back that have not yet arrived. One per refund that was routed in transit.
@@ -5508,6 +5524,7 @@ model WmsReturnsInbox {
   updatedAt        DateTime              @updatedAt
 
   order            SalesOrder?           @relation("WmsReturnsInboxOrder", fields: [orderId], references: [id], onDelete: SetNull)
+  refundAdoptions  SalesOrderRefundInboxAdoption[]
   product          Product?              @relation("WmsReturnsInboxProduct", fields: [productId], references: [id], onDelete: SetNull)
   warehouse        Warehouse?            @relation("WmsReturnsInboxWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
 

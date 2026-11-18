@@ -106,6 +106,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   reorder_threshold_overrides: { kind: 'CONFIG_ALLOWED', reason: 'per-warehouse reorder threshold overrides: planning configuration set by operators; the runner never writes it' },
   sales_order_refund_lines: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
   sales_order_refunds: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
+  sales_order_refund_inbox_adoptions: { kind: 'MUST_BE_EMPTY', reason: 'which returns-inbox arrivals a refund adopted: runtime history a first load starts without' },
   sales_order_refund_deletions: { kind: 'MUST_BE_EMPTY', reason: 'records of refunds deleted in error: runtime history a first load starts without' },
   sales_orders: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
   sessions: { kind: 'CONFIG_ALLOWED', reason: 'login sessions of operators' },

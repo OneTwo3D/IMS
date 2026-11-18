@@ -92,7 +92,7 @@ import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
 import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
-import { findRestockedInboxesToAdopt } from '@/lib/domain/sales/return-restock-cost'
+import { findRestockedInboxesToAdopt, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -4572,6 +4572,7 @@ export async function createSalesOrderRefund(
     // intentionally rely on the operator UI's double-submit guard instead of
     // inventing a synthetic service-level idempotency key.
     if (input.externalRefundId != null) {
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       const existingExternalRefund = await tx.salesOrderRefund.findFirst({
         where: {
           orderId: input.orderId,
@@ -4685,7 +4686,7 @@ export async function createSalesOrderRefund(
     // (one credit note per order) instead of posting a duplicate.
     if (input.chargeback) {
       const existingChargeback = await tx.salesOrderRefund.findFirst({
-        where: { orderId: input.orderId, chargeback: true },
+        where: { orderId: input.orderId, chargeback: true, deletedAt: null }, // a soft-deleted chargeback is not replayed
         select: {
           id: true,
           creditNoteNumber: true,
@@ -4813,10 +4814,11 @@ export async function createSalesOrderRefund(
     // (a chargeback already has no return warehouse). Nothing later re-reads the switch for this refund.
     // o3d-iil0b: with returns-in-transit ON, a refund whose returned units the warehouse ALREADY restocked (returns inbox, same order and
     // product) adopts that arrival: it links to it and books no new expectation or transit debit (and no second stock-in).
-    let adoptedReturnsInboxIds: string[] = []
+    // Decided under the order lock taken above; the claim on each arrival is recorded per inbox row and quantity in the refund's own transaction (below).
+    let inboxAdoptions: InboxAdoption[] = []
     if (restockWarehouseId && await readReturnsInTransitEnabled(tx)) {
-      adoptedReturnsInboxIds = (await findRestockedInboxesToAdopt(tx, { orderId: input.orderId, lines: refundLines })) ?? []
-      if (adoptedReturnsInboxIds.length > 0) restockWarehouseId = undefined
+      inboxAdoptions = (await findRestockedInboxesToAdopt(tx, { orderId: input.orderId, lines: refundLines })) ?? []
+      if (inboxAdoptions.length > 0) restockWarehouseId = undefined
     }
     const returnInTransit = Boolean(restockWarehouseId) && await readReturnsInTransitEnabled(tx)
 
@@ -5405,7 +5407,6 @@ export async function createSalesOrderRefund(
         source: refundSource,
         returnWarehouseId: restockWarehouseId || null,
         returnInTransit,
-        adoptedReturnsInboxIds,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
         chargeback: input.chargeback ?? false,
@@ -5642,12 +5643,13 @@ export async function createSalesOrderRefund(
     // follows (the same condition that arms `accountingRetryRequired` above), it is left unvalued and the staging
     // transaction values it in the same commit that persists the staged syncs. With no staging to come it is
     // valued now, there being nothing later to price it.
-    if (adoptedReturnsInboxIds.length > 0) {
+    if (inboxAdoptions.length > 0) {
+      await tx.salesOrderRefundInboxAdoption.createMany({ data: inboxAdoptions.map((a) => ({ refundId: createdRefund.id, inboxId: a.inboxId, qty: a.qty })) })
       await tx.activityLog.create({
         data: {
           entityType: 'SALES_ORDER', entityId: input.orderId, action: 'refund_adopted_returns_inbox', tag: 'sales', level: 'INFO',
-          description: `Refund ${creditNoteNumber ?? createdRefund.id} adopted ${adoptedReturnsInboxIds.length} returns-inbox arrival(s) the warehouse had already restocked: no new stock, return expectation or stock-in-transit entry was created for those units.`,
-          metadata: { refundId: createdRefund.id, returnsInboxIds: adoptedReturnsInboxIds },
+          description: `Refund ${creditNoteNumber ?? createdRefund.id} adopted ${inboxAdoptions.length} returns-inbox arrival(s) the warehouse had already restocked: no new stock, return expectation or stock-in-transit entry was created for those units.`,
+          metadata: { refundId: createdRefund.id, adoptions: inboxAdoptions },
         },
       })
     }

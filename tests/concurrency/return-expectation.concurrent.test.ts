@@ -97,6 +97,7 @@ async function cleanup(rig: Rig, fx: Awaited<ReturnType<typeof seed>> | undefine
   await rig.db.setting.deleteMany({ where: { key: SWITCH } }).catch(() => {})
   if (!fx) return
   const { db } = rig
+  await db.salesOrderRefundInboxAdoption.deleteMany({ where: { refund: { orderId: fx.orderId } } }).catch(() => {})
   await db.wmsReturnsInbox.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
   await db.returnExpectationLine.deleteMany({ where: { expectation: { orderId: fx.orderId } } }).catch(() => {})
   await db.returnExpectation.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
@@ -291,8 +292,9 @@ test(
       })
       const first = await rig.createSalesOrderRefund(rig.db, refundInput(seeded, suffix, 5_000_000 + Math.floor(Math.random() * 900_000)))
       assert.equal(first.success, true, `refund must succeed (${first.success ? '' : first.error})`)
-      const adopted = await rig.db.salesOrderRefund.findFirstOrThrow({ where: { orderId: seeded.orderId }, select: { id: true, returnInTransit: true, returnWarehouseId: true, adoptedReturnsInboxIds: true } })
-      assert.deepEqual(adopted.adoptedReturnsInboxIds, [inbox.id], 'linked to the arrival')
+      const adopted = await rig.db.salesOrderRefund.findFirstOrThrow({ where: { orderId: seeded.orderId }, select: { id: true, returnInTransit: true, returnWarehouseId: true } })
+      const links = await rig.db.salesOrderRefundInboxAdoption.findMany({ where: { refundId: adopted.id }, select: { inboxId: true, qty: true } })
+      assert.deepEqual(links.map((l) => [l.inboxId, Number(l.qty)]), [[inbox.id, 1]], 'linked to the arrival, per inbox row and quantity')
       assert.equal(adopted.returnInTransit, false)
       assert.equal(adopted.returnWarehouseId, null)
       let seen = await observe(rig, seeded)
@@ -313,3 +315,91 @@ test(
     }
   },
 )
+
+// o3d-iil0b follow-up: adoption counts EVERY claim on an arrival, per inbox row and quantity, under the order lock.
+async function addRestockedArrival(rig: Rig, fx: Awaited<ReturnType<typeof seed>>, suffix: string, qty: string, tag: string) {
+  const inbox = await rig.db.wmsReturnsInbox.create({
+    data: { connector: 'mintsoft', externalReturnId: `rxc-${tag}-${suffix}`, orderId: fx.orderId, productId: fx.productId, qty: new rig.Prisma.Decimal(qty), warehouseId: fx.returnsId, status: 'RESTOCKED' },
+    select: { id: true },
+  })
+  await rig.db.stockMovement.create({
+    data: { type: 'RETURN_INBOUND', productId: fx.productId, toWarehouseId: fx.returnsId, qty: new rig.Prisma.Decimal(qty), referenceType: 'WmsReturnsInbox', referenceId: inbox.id, unitCostBase: new rig.Prisma.Decimal('40'), totalValueBase: new rig.Prisma.Decimal('40').mul(qty) },
+  })
+  return inbox.id
+}
+
+const adoptionTest = { skip: process.env.RUN_DB_CONCURRENCY_TESTS !== '1' }
+
+test('return expectation (o3d-iil0b): an arrival an expectation already received is NOT adopted by the next refund', adoptionTest, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Awaited<ReturnType<typeof seed>> | undefined
+  try {
+    fx = await seed(rig, suffix)
+    await rig.db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: 'true' }, update: { value: 'true' } })
+    // Refund 1 (no arrival yet) routes its unit in transit: an expectation.
+    const first = await rig.createSalesOrderRefund(rig.db, refundInput(fx, suffix, 6_000_000 + Math.floor(Math.random() * 90_000)))
+    assert.equal(first.success, true, first.success ? '' : first.error)
+    // The unit then arrives and the arrival is matched to that expectation (what the restock does): the inbox row is RESTOCKED and the expectation line is received.
+    await addRestockedArrival(rig, fx, suffix, '1', 'matched')
+    await rig.db.returnExpectationLine.updateMany({ where: { expectation: { orderId: fx.orderId } }, data: { qtyReceived: new rig.Prisma.Decimal('1') } })
+    // Refund 2 must not adopt that arrival: it already belongs to refund 1's expectation.
+    const second = await rig.createSalesOrderRefund(rig.db, refundInput(fx, suffix, 6_100_000 + Math.floor(Math.random() * 90_000)))
+    assert.equal(second.success, true, second.success ? '' : second.error)
+    assert.equal(await rig.db.salesOrderRefundInboxAdoption.count({ where: { refund: { orderId: fx.orderId } } }), 0, 'nothing adopted')
+    assert.equal((await rig.db.returnExpectation.count({ where: { orderId: fx.orderId } })), 2, 'the second refund keeps its own expectation')
+  } finally {
+    await cleanup(rig, fx)
+    await rig.db.$disconnect()
+    await rig.pool.end()
+  }
+})
+
+test('return expectation (o3d-iil0b): two refunds racing for ONE arrival: exactly one adopts it', adoptionTest, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Awaited<ReturnType<typeof seed>> | undefined
+  try {
+    fx = await seed(rig, suffix)
+    await rig.db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: 'true' }, update: { value: 'true' } })
+    const inboxId = await addRestockedArrival(rig, fx, suffix, '1', 'race')
+    const [a, b] = await Promise.all([
+      rig.createSalesOrderRefund(rig.db, refundInput(fx, suffix, 6_200_000 + Math.floor(Math.random() * 90_000))),
+      rig.createSalesOrderRefund(rig.db, refundInput(fx, suffix, 6_300_000 + Math.floor(Math.random() * 90_000))),
+    ])
+    assert.equal(a.success, true, a.success ? '' : a.error)
+    assert.equal(b.success, true, b.success ? '' : b.error)
+    const adoptions = await rig.db.salesOrderRefundInboxAdoption.findMany({ where: { inboxId }, select: { qty: true } })
+    assert.equal(adoptions.length, 1, 'the arrival is adopted once')
+    assert.equal(adoptions.reduce((sum, r) => sum + Number(r.qty), 0), 1)
+    assert.equal(await rig.db.returnExpectation.count({ where: { orderId: fx.orderId } }), 1, 'the other refund routed its unit in transit')
+  } finally {
+    await cleanup(rig, fx)
+    await rig.db.$disconnect()
+    await rig.pool.end()
+  }
+})
+
+test('return expectation (o3d-iil0b): partial quantities are consumed per inbox row; a refund the remainder cannot cover adopts nothing', adoptionTest, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Awaited<ReturnType<typeof seed>> | undefined
+  try {
+    fx = await seed(rig, suffix)
+    await rig.db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: 'true' }, update: { value: 'true' } })
+    const inboxId = await addRestockedArrival(rig, fx, suffix, '1.5', 'partial')
+    const first = await rig.createSalesOrderRefund(rig.db, refundInput(fx, suffix, 6_400_000 + Math.floor(Math.random() * 90_000)))
+    assert.equal(first.success, true, first.success ? '' : first.error)
+    const rows = await rig.db.salesOrderRefundInboxAdoption.findMany({ where: { inboxId }, select: { qty: true } })
+    assert.deepEqual(rows.map((r) => Number(r.qty)), [1], 'one unit of the 1.5 consumed')
+    // 0.5 is left: a refund of one more unit is not fully covered, so it adopts nothing and keeps today\'s behaviour (an expectation).
+    const second = await rig.createSalesOrderRefund(rig.db, refundInput(fx, suffix, 6_500_000 + Math.floor(Math.random() * 90_000)))
+    assert.equal(second.success, true, second.success ? '' : second.error)
+    assert.equal(await rig.db.salesOrderRefundInboxAdoption.count({ where: { inboxId } }), 1)
+    assert.equal(await rig.db.returnExpectation.count({ where: { orderId: fx.orderId } }), 1)
+  } finally {
+    await cleanup(rig, fx)
+    await rig.db.$disconnect()
+    await rig.pool.end()
+  }
+})
