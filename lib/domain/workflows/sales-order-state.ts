@@ -5,10 +5,11 @@ import {
   type WorkflowTransitions,
 } from './status-types'
 
+// DRAFT is an entry state only: nothing moves BACK to it. An order that has left DRAFT has been finalised (re-priced at that day's rate, allocated, invoiced), and re-finalising it would re-rate and re-date the posted invoice.
 export const SALES_ORDER_TRANSITIONS = {
   DRAFT: ['PROCESSING', 'PENDING_PAYMENT', 'ALLOCATED', 'CANCELLED', 'ON_HOLD'],
-  PENDING_PAYMENT: ['PROCESSING', 'DRAFT', 'ALLOCATED', 'CANCELLED', 'ON_HOLD'],
-  ON_HOLD: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'CANCELLED'],
+  PENDING_PAYMENT: ['PROCESSING', 'ALLOCATED', 'CANCELLED', 'ON_HOLD'],
+  ON_HOLD: ['PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'CANCELLED'],
   PROCESSING: ['ALLOCATED', 'CANCELLED', 'ON_HOLD'],
   ALLOCATED: ['PICKING', 'PROCESSING', 'SHIPPED', 'CANCELLED', 'ON_HOLD'],
   PICKING: ['PACKING', 'SHIPPED', 'CANCELLED', 'ON_HOLD'],
