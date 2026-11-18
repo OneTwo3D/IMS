@@ -76,11 +76,12 @@ test('lock date: on or before refuses, after passes, and a missing or unreadable
   assert.equal(isOnOrBeforeLockDate('2026-03-31', 'not a date'), false)
 })
 
-test('the credit note day is the payload date when readable, else the day the refund was recorded', () => {
-  const recorded = new Date('2026-05-05T23:30:00.000Z')
+test('the credit note day is the payload date when readable, else the London day the refund was recorded', () => {
+  const recorded = new Date('2026-05-05T23:30:00.000Z') // 00:30 London on 6 May (BST)
   assert.equal(creditNoteDay('2026-05-04', recorded), '2026-05-04')
-  assert.equal(creditNoteDay(undefined, recorded), '2026-05-05')
-  assert.equal(creditNoteDay('05/04/2026', recorded), '2026-05-05')
+  assert.equal(creditNoteDay(undefined, recorded), '2026-05-06')
+  assert.equal(creditNoteDay('05/04/2026', recorded), '2026-05-06')
+  assert.equal(creditNoteDay(undefined, new Date('2026-12-05T23:30:00.000Z')), '2026-12-05', 'GMT: the UTC day')
 })
 
 test('the refund status after a delete is recomputed from the refunds that remain, on the NET basis only', () => {
@@ -126,4 +127,28 @@ test('accounting row verdicts: unsent is retired, posted is voided, anything unp
   // A cancelled row proven never posted is finished business; an unproven cancel (or a shadow) may stand in the ledger.
   assert.equal(classifyRefundSyncRow(row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true }), 'credit note').kind, 'ignore')
   assert.equal(classifyRefundSyncRow(row({ status: 'CANCELLED' }), 'credit note').kind, 'refuse')
+})
+
+test('a counter is never dated before what it counters: a refund deleted on the BST evening it was recorded is dated the LONDON day (not the UTC day before it)', async () => {
+  const { refundDeleteCounterDate } = await import('../../../lib/domain/sales/refund-delete-policy.ts')
+  // refund recorded 23:20 UTC 30 June (00:20 London 1 July): its COGS reversal / credit note are dated 2026-07-01; deleted 23:40 UTC the same night.
+  const now = new Date('2026-06-30T23:40:00Z')
+  assert.equal(refundDeleteCounterDate('2026-07-01', now), '2026-07-01')
+  assert.notEqual(refundDeleteCounterDate('2026-07-01', now), now.toISOString().slice(0, 10), 'the UTC day would be 30 June: the previous quarter')
+  assert.equal(refundDeleteCounterDate(null, now), '2026-07-01', 'no stored day: today\'s London day')
+  assert.equal(refundDeleteCounterDate('not-a-day', now), '2026-07-01')
+  // deleted later: today; an original dated after today (clock skew) is not countered before it
+  assert.equal(refundDeleteCounterDate('2026-07-01', new Date('2026-07-09T10:00:00Z')), '2026-07-09')
+  assert.equal(refundDeleteCounterDate('2026-07-03', now), '2026-07-03')
+  // the credit-note fallback day is the London day too
+  assert.equal(creditNoteDay(undefined, new Date('2026-06-30T23:20:00Z')), '2026-07-01')
+})
+
+test('the delete service dates every counter (COGS counter journal and its sub-ledger row, credit-note void) through refundDeleteCounterDate, never the UTC day', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync(new URL('../../../lib/domain/sales/refund-delete-service.ts', import.meta.url), 'utf8')
+  assert.equal(/toISOString\(\)\.slice\(0, ?10\)/.test(source), false, 'no UTC day derivation left in the service')
+  assert.equal((source.match(/refundDeleteCounterDate\(/g) ?? []).length, 2, 'the credit-note void and the COGS counter')
+  assert.match(source, /date: counterDate/)
+  assert.match(source, /journalDate: counterDate/)
 })

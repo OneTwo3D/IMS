@@ -10,6 +10,7 @@ import {
   buildStockMovementValueFieldsFromConsumed,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { manualStockAdjustmentMovementKey } from '@/lib/domain/inventory/stock-movement-idempotency'
+import { businessDateYmd } from '@/lib/business-date'
 
 // Extracted from app/actions/stock.ts (6oyu.1) so non-action callers — the WMS
 // stock-sync align-down path runs from a cron job — can post an adjustment
@@ -61,7 +62,7 @@ export function buildInventoryAdjustmentJournal(params: {
   const totalValue = Math.round(Math.abs(totalValueBase) * 100) / 100
   if (totalValue === 0) return null
 
-  const date = new Date().toISOString().slice(0, 10)
+  const date = businessDateYmd(new Date())
   const directionLabel = qty > 0 ? 'increase' : 'decrease'
   const reference = `Adj: ${productSku} ${qty > 0 ? '+' : ''}${qty} @ ${warehouseCode}`
   const narration = [

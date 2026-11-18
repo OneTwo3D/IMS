@@ -71,6 +71,7 @@ import {
   type CostLayerSnapshotEntry,
   type SerializedCostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { businessDateYmd } from '@/lib/business-date'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -1326,7 +1327,7 @@ export async function reverseOrphanedAllocationPosting(
     referenceId: orderId,
     payload: {
       _reversalToken: reversalToken,
-      date: new Date().toISOString().slice(0, 10),
+      date: businessDateYmd(new Date()),
       reference: `Allocation reversal: ${orderRef}`,
       narration:
         `Allocation reversal — re-allocation of order ${orderRef} removed `

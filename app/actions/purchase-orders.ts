@@ -1,5 +1,6 @@
 'use server'
 
+import { businessDateYmd } from '@/lib/business-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
@@ -3130,7 +3131,7 @@ export async function receivePurchaseOrder(
       if (accountingSettings.syncEnabled && totalReceiptValue.gt(0)) {
         const amount = roundQuantity(totalReceiptValue, 2).toNumber()
         const payload = {
-          date: new Date().toISOString().slice(0, 10),
+          date: businessDateYmd(new Date()),
           reference: `Receipt: ${po.reference}`,
           narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}`,
           lines: [
@@ -3727,7 +3728,7 @@ export async function returnPurchaseOrder(
       if (accountingSettings.syncEnabled && totalReturnedCostBase.gt(0.000001)) {
         const amount = roundQuantity(totalReturnedCostBase, 2).toNumber()
         const payload = {
-          date: new Date().toISOString().slice(0, 10),
+          date: businessDateYmd(new Date()),
           reference: returnRef,
           narration: `Supplier return for PO ${po.reference}`,
           lines: [
@@ -5430,7 +5431,7 @@ export async function markBillPaid(
             referenceType: 'PurchaseInvoice',
             referenceId: invoice.id,
             payload: {
-              date: paymentDate.toISOString().slice(0, 10),
+              date: businessDateYmd(paymentDate),
               reference: invoice.invoiceNumber ?? invoice.po.reference,
               narration: `Realised FX ${realised.outcome} on supplier payment ${invoice.invoiceNumber ?? invoice.po.reference}`,
               lines,
@@ -5788,7 +5789,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // The credit's payload is built BEFORE the claim so an undecided tax type is refused while the credit is still a DRAFT: claiming first would leave it POSTED, refused by the poster with
     // no Xero credit and no way back (posting requires DRAFT). A legacy bill line can reconstruct the right VAT and still have no mapped tax type.
     // Single date for both the journal and its subledger row (they must share the GL date dimension the reconciliation windows on).
-    const creditNoteDate = new Date().toISOString().slice(0, 10)
+    const creditNoteDate = businessDateYmd(new Date())
     const creditNotePayload = shouldQueueXero ? buildSupplierCreditNoteSyncPayload({
       creditNoteId: cn.id,
       creditNoteNumber: cn.creditNoteNumber,

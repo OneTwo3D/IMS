@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
 import { refusedCreditNoteError as refusedCreditNoteErrorOf } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { composeFinalBeforePost, creditNoteBeforePost, euCreditNoteSchemePostingRefusal, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
@@ -8328,7 +8329,7 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // Resolved HERE rather than left undefined for processEntry to fill from the wall
     // clock. An unset date made the allocation body differ on every execution, so a
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
-    date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+    date: (payload.date as string | undefined)?.slice(0, 10) || businessDateYmd(new Date()),
     sourceEntryId: entryId,
   }, { from: 'postedRow', record: origin })
 }

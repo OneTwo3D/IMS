@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { parseBatchDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -128,10 +129,21 @@ export const refundDeleteRefusals = {
   }),
 } as const
 
+/**
+ * The date of the journal / credit-note void that COUNTERS an earlier document of a refund: the later of the original's own day and today's BUSINESS (London) day, so a
+ * counter is never dated before what it counters. The original was dated on a London day (businessDateYmd at refund time), and the UTC day can be the day BEFORE it on a BST
+ * evening: a counter on the UTC day would land in the previous month / quarter from its original.
+ */
+export function refundDeleteCounterDate(originalDay: string | null, now: Date): string {
+  const today = businessDateYmd(now)
+  const original = originalDay === null ? null : parseBatchDay(originalDay)
+  return original !== null && original > today ? original : today
+}
+
 /** The day (YYYY-MM-DD) of a refund's credit note: the sync payload's own date when there is one, else the day the refund was recorded. */
 export function creditNoteDay(payloadDate: unknown, refundedAt: Date): string {
   const parsed = typeof payloadDate === 'string' ? parseBatchDay(payloadDate) : null
-  return parsed ?? refundedAt.toISOString().slice(0, 10)
+  return parsed ?? businessDateYmd(refundedAt)
 }
 
 /**

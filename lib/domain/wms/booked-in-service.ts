@@ -73,6 +73,7 @@ import {
   lockWmsAsnLineMaps,
   lockWmsAsnMaps,
 } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { businessDateYmd } from '@/lib/business-date'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -1365,7 +1366,7 @@ export async function processBookedInEvent(
           // are one decision, and no remap can commit between this read and this transaction's COMMIT.
           const accounts = await accountsForPosting(accountingConnector)
           const payload = {
-            date: now.toISOString().slice(0, 10),
+            date: businessDateYmd(now),
             reference: `Receipt: ${po.reference}`,
             narration: `Stock receipt for PO ${po.reference} via WMS ASN ${lockedEvent.externalAsnId}`,
             lines: [

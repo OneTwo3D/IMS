@@ -64,6 +64,7 @@ import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
 import { countryName, formatCountryDisplay } from '@/lib/countries'
+import { businessDateYmd } from '@/lib/business-date'
 
 type WarehouseInfo = { id: string; code: string; name: string }
 
@@ -547,7 +548,7 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
   const [method, setMethod] = useState('')
   const [reference, setReference] = useState('')
   const [notes, setNotes] = useState('')
-  const [paidAt, setPaidAt] = useState(new Date().toISOString().slice(0, 10))
+  const [paidAt, setPaidAt] = useState(businessDateYmd(new Date()))
   const [error, setError] = useState('')
 
   function handleSave() {

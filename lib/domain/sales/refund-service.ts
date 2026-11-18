@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { shareLockOrderTaxRates } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -3526,7 +3527,7 @@ async function stageRefundAccountingReversals(
   // khdw: capture the COGS reversal's GL posting date once so it both drives the
   // journal payload and is persisted on the refund for the daily-batch reconciliation.
   if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
-    const cogsReversalJournalDate = new Date().toISOString().slice(0, 10)
+    const cogsReversalJournalDate = businessDateYmd(new Date())
     // Goods in transit are not in Inventory: the debit goes to Stock in Transit until they arrive (the inventory
     // sub-ledger is cost layers, and none exists for units that are not back). Only a refund that actually
     // returns stock is in transit (`returnWarehouseId`). A refund with nothing to return has no shipped cost
@@ -3648,7 +3649,7 @@ async function stageRefundAccountingReversals(
       // it and previously had nothing at all naming its chart.
       chartConnector: settings.connector,
       payload: {
-        date: new Date().toISOString().slice(0, 10),
+        date: businessDateYmd(new Date()),
         reference: hasUnearnedReversal
           ? `Unearned reversal: ${params.orderRef}`
           : `Allocation reversal: ${params.orderRef}`,
