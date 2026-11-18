@@ -5,7 +5,7 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
-import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
+import { clearLoginThrottle, loginAttemptAllowed } from '@/lib/auth/login-throttle'
 import { getClientIp, isTrustedProxyConfigured } from '@/lib/request-ip'
 import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
 import {
@@ -178,20 +178,13 @@ export const authConfig: NextAuthConfig = {
         }
 
         // Fail closed so a rate-limit backend outage cannot silently disable
-        // brute-force protection. Keyed on email+IP for targeted-guess throttling.
-        const rlKey = `login:${parsed.data.email.toLowerCase()}:${clientIp}`
-        const rl = await checkRateLimit(rlKey, 10, 15 * 60_000, { failClosed: true })
-        if (!rl.allowed) return null
-
-        // Broader per-IP cap throttles password-spraying (one password across
-        // many accounts from one source). Only enabled when trusted-proxy
-        // resolution is configured: without it every client collapses onto the
-        // fronting proxy's IP and this cap would lock out an entire office.
-        if (isTrustedProxyConfigured() && clientIp !== 'unknown') {
-          const ipRlKey = `login-ip:${clientIp}`
-          const ipRl = await checkRateLimit(ipRlKey, 50, 15 * 60_000, { failClosed: true })
-          if (!ipRl.allowed) return null
-        }
+        // brute-force protection. See lib/auth/login-throttle.ts for the three buckets.
+        const allowed = await loginAttemptAllowed({
+          email: parsed.data.email,
+          clientIp,
+          ipIsTrustworthy: isTrustedProxyConfigured(),
+        })
+        if (!allowed) return null
 
         const user = await db.user.findUnique({
           where: { email: parsed.data.email },
@@ -216,7 +209,7 @@ export const authConfig: NextAuthConfig = {
         )
         if (!user || !user.active || !passwordMatch) return null
 
-        await clearRateLimit(rlKey)
+        await clearLoginThrottle(parsed.data.email, clientIp)
 
         return {
           id: user.id,

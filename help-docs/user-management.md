@@ -58,6 +58,7 @@ On the login page, click **Forgot password?** (next to the password box), enter 
 - "This reset link is invalid or has expired. Request a new one." means the link was already used, is older than 60 minutes, or was copied incompletely. Use **Request a new link**.
 - No email arriving usually means outbound email is not working (see Settings > Company > Email and use **Test SMTP**), or the address is not the one on your account. An administrator can also set a new password for you from **Settings > Users**.
 - Resetting a password does not turn off two-factor authentication; you still need your authenticator code to sign in.
+- Resetting a password **removes all your passkeys**, in case one was added by someone else. Sign in with the new password (and your authenticator code) and add a passkey again from your profile.
 
 
 ## Confirming It's You (Re-authentication)
@@ -69,6 +70,7 @@ Sensitive actions ask you to prove it is you again, even though you are already 
 - save or test connector credentials, or run an integration action that cannot be undone (replaying work from the sync exceptions inbox, settling a ledger row, retrying failed accounting rows)
 - reset the database
 - change your own sign-in email
+- turn on two-factor authentication (**Enable 2FA**) or add a passkey (**Add Passkey**) on your profile
 
 Once you have confirmed, you are not asked again for a short time (15 minutes by default). If the password is wrong, the box says "Re-authentication failed." and the action is not carried out.
 
@@ -96,6 +98,8 @@ Add an extra layer of security by enabling time-based one-time passwords (TOTP).
 ### Signing In with TOTP
 
 When two-factor authentication is enabled, you will be prompted for a code from your authenticator app after entering your email and password.
+
+Each code works **once**. If you sign in and then, within the same 30 seconds, are asked for a code again (for example in the **Confirm it's you** box), you will see "That code was already used": wait for the app to show the next code.
 
 ### Turning it off, or losing your authenticator
 

@@ -38,9 +38,16 @@ export async function requestPasswordReset(email: string): Promise<PasswordReset
   const ip = getClientIp(await headers()) ?? 'unknown'
   // Per-IP cap guards against email-bombing across many target addresses; the
   // per-email+IP cap guards a single target. Either tripping → silent ack.
-  const ipLimit = await checkRateLimit(`pwreset-ip:${ip}`, 20, 15 * 60_000, { failClosed: true })
+  // The per-IP cap only means something when the client IP is trustworthy: with no
+  // trusted proxy configured every caller is 'unknown', and a shared bucket would let
+  // anyone block every user's password reset.
+  const ipLimit = ip === 'unknown'
+    ? { allowed: true }
+    : await checkRateLimit(`pwreset-ip:${ip}`, 20, 15 * 60_000, { failClosed: true })
   const emailLimit = await checkRateLimit(`pwreset:${normalizedEmail}:${ip}`, 5, 15 * 60_000, { failClosed: true })
-  if (!ipLimit.allowed || !emailLimit.allowed) return REQUEST_ACK
+  // Per-account cap whatever the source address (rotating IPs cannot bomb one mailbox).
+  const accountLimit = await checkRateLimit(`pwreset-acct:${normalizedEmail}`, 10, 60 * 60_000, { failClosed: true })
+  if (!ipLimit.allowed || !emailLimit.allowed || !accountLimit.allowed) return REQUEST_ACK
 
   const user = await db.user.findFirst({
     where: { email: { equals: normalizedEmail, mode: 'insensitive' }, active: true },
@@ -108,7 +115,9 @@ export async function resetPassword(token: string, newPassword: string): Promise
   if (policyError) return { success: false, error: policyError }
 
   const ip = getClientIp(await headers()) ?? 'unknown'
-  const limit = await checkRateLimit(`pwreset-confirm:${ip}`, 20, 15 * 60_000, { failClosed: true })
+  const limit = ip === 'unknown'
+    ? { allowed: true }
+    : await checkRateLimit(`pwreset-confirm:${ip}`, 20, 15 * 60_000, { failClosed: true })
   if (!limit.allowed) return { success: false, error: 'Too many attempts. Please try again later.' }
 
   const userId = await consumeAuthToken(passwordResetTokenKey(token))
@@ -123,10 +132,16 @@ export async function resetPassword(token: string, newPassword: string): Promise
 
   const passwordHash = await bcrypt.hash(newPassword, 12)
   // Bumping sessionVersion signs out every existing session for this user.
-  await db.user.update({
-    where: { id: user.id },
-    data: { passwordHash, sessionVersion: { increment: 1 } },
-  })
+  // Passkeys are removed with the password: a passkey planted from a stolen session
+  // would otherwise survive the very reset meant to evict the intruder. The user signs
+  // in with the new password (plus TOTP) and can enrol a passkey again.
+  await db.$transaction([
+    db.user.update({
+      where: { id: user.id },
+      data: { passwordHash, sessionVersion: { increment: 1 } },
+    }),
+    db.passkey.deleteMany({ where: { userId: user.id } }),
+  ])
 
   // Invalidate any other outstanding reset links for this user so an older, still-unused
   // link can't reset the password again after this one.

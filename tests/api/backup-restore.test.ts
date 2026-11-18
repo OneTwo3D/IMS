@@ -9,6 +9,10 @@ import test from 'node:test'
 
 import { NextRequest, NextResponse } from 'next/server'
 
+// The restore token is bound to the client IP, which is only resolved from forwarding headers when a
+// trusted proxy is configured (lib/request-ip.ts).
+process.env.TRUSTED_PROXY_IPS = '10.255.255.1'
+
 // Route-handler unit tests run through `npm run test:unit`
 // (`node --import tsx --test`), matching the existing explicit `.ts`
 // imports used by API route tests in this repository.

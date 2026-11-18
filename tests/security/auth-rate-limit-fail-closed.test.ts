@@ -14,7 +14,8 @@ function read(rel: string): string {
 }
 
 const AUTH_CRITICAL_FILES = [
-  'lib/auth/config.ts',
+  'lib/auth/login-throttle.ts',
+  'app/api/auth/totp-setup/route.ts',
   'app/api/auth/totp/route.ts',
   'app/api/auth/step-up/route.ts',
   'app/actions/password-reset.ts',
