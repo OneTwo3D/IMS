@@ -14,6 +14,7 @@ import {
   countedUnearnedReversalRows,
   describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
+  unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
   unearnedReversalStandingReport,
@@ -356,7 +357,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
   const bPartialOrderIds = new Set(
     bShipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
   )
-  const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+  const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown }>>()
   const bReversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
   const unearnedReversalWarnings: string[] = []
   const bShippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
@@ -382,7 +383,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
           },
         ],
       },
-      select: { id: true, referenceType: true, referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
+      select: { id: true, referenceType: true, referenceId: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
     })
     for (const sync of bReversalSyncs) {
       const targetOrderId = sync.referenceType === 'SalesOrder' ? sync.referenceId : bRefundIdToOrderId.get(sync.referenceId)
@@ -394,7 +395,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
     for (const [targetOrderId, allRows] of bReversalStandingRowsByOrder) {
       bReversalSyncsByOrder.set(
         targetOrderId,
-        countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload })),
+        countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload, payloadAccountNets: sync.payloadAccountNets })),
       )
     }
     if (bPartialOrderIds.size > 0) {
@@ -464,6 +465,12 @@ async function computePreview(): Promise<DailyBatchPreview> {
       unearnedReversalStandingReport(bReversalStandingRowsByOrder.get(orderId) ?? []),
     )
     if (unearnedReport) unearnedReversalWarnings.push(unearnedReport)
+    // o3d-oyur (Codex r2 HIGH): same as the sync - the order's shipments are not journaled while a counted reversal is unreadable, so none is previewed.
+    const unreadableUnearnedReversals = unreadableUnearnedReversalRows(bReversalSyncsByOrder.get(orderId) ?? [])
+    if (unreadableUnearnedReversals.length > 0) {
+      unearnedReversalWarnings.push(`Order ${getSalesOrderReference({ id: orderId, ...order })}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so the run will not journal this order's shipments (they are retried once the reversal is readable).`)
+      continue
+    }
     const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
     let runningRevenue = 0
 

@@ -19,6 +19,8 @@ import { computePrepaidReconciliation } from '@/lib/domain/purchasing/prepaid-re
 import { getSession } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
+import { getPurchaseOrderPegs } from '@/app/actions/pegging'
+import { PoPegsCard } from '@/components/sales/po-pegs-card'
 import { PoDetailClient } from './po-detail-client'
 
 export const metadata: Metadata = { title: 'Purchase Order' }
@@ -47,6 +49,8 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   ])
 
   if (!po) notFound()
+  const pegs = await getPurchaseOrderPegs(id)
+  const pegLineLabels = Object.fromEntries(po.lines.map((l) => [l.id, l.sku]))
   // Supplier SKU per product from the existing supplier-product mapping (the loader the PO form uses); a failed read leaves the column empty rather than breaking the page.
   const supplierSkus: Record<string, string | null> = {}
   try {
@@ -91,7 +95,8 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} />
+      <PoPegsCard pegs={pegs} lineLabels={pegLineLabels} />
     </div>
   )
 }

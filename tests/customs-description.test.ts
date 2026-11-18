@@ -13,7 +13,7 @@ test('nullish/blank input returns empty string', () => {
   assert.equal(clampCustomsDescription('   '), '')
 })
 
-test('long descriptions are clamped to <= 50 chars on a word boundary', () => {
+test('long descriptions are clamped to <= 35 chars on a word boundary', () => {
   const long = 'linear stepper motor with integrated leadscrew, 42mm frame, 1.68A'
   const clamped = clampCustomsDescription(long)
   assert.ok(clamped.length <= CUSTOMS_DESCRIPTION_MAX, `len=${clamped.length}`)
@@ -27,6 +27,16 @@ test('no trailing separator is left after clamping', () => {
   const clamped = clampCustomsDescription('electrical connector, up to 1000 volts, panel-mount housing')
   assert.equal(clamped, clamped.replace(/[\s,;:-]+$/, ''))
   assert.ok(clamped.length <= CUSTOMS_DESCRIPTION_MAX)
+})
+
+test('limit is the WooCommerce native 35', () => {
+  assert.equal(CUSTOMS_DESCRIPTION_MAX, 35)
+  assert.ok(clampCustomsDescription('a'.repeat(60)).length <= 35)
+})
+
+test('characters WooCommerce rejects are dropped', () => {
+  assert.equal(clampCustomsDescription('brass <nozzle> ™ \u{1F600} extruder'), 'brass nozzle extruder')
+  assert.equal(clampCustomsDescription('Widget®'), 'Widget')
 })
 
 test('internal whitespace is collapsed', () => {

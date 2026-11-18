@@ -54,7 +54,7 @@ export const DEFAULT_STOCK = stockCsv([
 ])
 export const DEFAULT_PRODUCTS = productsCsv([{ sku: 'SKU-1' }, { sku: 'SKU-2' }, { sku: 'SKU-3' }])
 
-/** An export directory under /var/tmp (a root-owned sticky parent), with a manifest that declares the digest of every file it names. */
+/** An export directory under scratchRoot() (a root-owned sticky parent), with a manifest that declares the digest of every file it names. */
 export function writeExport(bases: string[], options: ExportOptions = {}): string {
   const dir = scratchDir(bases, 'recon-qoblex-')
   const files: Record<string, string> = { ...(options.extra ?? {}) }

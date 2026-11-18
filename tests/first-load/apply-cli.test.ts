@@ -262,7 +262,7 @@ test('the target is proved unchanged by exact counts of every table: one row, on
 // The files
 // ---------------------------------------------------------------------------------------------------------------------------------
 
-// Under /var/tmp, not os.tmpdir(): the unit tier points TMPDIR at a private directory that other accounts could write to, and the report directory's ancestor check (rightly) refuses that.
+// Under scratchRoot(), not os.tmpdir(): the unit tier points TMPDIR at a private directory that other accounts could write to, and the report directory's ancestor check (rightly) refuses that.
 const scratch = mkdtempSync(path.join(scratchRoot(), 'first-load-apply-cli-unit-'))
 after(() => rmSync(scratch, { recursive: true, force: true }))
 let counter = 0

@@ -34,9 +34,10 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
       accountingContactProvenance: 'ledger contact provenance, part of the accounting record',
     },
   },
+  // wcLineBaseline (JSON): WooCommerce line item ids, quantities, SKUs and the order total taken at the first IMS line edit. Product and money figures only: no name, address, email or free text.
   SalesOrder: {
     erased: ['customerName', 'customerEmail', 'customerVatNumber', 'billingAddress', 'shippingAddress', 'notes', 'internalNotes', 'trackingNumber'],
-    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses'],
+    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
     retained: {
       invoiceNumber: 'issued invoice number, statutory record',
       accountingInvoiceId: 'ledger document id, statutory record',
@@ -90,17 +91,27 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
+    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
     },
   },
+  // o3d-ngmt.22: the record that a refund recorded in error was deleted. Keyed to its order by id only (no foreign key, so it outlives a deleted order). Ids, a credit note number,
+  // amounts and a JSON of the reversed movements (ids and quantities); the one free-text column is the operator's delete reason, retained like the refund's own reason.
+  SalesOrderRefundDeletion: {
+    erased: [],
+    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId', 'reversal'],
+    retained: {
+      reason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
+    },
+  },
   // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
   CogsEntry: { erased: [], notPersonal: [], retained: {} },
-  CostLayer: { erased: [], notPersonal: [], retained: {} },
+  CostLayer: { erased: [], notPersonal: ['returnMovementId'], retained: {} },
   CostLayerRevaluation: { erased: [], notPersonal: ['reason'], retained: {} },
   CostLayerSourceLine: { erased: [], notPersonal: ['sourceCostLayerId'], retained: {} },
   OrderAllocation: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },
+  SalesOrderLinePeg: { erased: [], notPersonal: ['createdById', 'endedById', 'receivedByWarehouse', 'seenLandedByWarehouse'], retained: {} },
   Payment: {
     erased: ['notes'],
     notPersonal: ['currency', 'method'],
@@ -181,6 +192,14 @@ ERASURE_CLASSIFICATION.RefusedAction = {
   notPersonal: ['entityType', 'entityId', 'action', 'gate', 'intent', 'detail', 'resolution'],
   retained: {},
 }
+// WooCommerce-vs-IMS order divergence records: keyed by the order id (no foreign key, so the row outlives a deleted order). The differences are built by IMS
+// from SKUs, quantities and amounts only (never a payload's free text, name, address or note), so nothing is erased and no free-text guard is needed.
+ERASURE_CLASSIFICATION.WcOrderDivergence = {
+  erased: [],
+  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution'],
+  retained: {},
+}
+ERASURE_CLASSIFICATION.WcOrderDivergenceRecheck = { erased: [], notPersonal: ['orderId', 'externalOrderId'], retained: {} }
 // Xero payment-matching results: one row per customer receipt, keyed by the payment and order ids (no foreign key, so the row outlives a deleted receipt). It holds ids, a Xero
 // bank-account id, an amount, a currency and a reason code in fixed wording built by IMS: no person is named and no remote free text is stored, so nothing is erased.
 ERASURE_CLASSIFICATION.XeroPaymentMatch = {
@@ -217,7 +236,7 @@ ERASURE_CLASSIFICATION.ShoppingSyncLog = {
 // The contact block of a payload is scrubbed by derived-copies.ts / erase-personal-data.ts (email always; name kept only where the copy may describe a posted, retained document).
 ERASURE_CLASSIFICATION.AccountingSyncLog = {
   erased: ['payload', 'errorMessage'],
-  notPersonal: ['connector', 'referenceType', 'referenceId', 'settlementBasis', 'connectionProvenance', 'createDispatchIdempotencyKey', 'followUpObligations'],
+  notPersonal: ['connector', 'referenceType', 'referenceId', 'settlementBasis', 'connectionProvenance', 'createDispatchIdempotencyKey', 'followUpObligations', 'payloadAccountNets'],
   retained: {
     externalTransactionId: 'the ledger document id reconciles the posted document',
     attemptedInvoiceNumber: 'the invoice number is part of the retained invoice record',

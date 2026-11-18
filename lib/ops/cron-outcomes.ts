@@ -177,6 +177,8 @@ export const cronOutcomes = {
   'invoice-documents': (r: InvoiceDocumentsCronResult) =>
     from(r, r.stoppedEarly ? structural({ error: r.stoppedEarly }) : null, num(r.failed) > 0 ? 'failed' : null),
   // an archive pass reports what it archived and skipped; there is no failure signal short of a throw
+  // failed: number (products whose storefront or warehouse hand-over threw; they keep their mark and are retried, then parked)
+  'product-sync-marks': (r: { failed: number }) => from(r, num(r.failed) > 0 ? 'failed' : null),
   'product-lifecycle-archive': (r: { scanned: number; archived: number; skippedWithStock: number; skippedWithIncoming: number }) => noFailureSignal(r),
   // status: FAILED = a stale feed that no admin could be told about
   'read-sync-liveness': (r: Ret<typeof runReadSyncLivenessAlarmLive>) => from(r, r.status === 'FAILED' ? 'failed' : null),

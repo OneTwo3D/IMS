@@ -1,7 +1,7 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test, { mock } from 'node:test'
@@ -235,7 +235,8 @@ test('LIVE: one write, the marker is saved, a rescan and a replay send nothing m
     assert.equal(tick.scan.queued, 1, JSON.stringify(tick))
     assert.equal(tick.succeeded, 1, JSON.stringify(tick))
     assert.equal(transport.puts.length, 1)
-    assert.deepEqual(transport.puts[0]!.body, { meta_data: [{ key: '_ims_invoice_pdf_available', value: 'yes' }] })
+    // Pinned against the helper-plugin contract fixture (tests/connectors/woo-helper-invoice-contract.test.ts reads the plugin against it).
+    assert.deepEqual(transport.puts[0]!.body, JSON.parse(readFileSync('tests/fixtures/woo-helper-invoice-contract.json', 'utf8')).orderMeta.imsWritesOnPublish)
     assert.equal(transport.puts[0]!.path, `/orders/wc-${order.orderNumber!.slice(5)}`)
     const marker = await d.db.invoiceStorePublication.findUniqueOrThrow({ where: { orderId: order.id } })
     const doc = await d.db.salesOrderInvoiceDocument.findFirstOrThrow({ where: { orderId: order.id } })

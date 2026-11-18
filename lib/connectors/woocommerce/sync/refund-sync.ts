@@ -26,13 +26,32 @@ import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
 type CreateRefundAction = typeof createRefundAction
 
+/**
+ * Map the store's free-text refund reason onto a configured return reason: an ACTIVE reason whose name equals the text, ignoring case and surrounding
+ * whitespace. No match (or no text, or no reason table available to the caller) is null, never a guess and never a new reason. If two active reasons
+ * differ only by case (the Settings screen refuses that, but a direct write could) the first in the configured order wins.
+ */
+export async function resolveReturnReasonId(
+  client: Partial<Pick<typeof db, 'returnReason'>>,
+  text: string | null | undefined,
+): Promise<string | null> {
+  const name = text?.trim()
+  if (!name || !client.returnReason) return null
+  const match = await client.returnReason.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' }, active: true },
+    orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+    select: { id: true },
+  })
+  return match?.id ?? null
+}
+
 export type WcRefundSyncDependencies = {
   // o3d-w00 (Codex r7 #5): the identity an ITEMISED refund line will be re-grossed under is priced by
   // the WRITER now, inside the refund transaction, so this sync reads no tax rates of its own — it
   // states the VAT WooCommerce reported per refunded line and lets the fence there act on it.
   // `organisation` is read only when the order's stored FX rate is unusable (to tell a base-currency order, rate 1,
   // from a foreign one that must be refused): a refund on an order with a usable rate never touches it.
-  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'wmsOperatorTask' | '$transaction'> & Partial<Pick<typeof db, 'organisation'>>
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'wmsOperatorTask' | '$transaction'> & Partial<Pick<typeof db, 'organisation' | 'returnReason'>>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -676,6 +695,8 @@ export async function syncWcRefund(
       select: {
         id: true,
         externalOrderNumber: true,
+        // Set when an operator edited the order's lines in IMS: a refund line naming a storefront line the edit removed can no longer be linked (see the quarantine below).
+        editedInImsAt: true,
         fxRateToBase: true,
         // o3d-q0x56.8: the ORDER's currency, read only to tell a base-currency order (rate 1 by definition) from a
         // foreign one whose stored rate is missing. The shipping identity is still resolved by the writer, not here.
@@ -925,6 +946,28 @@ export async function syncWcRefund(
     }[] = []
 
     if (wcRefund.line_items.length > 0 && hasQtyRefund) {
+      // AN ORDER EDITED IN IMS (owner-ruled desync): its edit keeps the storefront line id of every line it continues and drops that of a line it removed. A refund returning QUANTITY of a line that is not on the order any more
+      // (the storefront still has it) has no stock source or cost to reverse here: written unlinked it would be booked as non-quantity revenue, with no stock return and no COGS reversal, while the refund reads as applied.
+      // It is QUARANTINED instead, and nothing is recorded or sent; an operator records it by hand against what was actually returned.
+      if (so.editedInImsAt != null) {
+        const unlinked = wcRefund.line_items.filter((rl) => Math.abs(rl.quantity) > 0 && !so.lines.some((l) => l.externalLineItemId === refundedOrderLineId(rl)))
+        if (unlinked.length > 0) {
+          const names = unlinked.map((rl) => `"${rl.name || `item ${refundedOrderLineId(rl)}`}" x${Math.abs(rl.quantity)}`).join(', ')
+          const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} returns ${names}, a line this order no longer has because it was edited in IMS after confirmation, so IMS cannot link it to an order line and the refund was NOT recorded: no stock was returned, no cost was reversed and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund. ${REFUND_PARK_MANUAL_RESOLUTION_HINT}`)
+          await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
+          await writeActivity({
+            entityType: 'SALES_ORDER',
+            entityId: so.id,
+            action: 'refund_sync_line_removed_by_edit',
+            tag: 'sync',
+            level: 'WARNING',
+            description: error,
+            metadata: { externalRefundId: wcRefund.id },
+            resolveUser: false,
+          })
+          return { outcome: 'quarantined-refusal', error }
+        }
+      }
       // Line-item refund with quantities
       for (const rl of wcRefund.line_items) {
         const qty = Math.abs(rl.quantity)
@@ -1145,6 +1188,9 @@ export async function syncWcRefund(
       returnWarehouseId = returnWh?.id
     }
 
+    // The store's refund reason text maps onto a configured return reason only when it matches an ACTIVE reason's name (ignoring case); anything else stays unmapped. Reasons are never created here.
+    const returnReasonId = await resolveReturnReasonId(client, wcRefund.reason)
+
     // Use the createRefund action
     const createRefund = dependencies.createRefund
       ?? (await import('@/app/actions/sales')).createRefund
@@ -1155,7 +1201,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}) },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, ...(returnReasonId ? { returnReasonId } : {}), statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}) },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error

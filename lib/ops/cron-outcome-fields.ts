@@ -81,6 +81,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     ignored: { deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads' },
   },
   'recompute-product-lead-times': { consumed: ['failed'] },
+  'product-sync-marks': { consumed: ['failed'] },
   'reconciliation-pack': {},
   'reallocation-sweep': {
     consumed: ['errors', 'directCreateMarkers.errors', 'failures', 'stockEnqueueFailures'],

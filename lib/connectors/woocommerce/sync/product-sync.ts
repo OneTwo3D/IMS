@@ -28,9 +28,9 @@ import {
 } from './product-sync-errors'
 import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../credentials'
 import type { ConnectorCredentials } from '../../types'
-import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
-import { clampCustomsDescription } from '@/lib/trade/customs-description'
+import { extractWcCustomsFields, type WcCustomsFields, type WcRejectedCustomsValue } from './customs-fields'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -565,9 +565,12 @@ function asTrimmedString(value: unknown): string | null {
 }
 
 // Trade fields (HS code / country-of-origin / customs description) are owned upstream by
-// hs-code-woo, which writes authoritative WC pa_* attributes. Policy: WC wins when present.
+// hs-code-woo, which writes WooCommerce's native customs fields (customs_commodity_code,
+// customs_country_of_origin, customs_description; the older pa_* attributes are a per-field
+// fallback, see customs-fields.ts). Policy: WC wins when present.
 // When WC supplies a differing value we overwrite IMS (so re-classifications/corrections
-// propagate); when WC omits the attribute we preserve the existing IMS value (never null it).
+// propagate); when WC omits the field (native and every fallback) we preserve the existing IMS
+// value (never null it).
 // Inputs are expected already-trimmed (see asTrimmedString / toIsoCountryCode at the call
 // site); an empty string is treated as absent via truthiness.
 export const WC_TRADE_FIELDS = ['hsCode', 'countryOfOrigin', 'customsDescription'] as const
@@ -588,6 +591,27 @@ export function resolveWcTradeFieldUpdates(
     }
   }
   return changes
+}
+
+/**
+ * Operator-facing sentences for customs data WooCommerce supplied that IMS could not use, plus
+ * the new-row case where the China default had to be declared because no usable origin existed.
+ * Empty when there is nothing to say. Pure: the caller decides where it is recorded.
+ */
+export function describeWcCustomsWarnings(
+  sku: string,
+  rejected: readonly WcRejectedCustomsValue[],
+  opts: { isNewRow: boolean; resolvedOrigin: string | null },
+): string[] {
+  const warnings = rejected.map(
+    (r) => `${sku}: WooCommerce ${r.field} "${r.value}" is not usable by IMS and was ignored`,
+  )
+  if (opts.isNewRow && !opts.resolvedOrigin) {
+    warnings.push(
+      `${sku}: no usable country of origin from WooCommerce; created with the default ${DEFAULT_COUNTRY_OF_ORIGIN}. Correct the product's origin.`,
+    )
+  }
+  return warnings
 }
 
 /** Parse a WC numeric-ish value, returning null if empty/NaN. */
@@ -630,21 +654,6 @@ function normalizeAttributeOptions(options: unknown): string[] {
   return options
     .map((option) => asTrimmedString(option))
     .filter((option): option is string => Boolean(option))
-}
-
-/** Search WC product attributes array by name (case-insensitive, ignores underscores/spaces), return first option value. */
-function getWcAttribute(
-  attrs: WcFullProduct['attributes'] | undefined,
-  ...names: string[]
-): string | null {
-  if (!Array.isArray(attrs)) return null
-  const normalise = (s: string) => s.toLowerCase().replace(/[_\s]+/g, '')
-  const targets = names.map(normalise)
-  const attr = attrs.find((a) => {
-    const name = asTrimmedString(a?.name)
-    return name ? targets.includes(normalise(name)) : false
-  })
-  return attr ? normalizeAttributeOptions(attr.options)[0] ?? null : null
 }
 
 async function snapshotProductSyncContext(): Promise<{
@@ -844,16 +853,13 @@ export async function syncWcProductToIms(
     const imageUrl = getFirstImageUrl(wcProduct.images)
     const gtin = asTrimmedString(wcProduct.global_unique_id)
 
-    // Customs fields from WC attributes
-    const hsCodeAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'hs_code', 'hs code', 'hscode'))
-    const originAttr = getWcAttribute(wcProduct.attributes, 'country_of_origin', 'Country of Origin', 'coo')
-    const originIso = toIsoCountryCode(originAttr)
-    const customsDescriptionRaw = asTrimmedString(getWcAttribute(wcProduct.attributes, 'customs_description', 'customs description', 'customsdescription'))
-    // Cap at the downstream WMS 50-char customs-description limit on the way in,
-    // so the stored value matches what we can push downstream (and never blocks
-    // a WMS product create). Preserve null/blank so "WC omitted it" semantics
-    // are unchanged.
-    const customsDescriptionAttr = customsDescriptionRaw ? clampCustomsDescription(customsDescriptionRaw) : customsDescriptionRaw
+    // Customs fields: WooCommerce native fields first, attribute / legacy-meta fallback per field.
+    // The description is clamped on the way in (null/blank preserved: "WC omitted it").
+    const customs = extractWcCustomsFields(wcProduct)
+    const hsCodeAttr = customs.hsCode
+    const originIso = customs.countryOfOrigin
+    const customsDescriptionAttr = customs.customsDescription
+    const customsWarnings: string[] = []
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
@@ -892,7 +898,7 @@ export async function syncWcProductToIms(
     )
 
     // --- Local writes: all of them, in ONE transaction ---
-    const { syncedProductId, syncedSku, tradeChanges, wasUpdate, structureConflicts } = await db.$transaction(
+    const { syncedProductId, syncedSku, customsWarnings: importWarnings, tradeChanges, wasUpdate, structureConflicts } = await db.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // Fence step 3 (o3d-mlc7): the settings lock comes FIRST, before any per-SKU lock.
         // Both families are taken inside this transaction, so a fixed order between them is
@@ -1289,7 +1295,8 @@ export async function syncWcProductToIms(
         } else if (isVariable) {
           structureConflicts.push(
             ...await applyVariations(
-              tx, variations, productId, wcProduct.name, imsCategoryId, structurallyTransformed,
+              tx, variations, productId, wcProduct.name, imsCategoryId, structurallyTransformed, customs,
+              customsWarnings,
             ),
           )
         }
@@ -1320,9 +1327,17 @@ export async function syncWcProductToIms(
         // LAST, so it sees as much of the concurrent world as this transaction ever can.
         await assertTransformedRowsStillTransformable(tx, structurallyTransformed)
 
+        customsWarnings.unshift(
+          ...describeWcCustomsWarnings(productSku, customs.rejected, {
+            isNewRow: !existing,
+            resolvedOrigin: originIso,
+          }),
+        )
+
         return {
           syncedProductId: productId,
           syncedSku: productSku,
+          customsWarnings,
           tradeChanges: changes,
           wasUpdate: Boolean(existing),
           structureConflicts,
@@ -1338,6 +1353,20 @@ export async function syncWcProductToIms(
     // sync/cron contexts too); never affects the import result.
     if (wasUpdate) {
       void invalidateStaleHsProposal(syncedProductId).catch((err) => console.error(err))
+    }
+
+    // Customs values IMS could not use (and a defaulted origin on a new row): a durable WARNING the
+    // operator can see, never a failure of the import. logActivity swallows its own errors.
+    if (importWarnings.length > 0) {
+      await logActivity({
+        entityType: 'PRODUCT',
+        entityId: syncedProductId,
+        action: 'wc_customs_value_unusable',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce customs data needs attention: ${importWarnings.slice(0, 10).join('; ')}${importWarnings.length > 10 ? `; +${importWarnings.length - 10} more` : ''}`,
+        resolveUser: false,
+      })
     }
 
     // Audit trail when hs-code-woo overwrote IMS trade fields (bhdm.2). logActivity
@@ -1814,6 +1843,14 @@ async function applyVariations(
    * lands, not once the loop finishes.
    */
   structurallyTransformed: Map<string, string>,
+  /**
+   * The parent's customs fields (already extracted). A variation's own REST values inherit the
+   * parent's in view context, but a payload that omits them (older WooCommerce, an attribute-only
+   * store, a legacy-description meta that lives on the parent) falls back to these per field.
+   */
+  parentCustoms: WcCustomsFields,
+  /** Collects customs warnings (unusable WC values, defaulted origin) for the caller to record. */
+  customsWarnings: string[],
 ): Promise<WcProductStructureConflict[]> {
   const conflicts: WcProductStructureConflict[] = []
   const entries = variations
@@ -1879,8 +1916,20 @@ async function applyVariations(
     const heightCm = parseNum(v.dimensions?.height)
     const imageUrl = getFirstImageUrl(v.images)
     const gtin = asTrimmedString(v.global_unique_id)
+    const ownCustoms = extractWcCustomsFields(v)
+    const variantCustoms: WcTradeSnapshot = {
+      hsCode: ownCustoms.hsCode ?? parentCustoms.hsCode,
+      countryOfOrigin: ownCustoms.countryOfOrigin ?? parentCustoms.countryOfOrigin,
+      customsDescription: ownCustoms.customsDescription ?? parentCustoms.customsDescription,
+    }
 
     const existing = existingBySku.get(sku)
+    customsWarnings.push(
+      ...describeWcCustomsWarnings(sku, ownCustoms.rejected, {
+        isNewRow: !existing,
+        resolvedOrigin: variantCustoms.countryOfOrigin,
+      }),
+    )
 
     if (existing) {
       // The update below rewrites type/parentId/externalProductId, so refuse a row a
@@ -1971,6 +2020,17 @@ async function applyVariations(
       if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
       if (salePriceUpdate !== undefined) updateData.salePriceBase = salePriceUpdate
       if (gtin && !existing.barcode) updateData.barcode = gtin
+      // Same policy as the parent: a WC value replaces a differing IMS one, an absent one never clears it.
+      for (const change of resolveWcTradeFieldUpdates(
+        {
+          hsCode: existing.hsCode ?? null,
+          countryOfOrigin: existing.countryOfOrigin ?? null,
+          customsDescription: existing.customsDescription ?? null,
+        },
+        variantCustoms,
+      )) {
+        updateData[change.field] = change.to
+      }
 
       // o3d-4kfh r7 (Codex finding 2): the VARIATION path writes a type too — `VARIANT`, over
       // whatever the IMS row was. An IMS KIT whose SKU is adopted as a WC variation is the same
@@ -2042,6 +2102,10 @@ async function applyVariations(
           parentId: imsParentId,
           ...(parentCategoryId != null ? { categoryId: parentCategoryId } : {}),
           externalProductId: BigInt(v.id),
+          hsCode: variantCustoms.hsCode,
+          // Mirrors the parent's create: the China default only when WooCommerce supplies no origin.
+          countryOfOrigin: variantCustoms.countryOfOrigin ?? DEFAULT_COUNTRY_OF_ORIGIN,
+          customsDescription: variantCustoms.customsDescription,
         },
       })
       // WC can repeat a SKU across variations of one parent; keep the map authoritative

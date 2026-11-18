@@ -2,6 +2,8 @@
 export type OrderListUrlState = {
   q: string
   statuses: string[]
+  /** Sales orders only: Invoicing filter picks (NOT_INVOICED, PARTIALLY_INVOICED, FULLY_INVOICED). */
+  invoicing?: string[]
   page: number
   showCompleted: boolean
   includeArchived: boolean
@@ -20,6 +22,7 @@ export function orderListHref(pathname: string, state: OrderListUrlState): strin
   const p = new URLSearchParams()
   if (state.q) p.set('q', state.q)
   if (state.statuses.length) p.set('status', state.statuses.join(','))
+  if (state.invoicing?.length) p.set('invoicing', state.invoicing.join(','))
   if (state.showCompleted) p.set('completed', '1')
   if (state.includeArchived) p.set('archived', '1')
   if (state.invoiced) p.set('invoiced', '1')
