@@ -428,6 +428,7 @@ export async function connectorFetch(
   const abortSignal = createConnectorAbortSignal(init.signal, timeoutMs, options.connectorName)
   // Only when the e2e loopback allowance applies to the FIRST hop: the origin a redirect must stay on.
   const firstHopLoopbackOrigin = allowsE2eLocalHttp(url, options) ? url.origin : undefined
+  let crossOriginBodyRefusal: string | null = null
 
   try {
     // One wall-clock timeout budget covers connection, response, and all
@@ -456,6 +457,7 @@ export async function connectorFetch(
       }
       const gateRefusal = options.hopGate?.({ method, url, redirectCount })
       if (gateRefusal) throw new Error(gateRefusal)
+      if (crossOriginBodyRefusal) throw new Error(crossOriginBodyRefusal)
       // Counted BEFORE the dispatch, synchronously: a unit of work that wants to know whether anything left can only over-count.
       noteRemoteWriteDispatched(method)
       const response = await sendConnectorRequest(url, method, headers, body, abortSignal.signal, options)
@@ -472,8 +474,11 @@ export async function connectorFetch(
       }
 
       // A 307/308 replays the body; a body (e.g. a login POST with a username and password) never goes to another origin.
+      // The refusal is raised at the top of the NEXT pass, AFTER the outbound-write hold has judged that hop: a granted write
+      // redirected to an origin it holds no grant for must keep the hold's own refusal, which says the first request WAS sent
+      // ("REFUSED AFTER A REDIRECT ... may have taken effect"), and a generic Error here would hide that from every queue.
       if (body != null && nextUrl.origin !== url.origin && redirectMethod(method, response.status) === method) {
-        throw new Error(`${options.connectorName} answered with a cross-origin redirect (HTTP ${response.status}); the request body was not replayed to the new origin.`)
+        crossOriginBodyRefusal = `${options.connectorName} answered with a cross-origin redirect (HTTP ${response.status}); the request body was not replayed to the new origin.`
       }
       const nextMethod = redirectMethod(method, response.status)
       const methodChangedToGet = nextMethod !== method && nextMethod === 'GET'
