@@ -17,7 +17,7 @@ const state = {
   reportFilters: [] as unknown[],
 }
 
-mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) } })
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined } })
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/domain/purchasing/purchase-order-fx', { namedExports: { resolvePurchaseOrderFxRateToBase: async () => 1 } })
@@ -26,9 +26,18 @@ mock.module('@/lib/domain/inventory/replenishment-reports', {
     getReorderReport: async (filters: unknown) => { state.reportFilters.push(filters); return { rows: state.rows } },
   },
 })
+// The reference is minted by the numbering module in the same transaction as the order; its own tests cover it. Here it is a fixed value.
+mock.module('@/lib/domain/numbering/mint', { namedExports: {
+  mintCommittedDocumentNumber: async () => 'PO-20260101-TEST',
+  claimDocumentNumber: async () => undefined,
+  retryWhenNumberTaken: async (attempt: () => Promise<unknown>) => attempt(),
+} })
+const fakeDb: Record<string, unknown> = {
+  $transaction: async (run: (tx: unknown) => Promise<unknown>) => run(fakeDb),
+}
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
+    db: Object.assign(fakeDb, {
       purchaseOrder: {
         findMany: async (args: { where: Record<string, unknown> }) => { state.findManyWhere.push(args.where); return state.recent },
         create: async (args: { data: PoData }) => { state.created.push(args) },
@@ -36,7 +45,7 @@ mock.module('@/lib/db', {
       supplier: { findUnique: async () => ({ currency: 'GBP' }) },
       supplierProduct: { findMany: async () => [] },
       warehouse: { findMany: async () => [] }, // no warehouse is restricted (po-warehouse-eligibility)
-    },
+    }),
   },
 })
 

@@ -101,7 +101,7 @@ test('auth hardening against a real database', { skip }, async (t) => {
       },
     })
 
-    const optionsResult = await passkeyActions.getPasskeyAuthenticationOptions(`p2g-${tag}-a@example.test`)
+    const optionsResult = await passkeyActions.getPasskeyAuthenticationOptions()
     assert.ok('options' in optionsResult && optionsResult.options)
     const { options, challengeKey } = optionsResult as { options: { challenge: string }; challengeKey: string }
 

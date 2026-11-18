@@ -1,0 +1,14 @@
+{
+  "note": "What each document type's DEFAULT pattern must produce, captured from the code that minted these numbers before patterns existed (sales.ts makeReference, purchase-orders.ts makeReference, refund-service.ts nextCreditNoteNumber). A default that drifts from these is a renumbering nobody asked for. 'stem' is everything before the 4 random characters.",
+  "cases": [
+    { "type": "sales_order", "prefix": "SO-", "isoDate": "2026-11-07T09:30:00.000Z", "stem": "SO-20261107-", "patternText": "SO-{YYYY}{MM}{DD}-{RAND:4}" },
+    { "type": "sales_order", "prefix": "ORD-", "isoDate": "2026-12-31T23:59:59.000Z", "stem": "ORD-20261231-", "patternText": "ORD-{YYYY}{MM}{DD}-{RAND:4}" },
+    { "type": "sales_order", "prefix": "", "isoDate": "2027-01-02T00:00:00.000Z", "stem": "20270102-", "patternText": "{YYYY}{MM}{DD}-{RAND:4}" },
+    { "type": "purchase_order", "prefix": "PO-", "isoDate": "2026-11-07T09:30:00.000Z", "stem": "PO-20261107-", "patternText": "PO-{YYYY}{MM}{DD}-{RAND:4}" },
+    { "type": "purchase_order", "prefix": "BUY/", "isoDate": "2026-02-03T04:05:06.000Z", "stem": "BUY/20260203-", "patternText": "BUY/{YYYY}{MM}{DD}-{RAND:4}" },
+    { "type": "credit_note", "prefix": "CN-", "isoDate": "2026-06-15T12:00:00.000Z", "seq": 1, "expected": "CN-2026-00001", "patternText": "CN-{YYYY}-{SEQ:5}" },
+    { "type": "credit_note", "prefix": "CN-", "isoDate": "2026-06-15T12:00:00.000Z", "seq": 123456, "expected": "CN-2026-123456", "patternText": "CN-{YYYY}-{SEQ:5}" },
+    { "type": "credit_note", "prefix": "CRN", "isoDate": "2027-06-15T12:00:00.000Z", "seq": 42, "expected": "CRN2027-00042", "patternText": "CRN{YYYY}-{SEQ:5}" },
+    { "type": "shipment", "prefix": "", "isoDate": "2026-11-07T09:30:00.000Z", "expected": null, "patternText": null }
+  ]
+}

@@ -266,9 +266,9 @@ test('fee lines are marked isFeeLine; goods lines never are, and carry no forceN
   const [feeLine] = mapWcFeeLines([{ id: 9, name: 'EU Duty', tax_class: '', total: '3.00', total_tax: '0.00', taxes: [] }])
   assert.equal(feeLine.isFeeLine, true)
   assert.equal(feeLine.forceNoTax, true)
-  // A no-rate goods line (no SKU, so no database lookup): unchanged vs development - no forceNoTax, not a fee.
+  // A no-rate goods line (no SKU and no WooCommerce product id, so no database lookup): unchanged vs development - no forceNoTax, not a fee.
   const [goods] = await mapWcLineItems([
-    { id: 1, name: 'Gift card', product_id: 5, variation_id: 0, quantity: 1, tax_class: '', subtotal: '25.00', subtotal_tax: '0.00', total: '25.00', total_tax: '0.00', sku: '', price: 25, taxes: [], meta_data: [] } as never,
+    { id: 1, name: 'Gift card', product_id: 0, variation_id: 0, quantity: 1, tax_class: '', subtotal: '25.00', subtotal_tax: '0.00', total: '25.00', total_tax: '0.00', sku: '', price: 25, taxes: [], meta_data: [] } as never,
   ], 1)
   assert.equal(goods.forceNoTax, undefined)
   assert.equal(goods.isFeeLine, undefined)

@@ -429,7 +429,7 @@ test('the clear wire mirrors the live sync and stays unverified in one place', (
 })
 
 const CLEAR_DTO = { sku: 'S', name: 'N', customsDescription: null, barcode: null, commodityCode: null, countryOfManufacture: null, weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null }
-function fakeTransport(reply: { data: unknown; error?: string | null }, readBack: Record<string, unknown> | null) {
+function fakeTransport(reply: { data: unknown; error?: string | null; held?: boolean }, readBack: Record<string, unknown> | null) {
   const posts: string[] = []
   return {
     posts,
@@ -444,7 +444,7 @@ test('sendMintsoftProductClears: an unsupported field is never POSTed and is rep
   const t = fakeTransport({ data: { Success: true, Message: 'ok' } }, { CommodityCode: null })
   const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['customsDescription', 'countryOfManufacture'], { externalProductId: '42' }, t.transport)
   assert.deepEqual(t.posts, [])
-  assert.deepEqual(out, { cleared: [], rejected: [], skipped: [], unsupported: ['customsDescription', 'countryOfManufacture'] })
+  assert.deepEqual(out, { cleared: [], rejected: [], skipped: [], superseded: [], unsupported: ['customsDescription', 'countryOfManufacture'] })
 })
 
 test('sendMintsoftProductClears: CommodityCode is sent and counted only when the read-back shows it empty', async () => {
@@ -456,13 +456,52 @@ test('sendMintsoftProductClears: CommodityCode is sent and counted only when the
   const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, kept.transport)
   assert.deepEqual(out.cleared, [])
   assert.equal(out.rejected[0].message, 'clear not applied')
+  assert.equal(out.rejected[0].answered, true, 'a verified not-applied answer counts toward the retry cap')
 })
 
-test("sendMintsoftProductClears: a 'Nothing to update/add' answer is not applied, whatever the read-back says", async () => {
-  const t = fakeTransport({ data: { Success: true, Message: 'Product Successfully Updated! Nothing to update/add' } }, { CommodityCode: { Code: '' } })
-  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, t.transport)
+test('sendMintsoftProductClears: answered refusals count as answered; timeouts and failed read-backs are unverifiable; a hold spends nothing', async () => {
+  const down = fakeTransport({ data: null, error: 'connect ETIMEDOUT' }, null)
+  const a = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, down.transport)
+  assert.equal(a.rejected.length, 1)
+  assert.deepEqual([a.rejected[0].answered, a.rejected[0].unverifiable], [undefined, true])
+  const blind = fakeTransport({ data: { Success: true } }, null)
+  const b = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, blind.transport)
+  assert.deepEqual([b.rejected[0].answered, b.rejected[0].unverifiable], [undefined, true])
+  const refused = fakeTransport({ data: { Success: false, Message: 'no' } }, null)
+  const c = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, refused.transport)
+  assert.deepEqual([c.rejected[0].answered, c.rejected[0].unverifiable], [true, undefined])
+  const http = fakeTransport({ data: null, error: 'Mintsoft request failed with status 422' }, null)
+  const d = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, http.transport)
+  assert.deepEqual([d.rejected[0].answered, d.rejected[0].unverifiable], [true, undefined])
+  const held = fakeTransport({ data: null, error: 'held', held: true }, null)
+  const e = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, held.transport)
+  assert.deepEqual([e.rejected[0].answered, e.rejected[0].unverifiable], [undefined, undefined])
+})
+
+test('sendMintsoftProductClears: the request body is built from the fresh read, not the planning snapshot', async () => {
+  const t = fakeTransport({ data: { Success: true } }, { CommodityCode: null })
+  await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], {
+    externalProductId: '42',
+    freshProduct: async () => ({ ...CLEAR_DTO, name: 'Fresh name' }),
+  }, t.transport)
+  assert.equal(JSON.parse(t.posts[0]).Name, 'Fresh name')
+})
+
+test('the default clear transport bounds a request well inside the 10 minute lease', () => {
+  assert.ok(client.MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS <= 120_000)
+  assert.ok(client.MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS < productSync.CUSTOMS_CLEAR_LEASE_MINUTES * 60_000)
+})
+
+test("sendMintsoftProductClears: a 'Nothing to update/add' answer is settled by the read-back: empty counts as cleared, still set is not applied", async () => {
+  const msg = { data: { Success: true, Message: 'Product Successfully Updated! Nothing to update/add' } }
+  const empty = fakeTransport(msg, { CommodityCode: { Code: '' } })
+  const done = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, empty.transport)
+  assert.deepEqual(done.cleared, ['commodityCode'])
+  assert.deepEqual(done.rejected, [])
+  const held = fakeTransport(msg, { CommodityCode: { Code: '85011099' } })
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, held.transport)
   assert.deepEqual(out.cleared, [])
-  assert.match(out.rejected[0].message, /not applied/)
+  assert.match(out.rejected[0].message, /nothing to update/)
 })
 
 test('sendMintsoftProductClears: a clear the claim refuses is not sent and is not a failure', async () => {
@@ -474,7 +513,7 @@ test('sendMintsoftProductClears: a clear the claim refuses is not sent and is no
   }, t.transport)
   assert.deepEqual(claimed, ['commodityCode'])
   assert.deepEqual(t.posts, [])
-  assert.deepEqual(out, { cleared: [], rejected: [], skipped: [{ field: 'commodityCode', reason: 'the field was filled again' }], unsupported: [] })
+  assert.deepEqual(out, { cleared: [], rejected: [], skipped: [{ field: 'commodityCode', reason: 'the field was filled again' }], superseded: [], unsupported: [] })
 })
 
 test('sendMintsoftProductClears: the request is made INSIDE the claim', async () => {
@@ -487,6 +526,52 @@ test('sendMintsoftProductClears: the request is made INSIDE the claim', async ()
     clearClaim: async (_f, send) => { inside = true; try { return { claimed: true, value: await send() } } finally { inside = false } },
   }, t.transport)
   assert.deepEqual(out.cleared, ['commodityCode'])
+})
+
+test('sendMintsoftProductClears: a lease held by another run is skipped with retry set', async () => {
+  const t = fakeTransport({ data: { Success: true } }, { CommodityCode: null })
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], {
+    externalProductId: '42',
+    clearClaim: async () => ({ claimed: false, reason: 'another run holds the clear lease', retry: true }),
+  }, t.transport)
+  assert.deepEqual(out.skipped, [{ field: 'commodityCode', reason: 'another run holds the clear lease', retry: true }])
+})
+
+test('sendMintsoftProductClears: a clear superseded by a refill in flight is never read back or counted cleared', async () => {
+  const t = fakeTransport({ data: { Success: true } }, { CommodityCode: { Code: '' } })
+  let reads = 0
+  t.transport.readBack = async () => { reads += 1; return { CommodityCode: { Code: '' } } }
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], {
+    externalProductId: '42',
+    clearClaim: async (_f, send) => ({ claimed: true, value: await send(), superseded: 'the field was filled again while the clear was in flight' }),
+  }, t.transport)
+  assert.equal(t.posts.length, 1)
+  assert.equal(reads, 0)
+  assert.deepEqual(out.cleared, [])
+  assert.deepEqual(out.rejected, [])
+  assert.deepEqual(out.superseded, [{ field: 'commodityCode', reason: 'the field was filled again while the clear was in flight' }])
+})
+
+test('mintsoftFieldValue reads the value Mintsoft holds, null when empty or unread', () => {
+  assert.equal(client.mintsoftFieldValue({ CustomsDescription: ' Motor ' }, 'customsDescription'), 'Motor')
+  assert.equal(client.mintsoftFieldValue({ CountryOfManufacture: { Code: 'CN' }, CountryOfManufactureId: 5 }, 'countryOfManufacture'), 'CN')
+  assert.equal(client.mintsoftFieldValue({ CommodityCode: { Code: '' } }, 'commodityCode'), null)
+  assert.equal(client.mintsoftFieldValue(null, 'commodityCode'), null)
+})
+
+test('resolveManualCustomsClears: description and origin only while Mintsoft is KNOWN to hold a value; a capped commodity code too', () => {
+  const at = new Date('2026-11-18T10:00:00.000Z')
+  const product = { hsCode: null, countryOfOrigin: null, customsDescription: null, customsClears: [{ field: 'customsDescription', createdAt: at }, { field: 'countryOfOrigin', createdAt: at }, { field: 'hsCode', createdAt: at, attempts: 1 }] }
+  const held = { CustomsDescription: 'Motor', CountryOfManufacture: { Code: 'CN' }, CountryOfManufactureId: 1, CommodityCode: { Code: '85011099' } }
+  assert.deepEqual(productSync.resolveManualCustomsClears(product, held), ['customsDescription', 'countryOfManufacture'])
+  assert.deepEqual(productSync.resolveManualCustomsClears(product, undefined), [], 'unknown is not "still holds"')
+  assert.deepEqual(productSync.resolveManualCustomsClears(product, { CustomsDescription: '', CountryOfManufacture: null, CommodityCode: null }), [])
+  const capped = { ...product, customsClears: [{ field: 'hsCode', createdAt: at, attempts: productSync.CUSTOMS_CLEAR_MAX_ATTEMPTS }] }
+  assert.deepEqual(productSync.resolveManualCustomsClears(capped, held), ['commodityCode'])
+  const unverified = { ...product, customsClears: [{ field: 'hsCode', createdAt: at, unverifiedAttempts: productSync.CUSTOMS_CLEAR_MAX_UNVERIFIED_ATTEMPTS }] }
+  assert.deepEqual(productSync.resolveManualCustomsClears(unverified, held), ['commodityCode'])
+  assert.equal(productSync.customsClearCapSpent({ attempts: 4, unverifiedAttempts: 19 }), false)
+  assert.deepEqual(productSync.resolveManualCustomsClears({ ...product, customsDescription: 'Refilled' }, held), ['countryOfManufacture'])
 })
 
 test('plannedClearMarkers keys each marker version by the WMS field', () => {

@@ -83,6 +83,8 @@ async function seedMixedFreight() {
     ],
   })
   assert.equal(freight.success, true, String(freight.error))
+  // A bill is only raised on an order that has been placed with the supplier (the PR's status gate), so the freight order is sent before it is billed.
+  await db.purchaseOrder.update({ where: { id: freight.po!.id }, data: { status: 'PO_SENT' } })
   const lines = await db.freightCostLine.findMany({ where: { poId: freight.po!.id }, orderBy: { sortOrder: 'asc' }, select: { id: true, description: true, amountForeign: true, vatable: true, distributionMethod: true } })
   return { db, poId: freight.po!.id, lines }
 }

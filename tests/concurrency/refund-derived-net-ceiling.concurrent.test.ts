@@ -93,6 +93,7 @@ test(
       const extra = await refundOne(101)
       assert.equal(extra.success, false, 'the 101st unit does not exist')
       assert.match(extra.success === false ? extra.error : '', /exceeds the 0 still refundable on that line/, 'refused by the line\'s own remaining quantity')
+      assert.equal(extra.success === false && extra.quarantine === true, true, 'a deterministic over-quantity refusal is a quarantine (operator-resolvable), not a retryable failure')
       const overCeiling = await createSalesOrderRefund(db, {
         orderId: order.id,
         lines: [{ lineId, productId: null, description: 'Tiny', qty: 0, totalForeign: 0.1, totalBase: 0.1, lineKind: 'sale' }],
@@ -102,6 +103,7 @@ test(
       })
       assert.equal(overCeiling.success, false)
       assert.match(overCeiling.success === false ? overCeiling.error : '', /Refund total would exceed order total/, 'an amount-only row on a fully refunded order is refused by the order-wide ceiling')
+      assert.equal(overCeiling.success === false && overCeiling.quarantine === true, true, 'the over-total refusal is a quarantine: it repeats identically on every retry')
       const publicZero = await createSalesOrderRefund(db, {
         orderId: order.id,
         lines: [{ lineId, productId: null, description: 'Tiny', qty: 0, totalForeign: 0.1, totalBase: 0.1, lineKind: 'sale' }],
