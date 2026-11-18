@@ -650,6 +650,8 @@ function TransferCard({
       setTransfer(next)
       onUpdated(next)
       router.refresh()
+      // Dispatch cancelled; the message, when present, tells the operator to ask the warehouse to cancel the ASN IMS closed.
+      if (res.message) setActionError(res.message)
     }
     else setActionError(res.message ?? 'Failed.')
   }

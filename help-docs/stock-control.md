@@ -123,7 +123,7 @@ Stock the warehouse system has already brought in (through its stock sync) count
 ### Cancelling
 
 - A **draft** can be cancelled at any time (after a confirmation); no stock has moved.
-- An **in-transit** transfer is cancelled with **Cancel dispatch** (the no-entry icon beside the receive buttons), which returns the stranded stock to the source warehouse. Use it only if the transfer will never be received. It is refused, and the icon is hidden, once any part of the transfer has been received or the warehouse system has brought stock in; finish receiving it instead.
+- An **in-transit** transfer is cancelled with **Cancel dispatch** (the no-entry icon beside the receive buttons), which returns the stranded stock to the source warehouse. Use it only if the transfer will never be received. It is refused, and the icon is hidden, once any part of the transfer has been received or the warehouse system has brought stock in; finish receiving it instead. Cancelling the dispatch also closes the transfer's warehouse ASN in IMS (so it no longer holds align-down for its SKUs); IMS cannot cancel it in Mintsoft, so the screen tells you to ask the warehouse to cancel it. It is refused while the ASN's creation is unconfirmed or the warehouse has booked it in and IMS has not yet reconciled that; use **Recheck booked-in** first.
 
 ### Importing transfers from CSV
 

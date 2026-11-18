@@ -1,3 +1,4 @@
+import { asnHasReceiptEvidence, readAlignUpReceiptEvidenceEnabled } from '@/lib/connectors/mintsoft/settings/align-up-receipt-evidence'
 import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -910,6 +911,8 @@ async function getAlignmentCandidateLines(
         select: {
           externalAsnId: true,
           createdAt: true,
+          status: true,
+          lastCallbackAt: true,
         },
       },
     },
@@ -1005,6 +1008,8 @@ async function getAlignmentCandidateLines(
   const refused: RefusedAlignmentCandidate[] = []
   const parentTransferIds = new Set<string>()
   const asnMapIds = new Set<string>(lines.map((line) => line.asnMapId))
+  // o3d-hqvrp.121: with the switch on, an ASN the warehouse has not reported anything against cannot absorb a rise in stock.
+  const requireReceiptEvidence = await readAlignUpReceiptEvidenceEnabled(tx as unknown as Parameters<typeof readAlignUpReceiptEvidenceEnabled>[0])
 
   for (const line of lines) {
     // FIRST, BEFORE ANY FACT ABOUT THIS ROW IS READ. Under the locks, a row this
@@ -1028,6 +1033,16 @@ async function getAlignmentCandidateLines(
         externalAsnId: line.asn.externalAsnId,
         reason: 'the ASN line was created after this run took its row locks',
         kind: 'raced',
+      })
+      continue
+    }
+
+    if (requireReceiptEvidence && !asnHasReceiptEvidence(line.asn)) {
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: `the warehouse has reported nothing booked in against this ASN (status ${line.asn.status}, no callback), so a rise in Mintsoft stock is not treated as its receipt (a return, stock-take or mis-booking raises stock too)`,
+        kind: 'unusable',
       })
       continue
     }
