@@ -6,10 +6,12 @@ import test, { mock } from 'node:test'
 const reports: Array<Record<string, unknown>> = []
 const enqueued: Array<Record<string, unknown>> = []
 let settings: Record<string, unknown> = {}
+let verdict = 'post'
 
 mock.module('@/lib/accounting', {
   namedExports: {
     getAccountingSettings: async () => settings,
+    accountingPostingVerdictForChart: async () => ({ verdict }),
     queueAccountingSyncTxWithOutcome: async (_tx: unknown, params: Record<string, unknown>) => {
       enqueued.push(params)
       return { queued: true }
@@ -60,6 +62,7 @@ function reset(connector: string | null, inventoryAccount = '630') {
   reports.length = 0
   enqueued.length = 0
   settings = { connector, inventoryAccount }
+  verdict = connector ? 'post' : 'no-chart'
 }
 
 test('no reason: value moved, no journal built -> the owed posting is reported', async () => {
@@ -101,5 +104,16 @@ test('a mapped reason still queues its journal and reports nothing', async () =>
   reset('xero')
   await (await loadApply())({ tx: fakeTx({ name: 'Damaged', accountCode: '820' }), productId: 'p', warehouseId: 'w', qty: 5, unitCostBase: 2, reasonId: 'r' })
   assert.equal(enqueued.length, 1)
+  assert.equal(reports.length, 0)
+})
+
+test('connector active but xero sync or the inventory-adjustment type is off (not-configured): nothing is owed', async () => {
+  reset('xero')
+  verdict = 'not-configured'
+  await (await loadApply())({ tx: fakeTx(null), productId: 'p', warehouseId: 'w', qty: 5, unitCostBase: 2 })
+  assert.equal(reports.length, 0)
+  reset('xero', '')
+  verdict = 'not-configured'
+  await (await loadApply())({ tx: fakeTx({ name: 'Damaged', accountCode: '820' }), productId: 'p', warehouseId: 'w', qty: 5, unitCostBase: 2, reasonId: 'r' })
   assert.equal(reports.length, 0)
 })

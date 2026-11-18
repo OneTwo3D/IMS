@@ -20,7 +20,8 @@ export function journalSentPennyImbalance(payload: unknown): number | null {
     if (debit === undefined && credit === undefined) continue
     isJournal = true
     const signed = (Number(debit ?? 0) || 0) - (Number(credit ?? 0) || 0)
-    total += Math.round(Math.round(signed * 100 * 1e6) / 1e6)
+    // Exactly the wire's rounding (prepareManualJournal: Math.round(signed * 100)); no pre-rounding, so a journal the wire sends balanced is never refused.
+    total += Math.round(signed * 100)
   }
   return isJournal ? total : null
 }

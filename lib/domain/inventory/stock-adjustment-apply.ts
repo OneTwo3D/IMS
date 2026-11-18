@@ -1,8 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { queueAccountingSyncTxWithOutcome, getAccountingSettings } from '@/lib/accounting'
+import { queueAccountingSyncTxWithOutcome, getAccountingSettings, accountingPostingVerdictForChart } from '@/lib/accounting'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
-import { logActivity } from '@/lib/activity-log'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost, lockStockLevelRow } from '@/lib/cost-layers'
@@ -308,7 +307,7 @@ export async function applyStockAdjustment({
   // o3d-hqvrp.47: a valued adjustment with NO account to post against (no reason, a reason with no account,
   // or no inventory account mapped) changed the cost layers and posted nothing, silently. Record the owed
   // posting the way every other refused producer does, so the ledger gap shows in the exception inbox.
-  // Only when an accounting connector is active: with none, nothing is owed (the same `not-configured` rule).
+  // Only when the adjustment would post (connector active, sync on, type on): otherwise nothing is owed (the `not-configured` rule). The owed row is the report; no separate activity-log row.
   // The one identity of this movement's journal: the enqueue below and the owed-posting row both take it.
   const journalIdentity = { type: 'INVENTORY_ADJUSTMENT' as const, referenceType: 'StockMovement', referenceId: movement.id }
   const adjustmentValueBase = isAddition
@@ -317,11 +316,15 @@ export async function applyStockAdjustment({
   const adjustmentHasValue = qty !== 0 && Math.round(Math.abs(adjustmentValueBase) * 100) !== 0
   if (adjustmentHasValue) {
     const unmappedSettings = providedSettings ?? await getAccountingSettings()
-    if (unmappedSettings.connector && (!accountCode || !unmappedSettings.inventoryAccount)) {
+    // Owed only when a mapped adjustment WOULD post: the same verdict the enqueue answers from (connector active,
+    // xero_sync_enabled on, the inventory-adjustment type on). `not-configured` and `no-chart` owe nothing.
+    const wouldPost = (!accountCode || !unmappedSettings.inventoryAccount) && unmappedSettings.connector
+      ? (await accountingPostingVerdictForChart(unmappedSettings.connector, 'INVENTORY_ADJUSTMENT')).verdict
+      : null
+    if (unmappedSettings.connector && (wouldPost === 'post' || wouldPost === 'chart-retired')) {
       // No enqueue ran (there was no journal to build), so there is no answer to forward: the outstanding row is
       // recorded directly, in the caller's transaction, under the key the journal would have been queued under.
       const unmapped = !accountCode ? 'reason_account' : 'inventory_account'
-      const postingDescription = `the inventory adjustment journal for ${product?.sku ?? productId} at ${warehouse?.name ?? warehouseId}`
       const remedy = !accountCode
         ? 'The adjustment has no reason, or its reason has no account, so no journal was built. Inventory in the '
           + 'ledger no longer matches IMS by the value of this adjustment. Post the journal by hand.'
@@ -341,15 +344,6 @@ export async function applyStockAdjustment({
         },
         { withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn) },
       )
-      await logActivity({
-        entityType: 'STOCK_ADJUSTMENT',
-        entityId: movement.id,
-        action: 'inventory_adjustment_journal_not_queued',
-        tag: 'accounting',
-        level: 'ERROR',
-        description: `NOTHING WAS QUEUED for ${postingDescription}: ${remedy}`,
-        metadata: { movementId: movement.id, productId, warehouseId, unmapped },
-      }).catch(() => { /* a report that cannot be written must not fail the adjustment */ })
     }
   }
 

@@ -28,7 +28,6 @@
 
 import { xeroHttpAttemptCount, xeroPost, type XeroNotSentReason } from './api'
 import type { JournalEntry, JournalLine } from '../types'
-import { NO_TAX_TYPE } from '@/lib/domain/accounting/sales-document-tax-types'
 
 type XeroManualJournalResponse = {
   ManualJournals: Array<{
@@ -150,10 +149,7 @@ export function prepareManualJournal(
         AccountCode: line.accountCode,
         Description: line.description,
       }
-      // o3d-hqvrp.59: a line with no TaxType let Xero apply the ACCOUNT's default tax, which can add VAT to a
-      // journal that carries none. Every IMS journal line is a net ledger movement, so an unset type is sent
-      // explicitly as the no-VAT code; a line that names a type keeps it.
-      xeroLine.TaxType = line.taxType ? line.taxType : NO_TAX_TYPE
+      if (line.taxType) xeroLine.TaxType = line.taxType
       return xeroLine
     })
     .filter((l): l is Record<string, unknown> => l !== null)
@@ -167,14 +163,6 @@ export function prepareManualJournal(
   const totalCredits = entry.lines.reduce((s, l) => s + Number(l.credit ?? 0), 0)
   if (Math.abs(totalDebits - totalCredits) > 0.01) {
     return { ok: false, error: `Journal unbalanced: debits=${totalDebits}, credits=${totalCredits}` }
-  }
-
-  // o3d-hqvrp.59: the check above is on the raw sums with a penny of slack, but the wire carries each line
-  // rounded to 2dp. Rounding per line can leave the SENT lines 1p apart (33.333 + 33.333 + 33.334 against 100),
-  // which Xero rejects or books out of balance. Checked on what is actually sent, in whole pennies.
-  const sentPennies = journalLines.reduce((sum, l) => sum + Math.round(Number(l.LineAmount) * 100), 0)
-  if (sentPennies !== 0) {
-    return { ok: false, error: `Journal unbalanced after per-line rounding: the lines as sent differ by ${(sentPennies / 100).toFixed(2)}` }
   }
 
   const journal: Record<string, unknown> = {

@@ -1463,18 +1463,6 @@ export async function queueAccountingSyncTx(
     })
   }
 
-  // o3d-hqvrp.59: a journal whose lines, rounded to the penny as the connector sends them, do not net to zero is
-  // refused HERE, before a row exists, instead of failing at the wire after a retry loop. `refused`: still owed.
-  const sentImbalance = journalSentPennyImbalance(params.payload)
-  if (sentImbalance !== null && sentImbalance !== 0) {
-    return answer({ queued: false, reason: 'refused' }, undefined, {
-      reason: 'journal_unbalanced',
-      remedy:
-        `The journal for this posting does not balance after each line is rounded to the penny (the lines differ by ${(sentImbalance / 100).toFixed(2)}), `
-        + 'so it was not queued. Post the entry by hand with the rounding corrected.',
-    })
-  }
-
   // Returns whether a GL counterpart for this posting exists or will post: false when
   // the type won't post (no active/enabled connector), true when it was queued or is
   // already queued. Callers that must stay consistent with the queue decision (e.g. the
@@ -1576,6 +1564,18 @@ export async function queueAccountingSyncTx(
   // Return false: no IMS GL counterpart posts, so callers stay consistent.
   if (isFxGainLossJournalSuppressed(context.connector, params.type)) {
     return answer({ queued: false, reason: 'not-configured' }, context.connector)
+  }
+
+  // o3d-hqvrp.59: a journal whose lines, rounded to the penny as the connector sends them, do not net to zero is
+  // refused HERE, after the not-configured verdicts (a disabled sync or type owes nothing) and before a row exists, instead of failing at the wire after a retry loop. `refused`: still owed.
+  const sentImbalance = journalSentPennyImbalance(params.payload)
+  if (sentImbalance !== null && sentImbalance !== 0) {
+    return answer({ queued: false, reason: 'refused' }, context.connector, {
+      reason: 'journal_unbalanced',
+      remedy:
+        `The journal for this posting does not balance after each line is rounded to the penny (the lines differ by ${(sentImbalance / 100).toFixed(2)}), `
+        + 'so it was not queued. Post the entry by hand with the rounding corrected.',
+    })
   }
 
   // o3d-q0x56.2 / .3 - A FOREIGN POSTING WITH NO USABLE IMS RATE IS NOT QUEUED (after the verdict: a type nobody posts is not owed). `refused`
