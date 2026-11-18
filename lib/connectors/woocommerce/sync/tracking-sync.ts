@@ -10,6 +10,7 @@ import { logActivity } from '@/lib/activity-log'
 import { wcFetch, wcPut } from '../api'
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import type { WcFullOrder, WcMeta, WcTrackingItem } from './types'
+import { TRACKSHIP_REFIRE_PENDING_GRACE_MS } from './trackship-refire'
 import { applyAstProvider, readAstProviderMappingEnabled, resolveAstProvider } from './ast-provider-mapping'
 
 type TrackingSourceRow = {
@@ -316,6 +317,18 @@ export async function pushImsTrackingToWc(
         syncedAt: new Date(),
       },
     })
+
+    // o3d-dzj3c: the tracking on the storefront CHANGED. An order the TrackShip re-fire sweep had closed as COVERED was covered for the OLD
+    // numbers; the sweep only looks at ACTIVE rows, so without this the new number is never checked against TrackShip. Re-open it, restart
+    // its back-off, and give TrackShip its grace before the first look. Inert while no state row exists (the sweep is off by default).
+    try {
+      await db.trackshipRefireState.updateMany({
+        where: { orderId, status: 'COVERED' },
+        data: { status: 'ACTIVE', attempts: 0, lastResult: null, nextAttemptAt: new Date(Date.now() + TRACKSHIP_REFIRE_PENDING_GRACE_MS) },
+      })
+    } catch (error) {
+      console.error(`[wc-tracking] pushed changed tracking for ${orderId} but could not re-open its TrackShip re-fire state:`, error)
+    }
 
     await logActivity({
       entityType: 'SALES_ORDER',
