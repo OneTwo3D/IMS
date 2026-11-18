@@ -63,7 +63,7 @@ test('the rows the answer rests on are locked FOR SHARE before they are read, in
 
 // ---- the census: every writer of a tax rate id uses the helper ----------------------------------------------------------
 const WRITERS: Array<[string, RegExp, string, number]> = [
-  ['app/actions/sales.ts', /resolveLinesTaxRates\(tx, lineData\)/, 'sales order create and draft edit (lines), each in its own writing transaction', 2],
+  ['app/actions/sales.ts', /resolveLinesTaxRates\(tx, lineData\)/, 'sales order create, order edit (lines) and the exchange inside a return (its replacement lines, under the refund transaction), each in its own writing transaction', 3],
   ['app/actions/sales.ts', /resolveWritableTaxRateIds\(tx, so\.lines/, 'sales order clone, in its transaction', 1],
   ['app/actions/purchase-orders.ts', /resolveLinesTaxRates\(tx, lineData\)/, 'purchase order create (lines), in the creating transaction', 1],
   ['app/actions/purchase-orders.ts', /resolveWritableTaxRateIds\(client, overrideIds/, 'purchase order create / edit (overrides; the edit passes its tx)', 1],

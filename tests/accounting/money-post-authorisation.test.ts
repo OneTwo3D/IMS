@@ -1368,7 +1368,7 @@ test('no other copy of the money-post date rule survives (o3d-0m56 r6, CRITICAL 
 
 /* ----------------- round 7, HIGH 1: one clock reading, carried, not two ----------------- */
 
-test('a post spanning a UTC MIDNIGHT is judged on the date it is sending (o3d-0m56 r7, HIGH 1)', async () => {
+test('a post spanning a BUSINESS-DAY (London) MIDNIGHT is judged on the date it is sending (o3d-0m56 r7, HIGH 1)', async () => {
   // ROUND 6 REMOVED THE MIRROR AND LEFT THE CLOCK. Both sides called one function — and its
   // wall-clock arm answers about whatever `Date` it is handed, so the processor resolving at
   // 23:59:59.900Z and the fence resolving at 00:00:00.100Z got two different DAYS. The probe then
@@ -1389,9 +1389,9 @@ test('a post spanning a UTC MIDNIGHT is judged on the date it is sending (o3d-0m
     }],
   }
   const undated = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 10 }
-  // The processor resolves the date it will send, a breath before midnight...
-  const sending = moneyPostDateToSend('INVOICE_PAYMENT', undated, new Date('2026-08-18T23:59:59.900Z'))
-  assert.equal(sending.ok && sending.date, '2026-08-18')
+  // The processor resolves the date it will send, a breath before London midnight...
+  const sending = moneyPostDateToSend('INVOICE_PAYMENT', undated, new Date('2026-08-18T22:59:59.900Z'))
+  assert.equal(sending.ok && sending.date, '2026-08-18', 'wall-clock arm: the LONDON day (BST midnight is 23:00Z)')
   const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: undated }])
 
   const verdict = await (await load())({
@@ -1402,7 +1402,7 @@ test('a post spanning a UTC MIDNIGHT is judged on the date it is sending (o3d-0m
     db,
     // ...and the fence runs a breath after it. Anything the fence resolves for itself is now the
     // NEXT day.
-    now: () => new Date('2026-08-19T00:00:00.100Z'),
+    now: () => new Date('2026-08-18T23:00:00.100Z'),
   })
 
   assert.deepEqual(xeroCalls, ['Invoices/inv-1'])

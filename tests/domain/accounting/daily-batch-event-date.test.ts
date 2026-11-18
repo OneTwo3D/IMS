@@ -11,6 +11,7 @@ import {
   parseBatchDay,
   resolvePostingDate,
   utcDay,
+  businessDay,
 } from '@/lib/domain/accounting/daily-batch-event-date'
 import { preBatchRefundedNetBase, revenueDeferralAmount, revenueDeferralGrossAmount, preBatchRefundAdjustments, preBatchRefundsNettedIntoStoredDeferral } from '@/lib/domain/accounting/daily-batch-discount-fence'
 
@@ -175,4 +176,19 @@ test('isOnOrBeforeLock is true on the lock day and before, false after, and neve
   assert.equal(isOnOrBeforeLock('2026-04-01', '2026-03-31'), false)
   assert.equal(isOnOrBeforeLock(null, '2026-03-31'), false)
   assert.equal(isOnOrBeforeLock('2026-03-01', null), false)
+})
+
+// One order's legs share a day: the paid day is read on the London business day, like the invoice and the receipt.
+test('businessDay reads the London day: 23:30 UTC in BST is the next day, and in winter it is the UTC day', () => {
+  assert.equal(businessDay(new Date('2026-06-30T23:30:00.000Z')), '2026-07-01')
+  assert.equal(utcDay(new Date('2026-06-30T23:30:00.000Z')), '2026-06-30')
+  assert.equal(businessDay('2026-12-31T23:30:00.000Z'), '2026-12-31')
+  assert.equal(businessDay(null), null)
+  assert.equal(businessDay('not a date'), null)
+})
+test('a deferral for an order paid 23:30 UTC on 30 June (BST) is dated 1 July, with the invoice, when the run day is the business day', () => {
+  const ctx = { today: '2026-07-01', lockDate: null }
+  assert.equal(resolvePostingDate(businessDay('2026-06-30T23:30:00.000Z'), ctx).date, '2026-07-01')
+  // On the UTC run day it would have been clamped back to 30 June: the run day is the business day for that reason.
+  assert.equal(resolvePostingDate(businessDay('2026-06-30T23:30:00.000Z'), { today: '2026-06-30', lockDate: null }).date, '2026-06-30')
 })

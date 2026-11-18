@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
 import { refusedCreditNoteError as refusedCreditNoteErrorOf } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { composeFinalBeforePost, creditNoteBeforePost, euCreditNoteSchemePostingRefusal, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
@@ -3886,6 +3887,7 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   DAILY_BATCH_INVENTORY_RECONCILIATION: POST_EFFECT_JOURNAL,
   DAILY_BATCH_COGS_RECONCILIATION: POST_EFFECT_JOURNAL,
   DAILY_BATCH_TRANSIT_RECONCILIATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_GRIR_RECLASS: POST_EFFECT_JOURNAL,
   UNEARNED_REV_REVERSAL: POST_EFFECT_JOURNAL,
   // Added by the compiler, not by hand: this Record is exhaustive over AccountingSyncType on
   // purpose (o3d-e2mz r4), so a type merged since — o3d-0i5y's allocation reversal — fails the
@@ -6973,6 +6975,7 @@ export async function processClaimedEntry(
     case 'DAILY_BATCH_INVENTORY_RECONCILIATION':
     case 'DAILY_BATCH_COGS_RECONCILIATION':
     case 'DAILY_BATCH_TRANSIT_RECONCILIATION':
+    case 'DAILY_BATCH_GRIR_RECLASS':
     case 'UNEARNED_REV_REVERSAL':
     // o3d-0i5y r9: the orphaned-allocation reversal. A plain manual journal like every other type
     // in this group — the amount is decided (and evidenced) at staging time, not here.
@@ -8328,7 +8331,7 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // Resolved HERE rather than left undefined for processEntry to fill from the wall
     // clock. An unset date made the allocation body differ on every execution, so a
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
-    date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+    date: (payload.date as string | undefined)?.slice(0, 10) || businessDateYmd(new Date()),
     sourceEntryId: entryId,
   }, { from: 'postedRow', record: origin })
 }

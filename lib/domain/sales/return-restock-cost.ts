@@ -1,7 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSyncTxWithOutcome } from '@/lib/accounting'
 import { withSavepoint } from '@/lib/db/savepoint'
-import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import type { PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { buildInventoryAdjustmentJournal } from '@/lib/domain/inventory/stock-adjustment-apply'
 import { getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
@@ -171,6 +171,9 @@ export async function queueReturnRestockValueJournal(
       // No reason account (none chosen, or it has no GL code) or no Inventory account: the value entered stock but the
       // ledger was told nothing. Owed, like any unqueued posting; a missing connector account is `not-configured`.
       if (!reasonAccountCode && settings.inventoryAccount) {
+        // Nothing was enqueued: no reason account means no journal to enqueue. The owed outcome is held by name and
+        // forwarded, as the manufacturing journal does for a retired chart, never built inline at the report.
+        const unmappedAccountOutcome: EnqueueOutcomeLike = { queued: false, reason: 'refused', connector: settings.connector }
         await reportPostingNotQueued({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: params.inboxId,
@@ -179,8 +182,8 @@ export async function queueReturnRestockValueJournal(
           posting: `the inventory journal for the restocked return of ${product?.sku ?? productId} at ${params.warehouse.name}`,
           committed: 'the return stock movement and its cost layer are written in IMS',
           remedy: 'Choose an adjustment reason with a GL account when restocking. Inventory in the ledger no longer matches IMS by the value of this restock; post the journal by hand (Dr Inventory / Cr the stock-gain account).',
-          outcome: { queued: false },
-          metadata: { inboxId: params.inboxId, productId, warehouseId: params.warehouse.id, adjustmentReasonId: params.adjustmentReasonId ?? null },
+          outcome: unmappedAccountOutcome,
+          metadata: { inboxId: params.inboxId, productId, warehouseId: params.warehouse.id, adjustmentReasonId: params.adjustmentReasonId ?? null, chartConnector: settings.connector },
           inTransaction: {
             client: tx as unknown as PostingRefusalClient,
             withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),

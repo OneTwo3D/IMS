@@ -6,7 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { isDeclarableCn8, normalizeCn8 } from '@/lib/trade/cn-validate'
 import { DEFAULT_COUNTRY_OF_ORIGIN, toIsoCountryCode } from '@/lib/countries'
-import type { WmsClearableProductField, WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
+import type { WmsClearableProductField, WmsClearClaim, WmsProductDto, WmsProductRef } from '@/lib/connectors/wms/types'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { mintsoftProducerSeam } from '../producer-seam'
@@ -14,7 +14,7 @@ import { snapshotFromRow } from '@/lib/domain/product-content/store'
 import { classifyIdentifierCodes, sameCode, type IdentifierCodes } from '@/lib/domain/products/identifiers'
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
 import { classifyMintsoftProductRecord } from '../api/normalizers'
-import { mintsoftFieldIsEmpty } from '../api/client'
+import { mintsoftCanClear, mintsoftFieldIsEmpty } from '../api/client'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
 import { applyMintsoftProductParity, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
 import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation, type ParentDeletionCounters } from './parent-sku-deletion'
@@ -53,7 +53,7 @@ export const PRODUCT_SYNC_CANDIDATE_SELECT = {
   parent: { select: { name: true, weight: true, widthCm: true, heightCm: true, depthCm: true } },
   content: { select: { shortDescription: true, longDescription: true, images: true } },
   // Customs fields emptied in IMS (value -> nothing): the only evidence that Mintsoft's copy is to be cleared.
-  customsClears: { select: { field: true } },
+  customsClears: { select: { field: true, createdAt: true } },
   wmsProductLinks: {
     where: { connector: 'mintsoft' },
     select: {
@@ -94,7 +94,7 @@ export type ProductSyncCandidate = {
   parent?: { name: string; weight: Prisma.Decimal | null; widthCm: Prisma.Decimal | null; heightCm: Prisma.Decimal | null; depthCm: Prisma.Decimal | null } | null
   content?: { shortDescription: string | null; longDescription: string | null; images: Prisma.JsonValue } | null
   /** Customs fields emptied in IMS; absent on a candidate built without the relation (none). */
-  customsClears?: Array<{ field: string }>
+  customsClears?: Array<{ field: string; createdAt?: Date }>
   wmsProductLinks: Array<{
     id: string
     externalProductId: string
@@ -316,6 +316,82 @@ export function resolveSettledCustomsMarkers(
   const pending = new Set(resolveMintsoftCustomsClears(product, remoteRaw, marked).map((f) => IMS_FIELD_OF_WMS_CLEAR[f]))
   // The origin marker is never settled here: while the origin stays blank it also stops the CN default being re-declared.
   return marked.filter((m) => m !== 'countryOfOrigin' && !pending.has(m as never))
+}
+
+/** What a clear is told about the marker it was planned from: the version (createdAt) the planner saw. */
+export type PlannedClearMarkers = Partial<Record<WmsClearableProductField, Date>>
+
+export function plannedClearMarkers(markers: ReadonlyArray<{ field: string; createdAt?: Date }>): PlannedClearMarkers {
+  const out: PlannedClearMarkers = {}
+  for (const [wmsField, imsField] of Object.entries(IMS_FIELD_OF_WMS_CLEAR) as Array<[WmsClearableProductField, string]>) {
+    const marker = markers.find((m) => m.field === imsField)
+    if (marker?.createdAt) out[wmsField] = marker.createdAt
+  }
+  return out
+}
+
+/**
+ * The claim taken around each clear request. Planning read the product and its markers some time before the request goes out; a
+ * refill in between (the trigger then removes the marker) must not still send the clear. So immediately before the request the
+ * marker row is locked (`FOR UPDATE`) and re-read in a transaction that stays open until the request settles: the clear goes
+ * only while the SAME marker (same `createdAt`, so not a later empty -> refill -> empty cycle) is current and the IMS field is
+ * still empty. A refill that races the request blocks on the lock (its trigger deletes the marker) and lands after it; one that
+ * landed before finds the marker gone, or the field filled, and the clear is skipped.
+ */
+export function buildCustomsClearClaim(productId: string, planned: PlannedClearMarkers): WmsClearClaim {
+  return async <T>(field: WmsClearableProductField, send: () => Promise<T>) => {
+    const imsField = IMS_FIELD_OF_WMS_CLEAR[field]
+    const plannedAt = planned[field]
+    if (!plannedAt) return { claimed: false as const, reason: 'no marker was planned for this clear' }
+    return db.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<Array<{ createdAt: Date }>>(
+        Prisma.sql`SELECT "createdAt" FROM "product_customs_clears" WHERE "productId" = ${productId} AND "field" = ${imsField} FOR UPDATE`,
+      )
+      if (rows.length === 0) return { claimed: false as const, reason: 'the field was filled again, so its clear marker is gone' }
+      if (rows[0].createdAt.getTime() !== plannedAt.getTime()) return { claimed: false as const, reason: 'the clear marker was replaced since the clear was planned' }
+      const current = await tx.product.findUnique({ where: { id: productId }, select: { hsCode: true, countryOfOrigin: true, customsDescription: true } })
+      if (!current) return { claimed: false as const, reason: 'the product no longer exists' }
+      if (trimToNull(current[imsField])) return { claimed: false as const, reason: 'the IMS field is no longer empty' }
+      return { claimed: true as const, value: await send() }
+    }, { timeout: 60_000, maxWait: 10_000 })
+  }
+}
+
+export const MINTSOFT_CANNOT_CLEAR_MESSAGE = 'Mintsoft cannot clear this field via the API — clear it in Mintsoft by hand'
+
+/**
+ * A marked clear of a field Mintsoft cannot clear through the API is never attempted. It is recorded ONCE per marker (the audit
+ * row is looked up first) so an operator knows to clear it by hand, and the marker is settled, except the origin's, which also
+ * stops the China default being re-declared over a cleared origin and so stays until the origin is filled again. Returns the
+ * fields recorded.
+ */
+export async function settleUnsupportedCustomsClears(
+  product: { id: string; sku: string; customsClears?: ReadonlyArray<{ field: string; createdAt?: Date }> },
+  externalProductId: string,
+  unsupported: readonly WmsClearableProductField[],
+): Promise<void> {
+  for (const field of unsupported) {
+    const imsField = IMS_FIELD_OF_WMS_CLEAR[field]
+    const marker = (product.customsClears ?? []).find((m) => m.field === imsField)
+    const summary = `Mintsoft cannot clear ${imsField} for ${product.sku}`
+    const already = await db.wmsMutationEvent.findFirst({
+      where: {
+        connector: 'mintsoft', action: 'product_upsert', entityType: 'PRODUCT', entityId: product.id, summary,
+        ...(marker?.createdAt ? { createdAt: { gte: marker.createdAt } } : {}),
+      },
+      select: { id: true },
+    })
+    if (!already) {
+      await recordWmsMutationEvent({
+        connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'FAILED',
+        entityType: 'PRODUCT', entityId: product.id, externalId: externalProductId,
+        summary, before: { field: imsField }, error: MINTSOFT_CANNOT_CLEAR_MESSAGE,
+      })
+    }
+    if (imsField !== 'countryOfOrigin') {
+      await db.productCustomsClear.deleteMany({ where: { productId: product.id, field: imsField } })
+    }
+  }
 }
 
 export function hashMintsoftProductDto(product: WmsProductDto): string {
@@ -836,11 +912,18 @@ async function syncOneMintsoftProduct(
     ? (context.product.customsClears ?? []).map((m) => m.field)
     : []
   const remoteRawForClears = authoritative ? (authoritative.raw ?? {}) : undefined
-  const clearFields = earlyExternalProductId ? resolveMintsoftCustomsClears(context.product, remoteRawForClears, markedFields) : []
+  const plannedClears = earlyExternalProductId ? resolveMintsoftCustomsClears(context.product, remoteRawForClears, markedFields) : []
+  // A field Mintsoft has no API way to clear is never sent (and so never retried): recorded once for the operator instead.
+  const clearFields = plannedClears.filter(mintsoftCanClear)
+  const unsupportedClears = plannedClears.filter((f) => !mintsoftCanClear(f))
+  const plannedMarkers = plannedClearMarkers(context.product.customsClears ?? [])
   // Markers whose Mintsoft copy is already empty are settled: drop them (no request needed).
   const settledMarkers = earlyExternalProductId ? resolveSettledCustomsMarkers(context.product, remoteRawForClears, markedFields) : []
   if (settledMarkers.length > 0) {
     await db.productCustomsClear.deleteMany({ where: { productId: context.product.id, field: { in: settledMarkers } } })
+  }
+  if (earlyExternalProductId && unsupportedClears.length > 0) {
+    await settleUnsupportedCustomsClears(context.product, earlyExternalProductId, unsupportedClears)
   }
   // An origin the operator CLEARED (marked, still blank) is not re-declared as the CN default on an update, which would undo the
   // clear. An origin that was merely never set keeps the CN default exactly as before. This marker is kept after the clear
@@ -1092,7 +1175,7 @@ async function syncOneMintsoftProduct(
       externalProductId,
       omitBarcode: barcodePlan.omitBarcode,
       ...(identifierPlan ? { omitMpn: identifierPlan.omitMpn } : {}),
-      ...(externalProductId && clearFields.length ? { clearFields } : {}),
+      ...(externalProductId && clearFields.length ? { clearFields, clearClaim: buildCustomsClearClaim(context.product.id, plannedMarkers) } : {}),
     }, upsertSeam.clearance)
   } catch (error) {
     await recordWmsMutationEvent({
@@ -1114,6 +1197,8 @@ async function syncOneMintsoftProduct(
     })
   }
   const rejectedClears = synced.clearOutcome?.rejected ?? []
+  // A clear skipped by the claim (the field was refilled meanwhile) is not a failure and is not retried.
+  const skippedClears = synced.clearOutcome?.skipped ?? []
   if (rejectedClears.length > 0) payloadHash = `${payloadHash}:clear-pending`
   const upsertEvent = {
     connector: 'mintsoft', direction: 'OUTBOUND', action: 'product_upsert', outcome: 'SUCCEEDED',
@@ -1122,7 +1207,7 @@ async function syncOneMintsoftProduct(
       ? `Mintsoft product updated for ${context.product.sku}`
       : `Mintsoft product created for ${context.product.sku}`,
     before: { externalProductId: externalProductId ?? null, payloadHash: existingLink?.payloadHash ?? null },
-    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, ...(identifierPlan ? { mpnOmitted: identifierPlan.omitMpn } : {}), payloadHash, ...(rejectedClears.length ? { rejectedClears } : {}) },
+    after: { externalProductId: synced.externalId, sku: dto.sku, barcodeOmitted: barcodePlan.omitBarcode, ...(identifierPlan ? { mpnOmitted: identifierPlan.omitMpn } : {}), payloadHash, ...(rejectedClears.length ? { rejectedClears } : {}), ...(skippedClears.length ? { skippedClears } : {}) },
   } as const
 
   // The event records only AFTER the local link persisted (Codex r2) — a link

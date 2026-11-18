@@ -31,7 +31,8 @@ import { logActivity } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { toDecimal, subtractMoney, addMoney, type Decimal } from '@/lib/domain/math/decimal'
-import { parseBatchDay, utcDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { businessDay, parseBatchDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { businessDateYmd } from '@/lib/business-date'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { foreignCurrencyRateRefusal } from '@/lib/domain/accounting/foreign-currency-rate-guard'
 import { ledgerSalesInvoiceTotalForeign } from '@/lib/domain/accounting/settlement-status'
@@ -226,7 +227,7 @@ export function planPaymentMatch(facts: MatchFacts): MatchPlan {
     return plan(status, reason, text, mapped, amountDue)
   }
 
-  const day = utcDay(facts.paidAt)
+  const day = businessDay(facts.paidAt)
   if (facts.lockDate && day && day <= facts.lockDate) {
     return plan('BLOCKED', 'LOCKED_PERIOD', `the receipt is dated ${day}, on or before the Xero books lock date ${facts.lockDate}; its date is not moved`, mapped, due)
   }
@@ -307,7 +308,7 @@ async function registrationsAreOwed(): Promise<boolean> {
 
 function isHeld(paidAt: Date): boolean {
   if (paymentMatchingSeams.outboundHeld) return paymentMatchingSeams.outboundHeld(paidAt)
-  return xeroProducerSeamVerdict({ connector: 'xero', type: 'INVOICE_PAYMENT', payload: { paymentDate: paidAt.toISOString().slice(0, 10) } }).kind === 'shadow'
+  return xeroProducerSeamVerdict({ connector: 'xero', type: 'INVOICE_PAYMENT', payload: { paymentDate: businessDateYmd(paidAt) } }).kind === 'shadow'
 }
 
 /**
