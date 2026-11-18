@@ -91,6 +91,11 @@ export type MintsoftSettings = {
   mintsoft_channel_id: string
   /** Optional Mintsoft WarehouseId that further scopes the inbound delta. */
   mintsoft_warehouse_id: string
+  /**
+   * 'true' sends the order's mirrored IOSS number as `IOSSNumber` on the order CREATE push (only when the order has one). Anything
+   * else, including unset, is OFF: the push payload is then identical to what it was before the setting existed.
+   */
+  mintsoft_send_ioss_number: string
 }
 
 export const MINTSOFT_SETTING_KEYS = [
@@ -106,6 +111,7 @@ export const MINTSOFT_SETTING_KEYS = [
   'mintsoft_client_id',
   'mintsoft_channel_id',
   'mintsoft_warehouse_id',
+  'mintsoft_send_ioss_number',
 ] as const
 
 // `{id}` is substituted with the Mintsoft internal order id. Matches the proven
@@ -127,6 +133,7 @@ const MINTSOFT_DEFAULTS: MintsoftSettings = {
   mintsoft_client_id: '',
   mintsoft_channel_id: '',
   mintsoft_warehouse_id: '',
+  mintsoft_send_ioss_number: '',
 }
 
 /**

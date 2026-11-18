@@ -2,6 +2,8 @@
  * WooCommerce → IMS order import.
  */
 
+import { readWcLineCustomsUnitValue } from './duty-tax-mirror'
+import { mirrorIossFromRegime } from './duty-tax-regime-mirror'
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
 import { advancePullCursor, laterCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
@@ -1378,6 +1380,44 @@ export function wclcComponentColumns(wcOrder: WcFullOrder): {
   return { wclcDutyComponent: c.dutyComponent, wclcTaxComponent: c.taxComponent, wclcHandlingComponent: c.handlingComponent }
 }
 
+/**
+ * The wclc components follow WooCommerce on an update, but the fee lines and the invoice built from them are NOT rebuilt. When a delivery moves a
+ * component away from what was stored (so the split no longer matches the retained fee lines and invoice) an operator is told: one WARNING on the
+ * order's activity naming the old and new values. Nothing is changed beyond the mirrored columns. A stored value that was not read (undefined) is not compared.
+ */
+async function warnWhenWclcComponentsMoved(
+  orderId: string,
+  wcOrder: WcFullOrder,
+  stored: { wclcDutyComponent?: unknown; wclcTaxComponent?: unknown; wclcHandlingComponent?: unknown } | null,
+): Promise<void> {
+  if (!stored || !Array.isArray(wcOrder.meta_data)) return
+  const incoming = wclcComponentColumns(wcOrder)
+  const pairs: Array<[string, unknown, string | null]> = [
+    ['duty', stored.wclcDutyComponent, incoming.wclcDutyComponent],
+    ['import VAT', stored.wclcTaxComponent, incoming.wclcTaxComponent],
+    ['handling', stored.wclcHandlingComponent, incoming.wclcHandlingComponent],
+  ]
+  const text = (v: unknown) => (v === null || v === undefined ? null : String(v))
+  const moved = pairs.filter(([, before, after]) => {
+    if (before === undefined) return false
+    const b = text(before)
+    if (b === null || after === null) return b !== after
+    return !toDecimal(b).eq(toDecimal(after))
+  })
+  if (moved.length === 0) return
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'wc_duty_tax_components_changed',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `WooCommerce changed the duty/tax split of order ${wcOrder.number} after import (${moved.map(([name, b, a]) => `${name}: ${text(b) ?? 'none'} to ${a ?? 'none'}`).join('; ')}). `
+      + 'The components shown on the order now follow WooCommerce, but the fee lines and the sales invoice were built from the earlier split and were not rebuilt. Check them against WooCommerce.',
+    metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), moved: moved.map(([name, b, a]) => ({ name, before: text(b), after: a })) },
+    resolveUser: false,
+  })
+}
+
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string, snapshotVersion?: string): Promise<PaidBlockOutcome> {
   // WOOCOMMERCE HAS ANONYMISED THIS ORDER (positive marker): mirror it FIRST, so the update below reads the erasure marker under the order lock
   // and withholds the placeholder values WooCommerce now holds. Idempotent (an erased order is a no-op); a failure throws and the delivery retries.
@@ -1451,6 +1491,7 @@ async function updateExistingWcOrderCore(
   const payloadHasCreditConflict = reclassified.signalProblems.length > 0
   let reviewFlagged = false
   let repopulationRefused = false
+  let storedComponents: { wclcDutyComponent?: unknown; wclcTaxComponent?: unknown; wclcHandlingComponent?: unknown } | null = null
   await db.$transaction(async (tx) => {
     // Only a payload that shows credit or any credit-evidence problem can need a review; the steady state reads nothing.
     if (payloadCredit.gt(0) || payloadHasCreditConflict) {
@@ -1478,6 +1519,10 @@ async function updateExistingWcOrderCore(
     // rest of the update (shipping, paid state, order number) proceeds exactly as before.
     await lockSalesOrder(tx, orderId)
     const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true } })
+    // The stored split is read only when this delivery carries one (an order without wclc components reads nothing extra).
+    if (Array.isArray(wcOrder.meta_data) && Object.values(wclcComponentColumns(wcOrder)).some((v) => v !== null)) {
+      storedComponents = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
+    }
     const erased = erasure?.erasedAt != null
     // EDITED IN IMS (owner-ruled desync, o3d-tgt2j policy): an operator edited this order here after confirming it, so WooCommerce's copy of the fields the edit can set (addresses, notes, shipping label / courier) is the
     // ORIGINAL and must not be written back over the edit. Paid state, the order number and the VAT number still mirror; the lines and total never did (see order-edit-drift.ts).
@@ -1508,9 +1553,9 @@ async function updateExistingWcOrderCore(
         ...(!keepImsEdit && Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
           ? (({ shippingService, courierKey, shippingMethodId }) => ({ shippingService, courierKey, shippingMethodId }))(mapWcShipping(wcOrder))
           : {}),
-        // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
-        // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
-        // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
+        // The wclc components FOLLOW WooCommerce on every delivery (stored as reported, never recomputed, D5; not personal data, so erased and
+        // IMS-edited orders keep following them). No line or invoice is rebuilt from them (surfaceWcOrderEditDrift reports a moved split).
+        ...(Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
         ...(erased || keepImsEdit
           ? {}
           : {
@@ -1535,9 +1580,21 @@ async function updateExistingWcOrderCore(
         unregisteredPaidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
       },
     })
+    // The per-line customs value override follows WooCommerce too, matched on the WooCommerce line item id (the lines themselves are not rebuilt here).
+    if (Array.isArray(wcOrder.line_items)) {
+      for (const item of wcOrder.line_items) {
+        // A line item that carries no meta list says nothing about the override: leave the stored value alone.
+        if (typeof item?.id !== 'number' || !Array.isArray(item.meta_data)) continue
+        await tx.salesOrderLine.updateMany({
+          where: { orderId, externalLineItemId: item.id },
+          data: { wcCustomsUnitValue: readWcLineCustomsUnitValue(item) },
+        })
+      }
+    }
   })
 
   if (repopulationRefused) await recordRepopulationRefused(orderId, wcOrder)
+  await warnWhenWclcComponentsMoved(orderId, wcOrder, storedComponents)
 
   if (reviewFlagged) {
     await logActivity({
@@ -3196,6 +3253,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       // the marker permanently (Codex review r4). An unresolved marker is recovered by
       // sweepUnresolvedDirectCreateMarkers instead, which waits out the import's grace window.
       // It also keeps this, the hot path, free of the feature entirely.
+      await mirrorIossFromRegime(heldOrderId)
       return { success: true, orderId: heldOrderId }
     }
     // THE SINGLE PIVOT (o3d-tj6v r4). This one read answers both "create or update?" and "is this
@@ -3570,6 +3628,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         productId: l.productId,
         externalLineItemId: l.externalLineItemId,
         wclcFeeKind: l.wclcFeeKind ?? null,
+        wcCustomsUnitValue: l.wcCustomsUnitValue ?? null,
         sku: l.sku,
         description: l.description,
         qty: l.qty,
@@ -3937,6 +3996,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           },
         })
       }
+      // The stamped regime is mirrored on EVERY successful create-path return (held invoice, non-processing, initial import), not only the
+      // fully accounted one.
+      await mirrorIossFromRegime(so.id)
       return { success: true as const, orderId: so.id }
     }
 
@@ -4286,6 +4348,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       resolveUser: false,
     })
 
+    await mirrorIossFromRegime(so.id)
     return { success: true, orderId: so.id }
   } catch (e) {
     if (e instanceof WcImportErasedRetry) return { success: false, error: e.message, erasedRetry: { customerId: e.customerId } }

@@ -99,6 +99,9 @@ export async function eraseOrdersPersonalDataInTx(
         erasedAt,
       },
     })).count
+    // CUSTOM FIELD VALUES on these orders: operator-entered free text can name or describe the person, so every value is deleted with the order's
+    // personal data (the field definitions are not personal and stay). An erased order refuses new values (values-service.ts, under the order lock).
+    await tx.customFieldValue.deleteMany({ where: { salesOrderId: { in: ids } } })
     counts.shipments += (await tx.shipment.updateMany({ where: { orderId: { in: ids }, trackingNumber: { not: null } }, data: { trackingNumber: null } })).count
     counts.shoppingOrderLinks += (await tx.shoppingOrderLink.updateMany({ where: { orderId: { in: ids } }, data: { metadata: Prisma.JsonNull } })).count
     counts.wmsStatusSnapshots += (await tx.wmsOrderStatusSnapshot.updateMany({

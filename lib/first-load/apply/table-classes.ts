@@ -64,6 +64,8 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   invoice_store_publications: { kind: 'MUST_BE_EMPTY', reason: 'what was written to the storefront about the customer invoice of existing orders' },
   landed_cost_links: { kind: 'MUST_BE_EMPTY', reason: 'landed-cost records' },
   landed_cost_revaluation_runs: { kind: 'MUST_BE_EMPTY', reason: 'landed-cost records' },
+  custom_field_definitions: { kind: 'CONFIG_ALLOWED', reason: 'operator-defined custom field definitions: configuration set in settings; the runner never writes it' },
+  custom_field_values: { kind: 'MUST_BE_EMPTY', reason: 'values of custom fields on products and sales orders: operator-entered data (order values can hold personal data) that a first load starts without' },
   location_stock_buffers: { kind: 'CONFIG_ALLOWED', reason: 'operator-set channel hold-back quantities; availability configuration, not stock history, and no stock row is created by one' },
   manufacturing_cost_lines: { kind: 'MUST_BE_EMPTY', reason: 'manufacturing cost records' },
   notification_read_receipts: { kind: 'CONFIG_ALLOWED', reason: 'which operator read which notification' },

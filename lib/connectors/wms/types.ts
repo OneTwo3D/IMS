@@ -425,6 +425,14 @@ export type WmsOrderPushInput = {
   phone: string | null
   /** Customer VAT/IOSS number for customs declarations; null when not provided. */
   vatNumber: string | null
+  /**
+   * TRUE ONLY WHEN the order's EU VAT stamp is IOSS (absent otherwise). The IOSS number itself is NOT carried here: it is the shop's one
+   * number, resolved from the CURRENT `shop_ioss_number` setting at create time, so a change or clear never leaves a queued order with a
+   * stale copy. Whether a connector sends it is the connector's own setting (Mintsoft: `mintsoft_send_ioss_number`, default off).
+   */
+  iossStamped?: boolean
+  /** Set by the connector at create time from the current shop setting (never by the sweep). Absent unless the connector decided to send it. */
+  iossNumber?: string | null
   comments: string | null
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null

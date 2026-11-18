@@ -20,6 +20,7 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   advancePoStatus,
+  approvePurchaseOrder,
   confirmAndSendPurchaseOrder,
   sendPurchaseOrderEmail,
   updatePoTracking,
@@ -86,6 +87,9 @@ type Props = {
   poEmailEnabled: boolean
   /** May this user write the internal per-line notes (purchasing.create). */
   canEditLineNotes?: boolean
+  /** The signed-in user holds `purchasing.approve` (the server re-checks it, and that they are not the order's creator). */
+  canApprove?: boolean
+  currentUserId?: string
   /** Supplier SKU per product id, from the supplier's product mapping (getSupplierLastPrices). */
   supplierSkus?: Record<string, string | null>
 }
@@ -2052,7 +2056,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false }: Props) {
+export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false, canApprove = false, currentUserId }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2142,6 +2146,18 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
     })
   }
 
+  function handleApprove() {
+    setError('')
+    setNotice('')
+    startTransition(async () => {
+      const result = await approvePurchaseOrder(po.id)
+      if (result.success) {
+        setNotice('The purchase order is approved. It can now be sent to the supplier.')
+        router.refresh()
+      } else setError(result.error ?? 'Failed')
+    })
+  }
+
   function handleEmailPo() {
     setError('')
     setNotice('')
@@ -2195,6 +2211,19 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[po.status]}`}>
           {STATUS_LABELS[po.status]}
         </span>
+        {po.approvalState === 'AWAITING' && (
+          <span
+            className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-900 dark:bg-amber-900 dark:text-amber-100 border-amber-200"
+            title="This order is at or above the approval threshold and cannot be sent to the supplier until an approver approves it."
+          >
+            Awaiting approval
+          </span>
+        )}
+        {po.approvalState === 'APPROVED' && po.approvedAt && (
+          <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 border-green-200">
+            Approved{po.approvedByName ? ` by ${po.approvedByName}` : ''} on {new Date(po.approvedAt).toLocaleDateString()}
+          </span>
+        )}
         {closedShort && (
           <span
             className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-900 dark:bg-amber-900 dark:text-amber-100 border-amber-200"
@@ -2219,6 +2248,15 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
           </span>
         )}
         <div className="flex items-center gap-2 ml-auto">
+          {po.approvalState === 'AWAITING' && canApprove && !editing && (
+            po.createdById && po.createdById === currentUserId ? (
+              <span className="text-xs text-muted-foreground">You created this order, so another approver must approve it.</span>
+            ) : (
+              <Button size="sm" onClick={handleApprove} disabled={isPending}>
+                {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-1" />}Approve
+              </Button>
+            )
+          )}
           {canEdit && !editing && (
             <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
               <Pencil className="h-4 w-4 mr-1" />Edit
