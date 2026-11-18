@@ -12,9 +12,10 @@ import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { WmsOrderPushChip } from '@/components/sales/wms-order-push-chip'
 import type { WmsOrderPushStateView } from '@/app/actions/wms-order-push'
 import { MergeCandidateBadge } from '@/components/sales/merge-candidate-badge'
+import { MergeHoldBadge } from '@/components/sales/merge-hold-badge'
 import { ShopRefundBadge } from '@/components/sales/shop-refund-badge'
 import type { ShopRefundBadgeView } from '@/app/actions/shop-refund-tasks'
-import type { MergeCandidateBadgeView } from '@/app/actions/wms-merge-candidates'
+import type { MergeCandidateBadgeView, MergeHoldBadgeView } from '@/app/actions/wms-merge-candidates'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -121,6 +122,7 @@ type Props = {
   wmsOrderStatus?: WmsOrderStatusView | null
   wmsPushState?: WmsOrderPushStateView | null
   mergeCandidate?: MergeCandidateBadgeView | null
+  mergeHold?: MergeHoldBadgeView | null
   shopRefundDue?: ShopRefundBadgeView | null
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
@@ -1236,7 +1238,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, mergeHold = null, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -1787,6 +1789,11 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
           {mergeCandidate && (
             <span className="inline-flex items-center self-center">
               <MergeCandidateBadge view={mergeCandidate} />
+            </span>
+          )}
+          {mergeHold && (
+            <span className="inline-flex items-center self-center">
+              <MergeHoldBadge view={mergeHold} />
             </span>
           )}
           {canCancel && (

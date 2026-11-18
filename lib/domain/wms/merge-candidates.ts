@@ -15,6 +15,8 @@ import {
   type MergeCandidateOrder,
   type MergeGroup,
 } from './merge-candidate-match'
+import { isMergeHoldEnabled, placeMergeHolds, type MergeHoldPlacement } from './merge-hold'
+import { prismaMergeHoldPort } from './merge-hold-port'
 import { mergeCandidateQuery, raiseWmsOperatorTask, wmsOperatorTaskHash, type WmsOperatorTaskPayload } from './operator-tasks'
 
 /**
@@ -66,6 +68,11 @@ export type MergeCandidatePort = {
   isOwed(connector: string): Promise<boolean>
   /** Resolve this connector's OPEN merge-candidate tasks whose group is not in `keepBases`. Returns how many. */
   resolveTasksNotIn(connector: string, keepBases: readonly string[]): Promise<number>
+  /**
+   * OPTIONAL (merge holds, setting `wms_merge_hold_enabled`, off by default): hold the orders of these groups in the warehouse. Absent, or the setting off,
+   * it does nothing and the pass is exactly the flag-mode pass. A failure is caught by the pass and never fails the detection.
+   */
+  placeHolds?(env: MergeCandidateEnvironment, groups: readonly MergeGroup[]): Promise<MergeHoldPlacement | null>
   /** Run the whole compute, raise, resolve pass holding the connector's detection lock; `null` when another pass holds it. */
   withLock<T>(connector: string, fn: () => Promise<T>): Promise<T | null>
   now(): Date
@@ -74,7 +81,7 @@ export type MergeCandidatePort = {
 export type MergeCandidateRun =
   | { mode: 'off'; groups: [] }
   | { mode: 'flag'; skipped: string; groups: [] }
-  | { mode: 'flag'; groups: MergeGroup[]; created: number; reopened: number; resolved: number }
+  | { mode: 'flag'; groups: MergeGroup[]; created: number; reopened: number; resolved: number; /** Present only when merge holds are on. */ holds?: MergeHoldPlacement }
 
 /** The groups, computed from the port's data. Writes nothing. */
 async function computeGroups(port: MergeCandidatePort, env: MergeCandidateEnvironment): Promise<MergeGroup[]> {
@@ -129,13 +136,26 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
     }
     // A stale group is not kept: an open task it already had is resolved like any group that stopped qualifying.
     const resolved = await port.resolveTasksNotIn(env.connectorId, kept)
-    return { mode: 'flag', groups: groups.filter((group) => kept.includes(group.basis)), created, reopened, resolved }
+    const keptGroups = groups.filter((group) => kept.includes(group.basis))
+    // MERGE HOLDS (off by default): only groups that still qualified under their order locks just now are held. Non-fatal.
+    let holds: MergeHoldPlacement | null = null
+    if (port.placeHolds) {
+      try {
+        holds = await port.placeHolds(env, keptGroups)
+      } catch (error) {
+        console.warn(`[wms-merge-candidates] merge holds failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return { mode: 'flag', groups: keptGroups, created, reopened, resolved, ...(holds ? { holds } : {}) }
   }
   const pass = await port.withLock(env.connectorId, async () => {
     let result = await onePass()
     if (await port.isOwed(env.connectorId)) {
       const again = await onePass()
-      result = { mode: 'flag', groups: again.groups, created: result.created + again.created, reopened: result.reopened + again.reopened, resolved: result.resolved + again.resolved }
+      const holds = result.holds || again.holds
+        ? { held: (result.holds?.held ?? 0) + (again.holds?.held ?? 0), refused: (result.holds?.refused ?? 0) + (again.holds?.refused ?? 0), failed: (result.holds?.failed ?? 0) + (again.holds?.failed ?? 0), shadowed: (result.holds?.shadowed ?? 0) + (again.holds?.shadowed ?? 0), skipped: (result.holds?.skipped ?? 0) + (again.holds?.skipped ?? 0) }
+        : undefined
+      result = { mode: 'flag', groups: again.groups, created: result.created + again.created, reopened: result.reopened + again.reopened, resolved: result.resolved + again.resolved, ...(holds ? { holds } : {}) }
     }
     return result
   })
@@ -222,6 +242,10 @@ export const prismaMergeCandidatePort: MergeCandidatePort = {
     return outcome !== null && typeof outcome === 'object' && 'lockSkipped' in outcome ? null : outcome as Awaited<ReturnType<typeof fn>>
   },
   readMode: () => readWmsMergeCandidateMode(),
+  async placeHolds(env, groups) {
+    if (!(await isMergeHoldEnabled())) return null
+    return placeMergeHolds(prismaMergeHoldPort, { connectorId: env.connectorId, connectorLabel: env.connectorLabel }, groups)
+  },
 
   async environment() {
     const state = await getIntegrationPluginState()

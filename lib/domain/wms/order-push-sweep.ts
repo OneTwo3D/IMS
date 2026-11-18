@@ -4670,6 +4670,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
             OR (l.scope_mode::text = 'MIXED' AND l.scope_dirty_at IS NOT NULL AND o.status::text IN ('SHIPPED', 'COMPLETED', 'DELIVERED'))
           )
           AND o."refundStatus"::text <> 'FULL'
+          -- An order on MERGE HOLD in the warehouse is not amended: the change is shown on Exceptions as "act in" the warehouse system (merge-hold.ts).
+          AND NOT EXISTS (SELECT 1 FROM wms_merge_holds h WHERE h.order_id = l."orderId" AND h.state::text IN ('HOLDING', 'HELD'))
           AND (
             o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
             -- An allocation / shipment writer marked the scope dirty (only read while the mixed-warehouse feature is on; a change the warehouse
@@ -4776,7 +4778,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       db.wmsOrderPushLink.findMany({
         // MERGED links are included (their survivor holds the goods); a link whose hold the WMS already refused carries a notice and is not retried.
         // despatchSettledAt: the warehouse's part has already left (mixed-warehouse scope; null while the feature is off): it is never held or cancelled there.
-        where: { connector, state: { in: ['SYNCED', 'MERGED'] }, holdNoticeAt: null, despatchSettledAt: null, externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
+        // An order on MERGE HOLD in the warehouse is never cancelled for a withdrawal / IMS hold: a person decides (merge-hold.ts escalates it).
+        where: { connector, state: { in: ['SYNCED', 'MERGED'] }, holdNoticeAt: null, despatchSettledAt: null, externalOrderId: { not: null }, order: { status: 'ON_HOLD', wmsMergeHolds: { none: { state: { in: ['HOLDING', 'HELD'] } } } } },
         select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true },
         take: limit,
       }) as Promise<WmsPushLinkRef[]>,
@@ -4789,7 +4792,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           // The warehouse's part of a mixed-warehouse order has already despatched: a full refund or cancel of the order never cancels it there.
           despatchSettledAt: null,
           externalOrderId: { not: null },
-          order: WMS_CANCELLABLE_ORDER_WHERE,
+          // ...and never cancelled while on merge hold (see the hold pass).
+          order: { AND: [WMS_CANCELLABLE_ORDER_WHERE, { wmsMergeHolds: { none: { state: { in: ['HOLDING', 'HELD'] } } } }] },
         },
         select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true, order: { select: { orderNumber: true } } },
         take: limit,

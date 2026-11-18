@@ -94,3 +94,28 @@ export async function saveMergeCandidateMode(input: unknown): Promise<{ success:
   revalidatePath('/sync')
   return { success: true }
 }
+
+export type MergeHoldBadgeView = {
+  /** HELD: on merge hold in the warehouse. NOT_HELD: IMS could not hold it (the badge says so). */
+  state: 'HELD' | 'NOT_HELD'
+  /** Held longer than MERGE_HOLD_REMIND_HOURS: the red badge. */
+  overdue: boolean
+  heldAt: string | null
+}
+
+/** The merge-hold badge for one sales order, or null (no hold row, the hold cleared, or the read failed: the order page must still render). A read of IMS's own table. */
+export async function getMergeHoldForSalesOrder(salesOrderId: string): Promise<MergeHoldBadgeView | null> {
+  await requireInternalUser()
+  try {
+    const row = await db.wmsMergeHold.findFirst({
+      where: { orderId: salesOrderId, state: { in: ['HOLDING', 'HELD', 'NOT_HELD'] } },
+      select: { state: true, heldAt: true, remindedAt: true },
+    })
+    if (!row) return null
+    if (row.state === 'NOT_HELD') return { state: 'NOT_HELD', overdue: false, heldAt: null }
+    return { state: 'HELD', overdue: row.remindedAt !== null, heldAt: row.heldAt ? row.heldAt.toISOString() : null }
+  } catch (error) {
+    console.error('[merge-holds] badge read failed', error instanceof Error ? error.message : String(error))
+    return null
+  }
+}

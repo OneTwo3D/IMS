@@ -151,6 +151,8 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   pushOrder: { family: 'mintsoft-write', memberOnly: true },
   updateOrder: { family: 'mintsoft-write', memberOnly: true },
   cancelOrder: { family: 'mintsoft-write', memberOnly: true },
+  holdOrder: { family: 'mintsoft-write', memberOnly: true },
+  holdMintsoftOrderForMerge: { family: 'mintsoft-write' },
   removeOrderItems: { family: 'mintsoft-write', memberOnly: true },
   cancelMergedOrder: { family: 'mintsoft-write', memberOnly: true },
   addOrderComment: { family: 'mintsoft-write', memberOnly: true },
