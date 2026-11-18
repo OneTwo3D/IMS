@@ -1152,6 +1152,9 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
     if (!existing) return { message: 'Transfer not found.' }
     const transition = validateStockTransferStatusTransition(existing.status, 'CANCELLED')
     if (!transition.success) return { message: transition.error }
+    // The state machine also models IN_TRANSIT -> CANCELLED (cancelDispatchedTransfer), but the PLAIN cancel
+    // performs no stock movement, so it is only safe from DRAFT. That restriction belongs here, not in the map.
+    if (existing.status !== 'DRAFT') return { message: 'Only a draft transfer can be cancelled here; cancel a dispatched transfer with cancelDispatchedTransfer.' }
 
     // 7ddn: close the dispatch/cancel race. Without the lock + conditional guard, a
     // concurrent dispatchTransfer (DRAFT→IN_TRANSIT, which decrements source stock)
@@ -1221,6 +1224,8 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
       if (transfer.status !== 'IN_TRANSIT') {
         throw new Error('Only an in-transit transfer can have its dispatch cancelled')
       }
+      const cancelTransition = validateStockTransferStatusTransition(transfer.status, 'CANCELLED')
+      if (!cancelTransition.success) throw new Error(cancelTransition.error)
 
       // STEP 3 of the lock order, before the line locks (step 4) below. Closes the transfer's open ASN in IMS so it
       // stops holding align-down and cannot be booked against a cancelled parent (o3d-hqvrp.120). No warehouse write.
