@@ -14,6 +14,8 @@ On a product's page, use the stock adjustment form: choose the warehouse, enter 
 - **Unit cost** (base currency). Leave blank to use the product's average cost. It is **required for an addition when the product has no existing cost** at all, because stock booked at zero would be sold later at zero cost; the form then refuses with a message asking for a unit cost. Enter **0** only for genuinely free stock such as samples.
 - Removals always take the cost of the oldest layers (FIFO), so no cost is asked for.
 
+**Removing stock that is reserved for orders.** A removal that is larger than the available stock (on hand minus reserved) is refused, with a message to release the reservations first. An administrator can switch on the setting `stock_adjustment_release_reserved` (off by default): a single removal, or a bulk batch of one line, then releases the allocations of the newest orders first, as far as the removal needs, in the same step, and records each release on the order. Allocations that a picked, packed or shipped shipment already covers, or that have already been posted to the accounts, are not released, and the removal is refused as before if that leaves too little. Transfers and purchase-order returns are not affected.
+
 ### Bulk Adjustment
 
 At **Stock Control > Stock Adjustments**, click **New Adjustment** to adjust several products in one batch.

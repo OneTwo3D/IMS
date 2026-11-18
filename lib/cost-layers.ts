@@ -28,6 +28,7 @@ import {
   type Decimal,
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
+import { businessDateYmd } from '@/lib/business-date'
 
 type TxClient = Prisma.TransactionClient
 type ShipmentCogsRevaluationSyncOptions = {
@@ -291,7 +292,7 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
     const abs = delta.abs().toNumber()
     const increase = delta.gt(0)
     return {
-      date: new Date().toISOString().slice(0, 10),
+      date: businessDateYmd(new Date()),
       reference: `Shipment COGS revaluation: ${input.shipmentId}`,
       narration: `Late landed cost on shipped units: shipment ${input.shipmentId} COGS ${oldCogs.toFixed(2)} to ${newCogs.toFixed(2)}, funded from the in-transit account`,
       lines: [
@@ -326,7 +327,7 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
   }
 
   return {
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     reference: `Shipment COGS revaluation: ${input.shipmentId}`,
     narration: `Reverse and repost shipment COGS after cost-layer revaluation for shipment ${input.shipmentId}`,
     lines,

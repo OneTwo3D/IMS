@@ -28,7 +28,7 @@ export type OrderDocumentMoneyInput = {
     discountAmount?: NumLike | null
     totalForeign: NumLike
     taxForeign?: NumLike | null
-    taxRate?: { rate: NumLike | null } | null
+    taxRate?: { rate: NumLike | null; reverseCharge?: boolean | null } | null
   }>
 }
 
@@ -99,4 +99,22 @@ export function invoiceDocumentIdentity(so: {
     reference,
     orderReference: reference === orderRef ? null : orderRef,
   }
+}
+
+/** The wording printed on an invoice that carries a reverse-charge line (the customer, not the seller, accounts for the VAT). */
+export const REVERSE_CHARGE_WORDING = 'Reverse charge: the customer is to account to the relevant tax authority for the VAT on the lines marked "Reverse charge".'
+
+/**
+ * The per-line VAT rate cell of a printed invoice, and the reverse-charge wording when any line is reverse-charged. A reverse-charge line
+ * prints "Reverse charge" (its VAT is not charged by the seller); a line with a rate prints it ("20%", "5%", "0%"); a line naming no rate prints "-".
+ */
+export function invoiceLineVatDetail(lines: ReadonlyArray<{ taxRate?: { rate: NumLike | null; reverseCharge?: boolean | null } | null }>): { rateCells: string[]; reverseChargeNote: string | null } {
+  const rateCells = lines.map((l) => {
+    if (l.taxRate?.reverseCharge) return 'Reverse charge'
+    if (l.taxRate?.rate == null) return '-'
+    const pct = n(l.taxRate.rate) * 100
+    return `${Number.isInteger(Math.round(pct * 100) / 100) ? pct.toFixed(0) : pct.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}%`
+  })
+  const anyReverse = lines.some((l) => l.taxRate?.reverseCharge)
+  return { rateCells, reverseChargeNote: anyReverse ? REVERSE_CHARGE_WORDING : null }
 }

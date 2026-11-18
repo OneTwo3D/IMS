@@ -36,6 +36,7 @@ import {
   countUnfinishedRefundReservationReleases,
   type OutstandingReleaseReadClient,
 } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
@@ -244,7 +245,7 @@ async function loadOrderLeafQuantities(
   // plan, so this check intentionally includes PICKING/PACKED rows as well as
   // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
   // validation: both transactions see the same active planned shipment set.
-  const [orderLines, activeShipmentLines, refundLines] = await Promise.all([
+  const [orderLines, activeShipmentLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
       // o3d-kouj: `fulfillmentRequirements` is the line's PINNED recipe — see the note below on
@@ -270,11 +271,10 @@ async function loadOrderLeafQuantities(
     // already nets refunds at BUILD time; this is the dispatch-time backstop for a shipment that
     // predates the refund. Runs under the order lock (transitionShipmentStatus), so a concurrent refund
     // is serialized.
-    client.salesOrderRefundLine.findMany({
-      where: { refund: { orderId } },
-      select: { salesOrderLineId: true, productId: true, qty: true },
-    }),
   ])
+  // o3d-hqvrp.77: units a refund RETURNED from already-shipped goods are not a cancellation, so they
+  // must not net out of what is still to ship.
+  const refundLines = await loadNettedRefundLines(client, { refund: { orderId } })
 
   // Shipment lines are LEAF-product rows: a kit order line expands to its component products, so a kit
   // line can have several shipment lines (one per component) under the same lineId. All quantities must
@@ -542,6 +542,15 @@ export async function confirmSalesOrderShipments(
       )
     }
 
+    // o3d-hqvrp.76: a hold stops fulfilment. Building shipments raised an ON_HOLD order to ALLOCATED
+    // (ON_HOLD -> ALLOCATED is a legal edge), silently lifting the hold, and for a withdrawal hold left
+    // withdrawalHoldAt set on an order that no longer showed as held. Refused before the first write.
+    if (so.status === 'ON_HOLD') {
+      throw new Error(
+        'This order is on hold, so shipments cannot be created for it. Release the hold first, then create the shipments.',
+      )
+    }
+
     const allocs = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },
@@ -574,10 +583,7 @@ export async function confirmSalesOrderShipments(
     // (refund state is orthogonal now and a refund does not delete allocations).
     // Allocations are leaf-product rows, so a refunded sales line is expanded to its
     // component requirements (kit/BOM aware) before reducing the matching allocations.
-    const shipmentRefundLines = await tx.salesOrderRefundLine.findMany({
-      where: { refund: { orderId } },
-      select: { salesOrderLineId: true, productId: true, qty: true },
-    })
+    const shipmentRefundLines = await loadNettedRefundLines(tx, { refund: { orderId } })
     const refundProductIds = [...new Set(
       shipmentRefundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
     )]
@@ -1474,6 +1480,12 @@ export async function transitionShipmentStatus(
     })
     if (lockedOrder && SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(lockedOrder.status))) {
       throw new Error(terminalOrderTransitionError(String(lockedOrder.status)))
+    }
+    // o3d-hqvrp.76: an ON_HOLD order's shipments do not advance (the dispatch branch already refuses
+    // it). A warehouse progress report (allowRecordWhenNotReady) is the goods' physical state, so it
+    // is still recorded, as the warehouse dispatch is.
+    if (lockedOrder?.status === 'ON_HOLD' && !input.allowRecordWhenNotReady) {
+      throw new Error('This order is on hold, so its shipments cannot be advanced. Release the hold, then continue picking and packing.')
     }
     await tx.$queryRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
     const locked = await tx.shipment.findUnique({

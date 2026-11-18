@@ -175,6 +175,7 @@ Found at **Settings > Custom fields** (needs the company settings permission). A
 
 - **Purchase units** — define units of measure with conversion factors (e.g. 1 case = 12 units)
 - **Landed cost distribution method** — choose how landed costs are allocated across purchase order lines
+- **Minimum margin** — the lowest gross margin a purchase order line may have, against the product's list price ex-VAT (Admin only). Set a **global minimum %** (0 to 99.99), and optionally a different minimum for individual **categories** and **products**; the most specific one wins (product, then its parent product, then category, then global). Choose **Warn** (the line is marked on the PO form) or **Block** (the server refuses to save or send the order until an override note is entered; the note is recorded on the order with who and when). Leave everything empty for no minimum, which is the default and changes nothing. A line whose margin cannot be worked out is never blocked. Internal only: see Purchasing, "Minimum margin (warn or block)".
 - **Purchase order approval threshold** — **Settings > Company > Documents**. An amount in base currency (ex VAT). A goods purchase order at or above it must be approved by a user holding the `purchasing.approve` permission (Administrators and Managers; never the order's creator) before it can be sent or emailed to the supplier. Blank or 0 (the default) means no approval is needed. See [Purchasing](purchasing.md#purchase-order-approval).
 
 ## Accounting Settings

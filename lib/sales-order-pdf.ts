@@ -75,7 +75,7 @@ export const SALES_ORDER_PDF_LINE_SELECT = {
   discountAmount: true,
   totalForeign: true,
   taxForeign: true,
-  taxRate: { select: { rate: true } },
+  taxRate: { select: { rate: true, reverseCharge: true } },
 } as const
 
 export async function loadSalesOrderForPdf(orderId: string): Promise<(SalesOrderPdfSource & { isQuote: boolean; status: string }) | null> {

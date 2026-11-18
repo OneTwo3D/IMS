@@ -6,6 +6,7 @@ export const FINANCE_ANALYTICS_LINKS = [
   { href: '/analytics/ar-aging', label: 'AR Aging' },
   { href: '/analytics/ap-aging', label: 'AP Aging' },
   { href: '/analytics/fx-gain-loss', label: 'FX Gain/Loss' },
+  { href: '/analytics/grir', label: 'GR/IR' },
 ] as const
 
 export function canAccessFinanceAnalytics(role: string | null | undefined): boolean {

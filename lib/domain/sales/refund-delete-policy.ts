@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { parseBatchDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -40,6 +41,7 @@ export const REFUND_DELETE_REFUSAL_CODES = [
   'in_transit_return',
   'warehouse_release_in_flight',
   'legacy_basis',
+  'exchange_refund',
 ] as const
 export type RefundDeleteRefusalCode = (typeof REFUND_DELETE_REFUSAL_CODES)[number]
 
@@ -117,16 +119,31 @@ export const refundDeleteRefusals = {
     code: 'warehouse_release_in_flight',
     message: 'The stock reservation for this refund is being released right now. Wait a few minutes and try again.',
   }),
+  exchangeRefund: (): RefundDeleteRefusal => ({
+    code: 'exchange_refund',
+    message: 'Replacement items were added to the order for this return (an exchange), and they have been reserved, shipped or invoiced on the strength of it. Deleting the refund would leave them unexplained, so it cannot be deleted here. Correct it with a new entry instead.',
+  }),
   legacyBasis: (): RefundDeleteRefusal => ({
     code: 'legacy_basis',
     message: 'This order has an older refund whose totals are not on the current net basis, so the order\'s refund status cannot be recalculated safely after a delete.',
   }),
 } as const
 
+/**
+ * The date of the journal / credit-note void that COUNTERS an earlier document of a refund: the later of the original's own day and today's BUSINESS (London) day, so a
+ * counter is never dated before what it counters. The original was dated on a London day (businessDateYmd at refund time), and the UTC day can be the day BEFORE it on a BST
+ * evening: a counter on the UTC day would land in the previous month / quarter from its original.
+ */
+export function refundDeleteCounterDate(originalDay: string | null, now: Date): string {
+  const today = businessDateYmd(now)
+  const original = originalDay === null ? null : parseBatchDay(originalDay)
+  return original !== null && original > today ? original : today
+}
+
 /** The day (YYYY-MM-DD) of a refund's credit note: the sync payload's own date when there is one, else the day the refund was recorded. */
 export function creditNoteDay(payloadDate: unknown, refundedAt: Date): string {
   const parsed = typeof payloadDate === 'string' ? parseBatchDay(payloadDate) : null
-  return parsed ?? refundedAt.toISOString().slice(0, 10)
+  return parsed ?? businessDateYmd(refundedAt)
 }
 
 /**

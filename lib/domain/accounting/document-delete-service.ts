@@ -28,7 +28,7 @@ import { asRoutableAccountingConnector } from '@/lib/accounting/connector-proven
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { DOCUMENT_DELETED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
-import { utcDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import {
   decideDocumentDelete,
   ledgerOwnershipVerdict,
@@ -68,7 +68,7 @@ export type DocumentDeleteCandidate = {
 }
 
 function dayOf(value: Date | string | null | undefined): string | null {
-  return utcDay(value)
+  return businessDay(value)
 }
 
 /** Read every fact the decision needs. Reads only; no network. */

@@ -18,7 +18,7 @@ mock.module('@/lib/domain/purchasing/purchasing-analytics', {
   namedExports: { getOpenPurchaseOrdersReport: boom, getSupplierPerformanceReport: boom, getPurchasePriceVarianceReport: boom, getSpendReport: boom, getLeadTimeReport: boom },
 })
 mock.module('@/lib/domain/finance/finance-period-analytics', {
-  namedExports: { getVatReport: boom, getArAgingReport: boom, getApAgingReport: boom, getCurrencySummaryReport: boom, getFxGainLossReport: boom },
+  namedExports: { getVatReport: boom, getArAgingReport: boom, getApAgingReport: boom, getCurrencySummaryReport: boom, getFxGainLossReport: boom, getGrirReport: boom },
 })
 mock.module('@/lib/domain/inventory/replenishment-reports', {
   namedExports: { getReorderReport: boom, getBackorderDemandReport: boom, getComponentShortageReport: boom },
@@ -50,7 +50,7 @@ test('purchasing exports return the not-computed CSV for every report', async ()
 
 test('finance exports return the not-computed CSV for every report', async () => {
   const { GET } = await import('../../app/api/export/finance-analytics/route.ts')
-  const first: Record<string, string> = { vat: 'side', 'ar-aging': 'partyName', 'ap-aging': 'partyName', 'currency-summary': 'currency', 'fx-gain-loss': 'side' }
+  const first: Record<string, string> = { vat: 'side', 'ar-aging': 'partyName', 'ap-aging': 'partyName', 'currency-summary': 'currency', 'fx-gain-loss': 'side', grir: 'supplierName' }
   for (const [report, col] of Object.entries(first)) {
     await assertNotComputed(await GET(new NextRequest(`http://localhost/api/export/finance-analytics?report=${report}`)), col, report)
   }

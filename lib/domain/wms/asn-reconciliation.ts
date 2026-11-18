@@ -11,6 +11,20 @@ import { addMoney, toDecimal } from '@/lib/domain/math/decimal'
 export const WMS_RECEIPT_QTY_EPSILON = 0.0001
 
 /**
+ * o3d-b8x0f. THE ONE DEFINITION of "this line has something new to book". The apply path and the dry run's
+ * `wouldCreateReceipt` / `wouldCreateCostLayer` must agree, so both use the epsilon: a delta at or below it is not actionable
+ * (and is not written to a `Decimal(12,4)` column that would round it away and leave it actionable for ever).
+ */
+export function bookedInDeltaIsActionable(currentReceivedQty: number, lastProcessedReceivedQty: number): boolean {
+  return currentReceivedQty - lastProcessedReceivedQty > WMS_RECEIPT_QTY_EPSILON
+}
+
+/** o3d-b8x0f. A line is fully booked in when what was processed reaches what was expected, within the same epsilon. */
+export function bookedInLineIsComplete(lastProcessedReceivedQty: number, expectedQty: number): boolean {
+  return lastProcessedReceivedQty >= expectedQty - WMS_RECEIPT_QTY_EPSILON
+}
+
+/**
  * The parent transfer statuses under which a `wms_asn_line_maps` row may still be
  * used to bring units into stock (6oyu.19, Codex round-7 HIGH-1).
  *

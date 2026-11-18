@@ -71,6 +71,7 @@ import {
   describeBomRecipeRefusal,
   syncBomRecipeFromProductComponents,
 } from '@/lib/products/bom-recipe'
+import { businessDateYmd } from '@/lib/business-date'
 
 type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
 
@@ -1087,7 +1088,7 @@ export async function updateManufacturingOrderStatus(
                   lines,
                 })}`,
                 payload: {
-                  date: now.toISOString().slice(0, 10),
+                  date: businessDateYmd(now),
                   reference,
                   narration,
                   lines,
@@ -2044,7 +2045,7 @@ export async function updateManufacturingCostLines(
               chartConnector: settings?.connector ?? null,
               idempotencyKey: reclassIdempotencyKey,
               payload: {
-                date: new Date().toISOString().slice(0, 10),
+                date: businessDateYmd(new Date()),
                 reference: `MFG-RECLASS: ${po.reference}`,
                 narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
                 lines: journalLines,

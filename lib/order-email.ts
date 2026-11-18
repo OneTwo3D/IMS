@@ -16,7 +16,7 @@ import {
 } from '@/lib/pdf'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
-import { orderDocumentMoney, drawTotalsRows, invoiceDocumentIdentity } from '@/lib/pdf-order-money'
+import { orderDocumentMoney, drawTotalsRows, invoiceDocumentIdentity, invoiceLineVatDetail } from '@/lib/pdf-order-money'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
@@ -91,17 +91,20 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   const { view, totalsRows } = orderDocumentMoney(so)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230, wrap: true },
+    { label: 'Description', width: 190, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
+    { label: 'VAT rate', width: 40, align: 'right' },
     { label: `${view.vatIsAdditional ? 'VAT' : 'incl. VAT'} (${sym})`, width: 55, align: 'right' },
     { label: `Total ${view.basisLabel} (${sym})`, width: 75, align: 'right' },
   ]
+  const vatDetail = invoiceLineVatDetail(so.lines)
   const rows = so.lines.map((l, i) => [
     String(i + 1),
     l.description + (l.sku ? ` (${l.sku})` : ''),
     String(Number(l.qty)),
     Number(l.unitPriceForeign).toFixed(2),
+    vatDetail.rateCells[i],
     Number(l.taxForeign ?? 0).toFixed(2),
     view.lines[i].total.toFixed(2),
   ])
@@ -110,6 +113,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   // keep the totals block together rather than splitting it across the page break.
   if (doc.y + 90 > 780) doc.addPage()
   drawTotalsRows(doc, totalsRows, (v) => formatMoney(v, sym, symPos), columns)
+  if (vatDetail.reverseChargeNote) doc.font('Helvetica-Bold').fontSize(8).fillColor('#444').text(vatDetail.reverseChargeNote, 50, doc.y + 6, { width: 495 })
 
   const base = await getBaseCurrencyDisplay()
   if (so.currency !== base.code) {
