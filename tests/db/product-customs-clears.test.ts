@@ -87,3 +87,11 @@ test('WooCommerce import: an empty native value WITH the cleared-fields meta emp
     assert.equal(row.hsCode, '85011099')
   })
 })
+
+test('the inherited-fields list is NOT NULL: a null is refused by the database, and the column default is an empty list', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const p = await make(tx, {})
+    assert.deepEqual(p.customsInherited, [])
+    await assert.rejects(tx.$executeRaw`UPDATE "products" SET "customsInherited" = NULL WHERE "id" = ${p.id}`, /null value|not-null|violates/i)
+  })
+})

@@ -162,20 +162,27 @@ export type WmsClearableProductField = 'customsDescription' | 'commodityCode' | 
 export type WmsProductClearOutcome = {
   cleared: WmsClearableProductField[]
   rejected: { field: WmsClearableProductField; message: string }[]
-  /** Not sent: the claim made immediately before the request found the clear no longer wanted (the field was refilled, or the marker was replaced). Not a failure: nothing is retried. */
-  skipped: { field: WmsClearableProductField; reason: string }[]
+  /**
+   * Not sent: the lease taken immediately before the request was refused. Not a failure. Nothing is retried unless `retry` is
+   * set (another run holds the lease: the clear is still wanted and the next run must offer it again).
+   */
+  skipped: { field: WmsClearableProductField; reason: string; retry?: boolean }[]
+  /** Sent, but the clear stopped being wanted while the request was in flight (the field was refilled): the warehouse may now hold the emptied value, so the next run must send the refilled one. */
+  superseded: { field: WmsClearableProductField; reason: string }[]
   /** Not sent: the WMS has no API way to clear this field. Never retried; an operator clears it by hand. */
   unsupported: WmsClearableProductField[]
 }
 
 /**
- * Taken around each clear request: runs `send` only while the caller can still stand behind the clear, holding whatever
- * lock keeps that true until `send` settles. `claimed: false` means the clear was not wanted any more and nothing was sent.
+ * Taken around each clear request: runs `send` only while the caller can still stand behind the clear. The claim is a short
+ * durable lease (no lock, no transaction is held across the request). `claimed: false` means the clear was not wanted (or is
+ * owned by another run) and nothing was sent. `superseded` on a claimed result means the clear stopped being wanted while the
+ * request was in flight: the request went out, but its result must not be treated as applied.
  */
 export type WmsClearClaim = <T>(
   field: WmsClearableProductField,
   send: () => Promise<T>,
-) => Promise<{ claimed: true; value: T } | { claimed: false; reason: string }>
+) => Promise<{ claimed: true; value: T; superseded?: string } | { claimed: false; reason: string; retry?: boolean }>
 
 export type WmsProductRef = {
   externalId: string

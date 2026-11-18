@@ -1,7 +1,7 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import { isMintsoftLoginForbidden, MINTSOFT_POLL_NEEDS_KEY_TEXT } from './auth-no-login'
 import { BUNDLE_CLAIM_CHANGED_TEXT } from '../sync/bundle-create-outcome'
-import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDeleteResult, WmsClearableProductField, WmsProductClearOutcome, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDeleteResult, WmsClearableProductField, WmsClearClaim, WmsProductClearOutcome, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   readMintsoftAsnItemExpectedQuantity,
   readMintsoftAsnItemLineIdentity,
@@ -362,6 +362,18 @@ export function mintsoftFieldIsEmpty(raw: Record<string, unknown> | null | undef
   return emptyCode(raw.CountryOfManufacture) && (id == null || id === 0 || id === '0')
 }
 
+/** The value Mintsoft holds for a clearable field, as text; null when the field is empty or the record was not read. */
+export function mintsoftFieldValue(raw: Record<string, unknown> | null | undefined, field: WmsClearableProductField): string | null {
+  if (!raw || mintsoftFieldIsEmpty(raw, field)) return null
+  const value = field === 'customsDescription' ? raw.CustomsDescription : field === 'commodityCode' ? raw.CommodityCode : raw.CountryOfManufacture
+  if (typeof value === 'string') return value.trim() || null
+  if (value && typeof value === 'object') {
+    const code = (value as Record<string, unknown>).Code ?? (value as Record<string, unknown>).code
+    if (typeof code === 'string' && code.trim()) return code.trim()
+  }
+  return null
+}
+
 /**
  * The follow-up request that erases one customs field of an existing product. It carries the same body the update does
  * (so it can never be read as a partial replace that blanks other fields; barcode only when non-empty and not omitted)
@@ -710,8 +722,10 @@ export async function sendMintsoftProductClears(
   options: WmsUpsertProductOptions,
   transport: MintsoftClearTransport = MINTSOFT_CLEAR_TRANSPORT,
 ): Promise<WmsProductClearOutcome> {
-  const outcome: WmsProductClearOutcome = { cleared: [], rejected: [], skipped: [], unsupported: [] }
+  const outcome: WmsProductClearOutcome = { cleared: [], rejected: [], skipped: [], superseded: [], unsupported: [] }
   const sent: WmsClearableProductField[] = []
+  // Fields whose request answered "Nothing to update/add": no proof either way, so the read-back below decides.
+  const nothingToUpdate = new Set<WmsClearableProductField>()
   for (const field of new Set(fields)) {
     if (!mintsoftCanClear(field)) {
       outcome.unsupported.push(field)
@@ -726,14 +740,19 @@ export async function sendMintsoftProductClears(
         if (body.Success === false) {
           throw new Error(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
         }
-        // Success with "Nothing to update/add" is Mintsoft saying it changed nothing: the clear was not applied.
-        if (isMintsoftNothingToUpdate(body.Message)) throw new Error('clear not applied (Mintsoft reported nothing to update)')
+        // Success with "Nothing to update/add" is Mintsoft saying it changed nothing. That is also what it says when the field is
+        // already empty, so it is neither a failure nor proof: the read-back below counts the clear only if the field IS empty.
+        if (isMintsoftNothingToUpdate(body.Message)) nothingToUpdate.add(field)
       }
     }
     try {
-      const claimed = options.clearClaim ? await options.clearClaim(field, post) : (await post(), { claimed: true as const })
+      const claimed: Awaited<ReturnType<WmsClearClaim>> = options.clearClaim ? await options.clearClaim(field, post) : (await post(), { claimed: true as const, value: undefined })
       if (!claimed.claimed) {
-        outcome.skipped.push({ field, reason: claimed.reason })
+        outcome.skipped.push({ field, reason: claimed.reason, ...(claimed.retry ? { retry: true } : {}) })
+        continue
+      }
+      if (claimed.superseded) {
+        outcome.superseded.push({ field, reason: claimed.superseded })
         continue
       }
       sent.push(field)
@@ -754,7 +773,7 @@ export async function sendMintsoftProductClears(
   }
   for (const field of sent) {
     if (raw && mintsoftFieldIsEmpty(raw, field)) outcome.cleared.push(field)
-    else outcome.rejected.push({ field, message: raw ? 'clear not applied' : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
+    else outcome.rejected.push({ field, message: raw ? (nothingToUpdate.has(field) ? 'clear not applied (Mintsoft reported nothing to update)' : 'clear not applied') : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
   }
   return outcome
 }
