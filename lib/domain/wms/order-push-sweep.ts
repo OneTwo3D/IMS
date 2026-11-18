@@ -2688,6 +2688,8 @@ export async function runWmsOrderPushSweepCore(
         // A new order has no link yet, so nothing says it is a part: a scope that cannot be read falls back to development's behaviour (the whole order), as if
         // the feature were off. (A link already pushed as a part fails closed in the amend pass.)
         console.error(`[wms-order-push] could not read the mixed-warehouse scope of ${order.id}; sending as development does: ${scrubWmsError(scopeError, 'read failed')}`)
+        // Reported, not swallowed: the order still goes as development sends it, but a scope that cannot be read is a failure the cron must answer.
+        result.failed += 1
         scope = undefined
       }
 
@@ -2901,6 +2903,7 @@ export async function runWmsOrderPushSweepCore(
             const fresh = await loadScope(order.id, order.shipFromWarehouseId)
             if (fresh !== undefined || scope === undefined) { scope = fresh; scopeReadAt = rereadAt }
           } catch {
+            result.failed += 1
             await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
               state: 'PENDING_CREATE', attempts: order.pushAttempts,
               lastError: 'Not sent by IMS: the order\'s allocation could not be re-read before the send.',
@@ -3570,10 +3573,8 @@ export async function runWmsOrderPushSweepCore(
         } catch (scopeError) {
           console.error(`[wms-order-push] could not read the mixed-warehouse scope of ${link.order.id}: ${scrubWmsError(scopeError, 'read failed')}`)
           // Only a link already pushed as a part fails closed (the whole order must never be sent to it); any other link amends as development does.
-          if (linkIsMixed) {
-            result.failed += 1
-            continue
-          }
+          result.failed += 1
+          if (linkIsMixed) continue
           scope = undefined
         }
         if (scope && linkIsMixed && link.pushWarehouseId) externalWarehouseId = externalWarehouseByWarehouse.get(link.pushWarehouseId) ?? externalWarehouseId

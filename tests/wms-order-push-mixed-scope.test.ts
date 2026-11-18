@@ -110,6 +110,7 @@ test('create: a scope that cannot be READ falls back to development (the whole o
   let r
   try { r = await runWmsOrderPushSweepCore(connector({ pushOrder: async (input) => { sent = input; return okPush() } }), 'mintsoft', port, { now: NOW }) } finally { console.error = original }
   assert.equal(r.created, 1)
+  assert.equal(r.failed, 1, 'reported, so the cron answers failed')
   assert.equal(JSON.stringify(sent), GOLDEN)
 })
 
