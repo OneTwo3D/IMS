@@ -541,8 +541,15 @@ export function checkWcStoreCreditReconciles(input: {
   // minor unit could not be told apart from a credit of one or two minor units that is ALSO already in the
   // line totals (it would be subtracted twice and land inside the allowance), which sends the warehouse a
   // reduced goods value. An order that is genuinely a minor unit out is refused for an operator to look at.
-  const tolerance = toDecimal(10).pow(-currencyMinorUnits(input.currency)).div(4)
-  const within = input.shortfallOnly ? difference.lt(tolerance) : difference.abs().lt(tolerance)
+  const minorUnit = toDecimal(10).pow(-currencyMinorUnits(input.currency))
+  // "ROUND TAX AT SUBTOTAL" (WooCommerce > Tax): the line and shipping taxes are reported UNROUNDED and only the order's total tax is rounded, once. The components
+  // then sum to a figure that sits up to HALF a minor unit from the total Woo reports, which the quarter-unit tolerance refused (an honest order, or one with no
+  // credit at all). That is evidenced by the tax itself: a tax figure with more decimals than the currency's minor unit. Then, and only then, the allowance is half a
+  // minor unit (inclusive: a total that rounded up from exactly x.xx5 is that far out); a whole minor unit, a credit that is also inside the lines, is still refused.
+  const taxUnrounded = input.taxForeign.decimalPlaces() > currencyMinorUnits(input.currency)
+  const tolerance = taxUnrounded ? minorUnit.div(2) : minorUnit.div(4)
+  const gap = input.shortfallOnly ? difference : difference.abs()
+  const within = taxUnrounded ? gap.lte(tolerance) : gap.lt(tolerance)
   return within ? { ok: true } : { ok: false, difference, tolerance }
 }
 

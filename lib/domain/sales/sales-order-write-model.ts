@@ -14,6 +14,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { expectedSalesOrderLineTaxForeign } from '@/lib/domain/sales/sales-order-tax-validation'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { allocateOrderDiscountBase } from '@/lib/sales-currency'
 
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
@@ -48,6 +49,13 @@ export type WriteModelInput = {
   fees?: { description: string; amount: number }[]
   /** Gross when pricesIncludeVat. */
   orderDiscountForeign?: number
+  /**
+   * Tax the order discount at the LINES' rates instead of the header rate. The discount is apportioned across the lines by the same allocator the order analytics use
+   * (allocateOrderDiscountBase: weighted by each line's net, or gross on a VAT-inclusive order, last line takes the rounding), each share taxed at its own line's rate, and the cap
+   * is the lines' own gross. Off (the default) it is taxed at the header rate, which is what an already-posted document carries. Only the write of a NEW order or an EDIT reads this;
+   * a stored order is never re-priced by it.
+   */
+  apportionDiscountTax?: boolean
 }
 
 export type WriteModelLine = {
@@ -152,12 +160,27 @@ export function buildSalesOrderWriteModel(args: WriteModelInput): SalesOrderWrit
 
   // Order-level discount — cap at line subtotal (compare in gross when inclVat).
   const rawOrderDisc = args.orderDiscountForeign ?? 0
-  const linesGrossForCap = shippingInclVat
-    ? toDecimal(linesSubtotalForeign).mul(toDecimal(1).add(vatRate))
-    : toDecimal(linesSubtotalForeign)
-  const orderDiscForeign = Prisma.Decimal.min(toDecimal(rawOrderDisc), linesGrossForCap)
-  const discNetForeign = shippingInclVat ? orderDiscForeign.div(toDecimal(1).add(vatRate)) : orderDiscForeign
-  const discTaxForeign = shippingInclVat ? orderDiscForeign.sub(discNetForeign) : (vatRate > 0 ? discNetForeign.mul(vatRate) : toDecimal(0))
+  let orderDiscForeign: Prisma.Decimal
+  let discNetForeign: Prisma.Decimal
+  let discTaxForeign: Prisma.Decimal
+  if (args.apportionDiscountTax && lineData.length > 0) {
+    // Each line's share of the discount is taxed at that line's own rate (the header rate does not apply to goods that carry another one).
+    const grossCap = lineData.reduce((sum, l, i) => sum.add(inclVat ? toDecimal(l.totalForeign).mul(toDecimal(1).add(args.lines[i]!.rate)) : toDecimal(l.totalForeign)), toDecimal(0))
+    orderDiscForeign = Prisma.Decimal.min(toDecimal(rawOrderDisc), grossCap)
+    const shares = allocateOrderDiscountBase(
+      { fxRateToBase: 1, pricesIncludeVat: inclVat, taxRatePercent: vatRate, discountAmount: orderDiscForeign.toNumber() },
+      lineData.map((l, i) => ({ totalBase: l.totalForeign, totalForeign: l.totalForeign, taxRatePercent: args.lines[i]!.rate })),
+    )
+    discNetForeign = shares.reduce((sum, share) => sum.add(share), toDecimal(0))
+    discTaxForeign = shares.reduce((sum, share, i) => sum.add(toDecimal(share).mul(args.lines[i]!.rate)), toDecimal(0))
+  } else {
+    const linesGrossForCap = shippingInclVat
+      ? toDecimal(linesSubtotalForeign).mul(toDecimal(1).add(vatRate))
+      : toDecimal(linesSubtotalForeign)
+    orderDiscForeign = Prisma.Decimal.min(toDecimal(rawOrderDisc), linesGrossForCap)
+    discNetForeign = shippingInclVat ? orderDiscForeign.div(toDecimal(1).add(vatRate)) : orderDiscForeign
+    discTaxForeign = shippingInclVat ? orderDiscForeign.sub(discNetForeign) : (vatRate > 0 ? discNetForeign.mul(vatRate) : toDecimal(0))
+  }
   const discNetForeignR = round4(discNetForeign)
   const discTaxForeignR = round4(discTaxForeign)
   const discNetBase = divideRoundedNumber(discNetForeignR, fxRate, 4)
