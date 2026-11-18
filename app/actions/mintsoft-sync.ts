@@ -1,6 +1,6 @@
 'use server'
 
-import { priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
+import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -682,6 +682,8 @@ const MintsoftExternalAsnIdSchema = z.string().trim().min(1, 'ASN ID is required
 const MintsoftReturnRestockInputSchema = z.object({
   id: z.string().min(1, 'Return inbox item ID is required.'),
   warehouseId: z.string().min(1, 'Warehouse is required.'),
+  /** The adjustment reason whose GL account is credited for the value of units no refund covers. */
+  adjustmentReasonId: z.string().min(1).nullable().optional(),
 })
 const MintsoftCreatePurchaseOrderAsnInputSchema = z.object({
   packagingType: z.enum(['PARCEL', 'PALLET', 'CONTAINER']).nullable().optional(),
@@ -5591,6 +5593,7 @@ export async function restockMintsoftReturnInboxItem(
   let returnedProductIds: string[] = []
   let successMessage = 'Mintsoft return restocked.'
   let activityMetadata: MintsoftReturnRestockActivityMetadata | null = null
+  let partlyCoveredQty = 0
 
   // Pool read before the transaction: the ledger an arrival that clears a refund's Stock in Transit would post to.
   const receiptAccounting = await readReceiptAccounting()
@@ -5676,6 +5679,20 @@ export async function restockMintsoftReturnInboxItem(
         if (receipt.expectationIds.length > 0) rows = receipt.rows
       }
 
+      // Units a refund already restocked (or whose expectation covers them) are not restocked or journalled again: the
+      // refund's own COGS reversal already credited them. Only the uncovered remainder is valued below.
+      if (item.orderId) {
+        const netted = await netUnpricedReturnRowsAgainstRefunds(tx, { inboxId: item.id, orderId: item.orderId, rows })
+        if (netted.coveredQty > 0) {
+          if (netted.rows.length === 0) {
+            throw new Error(
+              `These ${netted.coveredQty} unit${netted.coveredQty === 1 ? ' was' : 's were'} already restocked by the refund on this order. Mark the item Refunded only; it was not restocked again and nothing was valued or journalled.`,
+            )
+          }
+          partlyCoveredQty = netted.coveredQty
+        }
+        rows = netted.rows
+      }
       // A row no expectation priced has no unit cost; give it one so the units enter with a cost layer.
       const pricedRows = await priceUnpricedReturnRows(tx, warehouse.id, rows)
       const alreadyBooked = await tx.stockMovement.count({
@@ -5695,6 +5712,7 @@ export async function restockMintsoftReturnInboxItem(
           warehouse: { id: warehouse.id, code: warehouse.code, name: warehouse.name },
           originalRows: rows,
           pricedRows,
+          adjustmentReasonId: data.adjustmentReasonId ?? null,
         })
       }
 
@@ -5704,12 +5722,12 @@ export async function restockMintsoftReturnInboxItem(
           status: 'RESTOCKED',
           warehouseId: warehouse.id,
           resolvedAt: new Date(),
-          resolutionNote: `Restocked ${qty} unit${qty === 1 ? '' : 's'} to ${warehouse.code}`,
+          resolutionNote: `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} to ${warehouse.code}${partlyCoveredQty > 0 ? `; ${partlyCoveredQty} already restocked by the refund` : ''}`,
         },
       })
 
       returnedProductIds = returnedRows.map((row) => row.productId)
-      successMessage = `Restocked ${qty} unit${qty === 1 ? '' : 's'} of ${item.sku ?? 'the product'} to ${warehouse.code}.`
+      successMessage = `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} of ${item.sku ?? 'the product'} to ${warehouse.code}.${partlyCoveredQty > 0 ? ` ${partlyCoveredQty} unit${partlyCoveredQty === 1 ? ' was' : 's were'} already restocked by the refund and were not restocked or valued again.` : ''}`
       activityMetadata = {
         inboxId: item.id,
         externalReturnId: item.externalReturnId,
