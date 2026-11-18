@@ -162,6 +162,8 @@ import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idem
 import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-release'
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { PermanentStatusTransitionError, isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import { headerTaxRateMismatch, resolveHeaderTaxRate, salesOrderMoneyRefusal } from '@/lib/domain/sales/sales-order-input-validation'
+import { markPaidRefusal } from '@/lib/domain/sales/mark-paid-guard'
 import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-state'
 import { readSingleXeroDocument } from '@/lib/connectors/xero/single-document'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
@@ -1188,7 +1190,6 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
   // A CONFIRMED order's edit pins the rate the order was booked at (its invoice, its payment and its base-currency figures were made at it): `pinnedFxRate` replaces the lookup and the form's expected-rate check.
   const fxRate = options?.pinnedFxRate ?? await resolveFxRateToBase(db, input.currency, await getBaseCurrencyCode(), new Date())
   if (options?.pinnedFxRate === undefined && input.expectedFxRate !== undefined && input.expectedFxRate !== fxRate) return { ok: false as const, error: `FX_RATE_CHANGED: the ${input.currency} table rate moved from ${input.expectedFxRate} to ${fxRate} since it was checked; nothing was written` }
-  const vatRate = input.taxRateValue ?? 0
   const inclVat = !!input.pricesIncludeVat
   // --- Tax category resolution ---------------------------------------
   // Load each line's product category + the order default rate so we can
@@ -1236,6 +1237,11 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
       })
     : null
   const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
+  // THE NAMED RATE'S VALUE WINS: the header rate prices shipping, fees and the order discount, and the invoice posts those under the named rate's tax type, so a typed or stale value must not differ from it.
+  // Only when the name no longer resolves (renamed or deactivated since the form loaded) is the caller's own value kept, so an existing order stays editable.
+  const taxRateMismatch = headerTaxRateMismatch(orderDefaultProfile?.taxRateValue, input.taxRateValue)
+  if (taxRateMismatch) return { ok: false as const, error: taxRateMismatch }
+  const vatRate = resolveHeaderTaxRate(orderDefaultProfile?.taxRateValue, input.taxRateValue)
   const orderDefaultCtx = {
     id: orderDefaultProfile?.taxRateId ?? null,
     name: orderDefaultProfile?.taxRateName ?? input.taxRateName ?? null,
@@ -1418,7 +1424,7 @@ function validateSalesOrderInput(input: CreateSoInput): string | null {
     if (l.qty <= 0) return `Invalid qty for ${l.sku}`
     if (l.unitPriceForeign < 0) return `Negative price for ${l.sku}`
   }
-  return null
+  return salesOrderMoneyRefusal(input)
 }
 
 export async function createSalesOrder(input: CreateSoInput): Promise<CreateSalesOrderResult> {
@@ -4677,9 +4683,12 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
     const locked = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, id)
       await assertNotQuoteUnderLock(tx, id, 'it cannot be marked paid')
-      const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
+      const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true, status: true, unregisteredPaidAt: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
+      const paymentCount = await tx.payment.count({ where: { orderId: id, refundId: null } })
+      const refusal = markPaidRefusal({ status: row.status, markingAsPaid, hasUnregisteredPaidMarker: row.unregisteredPaidAt != null, paymentCount })
+      if (refusal) return { refusal }
       const paidAt = markingAsPaid ? new Date() : null
       await appendShortfallCleared(tx, id)
       await tx.salesOrder.update({
@@ -4704,6 +4713,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       return { so: row, markingAsPaid }
     }, STOCK_TX_OPTIONS)
     if (!locked) return { success: false, error: 'Order not found' }
+    if ('refusal' in locked) return { success: false, error: locked.refusal }
     const { so, markingAsPaid } = locked
 
     // Only auto-generate invoice when transitioning TO paid (not when toggling off).

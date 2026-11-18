@@ -206,7 +206,7 @@ test('[refund 182 hold] a refund whose VAT is over the order\'s VAT not already 
   t.after(async () => { await restore(); await cleanup(deps.db, fx); await cleanup(deps.db, fx2) })
   await seedXeroList(deps.db, { TAX131: '0.000000' })
   // The stated gross and the stated tax disagree beyond rounding: refused by the writer's rate-182 check, nothing recorded.
-  const lines = (net: number, tax: number) => [itemised(fx.goods, 'Widget', net, tax)]
+  const lines = (net: number, tax: number, goods = fx.goods) => [itemised(goods, 'Widget', net, tax)]
   const internal = (gross: number, statedTax: number) => ({ internalBypassToken: deps.bypass, externalRefundId: wooRefundId(), statedGrossForeign: gross, eas182StatedTaxForeign: statedTax })
   const mismatch = await deps.createRefund(fx.orderId, lines(100, 19), 'mismatch', undefined, internal(125, 19))
   assert.equal(mismatch.success, false)
@@ -217,9 +217,9 @@ test('[refund 182 hold] a refund whose VAT is over the order\'s VAT not already 
   assert.equal(lineMismatch.success, false)
   assert.match(lineMismatch.error ?? '', /does not match the VAT the refund states in all/)
   // An earlier refund took 25 of the order's 25.46 VAT (re-priced by the plugin, so the line states 25); a second one asking 6.46 is over what is left.
-  const first = await deps.createRefund(fx2.orderId, lines(100, 25), 'first', undefined, internal(125, 25))
+  const first = await deps.createRefund(fx2.orderId, lines(100, 25, fx2.goods), 'first', undefined, internal(125, 25))
   assert.equal(first.success, true, first.error)
-  const over = await deps.createRefund(fx2.orderId, lines(34, 6.46), 'over', undefined, internal(40.46, 6.46))
+  const over = await deps.createRefund(fx2.orderId, lines(34, 6.46, fx2.goods), 'over', undefined, internal(40.46, 6.46))
   assert.equal(over.success, false)
   assert.match(over.error ?? '', /more than the order's collected VAT not already refunded/)
   assert.equal((await deps.db.salesOrderRefund.count({ where: { orderId: fx2.orderId } })), 1, 'only the first is recorded')
