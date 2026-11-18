@@ -352,6 +352,10 @@ Behavior notes:
 - Re-saving the same tracking is idempotent and does not intentionally create duplicate upstream entries
 - Reflected WooCommerce `order.updated` webhooks from IMS-originated status/tracking pushes are explicitly suppressed
 
+#### Retrying lost tracking pushes (off by default)
+
+If IMS stops between saving a shipment and pushing its tracking to WooCommerce (a partial shipment, a tracking edit), the tracking would otherwise never reach the order. When the setting `wc_tracking_reconcile_enabled` is `true`, the 5-minute inbox job looks at orders shipped or edited in the last 72 hours that have no tracking push newer than the shipment, and pushes their tracking again (at most 25 orders per run; one that failed in the last 15 minutes waits). It writes nothing when WooCommerce already has the same tracking, and it leaves an order alone when WooCommerce already shows it as completed, cancelled, refunded, failed or trashed. Every push goes through the same outbound hold as any other tracking write, so nothing is sent while writes are held. The setting is off by default and has no checkbox yet: it is switched on by an administrator in the settings table.
+
 #### Tracking provider mapping (off by default)
 
 Advanced Shipment Tracking (AST) builds the customer's tracking link and branding from a provider slug such as `royal-mail`. By default IMS writes the courier's display name instead, which AST cannot resolve, so the link may show as plain text.

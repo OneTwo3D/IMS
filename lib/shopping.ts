@@ -243,7 +243,10 @@ export async function pushProductMetadata(productId: string): Promise<PushProduc
   return { success: true }
 }
 
-export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOrderDeliveryMetadataResult> {
+export async function pushOrderDeliveryMetadata(
+  orderId: string,
+  options: { skipWcStatuses?: readonly string[] } = {},
+): Promise<PushOrderDeliveryMetadataResult> {
   const connectors = await listRunnableShoppingConnectorIds()
   if (connectors.length === 0) return { success: false, error: 'No runnable shopping connector configured' }
 
@@ -259,7 +262,7 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
         })
         if (!seam.proceed) return { connector, result: shadowedPush(seam) }
         const { pushImsTrackingToWc } = await import('@/lib/connectors/woocommerce/sync/tracking-sync')
-        return { connector, result: await pushImsTrackingToWc(orderId) }
+        return { connector, result: await pushImsTrackingToWc(orderId, options) }
       }
     }
   }))
@@ -275,6 +278,15 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
   if (shadowed) return { success: false, shadowed: true, error: 'error' in shadowed.result ? shadowed.result.error : undefined }
 
   return { success: true, skipped: results.every((entry) => 'skipped' in entry.result && !!entry.result.skipped) }
+}
+
+/**
+ * Re-push tracking that a crash between a shipment's commit and its post-commit push lost (o3d-ekujm). OFF unless
+ * `wc_tracking_reconcile_enabled` is `true`. Every write goes through `pushOrderDeliveryMetadata` and so through the outbound hold.
+ */
+export async function reconcileShoppingTrackingPushes() {
+  const { reconcileWcTrackingPushes } = await import('@/lib/connectors/woocommerce/sync/tracking-reconcile')
+  return reconcileWcTrackingPushes()
 }
 
 /**
