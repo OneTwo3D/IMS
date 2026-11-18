@@ -294,7 +294,7 @@ test('active stock movement writer files route reporting values through the help
 // names — fails here until the census is deliberately updated.
 //
 // It also fixes the census the refusal's reach is described by. `...FromTotal` is NOT a
-// choke point for every costed movement: the plain sibling has twelve production callers
+// choke point for every costed movement: the plain sibling has thirteen production callers
 // that never reach it. Negative-basis cover comes from BOTH builders refusing.
 const EXPECTED_BUILDER_CALL_SITES: Record<string, Record<string, number>> = {
   // Reached via the from-total form: five direct invocations.
@@ -314,7 +314,7 @@ const EXPECTED_BUILDER_CALL_SITES: Record<string, Record<string, number>> = {
     'lib/domain/sales/shipment-service.ts': 1,
   },
   // The SIBLING, which enforces the same non-negative invariant independently and is NOT
-  // reached through the from-total form at all: twelve.
+  // reached through the from-total form at all: thirteen.
   buildStockMovementValueFields: {
     'app/actions/manufacturing.ts': 1,
     'app/actions/purchase-orders.ts': 1,
@@ -326,6 +326,7 @@ const EXPECTED_BUILDER_CALL_SITES: Record<string, Record<string, number>> = {
     'lib/domain/inventory/stock-adjustment-apply.ts': 1,
     'lib/domain/sales/refund-service.ts': 1,
     'lib/domain/wms/booked-in-service.ts': 3,
+    'lib/domain/wms/retired-asn-credit-fold.ts': 1,
   },
 }
 
@@ -390,5 +391,5 @@ test('o3d-gd2f: the value builders have EXACTLY this census of production call s
   )
   assert.equal(total(actual.buildStockMovementValueFieldsFromTotal!), 5, 'five direct from-total call sites')
   assert.equal(total(actual.buildStockMovementValueFieldsFromConsumed!), 7, 'seven from-consumed call sites')
-  assert.equal(total(actual.buildStockMovementValueFields!), 12, 'twelve sibling call sites')
+  assert.equal(total(actual.buildStockMovementValueFields!), 13, 'thirteen sibling call sites')
 })

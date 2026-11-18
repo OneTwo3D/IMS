@@ -245,6 +245,8 @@ If the supplier was billed for more than was received (a prepaid supplier), clos
 
 An order whose lines have an **open warehouse ASN** (being created, open, partly booked in, or booked in but not yet reconciled) cannot be closed or cancelled. The message names the SKUs and ASN numbers. Book the goods in through the ASN (**Recheck booked-in**) or retire the ASN first, then close the order. This keeps the warehouse from receiving goods against an order that no longer expects them. Warehouse (Mintsoft) ASN handling is described in [Warehouse (Mintsoft)](warehouse.md).
 
+If the close or cancel is refused because stock the warehouse sync brought in is "not yet booked into this order" and the ASN has already been retired, **Recheck booked-in** has nothing to re-drive. Press **Reconcile warehouse receipt** in the close dialog: it folds that stock into the order's received quantity so it can be returned and the order closed. It adds no stock, cost or accounting entry (the warehouse sync already did), and is refused while the order still has an open ASN.
+
 ### Idempotent cancellation
 
 Cancelling a PO that is already CANCELLED is a no-op: the system returns success without writing duplicate activity log entries. It is safe to retry a cancellation after a transient error.

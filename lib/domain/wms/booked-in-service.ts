@@ -9,6 +9,8 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import {
   buildBookedInDryRun,
+  bookedInDeltaIsActionable,
+  bookedInLineIsComplete,
   isTransferUsableForWmsReceipt,
   reconcileBookedInQuantities,
   resolveManualReceiptPool,
@@ -625,8 +627,10 @@ export async function processBookedInEvent(
           }
         })
 
+      // o3d-b8x0f: the delta must clear WMS_RECEIPT_QTY_EPSILON, the same threshold the dry run uses for
+      // wouldCreateReceipt / wouldCreateCostLayer, so apply never writes what the review image says it won't.
       const actionableLines = candidateLines
-        .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
+        .filter((line) => bookedInDeltaIsActionable(line.currentReceivedQty, Number(line.lastProcessedReceivedQty)))
 
       // o3d-h66s — EVERY CANDIDATE LINE, NOT JUST THE ACTIONABLE ONES: THE READ'S SCOPE MUST EQUAL
       // THE JUDGEMENT'S SCOPE.
@@ -1702,7 +1706,7 @@ export async function processBookedInEvent(
           lastProcessedReceivedQty: true,
         },
       })
-      const asnClosed = refreshedLines.every((line) => Number(line.lastProcessedReceivedQty) >= Number(line.expectedQty))
+      const asnClosed = refreshedLines.every((line) => bookedInLineIsComplete(Number(line.lastProcessedReceivedQty), Number(line.expectedQty)))
       const asnStatusAfter = asnClosed ? 'BOOKED_IN' : 'PARTIALLY_BOOKED_IN'
 
       await tx.wmsAsnMap.update({
