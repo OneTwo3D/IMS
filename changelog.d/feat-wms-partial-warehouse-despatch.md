@@ -1,0 +1,3 @@
+### Fulfilment
+
+- A warehouse (Mintsoft) despatch on an order split across warehouses now ships only the despatching warehouse's own shipments and leaves the other warehouses' shipments open, instead of refusing the whole despatch (owner ruling). The order is not marked Shipped and no WooCommerce completion is sent until every shipment has shipped; the shipped part's stock, cost and daily accounting batch follow that shipment as normal. This is not counted as a despatch failure by the circuit breaker. Order lines the warehouse despatched that IMS holds only in another warehouse are not shipped and raise a "Despatch covers lines held in another warehouse" item on the exceptions page. Ship the other warehouse's shipment in IMS when it leaves.

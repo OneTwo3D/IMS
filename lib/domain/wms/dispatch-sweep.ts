@@ -3079,11 +3079,17 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         tracking,
         ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true, ...(options.fence ? { shipFence: options.fence } : {}) } : {}),
       })
-      if (result.success) {
+      // A mixed-warehouse order (owner ruling 2026-11-18): only this warehouse's shipments were shipped; the order stays open for the others. That is a
+      // SUCCESS (never counted as a dispatch failure). The link keeps being polled until the order ships, so a re-apply that shipped nothing new is not
+      // recorded again as a mutation event.
+      const partial = result.success ? result.partialWarehouse : undefined
+      if (result.success && !(partial && partial.shippedShipmentCount === 0)) {
         await recordWmsMutationEvent({
           connector: connectorId, direction: 'INBOUND', action: 'dispatch_applied', outcome: 'SUCCEEDED',
           entityType: 'SALES_ORDER', entityId: orderId,
-          summary: `WMS despatch applied to order ${orderBefore?.orderNumber ?? orderId} — shipment marked SHIPPED`,
+          summary: partial
+            ? `WMS despatch applied to order ${orderBefore?.orderNumber ?? orderId} — ${partial.shippedShipmentCount} shipment(s) in the despatching warehouse marked SHIPPED; ${partial.openShipmentIds.length} shipment(s) in another warehouse left open`
+            : `WMS despatch applied to order ${orderBefore?.orderNumber ?? orderId} — shipment marked SHIPPED`,
           before: { orderStatus: orderBefore?.status ?? null },
           after: { shipmentStatus: 'SHIPPED', tracking: tracking.map((entry) => ({ trackingNumber: entry.trackingNumber, shippingService: entry.shippingService ?? null })) },
           triggeredBy: 'dispatch-sweep',
