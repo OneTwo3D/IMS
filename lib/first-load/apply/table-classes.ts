@@ -124,6 +124,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   stock_movement_backfill_audit: { kind: 'MUST_BE_EMPTY', reason: 'stock-movement backfill audit' },
   stock_movements: { kind: 'RUNNER_WRITES', reason: 'opening-stock movements' },
   product_sync_marks: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs' },
+  product_customs_clears: { kind: 'MUST_BE_EMPTY', reason: 'derived clear markers kept by a trigger on products; a first load starts with none' },
   stock_sync_jobs: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs' },
   stock_sync_states: { kind: 'MUST_BE_EMPTY', reason: 'stock-sync state and jobs' },
   stock_transfer_lines: { kind: 'MUST_BE_EMPTY', reason: 'stock transfers' },
