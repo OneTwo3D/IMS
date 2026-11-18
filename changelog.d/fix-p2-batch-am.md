@@ -1,0 +1,6 @@
+### P2 batch AM: reports and stock
+- **COGS Report**: a sales line shipped across two periods now books only its in-window share of revenue (it booked the whole line in each); credit follows the same share and the part for other windows is reported off-report instead of dropped. The Gross margin total is now revenue less the COGS of the matched rows (new `totals.cogsBaseWithRevenue`, "COGS of matched rows" on the page), so it reconciles with its own columns.
+- **Product Profitability**: revenue and profit travel as exact decimal strings (`revenueExact`, `profitExact`) and the page sums and rounds them without float64, so a bounded figure above 2^53 can no longer print below its own ceiling.
+- **Sales Stats cards and dashboard cash bridge**: the `lower` verdict now has its own sentence/tooltip (previously blank or the weaker "direction not established").
+- **Supplier aging**: new **Credited** column (POSTED supplier credit notes, VAT-inclusive like Billed), on the page and in the CSV, with its basis stated. Billed figures and age bands are unchanged.
+- **Stock transfers**: the state machine now models IN_TRANSIT -> CANCELLED (performed by cancelDispatchedTransfer); the plain cancel keeps its DRAFT-only rule in its own guard. Generated workflow docs include the transition.
