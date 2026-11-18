@@ -175,7 +175,7 @@ const listReads = () => fetches.filter((f) => f.path === '/products/50/variation
 
 test('a parent over the 2,000-variation cap is skipped and reported, not a window error (o3d-hqvrp.104)', async () => {
   reset()
-  candidates = [variant('v1', 'V1'), product('s1', 'SIMPLE-1', BigInt(9))]
+  candidates = [variant('v1', 'V1'), product('s1', 'S9', BigInt(9))]
   levels = [
     { productId: 'v1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
     { productId: 's1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
@@ -192,7 +192,7 @@ test('a parent over the 2,000-variation cap is skipped and reported, not a windo
 
 test('a variation page that keeps failing skips the parent for the pass, without a window error (o3d-hqvrp.104)', async () => {
   reset()
-  candidates = [variant('v1', 'V1'), product('s1', 'SIMPLE-1', BigInt(9))]
+  candidates = [variant('v1', 'V1'), product('s1', 'S9', BigInt(9))]
   levels = [
     { productId: 'v1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
     { productId: 's1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
@@ -216,7 +216,7 @@ test('a parent\'s variation list is read once per parent, not once per 100-varia
   await run()
   assert.equal(listReads().filter((f) => f.params.page === '1').length, 1, 'page 1 is read once for two batches')
   assert.equal(listReads().filter((f) => f.params.page === '2').length, 1)
-  assert.equal(updates().filter((u) => u.id >= 1000).length, 101, 'all 101 variants resolved and pushed')
+  assert.equal(updates().filter((u) => (u.id as number) >= 1000).length, 101, 'all 101 variants resolved and pushed')
 })
 
 test('a database error while re-reading stock for a batch sends it unclamped and does not abort the run (o3d-hqvrp.100)', async () => {

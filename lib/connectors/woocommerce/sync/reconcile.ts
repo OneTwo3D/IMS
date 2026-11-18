@@ -78,6 +78,12 @@ export type WcReconcileResult = {
  * only AFTER the stock queue and the stock reconcile, and only inside what is left of the request budget, so a slow store cannot starve the
  * stock backstop or run the request past the proxy cut-off. Each retry goes through the same gate and hold as the first push.
  */
+/** Every exit of the run goes through here, so the product-push retry sweep runs after all the stock work, whichever way that ended. */
+async function finishReconcile(results: WcReconcileResult, startedAt: number): Promise<WcReconcileResult> {
+  await retryProductPushesWithinBudget(results, startedAt)
+  return results
+}
+
 async function retryProductPushesWithinBudget(results: WcReconcileResult, startedAt: number): Promise<void> {
   const deadlineAt = startedAt + STOCK_RECONCILE_REQUEST_BUDGET_MS
   if (Date.now() >= deadlineAt) return
@@ -92,12 +98,6 @@ async function retryProductPushesWithinBudget(results: WcReconcileResult, starte
 
 export async function runWcReconcile(): Promise<WcReconcileResult> {
   const startedAt = Date.now()
-  const results = await runWcReconcileStages(startedAt)
-  await retryProductPushesWithinBudget(results, startedAt)
-  return results
-}
-
-async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResult> {
   const results: WcReconcileResult = {}
 
   const webhookPrimaryActive = await isWcOrderWebhookPrimaryActive()
@@ -210,7 +210,7 @@ async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResul
             reconciliationDue: true,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         }
         chunks++
         pushed += stock.synced
@@ -238,7 +238,7 @@ async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResul
               resumeAfter: cursor,
               lastReconciledAt: lastReconcile?.value ?? null,
             }
-            return results
+            return finishReconcile(results, startedAt)
           }
         } else if (stock.aborted === true && cursor == null) {
           // Refused before any window was handled (the setting, the credentials or the warehouses). Nothing was reconciled, so
@@ -251,7 +251,7 @@ async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResul
             reconciliationDue: true,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         } else {
           // The window was not handled: an outage or a credentials rebind cut it short, or a candidate in it did not complete
           // (a failed lookup, preflight page or push entry, a mapping that could not be saved, a duplicate external id, a kit
@@ -274,7 +274,7 @@ async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResul
             resumeAfter: cursor,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         }
         // The last window handled: the pass is over. Clearing the cursor and writing the stamp are ONE commit, and only while the
         // WooCommerce settings version is still the one this pass ran against. A credentials rebind or cache reset after the last
@@ -302,7 +302,7 @@ async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResul
             reconciliationDue: true,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         }
         results.stock = {
           queued,
@@ -323,5 +323,5 @@ async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResul
     }
   }
 
-  return results
+  return finishReconcile(results, startedAt)
 }

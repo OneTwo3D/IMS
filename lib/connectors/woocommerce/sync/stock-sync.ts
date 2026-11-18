@@ -1081,6 +1081,8 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // log, unmatched counts — all intact for the operator-facing report.
   let versionBumpedMidRun = false
 
+  // SKUs of variants whose parent was skipped this pass: reported, neither errors nor unmatched.
+  const skippedParentSkus = new Set<string>()
   if (needsResolution.length > 0) {
     await options?.onProgress?.({ phase: 'resolving', processed: 0, synced: 0, total: needsResolution.length })
     const { resolved, errors: lookupErrors, totalAttempts, failedAttempts, skippedParents } =
@@ -1107,7 +1109,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
 
     // o3d-hqvrp.104: a parent whose variation list cannot be read (over the cap, or a page that keeps failing) is skipped for this pass. It is
     // reported, but is not a window error: otherwise one such parent would hold the daily reconcile at its window for ever.
-    const skippedParentSkus = new Set(skippedParents.flatMap((parent) => parent.skus))
+    for (const sku of skippedParents.flatMap((parent) => parent.skus)) skippedParentSkus.add(sku)
     if (skippedParents.length > 0) {
       result.skippedParents = skippedParents.map((parent) => `${parent.parentSku} (${parent.skus.length} variant(s)): ${parent.reason}`)
       await logActivity({
@@ -1320,7 +1322,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // -------- Count matched/unmatched from final effective state --------
   for (const p of products) {
     if (effectiveTargets.has(p.id)) result.matched++
-    else if (!result.errors.some((msg) => msg.includes(`SKU ${p.sku}`))) {
+    else if (!skippedParentSkus.has(p.sku) && !result.errors.some((msg) => msg.includes(`SKU ${p.sku}`))) {
       // Only count as "unmatched" if there wasn't a lookup/drift error for this SKU.
       // Those are counted as errors, not catalog mismatches.
       result.unmatched++

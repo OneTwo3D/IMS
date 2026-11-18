@@ -377,7 +377,7 @@ export const DECLARATIONS: readonly Declaration[] = [
     'PUTs the order status onto the WooCommerce order.'),
   d('lib/connectors/woocommerce/sync/product-sync.ts::pushImsProductToWcOnce::wcPut#1', 'woocommerce', 'product.meta', 'direct-write', 'not-applicable',
     'PUTs product metadata onto the WooCommerce product.'),
-  d('lib/connectors/woocommerce/sync/reconcile.ts::runWcReconcile::pushProductMetadata[reference]#1', 'woocommerce', 'product.meta', 'facade', 'not-applicable',
+  d('lib/connectors/woocommerce/sync/reconcile.ts::retryProductPushesWithinBudget::pushProductMetadata[reference]#1', 'woocommerce', 'product.meta', 'facade', 'not-applicable',
     'Retry sweep for failed product pushes (every pass, at most 50 products): hands each product to the shopping facade, which applies the settings gate and the producer hold exactly as for the first push.'),
   d('lib/connectors/woocommerce/sync/reconcile.ts::runWcReconcile::pushStockToWc#1', 'woocommerce', 'stock', 'drain', 'not-applicable',
     'Performs the stock push to WooCommerce (drain of the stock queue, a reconcile, or a manual push).'),

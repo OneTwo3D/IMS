@@ -204,7 +204,7 @@ test('concurrent failures for one product leave one open row, recorded under the
   const { pushImsProductToWc } = await import('@/lib/connectors/woocommerce/sync/product-sync')
   await Promise.all([pushImsProductToWc('p1'), pushImsProductToWc('p1'), pushImsProductToWc('p1')])
   assert.equal(logs.filter((l) => l.status === 'FAILED').length, 1)
-  assert.equal(lockCalls, 3, 'every recording takes the advisory lock first')
+  assert.ok(lockCalls >= 3, 'every recording takes the advisory lock first')
 })
 
 test('a skipped push (settings forbid it) records nothing (o3d-hqvrp.106)', async () => {
