@@ -161,8 +161,12 @@ export type WmsClearableProductField = 'customsDescription' | 'commodityCode' | 
 /** What happened to the explicit clears of an UPDATE. A rejected clear never fails the update that carried it. */
 export type WmsProductClearOutcome = {
   cleared: WmsClearableProductField[]
-  /** `notApplied` is set only when Mintsoft answered and a read-back verified the field still holds a value: the only rejection that counts against the retry cap. */
-  rejected: { field: WmsClearableProductField; message: string; notApplied?: boolean }[]
+  /**
+   * `answered`: Mintsoft RESPONDED and the clear did not take (Success:false, an HTTP error status, or a read-back showing the value) - counts toward the retry cap.
+   * `unverifiable`: no answer or no proof (timeout, network error, failed read-back) - counts toward a separate, higher cap.
+   * Neither: nothing reached Mintsoft (the outbound hold refused it) - spends nothing.
+   */
+  rejected: { field: WmsClearableProductField; message: string; answered?: boolean; unverifiable?: boolean }[]
   /**
    * Not sent: the lease taken immediately before the request was refused. Not a failure. Nothing is retried unless `retry` is
    * set (another run holds the lease: the clear is still wanted and the next run must offer it again).

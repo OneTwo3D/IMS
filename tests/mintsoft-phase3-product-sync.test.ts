@@ -429,7 +429,7 @@ test('the clear wire mirrors the live sync and stays unverified in one place', (
 })
 
 const CLEAR_DTO = { sku: 'S', name: 'N', customsDescription: null, barcode: null, commodityCode: null, countryOfManufacture: null, weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null }
-function fakeTransport(reply: { data: unknown; error?: string | null }, readBack: Record<string, unknown> | null) {
+function fakeTransport(reply: { data: unknown; error?: string | null; held?: boolean }, readBack: Record<string, unknown> | null) {
   const posts: string[] = []
   return {
     posts,
@@ -456,17 +456,26 @@ test('sendMintsoftProductClears: CommodityCode is sent and counted only when the
   const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, kept.transport)
   assert.deepEqual(out.cleared, [])
   assert.equal(out.rejected[0].message, 'clear not applied')
-  assert.equal(out.rejected[0].notApplied, true, 'a verified not-applied answer counts toward the retry cap')
+  assert.equal(out.rejected[0].answered, true, 'a verified not-applied answer counts toward the retry cap')
 })
 
-test('sendMintsoftProductClears: transport errors and failed read-backs are rejected WITHOUT notApplied (they never spend the retry cap)', async () => {
+test('sendMintsoftProductClears: answered refusals count as answered; timeouts and failed read-backs are unverifiable; a hold spends nothing', async () => {
   const down = fakeTransport({ data: null, error: 'connect ETIMEDOUT' }, null)
   const a = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, down.transport)
   assert.equal(a.rejected.length, 1)
-  assert.equal(a.rejected[0].notApplied, undefined)
+  assert.deepEqual([a.rejected[0].answered, a.rejected[0].unverifiable], [undefined, true])
   const blind = fakeTransport({ data: { Success: true } }, null)
   const b = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, blind.transport)
-  assert.equal(b.rejected[0].notApplied, undefined)
+  assert.deepEqual([b.rejected[0].answered, b.rejected[0].unverifiable], [undefined, true])
+  const refused = fakeTransport({ data: { Success: false, Message: 'no' } }, null)
+  const c = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, refused.transport)
+  assert.deepEqual([c.rejected[0].answered, c.rejected[0].unverifiable], [true, undefined])
+  const http = fakeTransport({ data: null, error: 'Mintsoft request failed with status 422' }, null)
+  const d = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, http.transport)
+  assert.deepEqual([d.rejected[0].answered, d.rejected[0].unverifiable], [true, undefined])
+  const held = fakeTransport({ data: null, error: 'held', held: true }, null)
+  const e = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, held.transport)
+  assert.deepEqual([e.rejected[0].answered, e.rejected[0].unverifiable], [undefined, undefined])
 })
 
 test('sendMintsoftProductClears: the request body is built from the fresh read, not the planning snapshot', async () => {
@@ -559,6 +568,9 @@ test('resolveManualCustomsClears: description and origin only while Mintsoft is 
   assert.deepEqual(productSync.resolveManualCustomsClears(product, { CustomsDescription: '', CountryOfManufacture: null, CommodityCode: null }), [])
   const capped = { ...product, customsClears: [{ field: 'hsCode', createdAt: at, attempts: productSync.CUSTOMS_CLEAR_MAX_ATTEMPTS }] }
   assert.deepEqual(productSync.resolveManualCustomsClears(capped, held), ['commodityCode'])
+  const unverified = { ...product, customsClears: [{ field: 'hsCode', createdAt: at, unverifiedAttempts: productSync.CUSTOMS_CLEAR_MAX_UNVERIFIED_ATTEMPTS }] }
+  assert.deepEqual(productSync.resolveManualCustomsClears(unverified, held), ['commodityCode'])
+  assert.equal(productSync.customsClearCapSpent({ attempts: 4, unverifiedAttempts: 19 }), false)
   assert.deepEqual(productSync.resolveManualCustomsClears({ ...product, customsDescription: 'Refilled' }, held), ['countryOfManufacture'])
 })
 

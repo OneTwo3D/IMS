@@ -16,7 +16,7 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 type Row = Record<string, unknown>
-const mintsoft = { code: null as string | null, pushes: [] as Array<{ code: string | null; clears: string[] }>, onClearPost: null as null | (() => Promise<void>) }
+const mintsoft = { code: null as string | null, pushes: [] as Array<{ code: string | null; clears: string[] }>, onClearPost: null as null | (() => Promise<void>), mode: 'land' as 'land' | 'refuse' | 'timeout' }
 
 function remoteRaw(sku: string): Row {
   return {
@@ -51,6 +51,8 @@ async function load() {
           post: async (_path: string, init: { body: string }) => {
             // the request is slow: other things happen before it lands
             if (mintsoft.onClearPost) await mintsoft.onClearPost()
+            if (mintsoft.mode === 'refuse') return { data: { Success: false, Message: 'refused' } }
+            if (mintsoft.mode === 'timeout') return { data: null, error: 'The operation was aborted due to timeout' }
             if (JSON.parse(init.body).CommodityCode?.Code === '') mintsoft.code = null
             return { data: { Success: true, Message: 'ok' } }
           },
@@ -100,6 +102,73 @@ test('B pushes the refilled code between A\'s send and A\'s recheck: Mintsoft st
     assert.equal(await db.productCustomsClear.count({ where: { productId: product.id } }), 0)
   } finally {
     mintsoft.onClearPost = null
+    await db.wmsMutationEvent.deleteMany({ where: { entityId: product.id } })
+    await db.wmsStockDiscrepancy.deleteMany({ where: { productId: product.id } })
+    await db.product.delete({ where: { id: product.id } })
+    await db.warehouse.delete({ where: { id: warehouse.id } })
+  }
+})
+
+async function runOnce(db: Awaited<ReturnType<typeof load>>['db'], sync: Awaited<ReturnType<typeof load>>['sync'], connector: unknown, productId: string, warehouse: { id: string; code: string }) {
+  const candidate = await sync.getProductSyncCandidate(productId)
+  await sync.syncOneMintsoftProduct({ product: candidate!, scopes: [{ warehouseId: warehouse.id, warehouseCode: warehouse.code }], connector: connector as never })
+}
+
+test('a clear Mintsoft keeps ANSWERING no (Success:false) reaches the cap of 5 and opens the manual discrepancy; no clear is sent after', { skip }, async () => {
+  const { db, sync, connector } = await load()
+  const warehouse = await db.warehouse.create({ data: { code: `CAP${randomUUID().slice(0, 8)}`, name: 'Cap probe' } })
+  const product = await db.product.create({ data: { sku: `CAP-${randomUUID()}`, name: 'Cap probe', hsCode: X, countryOfOrigin: 'CN' } })
+  try {
+    await db.wmsProductLink.create({ data: { productId: product.id, connector: 'mintsoft', externalProductId: '42', payloadHash: 'old' } })
+    await db.product.update({ where: { id: product.id }, data: { hsCode: null } })
+    mintsoft.code = X
+    mintsoft.mode = 'refuse'
+    mintsoft.pushes.length = 0
+    for (let run = 0; run < sync.CUSTOMS_CLEAR_MAX_ATTEMPTS; run += 1) await runOnce(db, sync, connector, product.id, warehouse)
+    assert.equal(mintsoft.pushes.filter((p) => p.clears.length).length, sync.CUSTOMS_CLEAR_MAX_ATTEMPTS)
+    const marker = await db.productCustomsClear.findFirstOrThrow({ where: { productId: product.id } })
+    assert.equal(marker.attempts, sync.CUSTOMS_CLEAR_MAX_ATTEMPTS)
+    await runOnce(db, sync, connector, product.id, warehouse)
+    assert.equal(mintsoft.pushes.filter((p) => p.clears.length).length, sync.CUSTOMS_CLEAR_MAX_ATTEMPTS, 'no sixth clear request')
+    const open = await db.wmsStockDiscrepancy.findMany({ where: { productId: product.id, category: 'CUSTOMS_CLEAR_MANUAL', status: 'OPEN' } })
+    assert.equal(open.length, 1)
+    assert.match(open[0].wmsValue ?? '', /commodity code/)
+  } finally {
+    mintsoft.mode = 'land'
+    await db.wmsMutationEvent.deleteMany({ where: { entityId: product.id } })
+    await db.wmsStockDiscrepancy.deleteMany({ where: { productId: product.id } })
+    await db.product.delete({ where: { id: product.id } })
+    await db.warehouse.delete({ where: { id: warehouse.id } })
+  }
+})
+
+test('unanswered clears (timeouts) spend the separate cap of 20 and then also open the discrepancy', { skip }, async () => {
+  const { db, sync, connector } = await load()
+  const warehouse = await db.warehouse.create({ data: { code: `UNV${randomUUID().slice(0, 8)}`, name: 'Unverified probe' } })
+  const product = await db.product.create({ data: { sku: `UNV-${randomUUID()}`, name: 'Unverified probe', hsCode: X, countryOfOrigin: 'CN' } })
+  try {
+    await db.wmsProductLink.create({ data: { productId: product.id, connector: 'mintsoft', externalProductId: '42', payloadHash: 'old' } })
+    await db.product.update({ where: { id: product.id }, data: { hsCode: null } })
+    mintsoft.code = X
+    mintsoft.mode = 'timeout'
+    mintsoft.pushes.length = 0
+    await runOnce(db, sync, connector, product.id, warehouse)
+    let marker = await db.productCustomsClear.findFirstOrThrow({ where: { productId: product.id } })
+    assert.equal(marker.attempts, 0, 'a timeout is not an answer')
+    assert.equal(marker.unverifiedAttempts, 1)
+    // five more timeouts still send (the answered cap is untouched)
+    for (let run = 0; run < 5; run += 1) await runOnce(db, sync, connector, product.id, warehouse)
+    assert.equal(mintsoft.pushes.filter((p) => p.clears.length).length, 6)
+    await db.productCustomsClear.updateMany({ where: { productId: product.id }, data: { unverifiedAttempts: sync.CUSTOMS_CLEAR_MAX_UNVERIFIED_ATTEMPTS - 1 } })
+    await runOnce(db, sync, connector, product.id, warehouse)
+    marker = await db.productCustomsClear.findFirstOrThrow({ where: { productId: product.id } })
+    assert.equal(marker.unverifiedAttempts, sync.CUSTOMS_CLEAR_MAX_UNVERIFIED_ATTEMPTS)
+    await runOnce(db, sync, connector, product.id, warehouse)
+    assert.equal(mintsoft.pushes.filter((p) => p.clears.length).length, 7, 'no clear once the cap is spent')
+    const open = await db.wmsStockDiscrepancy.findMany({ where: { productId: product.id, category: 'CUSTOMS_CLEAR_MANUAL', status: 'OPEN' } })
+    assert.equal(open.length, 1)
+  } finally {
+    mintsoft.mode = 'land'
     await db.wmsMutationEvent.deleteMany({ where: { entityId: product.id } })
     await db.wmsStockDiscrepancy.deleteMany({ where: { productId: product.id } })
     await db.product.delete({ where: { id: product.id } })

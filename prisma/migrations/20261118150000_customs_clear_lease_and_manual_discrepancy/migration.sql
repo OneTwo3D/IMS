@@ -7,6 +7,7 @@ ALTER TYPE "WmsDiscrepancyCategory" ADD VALUE IF NOT EXISTS 'CUSTOMS_CLEAR_MANUA
 ALTER TABLE "product_customs_clears" ADD COLUMN "claimToken" TEXT;
 ALTER TABLE "product_customs_clears" ADD COLUMN "claimedAt" TIMESTAMP(3);
 ALTER TABLE "product_customs_clears" ADD COLUMN "attempts" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "product_customs_clears" ADD COLUMN "unverifiedAttempts" INTEGER NOT NULL DEFAULT 0;
 
 -- The inherited-fields list is never null (the Prisma field is a non-null list); the earlier migration left the column nullable.
 UPDATE "products" SET "customsInherited" = ARRAY[]::TEXT[] WHERE "customsInherited" IS NULL;

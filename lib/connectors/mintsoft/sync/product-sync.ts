@@ -53,7 +53,7 @@ export const PRODUCT_SYNC_CANDIDATE_SELECT = {
   parent: { select: { name: true, weight: true, widthCm: true, heightCm: true, depthCm: true } },
   content: { select: { shortDescription: true, longDescription: true, images: true } },
   // Customs fields emptied in IMS (value -> nothing): the only evidence that Mintsoft's copy is to be cleared.
-  customsClears: { select: { field: true, createdAt: true, attempts: true } },
+  customsClears: { select: { field: true, createdAt: true, attempts: true, unverifiedAttempts: true } },
   wmsProductLinks: {
     where: { connector: 'mintsoft' },
     select: {
@@ -94,7 +94,7 @@ export type ProductSyncCandidate = {
   parent?: { name: string; weight: Prisma.Decimal | null; widthCm: Prisma.Decimal | null; heightCm: Prisma.Decimal | null; depthCm: Prisma.Decimal | null } | null
   content?: { shortDescription: string | null; longDescription: string | null; images: Prisma.JsonValue } | null
   /** Customs fields emptied in IMS; absent on a candidate built without the relation (none). */
-  customsClears?: Array<{ field: string; createdAt?: Date; attempts?: number }>
+  customsClears?: Array<{ field: string; createdAt?: Date; attempts?: number; unverifiedAttempts?: number }>
   wmsProductLinks: Array<{
     id: string
     externalProductId: string
@@ -338,6 +338,13 @@ export function plannedClearMarkers(markers: ReadonlyArray<{ field: string; crea
 export const CUSTOMS_CLEAR_LEASE_MINUTES = 10
 /** Clear requests per marker before the field is left to the operator as an open discrepancy. */
 export const CUSTOMS_CLEAR_MAX_ATTEMPTS = 5
+/** Clear requests per marker that ended with no answer or no proof (timeout, network error, failed read-back) before the field is left to the operator. */
+export const CUSTOMS_CLEAR_MAX_UNVERIFIED_ATTEMPTS = 20
+
+/** True once a marker's retry budget is spent on either count: Mintsoft answered "no" five times, or twenty tries were never answered or verified. */
+export function customsClearCapSpent(marker: { attempts?: number; unverifiedAttempts?: number } | undefined): boolean {
+  return (marker?.attempts ?? 0) >= CUSTOMS_CLEAR_MAX_ATTEMPTS || (marker?.unverifiedAttempts ?? 0) >= CUSTOMS_CLEAR_MAX_UNVERIFIED_ATTEMPTS
+}
 
 const IMS_CUSTOMS_COLUMN_SQL: Readonly<Record<'customsDescription' | 'hsCode' | 'countryOfOrigin', Prisma.Sql>> = {
   customsDescription: Prisma.sql`"customsDescription"`,
@@ -368,7 +375,7 @@ export function buildCustomsClearClaim(productId: string, planned: PlannedClearM
       SET "claimToken" = ${token}, "claimedAt" = now()
       WHERE c."productId" = ${productId} AND c."field" = ${imsField} AND c."createdAt" = ${plannedAt}
         AND (c."claimToken" IS NULL OR c."claimedAt" < now() - make_interval(mins => ${CUSTOMS_CLEAR_LEASE_MINUTES}))
-        AND c."attempts" < ${CUSTOMS_CLEAR_MAX_ATTEMPTS}
+        AND c."attempts" < ${CUSTOMS_CLEAR_MAX_ATTEMPTS} AND c."unverifiedAttempts" < ${CUSTOMS_CLEAR_MAX_UNVERIFIED_ATTEMPTS}
         AND EXISTS (SELECT 1 FROM "products" p WHERE p."id" = c."productId" AND NULLIF(btrim(p.${column}), '') IS NULL)
       RETURNING 1 AS one`)
     if (acquired.length === 0) {
@@ -378,7 +385,7 @@ export function buildCustomsClearClaim(productId: string, planned: PlannedClearM
       const current = await db.product.findUnique({ where: { id: productId }, select: { hsCode: true, countryOfOrigin: true, customsDescription: true } })
       if (!current) return { claimed: false as const, reason: 'the product no longer exists' }
       if (trimToNull(current[imsField])) return { claimed: false as const, reason: 'the IMS field is no longer empty' }
-      if (marker.attempts >= CUSTOMS_CLEAR_MAX_ATTEMPTS) return { claimed: false as const, reason: 'the retry cap for this clear is spent' }
+      if (customsClearCapSpent(marker)) return { claimed: false as const, reason: 'the retry cap for this clear is spent' }
       return { claimed: false as const, reason: 'another run holds the clear lease', retry: true }
     }
     // A failing release is logged and never masks the request's own error or result; a lease left behind simply expires.
@@ -430,7 +437,7 @@ export function resolveManualCustomsClears(
   return resolveMintsoftCustomsClears(product, remoteRaw, marked).filter((f) => {
     if (!mintsoftCanClear(f)) return true
     const marker = markers.find((m) => m.field === IMS_FIELD_OF_WMS_CLEAR[f])
-    return (marker?.attempts ?? 0) >= CUSTOMS_CLEAR_MAX_ATTEMPTS
+    return customsClearCapSpent(marker)
   })
 }
 
@@ -465,7 +472,7 @@ export async function syncManualCustomsClearDiscrepancy(
   // Mintsoft was not read: only the IMS side can be judged. Nothing marked and still empty that Mintsoft cannot clear => nothing is pending.
   const stillPending = (context.product.customsClears ?? []).some((m) => {
     const wms = (Object.keys(IMS_FIELD_OF_WMS_CLEAR) as WmsClearableProductField[]).find((f) => IMS_FIELD_OF_WMS_CLEAR[f] === m.field)
-    return wms && (!mintsoftCanClear(wms) || (m.attempts ?? 0) >= CUSTOMS_CLEAR_MAX_ATTEMPTS) && !trimToNull(context.product[m.field as 'hsCode'])
+    return wms && (!mintsoftCanClear(wms) || customsClearCapSpent(m)) && !trimToNull(context.product[m.field as 'hsCode'])
   })
   if (!stillPending) await resolveProductDiscrepancy(context.scopes, context.product.id, 'CUSTOMS_CLEAR_MANUAL')
 }
@@ -1026,7 +1033,8 @@ export async function syncOneMintsoftProduct(
   // A field Mintsoft has no API way to clear is never sent (and so never retried): recorded once for the operator instead.
   // A field Mintsoft has no API way to clear (or whose retry cap is spent) is never sent: an open discrepancy tells the operator instead.
   const manualClears = new Set(resolveManualCustomsClears(context.product, remoteRawForClears))
-  const clearFields = plannedClears.filter((f) => mintsoftCanClear(f) && !manualClears.has(f) && ((context.product.customsClears ?? []).find((m) => m.field === IMS_FIELD_OF_WMS_CLEAR[f])?.attempts ?? 0) < CUSTOMS_CLEAR_MAX_ATTEMPTS)
+  // The recovery push after a superseded clear sends NO clears (no second request, no attempt spent twice).
+  const clearFields = context.recovery ? [] : plannedClears.filter((f) => mintsoftCanClear(f) && !manualClears.has(f) && !customsClearCapSpent((context.product.customsClears ?? []).find((m) => m.field === IMS_FIELD_OF_WMS_CLEAR[f])))
   const plannedMarkers = plannedClearMarkers(context.product.customsClears ?? [])
   // Markers whose Mintsoft copy is already empty are settled: drop them (no request needed), each only while it is still the version read.
   const settledMarkers = earlyExternalProductId ? resolveSettledCustomsMarkers(context.product, remoteRawForClears, markedFields) : []
@@ -1316,15 +1324,16 @@ export async function syncOneMintsoftProduct(
     )
   }
   const rejectedClears = synced.clearOutcome?.rejected ?? []
-  // Only an attempt that Mintsoft answered and a read-back verified NOT applied counts toward the retry cap; a transport error,
-  // a timeout, a failed read-back or a superseded result retries without spending it.
+  // Every outcome where Mintsoft RESPONDED (Success:false, an HTTP error status, a read-back showing the value) spends the cap of
+  // five; an unverifiable one (timeout, network error, failed read-back) spends a separate, higher cap of twenty; a superseded
+  // result or an outbound-hold refusal spends nothing. Past either cap the field goes to the operator as a discrepancy.
   for (const rejected of rejectedClears) {
-    if (!rejected.notApplied) continue
+    if (!rejected.answered && !rejected.unverifiable) continue
     const marker = (context.product.customsClears ?? []).find((m) => m.field === IMS_FIELD_OF_WMS_CLEAR[rejected.field])
     if (!marker) continue
     await db.productCustomsClear.updateMany({
       where: { productId: context.product.id, field: marker.field, ...(marker.createdAt ? { createdAt: marker.createdAt } : {}) },
-      data: { attempts: { increment: 1 } },
+      data: rejected.answered ? { attempts: { increment: 1 } } : { unverifiedAttempts: { increment: 1 } },
     })
   }
   // A clear skipped by the claim (the field was refilled meanwhile) is not a failure and is not retried.

@@ -4006,6 +4006,8 @@ model ProductCustomsClear {
   claimedAt  DateTime?
   /// Clear requests started for this marker. Past the cap the clear is left to the operator (an open discrepancy) instead of retried forever.
   attempts   Int      @default(0)
+  /// Clear requests that ended with no answer or no proof (timeout, network error, failed read-back): a separate, higher cap than `attempts`, so a long outage does not hand the clear to the operator but a clear that never gets through eventually does.
+  unverifiedAttempts Int @default(0)
 
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
 

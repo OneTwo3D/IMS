@@ -702,9 +702,14 @@ export async function upsertMintsoftProduct(
 
 /** What the clear sender talks to Mintsoft through; the defaults are the real client, a test passes its own. */
 export type MintsoftClearTransport = {
-  post: (path: string, init: { method: 'POST'; body: string }) => Promise<{ data: unknown; error?: string | null }>
+  post: (path: string, init: { method: 'POST'; body: string }) => Promise<{ data: unknown; error?: string | null; held?: boolean }>
   readBack: (externalProductId: string) => Promise<Record<string, unknown> | null>
 }
+
+/** Mintsoft RESPONDED to the clear request and refused it (Success:false or an HTTP error status). */
+class MintsoftClearAnsweredError extends Error {}
+/** The outbound hold stopped the request before it left IMS. */
+class MintsoftClearHeldError extends Error {}
 
 /** Longest a single clear request may run (must stay well under the clear lease of 10 minutes). */
 export const MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS = 120_000
@@ -739,11 +744,14 @@ export async function sendMintsoftProductClears(
       // Built from a fresh read when the caller supplies one (it runs inside the claim, after the lease is held).
       const request = buildMintsoftProductClearRequest(options.freshProduct ? await options.freshProduct() : product, field, options)
       const result = await transport.post(request.path, { method: request.method, body: request.body })
-      if (result.error) throw new Error(result.error)
+      if ((result as { held?: boolean }).held) throw new MintsoftClearHeldError(result.error ?? 'The outbound-write hold refused the request.')
+      // "failed with status N" is how the client words an HTTP response that was an error status: Mintsoft answered. Anything else
+      // (timeout, abort, connection error) proves nothing about whether it did.
+      if (result.error) throw (/with status \d{3}/.test(result.error) ? new MintsoftClearAnsweredError(result.error) : new Error(result.error))
       const body = result.data as { Success?: unknown; Message?: unknown } | null
       if (body && typeof body === 'object') {
         if (body.Success === false) {
-          throw new Error(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
+          throw new MintsoftClearAnsweredError(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
         }
         // Success with "Nothing to update/add" is Mintsoft saying it changed nothing. That is also what it says when the field is
         // already empty, so it is neither a failure nor proof: the read-back below counts the clear only if the field IS empty.
@@ -762,7 +770,11 @@ export async function sendMintsoftProductClears(
       }
       sent.push(field)
     } catch (error) {
-      outcome.rejected.push({ field, message: error instanceof Error ? error.message : 'Mintsoft clear failed' })
+      outcome.rejected.push({
+        field,
+        message: error instanceof Error ? error.message : 'Mintsoft clear failed',
+        ...(error instanceof MintsoftClearAnsweredError ? { answered: true } : error instanceof MintsoftClearHeldError ? {} : { unverifiable: true }),
+      })
     }
   }
   if (sent.length === 0) return outcome
@@ -778,7 +790,7 @@ export async function sendMintsoftProductClears(
   }
   for (const field of sent) {
     if (raw && mintsoftFieldIsEmpty(raw, field)) outcome.cleared.push(field)
-    else outcome.rejected.push({ field, ...(raw ? { notApplied: true } : {}), message: raw ? (nothingToUpdate.has(field) ? 'clear not applied (Mintsoft reported nothing to update)' : 'clear not applied') : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
+    else outcome.rejected.push({ field, ...(raw ? { answered: true } : { unverifiable: true }), message: raw ? (nothingToUpdate.has(field) ? 'clear not applied (Mintsoft reported nothing to update)' : 'clear not applied') : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
   }
   return outcome
 }
