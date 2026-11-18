@@ -15,12 +15,13 @@ import {
 const NOW = new Date('2026-11-18T12:00:00Z')
 const minutesAgo = (m: number) => new Date(NOW.getTime() - m * 60_000)
 
-type Order = { id: string; shipments: Array<{ updatedAt: Date; trackingNumber: string | null }> }
-type Log = { entityId: string; status: 'SYNCED' | 'FAILED'; createdAt: Date }
+type Order = { id: string; shipments: Array<{ updatedAt?: Date; trackingNumber: string | null }> }
+type Log = { entityId: string; status: 'SYNCED' | 'FAILED'; createdAt: Date; payload?: unknown }
 
 function harness(orders: Order[], logs: Log[] = [], enabled = true) {
   const pushes: Array<{ orderId: string; skip: readonly string[] }> = []
   const created: Array<Record<string, unknown>> = []
+  const pages: Array<{ cursor: string | null; take: number }> = []
   let pushResult: (orderId: string) => { success: boolean; skipped?: boolean; shadowed?: boolean } | Error = () => ({ success: true })
   const deps: Partial<WcTrackingReconcileDeps> = {
     isEnabled: async () => enabled,
@@ -32,18 +33,29 @@ function harness(orders: Order[], logs: Log[] = [], enabled = true) {
       return result
     },
     db: {
-      salesOrder: { findMany: async () => orders },
+      salesOrder: {
+        findMany: async ({ where, take }: { where: { id?: { gt: string } }; take: number }) => {
+          pages.push({ cursor: where.id?.gt ?? null, take })
+          return [...orders].sort((x, y) => (x.id < y.id ? -1 : 1)).filter((o) => !where.id || o.id > where.id.gt).slice(0, take)
+        },
+      },
       shoppingSyncLog: {
-        findFirst: async ({ where }: { where: { status: string; entityId: string; createdAt: { gte: Date } } }) =>
-          logs.find((l) => l.entityId === where.entityId && l.status === where.status && l.createdAt >= where.createdAt.gte) ?? null,
+        findMany: async ({ where }: { where: { status: string; entityId: { in: string[] }; createdAt: { gte: Date } } }) =>
+          logs
+            .filter((l) => where.entityId.in.includes(l.entityId) && l.status === where.status && l.createdAt >= where.createdAt.gte)
+            .sort((x, y) => x.createdAt.getTime() - y.createdAt.getTime()),
         create: async ({ data }: { data: Record<string, unknown> }) => { created.push(data); return data },
       },
     } as never,
   }
-  return { deps, pushes, created, setPush: (fn: typeof pushResult) => { pushResult = fn } }
+  return { deps, pushes, created, pages, setPush: (fn: typeof pushResult) => { pushResult = fn } }
 }
 
-const lost = (id: string): Order => ({ id, shipments: [{ updatedAt: minutesAgo(60), trackingNumber: 'TRK1' }] })
+const synced = (entityId: string, minutes: number, ...numbers: string[]): Log => ({
+  entityId, status: 'SYNCED', createdAt: minutesAgo(minutes), payload: { meta_key: '_wc_shipment_tracking_items', items: numbers.map((n) => ({ tracking_number: n })) },
+})
+
+const lost = (id: string, tracking = 'TRK1'): Order => ({ id, shipments: [{ trackingNumber: tracking }] })
 
 test('an order whose tracking was never pushed is re-pushed, and the skip-list is passed', async () => {
   const h = harness([lost('o1')])
@@ -58,16 +70,43 @@ test('disabled flag: nothing is scanned or pushed', async () => {
   assert.equal(h.pushes.length, 0)
 })
 
-test('an order with a SYNCED tracking row newer than the shipment change is not pushed again', async () => {
-  const h = harness([lost('o1')], [{ entityId: 'o1', status: 'SYNCED', createdAt: minutesAgo(30) }])
+test('an order whose latest SYNCED push carries exactly the current tracking is covered', async () => {
+  const h = harness([lost('o1')], [synced('o1', 30, 'trk1')])
   await reconcileWcTrackingPushes(h.deps)
   assert.equal(h.pushes.length, 0)
 })
 
-test('a SYNCED row OLDER than the latest shipment change does not cover it', async () => {
-  const h = harness([lost('o1')], [{ entityId: 'o1', status: 'SYNCED', createdAt: minutesAgo(120) }])
+test('a late log for OLD tracking does not hide a newer lost update (content, not timestamps)', async () => {
+  // Shipment now carries TRK2 (the edit whose push was lost); an older push of TRK1 logged AFTER the edit committed.
+  const h = harness([lost('o1', 'TRK2')], [synced('o1', 1, 'TRK1')])
   await reconcileWcTrackingPushes(h.deps)
   assert.equal(h.pushes.length, 1)
+})
+
+test('the LATEST synced row decides: an older matching row does not cover a newer different one', async () => {
+  const h = harness([lost('o1', 'TRK2')], [synced('o1', 50, 'TRK2'), synced('o1', 10, 'TRK1')])
+  await reconcileWcTrackingPushes(h.deps)
+  assert.equal(h.pushes.length, 1)
+})
+
+test('a verification mark covers the order by its recorded tracking numbers', async () => {
+  const mark: Log = { entityId: 'o1', status: 'SYNCED', createdAt: minutesAgo(5), payload: { meta_key: '_wc_shipment_tracking_items', items: [], reconcileVerified: true, reconcileTrackingNumbers: ['trk1'] } }
+  const covered = harness([lost('o1')], [mark])
+  await reconcileWcTrackingPushes(covered.deps)
+  assert.equal(covered.pushes.length, 0)
+  const stale = harness([lost('o1', 'TRK9')], [mark])
+  await reconcileWcTrackingPushes(stale.deps)
+  assert.equal(stale.pushes.length, 1)
+})
+
+test('a large covered backlog cannot starve a later order: every eligible order is paged through', async () => {
+  const covered = Array.from({ length: 450 }, (_, i) => lost(`a${String(i).padStart(4, '0')}`))
+  const logs = covered.map((o) => synced(o.id, 30, 'TRK1'))
+  const h = harness([...covered, lost('z-late-lost')], logs)
+  await reconcileWcTrackingPushes(h.deps)
+  assert.deepEqual(h.pushes.map((p) => p.orderId), ['z-late-lost'])
+  assert.ok(h.pages.length >= 3, 'more than one page was read')
+  assert.equal(h.pages[1].cursor, 'a0199', 'the cursor is a keyset on id')
 })
 
 test('a recent FAILED attempt backs the order off; an old one does not', async () => {
@@ -80,7 +119,7 @@ test('a recent FAILED attempt backs the order off; an old one does not', async (
 })
 
 test('shipments without a tracking number are not candidates', async () => {
-  const h = harness([{ id: 'o1', shipments: [{ updatedAt: minutesAgo(60), trackingNumber: '  ' }] }])
+  const h = harness([{ id: 'o1', shipments: [{ trackingNumber: '  ' }] }])
   await reconcileWcTrackingPushes(h.deps)
   assert.equal(h.pushes.length, 0)
 })
@@ -101,7 +140,7 @@ test('an unchanged push writes a verification mark so the order stops being a ca
   assert.equal(h.created.length, 1)
   assert.equal(h.created[0].status, 'SYNCED')
   assert.equal(h.created[0].entityId, 'o1')
-  assert.deepEqual(h.created[0].payload, { meta_key: '_wc_shipment_tracking_items', items: [], reconcileVerified: true })
+  assert.deepEqual(h.created[0].payload, { meta_key: '_wc_shipment_tracking_items', items: [], reconcileVerified: true, reconcileTrackingNumbers: ['trk1'] })
 })
 
 test('failures and throws are counted and do not stop the batch', async () => {

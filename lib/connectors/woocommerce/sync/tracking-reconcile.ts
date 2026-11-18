@@ -8,7 +8,10 @@
  *
  * This sweep re-derives the obligation from durable state instead of adding a mark at every shipping call site. An order
  * is a candidate when it has a WooCommerce link and a SHIPPED shipment with a tracking number that changed inside the
- * window, and no TO_CONNECTOR tracking `shoppingSyncLog` row (SYNCED) is newer than that change. Each candidate goes
+ * window, and the LATEST SYNCED TO_CONNECTOR tracking `shoppingSyncLog` row does not carry exactly the tracking numbers the
+ * order's shipments have now (compared by content, never by timestamp: a slow older push that logs after a newer edit
+ * committed would otherwise look like proof the newer tracking was delivered). Orders are paged by id with a keyset cursor,
+ * so every eligible order in the window is examined and a large covered backlog cannot starve later orders. Each candidate goes
  * through `pushOrderDeliveryMetadata` unchanged, so it passes the producer seam (the outbound hold) and `wcPut`'s egress
  * barrier like every other tracking write, and `pushImsTrackingToWc` is idempotent (it reads WooCommerce first and writes
  * nothing when the tracking already matches).
@@ -29,7 +32,7 @@ export const WC_TRACKING_RECONCILE_WINDOW_MS = 72 * 60 * 60 * 1000
 export const WC_TRACKING_RECONCILE_GRACE_MS = 5 * 60 * 1000
 export const WC_TRACKING_RECONCILE_RETRY_BACKOFF_MS = 15 * 60 * 1000
 export const WC_TRACKING_RECONCILE_BATCH = 25
-const CANDIDATE_SCAN_LIMIT = 1000
+const PAGE_SIZE = 200
 const TRACKING_META_KEY = '_wc_shipment_tracking_items'
 /** WooCommerce statuses where the sweep writes nothing (see the header). */
 export const WC_TRACKING_RECONCILE_SKIP_WC_STATUSES = ['completed', 'cancelled', 'refunded', 'failed', 'trash'] as const
@@ -61,6 +64,21 @@ const defaultDeps: WcTrackingReconcileDeps = {
 
 const trackingRowWhere = { path: ['meta_key'], equals: TRACKING_META_KEY } as const
 
+/** The tracking numbers the order's shipments carry now, normalised the way the outbound push dedupes them. */
+export function currentTrackingNumbers(shipments: Array<{ trackingNumber: string | null }>): string[] {
+  return [...new Set(shipments.map((s) => (s.trackingNumber ?? '').trim().toLowerCase()).filter(Boolean))].sort()
+}
+
+/** The tracking numbers a logged push (or a reconcile verification mark) says it delivered. */
+export function loggedTrackingNumbers(payload: unknown): string[] {
+  if (typeof payload !== 'object' || payload === null) return []
+  const p = payload as { reconcileTrackingNumbers?: unknown; items?: unknown }
+  const raw: unknown[] = Array.isArray(p.reconcileTrackingNumbers)
+    ? p.reconcileTrackingNumbers
+    : Array.isArray(p.items) ? p.items.map((item) => (item as { tracking_number?: unknown } | null)?.tracking_number) : []
+  return [...new Set(raw.map((n) => (typeof n === 'string' ? n.trim().toLowerCase() : '')).filter(Boolean))].sort()
+}
+
 export async function reconcileWcTrackingPushes(overrides: Partial<WcTrackingReconcileDeps> = {}): Promise<WcTrackingReconcileResult> {
   const deps = { ...defaultDeps, ...overrides }
   if (!(await deps.isEnabled())) return { skipped: true, reason: 'wc_tracking_reconcile_disabled' }
@@ -75,63 +93,72 @@ export async function reconcileWcTrackingPushes(overrides: Partial<WcTrackingRec
     trackingNumber: { not: null },
     updatedAt: { gte: windowStart, lte: graceCutoff },
   }
-  const orders = await deps.db.salesOrder.findMany({
-    where: {
-      shoppingLinks: { some: { connector: 'woocommerce' } },
-      shipments: { some: shipmentFilter },
-    },
-    select: { id: true, shipments: { where: shipmentFilter, select: { updatedAt: true, trackingNumber: true } } },
-    take: CANDIDATE_SCAN_LIMIT,
-  })
-
   const result = { scanned: 0, pushed: 0, unchanged: 0, held: 0, failed: 0 }
-  for (const order of orders) {
-    if (result.scanned >= WC_TRACKING_RECONCILE_BATCH) break
-    const changedAt = order.shipments
-      .filter((shipment) => (shipment.trackingNumber ?? '').trim() !== '')
-      .reduce<Date | null>((latest, shipment) => (latest === null || shipment.updatedAt > latest ? shipment.updatedAt : latest), null)
-    if (!changedAt) continue
-
-    const covered = await deps.db.shoppingSyncLog.findFirst({
+  let cursor: string | null = null
+  while (result.scanned < WC_TRACKING_RECONCILE_BATCH) {
+    const orders: Array<{ id: string; shipments: Array<{ trackingNumber: string | null }> }> = await deps.db.salesOrder.findMany({
       where: {
-        connector: 'woocommerce', direction: 'TO_CONNECTOR', status: 'SYNCED', entityType: 'SalesOrder',
-        entityId: order.id, createdAt: { gte: changedAt }, payload: trackingRowWhere,
+        shoppingLinks: { some: { connector: 'woocommerce' } },
+        shipments: { some: shipmentFilter },
+        ...(cursor ? { id: { gt: cursor } } : {}),
       },
-      select: { id: true },
+      // ALL of the order's SHIPPED tracking, not only the recently changed rows: coverage is judged on the whole set.
+      select: { id: true, shipments: { where: { status: 'SHIPPED', trackingNumber: { not: null } }, select: { trackingNumber: true } } },
+      orderBy: { id: 'asc' },
+      take: PAGE_SIZE,
     })
-    if (covered) continue
-    const recentlyFailed = await deps.db.shoppingSyncLog.findFirst({
-      where: {
-        connector: 'woocommerce', direction: 'TO_CONNECTOR', status: 'FAILED', entityType: 'SalesOrder',
-        entityId: order.id, createdAt: { gte: backoffStart }, payload: trackingRowWhere,
-      },
-      select: { id: true },
-    })
-    if (recentlyFailed) continue
+    if (orders.length === 0) break
+    cursor = orders[orders.length - 1].id
+    const ids = orders.map((o) => o.id)
 
-    result.scanned += 1
-    try {
-      const push = await deps.pushTracking(order.id, { skipWcStatuses: WC_TRACKING_RECONCILE_SKIP_WC_STATUSES })
-      if (push.shadowed) {
-        result.held += 1
-      } else if (!push.success) {
+    const base = { connector: 'woocommerce', direction: 'TO_CONNECTOR' as const, entityType: 'SalesOrder', entityId: { in: ids }, payload: trackingRowWhere }
+    const synced = await deps.db.shoppingSyncLog.findMany({
+      where: { ...base, status: 'SYNCED', createdAt: { gte: windowStart } },
+      select: { entityId: true, payload: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    })
+    const latestSynced = new Map<string, unknown>()
+    for (const row of synced) if (row.entityId) latestSynced.set(row.entityId, row.payload) // ascending: the last write wins
+    const failed = await deps.db.shoppingSyncLog.findMany({
+      where: { ...base, status: 'FAILED', createdAt: { gte: backoffStart } },
+      select: { entityId: true },
+    })
+    const backedOff = new Set(failed.map((row) => row.entityId))
+
+    for (const order of orders) {
+      if (result.scanned >= WC_TRACKING_RECONCILE_BATCH) break
+      const current = currentTrackingNumbers(order.shipments)
+      if (current.length === 0) continue
+      const logged = latestSynced.has(order.id) ? loggedTrackingNumbers(latestSynced.get(order.id)) : null
+      if (logged !== null && JSON.stringify(logged) === JSON.stringify(current)) continue
+      if (backedOff.has(order.id)) continue
+
+      result.scanned += 1
+      try {
+        const push = await deps.pushTracking(order.id, { skipWcStatuses: WC_TRACKING_RECONCILE_SKIP_WC_STATUSES })
+        if (push.shadowed) {
+          result.held += 1
+        } else if (!push.success) {
+          result.failed += 1
+        } else if (push.skipped) {
+          result.unchanged += 1
+          await deps.db.shoppingSyncLog.create({
+            data: {
+              direction: 'TO_CONNECTOR', status: 'SYNCED', entityType: 'SalesOrder', entityId: order.id,
+              // `items` stays empty on purpose: the webhook echo check reads `items`, and a mark must never suppress a real webhook.
+              payload: { meta_key: TRACKING_META_KEY, items: [], reconcileVerified: true, reconcileTrackingNumbers: current },
+              syncedAt: now,
+            },
+          })
+        } else {
+          result.pushed += 1
+        }
+      } catch (error) {
         result.failed += 1
-      } else if (push.skipped) {
-        result.unchanged += 1
-        await deps.db.shoppingSyncLog.create({
-          data: {
-            direction: 'TO_CONNECTOR', status: 'SYNCED', entityType: 'SalesOrder', entityId: order.id,
-            payload: { meta_key: TRACKING_META_KEY, items: [], reconcileVerified: true },
-            syncedAt: now,
-          },
-        })
-      } else {
-        result.pushed += 1
+        console.error('[tracking-reconcile] push threw', { orderId: order.id, error: error instanceof Error ? error.message : String(error) })
       }
-    } catch (error) {
-      result.failed += 1
-      console.error('[tracking-reconcile] push threw', { orderId: order.id, error: error instanceof Error ? error.message : String(error) })
     }
+    if (orders.length < PAGE_SIZE) break
   }
   return result
 }
