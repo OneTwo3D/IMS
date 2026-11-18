@@ -1,5 +1,6 @@
 'use server'
 
+import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -292,6 +293,14 @@ export type PoRow = {
   trackingNumber: string | null
   shippingProvider: string | null
   skipPreferredSupplierUpdate: boolean
+  /** The user who created the order; null for imported and older orders. */
+  createdById: string | null
+  /** NOT_REQUIRED: no gate applies. AWAITING: needs approval before it can be sent. APPROVED: approved and still covered. */
+  approvalState: 'NOT_REQUIRED' | 'AWAITING' | 'APPROVED'
+  approvedAt: string | null
+  approvedById: string | null
+  /** Filled by the detail read only. */
+  approvedByName: string | null
 }
 
 export type PoReturn = {
@@ -497,6 +506,12 @@ const PO_SELECT = {
   notes: true,
   internalNotes: true,
   skipPreferredSupplierUpdate: true,
+  createdById: true,
+  approvedById: true,
+  approvedAt: true,
+  approvedTotalBase: true,
+  approvedSupplierId: true,
+  approvedCurrency: true,
   createdAt: true,
   updatedAt: true,
   supplier: { select: { id: true, name: true, prepaid: true } },
@@ -560,6 +575,12 @@ function mapPoRow(po: {
   notes: string | null
   internalNotes: string | null
   skipPreferredSupplierUpdate: boolean
+  createdById: string | null
+  approvedById: string | null
+  approvedAt: Date | null
+  approvedTotalBase: unknown
+  approvedSupplierId: string | null
+  approvedCurrency: string | null
   createdAt: Date
   updatedAt: Date
   trackingNumber: string | null
@@ -568,7 +589,11 @@ function mapPoRow(po: {
   destinationWarehouse: { name: string } | null
   lines: { id: string; qtyReceived: unknown; qtyReturned: unknown }[]
   _count: { invoices: number; returns: number }
-}): PoRow {
+}, approvalThreshold: Prisma.Decimal | null = null): PoRow {
+  const approval = evaluatePoApproval({
+    type: po.type, supplierId: po.supplierId, currency: po.currency, totalBase: po.totalBase as MoneyLike, taxBase: po.taxBase as MoneyLike,
+    approvedAt: po.approvedAt, approvedTotalBase: po.approvedTotalBase as MoneyLike | null, approvedSupplierId: po.approvedSupplierId, approvedCurrency: po.approvedCurrency,
+  }, approvalThreshold)
   const anyReturned = po.lines.some((l) => Number(l.qtyReturned) > 0)
   const allReturned = po.lines.length > 0 && po.lines.every(
     (l) => Number(l.qtyReceived) > 0 && Number(l.qtyReturned) >= Number(l.qtyReceived),
@@ -614,6 +639,11 @@ function mapPoRow(po: {
     trackingNumber: po.trackingNumber ?? null,
     shippingProvider: po.shippingProvider ?? null,
     skipPreferredSupplierUpdate: po.skipPreferredSupplierUpdate,
+    createdById: po.createdById,
+    approvalState: !approval.required ? 'NOT_REQUIRED' : approval.approved ? 'APPROVED' : 'AWAITING',
+    approvedAt: po.approvedAt?.toISOString() ?? null,
+    approvedById: po.approvedById,
+    approvedByName: null,
   }
 }
 
@@ -743,7 +773,8 @@ export async function getPurchaseOrders(params: PoListParams = {}): Promise<PoLi
     skip: (page - 1) * pageSize,
     take: pageSize,
   })
-  return { ...buildListPage(page, pageSize, total), rows: pos.map(mapPoRow), hidesArchived, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
+  const approvalThreshold = await readApprovalThreshold(db)
+  return { ...buildListPage(page, pageSize, total), rows: pos.map((p) => mapPoRow(p, approvalThreshold)), hidesArchived, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
 /**
@@ -1054,7 +1085,12 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null, po.currency),
   ])
 
-  const row = mapPoRow(po)
+  const approvalThreshold = await readApprovalThreshold(db)
+  const row = mapPoRow(po, approvalThreshold)
+  if (po.approvedById) {
+    const approver = await db.user.findUnique({ where: { id: po.approvedById }, select: { name: true, email: true } })
+    row.approvedByName = approver ? (approver.name || approver.email) : 'a former user'
+  }
   return {
     ...row,
     lines: mappedLines,
@@ -1330,7 +1366,8 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
   try {
     // A system-actor context (the first-load apply runner) replaces the session check; anything that is not the real
     // capability takes the permission check, so a forged argument fails closed.
-    if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
+    let creatorId: string | null = null
+    if (system?.systemImportToken !== SYSTEM_IMPORT) creatorId = (await requirePermission('purchasing.create')).user.id
     // The acting user for the minimum-margin guard (null for a system import, which is not assessed). Read after the permission check above.
     const session = system?.systemImportToken !== SYSTEM_IMPORT ? await requireAuth() : null
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
@@ -1529,6 +1566,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       data: {
         reference: poReference,
         type: 'GOODS',
+        createdById: creatorId,
         supplierId: input.supplierId,
         currency: input.currency,
         fxRateToBase: fxRate,
@@ -2184,10 +2222,44 @@ export async function updatePurchaseOrder(
             data: updates,
             select: PO_SELECT,
           })
-      return { po }
+      // An approved order that this edit made dearer, or moved to another supplier or currency, is no longer the order that was approved. Judged
+      // here, under the same row lock, against the total the edit started from, so an approval racing this edit either lands before it (and is
+      // cleared by it) or after it (and approves the edited order).
+      const approvalAfter = await tx.purchaseOrder.findUnique({ where: { id }, select: PO_APPROVAL_FACTS_SELECT })
+      let approvalCleared = false
+      if (approvalAfter && editInvalidatesApproval(locked, approvalAfter)) {
+        await tx.purchaseOrder.update({ where: { id }, data: CLEARED_APPROVAL })
+        approvalCleared = true
+      }
+      // An order whose creator was never recorded takes the editor as its recorded maker, which is what lets approval proceed (by someone else).
+      await tx.purchaseOrder.updateMany({ where: { id, createdById: null }, data: { createdById: session.user.id } })
+      return { po: approvalCleared ? { ...po, ...CLEARED_APPROVAL } : po, approvalCleared }
     }, STOCK_TX_OPTIONS)
     if ('refused' in edit) return { success: false, error: edit.refused }
     const po = edit.po
+    if (!['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED'].includes(existing.status)) {
+      // The supplier may already hold the earlier version (or an email for it may be in flight): say so on the order.
+      try {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER', entityId: id, action: 'edited_after_send', tag: 'purchase', level: 'WARNING',
+          description: `PO ${po.reference} was edited after it was sent to the supplier (status ${existing.status}): the supplier's copy may differ from this version`,
+          metadata: { reference: po.reference, status: existing.status },
+        })
+      } catch (logError) {
+        console.error('Failed to log PO edit after send:', logError)
+      }
+    }
+    if (edit.approvalCleared) {
+      try {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER', entityId: id, action: 'approval_cleared', tag: 'purchase', level: 'INFO',
+          description: `Approval of PO ${po.reference} cleared: the edit raised the total or changed the supplier or currency, so it needs approving again`,
+          metadata: { reference: po.reference },
+        })
+      } catch (logError) {
+        console.error('Failed to log PO approval clearing:', logError)
+      }
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
@@ -2245,6 +2317,8 @@ export async function advancePoStatus(
       }
       const transition = validatePurchaseOrderStatusTransition(existing.status, targetStatus)
       if (!transition.success) throw new Error(transition.error)
+      // The approval gate, under the row lock taken above: an approval, an edit or a threshold change cannot slip between this check and the status write.
+      if (targetStatus === 'PO_SENT') await assertPoApprovedForSend(tx, id)
 
       // Close: one operation at every stage. Nothing landed -> the order is retired; something landed -> close-short (the
       // received stock and its cost stay, the unreceived balance is dropped). A live warehouse ASN refuses. Read and written
@@ -2331,6 +2405,13 @@ export async function advancePoStatus(
     }
   } catch (e) {
     if (e instanceof MarginBlockedError) return { success: false, error: e.message }
+    if (e instanceof PoApprovalRequiredError) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER', entityId: id, action: 'send_refused_unapproved', tag: 'purchase', level: 'WARNING',
+        description: `PO ${id} was not advanced to ${targetStatus}: it needs approval first`, metadata: { targetStatus },
+      }).catch(() => undefined)
+      return { success: false, error: e.message }
+    }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
@@ -2350,6 +2431,13 @@ export async function advancePoStatus(
  * mode, exactly as order confirmations are, so a stage with no SMTP configured keeps it queued/failed rather than mailing anyone.
  */
 async function queuePurchaseOrderEmail(id: string, reference: string, supplierEmail: string | null): Promise<PoSendResult> {
+  // Defence in depth: the one place an email is queued refuses an order that needs approval it does not have, whichever caller got here.
+  try {
+    await assertPoApprovedForSend(db, id)
+  } catch (e) {
+    if (e instanceof PoApprovalRequiredError) return { status: 'failed', message: e.message }
+    throw e
+  }
   const result = await runPoSend(supplierEmail, {
     isEnabled: isPurchaseOrderEmailEnabled,
     queue: async (to) => {
@@ -2392,9 +2480,12 @@ export async function confirmAndSendPurchaseOrder(
   if (!advanced.success) return { success: false, error: advanced.error }
   let send: PoSendResult
   try {
+    // An order that is already PO_SENT is a no-op for the advance above, so the email half checks the gate itself.
+    await assertPoApprovedForSend(db, id)
     const po = await getPurchaseOrderQueueData(id)
     send = await queuePurchaseOrderEmail(id, po.reference, po.supplierEmail)
   } catch (e) {
+    if (e instanceof PoApprovalRequiredError) return { success: false, error: e.message }
     send = { status: 'failed', message: `The order is confirmed, but the email could not be queued (${e instanceof Error ? e.message : String(e)}). Use "Email PO" to retry.` }
   }
   return { success: true, ...(advanced.warnings ? { warnings: advanced.warnings } : {}), send }
@@ -2408,9 +2499,11 @@ export async function sendPurchaseOrderEmail(id: string): Promise<{ success: boo
     if (['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'CANCELLED'].includes(po.status)) {
       return { success: false, error: 'Confirm the purchase order before emailing it to the supplier.' }
     }
+    await assertPoApprovedForSend(db, id)
     const send = await queuePurchaseOrderEmail(id, po.reference, po.supplierEmail)
     return { success: send.status === 'queued' || send.status === 'already_queued', ...(send.status === 'queued' || send.status === 'already_queued' ? {} : { error: send.message }), send }
   } catch (e) {
+    if (e instanceof PoApprovalRequiredError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }
@@ -2426,6 +2519,89 @@ export async function setPurchaseOrderEmailEnabled(enabled: boolean): Promise<{ 
     })
     revalidatePath('/settings/company')
     revalidatePath('/purchase-orders')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/** The Settings > Purchasing approval threshold, as the stored text ('' = no gate) with the base currency it is measured in. */
+export async function getPoApprovalThresholdSetting(): Promise<{ value: string; baseCurrency: string }> {
+  await requirePermission('settings.company')
+  const [row, baseCurrency] = await Promise.all([
+    db.setting.findUnique({ where: { key: PO_APPROVAL_THRESHOLD_SETTING_KEY }, select: { value: true } }),
+    getBaseCurrencyCode(),
+  ])
+  const threshold = await readApprovalThreshold({ setting: { findUnique: async () => row } })
+  return { value: threshold ? threshold.toFixed() : '', baseCurrency }
+}
+
+/** Set (or, blank / 0, clear) the approval threshold: goods POs at or above it, ex VAT in base currency, need approval before they are sent. */
+export async function setPoApprovalThreshold(raw: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('settings.company')
+    const parsed = validateApprovalThresholdInput(String(raw ?? ''))
+    if (!parsed.ok) return { success: false, error: parsed.error }
+    await db.setting.upsert({
+      where: { key: PO_APPROVAL_THRESHOLD_SETTING_KEY },
+      create: { key: PO_APPROVAL_THRESHOLD_SETTING_KEY, value: parsed.stored },
+      update: { value: parsed.stored },
+    })
+    await logActivity({
+      entityType: 'SETTING', entityId: PO_APPROVAL_THRESHOLD_SETTING_KEY, action: 'setting_changed', tag: 'settings', level: 'INFO',
+      description: parsed.stored === '' ? 'Purchase order approval switched OFF (no threshold)' : `Purchase order approval threshold set to ${parsed.stored} (base currency, ex VAT)`,
+    })
+    revalidatePath('/settings/company')
+    revalidatePath('/purchase-orders')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Approve a purchase order that needs approval (goods, ex-VAT base total at or above the threshold). Needs `purchasing.approve`, and the
+ * approver must not be the order's creator. Done under the order's row lock so it serialises with an edit and with the send paths: it
+ * snapshots the total, supplier and currency it is approving, and an edit that lands later and raises the total clears it.
+ */
+export async function approvePurchaseOrder(id: string): Promise<{ success: boolean; error?: string; alreadyApproved?: boolean }> {
+  try {
+    const session = await requirePermission('purchasing.approve')
+    const outcome = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      const po = await tx.purchaseOrder.findUnique({ where: { id }, select: { ...PO_APPROVAL_FACTS_SELECT, status: true, reference: true, createdById: true } })
+      if (!po) return { refused: 'PO not found' }
+      if (po.type !== 'GOODS') return { refused: 'Only goods purchase orders are approved.' }
+      if (!PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL.includes(po.status)) return { refused: `A ${po.status} purchase order cannot be approved.` }
+      const threshold = await readApprovalThreshold(tx)
+      const state = evaluatePoApproval(po, threshold)
+      if (!state.required) return { refused: 'This purchase order does not need approval.' }
+      if (state.approved) return { alreadyApproved: true as const, reference: po.reference }
+      // An order with no stored creator (imported, or created before the column existed) is attributed from the activity log's create entry. If the
+      // creator still cannot be established, self-approval cannot be ruled out, so the order is refused until someone re-saves it (see below).
+      const creatorId = po.createdById ?? (await tx.activityLog.findFirst({ where: { entityType: 'PURCHASE_ORDER', entityId: id, action: 'created', userId: { not: null } }, orderBy: { createdAt: 'asc' }, select: { userId: true } }))?.userId ?? null
+      if (!creatorId) return { refused: PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE }
+      if (approverIsRequester(creatorId, session.user.id)) return { refused: PO_APPROVAL_SELF_MESSAGE }
+      const approvedTotalBase = approvalSpendBase(po)
+      await tx.purchaseOrder.update({
+        where: { id },
+        data: { approvedById: session.user.id, approvedAt: new Date(), approvedTotalBase, approvedSupplierId: po.supplierId, approvedCurrency: po.currency },
+      })
+      return { approved: true as const, reference: po.reference, approvedTotalBase: approvedTotalBase.toFixed(4) }
+    }, STOCK_TX_OPTIONS)
+    if ('refused' in outcome) return { success: false, error: outcome.refused }
+    if ('alreadyApproved' in outcome) return { success: true, alreadyApproved: true }
+    try {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER', entityId: id, action: 'approved', tag: 'purchase', level: 'INFO',
+        description: `Approved PO ${outcome.reference} (${outcome.approvedTotalBase} base, ex VAT)`,
+        metadata: { reference: outcome.reference, approvedTotalBase: outcome.approvedTotalBase, approvedById: session.user.id },
+      })
+    } catch (logError) {
+      console.error('Failed to log PO approval:', logError)
+    }
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${id}`)
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
