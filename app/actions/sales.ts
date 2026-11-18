@@ -1325,6 +1325,8 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
     shippingForeign: input.shippingForeign,
     fees: input.fees,
     orderDiscountForeign: input.orderDiscountForeign,
+    // OFF unless an operator enables it: the invoice still posts the discount on the header rate, so the apportioned tax is only for a deployment whose posting follows it (see changelog).
+    apportionDiscountTax: process.env.IMS_APPORTION_ORDER_DISCOUNT_TAX === '1',
     lines: input.lines.map((l, idx) => ({ input: l, rate: lineResolved[idx].taxRateValue, taxRateId: lineResolved[idx].taxRateId })),
   })
   return { ok: true as const, fxRate, vatRate, inclVat, model, lineResolved, taxValidation, destCountry, productCategoryById, orderDefaultRate }
