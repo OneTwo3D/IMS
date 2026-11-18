@@ -37,7 +37,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   // wcLineBaseline (JSON): WooCommerce line item ids, quantities, SKUs and the order total taken at the first IMS line edit. Product and money figures only: no name, address, email or free text.
   SalesOrder: {
     erased: ['customerName', 'customerEmail', 'customerVatNumber', 'billingAddress', 'shippingAddress', 'notes', 'internalNotes', 'trackingNumber'],
-    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
+    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
     retained: {
       invoiceNumber: 'issued invoice number, statutory record',
       accountingInvoiceId: 'ledger document id, statutory record',
@@ -171,6 +171,13 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   WmsReturnsInbox: {
     erased: ['reason', 'rawPayload', 'resolutionNote'],
     notPersonal: ['connector', 'externalReturnId', 'sku', 'reference', 'resolvedBy'],
+    retained: {},
+  },
+  // Sales-order custom field values (product values are not personal and are not linked to an order). The text and JSON an operator types
+  // into an order's custom fields can be about the person, so both are erased: the erasure DELETES every value row of the order.
+  CustomFieldValue: {
+    erased: ['valueText', 'valueJson'],
+    notPersonal: ['id'],
     retained: {},
   },
 }

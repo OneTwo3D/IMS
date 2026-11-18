@@ -131,6 +131,19 @@ Two read-only lists sit at the bottom of **Settings > Sales**:
 - **Recent Tax Rate Fallbacks** — recent events where a line's tax rate could not be matched and a fallback was used or blocked. Use it to find the rate that needs mapping (see [Troubleshooting](troubleshooting.md)).
 - **Recent Invoice PDF Token Security Signals** — orders whose customer invoice PDF link was used from a copied session or a changed address. An unexpected entry is worth a look; an empty list is normal.
 
+## Custom Fields
+
+Found at **Settings > Custom fields** (needs the company settings permission). Add your own typed fields to **products** (and their variants) and to **sales orders**, with no software change. Both use the same definitions, grouped on screen by a **group** (namespace) you choose, such as `logistics` or `manufacturing`.
+
+- **Add field.** Give it a label, a group, a **key** and a type. The key is lower-case letters, digits and underscores, is unique among the fields for products (and, separately, among those for orders), and **cannot be changed later**: it is the CSV column name (`cf:key`) and the address of the sales order list filter.
+- **Types.** Text (free text, or a **drop-down** if you list choices, one per line), whole number, decimal number (exact, up to 10 decimal places), yes / no, date, date and time (UTC), JSON and link (a web address starting http:// or https://).
+- **Required when saved** stops a value being cleared once it is set. It does not stop a product or order being created without it, and it does not touch existing records.
+- **Changing a field.** The label, group, sort order, required flag and shown/hidden flag can always change. The **type is fixed as soon as any value exists** (the page says how many). To change the type, hide the field and add a new one. A drop-down's choices can change, but a choice that is already used by a value cannot be removed.
+- **Hide / show.** Hiding a field removes it from the product and order pages, the product CSV and the list filter. **No value is deleted**: showing the field again brings every value back. A field with no values can also be deleted.
+- **Limits.** Up to 100 fields per kind (product or order), up to 100 choices on a drop-down, 2,000 characters of text.
+- **Not sent anywhere.** Values stay in IMS: they are not sent to WooCommerce, Mintsoft or Xero, and orders imported from WooCommerce start with no values. Variants keep their own values (nothing is inherited from the variable parent).
+- **Audit.** Creating, changing, hiding and deleting a field is written to the Activity Log.
+
 ## Purchasing Settings
 
 - **Purchase units** — define units of measure with conversion factors (e.g. 1 case = 12 units)

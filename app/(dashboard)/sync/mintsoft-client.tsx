@@ -39,7 +39,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { MintsoftCourierMapSection, MintsoftOrderDispatchSection } from './mintsoft-courier-map'
+import { MintsoftCourierMapSection, MintsoftOrderDispatchSection, MintsoftSendIossNumberSection } from './mintsoft-courier-map'
 import { Textarea } from '@/components/ui/textarea'
 import { MergeCandidatesSection } from './merge-candidates-section'
 
@@ -583,6 +583,7 @@ export function MintsoftClient({ data, configured }: Props) {
       <MintsoftCourierMapSection />
 
       <MintsoftOrderDispatchSection />
+      <MintsoftSendIossNumberSection />
 
       <MergeCandidatesSection />
 

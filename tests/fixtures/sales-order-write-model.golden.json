@@ -87,7 +87,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -108,6 +110,7 @@
         "totalBase": "14.2",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       },
       {
@@ -128,6 +131,7 @@
         "totalBase": "37.035",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       },
       {
@@ -148,6 +152,7 @@
         "totalBase": "149.985",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       }
     ]
@@ -240,7 +245,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -261,6 +268,7 @@
         "totalBase": "9.5238",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       },
       {
@@ -281,6 +289,7 @@
         "totalBase": "72",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       }
     ]
@@ -373,7 +382,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -394,6 +405,7 @@
         "totalBase": "89.6987",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       },
       {
@@ -414,6 +426,7 @@
         "totalBase": "3.5577",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       }
     ]
@@ -506,7 +519,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -527,6 +542,7 @@
         "totalBase": "32",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       },
       {
@@ -547,6 +563,7 @@
         "totalBase": "24.8",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       },
       {
@@ -567,6 +584,7 @@
         "totalBase": "7.76",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       }
     ]
@@ -659,7 +677,9 @@
       "externalUpdatedAt": null,
       "archived": false,
       "paymentRemovedAt": null,
-      "paymentRemovedForeign": null
+      "paymentRemovedForeign": null,
+      "deliveryTerm": null,
+      "iossNumber": null
     },
     "lines": [
       {
@@ -680,6 +700,7 @@
         "totalBase": "8.4615",
         "cogsBase": null,
         "fulfillmentRequirements": null,
+        "wcCustomsUnitValue": null,
         "exchangeForRefundId": null
       }
     ]

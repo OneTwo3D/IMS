@@ -189,6 +189,8 @@ import { SHOP_DESYNC_WARNING, paidOrderTotalChangeRefusal, resolveSalesOrderAddr
 import { RETURN_EXCHANGE_OFF_REFUSAL, RETURN_EXCHANGE_SETTING_KEY, exchangeRequestRefusal, resolveReturnExchangeBlock, returnExchangeEnabledFromSetting, returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
 import { hasPermission } from '@/lib/permissions'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
+import { filterableCustomFields, resolveCustomFieldListFilter, type FilterableCustomField } from '@/lib/custom-fields/filter'
+import { loadActiveDefinitions } from '@/lib/custom-fields/values-service'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -212,6 +214,8 @@ export type SoStatus =
 
 export type SoLineRow = {
   id: string
+  /** Per-unit customs value override mirrored from WooCommerce (`_wc_label_customs_unit_value`), order currency, as a decimal string; null when none. Read-only. */
+  wcCustomsUnitValue?: string | null
   productId: string | null
   sku: string
   imageUrl: string | null
@@ -309,7 +313,18 @@ export type SoRow = {
   shipmentOutstandingQty: number | null
 }
 
+/** What WooCommerce reported for duty and tax on this order, mirrored as stored and shown read-only. Decimal amounts are strings in the ORDER currency. */
+export type WooDutyTaxMirror = {
+  iossNumber: string | null
+  deliveryTerm: string | null
+  dutyComponent: string | null
+  taxComponent: string | null
+  handlingComponent: string | null
+}
+
 export type SoDetail = SoRow & {
+  /** The duty/tax results mirrored from WooCommerce; null when the order carries none of them. */
+  wooDutyTax?: WooDutyTaxMirror | null
   /** The linked customer, so the edit form can pre-select it. */
   customerId: string | null
   /** The order's version as loaded: the edit form sends it back and the edit is refused if the order moved since. */
@@ -757,6 +772,7 @@ function mapSoRow(so: {
 
 function mapLine(l: {
   id: string
+  wcCustomsUnitValue?: { toString(): string } | null
   productId: string | null
   sku: string | null
   description: string
@@ -777,6 +793,7 @@ function mapLine(l: {
 }): SoLineRow {
   return {
     id: l.id,
+    wcCustomsUnitValue: l.wcCustomsUnitValue == null ? null : l.wcCustomsUnitValue.toString(),
     productId: l.productId,
     sku: l.sku ?? '',
     imageUrl: l.product?.imageUrl ?? l.product?.parent?.imageUrl ?? null,
@@ -815,9 +832,15 @@ export type SoListParams = {
   showCompleted?: boolean
   /** Include archived orders in the default view. */
   includeArchived?: boolean
+  /** Filter by a custom field (a dropdown or yes / no field): its key and the chosen value. Unknown keys and values are ignored. */
+  customFieldKey?: string
+  customFieldValue?: string
 }
 
 export type SoListResult = ListPage & {
+  /** The custom fields the list can be filtered by (dropdown and yes / no fields), and the filter currently applied. */
+  customFieldFilters: FilterableCustomField[]
+  appliedCustomField: { key: string; value: string } | null
   rows: SoRow[]
   /** What the current view is hiding by default; search and explicit status picks lift it. */
   hides: SoListHidden
@@ -843,12 +866,15 @@ async function attachShipmentOutstanding(row: SoRow): Promise<void> {
 
 export async function getSalesOrders(params: SoListParams = {}): Promise<SoListResult> {
   await requireInternalUser()
+  const customFieldDefinitions = await loadActiveDefinitions(db, 'SALES_ORDER')
+  const customFieldFilter = resolveCustomFieldListFilter(customFieldDefinitions, params.customFieldKey, params.customFieldValue)
   const filter: SoListFilter = {
     q: normaliseListQuery(params.q),
     statuses: normaliseStatuses(params.status, SO_STATUSES),
     invoicing: normaliseStatuses(params.invoicing, SO_INVOICING_FILTERS),
     showCompleted: params.showCompleted === true,
     includeArchived: params.includeArchived === true,
+    ...(customFieldFilter ? { customField: customFieldFilter } : {}),
   }
   const where = buildSalesOrderListWhere(filter)
   const hides = soListHides(filter)
@@ -889,7 +915,11 @@ export async function getSalesOrders(params: SoListParams = {}): Promise<SoListR
     return row
   })
   await Promise.all(rows.map(attachShipmentOutstanding))
-  return { ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
+  return {
+    ...buildListPage(page, pageSize, total), rows, hides, hiddenCompletedCount, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q),
+    customFieldFilters: filterableCustomFields(customFieldDefinitions),
+    appliedCustomField: customFieldFilter ? { key: params.customFieldKey!, value: params.customFieldValue! } : null,
+  }
 }
 
 /**
@@ -943,8 +973,14 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       updatedAt: true,
       billingAddress: true,
       shippingAddress: true,
+      iossNumber: true,
+      deliveryTerm: true,
+      wclcDutyComponent: true,
+      wclcTaxComponent: true,
+      wclcHandlingComponent: true,
       lines: {
         select: {
+          wcCustomsUnitValue: true,
           id: true, productId: true, sku: true, description: true,
           qty: true, unitPriceForeign: true, unitPriceBase: true, discountStr: true, discountAmount: true,
           taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
@@ -1042,8 +1078,19 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
   const detailRow = mapSoRow(so)
   await attachShipmentOutstanding(detailRow)
 
+  const decimalText = (value: { toString(): string } | null | undefined) => (value == null ? null : value.toString())
+  const wooDutyTax: WooDutyTaxMirror = {
+    iossNumber: so.iossNumber,
+    deliveryTerm: so.deliveryTerm,
+    dutyComponent: decimalText(so.wclcDutyComponent),
+    taxComponent: decimalText(so.wclcTaxComponent),
+    handlingComponent: decimalText(so.wclcHandlingComponent),
+  }
+  const hasWooDutyTax = Object.values(wooDutyTax).some((v) => v !== null) || so.lines.some((l) => l.wcCustomsUnitValue != null)
+
   return {
     ...detailRow,
+    wooDutyTax: hasWooDutyTax ? wooDutyTax : null,
     settlement,
     customerId: so.customerId,
     updatedAt: so.updatedAt.toISOString(),
