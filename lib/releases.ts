@@ -14,6 +14,39 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '5.1.0',
+    date: '2026-11-18',
+    title: 'Sales quotations, purchase order approval and minimum margin, GR/IR accrual, typed custom fields, document numbering, exchanges, Edit by CSV, and a security and audit-fix pass',
+    summary: 'Release with operator actions: set TRUSTED_PROXY_IPS before deploying (login throttling reads the client address only from configured proxies), and check where the reverse proxy runs before deploying the stage unit file, which now binds 127.0.0.1. Migrations (all additive) apply automatically on deploy. New and changed: sales quotations, purchase order approval above a threshold and a minimum margin on purchase order lines, a GR/IR accrual sub-ledger and report, typed custom fields on products and sales orders, document numbering patterns, order attachments, sales-order to purchase-order pegging, exchanges inside a return, Edit by CSV on the Inventory list, WooCommerce native customs fields and duty and tax mirrored from the store, a Delete invoice and Delete bill action in Xero, and a large batch of security, accounting, WooCommerce and Mintsoft audit fixes. Built, switched off: refund delete, Xero document delete, WooCommerce order divergence reporting, TrackShip re-fire, the warehouse not-found strike count, the tracking reconcile sweep, lazy invoice fetch, and three new settings (mintsoft_align_up_requires_receipt_evidence, supplier_quote_shipping_landed_enabled, stock_adjustment_release_reserved).',
+    userMessage: 'IMS 5.1 adds sales quotations, purchase order approval and minimum margin, typed custom fields, document numbering patterns, order attachments, exchanges inside a return and Edit by CSV on the Inventory list. Administrators: set TRUSTED_PROXY_IPS before deploying.',
+    userHighlights: [
+      'Sales: quotations with a PDF (emailing them is built, switched off), exchanges recorded inside a return, order attachments on sales and purchase orders, and pegging a sales order line to a purchase order line so received stock is allocated to it first.',
+      'Purchasing: purchase orders above a threshold need approval before they are sent, a minimum gross margin per purchase order line can warn or block, and the sales price can be edited from the margin column.',
+      'Inventory: Edit by CSV on the Inventory list gives a pre-filled download and a per-product diff before anything is applied; typed custom fields on products, variants and sales orders are managed under Settings > Custom fields.',
+      'Settings: number patterns and counters for sales orders, purchase orders, credit notes and shipments, under Settings > Company > Numbering.',
+      'Accounting: a GR/IR report under Analytics shows goods received and not invoiced, and billed and not received, by supplier and purchase order. Posting it to Xero is built, switched off.',
+      'Xero: an invoice or bill that IMS pushed can be deleted in IMS and Xero together, freeing its number. Built, switched off.',
+      'WooCommerce: native customs fields, the IOSS number, delivery term and duty and tax components are mirrored read-only onto the order; webhook secret rotation keeps the previous secret valid for 48 hours, with a Revoke previous secret button.',
+      'Security: sign-in, two-factor, backup and settings-secret hardening, with optional backup encryption before upload.',
+    ],
+    technicalHighlights: [
+      'Migrations (all additive): wc_order_divergences; so_po_pegging columns and table; mirror_woo_duty_tax columns; accounting document delete sync types and the accounting_document_deletions table; order_attachments and order_attachment_file_deletions; custom_field_definitions and custom_field_values; product_sync_marks; product_customs_clears and product_customs_inherited; sales_quotations; purchase_orders approval columns (six nullable); sales_order_lines exchange_for_refund link; new operator-task reason wms_not_found; the TrackShip re-fire state table and two columns with constant defaults on the order status snapshot table; the GR/IR sub-ledger tables; document numbering counters; customs clear lease and manual discrepancy columns; wms_discrepancy sku renamed; the push warehouse column on wms_order_push_links.',
+      'Security: forwarded client address headers are trusted only for TRUSTED_PROXY_IPS / TRUSTED_PROXY_CIDRS; a password reset removes passkeys; getSetting returns sensitive values masked; backup target settings sit behind step-up; cost and margin data, cross-site request and CSV formula fixes; authorization fixes on stock adjustment edits, product prices and forecast settings.',
+      'Accounting: GR/IR movements are written in the same transaction as the event, idempotent on the source event; refunds without a stock return no longer reverse COGS into Inventory; order-level purchase discounts reach the cost layer; supplier returns consume the returned order layers; a snapshot-day, short-close freight and supplier-quoted shipping pass; unrealised FX; sub-ledger reconciliations in the invariant report.',
+      'WooCommerce: reconcile cadence and buried product recovery, stale delivery handling, inbound import fixes, failed product pushes recorded and retried, and the product.updated webhook following the product sync settings.',
+      'Mintsoft: customs data cleared in IMS now clears in Mintsoft without holding a lock across the call; ASN, align and returns fixes; the IOSS number is sent only with mintsoft_send_ioss_number on (default off).',
+      'Built, switched off: refund_delete_enabled, xero_document_delete_enabled, wc_order_divergence_detection_enabled, trackship_refire_enabled (needs helper plugin 1.4.0), wms_not_found_after_strikes_enabled, wc_tracking_reconcile_enabled, invoice_documents_lazy_fetch_enabled, grir_xero_posting_enabled, sales_quote_email_enabled, return_exchange_enabled, mintsoft_send_ioss_number, mintsoft_align_up_requires_receipt_evidence, supplier_quote_shipping_landed_enabled and stock_adjustment_release_reserved. With each off, payloads and reports are unchanged.',
+    ],
+    operatorActions: [
+      'Set TRUSTED_PROXY_IPS (or TRUSTED_PROXY_CIDRS) in the server environment before deploying: the client address from X-Forwarded-For and X-Real-IP is trusted only for configured proxies, and without it login throttling sees every client as unknown (#1007).',
+      'Optional: set BACKUP_ENCRYPTION_KEY in the server environment to make the Encrypt backups before upload option available (Settings > Backup & Restore > Storage, off by default); the key lives apart from the backups, which cannot be decrypted without it (#1003).',
+      'Three new settings default off and stay off unless the owner decides otherwise: mintsoft_align_up_requires_receipt_evidence (#1025), supplier_quote_shipping_landed_enabled (#1028) and stock_adjustment_release_reserved (#1017).',
+      'Keep these flags off: refund_delete_enabled, xero_document_delete_enabled, wc_order_divergence_detection_enabled, trackship_refire_enabled, wms_not_found_after_strikes_enabled, invoice_documents_lazy_fetch_enabled and wc_tracking_reconcile_enabled.',
+      'The repository stage systemd unit now binds 127.0.0.1: check where the reverse proxy runs before deploying the unit file, because a proxy on another host cannot reach an app bound to 127.0.0.1.',
+      'Webhook secret rotation has a 48-hour grace window: the previous WooCommerce webhook secret stays valid for 48 hours after a new one is saved, and the Revoke previous secret button ends the window early (#1026).',
+    ],
+  },
+  {
     version: '5.0.0',
     date: '2026-11-17',
     title: 'Xero rounding account required, Mintsoft operator tasks instead of order comments, purchase order PDF, prepared stocktakes, reorder planning dates',
