@@ -21,6 +21,9 @@ import { getMergeCandidateForSalesOrder } from '@/app/actions/wms-merge-candidat
 import { getShopRefundDueForSalesOrder } from '@/app/actions/shop-refund-tasks'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
+import { getCustomFieldCardData } from '@/app/actions/custom-fields'
+import { CustomFieldsCard } from '@/components/custom-fields/custom-fields-card'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { getSalesOrderPegs } from '@/app/actions/pegging'
 import { SoDetailClient } from './so-detail-client'
@@ -74,6 +77,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   })
 
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
+  const customFields = await getCustomFieldCardData('SALES_ORDER', id)
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
 
   return (
@@ -108,6 +112,11 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         paidWithoutInvoice={paidWithoutInvoice}
         editForm={editForm}
         pegs={pegs}
+      />
+      <CustomFieldsCard
+        key={JSON.stringify(customFields.fields.map((f) => [f.id, f.value, f.label, f.options]))}
+        data={customFields}
+        canEdit={hasPermission(session.user.role, 'sales.create')}
       />
     </div>
   )

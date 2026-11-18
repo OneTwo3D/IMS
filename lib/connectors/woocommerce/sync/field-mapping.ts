@@ -9,6 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine, WcMeta } from './types'
+import { readWcLineCustomsUnitValue } from './duty-tax-mirror'
 import { classifyWcCouponLines } from './coupon-classification'
 import { knownWcTaxClassCategory } from './tax-class-category'
 import { isPlaceholderEmail, isPlaceholderName } from './anonymisation'
@@ -217,6 +218,8 @@ export type MappedLine = {
    */
   externalTaxRateId: number | null
   externalLineItemId: number | null
+  /** Mirrored line meta `_wc_label_customs_unit_value` (see readWcLineCustomsUnitValue); null when absent. */
+  wcCustomsUnitValue?: string | null
   taxCategoryFallback?: TaxCategory
   /**
    * Which wclc fee a fee line is, read from the line's own `_wclc_fee_kind` item meta (only when the `_wclc_fee`
@@ -315,6 +318,7 @@ export async function mapWcLineItems(
       taxForeign: roundDecimalNumber(tax, 4),
       externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
       externalLineItemId: item.id,
+      wcCustomsUnitValue: readWcLineCustomsUnitValue(item),
     }
   })
 }

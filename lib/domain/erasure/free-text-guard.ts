@@ -54,5 +54,6 @@ export const UNGUARDED_FREE_TEXT: Readonly<Record<string, string>> = {
   'AccountingSyncLog.payload': 'the contact block is replaced by the erasure and by the central accounting-row gate (createAccountingSyncLogRow) and the posting gate; financial fields are kept',
   'AccountingEventLog.message': 'guarded by trigger accounting_event_logs_erased_contact (migration erasure_derived_copies); a final failure writes the raw connector error here',
   'AccountingEventLog.metadata': 'the superseded body is guarded by trigger accounting_event_logs_erased_contact (migration erasure_derived_copies)',
+  'CustomFieldValue.valueText': 'applyCustomFieldValues writes it under the order lock and refuses an erased order (values-service.ts); the erasure deletes the rows that exist',
   'WmsSyncLog.payload': 'the returns sync no longer writes the raw warehouse record here (only the return id); rows written before that are cleared by the erasure (raw-payloads.ts)',
 }

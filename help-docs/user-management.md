@@ -154,9 +154,9 @@ Safeguards: you cannot change your own role away from Administrator, deactivate 
 | Role | Sidebar sections it sees | Notable limits |
 |---|---|---|
 | **Administrator** | Everything, including Integrations, Activity and all Settings pages | None |
-| **Manager** | Dashboard, Inventory (including HS Code Review), Stock Control, Purchases, Sales, Analytics, Manufacturing, Integrations, Activity | No Settings and no user management |
+| **Manager** | Dashboard, Inventory (including HS Code Review), Stock Control, Purchases (including approving large purchase orders), Sales, Analytics, Manufacturing, Integrations, Activity | No Settings and no user management |
 | **Warehouse** | Dashboard, Inventory (can edit products and use HS Code Review; no cost prices), Stock Control (adjustments and transfers), Purchases (receive goods; cannot create orders or record supplier invoices), Sales (process and ship; cannot create orders or refund), Manufacturing, inventory-ledger reports | No Integrations, no Activity, no Settings, no other Analytics |
-| **Finance** | Dashboard, Inventory (read, with prices), Purchases (create, supplier invoices), Sales (read, refunds), Analytics | No Stock Control, no Manufacturing, no Integrations, no Activity, no Settings; cannot create or process sales orders |
+| **Finance** | Dashboard, Inventory (read, with prices), Purchases (create, supplier invoices; cannot approve purchase orders), Sales (read, refunds), Analytics | No Stock Control, no Manufacturing, no Integrations, no Activity, no Settings; cannot create or process sales orders |
 | **Read Only** | Dashboard, Inventory, Purchases, Sales, Analytics (all view-only) | Cannot change anything; some purchasing and cost reports are not shown to this role |
 | **Supplier** | Their own portal only (see below) | No access to the internal system |
 

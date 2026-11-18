@@ -30,8 +30,7 @@ test('legacy product export keeps prices for roles with inventory.prices (o3d-1p
 
 test('the export route applies the price gate and keeps its header (o3d-1plf9)', async () => {
   const src = await readFile(path.join(process.cwd(), 'app/api/export/products/route.ts'), 'utf8')
-  assert.match(src, /gateLegacyExportPrices\(rows, /)
-  assert.match(src, /toCsv\(gated, HEADERS\)/)
+  assert.match(src, /toCsv\(gateLegacyExportPrices\(buildRows\(batch, values\), canSeePrices\), headers\)/, 'every streamed batch is gated')
   assert.match(src, /'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive'/)
 })
 

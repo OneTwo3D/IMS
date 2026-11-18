@@ -1,5 +1,6 @@
 'use server'
 
+import { CLEARED_APPROVAL } from '@/lib/domain/purchasing/po-approval'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
@@ -433,6 +434,8 @@ export async function submitSupplierQuote(
           // Admin review is still required before a binding PO is sent.
           status: 'QUOTE_RECEIVED',
           poSentAt: null,
+          // A new quote is new money: any earlier purchase-order approval no longer covers it.
+          ...CLEARED_APPROVAL,
         },
       })
       if (updated.count === 0) throw new Error('RFQ status changed while quote was being submitted')
