@@ -13,8 +13,10 @@ import test, { mock } from 'node:test'
  * because the failure mode is a plausible-looking wrong figure, not an exception.
  */
 
+let ROLE = 'ADMIN'
+
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: ROLE } }) },
 })
 mock.module('@/app/actions/settings', {
   namedExports: { getSetting: async () => '04-06' },
@@ -294,4 +296,31 @@ test('the Cash Bridge marks its two net-derived bars with the RELATION, not a bo
   assert.equal(bars.get('COGS'), 'exact')
   assert.equal(bars.get('Refunds'), 'exact')
   assert.equal(bars.get('Discounts'), 'exact')
+})
+
+test('SEC-M15: a Read-only user gets no COGS, profit, margin or inventory value from the dashboard action', async () => {
+  ORDERS = [order({ id: 'A', createdAt: TODAY_NOON, lineTotalBase: 100, cogsBase: 40, refunds: [] })]
+  try {
+    ROLE = 'ADMIN'
+    const admin = await todayVsYesterday()
+    assert.equal(admin.costFiguresVisible, true)
+    assert.equal(admin.kpi.cogsCurrent, 40)
+    assert.equal(admin.kpi.marginCurrent, 60)
+    assert.equal(admin.topProducts[0].marginPct, 60)
+
+    for (const role of ['READONLY', 'WAREHOUSE']) {
+      ROLE = role
+      const d = await todayVsYesterday()
+      assert.equal(d.costFiguresVisible, false, role)
+      assert.equal(d.kpi.cogsCurrent, 0, role)
+      assert.equal(d.kpi.profitCurrent, 0, role)
+      assert.equal(d.kpi.marginCurrent, 0, role)
+      assert.equal(d.kpi.inventoryValue, 0, role)
+      assert.ok(d.chartData.every((c) => c.cogs === 0 && c.marginPct === 0 && c.compCogs === 0 && c.compMarginPct === 0), role)
+      assert.ok(d.topProducts.every((t) => t.marginPct === 0), role)
+      assert.equal(d.kpi.netSalesCurrent, 100, 'sales figures are not cost data and stay')
+    }
+  } finally {
+    ROLE = 'ADMIN'
+  }
 })

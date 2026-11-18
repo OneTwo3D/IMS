@@ -51,6 +51,8 @@ To create a new order manually:
 
 A Draft can be changed afterwards with **Edit order** (see *Editing an order* below).
 
+The order form shows an estimated **COGS** per line, **Est. COGS** and **Est. Margin** to Admin, Manager and Finance users only; other roles do not see unit costs.
+
 The **Ship From** warehouse is pre-selected with your default warehouse (the first warehouse if none is marked default); change it if the order ships from elsewhere. The stock figures beside each product are for the selected warehouse.
 
 **VAT and "Incl. VAT".** The order has one default VAT rate and one setting for whether the prices you type include VAT. If prices include VAT, choose the order's default VAT rate: the VAT is taken out of the prices you typed, the order totals are what you typed, and the invoice goes to the accounting system as VAT-inclusive at those same prices. Ticking **Incl. VAT** while the default rate is **No VAT** and a line carries VAT (from its product's tax category or a rate you chose on the line) is refused, because the prices could be read two ways: choose the default rate, or untick **Incl. VAT** and enter net prices. The **Incl. VAT** box is always shown, even when the rate is **No VAT**. A draft saved earlier in that state cannot be moved out of Draft; cancel it and create a new order. Clones made and shipped before this was fixed have no invoice and need one raising by hand.

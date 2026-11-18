@@ -4,6 +4,7 @@ import { auth } from '@/lib/auth'
 import { sessionInvalidLoginReason, type SessionInvalidReason } from '@/lib/auth/session-state'
 import { buildCsp, cspHeaderName, errorTrackingOriginFromDsn, generateNonce, getCspMode } from '@/lib/security/csp'
 import { API_PATH_PREFIX, evaluateProxyAuthz, isPublicProxyPath, type ProxySession } from '@/lib/security/proxy-authz'
+import { evaluateCsrfOrigin } from '@/lib/security/csrf-origin'
 import { isTurnstileEnabled } from '@/lib/turnstile'
 
 /** The session resolver — injectable so handleProxy can be driven end-to-end in tests (muid). */
@@ -55,6 +56,14 @@ export async function handleProxy(
     loginUrl.searchParams.set('callbackUrl', pathname)
     if (invalidReason) loginUrl.searchParams.set('reason', sessionInvalidLoginReason(invalidReason))
     return withCsp(NextResponse.redirect(loginUrl))
+  }
+
+  // Cookie-authenticated mutating API routes must come from this origin (route-auth policy decides which routes).
+  if (isApiRoute) {
+    const csrf = evaluateCsrfOrigin({ method: request.method, pathname, headers: request.headers })
+    if (!csrf.allowed) {
+      return NextResponse.json({ error: 'Forbidden', code: 'cross_origin_request', detail: csrf.reason }, { status: 403 })
+    }
   }
 
   // Public routes — skip the auth check but still emit CSP on HTML.

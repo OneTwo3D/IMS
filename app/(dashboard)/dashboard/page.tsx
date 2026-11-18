@@ -20,7 +20,7 @@ export default async function Page() {
 
   const dashboardData = await getDashboardData(initialPeriod, initialCompare)
 
-  const { kpi, chartData, topProducts, recentOrders, incomingPOs, periodLabel, compLabel } = dashboardData
+  const { kpi, chartData, topProducts, recentOrders, incomingPOs, periodLabel, compLabel, costFiguresVisible } = dashboardData
 
   // Show onboarding banner only for admins who haven't completed or dismissed it
   let showOnboardingBanner = false
@@ -43,6 +43,7 @@ export default async function Page() {
       incomingPOs={incomingPOs}
       periodLabel={periodLabel}
       compLabel={compLabel}
+      costFiguresVisible={costFiguresVisible}
       initialPeriod={initialPeriod}
       initialCompare={initialCompare}
       showOnboardingBanner={showOnboardingBanner}
