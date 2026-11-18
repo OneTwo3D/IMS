@@ -21,7 +21,7 @@ When something goes wrong, three places hold the information you need:
 ### "Invalid credentials" but the password is correct
 - Caps lock?
 - Did you set the email or username field? Some installations use email-only.
-- Repeated failed attempts for the same email from the same address are blocked for 15 minutes, and the screen does not say so; wait and try again. (An administrator cannot lift this early.)
+- Repeated failed attempts for the same email make the login page ask you to wait (a few seconds, growing to at most 15 minutes); wait and try again. A browser you have signed in from before is not held up by other people's failed attempts. (An administrator cannot lift the wait early.)
 - The account may have been deactivated (Settings > Users shows it as Inactive).
 - A line above the form saying your session ended means you were signed out by a change to your account or because the session expired; just sign in again.
 - Have you been migrated to passkey-only? The login screen will show a passkey prompt instead of a password field.
