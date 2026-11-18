@@ -450,6 +450,63 @@ async function invalidateMappingInLockedTx(
   }
 }
 
+// o3d-hqvrp.100: every run clamps to min(snapshot, fresh) ONCE, before a batch loop that can run for minutes, so a later batch could post an
+// older, higher figure over a lower one a concurrent job had pushed meanwhile (and record it as lastPushedQty, hiding the echo). Each batch now
+// re-reads current availability for its own products and clamps down, and that read + the POST run under one in-process lock so the order
+// in which runs read is the order in which they write. (Across server processes only the shorter per-batch window remains.)
+let stockPushLockTail: Promise<void> = Promise.resolve()
+
+export async function withStockPushLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = stockPushLockTail
+  let release!: () => void
+  stockPushLockTail = new Promise<void>((resolve) => { release = resolve })
+  await previous
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
+/** Stock ids a batch's availability depends on: the products and every component beneath them, nested kits included. */
+function stockIdsForBatch(batch: PushEntry[], productById: Map<string, CandidateProduct>): string[] {
+  const ids = new Set<string>()
+  const visit = (id: string, depth: number) => {
+    if (ids.has(id) || depth > 12) return
+    ids.add(id)
+    for (const component of productById.get(id)?.productComponents ?? []) visit(component.componentId, depth + 1)
+  }
+  for (const entry of batch) visit(entry.productId, 0)
+  return [...ids]
+}
+
+export type BatchClampContext = {
+  productById: Map<string, CandidateProduct>
+  whIds: string[]
+  heldByProduct: ReadonlyMap<string, number> | undefined
+}
+
+/** Lower (never raise) each entry's quantity to what is available now. */
+async function clampBatchToCurrentStock(batch: PushEntry[], ctx: BatchClampContext): Promise<void> {
+  const batchProducts = batch
+    .map((entry) => ctx.productById.get(entry.productId))
+    .filter((product): product is CandidateProduct => product != null)
+  if (batchProducts.length === 0) return
+  const fresh = await computeFreshAvailableByProduct(
+    batchProducts,
+    ctx.productById,
+    ctx.whIds,
+    stockIdsForBatch(batch, ctx.productById),
+    ctx.heldByProduct,
+  )
+  for (const entry of batch) {
+    const available = fresh.get(entry.productId)
+    if (available === undefined) continue
+    const clamped = Math.floor(Math.min(entry.payload.stock_quantity, available))
+    if (clamped < entry.payload.stock_quantity) entry.payload.stock_quantity = clamped
+  }
+}
+
 async function pushBatchWithFence(
   batch: PushEntry[],
   creds: ConnectorCredentials,
@@ -1393,10 +1450,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // belong to), but continuing would keep pushing to the old store
   // after the operator explicitly disconnected it. Break out and
   // surface the abort instead.
+  const clampCtx: BatchClampContext = { productById, whIds, heldByProduct }
   await options?.onProgress?.({ phase: 'pushing', processed: 0, synced: 0, total: pushEntries.length })
   for (let i = 0; i < pushEntries.length; i += WC_BATCH_SIZE) {
     const batch = pushEntries.slice(i, i + WC_BATCH_SIZE)
-    const batchOutcome = await pushBatchWithFence(batch, creds, syncVersion)
+    const batchOutcome = await withStockPushLock(async () => {
+      await clampBatchToCurrentStock(batch, clampCtx)
+      return pushBatchWithFence(batch, creds, syncVersion)
+    })
     if (batchOutcome.status === 'version_changed') {
       const remaining = pushEntries.length - i
       result.errors.push(
@@ -1452,7 +1513,10 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     for (const group of byParent.values()) {
       for (let i = 0; i < group.length; i += WC_VARIATION_BATCH_SIZE) {
         const batch = group.slice(i, i + WC_VARIATION_BATCH_SIZE)
-        const outcome = await pushVariantBatchWithFence(batch, creds, syncVersion)
+        const outcome = await withStockPushLock(async () => {
+          await clampBatchToCurrentStock(batch, clampCtx)
+          return pushVariantBatchWithFence(batch, creds, syncVersion)
+        })
         if (outcome.status === 'version_changed') {
           const remaining = variantPushEntries.length - processedVariantEntries
           result.errors.push(
@@ -2049,6 +2113,9 @@ function computeKitAvailability(
         kitsInWarehouse = 0
         break
       }
+      // A service, leaflet, gift wrap or fee carries no stock rows, and a VARIABLE parent holds none itself: neither limits how many kits
+      // can be built (reading their absent stock as 0 pinned the kit at 0 for ever).
+      if (component.component.type === 'NON_INVENTORY' || component.component.type === 'VARIABLE') continue
       let available = Math.max(0, stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? 0)
       if (component.component.type === 'KIT') {
         const nested = productById.get(component.componentId)
@@ -2264,6 +2331,32 @@ async function pushVariantBatchWithFence(
   })
 }
 
+/** The most variation pages read for one parent (WooCommerce caps a page at 100; the product import reads up to 1,000 variations). */
+const MAX_VARIATION_PAGES = 20
+
+/**
+ * Every variation of a parent, paged. Reading page 1 alone left variants beyond the first 100 counted as unmatched and never
+ * pushed. A failed later page is an error (a partial list must not pass as complete); a short page ends the read.
+ */
+async function fetchAllVariationsOfParent(
+  parentWcId: number,
+  creds: ConnectorCredentials,
+): Promise<{ data: unknown; error?: string }> {
+  const all: unknown[] = []
+  for (let page = 1; page <= MAX_VARIATION_PAGES; page++) {
+    const res = await safeWcFetch(
+      `/products/${parentWcId}/variations`,
+      { per_page: '100', page: String(page) },
+      creds,
+    )
+    if (res.error) return { data: null, error: res.error }
+    const rows = Array.isArray(res.data) ? res.data : []
+    all.push(...rows)
+    if (rows.length < 100) return { data: all }
+  }
+  return { data: null, error: `parent WC ${parentWcId} has more than ${MAX_VARIATION_PAGES * 100} variations; refusing a partial read` }
+}
+
 /**
  * Resolve SKUs → WC product ids with bounded parallelism.
  * Returns both resolved ids and any transport errors so the caller can
@@ -2367,11 +2460,7 @@ async function resolveSkusInParallel(
         continue
       }
 
-      const variationLookup = await safeWcFetch(
-        `/products/${parentWcId}/variations`,
-        { per_page: '100' },
-        creds,
-      )
+      const variationLookup = await fetchAllVariationsOfParent(parentWcId, creds)
       if (variationLookup.error) {
         failedAttempts++
         for (const product of batch) {

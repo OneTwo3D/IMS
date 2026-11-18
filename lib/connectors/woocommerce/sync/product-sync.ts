@@ -2262,9 +2262,83 @@ export function buildImsToWcProductPayload(product: {
   return updateData
 }
 
-export async function pushImsProductToWc(
+type PushImsProductToWcResult = { success: boolean; error?: string; skipped?: boolean; warning?: string }
+
+/** The `recordKind` of the open record a failed IMS-to-WooCommerce product push leaves for the retry sweep. */
+export const WC_PRODUCT_PUSH_RETRY_KIND = 'product_push_retry'
+/** A failed push is retried for this long after it first failed; after that the FAILED row stays for an operator. */
+const WC_PRODUCT_PUSH_RETRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * Push one IMS product to WooCommerce. A failure (an error answer, a timeout, a thrown error) is no longer dropped: it leaves ONE open FAILED
+ * ShoppingSyncLog row per product, which `retryFailedWcProductPushes` (run by the reconcile cron) pushes again, and a later success closes.
+ * A push the settings or the hold skipped is neither a failure nor a success and touches nothing.
+ */
+export async function pushImsProductToWc(productId: string): Promise<PushImsProductToWcResult> {
+  const result = await pushImsProductToWcOnce(productId)
+  if (result.skipped) return result
+  try {
+    if (result.success) {
+      await db.shoppingSyncLog.updateMany({
+        where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED' },
+        data: { status: 'SYNCED', syncedAt: new Date() },
+      })
+    } else {
+      const open = await db.shoppingSyncLog.updateMany({
+        where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED' },
+        data: { errorMessage: (result.error ?? 'unknown error').slice(0, 2000) },
+      })
+      if (open.count === 0) {
+        await db.shoppingSyncLog.create({
+          data: {
+            direction: 'TO_CONNECTOR',
+            status: 'FAILED',
+            entityType: 'Product',
+            entityId: productId,
+            errorMessage: (result.error ?? 'unknown error').slice(0, 2000),
+            recordKind: WC_PRODUCT_PUSH_RETRY_KIND,
+          },
+        })
+      }
+    }
+  } catch (bookkeepingError) {
+    // Recording must never turn a push result into a throw for the caller.
+    console.error('[wc-product-push] could not record the push outcome', bookkeepingError)
+  }
+  return result
+}
+
+/**
+ * Push again every product whose last push failed (oldest first, bounded). Goes through `retry` (the caller's pushProductMetadata) so the
+ * settings gate and the producer hold apply exactly as for the first attempt. Returns counts only.
+ */
+export async function retryFailedWcProductPushes(
+  retry: (productId: string) => Promise<{ success: boolean; skipped?: boolean }>,
+  options?: { limit?: number; now?: number },
+): Promise<{ retried: number; resolved: number; remaining: number }> {
+  const since = new Date((options?.now ?? Date.now()) - WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
+  const rows = await db.shoppingSyncLog.findMany({
+    where: { connector: 'woocommerce', entityType: 'Product', recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED', createdAt: { gte: since }, entityId: { not: null } },
+    orderBy: { createdAt: 'asc' },
+    select: { entityId: true },
+    take: options?.limit ?? 50,
+  })
+  const ids = [...new Set(rows.map((row) => row.entityId).filter((id): id is string => id != null))]
+  let resolved = 0
+  for (const id of ids) {
+    try {
+      const outcome = await retry(id)
+      if (outcome.success && !outcome.skipped) resolved++
+    } catch (error) {
+      console.error('[wc-product-push] retry threw', error)
+    }
+  }
+  return { retried: ids.length, resolved, remaining: ids.length - resolved }
+}
+
+async function pushImsProductToWcOnce(
   productId: string,
-): Promise<{ success: boolean; error?: string; skipped?: boolean; warning?: string }> {
+): Promise<PushImsProductToWcResult> {
   try {
     // The writer re-checks on its own, whatever the caller did: `wc_sync_product_enabled` and
     // `wc_sync_product_direction` decide whether IMS may write to the live product at all. A read

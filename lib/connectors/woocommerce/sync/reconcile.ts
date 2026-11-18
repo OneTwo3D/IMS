@@ -2,7 +2,7 @@ import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, runWcCancellationBackstop, syncNewWcOrders } from './order-import'
-import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
+import { isWcProductWebhookPrimaryActive, retryFailedWcProductPushes, syncAllWcProducts } from './product-sync'
 import { processQueuedWcStockSyncJobs } from './stock-sync-jobs'
 import { queueRefundStockCorrections } from './refund-stock-correction'
 import { pushStockToWc } from './stock-sync'
@@ -55,6 +55,8 @@ export type WcReconcileResult = {
   heldSalesInvoices?: Awaited<ReturnType<typeof retryHeldWcSalesInvoiceReleases>>
   products?: Awaited<ReturnType<typeof syncAllWcProducts>> | WcReconcileSkipped
   refundStockCorrections?: { error: string }
+  /** IMS-to-WooCommerce product pushes that failed earlier and were pushed again this pass. */
+  productPushRetries?: { retried: number; resolved: number; remaining: number }
   stock?: {
     queued: Awaited<ReturnType<typeof processQueuedWcStockSyncJobs>>
     sync?: Awaited<ReturnType<typeof pushStockToWc>>
@@ -131,6 +133,16 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
             }
       }
     }
+  }
+
+  // o3d-hqvrp.106: product pushes IMS sent WooCommerce that failed (an error or a timeout) are pushed again on every pass. Every pass reads
+  // a database queue; each retry goes through the same gate and hold as the first push, and a product the settings forbid is not retried.
+  try {
+    const { pushProductMetadata } = await import('@/lib/shopping')
+    const retries = await retryFailedWcProductPushes(pushProductMetadata)
+    if (retries.retried > 0) results.productPushRetries = retries
+  } catch (error) {
+    console.error('[wc-reconcile] retrying failed product pushes failed', error)
   }
 
   const stockEnabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
