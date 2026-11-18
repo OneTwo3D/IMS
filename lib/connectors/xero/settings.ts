@@ -53,11 +53,6 @@ export type XeroSettings = {
    */
   xero_document_delete_enabled: string
   /**
-   * After a sales credit note posts, apply it to the order's Xero invoice (PUT CreditNotes/{id}/Allocations), capped at what the credit note has left and the invoice still owes. 'true' or 'false'; off by default.
-   * With it off nothing is sent beyond the credit note itself, as before.
-   */
-  xero_sales_credit_note_allocation_enabled: string
-  /**
    * Last LOCKED day in Xero (`YYYY-MM-DD`), IMPORTED from the Organisation endpoint (books-lock-date.ts); empty = none
    * read or none set. Read-only: deliberately not in XERO_SETTING_KEYS, so the settings save cannot write it.
    */
@@ -89,7 +84,6 @@ export const XERO_SETTING_KEYS = [
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
   'grir_xero_posting_enabled',
   'xero_document_delete_enabled',
-  'xero_sales_credit_note_allocation_enabled',
 ]
 
 /** Imported from Xero, never saved from the settings form: read by getXeroSettings, absent from the save allowlist above. */
@@ -136,7 +130,6 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_payment_polling_enabled: 'false',
   grir_xero_posting_enabled: 'false',
   xero_document_delete_enabled: 'false',
-  xero_sales_credit_note_allocation_enabled: 'false',
   xero_books_lock_date: '',
   xero_books_lock_date_read_at: '',
 }

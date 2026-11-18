@@ -664,8 +664,6 @@ export async function allocatePurchaseCreditNote(
   success: boolean
   allocatedAmount?: number
   error?: string
-  /** The refusal is "the bill has nothing due": expected, not a failure to report loudly. */
-  nothingDue?: boolean
   /** Present when a PUT WAS made but did not cover the whole request. */
   partial?: { allocatedNow: number; totalAllocatedToThisBill: number; requested: number; shortfall: number }
 }> {
@@ -712,7 +710,7 @@ export async function allocatePurchaseCreditNote(
   }
   const decision = decideCreditNoteAllocation({ requested, remainingCredit, amountDue, allocatedCents })
   if (decision.action === 'already-allocated') return { success: true, allocatedAmount: 0 }
-  if (decision.action === 'refuse') return { success: false, error: decision.reason, nothingDue: amountDue <= 0 && remainingCredit > 0 }
+  if (decision.action === 'refuse') return { success: false, error: decision.reason }
   const allocateAmount = decision.amount
 
   // o3d-h9pb (Codex round 5), half 1: ONE KEY PER DISTINCT ALLOCATION. The processor's key is derived from
@@ -765,37 +763,4 @@ export async function allocatePurchaseCreditNote(
       + `(${remainingCredit.toFixed(2)}) or the bill's amount due (${amountDue.toFixed(2)}) was smaller than the request. Allocate the rest in Xero or add credit, `
       + 'then retry: a retry sends only the remainder.'),
   }
-}
-
-/**
- * o3d-hqvrp.39: apply a posted SALES credit note (ACCRECCREDIT) to the Xero invoice of the order it was raised against, so the invoice stops
- * showing as outstanding. The endpoint is the one the supplier side uses (`CreditNotes/{id}/Allocations`); what differs is the sizing: a sales
- * credit note is raised for the refund, and the invoice may owe LESS than that (it was part-paid, or already settled), so the amount is the whole
- * credit note, capped by the credit it has left and by what the invoice still owes. A cap is normal here and is NOT a failure (a partial
- * allocation on the purchase side is). An invoice with nothing due (the cash-out case: paid, then refunded) is refused by the same decision table and
- * reported, never forced.
- *
- * The caller sends this only when `xero_sales_credit_note_allocation_enabled` is 'true' and only for a credit note it has just posted AUTHORISED.
- */
-export async function allocateSalesCreditNoteToInvoice(
-  params: { creditNoteId: string; invoiceId: string; date: string },
-  opts?: { idempotencyKey?: string },
-): Promise<{ success: boolean; allocatedAmount?: number; error?: string; /** Nothing to do and nothing wrong (nothing due on the invoice): report quietly. */ benign?: boolean }> {
-  const cnRes = await xeroGet<{ CreditNotes?: unknown }>(`CreditNotes/${params.creditNoteId}`)
-  if (!cnRes.ok) return { success: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
-  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; Total?: unknown; Status?: unknown; Allocations?: unknown }>(
-    cnRes.data, 'CreditNotes', 'CreditNoteID', params.creditNoteId)
-  if (cnRead.status === 'unreadable') return { success: false, error: `Credit note not read from Xero for allocation: ${cnRead.reason}` }
-  // A re-run after a full allocation reads PAID, not AUTHORISED: an allocation to THIS invoice already on the note is the answer, not a warning.
-  const alreadyCents = readAllocatedToInvoiceCents(cnRead.document.Allocations, params.invoiceId)
-  if (alreadyCents !== null && alreadyCents > 0) return { success: true, allocatedAmount: 0 }
-  if (cnRead.document.Status !== 'AUTHORISED') {
-    return { success: false, error: `Credit note is ${String(cnRead.document.Status)} in Xero, not AUTHORISED, so it cannot be allocated yet` }
-  }
-  const total = readXeroBalance(cnRead.document.Total)
-  if (total === null || total <= 0) return { success: false, error: 'Credit note read from Xero states no readable Total, so IMS cannot size the allocation' }
-  const result = await allocatePurchaseCreditNote({ creditNoteId: params.creditNoteId, invoiceId: params.invoiceId, amount: total, date: params.date }, opts)
-  // The capped case: the allocation WAS made, for less than the whole note.
-  if (!result.success && result.partial) return { success: true, allocatedAmount: result.allocatedAmount }
-  return { success: result.success, allocatedAmount: result.allocatedAmount, error: result.error, benign: result.nothingDue === true }
 }

@@ -39,7 +39,7 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, allocateSalesCreditNoteToInvoice, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
@@ -4429,10 +4429,6 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         }
 
         result.succeeded++
-        // o3d-hqvrp.39: AFTER the credit note's success is recorded, so the extra Xero calls never lengthen the post's own window. OFF by default; best effort.
-        if (entry.type === 'CREDIT_NOTE' && entry.referenceType === 'SalesOrderRefund' && syncResult.externalId) {
-          await allocateSalesCreditNoteAfterPost({ lease, entryId: entry.id, refundId: entry.referenceId, creditNoteId: syncResult.externalId, date: String(payload.date ?? '').slice(0, 10) })
-        }
       } else {
         const errorMessage = syncResult.error ?? 'Unknown error'
         if (isRateLimitError(errorMessage)) {
@@ -5227,74 +5223,6 @@ async function xeroPaymentCurrencyRate(
 /** Why a queued REALISED_FX_JOURNAL row is retired instead of sent (o3d-q0x56.2). Exported so a test pins the exact words. */
 export const REALISED_FX_JOURNAL_RETIRED_REASON =
   'Retired, not sent: Xero books the realised FX gain/loss itself, at the settlement rate IMS sends on the payment, so an IMS-generated realised-FX journal would book it twice.'
-
-/**
- * o3d-hqvrp.39: the optional allocation of a just-posted sales credit note to its invoice. Off unless `xero_sales_credit_note_allocation_enabled` is 'true'.
- * Never throws and never fails the credit note's row: the outcome is an activity-log line (WARNING when nothing was allocated).
- */
-async function allocateSalesCreditNoteAfterPost(p: {
-  lease: NonNullable<Awaited<ReturnType<typeof openRemoteWriteLease>>>
-  entryId: string
-  refundId: string
-  creditNoteId: string
-  date: string
-}): Promise<void> {
-  try {
-    const enabled = await db.setting.findUnique({ where: { key: 'xero_sales_credit_note_allocation_enabled' } })
-    if (enabled?.value !== 'true') return
-    const refund = await db.salesOrderRefund.findUnique({
-      where: { id: p.refundId },
-      select: { order: { select: { id: true, accountingInvoiceId: true, accountingInvoiceConnector: true, paidAt: true } } },
-    })
-    const order = refund?.order
-    const invoiceId = order?.accountingInvoiceId
-    if (!order || !invoiceId || (order.accountingInvoiceConnector ?? XERO_CONNECTOR) !== XERO_CONNECTOR) return
-    // IMS cannot tell a refund that went back to the customer as cash from one meant to settle the invoice (a WooCommerce refund records no payment-back
-    // here). Cash can only be returned if cash came in, so ONLY an order with no receipt of any kind (none recorded, none queued, never marked paid) is
-    // allocated; anything else is left unallocated for the operator, as before this setting existed.
-    const [receipts, queuedReceipts] = await Promise.all([
-      db.payment.count({ where: { orderId: order.id } }),
-      db.accountingSyncLog.count({ where: { type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: order.id, ...WORK_SLOT_OCCUPIED_WHERE } }),
-    ])
-    if (order.paidAt !== null || receipts > 0 || queuedReceipts > 0) {
-      await logActivity({
-        entityType: 'SALES_ORDER', entityId: order.id, action: 'xero_credit_note_allocation_skipped', tag: 'accounting', level: 'INFO',
-        description: `Credit note ${p.creditNoteId} was not allocated to the order's Xero invoice: the order has receipts, so the refund may have been paid back in cash. Allocate it in Xero if it is meant to settle the invoice.`,
-        metadata: { syncLogId: p.entryId, refundId: p.refundId, creditNoteId: p.creditNoteId },
-      })
-      return
-    }
-    const fence = await p.lease.fenceBeforeRemoteWrite('credit-note-allocation')
-    if (!fence.ok) return
-    const result = await allocateSalesCreditNoteToInvoice(
-      { creditNoteId: p.creditNoteId, invoiceId, date: p.date || businessDateYmd(new Date()) },
-      { idempotencyKey: buildXeroIdempotencyKey(p.entryId, 'credit-note-allocation') },
-    )
-    const level = result.success || result.benign ? 'INFO' : 'WARNING'
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: order.id,
-      action: result.success ? 'xero_credit_note_allocated' : 'xero_credit_note_allocation_not_made',
-      tag: 'accounting',
-      level,
-      description: result.success
-        ? `Credit note ${p.creditNoteId} is allocated to the order's Xero invoice (${(result.allocatedAmount ?? 0).toFixed(2)} allocated now).`
-        : result.benign
-          ? `Credit note ${p.creditNoteId} was not allocated: the order's Xero invoice has nothing due.`
-          : `Credit note ${p.creditNoteId} posted but was NOT allocated to the order's Xero invoice: ${result.error ?? 'unknown reason'}`,
-      metadata: { syncLogId: p.entryId, refundId: p.refundId, creditNoteId: p.creditNoteId, invoiceId, allocatedAmount: result.allocatedAmount ?? null },
-    })
-  } catch (e) {
-    await logActivity({
-      entityType: 'SYSTEM',
-      action: 'xero_credit_note_allocation_not_made',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: `Credit note ${p.creditNoteId} posted but its allocation to the invoice failed: ${String(e)}`,
-      metadata: { syncLogId: p.entryId, refundId: p.refundId },
-    }).catch(() => { /* logging must never fail the post */ })
-  }
-}
 
 function resolveInvoiceStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'AUTHORISED'

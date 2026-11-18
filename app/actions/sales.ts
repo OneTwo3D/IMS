@@ -4869,8 +4869,13 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
         orderBy: { createdAt: 'desc' },
         select: { payload: true, externalTransactionId: true },
       })
+      const deletions = await tx.accountingDocumentDeletion.findMany({
+        where: { referenceType: 'SalesOrder', referenceId: id, kind: 'SALES_INVOICE' },
+        select: { externalDocumentId: true },
+      })
       const toRecord = resolveInvoiceNumberToRecord({
         orderAccountingInvoiceId: so.accountingInvoiceId,
+        deletedExternalIds: deletions.map((d) => d.externalDocumentId),
         queuedInvoices: queuedInvoices.map((row) => ({
           invoiceNumber: row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) && typeof (row.payload as Record<string, unknown>).invoiceNumber === 'string'
             ? (row.payload as Record<string, string>).invoiceNumber
