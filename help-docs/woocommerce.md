@@ -422,6 +422,8 @@ The **Products** tab controls bidirectional product synchronisation.
 
 - Variation attributes are synced for the options panel
 
+**Products IMS could not import.** If a WooCommerce product cannot be imported for a reason a retry will never fix (its GTIN belongs to another IMS product, its WooCommerce id is mapped to another IMS product, a product-structure conflict, or too many variations), the sync moves on so the rest of the catalogue keeps syncing, and logs one error naming the SKUs. IMS remembers those products (up to 5,000; if the list is ever full, the sync carries on, logs an error naming the extra products and keeps them in a separate overflow record, and those need a re-save in WooCommerce once fixed). On every product sync run it fetches up to 20 of them directly from WooCommerce, least recently tried first, and imports any whose conflict is gone, so once you have fixed the duplicate or the mapping in IMS you do not need to re-save the product in WooCommerce. A product that is still in conflict stays on the list quietly; one that no longer exists in WooCommerce drops off it. A re-attempt that fails for a passing reason (a store or database error) never holds up the product sync; it is counted, and after five failures in a row the activity log raises a warning. If more are waiting than one run takes, the activity log says how many were left for later runs.
+
 **There is a supported size for a variable product: 1,000 variations.** A product's variations are
 read in full *before* anything is written, and then applied in a single transaction, so a failure
 anywhere leaves the catalogue exactly as it was. That transaction has a budget, and 1,000 variations
