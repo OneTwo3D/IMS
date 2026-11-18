@@ -540,10 +540,11 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
   for its text. The verdict is read back from a file the reporter writes, so a reporter that did not load
   is a failure too. `tests/scripts/db-tier-census.test.ts` drives it over fixtures of each shape.
   **Two things it still does not do.** It does not prove the tests assert anything (see the last bullet),
-  and one skip is allowed by name: `startup-option-verdict-across-bundles` needs `.next` build output this
-  job does not have; the job that builds sets `IMS_REQUIRE_BUILD_ARTIFACT=1`, which turns those two skips
-  into failures. The allowance is a ceiling in `ALLOWED_SKIPS`, so a third skip in that file, or a skip
-  anywhere else, fails. It is scoped to `test:db`: `test:unit` also globs `tests/db/**` with no database,
+  and three skips are allowed, by exact test name with a per-file ceiling (`ALLOWED_SKIPS`), because the
+  environment cannot run them: the two built-artifact legs of `startup-option-verdict-across-bundles` (no
+  `.next` output here; the job that builds sets `IMS_REQUIRE_BUILD_ARTIFACT=1`, which turns them into
+  failures) and the Unix-socket leg of `connection-schema-pinning` (CI's PostgreSQL is TCP-only; set
+  `UNIX_SOCKET_DATABASE_URL` locally to run it). Any other skip, or a further skip in those files, fails. It is scoped to `test:db`: `test:unit` also globs `tests/db/**` with no database,
   where skips are the normal state, and never loads the reporter.
 * **ENFORCED, in addition, for `RUN_DB_RETENTION_TESTS` ALONE.** `test:db` still sets it together with
   `REQUIRE_DB_RETENTION_TESTS`, and the three files gated on it throw on load if handed the `REQUIRE_` half

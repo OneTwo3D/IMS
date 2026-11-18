@@ -53,23 +53,33 @@ export function recordEvent(tally, event) {
   // "passes" that way). That is not a test the file executed.
   if (data.name === data.file) return
   const entry = tally.get(data.file) ?? { executed: 0, skipped: [], todo: 0 }
-  if (data.skip !== undefined && data.skip !== false) entry.skipped.push(`${data.name}${typeof data.skip === 'string' ? ` (${data.skip})` : ''}`)
+  if (data.skip !== undefined && data.skip !== false) entry.skipped.push({ name: data.name, reason: typeof data.skip === 'string' ? data.skip : '' })
   else if (data.todo !== undefined && data.todo !== false) entry.todo++
   else entry.executed++
   tally.set(data.file, entry)
 }
 
 /**
- * THE ONLY SKIPS THE TIER IS ALLOWED, each with the place that enforces them instead. A skip not named here
- * fails the census. An entry is a CEILING on the number of skipped tests in that file (a third skip, or a new
- * skipped file, still fails) and never excuses a file from executing at least one test.
- *
- * startup-option-verdict-across-bundles: its two built-artifact legs need `.next` output, which this job does
- * not build. They are NOT silently lost: the job that builds sets IMS_REQUIRE_BUILD_ARTIFACT=1, which turns
- * those very skips into failures (see skipOrFail in that file). Found by the first run of this census.
+ * THE ONLY SKIPS THE TIER IS ALLOWED: exact test names, each with why the environment cannot run it here and
+ * where it is enforced instead. A skip whose name is not listed fails the census, and `ceiling` caps how many
+ * of the listed names may skip in that file. An entry never excuses a file from executing at least one test.
  */
 export const ALLOWED_SKIPS = {
-  'tests/db/startup-option-verdict-across-bundles.test.ts': 2,
+  // Its two built-artifact legs need `.next` output, which this job does not build. The job that builds sets
+  // IMS_REQUIRE_BUILD_ARTIFACT=1, which turns these very skips into failures (skipOrFail in that file).
+  'tests/db/startup-option-verdict-across-bundles.test.ts': {
+    ceiling: 2,
+    names: [
+      'o3d-2k5r r21: every copy of this module in the built output reaches the process-wide slot',
+      'o3d-2k5r r20 (built server): the probe instrumentation runs lets the RUNTIME carry the schema',
+    ],
+  },
+  // Needs a Unix-socket route to PostgreSQL. CI's service container is TCP-only, so there is none; the test
+  // itself skips unless UNIX_SOCKET_DATABASE_URL names one, which a developer's local cluster can supply.
+  'tests/db/connection-schema-pinning.test.ts': {
+    ceiling: 1,
+    names: ['o3d-2k5r r24 (live): a Unix socket carries the pin, reports NO PEER, and is refused for it'],
+  },
 }
 
 /**
@@ -84,8 +94,11 @@ export function evaluateCensus({ expected, tally, allowedSkips = ALLOWED_SKIPS, 
     const entry = tally.get(file)
     if (!entry) { problems.push(`${file}: reported NO tests - not collected, failed to load, or registered nothing`); continue }
     const rel = root ? path.relative(root, file).split(path.sep).join('/') : file
-    const ceiling = allowedSkips[rel] ?? 0
-    if (entry.skipped.length > ceiling) problems.push(`${file}: ${entry.skipped.length} skipped${ceiling > 0 ? ` (only ${ceiling} allowed)` : ''} (${entry.skipped.slice(0, 3).join('; ')}${entry.skipped.length > 3 ? '; ...' : ''})`)
+    const allowance = allowedSkips[rel] ?? { ceiling: 0, names: [] }
+    const unlisted = entry.skipped.filter((skip) => !allowance.names.includes(skip.name))
+    const describe = (skips) => skips.slice(0, 3).map((skip) => `${skip.name}${skip.reason ? ` (${skip.reason})` : ''}`).join('; ') + (skips.length > 3 ? '; ...' : '')
+    if (unlisted.length > 0) problems.push(`${file}: ${unlisted.length} skipped and not allowed by name (${describe(unlisted)})`)
+    else if (entry.skipped.length > allowance.ceiling) problems.push(`${file}: ${entry.skipped.length} skipped, ceiling is ${allowance.ceiling} (${describe(entry.skipped)})`)
     if (entry.executed === 0) problems.push(`${file}: executed ZERO tests`)
   }
   const known = new Set(expected)

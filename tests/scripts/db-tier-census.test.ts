@@ -106,7 +106,7 @@ test('one skip among executed tests still fails: the tier is expected to run in 
     'mixed.test.ts': `import test from 'node:test'\ntest('a', () => {})\ntest('b', { skip: 'because' }, () => {})\n`,
   })
   assert.equal(result.ok, false)
-  assert.match(result.problems.join('\n'), /mixed\.test\.ts: 1 skipped \(b \(because\)\)/)
+  assert.match(result.problems.join('\n'), /mixed\.test\.ts: 1 skipped and not allowed by name \(b \(because\)\)/)
 })
 
 test('a failing test counts as executed - the runner fails the run for it, the census does not double-report', () => {
@@ -128,18 +128,21 @@ test('package.json test:db runs the census wrapper and nothing else', () => {
   assert.equal(pkg.scripts['test:db'], 'node scripts/run-db-tier.mjs')
 })
 
-test('the allowlist is a CEILING on one named file: it excuses neither a further skip nor a file that executes nothing', () => {
-  const file = '/r/tests/db/startup-option-verdict-across-bundles.test.ts'
-  const verdict = (entry: { executed: number; skipped: string[]; todo: number }) =>
+test('the allowlist is by EXACT NAME with a per-file ceiling: it excuses no other skip and no file that executes nothing', () => {
+  const file = '/r/tests/db/connection-schema-pinning.test.ts'
+  const allowed = 'o3d-2k5r r24 (live): a Unix socket carries the pin, reports NO PEER, and is refused for it'
+  const skip = (name: string) => ({ name, reason: 'r' })
+  const verdict = (entry: { executed: number; skipped: Array<{ name: string; reason: string }>; todo: number }) =>
     evaluateCensus({ expected: [file], tally: new Map([[file, entry]]), allowedSkips: ALLOWED_SKIPS, root: '/r' })
-  assert.deepEqual(ALLOWED_SKIPS, { 'tests/db/startup-option-verdict-across-bundles.test.ts': 2 })
-  assert.equal(verdict({ executed: 3, skipped: ['a', 'b'], todo: 0 }).ok, true, 'the two documented skips pass')
-  assert.equal(verdict({ executed: 3, skipped: ['a', 'b', 'c'], todo: 0 }).ok, false, 'a third is a new hidden skip')
-  assert.equal(verdict({ executed: 0, skipped: ['a', 'b'], todo: 0 }).ok, false, 'and a file that ran nothing is never excused')
+  assert.deepEqual(ALLOWED_SKIPS['tests/db/connection-schema-pinning.test.ts'], { ceiling: 1, names: [allowed] })
+  assert.equal(verdict({ executed: 3, skipped: [skip(allowed)], todo: 0 }).ok, true, 'the documented skip passes')
+  assert.equal(verdict({ executed: 3, skipped: [skip(allowed), skip(allowed)], todo: 0 }).ok, false, 'over the ceiling fails')
+  assert.equal(verdict({ executed: 3, skipped: [skip('some other test')], todo: 0 }).ok, false, 'a different skipped test in the same file fails')
+  assert.equal(verdict({ executed: 0, skipped: [skip(allowed)], todo: 0 }).ok, false, 'a file that ran nothing is never excused')
   const other = '/r/tests/db/other.test.ts'
   assert.equal(
-    evaluateCensus({ expected: [other], tally: new Map([[other, { executed: 1, skipped: ['x'], todo: 0 }]]), allowedSkips: ALLOWED_SKIPS, root: '/r' }).ok,
+    evaluateCensus({ expected: [other], tally: new Map([[other, { executed: 1, skipped: [skip(allowed)], todo: 0 }]]), allowedSkips: ALLOWED_SKIPS, root: '/r' }).ok,
     false,
-    'the allowance names one file; any other skipping file fails',
+    'the allowance names one file; the same test name skipping anywhere else fails',
   )
 })
