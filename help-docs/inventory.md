@@ -59,7 +59,7 @@ Every screen with a **Templates** menu (Inventory, Customers, Suppliers, Sales O
 
 These rules apply consistently across every CSV import in the app — if a screen has a Templates menu next to its Import button, the template, the guidance row, and the empty-cell behaviour all work the same way.
 
-**Row counts.** In a product import, a KIT or BOM row whose components could not be applied (invalid component, circular reference, orders in flight) is counted once, as skipped.
+**Component failures.** In a product import, a KIT or BOM row is saved before its components are applied. If its components or recipe are refused (invalid component, circular reference, orders in flight), the row stays counted as created or updated, the result says how many rows were saved without their components, the import is not reported as fully successful, and the messages say why. Fix those rows and re-import.
 
 **Row and file limits.** Every CSV importer accepts at most **10,000 rows** and **10 MB** per file.
 A file over 10 MB is refused outright and nothing is imported. A file with more than 10,000 rows is

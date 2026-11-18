@@ -27,7 +27,7 @@ import {
 } from '@/lib/products/categories'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { demoteComponentRowToSkipped, type ComponentPassRow } from '@/lib/products/import-row-accounting'
+import { recordComponentRowFailure, type ComponentPassRow } from '@/lib/products/import-row-accounting'
 import { endOfBusinessDateUtc } from '@/lib/currencies/fx-select'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
@@ -103,11 +103,12 @@ function capRows<T>(rows: T[]): { rows: T[]; dropped: number } {
 
 function buildImportPreviewResult(
   totalRows: number,
-  result: { created: number; updated: number; skipped: number; errors: string[] },
+  result: { created: number; updated: number; skipped: number; componentsFailed?: number; errors: string[] },
   dropped: number,
   error?: string,
 ) {
   return createCsvImportPreviewResult({
+    componentsFailed: result.componentsFailed,
     totalRows,
     created: result.created,
     updated: result.updated,
@@ -891,7 +892,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
       if (componentsStr && COMPONENT_BEARING_TYPES.has(committedType)) {
         const componentProductId = skuToId.get(sku)
         if (componentProductId) {
-          componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr, rowOutcome, demoted: false })
+          componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr, rowOutcome, componentFailureCounted: false })
         }
       }
     } catch (e: unknown) {
@@ -926,7 +927,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
 
     if (hasComponentError) {
       result.errors.push(`Row ${cr.lineNum}: ${cr.sku} components were not updated because one or more component values were invalid`)
-      demoteComponentRowToSkipped(result, cr)
+      recordComponentRowFailure(result, cr)
       continue
     }
 
@@ -936,12 +937,12 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
       const preflight = await detectComponentCycle(productId, components.map((c) => c.componentId))
       if (preflight.kind === 'self') {
         result.errors.push(`Row ${cr.lineNum}: ${cr.sku} cannot be a component of itself`)
-        demoteComponentRowToSkipped(result, cr)
+        recordComponentRowFailure(result, cr)
         continue
       }
       if (preflight.kind === 'cycle') {
         result.errors.push(`Row ${cr.lineNum}: circular BOM reference detected for ${cr.sku}`)
-        demoteComponentRowToSkipped(result, cr)
+        recordComponentRowFailure(result, cr)
         continue
       }
 
@@ -967,7 +968,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
             `Row ${cr.lineNum}: ${cr.sku} would make the manufacturing BOM graph circular `
             + `(${bomCycle.join(' -> ')}) — neither the component list nor the BOM recipe was written`,
           )
-          demoteComponentRowToSkipped(result, cr)
+          recordComponentRowFailure(result, cr)
           continue
         }
       }
@@ -1100,7 +1101,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
               + 'or cancel those orders and re-run; already shipped, completed, delivered or cancelled '
               + 'orders do not block',
             )
-            demoteComponentRowToSkipped(result, cr)
+            recordComponentRowFailure(result, cr)
             continue
           }
           if (!wrote) {
@@ -1110,7 +1111,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
               `Row ${cr.lineNum}: ${cr.sku} no longer accepts components (its type changed while the import `
               + 'was running) — components were not written',
             )
-            demoteComponentRowToSkipped(result, cr)
+            recordComponentRowFailure(result, cr)
             continue
           }
           const product = touchedProducts.find((entry) => entry.id === productId)
@@ -1131,12 +1132,12 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
         // dry-run preview the operator decides on.
         if (e instanceof BomRecipeCycleError) {
           result.errors.push(e.message)
-          demoteComponentRowToSkipped(result, cr)
+          recordComponentRowFailure(result, cr)
           continue
         }
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push(`Components for ${cr.sku}: ${msg}`)
-        demoteComponentRowToSkipped(result, cr)
+        recordComponentRowFailure(result, cr)
       }
     }
   }
