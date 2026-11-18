@@ -127,6 +127,8 @@ export type AgingReportRow = {
   partyName: string
   contact: string | null
   documentCount: number
+  /** AR only: orders on this row whose balance nets to zero but is indeterminate (an unplaceable credit), so something may still be owed. */
+  uncertainDocumentCount?: number
   current: string
   bucket1: string
   bucket2: string
@@ -493,7 +495,8 @@ export async function getVatReport(
         order: {
           invoicedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
           status: { not: SalesOrderStatus.CANCELLED },
-          archived: false,
+          // No `archived` condition: retention archives old orders for list display only; their invoices stand, so a
+          // statutory period figure must not drop once the order is archived (see INVOICED_ORDER_WHERE).
         },
         ...(reportingCategoryFilter && {
           taxRate: { reportingCategory: { equals: reportingCategoryFilter } },
@@ -650,7 +653,7 @@ export async function getVatReport(
     purchaseTaxBase: moneyString(totals.purchaseTaxBase, baseCurrency),
     taxBase: moneyString(netTaxBase, baseCurrency),
   }, [
-    'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled and archived sales orders are excluded.',
+    'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled sales orders are excluded; archived orders are included (archiving only hides an order from operational lists).',
     'Jurisdiction uses TaxRate.countryCode when configured, otherwise the sales shipping country or supplier country.',
   ], options.paginate !== false)
 }
@@ -661,6 +664,7 @@ function agingRowsFromAccumulators(
     partyName: string
     contact: string | null
     documentIds: Set<string>
+    uncertainDocumentIds?: Set<string>
     current: Prisma.Decimal
     bucket1: Prisma.Decimal
     bucket2: Prisma.Decimal
@@ -676,6 +680,7 @@ function agingRowsFromAccumulators(
     partyName: row.partyName,
     contact: row.contact,
     documentCount: row.documentIds.size,
+    ...(row.uncertainDocumentIds ? { uncertainDocumentCount: row.uncertainDocumentIds.size } : {}),
     current: moneyString(row.current, baseCurrency),
     bucket1: moneyString(row.bucket1, baseCurrency),
     bucket2: moneyString(row.bucket2, baseCurrency),
@@ -732,6 +737,7 @@ export async function getArAgingReport(
     partyName: string
     contact: string | null
     documentIds: Set<string>
+    uncertainDocumentIds?: Set<string>
     current: Prisma.Decimal
     bucket1: Prisma.Decimal
     bucket2: Prisma.Decimal
@@ -741,6 +747,7 @@ export async function getArAgingReport(
     lastPaymentDate: Date | null
   }>()
   let unplacedCreditOrders = 0
+  let uncertainSettledOrders = 0
   const asOfInclusive = new Date(asOfExclusive.getTime() - 1)
   const balances = new Map<string, ReturnType<typeof receivableBalance>>()
   for (const order of orders) {
@@ -748,8 +755,12 @@ export async function getArAgingReport(
     const result = receivableBalance(order, asOfInclusive)
     balances.set(order.id, result)
     if (result.bound !== 'exact') unplacedCreditOrders += 1
-    if (result.status !== 'outstanding') continue
-    const outstanding = toDecimal(result.balance)
+    // A zero balance with an indeterminate bound is NOT settled: an unplaceable credit was valued at 0, so something may still be owed.
+    // Keep it as an explicitly uncertain row (and count it in the notice) instead of dropping it.
+    const uncertainSettled = result.status === 'settled' && result.bound === 'indeterminate'
+    if (result.status !== 'outstanding' && !uncertainSettled) continue
+    if (uncertainSettled) uncertainSettledOrders += 1
+    const outstanding = toDecimal(uncertainSettled ? 0 : result.balance)
     const key = order.customerId ?? order.customerEmail ?? order.customerName ?? 'unknown'
     let row = byCustomer.get(key)
     if (!row) {
@@ -758,6 +769,7 @@ export async function getArAgingReport(
         partyName: order.customerName ?? order.customerEmail ?? 'Unknown customer',
         contact: order.customerEmail,
         documentIds: new Set(),
+        uncertainDocumentIds: new Set(),
         current: new Prisma.Decimal(0),
         bucket1: new Prisma.Decimal(0),
         bucket2: new Prisma.Decimal(0),
@@ -767,6 +779,11 @@ export async function getArAgingReport(
         lastPaymentDate: null,
       }
       byCustomer.set(key, row)
+    }
+    if (uncertainSettled) {
+      row.documentIds.add(order.id)
+      row.uncertainDocumentIds!.add(order.id)
+      continue
     }
     const dueDate = order.paymentDueAt ?? invoicedPeriodDate(order)
     const bucket = bucketAmount(ageDays(asOf, dueDate), outstanding, buckets)
@@ -798,6 +815,7 @@ export async function getArAgingReport(
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
     ...approximateDateNotice(orders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
+    ...(uncertainSettledOrders > 0 ? [`${uncertainSettledOrders} order${uncertainSettledOrders === 1 ? ' nets' : 's net'} to a zero balance only because a credit could not be placed (its value counted as 0), so something may still be owed; ${uncertainSettledOrders === 1 ? 'it is' : 'they are'} listed as uncertain documents with no aged amount rather than treated as settled.`] : []),
     ...(unplacedCreditOrders > 0 ? [`${unplacedCreditOrders} order${unplacedCreditOrders === 1 ? ' carries a credit' : 's carry credits'} whose basis or amount could not be established exactly; ${unplacedCreditOrders === 1 ? 'its' : 'their'} outstanding balance is an upper bound or only approximate.`] : []),
   ], options.paginate !== false)
 }
@@ -836,6 +854,7 @@ export async function getApAgingReport(
     partyName: string
     contact: string | null
     documentIds: Set<string>
+    uncertainDocumentIds?: Set<string>
     current: Prisma.Decimal
     bucket1: Prisma.Decimal
     bucket2: Prisma.Decimal

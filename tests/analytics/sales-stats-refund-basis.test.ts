@@ -372,3 +372,17 @@ test('products: an all-NET period claims nothing at all (o3d-7jfq control)', asy
   assert.equal(row.netRevenueBound, 'exact')
   assert.equal(summary.netRevenueBound, 'exact')
 })
+
+test('aging: an indeterminate zero balance is kept as an uncertain row, not dropped as settled (o3d-hqvrp.326)', async () => {
+  // £100 invoice, £100 receipt, and an unplaceable credit (no basis, negative total) valued at 0: balance 0 but indeterminate.
+  AGING_ORDERS = [agingOrder({ id: 'SO-U', totalBase: 100, taxBase: 0, paid: 100, refunds: [{ totalBase: -5, totalsBasis: null }] })]
+  const r = (await aging()).get('SO-U')
+  assert.ok(r, 'the order still has a row')
+  assert.equal(r.dueAmount, 0)
+  assert.equal(r.dueBound, 'indeterminate')
+})
+
+test('aging: an exact zero balance is still omitted as settled (o3d-hqvrp.326)', async () => {
+  AGING_ORDERS = [agingOrder({ id: 'SO-S', totalBase: 100, taxBase: 0, paid: 100, refunds: [] })]
+  assert.equal((await aging()).has('SO-S'), false)
+})
