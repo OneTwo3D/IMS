@@ -1422,6 +1422,7 @@ export async function runAccountingInvariantReport(options: {
   // Independent of the GL: the journals as queued against what the sub-ledger recorded for the same window. A GL reconciliation that
   // agrees proves the journal arrived with the sub-ledger's own figure; this names a sub-ledger gap (a posting site that records no row,
   // a row with a different figure) that the GL comparison cannot tell from a ledger fault. A warning, as it is a diagnostic.
+  const crossCheckFailures: Array<{ code: string; label: string; window: { openingExclusive: string; closingInclusive: string }; error: string }> = []
   for (const check of [
     { reconciliation: cogsReconciliation, ledger: 'cogs' as const, flows: COGS_CROSS_CHECK_FLOWS, code: 'cogs_subledger_queued_journal_mismatch', label: 'COGS' },
     { reconciliation: transitReconciliation, ledger: 'transit' as const, flows: TRANSIT_CROSS_CHECK_FLOWS, code: 'transit_subledger_queued_journal_mismatch', label: 'Transit' },
@@ -1436,7 +1437,9 @@ export async function runAccountingInvariantReport(options: {
         closingInclusive: reconciliation.balanceDate,
         ...check.flows,
       }, check.ledger)
-    } catch {
+    } catch (err) {
+      // The cross-check is a diagnostic and must not fail the report, but a failure to run it is itself reported (never swallowed): carried out of the loop and raised as a finding below.
+      crossCheckFailures.push({ code: check.code, label: check.label, window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, error: err instanceof Error ? err.message : String(err) })
       continue
     }
     if (result.inconclusive) {
@@ -1454,6 +1457,14 @@ export async function runAccountingInvariantReport(options: {
       code: check.code,
       message: `The ${check.label} sub-ledger recorded ${result.ledgerNet.toFixed(2)} for the window, but the journals queued for the same window move the account by ${result.queuedNet.toFixed(2)} (a difference of ${result.delta.toFixed(2)} against a rounding allowance of ${result.tolerance.toFixed(2)}${result.unreadableJournalCount > 0 ? `; ${result.unreadableJournalCount} journal(s) could not be read${result.compactedJournalCount > 0 ? `, ${result.compactedJournalCount} of them compacted` : ''}` : ''}${result.notLiveJournalCount > 0 ? `; ${result.notLiveJournalCount} FAILED or cancelled journal(s) worth ${result.notLiveNet.toFixed(2)} are reported apart from the queued figure` : ''})`,
       details: { window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, ...result },
+    })
+  }
+  for (const failure of crossCheckFailures) {
+    findings.push({
+      severity: 'info',
+      code: `${failure.code}_unavailable`,
+      message: `The ${failure.label} sub-ledger could not be compared with the queued journals: the check failed to run (${failure.error}), so this report says nothing about it`,
+      details: { window: failure.window },
     })
   }
 
