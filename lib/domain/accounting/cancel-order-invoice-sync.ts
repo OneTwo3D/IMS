@@ -1,6 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { CLAIMS_TO_HAVE_POSTED_WHERE } from '@/lib/domain/accounting/ledger-standing'
-import { invoiceNumberIsExternallySupplied } from '@/lib/domain/accounting/sales-invoice-number'
+import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { lockOrderFirst, recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
@@ -109,44 +108,31 @@ export async function assertNoSalesInvoicePostingInFlight(
 }
 
 /**
- * The invoice for an order that stands (or claims to stand) in the ledger, if one exists. Cancelling an order never touches it, so a cancellation of such an
+ * The invoice for an order that stands in the ledger, if one exists. Cancelling an order never touches it, so a cancellation of such an
  * order leaves a receivable, its revenue deferral and its allocation journals standing in the ledger.
  *
- * WHAT COUNTS, widest first, because the question is "may a receivable still be open", not "did IMS prove it":
- *   - an IMS SALES_INVOICE row that is SYNCED or names a document, whoever's claim that is: the connector's writeback, an operator release, and an
- *     operator ASSERTION that it posted (typed document id). An asserted row is the only local record of a document IMS never saw;
- *   - a Xeroom-era invoice: the order carries an invoice number supplied by an external invoicing connector, so the incumbent raised the ledger invoice
- *     and any IMS row was left FAILED with no id by the ownership fence.
+ * WHAT COUNTS: an IMS SALES_INVOICE row that is a PROVEN LEDGER FACT (`PROVEN_LEDGER_FACT_WHERE`): the connector's own writeback or an operator
+ * release of a connector id, SYNCED or naming a document. A Xeroom-era invoice counts only through such a row. A WooCommerce invoice number is never
+ * evidence: the importer stores one on every numbered order, including ones IMS invoices itself and that never posted.
  *
- * WHAT DOES NOT: a row whose cancellation the connector VERIFIED (the invoice was undone in the ledger) and a row an operator settled as NOT posted
- * (CANCELLED, no document id). Neither is selected by the claim predicate or is carved out of it below.
+ * WHAT DOES NOT: a FAILED row that merely carries an id, a row whose cancellation the connector VERIFIED, an operator-asserted or
+ * operator-settled NOT-posted row, and a HELD_SHADOW row.
  */
 export async function findPostedSalesInvoiceSync(
-  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'> & Partial<Pick<Prisma.TransactionClient, 'salesOrder'>>,
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   orderId: string,
 ): Promise<{ id: string; connector: string; type: string } | null> {
-  const row = await tx.accountingSyncLog.findFirst({
+  return tx.accountingSyncLog.findFirst({
     where: {
       referenceId: orderId,
       type: { in: [...SALES_INVOICE_SYNC_TYPES] },
       AND: [
-        CLAIMS_TO_HAVE_POSTED_WHERE,
+        PROVEN_LEDGER_FACT_WHERE,
         { OR: [{ settlementBasis: null }, { settlementBasis: { not: VERIFIED_REVERSAL_SETTLEMENT_BASIS } }] },
       ],
     },
     select: { id: true, connector: true, type: true },
   })
-  if (row) return row
-  if (!tx.salesOrder) return null
-  const order = await tx.salesOrder.findUnique({
-    where: { id: orderId },
-    select: { invoiceNumber: true, shoppingLinks: { select: { connector: true } } },
-  })
-  const invoiceNumber = order?.invoiceNumber?.trim()
-  if (order && invoiceNumber && invoiceNumberIsExternallySupplied(order.shoppingLinks.map((link) => link.connector))) {
-    return { id: invoiceNumber, connector: 'xeroom', type: 'EXTERNAL_INVOICE' }
-  }
-  return null
 }
 
 /** What a MANUAL cancellation of an order with a posted invoice is told. Every step named here is one the operator can take. */

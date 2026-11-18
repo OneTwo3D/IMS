@@ -46,9 +46,15 @@ test('posted-invoice detection selects asserted and id-less SYNCED rows and carv
   assert.match(where, /"settlementBasis":\{"not":"VERIFIED_REVERSAL"\}/)
 })
 
-test('a Xeroom-era invoice (externally supplied number, FAILED id-less IMS row) is detected from the order', async () => {
-  const { tx } = stubTx({ order: { invoiceNumber: 'INV-7', shoppingLinks: [{ connector: 'woocommerce' }] } })
-  assert.deepEqual(await findPostedSalesInvoiceSync(tx, 'order-1'), { id: 'INV-7', connector: 'xeroom', type: 'EXTERNAL_INVOICE' })
-  const own = stubTx({ order: { invoiceNumber: 'INV-7', shoppingLinks: [] } })
-  assert.equal(await findPostedSalesInvoiceSync(own.tx, 'order-1'), null)
+test('a WooCommerce invoice number is never read as a posted invoice; only the proven-ledger-fact predicate decides', async () => {
+  const { tx, calls } = stubTx({ order: { invoiceNumber: 'INV-7', shoppingLinks: [{ connector: 'woocommerce' }] } })
+  assert.equal(await findPostedSalesInvoiceSync(tx, 'order-1'), null)
+  assert.equal(calls.length, 1, 'one ledger query and no order-number fallback')
+  const where = JSON.stringify(calls[0].where)
+  assert.match(where, /"settlementBasis":"OPERATOR_RELEASE"/, 'proven-ledger-fact basis (connector or release)')
+  assert.doesNotMatch(where, /"OPERATOR_ASSERTION"/)
+})
+
+test('the Group B transaction carries explicit maxWait/timeout options', () => {
+  assert.match(dailySync, /\}, GROUP_B_TX_OPTIONS\)\n    if \(groupBCount > 0\)/)
 })

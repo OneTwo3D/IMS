@@ -139,6 +139,8 @@ import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
 export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
+/** Group B row-locks up to a whole batch window of orders and cost layers; Prisma's 5 s default would roll it back on one busy order. */
+export const GROUP_B_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 }
 const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
@@ -2500,7 +2502,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       }
 
       return processedShipmentCount
-    })
+    }, GROUP_B_TX_OPTIONS)
     if (groupBCount > 0) {
       result.groupB += groupBCount
     }

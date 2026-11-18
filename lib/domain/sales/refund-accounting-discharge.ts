@@ -97,7 +97,7 @@ export async function dischargeRefundAccountingObligation(
         accountingRetryRequired: false,
         accountingWarning: null,
         accountingRetrySyncs: Prisma.DbNull,
-        ...(zero ? { allocatedReliefAmount: 0 } : {}),
+        ...(zero ? { allocatedReliefAmount: 0, unearnedReversedAmount: 0 } : {}),
       },
     })
     return { discharged: true as const, reliefWrittenDown: zero }
