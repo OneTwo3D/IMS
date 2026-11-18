@@ -44,3 +44,20 @@ export const EXTERNAL_INVOICE_NUMBER_CONNECTORS: readonly string[] = ['woocommer
 export function invoiceNumberIsExternallySupplied(connectors: readonly string[]): boolean {
   return connectors.some((c) => EXTERNAL_INVOICE_NUMBER_CONNECTORS.includes(c))
 }
+
+/**
+ * o3d-hqvrp.69: which number `generateInvoiceNumber` records on an order that has none yet.
+ *
+ * An order finalised from the IMS side queues its SALES_INVOICE at creation, and that payload already carries the number Xero will be posted under
+ * (the persisted number, else `inv_prefix` + the order reference). Minting a SECOND, sequential number for the same order made the customer's PDF
+ * carry a number that the accounting back-reference then overwrote with the queued one: the number printed on the PDF vanished and the counter
+ * kept a gap. So while a sales invoice is queued or posted for the order, THAT number is the order's number and nothing is minted. With nothing
+ * queued (sync off, or the invoice not raised yet) the sequential number is minted as before, and the later enqueue then posts under it.
+ */
+export function resolveInvoiceNumberToRecord(params: {
+  /** `invoiceNumber` of the payload of this order's live (not failed, not cancelled) SALES_INVOICE sync row, if there is one. */
+  queuedInvoiceNumber: string | null | undefined
+}): { action: 'adopt-queued'; invoiceNumber: string } | { action: 'mint' } {
+  const queued = params.queuedInvoiceNumber?.trim()
+  return queued ? { action: 'adopt-queued', invoiceNumber: queued } : { action: 'mint' }
+}

@@ -1053,3 +1053,27 @@ export function resolvePostedRefundTaxIdentity(input: PostedRefundTaxIdentityInp
   }
   return { ok: true, accountingTaxType, reverseCharge, vatRate: postedRate }
 }
+
+/**
+ * o3d-hqvrp.323: the posted-VAT fence for the SERVER-DERIVED order-discount reversal on a public refund.
+ *
+ * The reversal is cut as a share of the order's discount, converted at the order's header rate (`orderDiscountReversal`), and posts as a
+ * negative line under the order default's tax code. The per-leg fence skips a discount leg (it has no VAT figure of its own), so before this the only guard
+ * was the cumulative gross ceiling, which says nothing about the RATE: a tax mapping edited since the order was charged posts the reversal at a rate the
+ * discount never carried, and the credit note then credits (or claws back) the wrong VAT. Refused here when the rate the leg posts at is not the rate
+ * the order was charged at. An order with no header rate states nothing to compare against and is left to the existing ceiling.
+ */
+export function orderDiscountReversalRateRefusal(input: {
+  postedRate: Decimal
+  /** `SalesOrder.taxRatePercent` (a percentage, 20 = 20%); null/0 = the order states no header rate. */
+  chargedRatePercent: DecimalInput | null | undefined
+  label: string
+}): string | null {
+  if (input.chargedRatePercent == null) return null
+  const chargedPercent = toDecimal(input.chargedRatePercent)
+  if (!chargedPercent.gt(0)) return null
+  const charged = chargedPercent.div(100)
+  // Rates are stored to 6 places; anything closer than that is the same rate.
+  if (input.postedRate.sub(charged).abs().lte(toDecimal('0.000001'))) return null
+  return `${input.label} would post at ${input.postedRate.mul(100).toDecimalPlaces(4).toString()}% but the order's discount was charged at ${chargedPercent.toDecimalPlaces(4).toString()}%, so the VAT it reverses would be wrong. Restore the tax mapping, or raise the credit note manually.`
+}

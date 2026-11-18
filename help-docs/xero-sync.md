@@ -684,6 +684,10 @@ Refunds create a Xero credit note in all cases. Additional reversal journals dep
 | Allocated but not shipped | Credit note + DR Unearned / CR Sales + DR Inventory / CR Allocated |
 | Partially or fully shipped | Credit note + DR Inventory / CR COGS (shipped portion) + unearned reversal (unshipped portion) |
 
+### Applying a credit note to its invoice (off by default)
+
+The setting `xero_sales_credit_note_allocation_enabled` is **off by default**; while it is off IMS sends the credit note and nothing more, as before. When it is `true`, after a sales credit note has posted as **Authorised** IMS applies it to the order's Xero invoice, for the credit note's whole total or what the invoice still owes if that is less, so the invoice stops showing as outstanding. The attempt is made once, straight after the post, and never fails the credit note: if Xero refuses (the invoice is already paid, so nothing is due, or the credit has been used elsewhere) the order's activity log carries a warning, **Credit note ... posted but was NOT allocated**, and the allocation is done in Xero. Paying the customer back (the cash-out of a refund of a paid invoice) is not posted by IMS yet.
+
 ### Chargebacks and the order-level discount
 
 When the payment poller sees a payment reversed, IMS raises a **chargeback** credit note that
@@ -733,6 +737,8 @@ is the one already recorded on the sales order:
 | Manual / IMS-created | The order's own invoice number if one has been generated, otherwise the Invoice Prefix from Settings → Company → Document Numbering plus the order reference |
 
 Two things follow from this, and both matter.
+
+A number is minted only when none is queued: if the order's invoice is already queued or posted, **Generate invoice number** (and the on-paid and on-shipped triggers) record the number that invoice was queued under instead of minting a second one, so the number on the PDF is the number in Xero.
 
 **One order, one number.** The create is an *update-or-create on `InvoiceNumber`*, so re-posting the
 same order replaces its own document instead of adding a second one. That property only holds while

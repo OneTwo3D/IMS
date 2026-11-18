@@ -764,3 +764,33 @@ export async function allocatePurchaseCreditNote(
       + 'then retry: a retry sends only the remainder.'),
   }
 }
+
+/**
+ * o3d-hqvrp.39: apply a posted SALES credit note (ACCRECCREDIT) to the Xero invoice of the order it was raised against, so the invoice stops
+ * showing as outstanding. The endpoint is the one the supplier side uses (`CreditNotes/{id}/Allocations`); what differs is the sizing: a sales
+ * credit note is raised for the refund, and the invoice may owe LESS than that (it was part-paid, or already settled), so the amount is the whole
+ * credit note, capped by the credit it has left and by what the invoice still owes. A cap is normal here and is NOT a failure (a partial
+ * allocation on the purchase side is). An invoice with nothing due (the cash-out case: paid, then refunded) is refused by the same decision table and
+ * reported, never forced.
+ *
+ * The caller sends this only when `xero_sales_credit_note_allocation_enabled` is 'true' and only for a credit note it has just posted AUTHORISED.
+ */
+export async function allocateSalesCreditNoteToInvoice(
+  params: { creditNoteId: string; invoiceId: string; date: string },
+  opts?: { idempotencyKey?: string },
+): Promise<{ success: boolean; allocatedAmount?: number; error?: string }> {
+  const cnRes = await xeroGet<{ CreditNotes?: unknown }>(`CreditNotes/${params.creditNoteId}`)
+  if (!cnRes.ok) return { success: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
+  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; Total?: unknown; Status?: unknown }>(
+    cnRes.data, 'CreditNotes', 'CreditNoteID', params.creditNoteId)
+  if (cnRead.status === 'unreadable') return { success: false, error: `Credit note not read from Xero for allocation: ${cnRead.reason}` }
+  if (cnRead.document.Status !== 'AUTHORISED') {
+    return { success: false, error: `Credit note is ${String(cnRead.document.Status)} in Xero, not AUTHORISED, so it cannot be allocated yet` }
+  }
+  const total = readXeroBalance(cnRead.document.Total)
+  if (total === null || total <= 0) return { success: false, error: 'Credit note read from Xero states no readable Total, so IMS cannot size the allocation' }
+  const result = await allocatePurchaseCreditNote({ creditNoteId: params.creditNoteId, invoiceId: params.invoiceId, amount: total, date: params.date }, opts)
+  // The capped case: the allocation WAS made, for less than the whole note.
+  if (!result.success && result.partial) return { success: true, allocatedAmount: result.allocatedAmount }
+  return { success: result.success, allocatedAmount: result.allocatedAmount, error: result.error }
+}

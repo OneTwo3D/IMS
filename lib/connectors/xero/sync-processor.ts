@@ -39,7 +39,7 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, allocateSalesCreditNoteToInvoice, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
@@ -5224,6 +5224,55 @@ async function xeroPaymentCurrencyRate(
 export const REALISED_FX_JOURNAL_RETIRED_REASON =
   'Retired, not sent: Xero books the realised FX gain/loss itself, at the settlement rate IMS sends on the payment, so an IMS-generated realised-FX journal would book it twice.'
 
+/**
+ * o3d-hqvrp.39: the optional allocation of a just-posted sales credit note to its invoice. Off unless `xero_sales_credit_note_allocation_enabled` is 'true'.
+ * Never throws and never fails the credit note's row: the outcome is an activity-log line (WARNING when nothing was allocated).
+ */
+async function allocateSalesCreditNoteAfterPost(p: {
+  lease: NonNullable<Awaited<ReturnType<typeof openRemoteWriteLease>>>
+  entryId: string
+  refundId: string
+  creditNoteId: string
+  date: string
+}): Promise<void> {
+  try {
+    const enabled = await db.setting.findUnique({ where: { key: 'xero_sales_credit_note_allocation_enabled' } })
+    if (enabled?.value !== 'true') return
+    const refund = await db.salesOrderRefund.findUnique({
+      where: { id: p.refundId },
+      select: { order: { select: { id: true, accountingInvoiceId: true, accountingInvoiceConnector: true } } },
+    })
+    const invoiceId = refund?.order.accountingInvoiceId
+    if (!invoiceId || (refund?.order.accountingInvoiceConnector ?? XERO_CONNECTOR) !== XERO_CONNECTOR) return
+    const fence = await p.lease.fenceBeforeRemoteWrite('credit-note-allocation')
+    if (!fence.ok) return
+    const result = await allocateSalesCreditNoteToInvoice(
+      { creditNoteId: p.creditNoteId, invoiceId, date: p.date || businessDateYmd(new Date()) },
+      { idempotencyKey: buildXeroIdempotencyKey(p.entryId, 'credit-note-allocation') },
+    )
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: refund!.order.id,
+      action: result.success ? 'xero_credit_note_allocated' : 'xero_credit_note_allocation_not_made',
+      tag: 'accounting',
+      level: result.success ? 'INFO' : 'WARNING',
+      description: result.success
+        ? `Credit note ${p.creditNoteId} allocated to the order's Xero invoice (${(result.allocatedAmount ?? 0).toFixed(2)}).`
+        : `Credit note ${p.creditNoteId} posted but was NOT allocated to the order's Xero invoice: ${result.error ?? 'unknown reason'}`,
+      metadata: { syncLogId: p.entryId, refundId: p.refundId, creditNoteId: p.creditNoteId, invoiceId, allocatedAmount: result.allocatedAmount ?? null },
+    })
+  } catch (e) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_credit_note_allocation_not_made',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: `Credit note ${p.creditNoteId} posted but its allocation to the invoice failed: ${String(e)}`,
+      metadata: { syncLogId: p.entryId, refundId: p.refundId },
+    }).catch(() => { /* logging must never fail the post */ })
+  }
+}
+
 function resolveInvoiceStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'AUTHORISED'
 }
@@ -6819,7 +6868,14 @@ export async function processClaimedEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(async (r) => {
+        // o3d-hqvrp.39: behind a setting that is OFF by default, apply the credit note to the order's invoice. BEST EFFORT AND AFTER THE POST: the credit note is
+        // already in the ledger and the row must not be failed (a retry would re-post the credit note), so a refusal or a lost response is logged for the operator.
+        if (r.success && r.creditNoteId && referenceType === 'SalesOrderRefund' && resolveInvoiceStatus(postingMode) === 'AUTHORISED') {
+          await allocateSalesCreditNoteAfterPost({ lease, entryId, refundId: referenceId, creditNoteId: r.creditNoteId, date: String(payload.date ?? '').slice(0, 10) })
+        }
+        return { success: r.success, externalId: r.creditNoteId, error: r.error }
+      })
     }
 
     case 'CREDIT_NOTE_VOID': {
