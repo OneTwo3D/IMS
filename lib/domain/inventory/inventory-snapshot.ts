@@ -1,5 +1,6 @@
 import { Prisma, type PrismaClient, type StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { businessDateYmd } from '@/lib/business-date'
 import {
   loadReservationSourceRows,
   type ReservationBreakdownClient,
@@ -324,6 +325,25 @@ function formatSnapshotDate(date: Date): string {
 
 export function previousUtcDate(from: Date = new Date()): Date {
   return addUtcDays(parseSnapshotDate(from), -1)
+}
+
+/**
+ * The snapshot label for a cron run at `from`: the BUSINESS (Europe/London) day that has just ended. The cron fires at 00:00 host
+ * time (London), which in BST is 23:00 UTC of the day before, so the UTC-based previousUtcDate labelled that run a day too early.
+ */
+export function previousBusinessDate(from: Date = new Date()): Date {
+  return addUtcDays(parseSnapshotDate(businessDateYmd(from)), -1)
+}
+
+/** The instant the business day labelled `snapshotDate` ends (London midnight of the next day: 23:00 UTC in BST, 00:00 UTC in GMT). */
+export function startOfNextBusinessDay(snapshotDate: Date): Date {
+  const nextYmd = formatSnapshotDate(addUtcDays(snapshotDate, 1))
+  const utcMidnight = startOfNextUtcDay(snapshotDate)
+  for (const offsetHours of [1, 0]) {
+    const candidate = new Date(utcMidnight.getTime() - offsetHours * 3_600_000)
+    if (businessDateYmd(candidate) === nextYmd && businessDateYmd(new Date(candidate.getTime() - 1)) !== nextYmd) return candidate
+  }
+  return utcMidnight
 }
 
 function calendarDayCount(fromDate: Date, toDate: Date): number {
@@ -965,7 +985,7 @@ export async function writeDailyInventorySnapshot(options: {
     snapshotCount: snapshotsWritten,
     source: 'cron',
     checkMethod: 'daily_current_state_v1',
-    cutoffAt: startOfNextUtcDay(snapshotDate),
+    cutoffAt: startOfNextBusinessDay(snapshotDate),
   })
   const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationSnapshot.rows)
   await writeReservationSnapshotRun(client, {
@@ -974,7 +994,7 @@ export async function writeDailyInventorySnapshot(options: {
     reservationSnapshotCount: reservationSnapshotsWritten,
     source: 'cron',
     checkMethod: 'daily_current_state_v1',
-    cutoffAt: startOfNextUtcDay(snapshotDate),
+    cutoffAt: startOfNextBusinessDay(snapshotDate),
     reservationSourceCount: reservationSnapshot.reservationSourceCount,
   })
 

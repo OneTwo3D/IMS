@@ -108,6 +108,8 @@ const tx = {
     update: async () => { writes++; return {} },
     findMany: async () => [LINE],
   },
+  // o3d-hqvrp: submitSupplierQuote reads the quoted-shipping setting (absent = OFF, the default).
+  setting: { findUnique: async () => null },
 }
 const fakeDb = {
   $transaction: async (fn: (client: typeof tx) => unknown) => fn(tx),

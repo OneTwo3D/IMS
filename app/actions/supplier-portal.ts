@@ -13,6 +13,7 @@ import { sessionAccessDenial } from '@/lib/auth/session-state'
 import { applyHeaderOrderDiscount, resolveHeaderOrderDiscountForeign } from '@/lib/domain/purchasing/order-discount'
 import { calcRequotedLineAmounts } from '@/lib/domain/purchasing/quote-line-amounts'
 import { SUPPLIER_QUOTABLE_STATUSES, SUPPLIER_RFQ_VIEWABLE_STATUSES, supplierSentPurchaseOrderWhere } from '@/lib/domain/purchasing/supplier-portal-visibility'
+import { planQuotedShipping, SUPPLIER_QUOTE_SHIPPING_SETTING_KEY } from '@/lib/domain/purchasing/quote-shipping'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -384,8 +385,35 @@ export async function submitSupplierQuote(
       const grossSubtotalBase = updatedLines.reduce((sum, line) => sum.add(line.totalBase), toDecimal(0))
       const grossTaxForeign = updatedLines.reduce((sum, line) => sum.add(line.taxForeign), toDecimal(0))
       const grossTaxBase = updatedLines.reduce((sum, line) => sum.add(line.taxBase), toDecimal(0))
-      const shippingForeign = toDecimal(safeData.shippingCost)
-      const shippingBase = shippingForeign.div(effectiveFxRate)
+      let shippingForeign = toDecimal(safeData.shippingCost)
+      let shippingBase = shippingForeign.div(effectiveFxRate)
+      // Supplier-quoted shipping as a freight cost line (landed + billable), behind a setting that defaults OFF; see quote-shipping.ts.
+      const landQuotedShipping = (await tx.setting.findUnique({ where: { key: SUPPLIER_QUOTE_SHIPPING_SETTING_KEY }, select: { value: true } }))?.value === 'true'
+      let quotedShippingPlan: ReturnType<typeof planQuotedShipping> | null = null
+      if (landQuotedShipping) {
+        const costLines = await tx.freightCostLine.findMany({
+          where: { poId },
+          select: { id: true, description: true, amountForeign: true, vatable: true },
+          orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+        })
+        quotedShippingPlan = planQuotedShipping({
+          shippingForeign,
+          fxRateToBase: effectiveFxRate,
+          vatRate: lockedPo.taxRatePercent ?? 0,
+          costLines,
+        })
+        if (quotedShippingPlan.deleteIds.length > 0) {
+          await tx.freightCostLine.deleteMany({ where: { id: { in: quotedShippingPlan.deleteIds }, poId } })
+        }
+        if (quotedShippingPlan.create) {
+          await tx.freightCostLine.create({
+            data: { poId, ...quotedShippingPlan.create, distributionMethod: 'BY_VALUE' },
+          })
+        }
+        // The order's freight aggregate is the sum of its cost lines (buyer lines stay beside the supplier's shipping).
+        shippingForeign = quotedShippingPlan.directFreightForeign
+        shippingBase = quotedShippingPlan.directFreightBase
+      }
 
       // o3d-lx1: reapply the RFQ's header discount to the requoted subtotal instead of leaving
       // discountAmount orphaned (which overstated subtotalBase/totalBase). A percentage discount
@@ -413,8 +441,9 @@ export async function submitSupplierQuote(
       })
       const subtotalForeign = toDecimal(netted.subtotalForeign)
       const subtotalBase = toDecimal(netted.subtotalBase)
-      const taxForeign = toDecimal(netted.taxForeign)
-      const taxBase = toDecimal(netted.taxBase)
+      // The buyer's vatable cost lines keep their VAT (it is not part of the line tax the requote recomputes).
+      const taxForeign = toDecimal(netted.taxForeign).add(quotedShippingPlan?.costLineVatForeign ?? 0)
+      const taxBase = toDecimal(netted.taxBase).add(quotedShippingPlan?.costLineVatBase ?? 0)
 
       const updated = await tx.purchaseOrder.updateMany({
         where: { id: poId, supplierId: ctx.supplierId, status: { in: [...SUPPLIER_QUOTABLE_STATUSES] } },

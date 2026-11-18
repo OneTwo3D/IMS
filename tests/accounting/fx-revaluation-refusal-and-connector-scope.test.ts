@@ -114,7 +114,7 @@ function revaluationRow(id: string, connector: string, valuationDate: string): R
 
 const OPEN_USD_RECEIVABLE = {
   id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null, invoiceNumber: 'INV-1',
-  currency: 'USD', totalForeign: 100, totalBase: 80, fxRateToBase: 0.8, payments: [],
+  currency: 'USD', totalForeign: 100, totalBase: 80, fxRateToBase: 0.8, payments: [], refunds: [],
 }
 
 function reset(connector: 'xero' | 'quickbooks', rows: Row[]): void {
