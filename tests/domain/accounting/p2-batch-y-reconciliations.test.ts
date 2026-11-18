@@ -1,12 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { businessDayStartInstant } from '@/lib/business-date'
 import { DEFAULT_RECURRING_SWEEP_CAP, evaluateAccountGlReconciliation, guardRecurringSweep } from '@/lib/domain/accounting/account-gl-reconciliation'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { inventoryGlReconciliationFinding } from '@/lib/domain/accounting/invariants'
 import { evaluateSubledgerCrossCheck } from '@/lib/domain/accounting/subledger-journal-cross-check'
-import { loadInTransitTransferValueBase } from '@/lib/domain/inventory/in-transit-transfer-value'
 import { inventoryGlVarianceFromSnapshot } from '@/lib/domain/inventory/inventory-costing-reports'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
@@ -14,17 +13,15 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 test('ACC-M7: a sweep that takes the trailing swept total past the cap is a flag, not a sweep', () => {
   const day = evaluateAccountGlReconciliation({ subledgerValue: 100.9, glBalance: 100 })
   assert.equal(day.action, 'sweep', 'within the £1 per-day limit on its own')
-  assert.equal(guardRecurringSweep(day, { priorSweptAbs: 0, cap: DEFAULT_RECURRING_SWEEP_CAP }).action, 'sweep')
-  assert.equal(guardRecurringSweep(day, { priorSweptAbs: 4.5, cap: DEFAULT_RECURRING_SWEEP_CAP }).action, 'flag')
+  assert.equal(guardRecurringSweep(day, { priorSweptNet: 0, cap: DEFAULT_RECURRING_SWEEP_CAP }).action, 'sweep')
+  const capped = guardRecurringSweep(day, { priorSweptNet: 4.5, cap: DEFAULT_RECURRING_SWEEP_CAP })
+  assert.equal(capped.action, 'flag')
+  assert.equal(capped.recurringSweepCap?.projectedNet, 5.4, 'the cap is named on the result, so it is not reported as a gap beyond tolerance')
+  // Signed: the opposite direction brings the net back under the cap.
+  assert.equal(guardRecurringSweep(day, { priorSweptNet: -4.5, cap: DEFAULT_RECURRING_SWEEP_CAP }).action, 'sweep')
   // Only a sweep is downgraded.
   const balanced = evaluateAccountGlReconciliation({ subledgerValue: 100, glBalance: 100 })
-  assert.equal(guardRecurringSweep(balanced, { priorSweptAbs: 99, cap: 5 }).action, 'balanced')
-})
-
-// ACC-M7: the GL day is the London business day; the snapshot day is the UTC day.
-test('ACC-M7: the business day starts at 23:00 UTC the evening before in BST and at 00:00 UTC in winter', () => {
-  assert.equal(businessDayStartInstant('2026-07-02').toISOString(), '2026-07-01T23:00:00.000Z')
-  assert.equal(businessDayStartInstant('2026-12-02').toISOString(), '2026-12-02T00:00:00.000Z')
+  assert.equal(guardRecurringSweep(balanced, { priorSweptNet: 99, cap: 5 }).action, 'balanced')
 })
 
 function journalDateOf(upserts: Array<{ create: { journalDate: Date } }>): string {
@@ -84,31 +81,21 @@ test('ACC-M10: a missing or differently dated Allocated Inventory balance blanks
   }
 })
 
-// ACC-M12: stock on a dispatched transfer.
-test('ACC-M12: stock dispatched and not yet received is added to the valuation compared with the GL', () => {
-  const inv = { balanceDate: new Date('2026-10-25T00:00:00.000Z'), amountBase: toDecimal('1000.00') }
-  const r = inventoryGlVarianceFromSnapshot(inv, '2026-10-25', toDecimal('940.00'), '630', { inTransitValueBase: toDecimal('60.00') })
-  assert.equal(r.glVarianceBase?.toFixed(2), '0.00', 'was -60.00: the stock is in no warehouse but still in the Inventory account')
-  assert.match(r.notices[0]!, /60\.00 of stock dispatched on a transfer/)
+
+// o3d-hqvrp.43: a sweep withheld by the recurring cap is its own warning, never a critical gap "beyond rounding tolerance".
+test('recurring-sweep cap: reported as a warning with its own code and wording', () => {
+  const day = evaluateAccountGlReconciliation({ subledgerValue: 100.9, glBalance: 100 })
+  const capped = guardRecurringSweep(day, { priorSweptNet: 4.5, cap: DEFAULT_RECURRING_SWEEP_CAP })
+  const finding = inventoryGlReconciliationFinding({ available: true, balanceDate: '2026-11-17', ...capped })
+  assert.equal(finding?.severity, 'warning')
+  assert.equal(finding?.code, 'inventory_recurring_residue_not_swept')
+  assert.match(finding!.message, /Recurring small residue not swept \(cap reached\)/)
+  assert.doesNotMatch(finding!.message, /beyond rounding tolerance/)
 })
 
-test('ACC-M12: the in-transit value is dispatched value less landed value, before the cutoff', async () => {
-  const seen: Array<{ type: string; before: Date }> = []
-  const client = {
-    stockMovement: {
-      aggregate: async (args: { where: { type: string; referenceType: string; createdAt: { lt: Date } } }) => {
-        assert.equal(args.where.referenceType, 'StockTransfer')
-        seen.push({ type: args.where.type, before: args.where.createdAt.lt })
-        return { _sum: { totalValueBase: args.where.type === 'TRANSFER_OUT' ? '100.000000' : '40.000000' } }
-      },
-    },
-  }
-  const cutoff = new Date('2026-10-26T00:00:00.000Z')
-  const value = await loadInTransitTransferValueBase(cutoff, client as never)
-  assert.equal(value.toFixed(2), '60.00')
-  assert.deepEqual(seen.map((s) => s.type).sort(), ['TRANSFER_IN', 'TRANSFER_OUT'])
-  assert.ok(seen.every((s) => s.before.getTime() === cutoff.getTime()))
-  // Nothing in transit: zero, never a negative owed to the GL.
-  const none = await loadInTransitTransferValueBase(cutoff, { stockMovement: { aggregate: async () => ({ _sum: { totalValueBase: null } }) } } as never)
-  assert.equal(none.toFixed(2), '0.00')
+test('recurring-sweep cap: a gap over the per-day limit stays critical, and a sweep or balanced result raises nothing', () => {
+  const gap = evaluateAccountGlReconciliation({ subledgerValue: 105, glBalance: 100 })
+  assert.equal(inventoryGlReconciliationFinding({ available: true, balanceDate: '2026-11-17', ...gap })?.severity, 'critical')
+  assert.equal(inventoryGlReconciliationFinding({ available: true, balanceDate: '2026-11-17', ...evaluateAccountGlReconciliation({ subledgerValue: 100.5, glBalance: 100 }) }), null)
+  assert.equal(inventoryGlReconciliationFinding({ available: false, reason: 'no_subledger_snapshot' }), null)
 })

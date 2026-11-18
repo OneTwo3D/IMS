@@ -2029,6 +2029,8 @@ export async function updateManufacturingCostLines(
               inventoryDeltaBase,
               recalcRunId,
             })}`
+            // ONE date for the journal and its COGS sub-ledger row: two clock reads could straddle London midnight and date them a day apart.
+            const reclassDate = businessDateYmd(new Date())
             const reclassQueued = await queueAccountingSyncTx(tx, {
               type: 'MANUFACTURING_RECLASS',
               referenceType: 'ProductionOrder',
@@ -2046,7 +2048,7 @@ export async function updateManufacturingCostLines(
               chartConnector: settings?.connector ?? null,
               idempotencyKey: reclassIdempotencyKey,
               payload: {
-                date: businessDateYmd(new Date()),
+                date: reclassDate,
                 reference: `MFG-RECLASS: ${po.reference}`,
                 narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
                 lines: journalLines,
@@ -2070,7 +2072,7 @@ export async function updateManufacturingCostLines(
                 sourceRef: productionOrderId,
                 idempotencyKey: reclassIdempotencyKey,
                 baseDelta: roundCurrency(cogsLegSigned),
-                journalDate: businessDateYmd(new Date()),
+                journalDate: reclassDate,
               })
             }
           }

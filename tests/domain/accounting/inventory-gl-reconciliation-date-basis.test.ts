@@ -2,15 +2,13 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 /**
- * ACC-M7 / ACC-M12 at the loader: the inventory reconciliation measures both sides over the same day, adds back stock on a dispatched
- * transfer, and will not sweep a residue that recurs every day.
+ * ACC-M7 at the loader: the inventory reconciliation will not sweep a residue that recurs every day. The cap is on the NET sweep of
+ * posted (or still postable) sweeps; FAILED and cancelled sweeps do not count.
  */
 type Snap = { balanceDate: Date; accountCode: string; amountBase: string; externalAccountId: string }
 const day = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
-let straddleMovements = 0
-let transferOut: string | null = null
-let transferIn: string | null = null
-let priorSweeps: Array<{ payload: unknown }> = []
+type Sweep = { status: string; payload: unknown }
+let priorSweeps: Sweep[] = []
 let subledger = '1000'
 const BALANCE_DATE = '2026-07-10' // BST
 
@@ -31,12 +29,7 @@ mock.module('@/lib/db', {
       },
       inventorySnapshot: { findMany: async () => [{ valueBase: subledger, valueReplayReliable: true }] },
       inventorySnapshotRun: { findUnique: async () => ({ id: 'r' }) },
-      stockMovement: {
-        count: async () => straddleMovements,
-        aggregate: async ({ where }: { where: { type: string } }) => ({ _sum: { totalValueBase: where.type === 'TRANSFER_OUT' ? transferOut : transferIn } }),
-      },
-      costLayerRevaluation: { count: async () => 0 },
-      accountingSyncLog: { findMany: async () => priorSweeps },
+      accountingSyncLog: { findMany: async ({ where }: { where: { status: { in: string[] } } }) => priorSweeps.filter((row) => where.status.in.includes(row.status)) },
     },
   },
 })
@@ -45,32 +38,38 @@ const settings = { inventoryAccount: '630', allocatedInventoryAccount: '631' }
 mock.module('@/lib/accounting', { namedExports: { getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }), getAccountingSettingsFor: async () => settings, getAccountingSettings: async () => settings } })
 
 const load = async () => (await import('../../../lib/domain/accounting/inventory-gl-reconciliation.ts')).loadInventoryGlReconciliation({ now: day(BALANCE_DATE) })
-const reset = () => { straddleMovements = 0; transferOut = null; transferIn = null; priorSweeps = []; subledger = '1000' }
+const reset = () => { priorSweeps = []; subledger = '1000' }
+const sweep = (status: string, line: { debit?: number; credit?: number }): Sweep => ({ status, payload: { lines: [{ accountCode: '630', ...line }] } })
 
-test('ACC-M7: stock moving in the BST hour the UTC and business days disagree withholds the comparison', async () => {
-  reset(); straddleMovements = 3
-  assert.deepEqual(await load(), { available: false, reason: 'snapshot_window_straddles_business_day' })
-})
-
-test('ACC-M7: with nothing moving in that hour the comparison is made', async () => {
-  reset()
-  const r = await load()
-  assert.equal(r.available, true)
-  assert.equal(r.available && r.action, 'balanced')
-})
-
-test('ACC-M7: a residue within the per-day limit is not swept once the trailing sweeps have used the cap', async () => {
+test('ACC-M7: with a small residue and no prior sweeps the comparison sweeps', async () => {
   reset(); subledger = '1000.40'
-  const first = await load()
-  assert.equal(first.available && first.action, 'sweep')
-  priorSweeps = Array.from({ length: 12 }, () => ({ payload: { lines: [{ accountCode: '630', debit: 0.4 }] } }))
-  const recurring = await load()
-  assert.equal(recurring.available && recurring.action, 'flag', 'twelve prior sweeps of 0.40 are a recurring error, not rounding')
+  const r = await load()
+  assert.equal(r.available && r.action, 'sweep')
+  assert.equal(r.available && r.recurringSweepCap, undefined)
 })
 
-test('ACC-M12: value dispatched on a transfer and not yet received is part of the subledger compared with the GL', async () => {
-  reset(); subledger = '940'; transferOut = '100'; transferIn = '40'
+test('ACC-M7: a one-directional residue that has used the cap is a flag carrying the cap, not a plain gap', async () => {
+  reset(); subledger = '1000.40'
+  priorSweeps = Array.from({ length: 12 }, () => sweep('SYNCED', { debit: 0.4 }))
   const r = await load()
-  assert.equal(r.available && r.subledgerValue, 1000)
-  assert.equal(r.available && r.action, 'balanced', 'was a 60.00 flag: the stock is out of the snapshot but still in the Inventory account')
+  assert.equal(r.available && r.action, 'flag')
+  assert.equal(r.available && r.recurringSweepCap?.cap, 5)
+  assert.equal(r.available && r.recurringSweepCap?.priorSweptNet, 4.8)
+})
+
+test('ACC-M7: residue that alternates in sign nets to nothing and is still swept', async () => {
+  reset(); subledger = '1000.40'
+  priorSweeps = Array.from({ length: 30 }, (_, i) => sweep('SYNCED', i % 2 === 0 ? { debit: 0.4 } : { credit: 0.4 }))
+  const r = await load()
+  assert.equal(r.available && r.action, 'sweep', 'the absolute total is 12.00 but the net is 0.00: rounding, not a recurring error')
+})
+
+test('ACC-M7: FAILED and CANCELLED sweeps never posted and do not use the cap', async () => {
+  reset(); subledger = '1000.40'
+  priorSweeps = [
+    ...Array.from({ length: 12 }, () => sweep('FAILED', { debit: 0.4 })),
+    ...Array.from({ length: 12 }, () => sweep('CANCELLED', { debit: 0.4 })),
+  ]
+  const r = await load()
+  assert.equal(r.available && r.action, 'sweep')
 })

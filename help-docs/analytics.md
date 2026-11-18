@@ -65,7 +65,7 @@ Warehouse users can access the stock-position report family. Broader analytics r
 | **Landed Cost Analysis** | Purchase-order landed cost uplift, allocation method, revaluation run evidence, and effective unit cost impact. |
 | **Inventory Turnover** | Sales-dispatch COGS divided by observed average inventory value from daily snapshots. |
 
-The Inventory Valuation GL variance compares the valuation, plus any stock dispatched on a transfer and not yet received (a notice says how much), with the Inventory and Allocated Inventory accounts together. If the Allocated Inventory account is configured and has no balance dated the same day, the variance is blank rather than comparing Inventory alone.
+The Inventory Valuation GL variance compares the valuation with the Inventory and Allocated Inventory accounts together. If the Allocated Inventory account is configured and has no balance dated the same day, the variance is blank rather than comparing Inventory alone.
 
 Inventory valuation and COGS only show accounting variance when matching account-balance snapshots have been ingested from the accounting connector. Missing snapshots are shown as explicit notices rather than inferred balances.
 

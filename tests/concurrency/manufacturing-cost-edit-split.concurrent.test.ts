@@ -199,9 +199,10 @@ async function runCase(label: string, sc: Scenario, extend?: (world: Awaited<Ret
   // ACC-M9: the reclass journal's COGS leg moves the GL COGS account, so the COGS sub-ledger must hold a row for it, equal to the leg as
   // posted. Before the fix there was none, and the COGS reconciliation read the gap as a ledger fault.
   const reclassCogs = netDebit(reclass, '500')
-  const subledgerRows = await db.cogsSubledgerMovement.findMany({ where: { sourceType: 'MANUFACTURING_RECLASS', sourceRef: world.productionId }, select: { baseDelta: true } })
+  const subledgerRows = await db.cogsSubledgerMovement.findMany({ where: { sourceType: 'MANUFACTURING_RECLASS', sourceRef: world.productionId }, select: { baseDelta: true, journalDate: true } })
   if (Math.abs(reclassCogs) >= 0.005) {
     assert.equal(subledgerRows.length, 1, 'one COGS sub-ledger row for the reclass COGS leg')
+    assert.equal(subledgerRows[0]!.journalDate.toISOString().slice(0, 10), (reclassRows[0]!.payload as { date: string }).date, 'the row is dated with its journal (one date, not a second clock read)')
     assert.ok(Math.abs(Number(subledgerRows[0]!.baseDelta) - reclassCogs) < 0.0001, `the row (${subledgerRows[0]!.baseDelta}) is the COGS leg as posted (${reclassCogs})`)
   } else {
     assert.equal(subledgerRows.length, 0, 'no COGS leg, no row')

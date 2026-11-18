@@ -17,7 +17,6 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { assertSourceLimit, SourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import { getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots, getAccountingSettingsFor } from '@/lib/accounting'
-import { loadInTransitTransferValueBase } from '@/lib/domain/inventory/in-transit-transfer-value'
 import { cache } from 'react'
 import { DISPLAY_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
@@ -650,9 +649,7 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
       throw error
     }
   }
-  // Stock on a dispatched, not yet received transfer is in no warehouse and so not in the valuation, but is still in the GL Inventory account.
-  const inTransitValueBase = await loadInTransitTransferValueBase(exclusiveEndOfUtcDay(new Date(`${asOf}T00:00:00.000Z`)))
-  const variance = inventoryGlVarianceFromSnapshot(snapshot, asOf, totalValueBase, context.inventoryAccountCode, { allocated, inTransitValueBase })
+  const variance = inventoryGlVarianceFromSnapshot(snapshot, asOf, totalValueBase, context.inventoryAccountCode, { allocated })
   // A proven-absent zero is compared as the real zero it is, and the figure says it is not a balance Xero reported.
   if (snapshot && variance.glBalanceBase !== null && glLegProvenance(snapshot) === 'proven-absent') {
     variance.notices.push(`The GL balance for inventory asset account ${context.inventoryAccountCode} is zero because the account is absent from a Xero Trial Balance that proved itself complete; Xero reported no row for it.`)
@@ -673,8 +670,6 @@ export function inventoryGlVarianceFromSnapshot(
   options?: {
     /** The Allocated Inventory account and its stored balance. Null/absent: the account is not configured, Inventory alone is the GL on-hand value. */
     allocated?: { accountCode: string; snapshot: { balanceDate: Date; amountBase: Decimal } | null } | null
-    /** Value of stock dispatched on a transfer and not yet received: valued by neither warehouse, still in the Inventory account. */
-    inTransitValueBase?: Decimal
   },
 ): { glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] } {
   if (!snapshot) {
@@ -706,13 +701,9 @@ export function inventoryGlVarianceFromSnapshot(
     }
     glBalanceBase = glBalanceBase.add(allocated.snapshot.amountBase)
   }
-  const inTransit = options?.inTransitValueBase ?? toDecimal(0)
-  if (!inTransit.isZero()) {
-    notices.push(`The valuation includes ${inTransit.toFixed(2)} of stock dispatched on a transfer and not yet received, which is in no warehouse but is still in the GL inventory account.`)
-  }
   return {
     glBalanceBase,
-    glVarianceBase: calculateAccountBalanceVarianceBase(totalValueBase.add(inTransit), glBalanceBase),
+    glVarianceBase: calculateAccountBalanceVarianceBase(totalValueBase, glBalanceBase),
     notices,
   }
 }
