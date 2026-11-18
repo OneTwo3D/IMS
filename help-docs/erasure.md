@@ -11,7 +11,7 @@ This page says what an erasure removes, what it keeps, and where it **cannot** r
 
 ## What is erased
 
-Names, email addresses, phone numbers, company, VAT numbers, billing and shipping addresses, order notes and internal notes, tracking numbers, the storefront customer id and order key, and the same details wherever IMS copied them: queued and sent email addresses, the stored copies of WooCommerce and warehouse payloads, accounting payload copies, activity-log rows about the customer or order, and notifications about the order. Waiting emails to the person are cancelled.
+Names, email addresses, phone numbers, company, VAT numbers, billing and shipping addresses, order notes and internal notes, **custom field values on the order** (free text an operator entered; the field definitions stay), tracking numbers, the storefront customer id and order key, and the same details wherever IMS copied them: queued and sent email addresses, the stored copies of WooCommerce and warehouse payloads, accounting payload copies, activity-log rows about the customer or order, and notifications about the order. Waiting emails to the person are cancelled.
 
 ## What is kept, for six years
 

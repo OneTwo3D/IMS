@@ -23,7 +23,7 @@ export type Permission =
   | 'dashboard'
   | 'inventory' | 'inventory.edit' | 'inventory.prices'
   | 'stock_control' | 'stock_control.adjust' | 'stock_control.transfer'
-  | 'purchasing' | 'purchasing.create' | 'purchasing.receive' | 'purchasing.invoice'
+  | 'purchasing' | 'purchasing.create' | 'purchasing.receive' | 'purchasing.invoice' | 'purchasing.approve'
   | 'sales' | 'sales.create' | 'sales.process' | 'sales.refund'
   | 'manufacturing'
   | 'analytics'
@@ -44,7 +44,9 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'internal',
     'dashboard', 'inventory', 'inventory.edit', 'inventory.prices',
     'stock_control', 'stock_control.adjust', 'stock_control.transfer',
-    'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice',
+    // purchasing.approve: the order approval gate (po_approval_threshold_base). ADMIN and MANAGER run purchasing and own spend decisions; FINANCE
+    // creates and bills POs (maker role, kept separate from approving), WAREHOUSE receives, READONLY/SUPPLIER only read or are external.
+    'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice', 'purchasing.approve',
     'sales', 'sales.create', 'sales.process', 'sales.refund',
     'manufacturing', 'analytics', 'analytics.inventory_ledger', 'analytics.inventory_costing', 'sync',
     'settings', 'settings.company', 'settings.users',
@@ -54,7 +56,9 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'internal',
     'dashboard', 'inventory', 'inventory.edit', 'inventory.prices',
     'stock_control', 'stock_control.adjust', 'stock_control.transfer',
-    'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice',
+    // purchasing.approve: the order approval gate (po_approval_threshold_base). ADMIN and MANAGER run purchasing and own spend decisions; FINANCE
+    // creates and bills POs (maker role, kept separate from approving), WAREHOUSE receives, READONLY/SUPPLIER only read or are external.
+    'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice', 'purchasing.approve',
     'sales', 'sales.create', 'sales.process', 'sales.refund',
     'manufacturing', 'analytics', 'analytics.inventory_ledger', 'analytics.inventory_costing', 'sync',
     'activity_log', 'help',
