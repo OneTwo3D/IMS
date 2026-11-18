@@ -695,14 +695,16 @@ async function sendMintsoftProductClears(
   // A POST without an error does not prove the clear worked (the wire format is unverified): read the product back and
   // count a field cleared only when Mintsoft shows it empty.
   let raw: Record<string, unknown> | null = null
+  let readBackError: string | null = null
   try {
     raw = (await fetchMintsoftProduct(options.externalProductId as string))?.raw ?? null
-  } catch {
-    raw = null
+  } catch (error) {
+    // Carried into every sent field's rejection below: an unverifiable clear is a retryable failure, never a silent success.
+    readBackError = error instanceof Error ? error.message : 'Mintsoft read-back failed'
   }
   for (const field of sent) {
     if (raw && mintsoftFieldIsEmpty(raw, field)) outcome.cleared.push(field)
-    else outcome.rejected.push({ field, message: raw ? 'clear not applied' : 'clear not applied (could not read the product back to verify)' })
+    else outcome.rejected.push({ field, message: raw ? 'clear not applied' : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
   }
   return outcome
 }
