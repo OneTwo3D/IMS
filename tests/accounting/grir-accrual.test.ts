@@ -175,11 +175,34 @@ test('billed goods that are returned leave a billed-not-received debit that the 
   assert.equal(posted.success, true, String(posted.error))
   const credits = await byType(po.id, 'SUPPLIER_CREDIT_NOTE')
   assert.equal(credits.length, 1)
-  assert.equal(credits[0]!.poLineId, null)
+  assert.equal(credits[0]!.poLineId, po.lineId, 'valued per line, like the return')
   assert.equal((await balance(po.id)).toNumber(), 0, 'the supplier has credited the 4 returned units: the debit is lifted')
   // Posting again claims nothing and writes nothing.
   await postSupplierCreditNote(note.id)
   assert.equal((await byType(po.id, 'SUPPLIER_CREDIT_NOTE')).length, 1)
+})
+
+// [mutation: value the credit at the credit's net instead of the PO value, or send the difference to the balance]
+test('a returned-and-credited line nets to exactly zero when the bill carried a different price: the difference is a price-difference reversal, not balance', async () => {
+  const { returnPurchaseOrder, postSupplierCreditNote } = await import('@/app/actions/purchase-orders')
+  const po = await seedPo(10, 12)
+  assert.equal((await receive(po, 10)).success, true)
+  assert.equal((await bill(po, 10, 13)).success, true)
+  assert.equal((await returnPurchaseOrder(po.id, [{ poLineId: po.lineId, qtyReturned: 4, warehouseId }], 'faulty')).success, true)
+  assert.equal((await balance(po.id)).toNumber(), -48, 'billed 10 at the PO value, 6 retained')
+  const note = await s.db.supplierCreditNote.findFirstOrThrow({ where: { poId: po.id, isReturnGenerated: true }, select: { id: true, amountBase: true } })
+  assert.equal((await postSupplierCreditNote(note.id)).success, true)
+  const credit = (await byType(po.id, 'SUPPLIER_CREDIT_NOTE'))[0]!
+  assert.equal(Number(credit.baseDelta), 48, 'the 4 credited units at the PO value 12, not at the credit net 52')
+  assert.equal((await balance(po.id)).toNumber(), 0, 'no false 4 left on GR/IR')
+  const ppv = (await byType(po.id, 'BILL_PRICE_VARIANCE')).reduce((t, r) => t + Number(r.baseDelta), 0)
+  assert.ok(Math.abs(ppv - 6) < 0.000001, `the premium on the 6 retained units remains (6), got ${ppv}`)
+  // A credit with nothing billed-and-returned to clear writes no balance row.
+  const po2 = await seedPo(10, 12)
+  assert.equal((await receive(po2, 10)).success, true)
+  assert.equal((await bill(po2, 6, 12)).success, true)
+  assert.equal((await returnPurchaseOrder(po2.id, [{ poLineId: po2.lineId, qtyReturned: 4, warehouseId }], 'faulty')).success, true)
+  assert.equal((await balance(po2.id)).toNumber(), 0, 'received 10, returned 4, billed 6: settled with no credit needed')
 })
 
 // [mutation: make the row key random instead of per source event]
@@ -308,20 +331,23 @@ test('with GR/IR posting ON the batch stages one reclass journal per day (Stock 
   assert.equal((await grirLogs()).length, logs.length)
 })
 
-// [mutation: ignore the producer hold for this type]
-test('with GR/IR posting ON and the Xero hold enforced, the journal is shadowed: nothing is queued and the transit sub-ledger records nothing', async () => {
+// [mutation: ignore the producer hold for this type, or consume the rows of a shadowed journal]
+test('with GR/IR posting ON and the Xero hold enforced, the journal is shadowed: nothing is queued, no transit row, the rows stay unconsumed and post once the hold is lifted', async () => {
   const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
   const po = await seedPo(10, 7)
   assert.equal((await receive(po, 10)).success, true)
   const logsBefore = (await grirLogs()).length
   const transitBefore = await s.db.transitSubledgerMovement.count({ where: { sourceType: 'GRIR_RECLASS' } })
   const outboxBefore = await s.db.integrationOutbox.count()
+  const pendingRows = await unconsumed()
+  assert.ok(pendingRows > 0)
   const saved = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
   process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'xero'
   try {
     const result = await runDailyBatchSync()
     assert.equal(result.errors.length, 0, result.errors.join('; '))
-    assert.equal(result.grirReclassJournals, 1, 'the journal was composed')
+    assert.equal(result.grirReclassJournals, 0, 'nothing was queued')
+    assert.equal(result.grirReclassShadowed, 1, 'the journal was composed and shadowed')
   } finally {
     if (saved === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS; else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = saved
   }
@@ -332,7 +358,15 @@ test('with GR/IR posting ON and the Xero hold enforced, the journal is shadowed:
   assert.equal(added.every((l) => l.status === 'CANCELLED'), true, 'the shadow row is recorded CANCELLED')
   assert.equal(await s.db.integrationOutbox.count(), outboxBefore, 'no outbox job')
   assert.equal(await s.db.transitSubledgerMovement.count({ where: { sourceType: 'GRIR_RECLASS' } }), transitBefore, 'the ledger did not move, so the transit sub-ledger claims nothing')
-  assert.equal(await unconsumed(), 0)
+  assert.equal(await unconsumed(), pendingRows, 'the shadowed rows are NOT consumed')
+  // The hold is lifted: the same rows post.
+  const lifted = await runDailyBatchSync()
+  assert.equal(lifted.errors.length, 0, lifted.errors.join('; '))
+  assert.ok((lifted.grirReclassJournals ?? 0) >= 1, 'the journal is queued now')
+  assert.equal(await unconsumed(), 0, 'and its rows are consumed')
+  const after = (await grirLogs()).slice(logsBefore)
+  assert.equal(after.filter((l) => l.status === 'PENDING').length, lifted.grirReclassJournals)
+  assert.ok(await s.db.transitSubledgerMovement.count({ where: { sourceType: 'GRIR_RECLASS' } }) > transitBefore)
 })
 
 // [mutation: stage with the GR/IR account unmapped]
@@ -367,7 +401,7 @@ test('the opening-balance plan lists received-but-unbilled lines with no history
   assert.equal(mine[0]!.openQty, '6')
   assert.equal(mine[0]!.baseDelta, '72')
   assert.equal(plan.rows.some((r) => r.poId === live.id), false, 'a line that already accrues is left alone')
-  assert.ok(plan.skippedWithHistory >= 1)
+  assert.ok(plan.alreadyTracked >= 1)
 
   const beforeCount = await s.db.grirSubledgerMovement.count()
   // DRY RUN: the planner alone writes nothing.
@@ -387,6 +421,32 @@ test('the opening-balance plan lists received-but-unbilled lines with no history
   await applyGrirOpeningBalance(plan, { asOf: '2026-11-17', client: s.db })
   assert.equal(await s.db.grirSubledgerMovement.count(), afterFirst, 'replaying the same plan writes nothing')
   assert.equal((await balance(legacy.id)).toNumber(), 72)
+})
+
+// [mutation: skip a line as soon as it has any live row, instead of completing it]
+test('the opening-balance plan completes a line with pre-existing history AFTER its first live movement: 10 received before deployment, 5 billed after, opens +10', async () => {
+  const { planGrirOpeningBalance, applyGrirOpeningBalance } = await import('@/lib/domain/accounting/grir-opening-balance')
+  const po = await seedPo(10, 12)
+  await s.db.purchaseOrderLine.update({ where: { id: po.lineId }, data: { qtyReceived: '10' } })
+  await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'RECEIVED' } })
+  assert.equal((await bill(po, 5, 12)).success, true)
+  assert.equal((await balance(po.id)).toNumber(), -60, 'the live ledger alone says billed-not-received')
+  const plan = await planGrirOpeningBalance(s.db)
+  const row = plan.rows.find((r) => r.poId === po.id)!
+  assert.ok(row, 'the line is planned although it already has a live row')
+  assert.equal(row.liveQty, '-5')
+  assert.equal(row.openQty, '10')
+  assert.equal(row.baseDelta, '120')
+  await applyGrirOpeningBalance(plan, { asOf: '2026-11-17', client: s.db })
+  assert.equal((await balance(po.id)).toNumber(), 60, '(10 received - 5 billed) x 12')
+  assert.equal((await planGrirOpeningBalance(s.db)).rows.some((r) => r.poId === po.id), false, 'a second run plans nothing for it')
+  const count = await s.db.grirSubledgerMovement.count({ where: { poId: po.id } })
+  await applyGrirOpeningBalance(plan, { asOf: '2026-11-17', client: s.db })
+  assert.equal(await s.db.grirSubledgerMovement.count({ where: { poId: po.id } }), count, 'replaying the old plan writes nothing')
+  // A movement after the opening keeps the line tracked.
+  assert.equal((await bill(po, 5, 12)).success, true)
+  assert.equal((await planGrirOpeningBalance(s.db)).rows.some((r) => r.poId === po.id), false)
+  assert.equal((await balance(po.id)).toNumber(), 0)
 })
 
 // [mutation: let the script write without the dry-run flag guard]

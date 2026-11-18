@@ -1,16 +1,19 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { grirJournalDate, loadGrirPoValuation, writeGrirMovement } from '@/lib/domain/accounting/grir-subledger-movement'
+import { loadPurchaseOrderLineLandedQty, requirePoLineLandedQty } from '@/lib/domain/inventory/po-line-landed-quantity'
+import { GRIR_BALANCE_SOURCE_TYPES } from '@/lib/domain/accounting/grir-subledger-movement'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
 /**
  * OPENING GR/IR FROM RECEIVED-BUT-UNBILLED LINES (stage only; production is reinstalled and gets none).
  *
- * A line that was received or billed before the GR/IR sub-ledger existed carries no history in it. For every order line with NO sub-ledger row at all and a
- * non-zero (received - returned - billed) quantity, the plan is ONE OPENING_BALANCE row for that quantity at the PO goods unit cost (positive = received
- * not billed, negative = billed not received). A line that already has any sub-ledger row is left alone and counted, because its history is already
- * accruing correctly and an opening row on top would count the same goods twice. The key is `grir:opening:<poLineId>`, so a second run writes nothing
- * for a line it already opened, and a line that has since gained live rows is skipped by the same rule: the script is idempotent and safe to re-run.
+ * A line that was received or billed before the GR/IR sub-ledger existed carries no (or only part of its) history in it. For every order line the
+ * EXPECTED position from the source data is landed - returned - billed (landed = `qtyReceived` plus what a warehouse alignment brought in, the same
+ * quantity the order's status uses). The line's LIVE position is the sum of its sub-ledger rows (every balance type). The plan is the DIFFERENCE,
+ * written as one OPENING_BALANCE row at the PO goods unit cost: so a line received before deployment and billed in part afterwards (live rows: -5)
+ * gets the missing +10, and a line the ledger already tracks completely gets nothing. The key carries the line and the quantity
+ * (`grir:opening:<poLineId>:<qty>`), and a second run finds expected = live, so it plans nothing; replaying an old plan upserts onto the same key.
  *
  * The plan is computed by the one function both the dry run and the write use, so the dry run reports exactly what a real run would write.
  */
@@ -22,7 +25,9 @@ export type GrirOpeningPlanRow = {
   received: string
   returned: string
   billed: string
-  /** received - returned - billed: + received not billed, - billed not received. */
+  /** What the sub-ledger already holds for the line. */
+  liveQty: string
+  /** (landed - returned - billed) - live: the quantity to open. + received not billed, - billed not received. */
   openQty: string
   unitCostBase: string
   baseDelta: string
@@ -31,14 +36,14 @@ export type GrirOpeningPlanRow = {
 
 export type GrirOpeningPlan = {
   rows: GrirOpeningPlanRow[]
-  /** Lines with a non-zero open quantity that already carry sub-ledger rows and were left alone. */
-  skippedWithHistory: number
-  /** Lines whose open quantity is zero. */
+  /** Lines whose live sub-ledger position already equals the source data (nothing to open), including lines with live rows only. */
+  alreadyTracked: number
+  /** Lines with nothing open at all. */
   settled: number
   totalBaseDelta: string
 }
 
-type OpeningClient = Pick<Prisma.TransactionClient, 'purchaseOrder' | 'purchaseInvoiceLine' | 'grirSubledgerMovement' | 'purchaseReceipt'>
+type OpeningClient = Pick<Prisma.TransactionClient, 'purchaseOrder' | 'purchaseOrderLine' | 'purchaseInvoiceLine' | 'grirSubledgerMovement' | 'purchaseReceipt' | 'wmsAsnLineMap'>
 
 const FREIGHT_ORDER_TYPE = 'FREIGHT'
 
@@ -59,11 +64,12 @@ export async function planGrirOpeningBalance(client: OpeningClient = db, options
     _sum: { qtyBilled: true },
   })
   const billedByLine = new Map(billedRows.map((row) => [row.poLineId, toDecimal(row._sum.qtyBilled)]))
-  const withHistory = new Set((lineIds.length === 0 ? [] : await client.grirSubledgerMovement.findMany({
-    where: { poLineId: { in: lineIds } },
-    select: { poLineId: true },
-    distinct: ['poLineId'],
-  })).map((row) => row.poLineId))
+  const liveRows = lineIds.length === 0 ? [] : await client.grirSubledgerMovement.groupBy({
+    by: ['poLineId'],
+    where: { poLineId: { in: lineIds }, sourceType: { in: [...GRIR_BALANCE_SOURCE_TYPES] } },
+    _sum: { qtyDelta: true },
+  })
+  const liveByLine = new Map(liveRows.map((row) => [row.poLineId, toDecimal(row._sum.qtyDelta)]))
   const receiptRows = lineIds.length === 0 ? [] : await client.purchaseReceipt.findMany({
     where: { lines: { some: { poLineId: { in: lineIds } } } },
     select: { receivedAt: true, lines: { select: { poLineId: true } } },
@@ -77,18 +83,20 @@ export async function planGrirOpeningBalance(client: OpeningClient = db, options
   }
 
   const rows: GrirOpeningPlanRow[] = []
-  let skippedWithHistory = 0
+  let alreadyTracked = 0
   let settled = 0
   let total: Decimal = toDecimal(0)
   for (const order of orders) {
     const valuation = await loadGrirPoValuation(client, order.id)
+    const landed = await loadPurchaseOrderLineLandedQty(client as never, order.lines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })))
     for (const line of order.lines) {
-      const received = toDecimal(line.qtyReceived)
+      const received = requirePoLineLandedQty(landed, line.id).qty
       const returned = toDecimal(line.qtyReturned)
       const billed = billedByLine.get(line.id) ?? toDecimal(0)
-      const openQty = received.sub(returned).sub(billed)
-      if (openQty.isZero()) { settled += 1; continue }
-      if (withHistory.has(line.id)) { skippedWithHistory += 1; continue }
+      const expected = received.sub(returned).sub(billed)
+      const live = liveByLine.get(line.id) ?? toDecimal(0)
+      const openQty = expected.sub(live)
+      if (openQty.isZero()) { if (expected.isZero()) settled += 1; else alreadyTracked += 1; continue }
       const unit = valuation.goodsUnitCostByLine.get(line.id) ?? toDecimal(0)
       const baseDelta = roundQuantity(openQty.mul(unit), 6)
       total = total.add(baseDelta)
@@ -100,6 +108,7 @@ export async function planGrirOpeningBalance(client: OpeningClient = db, options
         received: received.toString(),
         returned: returned.toString(),
         billed: billed.toString(),
+        liveQty: live.toString(),
         openQty: openQty.toString(),
         unitCostBase: unit.toString(),
         baseDelta: baseDelta.toString(),
@@ -107,7 +116,7 @@ export async function planGrirOpeningBalance(client: OpeningClient = db, options
       })
     }
   }
-  return { rows, skippedWithHistory, settled, totalBaseDelta: total.toString() }
+  return { rows, alreadyTracked, settled, totalBaseDelta: total.toString() }
 }
 
 /** Write the plan. Each row is a first-write-wins upsert on its own key, so a re-run (or two runs at once) cannot double-open a line. */
@@ -118,7 +127,7 @@ export async function applyGrirOpeningBalance(plan: GrirOpeningPlan, options: { 
     await writeGrirMovement(client as never, {
       sourceType: 'OPENING_BALANCE',
       sourceRef: row.poId,
-      idempotencyKey: `grir:opening:${row.poLineId}`,
+      idempotencyKey: `grir:opening:${row.poLineId}:${row.openQty}`,
       poId: row.poId,
       poLineId: row.poLineId,
       supplierId: row.supplierId,

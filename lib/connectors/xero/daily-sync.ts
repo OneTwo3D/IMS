@@ -744,6 +744,8 @@ export type XeroDailyBatchResult = {
   transitReconciliationSwept?: number | null
   /** GR/IR accrual: how many reclass journals this run staged (0 while `grir_xero_posting_enabled` is off, which is the default). */
   grirReclassJournals?: number
+  /** GR/IR reclass journals the producer hold recorded as shadows this run (their source rows stay unconsumed). */
+  grirReclassShadowed?: number
 }
 
 export function resolveXeroDailyBatchLimit(value = process.env.XERO_DAILY_BATCH_LIMIT): number {
@@ -1626,16 +1628,21 @@ async function stageGrirReclassJournals(
               _postingMode: 'submitted',
             },
           }, staged)
-          // A shadow is never posted by IMS: the ledger did not move, so the transit sub-ledger must not claim it did.
-          if (staged.queued) {
-            await recordTransitSubledgerMovement(tx, {
-              sourceType: 'GRIR_RECLASS',
-              sourceRef: referenceId,
-              idempotencyKey: `grir-reclass:${referenceId}`,
-              baseDelta: journal.transitDelta,
-              journalDate: group.date,
-            })
+          // A shadow is never posted by IMS: the ledger did not move, so the transit sub-ledger must not claim it did, and the rows the journal was
+          // built from are NOT consumed. Unlike A2 and Group B (which stamp their source rows with the shadow's id), a GR/IR movement is the only
+          // record of its accrual: nothing re-derives it, so consuming it into a shadow would lose it for good when the hold is lifted. The shadow is
+          // recorded again (same batch reference while the rows are unchanged) and the rows post on the first run after the hold is lifted.
+          if (!staged.queued) {
+            result.grirReclassShadowed = (result.grirReclassShadowed ?? 0) + 1
+            continue
           }
+          await recordTransitSubledgerMovement(tx, {
+            sourceType: 'GRIR_RECLASS',
+            sourceRef: referenceId,
+            idempotencyKey: `grir-reclass:${referenceId}`,
+            baseDelta: journal.transitDelta,
+            journalDate: group.date,
+          })
           result.grirReclassJournals = (result.grirReclassJournals ?? 0) + 1
         }
         await tx.grirSubledgerMovement.updateMany({

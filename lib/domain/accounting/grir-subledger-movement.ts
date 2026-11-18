@@ -19,8 +19,9 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  *   BILL                  -  billed qty x PO goods unit cost.             Written with the bill. Only goods lines (a freight cost line is not here).
  *   BILL_UPDATE           -  the signed delta of an edited bill's goods quantity, valued the same way.
  *   SUPPLIER_RETURN       -  returned qty x PO goods unit cost: reverses the receipt portion. Written with the return.
- *   SUPPLIER_CREDIT_NOTE  +  the NET of a return-generated credit note: the supplier crediting back goods that were already billed, which lifts the
- *                            debit a return of billed goods left. Only return-generated notes (a freight credit note is the transit path's).
+ *   SUPPLIER_CREDIT_NOTE  +  a return-generated credit note: the supplier crediting back goods that were billed and then returned, valued per line at
+ *                            the PO goods unit cost (like the return), lifting the debit that return left. The difference to the credit's net goes to
+ *                            BILL_PRICE_VARIANCE. Only return-generated notes (a freight credit note is the transit path's).
  *   OPENING_BALANCE       +/- the received-not-billed (or billed-not-received) quantity of a line that had no sub-ledger history, at the PO goods unit cost.
  *                         Written ONLY by the stage opening-balance script (scripts/grir-opening-balance.ts); production is reinstalled and has none.
  *   BILL_PRICE_VARIANCE   billed value - PO value of the billed goods (positive = the bill is dearer than the order). THE PRICE DIFFERENCE. No
@@ -37,7 +38,7 @@ export const GRIR_PRICE_VARIANCE_SOURCE_TYPE = 'BILL_PRICE_VARIANCE' as const
 export type GrirBalanceSourceType = (typeof GRIR_BALANCE_SOURCE_TYPES)[number]
 export type GrirSourceType = GrirBalanceSourceType | typeof GRIR_PRICE_VARIANCE_SOURCE_TYPE
 
-export type GrirClient = Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrder'>
+export type GrirClient = Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrder' | 'purchaseOrderLine'>
 
 /** UTC date-only midnight, as the transit sub-ledger normalises its journal date (the reclass window is a date window). */
 export function grirJournalDate(value: Date | string): Date {
@@ -225,22 +226,63 @@ export async function recordGrirSupplierReturn(
 }
 
 /**
- * A RETURN-GENERATED SUPPLIER CREDIT NOTE: the supplier crediting back goods that were billed and then returned. `netBase` is the credit's NET
- * (the same figure the credit note's transit row carries). It is valued per bill, not per order line, so the row has no line.
+ * A RETURN-GENERATED SUPPLIER CREDIT NOTE: the supplier crediting back goods that were billed and then returned. Valued like the return it answers:
+ * the credited quantity at the PO goods unit cost, per line, so a line that was received, billed, returned and credited nets to exactly zero
+ * whatever price the bill carried. The credited quantity of a line is what is still BILLED NOT RECEIVED on it (a negative net quantity), capped by the
+ * quantity returned and not yet credited (so a prepaid bill ahead of receipt is never cleared by a credit). The difference between the credit's NET
+ * (`netBase`, the figure its transit row carries, which carries the bill's price and any FX difference) and the PO-valued credit is a
+ * BILL_PRICE_VARIANCE reversal (negative = the credit gives back price difference), so it never reaches the balance. A credit with nothing to clear
+ * writes only the variance.
  */
 export async function recordGrirReturnCreditNote(
   client: GrirClient,
   input: { poId: string; supplierId: string; creditNoteId: string; netBase: DecimalInput; journalDate: Date | string; at: Date },
 ): Promise<void> {
+  const valuation = await loadGrirPoValuation(client, input.poId)
+  const lines = await client.purchaseOrderLine.findMany({ where: { poId: input.poId }, select: { id: true, qtyReturned: true } })
+  const history = await client.grirSubledgerMovement.groupBy({
+    by: ['poLineId', 'sourceType'],
+    where: { poId: input.poId, poLineId: { not: null }, sourceType: { in: [...GRIR_BALANCE_SOURCE_TYPES] } },
+    _sum: { qtyDelta: true },
+  })
+  const netQty = new Map<string, Decimal>()
+  const creditedQty = new Map<string, Decimal>()
+  for (const row of history) {
+    if (!row.poLineId) continue
+    const qty = toDecimal(row._sum.qtyDelta)
+    netQty.set(row.poLineId, (netQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
+    if (row.sourceType === 'SUPPLIER_CREDIT_NOTE') creditedQty.set(row.poLineId, (creditedQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
+  }
+  let poValued = new Prisma.Decimal(0)
+  for (const line of lines.slice().sort((a, b) => (a.id < b.id ? -1 : 1))) {
+    const billedNotReceived = (netQty.get(line.id) ?? new Prisma.Decimal(0)).neg()
+    const returnedNotCredited = toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0)
+    const qty = Prisma.Decimal.min(billedNotReceived, returnedNotCredited)
+    if (qty.lte(0)) continue
+    const value = roundQuantity(qty.mul(unitCostFor(valuation, line.id)), 6)
+    poValued = poValued.add(value)
+    await writeGrirMovement(client, {
+      sourceType: 'SUPPLIER_CREDIT_NOTE',
+      sourceRef: input.creditNoteId,
+      idempotencyKey: `grir:credit-note:${input.creditNoteId}:${line.id}`,
+      poId: input.poId,
+      poLineId: line.id,
+      supplierId: input.supplierId,
+      qtyDelta: qty,
+      baseDelta: value,
+      journalDate: input.journalDate,
+      occurredAt: input.at,
+    })
+  }
   await writeGrirMovement(client, {
-    sourceType: 'SUPPLIER_CREDIT_NOTE',
+    sourceType: GRIR_PRICE_VARIANCE_SOURCE_TYPE,
     sourceRef: input.creditNoteId,
-    idempotencyKey: `grir:credit-note:${input.creditNoteId}`,
+    idempotencyKey: `grir:credit-note-ppv:${input.creditNoteId}`,
     poId: input.poId,
     poLineId: null,
     supplierId: input.supplierId,
     qtyDelta: null,
-    baseDelta: input.netBase,
+    baseDelta: poValued.sub(toDecimal(input.netBase)),
     journalDate: input.journalDate,
     occurredAt: input.at,
   })
