@@ -3,6 +3,7 @@
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { assertOverviewAnalyticsAccess } from '@/lib/security/overview-analytics-access'
 import { logActivity } from '@/lib/activity-log'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -128,7 +129,7 @@ const DEFAULT_SETTINGS: ForecastSettings = {
 }
 
 export async function getForecastSettings(): Promise<ForecastSettings> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const [row, retentionRow] = await Promise.all([
     db.setting.findUnique({ where: { key: 'forecast_settings' } }),
     db.setting.findUnique({ where: { key: 'forecast_retention_months' } }),
@@ -144,7 +145,7 @@ export async function getForecastSettings(): Promise<ForecastSettings> {
 }
 
 export async function saveForecastSettings(settings: ForecastSettings): Promise<void> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   await db.$transaction([
     db.setting.upsert({
       where: { key: 'forecast_settings' },
@@ -199,7 +200,7 @@ function exponentialSmoothing(data: number[], alpha = 0.3): number {
 // ---------------------------------------------------------------------------
 
 export async function generateForecasts(options: GenerateForecastOptions = {}): Promise<ProductForecast[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const settings = await getForecastSettings()
   const now = new Date()
   const reviewStart = new Date(now.getTime() - settings.reviewPeriodDays * 86400000)

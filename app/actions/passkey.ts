@@ -141,10 +141,13 @@ export async function verifyPasskeyRegistration(
 
 // --- Authentication ---
 
-export async function getPasskeyAuthenticationOptions(email?: string) {
+// This action is public by necessity (it runs before login), so it must also be harmless to call repeatedly:
+// each call stores its challenge under its OWN random ceremony key. A shared key (the old `auth:discoverable`
+// or `auth:<email>`) let any unauthenticated caller overwrite and so invalidate every login in flight.
+export async function getPasskeyAuthenticationOptions() {
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }
-  const challengeKey = email ? `auth:${email}` : `auth:discoverable`
+  const challengeKey = `auth:${randomBytes(16).toString('hex')}`
 
   const options = await generateAuthenticationOptions({
     rpID: originConfig.rpId,

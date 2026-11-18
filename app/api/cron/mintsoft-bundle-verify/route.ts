@@ -1,3 +1,4 @@
+import { withMintsoftNoLogin } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
@@ -19,6 +20,6 @@ export async function GET(request: Request) {
     return cronSkippedResponse('Mintsoft plugin disabled')
   }
 
-  const result = await runMintsoftBundleVerify({ triggeredBy: 'cron' })
+  const result = await withMintsoftNoLogin(() => runMintsoftBundleVerify({ triggeredBy: 'cron' }))
   return cronResultResponse(result, { outcomeClass: cronOutcome('mintsoft-bundle-verify', result) })
 }

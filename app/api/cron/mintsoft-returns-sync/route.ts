@@ -1,3 +1,4 @@
+import { withMintsoftNoLogin } from '@/lib/connectors/mintsoft/api/auth-no-login'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { runMintsoftReturnsSync } from '@/lib/connectors/mintsoft/sync/returns-sync'
@@ -19,6 +20,6 @@ export async function GET(request: Request) {
     return cronSkippedResponse('Mintsoft plugin disabled')
   }
 
-  const result = await runMintsoftReturnsSync('cron')
+  const result = await withMintsoftNoLogin(() => runMintsoftReturnsSync('cron'))
   return cronResultResponse(result, { outcomeClass: cronOutcome('mintsoft-returns-sync', result) })
 }

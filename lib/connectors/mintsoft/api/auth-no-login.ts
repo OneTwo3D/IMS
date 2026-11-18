@@ -1,4 +1,4 @@
-import { AsyncLocalStorage } from 'node:async_hooks'
+import { isWmsLoginForbidden, withWmsNoLogin } from '@/lib/domain/wms/no-login-scope'
 
 /**
  * READ-ONLY AUTHENTICATION FOR SCHEDULED POLLS.
@@ -9,14 +9,12 @@ import { AsyncLocalStorage } from 'node:async_hooks'
  * never be the thing that logs in. Inside `withMintsoftNoLogin` the access-token path uses a fixed API key or an
  * unexpired stored key and otherwise REFUSES, with the sentence below; it never requests `/api/Auth`.
  */
-const noLoginScope = new AsyncLocalStorage<true>()
-
 export function withMintsoftNoLogin<T>(run: () => Promise<T>): Promise<T> {
-  return noLoginScope.run(true, run)
+  return withWmsNoLogin(run)
 }
 
 export function isMintsoftLoginForbidden(): boolean {
-  return noLoginScope.getStore() === true
+  return isWmsLoginForbidden()
 }
 
 /** The one sentence an operator reads when a scheduled poll declines to log in. */
