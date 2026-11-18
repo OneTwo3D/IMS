@@ -139,6 +139,7 @@ import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/pu
 import {
   assertFreightTotalNotNegative,
   buildFreightCostLineRows,
+  FREIGHT_COST_KINDS,
   CreateFreightPoInputSchema,
   FREIGHT_NET_CREDIT_MESSAGE,
   FreightEditRefusedError,
@@ -368,7 +369,7 @@ export type PoDetail = PoRow & {
   returns: PoReturn[]
   invoices: InvoiceRow[]
   supplierCreditNotes: SupplierCreditNoteRow[]
-  freightCostLines: { id: string; description: string; amountForeign: number; amountBase: number; amountBilled: number; vatable: boolean; distributionMethod: string }[]
+  freightCostLines: { id: string; description: string; amountForeign: number; amountBase: number; amountBilled: number; vatable: boolean; distributionMethod: string; kind: 'SHIPPING' | null }[]
   linkedFreightPos: {
     linkId: string
     method: string
@@ -444,7 +445,7 @@ export type CreatePoInput = {
   taxRateId?: string
   taxRateName?: string
   taxRateValue?: number // e.g. 0.20 for 20%
-  additionalCosts?: { description: string; amountForeign: number; vatable: boolean; distributionMethod: string }[]
+  additionalCosts?: { description: string; amountForeign: number; vatable: boolean; distributionMethod: string; /** SHIPPING tags the buyer's shipping estimate (a supplier-quoted shipping replaces it). */ kind?: 'SHIPPING' | null }[]
   /** Original user input for the order-level discount, e.g. "10%" or "50.00". */
   orderDiscountStr?: string | null
   /**
@@ -988,6 +989,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           amountBase: true,
           vatable: true,
           distributionMethod: true,
+          kind: true,
         },
         orderBy: { sortOrder: 'asc' },
       },
@@ -1223,6 +1225,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       amountBilled: amountBilledByCostLine.get(cl.id) ?? 0,
       vatable: cl.vatable,
       distributionMethod: cl.distributionMethod as string,
+      kind: cl.kind ?? null,
     })),
     linkedFreightPos: freightLinks.map((fl) => ({
       linkId: fl.linkId,
@@ -1394,6 +1397,8 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       creatorId = session.user.id
     }
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
+    const badCostKind = invalidCostLineKind(input.additionalCosts)
+    if (badCostKind) return { success: false, error: badCostKind }
     if (input.reference?.trim()) {
       const existing = await db.purchaseOrder.findUnique({
         where: { reference: input.reference.trim() },
@@ -1565,6 +1570,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         vatable: ac.vatable,
         distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
         sortOrder: i,
+        ...(ac.kind ? { kind: ac.kind } : {}),
       }))
 
     // Minimum gross margin (o3d-hqvrp.380), recomputed here from the costs about to be stored. A system import (historical
@@ -1740,6 +1746,12 @@ function checkAmendHeader(
   return null
 }
 
+/** The refusal for a cost line carrying a `kind` other than SHIPPING (the only tag there is), or null. */
+function invalidCostLineKind(costs: ReadonlyArray<{ kind?: unknown }> | undefined): string | null {
+  const bad = costs?.find((c) => c.kind != null && !(FREIGHT_COST_KINDS as readonly unknown[]).includes(c.kind))
+  return bad ? 'A cost line can only be tagged "Shipping" or left untagged.' : null
+}
+
 export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf'>> & { refreshFxRate?: boolean }
 
 export async function updatePurchaseOrder(
@@ -1748,6 +1760,8 @@ export async function updatePurchaseOrder(
 ): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
+    const badCostKind = invalidCostLineKind(requestedEdit.additionalCosts)
+    if (badCostKind) return { success: false, error: badCostKind }
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
@@ -2163,6 +2177,7 @@ export async function updatePurchaseOrder(
                 vatable: ac.vatable,
                 distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
                 sortOrder: i,
+                ...(ac.kind ? { kind: ac.kind } : {}),
               }
             })
           if (costLineData.length > 0) {

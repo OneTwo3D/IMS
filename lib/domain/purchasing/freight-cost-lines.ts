@@ -34,6 +34,10 @@ const finiteNumber = (label: string) => z
   .number({ error: `${label} must be a number` })
   .refine(Number.isFinite, `${label} must be a finite number`)
 
+export const FREIGHT_COST_KINDS = ['SHIPPING'] as const
+export type FreightCostKindValue = (typeof FREIGHT_COST_KINDS)[number]
+export const freightCostKindSchema = z.enum(FREIGHT_COST_KINDS, { error: 'Cost line kind must be SHIPPING or empty' }).nullable()
+
 export const FreightCostLineInputSchema = z.object({
   /**
    * The id of the STORED cost line this row edits. Optional: a row without one is a NEW line. `updateFreightPoCosts`
@@ -47,6 +51,8 @@ export const FreightCostLineInputSchema = z.object({
   distributionMethod: z
     .string({ error: 'Each cost line needs a distribution method' })
     .refine((value) => isDistributionMethod(value), `Distribution method must be one of ${LANDED_COST_DISTRIBUTION_METHODS.join(', ')}`),
+  /** Optional tag: `SHIPPING` marks the buyer's shipping estimate. Anything else is refused; absent/null = untagged. */
+  kind: freightCostKindSchema.optional(),
 })
 
 export type FreightCostLineInput = z.infer<typeof FreightCostLineInputSchema>
@@ -112,6 +118,8 @@ export type FreightCostLineRow = {
   vatable: boolean
   distributionMethod: LandedCostDistributionMethod
   sortOrder: number
+  /** Present only when the line is tagged, so an untagged line persists byte-identical to before the tag existed. */
+  kind?: FreightCostKindValue
 }
 
 export type FreightCostLineRows = {
@@ -152,6 +160,7 @@ export function buildFreightCostLineRows(
       vatable: line.vatable,
       distributionMethod: line.distributionMethod as LandedCostDistributionMethod,
       sortOrder: index,
+      ...(line.kind ? { kind: line.kind } : {}),
     }
   })
   const subtotalBase = subtotalForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
