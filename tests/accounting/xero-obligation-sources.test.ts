@@ -71,7 +71,7 @@ test('CENSUS: every AccountingSyncType declares its obligation source, consisten
 })
 
 test('the types Xeroom owns in every phase never go LIVE, so their obligation source cannot gate a posting', () => {
-  for (const type of ['SALES_INVOICE', 'SALES_INVOICE_UPDATE', 'CREDIT_NOTE']) {
+  for (const type of ['SALES_INVOICE', 'SALES_INVOICE_UPDATE', 'SALES_INVOICE_DELETE', 'CREDIT_NOTE']) {
     const row = mapRowFor(type)!
     assert.notEqual(row.owners.P2, 'IMS', type)
   }
@@ -143,6 +143,8 @@ test('INLINE PRODUCERS: the declared date field sits in the payload each produce
     'PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE', 'PURCHASE_CREDIT_NOTE', 'COGS_REVERSAL', 'INVENTORY_ADJUSTMENT', 'STOCK_IN_TRANSIT', 'COGS_JOURNAL',
     // Xeroom-owned in every phase (never LIVE): their date cannot gate a posting, see the test above.
     'SALES_INVOICE', 'SALES_INVOICE_UPDATE', 'CREDIT_NOTE', 'CREDIT_NOTE_VOID',
+    // o3d-ngmt.21: the delete's payload carries the document's own date (pinned in tests/accounting/xero-document-delete.test.ts).
+    'SALES_INVOICE_DELETE', 'PURCHASE_INVOICE_DELETE',
   ])
   for (const site of INLINE_SITES) {
     const text = readFileSync(path.join(process.cwd(), site.file), 'utf8')
@@ -344,7 +346,7 @@ test('A HOP MUST BE THE SAME DOCUMENT: a parent of the right type from another r
  * every other test reads the declaration it is judging.
  */
 const POSTING_PATH_FIELD: Record<string, 'date' | 'paymentDate'> = {
-  PURCHASE_INVOICE: 'date', PURCHASE_INVOICE_UPDATE: 'date', COGS_JOURNAL: 'date', INVENTORY_ADJUSTMENT: 'date', SALES_INVOICE: 'date', SALES_INVOICE_UPDATE: 'date',
+  PURCHASE_INVOICE: 'date', PURCHASE_INVOICE_UPDATE: 'date', COGS_JOURNAL: 'date', INVENTORY_ADJUSTMENT: 'date', SALES_INVOICE: 'date', SALES_INVOICE_UPDATE: 'date', SALES_INVOICE_DELETE: 'date', PURCHASE_INVOICE_DELETE: 'date',
   INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', CREDIT_NOTE_VOID: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
   STOCK_RECEIPT: 'date', COGS_REVERSAL: 'date', DAILY_BATCH_REVENUE_DEFERRAL: 'date', DAILY_BATCH_INVENTORY_ALLOC: 'date', DAILY_BATCH_GROUP_B: 'date',
   DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', DAILY_BATCH_GRIR_RECLASS: 'date', UNEARNED_REV_REVERSAL: 'date',

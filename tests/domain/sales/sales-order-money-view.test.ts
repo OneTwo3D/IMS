@@ -241,7 +241,7 @@ test('printed VAT rows add up to the stored VAT on a mixed-rate order whose disc
 
 // [mutation: a route prints the raw stored line total, or stops using the shared totals block]
 test('both customer PDFs print the shared view and totals block', () => {
-  for (const file of ['app/api/sales-order/[id]/route.ts', 'app/api/invoice/[id]/route.ts']) {
+  for (const file of ['lib/sales-order-pdf.ts', 'app/api/invoice/[id]/route.ts']) {
     const src = readFileSync(file, 'utf8')
     assert.match(src, /view\.lines\[i\]\.total\.toFixed\(2\)/, `${file}: lines come from the view`)
     assert.ok(src.includes('orderDocumentMoney(so)') && src.includes('drawTotalsRows('), `${file}: totals come from the shared helper`)

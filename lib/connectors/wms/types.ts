@@ -152,11 +152,25 @@ export type WmsProductDto = {
   raw?: Record<string, unknown> | null
 }
 
+/**
+ * The customs fields an IMS-side clear may erase in a WMS. Deliberately has NO barcode / EAN / UPC member: identifiers are
+ * never cleared, so no caller can even express it.
+ */
+export type WmsClearableProductField = 'customsDescription' | 'commodityCode' | 'countryOfManufacture'
+
+/** What happened to the explicit clears of an UPDATE. A rejected clear never fails the update that carried it. */
+export type WmsProductClearOutcome = {
+  cleared: WmsClearableProductField[]
+  rejected: { field: WmsClearableProductField; message: string }[]
+}
+
 export type WmsProductRef = {
   externalId: string
   sku: string
   barcode: string | null
   raw: Record<string, unknown> | null
+  /** Present only when the upsert asked for clears (see WmsUpsertProductOptions.clearFields). */
+  clearOutcome?: WmsProductClearOutcome
 }
 
 export type WmsReturnRecord = {
@@ -275,6 +289,12 @@ export type WmsUpsertProductOptions = {
   omitBarcode?: boolean
   /** Leave the WMS's UPC (MPN) field out of the write. Only meaningful, and only sent, when the identifier split is on. */
   omitMpn?: boolean
+  /**
+   * Customs fields to ERASE in the WMS, each sent as its own follow-up request after the update so a WMS refusal of one
+   * clear cannot fail the update or the other clears. UPDATE only: ignored without an externalProductId (a create has
+   * nothing to clear). Barcode/EAN/UPC are not clearable.
+   */
+  clearFields?: WmsClearableProductField[]
 }
 
 /**
@@ -425,6 +445,14 @@ export type WmsOrderPushInput = {
   phone: string | null
   /** Customer VAT/IOSS number for customs declarations; null when not provided. */
   vatNumber: string | null
+  /**
+   * TRUE ONLY WHEN the order's EU VAT stamp is IOSS (absent otherwise). The IOSS number itself is NOT carried here: it is the shop's one
+   * number, resolved from the CURRENT `shop_ioss_number` setting at create time, so a change or clear never leaves a queued order with a
+   * stale copy. Whether a connector sends it is the connector's own setting (Mintsoft: `mintsoft_send_ioss_number`, default off).
+   */
+  iossStamped?: boolean
+  /** Set by the connector at create time from the current shop setting (never by the sweep). Absent unless the connector decided to send it. */
+  iossNumber?: string | null
   comments: string | null
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null

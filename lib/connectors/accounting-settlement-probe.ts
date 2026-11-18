@@ -2684,10 +2684,32 @@ export async function authoriseMoneyPost(
     }
     if (verdict.outcome === 'unknown') {
       if (verdict.cause !== 'attempt-undescribable') {
+        // o3d-2r2a3 — A HAND-ENTERED PAYMENT IT CANNOT READ, ON A DOCUMENT NO IMS ENTRY HAS SENT TO, REFUSES THIS FIRST POST WITH NO
+        // WAY OUT STATED. This post has just claimed the row's attempt stamp, so the row is itself an attempt from now on: its
+        // retries (and the Accounting Sync page's "Checked the ledger" control, offered on the FAILED row) judge it as its own
+        // contender, where an operator ledger check for this entry and this receipt is read. Only the sentence was missing: the
+        // remedy the contender loop below names for an unreadable record is named here too, against THIS entry.
+        const { classifyLedgerSettlementWithOperatorChecks } = await import('@/lib/domain/accounting/operator-ledger-check')
+        const remedy = classifyLedgerSettlementWithOperatorChecks(
+          attempt,
+          probe,
+          ledgerCheckScopeForPost({ type: params.type, connector: params.connector, attemptSyncLogId: params.entryId, postingPayload: params.payload }),
+          [],
+        ).remedy
         return {
           proceed: false,
           error: `Not sent: IMS could not establish what the accounting connector already holds against `
-            + `this document (${verdict.reason}). Posting on a reading that failed could pay it twice.`,
+            + `this document (${verdict.reason}). Posting on a reading that failed could pay it twice.`
+            + (remedy
+              ? ` ${describeLedgerCheckRemedy(remedy, describeAttemptForLedgerCheck({
+                syncLogId: params.entryId,
+                status: 'queued',
+                amount: attempt.amount === null ? null : formatLedgerMoney(attempt.amount),
+                currency: attempt.currency,
+                date: attempt.date,
+                marker,
+              }), 'post')}`
+              : ''),
         }
       }
       // Undescribable AND the ledger is not empty: this row cannot say what it would create, so it

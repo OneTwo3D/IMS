@@ -144,7 +144,10 @@ export async function getForecastSettings(): Promise<ForecastSettings> {
 }
 
 export async function saveForecastSettings(settings: ForecastSettings): Promise<void> {
+  // A write, and retentionMonths drives the demand-history purge: reading analytics is not enough
+  // (READONLY holds `analytics`). Same bar as creating a purchase order, the decision these settings feed.
   await requirePermission('analytics')
+  await requirePermission('purchasing.create')
   await db.$transaction([
     db.setting.upsert({
       where: { key: 'forecast_settings' },
@@ -424,7 +427,8 @@ export async function createReorderPOs(
   productIds: string[],
   options: { filters?: ReorderActionFilters; supplierOverrides?: Record<string, string> } = {},
 ): Promise<{ success: boolean; poCount: number; skippedSupplierCount?: number; skippedProducts?: ReorderPoSkip[]; error?: string }> {
-  await requirePermission('purchasing.create')
+  const session = await requirePermission('purchasing.create')
+  const creatorId = session.user.id
   try {
     const generatedAt = new Date().toISOString()
     const actionFilters = sanitizeReorderActionFilters(options.filters)
@@ -545,6 +549,7 @@ export async function createReorderPOs(
         data: {
           reference: ref,
           type: 'GOODS',
+          createdById: creatorId,
           supplierId,
           currency,
           fxRateToBase: fxRate,

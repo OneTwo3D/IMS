@@ -4,7 +4,7 @@ import { hasPermission } from '@/lib/permissions'
 import { getBranding } from '@/lib/pdf'
 import { renderEmailHtml, getSampleEmailData, type EmailTemplateType } from '@/lib/email-template'
 
-const VALID_TYPES: EmailTemplateType[] = ['invoice', 'sales_order', 'purchase_order', 'rfq', 'credit_note', 'packing_slip', 'manufacturing_order']
+const VALID_TYPES: EmailTemplateType[] = ['invoice', 'sales_order', 'quote', 'purchase_order', 'rfq', 'credit_note', 'packing_slip', 'manufacturing_order']
 
 export async function GET(req: NextRequest) {
   const session = await requireApiAuth()

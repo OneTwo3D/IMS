@@ -24,7 +24,8 @@ import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { validateBackupScheduleInput, type BackupScheduleInput } from '@/lib/domain/settings/backup-schedule-input'
 import { toIsoCountryCode } from '@/lib/countries'
-import { getSettingValue, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
+import { getSettingValue, maskSettingSecret, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
+import { isMaskedSecret } from '@/lib/security/secret-mask'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
 import { maybeQueueTaxRateSync } from '@/lib/accounting/tax-rate-sync-trigger'
 import {
@@ -940,7 +941,15 @@ export async function getSetting(key: string): Promise<string | null> {
   // addressable endpoint and is reached without going through any page. The
   // legitimate callers of the sensitive keys are the backup and sales settings
   // pages, which are ADMIN-only, so 'settings' costs them nothing.
-  if (SENSITIVE_SETTING_KEYS.has(key)) await requirePermission('settings')
+  if (SENSITIVE_SETTING_KEYS.has(key)) {
+    await requirePermission('settings')
+    // SEC-M9: this action has no step-up gate, so it never returns a credential in clear, not even
+    // to an ADMIN. It answers "is one configured, and what does it start with", which is all the
+    // screens that call it do (they mask again). Writing a credential goes through the dedicated
+    // fresh-auth actions; a masked value posted back is ignored by them.
+    const stored = await getSettingValue(key)
+    return stored === null ? null : maskSettingSecret(key, stored)
+  }
   return getSettingValue(key)
 }
 
@@ -1022,7 +1031,10 @@ export async function setSetting(key: string, value: string): Promise<SettingSav
 export async function setSettings(values: Record<string, string>): Promise<SettingSaveResult> {
   await requirePermission('settings.company')
 
-  const entries = Object.entries(values)
+  assertWritableSettingKeys(Object.keys(values))
+  // getSetting hands a sensitive key back masked, so a form that round-trips it posts the mask. That
+  // means "unchanged", never "set the credential to this".
+  const entries = Object.entries(values).filter(([key, value]) => !(SENSITIVE_SETTING_KEYS.has(key) && isMaskedSecret(value)))
   if (entries.length === 0) return { status: 'saved' }
 
   // ONLY ALLOWLISTED PREFERENCE KEYS ARE WRITTEN, AND THE CHECK IS BEFORE THE COMMIT

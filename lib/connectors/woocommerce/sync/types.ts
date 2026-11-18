@@ -202,7 +202,7 @@ export type WcFullProduct = {
   categories: { id: number; name: string; slug: string }[]
   tags: { id: number; name: string; slug: string }[]
   images: { id: number; src: string; name: string; alt: string; date_modified_gmt?: string }[]
-  attributes: { id: number; name: string; position: number; visible: boolean; variation: boolean; options: string[] }[]
+  attributes: { id: number; name: string; slug?: string; position: number; visible: boolean; variation: boolean; options: string[] }[]
   variations: number[]
   meta_data: WcMeta[]
   parent_id: number

@@ -10,6 +10,9 @@ import path from 'node:path'
  */
 export const ORIGINAL_TMPDIR_VAR = 'IMS_TEST_ORIGINAL_TMPDIR'
 
+/** Colon-separated private directories the sentinel made in this process chain; never a scratch root (group/other-writable, owned by the test account: the report-directory ancestor checks refuse them). */
+export const PRIVATE_TMPDIRS_VAR = 'IMS_TEST_PRIVATE_TMPDIRS'
+
 /**
  * The longest scratch root a throwaway cluster can sit under. A Postgres unix-socket path is limited to about 107
  * bytes, and the longest cluster below a root is `<prefix, up to ~30 bytes>/pg/sock/.s.PGSQL.<port>` (about 55 bytes).
@@ -36,6 +39,8 @@ function underForbidden(dir: string): boolean {
 function usable(dir: string | undefined): dir is string {
   if (!dir) return false
   if (underForbidden(dir)) return false
+  const privates = (process.env[PRIVATE_TMPDIRS_VAR] ?? '').split(':').filter(Boolean)
+  if (privates.some((p) => [path.resolve(dir), realOrSelf(dir)].some((c) => c === p || c === realOrSelf(p)))) return false
   try {
     if (!statSync(dir).isDirectory()) return false
     accessSync(dir, constants.W_OK | constants.X_OK)

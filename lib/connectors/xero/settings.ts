@@ -48,6 +48,11 @@ export type XeroSettings = {
   /** 'true' = the daily batch posts the GR/IR reclass journal (Stock in Transit <-> GR/IR). Default 'false': nothing is posted and the sub-ledger still accrues. */
   grir_xero_posting_enabled: string
   /**
+   * Allow an operator to delete a synced invoice or bill in IMS and Xero together (renumber, then DELETE or VOID in Xero). 'true' or 'false'; off by default.
+   * Every Xero write it makes goes through the ordinary outbox and the outbound-write hold.
+   */
+  xero_document_delete_enabled: string
+  /**
    * Last LOCKED day in Xero (`YYYY-MM-DD`), IMPORTED from the Organisation endpoint (books-lock-date.ts); empty = none
    * read or none set. Read-only: deliberately not in XERO_SETTING_KEYS, so the settings save cannot write it.
    */
@@ -78,6 +83,7 @@ export const XERO_SETTING_KEYS = [
   'xero_manufacturing_overhead_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
   'grir_xero_posting_enabled',
+  'xero_document_delete_enabled',
 ]
 
 /** Imported from Xero, never saved from the settings form: read by getXeroSettings, absent from the save allowlist above. */
@@ -123,6 +129,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_daily_batch_enabled: 'false',
   xero_payment_polling_enabled: 'false',
   grir_xero_posting_enabled: 'false',
+  xero_document_delete_enabled: 'false',
   xero_books_lock_date: '',
   xero_books_lock_date_read_at: '',
 }

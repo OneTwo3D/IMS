@@ -180,6 +180,9 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
 
   SALES_INVOICE_UPDATE: 'not-a-create',
   PURCHASE_INVOICE_UPDATE: 'not-a-create',
+  // A delete writes to a document that already stands in the ledger; it creates nothing, and a repeat finds the number already released.
+  SALES_INVOICE_DELETE: 'not-a-create',
+  PURCHASE_INVOICE_DELETE: 'not-a-create',
   BILL_ATTACHMENT: 'not-a-create',
   INVOICE_PDF: 'not-a-create',
   INVOICE_EMAIL: 'not-a-create',

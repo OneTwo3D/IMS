@@ -11,7 +11,9 @@ This page says what an erasure removes, what it keeps, and where it **cannot** r
 
 ## What is erased
 
-Names, email addresses, phone numbers, company, VAT numbers, billing and shipping addresses, order notes and internal notes, tracking numbers, the storefront customer id and order key, and the same details wherever IMS copied them: queued and sent email addresses, the stored copies of WooCommerce and warehouse payloads, accounting payload copies, activity-log rows about the customer or order, and notifications about the order. Waiting emails to the person are cancelled.
+Names, email addresses, phone numbers, company, VAT numbers, billing and shipping addresses, order notes and internal notes, **custom field values on the order** (free text an operator entered; the field definitions stay), tracking numbers, the storefront customer id and order key, and the same details wherever IMS copied them: queued and sent email addresses, the stored copies of WooCommerce and warehouse payloads, accounting payload copies, activity-log rows about the customer or order, and notifications about the order. Waiting emails to the person are cancelled.
+
+**Order attachments.** The supporting documents attached to the person's sales orders (a purchase order, an email, a proof of address) are **deleted**, rows and files, including ones already deleted from the order page. Their content cannot be redacted, so nothing is kept. Attachments on *purchase* orders belong to suppliers and are not touched. The files to remove are recorded in the same step as the erasure, so a crash or a file that cannot be removed (a permissions problem on the server) never leaves a file with nothing pointing at it: the file stays queued, an error is logged in the activity log with the stored file names, and the daily Activity Log Cleanup job retries until it is gone.
 
 ## What is kept, for six years
 
@@ -41,6 +43,7 @@ The moment an erasure leaves open warehouse orders, the operator who ran it is w
 ## What erasure does not reach
 
 - **Backups.** Erasure covers the live systems. Backups, on this server and off-site, age out on their normal schedule and still contain the erased data. **Restoring a backup brings erased data back.** After any restore, repeat the erasures made since that backup was taken: keep a note of such requests outside IMS, because the records are part of what a restore replaces.
+- **Order attachments already downloaded.** A copy someone saved from an order's Attachments card is outside IMS.
 - **Files already downloaded.** A CSV export or invoice PDF that someone saved is outside IMS.
 - **Email already sent.** A message on the wire cannot be recalled.
 - **Rows that mention the person but are keyed to something else.** A free-text note on another record cannot be found by key.
