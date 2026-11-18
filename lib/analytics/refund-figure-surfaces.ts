@@ -633,10 +633,17 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/refund-service.ts',
-    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'nonQtyRevenue', 'refundRevenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue'],
+    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'lineDrivenRevenue', 'nonQtyRevenue', 'refundRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue'],
     treatment: 'not-refund-sensitive',
     reason:
       'The refund WRITER. It creates the rows the reports classify; it publishes no report figure.',
+  },
+  {
+    file: 'lib/domain/sales/refund-unearned-remainder.ts',
+    figures: ['lineDrivenRevenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Pure helper for the refund WRITER: it decides how much of the order\u2019s deferred (unearned) revenue one refund\u2019s UNEARNED_REV_REVERSAL journal takes out of the unearned account. `lineDrivenRevenue` is an input to that ledger amount (the refund\u2019s own unshipped-quantity and non-quantity line value), never summed, netted or rendered as a report figure; no analytics reader consumes it.',
   },
   {
     file: 'lib/domain/sales/sales-fulfillment-analytics.ts',

@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
@@ -137,12 +138,12 @@ export async function findPostedSalesInvoiceSync(
 
 /** What a MANUAL cancellation of an order with a posted invoice is told. Every step named here is one the operator can take. */
 export function cancelWithPostedInvoiceMessage(invoice: { connector: string; id: string }): string {
-  return `This order's invoice is already posted to ${invoice.connector} (${invoice.id}), and cancelling the order does not void it or raise a credit note, so the receivable and its revenue deferral would stay in the ledger. Refund the order in full first (the refund raises the credit note), then cancel it.`
+  return `This order's invoice is already posted to ${invoice.connector} (${invoice.id}), and cancelling the order neither voids it nor credits it, so the receivable and its revenue deferral would stay in the ledger. Refund the order in full first (the refund raises the credit note), then cancel it.`
 }
 
 /** What the operator task for a STOREFRONT cancellation of an order with a posted invoice says. The order is already cancelled, and a cancelled order cannot be refunded in IMS. */
 export function cancelledWithPostedInvoiceTaskText(invoice: { connector: string; id: string }, orderNumber: string): string {
-  return `Order ${orderNumber} was cancelled by the storefront while its invoice is posted to ${invoice.connector} (${invoice.id}). IMS raised no void or credit note and cannot refund a cancelled order, so the invoice must be credited: raise a credit note against it in ${invoice.connector} by hand. The order's revenue deferral and inventory allocation journals also stay in the ledger until they are reversed by hand.`
+  return withLedgerCheck(`Order ${orderNumber} was cancelled by the storefront while its invoice is posted to ${invoice.connector} (${invoice.id}). IMS raised no void or credit note and cannot refund a cancelled order, so the invoice must be credited: raise a credit note against it in ${invoice.connector} by hand. The order's revenue deferral and inventory allocation journals also stay in the ledger until they are reversed by hand.`)
 }
 
 /**

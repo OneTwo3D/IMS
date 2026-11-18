@@ -30,7 +30,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   SHOP_REFUND_DUE: 'Refund in WooCommerce: IMS recorded this refund, the shop still has to pay it back',
   AMENDMENT_NOT_APPLIED: 'Order change not applied: the warehouse order is already past NEW',
   ORDER_NOT_FOUND: 'Warehouse order not found on repeated checks: IMS stopped checking its status',
-  CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: credit the invoice by hand',
+  CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: the invoice is still uncredited in the ledger',
 }
 
 export type WmsOperatorTaskInput = {
