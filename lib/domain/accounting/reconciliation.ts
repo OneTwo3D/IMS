@@ -1,5 +1,5 @@
 import { db } from '@/lib/db'
-import { allocationDebitRecreateTargets } from '@/lib/domain/accounting/allocation-debit-passes'
+import { allocationDebitRecreateTargets, allocationPassRaisedNoJournalByDesign } from '@/lib/domain/accounting/allocation-debit-passes'
 import { toJsonInputValue } from '@/lib/db/json-input'
 // decimal-boundary-ok: report-only (accounting reconciliation finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
@@ -799,7 +799,10 @@ function earlierA2PassBatchRefs(order: SourceOrderRow, currentRef: string, reten
     inventoryAllocatedBatchRef: order.inventoryAllocatedBatchRef?.trim() || null,
     inventoryAllocatedDate: null,
   }, { retentionCutoff })
-  return targets.flatMap((target) => (target.batchRef && target.batchRef !== currentRef ? [target.batchRef] : []))
+  return targets
+    .flatMap((target) => (target.batchRef && target.batchRef !== currentRef ? [target.batchRef] : []))
+    // A pass that raised no journal by design has nothing to be missing.
+    .filter((ref) => !allocationPassRaisedNoJournalByDesign(order.allocationBatchPasses, ref))
 }
 
 function eventKey(input: {

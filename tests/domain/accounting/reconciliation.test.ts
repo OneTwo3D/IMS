@@ -2650,3 +2650,18 @@ test('o3d-gzfm: an earlier A2 pass dated before the window start is not asked ab
     0,
   )
 })
+
+test('o3d-gzfm R1: an earlier A2 pass that raised no journal by design has no event to be missing', () => {
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    allocationBatchPasses: [
+      { amount: 0, syncLogId: null, connector: 'xero', accountCode: '631', batchRef: 'A2-2026-04-20-0ddba115', at: '2026-04-20T01:00:00.000Z' },
+      { amount: 5, syncLogId: 'log-late', connector: 'xero', accountCode: '631', batchRef: A2_REF, at: '2026-04-24T01:00:00.000Z' },
+    ],
+  }
+  assert.equal(
+    evaluateAccountingReconciliationRows(rows).filter((f) => f.code === 'source_order_inventory_allocation_without_event').length,
+    0,
+  )
+})

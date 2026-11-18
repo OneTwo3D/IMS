@@ -1162,7 +1162,12 @@ export async function repairAccountingBackReferences(
     // handed back (itself compare-and-set), and the row stays due exactly as before.
     if (!(await stampDeferral(fence.id, observedAt, deferredSince))) return
 
-    const persisted = await deps.logActivity({
+    // The claim is handed back in a `finally` unless the warning was confirmed persisted, so a throw
+    // (or a logActivity that never resolves to success) between the claim and the warning cannot
+    // swallow this interval's notification.
+    let persisted = false
+    try {
+    persisted = await deps.logActivity({
       entityType: 'SYSTEM',
       action: `${prefix}_backreference_settlement_deferred`,
       tag: 'sync',
@@ -1184,9 +1189,11 @@ export async function repairAccountingBackReferences(
         reason,
       },
     })
-    if (!persisted) {
-      console.error(`${prefix}: settlement deferral warning was not persisted; leaving the marker where it is`, fence.id)
-      await stampDeferral(fence.id, deferredSince, observedAt)
+    } finally {
+      if (!persisted) {
+        console.error(`${prefix}: settlement deferral warning was not persisted; leaving the marker where it is`, fence.id)
+        await stampDeferral(fence.id, deferredSince, observedAt)
+      }
     }
   }
 

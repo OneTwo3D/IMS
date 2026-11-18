@@ -141,6 +141,12 @@ export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
 export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
 /** Cap on ids a multi-pass group excludes from its window in one run (Prisma `notIn` fails above ~32,767 binds). */
 export const DAILY_BATCH_MAX_EXCLUDED_IDS = 5_000
+/**
+ * Most passes one Group B mode makes per run. Every pass is its own transaction under the session
+ * accounting lock (refund creation waits on it), so a refused backlog must not be walked one shipment
+ * per pass: the bound is on passes, not just on the exclusion list.
+ */
+export const DAILY_BATCH_MAX_GROUP_B_PASSES = 5
 /** Group B row-locks up to a whole batch window of orders and cost layers; Prisma's 5 s default would roll it back on one busy order. */
 export const GROUP_B_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 }
 const DAILY_BATCH_TYPES = [
@@ -1733,12 +1739,18 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   // Group A2 uses. The first pass is the old query unchanged, so nothing already queued changes key;
   // later passes only reach shipments the old query never reached.
   const excludedShipmentIds = new Set<string>()
+  // An order that failed or was refused in an earlier pass is skipped AS A UNIT: its later shipments
+  // must not be journaled past its stuck earlier one (the old single window failed whole orders).
+  const excludedOrderIds = new Set<string>()
+  const groupBStartedAt = Date.now()
+  let bPasses = 0
   const hasMoreBeforeThisGroup = result.hasMore.groupB
   let bAccepted = 0
   for (;;) {
   const passLimit = batchLimit - bAccepted
   if (passLimit <= 0) break
   let nextPass = false
+  bPasses++
   groupBSkip: try {
     // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
     // so from that moment another batch — or a refund, which shares this domain
@@ -1751,6 +1763,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     const bPostedGroups: Array<{ date: string; movedFromLockedDays: string[] }> = []
     let passWindowHasMore = false
     let passSkippedShipmentIds: string[] = []
+    let passSkippedOrderIds: string[] = []
     const groupBCount = await db.$transaction(async (tx) => {
       // o3d-c08y r2 (Codex HIGH): PROBE -> LOCK -> READ. This window's ids are read first, every cost
       // layer their data references is locked, and only then is the data itself read — under those
@@ -1760,7 +1773,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // shipment that stopped qualifying while we waited for the lock is simply not returned.
       const candidateWindow = takeDailyBatchWindow(await tx.shipment.findMany({
         where: excludedShipmentIds.size > 0
-          ? { AND: [groupBShipmentWhere(mode), { id: { notIn: [...excludedShipmentIds] } }] }
+          ? { AND: [groupBShipmentWhere(mode), { id: { notIn: [...excludedShipmentIds] } }, { orderId: { notIn: [...excludedOrderIds] } }] }
           : groupBShipmentWhere(mode),
         select: { id: true, orderId: true, createdAt: true, shippedAt: true, order: { select: { revenueDeferredDate: true, paidAt: true } }, lines: { select: { costLayerSnapshot: true } } },
         orderBy: { createdAt: 'asc' },
@@ -1774,6 +1787,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       candidateWindow.rows = candidateWindow.rows.filter((row) => groupBShipmentBelongsToPass(mode, row))
       if (candidateWindow.rows.length === 0) {
         passSkippedShipmentIds = windowShipmentIds
+        passSkippedOrderIds = [...new Set(candidateWindow.rows.map((row) => row.orderId))]
         return 0
       }
       const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
@@ -1861,6 +1875,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       if (shipments.length === 0) {
         passSkippedShipmentIds = windowShipmentIds
+        passSkippedOrderIds = [...new Set(candidateWindow.rows.map((row) => row.orderId))]
         return 0
       }
 
@@ -2309,6 +2324,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       const processedShipmentCount = shipmentResults.size
       passSkippedShipmentIds = windowShipmentIds.filter((id) => !shipmentResults.has(id))
+      passSkippedOrderIds = [...new Set(candidateWindow.rows.filter((row) => !shipmentResults.has(row.id)).map((row) => row.orderId))]
 
       // ACC-H11: ONE JOURNAL PER EVENT DATE. A shipment is dated the later of the day it shipped and the
       // day its order was paid (Group B waits for the deferral, and cannot recognise revenue before the
@@ -2541,7 +2557,25 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     // (otherwise the window already held everything), and only while the exclusion list stays under
     // the cap (o3d-f3a8 L-2: Prisma's notIn fails above ~32,767 bind values).
     for (const id of passSkippedShipmentIds) excludedShipmentIds.add(id)
-    nextPass = passSkippedShipmentIds.length > 0 && passWindowHasMore && excludedShipmentIds.size < DAILY_BATCH_MAX_EXCLUDED_IDS
+    for (const id of passSkippedOrderIds) excludedOrderIds.add(id)
+    const wantsMore = passSkippedShipmentIds.length > 0 && passWindowHasMore
+    // Stop when the pass skipped nothing new (nothing left to walk past), when the pass bound or the
+    // exclusion cap is reached, or when the run budget is spent (loop head). A first pass that journaled
+    // nothing still continues: that is exactly the starved-window case.
+    nextPass = wantsMore && bPasses < DAILY_BATCH_MAX_GROUP_B_PASSES
+      && excludedShipmentIds.size + excludedOrderIds.size < DAILY_BATCH_MAX_EXCLUDED_IDS
+    if (wantsMore && !nextPass) {
+      const heldMs = Date.now() - groupBStartedAt
+      console.warn(`Group B (${mode}) stopped after ${bPasses} pass(es), ${heldMs} ms under the accounting lock; ${excludedShipmentIds.size} shipment(s) skipped this run, candidates remain for the next run`)
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'daily_batch_group_b_pass_bound_reached',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Daily batch Group B (${mode}) made ${bPasses} pass(es) holding the accounting lock for ${heldMs} ms and stopped with candidates remaining (${excludedShipmentIds.size} shipment(s) skipped). The rest wait for the next run.`,
+        metadata: { mode, passes: bPasses, lockHeldMs: heldMs, skippedShipments: excludedShipmentIds.size, skippedOrders: excludedOrderIds.size, journaled: bAccepted },
+      })
+    }
   } catch (e) {
     result.errors.push(`Group B error: ${String(e)}`)
   }

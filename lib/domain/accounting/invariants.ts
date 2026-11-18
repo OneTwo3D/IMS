@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
-import { allocationDebitRecreateTargets } from '@/lib/domain/accounting/allocation-debit-passes'
+import { allocationDebitRecreateTargets, allocationPassRaisedNoJournalByDesign } from '@/lib/domain/accounting/allocation-debit-passes'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
 import { SHADOWED_OBLIGATION_WHERE, isShadowedObligation, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
@@ -770,7 +770,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       // bounded by the retention window. Each finding carries its batch reference so two findings on
       // one order are distinguishable.
       const targets = order.allocationBatchPasses == null
-        ? [{ batchRef: order.inventoryAllocatedBatchRef ?? null, stagedAt: order.inventoryAllocatedDate }]
+        ? [{ batchRef: order.inventoryAllocatedBatchRef ?? null, stagedAt: order.inventoryAllocatedDate, index: 0 }]
         : allocationDebitRecreateTargets({
           allocationBatchAmount: null,
           allocationBatchPasses: order.allocationBatchPasses,
@@ -779,7 +779,10 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         }, { retentionCutoff: rows.historicalBatchCutoff ?? null }).map((target, index) => ({
           batchRef: target.batchRef,
           stagedAt: index === 0 ? order.inventoryAllocatedDate : target.stagedAt,
-        }))
+          index,
+        })).filter((target) => target.index === 0
+          // An earlier pass that raised no journal by design (no log id, zero amount) has none to be missing.
+          || !target.batchRef || !allocationPassRaisedNoJournalByDesign(order.allocationBatchPasses, target.batchRef))
       for (const target of targets) {
         const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
           syncLogIndex,

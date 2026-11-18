@@ -293,6 +293,8 @@ type Harness = {
   raceAfterProbe: ((rows: SyncRow[]) => void) | null
 }
 
+const throwActivityFor = new Set<string>()
+
 function makeHarness(store: Store): Harness {
   store.creditNotes ??= []
   store.refunds ??= []
@@ -513,6 +515,7 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
     // Models the PRODUCTION contract: never throws, and reports whether the entry was PERSISTED.
     // A failed write pushes nothing — the operator did not see it — and answers false.
     logActivity: async (entry: BackReferenceSweepActivity) => {
+      if (throwActivityFor.has(entry.action)) throw new Error('activity log blew up')
       if (harness.failActivityFor.has(entry.action)) return false
       harness.activities.push(entry)
       return true
@@ -4318,6 +4321,25 @@ test('[o3d-32vm] a sweep that loses the race to a settlement stays silent and le
     'the row was settled by the winner; a warning naming it is spurious',
   )
   assert.equal(harness.store.syncRows[0].backReferenceDeferredSinceAt, null, 'and no stale marker is re-stamped on a settled row')
+})
+
+test('[o3d-32vm] a THROW between the claim and the warning hands the claim back, so the notification is not lost', async () => {
+  const harness = makeStarvedHarness()
+  const clock = fakeClock()
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  const startedAt = harness.store.syncRows[0].backReferenceDeferredSinceAt
+  assert.ok(startedAt)
+
+  throwActivityFor.add('xero_backreference_settlement_deferred')
+  clock.advance(BACK_REFERENCE_DEFERRAL_REPORT_INTERVAL_MS + 1000)
+  try {
+    await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 }).catch(() => undefined)
+  } finally {
+    throwActivityFor.clear()
+  }
+  assert.deepEqual(harness.store.syncRows[0].backReferenceDeferredSinceAt, startedAt, 'the claim was handed back')
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(harness.activities.filter((e) => e.action === 'xero_backreference_settlement_deferred').length, 1, 'reported on the next pass')
 })
 
 test('[o3d-3ix5] settling the row ENDS the run — the next deferral starts a fresh one', async () => {

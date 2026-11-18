@@ -1379,3 +1379,18 @@ test('o3d-gzfm: an earlier A2 pass older than the retention window is not asked 
     'its log may have been pruned, so absence proves nothing',
   )
 })
+
+test('o3d-gzfm R1: an earlier A2 pass that raised no journal by design (no log id, zero amount) is not a finding', () => {
+  const rows = midnightCrossingRows()
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    allocationBatchPasses: [
+      { amount: 0, syncLogId: null, connector: 'xero', accountCode: '631', batchRef: 'A2-2025-12-30-0ddba115', at: '2025-12-30T01:00:00.000Z' },
+      { amount: 5, syncLogId: 'log-late', connector: 'xero', accountCode: '631', batchRef: A2_REF, at: '2026-01-01T01:00:00.000Z' },
+    ],
+  }
+  assert.equal(
+    evaluateAccountingInvariantRows(rows).filter((f) => f.code === 'sales_order_inventory_allocation_without_sync_evidence').length,
+    0,
+  )
+})
