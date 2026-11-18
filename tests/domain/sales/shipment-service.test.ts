@@ -353,6 +353,11 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           ? where.status.in.includes(row.status)
           : row.status !== where.status.not))
       )).length,
+      // The unknown-status read (`status: { notIn }`) selects rows whose status this binary cannot name.
+      findMany: async ({ where }: { where: { idempotencyKey?: { in: string[] }; status?: { notIn: string[] } } }) => (state.releaseOutbox ?? []).filter((row) => (
+        (where.idempotencyKey === undefined || where.idempotencyKey.in.includes(row.idempotencyKey))
+        && (where.status === undefined || !where.status.notIn.includes(row.status))
+      )).map((row) => ({ status: row.status })),
     },
     salesOrderRefundLine: {
       findMany: async ({ where }: { where: { refund: { orderId: string } } }) => (state.refundLines ?? [])
@@ -2926,6 +2931,9 @@ test('o3d-2k5r r9: a backstop row carrying a status THIS BINARY DOES NOT KNOW st
 
   assert.equal(result.success, false)
   assert.match((result as { error: string }).error, /repack recovery/)
+  // The refusal names the unrecognised status and the rollback remedy rather than only a control that is not rendered.
+  assert.match((result as { error: string }).error, /not recognised by this version of IMS: QUARANTINED_BY_NEWER_RELEASE/)
+  assert.match((result as { error: string }).error, /roll forward/i)
   assert.equal(state.shipments[1].status, 'PACKED')
   assert.equal(state.movements.length, 0)
 })
@@ -2937,7 +2945,7 @@ type OutboxWhere = {
   connector?: string
   operation?: string
   idempotencyKey?: { in?: string[] }
-  status?: string | { in?: string[]; not?: string }
+  status?: string | { in?: string[]; not?: string; notIn?: string[] }
   attempts?: { lt?: number; gte?: number }
   lockedAt?: Date | null | { lt?: Date }
   lockedBy?: string
@@ -2957,6 +2965,7 @@ function outboxRowMatches(row: IntegrationOutboxRow, where: OutboxWhere | undefi
   if (typeof where.status === 'string' && row.status !== where.status) return false
   if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
   if (typeof where.status === 'object' && where.status.not !== undefined && row.status === where.status.not) return false
+  if (typeof where.status === 'object' && where.status.notIn && where.status.notIn.includes(row.status)) return false
   if (where.attempts?.lt !== undefined && row.attempts >= where.attempts.lt) return false
   if (where.attempts?.gte !== undefined && row.attempts < where.attempts.gte) return false
   if (where.lockedBy !== undefined && row.lockedBy !== where.lockedBy) return false

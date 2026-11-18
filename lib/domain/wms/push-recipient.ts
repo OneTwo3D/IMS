@@ -54,7 +54,13 @@ function isPartsShape(record: AddressRecord): boolean {
 
 /** The street line to send: the plain street when stored, else the legacy composite. */
 function streetLine(record: AddressRecord): string {
-  return isPartsShape(record) ? text(record, 'address1') : text(record, 'address1', 'line1', 'address_1')
+  if (isPartsShape(record)) return text(record, 'address1')
+  const line = text(record, 'address1', 'line1', 'address_1')
+  // A legacy composite is `street, company` (or just `company` when the street was blank). A line that is
+  // exactly the company name carries no street, so it must not count as a destination.
+  const company = text(record, 'company')
+  if (line && company && line.toLowerCase() === company.toLowerCase()) return ''
+  return line
 }
 
 /** Is this address somewhere a parcel can be delivered to? That REQUIRES a street line; a name or company alone is not a destination. */

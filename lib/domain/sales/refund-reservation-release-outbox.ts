@@ -60,7 +60,11 @@ export type OutboxStatusPredicate = { in: string[] } | { not: string }
 /** o3d-2k5r r4: the READ half — what "is a repack recovery still outstanding?" needs. */
 export type OutstandingReleaseReadClient = {
   salesOrderRefund: { findMany(args: unknown): Promise<Array<{ id: string }>> }
-  integrationOutbox: { count(args: unknown): Promise<number> }
+  integrationOutbox: {
+    count(args: unknown): Promise<number>
+    /** Optional so narrow fakes keep working; the real client always has it. */
+    findMany?(args: unknown): Promise<Array<{ status: string }>>
+  }
 }
 
 export const REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR = 'sales'
@@ -342,6 +346,57 @@ async function countRefundReservationReleasesAt(
       status: statusPredicate,
     },
   })
+}
+
+/**
+ * Every status this binary can name. A release row whose status is NOT in here was written by another
+ * binary (a newer one, after a rollback): this process cannot claim, resume or resolve it.
+ */
+const KNOWN_OUTBOX_STATUSES: string[] = Object.values(INTEGRATION_OUTBOX_STATUS)
+
+/**
+ * The `where` that selects refund-reservation-release rows in a status this binary does not know,
+ * for Sync Exceptions and the health counts. The dispatch fence blocks on such a row (see
+ * `UNFINISHED_RELEASE_STATUS_PREDICATE`) but nothing else raised it, so after a rollback it was an
+ * invisible wedge. Surfaced, not cleared: only the binary that wrote it understands its semantics.
+ */
+export const UNKNOWN_RELEASE_STATUS_ROW_WHERE = {
+  connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+  operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+  status: { notIn: KNOWN_OUTBOX_STATUSES },
+}
+
+/** Distinct unknown statuses blocking this order's release (empty when none). */
+export async function listUnknownReleaseStatuses(
+  orderId: string,
+  options: { client?: OutstandingReleaseReadClient } = {},
+): Promise<string[]> {
+  const client = options.client ?? (db as unknown as OutstandingReleaseReadClient)
+  if (typeof client.integrationOutbox.findMany !== 'function') return []
+  const refunds = await client.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
+  if (refunds.length === 0) return []
+  const rows = await client.integrationOutbox.findMany({
+    where: {
+      ...UNKNOWN_RELEASE_STATUS_ROW_WHERE,
+      idempotencyKey: { in: refunds.map((refund) => buildOutboxIdempotencyKey(
+        REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+        REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+        refund.id,
+      )) },
+    },
+    select: { status: true },
+  })
+  return [...new Set(rows.map((row) => row.status))].sort()
+}
+
+/** The sentence appended to the dispatch refusal when unknown statuses are what block it. */
+export function describeUnknownReleaseStatuses(statuses: string[]): string {
+  if (statuses.length === 0) return ''
+  return ` Blocking release row status not recognised by this version of IMS: ${statuses.join(', ')}. `
+    + 'There is no "Finish repack recovery" control for it, because it was written by a different (newer) '
+    + 'version, most likely before a rollback. Roll forward to the version that wrote it so it can resolve '
+    + 'the row, or have an administrator review the row under Sync > Exceptions (Integration outbox) and set '
+    + 'it to SUCCEEDED once the refunded units\u2019 reservation has been reconciled by hand.'
 }
 
 /**

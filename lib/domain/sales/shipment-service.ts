@@ -34,6 +34,8 @@ import {
 } from '@/lib/domain/sales/repack-recovery-affordance'
 import {
   countUnfinishedRefundReservationReleases,
+  describeUnknownReleaseStatuses,
+  listUnknownReleaseStatuses,
   type OutstandingReleaseReadClient,
 } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
@@ -1092,6 +1094,10 @@ export async function validateDispatchPreservesRepackRecovery(
     orderHasUnreopenableCommitment,
   })) return null
 
+  const unknownStatuses = await listUnknownReleaseStatuses(orderId, {
+    client: client as unknown as OutstandingReleaseReadClient,
+  })
+
   return 'This order still owes a repack recovery, so its shipments cannot be dispatched yet. '
     + 'A refund on this order reduced what it is owed, and releasing the refunded units\u2019 stock '
     + 'reservation was deferred because the order already had a shipment \u2014 the release re-runs '
@@ -1100,6 +1106,7 @@ export async function validateDispatchPreservesRepackRecovery(
     + 'the re-allocation would be refused for ever and the reservation would have to be reconciled '
     + 'by hand. Reopen the order\u2019s committed shipments for repack, run \u201CFinish repack '
     + 'recovery\u201D on the order, then rebuild with \u201CCreate Shipments\u201D and dispatch that.'
+    + describeUnknownReleaseStatuses(unknownStatuses)
 }
 
 export async function transitionShipmentStatus(

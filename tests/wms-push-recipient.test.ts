@@ -226,3 +226,19 @@ test('buildPushInput refuses an order with no street line on either address, wit
   assert.equal(refusals, 3)
   assert.ok(!/nothing was sent|never sent/i.test(NO_DELIVERY_STREET_REASON))
 })
+
+test('legacy company-only line1 is not a street: billing street is used instead', () => {
+  const r = resolvePushRecipient({
+    shippingAddress: { line1: 'Gift Co', company: 'Gift Co', city: 'Leeds' },
+    billingAddress: billing,
+    customerName: null, customerEmail: null,
+  })
+  assert.equal(r.addressSource, 'billing')
+  assert.equal(r.address.address1, '9 Billing Rd')
+  // a genuine legacy composite (street, company) is still a street
+  const ok = resolvePushRecipient({
+    shippingAddress: { line1: '1 Recipient St, Gift Co', company: 'Gift Co' },
+    billingAddress: billing, customerName: null, customerEmail: null,
+  })
+  assert.equal(ok.addressSource, 'shipping')
+})

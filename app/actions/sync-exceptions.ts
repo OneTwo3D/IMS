@@ -79,9 +79,11 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission } fro
 import {
   IntegrationOutboxAdminError,
   listIntegrationOutboxAdminRows,
+  toAdminIntegrationOutboxRow,
   replayIntegrationOutboxAdminRow,
 } from '@/lib/domain/integrations/outbox-admin'
 import { INTEGRATION_OUTBOX_STATUS } from '@/lib/domain/integrations/outbox'
+import { UNKNOWN_RELEASE_STATUS_ROW_WHERE } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import {
   DEAD_RECEIPT_EVENT_STATUS,
   buildDeadReceiptEventReplayData,
@@ -1261,7 +1263,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
     db.wmsOrderPushLink.count({ where: WMS_PUSH_INBOX_WHERE }),
-    db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
+    db.integrationOutbox.count({ where: { OR: [{ status: { in: OUTBOX_FAILURE_STATUSES } }, UNKNOWN_RELEASE_STATUS_ROW_WHERE] } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     // Store (WooCommerce) deliveries that ran out of retries, including order and refund deliveries held because
@@ -1433,7 +1435,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     // The admin list filter takes a single status, so query each failure status
     // and merge — filtering one mixed recent page would hide failures older
     // than the newest 50 rows of ANY status.
-    Promise.all(OUTBOX_FAILURE_STATUSES.map((status) => listIntegrationOutboxAdminRows({ status, limit: SECTION_LIMIT })))
+    // Plus release rows in a status this binary does not know: they block dispatch and no other read raises them.
+    Promise.all([
+      ...OUTBOX_FAILURE_STATUSES.map((status) => listIntegrationOutboxAdminRows({ status, limit: SECTION_LIMIT })),
+      db.integrationOutbox.findMany({ where: UNKNOWN_RELEASE_STATUS_ROW_WHERE, orderBy: { updatedAt: 'desc' }, take: SECTION_LIMIT })
+        .then((rows) => ({ rows: rows.map(toAdminIntegrationOutboxRow) })),
+    ])
       .then((results) => results
         .flatMap((result) => result.rows)
         .sort((left, right) => new Date(right.updatedAt as never).getTime() - new Date(left.updatedAt as never).getTime())
