@@ -56,7 +56,9 @@ const cases: Array<[string, string | undefined, string | undefined, boolean]> = 
   ['enabled + to_wc (IMS is master) does NOT import', 'true', 'to_wc', false],
   ['enabled + unrecognised direction does NOT import', 'true', 'sideways', false],
   ['sync disabled does NOT import (from_wc)', 'false', 'from_wc', false],
-  ['sync setting missing does NOT import', undefined, 'from_wc', false],
+  ['sync setting UNSET still imports (behaviour before .107; only an explicit false skips)', undefined, 'from_wc', true],
+  ['sync setting UNSET and direction UNSET still imports', undefined, undefined, true],
+  ['sync setting UNSET + to_wc does NOT import', undefined, 'to_wc', false],
   ['sync disabled + both does NOT import', 'false', 'both', false],
 ]
 for (const [name, enabled, direction, imports] of cases) {

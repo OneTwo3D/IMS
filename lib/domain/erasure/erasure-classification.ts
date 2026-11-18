@@ -151,7 +151,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   WmsOrderPushLink: {
     erased: ['lastError', 'dispatchLastError', 'dispatchUnresolvedError'],
     // doublePostageDetail: order numbers, currency and amounts only (built by decideDoublePostage); no name, address or contact.
-    notPersonal: ['connector', 'courierForm', 'courierFormName', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService', 'doublePostageDetail'],
+    notPersonal: ['connector', 'courierForm', 'courierFormName', 'pushWarehouseId', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService', 'doublePostageDetail'],
     retained: {
       externalOrderId: 'the warehouse order id reconciles the order with the warehouse',
       externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',

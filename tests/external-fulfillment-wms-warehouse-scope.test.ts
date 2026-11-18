@@ -12,25 +12,29 @@ const state = {
   shipments: [] as Row[],
   transitions: [] as Array<[string, string]>,
   activity: [] as Row[],
+  link: null as Row | null,
+  allocationCount: 1,
+  allocated: [] as string[],
 }
 
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async (entry: Row) => { state.activity.push(entry) } } })
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      wmsOrderPushLink: { findUnique: async () => (state.link ? { ...state.link } : null) },
       salesOrder: { findUnique: async () => ({ ...state.order }), findFirst: async () => ({ ...state.order }) },
       salesOrderLine: { findMany: async () => [] },
       shipmentLine: { findMany: async () => [] },
       salesOrderRefundLine: { findMany: async () => [] },
       stockMovement: { findMany: async () => [] },
-      orderAllocation: { count: async () => 1 },
+      orderAllocation: { count: async () => (state.allocationCount) },
       shipment: { count: async () => state.shipments.length, findMany: async () => state.shipments.map((row) => ({ ...row })) },
     },
   },
 })
 mock.module('@/app/actions/allocation', {
   namedExports: {
-    autoAllocateOrder: async () => ({ success: true, allocationCount: 1, unallocatedQty: 0 }),
+    autoAllocateOrder: async () => { state.allocated.push('auto'); return { success: true, allocationCount: 1, unallocatedQty: 0 } },
     confirmAllocations: async () => ({ success: true }),
     updateShipmentStatus: async (shipmentId: string, target: string) => { state.transitions.push([shipmentId, target]); return { success: true } },
   },
@@ -43,6 +47,10 @@ function reset(shipments: Row[]) {
   state.shipments = shipments
   state.transitions = []
   state.activity = []
+  state.link = null
+  state.allocated = []
+  state.allocationCount = 1
+  state.order.shipFromWarehouseId = 'wh-wms'
 }
 
 async function apply(source: 'mintsoft' | 'woocommerce') {
@@ -74,4 +82,37 @@ test('a storefront-sourced completion is not scoped by the WMS warehouse (contro
   const result = await apply('woocommerce')
   assert.deepEqual(result, { success: true })
   assert.deepEqual(state.transitions, [['shp-home', 'SHIPPED']])
+})
+
+test('the WMS warehouse is the one the order was PUSHED for, not the current ship-from (ship-from changed after the push)', async () => {
+  reset([{ id: 'shp-wms', status: 'PACKED', warehouseId: 'wh-wms' }])
+  state.link = { pushWarehouseId: 'wh-wms' }
+  state.order.shipFromWarehouseId = 'wh-home' // an operator changed it after the push
+  const result = await apply('mintsoft')
+  assert.deepEqual(result, { success: true }, 'the genuine WMS shipment is not read as foreign')
+  assert.deepEqual(state.transitions, [['shp-wms', 'SHIPPED']])
+})
+
+test('a shipment outside the PUSHED warehouse is refused even when ship-from now points at it', async () => {
+  reset([{ id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
+  state.link = { pushWarehouseId: 'wh-wms' }
+  state.order.shipFromWarehouseId = 'wh-home'
+  const result = await apply('mintsoft')
+  assert.equal((result as { refusal?: string }).refusal, 'wms_other_warehouse_shipments')
+  assert.deepEqual(state.transitions, [])
+})
+
+test('a link without a pushed warehouse falls back to the order ship-from warehouse', async () => {
+  reset([{ id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
+  state.link = { pushWarehouseId: null }
+  const result = await apply('mintsoft')
+  assert.equal((result as { refusal?: string }).refusal, 'wms_other_warehouse_shipments')
+})
+
+test('the refusal happens BEFORE any allocation side effect when the foreign shipment already exists', async () => {
+  reset([{ id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
+  state.allocationCount = 0 // allocation would normally run
+  const result = await apply('mintsoft')
+  assert.equal((result as { refusal?: string }).refusal, 'wms_other_warehouse_shipments')
+  assert.deepEqual(state.allocated, [], 'autoAllocateOrder never ran')
 })

@@ -961,7 +961,7 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
   let productSyncError: string | null = null
 
   // o3d-hqvrp.107: the Sync-page product settings decide whether WooCommerce may write IMS products, exactly as the
-  // hourly poll reads them (reconcile.ts): product sync enabled AND direction from_wc / both (unset reads as from_wc).
+  // hourly poll reads them (reconcile.ts): product sync not explicitly disabled (an unset key imports, as before) AND direction from_wc / both (unset reads as from_wc).
   // With `to_wc` (IMS is master), sync off, or an unrecognised direction the delivery is acknowledged and NOT imported,
   // else a shop-manager edit would overwrite IMS and the next push would send it back. A read failure propagates (500,
   // retried): an unreadable setting must not read as consent. The stock correction below is a separate setting and unchanged.
@@ -973,7 +973,9 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
     ])
     const direction = directionSetting?.value
     const importsFromWc = !direction || direction === 'from_wc' || direction === 'both'
-    if (enabledSetting?.value !== 'true' || !importsFromWc) {
+    // An UNSET enabled key keeps the behaviour before .107 (the webhook imported): only an explicit 'false' skips.
+    const syncDisabled = enabledSetting?.value === 'false'
+    if (syncDisabled || !importsFromWc) {
       productImportAllowed = false
       await logActivity({
         entityType: 'SYNC',
@@ -981,7 +983,7 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
         tag: 'sync',
         level: 'INFO',
         description: `WooCommerce product webhook for ${productPayload.sku} was not imported: `
-          + (enabledSetting?.value !== 'true'
+          + (syncDisabled
             ? 'product sync is disabled (wc_sync_product_enabled).'
             : `the product direction is ${direction ?? 'unset'}, which does not import from WooCommerce (wc_sync_product_direction).`),
         metadata: { externalId: productPayload.id, sku: productPayload.sku, productSyncEnabled: enabledSetting?.value ?? null, direction: direction ?? null },

@@ -807,6 +807,8 @@ function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderL
 type PushState = 'MERGED' | 'PENDING_CREATE' | 'PENDING_VERIFY' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD' | 'VALIDATION_FAILED' | 'AMBIGUOUS_CREATE'
 type LinkWrite = {
   connector?: string
+  /** The IMS warehouse the warehouse order was created for (the order's ship-from at create time). */
+  pushWarehouseId?: string | null
   externalOrderId?: string | null
   externalOrderNumber?: string | null
   state?: PushState
@@ -2893,14 +2895,14 @@ export async function runWmsOrderPushSweepCore(
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: components=${componentPence ?? 'ok'} payload=${payloadPence ?? 'ok'} (recording ${totalMismatchPence}; pushed, flagged for review)`)
         }
-        const createLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
+        const createLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-        const updateLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
+        const updateLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
             // A (re-)created warehouse order starts with no amendment in flight and no stale mark, written atomically with the state it is
             // SYNCED under (and with its snapshot, see upsertCreatedLinkWithItems).
             lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }

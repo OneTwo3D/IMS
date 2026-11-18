@@ -276,7 +276,7 @@ Webhooks deliver order changes to One Two Inventory in real-time, rather than wa
 4. Click **Setup Webhooks in WooCommerce** to auto-register the three required webhooks via the WC API:
    - `order.created` — imports new orders
    - `order.updated` — syncs status changes and refunds
-   - `product.updated` — syncs product changes into IMS, only when product sync is on and the direction is WooCommerce to IMS or Both; with sync off or IMS as product master the delivery is acknowledged and not imported
+   - `product.updated` — syncs product changes into IMS, unless product sync is switched off or the direction excludes WooCommerce to IMS; with sync off or IMS as product master the delivery is acknowledged and not imported
 
 Webhook deliveries are stored as soon as they arrive and processed within moments, rather than waiting for the next five-minute run of the **WooCommerce Webhook Inbox** job (that job stays as the backstop and drains anything left over). Deliveries received while sync is switched off are kept and imported once sync is back on, so nothing is lost across a pause.
 
