@@ -27,7 +27,7 @@ export type RefusedActionSeverity = (typeof REFUSED_ACTION_SEVERITIES)[number]
 /** The actions and gates this record is written for. A new instance adds its pair here, so the surface can name it. */
 export const REFUSED_ACTIONS = {
   /** An amendment attempted after the warehouse order left NEW. */
-  WMS_ORDER_AMEND: { label: 'Order change not applied in the warehouse', gates: ['WMS_ORDER_NOT_NEW'] },
+  WMS_ORDER_AMEND: { label: 'Order change not applied in the warehouse', gates: ['WMS_ORDER_NOT_NEW', 'WMS_AMEND_UNBUILDABLE'] },
   /** A split warehouse order that can never complete in IMS because a part was cancelled. */
   WMS_SPLIT_ORDER_COMPLETE: { label: 'Split order cannot complete', gates: ['WMS_SPLIT_PART_CANCELLED'] },
 } as const

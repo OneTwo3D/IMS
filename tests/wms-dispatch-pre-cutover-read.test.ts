@@ -194,7 +194,10 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
     repointLink: async () => {},
     clearDispatchFailures: async () => {},
     countLinksByOrderNumber: async (numbers: string[]) => new Map(numbers.map((n) => [n, 1])),
-    applyDispatch: async (_orderId: string, _tracking: unknown, opts?: Record<string, unknown>) => {
+    applyDispatch: async (_orderId: string, _tracking: unknown, rawOpts?: Record<string, unknown>) => {
+      // The despatch instant (o3d-hqvrp.114) dates the shipment; these assertions are about the storefront flag and fence, so it is set apart.
+      const { despatchedAt: _despatchedAt, ...flagOpts } = rawOpts ?? {}
+      const opts = rawOpts === undefined || Object.keys(flagOpts).length === 0 ? undefined : flagOpts
       // The verification's fence travels with the completion; recorded apart so the flag assertions stay about the flag.
       if (opts && 'fence' in opts) { const { fence, ...rest } = opts; fences.push(typeof fence === 'function'); fenceFns.push(fence as never); applyOptions.push(rest) } else { applyOptions.push(opts) }
       return { success: true }

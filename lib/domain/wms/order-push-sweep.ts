@@ -1447,6 +1447,27 @@ export async function runWmsOrderPushSweepCore(
     }
   }
 
+  /** Record an amendment IMS could not build (see the amendment pass). Retryable: it clears itself when the order builds again. Never throws. */
+  const recordUnbuildableAmendment = async (link: { order: { id: string; orderNumber: string | null } }, error: unknown): Promise<void> => {
+    if (!port.recordRefusedAction) return
+    try {
+      await port.recordRefusedAction({
+        entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
+        entityId: link.order.id,
+        action: 'WMS_ORDER_AMEND',
+        gate: 'WMS_AMEND_UNBUILDABLE',
+        permanence: 'RETRYABLE',
+        // The lines may have changed and cannot be compared: the safe side, as for an amendment with no recorded lines.
+        severity: 'HIGH',
+        intent: { orderNumber: link.order.orderNumber ?? null } as unknown as Prisma.InputJsonValue,
+        detail: `IMS could not build this order's change for the warehouse, so nothing was sent and the warehouse order may be out of date: ${scrubWmsError(error, 'unknown reason')}`,
+        now: now(),
+      })
+    } catch (recordError) {
+      console.error('[wms-order-push] could not record an unbuildable amendment', recordError)
+    }
+  }
+
   /**
    * The courier-fallback task for ONE service on ONE order. When it is recorded the link's due-marker is cleared (only for this service), so a task
    * that could not be recorded stays due and is raised by the courier pass of a later sweep whether or not the order is amended.
@@ -3461,7 +3482,17 @@ export async function runWmsOrderPushSweepCore(
           amendOrder = { ...link.order, ...current } as typeof link.order
         }
         amendService = amendOrder.shippingService
-        const input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
+        let input: WmsOrderPushInput
+        try {
+          input = applyLinkCourierForm(buildPushInput(amendOrder, externalWarehouseId), link)
+        } catch (buildError) {
+          // THE CHANGE CANNOT EVEN BE BUILT (a store-credit review, a removed street, a line with no SKU): nothing is sent and the link stays due, so it
+          // is retried every sweep. That used to leave only a lastError on a SYNCED link, which no one looks at while the warehouse works from stale
+          // data. It is now a standing refused-action row on Sync > Exceptions (one row however often it repeats; it ages into an alert, and closes
+          // when a later amendment is applied). Best effort: a failure to record never hides the build error, which still fails this link as before.
+          await recordUnbuildableAmendment(link, buildError)
+          throw buildError
+        }
         // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
         // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
         // amendment or a failed cleanup therefore always leaves them untrusted. If the mark cannot be written, nothing is sent.

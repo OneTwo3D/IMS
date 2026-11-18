@@ -1113,6 +1113,8 @@ export async function transitionShipmentStatus(
      * `completion`. Never set by an in-app dispatch, which refuses those statuses.
      */
     allowRecordWhenNotReady?: boolean
+    /** The instant the goods left (a warehouse-reported dispatch). Default: now. Never in the future. */
+    shippedAt?: Date
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
@@ -1142,7 +1144,8 @@ export async function transitionShipmentStatus(
   if (extra?.shippingService) data.shippingService = extra.shippingService
 
   if (targetStatus === 'SHIPPED') {
-    data.shippedAt = new Date()
+    const applyTime = new Date()
+    data.shippedAt = input.shippedAt && input.shippedAt.getTime() <= applyTime.getTime() ? input.shippedAt : applyTime
 
     const dispatchResult = await runInTransaction(client, async (tx) => {
       await lockSalesOrder(tx, shipment.orderId)

@@ -1581,6 +1581,8 @@ export async function updateShipmentStatus(
     skipStorefrontPush?: boolean
     /** Re-checked under the order lock inside the SHIPPED transaction; a non-null answer refuses the dispatch. */
     shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
+    /** A warehouse-reported dispatch: the instant the goods left, recorded as the shipment's shippedAt. Honoured only for the internal (system) caller. */
+    shippedAt?: Date
     /**
      * A warehouse-reported dispatch: if the order is found DRAFT / ON_HOLD / PENDING_PAYMENT under the order lock, the
      * goods have left, so the shipment, stock, FIFO and COGS are recorded, but the order is NOT promoted and nothing is
@@ -1611,6 +1613,7 @@ export async function updateShipmentStatus(
       ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
       ...(targetStatus === 'SHIPPED' ? { completion } : {}),
       ...(allowRecordWhenNotReady ? { allowRecordWhenNotReady: true } : {}),
+      ...(targetStatus === 'SHIPPED' && options?.shippedAt && options?.internalBypassToken === INTERNAL_ACTION_BYPASS ? { shippedAt: options.shippedAt } : {}),
     })
     if (!result.success) {
       try {

@@ -48,6 +48,11 @@ export type ExternalFulfillmentUpdate = {
    * refuses the dispatch (what the verification proved no longer holds), so nothing is shipped on a stale proof.
    */
   shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
+  /**
+   * When the external system says the goods left. The IMS shipment's shippedAt (which the daily accounting batch, period stock and despatch
+   * reporting key off) is this instant, not the moment a late apply runs. Absent: the apply time, as before.
+   */
+  despatchedAt?: Date
 }
 
 /**
@@ -794,6 +799,7 @@ export async function applyExternalFulfillmentUpdate(
           storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
           ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
+          ...(target === 'SHIPPED' && update.despatchedAt ? { shippedAt: update.despatchedAt } : {}),
         },
       )
 

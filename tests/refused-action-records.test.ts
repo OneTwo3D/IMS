@@ -141,7 +141,7 @@ function updateLinkFor(): WmsPushUpdateLink {
   }
 }
 
-async function amend(result: WmsOrderUpdateResult, opts: { recorded?: Array<{ externalItemId: string; sku: string; quantity: number }>; recordFails?: boolean } = {}) {
+async function amend(result: WmsOrderUpdateResult, opts: { recorded?: Array<{ externalItemId: string; sku: string; quantity: number }>; recordFails?: boolean; mutateOrder?: (order: Record<string, unknown>) => void } = {}) {
   const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
   const linkWrites: Array<Record<string, unknown>> = []
   const recordedRefusals: RefusedActionInput[] = []
@@ -152,7 +152,7 @@ async function amend(result: WmsOrderUpdateResult, opts: { recorded?: Array<{ ex
     activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: '301' }],
     releasableHeldOrders: async () => [], createCandidates: async () => [], revalidatableLinks: async () => ({ links: [], total: 0 }),
     ambiguousCreateLinks: async () => ({ links: [], total: 0 }), verifiableLinks: async () => [], holdableLinks: async () => [], cancellableLinks: async () => [],
-    updatableLinks: async () => [updateLinkFor()],
+    updatableLinks: async () => { const link = updateLinkFor(); opts.mutateOrder?.(link.order as unknown as Record<string, unknown>); return [link] },
     updateLink: async (_id: string, data: Record<string, unknown>) => { linkWrites.push(data) },
     updateLinkByOrder: async () => undefined, updateLinkIfState: async () => true, upsertByOrder: async () => undefined,
     screenLiveWithdrawals: async () => new Set<string>(), verifyWithdrawalFence: async () => true,
@@ -227,6 +227,75 @@ test('RESOLUTION: when the amendment later succeeds the standing refusal is clos
   const run = await amend({ updated: true, status: 'NEW' })
   assert.deepEqual(run.recordedRefusals, [])
   assert.deepEqual(run.resolved, [{ orderId: 'so-u', action: 'WMS_ORDER_AMEND' }])
+})
+
+test('o3d-hqvrp.113: an amendment IMS cannot even build is RECORDED (standing row, retryable), nothing is sent, and the link stays due', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { mutateOrder: (order) => { order.shippingAddress = { line1: '', city: 'Leeds', postcode: 'LS1', country: 'GB' } } })
+  assert.deepEqual(run.connectorCalls, [], 'nothing was sent to the warehouse')
+  assert.equal(run.recordedRefusals.length, 1)
+  const refusal = run.recordedRefusals[0]!
+  assert.equal(refusal.action, 'WMS_ORDER_AMEND')
+  assert.equal(refusal.gate, 'WMS_AMEND_UNBUILDABLE')
+  assert.equal(refusal.permanence, 'RETRYABLE')
+  assert.equal(refusal.severity, 'HIGH')
+  assert.equal(refusal.entityId, 'so-u')
+  assert.ok(refusal.detail && refusal.detail.length > 0)
+  // The pre-existing behaviour is kept: the link fails with its error and is NOT advanced (pushedAt), so it retries.
+  assert.equal(run.linkWrites.some((write) => 'pushedAt' in write), false)
+  assert.ok(run.linkWrites.some((write) => typeof write.lastError === 'string' && write.lastError.length > 0))
+  assert.deepEqual(run.tasks, [], 'no warehouse query: nothing can be asked until IMS can build the change')
+})
+
+test('o3d-hqvrp.113: failing to record an unbuildable amendment never hides the build failure', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { recordFails: true, mutateOrder: (order) => { order.shippingAddress = { line1: '', city: 'Leeds', postcode: 'LS1', country: 'GB' } } })
+  assert.ok(run.linkWrites.some((write) => typeof write.lastError === 'string' && write.lastError.length > 0))
+  assert.equal(run.linkWrites.some((write) => 'pushedAt' in write), false)
+})
+
+// --- o3d-hqvrp.114: the shipment is dated with the warehouse's despatch time --------------------------------------------------------------
+
+test('o3d-hqvrp.114: despatchInstantForApply: an exact instant is used; undated, imprecise or future values are not', () => {
+  const now = new Date('2026-11-18T00:05:00Z')
+  const { despatchInstantForApply } = dispatch
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-10-31T23:50:00Z' }], undefined, now)?.toISOString(), '2026-10-31T23:50:00.000Z')
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-10-31T23:50:00' }], 'europe-london', now)?.toISOString(), '2026-10-31T23:50:00.000Z', 'zone-less UK time (GMT on 31 Oct 2026? BST ended 25 Oct)')
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-07-31T23:50:00' }], 'europe-london', now)?.toISOString(), '2026-07-31T22:50:00.000Z', 'BST is read as UTC+1')
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-10-31T10:00:00Z' }, { despatchedAt: '2026-10-31T23:50:00Z' }], undefined, now)?.toISOString(), '2026-10-31T23:50:00.000Z', 'the latest')
+  assert.equal(despatchInstantForApply([{ despatchedAt: null }, { despatchedAt: '2026-10-31T23:50:00Z' }], undefined, now)?.toISOString(), '2026-10-31T23:50:00.000Z', 'an undated entry says nothing')
+  assert.equal(despatchInstantForApply([{ despatchedAt: null }], undefined, now), null)
+  assert.equal(despatchInstantForApply([], undefined, now), null)
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-10-31' }], 'europe-london', now), null, 'a date alone is not an instant')
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-10-31T23:50:00' }], undefined, now), null, 'zone-less with no known zone')
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-10-31T10:00:00Z' }, { despatchedAt: 'garbage' }], undefined, now), null)
+  assert.equal(despatchInstantForApply([{ despatchedAt: '2026-12-01T00:00:00Z' }], undefined, now), null, 'never post-dated')
+})
+
+test('o3d-hqvrp.114: the dispatch sweep applies an ordinary despatch DATED with the warehouse despatch time, not the sweep time', async () => {
+  const applied: Array<{ options: unknown }> = []
+  const { counters } = await runWmsDispatchSweepCore(dispatchDeps({
+    ...ENUMERATED,
+    clock: () => SWEEP_NOW,
+    listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN-1', carrier: 'RM', despatchedAt: '2026-07-14T23:50:00Z' })] }),
+    applyDispatch: async (_orderId, _tracking, options) => { applied.push({ options }); return { success: true } },
+  }), { now: SWEEP_NOW })
+  assert.equal(counters.dispatched, 1)
+  assert.equal(applied.length, 1)
+  const options = applied[0]!.options as { despatchedAt?: Date; storefrontAlreadyCompleted?: boolean } | undefined
+  assert.equal(options?.despatchedAt?.toISOString(), '2026-07-14T23:50:00.000Z')
+  assert.equal(options?.storefrontAlreadyCompleted, undefined)
+})
+
+test('o3d-hqvrp.114: a despatch with no usable time is applied exactly as before (no options)', async () => {
+  const applied: unknown[] = []
+  await runWmsDispatchSweepCore(dispatchDeps({
+    ...ENUMERATED,
+    clock: () => SWEEP_NOW,
+    listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+    fetchOrderStatus: async () => status({ status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TN-1' })] }),
+    applyDispatch: async (_orderId, _tracking, options) => { applied.push(options); return { success: true } },
+  }), { now: SWEEP_NOW })
+  assert.deepEqual(applied, [undefined])
 })
 
 // --- the split-order instance ----------------------------------------------------------------------------------------------------------

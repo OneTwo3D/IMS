@@ -1,0 +1,5 @@
+### Mintsoft order lifecycle: despatch dates and unbuildable changes
+
+- A despatch that Mintsoft reports with an exact despatch time now dates the IMS shipment (and so the daily accounting batch, period stock and despatch reports) with that time, not with the moment the sweep applied it. A despatch at 23:50 on the 31st applied at 00:05 stays in the earlier month. A despatch with no usable time, an imprecise one or one in the future is dated as before.
+- A change to an order that IMS cannot build for Mintsoft (for example a store-credit review or a removed delivery street) now appears on Sync > Exceptions as "Order change not applied in the warehouse", instead of only a note on the order link. It clears when a later change is applied.
+- Already in place and covered by tests, no change here: cancelling an order Mintsoft has already cancelled, changes refused after NEW (exception row plus a warehouse query task), and the "already exists" dedupe verifying number, reference and live status before linking.
