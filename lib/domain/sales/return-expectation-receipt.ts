@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { Prisma } from '@/app/generated/prisma/client'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import {
@@ -330,7 +331,7 @@ export async function receiveReturnAgainstExpectationsTx(
           sourceRef: expectation.refundId,
           idempotencyKey: `return-expectation-receipt:${expectation.id}:${params.inboxId}:residue`,
           baseDelta: subledgerBase.neg(),
-          journalDate: params.arrivedAt.toISOString().slice(0, 10),
+          journalDate: businessDateYmd(params.arrivedAt),
         })
       }
       continue
@@ -445,7 +446,7 @@ async function clearTransitInLedger(
   const amount = params.amount
   if (amount <= 0) return
   const payload = {
-    date: params.arrivedAt.toISOString().slice(0, 10),
+    date: businessDateYmd(params.arrivedAt),
     reference: `Return received: ${params.expectation.reference}`,
     narration: `Stock in Transit cleared on arrival of returned goods (${params.expectation.reference})`,
     lines: [

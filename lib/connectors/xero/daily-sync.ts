@@ -131,7 +131,7 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 import { XERO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { refreshXeroBooksLockDate } from '@/lib/connectors/xero/books-lock-date'
 import { businessDateYmd } from '@/lib/business-date'
-import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, utcDay, businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
@@ -2166,7 +2166,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // that date. Each date is its own journal with its own reference, the identity the stamps carry.
       const processedShipments = shipments.filter((shipment) => shipmentResults.has(shipment.id))
       const groupBDay = (shipment: (typeof shipments)[number]): string | null => laterDay(
-        utcDay(shipment.shippedAt ?? shipment.createdAt),
+        businessDay(shipment.shippedAt ?? shipment.createdAt),
         businessDay(shipment.order.paidAt),
       )
       // ACC-H12: a shipment of an order that is not deferred yet is costed on its own journal, dated the day the
@@ -2175,7 +2175,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const bDated = groupByPostingDate(processedShipments.filter((shipment) => !isCostedOnShipment(shipment)), groupBDay, dateContext)
       const bDatedDirect = groupByPostingDate(
         processedShipments.filter(isCostedOnShipment),
-        (shipment) => utcDay(shipment.shippedAt ?? shipment.createdAt),
+        (shipment) => businessDay(shipment.shippedAt ?? shipment.createdAt),
         dateContext,
       )
       if (bDated.deferred.length > 0 || bDatedDirect.deferred.length > 0) throw new Error('Group B: a shipment has no open posting day although the lock-blocks-run check passed')
@@ -2532,7 +2532,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             orderId: order.id,
             refundId: adjustment.refundId,
             amount: adjustment.deferredPart,
-            day: laterDay(utcDay(adjustment.refundedAt), paidDay),
+            day: laterDay(businessDay(adjustment.refundedAt), paidDay),
           })
         }
       }
@@ -2962,7 +2962,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           businessDay(order.paidAt),
           ...order.allocations
             .filter((alloc) => allocationSnapshots.has(alloc.id))
-            .map((alloc) => utcDay(alloc.createdAt)),
+            .map((alloc) => businessDay(alloc.createdAt)),
         )
         const a2Dated = groupByPostingDate(accepted, a2OrderDay, dateContext)
         if (a2Dated.deferred.length > 0) throw new Error('A2: an order has no open posting day although the lock-blocks-run check passed')

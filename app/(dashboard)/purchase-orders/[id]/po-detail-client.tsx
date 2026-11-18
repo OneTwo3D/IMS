@@ -64,6 +64,7 @@ import { PO_LINE_COLS_DEFAULT, PO_LINE_COLS_STORAGE_KEY, PO_LINE_OPTIONAL_COLS, 
 import { PoFormDialog } from '../po-form'
 import { PoLineNote } from '../po-line-note'
 import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
+import { businessDateYmd } from '@/lib/business-date'
 
 type Warehouse = { id: string; code: string; name: string; availableForPurchaseOrders?: boolean }
 
@@ -881,7 +882,7 @@ function BillDialog({
 
   // Step 2 fields
   const [invoiceNumber, setInvoiceNumber] = useState('')
-  const [invoiceDate, setInvoiceDate] = useState(new Date().toISOString().slice(0, 10))
+  const [invoiceDate, setInvoiceDate] = useState(businessDateYmd(new Date()))
   const [dueDate, setDueDate] = useState('')
   const [notes, setNotes] = useState('')
   const [uploading, setUploading] = useState(false)
@@ -1535,7 +1536,7 @@ function PayBillDialog({
   const [accounts, setAccounts] = useState<AccountingBankAccount[]>([])
   const [loadingAccounts, setLoadingAccounts] = useState(true)
   const [bankAccountId, setBankAccountId] = useState('')
-  const [paymentDate, setPaymentDate] = useState(new Date().toISOString().slice(0, 10))
+  const [paymentDate, setPaymentDate] = useState(businessDateYmd(new Date()))
   const [reference, setReference] = useState(invoice.invoiceNumber ?? '')
 
   const sym = po.currency === baseCurrency.code ? baseCurrency.symbol : po.currency

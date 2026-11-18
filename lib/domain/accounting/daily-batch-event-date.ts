@@ -6,7 +6,7 @@
  * overstates March margin and leaves the inventory/COGS reconciliations comparing a subledger dated by
  * event with a ledger dated by batch run.
  *
- * THE RULE. A journal is dated the day of the EVENT it records, in UTC like every other batch date:
+ * THE RULE. A journal is dated the day of the EVENT it records, on the BUSINESS (London) day (see `businessDay`):
  *
  *   Group A1 (revenue deferral)          the day the order was PAID
  *   Group A2 (inventory reclassification) the later of the day it was paid and the day its stock was allocated
@@ -41,9 +41,9 @@ export function utcDay(value: Date | string | null | undefined): string | null {
 }
 
 /**
- * The BUSINESS (Europe/London) calendar day of an instant, or null when absent or invalid. The day an order was PAID is read on this day, so the
- * deferral, the reclassification and the recognition agree with the invoice and the receipt, which are dated on it too (a payment at 23:30 UTC
- * in BST is the next London day). Shipment, allocation and refund event days stay on the UTC day.
+ * The BUSINESS (Europe/London) calendar day of an instant, or null when absent or invalid. EVERY event day of the batch (paid, shipped, allocated, refunded) is read
+ * on this day, so the deferral, the reclassification, the recognition and the COGS agree with the invoice, the receipt and the refund's own legs, which are dated on it
+ * too (a payment at 23:30 UTC in BST is the next London day). The run's own day is the London day as well, so no event day is ever after it.
  */
 export function businessDay(value: Date | string | null | undefined): string | null {
   if (value == null) return null

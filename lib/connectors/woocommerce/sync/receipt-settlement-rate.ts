@@ -1,4 +1,5 @@
 import { endOfBusinessDateUtc, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-select'
+import { businessDateYmd } from '@/lib/business-date'
 
 /**
  * o3d-q0x56.19 - THE SETTLEMENT RATE OF AN IMPORTED WOOCOMMERCE RECEIPT (owner ruling 2026-10-25).
@@ -31,10 +32,18 @@ export function utcCalendarDate(instant: Date): string {
 
 /**
  * THE SAME-DAY TEST, the importer's own and the reconciliation pack's (R16 holds a posted receipt to it): the receipt keeps the order's booked rate only when
- * the payment's UTC calendar date equals the order's. An unknown order instant (null) is never "the same day".
+ * the payment's business (London) day equals the order's, the day the invoice and the payment are dated. An unknown order instant (null) is never "the same day".
  */
 export function receiptOnOrderDay(orderedAt: Date | null, paidAt: Date): boolean {
-  return orderedAt !== null && utcCalendarDate(paidAt) === utcCalendarDate(orderedAt)
+  return orderedAt !== null && businessDateYmd(paidAt) === businessDateYmd(orderedAt)
+}
+
+/**
+ * The same test for a payment already POSTED, when only its (London business) payment day is known, as the reconciliation pack has it: the day equals the order's London day.
+ * A payment posted before the day moved to London carries the UTC day of the payment, so `legacyUtcDay` (true) judges it by the old rule: the posted day equals the order's UTC day.
+ */
+export function postedReceiptOnOrderDay(orderedAt: Date | null, postedDay: string, legacyUtcDay = false): boolean {
+  return orderedAt !== null && postedDay === (legacyUtcDay ? utcCalendarDate(orderedAt) : businessDateYmd(orderedAt))
 }
 
 export type WcReceiptRateLookup = (currency: string, asOf: Date) => Promise<number>
@@ -61,13 +70,14 @@ export async function resolveWcReceiptSettlementRate(params: {
   }
   // no known order instant is never "the same day": the payment-day central rate is used
   if (receiptOnOrderDay(params.orderedAt, paidAt)) return params.orderRate
-  const asOf = endOfBusinessDateUtc(paidAt)
+  // The end of the payment's BUSINESS day (the day it is posted on), the very instant the reconciliation pack's posted-vs-table check reads (R16: endOfBusinessDateUtc(posted day)).
+  const asOf = endOfBusinessDateUtc(businessDateYmd(paidAt))
   try {
     return await params.lookup(currency, asOf)
   } catch (error) {
     if (!isMissingFxRateError(error)) throw error
     throw new MissingFxRateError(
-      `foreign_payment_missing_rate: ${error.message} (the payment was made on ${utcCalendarDate(paidAt)}, a different day from the order; the order's rate is not used for it)`,
+      `foreign_payment_missing_rate: ${error.message} (the payment was made on ${businessDateYmd(paidAt)}, a different day from the order; the order's rate is not used for it)`,
       error.currency, error.asOf ?? asOf, error.reason, error.baseCurrency,
     )
   }

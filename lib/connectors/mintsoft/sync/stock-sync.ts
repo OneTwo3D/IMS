@@ -78,6 +78,7 @@ import {
 import { headerDiscountFactorForPo, unabsorbedBaseForQty, type LandedAllocationFloor } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
+import { businessDateYmd } from '@/lib/business-date'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 
 /**
@@ -2044,7 +2045,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
           // "are these still the right account codes".
           const accounts = await accountsForPosting(accountingConnector)
           const payload = {
-            date: now.toISOString().slice(0, 10),
+            date: businessDateYmd(now),
             reference: `Receipt: ${purchaseCost.poReference}`,
             narration: `Stock receipt for PO ${purchaseCost.poReference} via Mintsoft alignment against ASN `
               + `${candidate.asn.externalAsnId}`,

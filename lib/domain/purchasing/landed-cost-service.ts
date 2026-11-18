@@ -45,6 +45,7 @@ export {
   normalizeLandedCostMethod,
   type LandedCostDistributionMethod,
 } from './landed-cost-allocation'
+import { businessDateYmd } from '@/lib/business-date'
 
 export type PendingGrossCostLine = {
   id: string
@@ -1058,7 +1059,7 @@ export function buildLandedCostReclassJournalPayload(input: {
 }) {
   const { primaryPoRef, absDelta, isIncrease } = input
   return {
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     reference: `Landed cost reclass — ${primaryPoRef}`,
     narration: `Late landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} on ${primaryPoRef}`,
     lines: [
@@ -1086,7 +1087,7 @@ export function buildLandedCostCogsJournalPayload(input: {
 }) {
   const { primaryPoRef, absDelta, isIncrease } = input
   return {
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     reference: `Landed cost adjustment — ${primaryPoRef}`,
     narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${primaryPoRef}`,
     lines: [
