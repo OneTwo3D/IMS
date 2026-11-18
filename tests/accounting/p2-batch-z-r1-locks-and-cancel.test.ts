@@ -34,13 +34,13 @@ function stubTx(rows: { sync?: { id: string; connector: string; type: string } |
   }
 }
 
-test('posted-invoice detection selects asserted and id-less SYNCED rows and carves out only a verified reversal', async () => {
+test('posted-invoice detection selects proven ledger facts (never a bare FAILED id) and carves out a verified reversal', async () => {
   const { tx, calls } = stubTx({ sync: { id: 's1', connector: 'xero', type: 'SALES_INVOICE' } })
   const found = await findPostedSalesInvoiceSync(tx, 'order-1')
   assert.equal(found?.id, 's1')
   const where = JSON.stringify(calls[0].where)
-  // No settlement-basis restriction on the claim itself (an OPERATOR_ASSERTION row with a typed id is a claim to have posted) ...
-  assert.doesNotMatch(where, /"settlementBasis":"OPERATOR_RELEASE"/)
+  // Connector writeback or operator release only: an asserted row or a FAILED row that merely carries an id is not a ledger fact ...
+  assert.match(where, /"settlementBasis":"OPERATOR_RELEASE"/)
   assert.match(where, /"status":"SYNCED"/)
   // ... and a row whose cancellation the connector verified is excluded.
   assert.match(where, /"settlementBasis":\{"not":"VERIFIED_REVERSAL"\}/)

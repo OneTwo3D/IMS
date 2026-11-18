@@ -1774,15 +1774,12 @@ test('o3d-hqvrp.41: a repeated storefront cancel does not raise a second task fo
   assert.equal(operatorTaskWrites.length, 1)
 })
 
-test('o3d-hqvrp.41: a Xeroom-era invoice (external invoice number, no IMS row) counts as posted', async () => {
+test('o3d-hqvrp.41: a WooCommerce invoice number with no proven ledger row is NOT a posted invoice', async () => {
   const state = baseState({ order: { ...baseState().order, status: 'ALLOCATED' } })
   Object.assign(state.order, { invoiceNumber: 'INV-0042', shoppingLinks: [{ connector: 'woocommerce' }] })
   const client = createClient(state)
-
   const error = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' }).catch((e) => e)
-  assert.equal(isPermanentStatusTransitionError(error), true)
-  assert.match(String(error?.message), /already posted to xeroom \(INV-0042\)/)
-  assert.equal(state.order.status, 'ALLOCATED')
+  assert.doesNotMatch(String(error?.message ?? ''), /already posted/)
 })
 
 test('o3d-hqvrp.41: an invoice number IMS minted itself (no external connector) is not evidence of a posted invoice', async () => {
