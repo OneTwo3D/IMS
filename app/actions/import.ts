@@ -30,6 +30,7 @@ import {
 } from '@/lib/products/categories'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { recordComponentRowFailure, type ComponentPassRow } from '@/lib/products/import-row-accounting'
 import { endOfBusinessDateUtc } from '@/lib/currencies/fx-select'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
@@ -105,11 +106,12 @@ function capRows<T>(rows: T[]): { rows: T[]; dropped: number } {
 
 function buildImportPreviewResult(
   totalRows: number,
-  result: { created: number; updated: number; skipped: number; errors: string[] },
+  result: { created: number; updated: number; skipped: number; componentsFailed?: number; errors: string[] },
   dropped: number,
   error?: string,
 ) {
   return createCsvImportPreviewResult({
+    componentsFailed: result.componentsFailed,
     totalRows,
     created: result.created,
     updated: result.updated,
@@ -347,7 +349,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
   // during pass 2. That map is mutated by every rename in pass 1, so a SKU freed by one row
   // and reassigned to a different product by a later row resolved to the WRONG product —
   // which then passed both the sku and type checks, and had its component list replaced.
-  const componentRows: { lineNum: number; sku: string; productId: string; components: string }[] = []
+  const componentRows: ComponentPassRow[] = []
   const touchedProducts: Array<{ id: string; lifecycleStatus: ProductLifecycleStatus }> = []
   const createdProductIds = new Set<string>()
   const updatedProductIds = new Set<string>()
@@ -383,6 +385,8 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
 
   for (let i = 0; i < sorted.length; i++) {
     const { row, lineNum } = sorted[i]
+    // Which counter this row landed in (set where created++/updated++ happen); pass 2 needs it to move the row, not add it again.
+    let rowOutcome: 'created' | 'updated' = 'updated'
 
     const productIdFromRow = readCsvValue(row, 'productId', 'productid').trim() || null
     const sku = row['sku']?.trim()
@@ -759,6 +763,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
         touchedProducts.push({ id: existingProduct.id, lifecycleStatus })
         updatedProductIds.add(existingProduct.id)
         result.updated++
+        rowOutcome = 'updated'
       } else {
         const createData = {
           sku,
@@ -909,6 +914,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
         touchedProducts.push({ id: created.id, lifecycleStatus })
         createdProductIds.add(created.id)
         result.created++
+        rowOutcome = 'created'
       }
 
       // Track components for second pass
@@ -921,7 +927,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
       if (componentsStr && COMPONENT_BEARING_TYPES.has(committedType)) {
         const componentProductId = skuToId.get(sku)
         if (componentProductId) {
-          componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr })
+          componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr, rowOutcome, componentFailureCounted: false })
         }
       }
 
@@ -967,6 +973,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
 
     if (hasComponentError) {
       result.errors.push(`Row ${cr.lineNum}: ${cr.sku} components were not updated because one or more component values were invalid`)
+      recordComponentRowFailure(result, cr)
       continue
     }
 
@@ -976,10 +983,12 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
       const preflight = await detectComponentCycle(productId, components.map((c) => c.componentId))
       if (preflight.kind === 'self') {
         result.errors.push(`Row ${cr.lineNum}: ${cr.sku} cannot be a component of itself`)
+        recordComponentRowFailure(result, cr)
         continue
       }
       if (preflight.kind === 'cycle') {
         result.errors.push(`Row ${cr.lineNum}: circular BOM reference detected for ${cr.sku}`)
+        recordComponentRowFailure(result, cr)
         continue
       }
 
@@ -1005,7 +1014,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
             `Row ${cr.lineNum}: ${cr.sku} would make the manufacturing BOM graph circular `
             + `(${bomCycle.join(' -> ')}) — neither the component list nor the BOM recipe was written`,
           )
-          result.skipped++
+          recordComponentRowFailure(result, cr)
           continue
         }
       }
@@ -1138,6 +1147,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
               + 'or cancel those orders and re-run; already shipped, completed, delivered or cancelled '
               + 'orders do not block',
             )
+            recordComponentRowFailure(result, cr)
             continue
           }
           if (!wrote) {
@@ -1147,6 +1157,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
               `Row ${cr.lineNum}: ${cr.sku} no longer accepts components (its type changed while the import `
               + 'was running) — components were not written',
             )
+            recordComponentRowFailure(result, cr)
             continue
           }
           const product = touchedProducts.find((entry) => entry.id === productId)
@@ -1167,11 +1178,12 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
         // dry-run preview the operator decides on.
         if (e instanceof BomRecipeCycleError) {
           result.errors.push(e.message)
-          result.skipped++
+          recordComponentRowFailure(result, cr)
           continue
         }
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push(`Components for ${cr.sku}: ${msg}`)
+        recordComponentRowFailure(result, cr)
       }
     }
   }

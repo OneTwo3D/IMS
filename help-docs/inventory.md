@@ -45,7 +45,7 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
 
 ### CSV Export
 
-The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list), **Import CSV** and **New Product**. To change many existing products through a spreadsheet, select them and use **Edit by CSV**; see [Products: Edit by CSV](products.md).
+The buttons above the list are **Template** (a blank import file with the guidance row), **Export CSV** (the current filtered product list; the price columns are present but blank unless your role has the inventory prices permission), **Import CSV** and **New Product**. To change many existing products through a spreadsheet, select them and use **Edit by CSV**; see [Products: Edit by CSV](products.md).
 
 If you have set up [custom fields](#custom-fields) for products, **Export CSV** adds one extra column for each field that is switched on, named `cf:` followed by the field's key (for example `cf:hazard_class`). They come after all the other columns, so existing columns keep their place. On **Import CSV**, a `cf:` column writes that field. As with every other column, **a blank cell means "leave this value as it is"**: it never clears a value (clear one on the product page). A value that does not suit the field's type, or is not one of a dropdown's choices, is reported against its row; the rest of that product's row still imports and the product keeps its other custom field values. A `cf:` column that does not match a field switched on for products is reported once and ignored. The **Template** file does not include `cf:` columns: add them yourself, or start from an export.
 
@@ -60,6 +60,8 @@ Every screen with a **Templates** menu (Inventory, Customers, Suppliers, Sales O
 - To clear a value, use a sentinel like `NULL` or `-` per column where the importer documents it; a blank cell is read as "leave alone".
 
 These rules apply consistently across every CSV import in the app — if a screen has a Templates menu next to its Import button, the template, the guidance row, and the empty-cell behaviour all work the same way.
+
+**Component failures.** In a product import, a KIT or BOM row is saved before its components are applied. If its components or recipe are refused (invalid component, circular reference, orders in flight), the row stays counted as created or updated, the result says how many rows were saved without their components, the import is not reported as fully successful, and the messages say why. Fix those rows and re-import.
 
 **Row and file limits.** Every CSV importer accepts at most **10,000 rows** and **10 MB** per file.
 A file over 10 MB is refused outright and nothing is imported. A file with more than 10,000 rows is
