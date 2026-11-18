@@ -24,7 +24,19 @@ import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { validateBackupScheduleInput, type BackupScheduleInput } from '@/lib/domain/settings/backup-schedule-input'
 import { toIsoCountryCode } from '@/lib/countries'
-import { getSettingValue, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
+import { getSettingValue, maskSettingSecret, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
+
+/**
+ * Backup target credentials are written only by `saveBackupTargetSettings` (fresh-auth gated). They are
+ * never returned decrypted by the generic reader: a session without step-up could otherwise read the
+ * S3 secret / SFTP password / private key just by naming the key. Same mask format as the settings
+ * screens (first 4 characters + `****`).
+ */
+const WRITE_ONLY_BACKUP_SECRET_KEYS: ReadonlySet<string> = new Set([
+  'backup_s3_secret_key',
+  'backup_sftp_password',
+  'backup_sftp_private_key',
+])
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
 import { maybeQueueTaxRateSync } from '@/lib/accounting/tax-rate-sync-trigger'
 import {
@@ -941,7 +953,9 @@ export async function getSetting(key: string): Promise<string | null> {
   // legitimate callers of the sensitive keys are the backup and sales settings
   // pages, which are ADMIN-only, so 'settings' costs them nothing.
   if (SENSITIVE_SETTING_KEYS.has(key)) await requirePermission('settings')
-  return getSettingValue(key)
+  const value = await getSettingValue(key)
+  if (WRITE_ONLY_BACKUP_SECRET_KEYS.has(key)) return value ? maskSettingSecret(key, value) : null
+  return value
 }
 
 export type UserOption = { id: string; name: string; email: string }

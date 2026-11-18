@@ -537,3 +537,16 @@ test('the seeded retired-connector rows ARE readable — by ADMIN, and only by A
   assert.equal(checked, RETIRED_CONNECTOR_CREDENTIAL_KEYS.length, 'the loop must have run for every key')
   assert.ok(checked >= 7, `expected at least 7 retired credential keys, checked ${checked}`)
 })
+
+test('getSetting never returns the backup target secrets decrypted, even to an ADMIN (masked: first 4 chars + ****)', async () => {
+  currentRole = 'ADMIN'
+  const { getSetting } = await import('@/app/actions/settings')
+  for (const key of ['backup_s3_secret_key', 'backup_sftp_password', 'backup_sftp_private_key']) {
+    seededSettingRows.set(key, `seeded-secret-for-${key}`)
+    const value = await getSetting(key)
+    assert.equal(value, 'seed****', key)
+    assert.equal(String(value).includes('secret-for'), false, key)
+  }
+  seededSettingRows.delete('backup_s3_secret_key')
+  assert.equal(await getSetting('backup_s3_secret_key'), null)
+})
