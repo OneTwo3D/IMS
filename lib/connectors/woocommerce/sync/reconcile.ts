@@ -56,7 +56,7 @@ export type WcReconcileResult = {
   products?: Awaited<ReturnType<typeof syncAllWcProducts>> | WcReconcileSkipped
   refundStockCorrections?: { error: string }
   /** IMS-to-WooCommerce product pushes that failed earlier and were pushed again this pass. */
-  productPushRetries?: { retried: number; resolved: number; remaining: number }
+  productPushRetries?: { retried: number; resolved: number; remaining: number; deferred: number }
   stock?: {
     queued: Awaited<ReturnType<typeof processQueuedWcStockSyncJobs>>
     sync?: Awaited<ReturnType<typeof pushStockToWc>>
@@ -73,8 +73,31 @@ export type WcReconcileResult = {
   }
 }
 
+/**
+ * o3d-hqvrp.106: product pushes IMS sent WooCommerce that failed before a successful write (an error answer, a timeout) are pushed again, but
+ * only AFTER the stock queue and the stock reconcile, and only inside what is left of the request budget, so a slow store cannot starve the
+ * stock backstop or run the request past the proxy cut-off. Each retry goes through the same gate and hold as the first push.
+ */
+async function retryProductPushesWithinBudget(results: WcReconcileResult, startedAt: number): Promise<void> {
+  const deadlineAt = startedAt + STOCK_RECONCILE_REQUEST_BUDGET_MS
+  if (Date.now() >= deadlineAt) return
+  try {
+    const { pushProductMetadata } = await import('@/lib/shopping')
+    const retries = await retryFailedWcProductPushes(pushProductMetadata, { deadlineAt })
+    if (retries.retried > 0 || retries.deferred > 0) results.productPushRetries = retries
+  } catch (error) {
+    console.error('[wc-reconcile] retrying failed product pushes failed', error)
+  }
+}
+
 export async function runWcReconcile(): Promise<WcReconcileResult> {
   const startedAt = Date.now()
+  const results = await runWcReconcileStages(startedAt)
+  await retryProductPushesWithinBudget(results, startedAt)
+  return results
+}
+
+async function runWcReconcileStages(startedAt: number): Promise<WcReconcileResult> {
   const results: WcReconcileResult = {}
 
   const webhookPrimaryActive = await isWcOrderWebhookPrimaryActive()
@@ -133,16 +156,6 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
             }
       }
     }
-  }
-
-  // o3d-hqvrp.106: product pushes IMS sent WooCommerce that failed (an error or a timeout) are pushed again on every pass. Every pass reads
-  // a database queue; each retry goes through the same gate and hold as the first push, and a product the settings forbid is not retried.
-  try {
-    const { pushProductMetadata } = await import('@/lib/shopping')
-    const retries = await retryFailedWcProductPushes(pushProductMetadata)
-    if (retries.retried > 0) results.productPushRetries = retries
-  } catch (error) {
-    console.error('[wc-reconcile] retrying failed product pushes failed', error)
   }
 
   const stockEnabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })

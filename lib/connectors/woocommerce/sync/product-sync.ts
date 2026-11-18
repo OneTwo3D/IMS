@@ -2262,17 +2262,48 @@ export function buildImsToWcProductPayload(product: {
   return updateData
 }
 
-type PushImsProductToWcResult = { success: boolean; error?: string; skipped?: boolean; warning?: string }
+type PushImsProductToWcResult = {
+  success: boolean
+  error?: string
+  skipped?: boolean
+  warning?: string
+  /** The failure happened AFTER WooCommerce accepted the PUT (a verification failure). Sending the same PUT again cannot help and can overwrite store-side edits. */
+  permanent?: boolean
+}
 
 /** The `recordKind` of the open record a failed IMS-to-WooCommerce product push leaves for the retry sweep. */
 export const WC_PRODUCT_PUSH_RETRY_KIND = 'product_push_retry'
+/** The `recordKind` of an open record for a push that failed AFTER a successful PUT. Visible in the sync log, never retried by the sweep. */
+export const WC_PRODUCT_PUSH_PERMANENT_KIND = 'product_push_failed'
 /** A failed push is retried for this long after it first failed; after that the FAILED row stays for an operator. */
 const WC_PRODUCT_PUSH_RETRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+/** Per-product backoff: 1h after the first failure, then doubling (2h, 4h, ...), never past the retry window itself. */
+const WC_PRODUCT_PUSH_BACKOFF_BASE_MS = 60 * 60 * 1000
+/** Namespace of the per-product advisory lock that serialises recording an outcome (one open row per product). */
+const WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE = 0x57_43_50 // 'WCP'
+
+export function nextProductPushRetryDelayMs(failures: number): number {
+  const exponent = Math.min(Math.max(failures, 1) - 1, 20)
+  return Math.min(WC_PRODUCT_PUSH_BACKOFF_BASE_MS * 2 ** exponent, WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
+}
+
+type PushRetryState = { attempts: number; lastAttemptAt: string; nextDueAt: string }
+
+function readPushRetryState(payload: unknown): Partial<PushRetryState> {
+  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return {}
+  const raw = payload as Record<string, unknown>
+  return {
+    ...(typeof raw.attempts === 'number' ? { attempts: raw.attempts } : {}),
+    ...(typeof raw.lastAttemptAt === 'string' ? { lastAttemptAt: raw.lastAttemptAt } : {}),
+    ...(typeof raw.nextDueAt === 'string' ? { nextDueAt: raw.nextDueAt } : {}),
+  }
+}
 
 /**
  * Push one IMS product to WooCommerce. A failure (an error answer, a timeout, a thrown error) is no longer dropped: it leaves ONE open FAILED
- * ShoppingSyncLog row per product, which `retryFailedWcProductPushes` (run by the reconcile cron) pushes again, and a later success closes.
- * A push the settings or the hold skipped is neither a failure nor a success and touches nothing.
+ * ShoppingSyncLog row per product (recorded under a per-product lock, so concurrent failures cannot leave two). A failure BEFORE a successful
+ * PUT is picked up by `retryFailedWcProductPushes` with exponential backoff; a failure AFTER the PUT (a verification failure) is recorded as a
+ * permanent, visible row and never sent again. A later success closes the row. A push the settings or the hold skipped touches nothing.
  */
 export async function pushImsProductToWc(productId: string): Promise<PushImsProductToWcResult> {
   const result = await pushImsProductToWcOnce(productId)
@@ -2280,26 +2311,11 @@ export async function pushImsProductToWc(productId: string): Promise<PushImsProd
   try {
     if (result.success) {
       await db.shoppingSyncLog.updateMany({
-        where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED' },
+        where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: { in: [WC_PRODUCT_PUSH_RETRY_KIND, WC_PRODUCT_PUSH_PERMANENT_KIND] }, status: 'FAILED' },
         data: { status: 'SYNCED', syncedAt: new Date() },
       })
     } else {
-      const open = await db.shoppingSyncLog.updateMany({
-        where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED' },
-        data: { errorMessage: (result.error ?? 'unknown error').slice(0, 2000) },
-      })
-      if (open.count === 0) {
-        await db.shoppingSyncLog.create({
-          data: {
-            direction: 'TO_CONNECTOR',
-            status: 'FAILED',
-            entityType: 'Product',
-            entityId: productId,
-            errorMessage: (result.error ?? 'unknown error').slice(0, 2000),
-            recordKind: WC_PRODUCT_PUSH_RETRY_KIND,
-          },
-        })
-      }
+      await recordFailedProductPush(productId, result)
     }
   } catch (bookkeepingError) {
     // Recording must never turn a push result into a throw for the caller.
@@ -2308,24 +2324,66 @@ export async function pushImsProductToWc(productId: string): Promise<PushImsProd
   return result
 }
 
+async function recordFailedProductPush(productId: string, result: PushImsProductToWcResult): Promise<void> {
+  const errorMessage = (result.error ?? 'unknown error').slice(0, 2000)
+  const recordKind = result.permanent ? WC_PRODUCT_PUSH_PERMANENT_KIND : WC_PRODUCT_PUSH_RETRY_KIND
+  await db.$transaction(async (tx) => {
+    // Two failures for one product (the save path and the sweep) take turns here, so the second sees the first's row and updates it.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE}::int4, hashtext(${productId}))`
+    const open = await tx.shoppingSyncLog.findFirst({
+      where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: { in: [WC_PRODUCT_PUSH_RETRY_KIND, WC_PRODUCT_PUSH_PERMANENT_KIND] }, status: 'FAILED' },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, payload: true },
+    })
+    const now = Date.now()
+    const attempts = (readPushRetryState(open?.payload).attempts ?? 0) + 1
+    const state: PushRetryState = {
+      attempts,
+      lastAttemptAt: new Date(now).toISOString(),
+      nextDueAt: new Date(now + nextProductPushRetryDelayMs(attempts)).toISOString(),
+    }
+    if (open) {
+      await tx.shoppingSyncLog.update({ where: { id: open.id }, data: { errorMessage, recordKind, payload: state } })
+      return
+    }
+    await tx.shoppingSyncLog.create({
+      data: { direction: 'TO_CONNECTOR', status: 'FAILED', entityType: 'Product', entityId: productId, errorMessage, recordKind, payload: state },
+    })
+  })
+}
+
 /**
- * Push again every product whose last push failed (oldest first, bounded). Goes through `retry` (the caller's pushProductMetadata) so the
- * settings gate and the producer hold apply exactly as for the first attempt. Returns counts only.
+ * Push again the products whose last push failed before a successful PUT, in the order they come due (backoff per product: 1h, 2h, 4h, ...
+ * capped at 7 days). Goes through `retry` (the caller's pushProductMetadata) so the settings gate and the producer hold apply exactly as for
+ * the first attempt. Stops starting new pushes at `deadlineAt`; the rest wait for the next pass. Returns counts only.
  */
 export async function retryFailedWcProductPushes(
   retry: (productId: string) => Promise<{ success: boolean; skipped?: boolean }>,
-  options?: { limit?: number; now?: number },
-): Promise<{ retried: number; resolved: number; remaining: number }> {
-  const since = new Date((options?.now ?? Date.now()) - WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
+  options?: { limit?: number; now?: number; deadlineAt?: number },
+): Promise<{ retried: number; resolved: number; remaining: number; deferred: number }> {
+  const now = options?.now ?? Date.now()
+  const since = new Date(now - WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
   const rows = await db.shoppingSyncLog.findMany({
     where: { connector: 'woocommerce', entityType: 'Product', recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED', createdAt: { gte: since }, entityId: { not: null } },
     orderBy: { createdAt: 'asc' },
-    select: { entityId: true },
-    take: options?.limit ?? 50,
+    select: { entityId: true, payload: true, createdAt: true },
+    take: 1000,
   })
-  const ids = [...new Set(rows.map((row) => row.entityId).filter((id): id is string => id != null))]
+  const due = new Map<string, number>()
+  for (const row of rows) {
+    if (row.entityId == null || due.has(row.entityId)) continue
+    const state = readPushRetryState(row.payload)
+    const dueAt = state.nextDueAt ? Date.parse(state.nextDueAt) : Number.NEGATIVE_INFINITY
+    if (!Number.isNaN(dueAt) && dueAt > now) continue
+    due.set(row.entityId, Number.isNaN(dueAt) ? Number.NEGATIVE_INFINITY : dueAt)
+  }
+  const ordered = [...due.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id)
+  const ids = ordered.slice(0, options?.limit ?? 50)
   let resolved = 0
+  let retried = 0
   for (const id of ids) {
+    if (options?.deadlineAt != null && Date.now() >= options.deadlineAt) break
+    retried++
     try {
       const outcome = await retry(id)
       if (outcome.success && !outcome.skipped) resolved++
@@ -2333,7 +2391,7 @@ export async function retryFailedWcProductPushes(
       console.error('[wc-product-push] retry threw', error)
     }
   }
-  return { retried: ids.length, resolved, remaining: ids.length - resolved }
+  return { retried, resolved, remaining: retried - resolved, deferred: ordered.length - retried }
 }
 
 async function pushImsProductToWcOnce(
@@ -2517,12 +2575,12 @@ async function pushImsProductToWcOnce(
     if (putError) return { success: false, error: putError }
     if (expectedMpn && wcResponseConfirmsMpn(putData, expectedMpn.key, expectedMpn.mpn) === false) {
       // A plugin filter can reject a meta write and still answer 200: do not call that a success.
-      return { success: false, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }
+      return { success: false, permanent: true, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }
     }
     if (expectedGuidCleared) {
       const stored = (putData as { global_unique_id?: unknown } | null)?.global_unique_id
       if (typeof stored === 'string' && stored.trim() !== '') {
-        return { success: false, error: 'WooCommerce accepted the request but did not clear the stale GTIN field' }
+        return { success: false, permanent: true, error: 'WooCommerce accepted the request but did not clear the stale GTIN field' }
       }
     }
 

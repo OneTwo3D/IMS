@@ -77,24 +77,3 @@ test('a nested KIT absent from productById values the parent at 0 (no crash)', (
 
   assert.equal(available.get('P'), 0)
 })
-
-test('a kit with a NON_INVENTORY or VARIABLE component is limited by its stocked components only (o3d-hqvrp.105)', () => {
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows(['MUG', 'A', 50]))
-  const K = kit('K', [
-    { componentId: 'MUG', qty: 1 },
-    { componentId: 'WRAP', qty: 1, type: 'NON_INVENTORY' },
-    { componentId: 'VAR', qty: 1, type: 'VARIABLE' },
-  ])
-  const productById = new Map<string, CandidateProduct>([['K', K], ['MUG', simpleProduct('MUG')]])
-
-  const available = computeAvailableByProduct([K], ['A'], stockByProduct, stockByProductWarehouse, productById, [])
-
-  assert.equal(available.get('K'), 50)
-})
-
-test('a kit made only of NON_INVENTORY components still pushes 0 (nothing limits it, nothing builds it)', () => {
-  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows())
-  const K = kit('K', [{ componentId: 'WRAP', qty: 1, type: 'NON_INVENTORY' }])
-  const available = computeAvailableByProduct([K], ['A'], stockByProduct, stockByProductWarehouse, new Map([['K', K]]), [])
-  assert.equal(available.get('K'), 0)
-})

@@ -484,26 +484,71 @@ export type BatchClampContext = {
   productById: Map<string, CandidateProduct>
   whIds: string[]
   heldByProduct: ReadonlyMap<string, number> | undefined
+  /** o3d-taro: the back-in-stock date push is on. A clamp to 0 then recomputes the date meta exactly as the normal path does. */
+  etaEnabled?: boolean
+  previousStateByProductId?: ReadonlyMap<string, { lastPushedEtaDate: string | null }>
 }
 
-/** Lower (never raise) each entry's quantity to what is available now. */
+/**
+ * Lower (never raise) each entry's quantity to what is available now. A database error here never aborts the run: the batch is sent
+ * unclamped (exactly what it would have been before the clamp existed) and the failure is logged.
+ */
 async function clampBatchToCurrentStock(batch: PushEntry[], ctx: BatchClampContext): Promise<void> {
   const batchProducts = batch
     .map((entry) => ctx.productById.get(entry.productId))
     .filter((product): product is CandidateProduct => product != null)
   if (batchProducts.length === 0) return
-  const fresh = await computeFreshAvailableByProduct(
-    batchProducts,
-    ctx.productById,
-    ctx.whIds,
-    stockIdsForBatch(batch, ctx.productById),
-    ctx.heldByProduct,
-  )
+  let fresh: Map<string, number>
+  try {
+    fresh = await computeFreshAvailableByProduct(
+      batchProducts,
+      ctx.productById,
+      ctx.whIds,
+      stockIdsForBatch(batch, ctx.productById),
+      ctx.heldByProduct,
+    )
+  } catch (error) {
+    console.error('[wc-stock-push] could not re-read current stock for a batch; sending it unclamped', error)
+    await logActivity({
+      entityType: 'SYNC', action: 'stock_sync_clamp_failed', tag: 'sync', level: 'WARNING',
+      description: `Stock push could not re-read current stock for a batch of ${batch.length}; the batch was sent unclamped`,
+      metadata: { error: error instanceof Error ? error.message : String(error), skus: batch.slice(0, 10).map((entry) => entry.sku) },
+    }).catch(() => undefined)
+    return
+  }
+  const loweredToZero: PushEntry[] = []
   for (const entry of batch) {
     const available = fresh.get(entry.productId)
     if (available === undefined) continue
     const clamped = Math.floor(Math.min(entry.payload.stock_quantity, available))
-    if (clamped < entry.payload.stock_quantity) entry.payload.stock_quantity = clamped
+    if (clamped < entry.payload.stock_quantity) {
+      const wasPositive = entry.payload.stock_quantity > 0
+      entry.payload.stock_quantity = clamped
+      if (wasPositive && clamped <= 0) loweredToZero.push(entry)
+    }
+  }
+  if (!ctx.etaEnabled || loweredToZero.length === 0) return
+  // The date meta was decided from the pre-clamp quantity. A product now at 0 gets the same treatment as one that was at 0 to begin with:
+  // only a simple stockable product can carry a date, and only committed, dated, not-late supply produces one.
+  const eligible = loweredToZero.filter((entry) => {
+    const product = ctx.productById.get(entry.productId)
+    return product != null && (product.type === 'SIMPLE' || product.type === 'VARIANT') && !shouldForceWooZeroStock(product.lifecycleStatus)
+  })
+  if (eligible.length === 0) return
+  try {
+    const dates = await loadBackInStockDates(eligible.map((entry) => entry.productId))
+    for (const entry of eligible) {
+      const etaDate = dates.get(entry.productId) ?? ''
+      entry.etaDate = etaDate
+      if (etaDate !== '' || (ctx.previousStateByProductId?.get(entry.productId)?.lastPushedEtaDate ?? '') !== '') {
+        entry.payload.meta_data = [{ key: WC_ETA_DATE_META_KEY, value: etaDate }]
+      } else {
+        delete entry.payload.meta_data
+      }
+    }
+  } catch (error) {
+    // The quantity is already lowered (safe); only the date is left as decided before the clamp, to be corrected by the next push.
+    console.error('[wc-stock-push] could not look up the back-in-stock date after a clamp to 0', error)
   }
 }
 
@@ -1038,7 +1083,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
 
   if (needsResolution.length > 0) {
     await options?.onProgress?.({ phase: 'resolving', processed: 0, synced: 0, total: needsResolution.length })
-    const { resolved, errors: lookupErrors, totalAttempts, failedAttempts } =
+    const { resolved, errors: lookupErrors, totalAttempts, failedAttempts, skippedParents } =
       await resolveSkusInParallel(needsResolution, creds)
 
     // If every single lookup call failed, treat as a WC outage — bail hard.
@@ -1060,8 +1105,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       return result
     }
 
+    // o3d-hqvrp.104: a parent whose variation list cannot be read (over the cap, or a page that keeps failing) is skipped for this pass. It is
+    // reported, but is not a window error: otherwise one such parent would hold the daily reconcile at its window for ever.
+    const skippedParentSkus = new Set(skippedParents.flatMap((parent) => parent.skus))
+    if (skippedParents.length > 0) {
+      result.skippedParents = skippedParents.map((parent) => `${parent.parentSku} (${parent.skus.length} variant(s)): ${parent.reason}`)
+      await logActivity({
+        entityType: 'SYNC', action: 'stock_sync_parent_skipped', tag: 'sync', level: 'WARNING',
+        description: `Stock sync skipped ${skippedParents.length} variable parent(s) this pass because their variation list could not be read completely; their variants were not pushed`,
+        metadata: { parents: result.skippedParents.slice(0, 10) },
+      })
+    }
+
     // Partial failures: record as errors, leave those SKUs out of matched/unmatched counting.
-    const failedLookupSkus = new Set(lookupErrors.map((e) => e.sku))
+    const failedLookupSkus = new Set([...lookupErrors.map((e) => e.sku), ...skippedParentSkus])
     for (const err of lookupErrors) {
       result.errors.push(`lookup failure for SKU ${err.sku}: ${err.error}`)
     }
@@ -1450,7 +1507,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // belong to), but continuing would keep pushing to the old store
   // after the operator explicitly disconnected it. Break out and
   // surface the abort instead.
-  const clampCtx: BatchClampContext = { productById, whIds, heldByProduct }
+  const clampCtx: BatchClampContext = { productById, whIds, heldByProduct, etaEnabled, previousStateByProductId }
   await options?.onProgress?.({ phase: 'pushing', processed: 0, synced: 0, total: pushEntries.length })
   for (let i = 0; i < pushEntries.length; i += WC_BATCH_SIZE) {
     const batch = pushEntries.slice(i, i + WC_BATCH_SIZE)
@@ -2113,9 +2170,6 @@ function computeKitAvailability(
         kitsInWarehouse = 0
         break
       }
-      // A service, leaflet, gift wrap or fee carries no stock rows, and a VARIABLE parent holds none itself: neither limits how many kits
-      // can be built (reading their absent stock as 0 pinned the kit at 0 for ever).
-      if (component.component.type === 'NON_INVENTORY' || component.component.type === 'VARIABLE') continue
       let available = Math.max(0, stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? 0)
       if (component.component.type === 'KIT') {
         const nested = productById.get(component.componentId)
@@ -2341,7 +2395,7 @@ const MAX_VARIATION_PAGES = 20
 async function fetchAllVariationsOfParent(
   parentWcId: number,
   creds: ConnectorCredentials,
-): Promise<{ data: unknown; error?: string }> {
+): Promise<{ data: unknown; error?: string; overCap?: boolean }> {
   const all: unknown[] = []
   for (let page = 1; page <= MAX_VARIATION_PAGES; page++) {
     const res = await safeWcFetch(
@@ -2354,7 +2408,7 @@ async function fetchAllVariationsOfParent(
     all.push(...rows)
     if (rows.length < 100) return { data: all }
   }
-  return { data: null, error: `parent WC ${parentWcId} has more than ${MAX_VARIATION_PAGES * 100} variations; refusing a partial read` }
+  return { data: null, overCap: true, error: `parent WC ${parentWcId} has more than ${MAX_VARIATION_PAGES * 100} variations; refusing a partial read` }
 }
 
 /**
@@ -2382,7 +2436,10 @@ async function resolveSkusInParallel(
   errors: { sku: string; error: string }[]
   totalAttempts: number
   failedAttempts: number
+  /** Parents left out of this pass (over the variation cap, or a variation page that failed). Their variants are neither errors nor unmatched. */
+  skippedParents: { parentSku: string; skus: string[]; reason: string }[]
 }> {
+  const skippedParents: { parentSku: string; skus: string[]; reason: string }[] = []
   const resolved = new Map<string, EffectiveTarget>()
   const errors: { sku: string; error: string }[] = []
   let totalAttempts = 0
@@ -2428,6 +2485,11 @@ async function resolveSkusInParallel(
     const parentWcId = parents[0]?.id
     if (typeof parentWcId !== 'number') continue
 
+    // o3d-hqvrp.104: the parent's whole variation list is read at most ONCE per parent (not once per 100-variant batch), and a parent whose
+    // list cannot be read is skipped for this pass instead of failing its variants (which would hold the daily reconcile window for good).
+    let allVariations: Awaited<ReturnType<typeof fetchAllVariationsOfParent>> | undefined
+    let skipped: { parentSku: string; skus: string[]; reason: string } | undefined
+
     for (let i = 0; i < group.length; i += WC_VARIATION_BATCH_SIZE) {
       const batch = group.slice(i, i + WC_VARIATION_BATCH_SIZE)
       totalAttempts++
@@ -2460,12 +2522,16 @@ async function resolveSkusInParallel(
         continue
       }
 
-      const variationLookup = await fetchAllVariationsOfParent(parentWcId, creds)
+      const firstRead = allVariations === undefined
+      allVariations ??= await fetchAllVariationsOfParent(parentWcId, creds)
+      const variationLookup = allVariations
       if (variationLookup.error) {
-        failedAttempts++
-        for (const product of batch) {
-          errors.push({ sku: product.sku, error: variationLookup.error })
+        if (firstRead && !variationLookup.overCap) failedAttempts++
+        if (!skipped) {
+          skipped = { parentSku, skus: [], reason: variationLookup.error }
+          skippedParents.push(skipped)
         }
+        skipped.skus.push(...batch.map((product) => product.sku))
         continue
       }
       const variations = (variationLookup.data as WcVariation[] | null) ?? []
@@ -2527,7 +2593,7 @@ async function resolveSkusInParallel(
     () => worker(),
   )
   await Promise.all(workers)
-  return { resolved, errors, totalAttempts, failedAttempts }
+  return { resolved, errors, totalAttempts, failedAttempts, skippedParents }
 }
 
 // ---------------------------------------------------------------------------

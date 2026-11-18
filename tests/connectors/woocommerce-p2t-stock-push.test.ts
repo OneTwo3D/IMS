@@ -18,6 +18,9 @@ let posts: Array<{ path: string; body: unknown }> = []
 let onPost: (n: number) => void = () => undefined
 let fetches: Array<{ path: string; params: Record<string, string> }> = []
 let variationPages: Record<string, unknown[]> = {}
+let failVariationPage: string | null = null
+let failStockReadsAfterFirstPost = false
+let etaDates = new Map<string, string>()
 
 function modelProxy(name: string) {
   return new Proxy({}, {
@@ -28,7 +31,10 @@ function modelProxy(name: string) {
       }
       if (name === 'setting' && method === 'findMany') return [...settings].map(([key, value]) => ({ key, value }))
       if (name === 'warehouse' && method === 'findMany') return [{ id: 'w1' }]
-      if (name === 'stockLevel' && method === 'findMany') return levels
+      if (name === 'stockLevel' && method === 'findMany') {
+        if (failStockReadsAfterFirstPost && posts.length >= 1) throw new Error('connection reset')
+        return levels
+      }
       if (name === 'product' && method === 'findMany') return candidates
       if (name === 'product' && method === 'updateMany') return { count: 1 }
       if (name === 'product' && method === 'findUnique') {
@@ -51,6 +57,9 @@ const fakeDb: object = new Proxy({}, {
 
 mock.module('@/lib/db', { namedExports: { db: fakeDb } })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined, logActivityPersisted: async () => true } })
+mock.module('@/lib/domain/inventory/back-in-stock-date', {
+  namedExports: { loadBackInStockDates: async (ids: string[]) => new Map(ids.filter((id) => etaDates.has(id)).map((id) => [id, etaDates.get(id) as string])) },
+})
 mock.module('@/lib/connectors/woocommerce/producer-seam', {
   namedExports: { wooProducerSeam: async () => ({ proceed: true }) },
 })
@@ -60,7 +69,10 @@ mock.module('@/lib/connectors/woocommerce/api', {
       fetches.push({ path, params })
       if (path === '/orders') return { data: [], totalItems: 0, totalItemsPresent: true }
       const variations = /^\/products\/(\d+)\/variations$/.exec(path)
-      if (variations && !params.include) return { data: variationPages[`${variations[1]}:${params.page ?? '1'}`] ?? [] }
+      if (variations && !params.include) {
+        if (failVariationPage === (params.page ?? '1')) return { data: null, error: 'WC API error: 502' }
+        return { data: variationPages[`${variations[1]}:${params.page ?? '1'}`] ?? [] }
+      }
       if (variations && params.include) {
         return { data: Object.values(variationPages).flat().filter((v) => params.include.split(',').includes(String((v as { id: number }).id))) }
       }
@@ -89,6 +101,9 @@ function reset() {
   posts = []
   fetches = []
   variationPages = {}
+  failVariationPage = null
+  failStockReadsAfterFirstPost = false
+  etaDates = new Map()
   onPost = () => undefined
 }
 
@@ -152,4 +167,87 @@ test('variation resolution reads every page of a parent with more than 100 varia
   const variationPush = posts.find((p) => p.path.startsWith('/products/50/variations'))
   assert.ok(variationPush, 'the variation beyond page 1 received its stock')
   assert.equal((variationPush.body as { update: Array<{ id: number }> }).update[0].id, 2000)
+})
+
+const variant = (id: string, sku: string) => product(id, sku, null, { type: 'VARIANT', parent: { sku: 'PAR', externalProductId: BigInt(50) } })
+const fullPage = (page: number) => Array.from({ length: 100 }, (_, i) => ({ id: page * 1000 + i, sku: `OTHER-${page}-${i}` }))
+const listReads = () => fetches.filter((f) => f.path === '/products/50/variations' && !f.params.include)
+
+test('a parent over the 2,000-variation cap is skipped and reported, not a window error (o3d-hqvrp.104)', async () => {
+  reset()
+  candidates = [variant('v1', 'V1'), product('s1', 'SIMPLE-1', BigInt(9))]
+  levels = [
+    { productId: 'v1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
+    { productId: 's1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
+  ]
+  for (let page = 1; page <= 20; page++) variationPages[`50:${page}`] = fullPage(page)
+  const result = await run()
+  assert.deepEqual(result.errors, [], 'no error: the reconcile window must be able to advance')
+  assert.equal(result.skippedParents?.length, 1)
+  assert.match(result.skippedParents?.[0] ?? '', /PAR/)
+  assert.equal(result.unmatched, 0, 'the skipped variant is not counted unmatched either')
+  assert.ok(updates().some((u) => u.id === 9), 'other products still pushed')
+  assert.equal(updates().some((u) => u.id === 2000), false)
+})
+
+test('a variation page that keeps failing skips the parent for the pass, without a window error (o3d-hqvrp.104)', async () => {
+  reset()
+  candidates = [variant('v1', 'V1'), product('s1', 'SIMPLE-1', BigInt(9))]
+  levels = [
+    { productId: 'v1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
+    { productId: 's1', warehouseId: 'w1', quantity: 5, reservedQty: 0 },
+  ]
+  failVariationPage = '1'
+  const result = await run()
+  assert.deepEqual(result.errors, [])
+  assert.equal(result.skippedParents?.length, 1)
+  assert.ok(updates().some((u) => u.id === 9))
+})
+
+test('a parent\'s variation list is read once per parent, not once per 100-variant batch (o3d-hqvrp.104)', async () => {
+  reset()
+  const ids = Array.from({ length: 101 }, (_, i) => `v${String(i).padStart(3, '0')}`)
+  candidates = ids.map((id, i) => variant(id, `V${i}`))
+  levels = ids.map((id) => ({ productId: id, warehouseId: 'w1', quantity: 5, reservedQty: 0 }))
+  variationPages = {
+    '50:1': Array.from({ length: 100 }, (_, i) => ({ id: 1000 + i, sku: `V${i}` })),
+    '50:2': [{ id: 2000, sku: 'V100' }],
+  }
+  await run()
+  assert.equal(listReads().filter((f) => f.params.page === '1').length, 1, 'page 1 is read once for two batches')
+  assert.equal(listReads().filter((f) => f.params.page === '2').length, 1)
+  assert.equal(updates().filter((u) => u.id >= 1000).length, 101, 'all 101 variants resolved and pushed')
+})
+
+test('a database error while re-reading stock for a batch sends it unclamped and does not abort the run (o3d-hqvrp.100)', async () => {
+  reset()
+  const ids = Array.from({ length: 101 }, (_, i) => `p${String(i).padStart(3, '0')}`)
+  candidates = ids.map((id, i) => product(id, `S${i + 1}`, BigInt(i + 1)))
+  levels = ids.map((id) => ({ productId: id, warehouseId: 'w1', quantity: 10, reservedQty: 0 }))
+  failStockReadsAfterFirstPost = true
+  const result = await run()
+  const last = updates().find((u) => u.id === 101)
+  assert.ok(last, 'the second batch was still sent')
+  assert.equal(last.stock_quantity, 10, 'unclamped: the figure computed before the batch loop')
+  assert.equal(result.errors.some((e) => /connection reset/.test(e)), false)
+})
+
+test('a clamp to 0 recomputes the back-in-stock date meta like the normal path (o3d-hqvrp.100)', async () => {
+  reset()
+  settings.set('wc_back_in_stock_date_enabled', 'true')
+  const ids = Array.from({ length: 101 }, (_, i) => `p${String(i).padStart(3, '0')}`)
+  candidates = ids.map((id, i) => product(id, `S${i + 1}`, BigInt(i + 1)))
+  levels = ids.map((id) => ({ productId: id, warehouseId: 'w1', quantity: 10, reservedQty: 0 }))
+  etaDates = new Map([['p100', '2026-12-01']])
+  // Batch 1 is on the wire when the last product sells out.
+  onPost = (n) => {
+    if (n === 1) levels = levels.map((l) => (l.productId === 'p100' ? { ...l, quantity: 0 } : l))
+  }
+  await run()
+  const last = updates().find((u) => u.id === 101)
+  assert.ok(last)
+  assert.equal(last.stock_quantity, 0)
+  assert.deepEqual(last.meta_data, [{ key: '_oti_eta_date', value: '2026-12-01' }], 'clamped to 0 now carries its committed supply date')
+  const other = updates().find((u) => u.id === 1)
+  assert.equal(other?.meta_data, undefined, 'a product that stays in stock carries no date')
 })
