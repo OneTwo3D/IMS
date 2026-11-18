@@ -60,6 +60,7 @@ import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purcha
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
@@ -2953,15 +2954,10 @@ export async function receivePurchaseOrder(
           },
         })
 
-        await createCostLayer(tx, {
-          productId: poLine.productId,
-          warehouseId: rl.warehouseId,
-          qty: qtyReceived,
-          unitCostBase,
-          poLineId: poLine.id,
-          isOpeningStock: false,
-        })
-
+        // o3d-chs1h: the stock row is taken BEFORE the cost layer is written, the same direction the supplier return
+        // (stock_levels, then cost_layers) and the WMS alignment take them in, so a receipt of one PO and a return of
+        // another for the same product and warehouse cannot cycle. The reporting-evidence trigger checks at COMMIT, so
+        // the order inside the transaction does not matter to it.
         await tx.stockLevel.upsert({
           where: {
             productId_warehouseId: {
@@ -2978,6 +2974,15 @@ export async function receivePurchaseOrder(
           update: {
             quantity: { increment: qtyReceivedStr },
           },
+        })
+
+        await createCostLayer(tx, {
+          productId: poLine.productId,
+          warehouseId: rl.warehouseId,
+          qty: qtyReceived,
+          unitCostBase,
+          poLineId: poLine.id,
+          isOpeningStock: false,
         })
 
         await tx.purchaseOrderLine.update({
@@ -3055,8 +3060,10 @@ export async function receivePurchaseOrder(
         }
       }
 
-      if (accountingSettings.syncEnabled && totalReceiptValue.gt(0)) {
-        const amount = roundQuantity(totalReceiptValue, 2).toNumber()
+      // Gate on the ROUNDED amount: a sub-half-penny receipt value rounds to 0.00 and owes no journal.
+      const receiptJournalValue = receiptJournalAmount(totalReceiptValue)
+      if (accountingSettings.syncEnabled && receiptJournalValue != null) {
+        const amount = receiptJournalValue
         const payload = {
           date: new Date().toISOString().slice(0, 10),
           reference: `Receipt: ${po.reference}`,

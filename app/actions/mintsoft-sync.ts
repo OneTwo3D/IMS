@@ -1,5 +1,6 @@
 'use server'
 
+import { priceUnpricedReturnRows } from '@/lib/domain/sales/return-restock-cost'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -5674,7 +5675,8 @@ export async function restockMintsoftReturnInboxItem(
         referenceType: 'WmsReturnsInbox',
         referenceId: item.id,
         warehouseId: warehouse.id,
-        rows,
+        // A row no expectation priced has no unit cost; give it one so the units enter with a cost layer.
+        rows: await priceUnpricedReturnRows(tx, warehouse.id, rows),
         note: 'Mintsoft return restock',
       })
 
