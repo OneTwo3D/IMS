@@ -162,7 +162,7 @@ test('o3d-zpa7: the chain that makes the race unreachable is pinned in every reg
       `${connector} Group A1 must still require accountingInvoiceId — it is what makes the order undeletable (o3d-zpa7)`,
     )
     assert.ok(
-      src.includes('where: groupBShipmentWhere(mode),'),
+      src.includes('{ AND: [groupBShipmentWhere(mode), { id: { notIn:') && src.includes(': groupBShipmentWhere(mode),'),
       `${connector} Group B must still select through the shared clause (o3d-zpa7 / o3d-c08y)`,
     )
     assert.ok(
