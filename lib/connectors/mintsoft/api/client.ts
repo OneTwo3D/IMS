@@ -473,7 +473,11 @@ export function mintsoftAsnExpectationFromCreateInput(input: WmsAsnInput): Mints
   return {
     reference: input.reference,
     externalWarehouseId: input.externalWarehouseId,
-    lines: input.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.quantity })),
+    lines: input.lines.map((line) => ({
+      sourceLineId: line.sourceLineId,
+      expectedQty: line.quantity,
+      externalProductId: line.externalProductId,
+    })),
   }
 }
 
