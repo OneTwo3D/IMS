@@ -46,7 +46,7 @@ import {
   type RetiredPendingShipment,
 } from '@/lib/domain/sales/pending-shipment-reconciliation'
 import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
-import { proveAllocationDebitPosting } from '@/lib/domain/accounting/allocation-debit-posting-proof'
+import { allocationOpenBalance, proveAllocationDebitPosting, recordedAllocatedRelief } from '@/lib/domain/accounting/allocation-debit-posting-proof'
 import {
   assertNoSalesInvoicePostingInFlight,
   cancelPendingSalesInvoiceSyncForOrder,
@@ -63,7 +63,7 @@ import {
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { applyPegCapsToStockMap, applyPegHoldsToStockMap, evaluateOrderPegsInTx, loadPegContext } from '@/lib/domain/sales/peg-service'
 import { LEDGER_STANDING_SELECT, isShadowedObligation, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
-import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import {
@@ -1197,6 +1197,15 @@ export async function reverseOrphanedAllocationPosting(
       allocationBatchSyncLogId: true,
       allocationBatchConnector: true,
       allocationBatchAccountCode: true,
+      // o3d-efyx: the other two relief sources against this contra, as the order records them (see
+      // `recordedAllocatedRelief`): every JOURNALED shipment's Group B relief and every refund's.
+      shipments: {
+        where: { shipmentJournalDate: { not: null } },
+        select: { id: true, allocatedReliefAmount: true, cogsRelievedFromInventoryAt: true },
+      },
+      refunds: {
+        select: { id: true, allocatedReliefAmount: true, lines: { select: { costLayerSnapshot: true } } },
+      },
     },
   })
   const orderRef = order?.orderNumber ?? order?.externalOrderNumber ?? orderId
@@ -1256,10 +1265,36 @@ export async function reverseOrphanedAllocationPosting(
   // crediting more than A2 ever debited. The bound is the order's own record: what A2 posted, less
   // what earlier reversals have already credited back out. Read under the same order row lock as the
   // running total it is netted against, so the cap and the increment cannot see different states.
-  const openAllocatedContra = roundQuantity(
-    subtractMoney(toDecimal(proof.recordedDebit), toDecimal(order?.allocationReversalAmount ?? 0)),
-    2,
-  ).toNumber()
+  //
+  // o3d-efyx: AND NET OF GROUP B'S AND THE REFUNDS' RELIEF, which the first version of this bound left out. An
+  // order with a journaled shipment that is then un-staged can orphan units whose debit Group B already
+  // credited; the reversal would credit them again. The figure is the ONE `allocationOpenBalance` the refund uses.
+  const recordedRelief = recordedAllocatedRelief(
+    { shipments: order?.shipments, refunds: order?.refunds },
+    (snapshot) => parseCostLayerSnapshot(snapshot).some((entry) => entry.source === 'allocation'),
+  )
+  if (recordedRelief.kind === 'unresolved') {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'allocation_reversal_unproved',
+        tag: 'accounting',
+        level: 'ERROR',
+        description:
+          withLedgerCheck(`Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
+          + `${orderRef} carrying £${snapshotAmount.toFixed(2)} of recorded Group A2 basis, but NO Allocated `
+          + `Inventory reversal was raised: ${recordedRelief.reason}. Crediting without it could credit units whose `
+          + `debit was already relieved. Post CR ${settings.allocatedInventoryAccount} / DR ${settings.inventoryAccount} `
+          + `£${snapshotAmount.toFixed(2)} by hand if the debit is real and still open.`),
+      },
+    })
+    return
+  }
+  const openAllocatedContra = allocationOpenBalance(
+    proof.recordedDebit,
+    toDecimal(order?.allocationReversalAmount ?? 0).add(recordedRelief.groupB).add(recordedRelief.priorRefunds),
+  )
   if (openAllocatedContra <= 0) {
     await tx.activityLog.create({
       data: {
@@ -1272,7 +1307,7 @@ export async function reverseOrphanedAllocationPosting(
           `Re-allocation removed ${sumCostLayerSnapshotQty(orphaned).toString()} recorded unit(s) from order `
           + `${orderRef} carrying £${snapshotAmount.toFixed(2)} of recorded Group A2 basis, but the whole of `
           + `the £${proof.recordedDebit.toFixed(2)} A2 debited to Allocated Inventory for this order has `
-          + `already been credited back by earlier reversals. No further reversal was raised — crediting `
+          + `already been credited back by earlier reversals, Group B shipment relief or refunds. No further reversal was raised — crediting `
           + `again would move pounds the account never held.`,
       },
     })
@@ -1290,7 +1325,7 @@ export async function reverseOrphanedAllocationPosting(
         description:
           `Re-allocation orphaned units carrying £${snapshotAmount.toFixed(2)} of recorded Group A2 basis on `
           + `order ${orderRef}, but only £${openAllocatedContra.toFixed(2)} of the £`
-          + `${proof.recordedDebit.toFixed(2)} A2 debited is still open after earlier reversals. The `
+          + `${proof.recordedDebit.toFixed(2)} A2 debited is still open after earlier reversals, Group B relief and refunds. The `
           + `reversal was capped at the open balance; the difference was never in Allocated Inventory to `
           + `credit back.`,
       },

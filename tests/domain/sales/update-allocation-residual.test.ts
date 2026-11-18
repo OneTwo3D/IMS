@@ -70,6 +70,9 @@ const state = {
     allocationBatchConnector: 'xero' as string | null,
     allocationBatchAccountCode: '631' as string | null,
     allocationReversalAmount: null as number | null,
+    /** o3d-efyx: the other relief sources the reverser nets: journaled shipments' Group B relief and refunds' relief. */
+    shipments: [] as Array<{ id: string; allocatedReliefAmount: number | null; cogsRelievedFromInventoryAt?: Date | null }>,
+    refunds: [] as Array<{ id: string; allocatedReliefAmount: number | null; lines: Array<{ costLayerSnapshot: unknown }> }>,
     /**
      * o3d-i0o6 r3: the PASS HISTORY behind the amount. The three columns above describe the LATEST
      * A2 pass while `allocationBatchAmount` is the sum of all of them, so the proof asks this — one
@@ -693,6 +696,8 @@ function seedLines(qty: number) {
   state.order.allocationBatchConnector = 'xero'
   state.order.allocationBatchAccountCode = '631'
   state.order.allocationReversalAmount = null
+  state.order.shipments = []
+  state.order.refunds = []
   state.accountingSyncLogs.length = 0
   state.accountingSyncLogs.push({
     id: 'a2-log-1',
@@ -1716,6 +1721,82 @@ test('o3d-0i5y r10: reducing an allocation to ZERO reverses the WHOLE posted deb
     ],
     'all ten units at £4',
   )
+})
+
+function seedTenAtFour() {
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [{
+    id: 'alloc-a',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 10,
+    costLayerSnapshot: POSTED_AT_FOUR('10.000000'),
+  }]
+  state.shipmentLines = []
+}
+
+test('o3d-efyx: the reversal is capped by Group B relief of journaled shipments, not only by prior reversals', async () => {
+  // A2 debited £40. A journaled shipment's Group B already credited £30 of it, so only £10 is open. Shrinking to 6
+  // orphans £16 of record: crediting £16 would take £6 out of an account that no longer holds it.
+  seedTenAtFour()
+  state.order.shipments = [{ id: 'ship-1', allocatedReliefAmount: 30 }]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(reversalLines(), [['630', 10, null], ['631', null, 10]], 'capped at the £10 still open')
+  assert.equal(state.txActivity.some((entry) => entry.action === 'allocation_reversal_capped'), true)
+})
+
+test('o3d-efyx: the reversal is capped by a prior refund\'s relief too', async () => {
+  seedTenAtFour()
+  state.order.refunds = [{ id: 'refund-1', allocatedReliefAmount: 35, lines: [] }]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(reversalLines(), [['630', 5, null], ['631', null, 5]], 'capped at the £5 still open')
+})
+
+test('o3d-efyx: Group B relief that leaves nothing open raises no reversal and reports it', async () => {
+  seedTenAtFour()
+  state.order.shipments = [{ id: 'ship-1', allocatedReliefAmount: 40 }]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(queuedAccountingSyncs.length, 0)
+  assert.equal(state.txActivity.some((entry) => entry.action === 'allocation_reversal_unproved'), true)
+})
+
+test('o3d-efyx: a journaled shipment that records no relief cannot be netted, so NOTHING is reversed and it is reported', async () => {
+  seedTenAtFour()
+  state.order.shipments = [{ id: 'ship-legacy', allocatedReliefAmount: null }]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(queuedAccountingSyncs.length, 0)
+  const entry = state.txActivity.find((row) => row.action === 'allocation_reversal_unproved')
+  assert.match(String(entry?.description), /ship-legacy/)
+})
+
+test('o3d-efyx (control): with no Group B or refund relief the full £16 is still reversed', async () => {
+  seedTenAtFour()
+  state.order.shipments = [{ id: 'ship-1', allocatedReliefAmount: 0 }]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(reversalLines(), [['630', 16, null], ['631', null, 16]])
 })
 
 test('o3d-0i5y r10: the reversal is valued at what A2 POSTED, never at a pin a revaluation rewrote', async () => {

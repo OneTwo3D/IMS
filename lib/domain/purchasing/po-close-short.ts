@@ -10,6 +10,7 @@ import {
   queueLandedCostAdjustmentJournals,
   recalculateDirectLandedCosts,
   type LandedCostRecalcResult,
+  type LandedCostRevaluationOptions,
 } from '@/lib/domain/purchasing/landed-cost-service'
 
 /**
@@ -131,6 +132,8 @@ export async function retirePurchaseOrderLocked(
   id: string,
   intent: PoRetireIntent,
   beforeWrite?: (facts: { keptReceivedStock: boolean }) => void,
+  /** o3d-d0gog: the chart the caller read BEFORE its transaction (see LandedCostRevaluationOptions.accountingSettings). */
+  accountingSettings?: LandedCostRevaluationOptions['accountingSettings'],
 ): Promise<RetireOutcome> {
   const po = await tx.purchaseOrder.findUnique({
     where: { id },
@@ -193,6 +196,7 @@ export async function retirePurchaseOrderLocked(
       reason: 'purchase_order_closed_short',
       scheduleAdjustmentJournals: true, // durable backstop, as for every journaling revaluation
       landedQtyBasis: new Map(lineLanded.map((l) => [l.id, l.landedQty])),
+      ...(accountingSettings !== undefined ? { accountingSettings } : {}),
     })
     // The links' cost now sits on the units that landed.
     await tx.landedCostLink.updateMany({ where: { primaryPoId: id, ...CONTRIBUTING_LANDED_COST_LINK_WHERE }, data: { allocated: true } })

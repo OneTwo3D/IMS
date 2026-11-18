@@ -1725,6 +1725,8 @@ function EditFreightCostsDialog({
   // credit is therefore NOT editable here: it is listed read-only and sent back to the server unchanged (saving
   // replaces the order's lines, so leaving it out would silently delete it).
   const lockedLines = po.freightCostLines.filter((cl) => cl.amountForeign <= 0)
+  // What this dialog loaded; the server refuses the save if another operator changed the lines since (o3d-aks9m).
+  const [openedFingerprint] = useState(() => po.freightCostLinesFingerprint)
   const [costLines, setCostLines] = useState<FreightCostEditLine[]>(() => {
     if (po.freightCostLines.length > 0) {
       return po.freightCostLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
@@ -1780,6 +1782,7 @@ function EditFreightCostsDialog({
         taxRateId === '__recorded' || taxRateId === '__unset'
           ? undefined
           : (purchaseTaxRates.find((t) => t.id === taxRateId)?.rate ?? 0),
+        openedFingerprint,
       )
       if (result.success) {
         router.refresh()

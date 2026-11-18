@@ -145,6 +145,68 @@ export function allocationOpenBalance(debit: DecimalInput, relieved: DecimalInpu
   return open.gt(0) ? roundQuantity(open, 2).toNumber() : 0
 }
 
+/**
+ * o3d-efyx: THE OTHER TWO RELIEF SOURCES AGAINST THE ALLOCATED-INVENTORY CONTRA, as the ORDER RECORDS them.
+ *
+ * The orphaned-allocation reverser used to cap its credit at `allocationBatchAmount` less
+ * `allocationReversalAmount`: what A2 debited, less what earlier reversals credited back. The refund knows
+ * two more sources against the same contra: Group B's `Shipment.allocatedReliefAmount` for every JOURNALED
+ * shipment (credited when the units dispatched) and every prior refund's `SalesOrderRefund.allocatedReliefAmount`.
+ * A reversal that ignores them can credit units whose debit Group B (or a refund) already took out: the OVER-credit
+ * direction, which moves money that was never there.
+ *
+ * ONE definition of "open balance" is {@link allocationOpenBalance}; this adds the two missing terms using only the
+ * durable recorded columns (the refund additionally PROVES each against its journal, which needs the sync log and
+ * its retention rules and does not belong in a per-shrink reverser). Where a recorded figure is absent but the
+ * relief must have happened (a journaled shipment with no recorded relief; a refund that claimed allocation units
+ * with none recorded), the answer is `unresolved` and the caller raises NOTHING and reports: under-reversing leaves
+ * a visible standing debit, over-reversing hides one.
+ */
+export type RecordedAllocatedRelief =
+  | { kind: 'resolved'; groupB: Decimal; priorRefunds: Decimal }
+  | { kind: 'unresolved'; reason: string }
+
+export function recordedAllocatedRelief(order: {
+  shipments?: ReadonlyArray<{
+    id: string
+    allocatedReliefAmount: DecimalInput | null
+    cogsRelievedFromInventoryAt?: Date | null
+  }> | null
+  refunds?: ReadonlyArray<{
+    id: string
+    allocatedReliefAmount: DecimalInput | null
+    lines?: ReadonlyArray<{ costLayerSnapshot: unknown }> | null
+  }> | null
+}, claimsAllocationUnits: (costLayerSnapshot: unknown) => boolean): RecordedAllocatedRelief {
+  let groupB = toDecimal(0)
+  for (const shipment of order.shipments ?? []) {
+    if (shipment.allocatedReliefAmount != null) {
+      groupB = groupB.add(toDecimal(shipment.allocatedReliefAmount))
+      continue
+    }
+    // Costed straight out of Inventory: never drew on an allocation pin, so it relieved none.
+    if (shipment.cogsRelievedFromInventoryAt) continue
+    return {
+      kind: 'unresolved',
+      reason: `journaled shipment ${shipment.id} records no Allocated Inventory relief, so how much Group B already credited cannot be established`,
+    }
+  }
+  let priorRefunds = toDecimal(0)
+  for (const refund of order.refunds ?? []) {
+    if (refund.allocatedReliefAmount != null) {
+      priorRefunds = priorRefunds.add(toDecimal(refund.allocatedReliefAmount))
+      continue
+    }
+    if ((refund.lines ?? []).some((line) => claimsAllocationUnits(line.costLayerSnapshot))) {
+      return {
+        kind: 'unresolved',
+        reason: `refund ${refund.id} claimed allocated units but records no Allocated Inventory relief, so how much it already credited cannot be established`,
+      }
+    }
+  }
+  return { kind: 'resolved', groupB, priorRefunds }
+}
+
 /** THE CAP: a credit is the LESSER of what the lines value and the open balance. Shared, as above. */
 export function cappedAllocationCredit(lineBasis: Decimal, openBalance: number): Decimal {
   return lineBasis.gt(toDecimal(openBalance)) ? toDecimal(openBalance) : lineBasis
