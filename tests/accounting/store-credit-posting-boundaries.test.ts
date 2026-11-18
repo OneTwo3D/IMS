@@ -32,6 +32,8 @@ const CENSUS: Record<string, Row> = {
   INVOICE_PDF: E('read-only: downloads a PDF Xero already holds; posts and sends nothing'),
   PURCHASE_INVOICE: PURCHASING,
   PURCHASE_INVOICE_UPDATE: PURCHASING,
+  SALES_INVOICE_DELETE: E('removes a document IMS itself created; it posts no receivable, and a store-credit order never has the SYNCED create row the delete requires (o3d-ngmt.21)'),
+  PURCHASE_INVOICE_DELETE: PURCHASING,
   BILL_ATTACHMENT: PURCHASING,
   BILL_PAYMENT: PURCHASING,
   PURCHASE_CREDIT_NOTE: PURCHASING,

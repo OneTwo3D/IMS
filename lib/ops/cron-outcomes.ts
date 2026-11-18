@@ -33,7 +33,7 @@ import type { WcErasureSweepOutcome } from '@/lib/connectors/woocommerce/sync/an
 import type { purgeExpiredActivityLogs, purgeExpiredCronRuns } from '@/lib/activity-log-cleanup'
 import type { purgeExpiredData } from '@/lib/data-retention'
 import type { ProcessPendingWcWebhookEventsResult } from '@/lib/jobs/woocommerce/process-shopping-webhook-events'
-import type { processShoppingOrderCompletions, processShoppingOrderStatusPushes, processShoppingInvoiceDocumentPublications } from '@/lib/shopping'
+import type { processShoppingOrderCompletions, processShoppingOrderStatusPushes, processShoppingInvoiceDocumentPublications, processShoppingTrackshipRefires } from '@/lib/shopping'
 import type { XeroDailyBatchResult } from '@/lib/connectors/xero/daily-sync'
 import { counts, from, enumResult, noFailureSignal, num, permanentLists, structural, worstOutcome } from './cron-outcome-helpers'
 import { mintsoftCronOutcomes as warehouseConnectorCronOutcomes } from '@/lib/connectors/mintsoft/cron-outcomes' // wms-connector-boundary-ok: 2026-11-13: the registry spreads the connector's own entries
@@ -95,6 +95,7 @@ type ActivityCleanupCronResult = {
   cronRuns: Ret<typeof purgeExpiredCronRuns>
   dataRetention: Ret<typeof purgeExpiredData>
   wmsMutationEvents: number
+  attachmentFiles: { removed: number; failed: string[] }
 }
 type ReallocationSweepCronResult = Partial<Ret<typeof sweepUnallocatedProcessingOrders>> & {
   directCreateMarkers: Ret<typeof sweepUnresolvedDirectCreateMarkers> | null
@@ -114,6 +115,7 @@ export type ShoppingDrain =
   | Ret<typeof processShoppingOrderCompletions>
   | Ret<typeof processShoppingOrderStatusPushes>
   | Ret<typeof processShoppingInvoiceDocumentPublications>
+  | Ret<typeof processShoppingTrackshipRefires>
   | { skipped: boolean; reason?: string; error?: string }
 type ShoppingWebhookInboxCronResult = {
   connectors: {
@@ -121,6 +123,7 @@ type ShoppingWebhookInboxCronResult = {
       orderCompletions: ShoppingDrain
       orderStatusPushes: ShoppingDrain
       invoiceDocumentPublications: ShoppingDrain
+      trackshipRefires: ShoppingDrain
     }
   }
 }
@@ -154,8 +157,8 @@ export const cronOutcomes = {
     const sweepFailure = r.errors && r.errors.length > 0 ? structural({ errors: r.errors }) : null
     return from(r, counts(r, ['failed']), structural(r), sweepFailure)
   },
-  // a purge reports what it deleted; there is no failure signal short of a throw
-  'activity-cleanup': (r: ActivityCleanupCronResult) => noFailureSignal(r),
+  // a purge reports what it deleted; the one failure signal is an attachment file owed a deletion that could not be removed (attachmentFiles.failed: string[])
+  'activity-cleanup': (r: ActivityCleanupCronResult) => from(r, (r.attachmentFiles?.failed.length ?? 0) > 0 ? 'failed' : null),
   // `error` (the dump or its manifest failed); `uploadError` (a configured remote target did not take the copy); `cleanupError` (retention purge failed)
   backup: (r: BackupCronResult) => from(r, 'error' in r || 'uploadError' in r || 'cleanupError' in r ? 'failed' : null),
   // failed: number (a refused or unanswered TrackShip lookup, an order that could not be marked delivered)

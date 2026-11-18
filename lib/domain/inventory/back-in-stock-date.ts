@@ -3,6 +3,7 @@ import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { resolvePurchaseOrderLineLandedQty } from '@/lib/domain/inventory/po-line-landed-quantity'
 import { dateOnly } from '@/lib/domain/math/date-window'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
+import { isWmsAsnAwaitingUnits } from '@/lib/domain/wms/asn-awaiting-units'
 import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
 
 /**
@@ -13,7 +14,7 @@ import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
  * (lib/domain/inventory/po-line-landed-quantity.ts: qtyReceived plus the unabsorbed WMS alignment credit over EVERY ASN row of the line,
  * closed and retired included), so units WMS alignment or a book-in already brought into stock never date a future arrival. A past promise must never reach a customer and no date beats a wrong one, so:
  *
- *   - a supply source's date is the ASN's eta when the line is covered by an open ASN (OPEN / PARTIALLY_BOOKED_IN) that has one, else the
+ *   - a supply source's date is the ASN's eta when the line is covered by an open ASN (OPEN / PARTIALLY_BOOKED_IN, or BOOKED_IN not yet closed: see asn-awaiting-units.ts) that has one, else the
  *     line's effective ETA (its own date, else the order's: lib/domain/purchasing/line-eta.ts). An ASN with no eta falls through to the PO date;
  *   - a source resolved to a date BEFORE today (UTC calendar day) is LATE and is dropped, never rolled forward and never shown;
  *   - a source with no date is dropped;
@@ -38,9 +39,6 @@ export type BackInStockAsnLine = {
   /** The ASN header. `status` decides whether the row can DATE supply; every row, whatever its status, counts as landed stock. */
   asn: { eta: Date | null; status: string; closedAt?: Date | null }
 }
-
-/** ASN statuses that still expect units: only these rows can date a line's remaining supply. */
-const OPEN_ASN_STATUSES: ReadonlyArray<string> = ['OPEN', 'PARTIALLY_BOOKED_IN']
 
 /**
  * `asnLines` must be EVERY ASN row of the lines (closed and retired included): they all feed the landed quantity, and only the open ones
@@ -70,7 +68,7 @@ export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: Ba
     if (outstanding.lte(0)) continue
     for (const asnLine of lineAsnRows) {
       // closeAsnShort sets closedAt and leaves the status, so a closed-short ASN still reads PARTIALLY_BOOKED_IN: closedAt wins.
-      if (asnLine.asn.closedAt || !OPEN_ASN_STATUSES.includes(asnLine.asn.status)) continue
+      if (asnLine.asn.closedAt || !isWmsAsnAwaitingUnits(asnLine.asn)) continue
       // The row's own landed units are max(snapshot, receipt): a receipt can absorb the very units alignment credited, so the two
       // counters are not added.
       const accounted = toDecimal(asnLine.qtyAccountedViaSnapshot).gt(toDecimal(asnLine.qtyAccountedViaReceipt))

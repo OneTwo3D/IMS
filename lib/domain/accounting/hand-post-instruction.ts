@@ -35,7 +35,7 @@ export type HandPostInput = { type?: string } & (
   | { state: 'not-loaded' }
 )
 
-export type HandPostFlow = 'update' | 'payment' | 'conditional' | 'untyped'
+export type HandPostFlow = 'update' | 'payment' | 'delete' | 'conditional' | 'untyped'
 export type HandPostBranch = { when: string; then: string }
 
 export type HandPostInstruction = {
@@ -100,11 +100,14 @@ export function declinedWhileHeld(unaccounted: boolean, count: number): string {
  */
 export const UPDATE_POSTING_TYPES: ReadonlySet<string> = new Set(['SALES_INVOICE_UPDATE', 'PURCHASE_INVOICE_UPDATE'])
 export const PAYMENT_POSTING_TYPES: ReadonlySet<string> = new Set(['BILL_PAYMENT'])
+/** A delete of a synced invoice or bill (o3d-ngmt.21): the refused work is REMOVING a document, so "post it if absent" would be the opposite of the step. */
+export const DELETE_POSTING_TYPES: ReadonlySet<string> = new Set(['SALES_INVOICE_DELETE', 'PURCHASE_INVOICE_DELETE'])
 
 export function handPostFlowOf(type: string | undefined): HandPostFlow {
   if (typeof type !== 'string' || type.trim() === '') return 'untyped'
   if (UPDATE_POSTING_TYPES.has(type)) return 'update'
   if (PAYMENT_POSTING_TYPES.has(type)) return 'payment'
+  if (DELETE_POSTING_TYPES.has(type)) return 'delete'
   return 'conditional'
 }
 
@@ -141,6 +144,21 @@ export function handPostInstruction(input: { type?: string }): HandPostInstructi
       markHandledCondition: 'the CURRENT payment is in the ledger',
       markHandledConfirms: 'the CURRENT payment is in the ledger - already there, or you registered it as a new payment by hand',
       alreadyDone: 'the CURRENT payment is already in the ledger',
+    }
+  }
+  if (flow === 'delete') {
+    const branches: HandPostBranch[] = [
+      { when: 'it is already deleted or voided', then: 'do not repeat it' },
+      { when: 'it still exists', then: 'first change its number (add a suffix such as -DEL-ABC123) so the original number is free, then delete it if it is a draft or submitted, or void it if it is authorised and has no payments or credit applied' },
+    ]
+    return {
+      flow,
+      // "only if" on the removing clause, as every other instruction that acts on a document: the ledger is checked first and the removal is conditional on what it shows.
+      step: 'check the ledger for the document: if it is already deleted or voided, do not repeat it; only if it still exists, ' + branches[1].then,
+      branches,
+      markHandledCondition: 'the document is deleted or voided in the ledger',
+      markHandledConfirms: 'the document is deleted or voided in the ledger - it already was, or you removed it by hand',
+      alreadyDone: 'the document is already deleted or voided in the ledger',
     }
   }
   if (flow === 'conditional') {
@@ -341,6 +359,7 @@ export function renderHandPostInstructionDoc(): string {
   const rows: Array<[string, { type?: string }]> = [
     ['An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing', { type: 'SALES_INVOICE_UPDATE' }],
     ['A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded', { type: 'BILL_PAYMENT' }],
+    ['A DELETE of a synced invoice or bill (SALES_INVOICE_DELETE, PURCHASE_INVOICE_DELETE) - the work is removing the document, not posting it', { type: 'SALES_INVOICE_DELETE' }],
     ['Any other posting (no earlier document can exist)', { type: 'SALES_INVOICE' }],
     ['The posting type is not known where the text is shown', {}],
   ]

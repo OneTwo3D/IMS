@@ -410,7 +410,7 @@ test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback
   assert.deepEqual(
     client.normalizeMintsoftAsnFetchByIdResult(' ASN 77/2026 ', {
       status: 200,
-      data: { Status: 'COMPLETE', Items: [liveItem] },
+      data: { ASNStatus: { Name: 'COMPLETE' }, Items: [liveItem] },
     }),
     {
       externalAsnId: 'ASN 77/2026',
@@ -431,7 +431,7 @@ test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback
           raw: liveItem,
         },
       ],
-      raw: { Status: 'COMPLETE', Items: [liveItem] },
+      raw: { ASNStatus: { Name: 'COMPLETE' }, Items: [liveItem] },
     },
   )
 
@@ -439,7 +439,7 @@ test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback
   // what the assertion above used to assert as correct behaviour.
   const invented = client.normalizeMintsoftAsnFetchByIdResult('ASN 77/2026', {
     status: 200,
-    data: { Status: 'COMPLETE', Lines: [{ AsnLineId: 'line-1', SourceLineId: 'po-line-1', SKU: 'MS-SKU-1', Quantity: 5 }] },
+    data: { ASNStatus: { Name: 'COMPLETE' }, Lines: [{ AsnLineId: 'line-1', SourceLineId: 'po-line-1', SKU: 'MS-SKU-1', Quantity: 5 }] },
   })
   assert.ok(invented)
   assert.equal(invented.lines.length, 1)
@@ -456,7 +456,7 @@ test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback
   // overlooked (see the comment on `liveItem` above).
   const noProductId = client.normalizeMintsoftAsnFetchByIdResult('ASN 77/2026', {
     status: 200,
-    data: { Status: 'COMPLETE', Items: [{ ID: 'item-9', SourceLineId: 'po-line-1', QuantityExpected: 1, QuantityBooked: 1 }] },
+    data: { ASNStatus: { Name: 'COMPLETE' }, Items: [{ ID: 'item-9', SourceLineId: 'po-line-1', QuantityExpected: 1, QuantityBooked: 1 }] },
   })
   assert.equal(noProductId?.lines[0]!.externalProductId, 'item-9')
 })
@@ -486,7 +486,7 @@ test('normalizeMintsoftAsn accepts realistic create responses with explicit line
     QuantityBooked: 100,
   }
   assert.deepEqual(
-    normalizers.normalizeMintsoftAsn({ ID: 77, Status: 'NEW', Items: [item1, item2] }),
+    normalizers.normalizeMintsoftAsn({ ID: 77, ASNStatus: { Name: 'NEW' }, Items: [item1, item2] }),
     {
       externalAsnId: '77',
       status: 'NEW',
@@ -522,7 +522,7 @@ test('normalizeMintsoftAsn accepts realistic create responses with explicit line
           raw: item2,
         },
       ],
-      raw: { ID: 77, Status: 'NEW', Items: [item1, item2] },
+      raw: { ID: 77, ASNStatus: { Name: 'NEW' }, Items: [item1, item2] },
     },
   )
 

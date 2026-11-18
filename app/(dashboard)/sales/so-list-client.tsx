@@ -143,6 +143,22 @@ function FulfilmentChip({ so }: { so: SoRow }) {
   )
 }
 
+/** A quote is a draft with a flag: the badges say so, and say when its validity date has passed. */
+function QuoteBadges({ so }: { so: SoRow }) {
+  return (
+    <>
+      <span className="inline-flex items-center rounded-full border border-blue-300 bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-800 dark:border-blue-800 dark:bg-blue-950 dark:text-blue-200" title={so.quoteValidUntil ? `Valid until ${so.quoteValidUntil}` : undefined}>
+        Quote
+      </span>
+      {so.quoteExpired && (
+        <span className="inline-flex items-center rounded-full border border-red-300 bg-red-50 px-2 py-0.5 text-xs font-medium text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200" title={`Expired on ${so.quoteValidUntil}`}>
+          Expired
+        </span>
+      )}
+    </>
+  )
+}
+
 function invoiceStatus(so: SoRow): { label: string; cls: string } {
   // Refund state is orthogonal to the lifecycle status now — read refundStatus.
   if (so.refundStatus === 'FULL') return { label: 'Refunded', cls: 'bg-red-100 text-red-800' }
@@ -196,6 +212,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
     includeArchived: searchParams.get('archived') === '1',
     invoiced: false,
     returned: false,
+    quotes: searchParams.get('quotes') === '1',
     customFieldKey: list.appliedCustomField?.key,
     customFieldValue: list.appliedCustomField?.value,
   }
@@ -337,6 +354,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
             <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
               {STATUS_LABELS[so.status]}
             </span>
+            {so.isQuote && <QuoteBadges so={so} />}
             <FulfilmentChip so={so} />
           </TableCell>
         )
@@ -446,6 +464,14 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
 
   return (
     <div className="space-y-3">
+      <div className="flex items-center gap-1" role="tablist" aria-label="Order type">
+        <Button role="tab" aria-selected={!urlState.quotes} variant={urlState.quotes ? 'outline' : 'default'} size="sm" className="h-8 text-xs" onClick={() => navigate({ quotes: false })}>
+          All orders
+        </Button>
+        <Button role="tab" aria-selected={urlState.quotes} variant={urlState.quotes ? 'default' : 'outline'} size="sm" className="h-8 text-xs" onClick={() => navigate({ quotes: true })}>
+          Quotes
+        </Button>
+      </div>
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative flex-1 min-w-48 max-w-xs">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -540,7 +566,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
 
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">
-          {searching ? `No sales orders match "${urlState.q.trim()}" in any order, including completed and archived.` : 'No sales orders found.'}
+          {searching ? `No sales orders match "${urlState.q.trim()}" in any order, including completed and archived.` : (urlState.quotes ? 'No quotes found.' : 'No sales orders found.')}
         </p>
       ) : (
         <ResponsiveTableLayout
@@ -572,6 +598,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
                         <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
                           {STATUS_LABELS[so.status]}
                         </span>
+            {so.isQuote && <QuoteBadges so={so} />}
                         <FulfilmentChip so={so} />
                         <span className="text-sm font-semibold tabular-nums">
                           {fmtForeign(so.totalForeign, so.currency)}

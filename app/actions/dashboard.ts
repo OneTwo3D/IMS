@@ -5,6 +5,7 @@ import { outstandingPoValueBase } from '@/lib/domain/purchasing/outstanding-po-v
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { getSetting } from '@/app/actions/settings'
 import { requirePermission } from '@/lib/auth/server'
+import { canViewDashboardCostFigures, projectTopProduct, redactDashboardCostFigures } from '@/lib/security/dashboard-cost-redaction'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
@@ -257,8 +258,11 @@ export async function getDashboardData(
   incomingPOs: IncomingPO[]
   periodLabel: string
   compLabel: string
+  /** False when the caller's role may not see COGS, profit, margin or inventory value: those figures are zeroed. */
+  costFiguresVisible: boolean
 }> {
-  await requirePermission('dashboard')
+  const session = await requirePermission('dashboard')
+  const costFiguresVisible = canViewDashboardCostFigures(session.user.role)
   const tz = await getDisplayTimeZone()
   const fyStartStr = await getSetting('financial_year_start') ?? '04-06'
   const [fyMonth, fyDay] = fyStartStr.split('-').map(Number)
@@ -651,5 +655,7 @@ export async function getDashboardData(
     previous_period: 'Previous Period', previous_year: 'Previous Year', previous_fy: 'Previous FY',
   }
 
-  return { kpi, chartData, topProducts, recentOrders, incomingPOs, periodLabel: periodLabels[period], compLabel: compLabels[compareMode] }
+  const safeTopProducts = topProducts.map(projectTopProduct) as TopProduct[]
+  const visible = costFiguresVisible ? { kpi, chartData, topProducts: safeTopProducts } : redactDashboardCostFigures({ kpi, chartData, topProducts: safeTopProducts })
+  return { ...visible, recentOrders, incomingPOs, periodLabel: periodLabels[period], compLabel: compLabels[compareMode], costFiguresVisible }
 }

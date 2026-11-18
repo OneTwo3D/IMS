@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
+import { canViewDashboardCostFigures } from '@/lib/security/dashboard-cost-redaction'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -436,6 +437,7 @@ export async function updateAdjustmentMovement(
         where: { id },
         select: {
           id: true,
+          type: true,
           productId: true,
           fromWarehouseId: true,
           toWarehouseId: true,
@@ -450,6 +452,9 @@ export async function updateAdjustmentMovement(
         },
       })
       if (!movement) throw new Error('Movement not found')
+      if (movement.type !== 'ADJUSTMENT') {
+        throw new Error('Only stock adjustments can be edited')
+      }
 
       const oldIsAddition = movement.toWarehouseId !== null
       const oldWarehouseId = (oldIsAddition ? movement.toWarehouseId : movement.fromWarehouseId)!
@@ -814,8 +819,11 @@ export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Pr
  * it is intentionally left as Number() math (4ve5: verified display-only, no drift
  * risk). Anything that posts to accounting must use the Decimal engine instead.
  */
-export async function getAvgCogsMap(): Promise<Record<string, number>> {
-  await requireInternalUser()
+export async function getAvgCogsMap(): Promise<Record<string, number> | null> {
+  const session = await requireInternalUser()
+  // Unit costs are the Gross Margin report's data: the sales-order form's COGS/margin estimate is for the roles
+  // that may read that report. `null` tells the form to hide the estimate, not to show a zero cost.
+  if (!canViewDashboardCostFigures(session.user.role)) return null
   const layers = await db.costLayer.findMany({
     where: { remainingQty: { gt: 0 } },
     select: { productId: true, remainingQty: true, unitCostBase: true },

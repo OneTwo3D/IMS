@@ -230,6 +230,9 @@ export function compareMintsoftAsnAgainstExpectation(
 
   const items = remoteItems(asn)
   if (items?.some((item) => readMintsoftAsnItemLineIdentity(item).kind === 'unreadable')) {
+    // A warehouse-made ASN (every SourceLineId null) quoting our reference refuses too (o3d-66ca1): it can
+    // never be proven not-ours from its content (a lost create plus a later product-link change would
+    // defeat any such proof), so only an operator can say so.
     return { kind: 'lineIdentityUnreadable' }
   }
 
