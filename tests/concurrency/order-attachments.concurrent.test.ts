@@ -39,8 +39,10 @@ async function load() {
 type Loaded = Awaited<ReturnType<typeof load>>
 
 const PDF = (tag: string) => Buffer.from(`%PDF-1.4\n${tag}\n%%EOF\n`, 'latin1')
+const createdUserIds: string[] = []
 const as = async (db: Loaded['db'], role: string) => {
   const user = await db.user.create({ data: { email: `oa-${randomUUID()}@example.test`, name: 'Attachment Tester', passwordHash: 'x', role: role as never } })
+  createdUserIds.push(user.id)
   current = { user: { id: user.id, role } }
   return user.id
 }
@@ -72,7 +74,15 @@ async function seedOrders(db: Loaded['db']) {
   }
 }
 
-test.after(() => rmSync(uploadRoot, { recursive: true, force: true }))
+test.after(async () => {
+  rmSync(uploadRoot, { recursive: true, force: true })
+  // THE SCRATCH-DATABASE GUARD REFUSES ANY LATER FILE ONCE public.users HOLDS A ROW (an "installed application"): remove every user this file created, and the queue rows.
+  if (!RUN) return
+  const { db } = await load()
+  await db.orderAttachmentFileDeletion.deleteMany({})
+  await db.activityLog.deleteMany({ where: { userId: { in: createdUserIds } } })
+  await db.user.deleteMany({ where: { id: { in: createdUserIds } } })
+})
 
 test('[order attachments] upload stores the row and a randomly named file, lists, downloads as an attachment, and a soft delete hides both', { skip }, async (t) => {
   const { db, routes } = await load()
