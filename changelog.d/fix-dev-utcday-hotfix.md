@@ -1,1 +1,0 @@
-- **Fixed: development failed to compile after the GR/IR accrual and London business-day changes merged together.** The GR/IR reclass journal now groups its movements by the London business day, matching every other daily-batch leg.
