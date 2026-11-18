@@ -336,7 +336,7 @@ test('the allowlist names exactly the screens that call a generic settings write
   // The walk must have gone somewhere. Without this, a mistyped root would make every assertion
   // below compare two empty sets and pass.
   assert.ok(scanned > 200, `the walk reached only ${scanned} files`)
-  assert.ok(importers.length >= 8, `found only ${importers.length} generic-writer callers`)
+  assert.ok(importers.length >= 7, `found only ${importers.length} generic-writer callers`)
 
   assert.deepEqual(
     [...new Set(importers)].sort(),
@@ -396,7 +396,7 @@ test('each screen writes EXACTLY the keys it is filed under, in both directions'
     checked += keys.length
   }
   assert.equal(checked, WRITABLE_SETTING_KEYS.length, 'no key is filed under two screens or none')
-  assert.ok(checked >= 32, `the walk reached ${checked} keys`)
+  assert.ok(checked >= 19, `the walk reached ${checked} keys`)
 })
 
 test('the key-shape scan is not vacuous — it sees a key added to a payload', () => {

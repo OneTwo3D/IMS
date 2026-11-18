@@ -940,6 +940,7 @@ const NOT_CARRIED: Record<string, string> = {
   // secrets and credentials: copied from the root-only backup by an operator who needs them
   ANTHROPIC_API_KEY: 'secret',
   ENCRYPTION_KEY: 'secret',
+  BACKUP_ENCRYPTION_KEY: 'secret (dedicated key for encrypting backups before upload; copied from the root-only backup by an operator, and kept in the secret store)',
   NEXTAUTH_SECRET: 'secret (legacy name)',
   INTEGRATION_CONNECTION_FINGERPRINT_KEY: 'secret',
   INVOICE_DOCUMENT_MAX_BYTES: 'optional size ceiling for a fetched invoice PDF (default 10 MB); an operator tuning, set in the environment when wanted',
