@@ -517,7 +517,7 @@ test('[o3d-j625] the in-transaction rig can write a row too', async () => {
   // assertions actually need, is that this fixture inserts when the enqueue is attributed.
   const control = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: 'xero',
   })
 
@@ -536,7 +536,7 @@ test('[o3d-j625 r2] the in-transaction enqueue REFUSES an unchartered request as
   const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     reportOutcome: (outcome: { queued: boolean; reason?: string; connector: string | null }) => {
       answered.outcome = outcome
     },
@@ -557,7 +557,7 @@ test('[o3d-j625] the in-transaction enqueue refuses a retired chart, and reports
   const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
     reportOutcome: (outcome) => { answered.outcome = outcome },
   })
@@ -593,7 +593,7 @@ test('[o3d-j625 r13] a selection that MOVES between the check and the insert is 
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
   })
 
@@ -612,7 +612,7 @@ test('[o3d-j625] the in-transaction enqueue writes under the CHART’S connector
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
-    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }, { accountCode: settings.cogsAccount, credit: 10 }] },
     chartConnector: settings.connector,
   })
 
