@@ -249,9 +249,9 @@ Every receipt, bill, bill edit, supplier return and return-generated supplier cr
 - **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (the goods part of the value the stock layer carries; freight is not included).
 - **Billing** lowers it by the billed quantity at the **same purchase-order unit cost**. If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; it stays on Stock in Transit as it always has, and is shown per order in **Analytics > GR/IR**.
 - **Editing a bill** moves it by the change in the billed quantity.
-- **A supplier return** lowers it by the returned quantity at the order's unit cost. If those goods were already billed, the order shows as billed-not-received until the return-generated supplier credit note is posted, which clears it.
+- **A supplier return** lowers it by the returned quantity at the order's unit cost. If those goods were already billed, the order shows as billed-not-received until the return-generated supplier credit note is posted. The credit note clears it at the same order unit cost as the return (per line, for the quantity billed and returned), so a returned-and-credited line nets to zero whatever price the bill carried; the difference between the credit and that value is a price-difference reversal, not GR/IR.
 
-Receiving and billing the same quantity nets to zero whichever comes first. Nothing here is posted to Xero unless **GR/IR accrual posting** is switched on (Settings > Accounting > Xero; see Xero Accounting Sync). Stage can load an opening balance for goods received before the sub-ledger existed with `npm run grir:opening-balance -- --dry-run` (then without `--dry-run`); production gets none.
+Receiving and billing the same quantity nets to zero whichever comes first. Nothing here is posted to Xero unless **GR/IR accrual posting** is switched on (Settings > Accounting > Xero; see Xero Accounting Sync). Stage can load an opening balance for goods received before the sub-ledger existed (it fills the gap between what the order lines say and what the sub-ledger already holds, so a line billed after deployment is completed too) with `npm run grir:opening-balance -- --dry-run` (then without `--dry-run`); production gets none.
 
 ### Editing an unpaid bill
 
