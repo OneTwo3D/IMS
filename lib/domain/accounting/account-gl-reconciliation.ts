@@ -28,6 +28,8 @@ export type AccountGlReconciliation = {
   delta: number
   sweepLimit: number
   action: AccountGlReconciliationAction
+  /** Set when a `sweep` was withheld because the trailing net sweep would pass the cap: the gap is within the per-day limit, it recurs. */
+  recurringSweepCap?: { priorSweptNet: number; projectedNet: number; cap: number }
 }
 
 /**
@@ -38,6 +40,31 @@ export type AccountGlReconciliation = {
  * per call.
  */
 export const DEFAULT_GL_SWEEP_LIMIT = 1
+
+/**
+ * Ceiling on the NET rounding sweep of the trailing 30 days. The per-day limit alone lets a residue of up to £1 be swept every day
+ * for ever, which is how a small RECURRING error would be absorbed unseen. Genuine 6dp-vs-2dp rounding residue changes sign and nets
+ * to pence in a month; a one-directional residue accumulates, so a sweep that would take the signed trailing total past this is
+ * reported as a gap and not posted.
+ */
+export const DEFAULT_RECURRING_SWEEP_CAP = 5
+
+/**
+ * Downgrade a `sweep` to a `flag` when posting it would take the trailing NET swept total past `cap`. `priorSweptNet` is signed the
+ * way the sweep journal is: a debit to the account (delta > 0) is positive, a credit negative, so alternating residue nets out. Only
+ * sweeps that posted or may still post count (the caller leaves FAILED and cancelled ones out). A downgraded result carries
+ * `recurringSweepCap` so the cap is told apart from a gap beyond the per-day limit. Any other action is unchanged.
+ */
+export function guardRecurringSweep(
+  reconciliation: AccountGlReconciliation,
+  input: { priorSweptNet: number; cap: number },
+): AccountGlReconciliation {
+  if (reconciliation.action !== 'sweep') return reconciliation
+  const projected = Math.abs(roundToGlPrecisionNumber(input.priorSweptNet + reconciliation.delta))
+  return projected > input.cap
+    ? { ...reconciliation, action: 'flag', recurringSweepCap: { priorSweptNet: roundToGlPrecisionNumber(input.priorSweptNet), projectedNet: projected, cap: input.cap } }
+    : reconciliation
+}
 
 export function evaluateAccountGlReconciliation(input: {
   subledgerValue: number
@@ -65,7 +92,7 @@ export type GlLegProvenance = 'reported' | 'proven-absent'
 
 export type AccountGlReconciliationResult<Reason extends string = string> =
   | { available: false; reason: Reason }
-  | ({ available: true; balanceDate: string; /** Where each stored balance the figure rests on came from; a `proven-absent` leg is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is and labelled so. */ glProvenance?: Record<string, GlLegProvenance> } & AccountGlReconciliation)
+  | ({ available: true; balanceDate: string; /** Where each stored balance the figure rests on came from; a `proven-absent` leg is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is and labelled so. */ glProvenance?: Record<string, GlLegProvenance>; /** Period-movement reconciliations: the configured account the figure is for, and the opening date of the GL window (exclusive). */ accountCode?: string; windowOpening?: string } & AccountGlReconciliation)
 
 export type AccountReconciliationSweepJournal = {
   date: string

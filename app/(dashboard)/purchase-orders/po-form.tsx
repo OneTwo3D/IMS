@@ -192,6 +192,8 @@ type AdditionalCost = {
   amountForeign: number
   vatable: boolean
   distributionMethod: string
+  /** 'SHIPPING' tags the buyer's shipping estimate; null = untagged. */
+  kind: 'SHIPPING' | null
 }
 
 function makeKey() {
@@ -328,6 +330,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         amountForeign: cl.amountForeign,
         vatable: cl.vatable,
         distributionMethod: cl.distributionMethod,
+        kind: cl.kind,
       }))
     }
     if (existingPo.directFreightForeign > 0) {
@@ -337,6 +340,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         amountForeign: existingPo.directFreightForeign,
         vatable: false,
         distributionMethod: 'BY_VALUE',
+        kind: null,
       }]
     }
     return []
@@ -791,6 +795,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         amountForeign: ac.amountForeign,
         vatable: ac.vatable,
         distributionMethod: ac.distributionMethod,
+        ...(ac.kind ? { kind: ac.kind } : {}),
       })),
       orderDiscountStr: orderDiscount || undefined,
       orderDiscountForeign,
@@ -1352,7 +1357,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Additional Costs</h2>
           <Button
             variant="outline" size="sm"
-            onClick={() => setAdditionalCosts((prev) => [...prev, { key: makeKey(), description: '', amountForeign: 0, vatable: false, distributionMethod: 'BY_VALUE' }])}
+            onClick={() => setAdditionalCosts((prev) => [...prev, { key: makeKey(), description: '', amountForeign: 0, vatable: false, distributionMethod: 'BY_VALUE', kind: null }])}
           >
             <Plus className="h-3 w-3 mr-1" />Add Cost
           </Button>
@@ -1387,6 +1392,15 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                       className="rounded border-input"
                     />
                     VAT
+                  </label>
+                  <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0" title="Tag this line as your own shipping estimate. A supplier-quoted shipping replaces it (when enabled).">
+                    <input
+                      type="checkbox"
+                      checked={ac.kind === 'SHIPPING'}
+                      onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, kind: e.target.checked ? 'SHIPPING' : null } : c))}
+                      className="rounded border-input"
+                    />
+                    Shipping
                   </label>
                   <select
                     value={ac.distributionMethod}

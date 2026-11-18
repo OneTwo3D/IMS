@@ -3,7 +3,7 @@ import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate
 import {
   inventorySnapshotCounts,
   inventorySnapshotStatusReason,
-  previousUtcDate,
+  previousBusinessDate,
   writeDailyInventorySnapshot,
 } from '@/lib/domain/inventory/inventory-snapshot'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
@@ -45,7 +45,7 @@ export async function handleInventorySnapshotCron(
     writeLog: options.writeLog,
     run: async () => {
       const snapshotResult = await writeSnapshot({
-        snapshotDate: previousUtcDate(now()),
+        snapshotDate: previousBusinessDate(now()),
       })
       return snapshotResult as InventorySnapshotCronPayload
     },

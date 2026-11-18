@@ -128,7 +128,7 @@ const INLINE_SITES: Array<{ types: string[]; file: string; pattern: RegExp }> = 
   { types: ['PURCHASE_CREDIT_NOTE_ALLOCATION'], file: 'lib/connectors/xero/sync-processor.ts', pattern: /date: \(payload\.date as string \| undefined\)\?\.slice\(0, 10\)/ },
   { types: ['ALLOCATION_REVERSAL'], file: 'lib/domain/sales/allocation-service.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: `Allocation reversal: \$\{orderRef\}`/ },
   { types: ['MANUFACTURING_JOURNAL'], file: 'app/actions/manufacturing.ts', pattern: /date: businessDateYmd\(now\),\n\s*reference,/ },
-  { types: ['MANUFACTURING_RECLASS'], file: 'app/actions/manufacturing.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: `MFG-RECLASS: \$\{po\.reference\}`/ },
+  { types: ['MANUFACTURING_RECLASS'], file: 'app/actions/manufacturing.ts', pattern: /date: reclassDate,\n\s*reference: `MFG-RECLASS: \$\{po\.reference\}`/ },
   { types: ['COGS_REVERSAL'], file: 'lib/domain/sales/refund-service.ts', pattern: /date: cogsReversalJournalDate,/ },
   { types: ['UNEARNED_REV_REVERSAL'], file: 'lib/domain/sales/refund-service.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: hasUnearnedReversal/ },
   { types: ['DAILY_BATCH_INVENTORY_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Inventory reconciliation/ },

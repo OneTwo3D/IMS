@@ -82,6 +82,12 @@ enum PurchaseOrderType {
   FREIGHT    // secondary PO linked to goods PO (e.g. FedEx, customs)
 }
 
+/// What a cost line IS, where it matters to a rule. Only SHIPPING today: the buyer's own shipping estimate, which a supplier-quoted shipping REPLACES
+/// (supplier_quote_shipping_landed_enabled). NULL = untagged (every line that existed before, and every other cost).
+enum FreightCostKind {
+  SHIPPING
+}
+
 enum LandedCostMethod {
   BY_VALUE
   BY_WEIGHT
@@ -1592,6 +1598,7 @@ model FreightCostLine {
   vatable            Boolean          @default(false)
   distributionMethod LandedCostMethod @default(BY_VALUE)
   sortOrder          Int              @default(0)
+  kind               FreightCostKind?
 
   po                 PurchaseOrder    @relation(fields: [poId], references: [id])
   invoiceLines       PurchaseInvoiceLine[]
@@ -4424,6 +4431,9 @@ model WmsOrderPushLink {
   /// (sets both columns back to null; the clear is audited). `doublePostageDetail` is the sentence the operator reads: order numbers and amounts only.
   doublePostageAt       DateTime? @map("double_postage_at")
   doublePostageDetail   String?   @map("double_postage_detail")
+  /// The IMS warehouse the warehouse order was created for (the order's ship-from warehouse at create time). A despatch is evidence about
+  /// this warehouse only. Null on links created before this column existed (the despatch then falls back to the order's ship-from).
+  pushWarehouseId       String?   @map("push_warehouse_id")
   /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
   /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
   lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
@@ -4796,6 +4806,8 @@ enum WmsDiscrepancyCategory {
   INVALID_HS_CODE
   INVALID_COUNTRY_OF_ORIGIN
   CUSTOMS_CLEAR_MANUAL
+  /// An IMS SKU rename the warehouse product does not yet follow: nothing is created, the operator renames it there.
+  PRODUCT_SKU_RENAMED
 }
 
 enum WmsDiscrepancyStatus {

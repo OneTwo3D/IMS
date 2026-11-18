@@ -82,10 +82,10 @@ const DATE = '2026-06-30'
 const rate = (currency: string, value: string, at: string): FakeFxRow => ({ fromCurrency: 'GBP', toCurrency: currency, rate: value, fetchedAt: new Date(at) })
 const order = (id: string, ref: string, currency: string): Row => ({
   id, orderNumber: ref, externalOrderNumber: null, invoiceNumber: ref, currency,
-  totalForeign: 100, totalBase: 80, fxRateToBase: 1.25, payments: [],
+  totalForeign: 100, totalBase: 80, fxRateToBase: 1.25, payments: [], refunds: [],
 })
 const bill = (id: string, ref: string, currency: string): Row => ({
-  id, invoiceNumber: ref, totalForeign: 100, totalBase: 80, fxRateToBase: 1.25, po: { reference: `PO-${ref}`, currency },
+  id, invoiceNumber: ref, totalForeign: 100, totalBase: 80, fxRateToBase: 1.25, supplierCreditNotes: [], po: { reference: `PO-${ref}`, currency },
 })
 const priorJournal = (id: string, side: 'receivable' | 'payable', documents?: Array<{ documentId: string; reference: string; currency: string; gainLossBase: number; outstandingForeign?: string }>): Row => ({
   id, type: 'UNREALISED_FX_JOURNAL', status: 'SYNCED', connector: 'xero',
@@ -486,5 +486,20 @@ test('[R5 HIGH] a document read with nothing outstanding is closed: it contribut
   const result = await run()
   assert.equal(posted('reversal').length, 1)
   assert.equal(posted('revaluation', 'payable').length, 0)
-  assert.equal(result.skippedNoRate[0]?.treatment, 'excluded_closed')
+  // o3d-hqvrp.60: a document with nothing outstanding is now dropped from the POPULATION (getOpenPayables), as
+  // receivables always were, so it never reaches the rate stage: it is neither a missing-rate skip, nor reported as
+  // `excluded_closed`, nor does it withhold the side. The invariant this test pins is unchanged: the closed document
+  // contributes nothing and its prior valuation is backed out (the reversal above).
+  assert.equal(result.skippedNoRate.length, 0, 'a closed document is not a missing-rate skip')
+  assert.equal(result.withheldSides.length, 0, 'and does not withhold the side')
+})
+
+test('[o3d-hqvrp.60] a bill fully settled by POSTED credit notes is closed the same way: prior reversed, nothing carried or posted', async () => {
+  state.logs = [priorJournal('prior-ap', 'payable', [DOC('b-b', 'BILL-B', 'CHF', 20, '100')])]
+  state.payables = [{ ...bill('b-b', 'BILL-B', 'CHF'), supplierCreditNotes: [{ amountForeign: 100 }] }]
+  const result = await run()
+  assert.equal(posted('reversal').length, 1)
+  assert.equal(posted('revaluation', 'payable').length, 0)
+  assert.equal(result.skippedNoRate.length, 0)
+  assert.equal(result.withheldSides.length, 0)
 })

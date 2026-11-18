@@ -40,7 +40,11 @@ mock.module('@/lib/db', {
         // o3d-wgl6: the handler reads the bound store URL first; these tests are about the
         // permanent/transient split, so every delivery names the store that is bound.
         findUnique: async ({ where }: { where: { key: string } }) =>
-          where.key === 'wc_url' ? { key: 'wc_url', value: 'https://shop.example.com' } : null,
+          where.key === 'wc_url' ? { key: 'wc_url', value: 'https://shop.example.com' }
+          // o3d-hqvrp.107: product sync on, WooCommerce the master: the import is wanted.
+          : where.key === 'wc_sync_product_enabled' ? { key: where.key, value: 'true' }
+          : where.key === 'wc_sync_product_direction' ? { key: where.key, value: 'from_wc' }
+          : null,
         upsert: async ({ where }: { where: { key: string } }) => {
           settingUpserts.push(where.key)
           return {}

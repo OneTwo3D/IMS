@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { businessDateYmd } from '@/lib/business-date'
 import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
@@ -63,7 +64,9 @@ type TransitSubledgerMovementClient = Pick<Prisma.TransactionClient, 'transitSub
 // OUTSIDE its own GL day's window and the day would perpetually flag. Date inputs
 // (sites passing `new Date()`) MUST be truncated to match the string callers.
 function toJournalDate(value: Date | string): Date {
-  const isoDay = (typeof value === 'string' ? value : value.toISOString()).slice(0, 10)
+  // A Date is a business-day (Europe/London) instant, the same calendar the journal it records is dated on. The UTC day was an
+  // hour (BST) or more away from it, so a midnight-crossing row landed in the wrong GL window.
+  const isoDay = typeof value === 'string' ? value.slice(0, 10) : businessDateYmd(value)
   return new Date(`${isoDay}T00:00:00.000Z`)
 }
 

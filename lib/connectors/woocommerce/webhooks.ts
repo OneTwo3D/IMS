@@ -960,7 +960,38 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
   // fix (o3d-uh2).
   let productSyncError: string | null = null
 
+  // o3d-hqvrp.107: the Sync-page product settings decide whether WooCommerce may write IMS products, exactly as the
+  // hourly poll reads them (reconcile.ts): product sync not explicitly disabled (an unset key imports, as before) AND direction from_wc / both (unset reads as from_wc).
+  // With `to_wc` (IMS is master), sync off, or an unrecognised direction the delivery is acknowledged and NOT imported,
+  // else a shop-manager edit would overwrite IMS and the next push would send it back. A read failure propagates (500,
+  // retried): an unreadable setting must not read as consent. The stock correction below is a separate setting and unchanged.
+  let productImportAllowed = true
   if (canSyncProduct) {
+    const [enabledSetting, directionSetting] = await Promise.all([
+      db.setting.findUnique({ where: { key: 'wc_sync_product_enabled' } }),
+      db.setting.findUnique({ where: { key: 'wc_sync_product_direction' } }),
+    ])
+    const direction = directionSetting?.value
+    const importsFromWc = !direction || direction === 'from_wc' || direction === 'both'
+    // An UNSET enabled key keeps the behaviour before .107 (the webhook imported): only an explicit 'false' skips.
+    const syncDisabled = enabledSetting?.value === 'false'
+    if (syncDisabled || !importsFromWc) {
+      productImportAllowed = false
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_product_webhook_import_skipped',
+        tag: 'sync',
+        level: 'INFO',
+        description: `WooCommerce product webhook for ${productPayload.sku} was not imported: `
+          + (syncDisabled
+            ? 'product sync is disabled (wc_sync_product_enabled).'
+            : `the product direction is ${direction ?? 'unset'}, which does not import from WooCommerce (wc_sync_product_direction).`),
+        metadata: { externalId: productPayload.id, sku: productPayload.sku, productSyncEnabled: enabledSetting?.value ?? null, direction: direction ?? null },
+      })
+    }
+  }
+
+  if (canSyncProduct && productImportAllowed) {
     // No `observedVersion` is passed, and that is not an omission (o3d-wgl6). That argument
     // fences a payload the CALLER fetched against a rebind that landed since; the origin check
     // above already answers that question for a webhook, using the sending store's own identity
@@ -1026,7 +1057,7 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
         },
       })
     }
-  } else if (typeof productPayload.id === 'number') {
+  } else if (!canSyncProduct && typeof productPayload.id === 'number') {
     await logActivity({
       entityType: 'SYNC',
       action: 'wc_product_webhook',

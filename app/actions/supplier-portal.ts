@@ -13,6 +13,8 @@ import { sessionAccessDenial } from '@/lib/auth/session-state'
 import { applyHeaderOrderDiscount, resolveHeaderOrderDiscountForeign } from '@/lib/domain/purchasing/order-discount'
 import { calcRequotedLineAmounts } from '@/lib/domain/purchasing/quote-line-amounts'
 import { SUPPLIER_QUOTABLE_STATUSES, SUPPLIER_RFQ_VIEWABLE_STATUSES, supplierSentPurchaseOrderWhere } from '@/lib/domain/purchasing/supplier-portal-visibility'
+import { planQuotedShipping, SUPPLIER_QUOTE_SHIPPING_SETTING_KEY, SUPPLIER_QUOTED_SHIPPING_DESCRIPTION, type RefusedShippingReplace } from '@/lib/domain/purchasing/quote-shipping'
+import { readPoEditFacts } from '@/lib/domain/purchasing/po-edit-plan'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -314,6 +316,8 @@ export async function submitSupplierQuote(
     const supplierRef = sanitizeSupplierRef(safeData.supplierRef)
     if (!supplierRef) return { success: false, error: 'Supplier reference is required' }
 
+    // Set inside the transaction when a buyer's Shipping line could not be replaced; reported after it commits.
+    const quoteOutcome: { refusedShippingReplace: RefusedShippingReplace | null } = { refusedShippingReplace: null }
     const po = await db.$transaction(async (tx) => {
       await tx.$queryRaw`
         SELECT id
@@ -384,8 +388,40 @@ export async function submitSupplierQuote(
       const grossSubtotalBase = updatedLines.reduce((sum, line) => sum.add(line.totalBase), toDecimal(0))
       const grossTaxForeign = updatedLines.reduce((sum, line) => sum.add(line.taxForeign), toDecimal(0))
       const grossTaxBase = updatedLines.reduce((sum, line) => sum.add(line.taxBase), toDecimal(0))
-      const shippingForeign = toDecimal(safeData.shippingCost)
-      const shippingBase = shippingForeign.div(effectiveFxRate)
+      let shippingForeign = toDecimal(safeData.shippingCost)
+      let shippingBase = shippingForeign.div(effectiveFxRate)
+      // Supplier-quoted shipping as a freight cost line (landed + billable), behind a setting that defaults OFF; see quote-shipping.ts.
+      const landQuotedShipping = (await tx.setting.findUnique({ where: { key: SUPPLIER_QUOTE_SHIPPING_SETTING_KEY }, select: { value: true } }))?.value === 'true'
+      let quotedShippingPlan: ReturnType<typeof planQuotedShipping> | null = null
+      if (landQuotedShipping) {
+        const costLines = await tx.freightCostLine.findMany({
+          where: { poId },
+          select: { id: true, description: true, amountForeign: true, vatable: true, kind: true, _count: { select: { invoiceLines: true } } },
+          orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+        })
+        // Goods already landed against the order are only looked up when a buyer SHIPPING line could be replaced.
+        const hasBuyerShipping = costLines.some((c) => c.kind === 'SHIPPING' && c.description !== SUPPLIER_QUOTED_SHIPPING_DESCRIPTION)
+        const landed = hasBuyerShipping ? ((await readPoEditFacts(tx, poId))?.anyLanded ?? false) : false
+        quotedShippingPlan = planQuotedShipping({
+          shippingForeign,
+          fxRateToBase: effectiveFxRate,
+          vatRate: lockedPo.taxRatePercent ?? 0,
+          costLines: costLines.map(({ _count, ...c }) => ({ ...c, billed: _count.invoiceLines > 0 })),
+          landed,
+        })
+        quoteOutcome.refusedShippingReplace = quotedShippingPlan.refusedReplace
+        if (quotedShippingPlan.deleteIds.length > 0) {
+          await tx.freightCostLine.deleteMany({ where: { id: { in: quotedShippingPlan.deleteIds }, poId } })
+        }
+        if (quotedShippingPlan.create) {
+          await tx.freightCostLine.create({
+            data: { poId, ...quotedShippingPlan.create, distributionMethod: 'BY_VALUE' },
+          })
+        }
+        // The order's freight aggregate is the sum of its cost lines (buyer lines stay beside the supplier's shipping).
+        shippingForeign = quotedShippingPlan.directFreightForeign
+        shippingBase = quotedShippingPlan.directFreightBase
+      }
 
       // o3d-lx1: reapply the RFQ's header discount to the requoted subtotal instead of leaving
       // discountAmount orphaned (which overstated subtotalBase/totalBase). A percentage discount
@@ -413,8 +449,9 @@ export async function submitSupplierQuote(
       })
       const subtotalForeign = toDecimal(netted.subtotalForeign)
       const subtotalBase = toDecimal(netted.subtotalBase)
-      const taxForeign = toDecimal(netted.taxForeign)
-      const taxBase = toDecimal(netted.taxBase)
+      // The buyer's vatable cost lines keep their VAT (it is not part of the line tax the requote recomputes).
+      const taxForeign = toDecimal(netted.taxForeign).add(quotedShippingPlan?.costLineVatForeign ?? 0)
+      const taxBase = toDecimal(netted.taxBase).add(quotedShippingPlan?.costLineVatBase ?? 0)
 
       const updated = await tx.purchaseOrder.updateMany({
         where: { id: poId, supplierId: ctx.supplierId, status: { in: [...SUPPLIER_QUOTABLE_STATUSES] } },
@@ -449,6 +486,15 @@ export async function submitSupplierQuote(
       description: `Supplier submitted quote for ${po.reference} — ref: ${supplierRef}`,
       metadata: { supplierRef, shippingCost: safeData.shippingCost },
     })
+    const refusedShippingReplace = quoteOutcome.refusedShippingReplace
+    if (refusedShippingReplace) {
+      // A visible, operator-facing refusal row: the buyer's Shipping line was kept beside the supplier's (it is billed or landed).
+      await logActivity({
+        entityType: 'PURCHASE_ORDER', entityId: poId, action: 'supplier_quote_shipping_replace_refused', tag: 'purchase', level: 'WARNING',
+        description: `${po.reference}: ${refusedShippingReplace.message}`,
+        metadata: { reason: refusedShippingReplace.reason, costLineIds: refusedShippingReplace.lineIds },
+      })
+    }
     return { success: true }
   } catch (e) {
     if (e instanceof SupplierPortalAccessError) return { success: false, error: 'RFQ not found or not accessible' }

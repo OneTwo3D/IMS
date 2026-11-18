@@ -5,7 +5,9 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { GET, handleInventorySnapshotCron } from '@/app/api/cron/inventory-snapshot/route'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import {
+  previousBusinessDate,
   previousUtcDate,
+  startOfNextBusinessDay,
   writeDailyInventorySnapshot,
   type InventorySnapshotTestClient,
 } from '@/lib/domain/inventory/inventory-snapshot'
@@ -190,4 +192,34 @@ test('previousUtcDate normalizes to UTC midnight before subtracting a day', () =
     previousUtcDate(new Date('2026-05-28T23:59:59.999Z')).toISOString(),
     '2026-05-27T00:00:00.000Z',
   )
+})
+
+test('previousBusinessDate labels the London day that just ended (BST cron at 00:00 London = 23:00 UTC)', () => {
+  // 00:00 BST on 2 July is 23:00 UTC on 1 July; the business day that ended is 1 July (previousUtcDate says 30 June).
+  assert.equal(previousBusinessDate(new Date('2026-07-01T23:00:00.000Z')).toISOString(), '2026-07-01T00:00:00.000Z')
+  assert.equal(previousUtcDate(new Date('2026-07-01T23:00:00.000Z')).toISOString(), '2026-06-30T00:00:00.000Z')
+  // GMT: 00:00 London = 00:00 UTC.
+  assert.equal(previousBusinessDate(new Date('2026-01-02T00:00:00.000Z')).toISOString(), '2026-01-01T00:00:00.000Z')
+})
+
+test('startOfNextBusinessDay is London midnight: 23:00 UTC in BST, 00:00 UTC in GMT', () => {
+  assert.equal(startOfNextBusinessDay(new Date('2026-07-01T00:00:00.000Z')).toISOString(), '2026-07-01T23:00:00.000Z')
+  assert.equal(startOfNextBusinessDay(new Date('2026-01-01T00:00:00.000Z')).toISOString(), '2026-01-02T00:00:00.000Z')
+})
+
+test('the cron route labels a BST-midnight run with the business day that ended', async () => {
+  let seen: string | null = null
+  await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {
+    await handleInventorySnapshotCron(cronRequest('Bearer secret-token'), {
+      now: () => new Date('2026-07-01T23:00:00.000Z'),
+      writeLog: async () => undefined,
+      getMaintenanceResponse: async () => null,
+      checkCronRateLimit: async () => ({ allowed: true }) as never,
+      writeSnapshot: (async (o: { snapshotDate?: Date }) => {
+        seen = o.snapshotDate!.toISOString()
+        return { snapshotDate: '2026-07-01', snapshotsWritten: 0, reservationSnapshotsWritten: 0, reservationSnapshotStockLevelCount: 0, driftCount: 0 }
+      }) as never,
+    })
+  })
+  assert.equal(seen, '2026-07-01T00:00:00.000Z')
 })

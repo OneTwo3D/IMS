@@ -220,7 +220,7 @@ test('[o3d-j625 r2] the REVALUATION half is still routed by the settings object 
     totalForeign: 100,
     totalBase: 80,
     fxRateToBase: 0.8,
-    payments: [],
+    payments: [], refunds: [],
   }]
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
 

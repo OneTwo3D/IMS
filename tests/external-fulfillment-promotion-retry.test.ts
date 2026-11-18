@@ -59,6 +59,8 @@ mock.module('@/lib/db', {
       salesOrderRefundLine: { findMany: async () => [] },
       stockMovement: { findMany: async () => [] },
       orderAllocation: { count: async () => state.allocationCount },
+      // o3d-hqvrp.78: the WMS push-link read; no link, so the warehouse falls back to the order's ship-from (null here: nothing is refused).
+      wmsOrderPushLink: { findUnique: async () => null },
       // Every shipment is already SHIPPED, so none is `not: SHIPPED`.
       shipment: { count: async () => state.totalShipments, findMany: async () => state.openShipments },
     },

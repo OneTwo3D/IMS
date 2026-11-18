@@ -113,7 +113,7 @@ function reset() {
   state.syncResult = { success: true }
   state.stockSyncCalls = []
   state.activity = []
-  state.settings = new Map([['wc_sync_enabled', 'true'], ['wc_url', STORE_A]])
+  state.settings = new Map([['wc_sync_enabled', 'true'], ['wc_url', STORE_A], ['wc_sync_product_enabled', 'true'], ['wc_sync_product_direction', 'from_wc']])
   state.settingReads = []
 }
 

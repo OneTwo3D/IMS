@@ -276,7 +276,7 @@ Webhooks deliver order changes to One Two Inventory in real-time, rather than wa
 4. Click **Setup Webhooks in WooCommerce** to auto-register the three required webhooks via the WC API:
    - `order.created` — imports new orders
    - `order.updated` — syncs status changes and refunds
-   - `product.updated` — syncs product changes
+   - `product.updated` — syncs product changes into IMS, unless product sync is switched off or the direction excludes WooCommerce to IMS; with sync off or IMS as product master the delivery is acknowledged and not imported
 
 **Rotating the webhook secret.** Saving a new secret keeps the old one valid for **48 hours**, because every webhook already registered in WooCommerce keeps signing with the secret it was created with. After saving, click **Setup Webhooks in WooCommerce** again: it now also writes the new secret onto the existing webhooks (it no longer skips them), and once that has run nothing signs with the old secret. The helper plugin needs the new secret as well. After 48 hours only the current secret is accepted, so a webhook still signing with the old one is refused again.
 
