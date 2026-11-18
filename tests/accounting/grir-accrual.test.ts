@@ -108,7 +108,7 @@ test('a partial receipt and a partial bill leave the right open balance, and the
   assert.equal((await bill(po, 3, 12)).success, true)
   assert.equal((await balance(po.id)).toNumber(), 12, '(4 received - 3 billed) x 12')
   const { getGrirReport } = await import('@/lib/domain/finance/finance-period-analytics')
-  const report = await getGrirReport({ pageSize: 500 }, { deps: { baseCurrency: async () => 'GBP', client: s.db as never, now: () => new Date('2026-11-17T12:00:00Z') } })
+  const report = await getGrirReport({ pageSize: 500 }, { deps: { baseCurrency: async () => 'GBP', client: s.db as never } })
   const row = report.rows.find((r) => r.poId === po.id)!
   assert.ok(row, 'the order is on the report')
   assert.equal(row.supplierName, 'GRIR Supplier')
