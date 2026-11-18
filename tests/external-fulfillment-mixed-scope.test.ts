@@ -259,3 +259,12 @@ test('a link that is not MIXED (FULL or unscoped) is the ordinary path even with
   assert.deepEqual(await apply('mintsoft'), { success: true })
   assert.equal(state.applications.length, 0)
 })
+
+test('a storefront completed echo on a MIXED link whose warehouse order is held or cancelled is the ordinary completion (no open warehouse part)', async () => {
+  for (const linkState of ['HELD', 'CANCELLED', 'PENDING_CREATE']) {
+    reset()
+    state.link = { ...(state.link as Row), state: linkState }
+    state.shipments = [{ ...OWN_SHIPMENT, status: 'PACKED' }]
+    assert.deepEqual(await apply('woocommerce'), { success: true }, linkState)
+  }
+})

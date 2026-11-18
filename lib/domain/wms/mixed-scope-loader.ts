@@ -28,6 +28,15 @@ export async function loadMixedScopeForOrder(
   orderId: string,
   wmsWarehouseId: string,
 ): Promise<MixedScope | null> {
+  // FULL is decided from the allocations and shipments ALONE, before any kit graph or requirement snapshot is read: a single-warehouse order must never be
+  // blocked by a graph the part computation would have needed (a circular kit, an unreadable snapshot), so it stays development's payload.
+  const [firstAllocations, firstShipments] = await Promise.all([
+    client.orderAllocation.findMany({ where: { orderId }, select: { warehouseId: true, qty: true } }),
+    client.shipment.findMany({ where: { orderId }, select: { warehouseId: true, _count: { select: { lines: true } } } }),
+  ])
+  const elsewhere = firstAllocations.some((row) => row.warehouseId !== wmsWarehouseId && toDecimal(row.qty).toNumber() > 1e-6)
+    || firstShipments.some((row) => row.warehouseId !== wmsWarehouseId && row._count.lines > 0)
+  if (!elsewhere) return { mode: 'FULL' }
   const order = await client.salesOrder.findUnique({
     where: { id: orderId },
     select: {

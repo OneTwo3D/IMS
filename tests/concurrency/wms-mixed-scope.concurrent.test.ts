@@ -225,5 +225,16 @@ test('a settled link leaves the polling, hold and cancel passes; a dirty link en
     assert.equal(await due(), true, 'feature on: a dirty link is due')
     await d.db.wmsOrderPushLink.update({ where: { id: fx.linkId }, data: { scopeFrozenReason: 'NOT_NEW', scopeFrozenAt: new Date() } })
     assert.equal(await due(), false, 'a change the warehouse refused as past NEW is not re-selected')
+    // A settled part is never amended; a shipped order is examined only for a dirty MIXED link.
+    await d.db.wmsOrderPushLink.update({ where: { id: fx.linkId }, data: { scopeFrozenReason: null, scopeFrozenAt: null, scopeMode: 'MIXED', scopeDirtyAt: new Date() } })
+    assert.equal(await due(), true)
+    await d.db.wmsOrderPushLink.update({ where: { id: fx.linkId }, data: { despatchSettledAt: new Date() } })
+    assert.equal(await due(), false, 'a settled MIXED link is not amended')
+    await d.db.wmsOrderPushLink.update({ where: { id: fx.linkId }, data: { despatchSettledAt: null } })
+    await d.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED' } })
+    await d.db.$executeRaw`UPDATE sales_orders SET "updatedAt" = ${new Date(Date.now() - 7_200_000)} WHERE id = ${fx.orderId}`
+    assert.equal(await due(), true, 'a shipped order\'s dirty MIXED link is still examined (an EMPTY scope must be raised while the warehouse order is New)')
+    await d.db.wmsOrderPushLink.update({ where: { id: fx.linkId }, data: { scopeMode: 'FULL' } })
+    assert.equal(await due(), false, 'a shipped order\'s non-MIXED link is not')
   } finally { await clean(d, fx) }
 })

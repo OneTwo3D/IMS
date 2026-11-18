@@ -5,7 +5,6 @@ import {
   runWmsOrderPushSweepCore,
   type WmsOrderPushPort,
   type WmsPushCandidate,
-  type WmsPushLinkRef,
   type WmsPushRevalidateLink,
   type WmsPushUpdateLink,
 } from '../lib/domain/wms/order-push-sweep.ts'
@@ -103,15 +102,15 @@ test('create: a HOLD / REFUSED / EMPTY scope sends nothing: the order is parked 
   }
 })
 
-test('create: a scope that cannot be READ sends nothing and counts a failure (never the whole of a possibly mixed order)', async () => {
-  let pushed = 0
-  const { port } = makePort({ createCandidates: [candidate()], loadMixedScope: async () => { throw new Error('db down') } })
+test('create: a scope that cannot be READ falls back to development (the whole order), never blocks a single-warehouse order', async () => {
+  let sent: WmsOrderPushInput | null = null
+  const { port } = makePort({ createCandidates: [candidate()], loadMixedScope: async () => { throw new Error('circular kit') } })
   const original = console.error
   console.error = () => {}
   let r
-  try { r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { pushed += 1; return okPush() } }), 'mintsoft', port, { now: NOW }) } finally { console.error = original }
-  assert.equal(pushed, 0)
-  assert.equal(r.failed, 1)
+  try { r = await runWmsOrderPushSweepCore(connector({ pushOrder: async (input) => { sent = input; return okPush() } }), 'mintsoft', port, { now: NOW }) } finally { console.error = original }
+  assert.equal(r.created, 1)
+  assert.equal(JSON.stringify(sent), GOLDEN)
 })
 
 // ---- scoped amend ---------------------------------------------------------------------------------------------------------------------------------
@@ -206,24 +205,70 @@ test('amend: an unsendable scope with no recorded part to rebuild from sends not
   assert.equal(called, 0)
 })
 
-test('amend: an EMPTY scope sends no amendment (the cancel pass pulls the New order back)', async () => {
+test('amend: an EMPTY scope sends no amendment, raises one standing HIGH row for a person, and is stamped so it leaves the head of the batch (no cancel call)', async () => {
   let called = 0
-  const { port, refusals } = makePort({ updatable: [dueLink()], loadMixedScope: async () => ({ mode: 'EMPTY', reason: 'nothing for this warehouse' }) })
+  let cancels = 0
+  const { port, refusals, updates, recorded } = makePort({ updatable: [dueLink()], loadMixedScope: async () => ({ mode: 'EMPTY', reason: 'nothing for this warehouse' }) })
+  await runWmsOrderPushSweepCore(connector({ updateOrder: async () => { called += 1; return { updated: true, status: 'NEW' } }, cancelOrder: async () => { cancels += 1; return { cancelled: true, status: 'CANCELLED' } } }), 'mintsoft', port, { now: NOW })
+  assert.equal(called, 0)
+  assert.equal(cancels, 0, 'IMS never cancels the warehouse order for an EMPTY scope')
+  assert.equal(refusals.length, 1)
+  assert.equal(refusals[0].severity, 'HIGH')
+  assert.match(String(refusals[0].detail), /does not cancel the warehouse order/)
+  assert.equal(recorded.length, 1)
+  assert.ok(updates.some((u) => u.data.pushedAt), 'pushedAt is stamped: not re-selected at the head of every batch')
+})
+
+test('amend: a shipped order is examined for its scope only: EMPTY is raised, and an unsendable scope on it makes no header amendment', async () => {
+  let called = 0
+  const shipped = dueLink({ order: { ...candidate(), shipFromWarehouseId: 'wh-1', updatedAt: new Date('2026-11-18T09:45:00.000Z'), status: 'SHIPPED' } })
+  const { port, refusals } = makePort({ updatable: [shipped], loadMixedScope: async () => ({ mode: 'EMPTY', reason: 'nothing for this warehouse' }) })
   await runWmsOrderPushSweepCore(connector({ updateOrder: async () => { called += 1; return { updated: true, status: 'NEW' } } }), 'mintsoft', port, { now: NOW })
   assert.equal(called, 0)
   assert.equal(refusals[0].severity, 'HIGH')
-  assert.match(String(refusals[0].detail), /cancelled while it is still New/)
+  const hold = makePort({ updatable: [shipped], loadMixedScope: async () => HOLD, loadRecordedMixedScope: async () => MIXED })
+  await runWmsOrderPushSweepCore(connector({ updateOrder: async () => { called += 1; return { updated: true, status: 'NEW' } } }), 'mintsoft', hold.port, { now: NOW })
+  assert.equal(called, 0, 'the shipping itself bumped updatedAt: that is not an amendment')
 })
 
-test('cancel pass: an EMPTY-scope link is cancelled while the warehouse order is NEW, and is only ever effective then (past NEW: a notice, link stays live)', async () => {
-  const link: WmsPushLinkRef = { id: 'link-1', orderId: 'so-1', externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', scopeEmpty: true }
-  const cancelled = makePort({ cancellable: [link] })
-  const r = await runWmsOrderPushSweepCore(connector({ cancelOrder: async () => ({ cancelled: true, status: 'CANCELLED' }) }), 'mintsoft', cancelled.port, { now: NOW })
-  assert.equal(r.cancelled, 1)
-  const late = makePort({ cancellable: [link] })
-  const r2 = await runWmsOrderPushSweepCore(connector({ cancelOrder: async () => ({ cancelled: false, status: 'NOT_CANCELLABLE' }) }), 'mintsoft', late.port, { now: NOW })
-  assert.equal(r2.cancelled, 0)
-  assert.equal(late.updates.some((u) => u.data.state === 'CANCELLED'), false, 'a past-NEW warehouse order is never marked cancelled')
+test('amend: no recorded part to rebuild from stamps pushedAt (not re-selected every sweep) and sends nothing', async () => {
+  let called = 0
+  const { port, updates } = makePort({ updatable: [dueLink()], loadMixedScope: async () => HOLD, loadRecordedMixedScope: async () => null })
+  await runWmsOrderPushSweepCore(connector({ updateOrder: async () => { called += 1; return { updated: true, status: 'NEW' } } }), 'mintsoft', port, { now: NOW })
+  assert.equal(called, 0)
+  assert.ok(updates.some((u) => u.data.pushedAt))
+})
+
+test('amend: a scope read that throws falls back to development for a link that is not MIXED, and fails closed for a MIXED one', async () => {
+  const throwing = async () => { throw new Error('circular kit') }
+  const original = console.error
+  console.error = () => {}
+  try {
+    const sent: string[] = []
+    const plain: WmsPushUpdateLink = { id: 'link-1', externalOrderId: 'wms-1', order: { ...candidate(), shipFromWarehouseId: 'wh-1' } }
+    const a = makePort({ updatable: [plain], loadMixedScope: throwing })
+    const r = await runWmsOrderPushSweepCore(connector({ updateOrder: async (_id: string, input: WmsOrderPushInput) => { sent.push(JSON.stringify(input)); return { updated: true, status: 'NEW' } } }), 'mintsoft', a.port, { now: NOW })
+    assert.equal(r.updated, 1)
+    const b = makePort({ updatable: [plain] })
+    await runWmsOrderPushSweepCore(connector({ updateOrder: async (_id: string, input: WmsOrderPushInput) => { sent.push(JSON.stringify(input)); return { updated: true, status: 'NEW' } } }), 'mintsoft', b.port, { now: NOW })
+    assert.equal(sent[0], sent[1], 'byte-identical to a sweep with no scope support')
+    let called = 0
+    const c = makePort({ updatable: [dueLink()], loadMixedScope: throwing })
+    const r3 = await runWmsOrderPushSweepCore(connector({ updateOrder: async () => { called += 1; return { updated: true, status: 'NEW' } } }), 'mintsoft', c.port, { now: NOW })
+    assert.equal(called, 0)
+    assert.equal(r3.failed, 1)
+  } finally { console.error = original }
+})
+
+test('a header-only amendment on a link that is NOT MIXED is exactly development\'s payload', async () => {
+  const sent: string[] = []
+  const link: WmsPushUpdateLink = { id: 'link-1', externalOrderId: 'wms-1', scopeMode: 'FULL', order: { ...candidate(), shipFromWarehouseId: 'wh-1' } }
+  for (const loadMixedScope of [undefined, async () => HOLD]) {
+    const { port } = makePort({ updatable: [link], loadMixedScope })
+    await runWmsOrderPushSweepCore(connector({ updateOrder: async (_id: string, input: WmsOrderPushInput) => { sent.push(JSON.stringify(input)); return { updated: true, status: 'NEW' } } }), 'mintsoft', port, { now: NOW })
+  }
+  assert.equal(sent.length, 2)
+  assert.equal(sent[0], sent[1])
 })
 
 test('flag turned OFF with a MIXED link: the scope is still read for it (the whole order is never sent)', async () => {
@@ -288,7 +333,6 @@ type Seed = {
   updatable?: WmsPushUpdateLink[]
   loadMixedScope?: WmsOrderPushPort['loadMixedScope']
   loadRecordedMixedScope?: WmsOrderPushPort['loadRecordedMixedScope']
-  cancellable?: WmsPushLinkRef[]
 }
 function makePort(seed: Seed) {
   const upserts: Array<{ orderId: string; create: Record<string, unknown>; update: Record<string, unknown> }> = []
@@ -308,7 +352,7 @@ function makePort(seed: Seed) {
     verifiableLinks: async () => [],
     updatableLinks: async () => seed.updatable ?? [],
     holdableLinks: async () => [],
-    cancellableLinks: async () => seed.cancellable ?? [],
+    cancellableLinks: async () => [],
     upsertByOrder: async (orderId, create, update) => { upserts.push({ orderId, create, update }) },
     updateLink: async (id, data) => { updates.push({ id, data }) },
     updateLinkIfCreateClaimOwned: async () => true,

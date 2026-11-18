@@ -966,7 +966,8 @@ export async function applyExternalFulfillmentUpdate(
           const guarded = await guardUnscopedDespatch(update, order, orderRef, despatchLink)
           if (guarded) return guarded
         }
-      } else if (mixed && !despatchLink.despatchSettledAt) {
+      } else if (mixed && !despatchLink.despatchSettledAt && (despatchLink.state === 'SYNCED' || despatchLink.state === 'MERGED')) {
+        // Only while the warehouse still holds a live part: a held or cancelled warehouse order has no open part, so the storefront completion is the ordinary one.
         return refuseCompletionEchoOnOpenMixedPart(update, order.id, orderRef)
       }
     }

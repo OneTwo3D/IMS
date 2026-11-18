@@ -426,11 +426,10 @@ test('R4: the operator task text carries no status or error text from the wareho
 test('R2: the exception inbox lists a cancel notice by the cancel pass\'s OWN order predicate, not a copy of it', async () => {
   const { readFileSync } = await import('node:fs')
   const inbox = readFileSync(new URL('../lib/domain/wms/push-recovery-affordance.ts', import.meta.url), 'utf8')
-  assert.match(inbox, /cancelNoticeAt: \{ not: null \}, OR: WMS_CANCELLABLE_LINK_WHERE\.OR/)
+  assert.match(inbox, /cancelNoticeAt: \{ not: null \}, order: WMS_CANCELLABLE_ORDER_WHERE/)
   assert.doesNotMatch(inbox, /cancelNoticeAt: \{ not: null \}, order: \{ status: 'CANCELLED'/)
   const sweep = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
-  assert.match(sweep, /OR: WMS_CANCELLABLE_LINK_WHERE\.OR,/, 'and the port selects on the same constant')
-  assert.match(sweep, /\{ order: WMS_CANCELLABLE_ORDER_WHERE \}/, 'which is development\'s order predicate plus the EMPTY-scope clause')
+  assert.match(sweep, /order: WMS_CANCELLABLE_ORDER_WHERE,/, 'and the port selects on the same constant')
 })
 
 test('R1: a cancelled split order whose PRIMARY row reads not-despatched but whose part HAS shipped is still an error, with no storefront write', async () => {
