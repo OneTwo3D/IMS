@@ -197,3 +197,25 @@ test('[o3d-hl8l] a blank ASN id is refused rather than sweeping every unattribut
   assert.deepEqual(store.findFirstArgs, [], 'and nothing is queried on the way to the refusal')
   assert.deepEqual(store.rows, [])
 })
+
+test('[retry delay] the automatic recheck skips an event whose nextRetryAt is in the future; an operator Re-check does not', async () => {
+  const { enqueueMintsoftBookedInRecheckForAsn } = await loadJob()
+  reset()
+  const now = new Date('2026-08-20T09:00:00.000Z')
+  store.rows = [
+    {
+      id: 'row-waiting', connector: 'mintsoft', externalEventId: 'evt-w', externalAsnId: 'asn-9',
+      payload: {}, processedAt: null,
+      nextRetryAt: new Date('2026-08-20T09:30:00.000Z'),
+    } as ReceiptEventRow,
+  ]
+
+  const automatic = await enqueueMintsoftBookedInRecheckForAsn('asn-9', { now: () => now, respectRetryDelay: true })
+  assert.deepEqual(store.processed, [], 'not due: not retried early')
+  assert.equal(automatic.deferred, 1)
+  assert.equal(automatic.failed, 0)
+
+  const operator = await enqueueMintsoftBookedInRecheckForAsn('asn-9', { now: () => now })
+  assert.deepEqual(store.processed, ['row-waiting'], 'an explicit operator Re-check goes now')
+  assert.equal(operator.deferred, undefined)
+})

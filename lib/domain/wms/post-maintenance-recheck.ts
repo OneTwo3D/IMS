@@ -3,6 +3,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { MAINTENANCE_ENABLED_KEY, WMS_BOOKED_IN_RECHECK_DUE_KEY } from '@/lib/maintenance-mode'
+import { shouldEmitWarning } from '@/lib/domain/wms/warning-throttle'
 import { clearPostMaintenanceRecheckMarker } from '@/lib/domain/system/maintenance-recovery'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
 
@@ -56,6 +57,8 @@ export type PostMaintenanceRecheckResult = {
   attempted: number
   /** Attempts that threw or whose callback reported failures; the marker is kept so they are retried. */
   failed: number
+  /** Open ASNs whose outstanding event has a retry that is not due yet (kept for a later tick). */
+  deferred?: number
   /** True when the marker was cleared (every open ASN was attempted this tick). */
   drained: boolean
   windowEndedAt?: string
@@ -97,7 +100,7 @@ async function isMaintenanceModeOn(): Promise<boolean> {
 }
 
 export type PostMaintenanceRecheckDeps = {
-  recheckAsn: (externalAsnId: string, options: { reason: string }) => Promise<unknown>
+  recheckAsn: (externalAsnId: string, options: { reason: string; respectRetryDelay?: boolean }) => Promise<unknown>
 }
 
 export async function runPostMaintenanceBookedInRecheck(
@@ -136,6 +139,7 @@ export async function runPostMaintenanceBookedInRecheck(
   const candidates = truncated ? openAsns.slice(0, pageSize) : openAsns
 
   let failed = 0
+  let deferred = 0
   let attempted = 0
   let reopened = false
   for (const asn of candidates) {
@@ -153,11 +157,16 @@ export async function runPostMaintenanceBookedInRecheck(
     try {
       const outcome = await deps.recheckAsn(asn.externalAsnId, {
         reason: `automatic re-check after maintenance window ended ${windowEndedAt}`,
+        // An outstanding event keeps its own retry schedule; this pass does not pull it forward.
+        respectRetryDelay: true,
       })
       // A callback that RESOLVES can still report that it did not do the work: the booked-in processor
       // catches its own failures (an expired key in no-login mode, a WMS error) and returns a `failed`
       // counter. That is an attempt that did not recover the ASN, so it keeps the marker exactly as a throw does.
-      const reportedFailures = (outcome as { failed?: unknown } | null | undefined)?.failed
+      const reported = outcome as { failed?: unknown; deferred?: unknown } | null | undefined
+      // An event that is not due yet is still owed: keep the marker without retrying it early.
+      if (typeof reported?.deferred === 'number' && reported.deferred > 0) deferred += 1
+      const reportedFailures = reported?.failed
       if (typeof reportedFailures === 'number' && reportedFailures > 0) {
         failed += 1
         console.error(`[wms-post-maintenance-recheck] re-check reported ${reportedFailures} failure(s) for ${asn.externalAsnId}`)
@@ -171,7 +180,7 @@ export async function runPostMaintenanceBookedInRecheck(
   // Keep the marker when anything is still owed — a truncated page, an attempt that threw, or a
   // window that reopened. The next tick repeats the pass; a re-check of an ASN with nothing
   // outstanding books nothing in, so repeating is cheap and losing an ASN is not.
-  const complete = !truncated && failed === 0 && !reopened
+  const complete = !truncated && failed === 0 && deferred === 0 && !reopened
   let drained = false
   let refusal: PostMaintenanceRecheckResult['refusal'] = reopened ? 'window_reopened' : undefined
   if (complete) {
@@ -192,7 +201,11 @@ export async function runPostMaintenanceBookedInRecheck(
     }
   }
 
-  if (attempted > 0 || reopened) {
+  // A pass that keeps its marker repeats every tick; one warning an hour per window is enough to be seen
+  // without writing a row every five minutes for as long as the key stays expired.
+  const stillOwed = failed > 0 || deferred > 0 || truncated || reopened || !!refusal
+  const noisy = stillOwed && !shouldEmitWarning(`wms-post-maintenance-recheck:${connectorId}:${windowEndedAt}`)
+  if ((attempted > 0 || reopened) && !noisy) {
     await logActivity({
       entityType: 'SYNC',
       tag: 'sync',
@@ -201,15 +214,16 @@ export async function runPostMaintenanceBookedInRecheck(
       description:
         `Re-checked ${attempted} open ASN(s) after a maintenance window ended ${windowEndedAt}`
         + (failed > 0 ? ` — ${failed} could not be re-checked and will be retried` : '')
+        + (deferred > 0 ? ` — ${deferred} have a retry that is not due yet and will be re-checked when it is` : '')
         + (reopened ? ' — a maintenance window opened mid-pass, so the rest were left for the next tick' : '')
         + (refusal === 'recheck_marker_moved' ? ' — the marker moved during the pass and was left alone' : '')
         + (truncated ? ' — more remain and will be re-checked next tick' : ''),
-      metadata: { connector: connectorId, windowEndedAt, attempted, failed, truncated, refusal: refusal ?? null },
+      metadata: { connector: connectorId, windowEndedAt, attempted, failed, deferred, truncated, refusal: refusal ?? null },
       resolveUser: false,
     })
   }
 
-  return { skipped: false, attempted, failed, drained, windowEndedAt, ...(refusal ? { refusal } : {}) }
+  return { skipped: false, attempted, failed, ...(deferred > 0 ? { deferred } : {}), drained, windowEndedAt, ...(refusal ? { refusal } : {}) }
 }
 
 /**

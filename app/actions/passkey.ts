@@ -11,11 +11,14 @@ import type {
   AuthenticationResponseJSON,
 } from '@simplewebauthn/server'
 import { randomBytes } from 'crypto'
+import { headers } from 'next/headers'
 import { db } from '@/lib/db'
 import { getSession } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { checkRateLimit } from '@/lib/security/rate-limit'
+import { getClientIp, isTrustedProxyConfigured } from '@/lib/request-ip'
 
 const RP_NAME = 'onetwoInventory'
 
@@ -46,7 +49,7 @@ async function getPasskeyOriginConfig(): Promise<{ rpId: string; origin: string 
 }
 
 async function setChallenge(key: string, challenge: string) {
-  await setAuthToken(`passkey_challenge:${key}`, challenge, 5 * 60 * 1000)
+  await setAuthToken(`passkey_challenge:${key}`, challenge, PASSKEY_CEREMONY_TTL_MS)
 }
 
 async function getChallenge(key: string): Promise<string | null> {
@@ -144,9 +147,41 @@ export async function verifyPasskeyRegistration(
 // This action is public by necessity (it runs before login), so it must also be harmless to call repeatedly:
 // each call stores its challenge under its OWN random ceremony key. A shared key (the old `auth:discoverable`
 // or `auth:<email>`) let any unauthenticated caller overwrite and so invalidate every login in flight.
+//
+// Because each call now writes its own row, issuance is bounded: a per-IP rate limit, a cap on outstanding
+// (unexpired) ceremonies, and expired ones are pruned on issue.
+const PASSKEY_CEREMONY_TTL_MS = 5 * 60_000
+const PASSKEY_MAX_OUTSTANDING_CEREMONIES = 1000
+const PASSKEY_ISSUE_IP_MAX = 30
+// Without trusted-proxy resolution every client collapses onto the proxy's address, so the per-IP bucket is
+// really a global one and must be wide enough not to lock a whole office out.
+const PASSKEY_ISSUE_COLLAPSED_MAX = 300
+const PASSKEY_ISSUE_WINDOW_MS = 5 * 60_000
+const PASSKEY_CHALLENGE_KEY_PREFIX = 'passkey_challenge:auth:'
+
 export async function getPasskeyAuthenticationOptions() {
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }
+
+  const ip = getClientIp(await headers()) ?? 'unknown'
+  const limit = await checkRateLimit(
+    `passkey-options-ip:${ip}`,
+    isTrustedProxyConfigured() ? PASSKEY_ISSUE_IP_MAX : PASSKEY_ISSUE_COLLAPSED_MAX,
+    PASSKEY_ISSUE_WINDOW_MS,
+    { failClosed: true },
+  )
+  if (!limit.allowed) return { error: 'Too many sign-in attempts. Please wait a few minutes and try again.' }
+
+  const now = new Date()
+  await db.oneTimeToken.deleteMany({
+    where: { key: { startsWith: PASSKEY_CHALLENGE_KEY_PREFIX }, expiresAt: { lt: now } },
+  })
+  const outstanding = await db.oneTimeToken.count({
+    where: { key: { startsWith: PASSKEY_CHALLENGE_KEY_PREFIX }, expiresAt: { gte: now } },
+  })
+  if (outstanding >= PASSKEY_MAX_OUTSTANDING_CEREMONIES) {
+    return { error: 'Sign-in is busy. Please try again in a few minutes.' }
+  }
   const challengeKey = `auth:${randomBytes(16).toString('hex')}`
 
   const options = await generateAuthenticationOptions({

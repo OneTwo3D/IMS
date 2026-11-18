@@ -17,6 +17,8 @@ import test, { mock } from 'node:test'
 // every open ASN of BOTH source types.
 // ---------------------------------------------------------------------------------------------
 
+import { resetWarningThrottleForTests } from '../lib/domain/wms/warning-throttle.ts'
+
 type AsnRow = {
   externalAsnId: string
   connector: string
@@ -148,6 +150,7 @@ function asn(overrides: Partial<AsnRow> & { externalAsnId: string }): AsnRow {
 }
 
 function reset() {
+  resetWarningThrottleForTests()
   state.settings.clear()
   state.asns = []
   state.logs = []
@@ -431,4 +434,26 @@ test('a re-check that resolves with failed 0 still drains the marker', async () 
   })
   assert.equal(result.failed, 0)
   assert.equal(result.drained, true)
+})
+
+test('a not-due outstanding event keeps the marker, is not retried early, and does not warn on every tick', async () => {
+  reset()
+  state.settings.set(WMS_BOOKED_IN_RECHECK_DUE_KEY, '2026-07-20T10:00:00.000Z')
+  state.asns = [asn({ externalAsnId: 'ASN-WAITING' })]
+  const seen: Array<{ respectRetryDelay?: boolean }> = []
+  const waiting = {
+    recheckAsn: async (_id: string, options: { reason: string; respectRetryDelay?: boolean }) => {
+      seen.push(options)
+      return { processed: 0, failed: 0, deferred: 1 }
+    },
+  }
+  const { runPostMaintenanceBookedInRecheck } = await loadSweep()
+  const first = await runPostMaintenanceBookedInRecheck('mintsoft', waiting)
+  const second = await runPostMaintenanceBookedInRecheck('mintsoft', waiting)
+  assert.equal(seen[0]?.respectRetryDelay, true, 'the automatic pass asks the callback to honour nextRetryAt')
+  assert.equal(first.drained, false)
+  assert.equal(first.deferred, 1)
+  assert.equal(second.drained, false)
+  assert.equal(state.settings.get(WMS_BOOKED_IN_RECHECK_DUE_KEY), '2026-07-20T10:00:00.000Z')
+  assert.equal(state.logs.filter((l) => l.action === 'wms_post_maintenance_recheck').length, 1, 'one warning per hour, not one per tick')
 })

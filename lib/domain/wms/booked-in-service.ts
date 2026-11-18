@@ -19,6 +19,7 @@ import {
 } from './asn-reconciliation'
 import { loadManualReceiptPools, requireManualReceiptPool } from '@/lib/domain/wms/manual-receipt-pool'
 import { enqueueStockSync } from '@/lib/shopping'
+import { shouldEmitWarning } from '@/lib/domain/wms/warning-throttle'
 import { isWmsLoginRefusal } from '@/lib/domain/wms/no-login-scope'
 import { classifyStockEnqueueFailure } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
@@ -1945,7 +1946,8 @@ export async function processBookedInEvent(
     const message = error instanceof Error ? error.message : 'Mintsoft booked-in processing failed'
     if (isWmsLoginRefusal(error)) {
       await markEventLoginRefused(event.id, message)
-      await logActivity({
+      // One warning per event per hour: the retry is spaced, but an operator needs to see it, not a row per try.
+      if (shouldEmitWarning(`mintsoft-booked-in-key-expired:${event.id}`)) await logActivity({
         entityType: 'SYNC',
         entityId: event.id,
         tag: 'sync',
