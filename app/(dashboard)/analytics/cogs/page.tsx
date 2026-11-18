@@ -176,7 +176,7 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
         // per-row columns are three. A zero across all six is the claim that every credit reached a
         // row; anything else is why the period figures carry a mark.
         { label: 'Credit off-report — nothing to attribute to (net / gross / unproven)', value: `${money(report.totals.refundsUnattributedNetBasis)} / ${money(report.totals.refundsUnattributedGrossBasis)} / ${money(report.totals.refundsUnattributedUnknownBasis)}`, tone: 'warning' },
-        { label: 'Credit off-report — no revenue row here (net / gross / unproven)', value: `${money(report.totals.refundsOutsideReportNetBasis)} / ${money(report.totals.refundsOutsideReportGrossBasis)} / ${money(report.totals.refundsOutsideReportUnknownBasis)}`, tone: 'warning' },
+        { label: 'Credit off-report — line or product has no revenue row in this window (net / gross / unproven)', value: `${money(report.totals.refundsOutsideReportNetBasis)} / ${money(report.totals.refundsOutsideReportGrossBasis)} / ${money(report.totals.refundsOutsideReportUnknownBasis)}`, tone: 'warning' },
       ]}
       notices={report.notices}
       dateMode="period"

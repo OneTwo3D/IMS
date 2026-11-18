@@ -2,11 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   aggregateCogsReport,
+  cogsRevenueDenominatorQty,
   addExactCredit,
   emptyExactCredit,
   resolveCogsRevenueKeys,
   type CogsAggregationInput,
 } from '@/lib/domain/inventory/inventory-costing-reports'
+import { ExactFigure } from '@/lib/domain/math/exact-figure'
 import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
@@ -40,18 +42,60 @@ test('a line split across two warehouses in one window still books the whole lin
   assert.equal(totals.revenueBase.exactString(), '400')
 })
 
-test('credit on a prorated line follows the same share; the out-of-window part bounds the totals (o3d-002w)', () => {
+function creditOf(amount: string) {
   const credit = emptyExactCredit()
-  addExactCredit(credit, 'NET', '80')
-  const { rows, totals, credits } = aggregateCogsReport(
-    [input({ id: 'm1', qty: '1' })], 'product',
-    { byRevenueKey: new Map([['L:L1', credit]]), outsideReport: emptyExactCredit(), unattributed: emptyExactCredit() },
+  addExactCredit(credit, 'NET', amount)
+  return { byRevenueKey: new Map([['L:L1', credit]]), outsideReport: emptyExactCredit(), unattributed: emptyExactCredit() }
+}
+
+test('credit raised in the period comes off in full from the in-window share', () => {
+  const { rows, totals, credits } = aggregateCogsReport([input({ id: 'm1', qty: '1' })], 'product', creditOf('80'))
+  assert.equal(rows[0]!.refundsNetBasis.exactString(), '80')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '20', '100 - 80')
+  assert.equal(totals.revenueBase.exactString(), '20')
+  assert.equal(credits.outsideReport.net.exactString(), '0')
+})
+
+test('4 ordered, 1 refunded before shipping, 3 dispatched: revenue 300 and exact (round 1 HIGH)', () => {
+  // The loader hands revenueQty = cogsRevenueDenominatorQty(4 ordered, 1 refunded, 0 shipped) = 3.
+  const { rows, totals, credits } = aggregateCogsReport([input({ id: 'm1', qty: '3', cogsBase: '120', revenueQty: '3' })], 'product', creditOf('100'))
+  assert.equal(rows[0]!.revenueBase!.exactString(), '300')
+  assert.equal(rows[0]!.revenueBaseBound, 'exact')
+  assert.equal(totals.revenueBase.exactString(), '300')
+  assert.equal(credits.outsideReport.net.exactString(), '0')
+  assert.equal(credits.basisComplete, true, 'nothing off-report, so no upper-bound marker')
+})
+
+test('a refund AFTER dispatch of all 4 units: 400 - 100 = 300 exact', () => {
+  assert.equal(cogsRevenueDenominatorQty({ ordered: '4', refunded: '1', shipped: '4' }).exactString(), '4')
+  const { totals, credits } = aggregateCogsReport([input({ id: 'm1', qty: '4', cogsBase: '160', revenueQty: '4' })], 'product', creditOf('100'))
+  assert.equal(totals.revenueBase.exactString(), '300')
+  assert.equal(credits.basisComplete, true)
+})
+
+test('a pre-ship refund across two windows books 300 in total; the credit comes off in the period that raised it', () => {
+  // 4 ordered, 1 refunded before shipping, 1 shipped in June and 2 in July; the refund is raised in July.
+  const denominator = cogsRevenueDenominatorQty({ ordered: '4', refunded: '1', shipped: '3' }).exactString()
+  assert.equal(denominator, '3')
+  const june = aggregateCogsReport([input({ id: 'm1', qty: '1', revenueQty: denominator })], 'product')
+  const july = aggregateCogsReport([input({ id: 'm2', qty: '2', cogsBase: '80', revenueQty: denominator })], 'product', creditOf('100'))
+  assert.equal(june.totals.revenueBase.add(july.totals.revenueBase).exactString(), '300')
+  assert.equal(june.totals.revenueBase.mulDiv(ExactFigure.of(3), ExactFigure.of(1)).exactString(), '400')
+})
+
+test('cogsRevenueDenominatorQty: ordered less refunded, never below shipped', () => {
+  assert.equal(cogsRevenueDenominatorQty({ ordered: '4', refunded: '1', shipped: '0' }).exactString(), '3')
+  assert.equal(cogsRevenueDenominatorQty({ ordered: '4', refunded: '1', shipped: '2' }).exactString(), '3')
+  assert.equal(cogsRevenueDenominatorQty({ ordered: '4', refunded: '3', shipped: '2' }).exactString(), '2')
+  assert.equal(cogsRevenueDenominatorQty({ ordered: '4' }).exactString(), '4')
+})
+
+test('resolveCogsRevenueKeys prefers the per-line denominator over the ordered qty', () => {
+  const [line] = resolveCogsRevenueKeys(
+    [{ orderId: 'O1', productId: 'p1', shipmentLine: { lineId: 'L1', lineProductId: 'p1', lineTotalBase: '400', lineQty: '4' } }],
+    new Map(), new Map(), new Map([['L1', toDecimal('3')]]),
   )
-  assert.equal(rows[0]!.refundsNetBasis.exactString(), '20', 'a quarter of the credit for a quarter of the line')
-  assert.equal(rows[0]!.revenueBase!.exactString(), '80', '100 - 20')
-  assert.equal(totals.revenueBase.exactString(), '80')
-  assert.equal(credits.outsideReport.net.exactString(), '60', 'the credit for units shipped in other windows is not dropped')
-  assert.equal(credits.basisComplete, false)
+  assert.equal(line!.revenueQty!.toString(), '3')
 })
 
 test('the margin total reconciles with its own columns even when a row is Unmatched (o3d-002w)', () => {

@@ -27,6 +27,8 @@ import {
   netLinearFigureBoundExact,
 } from '@/lib/domain/sales/refund-basis-analytics'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
+import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
+import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { refundLinesRaisedInPeriodWhere } from '@/lib/domain/sales/refund-credit-buckets'
 
 const DEFAULT_PAGE_SIZE = 100
@@ -351,7 +353,7 @@ type SalesOrderRevenueRow = {
   id: string
   customerName: string | null
   shoppingLinks: Array<{ connector: string }>
-  lines: Array<{ productId: string | null; totalBase: DecimalInput; qty?: DecimalInput | null }>
+  lines: Array<{ id?: string; productId: string | null; totalBase: DecimalInput; qty?: DecimalInput | null }>
 }
 
 type LandedCostLineRow = {
@@ -428,8 +430,9 @@ export type CogsAggregationInput = {
   revenueKey?: string | null
   revenueBase: DecimalInput | null
   /**
-   * o3d-002w: the quantity `revenueBase` is denominated in (the sales line's ordered qty; for the blended
-   * order:product key, the sum over that product's lines). With it a dispatch books `revenue x qty / revenueQty`,
+   * o3d-002w: the quantity `revenueBase` is denominated in: the sales line's ordered qty LESS the units refunded and
+   * never shipped (`cogsRevenueDenominatorQty`; for the blended order:product key, the sum over that product's lines).
+   * With it a dispatch books `revenue x qty / revenueQty` and the period's credit comes off in full,
    * so a line shipped across two periods books only the in-window share in each. Absent: the share falls
    * back to the quantity dispatched inside the window, which books the WHOLE line in every window.
    */
@@ -1153,9 +1156,6 @@ export function aggregateCogsReport(
       lineRevenueByKey.set(input.revenueKey, { revenue: ExactFigure.of(input.revenueBase), totalQty: ExactFigure.of(input.qty), revenueQty })
     }
   }
-  // o3d-002w: credit against a prorated line that belongs to units dispatched OUTSIDE this window. It reaches
-  // no row, so it is carried into the off-report bucket (and bounds the totals) instead of being dropped.
-  const outsideWindowShares: ExactCredit[] = []
 
   const groups = new Map<string, {
     first: CogsAggregationInput
@@ -1225,10 +1225,13 @@ export function aggregateCogsReport(
         // THE SHARE STAYS A QUOTIENT (o3d-rv4a r5). Round 4 computed `revenue x q / Q` as a Decimal, which
         // rounds it to twenty significant digits, and then published it at six decimals, rounding again.
         shares.push(degenerate ? line.revenue : line.revenue.mulDiv(groupQty, denominator))
-        // The credit against the line is shared by the SAME exact q/Q (review H1: a Decimal share of it
-        // made an exactly-equal credit and revenue unequal in the nineteenth digit).
+        // The credit raised in this period is subtracted IN FULL across the line's groups, shared by the quantity
+        // dispatched in the window (not by the revenue denominator): the denominator already excludes refunded
+        // units, so prorating the credit by it as well would take a never-shipped unit off twice.
+        // The share is an exact quotient too (review H1: a Decimal share of it made an exactly-equal credit
+        // and revenue unequal in the nineteenth digit).
         const credit = credits.byRevenueKey.get(revKey)
-        if (credit) creditShares.push(degenerate ? credit : shareExactCredit(credit, groupQty, denominator))
+        if (credit) creditShares.push(degenerate ? credit : shareExactCredit(credit, groupQty, line.totalQty))
       }
       const groupRevenue = ExactFigure.sum(shares)
       const exactGroupCredits = sumExactCredits(creditShares)
@@ -1313,13 +1316,7 @@ export function aggregateCogsReport(
   // decided from the INTERVAL, never a sum: +100 NET against -100 GROSS cancels across bases, and
   // +120 GROSS against -120 GROSS cancels within one while their ex-VAT values need not.
   // `offRowCreditSummary`'s interval, exactly: none of it was subtracted, so it is unabsorbed.
-  for (const [revKey, line] of lineRevenueByKey) {
-    const credit = credits.byRevenueKey.get(revKey)
-    if (!credit || line.revenueQty == null || line.totalQty.sign() <= 0) continue
-    const outside = line.revenueQty.sub(line.totalQty)
-    if (outside.sign() > 0) outsideWindowShares.push(shareExactCredit(credit, outside, line.revenueQty))
-  }
-  const outsideReportCredit = sumExactCredits([credits.outsideReport, ...outsideWindowShares])
+  const outsideReportCredit = credits.outsideReport
   const offRow = exactUnabsorbedInterval(sumExactCredits([credits.unattributed, outsideReportCredit]), COGS_FIGURE_BASIS)
   const unaccountedInterval = sumExactIntervals([...unaccounted, offRow])
   const attributedCredit = sumExactCredits(attributed)
@@ -1666,6 +1663,8 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
   revenueByOrderProduct: Map<string, Decimal>
   /** o3d-002w: the ordered qty behind each revenue key's figure (sum over the product's lines). */
   qtyByOrderProduct: Map<string, Decimal>
+  /** The same denominator per sales line, for the line-level revenue key (`L:<lineId>`). */
+  qtyByLineId: Map<string, Decimal>
   orderMetaById: Map<string, { customerName: string | null; channel: string | null }>
 }> {
   const rows: SalesOrderRevenueRow[] = orderIds.length === 0
@@ -1676,7 +1675,7 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
           id: true,
           customerName: true,
           shoppingLinks: { select: { connector: true } },
-          lines: { select: { productId: true, totalBase: true, qty: true } },
+          lines: { select: { id: true, productId: true, totalBase: true, qty: true } },
         },
       })
   // The revenue cohort. A dispatch of any other order keeps its COST in this report but gets no
@@ -1689,6 +1688,28 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
         select: { id: true },
       })
   const invoicedOrderIds = new Set(invoicedRows.map((row) => row.id))
+  // Units the line can still ever ship: ordered - refunded, never below what committed shipments already
+  // cover (the rule allocation shrinks by, refund-unshipped-trim-plan). A refunded unit that never shipped
+  // must leave the revenue denominator, because the credit for it is then subtracted IN FULL.
+  const refundedByLine = new Map<string, Decimal>()
+  const shippedByLine = new Map<string, Decimal>()
+  if (invoicedOrderIds.size > 0) {
+    const invoicedIds = [...invoicedOrderIds]
+    const refundLines = await loadNettedRefundLines(db, { refund: { orderId: { in: invoicedIds } } })
+    for (const refundLine of refundLines) {
+      if (!refundLine.salesOrderLineId) continue
+      refundedByLine.set(refundLine.salesOrderLineId, (refundedByLine.get(refundLine.salesOrderLineId) ?? toDecimal(0)).add(toDecimal(refundLine.qty)))
+    }
+    const committed = await db.shipmentLine.findMany({
+      where: { shipment: { orderId: { in: invoicedIds }, status: { not: UNCOMMITTED_SHIPMENT_STATUS } } },
+      select: { lineId: true, productId: true, qty: true, line: { select: { productId: true } } },
+    })
+    for (const shipped of committed) {
+      if (shipped.line.productId !== shipped.productId) continue
+      shippedByLine.set(shipped.lineId, (shippedByLine.get(shipped.lineId) ?? toDecimal(0)).add(toDecimal(shipped.qty)))
+    }
+  }
+  const qtyByLineExact = new Map<string, ExactFigure>()
   // Summed EXACTLY and handed on as a Decimal holding every digit (a Decimal constructor does not round;
   // only Decimal arithmetic does). `.add` here would round a sum past twenty significant digits.
   const exactRevenueByOrderProduct = new Map<string, ExactFigure>()
@@ -1708,13 +1729,34 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
       if (!line.productId) continue
       const key = revenueKey({ orderId: order.id, productId: line.productId })
       exactRevenueByOrderProduct.set(key, (exactRevenueByOrderProduct.get(key) ?? ExactFigure.zero()).add(ExactFigure.of(line.totalBase)))
-      if (line.qty != null) exactQtyByOrderProduct.set(key, (exactQtyByOrderProduct.get(key) ?? ExactFigure.zero()).add(ExactFigure.of(line.qty)))
+      if (line.qty != null) {
+        const denominator = cogsRevenueDenominatorQty({ ordered: line.qty, refunded: line.id ? refundedByLine.get(line.id) : null, shipped: line.id ? shippedByLine.get(line.id) : null })
+        if (line.id) qtyByLineExact.set(line.id, denominator)
+        exactQtyByOrderProduct.set(key, (exactQtyByOrderProduct.get(key) ?? ExactFigure.zero()).add(denominator))
+      }
     }
   }
   for (const [key, sum] of exactRevenueByOrderProduct) revenueByOrderProduct.set(key, toDecimal(sum.exactString()))
   const qtyByOrderProduct = new Map<string, Decimal>()
   for (const [key, sum] of exactQtyByOrderProduct) qtyByOrderProduct.set(key, toDecimal(sum.exactString()))
-  return { invoicedOrderIds, revenueByOrderProduct, qtyByOrderProduct, orderMetaById }
+  const qtyByLineId = new Map<string, Decimal>()
+  for (const [id, qty] of qtyByLineExact) qtyByLineId.set(id, toDecimal(qty.exactString()))
+  return { invoicedOrderIds, revenueByOrderProduct, qtyByOrderProduct, qtyByLineId, orderMetaById }
+}
+
+/**
+ * The quantity a line's revenue is denominated in for the dispatch share: ordered minus refunded, but never
+ * below what has shipped. WooCommerce keeps the line at the ORDERED qty and books a refund as a refund line,
+ * so a 4 x 100 line with one unit refunded before dispatch ships 3 against a 400 line total and a 100 credit:
+ * 400 x 3/3 - 100 = 300. Prorating over the ordered 4 as well would take the unit off twice (225).
+ * A refund AFTER dispatch leaves shipped at 4, so the denominator stays 4 and the credit is still 100.
+ */
+export function cogsRevenueDenominatorQty(input: { ordered: DecimalInput; refunded?: DecimalInput | null; shipped?: DecimalInput | null }): ExactFigure {
+  const ordered = ExactFigure.of(input.ordered)
+  const refunded = input.refunded == null ? ExactFigure.zero() : ExactFigure.of(input.refunded)
+  const shipped = input.shipped == null ? ExactFigure.zero() : ExactFigure.of(input.shipped)
+  const remaining = ordered.sub(refunded)
+  return remaining.sub(shipped).sign() >= 0 ? remaining : shipped
 }
 
 export type CogsRevenueRowInput = {
@@ -1741,6 +1783,7 @@ export function resolveCogsRevenueKeys(
   rows: CogsRevenueRowInput[],
   revenueByOrderProduct: Map<string, Decimal>,
   qtyByOrderProduct: Map<string, Decimal> = new Map(),
+  qtyByLineId: Map<string, Decimal> = new Map(),
 ): Array<{ revenueKey: string | null; revenueBase: Decimal | null; revenueQty: Decimal | null }> {
   const lineLevelByOrderProduct = new Map<string, boolean>()
   for (const row of rows) {
@@ -1757,7 +1800,7 @@ export function resolveCogsRevenueKeys(
       return {
         revenueKey: `L:${row.shipmentLine.lineId}`,
         revenueBase: toDecimal(row.shipmentLine.lineTotalBase),
-        revenueQty: row.shipmentLine.lineQty == null ? null : toDecimal(row.shipmentLine.lineQty),
+        revenueQty: qtyByLineId.get(row.shipmentLine.lineId) ?? (row.shipmentLine.lineQty == null ? null : toDecimal(row.shipmentLine.lineQty)),
       }
     }
     return { revenueKey: opk, revenueBase: revenueByOrderProduct.get(opk) ?? null, revenueQty: qtyByOrderProduct.get(opk) ?? null }
@@ -2033,7 +2076,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   const sourceOrderIds = rows
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
-  const { invoicedOrderIds, revenueByOrderProduct, qtyByOrderProduct, orderMetaById } = await loadRevenueByOrderProduct(sourceOrderIds)
+  const { invoicedOrderIds, revenueByOrderProduct, qtyByOrderProduct, qtyByLineId, orderMetaById } = await loadRevenueByOrderProduct(sourceOrderIds)
   const resolvedRevenue = resolveCogsRevenueKeys(
     rows.map((row) => ({
       // Revenue (including the shipment-line link, which carries its own line total) only for invoiced orders.
@@ -2050,6 +2093,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     })),
     revenueByOrderProduct,
     qtyByOrderProduct,
+    qtyByLineId,
   )
   const inputs: CogsAggregationInput[] = rows.map((row, index) => {
     const product = row.movement.product

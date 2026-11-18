@@ -51,7 +51,10 @@ export type ProfitabilityFyFigures = {
    * is exact only below 2^53 units of the last place; above ~9e13 a ceiling rounded from one can print BELOW the
    * truth it bounds, and by then the precision is gone at the wire, not at the renderer. Every BOUNDED display (cell,
    * footer, card, CSV, and the browser's filtered subtotal) therefore sums and rounds THESE, with no Number in
-   * between. The numbers stay for sorting, filtering and tone, where a ~1e-16 relative error cannot matter.
+   * the display path. THE LIMIT: the stored line totals and refunds are added as decimals, but the per-line
+   * discount add-back and the order-discount allocation come from float helpers, and the running sum is a
+   * 20-significant-digit Decimal, so the figure is exact only while it stays below about 1e14 (sub-cent
+   * beyond that, never more). It is not claimed exact above that. The numbers stay for sorting, filtering and tone, where a ~1e-16 relative error cannot matter.
    */
   revenueExact: string
   profitExact: string
