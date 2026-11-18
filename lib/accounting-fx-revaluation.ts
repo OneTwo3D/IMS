@@ -387,14 +387,66 @@ async function revaluedSidesForDate(
   return sides
 }
 
+/**
+ * o3d-hqvrp.60 - THE UNREALISED-FX POPULATION. Receivables are orders that have been INVOICED: a DRAFT order and a quotation are
+ * not receivables (they were revalued before), and a cancelled one is not either. Exported so the population is testable.
+ */
+export const OPEN_RECEIVABLE_ORDER_WHERE = (baseCurrency: string) => ({
+  currency: { not: baseCurrency },
+  status: { notIn: ['CANCELLED', 'DRAFT'] as Array<'CANCELLED' | 'DRAFT'> },
+  isQuote: false,
+  refundStatus: { not: 'FULL' as const },
+  totalForeign: { gt: 0 },
+})
+
+/**
+ * What is still owed on an order: total, less receipts, less the credit notes raised against it (a credit note reduces the
+ * receivable until it is paid out, and the refund payment that settles it is not a receipt of the invoice). Never negative: a credit
+ * beyond the invoice is owed TO the customer, not a receivable. Pure; Decimal throughout.
+ */
+export function receivableOutstanding(order: {
+  totalForeign: unknown
+  totalBase: unknown
+  currency: string
+  payments: Array<{ amount: unknown; currency: string }>
+  refunds: Array<{ totalForeign: unknown }>
+}): { outstandingForeign: number; bookedBase: number } {
+  const paid = order.payments.reduce((sum, payment) => (
+    payment.currency === order.currency ? addMoney(sum, payment.amount as never) : sum
+  ), toDecimal(0))
+  const credited = order.refunds.reduce((sum, refund) => addMoney(sum, refund.totalForeign as never), toDecimal(0))
+  const outstandingForeign = roundAccountingMoney(subtractMoney(subtractMoney(order.totalForeign as never, paid), credited))
+  if (outstandingForeign < 0.01) return { outstandingForeign: 0, bookedBase: 0 }
+  // Prorate the stored base by the outstanding share (one fxRate per order).
+  const totalForeign = toDecimal(order.totalForeign as never)
+  const bookedBase = totalForeign.gt(0)
+    ? multiplyMoney(order.totalBase as never, outstandingForeign).div(totalForeign).toNumber()
+    : 0
+  return { outstandingForeign, bookedBase }
+}
+
+/**
+ * What is still owed on a supplier bill: total less the POSTED credit notes recorded against it (a DRAFT credit note has not reduced
+ * the ledger payable). A bill has one paid stamp, no part-payments, so a credit note is the only way a bill is part-settled. Never
+ * negative. The stored base is prorated by the outstanding share. Pure; Decimal throughout.
+ */
+export function payableOutstanding(invoice: {
+  totalForeign: unknown
+  totalBase: unknown
+  supplierCreditNotes: Array<{ amountForeign: unknown }>
+}): { outstandingForeign: number; bookedBase: number } {
+  const total = toDecimal(invoice.totalForeign as never)
+  const credited = invoice.supplierCreditNotes.reduce((sum, cn) => sum.add(toDecimal(cn.amountForeign as never)), toDecimal(0))
+  const outstanding = total.sub(credited)
+  if (!outstanding.gt(0)) return { outstandingForeign: 0, bookedBase: 0 }
+  // Preserve the stored bill precision (totalForeign is Decimal(18,4)); computeRealisedFx rounds the journal gain/loss to 2dp.
+  const bookedBase = total.gt(0) ? toDecimal(invoice.totalBase as never).mul(outstanding).div(total) : toDecimal(0)
+  return { outstandingForeign: outstanding.toNumber(), bookedBase: bookedBase.toNumber() }
+}
+
 async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> {
   const orders = await db.salesOrder.findMany({
-    where: {
-      currency: { not: baseCurrency },
-      status: { not: 'CANCELLED' },
-      refundStatus: { not: 'FULL' },
-      totalForeign: { gt: 0 },
-    },
+    where: OPEN_RECEIVABLE_ORDER_WHERE(baseCurrency),
     select: {
       id: true,
       orderNumber: true,
@@ -408,20 +460,13 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
         where: { refundId: null },
         select: { amount: true, currency: true },
       },
+      refunds: { select: { totalForeign: true } },
     },
   })
 
   return orders.flatMap((order) => {
-    const paid = order.payments.reduce((sum, payment) => (
-      payment.currency === order.currency ? addMoney(sum, payment.amount) : sum
-    ), toDecimal(0))
-    const outstandingForeign = roundAccountingMoney(subtractMoney(order.totalForeign, paid))
+    const { outstandingForeign, bookedBase } = receivableOutstanding(order)
     if (outstandingForeign < 0.01) return []
-    // Prorate the stored base by the outstanding share (one fxRate per order).
-    const totalForeign = toDecimal(order.totalForeign)
-    const bookedBase = totalForeign.gt(0)
-      ? multiplyMoney(order.totalBase, outstandingForeign).div(totalForeign).toNumber()
-      : 0
     return [{
       id: order.id,
       reference: order.invoiceNumber ?? order.externalOrderNumber ?? order.orderNumber ?? order.id,
@@ -448,24 +493,23 @@ async function getOpenPayables(baseCurrency: string): Promise<OpenBalance[]> {
       totalBase: true,
       fxRateToBase: true,
       po: { select: { reference: true, currency: true } },
+      supplierCreditNotes: { where: { status: 'POSTED' }, select: { amountForeign: true } },
     },
   })
 
-  return invoices.map((invoice) => ({
-    id: invoice.id,
-    reference: invoice.invoiceNumber ?? invoice.po.reference,
-    side: 'payable' as const,
-    currency: invoice.po.currency,
-    // Preserve the stored bill precision (totalForeign is Decimal(18,4)); do NOT
-    // 2dp-round here or 3-decimal currencies / 4dp bill totals would be revalued
-    // against an amount that disagrees with the stored payable. computeRealisedFx
-    // still rounds the resulting gain/loss to 2dp for the journal (cogs-audit scjz.57).
-    outstandingForeign: toDecimal(invoice.totalForeign).toNumber(),
-    bookedRateToBase: Number(invoice.fxRateToBase),
-    // Open payables are fully unpaid here (paidAt: null), so the outstanding base is
-    // the full stored totalBase — the real AP carrying value (cogs-audit scjz.55).
-    bookedBase: toDecimal(invoice.totalBase).toNumber(),
-  }))
+  return invoices.flatMap((invoice) => {
+    const { outstandingForeign, bookedBase } = payableOutstanding(invoice)
+    if (outstandingForeign <= 0) return []
+    return [{
+      id: invoice.id,
+      reference: invoice.invoiceNumber ?? invoice.po.reference,
+      side: 'payable' as const,
+      currency: invoice.po.currency,
+      outstandingForeign,
+      bookedRateToBase: Number(invoice.fxRateToBase),
+      bookedBase,
+    }]
+  })
 }
 
 async function buildRevaluationLines(params: {

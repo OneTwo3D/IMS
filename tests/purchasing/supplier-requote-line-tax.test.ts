@@ -96,8 +96,16 @@ const RFQ_LINE = {
   taxRate: { rate: new Prisma.Decimal('0.2') },
 }
 
+let landShipping = false
+const freightCreates: Array<Record<string, unknown>> = []
 const tx = {
   $queryRaw: async () => [],
+  setting: { findUnique: async () => (landShipping ? { value: 'true' } : null) },
+  freightCostLine: {
+    findMany: async () => [{ id: 'c1', description: 'Freight', amountForeign: new Prisma.Decimal('50'), vatable: true }],
+    deleteMany: async () => ({ count: 0 }),
+    create: async ({ data }: { data: Record<string, unknown> }) => { freightCreates.push(data); return data },
+  },
   purchaseOrder: {
     findFirst: async () => ({
       id: 'po-1',
@@ -166,4 +174,25 @@ test('submitSupplierQuote PERSISTS the recomputed line tax and sums it into the 
   assert.equal(poUpdateData?.subtotalForeign, '300')
   assert.equal(poUpdateData?.taxForeign, '60', 'the PO header must sum the requoted tax, not the RFQ tax')
   assert.equal(poUpdateData?.totalForeign, '360')
+})
+
+test('supplier-quoted shipping: OFF writes only the aggregate; ON also creates a landed cost line and keeps the buyer freight VAT', async () => {
+  const { submitSupplierQuote } = await import('@/app/actions/supplier-portal')
+  const quote = { lines: [{ lineId: 'line-1', unitPrice: 150, qty: 2 }], supplierRef: 'Q-99', expectedDelivery: '', shippingCost: 80, shippingMethod: '' }
+
+  landShipping = false
+  freightCreates.length = 0
+  assert.equal((await submitSupplierQuote('po-1', quote)).success, true)
+  assert.equal(freightCreates.length, 0, 'flag OFF: no cost line, behaviour unchanged')
+  assert.equal(poUpdateData?.directFreightForeign, '80')
+  const offTax = Number(poUpdateData?.taxForeign)
+
+  landShipping = true
+  assert.equal((await submitSupplierQuote('po-1', quote)).success, true)
+  assert.equal(freightCreates.length, 1)
+  assert.equal(freightCreates[0]?.description, 'Supplier quoted shipping')
+  assert.equal(String(freightCreates[0]?.amountForeign), '80')
+  assert.equal(poUpdateData?.directFreightForeign, '130', 'aggregate = buyer 50 + supplier 80')
+  assert.equal(Number(poUpdateData?.taxForeign) - offTax, 10, 'the 20% VAT on the buyer vatable 50 is kept')
+  landShipping = false
 })
