@@ -117,6 +117,7 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'woocommerce.order.wms-status-meta', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.invoice-note', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, ...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
   { key: 'woocommerce.order.invoice-document', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_invoice_document_enabled', defaultValue: 'false' }] },
+  { key: 'woocommerce.order.trackship-refire', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'trackship_refire_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.fx-rates', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_fx_push_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.webhooks', trigger: 'operator', requires: [{ plugin: 'woocommerce' }] },
 ]

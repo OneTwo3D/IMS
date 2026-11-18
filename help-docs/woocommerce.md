@@ -368,6 +368,22 @@ With the box unticked (the default) nothing changes: the tracking written to Woo
 
 This does not change whether AST sends its own despatch email: that is checked separately on the stage store. Partial shipments go through the companion plugin's partial-shipment route, which records the tracking number only and carries no provider.
 
+#### TrackShip re-fire (off by default)
+
+The customer-facing tracking page and the shipment-status e-mails stay with WooCommerce, Advanced Shipment Tracking and TrackShip: IMS stores the tracking and writes it onto the order, and never talks to TrackShip or sends the customer anything about it. TrackShip registers a shipment when an order completes, but that trigger has no retry of its own. An order that completes while the store's cache serves a stale read of its tracking is dropped for good: it has a tracking number but no TrackShip shipment, so there is no tracking page and no shipment-status e-mail. The old woo-mintsoft plugin found those orders and fired TrackShip again; IMS can now do the same.
+
+**Before you switch it on, install the onetwoInventory Helper plugin 1.4.0 or later on the store** (this is a change to the store's WooCommerce plugin: deploying it needs the owner's explicit OK, and the IMS release does not deploy it) (Sync > WooCommerce shows where to download it). The re-fire goes through a new signed route in that plugin, `POST /wp-json/oti/v1/order/{id}/trackship-refire`, signed with the same webhook secret as the partial-shipment route. The request is signed over the timestamp, method, path (so the order id) and body with a single-use nonce, and is refused outside a 5 minute window. Each missing tracking number is judged separately: the route refuses an order only when every missing number was despatched more than 7 days ago or has no usable despatch date, and fires when a recent one is missing (TrackShip's action is order-wide, so an old missing number on the same order is re-registered with it), and IMS re-checks the 7-day window at the moment of sending, so a delayed or replayed job cannot fire late. The route compares TrackShip's shipment rows with the order's tracking numbers and, only for a number TrackShip holds no shipment for (or one still pending after an hour), fires TrackShip's own `send_order_to_trackship` action, the call the plugin made. An order TrackShip already holds is left alone, so asking again is harmless. Until the plugin is updated, each look fails with a message naming the version and is retried.
+
+Set the setting `trackship_refire_enabled` to `true` to turn it on (anything else, or no value, is off, and while it is off nothing is looked at, queued or sent). The sweep runs inside the existing **WooCommerce Webhook Inbox** job (every 5 minutes):
+
+- Every shipped, tracked WooCommerce order gets a re-fire record. Its first look is an hour after despatch.
+- A look that finds TrackShip already holds every shipment ends the record (covered). A look that fires TrackShip waits at least an hour for TrackShip's own background job before the next.
+- **Back-off, per order:** the wait between looks is 5 minutes, then 10, 20, 40 and so on, doubling up to a cap of 24 hours. The wait is kept in the database, so a restart does not reset it.
+- **7-day window:** only orders despatched in the last 7 days are looked at. After that the parcel has arrived, and registering it again would e-mail the customer about a delivery they already had; the record is closed.
+- An order still unregistered after 5 looks (usually a courier TrackShip does not take, or a TrackShip account fault) is reported once in the activity log as `trackship_refire_stuck`. IMS keeps asking, less often each time, until the window closes.
+
+Like every WooCommerce write it goes through the outbox and is held while WooCommerce is shadowed: nothing is sent, the look is recorded as a shadow and is not spent. A failed request is retried (8 attempts, then **Sync > Exceptions**, where **Replay** asks again) and the order is not asked a second time while that job is waiting. Activity log: `trackship_refired`, `trackship_refire_retry`, `trackship_refire_dead_lettered`, `trackship_refire_stuck`.
+
 ### EU withdrawal requests
 
 If your store uses the EU order-withdrawal button plugin, IMS follows its statuses (the defaults are `pending-wdraw` for a submitted request and `withdrawn` for an approved one; the names can be changed in settings if your plugin uses others):
