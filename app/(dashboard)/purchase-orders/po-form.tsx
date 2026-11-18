@@ -30,9 +30,11 @@ import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
 import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
 import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, usableRate, type FormFxRate } from '@/lib/currencies/form-fx-rate'
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
+import { selectablePoWarehouses } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 import type { TaxCategory } from '@/app/generated/prisma/client'
+import { LineNotesField } from './po-line-note'
 
-type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null }
+type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null; availableForPurchaseOrders?: boolean }
 
 type Props = {
   suppliers: SupplierRow[]
@@ -96,6 +98,8 @@ type LineItem = {
   discount: string // user-entered discount, e.g. "5%" or "2.50"
   /** Optional per-line delivery date (YYYY-MM-DD). '' = inherit the order's Expected Delivery. */
   expectedDelivery: string
+  /** Internal per-line remark; '' = none. Never sent to the supplier. */
+  notes: string
   productCategory: TaxCategory
   // Per-line tax rate. When `taxRateAutoResolved` is true, the line follows
   // the order/supplier rate; when false the user has manually overridden it.
@@ -388,6 +392,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         unitCostForeign: Math.round(displayUnitCost * 10000) / 10000,
         discount: l.discountStr ?? '',
         expectedDelivery: l.expectedDelivery ? l.expectedDelivery.slice(0, 10) : '',
+        notes: l.notes ?? '',
         productCategory: (product?.taxCategory ?? 'STANDARD') as TaxCategory,
         // Re-derive line VAT from the order/supplier default on load (auto), so
         // it always tracks the supplier's Default VAT Rate. The net unit cost is
@@ -514,6 +519,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       qty: 1, purchaseUnitId: '', unitCostForeign: Math.round(displayCost * 10000) / 10000,
       discount: '',
       expectedDelivery: '',
+      notes: '',
       productCategory,
       taxRateId: resolved.taxRateId,
       taxRateValue: resolved.taxRateValue,
@@ -810,6 +816,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           sortOrder: i,
           discountStr: l.discount || undefined,
           expectedDelivery: l.expectedDelivery || null,
+          notes: l.notes.trim() || null,
           discountAmount: discAmount > 0 ? discAmount : undefined,
           // Only send the id when the user has manually overridden this line.
           // Auto lines pass null so the server applies the order/supplier rate.
@@ -1000,8 +1007,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
             >
               <option value="">Not specified</option>
-              {warehouses.map((w) => (
-                <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
+              {selectablePoWarehouses(warehouses, existingPo?.destinationWarehouseId).map((w) => (
+                <option key={w.id} value={w.id}>{w.code} — {w.name}{w.availableForPurchaseOrders === false ? ' (restricted: not available in purchase orders)' : ''}</option>
               ))}
             </select>
             {destWarehouse && (destWarehouse.addressLine1 || destWarehouse.city || destWarehouse.contactName) && (
@@ -1078,6 +1085,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                   <TableRow key={line.key}>
                     <TableCell>
                       <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                      <LineNotesField value={line.notes} onChange={(v) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, notes: v } : l))} />
                     </TableCell>
                     {purchaseUnits.length > 0 && (
                       <TableCell>

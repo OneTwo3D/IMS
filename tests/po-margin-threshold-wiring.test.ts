@@ -32,7 +32,7 @@ test('update: facts read before the transaction, refusal THROWN inside it (rolls
   const body = fn('updatePurchaseOrder')
   assert.ok(body.indexOf('loadMarginGuardContext(') < body.indexOf('db.$transaction'))
   assert.match(body, /throw new MarginBlockedError\(outcome\.message\)/)
-  assert.ok(body.indexOf('await enforceMargin(lineData)') < body.indexOf('tx.purchaseOrderLine.createMany({ data: lineData })'))
+  assert.ok(body.indexOf('await enforceMargin(lineData)') < body.indexOf('tx.purchaseOrderLine.createMany({ data: lineData.filter'))
   assert.match(body, /locked\.type !== 'GOODS'/)
   assert.match(body, /catch \(e\) \{\s*if \(e instanceof MarginBlockedError\) return \{ success: false, error: e\.message \}/)
   // an amend assesses only lines it adds or reprices, and before any of its writes

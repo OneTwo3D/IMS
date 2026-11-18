@@ -67,6 +67,8 @@ export type InvoiceDocumentDeps = {
   lookupCreditNoteClaims: (creditNoteNumber: string) => Promise<DocumentClaimsResult>
   downloadPdf: (kind: InvoiceDocumentKindName, documentId: string, connection?: RequiredXeroConnection) => Promise<DocumentDownloadResult>
   now: () => Date
+  /** Calls left in the ledger's rolling day, or null when unknown. The sweep defers on-demand requests while it is low. */
+  dayCallsRemaining?: () => number | null
 }
 
 export type EnsureInvoiceDocumentInput = {

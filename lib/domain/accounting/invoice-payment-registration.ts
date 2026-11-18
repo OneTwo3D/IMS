@@ -248,7 +248,7 @@ export type ExistingInvoicePaymentSync = LedgerStandingRow & {
  * a swept CANCELLED receipt be registered a second time against a replacement invoice (Codex,
  * o3d-f709 round 3 HIGH).
  */
-function mayHoldLedgerPayment(row: ExistingInvoicePaymentSync): boolean {
+export function mayHoldLedgerPayment(row: ExistingInvoicePaymentSync): boolean {
   // o3d-f709 (Codex HIGH, #724): THE PAYLOAD PROOF IS ROW 10 OF THE TRUTH TABLE AND NOTHING WIDER. This
   // used to be `mayHaveReachedLedger(row)` followed by "else the payload proof clears it", so a CANCELLED
   // row an operator settled NOT_POSTED, or one that still names a document, was removed from the

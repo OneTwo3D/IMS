@@ -85,6 +85,11 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: ['CREDIT_NOTE'],
     note: 'As sales.invoice.',
   }),
+  row('xero', 'sales.credit-note-void', { P1: 'xeroom', P2: 'xeroom' }, {
+    obligationTime: 'required',
+    accountingSyncTypes: ['CREDIT_NOTE_VOID'],
+    note: 'o3d-ngmt.22: voiding the credit note of a refund deleted in IMS. As sales.credit-note: Xeroom owns sales credit notes, so IMS shadows the void in P1 and P2 like the document it undoes.',
+  }),
   row('xero', 'sales.payment', { P1: 'nobody', P2: 'IMS' }, {
     obligationTime: 'required',
     accountingSyncTypes: ['INVOICE_PAYMENT'],
@@ -169,6 +174,10 @@ export const WRITER_OWNERSHIP_MAP = [
   row('mintsoft', 'product.content', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',
     note: 'Owner answer 3: description, short description and pictures are authored in WooCommerce and flow Woo -> IMS -> Mintsoft (IMS is the hub). Distinct from product.upsert, which is product META. Whether the bridge pushes descriptions today is unverified, so P1 is treated as plugin-owned and IMS shadows. An absolute state push of changed fields, so no obligation time.',
+  }),
+  row('mintsoft', 'product.delete', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
+    obligationTime: 'not-applicable',
+    note: 'The plugin\'s Python sync deletes a variable product\'s parent SKU in Mintsoft once every variation is confirmed there (o3d-zvec.20). Destructive, so IMS does it only behind its own setting (default off), only on proof from the stored product links, and refuses rather than deletes when unsure.',
   }),
   row('mintsoft', 'product.bundle', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     obligationTime: 'not-applicable',

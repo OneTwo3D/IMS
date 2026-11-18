@@ -759,10 +759,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/actions/purchase-orders.ts',
-    figures: ['amendMarginRows', 'enforceMargin', 'margin', 'marginCtx', 'marginOverride', 'marginOverrideNote'],
+    figures: ['amendMarginRows', 'enforceMargin', 'margin', 'marginCtx', 'marginOverride', 'marginOverrideNote', 'netTotal'],
     treatment: 'not-refund-sensitive',
     reason:
-      'Calls the server-side guard when a purchase order is created, edited or placed and carries the override note. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+      'Calls the server-side guard when a purchase order is created, edited or placed and carries the override note. Also `netTotal`: the net amount of a SUPPLIER credit note under the reverse-charge plan (converted to base for the transit posting), a purchase-side ledger amount that customer refunds of past sales never enter. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
   },
   {
     file: 'lib/domain/purchasing/margin-threshold-constants.ts',
@@ -798,6 +798,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     treatment: 'not-refund-sensitive',
     reason:
       'Pure margin computation for the PO preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/supplier-credit-note.ts',
+    figures: ['netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`netTotal` is the sum of the net lines of a supplier credit note split into reverse-charge net/VAT for the Xero posting. A purchase-side posting amount, not a sales revenue figure; no customer refund moves it.',
   },
   {
     file: 'app/(dashboard)/analytics/reorder/page.tsx',

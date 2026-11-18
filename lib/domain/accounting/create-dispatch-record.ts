@@ -167,6 +167,8 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
   MANUFACTURING_RECLASS: 'no-remedy',
 
   CREDIT_NOTE: 'natural-key-upsert',
+  // o3d-ngmt.22: a status write to a credit note that already stands; it creates nothing, and the void reads the document first.
+  CREDIT_NOTE_VOID: 'not-a-create',
   TAX_RATE_SYNC: 'natural-key-upsert',
   PURCHASE_INVOICE: 'create-only-refuses',
   SALES_INVOICE: 'number-fenced',

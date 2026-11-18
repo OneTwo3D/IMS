@@ -142,6 +142,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'o3d-d82p: durable drain of WooCommerce withdrawal suppressions; guarded by verifyCron.',
   },
+  '/api/cron/product-sync-marks': {
+    access: 'cron-secret',
+    reason: 'Paced drain of the storefront and warehouse sync owed by products edited by CSV; guarded by verifyCron.',
+  },
   '/api/cron/refund-reservation-release': {
     access: 'cron-secret',
     reason: 'o3d-67y: durable post-refund reservation-release drain; guarded by verifyCron.',
@@ -347,6 +351,14 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sync permission.',
   },
+  '/api/products/csv-edit/download': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with inventory.edit permission (price columns also need inventory.prices).',
+  },
+  '/api/products/csv-edit/upload': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with inventory.edit permission (price columns also need inventory.prices).',
+  },
   '/api/credit-note/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission.',
@@ -362,6 +374,10 @@ export const apiRouteAuthPolicy = {
   '/api/shopping/[connector]/invoice-pdf': {
     access: 'public-webhook',
     reason: 'Public shopping customer invoice PDF handoff; requires connector plugin enablement plus a short-lived connector HMAC request from the shopping platform.',
+  },
+  '/api/shopping/[connector]/credit-note-pdf': {
+    access: 'public-webhook',
+    reason: 'Public shopping customer credit note PDF handoff; requires connector plugin enablement plus a short-lived connector HMAC request from the shopping platform, and the refund must belong to the proved order.',
   },
   '/api/manufacturing-order/[id]': {
     access: 'authenticated',

@@ -1104,6 +1104,22 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
               </div>
             </label>
 
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={s.wc_order_divergence_detection_enabled === 'true'} onChange={(e) => setS({ ...s, wc_order_divergence_detection_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
+              <div>
+                <span className="text-sm font-medium">Report orders edited in WooCommerce</span>
+                <p className="text-xs text-muted-foreground">Off by default. When on, IMS compares each updated WooCommerce order with the IMS order (items, quantities, prices, shipping, discount, tax and total, with refunds taken out) and lists any difference under Sync &gt; Exceptions. It only reports: nothing is changed in IMS, WooCommerce or the warehouse.</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={s.wc_ast_provider_mapping_enabled === 'true'} onChange={(e) => setS({ ...s, wc_ast_provider_mapping_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
+              <div>
+                <span className="text-sm font-medium">Map couriers to tracking providers</span>
+                <p className="text-xs text-muted-foreground">Off by default. When on, the tracking IMS writes to a WooCommerce order names the Advanced Shipment Tracking provider (for example royal-mail or ups) so the customer&apos;s tracking link and branding work. FedEx-labelled orders are written as FedEx and Click &amp; Drop orders as Royal Mail. A courier IMS does not know is written as before and counted in the activity log.</p>
+              </div>
+            </label>
+
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-1.5">
                 <Label>Import order statuses</Label>
@@ -1292,6 +1308,13 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   <div>
                     <span className="text-sm font-medium">Include COGS (Cost of Goods Sold)</span>
                     <p className="text-xs text-muted-foreground">Pushes the next FIFO unit cost to WooCommerce&apos;s native Cost of Goods Sold field</p>
+                  </div>
+                </label>
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input type="checkbox" checked={s.wc_back_in_stock_date_enabled === 'true'} onChange={(e) => setS({ ...s, wc_back_in_stock_date_enabled: e.target.checked ? 'true' : 'false' })} className="rounded border-input" />
+                  <div>
+                    <span className="text-sm font-medium">Include estimated back-in-stock date</span>
+                    <p className="text-xs text-muted-foreground">For out-of-stock products, pushes the earliest committed supplier arrival date (never a past or undated one) as the _oti_eta_date product meta. Clears it when stock returns.</p>
                   </div>
                 </label>
                 {isStockPushUnsaved && (

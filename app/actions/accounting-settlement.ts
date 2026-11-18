@@ -12,10 +12,8 @@ import {
   type MirroredEventUpdateOutcome,
 } from '@/lib/domain/accounting/accounting-event-mirror'
 import { OWNS_MIRRORED_EVENT_WHERE, ledgerStanding, namesADocument, ownsMirroredEvent } from '@/lib/domain/accounting/ledger-standing'
-import {
-  applyFencedAttemptDecision,
-  type AttemptFenceRefusalReason,
-} from '@/lib/domain/accounting/sync-log-attempt'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt-decision'
+import type { AttemptFenceRefusalReason } from '@/lib/domain/accounting/sync-log-attempt'
 import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   buildCancelledSaleSettlementData,

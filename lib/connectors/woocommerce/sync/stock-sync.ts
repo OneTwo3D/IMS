@@ -43,6 +43,7 @@ import { commitDirtyOrderOutcome, loadDirtyOrdersForGuard, parseDirtySnapshot } 
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
+import { loadBackInStockDates } from '@/lib/domain/inventory/back-in-stock-date'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
@@ -55,6 +56,11 @@ import {
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
 import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
+
+/** o3d-taro: the setting that turns the back-in-stock date push on. Absent or anything but 'true' is OFF (the default). */
+export const WC_BACK_IN_STOCK_DATE_SETTING = 'wc_back_in_stock_date_enabled'
+/** o3d-taro: the WooCommerce product meta key. Value is a plain YYYY-MM-DD date, or '' when there is no date to show. */
+export const WC_ETA_DATE_META_KEY = '_oti_eta_date'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -300,7 +306,14 @@ export type PushEntry = {
     stock_quantity: number
     manage_stock: boolean
     cost_of_goods_sold?: { values: { defined_value: string }[] }
+    /** o3d-taro: only present when the back-in-stock date push is enabled AND the value changed or is non-empty. */
+    meta_data?: { key: string; value: string }[]
   }
+  /**
+   * o3d-taro: the date this push settles for the product ('' = cleared). Undefined whenever the feature is off, so nothing about the
+   * push or its persisted state changes. Never sent to WooCommerce (only `payload` is).
+   */
+  etaDate?: string
 }
 
 export type VariantPushEntry = PushEntry & {
@@ -374,11 +387,13 @@ async function persistSuccessfulPushState(
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
         lastPushedRemoteId: String(entry.externalId),
+        ...(entry.etaDate !== undefined ? { lastPushedEtaDate: entry.etaDate } : {}),
       },
       update: {
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
         lastPushedRemoteId: String(entry.externalId),
+        ...(entry.etaDate !== undefined ? { lastPushedEtaDate: entry.etaDate } : {}),
       },
     })
   }
@@ -565,6 +580,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     summary: { source: options?.source ?? null, forceAll: options?.forceAll === true, productCount: scopedProductIds ? scopedProductIds.length : null },
   })
   if (!seam.proceed) return shadowedStockResult(seam)
+  // o3d-taro: the back-in-stock date rides this push as product meta, which is its OWN operation of the ownership map ('product.meta':
+  // the plugin owns it in P1). Asked only when the setting is on; a shadow switches the date off for this run and leaves the stock push alone.
+  const etaSetting = await db.setting.findUnique({ where: { key: WC_BACK_IN_STOCK_DATE_SETTING } })
+  let etaEnabled = false
+  if (etaSetting?.value === 'true') {
+    const etaSeam = await wooProducerSeam({
+      operation: 'product.meta',
+      subjectType: 'StockPushEtaMeta',
+      subjectId: scopedProductIds ? [...scopedProductIds].sort().join(',').slice(0, 400) || '(none)' : '(all products)',
+      payload: { metaKey: WC_ETA_DATE_META_KEY, products: scopedProductIds ? [...scopedProductIds].sort() : 'all' },
+      summary: { source: options?.source ?? null, productCount: scopedProductIds ? scopedProductIds.length : null },
+    })
+    etaEnabled = etaSeam.proceed
+  }
   const forceProductIds = new Set(options?.forceProductIds ?? [])
   const forceAll = options?.forceAll === true
 
@@ -896,7 +925,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       connector: WC_STOCK_SYNC_CONNECTOR,
       productId: { in: products.map((product) => product.id) },
     },
-    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true },
+    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true, lastPushedEtaDate: true },
   })
   const previousStateByProductId = new Map(
     previousStates.map((state) => [state.productId, state]),
@@ -1238,6 +1267,26 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     result.errors.push(`Stock push skipped ${held.blockedProductIds.size} product(s): an on-hold/processing WooCommerce order names a variation IMS cannot resolve, so their stock cannot be proven safe.`)
   }
 
+  // -------- Back-in-stock dates (o3d-taro; only with the setting on) --------
+  // Only a simple stockable product at zero pushed availability can carry a date, and only committed, dated, not-late supply produces one.
+  const stockQuantityFor = (product: CandidateProduct): number => resolvePushStockQuantity(
+    availableByProduct.get(product.id) ?? 0,
+    freshAvailableByProduct.get(product.id) ?? 0,
+    shouldForceWooZeroStock(product.lifecycleStatus),
+  )
+  let etaDateByProduct = new Map<string, string>()
+  if (etaEnabled) {
+    const zeroIds = products
+      .filter((product) => effectiveTargets.has(product.id)
+        && (product.type === 'SIMPLE' || product.type === 'VARIANT')
+        && !shouldForceWooZeroStock(product.lifecycleStatus)
+        && stockQuantityFor(product) <= 0)
+      .map((product) => product.id)
+    etaDateByProduct = await loadBackInStockDates(zeroIds)
+  }
+  const unchangedEta = (entry: PushEntry, prev: { lastPushedEtaDate: string | null } | undefined): boolean =>
+    entry.etaDate === undefined || (prev?.lastPushedEtaDate ?? '') === entry.etaDate
+
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
   const variantPushEntries: VariantPushEntry[] = []
@@ -1255,11 +1304,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       result.skipped++
       continue
     }
-    const stockQuantity = resolvePushStockQuantity(
-      availableByProduct.get(product.id) ?? 0,
-      freshAvailableByProduct.get(product.id) ?? 0,
-      shouldForceWooZeroStock(product.lifecycleStatus),
-    )
+    const stockQuantity = stockQuantityFor(product)
     const payload: PushEntry['payload'] = {
       id: target.externalId,
       stock_quantity: stockQuantity,
@@ -1269,6 +1314,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     if (cogs !== undefined) {
       payload.cost_of_goods_sold = { values: [{ defined_value: cogs.toFixed(2) }] }
     }
+    let etaDate: string | undefined
+    if (etaEnabled) {
+      // '' = no date (stock returned, supply gone, undated or late). The meta is written when it has a value or when it clears a value we pushed before.
+      etaDate = (stockQuantity <= 0 ? etaDateByProduct.get(product.id) : undefined) ?? ''
+      if (etaDate !== '' || (previousStateByProductId.get(product.id)?.lastPushedEtaDate ?? '') !== '') {
+        payload.meta_data = [{ key: WC_ETA_DATE_META_KEY, value: etaDate }]
+      }
+    }
     if (isVariationCandidate(product) && target.parentWcId != null) {
       const entry: VariantPushEntry = {
         productId: product.id,
@@ -1276,6 +1329,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         externalId: target.externalId,
         parentWcId: target.parentWcId,
         payload,
+        ...(etaDate !== undefined ? { etaDate } : {}),
       }
       const prev = previousStateByProductId.get(product.id)
       if (
@@ -1284,12 +1338,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
         && prev.lastPushedRemoteId === String(entry.externalId)
+        && unchangedEta(entry, prev)
       ) {
         continue
       }
       variantPushEntries.push(entry)
     } else {
-      const entry: PushEntry = { productId: product.id, sku: product.sku, externalId: target.externalId, payload }
+      const entry: PushEntry = { productId: product.id, sku: product.sku, externalId: target.externalId, payload, ...(etaDate !== undefined ? { etaDate } : {}) }
       const prev = previousStateByProductId.get(product.id)
       if (
         !forceAll
@@ -1297,6 +1352,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
         && prev.lastPushedRemoteId === String(entry.externalId)
+        && unchangedEta(entry, prev)
       ) {
         continue
       }
