@@ -250,6 +250,11 @@ export async function runWmsOrderStatusSweep(
     }
 
     try {
+      // The snapshot as it stands BEFORE the lookup (flag on): the strike decision rests on this read, and the write is a compare-and-set against it.
+      // Read after the lookup it would already include a concurrent sweep's write and the staleness could not be seen.
+      const snapshotBeforeLookup = notFoundEnabled
+        ? await db.wmsOrderStatusSnapshot.findUnique({ where: { orderId: order.id }, select: { externalOrderId: true, lastError: true, notFoundStrikes: true, fetchedAt: true } })
+        : undefined
       const status = await connector.fetchOrderStatus(reference)
       const tracking = status?.tracking.find((entry) => entry.trackingNumber || entry.carrier)
 
@@ -274,12 +279,17 @@ export async function runWmsOrderStatusSweep(
       const pushedExternalId = order.wmsOrderPush?.state === 'SYNCED' ? (order.wmsOrderPush.externalOrderId ?? '') : ''
       let notFoundReason: string = WMS_LOOKUP_CONFIRMED_ABSENT
       let priorStrikes = 0
+      // The snapshot's fetchedAt as read for the strike decision (null: there was no snapshot). The write below applies a strike only if it is unchanged.
+      let knownFetchedAt: Date | null = null
       if (!status) {
-        const known = await db.wmsOrderStatusSnapshot.findUnique({
-          where: { orderId: order.id },
-          select: { externalOrderId: true, lastError: true, notFoundStrikes: true },
-        })
+        const known = snapshotBeforeLookup !== undefined
+          ? snapshotBeforeLookup
+          : await db.wmsOrderStatusSnapshot.findUnique({
+            where: { orderId: order.id },
+            select: { externalOrderId: true, lastError: true, notFoundStrikes: true, fetchedAt: true },
+          })
         priorStrikes = known?.notFoundStrikes ?? 0
+        knownFetchedAt = known?.fetchedAt ?? null
         // An order the warehouse SHOULD hold is probed on every lookup until it is marked NOTFOUND (at most WMS_NOT_FOUND_THRESHOLD probes, then it is no
         // longer polled): each strike needs a fresh answer, because the order may since have been merged, which the first absent answer could not know.
         const alreadyConfirmedAbsent = known
@@ -387,6 +397,13 @@ export async function runWmsOrderStatusSweep(
         await lockSalesOrder(tx, order.id)
         const current = await tx.salesOrder.findUnique({ where: { id: order.id }, select: { erasedAt: true } })
         const erased = current?.erasedAt != null
+        // COMPARE-AND-SET for the NOT-FOUND count. The absence answer (and the count it rests on) was read before this lock, across remote calls that can take
+        // seconds. If another sweep wrote this snapshot since (it found the order, or counted a strike), this result is STALE: it is discarded whole, so it can
+        // neither add a strike on a count that moved, nor mark NOTFOUND, nor overwrite a found status with "absent". The next sweep decides afresh.
+        if (notFoundEnabled && !status) {
+          const stored = await tx.wmsOrderStatusSnapshot.findUnique({ where: { orderId: order.id }, select: { fetchedAt: true } })
+          if ((stored?.fetchedAt.getTime() ?? null) !== (knownFetchedAt?.getTime() ?? null)) return { erased, stale: true as const }
+        }
         const storedFields = erased ? { ...fields, trackingNumber: null, carrier: null, deepLinkUrl: null } : fields
         await tx.wmsOrderStatusSnapshot.upsert({
           where: { orderId: order.id },
@@ -417,8 +434,9 @@ export async function runWmsOrderStatusSweep(
             })
           }
         }
-        return erased
+        return { erased, stale: false as const }
       })
+      if (erasedNow.stale) continue
       if (status) updated += 1
 
       // G6: clear the courier-pending review flag once the order is actually despatched
@@ -438,7 +456,7 @@ export async function runWmsOrderStatusSweep(
       // transient WC failure retries next tick instead of being permanently skipped.
       // Best-effort: a failed push must not fail the status sweep, but it is logged and
       // wcPushedStatus is left unchanged so it's re-attempted.
-      if (status && status.status && !erasedNow && status.status !== order.wmsOrderStatus?.wcPushedStatus) {
+      if (status && status.status && !erasedNow.erased && status.status !== order.wmsOrderStatus?.wcPushedStatus) {
         try {
           // Re-read the marker immediately before the storefront push: an erasure that committed after the snapshot write
           // above must not be followed by a push built from the lookup.

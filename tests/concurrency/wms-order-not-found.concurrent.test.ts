@@ -21,6 +21,8 @@ const scripts = new Map<string, Script>()
 const fetchCalls = new Map<string, number>()
 const byIdCalls: string[] = []
 let connectorReadsById = true
+/** Runs inside the warehouse lookup, before the sweep's write: the interleaving point of a concurrent sweep. */
+let duringLookup: ((reference: string) => Promise<void>) | null = null
 const foundStatus = (reference: string) => ({
   externalOrderId: `W-${reference}`, externalOrderNumber: reference, status: 'NEW', statusLabel: 'New', isSplit: false, partCount: null, isMerged: false,
   mergedOrderNumbers: [] as string[], deepLinkUrl: null, tracking: [] as Array<{ trackingNumber: string; carrier: string }>,
@@ -45,6 +47,7 @@ if (!skip) {
         } : {}),
         fetchOrderStatus: async (reference: string) => {
           fetchCalls.set(reference, (fetchCalls.get(reference) ?? 0) + 1)
+          if (duringLookup) await duringLookup(reference)
           const script = scripts.get(reference)
           if (!script || script.fetch === 'found') return foundStatus(reference)
           if (script.fetch === 'throw') throw new Error('Mintsoft is unreachable')
@@ -101,6 +104,7 @@ async function cleanup(d: Deps, orders: Array<{ id: string; reference: string }>
   await d.db.shoppingOrderLink.deleteMany({ where: { orderId: { in: ids } } })
   await d.db.salesOrder.deleteMany({ where: { id: { in: ids } } })
   connectorReadsById = true
+  duringLookup = null
   byIdCalls.length = 0
   for (const order of orders) { scripts.delete(order.reference); fetchCalls.delete(order.reference) }
   await setSwitch(d, null)
@@ -314,4 +318,36 @@ test('REGRESSION: a failed by-id read, or a connector that cannot read by id, ne
   assert.equal((await snapshotOf(d, order.id))?.notFoundStrikes, 2)
   assert.notEqual((await snapshotOf(d, order.id))?.status, 'NOTFOUND')
   assert.equal((await tasksOf(d, order.id)).length, 0)
+})
+
+test('REGRESSION: a STALE absence result is discarded: another sweep found the order between this sweep\'s lookup and its write, so it cannot add a strike, mark NOTFOUND or overwrite the found status', { skip }, async (t) => {
+  const d = await setup()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order]))
+  await setSwitch(d, 'true')
+  scripts.set(order.reference, { fetch: 'absent', probe: 'MISSING' })
+  for (let i = 0; i < d.sweep.WMS_NOT_FOUND_THRESHOLD - 1; i++) await sweepOnce(d)
+  assert.equal((await snapshotOf(d, order.id))?.notFoundStrikes, d.sweep.WMS_NOT_FOUND_THRESHOLD - 1, 'one strike short of the mark')
+  // The Nth sweep reads "absent"; before it writes, a concurrent sweep finds the order and resets the count.
+  let interleaved = false
+  duringLookup = async (reference) => {
+    if (interleaved || reference !== order.reference) return
+    interleaved = true
+    await d.db.wmsOrderStatusSnapshot.update({
+      where: { orderId: order.id },
+      data: { status: 'NEW', statusLabel: 'New', externalOrderId: `W-${order.reference}`, lastError: null, notFoundStrikes: 0, notFoundAt: null, fetchedAt: new Date(Date.now() + 5) },
+    })
+  }
+  await sweepOnce(d)
+  const after = await snapshotOf(d, order.id)
+  assert.equal(interleaved, true)
+  assert.equal(after?.status, 'NEW', 'the found status was not overwritten by the stale absence')
+  assert.equal(after?.notFoundStrikes, 0)
+  assert.equal(after?.notFoundAt, null)
+  assert.equal((await tasksOf(d, order.id)).length, 0, 'no task from a stale result')
+  // And the order is still polled: the next sweep decides afresh.
+  duringLookup = null
+  const before = polls(order.reference)
+  await sweepOnce(d)
+  assert.equal(polls(order.reference), before + 1)
 })

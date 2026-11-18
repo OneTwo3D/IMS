@@ -757,7 +757,8 @@ if (!function_exists('oti_handle_trackship_refire')) {
      *   result 'not_eligible'    something was missing but TrackShip's own gate (`is_order_shipped`) refused the order right now
      *                            (not in a trigger status, or no tracking visible); nothing was fired.
      *   result 'no_tracking'     the order carries no tracking number; nothing to register.
-     *   result 'outside_window'  a tracking number that TrackShip lacks was despatched more than 7 days ago; nothing fired (the parcel has arrived).
+     *   result 'outside_window'  every tracking number TrackShip lacks was despatched more than 7 days ago, or has no usable despatch date; nothing fired.
+     *                            When a RECENT number is missing too the route fires (order-wide: an old missing number is re-registered with it).
      *   result 'trackship_inactive'  TrackShip is not installed or not ready (HTTP 503); nothing was fired.
      *   404 oti_ts_not_found     no such order.
      *
@@ -824,34 +825,38 @@ if (!function_exists('oti_handle_trackship_refire')) {
             // A pending row is proof only inside the grace window, measured from when the tracking was shipped (the item's own date, which
             // nothing else touches), not from the order's modified time, which any unrelated save bumps.
             $now = time();
-            $missing = 0;
-            $outside = 0;
+            $missing = 0;   // missing, despatched inside the window: a repair is wanted
+            $outside = 0;   // missing, but despatched before the window OR with no usable date (fail closed): never a reason to fire
             foreach ($items as $item) {
                 $num = isset($item['tracking_number']) ? trim((string) $item['tracking_number']) : '';
                 if ($num === '') {
                     continue;
                 }
-                $shipped_at = isset($item['date_shipped']) ? (int) $item['date_shipped'] : 0;
-                $is_missing = !isset($status_by_number[$num])
-                    || ($status_by_number[$num] === 'pending_trackship' && $shipped_at > 0 && ($now - $shipped_at) > OTI_TS_PENDING_GRACE);
-                if ($is_missing && $shipped_at > 0 && ($now - $shipped_at) > OTI_TS_WINDOW) {
-                    $outside++;
-                    continue;
-                }
+                $raw_date = $item['date_shipped'] ?? 0;
+                $shipped_at = (is_int($raw_date) || (is_string($raw_date) && ctype_digit($raw_date))) ? (int) $raw_date : 0;
                 if (!isset($status_by_number[$num])) {
-                    $missing++;
+                    $is_missing = true;
+                } elseif ($status_by_number[$num] === 'pending_trackship') {
+                    // Pending proves a shipment only inside the grace; with no usable date the age cannot be judged, and it is left as covered.
+                    $is_missing = $shipped_at > 0 && ($now - $shipped_at) > OTI_TS_PENDING_GRACE;
+                } else {
+                    $is_missing = false;
+                }
+                if (!$is_missing) {
                     continue;
                 }
-                if ($status_by_number[$num] === 'pending_trackship') {
-                    $shipped = isset($item['date_shipped']) ? (int) $item['date_shipped'] : 0;
-                    if ($shipped > 0 && ($now - $shipped) > OTI_TS_PENDING_GRACE) {
-                        $missing++;
-                    }
+                // Each missing number is judged on its own. A missing date is NOT "recent": it counts as outside the window.
+                if ($shipped_at <= 0 || ($now - $shipped_at) > OTI_TS_WINDOW) {
+                    $outside++;
+                } else {
+                    $missing++;
                 }
             }
-            // Firing is order-wide, so one missing number past the window refuses the whole order: it would re-submit an old parcel.
-            if ($outside > 0) {
-                return new WP_REST_Response(['ok' => true, 'result' => 'outside_window', 'missing' => $missing + $outside], 200);
+            // Only when EVERY missing number is outside the window is the order refused. Firing is order-wide (TrackShip walks every tracking item), so
+            // when a recent number is missing too, the action also re-registers the old one: accepted, because that parcel never reached TrackShip
+            // either, and the alternative is leaving the recent parcel untracked for good. The answer says how many were outside.
+            if ($missing === 0 && $outside > 0) {
+                return new WP_REST_Response(['ok' => true, 'result' => 'outside_window', 'missing' => $outside], 200);
             }
             if ($missing === 0) {
                 return new WP_REST_Response(['ok' => true, 'result' => 'covered', 'missing' => 0], 200);
@@ -872,7 +877,7 @@ if (!function_exists('oti_handle_trackship_refire')) {
             } catch (\Throwable $e) {
                 return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => $missing], 503);
             }
-            return new WP_REST_Response(['ok' => true, 'result' => 'fired', 'missing' => $missing], 200);
+            return new WP_REST_Response(['ok' => true, 'result' => 'fired', 'missing' => $missing, 'outside_window' => $outside], 200);
         } finally {
             $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));
         }

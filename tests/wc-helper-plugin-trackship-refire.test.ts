@@ -97,3 +97,65 @@ test('the route is registered with its own verifier, and refuses orders outside 
   assert.match(PHP, /^const OTI_TS_WINDOW = 604800;$/m)
   assert.ok(handler.indexOf("'outside_window'") > 0 && handler.indexOf("'outside_window'") < handler.indexOf("do_action('send_order_to_trackship'"), 'the window refusal comes before the fire')
 })
+
+/**
+ * THE HANDLER, RUN FOR REAL (same lifting): TrackShip's items and shipment rows are stubbed, `do_action` records whether the order-wide action fired.
+ */
+type Item = { tracking_number: string; date_shipped?: unknown }
+function runHandler(items: Item[], rows: Array<{ tracking_number: string; shipment_status: string }>): { result: string; fired: boolean; outside_window?: number } {
+  const program = `<?php
+${constant('OTI_TS_PENDING_GRACE')}
+${constant('OTI_TS_WINDOW')}
+class WP_Error { function __construct(public $code = '', public $msg = '', public $data = []) {} }
+class WP_REST_Response { function __construct(public $data, public $status = 200) {} }
+class WP_REST_Request implements ArrayAccess { function offsetGet($o): mixed { return 77; } function offsetExists($o): bool { return true; } function offsetSet($o, $v): void {} function offsetUnset($o): void {} }
+function absint($v) { return abs((int) $v); }
+function wc_get_order($id) { return new stdClass(); }
+class TS { function get_tracking_items($id, $f) { return json_decode('${JSON.stringify(items)}', true); } }
+function trackship_for_woocommerce() { return new TS(); }
+function apply_filters($tag, $v, ...$a) { return true; }
+$GLOBALS['fired'] = false;
+function do_action($tag, ...$a) { if ($tag === 'send_order_to_trackship') $GLOBALS['fired'] = true; }
+class WPDB { public $prefix = 'wp_'; public $last_error = '';
+  function get_var($q) { return 1; } function query($q) { return 1; } function prepare($q, ...$a) { return $q; }
+  function get_results($q) { return array_map(fn($r) => (object) $r, json_decode('${JSON.stringify(rows)}', true)); } }
+$wpdb = new WPDB();
+${phpFunction('oti_handle_trackship_refire')}
+$r = oti_handle_trackship_refire(new WP_REST_Request());
+echo json_encode(array_merge($r->data, ['fired' => $GLOBALS['fired']]));
+`
+  const result = spawnSync('php', ['-d', 'display_errors=1'], { input: program, encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  return JSON.parse(result.stdout)
+}
+const DAY = 86_400
+const ago = (days: number) => now() - Math.round(days * DAY)
+
+test('REGRESSION: a missing tracking number with no usable despatch date fails closed (never "recent"): nothing fires', () => {
+  for (const date of [undefined, '', 0, '0', 'garbage', null, -5]) {
+    const outcome = runHandler([{ tracking_number: 'OLD', date_shipped: date }], [])
+    assert.equal(outcome.result, 'outside_window', `date ${String(date)}`)
+    assert.equal(outcome.fired, false)
+  }
+})
+
+test('REGRESSION: a recent parcel is repaired even when an older parcel of the same order is missing too (each number is judged on its own)', () => {
+  const outcome = runHandler([{ tracking_number: 'OLD', date_shipped: String(ago(20)) }, { tracking_number: 'NEW', date_shipped: String(ago(1)) }], [])
+  assert.equal(outcome.result, 'fired')
+  assert.equal(outcome.fired, true)
+  assert.equal(outcome.outside_window, 1, 'the answer says an old parcel was missing too (it is re-registered with the order-wide action)')
+})
+
+test('an order whose every missing number is outside the window is refused, and a covered recent one beside it does not change that', () => {
+  const rows = [{ tracking_number: 'NEW', shipment_status: 'in_transit' }]
+  const outcome = runHandler([{ tracking_number: 'OLD', date_shipped: String(ago(20)) }, { tracking_number: 'NEW', date_shipped: String(ago(1)) }], rows)
+  assert.equal(outcome.result, 'outside_window')
+  assert.equal(outcome.fired, false)
+})
+
+test('control: a recent missing parcel fires, a covered order does not, a pending row older than the grace is missing again', () => {
+  assert.deepEqual([runHandler([{ tracking_number: 'A', date_shipped: String(ago(1)) }], []).fired], [true])
+  assert.equal(runHandler([{ tracking_number: 'A', date_shipped: String(ago(1)) }], [{ tracking_number: 'A', shipment_status: 'in_transit' }]).result, 'covered')
+  assert.equal(runHandler([{ tracking_number: 'A', date_shipped: String(ago(1)) }], [{ tracking_number: 'A', shipment_status: 'pending_trackship' }]).fired, true)
+  assert.equal(runHandler([{ tracking_number: 'A', date_shipped: String(now() - 60) }], [{ tracking_number: 'A', shipment_status: 'pending_trackship' }]).result, 'covered')
+})
