@@ -30,9 +30,7 @@ mock.module('@/lib/db', {
       inventorySnapshot: { findMany: async () => [{ valueBase: '10', valueReplayReliable: true }] },
       inventorySnapshotRun: { findUnique: async () => ({ id: 'r' }) },
       setting: { findUnique: async () => ({ value: '2020-01-01' }) },
-      // The reconciliation also looks for stock moving in the hour the UTC and business days disagree, for stock on a transfer, and for recent sweeps.
-      stockMovement: { count: async () => 0, aggregate: async () => ({ _sum: { totalValueBase: null } }) },
-      costLayerRevaluation: { count: async () => 0 },
+      // The reconciliation also looks for recent sweeps.
       accountingSyncLog: { findMany: async () => [] },
     },
   },
