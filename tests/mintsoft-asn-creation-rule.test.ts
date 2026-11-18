@@ -14,6 +14,7 @@ import {
   type MintsoftAsnMapState,
 } from '@/lib/connectors/mintsoft/api/asn-creation-rule'
 import { normalizeMintsoftAsnListRowForRecovery } from '@/lib/connectors/mintsoft/api/client'
+import { decideMintsoftAsnCreation } from '@/lib/connectors/mintsoft/api/asn-recovery'
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 
 /**
@@ -34,10 +35,13 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 const EXPECTATION: MintsoftAsnExpectation = {
   reference: 'PO-1',
   externalWarehouseId: '6',
-  lines: [{ sourceLineId: 'line-a', expectedQty: 10 }, { sourceLineId: 'line-b', expectedQty: 2.5 }],
+  lines: [
+    { sourceLineId: 'line-a', expectedQty: 10 },
+    { sourceLineId: 'line-b', expectedQty: 2.5 },
+  ],
 }
 
-type Item = { ID?: number | string | null; SourceLineId?: unknown; QuantityExpected?: unknown }
+type Item = { ID?: number | string | null; SourceLineId?: unknown; QuantityExpected?: unknown; ProductId?: unknown }
 function row(poReference: string, warehouseId: number, items: Item[]): WmsAsnRef {
   return normalizeMintsoftAsnListRowForRecovery({ ID: 900, POReference: poReference, WarehouseId: warehouseId, Items: items })
 }
@@ -205,4 +209,24 @@ test('nothing outside the rule can conclude that no ASN exists', () => {
   assert.equal((action.match(/const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError/g) ?? []).length, 2)
   assert.equal((action.match(/await recordUnverifiedMintsoftAsnCreate\(/g) ?? []).length, 2)
   assert.equal((action.match(/\.\.\.\(unrecordedExternalAsnId \? \{ unrecordedExternalAsnId \} : \{\}\)/g) ?? []).length, 2)
+})
+
+/**
+ * o3d-66ca1: NOT FIXED, deliberately. A row quoting our POReference whose items ALL carry a null SourceLineId
+ * (a warehouse-made ASN) can never be proven not-ours from its content: a lost create followed by a
+ * product-link change would defeat any item-set proof (Codex R1/R2 on #1002). It refuses, whatever it holds.
+ */
+test('an all-unkeyed row quoting our reference always refuses, whatever products and quantities it holds', () => {
+  const unkeyed: Item[][] = [
+    [{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 4 }],
+    [{ ID: 1, SourceLineId: null, ProductId: 900, QuantityExpected: 10 }, { ID: 2, SourceLineId: null, ProductId: 901, QuantityExpected: 2.5 }],
+    [{ ID: 1, SourceLineId: null, ProductId: 71, QuantityExpected: 5 }],
+    [{ ID: 1, SourceLineId: null, QuantityExpected: 4 }],
+  ]
+  for (const items of unkeyed) {
+    const asn = row('PO-1', 6, items)
+    assert.equal(compareMintsoftAsnAgainstExpectation(asn, EXPECTATION).kind, 'lineIdentityUnreadable')
+    const verdict = decideMintsoftAsnCreation([asn], { ...EXPECTATION, mapKnowledge: { kind: 'readable', mappedExternalAsnIds: new Set() } })
+    assert.equal(verdict.kind, 'refused')
+  }
 })

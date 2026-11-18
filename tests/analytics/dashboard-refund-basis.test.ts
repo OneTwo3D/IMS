@@ -13,8 +13,10 @@ import test, { mock } from 'node:test'
  * because the failure mode is a plausible-looking wrong figure, not an exception.
  */
 
+let ROLE = 'ADMIN'
+
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) },
+  namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: ROLE } }) },
 })
 mock.module('@/app/actions/settings', {
   namedExports: { getSetting: async () => '04-06' },
@@ -294,4 +296,48 @@ test('the Cash Bridge marks its two net-derived bars with the RELATION, not a bo
   assert.equal(bars.get('COGS'), 'exact')
   assert.equal(bars.get('Refunds'), 'exact')
   assert.equal(bars.get('Discounts'), 'exact')
+})
+
+test('SEC-M15: a Read-only user gets no COGS, profit, margin or inventory value from the dashboard action', async () => {
+  ORDERS = [order({ id: 'A', createdAt: TODAY_NOON, lineTotalBase: 100, cogsBase: 40, refunds: [] })]
+  try {
+    ROLE = 'ADMIN'
+    const admin = await todayVsYesterday()
+    assert.equal(admin.costFiguresVisible, true)
+    assert.equal(admin.kpi.cogsCurrent, 40)
+    assert.equal(admin.kpi.marginCurrent, 60)
+    assert.equal(admin.topProducts[0].marginPct, 60)
+    assert.ok(!('totalCogs' in admin.topProducts[0]), 'working fields never ship, even to Admin')
+
+    for (const role of ['READONLY', 'WAREHOUSE']) {
+      ROLE = role
+      const d = await todayVsYesterday()
+      assert.equal(d.costFiguresVisible, false, role)
+      assert.equal(d.kpi.cogsCurrent, 0, role)
+      assert.equal(d.kpi.profitCurrent, 0, role)
+      assert.equal(d.kpi.marginCurrent, 0, role)
+      assert.equal(d.kpi.inventoryValue, 0, role)
+      assert.ok(d.chartData.every((c) => c.cogs === 0 && c.marginPct === 0 && c.compCogs === 0 && c.compMarginPct === 0), role)
+      assert.ok(d.topProducts.every((t) => t.marginPct === 0), role)
+      assert.equal(d.kpi.netSalesCurrent, 100, 'sales figures are not cost data and stay')
+      // Allowlist check: no cost-bearing key, at any depth, reaches a restricted role (40 is the order's COGS).
+      const costKey = /cogs|totalcogs|profit|margin|inventoryvalue|unitcost/i
+      const seen: string[] = []
+      const walk = (v: unknown, path: string) => {
+        if (Array.isArray(v)) return v.forEach((x, i) => walk(x, `${path}[${i}]`))
+        if (v && typeof v === 'object') {
+          for (const [k, x] of Object.entries(v)) {
+            if (costKey.test(k) && !(typeof x === 'number' && x === 0) && !(typeof x === 'string' && x === 'exact')) seen.push(`${path}.${k}=${String(x)}`)
+            walk(x, `${path}.${k}`)
+          }
+        }
+      }
+      walk({ kpi: d.kpi, chartData: d.chartData, topProducts: d.topProducts, recentOrders: d.recentOrders, incomingPOs: d.incomingPOs }, role)
+      assert.deepEqual(seen, [], role)
+      assert.ok(d.topProducts.length > 0)
+      assert.ok(d.topProducts.every((t) => !('totalCogs' in t) && !('refundsGrossBasisPositive' in t)), role)
+    }
+  } finally {
+    ROLE = 'ADMIN'
+  }
 })

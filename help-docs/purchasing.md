@@ -160,6 +160,17 @@ The **PO PDF** button on any purchase order opens the priced purchase order: sup
 - **A PO email is never sent twice automatically.** If the mail server had already been handed the message when the connection dropped or the 60-second send limit ran out, nobody can tell whether the supplier received it. The email ends **Failed** in the email queue with "Outcome unknown", and the order's activity shows a warning. Nothing is retried: check with the supplier, then click **Email PO** to send it again if needed. A failure before the message was handed over (the mail server could not be reached, or login failed) is retried automatically as before.
 
 
+## Attachments
+
+Every purchase order page has an **Attachments** card under the order, for the supporting documents that belong to it: supplier quotes, proformas, packing lists, delivery notes, certificates and emails. They live against the order instead of in someone's inbox.
+
+- **Upload** -- Anyone who can create or receive purchase orders (administrators, managers, finance and warehouse users) sees an **Upload** button. Accepted: PDF, images (PNG, JPEG, GIF, WebP), CSV, Excel (.xlsx), Word (.docx) and email (.eml, .msg), up to **20 MB** each. IMS checks what is *inside* the file, not just its name: a file whose content does not match its type, an executable, a web page or an SVG is refused with the reason.
+- **Download** -- Anyone who can view purchase orders (read-only users included) sees the list with each file's size, date and uploader, and a **Download** button. A file always downloads; it is never opened in the browser.
+- **Delete** -- The **Delete** button asks you to confirm. A deleted attachment disappears from the list and can no longer be downloaded. The file is kept on the server and the row is only marked deleted, so an administrator can still recover it; it is not shown again in IMS.
+- Attachments belong to one order. They are **not** copied to a supplier's bill in Xero: the accounting connector never sends them (see [Xero Accounting Sync](xero-sync.md)). Supplier logins do not see them.
+- Uploading and deleting are recorded in the order's activity log (who and when, never the file name).
+- **Backups:** the files are stored in the server's upload folder (`UPLOAD_STORAGE_DIR`, under `order-attachments`), **not** in the database. A database backup does not contain them. Make sure that folder is in your file backup, restored together with the database. See [Backup & Restore](backup-restore.md).
+
 ## Receiving a Purchase Order
 
 When goods arrive, open the PO and click **Receive Goods**. You can receive all lines at once or partially receive individual lines. You cannot receive more than the line's ordered quantity less what has already landed (including anything the warehouse has booked in or aligned).
@@ -288,6 +299,10 @@ message. See the Xero sync docs for retry semantics.
 
 Paid bills cannot be edited. Reverse the payment first if a correction is required.
 
+
+### Deleting a bill that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), a bill that IMS itself created in Xero shows a **Delete bill** button on the purchase order page for people who can edit bills. It renames the Xero bill with a random `-DEL-` suffix so the original supplier number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it. When Xero confirms, the bill and its lines are removed from IMS, the purchase order is no longer marked as invoiced if no other bill remains, and the Stock in Transit movement the bill recorded is reversed. A paid bill, a bill with supplier credit notes, one dated in a locked period, or one created by another system (for example Qoblex) is refused with the reason shown. See [Xero sync](xero-sync.md) for the full rules.
 
 ### Supplier credit notes
 

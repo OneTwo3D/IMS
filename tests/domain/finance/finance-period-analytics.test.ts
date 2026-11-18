@@ -754,3 +754,44 @@ test('FX gain/loss: a bill paid at an EXPLICIT 00:00:00Z instant reads the midni
   assert.equal((await getFxGainLossReport(fxWindow, fxOpts(clientWith({ paidAtExplicitInstant: null })))).rows[0]?.settlementRateToBase, '1.6')
   assert.ok(billSelects.length > 0 && billSelects.every((sel) => sel.paidAtExplicitInstant === true), 'the report reads the provenance column')
 })
+
+test('VAT report does not filter out archived orders (o3d-hqvrp.325)', async () => {
+  let where: unknown
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrderLine: { findMany: async (args: { where?: unknown }) => { where = args.where; return [] } },
+  }
+
+  const report = await getVatReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
+  )
+
+  const order = (where as { order: Record<string, unknown> }).order
+  assert.equal('archived' in order, false, 'archiving must not remove an invoiced order from the statutory VAT figure')
+  assert.equal(order.status !== undefined, true, 'cancelled orders stay excluded')
+  assert.doesNotMatch(report.notices.join(' '), /archived sales orders are excluded|Cancelled and archived/)
+})
+
+test('AR aging keeps an indeterminate zero-balance order as an uncertain row and counts it in the notice (o3d-hqvrp.326)', async () => {
+  const order = (id: string, refunds: unknown[]) => ({
+    id, customerId: 'c1', customerName: 'Acme', customerEmail: null,
+    createdAt: new Date('2026-05-01T00:00:00Z'), invoicedAt: new Date('2026-05-01T00:00:00Z'), paymentDueAt: null, paidAt: null,
+    paymentRemovals: [], totalBase: decimal('100'), totalForeign: null, currency: 'GBP',
+    payments: [{ amount: decimal('100'), currency: 'GBP', paidAt: new Date('2026-05-02T00:00:00Z'), refundId: null, settlementRateToBase: null }],
+    refunds,
+  })
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    // £100 invoice, £100 receipt, plus an unplaceable credit valued at 0: balance 0 but indeterminate.
+    salesOrder: { findMany: async () => [order('so-u', [{ totalBase: decimal('-5'), totalsBasis: null, lines: [], refundedAt: new Date('2026-05-10T00:00:00Z') }]), order('so-s', [])] },
+  }
+
+  const report = await getArAgingReport({ dateTo: '2026-06-30' }, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } })
+
+  assert.equal(report.rows.length, 1)
+  assert.equal(report.rows[0].documentCount, 1, 'only the uncertain order is listed; the exactly settled one is not')
+  assert.equal(report.rows[0].uncertainDocumentCount, 1)
+  assert.equal(report.rows[0].outstandingBase, '0')
+  assert.ok(report.notices.some((n) => /1 order nets to a zero balance only because a credit could not be placed/.test(n)), report.notices.join('\n'))
+})

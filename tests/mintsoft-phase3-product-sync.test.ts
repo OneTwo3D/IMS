@@ -330,3 +330,181 @@ test('isMintsoftProductEligible excludes parent and archived products', () => {
     false,
   )
 })
+
+// ---- clearing customs data in Mintsoft (never barcodes) ----
+
+const clearCandidate = { hsCode: null, countryOfOrigin: null, customsDescription: null }
+
+const ALL_IMS_MARKED = ['hsCode', 'countryOfOrigin', 'customsDescription']
+
+test('resolveMintsoftCustomsClears: only MARKED (populated -> empty) fields clear, when Mintsoft holds or may hold a value', () => {
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(clearCandidate, undefined, ALL_IMS_MARKED),
+    ['customsDescription', 'commodityCode', 'countryOfManufacture'],
+  )
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(clearCandidate, {
+      CustomsDescription: 'Old', CommodityCode: { Code: '85011099' }, CountryOfManufacture: { Code: 'CN' },
+    }, ['countryOfOrigin']),
+    ['countryOfManufacture'],
+  )
+})
+
+test('resolveMintsoftCustomsClears: an UNSET origin (no marker) never clears, even though Mintsoft holds the CN default', () => {
+  const remote = { CustomsDescription: 'Old', CommodityCode: { Code: '85011099' }, CountryOfManufacture: { Code: 'CN' }, CountryOfManufactureId: 44 }
+  assert.deepEqual(productSync.resolveMintsoftCustomsClears(clearCandidate, remote, []), [])
+  assert.deepEqual(productSync.resolveMintsoftCustomsClears(clearCandidate, undefined, []), [])
+})
+
+test('resolveMintsoftCustomsClears: nothing to clear when Mintsoft is already empty, or IMS holds a value again', () => {
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: { Code: '' } }, ALL_IMS_MARKED),
+    [],
+  )
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears(
+      { hsCode: '85011099', countryOfOrigin: 'CN', customsDescription: 'Motor' },
+      { CustomsDescription: 'Old', CommodityCode: { Code: '1' }, CountryOfManufacture: { Code: 'CN' } },
+      ALL_IMS_MARKED,
+    ),
+    [],
+  )
+  assert.deepEqual(
+    productSync.resolveMintsoftCustomsClears({ hsCode: '123', countryOfOrigin: 'Atlantis', customsDescription: 'x' }, undefined, ALL_IMS_MARKED),
+    [],
+  )
+})
+
+test('markers are settled once Mintsoft is known empty, and kept while a value remains or the record is unknown', () => {
+  const settled = productSync.resolveSettledCustomsMarkers
+  assert.deepEqual(settled(clearCandidate, { CustomsDescription: '', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ['hsCode', 'customsDescription'])
+  assert.deepEqual(settled(clearCandidate, { CustomsDescription: 'Old', CommodityCode: null, CountryOfManufacture: null }, ALL_IMS_MARKED), ['hsCode'])
+  assert.deepEqual(settled(clearCandidate, undefined, ALL_IMS_MARKED), [])
+  assert.equal(productSync.IMS_FIELD_OF_WMS_CLEAR.countryOfManufacture, 'countryOfOrigin')
+})
+
+test('the clear request is a full update body with the one field erased and never carries a cleared barcode', () => {
+  const dto = {
+    sku: 'SKU-C', name: 'Widget', customsDescription: null, barcode: null, commodityCode: null, countryOfManufacture: null,
+    weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null,
+  }
+  for (const field of ['commodityCode'] as const) {
+    const req = client.buildMintsoftProductClearRequest(dto, field, { externalProductId: '42' })
+    const body = JSON.parse(req.body)
+    assert.equal(req.method, 'POST')
+    assert.equal(body.ID, 42)
+    assert.equal(body.SKU, 'SKU-C')
+    assert.ok(Object.prototype.hasOwnProperty.call(body, client.MINTSOFT_CLEAR_WIRE[field].key))
+    assert.ok(!('EAN' in body) && !('UPC' in body), 'no identifier key at all when the IMS barcode is empty')
+  }
+  assert.throws(() => client.buildMintsoftProductClearRequest(dto, 'barcode' as never, { externalProductId: '42' }))
+  assert.throws(() => client.buildMintsoftProductClearRequest(dto, 'customsDescription', {}))
+})
+
+test('barcode / EAN / UPC are only ever sent when non-empty, on update, create and clear requests', () => {
+  const empty = {
+    sku: 'S', name: 'N', customsDescription: null, barcode: '', mpn: '', commodityCode: null, countryOfManufacture: null,
+    weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null,
+  }
+  for (const options of [{ externalProductId: '7' }, {}] as const) {
+    const body = JSON.parse(client.buildMintsoftProductUpsertRequest(empty, options).body)
+    assert.ok(!('EAN' in body) && !('UPC' in body))
+  }
+  const full = { ...empty, barcode: '5012345678900', mpn: 'MPN-1' }
+  const body = JSON.parse(client.buildMintsoftProductUpsertRequest(full, { externalProductId: '7' }).body)
+  assert.equal(body.EAN, '5012345678900')
+  const omitted = JSON.parse(client.buildMintsoftProductUpsertRequest(full, { externalProductId: '7', omitBarcode: true, omitMpn: true }).body)
+  assert.ok(!('EAN' in omitted) && !('UPC' in omitted))
+})
+
+test('the clear wire mirrors the live sync and stays unverified in one place', () => {
+  // Live test 2026-11-18: only CommodityCode can be blanked through the API.
+  assert.deepEqual(client.MINTSOFT_CLEAR_WIRE.commodityCode, { key: 'CommodityCode', value: { Code: '' }, verified: true })
+  assert.equal(client.MINTSOFT_CLEAR_WIRE.customsDescription.unsupported, true)
+  assert.equal(client.MINTSOFT_CLEAR_WIRE.countryOfManufacture.unsupported, true)
+  assert.deepEqual(['customsDescription', 'commodityCode', 'countryOfManufacture'].map((f) => client.mintsoftCanClear(f as never)), [false, true, false])
+  const dto = { sku: 'S', name: 'N', customsDescription: null, barcode: null, commodityCode: null, countryOfManufacture: null, weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null }
+  assert.throws(() => client.buildMintsoftProductClearRequest(dto, 'customsDescription', { externalProductId: '42' }), /cannot be cleared/)
+  assert.throws(() => client.buildMintsoftProductClearRequest(dto, 'countryOfManufacture', { externalProductId: '42' }), /cannot be cleared/)
+})
+
+const CLEAR_DTO = { sku: 'S', name: 'N', customsDescription: null, barcode: null, commodityCode: null, countryOfManufacture: null, weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null }
+function fakeTransport(reply: { data: unknown; error?: string | null }, readBack: Record<string, unknown> | null) {
+  const posts: string[] = []
+  return {
+    posts,
+    transport: {
+      post: async (_path: string, init: { body: string }) => { posts.push(init.body); return reply },
+      readBack: async () => readBack,
+    },
+  }
+}
+
+test('sendMintsoftProductClears: an unsupported field is never POSTed and is reported', async () => {
+  const t = fakeTransport({ data: { Success: true, Message: 'ok' } }, { CommodityCode: null })
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['customsDescription', 'countryOfManufacture'], { externalProductId: '42' }, t.transport)
+  assert.deepEqual(t.posts, [])
+  assert.deepEqual(out, { cleared: [], rejected: [], skipped: [], unsupported: ['customsDescription', 'countryOfManufacture'] })
+})
+
+test('sendMintsoftProductClears: CommodityCode is sent and counted only when the read-back shows it empty', async () => {
+  const ok = fakeTransport({ data: { Success: true, Message: 'Product Successfully Updated!' } }, { CommodityCode: { Code: '' } })
+  assert.deepEqual((await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, ok.transport)).cleared, ['commodityCode'])
+  assert.equal(ok.posts.length, 1)
+  assert.deepEqual(JSON.parse(ok.posts[0]).CommodityCode, { Code: '' })
+  const kept = fakeTransport({ data: { Success: true, Message: 'Product Successfully Updated!' } }, { CommodityCode: { Code: '85011099' } })
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, kept.transport)
+  assert.deepEqual(out.cleared, [])
+  assert.equal(out.rejected[0].message, 'clear not applied')
+})
+
+test("sendMintsoftProductClears: a 'Nothing to update/add' answer is not applied, whatever the read-back says", async () => {
+  const t = fakeTransport({ data: { Success: true, Message: 'Product Successfully Updated! Nothing to update/add' } }, { CommodityCode: { Code: '' } })
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, t.transport)
+  assert.deepEqual(out.cleared, [])
+  assert.match(out.rejected[0].message, /not applied/)
+})
+
+test('sendMintsoftProductClears: a clear the claim refuses is not sent and is not a failure', async () => {
+  const t = fakeTransport({ data: { Success: true } }, { CommodityCode: null })
+  const claimed: string[] = []
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], {
+    externalProductId: '42',
+    clearClaim: async (field) => { claimed.push(field); return { claimed: false, reason: 'the field was filled again' } },
+  }, t.transport)
+  assert.deepEqual(claimed, ['commodityCode'])
+  assert.deepEqual(t.posts, [])
+  assert.deepEqual(out, { cleared: [], rejected: [], skipped: [{ field: 'commodityCode', reason: 'the field was filled again' }], unsupported: [] })
+})
+
+test('sendMintsoftProductClears: the request is made INSIDE the claim', async () => {
+  const t = fakeTransport({ data: { Success: true } }, { CommodityCode: null })
+  let inside = false
+  const base = t.transport.post
+  t.transport.post = async (path, init) => { assert.equal(inside, true, 'POST outside the claim'); return base(path, init) }
+  const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], {
+    externalProductId: '42',
+    clearClaim: async (_f, send) => { inside = true; try { return { claimed: true, value: await send() } } finally { inside = false } },
+  }, t.transport)
+  assert.deepEqual(out.cleared, ['commodityCode'])
+})
+
+test('plannedClearMarkers keys each marker version by the WMS field', () => {
+  const at = new Date('2026-11-18T10:00:00.000Z')
+  assert.deepEqual(productSync.plannedClearMarkers([{ field: 'hsCode', createdAt: at }, { field: 'countryOfOrigin' }]), { commodityCode: at })
+})
+
+test('mintsoftFieldIsEmpty: a clear counts only when the read-back shows the field empty', () => {
+  const e = client.mintsoftFieldIsEmpty
+  assert.equal(e(null, 'customsDescription'), false, 'no read-back is not proof')
+  assert.equal(e({ CustomsDescription: '' }, 'customsDescription'), true)
+  assert.equal(e({ CustomsDescription: null }, 'customsDescription'), true)
+  assert.equal(e({ CustomsDescription: 'Old' }, 'customsDescription'), false)
+  assert.equal(e({ CommodityCode: null }, 'commodityCode'), true)
+  assert.equal(e({ CommodityCode: { Code: '' } }, 'commodityCode'), true)
+  assert.equal(e({ CommodityCode: { Code: '85011099' } }, 'commodityCode'), false)
+  assert.equal(e({ CountryOfManufacture: { Code: '' }, CountryOfManufactureId: 0 }, 'countryOfManufacture'), true)
+  assert.equal(e({ CountryOfManufacture: null, CountryOfManufactureId: null }, 'countryOfManufacture'), true)
+  assert.equal(e({ CountryOfManufacture: null, CountryOfManufactureId: 44 }, 'countryOfManufacture'), false)
+  assert.equal(e({ CountryOfManufacture: { Code: 'CN' }, CountryOfManufactureId: 0 }, 'countryOfManufacture'), false)
+})

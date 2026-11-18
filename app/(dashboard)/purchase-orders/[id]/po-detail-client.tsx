@@ -53,6 +53,8 @@ import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
+import { DeleteSyncedDocument } from '@/components/accounting/delete-synced-document'
+import type { DocumentDeleteUiState } from '@/lib/domain/accounting/document-delete-service'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatCalendarDate } from '@/lib/format-datetime'
@@ -86,6 +88,8 @@ type Props = {
   prepaidReconciliation: PrepaidReconciliationSummary
   /** Setting `purchase_order_email_enabled` (default off): whether Confirm & Send PO and Email PO mail the supplier. */
   poEmailEnabled: boolean
+  /** o3d-ngmt.21: per bill id, whether to offer deleting the synced bill, or why not. */
+  billDeleteStates?: Record<string, DocumentDeleteUiState>
   /** May this user write the internal per-line notes (purchasing.create). */
   canEditLineNotes?: boolean
   /** The signed-in user holds `purchasing.approve` (the server re-checks it, and that they are not the order's creator). */
@@ -2070,7 +2074,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false, canApprove = false, currentUserId }: Props) {
+export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false, canApprove = false, currentUserId, billDeleteStates }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -3125,6 +3129,7 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
                           </Button>
                         </>
                       )}
+                      <DeleteSyncedDocument kind="PURCHASE_BILL" documentId={inv.id} state={billDeleteStates?.[inv.id]} />
                     </div>
                   </div>
                   {inv.paidAt && (

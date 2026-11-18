@@ -9,13 +9,13 @@
 import { randomBytes } from 'crypto'
 import { NextRequest } from 'next/server'
 import bcrypt from 'bcryptjs'
-import { verify } from 'otplib'
 import { z } from 'zod'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
 import { setAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
 import { readTotpSecrets } from '@/lib/totp-secrets'
+import { verifyTotpCodeOnce } from '@/lib/auth/totp-replay'
 
 // Same dummy hash used by the login authorize() path so a missing passwordHash
 // still does constant-ish work and never short-circuits to a different answer.
@@ -33,6 +33,16 @@ export async function POST(request: NextRequest) {
   }
   if (session.user.sessionInvalidReason) {
     return Response.json({ error: 'Session expired' }, { status: 401 })
+  }
+
+  // A password-only session that has not cleared its 2FA challenge must not reach
+  // step-up: it would get a second guessing channel for the TOTP code (own rate
+  // bucket) and could mint a fresh-auth token without ever passing the second factor.
+  if (session.user.totpEnabled && !session.user.totpVerified) {
+    return Response.json(
+      { error: 'Complete two-factor verification first', code: 'second_factor_pending' },
+      { status: 403 },
+    )
   }
 
   const rlKey = `step_up:${session.user.id}`
@@ -74,8 +84,14 @@ export async function POST(request: NextRequest) {
     if (!secrets?.totpSecret) {
       return Response.json({ error: '2FA not configured' }, { status: 400 })
     }
-    const result = await verify({ secret: secrets.totpSecret, token: code })
-    if (!result.valid) {
+    const outcome = await verifyTotpCodeOnce({ userId: user.id, secret: secrets.totpSecret, code })
+    if (outcome === 'replayed') {
+      return Response.json(
+        { error: 'That authenticator code was already used. Wait for the next code.', totpRequired: true },
+        { status: 400 },
+      )
+    }
+    if (outcome !== 'ok') {
       return Response.json({ error: 'Invalid authenticator code', totpRequired: true }, { status: 400 })
     }
   }

@@ -1,0 +1,4 @@
+### Export and import accounting fixes (inventory)
+
+- **Fixed: the product export no longer shows prices to roles without inventory prices.** The Regular price, Sale price and Prices-include-tax columns of the Inventory export stay in the file (so existing templates and imports keep working) but are blank unless you have the inventory prices permission, matching Edit by CSV.
+- **Fixed: product import now reports component failures separately.** A KIT or BOM row is saved before its components are applied. If the components or recipe are then refused (invalid component, circular reference, orders in flight, type changed), the row stays counted as created or updated, the result shows a new "rows saved but components failed" notice, the import is reported as not fully successful, and the reason is listed in the messages. A circular BOM is no longer counted twice.
