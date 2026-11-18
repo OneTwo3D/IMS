@@ -313,14 +313,35 @@ export async function fetchMintsoftReturns(since: Date): Promise<WmsReturnRecord
 /**
  * How Mintsoft is told to ERASE a customs field. CONTRACT STATUS: NOT VERIFIED against Mintsoft (it was not called to
  * write this; the repository holds no capture of a cleared product). The values are the most plausible for the field's
- * shape: a string field is blanked, an object field (`{ Code }`) is nulled. Each clear is sent as its own request, so a
+ * shape: mirrors the live sync (woocommerce-mintsoft-sync): the string is blanked and an object field is sent as `{ Code: '' }`. Each clear is sent as its own request, so a
  * rejection is contained and reported rather than failing the update. Adjust here once a read-only capture and one
  * granted, controlled update confirm the real behaviour. There is no barcode entry, on purpose.
  */
-export const MINTSOFT_CLEAR_WIRE: Readonly<Record<WmsClearableProductField, { key: string; value: '' | null; verified: false }>> = {
+export const MINTSOFT_CLEAR_WIRE: Readonly<Record<WmsClearableProductField, { key: string; value: '' | { Code: '' }; verified: false }>> = {
   customsDescription: { key: 'CustomsDescription', value: '', verified: false },
-  commodityCode: { key: 'CommodityCode', value: null, verified: false },
-  countryOfManufacture: { key: 'CountryOfManufacture', value: null, verified: false },
+  commodityCode: { key: 'CommodityCode', value: { Code: '' }, verified: false },
+  countryOfManufacture: { key: 'CountryOfManufacture', value: { Code: '' }, verified: false },
+}
+
+/**
+ * True when the product read back from Mintsoft shows the field empty. The only proof a clear worked: a POST that returned
+ * no error proves nothing while the wire format is unverified.
+ */
+export function mintsoftFieldIsEmpty(raw: Record<string, unknown> | null | undefined, field: WmsClearableProductField): boolean {
+  if (!raw) return false
+  const emptyCode = (value: unknown): boolean => {
+    if (value == null) return true
+    if (typeof value === 'string') return value.trim() === ''
+    if (typeof value === 'object') {
+      const code = (value as Record<string, unknown>).Code ?? (value as Record<string, unknown>).code
+      return code == null || (typeof code === 'string' && code.trim() === '')
+    }
+    return false
+  }
+  if (field === 'customsDescription') return emptyCode(raw.CustomsDescription)
+  if (field === 'commodityCode') return emptyCode(raw.CommodityCode)
+  const id = raw.CountryOfManufactureId
+  return emptyCode(raw.CountryOfManufacture) && (id == null || id === 0 || id === '0')
 }
 
 /**
@@ -655,6 +676,7 @@ async function sendMintsoftProductClears(
   options: WmsUpsertProductOptions,
 ): Promise<WmsProductClearOutcome> {
   const outcome: WmsProductClearOutcome = { cleared: [], rejected: [] }
+  const sent: WmsClearableProductField[] = []
   for (const field of new Set(fields)) {
     try {
       const request = buildMintsoftProductClearRequest(product, field, options)
@@ -664,10 +686,23 @@ async function sendMintsoftProductClears(
       if (body && typeof body === 'object' && body.Success === false) {
         throw new Error(typeof body.Message === 'string' && body.Message ? body.Message : 'Mintsoft refused the clear')
       }
-      outcome.cleared.push(field)
+      sent.push(field)
     } catch (error) {
       outcome.rejected.push({ field, message: error instanceof Error ? error.message : 'Mintsoft clear failed' })
     }
+  }
+  if (sent.length === 0) return outcome
+  // A POST without an error does not prove the clear worked (the wire format is unverified): read the product back and
+  // count a field cleared only when Mintsoft shows it empty.
+  let raw: Record<string, unknown> | null = null
+  try {
+    raw = (await fetchMintsoftProduct(options.externalProductId as string))?.raw ?? null
+  } catch {
+    raw = null
+  }
+  for (const field of sent) {
+    if (raw && mintsoftFieldIsEmpty(raw, field)) outcome.cleared.push(field)
+    else outcome.rejected.push({ field, message: raw ? 'clear not applied' : 'clear not applied (could not read the product back to verify)' })
   }
   return outcome
 }

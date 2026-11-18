@@ -400,3 +400,24 @@ test('barcode / EAN / UPC are only ever sent when non-empty, on update, create a
   const omitted = JSON.parse(client.buildMintsoftProductUpsertRequest(full, { externalProductId: '7', omitBarcode: true, omitMpn: true }).body)
   assert.ok(!('EAN' in omitted) && !('UPC' in omitted))
 })
+
+test('the clear wire mirrors the live sync and stays unverified in one place', () => {
+  assert.deepEqual(client.MINTSOFT_CLEAR_WIRE.customsDescription, { key: 'CustomsDescription', value: '', verified: false })
+  assert.deepEqual(client.MINTSOFT_CLEAR_WIRE.commodityCode, { key: 'CommodityCode', value: { Code: '' }, verified: false })
+  assert.deepEqual(client.MINTSOFT_CLEAR_WIRE.countryOfManufacture, { key: 'CountryOfManufacture', value: { Code: '' }, verified: false })
+})
+
+test('mintsoftFieldIsEmpty: a clear counts only when the read-back shows the field empty', () => {
+  const e = client.mintsoftFieldIsEmpty
+  assert.equal(e(null, 'customsDescription'), false, 'no read-back is not proof')
+  assert.equal(e({ CustomsDescription: '' }, 'customsDescription'), true)
+  assert.equal(e({ CustomsDescription: null }, 'customsDescription'), true)
+  assert.equal(e({ CustomsDescription: 'Old' }, 'customsDescription'), false)
+  assert.equal(e({ CommodityCode: null }, 'commodityCode'), true)
+  assert.equal(e({ CommodityCode: { Code: '' } }, 'commodityCode'), true)
+  assert.equal(e({ CommodityCode: { Code: '85011099' } }, 'commodityCode'), false)
+  assert.equal(e({ CountryOfManufacture: { Code: '' }, CountryOfManufactureId: 0 }, 'countryOfManufacture'), true)
+  assert.equal(e({ CountryOfManufacture: null, CountryOfManufactureId: null }, 'countryOfManufacture'), true)
+  assert.equal(e({ CountryOfManufacture: null, CountryOfManufactureId: 44 }, 'countryOfManufacture'), false)
+  assert.equal(e({ CountryOfManufacture: { Code: 'CN' }, CountryOfManufactureId: 0 }, 'countryOfManufacture'), false)
+})

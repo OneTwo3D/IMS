@@ -14,6 +14,7 @@ import { snapshotFromRow } from '@/lib/domain/product-content/store'
 import { classifyIdentifierCodes, sameCode, type IdentifierCodes } from '@/lib/domain/products/identifiers'
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
 import { classifyMintsoftProductRecord } from '../api/normalizers'
+import { mintsoftFieldIsEmpty } from '../api/client'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
 import { applyMintsoftProductParity, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
 import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation, type ParentDeletionCounters } from './parent-sku-deletion'
@@ -280,15 +281,11 @@ export function resolveMintsoftCustomsClears(
   product: Pick<ProductSyncCandidate, 'hsCode' | 'countryOfOrigin' | 'customsDescription'>,
   remoteRaw: Record<string, unknown> | null | undefined,
 ): WmsClearableProductField[] {
-  const holds = (value: unknown): boolean => {
-    if (value && typeof value === 'object') return holds((value as Record<string, unknown>).Code ?? (value as Record<string, unknown>).code)
-    return typeof value === 'string' ? value.trim() !== '' : value != null
-  }
-  const mayHold = (key: string): boolean => (remoteRaw ? holds(remoteRaw[key]) : true)
+  const mayHold = (field: WmsClearableProductField): boolean => (remoteRaw ? !mintsoftFieldIsEmpty(remoteRaw, field) : true)
   const clears: WmsClearableProductField[] = []
-  if (!trimToNull(product.customsDescription) && mayHold('CustomsDescription')) clears.push('customsDescription')
-  if (!trimToNull(product.hsCode) && mayHold('CommodityCode')) clears.push('commodityCode')
-  if (!trimToNull(product.countryOfOrigin) && mayHold('CountryOfManufacture')) clears.push('countryOfManufacture')
+  if (!trimToNull(product.customsDescription) && mayHold('customsDescription')) clears.push('customsDescription')
+  if (!trimToNull(product.hsCode) && mayHold('commodityCode')) clears.push('commodityCode')
+  if (!trimToNull(product.countryOfOrigin) && mayHold('countryOfManufacture')) clears.push('countryOfManufacture')
   return clears
 }
 
@@ -956,6 +953,8 @@ async function syncOneMintsoftProduct(
     externalProductId
       && existingLink?.payloadHash
       && existingLink.payloadHash === payloadHash
+      // A pending clear is work: an unchanged hash (a field blank in IMS all along) must not hide a value Mintsoft still holds.
+      && clearFields.length === 0
       && (
         barcodePlan.kind === 'noop'
         || barcodePlan.kind === 'match'

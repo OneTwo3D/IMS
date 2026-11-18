@@ -96,3 +96,12 @@ test('a variation inheriting a populated parent is not cleared (inherited value 
   const changes = productSync.resolveWcTradeFieldUpdates(HELD, { ...HELD, hsCode: '90211000' }, [])
   assert.deepEqual(changes, [])
 })
+
+test('variation: parent cleared + variation present-but-invalid is NOT a clear; own or parent clear otherwise is', () => {
+  const none = { hsCode: null, countryOfOrigin: null, customsDescription: null }
+  const invalidOwn = { cleared: [] as never[], rejected: [{ field: 'hsCode' as const, value: '850110' }] }
+  assert.deepEqual(productSync.resolveVariationCleared(invalidOwn, { cleared: ['hsCode'], rejected: [] }, none), [])
+  assert.deepEqual(productSync.resolveVariationCleared({ cleared: [], rejected: [] }, { cleared: ['hsCode'], rejected: [] }, none), ['hsCode'])
+  assert.deepEqual(productSync.resolveVariationCleared({ cleared: ['hsCode'], rejected: [] }, {}, { ...none, hsCode: '90211000' }), [])
+  assert.deepEqual(productSync.resolveVariationCleared({ cleared: [], rejected: [] }, { cleared: [], rejected: [] }, none), [])
+})

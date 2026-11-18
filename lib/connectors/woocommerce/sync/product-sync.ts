@@ -602,6 +602,24 @@ export function resolveWcTradeFieldUpdates(
 }
 
 /**
+ * Fields a variation clears: the merged value is still empty, nothing present-but-unusable was supplied by the variation
+ * OR its parent, and the variation or the parent explicitly emptied it.
+ */
+export function resolveVariationCleared(
+  own: { cleared: readonly WcTradeField[]; rejected: readonly WcRejectedCustomsValue[] },
+  parent: { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
+  merged: WcTradeSnapshot,
+): WcTradeField[] {
+  return WC_TRADE_FIELDS.filter(
+    (f) =>
+      merged[f] === null
+      && !own.rejected.some((r) => r.field === f)
+      && !parent.rejected?.some((r) => r.field === f)
+      && (own.cleared.includes(f) || Boolean(parent.cleared?.includes(f))),
+  )
+}
+
+/**
  * Operator-facing sentences for customs data WooCommerce supplied that IMS could not use, plus
  * the new-row case where the China default had to be declared because no usable origin existed.
  * Empty when there is nothing to say. Pure: the caller decides where it is recorded.
@@ -1934,9 +1952,7 @@ async function applyVariations(
 
     // Cleared only when the variation itself is explicitly emptied (or has no value of its own and the parent is), and
     // nothing inherited from the parent fills the field: a variation inheriting a populated parent is never cleared.
-    const variantCleared = WC_TRADE_FIELDS.filter(
-      (f) => variantCustoms[f] === null && !parentCustoms.rejected?.some((r) => r.field === f) && (ownCustoms.cleared.includes(f) || parentCustoms.cleared?.includes(f)),
-    )
+    const variantCleared = resolveVariationCleared(ownCustoms, parentCustoms, variantCustoms)
 
     const existing = existingBySku.get(sku)
     customsWarnings.push(
