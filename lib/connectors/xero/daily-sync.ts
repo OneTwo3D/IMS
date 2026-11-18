@@ -134,7 +134,7 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 import { XERO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { refreshXeroBooksLockDate } from '@/lib/connectors/xero/books-lock-date'
 import { businessDateYmd } from '@/lib/business-date'
-import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, businessDay, utcDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
