@@ -1065,15 +1065,14 @@ export function resolvePostedRefundTaxIdentity(input: PostedRefundTaxIdentityInp
  */
 export function orderDiscountReversalRateRefusal(input: {
   postedRate: Decimal
-  /** `SalesOrder.taxRatePercent` (a percentage, 20 = 20%); null/0 = the order states no header rate. */
-  chargedRatePercent: DecimalInput | null | undefined
+  /** `SalesOrder.taxRatePercent`: despite the name a FRACTION (0.2000 = 20%), the same unit as `postedRate`; null/0 = the order states no header rate. */
+  chargedRate: DecimalInput | null | undefined
   label: string
 }): string | null {
-  if (input.chargedRatePercent == null) return null
-  const chargedPercent = toDecimal(input.chargedRatePercent)
-  if (!chargedPercent.gt(0)) return null
-  const charged = chargedPercent.div(100)
+  if (input.chargedRate == null) return null
+  const charged = toDecimal(input.chargedRate)
+  if (!charged.gt(0)) return null
   // Rates are stored to 6 places; anything closer than that is the same rate.
   if (input.postedRate.sub(charged).abs().lte(toDecimal('0.000001'))) return null
-  return `${input.label} would post at ${input.postedRate.mul(100).toDecimalPlaces(4).toString()}% but the order's discount was charged at ${chargedPercent.toDecimalPlaces(4).toString()}%, so the VAT it reverses would be wrong. Restore the tax mapping, or raise the credit note manually.`
+  return `${input.label} would post at ${input.postedRate.mul(100).toDecimalPlaces(4).toString()}% but the order's discount was charged at ${charged.mul(100).toDecimalPlaces(4).toString()}%, so the VAT it reverses would be wrong. Restore the order's default tax rate, or raise the credit note manually.`
 }

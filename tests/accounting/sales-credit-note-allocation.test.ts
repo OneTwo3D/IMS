@@ -69,6 +69,33 @@ test('[.39] a credit note that is not AUTHORISED is not allocated', async () => 
   assert.equal(puts.length, 0)
 })
 
+test('[.39] a re-run after a full allocation (credit note PAID, allocation to this invoice on it) is a quiet success', async () => {
+  const { allocateSalesCreditNoteToInvoice } = await import('@/lib/connectors/xero/credit-notes')
+  stub({ Status: 'PAID', RemainingCredit: 0, Allocations: [{ Amount: 30, Invoice: { InvoiceID: 'inv-1' } }] }, { AmountDue: 70 })
+  const r = await allocateSalesCreditNoteToInvoice(P)
+  assert.equal(r.success, true, JSON.stringify(r))
+  assert.equal(puts.length, 0)
+})
+
+test('[.39] an invoice with nothing due is reported as benign (INFO), not as a failure to warn about', async () => {
+  const { allocateSalesCreditNoteToInvoice } = await import('@/lib/connectors/xero/credit-notes')
+  stub({}, { AmountDue: 0 })
+  const r = await allocateSalesCreditNoteToInvoice(P)
+  assert.equal(r.success, false)
+  assert.equal(r.benign, true)
+})
+
+test('[.39] the allocation runs after the success is recorded, and only for an order with no receipts', async () => {
+  const fs = await import('node:fs')
+  const src = fs.readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8')
+  const drain = src.indexOf("entry.type === 'CREDIT_NOTE' && entry.referenceType === 'SalesOrderRefund' && syncResult.externalId")
+  const persist = src.indexOf('await persistPostedXeroDocument({\n          entry,')
+  assert.ok(persist > 0 && drain > persist, 'after persistPostedXeroDocument')
+  const fn = src.slice(src.indexOf('async function allocateSalesCreditNoteAfterPost'))
+  assert.match(fn, /order\.paidAt !== null \|\| receipts > 0 \|\| queuedReceipts > 0/)
+  assert.ok(fn.indexOf('receipts > 0') < fn.indexOf('allocateSalesCreditNoteToInvoice('), 'the receipts check precedes the Xero call')
+})
+
 test('[.39] the enabling setting is off by default and is a saveable setting key', async () => {
   const { XERO_SETTING_KEYS } = await import('@/lib/connectors/xero/settings')
   assert.ok(XERO_SETTING_KEYS.includes('xero_sales_credit_note_allocation_enabled'))
@@ -81,8 +108,19 @@ test('[.39] the enabling setting is off by default and is a saveable setting key
 
 test('[.69] a queued invoice number is adopted; with none queued a number is minted', async () => {
   const { resolveInvoiceNumberToRecord } = await import('@/lib/domain/accounting/sales-invoice-number')
-  assert.deepEqual(resolveInvoiceNumberToRecord({ queuedInvoiceNumber: ' INV-SO1 ' }), { action: 'adopt-queued', invoiceNumber: 'INV-SO1' })
-  for (const none of [null, undefined, '', '  ']) assert.deepEqual(resolveInvoiceNumberToRecord({ queuedInvoiceNumber: none }), { action: 'mint' })
+  const o = { orderAccountingInvoiceId: null }
+  assert.deepEqual(resolveInvoiceNumberToRecord({ ...o, queuedInvoices: [{ invoiceNumber: ' INV-SO1 ', externalId: null }] }), { action: 'adopt-queued', invoiceNumber: 'INV-SO1' })
+  for (const none of [null, undefined, '', '  ']) assert.deepEqual(resolveInvoiceNumberToRecord({ ...o, queuedInvoices: [{ invoiceNumber: none, externalId: null }] }), { action: 'mint' })
+  assert.deepEqual(resolveInvoiceNumberToRecord({ ...o, queuedInvoices: [] }), { action: 'mint' })
+})
+
+test('[.69] the number of a deleted/voided invoice (row posted, order link cleared) is never adopted', async () => {
+  const { resolveInvoiceNumberToRecord } = await import('@/lib/domain/accounting/sales-invoice-number')
+  // Delete unwind: order.accountingInvoiceId cleared, the old row stays SYNCED with its external id.
+  assert.deepEqual(resolveInvoiceNumberToRecord({ orderAccountingInvoiceId: null, queuedInvoices: [{ invoiceNumber: 'INV-00042', externalId: 'x-1' }] }), { action: 'mint' })
+  // Still linked: adopt. A newer pending row beats a stale deleted one.
+  assert.deepEqual(resolveInvoiceNumberToRecord({ orderAccountingInvoiceId: 'x-1', queuedInvoices: [{ invoiceNumber: 'INV-00042', externalId: 'x-1' }] }), { action: 'adopt-queued', invoiceNumber: 'INV-00042' })
+  assert.deepEqual(resolveInvoiceNumberToRecord({ orderAccountingInvoiceId: null, queuedInvoices: [{ invoiceNumber: 'INV-NEW', externalId: null }, { invoiceNumber: 'INV-00042', externalId: 'x-1' }] }), { action: 'adopt-queued', invoiceNumber: 'INV-NEW' })
 })
 
 test('[.69] generateInvoiceNumber consults the queued invoice before minting', async () => {
@@ -94,15 +132,16 @@ test('[.69] generateInvoiceNumber consults the queued invoice before minting', a
   assert.ok(read > 0 && mint > read, 'the sync-log read precedes the mint')
 })
 
-test('[.323] a discount reversal posting at another rate than the order charged is refused', async () => {
+test('[.323] taxRatePercent is a FRACTION: 0.2000 against a 20% code passes, against 17.5% is refused, a zero rate is skipped', async () => {
   const { orderDiscountReversalRateRefusal } = await import('@/lib/domain/sales/refund-posted-tax-identity')
   const base = { label: 'The order discount reversal' }
-  assert.equal(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.2'), chargedRatePercent: '20' }), null)
-  assert.match(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.25'), chargedRatePercent: '20' }) ?? '', /charged at 20%/)
-  assert.match(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0'), chargedRatePercent: 20 }) ?? '', /post at 0%/)
-  // No header rate stated: nothing to compare against.
-  assert.equal(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.25'), chargedRatePercent: null }), null)
-  assert.equal(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.25'), chargedRatePercent: 0 }), null)
+  assert.equal(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.2'), chargedRate: '0.2000' }), null)
+  assert.equal(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.2'), chargedRate: 0.2 }), null)
+  const refused = orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.175'), chargedRate: '0.2000' })
+  assert.match(refused ?? '', /post at 17\.5% but .* charged at 20%/)
+  assert.equal(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.2'), chargedRate: '0' }), null)
+  assert.equal(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0.2'), chargedRate: null }), null)
+  assert.match(orderDiscountReversalRateRefusal({ ...base, postedRate: toDecimal('0'), chargedRate: '0.2000' }) ?? '', /post at 0%/)
 })
 
 test('[.323] the fence calls the discount check on the public path only', async () => {

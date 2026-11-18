@@ -664,6 +664,8 @@ export async function allocatePurchaseCreditNote(
   success: boolean
   allocatedAmount?: number
   error?: string
+  /** The refusal is "the bill has nothing due": expected, not a failure to report loudly. */
+  nothingDue?: boolean
   /** Present when a PUT WAS made but did not cover the whole request. */
   partial?: { allocatedNow: number; totalAllocatedToThisBill: number; requested: number; shortfall: number }
 }> {
@@ -710,7 +712,7 @@ export async function allocatePurchaseCreditNote(
   }
   const decision = decideCreditNoteAllocation({ requested, remainingCredit, amountDue, allocatedCents })
   if (decision.action === 'already-allocated') return { success: true, allocatedAmount: 0 }
-  if (decision.action === 'refuse') return { success: false, error: decision.reason }
+  if (decision.action === 'refuse') return { success: false, error: decision.reason, nothingDue: amountDue <= 0 && remainingCredit > 0 }
   const allocateAmount = decision.amount
 
   // o3d-h9pb (Codex round 5), half 1: ONE KEY PER DISTINCT ALLOCATION. The processor's key is derived from
@@ -778,12 +780,15 @@ export async function allocatePurchaseCreditNote(
 export async function allocateSalesCreditNoteToInvoice(
   params: { creditNoteId: string; invoiceId: string; date: string },
   opts?: { idempotencyKey?: string },
-): Promise<{ success: boolean; allocatedAmount?: number; error?: string }> {
+): Promise<{ success: boolean; allocatedAmount?: number; error?: string; /** Nothing to do and nothing wrong (nothing due on the invoice): report quietly. */ benign?: boolean }> {
   const cnRes = await xeroGet<{ CreditNotes?: unknown }>(`CreditNotes/${params.creditNoteId}`)
   if (!cnRes.ok) return { success: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
-  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; Total?: unknown; Status?: unknown }>(
+  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; Total?: unknown; Status?: unknown; Allocations?: unknown }>(
     cnRes.data, 'CreditNotes', 'CreditNoteID', params.creditNoteId)
   if (cnRead.status === 'unreadable') return { success: false, error: `Credit note not read from Xero for allocation: ${cnRead.reason}` }
+  // A re-run after a full allocation reads PAID, not AUTHORISED: an allocation to THIS invoice already on the note is the answer, not a warning.
+  const alreadyCents = readAllocatedToInvoiceCents(cnRead.document.Allocations, params.invoiceId)
+  if (alreadyCents !== null && alreadyCents > 0) return { success: true, allocatedAmount: 0 }
   if (cnRead.document.Status !== 'AUTHORISED') {
     return { success: false, error: `Credit note is ${String(cnRead.document.Status)} in Xero, not AUTHORISED, so it cannot be allocated yet` }
   }
@@ -792,5 +797,5 @@ export async function allocateSalesCreditNoteToInvoice(
   const result = await allocatePurchaseCreditNote({ creditNoteId: params.creditNoteId, invoiceId: params.invoiceId, amount: total, date: params.date }, opts)
   // The capped case: the allocation WAS made, for less than the whole note.
   if (!result.success && result.partial) return { success: true, allocatedAmount: result.allocatedAmount }
-  return { success: result.success, allocatedAmount: result.allocatedAmount, error: result.error }
+  return { success: result.success, allocatedAmount: result.allocatedAmount, error: result.error, benign: result.nothingDue === true }
 }

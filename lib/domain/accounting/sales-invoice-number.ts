@@ -55,9 +55,17 @@ export function invoiceNumberIsExternallySupplied(connectors: readonly string[])
  * queued (sync off, or the invoice not raised yet) the sequential number is minted as before, and the later enqueue then posts under it.
  */
 export function resolveInvoiceNumberToRecord(params: {
-  /** `invoiceNumber` of the payload of this order's live (not failed, not cancelled) SALES_INVOICE sync row, if there is one. */
-  queuedInvoiceNumber: string | null | undefined
+  /** The order's current `accountingInvoiceId` (null once a delete/void has cleared it, or before the post). */
+  orderAccountingInvoiceId: string | null | undefined
+  /** This order's SALES_INVOICE rows that occupy the work slot, newest first, reduced to the number they were queued under and the document id they posted as. */
+  queuedInvoices: readonly { invoiceNumber: string | null | undefined; externalId: string | null | undefined }[]
 }): { action: 'adopt-queued'; invoiceNumber: string } | { action: 'mint' } {
-  const queued = params.queuedInvoiceNumber?.trim()
-  return queued ? { action: 'adopt-queued', invoiceNumber: queued } : { action: 'mint' }
+  for (const row of params.queuedInvoices) {
+    const number = row.invoiceNumber?.trim()
+    if (!number) continue
+    // A row that posted a document the order no longer points at is a deleted or voided invoice: the delete unwind clears the order's link and leaves the row SYNCED, and its number was freed in the ledger.
+    if (row.externalId && row.externalId !== params.orderAccountingInvoiceId) continue
+    return { action: 'adopt-queued', invoiceNumber: number }
+  }
+  return { action: 'mint' }
 }

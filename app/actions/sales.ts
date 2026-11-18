@@ -375,6 +375,8 @@ export type SoDetail = SoRow & {
       postedNet: number
       /** The rate of the tax code the line posts under (its persisted snapshot), or null when that code cannot be priced. */
       vatRate: number | null
+      /** True when no rate was stored with the refund line (an older refund) and `vatRate` was priced from the current tax table. */
+      vatRateEstimated: boolean
     }[]
   }[]
   payments: PaymentRow[]
@@ -1155,6 +1157,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         lineKind: rl.lineKind,
         postedNet: creditFactsByRefund.get(r.id)![index].postedNet,
         vatRate: creditFactsByRefund.get(r.id)![index].vatRate,
+        vatRateEstimated: creditFactsByRefund.get(r.id)![index].vatRateEstimated,
       })),
     })),
     payments: so.payments.map((p) => ({
@@ -4842,6 +4845,7 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
           externalOrderNumber: true,
           orderNumber: true,
           invoiceNumber: true,
+          accountingInvoiceId: true,
           isQuote: true,
           shoppingLinks: { select: { connector: true } },
         },
@@ -4860,16 +4864,20 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
       }
       // o3d-hqvrp.69: an invoice already queued (or posted) for this order owns the number it was queued under; minting another is what the
       // back-reference later overwrote. Read under the order lock the enqueue also holds.
-      const queuedInvoice = await tx.accountingSyncLog.findFirst({
+      const queuedInvoices = await tx.accountingSyncLog.findMany({
         where: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: id, ...WORK_SLOT_OCCUPIED_WHERE },
         orderBy: { createdAt: 'desc' },
-        select: { payload: true },
+        select: { payload: true, externalTransactionId: true },
       })
-      const queuedPayload = queuedInvoice?.payload
-      const queuedNumber = queuedPayload && typeof queuedPayload === 'object' && !Array.isArray(queuedPayload)
-        ? (queuedPayload as Record<string, unknown>).invoiceNumber
-        : null
-      const toRecord = resolveInvoiceNumberToRecord({ queuedInvoiceNumber: typeof queuedNumber === 'string' ? queuedNumber : null })
+      const toRecord = resolveInvoiceNumberToRecord({
+        orderAccountingInvoiceId: so.accountingInvoiceId,
+        queuedInvoices: queuedInvoices.map((row) => ({
+          invoiceNumber: row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) && typeof (row.payload as Record<string, unknown>).invoiceNumber === 'string'
+            ? (row.payload as Record<string, string>).invoiceNumber
+            : null,
+          externalId: row.externalTransactionId,
+        })),
+      })
       const invNum = toRecord.action === 'adopt-queued'
         ? toRecord.invoiceNumber
         : await nextDocumentNumber(tx, {

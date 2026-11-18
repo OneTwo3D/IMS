@@ -1026,7 +1026,7 @@ test('a full NET refund of a TAXABLE order reaches refundStatus=FULL, not stuck 
   // the GROSS 120 it stuck at PARTIAL forever; against the NET 100 it correctly reaches FULL.
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
   })
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
@@ -1098,7 +1098,7 @@ test('a later refund on an order with a legacy/unknown-basis refund is BLOCKED f
   // ceiling). Conversion is undecidable, so createSalesOrderRefund fails closed and refuses.
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
   })
   state.refunds.push({
     id: 'legacy-refund', orderId: 'order-1', creditNoteNumber: 'CN-legacy', externalRefundId: null,
@@ -1119,7 +1119,7 @@ test('a refund line SNAPSHOTS the resolved tax identity at creation (o3d-w00)', 
   // credit note posts under it instead of re-predicting from the order default at post time.
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
   })
   state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
   await createSalesOrderRefund(createClient(state), {
@@ -1140,7 +1140,7 @@ test('a line-linked refund with no tax code of its OWN snapshots the ORDER-DEFAU
   // wrong — if this fallback ever changes, the exception-inbox conversion is wrong the same day.
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
   })
   state.lines[0].taxRate = { accountingTaxType: null, reverseCharge: false }
   await createSalesOrderRefund(createClient(state), {
@@ -1240,7 +1240,7 @@ test('a FULLY reverse-charged order IS uniformly taxed and its monetary refund p
   // There was nothing to determine. Uniformity is now read off the effective post-swap identities.
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, taxRatePercent: 0, taxRateName: 'RC' }],
-    taxRates: [{ name: 'RC', accountingTaxType: 'ZERORATEDOUTPUT', active: true }],
+    taxRates: [{ name: 'RC', accountingTaxType: 'ZERORATEDOUTPUT', active: true, rate: 0 }],
   })
   state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
   state.lines.push({
@@ -1268,7 +1268,7 @@ test('a MIXTURE of reverse-charged and VAT-bearing lines is still REFUSED (o3d-w
   // could belong to either.
   const state = baseState({
     orders: [{ ...baseState().orders[0], taxRateName: 'Standard' }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
   })
   state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
   state.lines.push({
@@ -1296,7 +1296,7 @@ test('one order line cannot absorb money that came off another, under the refund
   const makeState = () => {
     const state = baseState({
       orders: [{ ...baseState().orders[0], totalBase: 240, taxBase: 40, taxRatePercent: 0.2, taxRateName: 'Standard' }],
-      taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+      taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
       refunds: [{
         id: 'refund-0', orderId: 'order-1', creditNoteNumber: 'CN-0', externalRefundId: null, reason: 'first',
         totalForeign: 100, totalBase: 100, returnWarehouseId: null, totalsBasis: 'NET',
@@ -1943,7 +1943,7 @@ test('the shipping charge is a capped target too, and two rows for one target ar
   // would pass alone.
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 126, taxBase: 21, taxRatePercent: 0.2, taxRateName: 'Standard', shippingForeign: 5 }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2 }],
     refunds: [{
       id: 'refund-0', orderId: 'order-1', creditNoteNumber: 'CN-0', externalRefundId: null, reason: 'first',
       totalForeign: 4, totalBase: 4, returnWarehouseId: null, totalsBasis: 'NET',
@@ -2143,7 +2143,7 @@ test('a monetary-only refund on a UNIFORM order posts under the single safe iden
   // identity must instead come from the line relation, which still carries the type.
   const state = baseState({
     orders: [{ ...baseState().orders[0], taxRateName: 'Standard' }],
-    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: false }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: false, rate: 0.2 }],
   })
   state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
   const result = await createSalesOrderRefund(createClient(state), {
@@ -2160,7 +2160,7 @@ test('a monetary-only refund on a UNIFORM order posts under the single safe iden
 test('a reverse-charge line snapshots the SWAPPED tax type (o3d-w00)', async () => {
   const state = baseState({
     orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, taxRatePercent: 0, taxRateName: 'RC' }],
-    taxRates: [{ name: 'RC', accountingTaxType: 'ZERORATEDOUTPUT', active: true }],
+    taxRates: [{ name: 'RC', accountingTaxType: 'ZERORATEDOUTPUT', active: true, rate: 0 }],
     settings: { reverse_charge_sales_tax_type: 'REVERSECHARGE' },
   })
   state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }

@@ -4429,6 +4429,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         }
 
         result.succeeded++
+        // o3d-hqvrp.39: AFTER the credit note's success is recorded, so the extra Xero calls never lengthen the post's own window. OFF by default; best effort.
+        if (entry.type === 'CREDIT_NOTE' && entry.referenceType === 'SalesOrderRefund' && syncResult.externalId) {
+          await allocateSalesCreditNoteAfterPost({ lease, entryId: entry.id, refundId: entry.referenceId, creditNoteId: syncResult.externalId, date: String(payload.date ?? '').slice(0, 10) })
+        }
       } else {
         const errorMessage = syncResult.error ?? 'Unknown error'
         if (isRateLimitError(errorMessage)) {
@@ -5240,25 +5244,44 @@ async function allocateSalesCreditNoteAfterPost(p: {
     if (enabled?.value !== 'true') return
     const refund = await db.salesOrderRefund.findUnique({
       where: { id: p.refundId },
-      select: { order: { select: { id: true, accountingInvoiceId: true, accountingInvoiceConnector: true } } },
+      select: { order: { select: { id: true, accountingInvoiceId: true, accountingInvoiceConnector: true, paidAt: true } } },
     })
-    const invoiceId = refund?.order.accountingInvoiceId
-    if (!invoiceId || (refund?.order.accountingInvoiceConnector ?? XERO_CONNECTOR) !== XERO_CONNECTOR) return
+    const order = refund?.order
+    const invoiceId = order?.accountingInvoiceId
+    if (!order || !invoiceId || (order.accountingInvoiceConnector ?? XERO_CONNECTOR) !== XERO_CONNECTOR) return
+    // IMS cannot tell a refund that went back to the customer as cash from one meant to settle the invoice (a WooCommerce refund records no payment-back
+    // here). Cash can only be returned if cash came in, so ONLY an order with no receipt of any kind (none recorded, none queued, never marked paid) is
+    // allocated; anything else is left unallocated for the operator, as before this setting existed.
+    const [receipts, queuedReceipts] = await Promise.all([
+      db.payment.count({ where: { orderId: order.id } }),
+      db.accountingSyncLog.count({ where: { type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: order.id, ...WORK_SLOT_OCCUPIED_WHERE } }),
+    ])
+    if (order.paidAt !== null || receipts > 0 || queuedReceipts > 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: order.id, action: 'xero_credit_note_allocation_skipped', tag: 'accounting', level: 'INFO',
+        description: `Credit note ${p.creditNoteId} was not allocated to the order's Xero invoice: the order has receipts, so the refund may have been paid back in cash. Allocate it in Xero if it is meant to settle the invoice.`,
+        metadata: { syncLogId: p.entryId, refundId: p.refundId, creditNoteId: p.creditNoteId },
+      })
+      return
+    }
     const fence = await p.lease.fenceBeforeRemoteWrite('credit-note-allocation')
     if (!fence.ok) return
     const result = await allocateSalesCreditNoteToInvoice(
       { creditNoteId: p.creditNoteId, invoiceId, date: p.date || businessDateYmd(new Date()) },
       { idempotencyKey: buildXeroIdempotencyKey(p.entryId, 'credit-note-allocation') },
     )
+    const level = result.success || result.benign ? 'INFO' : 'WARNING'
     await logActivity({
       entityType: 'SALES_ORDER',
-      entityId: refund!.order.id,
+      entityId: order.id,
       action: result.success ? 'xero_credit_note_allocated' : 'xero_credit_note_allocation_not_made',
       tag: 'accounting',
-      level: result.success ? 'INFO' : 'WARNING',
+      level,
       description: result.success
-        ? `Credit note ${p.creditNoteId} allocated to the order's Xero invoice (${(result.allocatedAmount ?? 0).toFixed(2)}).`
-        : `Credit note ${p.creditNoteId} posted but was NOT allocated to the order's Xero invoice: ${result.error ?? 'unknown reason'}`,
+        ? `Credit note ${p.creditNoteId} is allocated to the order's Xero invoice (${(result.allocatedAmount ?? 0).toFixed(2)} allocated now).`
+        : result.benign
+          ? `Credit note ${p.creditNoteId} was not allocated: the order's Xero invoice has nothing due.`
+          : `Credit note ${p.creditNoteId} posted but was NOT allocated to the order's Xero invoice: ${result.error ?? 'unknown reason'}`,
       metadata: { syncLogId: p.entryId, refundId: p.refundId, creditNoteId: p.creditNoteId, invoiceId, allocatedAmount: result.allocatedAmount ?? null },
     })
   } catch (e) {
@@ -6868,14 +6891,7 @@ export async function processClaimedEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(async (r) => {
-        // o3d-hqvrp.39: behind a setting that is OFF by default, apply the credit note to the order's invoice. BEST EFFORT AND AFTER THE POST: the credit note is
-        // already in the ledger and the row must not be failed (a retry would re-post the credit note), so a refusal or a lost response is logged for the operator.
-        if (r.success && r.creditNoteId && referenceType === 'SalesOrderRefund' && resolveInvoiceStatus(postingMode) === 'AUTHORISED') {
-          await allocateSalesCreditNoteAfterPost({ lease, entryId, refundId: referenceId, creditNoteId: r.creditNoteId, date: String(payload.date ?? '').slice(0, 10) })
-        }
-        return { success: r.success, externalId: r.creditNoteId, error: r.error }
-      })
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
     case 'CREDIT_NOTE_VOID': {

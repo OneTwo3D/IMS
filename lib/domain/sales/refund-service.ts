@@ -5183,9 +5183,11 @@ export async function createSalesOrderRefund(
           if (input.deriveSaleLineNetsFromStoredBalance && !input.chargeback && !creditsNothing(refundLine)) {
             const discountLabel = 'The order discount reversal'
             const pricedDiscount = priceRefundTaxIdentity({ kind: 'shipping', orderDefaultTaxType, reverseChargeSalesTaxType, rateByTaxType: postingRates, label: discountLabel })
-            if (!pricedDiscount.ok) return refuse(pricedDiscount.reason)
-            const rateRefusal = orderDiscountReversalRateRefusal({ postedRate: pricedDiscount.vatRate, chargedRatePercent: so.taxRatePercent, label: discountLabel })
-            if (rateRefusal) return refuse(rateRefusal)
+            // A default code that cannot be priced is not refused here: the leg is left to the cumulative ceiling and the post-time refusal, as before.
+            if (pricedDiscount.ok) {
+              const rateRefusal = orderDiscountReversalRateRefusal({ postedRate: pricedDiscount.vatRate, chargedRate: so.taxRatePercent, label: discountLabel })
+              if (rateRefusal) return refuse(rateRefusal)
+            }
           }
           continue
         }
@@ -5391,21 +5393,17 @@ export async function createSalesOrderRefund(
       else if (complete) frozenGross = gross.toDecimalPlaces(currencyMinorUnits(so.currency), 4).toNumber()
     }
     // o3d-hqvrp.321: EVERY refund records the rate of each line's tax code as of now (the scheme freeze above is the same figure where it ran), so the credit-note history never re-prices a posted line from a tax table edited since.
-    // A record kept for display never blocks a refund: if the table cannot be read or priced now, no rate is stored and the history says so.
-    let postedLineRates: Array<string | null> = refundLines.map(() => null)
+    // The rate each line's tax code carries now. A line whose code cannot be priced stores none (the history then says estimated); the table read itself is allowed to fail normally, as every other read in this transaction.
+    let postedLineRates: Array<string | null>
     if (frozenRates !== null) postedLineRates = frozenRates
     else {
-      try {
-        const postedIndex = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
-        postedLineRates = refundLines.map((refundLine) => {
-          const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
-          const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind).accountingTaxType
-          const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: postedIndex, label: 'refund line' }) : null
-          return priced !== null && priced.ok ? priced.rate.toString() : null
-        })
-      } catch {
-        postedLineRates = refundLines.map(() => null)
-      }
+      const postedIndex = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      postedLineRates = refundLines.map((refundLine) => {
+        const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
+        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind).accountingTaxType
+        const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: postedIndex, label: 'refund line' }) : null
+        return priced !== null && priced.ok ? priced.rate.toString() : null
+      })
     }
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
