@@ -9,7 +9,7 @@ const dbDouble = {
   purchaseOrder: { findUnique: async () => live },
   $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
     ...dbDouble,
-    $queryRaw: async () => [],
+    $executeRaw: async () => [],
   }),
 }
 mock.module('@/lib/db', { namedExports: { db: dbDouble, prisma: dbDouble } })
@@ -49,7 +49,7 @@ function dupTx(found: { id: string; po: { reference: string } } | null) {
   return {
     calls,
     tx: {
-      $queryRaw: async () => { calls.push('lock'); return [] },
+      $executeRaw: async () => { calls.push('lock'); return [] },
       purchaseInvoice: { findFirst: async (args: unknown) => { calls.push(args); return found } },
     },
   }

@@ -48,7 +48,7 @@ export class DuplicateSupplierInvoiceNumberError extends Error {
 }
 
 type DuplicateLookupTx = {
-  $queryRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown>
+  $executeRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown>
   purchaseInvoice: {
     findFirst(args: {
       where: { invoiceNumber: { equals: string; mode: 'insensitive' }; po: { supplierId: string } }
@@ -68,7 +68,7 @@ export async function assertNoDuplicateSupplierBill(
 ): Promise<void> {
   if (!params.invoiceNumber || params.override) return
   const key = `purchase-bill:${params.supplierId}:${params.invoiceNumber.toLowerCase()}`
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`
   const found = await tx.purchaseInvoice.findFirst({
     where: { invoiceNumber: { equals: params.invoiceNumber, mode: 'insensitive' }, po: { supplierId: params.supplierId } },
     select: { id: true, po: { select: { reference: true } } },
