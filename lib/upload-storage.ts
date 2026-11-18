@@ -5,6 +5,7 @@ const SAFE_UPLOAD_FILENAME = /^[a-zA-Z0-9._-]+$/
 const IMAGE_EXTENSIONS = ['gif', 'jpeg', 'jpg', 'png', 'webp'] as const
 const BRANDING_IMAGE_EXTENSIONS = ['jpeg', 'jpg', 'png', 'webp'] as const
 const PDF_EXTENSIONS = ['pdf'] as const
+const ORDER_ATTACHMENT_EXTENSIONS = ['pdf', 'png', 'jpg', 'gif', 'webp', 'csv', 'xlsx', 'docx', 'eml', 'msg'] as const
 
 type UploadDirectoryLabel = 'avatarUploads' | 'brandingUploads' | 'invoiceUploads' | 'invoiceQuarantineUploads'
 type UploadRootEnvName = 'UPLOAD_STORAGE_DIR' | 'PUBLIC_UPLOAD_STORAGE_DIR'
@@ -39,6 +40,15 @@ export function getInvoiceUploadDir(): string {
 
 export function getInvoiceQuarantineDir(): string {
   return path.join(getPrivateUploadRoot(), 'quarantine', 'invoices')
+}
+
+/** Supporting documents attached to purchase and sales orders. Private: served only through the permission-checked download route, by row id. */
+export function getOrderAttachmentDir(): string {
+  return path.join(getPrivateUploadRoot(), 'order-attachments')
+}
+
+export function getOrderAttachmentQuarantineDir(): string {
+  return path.join(getPrivateUploadRoot(), 'quarantine', 'order-attachments')
 }
 
 export function getAvatarUploadDir(): string {
@@ -90,6 +100,21 @@ export function resolveInvoiceUploadFilePath(filename: string): string | null {
 
 export function resolveInvoiceQuarantineFilePath(filename: string): string | null {
   return resolveUploadFilePath(getInvoiceQuarantineDir(), filename, PDF_EXTENSIONS)
+}
+
+/**
+ * The stored name is server-generated (see lib/order-attachment-storage.ts): a uuid and the extension of the verified type. Anything else
+ * (a separator, a dot-dot, an unknown extension) resolves to null, so a corrupted or forged row can never point outside the directory.
+ */
+const ORDER_ATTACHMENT_STORED_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]{2,5}$/
+
+export function resolveOrderAttachmentFilePath(storedName: string): string | null {
+  if (!ORDER_ATTACHMENT_STORED_NAME.test(storedName)) return null
+  return resolveUploadFilePath(getOrderAttachmentDir(), storedName, ORDER_ATTACHMENT_EXTENSIONS)
+}
+
+export function resolveOrderAttachmentQuarantineFilePath(filename: string): string | null {
+  return resolveUploadFilePath(getOrderAttachmentQuarantineDir(), filename, ORDER_ATTACHMENT_EXTENSIONS)
 }
 
 export function resolveAvatarUploadFilePath(filename: string): string | null {

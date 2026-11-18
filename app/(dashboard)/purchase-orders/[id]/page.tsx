@@ -19,6 +19,8 @@ import { computePrepaidReconciliation } from '@/lib/domain/purchasing/prepaid-re
 import { getSession } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { isPurchaseOrderEmailEnabled } from '@/lib/purchase-order-email'
+import { listOrderAttachments, canEditOrderAttachments, canViewOrderAttachments } from '@/lib/domain/order-attachments'
+import { OrderAttachmentsCard } from '@/components/orders/order-attachments-card'
 import { getPurchaseOrderPegs } from '@/app/actions/pegging'
 import { PoPegsCard } from '@/components/sales/po-pegs-card'
 import { PoDetailClient } from './po-detail-client'
@@ -83,6 +85,10 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
     invoices: po.invoices.map((inv) => ({ lines: inv.lines.map((il) => ({ poLineId: il.poLineId, qtyBilled: il.qtyBilled, totalBase: il.totalBase })) })),
   })
 
+  // Supporting documents: shown to anyone who can see purchase orders, editable by those who can edit them (the routes re-check both).
+  const attachments = session && canViewOrderAttachments(session.user.role, 'purchase') ? await listOrderAttachments('purchase', id) : []
+  const canEditAttachments = !!session && canEditOrderAttachments(session.user.role, 'purchase')
+
   const products = productsResult.products.filter(
     (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'DRAFT'),
   )
@@ -97,6 +103,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
       </div>
       <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} canApprove={!!session && hasPermission(session.user.role, 'purchasing.approve')} currentUserId={session?.user.id} />
       <PoPegsCard pegs={pegs} lineLabels={pegLineLabels} />
+      <OrderAttachmentsCard kind="purchase" orderId={po.id} attachments={attachments} canEdit={canEditAttachments} />
     </div>
   )
 }

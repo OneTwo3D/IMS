@@ -183,6 +183,7 @@ import {
   type ListPage, type SoListFilter, type SoListHidden,
 } from '@/lib/domain/lists/order-list-query'
 import { resolveFxRateToBase } from '@/lib/domain/sales/draft-fx-rate'
+import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal } from '@/lib/domain/sales/order-edit-affordance'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
@@ -4210,12 +4211,19 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       // SO-to-PO pegging: the order's pegs go with its lines (FK cascade); record their end first.
       await recordPegsRemovedWithLines(tx, { salesOrderLineIds: (await tx.salesOrderLine.findMany({ where: { orderId: id }, select: { id: true } })).map((l) => l.id) }, session.user.id ?? null)
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
+      // Supporting documents go with the order (the rows would cascade; the stored names are taken here so the files can be removed after the commit).
+      const attachmentFiles = await deleteSalesOrderAttachmentsInTx(tx, [id])
       await tx.salesOrder.delete({ where: { id } })
-      return { so, released }
+      return { so, released, attachmentFiles }
     }, { maxWait: 5000, timeout: 20000 })
 
     if ('error' in outcome) return { success: false, error: outcome.error }
     const { so, released } = outcome
+    try {
+      await drainOrderAttachmentFileDeletions()
+    } catch (fileError) {
+      console.error('Failed to remove attachment files of a deleted sales order', fileError)
+    }
 
     // Post-commit side effects: the stock sync mirrors the released reservations to the
     // storefront. Never fail the (already committed) delete on a sync error.

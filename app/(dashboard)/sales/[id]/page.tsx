@@ -25,6 +25,8 @@ import { hasPermission } from '@/lib/permissions'
 import { getCustomFieldCardData } from '@/app/actions/custom-fields'
 import { CustomFieldsCard } from '@/components/custom-fields/custom-fields-card'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { listOrderAttachments, canEditOrderAttachments, canViewOrderAttachments } from '@/lib/domain/order-attachments'
+import { OrderAttachmentsCard } from '@/components/orders/order-attachments-card'
 import { getSalesOrderPegs } from '@/app/actions/pegging'
 import { SoDetailClient } from './so-detail-client'
 
@@ -76,6 +78,10 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     warehouseIds: stockWarehouseIds,
   })
 
+  // Supporting documents (a customer purchase order, an email): the routes re-check both permissions.
+  const attachments = canViewOrderAttachments(session.user.role, 'sales') ? await listOrderAttachments('sales', so.id) : []
+  const canEditAttachments = canEditOrderAttachments(session.user.role, 'sales')
+
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
   const customFields = await getCustomFieldCardData('SALES_ORDER', id)
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
@@ -118,6 +124,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         data={customFields}
         canEdit={hasPermission(session.user.role, 'sales.create')}
       />
+      <OrderAttachmentsCard kind="sales" orderId={so.id} attachments={attachments} canEdit={canEditAttachments} />
     </div>
   )
 }

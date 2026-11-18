@@ -95,6 +95,7 @@ type ActivityCleanupCronResult = {
   cronRuns: Ret<typeof purgeExpiredCronRuns>
   dataRetention: Ret<typeof purgeExpiredData>
   wmsMutationEvents: number
+  attachmentFiles: { removed: number; failed: string[] }
 }
 type ReallocationSweepCronResult = Partial<Ret<typeof sweepUnallocatedProcessingOrders>> & {
   directCreateMarkers: Ret<typeof sweepUnresolvedDirectCreateMarkers> | null
@@ -154,8 +155,8 @@ export const cronOutcomes = {
     const sweepFailure = r.errors && r.errors.length > 0 ? structural({ errors: r.errors }) : null
     return from(r, counts(r, ['failed']), structural(r), sweepFailure)
   },
-  // a purge reports what it deleted; there is no failure signal short of a throw
-  'activity-cleanup': (r: ActivityCleanupCronResult) => noFailureSignal(r),
+  // a purge reports what it deleted; the one failure signal is an attachment file owed a deletion that could not be removed (attachmentFiles.failed: string[])
+  'activity-cleanup': (r: ActivityCleanupCronResult) => from(r, (r.attachmentFiles?.failed.length ?? 0) > 0 ? 'failed' : null),
   // `error` (the dump or its manifest failed); `uploadError` (a configured remote target did not take the copy); `cleanupError` (retention purge failed)
   backup: (r: BackupCronResult) => from(r, 'error' in r || 'uploadError' in r || 'cleanupError' in r ? 'failed' : null),
   // failed: number (a refused or unanswered TrackShip lookup, an order that could not be marked delivered)
