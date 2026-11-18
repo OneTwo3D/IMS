@@ -936,6 +936,9 @@ test('re-run: the decoder is bounded, and a value still decodable at the bound i
 /** Environment variables read by the code that a re-run deliberately does NOT carry, each with the reason. */
 const NOT_CARRIED: Record<string, string> = {
   WC_ADMISSION_REFUSAL_TTL_DAYS: 'optional tuning knob (days before a status-only WooCommerce admission refusal is retired, default 30); absent = the default, so a drop is harmless and no secret is involved',
+  DB_TIER_ROOT: 'test-harness plumbing between scripts/run-db-tier.mjs and its census reporter (repo root to scan); never an install setting',
+  DB_TIER_DIR: 'test-harness override of the census directory, used only by tests/scripts/db-tier-census.test.ts fixtures; never an install setting',
+  DB_TIER_CENSUS_OUT: 'test-harness plumbing: the file the census reporter writes its verdict to; never an install setting',
   GITHUB_HEAD_REF: 'set by GitHub Actions on pull requests; read only by scripts/check-changelog-fragments.mjs in CI',
   LEGACY_UNTRUSTED_FORWARDED_FOR: 'temporary migration aid that RELAXES a default (trust the right-most X-Forwarded-For with no trusted proxies configured); deliberately not carried, so a re-run falls back to the strict default and the operator re-adds it knowingly',
   // secrets and credentials: copied from the root-only backup by an operator who needs them

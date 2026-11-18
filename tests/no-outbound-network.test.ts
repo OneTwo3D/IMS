@@ -324,10 +324,14 @@ test('a child that is NOT Node and exists to move bytes is refused at the spawn 
 })
 
 test('all three test scripts load the trap', () => {
-  const scripts = (JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as { scripts: Record<string, string> }).scripts
-  for (const name of ['test:unit', 'test:concurrency', 'test:db']) {
+  const root = process.cwd()
+  const scripts = (JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { scripts: Record<string, string> }).scripts
+  for (const name of ['test:unit', 'test:concurrency']) {
     assert.match(scripts[name] ?? '', /--import\s+\.\/tests\/no-outbound-network\.cjs/, `${name} must --import the trap`)
   }
+  // test:db is the census wrapper, which owns the runner arguments (scripts/run-db-tier.mjs).
+  assert.equal(scripts['test:db'], 'node scripts/run-db-tier.mjs', 'test:db runs the wrapper')
+  assert.match(readFileSync(path.join(root, 'scripts', 'run-db-tier.mjs'), 'utf8'), /'--import',\s*'\.\/tests\/no-outbound-network\.cjs'/, 'test:db (the wrapper) must --import the trap')
 })
 
 // ---------------------------------------------------------------------------
