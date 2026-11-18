@@ -738,6 +738,9 @@ model Product {
   /// ({"US": "3921905050", "CA": "..."}). Owned by the Woo product import; separate from the IMS-owned `hsCode`.
   wcDutifyHsCodes Json?       @map("wc_dutify_hs_codes")
   countryOfOrigin String?     // 2-letter ISO code
+  /// The customs fields (IMS names: hsCode / countryOfOrigin / customsDescription) of a VARIATION whose value came from its parent at the last
+  /// WooCommerce import rather than from the variation itself. A parent whose field WooCommerce cleared clears exactly these variations.
+  customsInherited String[]   @default([])
   customsDescription String?  // free-text goods description for customs paperwork
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
   active          Boolean     @default(true)

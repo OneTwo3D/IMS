@@ -6,15 +6,31 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
-import { setSettings } from '@/app/actions/settings'
+import { saveBackupTargetSettings } from '@/app/actions/backup'
+import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 
 type Props = {
   s3: { endpoint: string; region: string; bucket: string; accessKey: string; secretKey: string; secretKeyConfigured: boolean; prefix: string }
+  encryptionEnabled?: boolean
   sftp: { host: string; port: string; user: string; password: string; passwordConfigured: boolean; privateKey: string; privateKeyConfigured: boolean; hostFingerprint: string; path: string }
 }
 
-export function BackupRemoteSettings({ s3, sftp }: Props) {
+export function BackupRemoteSettings({ s3, sftp, encryptionEnabled = false }: Props) {
   const [isPending, startTransition] = useTransition()
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+  const [error, setError] = useState<string | null>(null)
+  const [encryptState, setEncrypt] = useState(encryptionEnabled)
+
+  // The backup target decides where the database dump is sent, so saving it needs a fresh sign-in
+  // (step-up). On staleness the action returns fresh_auth_required: prompt, then retry once.
+  async function saveTarget(values: Record<string, string>, savedKey: string) {
+    setError(null)
+    let result = await saveBackupTargetSettings(values)
+    if (isFreshAuthFailure(result) && (await promptReauth())) result = await saveBackupTargetSettings(values)
+    if (result.success) showSaved(savedKey)
+    else setError(result.error ?? 'Could not save the backup settings.')
+  }
+
   const [saved, setSaved] = useState<string | null>(null)
 
   const [s3State, setS3] = useState(s3)
@@ -62,8 +78,7 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
       }
       // Only save secret if user replaced the masked value
       if (!isMasked(s3State.secretKey)) values.backup_s3_secret_key = s3State.secretKey
-      await setSettings(values)
-      showSaved('s3')
+      await saveTarget(values, 's3')
     })
   }
 
@@ -90,13 +105,39 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
       // Only save secrets if user replaced the masked values
       if (!isMasked(sftpState.password)) values.backup_sftp_password = sftpState.password
       if (!isMasked(sftpState.privateKey)) values.backup_sftp_private_key = sftpState.privateKey
-      await setSettings(values)
-      showSaved('sftp')
+      await saveTarget(values, 'sftp')
     })
   }
 
   return (
     <div className="space-y-6">
+      {stepUpDialog}
+      {error && <p className="text-sm text-red-600">{error}</p>}
+      {/* Encryption */}
+      <div>
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input
+            type="checkbox"
+            checked={encryptState}
+            disabled={isPending}
+            onChange={(e) => {
+              const next = e.target.checked
+              setEncrypt(next)
+              startTransition(async () => { await saveTarget({ backup_remote_encryption_enabled: next ? 'true' : 'false' }, 'enc') })
+            }}
+          />
+          Encrypt backups before upload
+        </label>
+        <p className="text-[11px] text-muted-foreground mt-1">
+          Uploads the SQL backup as <code>.sql.enc</code> (AES-256-GCM). The key is read from the server environment
+          (<code>BACKUP_ENCRYPTION_KEY</code>, else <code>SETTINGS_ENCRYPTION_KEY</code>) and is never stored with the backup.
+          Keep a copy of that key in your secret store: without it an encrypted backup cannot be restored. See Help: Backup &amp; Restore for decrypting.
+        </p>
+        {saved === 'enc' && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
+      </div>
+
+      <div className="border-t" />
+
       {/* S3 */}
       <div>
         <div className="flex items-center gap-2 mb-3">

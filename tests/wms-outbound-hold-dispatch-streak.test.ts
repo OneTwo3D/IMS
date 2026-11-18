@@ -27,12 +27,15 @@ const linkTable = {
 mock.module('@/lib/db', { namedExports: { db: { wmsOrderPushLink: linkTable, activityLog: { create: async () => ({}) } } } })
 
 function heldText(): string {
+  // The hold text is only recognised as held when the settings key is set; pin it so the test does not depend on the runner's env.
+  process.env.SETTINGS_ENCRYPTION_KEY = 'a1'.repeat(32)
   const refusal = outboundWriteRefusal({ connectorName: 'WooCommerce', method: 'POST', url: 'https://shop.example.com/wp-json/oti/v1/order/1/partial-shipment', env: {} })
   assert.ok(refusal)
   return new OutboundWriteHeldError(refusal, 0).message
 }
 
 test('a held partial-shipment push records its reason, spends no dispatch failure and never dead-letters; an ordinary failure does count', async () => {
+  process.env.SETTINGS_ENCRYPTION_KEY = 'a1'.repeat(32)
   const { createPrismaDispatchDeps, DISPATCH_MAX_CONSECUTIVE_FAILURES } = await import('../lib/domain/wms/dispatch-sweep')
   const deps = createPrismaDispatchDeps('mintsoft' as never, {} as never)
   const candidate = { linkId: 'link-1', externalOrderNumber: 'MS-1' } as never

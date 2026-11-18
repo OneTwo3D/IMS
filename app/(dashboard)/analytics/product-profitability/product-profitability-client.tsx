@@ -11,6 +11,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
 import type { ProfitabilityFyFigures, ProfitabilityRow, ProfitabilitySummary } from '@/app/actions/product-profitability'
+import { buildGuardedCsv } from '@/lib/csv-escape'
 import {
   boundSuffix,
   classifyLinearFigureBound,
@@ -381,12 +382,12 @@ export function ProductProfitabilityClient({ data }: Props) {
       ]
     }
     const csvRows = filtered.map((r) => [
-      r.sku, `"${r.name.replace(/"/g, '""')}"`, r.type, r.lifecycleStatus, r.totalStock,
+      r.sku, r.name, r.type, r.lifecycleStatus, r.totalStock,
       r.salesPrice ?? '', r.salePrice ?? '', r.latestCogs ?? '', r.unitMargin ?? '', r.unitMarginPct ?? '',
       ...csvFy(r.currentFy),
       ...csvFy(r.previousFy),
     ])
-    const csv = [header.join(','), ...csvRows.map((r) => r.join(','))].join('\n')
+    const csv = buildGuardedCsv(header, csvRows)
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')

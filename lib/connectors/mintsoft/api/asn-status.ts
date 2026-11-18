@@ -169,22 +169,16 @@ export function interpretMintsoftWireAsnStatus(status: string | null | undefined
   }
 }
 
-const ASN_STATUS_NAME_KEYS = ['Status', 'status', 'AsnStatus', 'asnStatus', 'ASNStatus', 'asnstatus'] as const
-const ASN_STATUS_ID_KEYS = ['ASNStatusId', 'AsnStatusId', 'asnStatusId', 'StatusId', 'statusId'] as const
-const NESTED_STATUS_ID_KEYS = ['ID', 'Id', 'id'] as const
-
 /**
  * THE ONLY TWO STATUS FIELDS MINTSOFT'S CONTRACT NAMES: `ASNStatusId` (int32) and `ASNStatus.ID` inside the
  * `ASNStatus` object (swagger read 2026-09-24 and confirmed on live ASN 6114 and created ASN 6117; bd
- * o3d-vcw8). They are STRICT: present with a value that is not a safe integer is an unreadable signal, not
- * a field to skip past — an `ASNStatusId` of `"3"` beside a name of `COMPLETE` would otherwise be a
- * disagreement discarded silently, which is the exact shape of round 9's finding.
+ * o3d-vcw8), plus the object's `Name`. They are STRICT: present with a value that is not a safe integer is
+ * an unreadable signal, not a field to skip past — an `ASNStatusId` of `"3"` beside a name of `COMPLETE`
+ * would otherwise be a disagreement discarded silently, which is the exact shape of round 9's finding.
  *
- * The other spellings in the lists above are GUESSES inherited from the pre-round-8 reader; Mintsoft serves
- * none of them. They stay LENIENT — a usable integer is a signal, anything else is ignored — because
- * refusing on some response wrapper's unrelated `status` or `statusId` would block ASN creation
- * tenant-wide over a field Mintsoft never sends. Narrowing the lists to the canonical two is tracked on
- * bd o3d-nvy1.
+ * The lenient guessed spellings (`Status`, `AsnStatus`, `StatusId`, `statusId`, …) inherited from the
+ * pre-round-8 reader are GONE (owner decision Q7): Mintsoft serves none of them, and a guessed key meant a
+ * response wrapper's unrelated `status` or `statusId` could contribute a signal.
  */
 const CANONICAL_STATUS_ID_KEY = 'ASNStatusId'
 const CANONICAL_NESTED_STATUS_ID_KEY = 'ID'
@@ -240,29 +234,23 @@ function idSignalsFrom(source: string, value: unknown, canonical: boolean): Wire
  */
 function collectWireStatusSignals(row: Record<string, unknown>): WireStatusSignal[] {
   const signals: WireStatusSignal[] = []
-  for (const key of ASN_STATUS_NAME_KEYS) {
-    const value = row[key]
-    if (typeof value === 'string') {
-      if (value.trim()) signals.push(nameSignal(key, value))
-      continue
-    }
+  const status = row[CANONICAL_STATUS_OBJECT_KEY]
+  if (typeof status === 'string') {
+    if (status.trim()) signals.push(nameSignal(CANONICAL_STATUS_OBJECT_KEY, status))
+  } else if (status && typeof status === 'object' && !Array.isArray(status)) {
     // `ASNStatus` is an OBJECT on the wire (`{ Name, Colour, TextColour, ID, … }`), which is why the old
     // string-only key list read it as absent and every live ASN arrived here as `null`.
-    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
-    const nested = value as Record<string, unknown>
-    const nestedName = nested.Name ?? nested.name
-    if (typeof nestedName === 'string' && nestedName.trim()) signals.push(nameSignal(`${key}.Name`, nestedName))
-    for (const idKey of NESTED_STATUS_ID_KEYS) {
-      if (!(idKey in nested)) continue
-      const canonical = key === CANONICAL_STATUS_OBJECT_KEY && idKey === CANONICAL_NESTED_STATUS_ID_KEY
-      const read = idSignalsFrom(`${key}.${idKey}`, nested[idKey], canonical)
-      signals.push(...read)
-      if (read.length > 0) break
+    const nested = status as Record<string, unknown>
+    const nestedName = nested.Name
+    if (typeof nestedName === 'string' && nestedName.trim()) {
+      signals.push(nameSignal(`${CANONICAL_STATUS_OBJECT_KEY}.Name`, nestedName))
+    }
+    if (CANONICAL_NESTED_STATUS_ID_KEY in nested) {
+      signals.push(...idSignalsFrom(`${CANONICAL_STATUS_OBJECT_KEY}.${CANONICAL_NESTED_STATUS_ID_KEY}`, nested[CANONICAL_NESTED_STATUS_ID_KEY], true))
     }
   }
-  for (const key of ASN_STATUS_ID_KEYS) {
-    if (!(key in row)) continue
-    signals.push(...idSignalsFrom(key, row[key], key === CANONICAL_STATUS_ID_KEY))
+  if (CANONICAL_STATUS_ID_KEY in row) {
+    signals.push(...idSignalsFrom(CANONICAL_STATUS_ID_KEY, row[CANONICAL_STATUS_ID_KEY], true))
   }
   return signals
 }

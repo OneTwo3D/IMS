@@ -83,7 +83,7 @@ const JUSTIFIED: Record<string, { count: number; reason: string }> = {
   "lib/ops/readiness-gate-collect.ts::startNpmScript": { count: 1, reason: "a kill of a process group that already exited" },
   "lib/ops/reconciliation-pack-schedule.ts::finish": { count: 1, reason: "carried: `recorded = false` is part of the result (the mapping fails an unrecorded run), and a result that never came is a start that failed" },
   "lib/ops/reconciliation-pack-schedule.ts::runScheduledReconciliationPack": { count: 1, reason: "carried: `recorded = false` is part of the result (the mapping fails an unrecorded run), and a result that never came is a start that failed" },
-  "lib/backup-remote.ts::uploadBackupArtifactsToTarget": { count: 1, reason: "cleanup of an orphaned upload: `orphanCleanupSucceeded: false` is carried in the BackupArtifactUploadError that is thrown next" },
+  "lib/backup-remote.ts::uploadArtifacts": { count: 1, reason: "cleanup of an orphaned upload: `orphanCleanupSucceeded: false` is carried in the BackupArtifactUploadError that is thrown next" },
   "lib/backup-remote.ts::uploadToSftp": { count: 1, reason: "the directory may already exist" },
   "lib/email-outbox.ts::recordUnknownOutcomeOnReference": { count: 1, reason: "the WARNING note on the purchase order is written after the row has settled FAILED (the unknown outcome is already recorded on the outbox row, and the drain counts it into `failed`); a failed note write must not reach the row's catch, which would requeue a possibly delivered email" },
   "lib/email-outbox.ts::proveDelegateIsInMemory": { count: 1, reason: "a refusal may already be on its way out; masking it would report the symptom instead of the finding" },
