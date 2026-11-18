@@ -286,4 +286,6 @@ export type StockSyncResult = SyncResult & {
    * stopped before it read anything. Always accompanies `aborted`. Nothing was sent. NOT a reconciliation: callers must not stamp it.
    */
   held?: boolean
+  /** Variable parents skipped this pass because their variation list could not be read completely (reported, not a window error). */
+  skippedParents?: string[]
 }

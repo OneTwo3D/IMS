@@ -1161,7 +1161,9 @@ export async function updateProduct(
   })
 
   try {
-    await pushProductMetadata(id)
+    const pushed = await pushProductMetadata(id)
+    // A failed push is recorded and retried by the reconcile cron (o3d-hqvrp.106); say so in the log rather than dropping the answer.
+    if (!pushed.success && !pushed.skipped && !pushed.shadowed) console.error(`[product-update] WooCommerce push failed for ${id}: ${pushed.error ?? 'unknown error'} (recorded for retry)`)
   } catch (syncError) {
     console.error(syncError)
   }

@@ -97,7 +97,7 @@ const SYNC_LOG_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'lib/connectors/woocommerce/sync/order-import.ts': { writers: 24, verdict: 'scrubbed (held sales invoice: the EU treatment and order-changed rewrites keep the parked payload as is and the release scrubs it under the order lock) / raw-woo (pending-FX queue and paid-block rows) / no-identity (status writes)' },
   'lib/connectors/woocommerce/sync/regime-policy-hold.ts': { writers: 2, verdict: 'scrubbed (a queued invoice parked back as a held sales invoice: the contact is scrubbed under the order lock when the order is erased)' },
   'lib/connectors/woocommerce/sync/order-status.ts': { writers: 1, verdict: 'no-identity (status push record)' },
-  'lib/connectors/woocommerce/sync/product-sync.ts': { writers: 4, verdict: 'no-identity (products)' },
+  'lib/connectors/woocommerce/sync/product-sync.ts': { writers: 7, verdict: 'no-identity (products: the product-push failure rows (product_push_retry / product_push_failed) hold only the product id, a truncated error text and retry counters and timestamps; no name, address or contact)' },
   'lib/connectors/woocommerce/sync/refund-sync.ts': { writers: 6, verdict: 'raw-woo (refund parks carry the raw refund and its free-text reason)' },
   'lib/connectors/woocommerce/sync/stock-sync.ts': { writers: 2, verdict: 'no-identity (stock)' },
   'lib/connectors/woocommerce/sync/tracking-reconcile.ts': { writers: 1, verdict: 'raw-woo (verification mark: reconcileTrackingItems carries the order tracking numbers; same family as the outbound tracking items, same unmet raw-payload scrub obligation)' },

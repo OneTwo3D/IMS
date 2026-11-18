@@ -141,31 +141,34 @@ function updateLinkFor(): WmsPushUpdateLink {
   }
 }
 
-async function amend(result: WmsOrderUpdateResult, opts: { recorded?: Array<{ externalItemId: string; sku: string; quantity: number }>; recordFails?: boolean } = {}) {
+async function amend(result: WmsOrderUpdateResult, opts: { recorded?: Array<{ externalItemId: string; sku: string; quantity: number }>; recordFails?: boolean; mutateOrder?: (order: Record<string, unknown>) => void; openRefusals?: Array<{ orderId: string; externalOrderId: string; lines: Array<{ sku: string; quantity: number }> }>; held?: Array<{ externalItemId: string; sku: string; quantity: number }>; hold?: boolean } = {}) {
   const { runWmsOrderPushSweepCore } = await import('../lib/domain/wms/order-push-sweep.ts')
   const linkWrites: Array<Record<string, unknown>> = []
   const recordedRefusals: RefusedActionInput[] = []
-  const resolved: Array<{ orderId: string; action: string }> = []
+  const resolved: Array<{ orderId: string; action: string; gate?: string | readonly string[] }> = []
   const taskPort = recordingTaskPort()
   const connectorCalls: string[] = []
   const port = {
     activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: '301' }],
     releasableHeldOrders: async () => [], createCandidates: async () => [], revalidatableLinks: async () => ({ links: [], total: 0 }),
-    ambiguousCreateLinks: async () => ({ links: [], total: 0 }), verifiableLinks: async () => [], holdableLinks: async () => [], cancellableLinks: async () => [],
-    updatableLinks: async () => [updateLinkFor()],
+    ambiguousCreateLinks: async () => ({ links: [], total: 0 }), verifiableLinks: async () => [], holdableLinks: async () => (opts.hold ? [{ id: 'link-u', orderId: 'so-u', externalOrderId: 'wms-u', externalOrderNumber: 'SO-U', attempts: 0, state: 'SYNCED' }] : []), cancellableLinks: async () => [],
+    updatableLinks: async () => { if (opts.hold) return []; const link = updateLinkFor(); opts.mutateOrder?.(link.order as unknown as Record<string, unknown>); return [link] },
     updateLink: async (_id: string, data: Record<string, unknown>) => { linkWrites.push(data) },
     updateLinkByOrder: async () => undefined, updateLinkIfState: async () => true, upsertByOrder: async () => undefined,
     screenLiveWithdrawals: async () => new Set<string>(), verifyWithdrawalFence: async () => true,
     raiseOperatorTask: taskPort.raiseOperatorTask,
     readOrderItems: async () => opts.recorded ?? [],
     recordRefusedAction: async (input: RefusedActionInput) => { if (opts.recordFails) throw new Error('database unavailable'); recordedRefusals.push(input) },
-    resolveRefusedActions: async (orderId: string, action: string) => { resolved.push({ orderId, action }) },
+    resolveRefusedActions: async (orderId: string, action: string, gate?: string | readonly string[]) => { resolved.push({ orderId, action, ...(gate ? { gate } : {}) }) },
+    openAmendmentRefusals: async () => opts.openRefusals ?? [],
     recordEvent: async () => undefined,
   } as unknown as WmsOrderPushPort
   const connector = {
     pushOrder: async () => { throw new Error('unexpected create') },
     updateOrder: async () => { connectorCalls.push('updateOrder'); return result },
     // A comment writer must never be reached: nothing may call it.
+    cancelOrder: async () => ({ cancelled: true, status: 'CANCELLED' }),
+    fetchOrderItemRefs: async () => opts.held ?? [],
     addOrderComment: async () => { connectorCalls.push('COMMENT'); throw new Error('IMS must not write a warehouse comment') },
   }
   await runWmsOrderPushSweepCore(connector as never, 'mintsoft', port, { now: NOW })
@@ -226,7 +229,101 @@ test('a refusal that cannot be recorded leaves the link DUE (no pushedAt), never
 test('RESOLUTION: when the amendment later succeeds the standing refusal is closed', async () => {
   const run = await amend({ updated: true, status: 'NEW' })
   assert.deepEqual(run.recordedRefusals, [])
-  assert.deepEqual(run.resolved, [{ orderId: 'so-u', action: 'WMS_ORDER_AMEND' }])
+  assert.deepEqual(run.resolved, [
+    { orderId: 'so-u', action: 'WMS_ORDER_AMEND', gate: 'WMS_AMEND_UNBUILDABLE' },
+    { orderId: 'so-u', action: 'WMS_ORDER_AMEND' },
+  ], 'the unbuildable gate closes as soon as the order builds, then the action closes on success')
+})
+
+test('o3d-hqvrp.113: an amendment IMS cannot even build is RECORDED (standing row, retryable), nothing is sent, and the link stays due', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { mutateOrder: (order) => { order.shippingAddress = { line1: '', city: 'Leeds', postcode: 'LS1', country: 'GB' } } })
+  assert.deepEqual(run.connectorCalls, [], 'nothing was sent to the warehouse')
+  assert.equal(run.recordedRefusals.length, 1)
+  const refusal = run.recordedRefusals[0]!
+  assert.equal(refusal.action, 'WMS_ORDER_AMEND')
+  assert.equal(refusal.gate, 'WMS_AMEND_UNBUILDABLE')
+  assert.deepEqual(run.resolved, [], 'an order that does not build closes nothing')
+  assert.equal(refusal.permanence, 'RETRYABLE')
+  assert.equal(refusal.severity, 'HIGH')
+  assert.equal(refusal.entityId, 'so-u')
+  assert.ok(refusal.detail && refusal.detail.length > 0)
+  // The pre-existing behaviour is kept: the link fails with its error and is NOT advanced (pushedAt), so it retries.
+  assert.equal(run.linkWrites.some((write) => 'pushedAt' in write), false)
+  assert.ok(run.linkWrites.some((write) => typeof write.lastError === 'string' && write.lastError.length > 0))
+  assert.deepEqual(run.tasks, [], 'no warehouse query: nothing can be asked until IMS can build the change')
+})
+
+const sameLines = [{ externalItemId: 'x1', sku: 'A', quantity: 3 }]
+const withheld = (order: Record<string, unknown>) => { order.storeCreditAssessment = 'REVIEW_REQUIRED' }
+
+test('o3d-hqvrp.113: a store-credit review bump with the SAME lines raises no row at all (a plain updatedAt bump is not an amendment)', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { recorded: sameLines, mutateOrder: withheld })
+  assert.deepEqual(run.recordedRefusals, [])
+  assert.deepEqual(run.connectorCalls, [])
+  assert.ok(run.linkWrites.some((write) => typeof write.lastError === 'string'), 'the link still fails with its build error')
+})
+
+test('o3d-hqvrp.113: a store-credit review with CHANGED lines is HIGH; with no recorded lines to compare it is HIGH (the safe side)', async () => {
+  const changed = await amend({ updated: true, status: 'NEW' }, { recorded: [{ externalItemId: 'x1', sku: 'A', quantity: 1 }], mutateOrder: withheld })
+  assert.equal(changed.recordedRefusals.length, 1)
+  assert.equal(changed.recordedRefusals[0]!.severity, 'HIGH')
+  const unknown = await amend({ updated: true, status: 'NEW' }, { recorded: [], mutateOrder: withheld })
+  assert.equal(unknown.recordedRefusals[0]!.severity, 'HIGH')
+})
+
+test('o3d-hqvrp.113: a removed delivery street is an address change: HIGH even when the lines are the same', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { recorded: sameLines, mutateOrder: (order) => { order.shippingAddress = { line1: '', city: 'Leeds', postcode: 'LS1', country: 'GB' } } })
+  assert.equal(run.recordedRefusals.length, 1)
+  assert.equal(run.recordedRefusals[0]!.severity, 'HIGH')
+})
+
+test('o3d-hqvrp.113: a build that fails for another reason with unchanged lines is LOW', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { recorded: sameLines, mutateOrder: (order) => { Object.defineProperty(order, 'taxForeign', { get() { throw new Error('unreadable tax') } }) } })
+  assert.equal(run.recordedRefusals.length, 1)
+  assert.equal(run.recordedRefusals[0]!.severity, 'LOW')
+})
+
+for (const outcome of [
+  { name: 'NOT_NEW', result: { updated: false, status: 'NOT_NEW' } },
+  { name: 'MERGED_SURVIVOR', result: { updated: false, status: 'MERGED_SURVIVOR' } },
+  { name: 'ORDER_NUMBER_MISMATCH', result: { updated: false, status: 'ORDER_NUMBER_MISMATCH' } },
+  { name: 'ORDER_UNVERIFIABLE', result: { updated: false, status: 'ORDER_UNVERIFIABLE' } },
+] as const) {
+  test(`o3d-hqvrp.113: a later attempt that BUILDS closes the unbuildable row (by gate) even when the outcome is ${outcome.name}`, async () => {
+    const run = await amend(outcome.result as WmsOrderUpdateResult, { recorded: [] })
+    assert.deepEqual(run.resolved[0], { orderId: 'so-u', action: 'WMS_ORDER_AMEND', gate: 'WMS_AMEND_UNBUILDABLE' })
+    assert.equal(run.resolved.some((entry) => entry.gate === undefined), false, 'only the unbuildable gate is closed; the outcome keeps its own row')
+  })
+}
+
+test('o3d-hqvrp.113: the line-verify pass closes only the verifiable gates, so it never resolves the unbuildable row', async () => {
+  const run = await amend({ updated: false, status: 'NOT_NEW' }, { recorded: [], openRefusals: [{ orderId: 'so-old', externalOrderId: 'wms-old', lines: [{ sku: 'A', quantity: 3 }] }], held: [{ externalItemId: 'h1', sku: 'A', quantity: 3 }] })
+  const verified = run.resolved.find((entry) => entry.orderId === 'so-old')
+  assert.deepEqual(verified, { orderId: 'so-old', action: 'WMS_ORDER_AMEND', gate: ['WMS_ORDER_NOT_NEW', 'WMS_ORDER_NOT_AMENDABLE'] })
+})
+
+test('o3d-hqvrp.113: an order put ON HOLD closes its unbuildable row (it leaves the amendment pass and is rebuilt on release)', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { hold: true })
+  assert.deepEqual(run.resolved, [{ orderId: 'so-u', action: 'WMS_ORDER_AMEND', gate: 'WMS_AMEND_UNBUILDABLE' }])
+})
+
+test('o3d-hqvrp.113: the verify query is restricted to the verifiable gates (unbuildable rows take no batch slot) and the resolver filters by gate', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
+  assert.match(source, /r\.gate IN \('WMS_ORDER_NOT_NEW', 'WMS_ORDER_NOT_AMENDABLE'\)/)
+  const calls: Array<Record<string, unknown>> = []
+  const refusedMod = await import('../lib/domain/refused-actions.ts')
+  const client = { refusedAction: { updateMany: async (args: { where: Record<string, unknown> }) => { calls.push(args.where); return { count: 1 } } } }
+  await refusedMod.resolveRefusedActions(client as never, { entityType: 'SALES_ORDER', entityId: 'so-1', action: 'WMS_ORDER_AMEND', gate: 'WMS_AMEND_UNBUILDABLE' }, 'ACTION_SUCCEEDED')
+  await refusedMod.resolveRefusedActions(client as never, { entityType: 'SALES_ORDER', entityId: 'so-1', action: 'WMS_ORDER_AMEND', gate: ['A', 'B'] }, 'ACTION_SUCCEEDED')
+  assert.equal(calls[0]!.gate, 'WMS_AMEND_UNBUILDABLE')
+  assert.deepEqual(calls[1]!.gate, { in: ['A', 'B'] })
+})
+
+test('o3d-hqvrp.113: failing to record an unbuildable amendment never hides the build failure', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { recordFails: true, mutateOrder: (order) => { order.shippingAddress = { line1: '', city: 'Leeds', postcode: 'LS1', country: 'GB' } } })
+  assert.ok(run.linkWrites.some((write) => typeof write.lastError === 'string' && write.lastError.length > 0))
+  assert.equal(run.linkWrites.some((write) => 'pushedAt' in write), false)
 })
 
 // --- the split-order instance ----------------------------------------------------------------------------------------------------------

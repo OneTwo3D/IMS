@@ -383,6 +383,14 @@ export const INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE = 411_220_880
 export const PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE = 411_220_881
 
 /**
+ * THE WC PRODUCT PUSH RECORD LOCK (two-int, key = hashtext(productId)).
+ *
+ * Taken (transaction scope) while recording the outcome of an IMS-to-WooCommerce product push, so one product never has two open
+ * retry/failed rows. Never held while the WooCommerce PUT is in flight. A hashtext collision only serialises two products' bookkeeping.
+ */
+export const WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE = 411_220_882
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -436,5 +444,6 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   INVOICE_DOCUMENT_PROMOTION_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE,
+  WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const
