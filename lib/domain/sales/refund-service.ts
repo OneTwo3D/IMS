@@ -1489,6 +1489,10 @@ function allocateRefundQtyAcrossLines<T extends { id: string }>(
   return taken
 }
 
+function hasRecordedReturn(value: unknown): boolean {
+  return Array.isArray(value) ? value.length > 0 : value != null
+}
+
 function consumeRefundLineQuantity(
   lineStates: Array<{
     id: string
@@ -1507,6 +1511,12 @@ function consumeRefundLineQuantity(
     totalBase: number
     unitPriceBase?: number | null
   },
+  /**
+   * Take unshipped units BEFORE shipped ones. Only the "is anything still to ship" test uses it, for a refund that
+   * brought no stock back: such a refund cannot have been a return of shipped goods, so a line of 3 with 2 shipped
+   * and 1 refunded has had its never-to-ship unit refunded, not a shipped one.
+   */
+  preferUnshipped = false,
 ): {
   shippedRevenue: number
   unshippedRevenue: number
@@ -1536,26 +1546,36 @@ function consumeRefundLineQuantity(
     if (remainingQty <= 0 || line.qty <= 0) break
 
     const unitRevenue = line.totalBase / line.qty
-    const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
-    const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
-    if (shippedTake > 0) {
-      const shippedValue = unitRevenue * shippedTake
-      shippedRevenue += shippedValue
-      assignedRevenue += shippedValue
-      remainingQty -= shippedTake
-      remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
-      lineAllocations.push({ lineId: line.id, shippedQty: shippedTake, unshippedQty: 0 })
+    const takeShipped = (): void => {
+      const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
+      const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
+      if (shippedTake > 0) {
+        const shippedValue = unitRevenue * shippedTake
+        shippedRevenue += shippedValue
+        assignedRevenue += shippedValue
+        remainingQty -= shippedTake
+        remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
+        lineAllocations.push({ lineId: line.id, shippedQty: shippedTake, unshippedQty: 0 })
+      }
     }
-
-    const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
-    const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
-    if (unshippedTake > 0) {
-      const unshippedValue = unitRevenue * unshippedTake
-      unshippedRevenue += unshippedValue
-      assignedRevenue += unshippedValue
-      remainingQty -= unshippedTake
-      remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
-      lineAllocations.push({ lineId: line.id, shippedQty: 0, unshippedQty: unshippedTake })
+    const takeUnshipped = (): void => {
+      const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
+      const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
+      if (unshippedTake > 0) {
+        const unshippedValue = unitRevenue * unshippedTake
+        unshippedRevenue += unshippedValue
+        assignedRevenue += unshippedValue
+        remainingQty -= unshippedTake
+        remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
+        lineAllocations.push({ lineId: line.id, shippedQty: 0, unshippedQty: unshippedTake })
+      }
+    }
+    if (preferUnshipped) {
+      takeUnshipped()
+      takeShipped()
+    } else {
+      takeShipped()
+      takeUnshipped()
     }
   }
 
@@ -1610,6 +1630,11 @@ async function stageRefundAccountingReversals(
   const refundRevenue = Math.round(params.refundLines.reduce((sum, line) => sum + toNetRevenue(line.totalBase), 0) * 100) / 100
 
   const reversalAmounts = await runInTransaction(client, async (tx) => {
+    // The order row lock Group B takes on every order it journals (lockSalesOrders in daily-sync). Staging reads
+    // shipment recognition and writes an unearned reversal that can sweep the WHOLE remaining deferral; without a
+    // shared lock Group B could be recognising that same deferral in an uncommitted transaction, and both would
+    // debit Unearned for it. Taken first, before any cost-layer lock, like every other writer in this domain.
+    await lockSalesOrder(tx, params.orderId)
     const orderAccounting = await tx.salesOrder.findUnique({
       where: { id: params.orderId },
       select: {
@@ -1693,6 +1718,14 @@ async function stageRefundAccountingReversals(
             // at staging, BEFORE any enqueue; while the flag stands, the journal it describes may never
             // have been queued, and an absent journal must not be read as "retention deleted it".
             accountingRetryRequired: true,
+            // The unearned this earlier refund's reversal debited (durable; its sync row is not) and the
+            // witness that says whether it staged at all: the remainder sweep nets them.
+            unearnedReversedAmount: true,
+            reversalStagingState: true,
+            // Whether it brought stock back. A refund that did not cannot have been a return of shipped goods.
+            returnShipmentQty: true,
+            returnCostSplit: true,
+            chargeback: true,
             lines: {
               select: {
                 id: true,
@@ -2689,20 +2722,39 @@ async function stageRefundAccountingReversals(
       remainingUnshippedQtyByLine.set(line.id, unshippedQty)
     }
 
+    // "Is anything still to ship" is decided from a SECOND pair of maps: shipped coverage, ordered qty and refunded
+    // qty per line. The pair above books a refund against shipped units first (right for COGS and revenue), which
+    // reads a refund of a never-to-ship unit on a part-shipped line as a refund of a shipped one and leaves that
+    // unit "outstanding" for ever. A refund that brought no stock back is booked against unshipped units first
+    // here, because it cannot have been a return of goods that left.
+    const toShipShippedQtyByLine = new Map(remainingShippedQtyByLine)
+    const toShipUnshippedQtyByLine = new Map(remainingUnshippedQtyByLine)
+
     for (const priorRefund of orderAccounting?.refunds ?? []) {
+      // A chargeback takes the money back for goods the customer keeps: shipped units first, like the booking.
+      const priorNothingCameBack = !priorRefund.chargeback
+        && !hasRecordedReturn(priorRefund.returnShipmentQty) && priorRefund.returnCostSplit == null
       for (const priorRefundLine of priorRefund.lines) {
+        const consumed = {
+          lineId: priorRefundLine.salesOrderLineId,
+          productId: priorRefundLine.productId,
+          description: priorRefundLine.description,
+          qty: refundBoundaryNumber(priorRefundLine.qty),
+          totalBase: refundBoundaryNumber(priorRefundLine.totalBase),
+          unitPriceBase: refundBoundaryNumber(priorRefundLine.unitPriceBase),
+        }
         consumeRefundLineQuantity(
           lineContexts,
           remainingShippedQtyByLine,
           remainingUnshippedQtyByLine,
-          {
-            lineId: priorRefundLine.salesOrderLineId,
-            productId: priorRefundLine.productId,
-            description: priorRefundLine.description,
-            qty: refundBoundaryNumber(priorRefundLine.qty),
-            totalBase: refundBoundaryNumber(priorRefundLine.totalBase),
-            unitPriceBase: refundBoundaryNumber(priorRefundLine.unitPriceBase),
-          },
+          consumed,
+        )
+        consumeRefundLineQuantity(
+          lineContexts,
+          toShipShippedQtyByLine,
+          toShipUnshippedQtyByLine,
+          consumed,
+          priorNothingCameBack,
         )
       }
     }
@@ -2900,6 +2952,13 @@ async function stageRefundAccountingReversals(
       )
       shippedQtyRevenue += allocation.shippedRevenue
       unshippedQtyRevenue += allocation.unshippedRevenue
+      consumeRefundLineQuantity(
+        lineContexts,
+        toShipShippedQtyByLine,
+        toShipUnshippedQtyByLine,
+        refundLine,
+        !stockReturned && !params.chargeback,
+      )
 
       const costSnapshot: CostLayerSnapshotEntry[] = []
       for (const lineAllocation of allocation.lineAllocations) {
@@ -2962,12 +3021,76 @@ async function stageRefundAccountingReversals(
       ))
     }
 
+    // THE REMAINDER SWEEP RESTS ON DURABLE FACTS ONLY. `priorUnearnedReversed` sums sync rows that
+    // `retention_sync_logs_months` hard-deletes, so on its own it under-counts what earlier refunds already took and
+    // the sweep would debit Unearned below zero. The sweep's prior-reversal figure therefore comes from each earlier
+    // refund's own `unearnedReversedAmount` (refund rows are never deleted); a refund written before the column (NULL)
+    // counts only through a sync row that is still readable, or the witness that it never staged. Any earlier refund
+    // that is none of those makes the figure unprovable, and then the sweep does not run at all.
+    let sweepPriorReversed = 0
+    const sweepUnprovenRefundIds: string[] = []
+    for (const row of priorUnearnedReversedRows) {
+      if (row.referenceType === 'SalesOrderRefund') continue
+      sweepPriorReversed += journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0
+    }
+    for (const priorRefund of orderAccounting?.refunds ?? []) {
+      const rowsTotal = priorUnearnedReversedRows
+        .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id)
+        .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
+      const rowCount = priorUnearnedReversedRows
+        .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id).length
+      if (priorRefund.unearnedReversedAmount != null) {
+        sweepPriorReversed += Math.max(refundBoundaryNumber(priorRefund.unearnedReversedAmount), rowsTotal)
+      } else if (rowCount > 0) {
+        sweepPriorReversed += rowsTotal
+      } else if (priorRefund.reversalStagingState === REVERSAL_STAGING_NOT_STAGED) {
+        // never staged: owes and took nothing
+      } else {
+        sweepUnprovenRefundIds.push(priorRefund.id)
+      }
+    }
+    // Open deferral after shipment recognition and every reversal known to have been taken: the larger of what the
+    // readable journals say and what the refunds recorded durably, because retention only ever erodes the former.
+    // It caps the line-driven reversal too, so a compacted journal cannot make an ordinary refund debit Unearned
+    // below zero either.
     const remainingUnearned = unreadableUnearnedReversalRows.length > 0
       ? 0
       : Math.round(Math.max(
         0,
-        refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
+        refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized
+          - Math.max(sweepPriorReversed, priorUnearnedReversed),
       ) * 100) / 100
+    const sweepTrusted = unreadableUnearnedReversalRows.length === 0 && sweepUnprovenRefundIds.length === 0
+    // Never more than the deferral stamped on the order less the recognition stamped on its shipments less every
+    // reversal known to have been taken; and nothing at all when an earlier refund's reversal cannot be established.
+    const sweepableUnearned = sweepTrusted ? remainingUnearned : 0
+
+    // Shipped coverage, ordered and refunded qty per line, over lines that actually ship. A line that never ships
+    // (no product, or a NON_INVENTORY product: a service or fee line) has nothing to wait for.
+    // With no shippable line at all nothing proves the order is done shipping, so that stays outstanding.
+    const shippableLines = lineContexts.filter((line) => (
+      !!line.productId && fulfillmentGraph.get(line.productId)?.type !== 'NON_INVENTORY'
+    ))
+    const hasOutstandingUnshippedQty = shippableLines.length === 0
+      || shippableLines.some((line) => (toShipUnshippedQtyByLine.get(line.id) ?? 0) > 0.0000001)
+    const sweepWouldApply = params.newStatus === 'REFUNDED' || !hasOutstandingUnshippedQty
+    if (sweepWouldApply && !sweepTrusted && unreadableUnearnedReversalRows.length === 0) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.orderId,
+          action: 'refund_unearned_sweep_withheld_unproven_prior',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Refund ${params.refundId} did not sweep the order's remaining unearned revenue: ${sweepUnprovenRefundIds.length} earlier refund(s) have no recorded unearned reversal and no readable journal (retention deletes them), so how much of the deferral is still open cannot be established. Only the refund's own line value was reversed. Check the unearned revenue account for this order.`,
+          metadata: {
+            orderId: params.orderId,
+            refundId: params.refundId,
+            unprovenRefundIds: sweepUnprovenRefundIds,
+          },
+        },
+      })
+    }
     // 6oyu.5: shipment-source entries are valued at the ORIGINALLY-POSTED COGS
     // (applyPostedShipmentUnitCosts), so both the COGS reversal below and the
     // returned-stock new inventory layer (snapshotReturnRows, shipment-source only)
@@ -3410,9 +3533,18 @@ async function stageRefundAccountingReversals(
     //    order, naming which record was missing and how many pounds are still sitting in the
     //    account. Surfaced by `sales_order_refund_allocation_basis_unresolved` in the accounting
     //    invariants.
+    const unearnedReversal = resolveUnearnedReversal({
+      remainingUnearned,
+      sweepableUnearned,
+      lineDrivenRevenue: unshippedQtyRevenue + nonQtyRevenue,
+      isFullRefund: params.newStatus === 'REFUNDED',
+      hasOutstandingUnshippedQty,
+    })
     await tx.salesOrderRefund.update({
       where: { id: params.refundId },
       data: {
+        // Durable, so a later refund's remainder sweep can net it after retention deletes this refund's journal.
+        unearnedReversedAmount: unearnedReversal,
         allocatedReliefAmount: allocationReversal,
         allocationBasisUnresolved: unresolvedNote,
         // o3d-2sm1 (Codex r1): THE WITNESS. Written here — one statement before the un-stage below,
@@ -3456,16 +3588,7 @@ async function stageRefundAccountingReversals(
       cogsReversalBase: roundQuantity(sumCostLayerSnapshot(shipmentRefundSnapshot), 6).toNumber(),
       // o3d-hqvrp.37/.38: sweep the remainder no later posting can recognise (a 99.9% FULL refund, or the
       // shipping/discount share once the unshipped remainder has been refunded).
-      unearnedReversal: resolveUnearnedReversal({
-        remainingUnearned,
-        lineDrivenRevenue: unshippedQtyRevenue + nonQtyRevenue,
-        isFullRefund: params.newStatus === 'REFUNDED',
-        // No product lines at all means nothing proves the order is done shipping: treat as outstanding.
-        hasOutstandingUnshippedQty: !lineContexts.some((line) => !!line.productId)
-          || lineContexts.some((line) => (
-            !!line.productId && (remainingUnshippedQtyByLine.get(line.id) ?? 0) > 0.0000001
-          )),
-      }),
+      unearnedReversal,
       // o3d-o97: the lines' own allocation cost, capped by the open balance, PLUS — on a full
       // refund — the part of that balance no line reached. On a resolved full refund the two sum
       // to exactly the open balance.

@@ -2430,6 +2430,10 @@ model SalesOrderRefund {
   // terminalises. With the row gone the relief reads ZERO and the residue reverses the whole A2
   // debit a second time. Refund rows are never deleted by retention.
   allocatedReliefAmount Decimal? @db.Decimal(18, 4) @map("accounting_allocated_relief_amount")
+  // The unearned revenue THIS refund's own UNEARNED_REV_REVERSAL debits, written in the same statement as the amount above. A later refund's
+  // remainder sweep nets earlier refunds' reversals from this column because their sync rows are hard-deleted by `retention_sync_logs_months`
+  // once terminal; refund rows are never deleted by retention. NULL: written before the column existed (the figure is then unknown, never zero).
+  unearnedReversedAmount Decimal? @db.Decimal(18, 4) @map("accounting_unearned_reversed_amount")
   // o3d-o97 r3: why this refund could NOT account for the order's A2 debit, or null when it could.
   // A refusal has to leave a remedy an operator can actually perform: the un-stage below is
   // SUPPRESSED whenever this is set, so the A2 stamp survives and the standing A2 invariants keep
@@ -4494,6 +4498,8 @@ enum WmsOperatorTaskReason {
   AMENDMENT_NOT_APPLIED
   /// The status sweep found the warehouse order absent on several consecutive polls, marked it NOTFOUND and stopped polling it: a person checks it in the warehouse.
   ORDER_NOT_FOUND
+  /// A storefront (or approved EU withdrawal) cancelled an order whose invoice is already posted to the ledger: IMS raised no credit note and a cancelled order cannot be refunded, so a person credits the invoice by hand.
+  CANCELLED_POSTED_INVOICE
 }
 
 enum WmsOperatorTaskStatus {

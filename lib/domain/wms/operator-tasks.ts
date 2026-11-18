@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -30,6 +30,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   SHOP_REFUND_DUE: 'Refund in WooCommerce: IMS recorded this refund, the shop still has to pay it back',
   AMENDMENT_NOT_APPLIED: 'Order change not applied: the warehouse order is already past NEW',
   ORDER_NOT_FOUND: 'Warehouse order not found on repeated checks: IMS stopped checking its status',
+  CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: credit the invoice by hand',
 }
 
 export type WmsOperatorTaskInput = {

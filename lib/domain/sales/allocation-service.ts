@@ -51,8 +51,10 @@ import {
   assertNoSalesInvoicePostingInFlight,
   cancelPendingSalesInvoiceSyncForOrder,
   cancelWithPostedInvoiceMessage,
+  cancelledWithPostedInvoiceTaskText,
   findPostedSalesInvoiceSync,
 } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { raiseWmsOperatorTask } from '@/lib/domain/wms/operator-tasks'
 import { PermanentStatusTransitionError, STATUS_GUARD_REFUSAL_PREFIX } from '@/lib/domain/sales/status-transition-errors'
 import {
   validateManualSalesOrderStatusTransition,
@@ -2517,7 +2519,14 @@ export async function cancelSalesOrderFulfillmentState(
   input: {
     orderId: string
     data?: Prisma.SalesOrderUpdateInput
+    /** Skips the lifecycle state machine (a storefront force-sync). */
     bypass?: boolean
+    /**
+     * The cancel is driven by an automated source of truth (the storefront's own cancel, an approved EU withdrawal), not by an operator
+     * choosing to cancel. Such a cancel cannot be refused for a posted invoice without dead-lettering it: it lands and is flagged with a
+     * durable operator task. Only a manual operator cancel (neither flag) is refused. Implied by `bypass`.
+     */
+    automated?: boolean
   },
 ): Promise<{
   previousStatus: string
@@ -2538,12 +2547,12 @@ export async function cancelSalesOrderFulfillmentState(
   // o3d-hqvrp.41: an invoice that already reached the ledger is not voided or credited by a cancellation,
   // and the deferral and allocation journals behind it stay too. A manual cancel is refused until the order
   // has been refunded in full (the credit note is the accounting reversal). A cancel driven by the storefront
-  // (`bypass`) is the source of truth and cannot be refused without dead-lettering, so it proceeds and is
-  // recorded as a WARNING for the operator to credit.
+  // (`bypass`) or by an approved withdrawal (`automated`) is the source of truth and cannot be refused without
+  // dead-lettering, so it proceeds and raises a durable operator task for the credit note.
   let postedInvoiceAtCancel: Awaited<ReturnType<typeof findPostedSalesInvoiceSync>> = null
   if (lockedOrder.refundStatus !== 'FULL') {
     postedInvoiceAtCancel = await findPostedSalesInvoiceSync(tx, input.orderId)
-    if (postedInvoiceAtCancel && !input.bypass) {
+    if (postedInvoiceAtCancel && !input.bypass && !input.automated) {
       throw new PermanentStatusTransitionError(cancelWithPostedInvoiceMessage(postedInvoiceAtCancel))
     }
   }
@@ -2681,6 +2690,22 @@ export async function cancelSalesOrderFulfillmentState(
   await cancelPendingSalesInvoiceSyncForOrder(tx, input.orderId, new Date())
 
   if (postedInvoiceAtCancel) {
+    const orderRow = await tx.salesOrder.findUnique({
+      where: { id: input.orderId },
+      select: { orderNumber: true, externalOrderNumber: true },
+    })
+    const orderLabel = orderRow?.orderNumber ?? orderRow?.externalOrderNumber ?? input.orderId
+    // A DURABLE task on the order, not just an activity row: a cancelled order drops out of the standing invariants, so nothing else would
+    // ever say that a receivable is still open. One task per (order, invoice): a repeated cancel does not raise a second.
+    await raiseWmsOperatorTask(tx, {
+      connector: postedInvoiceAtCancel.connector,
+      orderId: input.orderId,
+      externalOrderId: postedInvoiceAtCancel.id,
+      reason: 'CANCELLED_POSTED_INVOICE',
+      queryText: cancelledWithPostedInvoiceTaskText(postedInvoiceAtCancel, orderLabel),
+      dedupeBasis: `cancelled-posted-invoice:${input.orderId}:${postedInvoiceAtCancel.id}`,
+      payload: { orderNumber: orderRow?.orderNumber ?? null, externalOrderNumber: postedInvoiceAtCancel.id },
+    })
     await tx.activityLog.create({
       data: {
         entityType: 'SALES_ORDER',
@@ -2688,8 +2713,8 @@ export async function cancelSalesOrderFulfillmentState(
         action: 'cancelled_with_posted_invoice',
         tag: 'accounting',
         level: 'WARNING',
-        description: `Order was cancelled by the storefront while its invoice is posted to ${postedInvoiceAtCancel.connector} (sync log ${postedInvoiceAtCancel.id}). No void or credit note was raised: credit the invoice by hand (or refund the order), or the receivable and revenue deferral stay in the ledger.`,
-        metadata: { syncLogId: postedInvoiceAtCancel.id },
+        description: cancelledWithPostedInvoiceTaskText(postedInvoiceAtCancel, orderLabel),
+        metadata: { syncLogId: postedInvoiceAtCancel.id, invoiceConnector: postedInvoiceAtCancel.connector },
       },
     })
   }

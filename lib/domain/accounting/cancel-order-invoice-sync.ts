@@ -1,5 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { CLAIMS_TO_HAVE_POSTED_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { invoiceNumberIsExternallySupplied } from '@/lib/domain/accounting/sales-invoice-number'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { lockOrderFirst, recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
@@ -107,27 +109,54 @@ export async function assertNoSalesInvoicePostingInFlight(
 }
 
 /**
- * The posted (ledger-side) sales invoice for an order, if one exists: a SALES_INVOICE row that is a ledger fact. Cancelling an order never touches it, so a cancellation of such an order
- * leaves a receivable, its revenue deferral and its allocation journals standing in the ledger.
+ * The invoice for an order that stands (or claims to stand) in the ledger, if one exists. Cancelling an order never touches it, so a cancellation of such an
+ * order leaves a receivable, its revenue deferral and its allocation journals standing in the ledger.
+ *
+ * WHAT COUNTS, widest first, because the question is "may a receivable still be open", not "did IMS prove it":
+ *   - an IMS SALES_INVOICE row that is SYNCED or names a document, whoever's claim that is: the connector's writeback, an operator release, and an
+ *     operator ASSERTION that it posted (typed document id). An asserted row is the only local record of a document IMS never saw;
+ *   - a Xeroom-era invoice: the order carries an invoice number supplied by an external invoicing connector, so the incumbent raised the ledger invoice
+ *     and any IMS row was left FAILED with no id by the ownership fence.
+ *
+ * WHAT DOES NOT: a row whose cancellation the connector VERIFIED (the invoice was undone in the ledger) and a row an operator settled as NOT posted
+ * (CANCELLED, no document id). Neither is selected by the claim predicate or is carved out of it below.
  */
 export async function findPostedSalesInvoiceSync(
-  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'> & Partial<Pick<Prisma.TransactionClient, 'salesOrder'>>,
   orderId: string,
 ): Promise<{ id: string; connector: string; type: string } | null> {
-  // The ledger-standing module's own predicate for a ledger fact (the connector's writeback, with a document id or an id-less SYNCED).
-  return tx.accountingSyncLog.findFirst({
+  const row = await tx.accountingSyncLog.findFirst({
     where: {
       referenceId: orderId,
       type: { in: [...SALES_INVOICE_SYNC_TYPES] },
-      ...PROVEN_LEDGER_FACT_WHERE,
+      AND: [
+        CLAIMS_TO_HAVE_POSTED_WHERE,
+        { OR: [{ settlementBasis: null }, { settlementBasis: { not: VERIFIED_REVERSAL_SETTLEMENT_BASIS } }] },
+      ],
     },
     select: { id: true, connector: true, type: true },
   })
+  if (row) return row
+  if (!tx.salesOrder) return null
+  const order = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { invoiceNumber: true, shoppingLinks: { select: { connector: true } } },
+  })
+  const invoiceNumber = order?.invoiceNumber?.trim()
+  if (order && invoiceNumber && invoiceNumberIsExternallySupplied(order.shoppingLinks.map((link) => link.connector))) {
+    return { id: invoiceNumber, connector: 'xeroom', type: 'EXTERNAL_INVOICE' }
+  }
+  return null
 }
 
-/** What a manual cancellation of an order with a posted invoice is told. */
+/** What a MANUAL cancellation of an order with a posted invoice is told. Every step named here is one the operator can take. */
 export function cancelWithPostedInvoiceMessage(invoice: { connector: string; id: string }): string {
-  return `This order's invoice is already posted to ${invoice.connector} (sync log ${invoice.id}), and cancelling the order does not void it or raise a credit note, so the receivable and its revenue deferral would stay in the ledger. Refund the order in full first (which raises the credit note), then cancel it.`
+  return `This order's invoice is already posted to ${invoice.connector} (${invoice.id}), and cancelling the order does not void it or raise a credit note, so the receivable and its revenue deferral would stay in the ledger. Refund the order in full first (the refund raises the credit note), then cancel it.`
+}
+
+/** What the operator task for a STOREFRONT cancellation of an order with a posted invoice says. The order is already cancelled, and a cancelled order cannot be refunded in IMS. */
+export function cancelledWithPostedInvoiceTaskText(invoice: { connector: string; id: string }, orderNumber: string): string {
+  return `Order ${orderNumber} was cancelled by the storefront while its invoice is posted to ${invoice.connector} (${invoice.id}). IMS raised no void or credit note and cannot refund a cancelled order, so the invoice must be credited: raise a credit note against it in ${invoice.connector} by hand. The order's revenue deferral and inventory allocation journals also stay in the ledger until they are reversed by hand.`
 }
 
 /**

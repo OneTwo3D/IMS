@@ -1748,6 +1748,12 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       candidateWindow.rows = candidateWindow.rows.filter((row) => groupBShipmentBelongsToPass(mode, row))
       if (candidateWindow.rows.length === 0) return 0
       const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
+      // Row-lock every order this window journals, in id order and BEFORE the cost-layer locks (the order every other
+      // writer in this domain uses, so no cycle). A refund stages its unearned reversal, which can sweep the whole
+      // remaining deferral, under the same lock; without it the two could each read the other's uncommitted state and
+      // both debit Unearned for the same remainder. Everything below (shipments, refunds, reversal rows) is read after
+      // the lock, so a refund that committed first is seen and one that comes later waits for this transaction.
+      await lockSalesOrders(tx, [...new Set(candidateWindow.rows.map((row) => row.orderId))].sort())
       const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates: candidateWindow.rows })
 
       const shipmentRows = await tx.shipment.findMany({

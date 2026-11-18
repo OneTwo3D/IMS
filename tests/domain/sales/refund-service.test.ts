@@ -192,6 +192,10 @@ type Refund = {
   // o3d-o97 r3: the CR Allocated Inventory this refund's own reversal raised, and the refusal note
   // when it could not account for the order's A2 debit.
   allocatedReliefAmount?: number | null
+  /** The unearned this refund's own reversal debited, recorded durably (its sync row is deleted by retention). */
+  unearnedReversedAmount?: number | null
+  returnShipmentQty?: unknown
+  returnCostSplit?: unknown
   allocationBasisUnresolved?: string | null
   accountingRetrySyncs?: unknown
   // o3d-2sm1 (Codex r1): the witness. ABSENT on a fixture means what a NULL column means — the row
@@ -619,6 +623,12 @@ function createClient(state: State): RefundServiceClient {
                 // makes every prior refund look like one that restocked nothing.
                 returnWarehouseId: refund.returnWarehouseId,
                 allocatedReliefAmount: refund.allocatedReliefAmount ?? null,
+                // The remainder sweep's durable inputs. A selected column the fixture does not carry reads as NULL (absent).
+                ...Object.fromEntries(
+                  (['unearnedReversedAmount', 'reversalStagingState', 'returnShipmentQty', 'returnCostSplit', 'chargeback'] as const)
+                    .filter((column) => (select.refunds as { select?: Record<string, boolean> } | undefined)?.select?.[column])
+                    .map((column) => [column, (refund as Record<string, unknown>)[column] ?? null]),
+                ),
                 // o3d-fj4m: HONOURS THE SELECT, like the A2 read below. A double that returned the flag whether
                 // or not the production query asked for it would let `accountingRetryRequired: true` be deleted
                 // from the select and fail nothing (an unselected column reads undefined, i.e. "settled").
@@ -3914,6 +3924,167 @@ test('o3d-hqvrp.38: a refund that leaves units still to ship keeps the line-driv
   })
   assert.equal(result.success, true)
   assert.equal(unearnedDebit(result), 50)
+})
+
+
+function twoLineDeferredOrder(): State {
+  // Two lines worth 50 each, 120 deferred (20 shipping). Line 1 shipped and recognised 60.
+  return baseState({
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 },
+    ],
+    orders: [{
+      id: 'order-1', externalOrderNumber: null, orderNumber: 'SO-1', status: 'ALLOCATED', fxRateToBase: 1, totalBase: 120,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 120,
+      inventoryAllocatedDate: null, allocationBatchAmount: null,
+    }],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 60, cogsBatchAmount: 0,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] }],
+    }],
+  })
+}
+
+function addEarlierGoodwillRefund(state: State, extra: Partial<Refund>): void {
+  state.refunds.push({
+    id: 'refund-0', orderId: 'order-1', creditNoteNumber: 'CN-0', externalRefundId: null, reason: 'goodwill',
+    totalForeign: 20, totalBase: 20, returnWarehouseId: null, totalsBasis: 'NET', ...extra,
+  })
+  state.refundLines.push({
+    id: 'rl-0', refundId: 'refund-0', salesOrderLineId: null, productId: null, description: 'Goodwill', qty: 0,
+    unitPriceForeign: 0, unitPriceBase: 0, totalForeign: 20, totalBase: 20,
+  } as never)
+}
+
+test('o3d-hqvrp.38 r2: the sweep nets an earlier refund from its DURABLE figure when its sync log has been compacted away', async () => {
+  // A 20 goodwill refund reversed 20 of Unearned; its UNEARNED_REV_REVERSAL row was hard-deleted by retention (no sync rows at all).
+  // Open deferral is 120 - 60 recognised - 20 = 40. Summing the (absent) rows would say 60 and debit Unearned 20 below zero.
+  const state = twoLineDeferredOrder()
+  addEarlierGoodwillRefund(state, { unearnedReversedAmount: 20, reversalStagingState: 'STAGED' })
+  assert.equal(state.accountingSyncLogs?.length ?? 0, 0)
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 }],
+    reason: 'Unshipped remainder', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebit(result), 40, 'never more than deferral - recognition - what earlier refunds took')
+  const recorded = state.refunds.find((refund) => refund.id !== 'refund-0')
+  assert.equal(recorded?.unearnedReversedAmount, 40, 'and this refund records its own figure for the next one')
+})
+
+test('o3d-hqvrp.38 r2: an earlier refund whose reversal cannot be established withholds the sweep and says so', async () => {
+  // No durable figure, no readable journal, no witness that it never staged: the open balance is unprovable, so only the line value (capped
+  // by what the readable evidence leaves) is reversed, and an operator-visible WARNING is written.
+  const state = twoLineDeferredOrder()
+  addEarlierGoodwillRefund(state, { unearnedReversedAmount: null, reversalStagingState: null })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 }],
+    reason: 'Unshipped remainder', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebit(result), 50, 'line-driven only: no sweep of the 10 shipping share')
+  const warning = (state.activityLogs as Array<{ action?: string; level?: string }>).find((row) => row.action === 'refund_unearned_sweep_withheld_unproven_prior')
+  assert.ok(warning, 'the withheld sweep is recorded')
+  assert.equal(warning?.level, 'WARNING')
+})
+
+test('o3d-hqvrp.38 r2: a refund that never staged (NOT_STAGED witness) is a known zero and does not block the sweep', async () => {
+  const state = twoLineDeferredOrder()
+  addEarlierGoodwillRefund(state, { unearnedReversedAmount: null, reversalStagingState: 'NOT_STAGED' })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 }],
+    reason: 'Unshipped remainder', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebit(result), 60)
+})
+
+test('o3d-hqvrp.38 r2: staging takes the SAME per-order row lock Group B takes, so the sweep cannot double-debit with an in-flight journal', async () => {
+  const state = twoLineDeferredOrder()
+  const client = createClient(state)
+  const realQueryRaw = (client as unknown as { $queryRaw: (...args: unknown[]) => unknown }).$queryRaw
+  const orderLocks: string[] = []
+  ;(client as unknown as { $queryRaw: (...args: unknown[]) => unknown }).$queryRaw = (query: unknown, ...rest: unknown[]) => {
+    const text = typeof query === 'object' && query !== null && 'sql' in query ? String((query as { sql: string }).sql) : ''
+    if (/FROM "sales_orders" WHERE id = .* FOR UPDATE/.test(text)) orderLocks.push(text)
+    return realQueryRaw(query, ...rest)
+  }
+  await createSalesOrderRefund(client, {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 }],
+    reason: 'Unshipped remainder', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  // One for the refund-creation transaction and one for the staging transaction that computes and records the reversal.
+  assert.equal(orderLocks.length, 2)
+})
+
+test('o3d-hqvrp.38 r2: one line with 2 of 3 units shipped and the unshipped unit refunded counts as complete, so the sweep fires', async () => {
+  // Line of 3 at 30 each (90) with a 10 shipping share = 100 deferred. Two units shipped and recognised 66.67. The refund of one unit brings no
+  // stock back, so it is the never-to-ship unit: nothing is left to ship and the 33.33 still deferred (30 + the 3.33 share) is released.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 90 }],
+    orders: [{
+      id: 'order-1', externalOrderNumber: null, orderNumber: 'SO-1', status: 'ALLOCATED', fxRateToBase: 1, totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: null, allocationBatchAmount: null,
+    }],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 66.67, cogsBatchAmount: 0,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', productId: 'product-1', qty: 2, costLayerSnapshot: [] }],
+    }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 30 }],
+    reason: 'Remaining unit will not ship', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebit(result), 33.33)
+})
+
+test('o3d-hqvrp.38 r2: a RETURN of one shipped unit with another still to ship keeps the line-driven figure', async () => {
+  // Same order, but the refund brings stock back: it is a return of a shipped unit, so the third unit is still to ship and nothing is swept.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 90 }],
+    orders: [{
+      id: 'order-1', externalOrderNumber: null, orderNumber: 'SO-1', status: 'ALLOCATED', fxRateToBase: 1, totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: null, allocationBatchAmount: null,
+    }],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 66.67, cogsBatchAmount: 20,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', productId: 'product-1', qty: 2, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }] }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 30 }],
+    reason: 'Returned', creditNotePrefix: 'CN-', accountingSettings,
+    returnWarehouseId: 'warehouse-1',
+  })
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebit(result) ?? 0, 0)
+})
+
+test('o3d-hqvrp.38 r2: a service (NON_INVENTORY) line that never ships does not keep the order "outstanding"', async () => {
+  const state = twoLineDeferredOrder()
+  state.productGraph = { 'product-2': { type: 'NON_INVENTORY', productComponents: [] } } as never
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Shipped unit refunded', creditNotePrefix: 'CN-', accountingSettings,
+  })
+  assert.equal(result.success, true)
+  // Line 1 is shipped and refunded and line 2 is a service that never ships: nothing is left to ship, so the 60 still deferred is released.
+  assert.equal(unearnedDebit(result), 60)
 })
 
 // ---------------------------------------------------------------------------
