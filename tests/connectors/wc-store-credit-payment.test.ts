@@ -451,3 +451,26 @@ test('importWcOrder: the total reconciliation also runs for an order with no cre
   assert.match(body, /feeLines: wcOrder\.fee_lines,/, 'fee lines reach the classifier on import')
   assert.match(src, /classifyWcCouponLines\(wcOrder\.coupon_lines \?\? \[\], wcOrder\.meta_data, wcOrder\.fee_lines\)/, 'and on the update path')
 })
+
+// ---------------------------------------------------------------------------------------------------
+// "Round tax at subtotal": line and shipping taxes are reported unrounded, the order total is rounded once.
+// [mutation: drop the unrounded-tax branch (tolerance back to a quarter unit): red]
+// ---------------------------------------------------------------------------------------------------
+test('ROUND TAX AT SUBTOTAL: unrounded line taxes that sum half a penny off the order total reconcile (credit and no-credit)', () => {
+  // Three 3.33 lines at 20%: Woo reports 0.666 each (sum 1.998) + shipping 1.00 net (tax 0.20); total rounds 9.99 + 1.998 + 1.20 = 13.188 -> 13.19.
+  const base = { subtotalForeign: toDecimal('9.99'), taxForeign: toDecimal('2.198'), shippingForeign: toDecimal('1.00'), orderLevelDiscountForeign: toDecimal(0), currency: 'GBP' }
+  assert.equal(checkWcStoreCreditReconciles({ ...base, storeCreditForeign: toDecimal(0), orderTotalForeign: toDecimal('13.19'), shortfallOnly: true }).ok, true, 'no credit: 13.188 vs 13.19')
+  // 0.665 x 3 = 1.995 tax: components 9.99 + 1.995 + 1.00 + 0.20 = 13.185, Woo rounds the total to 13.19 (a half-penny gap); and 13.18 the other way.
+  const half = { ...base, taxForeign: toDecimal('2.195') }
+  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(0), orderTotalForeign: toDecimal('13.19'), shortfallOnly: true }).ok, true)
+  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(2), orderTotalForeign: toDecimal('11.19') }).ok, true, 'credit order, total rounded up')
+  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(2), orderTotalForeign: toDecimal('11.18') }).ok, true, 'credit order, total rounded down')
+})
+
+test('ROUND TAX AT SUBTOTAL: a whole penny is still refused, and rounded taxes keep the quarter-penny rule', () => {
+  const unrounded = { subtotalForeign: toDecimal('9.99'), taxForeign: toDecimal('2.198'), shippingForeign: toDecimal('1.00'), orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(0), currency: 'GBP' }
+  assert.equal(checkWcStoreCreditReconciles({ ...unrounded, orderTotalForeign: toDecimal('13.20') }).ok, false, '13.188 vs 13.20 is a whole penny out')
+  const rounded = { ...unrounded, taxForeign: toDecimal('2.20') }
+  assert.equal(checkWcStoreCreditReconciles({ ...rounded, orderTotalForeign: toDecimal('13.19') }).ok, true, 'rounded tax: exact match to 13.19')
+  assert.equal(checkWcStoreCreditReconciles({ ...rounded, orderTotalForeign: toDecimal('13.195') }).ok, false, 'rounded tax: a half-penny gap is NOT rounding, still refused')
+})
