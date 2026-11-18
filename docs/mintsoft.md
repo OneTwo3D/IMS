@@ -705,6 +705,12 @@ In-flight orders show a WMS status chip on the sales list and detail pages. The 
 
 The connector builds that deep link and stores it on the cached snapshot (core flows never reference a connector-specific URL format — see the connector boundary). So a change to the admin URL template reaches the **list** chips on the next status sweep, while the **detail** page — which queries the connector live — reflects it immediately.
 
+### NOTFOUND after repeated 404s
+
+Behind `wms_not_found_after_strikes_enabled` (default off, only `true` is on; unreadable is off). While off the sweep is exactly the pre-NOTFOUND behaviour: no strike counted, nothing marked, no task, a NOTFOUND snapshot is polled again, and the first confirmed-absent answer is not re-probed. The rest of this section describes the on state. One-way: nothing resumes polling a marked order except switching the setting off (follow-up filed).
+
+The status sweep counts, per order, the CONSECUTIVE lookups that found an order IMS pushed genuinely absent: `fetchOrderStatus` returned nothing AND the presence probe answered missing (a lookup that failed, or a probe that could not run, neither counts nor resets). A found order, a merged or ambiguous one, resets the count (`wms_order_status_snapshots.notFoundStrikes`). An order IMS has not pushed (no SYNCED push link with a warehouse id) is never counted, because absence is expected until the push settles. An order that IMS pushed is probed on every lookup, not only the first, so a later merge is seen before a strike is counted. Before counting, the absence is confirmed by identity: the connector's by-id read (`probeOrderAmendable` on the stored warehouse order id) must answer the warehouse's own 404 (`NOT_FOUND`); any other answer (the order exists under its id, merged, renamed, past NEW) resets the count, and a failed read or a connector without that read counts nothing. At `WMS_NOT_FOUND_THRESHOLD` (3, the old bridge's threshold) the snapshot becomes status `NOTFOUND` (`notFoundAt` set, `lastError` still the confirmed-absent marker, so the delete guard reads it as an authoritative absence), the order leaves the sweep's batch, and ONE `ORDER_NOT_FOUND` operator task and one activity row (`wms_order_not_found`) are written in the same transaction. Nothing is written to Mintsoft or WooCommerce.
+
 ## Connector Settings
 
 Beyond credentials, these connector settings drive dispatch and status. All are editable under Integrations → Mintsoft (no DB access required).

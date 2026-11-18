@@ -377,8 +377,30 @@ async function buildEmailConnectionFingerprint(data: EmailSettings): Promise<str
   })
 }
 
+/**
+ * SEC-M10: a masked SMTP password means "use the stored one". The stored password may only ever be
+ * presented to the server it was saved for. Otherwise any holder of settings.company could point the
+ * host at a machine they run, send a test (or save), and receive the real password in the SMTP AUTH
+ * exchange. Changing the server, port, user or security therefore requires typing the password.
+ */
+async function storedPasswordTargetChanged(data: EmailSettings): Promise<boolean> {
+  if (!data.smtp_pass.endsWith('***')) return false
+  const map = await getSettingValues(['email_smtp_host', 'email_smtp_port', 'email_smtp_user', 'email_smtp_secure'])
+  const same = (key: string, supplied: string, fallback: string) =>
+    (map.get(key) ?? fallback).trim().toLowerCase() === supplied.trim().toLowerCase()
+  return !(
+    same('email_smtp_host', data.smtp_host, '')
+    && same('email_smtp_port', data.smtp_port, EMAIL_DEFAULTS.smtp_port)
+    && same('email_smtp_user', data.smtp_user, '')
+    && same('email_smtp_secure', data.smtp_secure, EMAIL_DEFAULTS.smtp_secure)
+  )
+}
+
+const SMTP_TARGET_CHANGED_ERROR = 'The SMTP server, port, user or security changed. Re-enter the SMTP password to use it with the new settings.'
+
 export async function saveEmailSettings(data: EmailSettings): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
+  if (await storedPasswordTargetChanged(data)) return { success: false, error: SMTP_TARGET_CHANGED_ERROR }
   if (isSmtpConfigured(data)) {
     const gate = await assertIntegrationConnectionTestPassed('smtp', await buildEmailConnectionFingerprint(data), 'SMTP')
     if (!gate.ok) return { success: false, error: gate.error }
@@ -403,6 +425,7 @@ export async function sendTestEmailSettings(
   recipientEmail: string,
 ): Promise<{ success: boolean; message?: string; error?: string }> {
   await requirePermission('settings.company')
+  if (await storedPasswordTargetChanged(data)) return { success: false, error: SMTP_TARGET_CHANGED_ERROR }
 
   const storedPassword = data.smtp_pass.endsWith('***')
     ? (await getSettingValue('email_smtp_pass')) ?? ''

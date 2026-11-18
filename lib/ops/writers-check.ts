@@ -79,11 +79,13 @@ export const WRITER_CRON_ROUTES: Readonly<Record<string, 'always-callable' | 'fl
 export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.sales.invoice', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
   { key: 'xero.sales.invoice-update', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
+  { key: 'xero.sales.invoice-delete', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }, { settingTrue: 'xero_document_delete_enabled', defaultValue: 'false' }] },
   { key: 'xero.sales.credit-note', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }] },
   // Queued by an operator deleting a refund; the void itself is sent by the drain under the same credit-note switch.
   { key: 'xero.sales.credit-note-void', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }] },
   { key: 'xero.sales.payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_invoice' }] },
+  { key: 'xero.purchase.bill-delete', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_invoice' }, { settingTrue: 'xero_document_delete_enabled', defaultValue: 'false' }] },
   { key: 'xero.purchase.bill-payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill-attachment', trigger: 'automatic', requires: [...XERO_MASTER, { settingTrue: 'xero_sync_attach_pdf', defaultValue: 'true' }] },
   { key: 'xero.purchase.supplier-credit', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_credit_note' }] },
@@ -117,6 +119,7 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'woocommerce.order.wms-status-meta', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.invoice-note', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, ...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
   { key: 'woocommerce.order.invoice-document', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_invoice_document_enabled', defaultValue: 'false' }] },
+  { key: 'woocommerce.order.trackship-refire', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'trackship_refire_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.fx-rates', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_fx_push_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.webhooks', trigger: 'operator', requires: [{ plugin: 'woocommerce' }] },
 ]

@@ -570,6 +570,10 @@ Invoices can be generated either manually or automatically. The trigger for auto
 - **On ship** — invoice is created automatically when the order is shipped
 - **On paid** — invoice is created automatically when payment is received in full
 
+### Deleting an invoice that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), an invoice that IMS itself created in Xero shows a **Delete invoice** button on the order page for people who can process sales. It renames the Xero invoice with a random `-DEL-` suffix so the original number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it, and clears the invoice number and link from the order when Xero confirms. If the invoice has payments, refunds or credit notes, is dated in a locked period, was created by another system or is already being deleted, the page shows the reason instead. See [Xero sync](xero-sync.md) for the full rules.
+
 ### Editing an order
 
 **A Draft order can be edited.** Open the order and press **Edit order**: the same form you used to create it opens pre-filled, and you can change the customer, addresses, lines, quantities, prices, discounts, shipping, VAT basis, warehouse, delivery date and notes. **Save changes** re-prices the whole order exactly as creating it would (the same rounding, VAT and exchange-rate rules; a foreign-currency order is re-priced at today's table rate and refused if that rate is missing), replaces the lines, and keeps the order number, the status (still Draft) and the activity history, which records the edit with the old and new totals. An order that was saved with separate fee rows shows their sum as part of **Shipping** when you edit it. The order's external order number is not editable.
@@ -657,6 +661,17 @@ Three PDF documents are available for each sales order (a quote has its own, the
 - **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu for every order that is not a Draft or Cancelled, and from a **Packing slip** button on each shipment card (from Pending onwards, so it can be printed to pick from). The shipment button prints only that parcel. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
+
+## Attachments
+
+Every sales order page has an **Attachments** card under the order, for documents that belong to it: a customer's purchase order, an email thread, a proof of delivery or a photo of damage.
+
+- **Upload** -- Anyone who can create or process sales orders (administrators, managers and warehouse users) sees an **Upload** button. Accepted: PDF, images (PNG, JPEG, GIF, WebP), CSV, Excel (.xlsx), Word (.docx) and email (.eml, .msg), up to **20 MB** each. IMS checks the content of the file, not just its name, and refuses a file that is not what its name says.
+- **Download** -- Anyone who can view sales orders sees the list and a **Download** button. A file always downloads; it is never opened in the browser.
+- **Delete** -- The **Delete** button asks you to confirm. A deleted attachment disappears from the list and cannot be downloaded; the file is kept on the server and the row is only marked deleted.
+- **They can hold personal data.** A customer's purchase order or an email can carry a name, address or phone number. When a customer is erased (**GDPR Anonymise**, or WooCommerce anonymising an order that IMS mirrors) every attachment of their orders is **deleted for good**, deleted ones included, together with its file. An anonymised order takes no new attachment. Attachments do not go to WooCommerce, Mintsoft or Xero. See [Personal-data erasure](erasure.md).
+- Deleting a draft order deletes its attachments too.
+- **Backups:** the files are in the server's upload folder (`UPLOAD_STORAGE_DIR`, under `order-attachments`), not in the database; a database backup does not contain them. After a restore, an attachment whose file was not restored shows in the list but fails to download. See [Backup & Restore](backup-restore.md).
 
 ## Other Actions
 

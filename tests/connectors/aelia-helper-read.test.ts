@@ -88,8 +88,11 @@ function phpFunction(name: string): string {
   return PHP.slice(start, next > 0 ? next : undefined)
 }
 
-test('plugin source: version 1.3.1', () => {
-  assert.match(PHP, /^\s*\*\s*Version:\s+1\.3\.1\s*$/m)
+test('plugin source: version is at least 1.3.1 (the Aelia read route shipped in 1.3.0, the status rule in 1.3.1)', () => {
+  const match = /^\s*\*\s*Version:\s+(\d+)\.(\d+)\.(\d+)\s*$/m.exec(PHP)
+  assert.ok(match)
+  const [, major, minor, patch] = match.map(Number)
+  assert.ok(major > 1 || minor > 3 || (minor === 3 && patch >= 1))
 })
 
 test('plugin source: the route is /aelia-rates, GET only, authenticated by the same signature check as the other signed routes', () => {
