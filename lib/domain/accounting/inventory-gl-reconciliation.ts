@@ -1,10 +1,14 @@
 import { db } from '@/lib/db'
+import { businessDayStartInstant } from '@/lib/business-date'
+import { loadInTransitTransferValueBase } from '@/lib/domain/inventory/in-transit-transfer-value'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getAccountingSettings, getActiveAccountingConnectorInfo, getAccountingSettingsFor } from '@/lib/accounting'
 import { AccountBalanceMovementWithheldError, balanceDateString, findLatestConfiguredAccountBalanceSnapshot, glLegProvenance } from './account-balance-snapshots'
 import {
   DEFAULT_GL_SWEEP_LIMIT,
+  DEFAULT_RECURRING_SWEEP_CAP,
   buildAccountReconciliationSweepJournal,
+  guardRecurringSweep,
   evaluateAccountGlReconciliation,
   type AccountGlReconciliation,
   type AccountGlReconciliationAction,
@@ -65,6 +69,7 @@ export type InventoryGlReconciliationUnavailableReason =
   | 'gl_balance_unproven'
   | 'no_subledger_snapshot'
   | 'unreliable_subledger_snapshot'
+  | 'snapshot_window_straddles_business_day'
 
 export type InventoryGlReconciliationResult =
   | { available: false; reason: InventoryGlReconciliationUnavailableReason }
@@ -97,6 +102,8 @@ export type InventoryGlReconciliationResult =
 export async function loadInventoryGlReconciliation(options?: {
   now?: Date
   sweepLimit?: number
+  /** Ceiling on the sweeps of the trailing 30 days, above which a further sweep is surfaced as a gap. */
+  recurringSweepCap?: number
 }): Promise<InventoryGlReconciliationResult> {
   // Connector-agnostic: follow whichever accounting connector is active rather than
   // reading Xero directly (degrades to unavailable when none is active, or when the
@@ -165,20 +172,68 @@ export async function loadInventoryGlReconciliation(options?: {
   if (snapshotRows.some((row) => !row.valueReplayReliable)) {
     return { available: false, reason: 'unreliable_subledger_snapshot' }
   }
-  const subledgerValue = snapshotRows.reduce((sum, row) => sum + Number(row.valueBase), 0)
+  // THE TWO SIDES MUST BE MEASURED OVER THE SAME DAY. The GL balance is as at the end of the BUSINESS day (Europe/London), and every
+  // journal is dated on that calendar; the inventory snapshot for the same date is cut at the end of the UTC day. During BST the two
+  // differ by the hour from 23:00 to 24:00 UTC, so a stock movement in that hour is in the snapshot but in the next day's GL. Stock
+  // moving in that hour makes the comparison unsound, so it is withheld (never swept) rather than compared across mismatched dates.
+  const snapshotCutoff = new Date(balanceDate.getTime() + 86_400_000)
+  const businessDayEnd = businessDayStartInstant(balanceDateString(new Date(balanceDate.getTime() + 86_400_000)))
+  if (businessDayEnd.getTime() < snapshotCutoff.getTime()) {
+    const [movements, revaluations] = await Promise.all([
+      db.stockMovement.count({ where: { createdAt: { gte: businessDayEnd, lt: snapshotCutoff } } }),
+      db.costLayerRevaluation.count({ where: { effectiveAt: { gte: businessDayEnd, lt: snapshotCutoff } } }),
+    ])
+    if (movements + revaluations > 0) return { available: false, reason: 'snapshot_window_straddles_business_day' }
+  }
+
+  // Stock on a dispatched, not yet received transfer has left the snapshot (and the cost layers) but is still in the GL Inventory
+  // account: add its value back so the subledger is compared with what the GL actually holds.
+  const inTransitValue = await loadInTransitTransferValueBase(snapshotCutoff)
+  const subledgerValue = snapshotRows.reduce((sum, row) => sum + Number(row.valueBase), 0) + inTransitValue.toNumber()
   const glBalance = Number(inventorySnapshot.amountBase) + Number(allocatedSnapshot.amountBase)
+
+  const evaluated = evaluateInventoryGlReconciliation({
+    subledgerValue,
+    glBalance,
+    sweepLimit: options?.sweepLimit,
+  })
+  // A residue that is within the per-day limit EVERY day is not rounding, it is a recurring error the per-day limit hides: a sweep that
+  // would take the trailing total past the cap is surfaced as a gap instead of being posted.
+  const priorSwept = evaluated.action === 'sweep' ? await trailingInventorySweptAbs(balanceDateString(balanceDate)) : 0
+  const guarded = guardRecurringSweep(evaluated, { priorSweptAbs: priorSwept, cap: options?.recurringSweepCap ?? DEFAULT_RECURRING_SWEEP_CAP })
 
   return {
     available: true,
     balanceDate: balanceDateString(balanceDate),
     // Both legs passed the provenance check in the reader: each is a balance Xero reported or a proven-absent zero, and says which.
     glProvenance: { inventory: glLegProvenance(inventorySnapshot), allocated: glLegProvenance(allocatedSnapshot) },
-    ...evaluateInventoryGlReconciliation({
-      subledgerValue,
-      glBalance,
-      sweepLimit: options?.sweepLimit,
-    }),
+    ...guarded,
   }
+}
+
+/**
+ * The absolute value of the inventory rounding sweeps already raised in the 30 days before `balanceDate` (cancelled rows are not
+ * raised sweeps). Read from the sweep journals' own inventory line: one DR or CR per sweep.
+ */
+async function trailingInventorySweptAbs(balanceDate: string): Promise<number> {
+  const since = new Date(new Date(`${balanceDate}T00:00:00.000Z`).getTime() - 30 * 86_400_000)
+  const rows = await db.accountingSyncLog.findMany({
+    where: {
+      type: 'DAILY_BATCH_INVENTORY_RECONCILIATION',
+      status: { not: 'CANCELLED' },
+      createdAt: { gte: since },
+      // This as-of date's own sweep (a re-run) is not "prior".
+      NOT: { referenceId: `INVRECON-${balanceDate}` },
+    },
+    select: { payload: true },
+  })
+  let total = 0
+  for (const row of rows) {
+    const lines = (row.payload as { lines?: Array<{ debit?: number; credit?: number }> } | null)?.lines
+    const first = Array.isArray(lines) ? lines[0] : null
+    if (first) total += Math.abs(Number(first.debit ?? first.credit ?? 0))
+  }
+  return Math.round(total * 100) / 100
 }
 
 export type InventoryReconciliationSweepJournal = AccountReconciliationSweepJournal

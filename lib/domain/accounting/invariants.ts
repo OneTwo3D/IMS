@@ -5,6 +5,7 @@ import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-re
 import { SHADOWED_OBLIGATION_WHERE, isShadowedObligation, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
+import { COGS_CROSS_CHECK_FLOWS, TRANSIT_CROSS_CHECK_FLOWS, crossCheckSubledgerAgainstQueuedJournals, type SubledgerCrossCheck } from '@/lib/domain/accounting/subledger-journal-cross-check'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import { reversalRecordVerdict } from '@/lib/domain/sales/refund-reversal-record'
 
@@ -1389,6 +1390,35 @@ export async function runAccountingInvariantReport(options: {
         delta: transitReconciliation.delta,
         sweepLimit: transitReconciliation.sweepLimit,
       },
+    })
+  }
+
+  // Independent of the GL: the journals as queued against what the sub-ledger recorded for the same window. A GL reconciliation that
+  // agrees proves the journal arrived with the sub-ledger's own figure; this names a sub-ledger gap (a posting site that records no row,
+  // a row with a different figure) that the GL comparison cannot tell from a ledger fault. A warning, as it is a diagnostic.
+  for (const check of [
+    { reconciliation: cogsReconciliation, ledger: 'cogs' as const, flows: COGS_CROSS_CHECK_FLOWS, code: 'cogs_subledger_queued_journal_mismatch', label: 'COGS' },
+    { reconciliation: transitReconciliation, ledger: 'transit' as const, flows: TRANSIT_CROSS_CHECK_FLOWS, code: 'transit_subledger_queued_journal_mismatch', label: 'Transit' },
+  ]) {
+    const reconciliation = check.reconciliation
+    if (!reconciliation.available || !reconciliation.accountCode || !reconciliation.windowOpening) continue
+    let result: SubledgerCrossCheck
+    try {
+      result = await crossCheckSubledgerAgainstQueuedJournals({
+        accountCode: reconciliation.accountCode,
+        openingExclusive: reconciliation.windowOpening,
+        closingInclusive: reconciliation.balanceDate,
+        ...check.flows,
+      }, check.ledger)
+    } catch {
+      continue
+    }
+    if (result.agrees) continue
+    findings.push({
+      severity: 'warning',
+      code: check.code,
+      message: `The ${check.label} sub-ledger recorded ${result.ledgerNet.toFixed(2)} for the window, but the journals queued for the same window move the account by ${result.queuedNet.toFixed(2)} (a difference of ${result.delta.toFixed(2)} against a rounding allowance of ${result.tolerance.toFixed(2)}${result.unreadableJournalCount > 0 ? `; ${result.unreadableJournalCount} journal(s) could not be read` : ''})`,
+      details: { window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, ...result },
     })
   }
 

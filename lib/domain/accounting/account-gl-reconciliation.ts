@@ -39,6 +39,25 @@ export type AccountGlReconciliation = {
  */
 export const DEFAULT_GL_SWEEP_LIMIT = 1
 
+/**
+ * Ceiling on the rounding sweeps raised in the trailing 30 days. The per-day limit alone lets a residue of up to £1 be swept every day
+ * for ever, which is how a small RECURRING error would be absorbed unseen. Genuine 6dp-vs-2dp rounding residue is pence in a month, so
+ * a sweep that would take the trailing total over this is reported as a gap and not posted.
+ */
+export const DEFAULT_RECURRING_SWEEP_CAP = 5
+
+/**
+ * Downgrade a `sweep` to a `flag` when posting it would take the trailing swept total past `cap`. Any other action is unchanged.
+ */
+export function guardRecurringSweep(
+  reconciliation: AccountGlReconciliation,
+  input: { priorSweptAbs: number; cap: number },
+): AccountGlReconciliation {
+  if (reconciliation.action !== 'sweep') return reconciliation
+  const projected = roundToGlPrecisionNumber(input.priorSweptAbs + Math.abs(reconciliation.delta))
+  return projected > input.cap ? { ...reconciliation, action: 'flag' } : reconciliation
+}
+
 export function evaluateAccountGlReconciliation(input: {
   subledgerValue: number
   glBalance: number
@@ -65,7 +84,7 @@ export type GlLegProvenance = 'reported' | 'proven-absent'
 
 export type AccountGlReconciliationResult<Reason extends string = string> =
   | { available: false; reason: Reason }
-  | ({ available: true; balanceDate: string; /** Where each stored balance the figure rests on came from; a `proven-absent` leg is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is and labelled so. */ glProvenance?: Record<string, GlLegProvenance> } & AccountGlReconciliation)
+  | ({ available: true; balanceDate: string; /** Where each stored balance the figure rests on came from; a `proven-absent` leg is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is and labelled so. */ glProvenance?: Record<string, GlLegProvenance>; /** Period-movement reconciliations: the configured account the figure is for, and the opening date of the GL window (exclusive). */ accountCode?: string; windowOpening?: string } & AccountGlReconciliation)
 
 export type AccountReconciliationSweepJournal = {
   date: string

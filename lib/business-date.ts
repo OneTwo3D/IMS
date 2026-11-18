@@ -20,3 +20,18 @@ export function businessDateOfStamp(stamp: string, timeZone: string = DEFAULT_TI
   const instant = new Date(/(?:Z|[+-]\d{2}:?\d{2})$/.test(stamp) ? stamp : `${stamp}Z`)
   return Number.isNaN(instant.getTime()) ? null : businessDateYmd(instant, timeZone)
 }
+
+/**
+ * The instant the business day `ymd` (YYYY-MM-DD) begins: midnight Europe/London, so 23:00 UTC the evening before during BST and
+ * 00:00 UTC in winter. Used to find the hours where the UTC day and the business day disagree.
+ */
+export function businessDayStartInstant(ymd: string, timeZone: string = DEFAULT_TIMEZONE): Date {
+  const utcMidnight = new Date(`${ymd}T00:00:00.000Z`)
+  // No zone is more than 14h from UTC, and Europe/London is 0 or 1h: try each whole hour back from UTC midnight and take the first
+  // that is the first millisecond of `ymd` in the zone.
+  for (let hoursBack = -14; hoursBack <= 14; hoursBack += 1) {
+    const candidate = new Date(utcMidnight.getTime() - hoursBack * 3_600_000)
+    if (businessDateYmd(candidate, timeZone) === ymd && businessDateYmd(new Date(candidate.getTime() - 1), timeZone) !== ymd) return candidate
+  }
+  return utcMidnight
+}

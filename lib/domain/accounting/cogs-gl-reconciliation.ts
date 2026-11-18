@@ -172,6 +172,8 @@ export async function loadCogsGlReconciliation(options?: {
     available: true,
     balanceDate: balanceDateString(closingDate),
     glProvenance: { opening: glLegProvenance(movement.opening), closing: glLegProvenance(movement.closing) },
+    accountCode: cogsAccount,
+    windowOpening: balanceDateString(movement.opening.balanceDate),
     ...evaluateAccountGlReconciliation({
       subledgerValue,
       glBalance,

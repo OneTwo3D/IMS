@@ -17,6 +17,7 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { assertSourceLimit, SourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import { getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots, getAccountingSettingsFor } from '@/lib/accounting'
+import { loadInTransitTransferValueBase } from '@/lib/domain/inventory/in-transit-transfer-value'
 import { cache } from 'react'
 import { DISPLAY_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
@@ -541,7 +542,7 @@ function supplierMetas(product: ProductMeta): Array<{ id: string; name: string }
     .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
 }
 
-const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: AccountingConnectorId | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
+const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: AccountingConnectorId | null; baseCurrency: string; inventoryAccountCode: string | null; allocatedInventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
   // o3d-j625 r5 (review M-7) — ONE RESOLUTION, NOT TWO RUN IN PARALLEL.
   //
   // This is the same pair deleted elsewhere this round, and it is not read-only: the connector this context
@@ -555,6 +556,7 @@ const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: Acc
     connector: connectorInfo?.id ?? null,
     baseCurrency,
     inventoryAccountCode: settings.inventoryAccount.trim() || null,
+    allocatedInventoryAccountCode: settings.allocatedInventoryAccount?.trim() || null,
     cogsAccountCode: settings.cogsAccount.trim() || null,
   }
 })
@@ -622,7 +624,35 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
     }
     throw error
   }
-  const variance = inventoryGlVarianceFromSnapshot(snapshot, asOf, totalValueBase, context.inventoryAccountCode)
+  // The GL holds on-hand value in TWO accounts: Inventory, and the Allocated Inventory contra that Group A2 moves value into once an order
+  // is allocated (the cost layers carry that stock until dispatch). Comparing the valuation with Inventory alone shows every allocated
+  // order as a shortfall, so the balance it is compared with is the pair (the same basis as the inventory reconciliation).
+  let allocated: { accountCode: string; snapshot: Awaited<ReturnType<typeof findLatestConfiguredAccountBalanceSnapshot>> } | null = null
+  if (context.allocatedInventoryAccountCode) {
+    try {
+      allocated = {
+        accountCode: context.allocatedInventoryAccountCode,
+        snapshot: await findLatestConfiguredAccountBalanceSnapshot({
+          connector: context.connector,
+          accountCode: context.allocatedInventoryAccountCode,
+          balanceDate: asOf,
+          currency: context.baseCurrency,
+        }),
+      }
+    } catch (error) {
+      if (error instanceof AccountBalanceMovementWithheldError) {
+        return {
+          glBalanceBase: null,
+          glVarianceBase: null,
+          notices: [`The stored GL balance for the Allocated Inventory account ${context.allocatedInventoryAccountCode} cannot be relied on (${error.reason}), so GL variance is blank.`],
+        }
+      }
+      throw error
+    }
+  }
+  // Stock on a dispatched, not yet received transfer is in no warehouse and so not in the valuation, but is still in the GL Inventory account.
+  const inTransitValueBase = await loadInTransitTransferValueBase(exclusiveEndOfUtcDay(new Date(`${asOf}T00:00:00.000Z`)))
+  const variance = inventoryGlVarianceFromSnapshot(snapshot, asOf, totalValueBase, context.inventoryAccountCode, { allocated, inTransitValueBase })
   // A proven-absent zero is compared as the real zero it is, and the figure says it is not a balance Xero reported.
   if (snapshot && variance.glBalanceBase !== null && glLegProvenance(snapshot) === 'proven-absent') {
     variance.notices.push(`The GL balance for inventory asset account ${context.inventoryAccountCode} is zero because the account is absent from a Xero Trial Balance that proved itself complete; Xero reported no row for it.`)
@@ -640,6 +670,12 @@ export function inventoryGlVarianceFromSnapshot(
   asOf: string,
   totalValueBase: Decimal,
   accountCode: string,
+  options?: {
+    /** The Allocated Inventory account and its stored balance. Null/absent: the account is not configured, Inventory alone is the GL on-hand value. */
+    allocated?: { accountCode: string; snapshot: { balanceDate: Date; amountBase: Decimal } | null } | null
+    /** Value of stock dispatched on a transfer and not yet received: valued by neither warehouse, still in the Inventory account. */
+    inTransitValueBase?: Decimal
+  },
 ): { glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] } {
   if (!snapshot) {
     return {
@@ -656,10 +692,28 @@ export function inventoryGlVarianceFromSnapshot(
       notices: [`The latest stored GL balance for inventory asset account ${accountCode} is dated ${stored}, not ${asOf}, so GL variance is blank (pull the Trial Balance for ${asOf}).`],
     }
   }
+  const allocated = options?.allocated ?? null
+  let glBalanceBase = snapshot.amountBase
+  const notices: string[] = []
+  if (allocated) {
+    const allocatedStored = allocated.snapshot ? utcDateOnly(allocated.snapshot.balanceDate) : null
+    if (!allocated.snapshot || allocatedStored !== asOf) {
+      return {
+        glBalanceBase: null,
+        glVarianceBase: null,
+        notices: [`No stored GL balance dated ${asOf} exists for the Allocated Inventory account ${allocated.accountCode}${allocatedStored ? ` (the latest is dated ${allocatedStored})` : ''}, and the on-hand value is held across it and ${accountCode}, so GL variance is blank (pull the Trial Balance for ${asOf}).`],
+      }
+    }
+    glBalanceBase = glBalanceBase.add(allocated.snapshot.amountBase)
+  }
+  const inTransit = options?.inTransitValueBase ?? toDecimal(0)
+  if (!inTransit.isZero()) {
+    notices.push(`The valuation includes ${inTransit.toFixed(2)} of stock dispatched on a transfer and not yet received, which is in no warehouse but is still in the GL inventory account.`)
+  }
   return {
-    glBalanceBase: snapshot.amountBase,
-    glVarianceBase: calculateAccountBalanceVarianceBase(totalValueBase, snapshot.amountBase),
-    notices: [],
+    glBalanceBase,
+    glVarianceBase: calculateAccountBalanceVarianceBase(totalValueBase.add(inTransit), glBalanceBase),
+    notices,
   }
 }
 

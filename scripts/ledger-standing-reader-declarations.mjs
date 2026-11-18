@@ -173,6 +173,12 @@ export const DECLARATIONS = [
     reason: "Operator CLI: refuses to release another record's claim unless the row names an id and is in a repairable status; the dry run reads settlementBasis and refuses an operator-asserted row, and the transaction re-reads it." },
   { key: "scripts/release-accounting-external-id-claim.ts::main::cmp-synced#1", class: "GUARD",
     reason: "Operator CLI: refuses to release another record's claim unless the row names an id and is in a repairable status; the dry run reads settlementBasis and refuses an operator-asserted row, and the transaction re-reads it." },
+  { key: "lib/domain/accounting/inventory-gl-reconciliation.ts::trailingInventorySweptAbs::where-excludes-cancelled#1", class: "GUARD",
+    reason: "Sums the inventory rounding sweeps raised in the trailing 30 days so a residue that recurs daily is reported as a gap instead of swept again. A cancelled sweep journal never reached the ledger and is not counted; a queued or running one is (it may post). It only ever withholds a further sweep; it posts nothing and changes no balance." },
+  { key: "lib/domain/accounting/inventory-gl-reconciliation.ts::trailingInventorySweptAbs::where-admits-synced#1", class: "GUARD",
+    reason: "Same read as the entry above: the not-cancelled filter that admits synced rows is the point, a sweep that posted is part of the trailing total." },
+  { key: "lib/domain/accounting/subledger-journal-cross-check.ts::crossCheckSubledgerAgainstQueuedJournals::where-admits-synced#1", class: "DISPLAY",
+    reason: "Report-only diagnostic: sums the journals queued, running or synced for an account over a GL window to compare with the sub-ledger; it raises a warning finding and changes no posting or balance." },
 ]
 
 // The durable-shadow census (scripts/check-ledger-standing-readers.mjs, producer-side hold S3). Every use of a "may have reached the

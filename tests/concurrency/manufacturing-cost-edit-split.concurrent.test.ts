@@ -195,6 +195,17 @@ async function runCase(label: string, sc: Scenario, extend?: (world: Awaited<Ret
   assert.ok(Math.abs(inventory - stillInInventory * unitDelta) < 0.011, `Inventory moved by ${inventory}; the ${stillInInventory} unit(s) on hand, on a transfer or returned are Inventory (${stillInInventory * unitDelta})`)
   assert.ok(Math.abs(overhead - (sc.newOverhead - sc.oldOverhead)) < 0.011, 'the overhead credit is the whole edit')
   assert.ok(Math.abs(cogs + inventory - overhead) < 0.011, 'and the debits equal it')
+
+  // ACC-M9: the reclass journal's COGS leg moves the GL COGS account, so the COGS sub-ledger must hold a row for it, equal to the leg as
+  // posted. Before the fix there was none, and the COGS reconciliation read the gap as a ledger fault.
+  const reclassCogs = netDebit(reclass, '500')
+  const subledgerRows = await db.cogsSubledgerMovement.findMany({ where: { sourceType: 'MANUFACTURING_RECLASS', sourceRef: world.productionId }, select: { baseDelta: true } })
+  if (Math.abs(reclassCogs) >= 0.005) {
+    assert.equal(subledgerRows.length, 1, 'one COGS sub-ledger row for the reclass COGS leg')
+    assert.ok(Math.abs(Number(subledgerRows[0]!.baseDelta) - reclassCogs) < 0.0001, `the row (${subledgerRows[0]!.baseDelta}) is the COGS leg as posted (${reclassCogs})`)
+  } else {
+    assert.equal(subledgerRows.length, 0, 'no COGS leg, no row')
+  }
   return { cogs, inventory, productionId: world.productionId, shipmentIds }
 }
 
