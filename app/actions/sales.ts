@@ -11,6 +11,7 @@ import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { getSettingValue } from '@/lib/settings-store'
+import { PARTIAL_REMOVAL_CREDIT_NOTE_SETTING_KEY, partialRemovalCreditReason, planRemovalCreditNoteLines } from '@/lib/domain/accounting/partial-payment-removal-credit-note'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
@@ -2061,6 +2062,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   if (!so) return
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return
+  const roundToOrderTotal = (await getSettingValue('xero_round_to_order_total_enabled')) === 'true'
   if (reverseChargeSwapMissing(so.lines, settings.reverseChargeSalesTaxType)) throw new SalesInvoiceReverseChargeSwapNotSetError(so.currency)
   const multiComponentRateNames = multiComponentTaxRateNames(so.lines)
   if (multiComponentRateNames.length > 0 && !options?.checkOnly) {
@@ -2164,6 +2166,9 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     discountTaxType: orderDefaultTaxType ?? undefined,
     ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
     lineAmountsIncludeTax,
+    // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled` (off by default; with it off the payload is byte for byte what it was): the connector posts a Rounding line so the
+    // document totals what the order totals. Not part of the posting key (lib/accounting/payload-key.ts).
+    ...(roundToOrderTotal ? { orderTotal: Number(so.totalForeign) } : {}),
   }
 
   const sentCodes = [...new Set([...payload.lines.map((l) => l.taxType), payload.shippingTaxType, payload.discountTaxType].filter((c): c is string => typeof c === 'string' && c.trim() !== '' && !isNoTaxType(c)))]
@@ -4290,6 +4295,94 @@ export async function raiseChargebackForReversedOrder(
     })
     return { raised: false, error: result.error, manualResolutionRequired: true }
   }
+  return { raised: result.success, error: result.error }
+}
+
+/**
+ * o3d-hqvrp.395 (owner decision 2026-11-18): book a PARTIAL PAYMENT REMOVAL as a credit note for the removed amount, VAT apportioned pro rata and the deferred
+ * revenue unwound the same way (lib/domain/accounting/partial-payment-removal-credit-note.ts). It goes through the ordinary refund path, so the credit note is
+ * staged behind the outbound write hold like any other. BEHIND the setting `xero_partial_payment_removal_credit_note_enabled`, OFF by default: with it off this does
+ * nothing and a removal stays an operator decision, exactly as before.
+ *
+ * One credit note per removal record: the record's `refundId` and the credit note's reason (which names the record) both stop a retry raising a second.
+ * Internal only, like the chargeback: the payment poller passes the unforgeable token, any other caller needs sales.refund.
+ */
+export async function raisePartialPaymentRemovalCreditNote(
+  orderId: string,
+  recordId: string,
+  options?: { internalBypassToken?: symbol },
+): Promise<{ raised: boolean; reason?: string; error?: string }> {
+  if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    await requirePermission('sales.refund')
+  }
+  if ((await getSettingValue(PARTIAL_REMOVAL_CREDIT_NOTE_SETTING_KEY)) !== 'true') return { raised: false, reason: 'the partial payment removal credit note setting is off' }
+
+  const record = await db.paymentRemovalReconciliation.findUnique({
+    where: { id: recordId },
+    select: { id: true, orderId: true, kind: true, amountForeign: true, refundId: true },
+  })
+  if (!record || record.orderId !== orderId || record.kind !== 'REMOVED') return { raised: false, reason: 'no such removal record for this order' }
+  if (record.refundId) return { raised: false, reason: 'a credit note was already raised for this removal' }
+
+  const reasonText = partialRemovalCreditReason(record.id)
+  const link = async (refundId: string) => {
+    await db.paymentRemovalReconciliation.updateMany({ where: { id: record.id, refundId: null }, data: { refundId, ledgerAction: 'CREDIT_NOTE' } })
+  }
+  const existingRefund = await db.salesOrderRefund.findFirst({ where: { orderId, reason: reasonText }, select: { id: true, accountingRetryRequired: true } })
+  if (existingRefund) {
+    await link(existingRefund.id)
+    return existingRefund.accountingRetryRequired
+      ? { raised: false, error: 'the credit note exists but its accounting is still pending retry' }
+      : { raised: false, reason: 'a credit note was already raised for this removal' }
+  }
+
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      orderNumber: true, externalOrderNumber: true, totalForeign: true, totalBase: true, taxBase: true, shippingBase: true,
+      lines: { select: { id: true, productId: true, description: true, totalBase: true } },
+      // Credit notes this feature raised do not make the order "already refunded"; any other refund does (the removed amount's share of what remains is then ambiguous).
+      refunds: { where: { NOT: { reason: { startsWith: 'Payment partly removed from the ledger' } } }, select: { id: true } },
+    },
+  })
+  if (!order) return { raised: false, error: 'Order not found' }
+  const orderRef = order.orderNumber ?? order.externalOrderNumber ?? orderId
+  // A removal that needs a person is marked so the poller's retry does not raise the same warning every poll.
+  const markManual = () => db.paymentRemovalReconciliation.updateMany({ where: { id: record.id, refundId: null }, data: { ledgerAction: 'MANUAL_CREDIT_NOTE' } })
+  const manual = async (why: string) => {
+    await markManual()
+    await logActivity({
+      entityType: 'SALES_ORDER', entityId: orderId, action: 'payment_removal_credit_note_requires_manual_handling', tag: 'accounting', level: 'WARNING',
+      description: withLedgerCheck(`Part of the payment on order ${orderRef} is no longer in the ledger, but ${why}, so no credit note was raised automatically; raise it manually.`),
+      resolveUser: false,
+    })
+    return { raised: false, reason: `${why} — manual credit note required` }
+  }
+  if (order.refunds.length > 0) return manual('the order already has refunds (what remains to credit is ambiguous)')
+
+  const plan = planRemovalCreditNoteLines({
+    lines: order.lines.map((l) => ({ lineId: l.id, productId: l.productId, description: l.description ?? 'Line', totalBase: l.totalBase })),
+    shippingBase: order.shippingBase ?? 0,
+    orderNetTotalBase: subtractMoney(order.totalBase, order.taxBase ?? 0),
+    totalForeign: order.totalForeign,
+    removedForeign: record.amountForeign,
+  })
+  if (!plan.ok) return manual(plan.reason)
+
+  const result = await createRefund(orderId, plan.lines, reasonText, undefined, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+  const created = await db.salesOrderRefund.findFirst({ where: { orderId, reason: reasonText }, select: { id: true } })
+  if (created) await link(created.id)
+  if (result.conflict) return manual('a refund was recorded concurrently')
+  if (result.quarantine) {
+    await markManual()
+    await logActivity({
+      entityType: 'SALES_ORDER', entityId: orderId, action: 'payment_removal_credit_note_requires_manual_handling', tag: 'accounting', level: 'WARNING',
+      description: withLedgerCheck(`Part of the payment on order ${orderRef} is no longer in the ledger, but the credit note was refused: ${result.error ?? ''} Raise it manually.`),
+      resolveUser: false,
+    })
+    return { raised: false, error: result.error }
+  }
+  if (result.warning) return { raised: false, error: result.warning }
   return { raised: result.success, error: result.error }
 }
 

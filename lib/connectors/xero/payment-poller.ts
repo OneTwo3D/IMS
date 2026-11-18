@@ -30,6 +30,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
+import { getSettingValue } from '@/lib/settings-store'
 import { compareDecimal, ledgerAmountEpsilon, toDecimal as toDecimalSafe } from '@/lib/domain/math/decimal'
 import { xeroGet } from './api'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
@@ -878,9 +879,43 @@ export async function reconcilePartialRemovals(
       if (recorded.outcome === 'raced') {
         result.errors.push(`Partial payment removal for order ${ref} changed while it was being recorded; it is measured again on the next poll.`)
       }
+      // Owner decision (o3d-hqvrp.395), behind xero_partial_payment_removal_credit_note_enabled (off by default: raise does nothing): book it as a credit note.
+      if (recorded.outcome === 'recorded') await raiseRemovalCreditNote(order.id, recorded.recordId, ref, result)
     } catch (e) {
       result.errors.push(`Partial payment removal for order ${ref} could not be recorded: ${String(e)}`)
     }
+  }
+}
+
+async function raiseRemovalCreditNote(orderId: string, recordId: string, ref: string, result: PollResult): Promise<void> {
+  try {
+    const { raisePartialPaymentRemovalCreditNote } = await import('@/app/actions/sales')
+    const raised = await raisePartialPaymentRemovalCreditNote(orderId, recordId, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+    if (raised.error) result.errors.push(`The credit note for the payment removed from order ${ref} could not be completed: ${raised.error} It is retried on the next poll.`)
+  } catch (e) {
+    result.errors.push(`The credit note for the payment removed from order ${ref} failed: ${String(e)}. It is retried on the next poll.`)
+  }
+}
+
+/**
+ * The retry for `raiseRemovalCreditNote`: removals recorded while the setting was off, or whose credit note could not be raised, that still stand. Does nothing while the setting is off.
+ * Only a removal the order still carries is credited (the order's current shortfall covers its amount), oldest first, a few per poll.
+ */
+export async function retryPartialRemovalCreditNotes(result: PollResult): Promise<void> {
+  if ((await getSettingValue('xero_partial_payment_removal_credit_note_enabled')) !== 'true') return
+  try {
+    const rows = await db.paymentRemovalReconciliation.findMany({
+      where: { kind: 'REMOVED', refundId: null, ledgerAction: 'OPERATOR_DECISION', order: { paymentRemovedForeign: { not: null } } },
+      select: { id: true, orderId: true, amountForeign: true, order: { select: { orderNumber: true, externalOrderNumber: true, paymentRemovedForeign: true } } },
+      orderBy: { createdAt: 'asc' },
+      take: 20,
+    })
+    for (const row of rows) {
+      if (row.order.paymentRemovedForeign == null || compareDecimal(toDecimalSafe(row.order.paymentRemovedForeign), toDecimalSafe(row.amountForeign)) < 0) continue
+      await raiseRemovalCreditNote(row.orderId, row.id, row.order.orderNumber ?? row.order.externalOrderNumber ?? row.orderId, result)
+    }
+  } catch (e) {
+    result.errors.push(`Retrying the credit notes for removed payments failed: ${String(e)}`)
   }
 }
 
@@ -918,6 +953,8 @@ export async function restorePaidAgainOrders(
       const noCredit = credited !== null && compareDecimal(credited.abs(), epsilon) <= 0
 
       if (paid === null || !Number.isFinite(paid) || paid < 0 || !noCredit) {
+        // A credit note IMS raised for the removal (o3d-hqvrp.395) is the answer, not a question for the order owner: nothing to warn about.
+        if (await db.paymentRemovalReconciliation.findFirst({ where: { orderId: order.id, kind: 'REMOVED', refundId: { not: null } }, select: { id: true } })) continue
         // Settled by something other than a proved payment (a credit, or figures not stated): keep the shortfall, say so once.
         const seen = await db.activityLog.findFirst({
           where: { entityId: order.id, action: 'payment_removal_credit_settled', ...(order.paymentRemovedAt ? { createdAt: { gte: order.paymentRemovedAt } } : {}) },
@@ -1510,6 +1547,7 @@ async function processDeltaChunk(
   // shortfall recorded before.
   try {
     await reconcilePartialRemovals(salesResidual, result)
+    await retryPartialRemovalCreditNotes(result)
     await restorePaidAgainOrders(new Map(changed.filter((i) => i.Type === 'ACCREC' && i.Status === 'PAID').map((i) => [i.InvoiceID, i])), result)
   } catch (e) {
     result.errors.push(`Partial payment reconciliation error: ${String(e)}`)

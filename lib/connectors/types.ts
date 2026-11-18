@@ -239,6 +239,11 @@ export type InvoiceData = {
    * Each connector maps this to its own native flag.
    */
   lineAmountsIncludeTax?: boolean
+  /**
+   * The IMS order total this document must come to. Set only when the setting `xero_round_to_order_total_enabled` is on: the connector then posts a Rounding line
+   * so the document's total equals it (bounded by the reconciliation tolerance). Not part of the document's posting key. Absent = no such line.
+   */
+  orderTotal?: number
   reference?: string
 }
 
