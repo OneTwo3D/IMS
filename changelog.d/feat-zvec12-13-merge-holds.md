@@ -7,3 +7,6 @@
   - After 4 hours (`MERGE_HOLD_REMIND_HOURS`) a hold that is still in place raises one overdue task, a warning in the activity log and a notification, and the order badge turns red.
   - While an order is held, IMS sends no change, cancel or withdrawal hold to Mintsoft for it: a change shows as "Act in Mintsoft" under Exceptions, and a withdrawal or cancel raises a task for a person.
   - The hold clears when Mintsoft's status leaves awaiting confirmation, when a merge is detected, or when the order despatches.
+  - A hold request whose answer is lost (timeout, server error, unreadable reply) is no longer treated as "Not held". The order shows "Merge hold unconfirmed" (it may be held), a task names it, and IMS reads its Mintsoft status to settle it: awaiting confirmation means held, NEW means it is retried, anything else stays unconfirmed and raises a task. The merge candidate task stays open meanwhile.
+  - If a person confirms the orders in Mintsoft without merging them (or marks the merge candidate task Done), IMS does not hold that same group again. A group whose orders change is treated as new.
+  - A Mintsoft status IMS does not recognise (or cannot read) never ends a hold on record: IMS keeps it and raises a task. Every hold state change is written to the order's activity log.

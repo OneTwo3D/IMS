@@ -60,6 +60,10 @@ export type WmsOperatorTaskPayload = {
   items?: WmsOperatorTaskLine[]
   /** Merge candidate: the orders of the group (IMS and warehouse numbers only). */
   members?: Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>
+  /** Merge hold: the group this task is about (so a later retry can re-word it), its warnings, and for an unsettled-hold task which case it is. */
+  groupBasis?: string
+  warnings?: string[]
+  kind?: string
   /** Refund in WooCommerce (SHOP_REFUND_DUE): the IMS refund the task is about and the figures the operator refunds. IMS figures and ids only. */
   shopRefund?: {
     refundId: string

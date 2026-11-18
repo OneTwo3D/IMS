@@ -16,7 +16,7 @@ import {
   type MergeGroup,
 } from './merge-candidate-match'
 import { isMergeHoldEnabled, placeMergeHolds, type MergeHoldPlacement } from './merge-hold'
-import { prismaMergeHoldPort } from './merge-hold-port'
+import { mergeGroupBasesWithUnsettledHolds, prismaMergeHoldPort } from './merge-hold-port'
 import { mergeCandidateQuery, raiseWmsOperatorTask, wmsOperatorTaskHash, type WmsOperatorTaskPayload } from './operator-tasks'
 
 /**
@@ -73,6 +73,8 @@ export type MergeCandidatePort = {
    * it does nothing and the pass is exactly the flag-mode pass. A failure is caught by the pass and never fails the detection.
    */
   placeHolds?(env: MergeCandidateEnvironment, groups: readonly MergeGroup[]): Promise<MergeHoldPlacement | null>
+  /** Group bases with a member whose hold may have landed but is not settled: their candidate task is NOT resolved while the group no longer qualifies. */
+  unsettledHoldBases?(connector: string): Promise<string[]>
   /** Run the whole compute, raise, resolve pass holding the connector's detection lock; `null` when another pass holds it. */
   withLock<T>(connector: string, fn: () => Promise<T>): Promise<T | null>
   now(): Date
@@ -135,7 +137,16 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
       else if (outcome === 'reopened') reopened += 1
     }
     // A stale group is not kept: an open task it already had is resolved like any group that stopped qualifying.
-    const resolved = await port.resolveTasksNotIn(env.connectorId, kept)
+    // A member whose hold answer was lost may be held (so no longer NEW, so the group no longer qualifies): its candidate task stays open until that is settled.
+    let unsettled: string[] | null = []
+    if (port.unsettledHoldBases) {
+      unsettled = await port.unsettledHoldBases(env.connectorId).catch((error) => {
+        console.warn(`[wms-merge-candidates] unsettled holds unreadable: ${error instanceof Error ? error.message : String(error)}`)
+        return null
+      })
+    }
+    // (When the unsettled holds cannot be read, nothing is resolved: a task is never closed on a guess.)
+    const resolved = unsettled === null ? 0 : await port.resolveTasksNotIn(env.connectorId, [...kept, ...unsettled])
     const keptGroups = groups.filter((group) => kept.includes(group.basis))
     // MERGE HOLDS (off by default): only groups that still qualified under their order locks just now are held. Non-fatal.
     let holds: MergeHoldPlacement | null = null
@@ -244,8 +255,16 @@ export const prismaMergeCandidatePort: MergeCandidatePort = {
   readMode: () => readWmsMergeCandidateMode(),
   async placeHolds(env, groups) {
     if (!(await isMergeHoldEnabled())) return null
-    return placeMergeHolds(prismaMergeHoldPort, { connectorId: env.connectorId, connectorLabel: env.connectorLabel }, groups)
+    // A group a person already marked DONE (their own decision, not the system's auto-resolve) is not held: they chose to leave it as it is. A changed group has a new basis.
+    const done = groups.length === 0 ? [] : await db.wmsOperatorTask.findMany({
+      where: { connector: env.connectorId, reason: MERGE_TASK_REASON, status: 'DONE', NOT: { doneBy: MERGE_TASK_SYSTEM_ACTOR }, contentHash: { in: groups.map((group) => wmsOperatorTaskHash({ reason: MERGE_TASK_REASON, queryText: '', dedupeBasis: group.basis })) } },
+      select: { contentHash: true },
+    })
+    const decided = new Set(done.map((task) => task.contentHash))
+    const open = groups.filter((group) => !decided.has(wmsOperatorTaskHash({ reason: MERGE_TASK_REASON, queryText: '', dedupeBasis: group.basis })))
+    return placeMergeHolds(prismaMergeHoldPort, { connectorId: env.connectorId, connectorLabel: env.connectorLabel }, open)
   },
+  unsettledHoldBases: (connector) => mergeGroupBasesWithUnsettledHolds(connector),
 
   async environment() {
     const state = await getIntegrationPluginState()

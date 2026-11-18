@@ -4647,7 +4647,10 @@ enum WmsMergeHoldState {
   /// The hold request is about to be / was sent and its answer is not recorded (a crash here leaves HOLDING: treated as possibly held, never re-sent blind).
   HOLDING
   HELD
-  /// The warehouse refused, or the request failed: the order is NOT held (the badge says so). A transport failure is retried; a refusal is not.
+  /// The request failed or its answer was lost (timeout, 5xx, no Success field): the order MAY be held. Settled by a status read (awaiting confirmation: HELD, NEW: safe to retry,
+  /// anything else: stays UNKNOWN and an operator task asks a person). Counts as held for every "do not touch" query.
+  UNKNOWN
+  /// The warehouse refused (not retried), or an unknown outcome was settled as "still NEW" (retryable): the order is NOT held (the badge says so).
   NOT_HELD
   /// The warehouse order left the held status or was merged: nothing is blocked any more.
   CLEARED

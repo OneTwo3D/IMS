@@ -16,7 +16,11 @@ import {
   MERGE_HOLD_OVERDUE_TASK_REASON,
   MERGE_HOLD_TASK_REASON,
   MERGE_HOLD_WITHDRAWAL_TASK_REASON,
+  decideBeginHold,
   isMergeHoldEnabled,
+  isMergeHeldWarehouseStatus,
+  mergeHoldUnsettledBasis,
+  mergeHoldUnsettledQuery,
   mergeHoldActInWarehouse,
   mergeHoldOverdueBasis,
   mergeHoldOverdueQuery,
@@ -31,6 +35,7 @@ import {
   type MergeHoldObservation,
   type MergeHoldPort,
   type MergeHoldRow,
+  type MergeHoldTaskState,
 } from './merge-hold'
 
 /**
@@ -39,11 +44,11 @@ import {
  * release call in this file or anywhere else.
  */
 
-const ACTIVE = ['HOLDING', 'HELD'] as const
+const ACTIVE = ['HOLDING', 'HELD', 'UNKNOWN'] as const
 
 const orderLabel = (number: string | null, id: string) => number ?? id
 
-function toRow(row: { id: string; connector: string; orderId: string; externalOrderId: string; groupBasis: string; state: string; episode: number; attempts: number; refused: boolean; lastError: string | null; heldAt: Date | null; remindedAt: Date | null; updatedAt: Date }): MergeHoldRow {
+function toRow(row: { id: string; connector: string; orderId: string; externalOrderId: string; groupBasis: string; state: string; episode: number; attempts: number; refused: boolean; lastError: string | null; heldAt: Date | null; remindedAt: Date | null; clearReason: string | null; updatedAt: Date }): MergeHoldRow {
   return { ...row, state: row.state as MergeHoldRow['state'] }
 }
 
@@ -54,6 +59,30 @@ export async function mergeHoldEnvironment(): Promise<MergeHoldEnvironment | { s
   return { connectorId: resolution.id, connectorLabel: getWmsConnectorDef(resolution.id).label }
 }
 
+/** One state transition: compare-and-set on the current state (and the attempt, when given), with its audit entry in the same transaction. False when another writer moved the row. */
+async function moveRow(
+  row: MergeHoldRow,
+  from: readonly string[],
+  data: Prisma.WmsMergeHoldUncheckedUpdateManyInput,
+  action: string,
+  level: 'INFO' | 'WARNING',
+  description: string,
+  attempt?: number,
+): Promise<boolean> {
+  return db.$transaction(async (tx) => {
+    const moved = await tx.wmsMergeHold.updateMany({ where: { id: row.id, state: { in: from as never }, ...(attempt !== undefined ? { attempts: attempt } : {}) }, data })
+    if (moved.count === 0) {
+      console.warn(`[wms-merge-hold] ${action} did not apply: row ${row.id} is no longer ${from.join('/')}`)
+      return false
+    }
+    await logActivityInTransaction(tx, {
+      userId: null, entityType: 'SALES_ORDER', entityId: row.orderId, action, tag: 'sync', level, description,
+      metadata: { connector: row.connector, externalOrderId: row.externalOrderId, groupBasis: row.groupBasis, episode: row.episode },
+    })
+    return true
+  }, { maxWait: 5_000, timeout: 20_000 })
+}
+
 export const prismaMergeHoldPort: MergeHoldPort = {
   now: () => new Date(),
   isEnabled: () => isMergeHoldEnabled(),
@@ -62,26 +91,29 @@ export const prismaMergeHoldPort: MergeHoldPort = {
     return db.$transaction(async (tx) => {
       await lockSalesOrder(tx, member.orderId)
       const existing = await tx.wmsMergeHold.findUnique({ where: { connector_orderId: { connector: env.connectorId, orderId: member.orderId } } })
-      if (!existing) {
-        const created = await tx.wmsMergeHold.create({
+      const decision = decideBeginHold(existing ? toRow(existing) : null, member.externalOrderId, groupBasis)
+      if (decision === 'skip') return null
+      let next
+      if (decision === 'create' || !existing) {
+        next = await tx.wmsMergeHold.create({
           data: { connector: env.connectorId, orderId: member.orderId, externalOrderId: member.externalOrderId, groupBasis, state: 'HOLDING', attempts: 1 },
         })
-        return toRow(created)
+      } else if (decision === 'retry') {
+        next = await tx.wmsMergeHold.update({ where: { id: existing.id }, data: { state: 'HOLDING', attempts: { increment: 1 }, groupBasis } })
+      } else {
+        // CLEARED (and not decided by a person), or NOT_HELD for another warehouse order: a NEW episode on the same row.
+        next = await tx.wmsMergeHold.update({
+          where: { id: existing.id },
+          data: {
+            state: 'HOLDING', episode: { increment: 1 }, attempts: 1, refused: false, lastError: null, heldAt: null, remindedAt: null,
+            clearedAt: null, clearReason: null, blockedNoticeAt: null, externalOrderId: member.externalOrderId, groupBasis,
+          },
+        })
       }
-      if ((ACTIVE as readonly string[]).includes(existing.state)) return null
-      if (existing.state === 'NOT_HELD' && existing.externalOrderId === member.externalOrderId) {
-        // The same warehouse order: a definite refusal stands, and the attempts are bounded.
-        if (existing.refused || existing.attempts >= MERGE_HOLD_MAX_ATTEMPTS) return null
-        const next = await tx.wmsMergeHold.update({ where: { id: existing.id }, data: { state: 'HOLDING', attempts: { increment: 1 }, groupBasis } })
-        return toRow(next)
-      }
-      // CLEARED, or NOT_HELD for another warehouse order: a NEW episode on the same row.
-      const next = await tx.wmsMergeHold.update({
-        where: { id: existing.id },
-        data: {
-          state: 'HOLDING', episode: { increment: 1 }, attempts: 1, refused: false, lastError: null, heldAt: null, remindedAt: null,
-          clearedAt: null, clearReason: null, blockedNoticeAt: null, externalOrderId: member.externalOrderId, groupBasis,
-        },
+      await logActivityInTransaction(tx, {
+        userId: null, entityType: 'SALES_ORDER', entityId: member.orderId, action: 'wms_merge_hold_attempted', tag: 'sync', level: 'INFO',
+        description: `Merge hold attempt ${next.attempts} (episode ${next.episode}) started for warehouse order ${member.externalOrderId}.`,
+        metadata: { connector: env.connectorId, externalOrderId: member.externalOrderId, groupBasis, episode: next.episode, attempt: next.attempts, decision },
       })
       return toRow(next)
     }, { maxWait: 5_000, timeout: 20_000 })
@@ -109,23 +141,29 @@ export const prismaMergeHoldPort: MergeHoldPort = {
 
   async abandonHold(row) {
     // Nothing was sent: the attempt is taken back (never a refusal, never a hold). The row is left NOT_HELD so no stale HOLDING row blocks a later attempt.
-    await db.wmsMergeHold.updateMany({ where: { id: row.id, state: 'HOLDING' }, data: { state: 'NOT_HELD', refused: false, attempts: Math.max(0, row.attempts - 1), lastError: 'Not sent: the warehouse write is held by the producer-side hold' } })
+    await moveRow(row, ['HOLDING'], { state: 'NOT_HELD', refused: false, attempts: Math.max(0, row.attempts - 1), lastError: 'Not sent: the warehouse write is held by the producer-side hold' }, 'wms_merge_hold_abandoned', 'INFO',
+      `Merge hold attempt for warehouse order ${row.externalOrderId} was not sent: the warehouse write is held by the producer-side hold.`)
   },
 
   async recordHeld(row, at) {
-    await db.$transaction(async (tx) => {
-      const moved = await tx.wmsMergeHold.updateMany({ where: { id: row.id, state: 'HOLDING' }, data: { state: 'HELD', heldAt: at, lastError: null, refused: false } })
-      if (moved.count === 0) return
-      await logActivityInTransaction(tx, {
-        userId: null, entityType: 'SALES_ORDER', entityId: row.orderId, action: 'wms_merge_hold_placed', tag: 'sync', level: 'INFO',
-        description: `Merge hold placed: warehouse order ${row.externalOrderId} is held (awaiting confirmation) so a person can merge it with the customer's other order(s). IMS will not release it; confirm it in the warehouse after merging.`,
-        metadata: { connector: row.connector, externalOrderId: row.externalOrderId, groupBasis: row.groupBasis, episode: row.episode },
-      })
-    }, { maxWait: 5_000, timeout: 20_000 })
+    // This attempt's own answer wins over the upkeep's view: HOLDING, or UNKNOWN when the upkeep gave up on a slow attempt (same attempt number only).
+    await moveRow(row, ['HOLDING', 'UNKNOWN'], { state: 'HELD', heldAt: at, lastError: null, refused: false }, 'wms_merge_hold_placed', 'INFO',
+      `Merge hold placed: warehouse order ${row.externalOrderId} is held (awaiting confirmation) so a person can merge it with the customer's other order(s). IMS will not release it; confirm it in the warehouse after merging.`, row.attempts)
   },
 
   async recordNotHeld(row, outcome) {
-    await db.wmsMergeHold.updateMany({ where: { id: row.id, state: 'HOLDING' }, data: { state: 'NOT_HELD', refused: outcome.refused, lastError: outcome.error } })
+    await moveRow(row, ['HOLDING'], { state: 'NOT_HELD', refused: outcome.refused, lastError: outcome.error }, 'wms_merge_hold_not_held', 'WARNING',
+      `Merge hold refused for warehouse order ${row.externalOrderId}: the order is not held.`)
+  },
+
+  async recordUnknown(row, error) {
+    await moveRow(row, ['HOLDING'], { state: 'UNKNOWN', refused: false, lastError: error }, 'wms_merge_hold_unknown', 'WARNING',
+      `Merge hold outcome unknown for warehouse order ${row.externalOrderId}: the request failed or its answer was lost, so the order may be held. IMS reads its status to settle it.`)
+  },
+
+  async snapshotShowsHeld(row) {
+    const snapshot = await db.wmsOrderStatusSnapshot.findFirst({ where: { orderId: row.orderId }, select: { status: true, externalOrderId: true, lastError: true } })
+    return snapshot !== null && snapshot.externalOrderId === row.externalOrderId && !snapshot.lastError && isMergeHeldWarehouseStatus(snapshot.status)
   },
 
   async retryableMembers(env) {
@@ -148,21 +186,44 @@ export const prismaMergeHoldPort: MergeHoldPort = {
       }))
   },
 
-  async raiseGroupTask(env, group, heldFlags, episodes) {
+  async raiseGroupTask(env, group, states, episodes) {
     const anchor = group.members[0]
-    const queryText = mergeHoldQuery(group.members.map((m) => ({ ...m, held: heldFlags.get(m.orderId) === true })), group.warnings, env.connectorLabel)
+    const queryText = mergeHoldQuery(group.members.map((m) => ({ ...m, state: states.get(m.orderId) ?? 'not-held' })), group.warnings, env.connectorLabel)
     await db.$transaction(async (tx) => {
       const created = await raiseWmsOperatorTask(tx, {
         connector: env.connectorId, orderId: anchor.orderId, externalOrderId: anchor.externalOrderId, reason: MERGE_HOLD_TASK_REASON, queryText,
-        payload: { orderNumber: anchor.orderNumber, externalOrderNumber: anchor.externalOrderNumber, members: group.members },
+        payload: { orderNumber: anchor.orderNumber, externalOrderNumber: anchor.externalOrderNumber, members: group.members, groupBasis: group.basis, warnings: group.warnings },
         dedupeBasis: mergeHoldTaskBasis(group, episodes),
       })
       if (!created) return
       for (const member of group.members) {
         await logActivityInTransaction(tx, {
           userId: null, entityType: 'SALES_ORDER', entityId: member.orderId, action: 'wms_merge_hold_task_raised', tag: 'sync', level: 'INFO',
-          description: `An operator task asks a person to merge order ${orderLabel(member.orderNumber, member.orderId)} with the group's other orders in the warehouse and confirm it there.${heldFlags.get(member.orderId) === true ? '' : ' This order is NOT held.'}`,
+          description: `An operator task asks a person to merge order ${orderLabel(member.orderNumber, member.orderId)} with the group's other orders in the warehouse and confirm it there.${states.get(member.orderId) === 'held' ? '' : states.get(member.orderId) === 'unknown' ? ' Whether this order is held is UNKNOWN: check it in the warehouse.' : ' This order is NOT held.'}`,
           metadata: { connector: env.connectorId, orderIds: group.members.map((m) => m.orderId), warnings: group.warnings },
+        })
+      }
+    }, { maxWait: 5_000, timeout: 20_000 })
+  },
+
+  async reviseGroupTask(env, groupBasis) {
+    await db.$transaction(async (tx) => {
+      const open = await tx.wmsOperatorTask.findMany({ where: { connector: env.connectorId, reason: MERGE_HOLD_TASK_REASON, status: 'OPEN' }, select: { id: true, queryText: true, payload: true } })
+      const task = open.find((t) => (t.payload as { groupBasis?: string } | null)?.groupBasis === groupBasis)
+      if (!task) return
+      const payload = task.payload as { members?: MergeHoldMember[]; warnings?: string[] }
+      const members = payload.members ?? []
+      const rows = await tx.wmsMergeHold.findMany({ where: { connector: env.connectorId, groupBasis, orderId: { in: members.map((m) => m.orderId) } }, select: { orderId: true, state: true } })
+      const stateOf = new Map(rows.map((r) => [r.orderId, r.state === 'HELD' ? 'held' : r.state === 'HOLDING' || r.state === 'UNKNOWN' ? 'unknown' : 'not-held'] as [string, MergeHoldTaskState]))
+      const queryText = mergeHoldQuery(members.map((m) => ({ ...m, state: stateOf.get(m.orderId) ?? 'not-held' })), payload.warnings ?? [], env.connectorLabel)
+      if (queryText === task.queryText) return
+      const updated = await tx.wmsOperatorTask.updateMany({ where: { id: task.id, status: 'OPEN' }, data: { queryText } })
+      if (updated.count === 0) return
+      for (const member of members) {
+        await logActivityInTransaction(tx, {
+          userId: null, entityType: 'SALES_ORDER', entityId: member.orderId, action: 'wms_merge_hold_task_updated', tag: 'sync', level: 'INFO',
+          description: `The merge-hold task for this group was updated: order ${orderLabel(member.orderNumber, member.orderId)} is now ${stateOf.get(member.orderId) === 'held' ? 'held' : stateOf.get(member.orderId) === 'unknown' ? 'of unknown hold state' : 'NOT held'}.`,
+          metadata: { connector: env.connectorId, groupBasis, taskId: task.id },
         })
       }
     }, { maxWait: 5_000, timeout: 20_000 })
@@ -171,7 +232,7 @@ export const prismaMergeHoldPort: MergeHoldPort = {
   async logNotHeld(row, member, refused, error) {
     await logActivity({
       userId: null, entityType: 'SALES_ORDER', entityId: row.orderId, action: 'wms_merge_hold_failed', tag: 'sync', level: 'WARNING',
-      description: `Not held: IMS could not put order ${orderLabel(member.orderNumber, member.orderId)} on merge hold in the warehouse (${refused ? 'the warehouse refused it' : 'the request failed and the outcome is unknown'}). ${refused ? 'IMS will not retry.' : 'IMS retries.'} Check the order in the warehouse before it is picked.`,
+      description: `Not held: IMS could not put order ${orderLabel(member.orderNumber, member.orderId)} on merge hold in the warehouse (${refused ? 'the warehouse refused it' : 'the request failed and the outcome is unknown'}). ${refused ? 'IMS will not retry.' : 'IMS reads the warehouse status to settle it, then retries if it is still NEW.'} Check the order in the warehouse before it is picked.`,
       metadata: { connector: row.connector, externalOrderId: row.externalOrderId, refused, reason: scrubWmsError(error, 'unknown') },
       resolveUser: false,
     })
@@ -182,7 +243,7 @@ export const prismaMergeHoldPort: MergeHoldPort = {
       where: { connector, state: { in: [...ACTIVE] } },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       select: {
-        id: true, connector: true, orderId: true, externalOrderId: true, groupBasis: true, state: true, episode: true, attempts: true, refused: true, lastError: true, heldAt: true, remindedAt: true, updatedAt: true,
+        id: true, connector: true, orderId: true, externalOrderId: true, groupBasis: true, state: true, episode: true, attempts: true, refused: true, lastError: true, heldAt: true, remindedAt: true, clearReason: true, updatedAt: true,
         order: {
           select: {
             orderNumber: true, status: true, refundStatus: true, shippedAt: true, withdrawalHoldAt: true, withdrawalApprovedAt: true, updatedAt: true,
@@ -220,13 +281,36 @@ export const prismaMergeHoldPort: MergeHoldPort = {
   },
 
   async promoteToHeld(row, at) {
-    const moved = await db.wmsMergeHold.updateMany({ where: { id: row.id, state: 'HOLDING' }, data: { state: 'HELD', heldAt: at, lastError: null } })
-    return moved.count > 0
+    return moveRow(row, ['HOLDING', 'UNKNOWN'], { state: 'HELD', heldAt: at, lastError: null, refused: false }, 'wms_merge_hold_placed', 'INFO',
+      `Merge hold confirmed by a status read: warehouse order ${row.externalOrderId} is held (awaiting confirmation) so a person can merge it with the customer's other order(s). IMS will not release it; confirm it in the warehouse after merging.`)
   },
 
-  async demoteToNotHeld(row, error) {
-    const moved = await db.wmsMergeHold.updateMany({ where: { id: row.id, state: 'HOLDING' }, data: { state: 'NOT_HELD', refused: false, lastError: error } })
-    return moved.count > 0
+  async settleNotHeld(row, error) {
+    return moveRow(row, ['HOLDING', 'UNKNOWN'], { state: 'NOT_HELD', refused: false, lastError: error }, 'wms_merge_hold_settled', 'INFO',
+      `Merge hold settled as not held: warehouse order ${row.externalOrderId} is still NEW after the attempt, so IMS may retry.`)
+  },
+
+  async raiseUnsettledTask(env, obs, kind) {
+    const { row } = obs
+    const label = orderLabel(obs.orderNumber, row.orderId)
+    const status = obs.snapshot?.status ?? ''
+    return db.$transaction(async (tx) => {
+      const created = await raiseWmsOperatorTask(tx, {
+        connector: env.connectorId, orderId: row.orderId, externalOrderId: row.externalOrderId, reason: MERGE_HOLD_TASK_REASON,
+        queryText: mergeHoldUnsettledQuery(row.externalOrderId, label, status, kind, env.connectorLabel),
+        payload: { orderNumber: obs.orderNumber, kind },
+        dedupeBasis: mergeHoldUnsettledBasis(row, status, kind),
+      })
+      if (!created) return false
+      await logActivityInTransaction(tx, {
+        userId: null, entityType: 'SALES_ORDER', entityId: row.orderId, action: 'wms_merge_hold_unsettled', tag: 'sync', level: 'WARNING',
+        description: kind === 'UNKNOWN_OUTCOME'
+          ? `Merge hold outcome still unknown for order ${label}: the warehouse status (${status || 'unreadable'}) is neither held nor NEW. An operator task asks a person to check it.`
+          : `The warehouse status '${status || 'unreadable'}' of held order ${label} is not recognised, so IMS kept the hold on record. An operator task asks a person to check it.`,
+        metadata: { connector: row.connector, externalOrderId: row.externalOrderId, episode: row.episode, status, kind },
+      })
+      return true
+    }, { maxWait: 5_000, timeout: 20_000 })
   },
 
   async remind(env, obs, hours, at) {
@@ -295,6 +379,12 @@ export const prismaMergeHoldPort: MergeHoldPort = {
       })
     }, { maxWait: 5_000, timeout: 20_000 })
   },
+}
+
+/** The group bases that still have a member that MAY be held and whose outcome is not settled (HOLDING / UNKNOWN): their candidate task must stay open. */
+export async function mergeGroupBasesWithUnsettledHolds(connector: string): Promise<string[]> {
+  const rows = await db.wmsMergeHold.findMany({ where: { connector, state: { in: ['HOLDING', 'UNKNOWN'] } }, select: { groupBasis: true } })
+  return [...new Set(rows.map((row) => row.groupBasis))]
 }
 
 /** One cheap read: is there any active hold? (With the setting off and none, the maintenance writes and calls nothing.) */
