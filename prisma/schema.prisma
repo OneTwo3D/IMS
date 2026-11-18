@@ -246,6 +246,9 @@ enum AccountingSyncType {
   // 6oyu.4 (khdw): end-of-daily-batch sweep of the STOCK_IN_TRANSIT subledger-vs-GL
   // rounding residue (same guard — sub-penny swept, material gaps flagged never swept).
   DAILY_BATCH_TRANSIT_RECONCILIATION
+  // GR/IR accrual: the daily-batch reclass journal that moves the goods received-not-billed (and billed-not-received) value
+  // between Stock in Transit and the GR/IR account. Posted only while `grir_xero_posting_enabled` is on.
+  DAILY_BATCH_GRIR_RECLASS
   UNEARNED_REV_REVERSAL
   // o3d-0i5y r9: reverses the part of a Group A2 Allocated-Inventory debit that an allocation
   // rewrite has ORPHANED — units A2 posted for that no longer sit on any allocation row, so no
@@ -1090,7 +1093,7 @@ model TransitSubledgerMovement {
   id             String   @id @default(cuid())
   // 'PURCHASE_BILL' | 'PURCHASE_BILL_UPDATE' | 'SUPPLIER_CREDIT_NOTE' | 'STOCK_RECEIPT'
   // | 'LANDED_COST_RECLASS' | 'LANDED_COST_CONSUMED_OFFSET' | 'PURCHASE_ORDER_CANCEL'
-  // | 'SUPPLIER_RETURN' | 'CUSTOMER_RETURN_IN_TRANSIT'
+  // | 'SUPPLIER_RETURN' | 'CUSTOMER_RETURN_IN_TRANSIT' | 'GRIR_RECLASS'
   sourceType     String   @map("source_type")
   // originating entity (purchaseOrderId / creditNoteId) for traceability
   sourceRef      String   @map("source_ref")
@@ -1102,6 +1105,43 @@ model TransitSubledgerMovement {
 
   @@index([journalDate])
   @@map("transit_subledger_movements")
+}
+
+/// Append-only sub-ledger of the GR/IR (goods received, not invoiced) accrual, one signed row per source event, written in the SAME
+/// transaction as the receipt, the supplier bill, the bill edit, the supplier return or the return-generated credit note it records.
+/// Mirrors TransitSubledgerMovement (idempotent on a unique key). Sign: CREDIT-POSITIVE, `baseDelta` > 0 raises the GR/IR liability
+/// (goods received that no bill covers yet), < 0 lowers it (a bill, a return of the received goods). The open balance is the sum of the
+/// BALANCE source types (see lib/domain/accounting/grir-subledger-movement.ts); `BILL_PRICE_VARIANCE` rows are the price difference
+/// between a bill and the PO valuation, kept as their own movement and outside the balance (it stays on Stock in Transit exactly as
+/// it did before this ledger existed). No foreign keys: a plain id snapshot, like the other sub-ledgers.
+model GrirSubledgerMovement {
+  id             String    @id @default(cuid())
+  // 'RECEIPT' | 'BILL' | 'BILL_UPDATE' | 'SUPPLIER_RETURN' | 'SUPPLIER_CREDIT_NOTE' | 'OPENING_BALANCE' | 'BILL_PRICE_VARIANCE'
+  sourceType     String    @map("source_type")
+  // the originating entity (receipt / bill / return / credit note id) for traceability
+  sourceRef      String    @map("source_ref")
+  // dedupes a retried or replayed source event: first write wins
+  idempotencyKey String    @unique @map("idempotency_key")
+  poId           String    @map("po_id")
+  // null for a credit-note row, which is valued per bill and not per order line
+  poLineId       String?   @map("po_line_id")
+  supplierId     String    @map("supplier_id")
+  // signed stock-unit quantity on the same sign as baseDelta; null where the row carries no quantity
+  qtyDelta       Decimal?  @db.Decimal(18, 6) @map("qty_delta")
+  baseDelta      Decimal   @db.Decimal(18, 6) @map("base_delta")
+  // the GL date the movement posts on (date-only, UTC)
+  journalDate    DateTime  @map("journal_date")
+  // the instant of the source event, for the age of an open balance
+  occurredAt     DateTime  @map("occurred_at")
+  // set when the daily batch put this row into a GR/IR reclass journal; null = not (yet) posted
+  xeroBatchRef   String?   @map("xero_batch_ref")
+  createdAt      DateTime  @default(now())
+
+  @@index([poId])
+  @@index([supplierId])
+  @@index([journalDate])
+  @@index([xeroBatchRef])
+  @@map("grir_subledger_movements")
 }
 
 /// Governed by additional db-native reporting guarantees from migration

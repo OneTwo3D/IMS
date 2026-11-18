@@ -34,6 +34,8 @@ export const ACCOUNT_FIELDS: AccountFieldDef[] = [
   { suffix: 'shipping_account', label: 'Shipping Income', description: 'Shipping charges on sales' },
   { suffix: 'discount_account', label: 'Discounts Given', description: 'Order-level discounts' },
   { suffix: 'transit_account', label: 'Stock in Transit', description: 'Purchase bills and goods ordered but not yet received' },
+  // Xero-only: the GR/IR reclass journal is the Xero daily batch's (no quickbooks_* key).
+  { suffix: 'grir_account', label: 'GR/IR (goods received, not invoiced)', description: 'Clearing account the daily batch moves goods received but not yet billed into, out of Stock in Transit. Used only while GR/IR posting is switched on (Sub-Ledger section); leave blank otherwise. Must differ from Stock in Transit.', connectors: ['xero'] },
   { suffix: 'inventory_account', label: 'Inventory Asset', description: 'Stock on hand value' },
   { suffix: 'allocated_inventory_account', label: 'Allocated Inventory', description: 'Stock allocated to paid orders awaiting dispatch' },
   { suffix: 'cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
@@ -91,6 +93,13 @@ export function settingKeyFor(connectorId: AccountingConnectorId, suffix: string
  * if they do. Pure data so the rule is reviewable next to the fields it governs.
  */
 const MUST_BE_DISTINCT: Array<{ a: string; b: string; why: string }> = [
+  {
+    a: 'transit_account',
+    b: 'grir_account',
+    why:
+      'the GR/IR reclass journal moves value between Stock in Transit and GR/IR, so on one code it would post a journal that nets to ' +
+      'nothing and the accrual would stay hidden in Stock in Transit',
+  },
   {
     a: 'transit_account',
     b: 'allocated_inventory_account',
@@ -200,5 +209,10 @@ export function buildAccountingSettingsPayload(
     const key = settingKeyFor(connectorId, field.suffix)
     payload[key] = state[key] ?? ''
   }
+  // The GR/IR posting switch is a Xero daily-batch setting with no connector prefix (grir_xero_posting_enabled).
+  if (connectorId === 'xero') payload[GRIR_POSTING_SETTING_KEY] = state[GRIR_POSTING_SETTING_KEY] ?? ''
   return payload
 }
+
+/** The setting that switches the daily batch's GR/IR reclass journal on. Default off. */
+export const GRIR_POSTING_SETTING_KEY = 'grir_xero_posting_enabled'

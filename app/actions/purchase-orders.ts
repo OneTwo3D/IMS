@@ -73,6 +73,7 @@ import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purcha
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { recordGrirBill, recordGrirBillEdit, recordGrirReceipt, recordGrirReturnCreditNote, recordGrirSupplierReturn } from '@/lib/domain/accounting/grir-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
@@ -3006,7 +3007,8 @@ export async function receivePurchaseOrder(
         }
       }
 
-      await tx.purchaseReceipt.create({
+      const createdReceipt = await tx.purchaseReceipt.create({
+        select: { id: true },
         data: {
           poId: id,
           reference: receiptRef,
@@ -3020,6 +3022,9 @@ export async function receivePurchaseOrder(
           },
         },
       })
+      // GR/IR accrual: the goods quantity this receipt lays (the same rounded quantity the layer, the movement and the stock level take), valued at
+      // the PO goods unit cost. Recorded below with the stock, in this transaction, whether or not the Xero posting is on.
+      const grirReceiptLines: Array<{ poLineId: string; qty: Prisma.Decimal }> = []
 
       // Accumulate the receipt value in Decimal so the STOCK_RECEIPT journal
       // debit equals the sum of the cost-layer values (qty * Decimal unitCostBase)
@@ -3108,7 +3113,9 @@ export async function receivePurchaseOrder(
           where: { id: rl.poLineId },
           data: { qtyReceived: { increment: qtyReceivedStr } },
         })
+        grirReceiptLines.push({ poLineId: poLine.id, qty: qtyReceived })
       }
+      await recordGrirReceipt(tx, { poId: id, sourceRef: createdReceipt.id, keyBase: createdReceipt.id, at: new Date(), lines: grirReceiptLines })
 
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId: id },
@@ -3669,6 +3676,13 @@ export async function returnPurchaseOrder(
           data: { qtyReturned: { increment: rl.qtyReturned } },
         })
       }
+      // GR/IR accrual: a return reverses the receipt portion, the returned quantity at the PO goods unit cost (same transaction, always recorded).
+      await recordGrirSupplierReturn(tx, {
+        poId: id,
+        returnId: purchaseReturn.id,
+        at: new Date(),
+        lines: linesWithQty.map((rl) => ({ poLineId: rl.poLineId, qty: rl.qtyReturned })),
+      })
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId: id },
         select: { id: true, qty: true, qtyReceived: true, qtyReturned: true },
@@ -4362,6 +4376,18 @@ export async function createInvoice(
         },
       })
 
+      // GR/IR accrual: the goods lines of this bill debit GR/IR at the PO goods unit cost; the price difference is its own movement. In this transaction,
+      // whether or not the Xero posting is on. A freight cost line has no order line and stays on the transit path.
+      await recordGrirBill(tx, {
+        poId,
+        invoiceId: createdInvoice.id,
+        invoiceDate: input.invoiceDate,
+        at: invoiceDate,
+        lines: invoiceCalculation.lineData.flatMap((line) => (
+          line.poLineId ? [{ poLineId: line.poLineId, qtyBilled: line.qtyBilled, billedBase: line.totalBase }] : []
+        )),
+      })
+
       // Mark invoicedAt (don't change primary status — it's shown as a secondary badge)
       await tx.purchaseOrder.update({
         where: { id: poId },
@@ -4788,7 +4814,7 @@ export async function updateInvoice(
           // The id the edit's payload was built against, re-read under the lock: a first posting that was written back since the unlocked read
           // makes a payload built without it the wrong kind (a refresh of a create that no longer exists, rather than an update).
           accountingInvoiceId: true,
-          lines: { select: { id: true, poLineId: true, qtyBilled: true, description: true, unitCostForeign: true, totalForeign: true } },
+          lines: { select: { id: true, poLineId: true, qtyBilled: true, description: true, unitCostForeign: true, totalForeign: true, totalBase: true } },
         },
       })
       if (!lockedInvoice) throw new Error('Bill not found')
@@ -4928,6 +4954,24 @@ export async function updateInvoice(
           },
         })
       }
+
+      // GR/IR accrual: the signed delta of each goods line against the bill as it stood under the lock (a freight cost line is the transit path's).
+      await recordGrirBillEdit(tx, {
+        poId: invoice.poId,
+        invoiceId: invoice.id,
+        editId: randomUUID(),
+        at: new Date(),
+        lines: lineUpdates.flatMap((line) => {
+          if (!line.poLineId) return []
+          const before = lockedInvoice.lines.find((existing) => existing.id === line.id)
+          if (!before) return []
+          return [{
+            poLineId: line.poLineId,
+            qtyBilledDelta: toDecimal(line.qtyBilled).sub(toDecimal(before.qtyBilled)),
+            billedBaseDelta: toDecimal(line.totalBase).sub(toDecimal(before.totalBase)),
+          }]
+        }),
+      })
 
       // A bill that has no ledger document yet has nothing to update: its first posting is still to go out (or has gone out and is not linked
       // back), so the edit has to ride on that posting instead of being dropped. See purchase-invoice-pending-create-refresh.ts.
@@ -5680,7 +5724,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       where: { id },
       select: {
         id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true, purchaseInvoiceId: true,
-        amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
+        amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true, isReturnGenerated: true,
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
         // o3d-j625 r3 (Codex HIGH 2): `accountingInvoiceId` goes into the payload as
@@ -5910,6 +5954,24 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         data: { status: 'POSTED', postedAt: new Date() },
       })
       if (claimed.count === 0) return false
+      // GR/IR accrual: a return-generated credit note is the supplier crediting back goods that were billed and then returned, which lifts the
+      // debit the return left on GR/IR. Its NET is the figure its transit row carries. Recorded with the claim, whether or not the Xero posting is on.
+      // The credit's NET in base currency: ONE computation, the figure the transit row below carries as well as the GR/IR row.
+      const creditNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, cn.fxRateToBase).toNumber() : resolveSupplierCreditNoteTransitBase({
+        grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
+        billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
+        billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
+      })
+      if (cn.isReturnGenerated) {
+        await recordGrirReturnCreditNote(tx, {
+          poId: cn.poId,
+          supplierId: cn.supplierId,
+          creditNoteId: cn.id,
+          netBase: creditNetBase,
+          journalDate: creditNoteDate,
+          at: new Date(),
+        })
+      }
       if (shouldQueueXero) {
         const queued = await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_CREDIT_NOTE',
@@ -5939,11 +6001,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // keyed the same, only when actually queued (record on the queue's OWN
         // decision, bcz9.4). Net is derived from the offset bill's VAT ratio.
         if (queued) {
-          const transitNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, cn.fxRateToBase).toNumber() : resolveSupplierCreditNoteTransitBase({
-            grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
-            billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
-            billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
-          })
+          const transitNetBase = creditNetBase
           await recordTransitSubledgerMovement(tx, {
             sourceType: 'SUPPLIER_CREDIT_NOTE',
             sourceRef: cn.id,

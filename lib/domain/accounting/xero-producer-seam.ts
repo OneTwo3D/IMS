@@ -127,6 +127,7 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   DAILY_BATCH_INVENTORY_RECONCILIATION: { kind: 'payload', field: 'date' },
   DAILY_BATCH_COGS_RECONCILIATION: { kind: 'payload', field: 'date' },
   DAILY_BATCH_TRANSIT_RECONCILIATION: { kind: 'payload', field: 'date' },
+  DAILY_BATCH_GRIR_RECLASS: { kind: 'payload', field: 'date' },
   UNEARNED_REV_REVERSAL: { kind: 'payload', field: 'date' },
   ALLOCATION_REVERSAL: { kind: 'payload', field: 'date' },
   BILL_PAYMENT: { kind: 'payload', field: 'paymentDate' },

@@ -42,6 +42,7 @@ import { savePaymentAccountMap } from '@/app/actions/accounting'
 import { confirmXeroAccountMappingOwnership } from '@/app/actions/xero-sync'
 import {
   ACCOUNT_FIELDS,
+  GRIR_POSTING_SETTING_KEY,
   SYNC_TYPE_TOGGLES,
   buildAccountingSettingsPayload,
   isFieldAvailableForConnector,
@@ -1117,6 +1118,20 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 <p className="text-[11px] text-muted-foreground">Poll Xero every 15 minutes for paid invoices (manual orders) and paid bills (purchase orders).</p>
               </div>
             </label>
+            {connectorId === 'xero' && (
+              <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+                <input
+                  type="checkbox"
+                  checked={s[GRIR_POSTING_SETTING_KEY] === 'true'}
+                  onChange={e => handleField(GRIR_POSTING_SETTING_KEY, e.target.checked ? 'true' : 'false')}
+                  className="h-4 w-4 accent-primary mt-0.5"
+                />
+                <div>
+                  <span className="text-sm font-medium">GR/IR accrual posting</span>
+                  <p className="text-[11px] text-muted-foreground">Post the daily GR/IR reclass journal (goods received, not yet billed: Stock in Transit to the GR/IR account). Needs the GR/IR account mapped and the Daily Batch on. Off by default: nothing is posted and the GR/IR sub-ledger and report keep accruing.</p>
+                </div>
+              </label>
+            )}
           </Card>
 
           {/* Deleting synced documents (o3d-ngmt.21) */}
