@@ -154,6 +154,96 @@ export async function pushCreditNote(
   return { success: true, creditNoteId: res.data.CreditNotes[0].CreditNoteID }
 }
 
+/**
+ * o3d-ngmt.22: void a SALES credit note (ACCRECCREDIT) in Xero, because the refund it was raised for was deleted in IMS as recorded in error.
+ *
+ * IDEMPOTENT AND RESUMABLE. The document is READ first and the write is decided from what is there, so a retry after a lost response, or
+ * after a partial failure further up the chain, converges on the same end state instead of erroring on the second attempt:
+ *   VOIDED / DELETED  -> already done: success, nothing is sent.
+ *   allocated or paid -> REFUSED (permanent): money is attached to it in Xero, so voiding it would unwind a settlement IMS does not own.
+ *                        The operator reverses the allocation or payment in Xero first, then retries the row.
+ *   DRAFT / SUBMITTED -> DELETED (Xero only allows a delete on an unapproved document).
+ *   AUTHORISED        -> VOIDED.
+ *   any other status  -> refused with the status named, never guessed at.
+ * The status write is a POST to the document's own id (an update, never a create), so a repeat cannot mint a second document.
+ *
+ * NUMBER REUSE DOES NOT ARISE: credit note numbers are minted from a never-decreasing per-year counter (`nextCreditNoteNumber`), so a
+ * voided number is never handed to a later refund and the number is left on the voided document as its audit trail. (If that ever stops
+ * being true, the number must be suffixed here BEFORE the void, because Xero keeps a voided ACCRECCREDIT number occupied.)
+ */
+export type CreditNoteVoidReadback = {
+  CreditNoteID?: unknown
+  CreditNoteNumber?: unknown
+  Type?: unknown
+  Status?: unknown
+  RemainingCredit?: unknown
+  Total?: unknown
+  Allocations?: unknown
+  Payments?: unknown
+}
+
+type CreditNoteVoidDeps = {
+  get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
+  post: <T>(path: string, body: unknown, opts?: { idempotencyKey?: string }) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
+}
+
+/** The decision half of the void, pure so it is tested without a ledger. */
+export function decideCreditNoteVoid(note: CreditNoteVoidReadback | undefined, expectedId: string, expectedNumber?: string | null):
+  | { action: 'already-done' }
+  | { action: 'set-status'; status: 'VOIDED' | 'DELETED' }
+  | { action: 'refuse'; permanent: boolean; error: string } {
+  if (!note || typeof note.CreditNoteID !== 'string' || note.CreditNoteID !== expectedId) {
+    return { action: 'refuse', permanent: false, error: 'the ledger did not return the credit note under its recorded id, so nothing was changed' }
+  }
+  if (note.Type !== undefined && note.Type !== XERO_SALES_CREDIT_NOTE_TYPE) {
+    return { action: 'refuse', permanent: true, error: `the document under that id is not a sales credit note (type ${String(note.Type)}), so it was not touched` }
+  }
+  if (expectedNumber && typeof note.CreditNoteNumber === 'string' && note.CreditNoteNumber !== expectedNumber) {
+    return { action: 'refuse', permanent: true, error: `the credit note under that id carries number ${note.CreditNoteNumber}, not ${expectedNumber}, so it was not touched` }
+  }
+  const status = typeof note.Status === 'string' ? note.Status : ''
+  if (status === 'VOIDED' || status === 'DELETED') return { action: 'already-done' }
+  const allocated = Array.isArray(note.Allocations) && note.Allocations.length > 0
+  const paid = Array.isArray(note.Payments) && note.Payments.length > 0
+  if (allocated || paid || status === 'PAID') {
+    return {
+      action: 'refuse',
+      permanent: true,
+      error: withLedgerCheck('the credit note has been allocated to an invoice or paid out in the ledger, so it cannot be voided from IMS. Reverse the allocation or payment in the ledger, then retry this entry.'),
+    }
+  }
+  if (status === 'DRAFT' || status === 'SUBMITTED') return { action: 'set-status', status: 'DELETED' }
+  if (status === 'AUTHORISED') return { action: 'set-status', status: 'VOIDED' }
+  return { action: 'refuse', permanent: false, error: `the credit note is in status ${status || '(unknown)'}, which IMS does not void` }
+}
+
+export async function voidCreditNote(
+  data: { creditNoteId: string; creditNoteNumber?: string | null },
+  opts?: { idempotencyKey?: string },
+  deps: CreditNoteVoidDeps = { get: (path) => xeroGet(path), post: (path, body, o) => xeroPost(path, body, o) },
+): Promise<{ success: boolean; alreadyDone?: boolean; error?: string; permanent?: boolean }> {
+  if (!data.creditNoteId || /[^A-Za-z0-9-]/.test(data.creditNoteId)) {
+    return { success: false, permanent: true, error: 'the credit note carries no usable ledger id to void' }
+  }
+  let read: { ok: boolean; status: number; data?: { CreditNotes?: CreditNoteVoidReadback[] }; error?: string }
+  try {
+    read = await deps.get<{ CreditNotes?: CreditNoteVoidReadback[] }>(`CreditNotes/${data.creditNoteId}`)
+  } catch (error) {
+    return { success: false, error: `the credit note could not be read before voiding: ${String(error)}` }
+  }
+  if (!read.ok) return { success: false, error: read.error ?? `reading the credit note failed with HTTP ${read.status}` }
+  const decision = decideCreditNoteVoid(read.data?.CreditNotes?.[0], data.creditNoteId, data.creditNoteNumber)
+  if (decision.action === 'already-done') return { success: true, alreadyDone: true }
+  if (decision.action === 'refuse') return { success: false, permanent: decision.permanent, error: decision.error }
+  const res = await deps.post<XeroCreditNoteResponse>(
+    `CreditNotes/${data.creditNoteId}`,
+    { CreditNotes: [{ CreditNoteID: data.creditNoteId, Status: decision.status }] },
+    opts,
+  )
+  if (!res.ok) return { success: false, error: res.error ?? `voiding the credit note failed with HTTP ${res.status}` }
+  return { success: true }
+}
+
 export const XERO_PURCHASE_CREDIT_NOTE_TYPE = 'ACCPAYCREDIT'
 
 /**

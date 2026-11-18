@@ -179,6 +179,7 @@ type Refund = {
   creditNoteNumber: string | null
   externalRefundId: number | null
   reason: string | null
+  returnReasonId?: string | null
   totalForeign: number
   totalBase: number
   returnWarehouseId: string | null
@@ -306,6 +307,8 @@ type State = {
     externalTransactionId?: string | null
     settlementBasis?: string | null
     abandonedBeforeRemoteCall?: boolean | null
+    // o3d-oyur: the per-account summary compaction keeps when it drops `payload`. OMITTED means NULL (a legacy compacted row has none).
+    payloadAccountNets?: unknown
   }>
   settings: Record<string, string>
   // `rate` and `usedFor` are how a tax code is PRICED (o3d-w00 Codex r4 #2). Optional only because the
@@ -774,6 +777,7 @@ function createClient(state: State): RefundServiceClient {
         referenceType: log.referenceType,
         referenceId: log.referenceId,
         payload: log.payload,
+        payloadAccountNets: log.payloadAccountNets ?? null,
         externalTransactionId: log.externalTransactionId ?? null,
         settlementBasis: log.settlementBasis ?? null,
         abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
@@ -967,6 +971,19 @@ test('createSalesOrderRefund creates a partial refund record', async () => {
   assert.equal(state.refundLines[0].qty, 1)
   assert.equal(state.refundLines[0].unitPriceBase, 50)
   assert.equal(state.refundLines[0].salesOrderLineId, 'line-1')
+})
+
+test('a refund carries the structured return reason beside the untouched free-text reason; with none it is null', async () => {
+  const withReason = baseState()
+  const lines = [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }]
+  await createSalesOrderRefund(createClient(withReason), { orderId: 'order-1', lines, reason: 'Box was crushed', returnReasonId: 'rr-damaged', creditNotePrefix: 'CN-' })
+  assert.equal(withReason.refunds[0].returnReasonId, 'rr-damaged')
+  assert.equal(withReason.refunds[0].reason, 'Box was crushed', 'the free-text reason is unchanged')
+
+  const without = baseState()
+  await createSalesOrderRefund(createClient(without), { orderId: 'order-1', lines, reason: 'Customer return', creditNotePrefix: 'CN-' })
+  assert.equal(without.refunds[0].returnReasonId, null)
+  assert.equal(without.refunds[0].reason, 'Customer return')
 })
 
 test('createSalesOrderRefund dual-writes refundStatus=FULL on a full refund', async () => {
@@ -10849,4 +10866,133 @@ test('[o3d-hqvrp.32] a storefront return whose shipped units have no cost on rec
   assert.equal(result.success, true)
   assert.equal(stockOnHand(state), 0)
   assert.equal(state.refunds[0].returnWarehouseId ?? null, null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-oyur (Codex r1 HIGH) — a prior reversal with NO readable lines and NO preserved summary is
+// UNKNOWN, never zero. A legacy compacted row (payload {}, payloadAccountNets null) used to read as
+// "reversed nothing", which raised the open balance and let a later refund reverse the money twice.
+// ---------------------------------------------------------------------------
+
+function unearnedDeferralStateWithPriorReversal(prior: { payload: unknown; payloadAccountNets: unknown }): State {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: 0,
+      cogsBatchAmount: 0,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    allocations: [{
+      id: 'alloc-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+  state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+    connector: 'xero',
+    type: 'UNEARNED_REV_REVERSAL',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    status: 'SYNCED',
+    ...prior,
+  }]
+  return state
+}
+
+async function fullUnearnedRefund(state: State) {
+  return createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+}
+
+function unearnedDebitOf(result: Awaited<ReturnType<typeof fullUnearnedRefund>>): number | undefined {
+  const sync = result.success && result.accountingSyncs.find((s) => s.type === 'UNEARNED_REV_REVERSAL')
+  if (!sync) return undefined
+  return (sync.payload as { lines?: Array<{ accountCode?: string; debit?: number }> })
+    .lines?.find((l) => l.accountCode === accountingSettings.unearnedRevenueAccount && l.debit)?.debit
+}
+
+test('a prior UNEARNED_REV_REVERSAL with no lines and no summary withholds the unearned reversal, never counts it as zero (o3d-oyur)', async () => {
+  const state = unearnedDeferralStateWithPriorReversal({ payload: {}, payloadAccountNets: null })
+  const result = await fullUnearnedRefund(state)
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebitOf(result), undefined, 'NOT £100: the prior reversal took an unknown amount of the £100')
+  assert.ok(
+    state.activityLogs.some((log) => (log as { action?: string }).action === 'refund_unearned_reversal_withheld_unreadable_prior'),
+    'and the refund says why',
+  )
+})
+
+test('a compacted prior UNEARNED_REV_REVERSAL that kept its summary still nets exactly (o3d-oyur control)', async () => {
+  const state = unearnedDeferralStateWithPriorReversal({
+    payload: {},
+    payloadAccountNets: {
+      version: 1,
+      accounts: { [accountingSettings.unearnedRevenueAccount]: { credit: 0, debit: 40 } },
+    },
+  })
+  const result = await fullUnearnedRefund(state)
+  assert.equal(result.success, true)
+  assert.equal(unearnedDebitOf(result), 60, 'the £100 deferral less the £40 the summary says was reversed')
+  assert.equal(
+    state.activityLogs.some((log) => (log as { action?: string }).action === 'refund_unearned_reversal_withheld_unreadable_prior'),
+    false,
+  )
+})
+
+test('an order-level reversal with no lines and no summary makes the Allocated Inventory relief UNRESOLVED, not zero (o3d-oyur)', async () => {
+  const state = a2StagedAllocatedState()
+  state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+    id: 'legacy-order-reversal',
+    connector: 'xero',
+    type: 'UNEARNED_REV_REVERSAL',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    status: 'SYNCED',
+    payload: {},
+    payloadAccountNets: null,
+  }]
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+  assert.equal(result.success, true)
+  assert.equal(findAllocatedInventoryCredit(result), null, 'nothing is credited against an unknown relief')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /no readable lines and no preserved account summary/,
+  )
 })

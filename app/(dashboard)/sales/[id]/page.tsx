@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
 import { getSalesOrder } from '@/app/actions/sales'
+import { getReturnReasons } from '@/app/actions/return-reasons'
 import { getWarehouses, getScopedStockLevelMap, getAvgCogsMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getSetting, getTaxRates, getUsers } from '@/app/actions/settings'
@@ -23,6 +24,7 @@ import { requireAuth } from '@/lib/auth/server'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { listOrderAttachments, canEditOrderAttachments, canViewOrderAttachments } from '@/lib/domain/order-attachments'
 import { OrderAttachmentsCard } from '@/components/orders/order-attachments-card'
+import { getSalesOrderPegs } from '@/app/actions/pegging'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -31,7 +33,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue] = await Promise.all([
+  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger, wmsOrderStatus, wmsPushState, mergeCandidate, returnReasons, shopRefundDue] = await Promise.all([
     requireAuth(),
     getSalesOrder(id),
     getWarehouses(),
@@ -50,12 +52,14 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getWmsOrderStatusForSalesOrder(id),
     getWmsOrderPushStateForSalesOrder(id),
     getMergeCandidateForSalesOrder(id),
+    getReturnReasons(true),
     getShopRefundDueForSalesOrder(id),
   ])
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   if (!so) notFound()
+  const pegs = await getSalesOrderPegs(id)
   // audit-H2: a fully-paid order whose trigger won't auto-generate an invoice.
   const paidWithoutInvoice = shouldWarnPaidWithoutInvoice({
     becamePaid: Boolean(so.paidAt),
@@ -94,6 +98,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         wmsOrderStatus={wmsOrderStatus}
         wmsPushState={wmsPushState}
         mergeCandidate={mergeCandidate}
+        returnReasons={returnReasons}
         shopRefundDue={shopRefundDue}
         stockLevels={stockLevels}
         initialAllocations={allocations}
@@ -108,6 +113,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         rejectedAccountingSyncs={rejectedAccountingSyncs}
         paidWithoutInvoice={paidWithoutInvoice}
         editForm={editForm}
+        pegs={pegs}
       />
       <OrderAttachmentsCard kind="sales" orderId={so.id} attachments={attachments} canEdit={canEditAttachments} />
     </div>

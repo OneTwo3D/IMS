@@ -19,20 +19,16 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getSettingValue } from '@/lib/settings-store'
+import { WC_INVOICE_DOCUMENT_META_KEY, WC_INVOICE_DOCUMENT_META_VALUE } from '@/lib/domain/invoice-documents/storefront-contract'
+import { WC_INVOICE_DOCUMENT_ENABLED_SETTING, isInvoiceDocumentPublishingEnabled } from '@/lib/domain/invoice-documents/publishing-switch'
 import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
 import { wcPut } from '../api'
 import { assertWcAttemptMayWrite, isInsideWcAttemptFence } from '../attempt-fence'
 
-export const WC_INVOICE_DOCUMENT_ENABLED_SETTING = 'wc_invoice_document_enabled'
-export const WC_INVOICE_DOCUMENT_META_KEY = '_ims_invoice_pdf_available'
+export { WC_INVOICE_DOCUMENT_ENABLED_SETTING, isInvoiceDocumentPublishingEnabled }
+export { WC_INVOICE_DOCUMENT_META_KEY }
 /** The marker value for an invoice IMS posted itself: it has no document row, only the flat file. */
 export const LEGACY_FLAG_DOCUMENT_ID = 'legacy'
-
-/** Is the invoice-document writer switched on? Only an explicit `true`; unset, empty or anything else is OFF. */
-export async function isInvoiceDocumentPublishingEnabled(): Promise<boolean> {
-  return (await getSettingValue(WC_INVOICE_DOCUMENT_ENABLED_SETTING)) === 'true'
-}
 
 export type PublishInvoiceDocumentFlagOutcome =
   | { kind: 'written'; documentId: string }
@@ -87,7 +83,7 @@ export async function publishInvoiceDocumentFlagToWc(
   // THE SWITCH, READ AGAIN IMMEDIATELY BEFORE THE SEND: an operator who turns publishing off while an attempt is under way stops its PUT.
   await hooks.beforeLastSwitchRead?.()
   if (!(await isInvoiceDocumentPublishingEnabled())) return { kind: 'disabled' }
-  const result = await wcPut(`/orders/${externalOrderId}`, { meta_data: [{ key: WC_INVOICE_DOCUMENT_META_KEY, value: 'yes' }] })
+  const result = await wcPut(`/orders/${externalOrderId}`, { meta_data: [{ key: WC_INVOICE_DOCUMENT_META_KEY, value: WC_INVOICE_DOCUMENT_META_VALUE }] })
   if (result.held) return { kind: 'failed', held: true, error: `The invoice flag was not written to the WooCommerce order: ${result.error}` }
   if (result.error) return { kind: 'failed', held: false, error: `The invoice flag was not accepted by the WooCommerce order: ${result.error}` }
 

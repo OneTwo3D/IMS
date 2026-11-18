@@ -4,6 +4,7 @@ import { xeroBeforeCutoffRefusal, xeroProducerSeamVerdict, xeroResolveObligation
 import { freshAuthFailureResult, requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
+import { lockOrdersOfInvoiceRows, recomputeInvoicingStateForSyncLogs } from '@/lib/domain/sales/invoicing-state-sites'
 import { db } from '@/lib/db'
 import { checkBulkRetryConfirmation, isUsableEntryId } from '@/lib/domain/accounting/bulk-retry-confirmation'
 import type { BulkRetryConfirmation } from '@/lib/typed-confirmation'
@@ -38,7 +39,7 @@ import {
   syncReadinessVerdict,
   type AccountMappingRebindTx,
 } from '@/lib/connectors/xero/account-mapping-rebind'
-import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt-decision'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
 import { isMaskedSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
@@ -954,6 +955,8 @@ export async function retryFailedXeroSync(
         // The bulk path keeps the plain updateMany, deliberately (see the header): it makes no claim
         // about any particular attempt, and fencing it would refuse every row that has never been
         // fence-claimed while giving nothing back.
+        // Canonical lock order (order row, then sync rows), the cancellation's: the orders of the invoices being revived are locked BEFORE any of the rows are written.
+        if (allowedIds.length > 0) await lockOrdersOfInvoiceRows(tx as never, { id: { in: allowedIds } })
         let result: { count: number }
         if (allowedIds.length === 0) {
           result = { count: 0 }
@@ -982,6 +985,8 @@ export async function retryFailedXeroSync(
             data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
           })
         }
+        // A revived FAILED sales invoice is queued again, so it counts as an invoice again.
+        if (result.count > 0) await recomputeInvoicingStateForSyncLogs(tx as never, { id: { in: allowedIds } })
         return { count: result.count, refused, siblingIds }
       })
 

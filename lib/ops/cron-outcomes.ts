@@ -11,6 +11,7 @@ import type { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
 import type { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 import type { retryPendingWcOrdersWaitingForFx } from '@/lib/connectors/woocommerce/sync/order-import'
 import type { sweepUnregisteredReceipts } from '@/lib/domain/accounting/receipt-registration-sweep'
+import type { runPaymentMatchingPass } from '@/lib/domain/accounting/payment-matching'
 import type { writeDailyInventorySnapshot } from '@/lib/domain/inventory/inventory-snapshot'
 import type { runInvoiceDocumentSweep } from '@/lib/domain/invoice-documents/sweep'
 import type { getInvoiceDocumentHealth } from '@/lib/domain/invoice-documents/health'
@@ -71,6 +72,7 @@ type FxRatesCronResult = (Ret<typeof fetchAllFxRatesInternal> | { error: string 
     queue: Ret<typeof retryPendingWcOrdersWaitingForFx> | { error: string }
     orphans: Ret<typeof sweepUnregisteredReceipts> | { error: string }
   }
+  paymentMatching: Ret<typeof runPaymentMatchingPass> | { error: string }
   stepFailures?: Array<{ step: string; error: string }>
 }
 type AccountingSyncCronResult = {
@@ -176,6 +178,8 @@ export const cronOutcomes = {
   'invoice-documents': (r: InvoiceDocumentsCronResult) =>
     from(r, r.stoppedEarly ? structural({ error: r.stoppedEarly }) : null, num(r.failed) > 0 ? 'failed' : null),
   // an archive pass reports what it archived and skipped; there is no failure signal short of a throw
+  // failed: number (products whose storefront or warehouse hand-over threw; they keep their mark and are retried, then parked)
+  'product-sync-marks': (r: { failed: number }) => from(r, num(r.failed) > 0 ? 'failed' : null),
   'product-lifecycle-archive': (r: { scanned: number; archived: number; skippedWithStock: number; skippedWithIncoming: number }) => noFailureSignal(r),
   // status: FAILED = a stale feed that no admin could be told about
   'read-sync-liveness': (r: Ret<typeof runReadSyncLivenessAlarmLive>) => from(r, r.status === 'FAILED' ? 'failed' : null),

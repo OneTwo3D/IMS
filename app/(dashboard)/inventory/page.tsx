@@ -5,6 +5,8 @@ import { getStockUnitOptions } from '@/app/actions/settings'
 import { ProductFilters } from './product-filters'
 import { ProductTable } from '@/components/inventory/product-table'
 import { InventoryHeader } from './inventory-header'
+import { getSession } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 
 export const metadata: Metadata = { title: 'Inventory' }
@@ -26,6 +28,9 @@ export default async function InventoryPage({
   searchParams: Promise<SearchParams>
 }) {
   const sp = await searchParams
+  const session = await getSession()
+  const canEdit = !!session && hasPermission(session.user.role, 'inventory.edit')
+  const canEditPrices = !!session && hasPermission(session.user.role, 'inventory.prices')
   const page = parseInt(sp.page ?? '1')
 
   const [result, variableProducts, stockUnitOptions, categories, supplierOptions] = await Promise.all([
@@ -65,6 +70,8 @@ export default async function InventoryPage({
         page={result.page}
         pageSize={result.pageSize}
         searchParams={{ search: sp.search, type: sp.type, lifecycleStatus: sp.lifecycleStatus, categoryId: sp.categoryId, supplierId: sp.supplierId, sort: sp.sort, dir: sp.dir }}
+        canEdit={canEdit}
+        canEditPrices={canEditPrices}
       />
     </div>
   )

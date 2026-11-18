@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  PO_STATUSES, SO_STATUSES, buildListPage, buildPurchaseOrderListWhere, buildSalesOrderListWhere,
+  PO_STATUSES, SO_INVOICING_FILTERS, SO_STATUSES, buildListPage, buildPurchaseOrderListWhere, buildSalesOrderListWhere,
   normaliseListQuery, normalisePage, normaliseStatuses, poListHidesArchived, soListHides,
 } from '@/lib/domain/lists/order-list-query'
 import { EMPTY_ORDER_LIST_URL_STATE, orderListHref, orderListRangeLabel } from '@/lib/domain/lists/order-list-url'
@@ -115,4 +115,26 @@ test('purchase-order includeArchived shows archived orders with no search; the e
   assert.ok(!json(buildPurchaseOrderListWhere({ includeArchived: true })).includes('"archived"'))
   assert.ok(json(buildSalesOrderListWhere({ q: 'a' })).includes('"equals":"a","mode":"insensitive"'))
   assert.ok(json(buildPurchaseOrderListWhere({ q: 'a' })).includes('"equals":"a","mode":"insensitive"'))
+})
+
+test('the sales Invoicing filter selects on the invoicingState column, never on the status, so a cancelled order stays findable by it', () => {
+  const where = buildSalesOrderListWhere({ invoicing: ['NOT_INVOICED', 'PARTIALLY_INVOICED'] })
+  const text = json(where)
+  assert.ok(text.includes('"invoicingState":{"in":["NOT_INVOICED","PARTIALLY_INVOICED"]}'), text)
+  assert.ok(!text.includes('CANCELLED'), 'the filter does not exclude cancelled orders')
+  assert.deepEqual(json(buildSalesOrderListWhere({ invoicing: [] })), json(buildSalesOrderListWhere({})))
+  assert.deepEqual(json(buildSalesOrderListWhere({ invoicing: ['FULLY_INVOICED'], statuses: ['CANCELLED'] }).AND), json([
+    { archived: { not: true } }, { status: { in: ['CANCELLED'] } }, { invoicingState: { in: ['FULLY_INVOICED'] } },
+  ]), 'it combines with a status pick')
+})
+
+test('an explicit invoicing pick includes completed orders (a shipped, delivered order that was never invoiced is the point), archived stays hidden', () => {
+  assert.deepEqual(soListHides({ invoicing: ['NOT_INVOICED'] }), { completed: false, archived: true })
+  assert.ok(!json(buildSalesOrderListWhere({ invoicing: ['NOT_INVOICED'] })).includes('notIn'))
+})
+
+test('the invoicing picks round-trip through the address, and unknown values are dropped by the normaliser', () => {
+  assert.equal(orderListHref('/sales', { ...EMPTY_ORDER_LIST_URL_STATE, invoicing: ['NOT_INVOICED', 'FULLY_INVOICED'] }), '/sales?invoicing=NOT_INVOICED%2CFULLY_INVOICED')
+  assert.equal(orderListHref('/sales', EMPTY_ORDER_LIST_URL_STATE), '/sales')
+  assert.deepEqual(normaliseStatuses('NOT_INVOICED,bogus,FULLY_INVOICED', SO_INVOICING_FILTERS), ['NOT_INVOICED', 'FULLY_INVOICED'])
 })

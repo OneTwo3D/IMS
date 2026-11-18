@@ -63,9 +63,11 @@ A token issued on one network cannot be replayed from another, and tokens cannot
 Once invoice publication is switched on (see below), WooCommerce customers can download their invoice PDF from their Order page in the WC storefront. The flow is:
 
 1. The customer clicks "Download Invoice" on the WC order page.
-2. The WordPress helper plugin (`wc-invoice-handoff`) calls IMS with a customer-scoped token.
+2. The WordPress helper plugin (**onetwoInventory Helper**) calls IMS with a customer-scoped token.
 3. IMS verifies the WC order maps to a real IMS invoice and that the requesting customer owns it.
 4. The PDF is streamed back to the customer through the WC storefront.
+
+The **invoice e-mail** follows the same switch as My Account (`wc_invoice_document_enabled`): while it is off the e-mail attaches the invoice IMS renders itself, as it always did; once it is on, the e-mail attaches the Xero PDF IMS stored, the one the customer downloads, and an order whose stored invoice IMS cannot serve right now holds the e-mail back instead of sending a different rendering. Credit notes have their own download for the customer (never the invoice).
 
 Showing the stored invoice in the customer's **My Account** page is **not yet switched on**. The customer's Invoice button appears only on orders IMS has published, so while publication is off customers do not see it; email the invoice instead. See [WooCommerce](woocommerce.md#invoice-note-rules).
 

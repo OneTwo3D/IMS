@@ -80,6 +80,8 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.sales.invoice', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
   { key: 'xero.sales.invoice-update', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
   { key: 'xero.sales.credit-note', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }] },
+  // Queued by an operator deleting a refund; the void itself is sent by the drain under the same credit-note switch.
+  { key: 'xero.sales.credit-note-void', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }] },
   { key: 'xero.sales.payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_invoice' }] },
   { key: 'xero.purchase.bill-payment', trigger: 'automatic', requires: [...XERO_MASTER] },

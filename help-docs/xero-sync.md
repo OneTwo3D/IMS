@@ -703,6 +703,10 @@ This is why it matters: if the Discount account was configured *after* an invoic
 invoice charged the full goods value. Reversing it with a discount line would credit less than was
 charged and silently leave the difference on the customer's account.
 
+**Credit note void (a refund deleted in IMS).** When a refund recorded in error is deleted in IMS (see the Refunds help page), a credit note that was already posted is voided in Xero through the normal outbox. The delete is two-phase: IMS changes nothing about the refund until this entry succeeds, and then unwinds the refund as part of the same entry (a failure in that second step leaves the entry failed; retrying it repeats the harmless void read and finishes the delete). The sync page shows it as **Credit note void** against the deleted refund. It is **off unless** the credit note sync type is on, it follows the same posting hold as every other write (nothing is sent while outbound writes are held), and it is queued by the delete itself, never sent from the delete.
+
+How it behaves when it runs: it **reads the credit note first** and decides from what is there, so a retry after a lost response, or after a partial failure, converges. A credit note already **Voided** (or deleted) is a success and nothing is sent. An *Authorised* one is set to **Voided**; a draft one is deleted. One that has been **allocated to an invoice or paid out in Xero** is refused with that reason and is never changed: reverse the allocation or payment in Xero, then retry the entry. The credit note keeps its number as its audit trail; numbers are never reused because they come from a counter that does not go back. IMS refuses to start the delete when the credit note's date is on or before the lock date it last read from Xero, because Xero does not accept a change in a locked period. A posted COGS reversal journal is countered the same way, by a new journal with its lines swapped, queued as a COGS reversal against the deleted refund; an unsent one is simply cancelled.
+
 ## Transaction Types
 
 Configure which documents are synced to Xero under **Integrations → Xero → Transaction Types**. Each type can be set to **Off**, **Draft**, or **Submitted** (AUTHORISED in Xero):
@@ -883,6 +887,24 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 **A purchase order's rate is the table rate, never a typed one** (owner ruling 2026-10-25). `createPurchaseOrder`, the draft edit, the replenishment PO generator, the purchase-order CSV importer and the form all take the rate from the one lookup (`resolvePurchaseOrderFxRateToBase`, which calls `getFxRateToBase`); the former 2% override band (`PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE`) is gone. A PO is priced at the moment it is saved (the first load prices its orders at the end of their created day). A bill pushed to Xero therefore carries a `CurrencyRate` that IS an `fx_rates` row. An admin who needs another rate pins a manual override row (below); a stored PO rate is never rewritten.
 
 **A stored receipt is never left unregistered.** A receipt (a payment recorded by hand with Add payment, a WooCommerce paid transition, an imported paid order) is committed before its INVOICE_PAYMENT is queued. If the invoice had not posted yet, the invoice post registers it. If the invoice had already posted and the queueing failed, nothing used to retry it; now the scheduled FX-rates cron run sweeps every non-refund receipt on a posted invoice that has no INVOICE_PAYMENT row and no refusal notice (receipts older than 5 minutes, up to 50 per run, oldest first, recently failed ones behind) and registers it. Registration is keyed per receipt and document, so the inline call and the sweep never register it twice. Nothing is swept when no accounting connector posts payments.
+
+### Payment matching (Sync > Payment matching)
+
+A customer receipt IMS holds but Xero does not (a manual payment recorded after the invoice posted, a receipt of a payment method that had no bank account mapped at the time, a foreign-currency receipt refused for a missing rate) used to stay unregistered until someone noticed the unsettled badge. The **payment matching pass** looks for these on every FX-rates cron run (up to 50 per run) and matches each one to the open Xero invoice of its order, **by payment method and currency**, using the same *Payment Account Mapping* as every other payment. It is a sweep, not an event, and it adds no second way of posting: a live registration goes through the same path as Add payment and the receipt sweep above.
+
+**The mode** is set on the Sync > Payment matching page (administrators only) and is **off by default**:
+
+| Mode | What happens |
+|---|---|
+| **Off** | The matching pass does nothing. It does not stop the scheduled receipt sweep described above, which registers receipts with no payment row and no refusal notice in every mode. |
+| **Shadow** | Every candidate receipt is evaluated and listed on the page: the payment, the invoice, the bank account, the amount, the amount still open on the invoice, and the reason when it cannot be matched. **The matching pass sends nothing to Xero** and queues no sync row. Only receipts the scheduled receipt sweep leaves alone (those that carry a refusal notice) are listed, because the sweep registers every other eligible receipt in every mode, so listing it as "would post" would report work already done. Use it to review what live would do. |
+| **Live** | A receipt the evaluation says would post is claimed (one durable row per receipt, so a rerun or two sweeps at once cannot register it twice) and registered through the existing path. |
+
+**What the pass never does.** It never guesses a bank account: no mapping for the payment method and currency means *Not matched*, and the page says which method and currency to map. A receipt in a different currency from its invoice is *Not matched*. It never pays more than the amount still open on the invoice, in the invoice's currency (a part payment within what is open is allowed, as for any receipt). It never moves a payment out of a locked period: a receipt dated on or before the books lock date IMS imported from Xero is *Held back* and keeps its own date. A foreign-currency receipt without its stored settlement rate is *Held back*. While the outbound write hold is on, every match is *Held back* and nothing is posted.
+
+**Reading the page.** *Would post* (shadow only) is what live would register. *Not matched* means there is no safe match until the mapping or the currency is fixed. *Held back* names the rule that stops it (locked period, outbound write hold, over the amount due, an earlier payment attempt on the invoice that must be checked in Xero first). *Failed, will retry* is a live registration that did not reach the record; it is retried each run up to five times, then left for a person. *Registered* rows leave the list; the registration then posts like any other and shows in the sync log.
+
+A receipt that already has a payment row in the sync log is never a candidate: its registration, in whatever state, belongs to the retry paths described below.
 
 **Manual overrides and push log.** Settings → Accounting → **FX Rates** shows the current rate per currency, with a source badge (`ECB (frankfurter)`, `Aelia (before markup)` or `Manual override`). Pin a manual rate via the pencil icon — the daily fetch will then skip that currency until the override is cleared (the undo icon re-fetches from frankfurter). The same panel includes a recent-pushes table (one row per fan-out attempt to a shopping connector) so you can see whether the latest push to WooCommerce succeeded.
 
@@ -1931,6 +1953,8 @@ When a sales invoice is synced to Xero and payment is registered:
 3. A signed download link is pushed to the WooCommerce order as a customer-visible note
 4. An admin-only note with a "View in Xero" link is added to the WC order
 
+For an invoice **Xeroom** (not IMS) posted, IMS finds it in Xero read-only by its number, fetches the PDF and keeps it as the customer's one invoice; see the **Customer invoice in My Account** runbook (`docs/ops/invoice-documents-switchover-runbook.md`). Orders from before this existed are fetched on the customer's first click (queued, then fetched in the background within the shared 5,000-a-day Xero allowance, with a per-day cap), never in bulk. Credit notes are separate documents. IMS only reads from Xero for all of this; it writes nothing to Xero.
+
 Invoice PDFs are accessible via a signed URL: `/api/invoices/[orderId]?token=<hmac>`. The token is generated using HMAC-SHA256 and verified with timing-safe comparison.
 
 ## Xero Deep Links
@@ -2382,6 +2406,8 @@ to erase, and the warning is raised only for what that record names. Two consequ
   that could not;
 - a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
   the intended outcome, not a missing alarm: there was nothing to lose.
+
+**A compacted journal keeps its per-account net.** Retention writes each reversal-proof journal's per-account totals (codes and two numbers, no names) onto the row as it clears the payload, and the proof reads them once the lines are gone; a journal that cannot be summarised is left uncompacted and reported. A journal compacted **before this shipped** has neither, stays unprovable, and the credit is posted by hand. The refund and the daily batch treat such an unearned-revenue reversal as an **unknown amount, never zero**: the refund reverses no unearned revenue and logs a warning, and the daily batch skips that order's shipments (warning logged, nothing journaled) until the reversal is readable.
 
 A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
 against — recorded in a column retention does not touch — so it can be posted. Before, it was queued

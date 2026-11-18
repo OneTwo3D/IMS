@@ -37,6 +37,10 @@ export const SO_STATUSES = [
 ] as const
 export type SoListStatus = (typeof SO_STATUSES)[number]
 
+/** The sales order list's Invoicing filter: SalesOrder.invoicingState (lib/domain/sales/invoicing-state.ts). */
+export const SO_INVOICING_FILTERS = ['NOT_INVOICED', 'PARTIALLY_INVOICED', 'FULLY_INVOICED'] as const
+export type SoInvoicingFilter = (typeof SO_INVOICING_FILTERS)[number]
+
 export const SO_COMPLETED_STATUSES = ['COMPLETED', 'DELIVERED'] as const satisfies readonly SoListStatus[]
 
 export const PO_STATUSES = [
@@ -72,6 +76,8 @@ const ci = (value: string) => ({ contains: value, mode: 'insensitive' as const }
 export type SoListFilter = {
   q?: string
   statuses?: SoListStatus[]
+  /** Invoicing state picks (Not / Partially / Fully invoiced). Orthogonal to `statuses`; an explicit pick, like a status pick, includes completed orders. */
+  invoicing?: SoInvoicingFilter[]
   /** Show COMPLETED / DELIVERED orders in the default view. Search and an explicit status pick always include them. */
   showCompleted?: boolean
   /** Show archived orders in the default view. Search always includes them. */
@@ -84,7 +90,7 @@ export type SoListHidden = { completed: boolean; archived: boolean }
 export function soListHides(filter: SoListFilter): SoListHidden {
   const q = normaliseListQuery(filter.q)
   const searching = q.length > 0
-  const explicit = (filter.statuses?.length ?? 0) > 0
+  const explicit = (filter.statuses?.length ?? 0) > 0 || (filter.invoicing?.length ?? 0) > 0
   return {
     completed: !searching && !explicit && !filter.showCompleted,
     archived: !searching && !filter.includeArchived,
@@ -99,6 +105,8 @@ export function buildSalesOrderListWhere(filter: SoListFilter): Prisma.SalesOrde
   if (hides.archived) and.push({ archived: { not: true } })
   if (filter.statuses && filter.statuses.length > 0) and.push({ status: { in: filter.statuses } })
   else if (hides.completed) and.push({ status: { notIn: [...SO_COMPLETED_STATUSES] } })
+  // The invoicing state is its own column: a cancelled order keeps the state it had, so this filter never reads the status.
+  if (filter.invoicing && filter.invoicing.length > 0) and.push({ invoicingState: { in: filter.invoicing } })
 
   if (q && q.length < ORDER_LIST_MIN_SUBSTRING_LENGTH) {
     and.push({ OR: [{ orderNumber: eq(q) }, { externalOrderNumber: eq(q) }] })

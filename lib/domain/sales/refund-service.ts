@@ -70,14 +70,13 @@ import {
   assertedJournalRemedy,
   cappedAllocationCredit,
   describeJournalRowState,
-  extractPayloadNetMovement,
   isAssertedJournalRefusal,
   journalRowProvesAmount,
-  payloadLinesLegible,
   proveAllocationDebitPosting,
   proveJournalPosting,
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
+import { journalNetMovement, journalNetsReadable } from '@/lib/domain/accounting/journal-account-nets'
 import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { findDurableShadowRecords, shadowRecordNamesSyncLog } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -1361,10 +1360,12 @@ async function createReturnInboundMovementAndCostLayersTx(
     idempotencyKey?: string
   },
 ): Promise<'created' | 'duplicate'> {
+  let createdMovement: { id: string } | undefined
   try {
     // o3d-slrn: returning 'duplicate' leaves the CALLER continuing on this same tx, so the
     // failing insert must be savepointed or everything after it hits a 25P02.
-    await withSavepoint(tx, () => tx.stockMovement.create({
+    createdMovement = await withSavepoint(tx, () => tx.stockMovement.create({
+      select: { id: true },
       data: {
         type: 'RETURN_INBOUND',
         productId: params.movementRow.productId,
@@ -1413,6 +1414,8 @@ async function createReturnInboundMovementAndCostLayersTx(
         remainingQty: row.qty,
         unitCostBase: unitCostBase.toFixed(6),
         poLineId: row.poLineId ?? null,
+        // o3d-ngmt.22: which movement created this layer, so deleting the refund removes exactly the layers its own return made.
+        returnMovementId: createdMovement?.id ?? null,
       },
       select: { id: true },
     })
@@ -1755,6 +1758,7 @@ async function stageRefundAccountingReversals(
         referenceType: true,
         referenceId: true,
         payload: true,
+        payloadAccountNets: true,
         ...LEDGER_STANDING_SELECT,
       },
     })
@@ -2037,8 +2041,32 @@ async function stageRefundAccountingReversals(
 
     const priorUnearnedReversedRows = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+    // o3d-oyur (Codex r1 HIGH): a reversal whose lines are gone AND whose compaction summary is missing
+    // (a legacy compacted row, no backfill) moved an UNKNOWN amount, which is not a zero one. Counting it as
+    // zero raised the open unearned balance by whatever that reversal took and let this refund debit
+    // Unearned Revenue again. Unknown withholds this refund's unearned reversal altogether (the safe
+    // direction: it can only under-reverse, leaving a visible liability) and the refund says so.
+    const unreadableUnearnedReversalRows = priorUnearnedReversedRows
+      .filter((row) => journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') == null)
     const priorUnearnedReversed = priorUnearnedReversedRows
-      .reduce((sum, row) => sum + extractPayloadNetMovement(row.payload, settings.unearnedRevenueAccount, 'debit'), 0)
+      .reduce((sum, row) => sum + (journalNetMovement(row, settings.unearnedRevenueAccount, 'debit') ?? 0), 0)
+    if (unreadableUnearnedReversalRows.length > 0) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.orderId,
+          action: 'refund_unearned_reversal_withheld_unreadable_prior',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `${unreadableUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order have no readable lines and no preserved account summary (compacted before summaries existed), so how much unearned revenue they already reversed cannot be established. This refund reversed NO unearned revenue rather than risk reversing it twice: the unearned revenue account for this order needs reviewing.`,
+          metadata: {
+            orderId: params.orderId,
+            refundId: params.refundId,
+            unreadableReversalCount: unreadableUnearnedReversalRows.length,
+          },
+        },
+      })
+    }
     // o3d-3la07 (M7, REPORT-ONLY - the arithmetic above is unchanged). An UNEARNED_REV_REVERSAL that an
     // operator settled as posted still reduces the unearned revenue this refund may reverse (the
     // reversal is claimed to exist, so counting it errs towards under-reversing), but its figure is the
@@ -2212,7 +2240,7 @@ async function stageRefundAccountingReversals(
       }
       const journal = await tx.accountingSyncLog.findUnique({
         where: { id: record.syncLogId },
-        select: { connector: true, payload: true, ...LEDGER_STANDING_SELECT },
+        select: { connector: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
       })
       // Deleted by retention once terminal: read as the recorded amount, the least destructive of
       // the two readings left — but ASSUMED, not proved (o3d-o97 r6). Retention deletes SYNCED and
@@ -2313,7 +2341,13 @@ async function stageRefundAccountingReversals(
         priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS did not verify it against the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
         continue
       }
-      priorRefundAllocationRelief += extractPayloadNetMovement(row.payload, settings.allocatedInventoryAccount, 'credit')
+      // o3d-oyur (Codex r1 HIGH): null is UNKNOWN (lines compacted away, no summary), never zero relief.
+      const orderLevelRelief = journalNetMovement(row, settings.allocatedInventoryAccount, 'credit')
+      if (orderLevelRelief == null) {
+        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal (${describeJournalRowState(row)}) has no readable lines and no preserved account summary, so how much it already credited Allocated Inventory cannot be established`
+        continue
+      }
+      priorRefundAllocationRelief += orderLevelRelief
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
       // (1) THE RECORD the refund wrote when it decided its own reversal — RESOLVED, not trusted.
@@ -2496,7 +2530,7 @@ async function stageRefundAccountingReversals(
       const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
       // Read only when `unsettled` is empty (below), i.e. when EVERY row proves an amount, so no further
       // settled-ness filter is needed (one would be unobservable, and a second spelling of the rule).
-      const legible = reversalRows.filter((row) => payloadLinesLegible(row.payload))
+      const legible = reversalRows.filter((row) => journalNetsReadable(row))
       if (unsettled.length > 0) {
         // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
         // in-flight or abandoned reversal is pounds that may or may not have moved, and either
@@ -2944,10 +2978,12 @@ async function stageRefundAccountingReversals(
       ))
     }
 
-    const remainingUnearned = Math.round(Math.max(
-      0,
-      refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
-    ) * 100) / 100
+    const remainingUnearned = unreadableUnearnedReversalRows.length > 0
+      ? 0
+      : Math.round(Math.max(
+        0,
+        refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
+      ) * 100) / 100
     // 6oyu.5: shipment-source entries are valued at the ORIGINALLY-POSTED COGS
     // (applyPostedShipmentUnitCosts), so both the COGS reversal below and the
     // returned-stock new inventory layer (snapshotReturnRows, shipment-source only)
@@ -3884,6 +3920,8 @@ export async function createSalesOrderRefund(
     orderId: string
     lines: RefundRequestLine[]
     reason: string
+    /** The structured reason (a configured ReturnReason id), validated by the caller. Optional; the free-text `reason` above is separate. */
+    returnReasonId?: string | null
     returnWarehouseId?: string
     externalRefundId?: number
     creditNotePrefix: string
@@ -5191,6 +5229,7 @@ export async function createSalesOrderRefund(
         // by lib/connectors/woocommerce/sync/refund-stock-correction.ts once the stock job is durably recorded.
         stockCorrectionRequired: storefrontRefund && refundLines.some((line) => line.qty > 0 && Boolean(line.productId)),
         reason: input.reason || null,
+        returnReasonId: input.returnReasonId ?? null,
         totalForeign,
         totalBase: headerTotalBase,
         totalsBasis: 'NET',

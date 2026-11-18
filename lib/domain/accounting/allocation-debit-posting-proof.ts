@@ -62,6 +62,12 @@
  * caller can reach for the other's answer by accident.
  */
 
+import {
+  extractPayloadNetMovement,
+  journalNetMovement,
+  journalNetsReadable,
+  payloadLinesLegible,
+} from '@/lib/domain/accounting/journal-account-nets'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import {
@@ -87,7 +93,11 @@ export type JournalLedgerProof =
   | { kind: 'unproved'; statuses: string; asserted?: boolean }
 
 /** A journal row as the amount proof reads it: the ledger-standing columns plus the payload. */
-export type JournalProofRow = LedgerStandingRow & { payload: unknown }
+export type JournalProofRow = LedgerStandingRow & { payload: unknown; payloadAccountNets?: unknown }
+
+// The net readers live beside the summary they read (journal-account-nets.ts); re-exported so every
+// existing import of them from this module keeps working.
+export { extractPayloadNetMovement, payloadLinesLegible }
 
 /**
  * o3d-3la07 (M8/M9) - A ROW THAT CAN PROVE AN AMOUNT: SETTLED (SYNCED) AND A LEDGER FACT.
@@ -198,37 +208,6 @@ export function unprovedJournalClause(proof: { statuses: string; asserted?: bool
     : `${proof.statuses}, not SYNCED`
 }
 
-function boundaryNumber(value: unknown): number {
-  if (value === null || value === undefined) return 0
-  const parsed = typeof value === 'number' ? value : Number((value as { toString(): string }).toString())
-  return Number.isFinite(parsed) ? parsed : 0
-}
-
-/**
- * The account's NET movement across a journal payload's own lines, in the direction the caller
- * names. Net, never gross: a batch journal can touch one account on BOTH sides (two settings roles
- * mapped to the same code, a reconciliation rounding line), and a gross read lets a share be
- * "inside its batch" against a journal that moved the account a fraction of that.
- *
- * An empty account code is not a match — an unconfigured account would otherwise sum every line
- * whose own accountCode is blank (o3d-o97 r2).
- */
-export function extractPayloadNetMovement(
-  payload: unknown,
-  accountCode: string,
-  side: 'credit' | 'debit',
-): number {
-  if (!accountCode) return 0
-  const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
-  if (!Array.isArray(linesPayload)) return 0
-  return linesPayload.reduce((sum, line) => {
-    if (line.accountCode !== accountCode) return sum
-    const debit = boundaryNumber(line.debit ?? 0)
-    const credit = boundaryNumber(line.credit ?? 0)
-    return sum + (side === 'credit' ? credit - debit : debit - credit)
-  }, 0)
-}
-
 /**
  * o3d-o97 r5 — WHAT A JOURNAL ROW PROVES, WHICH IS NEVER ITS STATUS.
  *
@@ -242,15 +221,6 @@ export function extractPayloadNetMovement(
  * drops `payload` from a row it keeps, which is the same epistemic position as a row retention has
  * deleted outright. The CALLER resolves it, to whichever side moves the least money.
  */
-/**
- * Whether a sync row still carries readable journal lines. `backReferenceEvidenceCompactedAt`
- * compaction drops `payload` from a row it keeps, so a settled row can be present with nothing
- * readable on it — which is an ANSWER ("finished, outcome no longer legible"), not an error.
- */
-export function payloadLinesLegible(payload: unknown): boolean {
-  return Array.isArray((payload as { lines?: unknown } | null)?.lines)
-}
-
 export function proveJournalPosting(
   rows: JournalProofRow[],
   accountCode: string,
@@ -275,14 +245,15 @@ export function proveJournalPosting(
       asserted: rows.some((row) => ledgerStanding(row) === 'ASSERTED_POSTED'),
     }
   }
-  if (rows.some((row) => !payloadLinesLegible(row.payload))) return { kind: 'illegible' }
+  // A row whose lines are gone is still readable if compaction preserved its per-account net (o3d-oyur).
+  if (rows.some((row) => !journalNetsReadable(row))) return { kind: 'illegible' }
   if (!accountCode) return { kind: 'unproved', statuses: 'no Allocated Inventory account configured' }
   return {
     kind: 'proved',
     // Floored at zero because a negative net is the account moving the OTHER WAY, which is not a
     // smaller debit but none of one.
     amount: Math.max(0, rows.reduce(
-      (sum, row) => sum + extractPayloadNetMovement(row.payload, accountCode, side),
+      (sum, row) => sum + (journalNetMovement(row, accountCode, side) ?? 0),
       0,
     )),
   }
@@ -390,7 +361,7 @@ export type AllocationDebitPostingProofClient = {
   accountingSyncLog: {
     findUnique(args: {
       where: { id: string }
-      select: { status: true; connector: true; payload: true } & typeof LEDGER_STANDING_SELECT
+      select: { status: true; connector: true; payload: true; payloadAccountNets: true } & typeof LEDGER_STANDING_SELECT
     }): Promise<(JournalProofRow & { connector: string | null }) | null>
   }
 }
@@ -548,7 +519,7 @@ export async function proveAllocationDebitPosting<C extends string = string>(
   for (const [journalId, share] of byJournal) {
     const journal = await client.accountingSyncLog.findUnique({
       where: { id: journalId },
-      select: { connector: true, payload: true, ...LEDGER_STANDING_SELECT },
+      select: { connector: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
     })
     if (!journal) {
       return {

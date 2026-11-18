@@ -29,10 +29,10 @@ test('processes a sales order through shipment and tracking edit', async ({ page
   await expect(page.getByText(/shipment from/i)).toBeVisible()
 
   await page.getByRole('button', { name: /start picking/i }).click()
-  await expect(page.getByText('Picking', { exact: false })).toBeVisible()
+  await expect(page.getByText('Picking', { exact: true })).toBeVisible()
 
   await page.getByRole('button', { name: /mark packed/i }).click()
-  await expect(page.getByText('Packed', { exact: false })).toBeVisible()
+  await expect(page.getByText('Packed', { exact: true })).toBeVisible()
 
   await page.getByRole('button', { name: /^Ship$/ }).click()
   const shipDialog = page.getByRole('dialog', { name: 'Ship Parcel' })

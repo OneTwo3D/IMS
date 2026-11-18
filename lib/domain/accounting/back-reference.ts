@@ -1,4 +1,5 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import type { AccountingLinkSource, AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { NAMES_A_DOCUMENT_WHERE } from '@/lib/domain/accounting/ledger-standing'
@@ -1751,6 +1752,11 @@ export async function releaseAndRelinkExternalDocumentId(
       // because a record of a destructive act that can fail on its own is not a record. A throw here
       // takes the release down with it and the operator is told the command failed and wrote
       // nothing — which is true, and is recoverable by re-running.
+      // The released holder lost its link, and the order the id was applied to gained one: both invoicing states are re-derived.
+      if (holder.model === 'SalesOrder') {
+        await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, params.confirmedHolderId)
+        if (applied.referenceType === 'SalesOrder') await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, applied.referenceId)
+      }
       const release = {
         releasedFrom: params.confirmedHolderId,
         appliedTo: { referenceType: applied.referenceType, referenceId: applied.referenceId },
