@@ -21,6 +21,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import {
   advancePoStatus,
   approvePurchaseOrder,
+  reconcileRetiredAsnCredit,
   confirmAndSendPurchaseOrder,
   sendPurchaseOrderEmail,
   updatePoTracking,
@@ -1997,6 +1998,16 @@ function RetirePoDialog({
     ? (intent === 'close' ? 'Close short' : 'Cancel the unreceived balance')
     : (intent === 'close' ? 'Close this purchase order' : 'Cancel this purchase order')
 
+  const needsReconcile = error.includes('not yet booked into this order')
+
+  function reconcile() {
+    startTransition(async () => {
+      const result = await reconcileRetiredAsnCredit(po.id)
+      if (result.success) setError(`${result.message ?? 'Reconciled.'} You can now ${intent === 'close' ? 'close' : 'cancel'} the order.`)
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
   function confirm() {
     setError('')
     startTransition(async () => {
@@ -2042,6 +2053,9 @@ function RetirePoDialog({
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Keep order open</Button>
+          {needsReconcile && (
+            <Button variant="outline" onClick={reconcile} disabled={isPending}>Reconcile warehouse receipt</Button>
+          )}
           <Button variant={intent === 'cancel' ? 'destructive' : 'default'} onClick={confirm} disabled={isPending}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             {hasReceived && !fullyReceived ? 'Drop the balance' : (intent === 'close' ? 'Close order' : 'Cancel order')}

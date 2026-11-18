@@ -16,6 +16,8 @@ import { queueEmail } from '@/lib/email-outbox'
 import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
 import { requirePermission } from '@/lib/auth/server'
+import { findLiveAsnBlocks } from '@/lib/domain/wms/po-receipt-asn-guard'
+import { foldRetiredAsnCreditIntoPurchaseOrder } from '@/lib/domain/wms/retired-asn-credit-fold'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
 // order the WMS alignment relies on. See that module's census of every writer.
 import {
@@ -2238,6 +2240,55 @@ export async function updatePurchaseOrder(
       metadata: null,
     })
     return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Operator-side reconcile for a purchase order whose warehouse stock credit sits on an ALREADY-RETIRED ASN (o3d-98hnd). Close, cancel
+ * and the supplier-return flow all wait for that credit to be folded into the line's received quantity; for an open ASN the Recheck
+ * booked-in action does it, but a retired ASN is never re-driven. This folds the credit in (no stock, cost layer or journal is added:
+ * the alignment already did that). Refused while a live ASN exists, because a live ASN's manual-receipt pool reads `qtyReceived`.
+ */
+export async function reconcileRetiredAsnCredit(poId: string): Promise<{ success: boolean; error?: string; foldedQty?: number; message?: string }> {
+  try {
+    await requirePermission('purchasing.receive')
+    const result = await db.$transaction(async (tx) => {
+      const probe = await tx.purchaseOrder.findUnique({ where: { id: poId }, select: { type: true } })
+      if (!probe) throw new Error('PO not found')
+      if (probe.type === 'GOODS') await lockLandedCostRevaluationScope(tx, { primaryPoIds: [poId] })
+      else await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+      const po = await tx.purchaseOrder.findUnique({ where: { id: poId }, select: { reference: true, lines: { select: { id: true } } } })
+      if (!po) throw new Error('PO not found')
+      const lineIds = po.lines.map((l) => l.id)
+      const blocks = await findLiveAsnBlocks(tx, lineIds)
+      if (blocks.length > 0) {
+        throw new Error(`${po.reference} still has an open warehouse ASN (${[...new Set(blocks.map((b) => b.externalAsnId))].join(', ')}). Use Recheck booked-in on it instead.`)
+      }
+      const folded = await foldRetiredAsnCreditIntoPurchaseOrder(tx, { poId, reference: po.reference, poLineIds: lineIds })
+      return { reference: po.reference, folded }
+    }, STOCK_TX_OPTIONS)
+    if (result.folded.lines.length > 0) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: poId,
+        action: 'retired_asn_credit_reconciled',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `Folded ${result.folded.foldedQty} unit(s) of warehouse stock credit on retired ASN(s) into the received quantity of ${result.reference}`,
+        metadata: { reference: result.reference, foldedQty: result.folded.foldedQty, lines: result.folded.lines },
+      })
+    }
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${poId}`)
+    return {
+      success: true,
+      foldedQty: result.folded.foldedQty,
+      message: result.folded.lines.length > 0
+        ? `Reconciled ${result.folded.foldedQty} unit(s) from retired warehouse ASNs into the received quantity.`
+        : 'Nothing to reconcile: no retired warehouse ASN holds unreconciled stock credit on this order.',
+    }
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) }
   }
 }
 
