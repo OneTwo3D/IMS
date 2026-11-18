@@ -104,3 +104,13 @@ test('a single-rate order is priced the same either way, and the default (flag a
   const base = { fxRate: 1, vatRate: 0.2, pricesIncludeVat: false, orderDiscountForeign: 30, lines: mixedLines([0.2, 0.2]) }
   assert.deepEqual(buildSalesOrderWriteModel({ ...base, apportionDiscountTax: true }).totals, buildSalesOrderWriteModel(base).totals)
 })
+
+test('the apportioned-discount-tax switch is the setting sales_order_discount_tax_apportion_enabled (=== "true"), never an environment variable', () => {
+  const source = readFileSync(join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+  assert.ok(
+    source.includes("(await getSettingValue('sales_order_discount_tax_apportion_enabled')) === 'true'"),
+    'prepareSalesOrderWrite must read the setting, OFF unless it is exactly "true"',
+  )
+  assert.ok(!/IMS_APPORTION_ORDER_DISCOUNT_TAX/.test(source), 'the env var read is gone')
+  assert.match(source, /apportionDiscountTax,\n/, 'the setting value is what is passed to the write model')
+})
