@@ -145,6 +145,7 @@
  */
 
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { currencyMinorUnits, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
@@ -1074,5 +1075,5 @@ export function orderDiscountReversalRateRefusal(input: {
   if (!charged.gt(0)) return null
   // Rates are stored to 6 places; anything closer than that is the same rate.
   if (input.postedRate.sub(charged).abs().lte(toDecimal('0.000001'))) return null
-  return `${input.label} would post at ${input.postedRate.mul(100).toDecimalPlaces(4).toString()}% but the order's discount was charged at ${charged.mul(100).toDecimalPlaces(4).toString()}%, so the VAT it reverses would be wrong. Restore the order's default tax rate, or raise the credit note manually.`
+  return withLedgerCheck(`${input.label} would post at ${input.postedRate.mul(100).toDecimalPlaces(4).toString()}% but the order's discount was charged at ${charged.mul(100).toDecimalPlaces(4).toString()}%, so the VAT it reverses would be wrong. Restore the order's default tax rate, or raise the credit note manually.`)
 }
