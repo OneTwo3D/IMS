@@ -10,6 +10,7 @@ const dbDouble = {
   $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({
     ...dbDouble,
     $executeRaw: async () => [],
+    $queryRaw: async () => [],
   }),
 }
 mock.module('@/lib/db', { namedExports: { db: dbDouble, prisma: dbDouble } })
