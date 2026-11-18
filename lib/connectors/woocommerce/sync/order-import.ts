@@ -1555,8 +1555,6 @@ async function updateExistingWcOrderCore(
       data: {
         externalOrderNumber: wcOrder.number,
         ...(erased || staleDelivery ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
-        // The stored modified time follows the newest delivery applied (it was only ever written on create).
-        ...(!staleDelivery && incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) ? { externalUpdatedAt: incomingModifiedAt } : {}),
         // The shipping label, method id and courier key are refreshed TOGETHER from the CURRENT first shipping line (the key
         // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
         // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
@@ -1574,6 +1572,8 @@ async function updateExistingWcOrderCore(
               shippingAddress: mapWcAddress(wcOrder.shipping),
               notes: wcOrder.customer_note || null,
             }),
+        // The stored modified time follows the newest delivery applied (it was only ever written on create).
+        ...(!staleDelivery && incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) ? { externalUpdatedAt: incomingModifiedAt } : {}),
         paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //
