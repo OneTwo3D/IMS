@@ -41,3 +41,15 @@ test('o3d-cr517: a NET credit comes off a GROSS order total as its VAT-inclusive
   assert.equal(receivableOutstanding({ ...order, refunds: [{ totalForeign: '50', totalBase: '40', totalsBasis: 'NET', lines: [] }] }).outstandingForeign, 70)
   assert.equal(receivableOutstanding({ ...order, refunds: [{ totalForeign: '50', totalBase: '40', totalsBasis: null }] }).outstandingForeign, 70)
 })
+
+test('o3d-cr517: a fully refunded NET order in a high-ratio currency leaves nothing outstanding (gross-up in foreign terms)', () => {
+  // 12,000 JPY gross (10,000 net + 2,000 VAT) booked at 61.37 GBP gross; the base figures are rounded independently of the foreign ones.
+  const order = {
+    totalForeign: '12000', totalBase: '61.37', currency: 'JPY', payments: [],
+    refunds: [{
+      totalForeign: '10000', totalBase: '51.14', totalsBasis: 'NET',
+      lines: [{ totalBase: '51.14', salesOrderLine: { totalBase: '51.14', taxBase: '10.23' } }],
+    }],
+  }
+  assert.equal(receivableOutstanding(order).outstandingForeign, 0)
+})

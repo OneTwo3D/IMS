@@ -137,6 +137,7 @@ import { refreshXeroBooksLockDate } from '@/lib/connectors/xero/books-lock-date'
 import { businessDateYmd } from '@/lib/business-date'
 import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
+import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
 export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
@@ -1912,10 +1913,14 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       const refunds = await tx.salesOrderRefund.findMany({
         where: { orderId: { in: orderIds } },
-        select: { id: true, orderId: true, unearnedReversedAmount: true },
+        select: { id: true, orderId: true, unearnedReversedAmount: true, accountingRetryRequired: true },
       })
-      const refundsByOrder = new Map<string, typeof refunds>()
-      for (const refund of refunds) refundsByOrder.set(refund.orderId, [...(refundsByOrder.get(refund.orderId) ?? []), refund])
+      // o3d-fk9py: a refund whose journal was only shadowed (never sent) is not proof the reversal reached the ledger.
+      const shadowedRefundIds = new Set(
+        refunds.length === 0 ? [] : (await findDurableShadowRecords(tx, 'xero', [{ subjectType: 'SalesOrderRefund', exactIds: refunds.map((refund) => refund.id), operations: ['inventory.journals'] }])).map((record) => record.subjectId),
+      )
+      const refundsByOrder = new Map<string, Array<(typeof refunds)[number] & { shadowed: boolean }>>()
+      for (const refund of refunds) refundsByOrder.set(refund.orderId, [...(refundsByOrder.get(refund.orderId) ?? []), { ...refund, shadowed: shadowedRefundIds.has(refund.id) }])
       const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
       // o3d-3la07 (M5, D3: REPORT-ONLY). The netting below still sums exactly the PENDING / PROCESSING /
       // SYNCED rows it always did (`countedUnearnedReversalRows`); the read is widened by the CANCELLED

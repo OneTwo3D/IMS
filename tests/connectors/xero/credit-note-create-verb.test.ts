@@ -161,6 +161,23 @@ test('the ledger holding TWO documents under our number refuses and says payable
   assert.deepEqual(calls, [])
 })
 
+test('o3d-n0o5f: after the extras are voided, the one live survivor is adopted (voided siblings do not count as duplicates)', async () => {
+  reset()
+  const { pushPurchaseCreditNote } = await creditNotes()
+  const result = await pushPurchaseCreditNote(base, 'AUTHORISED', {
+    firstAttempt: false,
+    creditNote: CN,
+    lookup: says({ ok: true, claims: [
+      { creditNoteId: 'cn-void', creditNoteNumber: 'SCN-scn-2', status: 'VOIDED' },
+      { creditNoteId: 'cn-live', creditNoteNumber: 'SCN-scn-2', status: 'AUTHORISED' },
+      { creditNoteId: 'cn-del', creditNoteNumber: 'SCN-scn-2', status: 'DELETED' },
+    ] }),
+  })
+  assert.equal(result.success, true, result.error)
+  assert.equal(result.adopted, true)
+  assert.deepEqual(calls, [], 'adopting sends nothing')
+})
+
 test('a VOIDED document under our number is never adopted — that is a human decision', async () => {
   reset()
   const { pushPurchaseCreditNote } = await creditNotes()

@@ -418,14 +418,15 @@ export function receivableOutstanding(order: {
   ), toDecimal(0))
   // o3d-cr517: the order total is GROSS (VAT-inclusive) but a NET-basis refund's `totalForeign` is ex-VAT, so subtracting it left the
   // refunded VAT in the receivable. A NET credit that can be placed exactly is taken as its gross equivalent (the same reading the
-  // aging reports use), converted to the order currency at the order's own booked rate (one rate per order); a credit that cannot be placed,
+  // aging reports use), in the order currency (see below); a credit that cannot be placed,
   // or a legacy/GROSS one, is read as it stands, exactly as before.
-  const orderTotalForeign = toDecimal(order.totalForeign as never)
-  const orderTotalBase = toDecimal(order.totalBase as never)
   const credited = order.refunds.reduce((sum, refund) => {
-    if (refund.totalsBasis === 'NET' && orderTotalForeign.gt(0) && orderTotalBase.gt(0)) {
+    const refundBase = toDecimal(refund.totalBase as never)
+    if (refund.totalsBasis === 'NET' && refundBase.gt(0)) {
       const placed = refundCreditsAsGross([{ totalBase: refund.totalBase, totalsBasis: 'NET', lines: refund.lines }])
-      if (placed.bound === 'exact') return addMoney(sum, multiplyMoney(placed.credit as never, orderTotalForeign).div(orderTotalBase) as never)
+      // Grossed up in the ORDER's currency: the refund's own foreign total scaled by gross/net, so no base rounding and no order-level
+      // ratio is involved (a fully refunded order leaves nothing outstanding even in a high-ratio currency).
+      if (placed.bound === 'exact') return addMoney(sum, multiplyMoney(refund.totalForeign as never, placed.credit as never).div(refundBase) as never)
     }
     return addMoney(sum, refund.totalForeign as never)
   }, toDecimal(0))

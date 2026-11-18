@@ -75,12 +75,18 @@ export function sumPostedUnearnedReversal(
  */
 export function durableUnearnedReversalTopUp(
   reversalSyncs: Array<{ payload: unknown; payloadAccountNets?: unknown; refundId?: string | null }>,
-  refunds: Array<{ id: string; unearnedReversedAmount: unknown }>,
+  refunds: Array<{ id: string; unearnedReversedAmount: unknown; accountingRetryRequired?: boolean | null; shadowed?: boolean }>,
   unearnedRevenueAccount: string,
 ): number {
   let total = 0
   for (const refund of refunds) {
     if (refund.unearnedReversedAmount == null) continue
+    // A column is a STAGING figure: it is written before anything is queued. With no counted row for the refund it is proved only by
+    // retention having erased the row, which is not the case while the refund still owes its accounting (nothing was queued) or its
+    // journal was only shadowed (never sent). Counting it there would net a reversal that never reaches Xero (refund-service refuses
+    // the same two states on its relief path).
+    const hasRows = reversalSyncs.some((sync) => sync.refundId === refund.id)
+    if (!hasRows && (refund.accountingRetryRequired || refund.shadowed)) continue
     const durable = Number(refund.unearnedReversedAmount)
     if (!Number.isFinite(durable)) continue
     const rowsTotal = sumPostedUnearnedReversal(

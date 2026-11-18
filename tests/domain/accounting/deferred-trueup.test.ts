@@ -166,3 +166,18 @@ test('o3d-nz0e0: a reversal posted under a since re-mapped unearned account is r
   assert.equal(unearnedReversalDebit({ payload: { lines: [{ accountCode: 'UNEARNED', debit: 7 }] } }, 'UNEARNED'), 7)
   assert.equal(unearnedReversalDebit({ payload: {}, payloadAccountNets: null }, 'UNEARNED'), null)
 })
+
+test('o3d-fk9py: a staged-but-never-queued reversal is NOT counted (refund still owes its accounting, or only shadowed)', () => {
+  // No sync row, column 30: the unfinished hand-off queued nothing, so nothing reaches Xero. Counting it would leave 30 on Unearned for good.
+  assert.equal(durableUnearnedReversalTopUp([], [{ id: 'r1', unearnedReversedAmount: 30, accountingRetryRequired: true }], 'UNEARNED'), 0)
+  assert.equal(durableUnearnedReversalTopUp([], [{ id: 'r1', unearnedReversedAmount: 30, shadowed: true }], 'UNEARNED'), 0)
+  // The same refund with its journal row still readable keeps counting from the row (proved queued), top-up only for the excess.
+  const rows = [{ refundId: 'r1', payload: { lines: [{ accountCode: 'UNEARNED', debit: 30 }] } }]
+  assert.equal(durableUnearnedReversalTopUp(rows, [{ id: 'r1', unearnedReversedAmount: 30, accountingRetryRequired: true }], 'UNEARNED'), 0)
+  // Retention case (no row, no flag, no shadow) still tops up from the durable figure.
+  assert.equal(durableUnearnedReversalTopUp([], [{ id: 'r1', unearnedReversedAmount: 30, accountingRetryRequired: false }], 'UNEARNED'), 30)
+})
+
+test('o3d-fk9py: a never-post settlement zeroes the column, so it adds nothing', () => {
+  assert.equal(durableUnearnedReversalTopUp([], [{ id: 'r1', unearnedReversedAmount: 0, accountingRetryRequired: false }], 'UNEARNED'), 0)
+})

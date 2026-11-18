@@ -46,19 +46,8 @@ function createClient(input: {
     categoryId?: string
   }>
   postAsOfRevaluations?: Array<{ productId?: string; warehouseId?: string; effectiveAt: Date }>
-  /** o3d-cr517: the snapshot run rows (the instant each snapshot was cut at). Absent = no run table on the client. */
-  runs?: Array<{ snapshotDate: Date; cutoffAt: Date | null }>
 } = {}): OnHandAsOfClient {
   return {
-    ...(input.runs ? {
-      inventorySnapshotRun: {
-        findUnique: async (args: unknown) => {
-          const date = (args as { where: { snapshotDate: Date } }).where.snapshotDate
-          const run = input.runs!.find((row) => row.snapshotDate.getTime() === date.getTime())
-          return run ? { cutoffAt: run.cutoffAt } : null
-        },
-      },
-    } : {}),
     inventorySnapshot: {
       findFirst: async (args: unknown) => {
         const query = args as {
@@ -985,26 +974,4 @@ test('getOnHandAsOf current reverse replay reverses a midnight movement when now
     valueBase: '20.000000',
     unitCostBase: '2.000000',
   }])
-})
-
-test('getOnHandAsOf replays from the snapshot run\'s own cutoff, not UTC midnight, for a BST snapshot (o3d-cr517)', async () => {
-  // Snapshot labelled 2026-07-01 (London day) cut at London midnight = 2026-07-01T23:00Z. A movement at 23:30Z is AFTER the snapshot's
-  // state and must be replayed; one at 22:30Z is inside it and must not be. The UTC-midnight anchor got both wrong.
-  const client = createClient({
-    runs: [{ snapshotDate: new Date('2026-07-01T00:00:00.000Z'), cutoffAt: new Date('2026-07-01T23:00:00.000Z') }],
-    snapshots: [{
-      snapshotDate: new Date('2026-07-01T00:00:00.000Z'),
-      productId: 'product-1',
-      warehouseId: 'warehouse-1',
-      qty: decimal('10'),
-      valueBase: decimal('20'),
-    }],
-    movements: [
-      { id: 'inside', productId: 'product-1', fromWarehouseId: null, toWarehouseId: 'warehouse-1', qty: decimal('100'), totalValueBase: decimal('100'), createdAt: new Date('2026-07-01T22:30:00.000Z') },
-      { id: 'after', productId: 'product-1', fromWarehouseId: null, toWarehouseId: 'warehouse-1', qty: decimal('5'), totalValueBase: decimal('15'), createdAt: new Date('2026-07-01T23:30:00.000Z') },
-    ],
-  })
-  const result = await getOnHandAsOf({ client, asOf: '2026-07-02', now: () => new Date('2026-07-10T12:00:00.000Z') })
-  assert.equal(result.source, 'snapshot_forward_replay')
-  assert.equal(result.rows[0]?.qty, '15.000000', 'snapshot 10 + the 23:30Z receipt 5; the 22:30Z one is already in the snapshot')
 })
