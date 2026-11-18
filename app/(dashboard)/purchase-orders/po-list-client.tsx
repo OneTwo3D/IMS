@@ -268,6 +268,11 @@ export function PoListClient({ list, currencySymbols = {}, currencyPositions = {
               <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[po.status]}`}>
                 {STATUS_LABELS[po.status]}
               </span>
+              {po.approvalState === 'AWAITING' && (
+                <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-900 dark:bg-amber-900 dark:text-amber-100 border-amber-200">
+                  Awaiting approval
+                </span>
+              )}
               {po.isInvoiced && po.status !== 'INVOICED' && (
                 <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200 border-purple-200">
                   Invoiced
