@@ -72,7 +72,7 @@ async function apply(source: 'mintsoft' | 'woocommerce') {
 
 test('a Mintsoft despatch on a mixed-warehouse order ships ONLY the WMS warehouse shipment and leaves the other open', async () => {
   reset([{ id: 'shp-wms', status: 'PACKED', warehouseId: 'wh-wms' }, { id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
-  state.lines = [{ lineId: 'l1', shipment: { warehouseId: 'wh-wms' } }, { lineId: 'l1', shipment: { warehouseId: 'wh-home' } }]
+  state.lines = [{ lineId: 'l1', qty: 1, shipment: { warehouseId: 'wh-wms' } }, { lineId: 'l1', qty: 1, shipment: { warehouseId: 'wh-home' } }]
   const result = await apply('mintsoft')
   assert.equal(result.success, true, 'a success, not a refusal: the dispatch breaker never sees a failure')
   assert.deepEqual((result as { partialWarehouse?: unknown }).partialWarehouse, { shippedShipmentCount: 1, openShipmentIds: ['shp-home'], openWarehouseIds: ['wh-home'] })
@@ -80,29 +80,30 @@ test('a Mintsoft despatch on a mixed-warehouse order ships ONLY the WMS warehous
   const note = state.activity.find((entry) => entry.action === 'external_fulfillment_other_warehouse_open')
   assert.ok(note, 'the open shipment is visible')
   assert.deepEqual((note.metadata as { shipmentIds: string[] }).shipmentIds, ['shp-home'])
-  assert.equal(state.refused.length, 0, 'the line is also covered in the WMS warehouse: no refused action')
+  assert.deepEqual(state.refused.map((row) => row.action), ['WMS_OTHER_WAREHOUSE_PART_OPEN'], 'a DURABLE row says the other warehouse part is still to ship; the line is covered in the WMS warehouse so no lines row')
   assert.ok(!state.activity.some((entry) => entry.action === 'external_fulfillment_failed'))
 })
 
 test('a mixed-warehouse despatch that covers a line held ONLY in the other warehouse ships nothing of it and raises a refused-action row', async () => {
   reset([{ id: 'shp-wms', status: 'PACKED', warehouseId: 'wh-wms' }, { id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
-  state.lines = [{ lineId: 'l1', shipment: { warehouseId: 'wh-wms' } }, { lineId: 'l2', shipment: { warehouseId: 'wh-home' } }]
+  state.lines = [{ lineId: 'l1', qty: 1, shipment: { warehouseId: 'wh-wms' } }, { lineId: 'l2', qty: 1, shipment: { warehouseId: 'wh-home' } }]
   const result = await apply('mintsoft')
   assert.equal(result.success, true)
   assert.deepEqual(state.transitions, [['shp-wms', 'SHIPPED']])
-  assert.equal(state.refused.length, 1)
-  assert.equal(state.refused[0].action, 'WMS_DESPATCH_OTHER_WAREHOUSE_LINES')
-  assert.deepEqual((state.refused[0].intent as { lineIds: string[] }).lineIds, ['l2'])
-  assert.match(String(state.refused[0].detail), /NOT shipped/)
+  const linesRow = state.refused.find((row) => row.action === 'WMS_DESPATCH_OTHER_WAREHOUSE_LINES')
+  assert.ok(linesRow && state.refused.some((row) => row.action === 'WMS_OTHER_WAREHOUSE_PART_OPEN'))
+  assert.deepEqual((linesRow.intent as { lineIds: string[] }).lineIds, ['l2'])
+  assert.match(String(linesRow.detail), /NOT shipped/)
+  assert.doesNotMatch(String(linesRow.detail), /by hand/)
 })
 
 test('a despatch with nothing in the WMS warehouse ships nothing, is a success, and does not try the unflipped-order retry', async () => {
   reset([{ id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
-  state.lines = [{ lineId: 'l1', shipment: { warehouseId: 'wh-home' } }]
+  state.lines = [{ lineId: 'l1', qty: 1, shipment: { warehouseId: 'wh-home' } }]
   const result = await apply('mintsoft')
   assert.equal(result.success, true)
   assert.deepEqual(state.transitions, [])
-  assert.equal(state.refused.length, 1)
+  assert.ok(state.refused.length >= 1)
   assert.ok(!state.activity.some((entry) => entry.action === 'external_fulfillment_applied'), 'no "applied" entry for a tick that applied nothing')
   assert.ok(!state.activity.some((entry) => entry.action === 'external_fulfillment_other_warehouse_open'), 'and no repeat entry on a re-apply that shipped nothing new')
 })
@@ -160,3 +161,18 @@ test('a mixed-warehouse WMS despatch asks for the storefront completion only thr
   assert.deepEqual(state.optionsSeen.map((o) => o.completionAuthority), ['EXTERNAL'])
 })
 
+
+test('coverage is per QUANTITY: a line split across warehouses raises the still-to-ship row even though the WMS warehouse holds part of it', async () => {
+  reset([{ id: 'shp-wms', status: 'PACKED', warehouseId: 'wh-wms' }, { id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
+  state.lines = [{ lineId: 'l1', qty: 3, shipment: { warehouseId: 'wh-wms' } }, { lineId: 'l1', qty: 2, shipment: { warehouseId: 'wh-home' } }]
+  await apply('mintsoft')
+  assert.deepEqual(state.refused.map((row) => row.action), ['WMS_OTHER_WAREHOUSE_PART_OPEN'])
+})
+
+test('an order allocated by THIS despatch (pushed before it was allocated, so the WMS was sent every line) raises the lines row for the foreign lines', async () => {
+  reset([{ id: 'shp-wms', status: 'PACKED', warehouseId: 'wh-wms' }, { id: 'shp-home', status: 'PACKED', warehouseId: 'wh-home' }])
+  state.allocationCount = 0
+  state.lines = [{ lineId: 'l1', qty: 3, shipment: { warehouseId: 'wh-wms' } }, { lineId: 'l1', qty: 2, shipment: { warehouseId: 'wh-home' } }]
+  await apply('mintsoft')
+  assert.ok(state.refused.some((row) => row.action === 'WMS_DESPATCH_OTHER_WAREHOUSE_LINES'))
+})

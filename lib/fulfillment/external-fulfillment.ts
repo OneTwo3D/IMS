@@ -669,10 +669,13 @@ async function partitionWmsShipmentsByWarehouse<T extends { id: string; warehous
 const WMS_DESPATCH_OTHER_WAREHOUSE_ACTION = 'external_fulfillment_other_warehouse_open'
 
 /**
- * Tell a person about the shipments a mixed-warehouse WMS despatch left open. Always an activity entry; when the open shipments carry order lines that
- * NO shipment in the WMS warehouse covers (the WMS despatched those lines, IMS holds them only in another warehouse and will not ship them on the
- * WMS's word), also a refused-action row (MEDIUM, ages into an alert; closed by the order shipping). Best effort: bookkeeping that cannot be
- * written never fails a despatch that has already been applied.
+ * Tell a person about the shipments a mixed-warehouse WMS despatch left open, DURABLY: a refused-action row, not just an activity entry (an order that
+ * stays open with only a log line is invisible and never alerts). Two rows, both closed when the order ships (resolveObsoleteRefusedActions):
+ *   - WMS_OTHER_WAREHOUSE_PART_OPEN, always: the other warehouse's part is still to ship; the order completes (and the storefront is completed) when it does.
+ *   - WMS_LINES_IN_OTHER_WAREHOUSE, when the WMS may have been sent lines IMS holds in another warehouse: coverage is compared PER QUANTITY (a line split across
+ *     warehouses counts only what the WMS warehouse holds), and always when this very call created the allocation (the order was pushed before it was
+ *     allocated, so the WMS was sent every line). Those goods may already have left the WMS, so the other warehouse must NOT ship them by hand.
+ * Best effort: bookkeeping that cannot be written never fails a despatch that has already been applied.
  */
 async function reportOtherWarehouseShipmentsLeftOpen(
   update: ExternalFulfillmentUpdate,
@@ -681,41 +684,56 @@ async function reportOtherWarehouseShipmentsLeftOpen(
   wmsWarehouseId: string | null,
   foreign: Array<{ id: string; warehouseId: string | null }>,
   shippedHere: number,
+  freshlyAllocated: boolean,
 ): Promise<void> {
   try {
     const lines = await db.shipmentLine.findMany({
       where: { shipment: { orderId } },
-      select: { lineId: true, shipment: { select: { warehouseId: true } } },
+      select: { lineId: true, qty: true, shipment: { select: { warehouseId: true } } },
     })
-    const foreignIds = new Set(foreign.map((shipment) => shipment.warehouseId))
-    const coveredByWmsWarehouse = new Set(lines.filter((row) => !row.shipment.warehouseId || !foreignIds.has(row.shipment.warehouseId)).map((row) => row.lineId))
-    const foreignOnlyLineIds = [...new Set(lines.filter((row) => row.shipment.warehouseId && foreignIds.has(row.shipment.warehouseId) && !coveredByWmsWarehouse.has(row.lineId)).map((row) => row.lineId))]
-    const warehouseIds = [...foreignIds]
-    const description = `${update.source} despatched order ${orderRef}: ${shippedHere} shipment(s) in the warehouse it serves were marked shipped. `
-      + `IMS also holds ${foreign.length} unshipped shipment(s) in another warehouse; they were left open, the order was not marked shipped and no `
-      + 'storefront completion was sent. Ship them in IMS when they leave; the order completes then.'
-    // The link is polled until the order ships, so a re-apply that shipped nothing new must not write the same entry every tick.
+    const foreignWarehouses = new Set(foreign.map((shipment) => shipment.warehouseId))
+    const wmsQty = new Map<string, number>()
+    const foreignQty = new Map<string, number>()
+    for (const row of lines) {
+      const target = row.shipment.warehouseId && foreignWarehouses.has(row.shipment.warehouseId) ? foreignQty : wmsQty
+      target.set(row.lineId, (target.get(row.lineId) ?? 0) + Number(row.qty))
+    }
+    // Per quantity: a line is at risk when it has units in another warehouse and the WMS warehouse holds none of it (or, freshly allocated, any of it).
+    const atRiskLineIds = [...foreignQty.keys()].filter((lineId) => freshlyAllocated || (wmsQty.get(lineId) ?? 0) <= 0)
+    const warehouseIds = [...foreignWarehouses]
+    const { recordRefusedAction, REFUSED_ACTION_ENTITY_SALES_ORDER } = await import('@/lib/domain/refused-actions')
+    const intent = { orderNumber: orderRef, wmsWarehouseId, shipmentIds: foreign.map((shipment) => shipment.id), warehouseIds }
+    await recordRefusedAction(db as never, {
+      entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
+      entityId: orderId,
+      action: 'WMS_OTHER_WAREHOUSE_PART_OPEN',
+      gate: 'WMS_OTHER_WAREHOUSE_SHIPMENT_OPEN',
+      permanence: 'RETRYABLE',
+      severity: 'MEDIUM',
+      intent,
+      detail: `The warehouse despatched its part of this order, but ${foreign.length} shipment(s) in another warehouse are still to ship, so the order is not marked shipped and the storefront has not been completed. Ship them in IMS when they leave; the order completes then.`,
+    })
+    // The link is no longer polled once its part is applied, but an activity entry is only written for a despatch that shipped something.
     if (shippedHere > 0) await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: WMS_DESPATCH_OTHER_WAREHOUSE_ACTION,
       tag: 'sync',
       level: 'INFO',
-      description,
-      metadata: { source: update.source, wmsWarehouseId, shipmentIds: foreign.map((shipment) => shipment.id), warehouseIds, shippedHere, foreignOnlyLineIds },
+      description: `${update.source} despatched order ${orderRef}: ${shippedHere} shipment(s) in the warehouse it serves were marked shipped. ${foreign.length} unshipped shipment(s) in another warehouse were left open.`,
+      metadata: { ...intent, source: update.source, shippedHere, atRiskLineIds },
       resolveUser: false,
     })
-    if (foreignOnlyLineIds.length > 0) {
-      const { recordRefusedAction, REFUSED_ACTION_ENTITY_SALES_ORDER } = await import('@/lib/domain/refused-actions')
+    if (atRiskLineIds.length > 0) {
       await recordRefusedAction(db as never, {
         entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
         entityId: orderId,
         action: 'WMS_DESPATCH_OTHER_WAREHOUSE_LINES',
         gate: 'WMS_LINES_IN_OTHER_WAREHOUSE',
         permanence: 'RETRYABLE',
-        severity: 'MEDIUM',
-        intent: { orderNumber: orderRef, wmsWarehouseId, shipmentIds: foreign.map((shipment) => shipment.id), lineIds: foreignOnlyLineIds },
-        detail: `The warehouse despatched ${foreignOnlyLineIds.length} order line(s) that IMS holds only in a different warehouse. They were NOT shipped, because the goods did not leave that warehouse as far as IMS knows. Ship that warehouse's shipment by hand, or reallocate the lines to the despatching warehouse.`,
+        severity: 'HIGH',
+        intent: { ...intent, lineIds: atRiskLineIds },
+        detail: `The warehouse may have despatched ${atRiskLineIds.length} order line(s) that IMS holds in a different warehouse. They were NOT shipped in IMS. Check with the warehouse what left before anyone ships them: reallocate the lines to the despatching warehouse rather than shipping them from the other one.`,
       })
     }
   } catch (error) {
@@ -762,6 +780,8 @@ export async function applyExternalFulfillmentUpdate(
   }
 
   const allocationCount = await db.orderAllocation.count({ where: { orderId: order.id } })
+  // True when THIS call created the allocation: an order pushed to the WMS before it was allocated was sent every line.
+  const allocatedByThisCall = allocationCount === 0 && !orderNotReady
   if (allocationCount === 0 && !orderNotReady) {
     const result = await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     if (!result.success) {
@@ -915,7 +935,7 @@ export async function applyExternalFulfillmentUpdate(
   const partialWarehouse = foreignOpen.length > 0
     ? { shippedShipmentCount: shipments.length, openShipmentIds: foreignOpen.map((shipment) => shipment.id), openWarehouseIds: [...new Set(foreignOpen.map((shipment) => shipment.warehouseId as string))] }
     : undefined
-  if (partialWarehouse) await reportOtherWarehouseShipmentsLeftOpen(update, order.id, orderRef, wmsWarehouseId, foreignOpen, shipments.length)
+  if (partialWarehouse) await reportOtherWarehouseShipmentsLeftOpen(update, order.id, orderRef, wmsWarehouseId, foreignOpen, shipments.length, allocatedByThisCall)
 
   // RETRY OF A COMPLETION THAT LEFT THE ORDER UNFLIPPED. Every shipment may already be SHIPPED while the order itself was not
   // promoted: a verification fence refused at the order flip after the shipment committed, or (SHP-H1) the promotion failed or

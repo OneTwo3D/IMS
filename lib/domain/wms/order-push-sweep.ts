@@ -450,6 +450,15 @@ type OrderForPush = {
   totalForeign: unknown
   lines: CandidateLine[]
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
+  /**
+   * What IMS has allocated for the order, per warehouse. Read ONLY to scope a push of a MIXED-warehouse order (allocations in more than one warehouse):
+   * the warehouse is then sent just the lines allocated to ITS warehouse. Absent or single-warehouse: the push is unchanged.
+   */
+  allocations?: Array<{ lineId: string; productId: string; warehouseId: string; qty: unknown }>
+  /** The warehouse the WMS order was created for (the push link's `pushWarehouseId`); wins over the ship-from warehouse when scoping an amendment. */
+  pushWarehouseId?: string | null
+  /** The order's ship-from warehouse: the WMS warehouse of a create. */
+  shipFromWarehouseId?: string | null
   /** The business-event time of the order (paid, else created): the producer-side hold's obligation time. Read-only evidence; absent in a hand-built port. */
   paidAt?: Date | null
   createdAt?: Date | null
@@ -571,6 +580,13 @@ export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPu
   try {
     const goodsLines = order.lines.filter((line) => !isMirroredFeeLine(line))
     const feeLines = order.lines.filter((line) => isMirroredFeeLine(line))
+    const refundedOnly = refundedQtyByLine({ refunds: order.refunds })
+    const foreign = foreignWarehouseWithheldQty(order, refundedOnly)
+    let foreignNet = toDecimal(0)
+    for (const line of goodsLines) {
+      const units = line.id ? foreign.get(line.id) : undefined
+      if (units) foreignNet = foreignNet.add(dec(line.totalForeign).mul(toDecimal(units)).div(toDecimal(num(line.qty) || 1)))
+    }
     const verdict = reconcilePushTotals({
       currency: order.currency,
       orderTotal: order.totalForeign as Parameters<typeof reconcilePushTotals>[0]['orderTotal'],
@@ -578,9 +594,10 @@ export function payloadTotalMismatchPence(order: OrderForPush, input: WmsOrderPu
       // Fee lines are not pushed (see mirrored-fee-line.ts), so the order total they are part of is balanced by
       // withholding their NET from the expected side. Their VAT is NOT withheld: it is inside `totalVat`, which the
       // payload sends in full (the plugin's TotalVat is WooCommerce's total tax), so it sits on both sides already.
-      withheldGoodsGross: withheldGoodsGross(goodsLines, refundedQtyByLine(order)).add(feeLinesNet(feeLines)),
-      withheldLineCount: withheldLineCount(goodsLines, refundedQtyByLine(order)),
-      withheldNetOnlyLineCount: feeLines.length,
+      withheldGoodsGross: withheldGoodsGross(goodsLines, refundedOnly).add(feeLinesNet(feeLines)).add(foreignNet),
+      withheldLineCount: withheldLineCount(goodsLines, refundedOnly),
+      // Fee lines, and the units left out of a mixed-warehouse push, are withheld at their NET: their VAT is inside `totalVat`, which the payload sends in full.
+      withheldNetOnlyLineCount: feeLines.length + foreign.size,
       payload: input,
       pricesIncludeVat: order.pricesIncludeVat,
     })
@@ -686,6 +703,7 @@ export const ORDER_PUSH_SELECT = {
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true, wclcFeeKind: true, productId: true, externalLineItemId: true } },
   refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
+  allocations: { select: { lineId: true, productId: true, warehouseId: true, qty: true } },
   paidAt: true,
   createdAt: true,
 } as const
@@ -783,12 +801,33 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string)
     shippingVat: 0,
     discountExVat: num(order.discountAmount),
     discountVat: 0,
-    lines: buildLines(order.lines, refundedQtyByLine(order)),
+    lines: buildMixedAwareLines(order),
   }
 }
 
+/** The payload lines of an order, scoped to the WMS warehouse when the order is mixed-warehouse; refuses a mixed order that leaves nothing to send. */
+function buildMixedAwareLines(order: OrderForPush): WmsOrderPushLine[] {
+  const withheld = refundedQtyByLine(order)
+  const lines = buildLines(order.lines, withheld)
+  if (lines.length === 0 && foreignWarehouseWithheldQty(order, refundedQtyByLine({ refunds: order.refunds })).size > 0) {
+    throw new Error(NOTHING_ALLOCATED_TO_WMS_WAREHOUSE_REASON)
+  }
+  return lines
+}
+
 // Sum refunded quantity per sales-order line so the WMS payload can exclude it.
-function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }> }): Map<string, number> {
+//
+// ALSO the single choke point for the MIXED-WAREHOUSE scope (owner ruling 2026-11-18): the units of a line that are NOT allocated to the WMS warehouse are
+// withheld from the payload exactly as refunded units are (left out of the lines, and counted by the total guard as withheld goods), so the warehouse is
+// only ever sent - and therefore only ever despatches - what IMS holds in its own warehouse. A single-warehouse (or unallocated) order adds nothing here,
+// so its payload is byte-identical to before.
+function refundedQtyByLine(order: {
+  refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
+  lines?: CandidateLine[]
+  allocations?: OrderForPush['allocations']
+  pushWarehouseId?: string | null
+  shipFromWarehouseId?: string | null
+}): Map<string, number> {
   const map = new Map<string, number>()
   for (const refund of order.refunds ?? []) {
     for (const line of refund.lines) {
@@ -796,8 +835,47 @@ function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderL
       map.set(line.salesOrderLineId, (map.get(line.salesOrderLineId) ?? 0) + num(line.qty))
     }
   }
+  for (const [lineId, withheld] of foreignWarehouseWithheldQty(order, map)) map.set(lineId, (map.get(lineId) ?? 0) + withheld)
   return map
 }
+
+/**
+ * The units of each goods line to LEAVE OUT of a WMS push because IMS allocated them to another warehouse. Empty unless the order's allocations span MORE
+ * than one warehouse. The WMS warehouse is the one the order was pushed for (`pushWarehouseId`), else the order's ship-from. For a line the units sent are the
+ * units allocated to the WMS warehouse (a kit, whose allocations are per component, is sent the smallest whole share any component has there); units
+ * allocated to nowhere are not sent either, in a mixed order. Refunded units are netted first (`refunded`), so the two never count a unit twice.
+ */
+export function foreignWarehouseWithheldQty(
+  order: { lines?: CandidateLine[]; allocations?: OrderForPush['allocations']; pushWarehouseId?: string | null; shipFromWarehouseId?: string | null },
+  refunded: Map<string, number>,
+): Map<string, number> {
+  const out = new Map<string, number>()
+  const allocations = order.allocations ?? []
+  if (new Set(allocations.map((row) => row.warehouseId)).size < 2) return out
+  const wmsWarehouseId = order.pushWarehouseId ?? order.shipFromWarehouseId ?? null
+  for (const line of order.lines ?? []) {
+    if (!line.id || isMirroredFeeLine(line)) continue
+    const net = Math.max(0, (num(line.qty) || 1) - (refunded.get(line.id) ?? 0))
+    if (net <= 0) continue
+    const rows = allocations.filter((row) => row.lineId === line.id)
+    const byProduct = new Map<string, { total: number; own: number }>()
+    for (const row of rows) {
+      const entry = byProduct.get(row.productId) ?? { total: 0, own: 0 }
+      entry.total += num(row.qty)
+      if (row.warehouseId === wmsWarehouseId) entry.own += num(row.qty)
+      byProduct.set(row.productId, entry)
+    }
+    let sendUnits = 0
+    if (byProduct.size === 1 && line.productId && byProduct.has(line.productId)) sendUnits = byProduct.get(line.productId)!.own
+    else if (byProduct.size > 0) sendUnits = Math.min(net, ...[...byProduct.values()].map((entry) => (entry.total > 0 ? Math.floor(net * (entry.own / entry.total)) : 0)))
+    const withheld = net - Math.min(net, Math.max(0, Math.floor(sendUnits)))
+    if (withheld > 0) out.set(line.id, withheld)
+  }
+  return out
+}
+
+/** A mixed-warehouse order with nothing allocated to the WMS warehouse: there is nothing to send. Parked locally, no remote call (see NO_GOODS_TO_PUSH_REASON). */
+export const NOTHING_ALLOCATED_TO_WMS_WAREHOUSE_REASON = 'Every line of this order is allocated to another warehouse, so nothing is sent to the warehouse that serves the WMS. Reallocate the order to that warehouse, or ship it from the other one.'
 
 // --- Testability boundary -------------------------------------------------
 // The sweep's data access is behind a port so the state machine can be unit
@@ -809,6 +887,7 @@ type LinkWrite = {
   connector?: string
   /** The IMS warehouse the warehouse order was created for (the order's ship-from at create time). */
   pushWarehouseId?: string | null
+  partialDespatchAppliedAt?: Date | null
   externalOrderId?: string | null
   externalOrderNumber?: string | null
   state?: PushState
@@ -861,6 +940,8 @@ const RESET_DISPATCH_FAILURES = {
   dispatchUnresolvedCount: 0,
   dispatchUnresolvedError: null,
   dispatchUnresolvedAt: null,
+  // A fresh warehouse order has had no partial despatch applied.
+  partialDespatchAppliedAt: null,
   // Same rationale for the reconcile stamp: the recency belonged to the OLD
   // WMS order; the fresh one must rotate to the front of verification.
   reconcileCheckedAt: null,
@@ -950,7 +1031,9 @@ export const WMS_CANCELLABLE_ORDER_WHERE = {
     { status: 'CANCELLED' as const },
     // A fully-refunded order that has not yet dispatched must be pulled from the WMS too; it keeps its lifecycle status under the
     // orthogonal refund model, so refundStatus (not status) is what flags it for cancellation.
-    { refundStatus: 'FULL' as const, status: { notIn: [...POST_DISPATCH_STATUSES, 'CANCELLED' as const] } },
+    // ...unless a shipment already left: a mixed-warehouse order whose WMS part was despatched stays open (not SHIPPED) while another warehouse's
+    // shipment is outstanding, but the goods the WMS holds are gone, so there is nothing to pull back from it.
+    { refundStatus: 'FULL' as const, status: { notIn: [...POST_DISPATCH_STATUSES, 'CANCELLED' as const] }, shipments: { none: { status: 'SHIPPED' as const } } },
   ],
 }
 
@@ -1468,7 +1551,7 @@ export async function runWmsOrderPushSweepCore(
       if (message !== NO_DELIVERY_STREET_REASON) {
         let lineChange: AmendmentLineChange = 'UNKNOWN'
         try {
-          const wanted = buildLines(order.lines, refundedQtyByLine(order)).map((line) => ({ sku: line.sku, quantity: Number(line.quantity) }))
+          const wanted = buildMixedAwareLines(order).map((line) => ({ sku: line.sku, quantity: Number(line.quantity) }))
           const recorded = port.readOrderItems ? await port.readOrderItems(link.id).catch(() => null) : null
           lineChange = classifyAmendmentLineChange(wanted, recorded)
         } catch {
@@ -4487,10 +4570,12 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       `
       const dueIds = dueRows.map((row) => row.id)
       if (!dueIds.length) return []
-      return db.wmsOrderPushLink.findMany({
+      const dueLinks = await db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
-        select: { id: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
+        select: { id: true, pushWarehouseId: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true } } },
       })
+      // The warehouse the WMS order was created for scopes a mixed-warehouse amendment (see refundedQtyByLine); a link with none falls back to ship-from.
+      return dueLinks.map(({ pushWarehouseId, ...link }) => ({ ...link, order: { ...link.order, pushWarehouseId } }))
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
       // o3d-92fu. The order predicate is deliberately IDENTICAL to createCandidates', because

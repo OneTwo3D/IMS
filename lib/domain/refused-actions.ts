@@ -31,6 +31,8 @@ export const REFUSED_ACTIONS = {
   /** A split warehouse order that can never complete in IMS because a part was cancelled. */
   WMS_SPLIT_ORDER_COMPLETE: { label: 'Split order cannot complete', gates: ['WMS_SPLIT_PART_CANCELLED'] },
   /** A WMS despatch of a mixed-warehouse order covering lines IMS holds only in another warehouse (not shipped on the WMS's word). */
+  /** A WMS despatch shipped only its own warehouse's part of a mixed-warehouse order; another warehouse's shipment is still to ship. */
+  WMS_OTHER_WAREHOUSE_PART_OPEN: { label: "Other warehouse's part is still to ship", gates: ['WMS_OTHER_WAREHOUSE_SHIPMENT_OPEN'] },
   WMS_DESPATCH_OTHER_WAREHOUSE_LINES: { label: 'Despatch covers lines held in another warehouse', gates: ['WMS_LINES_IN_OTHER_WAREHOUSE'] },
 } as const
 export type RefusedActionName = keyof typeof REFUSED_ACTIONS
