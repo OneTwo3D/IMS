@@ -1,6 +1,7 @@
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { randomUUID } from 'node:crypto'
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
@@ -2043,6 +2044,7 @@ export async function releaseOrderAllocationsInTx(
   // The allocation rows are deleted FIRST so the shared helper reads the true post-teardown state
   // (zero open quantity everywhere) rather than being told what to conclude.
   await tx.orderAllocation.deleteMany({ where: { orderId } })
+  await markWmsScopeDirtyInTx(tx, orderId)
   // o3d-kouj: the rows are gone, so any pin on a line that holds nothing else is now dormant — a
   // recipe no reader should still be answering from. Retired here, under the same lock, in the same
   // transaction as the release that made it dormant.
@@ -2374,6 +2376,7 @@ export async function trimUnshippedAllocationsForRefundTx(
     }
     await applyAllocationReservationDelta(tx, [{ productId: step.productId, warehouseId: step.warehouseId, qty: step.qty }], 'release', params.orderId)
   }
+  await markWmsScopeDirtyInTx(tx, params.orderId)
   const reconciliation = await reconcilePendingShipments(tx, params.orderId, {
     cause: params.cause ?? 'a refund releasing the unshipped reservation of its units',
     userId: params.userId,
@@ -2666,6 +2669,7 @@ export async function cancelSalesOrderFulfillmentState(
       status: { in: ['PENDING', 'PICKING', 'PACKED'] },
     },
   })
+  await markWmsScopeDirtyInTx(tx, input.orderId)
   // o3d-kouj: same rule as the release path — a pin with nothing in flight behind it is dormant.
   // AFTER the shipment delete, not before: the picked/packed shipments this cancel destroys are
   // exactly what would otherwise still make their lines look untouchable, and a line whose only
@@ -4103,6 +4107,9 @@ export async function allocateSalesOrder(
           },
         })
       }
+
+      // The allocation set changed (this branch only runs for a changed set): the warehouse's part of the order must be re-derived.
+      await markWmsScopeDirtyInTx(tx, orderId)
 
       // -------------------------------------------------------------------------------------
       // o3d-kouj: PIN THE RECIPE ONTO EVERY LINE THIS RUN JUST PUT IN FLIGHT.
