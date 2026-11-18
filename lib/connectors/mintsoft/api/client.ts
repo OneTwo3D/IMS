@@ -706,8 +706,12 @@ export type MintsoftClearTransport = {
   readBack: (externalProductId: string) => Promise<Record<string, unknown> | null>
 }
 
+/** Longest a single clear request may run (must stay well under the clear lease of 10 minutes). */
+export const MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS = 120_000
+
 const MINTSOFT_CLEAR_TRANSPORT: MintsoftClearTransport = {
-  post: (path, init) => mintsoftRequest<unknown>(path, init),
+  // A clear request is bounded well inside the 10 minute clear lease, so a lease can never expire under a request still in flight.
+  post: (path, init) => mintsoftRequest<unknown>(path, { ...init, signal: AbortSignal.timeout(MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS) }),
   readBack: async (externalProductId) => (await fetchMintsoftProduct(externalProductId))?.raw ?? null,
 }
 
@@ -732,7 +736,8 @@ export async function sendMintsoftProductClears(
       continue
     }
     const post = async (): Promise<void> => {
-      const request = buildMintsoftProductClearRequest(product, field, options)
+      // Built from a fresh read when the caller supplies one (it runs inside the claim, after the lease is held).
+      const request = buildMintsoftProductClearRequest(options.freshProduct ? await options.freshProduct() : product, field, options)
       const result = await transport.post(request.path, { method: request.method, body: request.body })
       if (result.error) throw new Error(result.error)
       const body = result.data as { Success?: unknown; Message?: unknown } | null
@@ -773,7 +778,7 @@ export async function sendMintsoftProductClears(
   }
   for (const field of sent) {
     if (raw && mintsoftFieldIsEmpty(raw, field)) outcome.cleared.push(field)
-    else outcome.rejected.push({ field, message: raw ? (nothingToUpdate.has(field) ? 'clear not applied (Mintsoft reported nothing to update)' : 'clear not applied') : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
+    else outcome.rejected.push({ field, ...(raw ? { notApplied: true } : {}), message: raw ? (nothingToUpdate.has(field) ? 'clear not applied (Mintsoft reported nothing to update)' : 'clear not applied') : `clear not applied (could not read the product back to verify${readBackError ? `: ${readBackError}` : ''})` })
   }
   return outcome
 }

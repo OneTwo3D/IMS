@@ -456,6 +456,31 @@ test('sendMintsoftProductClears: CommodityCode is sent and counted only when the
   const out = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, kept.transport)
   assert.deepEqual(out.cleared, [])
   assert.equal(out.rejected[0].message, 'clear not applied')
+  assert.equal(out.rejected[0].notApplied, true, 'a verified not-applied answer counts toward the retry cap')
+})
+
+test('sendMintsoftProductClears: transport errors and failed read-backs are rejected WITHOUT notApplied (they never spend the retry cap)', async () => {
+  const down = fakeTransport({ data: null, error: 'connect ETIMEDOUT' }, null)
+  const a = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, down.transport)
+  assert.equal(a.rejected.length, 1)
+  assert.equal(a.rejected[0].notApplied, undefined)
+  const blind = fakeTransport({ data: { Success: true } }, null)
+  const b = await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], { externalProductId: '42' }, blind.transport)
+  assert.equal(b.rejected[0].notApplied, undefined)
+})
+
+test('sendMintsoftProductClears: the request body is built from the fresh read, not the planning snapshot', async () => {
+  const t = fakeTransport({ data: { Success: true } }, { CommodityCode: null })
+  await client.sendMintsoftProductClears(CLEAR_DTO, ['commodityCode'], {
+    externalProductId: '42',
+    freshProduct: async () => ({ ...CLEAR_DTO, name: 'Fresh name' }),
+  }, t.transport)
+  assert.equal(JSON.parse(t.posts[0]).Name, 'Fresh name')
+})
+
+test('the default clear transport bounds a request well inside the 10 minute lease', () => {
+  assert.ok(client.MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS <= 120_000)
+  assert.ok(client.MINTSOFT_CLEAR_REQUEST_TIMEOUT_MS < productSync.CUSTOMS_CLEAR_LEASE_MINUTES * 60_000)
 })
 
 test("sendMintsoftProductClears: a 'Nothing to update/add' answer is settled by the read-back: empty counts as cleared, still set is not applied", async () => {

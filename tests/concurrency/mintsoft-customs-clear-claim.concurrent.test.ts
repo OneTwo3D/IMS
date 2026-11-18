@@ -30,7 +30,7 @@ async function clearedProduct(db: Awaited<ReturnType<typeof load>>['db'], extra:
   return { product, markers }
 }
 
-test('the clear is sent while the planned marker is current; the lease is released and an attempt counted', { skip }, async () => {
+test('the clear is sent while the planned marker is current; the lease is released and no attempt is spent', { skip }, async () => {
   const { db, sync } = await load()
   const { product, markers } = await clearedProduct(db)
   try {
@@ -44,7 +44,7 @@ test('the clear is sent while the planned marker is current; the lease is releas
     const after = await db.productCustomsClear.findFirstOrThrow({ where: { productId: product.id } })
     assert.equal(after.claimToken, null)
     assert.equal(after.claimedAt, null)
-    assert.equal(after.attempts, 1)
+    assert.equal(after.attempts, 0, 'attempts are counted only for a verified not-applied answer, by the caller')
   } finally {
     await db.product.delete({ where: { id: product.id } })
   }
@@ -181,7 +181,7 @@ test('the retry cap stops the clear and a failing request still releases the lea
     await assert.rejects(sync.buildCustomsClearClaim(product.id, planned)('commodityCode', async () => { throw new Error('boom') }), /boom/)
     const after = await db.productCustomsClear.findFirstOrThrow({ where: { productId: product.id } })
     assert.equal(after.claimToken, null, 'released after a failure')
-    assert.equal(after.attempts, 1)
+    assert.equal(after.attempts, 0, 'a failed request does not spend the retry cap')
     await db.productCustomsClear.updateMany({ where: { productId: product.id }, data: { attempts: sync.CUSTOMS_CLEAR_MAX_ATTEMPTS } })
     let sent = 0
     const capped = await sync.buildCustomsClearClaim(product.id, planned)('commodityCode', async () => { sent += 1 })

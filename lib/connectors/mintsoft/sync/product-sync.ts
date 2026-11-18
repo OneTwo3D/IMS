@@ -119,6 +119,10 @@ type ProductSyncContext = {
   connector: ReturnType<typeof getWmsConnector>
   /** The id of the sync job this product is processed in; stamped on the link only when its metadata is confirmed in Mintsoft. */
   runId?: string
+  /** Recovery after a superseded clear: push the product's current payload even when its stored hash says it is already sent. */
+  forceUpsert?: boolean
+  /** This run IS a recovery push: it never starts another. */
+  recovery?: boolean
 }
 
 export type MintsoftProductSyncResult = {
@@ -361,7 +365,7 @@ export function buildCustomsClearClaim(productId: string, planned: PlannedClearM
     const token = randomUUID()
     const acquired = await db.$queryRaw<Array<{ one: number }>>(Prisma.sql`
       UPDATE "product_customs_clears" AS c
-      SET "claimToken" = ${token}, "claimedAt" = now(), "attempts" = c."attempts" + 1
+      SET "claimToken" = ${token}, "claimedAt" = now()
       WHERE c."productId" = ${productId} AND c."field" = ${imsField} AND c."createdAt" = ${plannedAt}
         AND (c."claimToken" IS NULL OR c."claimedAt" < now() - make_interval(mins => ${CUSTOMS_CLEAR_LEASE_MINUTES}))
         AND c."attempts" < ${CUSTOMS_CLEAR_MAX_ATTEMPTS}
@@ -377,27 +381,31 @@ export function buildCustomsClearClaim(productId: string, planned: PlannedClearM
       if (marker.attempts >= CUSTOMS_CLEAR_MAX_ATTEMPTS) return { claimed: false as const, reason: 'the retry cap for this clear is spent' }
       return { claimed: false as const, reason: 'another run holds the clear lease', retry: true }
     }
-    const release = () => db.productCustomsClear.updateMany({
-      where: { productId, field: imsField, claimToken: token },
-      data: { claimToken: null, claimedAt: null },
-    })
-    let value: T
+    // A failing release is logged and never masks the request's own error or result; a lease left behind simply expires.
+    const release = async (): Promise<void> => {
+      try {
+        await db.productCustomsClear.updateMany({
+          where: { productId, field: imsField, claimToken: token },
+          data: { claimToken: null, claimedAt: null },
+        })
+      } catch (releaseError) {
+        console.error(`Mintsoft customs clear: releasing the ${imsField} lease for product ${productId} failed; it expires on its own`, releaseError)
+      }
+    }
     try {
-      value = await send()
-    } catch (error) {
+      const value = await send()
+      // Still the same marker, still ours, field still empty? Only then did the clear land on a field IMS still wants empty.
+      const stillWanted = await db.$queryRaw<Array<{ one: number }>>(Prisma.sql`
+        SELECT 1 AS one FROM "product_customs_clears" c
+        WHERE c."productId" = ${productId} AND c."field" = ${imsField} AND c."createdAt" = ${plannedAt} AND c."claimToken" = ${token}
+          AND EXISTS (SELECT 1 FROM "products" p WHERE p."id" = c."productId" AND NULLIF(btrim(p.${column}), '') IS NULL)`)
+      if (stillWanted.length === 0) {
+        return { claimed: true as const, value, superseded: 'the field was filled again while the clear was in flight' }
+      }
+      return { claimed: true as const, value }
+    } finally {
       await release()
-      throw error
     }
-    // Still the same marker, still ours, field still empty? Only then did the clear land on a field IMS still wants empty.
-    const stillWanted = await db.$queryRaw<Array<{ one: number }>>(Prisma.sql`
-      SELECT 1 AS one FROM "product_customs_clears" c
-      WHERE c."productId" = ${productId} AND c."field" = ${imsField} AND c."createdAt" = ${plannedAt} AND c."claimToken" = ${token}
-        AND EXISTS (SELECT 1 FROM "products" p WHERE p."id" = c."productId" AND NULLIF(btrim(p.${column}), '') IS NULL)`)
-    await release()
-    if (stillWanted.length === 0) {
-      return { claimed: true as const, value, superseded: 'the field was filled again while the clear was in flight' }
-    }
-    return { claimed: true as const, value }
   }
 }
 
@@ -587,7 +595,7 @@ async function getMintsoftProductSyncScopes(): Promise<MintsoftProductSyncScope[
   }))
 }
 
-async function getProductSyncCandidate(productId: string): Promise<ProductSyncCandidate | null> {
+export async function getProductSyncCandidate(productId: string): Promise<ProductSyncCandidate | null> {
   return db.product.findUnique({
     where: { id: productId },
     select: PRODUCT_SYNC_CANDIDATE_SELECT,
@@ -942,10 +950,33 @@ async function backfillMpnFromMintsoft(context: ProductSyncContext, mpn: string,
   return { ok: true }
 }
 
-async function syncOneMintsoftProduct(
+/**
+ * The payload of a customs-clear request, rebuilt from a FRESH read of the product (the planning snapshot may be minutes old).
+ * The identifier-split fields (barcode / MPN) stay as planned; everything else follows the product as it is now.
+ */
+async function buildFreshMintsoftClearDto(context: ProductSyncContext, planned: WmsProductDto): Promise<WmsProductDto> {
+  const fresh = await getProductSyncCandidate(context.product.id)
+  if (!fresh) return planned
+  let dto = buildMintsoftProductDto(fresh)
+  const { commodityCode } = resolveMintsoftCommodityCode(dto.commodityCode)
+  if (commodityCode !== dto.commodityCode) dto = { ...dto, commodityCode }
+  if (await readMintsoftProductParityEnabled()) {
+    dto = applyMintsoftProductParity(dto, fresh, await readMintsoftProductCost(fresh.id, fresh.type))
+  }
+  if ((fresh.customsClears ?? []).some((m) => m.field === 'countryOfOrigin') && !trimToNull(fresh.countryOfOrigin)) {
+    dto = { ...dto, countryOfManufacture: null }
+  }
+  dto = { ...dto, barcode: planned.barcode }
+  if ('mpn' in planned) dto = { ...dto, mpn: planned.mpn }
+  return dto
+}
+
+export async function syncOneMintsoftProduct(
   context: ProductSyncContext,
 ): Promise<ProductSyncLineResult> {
   if (!isMintsoftProductEligible(context.product)) {
+    // Nothing is synced (or cleared) for it any more: a manual-clear discrepancy left open would never resolve otherwise.
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'CUSTOMS_CLEAR_MANUAL')
     return {
       sku: context.product.sku,
       productId: context.product.id,
@@ -1002,7 +1033,10 @@ async function syncOneMintsoftProduct(
   if (settledMarkers.length > 0) {
     await deleteCustomsMarkers(context.product.id, (context.product.customsClears ?? []).filter((m) => settledMarkers.includes(m.field)))
   }
-  if (earlyExternalProductId) {
+  if (!earlyExternalProductId) {
+    // Not (yet) linked to a Mintsoft product: no remote copy is known to hold anything to clear by hand.
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'CUSTOMS_CLEAR_MANUAL')
+  } else {
     await syncManualCustomsClearDiscrepancy(
       { scopes: context.scopes, product: { ...context.product, customsClears: (context.product.customsClears ?? []).filter((m) => !settledMarkers.includes(m.field)) } },
       remoteRawForClears,
@@ -1164,6 +1198,7 @@ async function syncOneMintsoftProduct(
       && existingLink.payloadHash === payloadHash
       // A pending clear is work: an unchanged hash (a field blank in IMS all along) must not hide a value Mintsoft still holds.
       && clearFields.length === 0
+      && !context.forceUpsert
       && (
         barcodePlan.kind === 'noop'
         || barcodePlan.kind === 'match'
@@ -1204,7 +1239,7 @@ async function syncOneMintsoftProduct(
     }
   }
 
-  if (barcodePlan.kind === 'conflict' && externalProductId && existingLink?.payloadHash === payloadHash) {
+  if (barcodePlan.kind === 'conflict' && externalProductId && existingLink?.payloadHash === payloadHash && !context.forceUpsert) {
     await upsertMintsoftProductLink({
       productId: context.product.id,
       externalProductId,
@@ -1258,7 +1293,7 @@ async function syncOneMintsoftProduct(
       externalProductId,
       omitBarcode: barcodePlan.omitBarcode,
       ...(identifierPlan ? { omitMpn: identifierPlan.omitMpn } : {}),
-      ...(externalProductId && clearFields.length ? { clearFields, clearClaim: buildCustomsClearClaim(context.product.id, plannedMarkers) } : {}),
+      ...(externalProductId && clearFields.length ? { clearFields, clearClaim: buildCustomsClearClaim(context.product.id, plannedMarkers), freshProduct: () => buildFreshMintsoftClearDto(context, dto) } : {}),
     }, upsertSeam.clearance)
   } catch (error) {
     await recordWmsMutationEvent({
@@ -1281,6 +1316,17 @@ async function syncOneMintsoftProduct(
     )
   }
   const rejectedClears = synced.clearOutcome?.rejected ?? []
+  // Only an attempt that Mintsoft answered and a read-back verified NOT applied counts toward the retry cap; a transport error,
+  // a timeout, a failed read-back or a superseded result retries without spending it.
+  for (const rejected of rejectedClears) {
+    if (!rejected.notApplied) continue
+    const marker = (context.product.customsClears ?? []).find((m) => m.field === IMS_FIELD_OF_WMS_CLEAR[rejected.field])
+    if (!marker) continue
+    await db.productCustomsClear.updateMany({
+      where: { productId: context.product.id, field: marker.field, ...(marker.createdAt ? { createdAt: marker.createdAt } : {}) },
+      data: { attempts: { increment: 1 } },
+    })
+  }
   // A clear skipped by the claim (the field was refilled meanwhile) is not a failure and is not retried.
   const skippedClears = synced.clearOutcome?.skipped ?? []
   // Offered again next run: a rejected clear, one whose lease another run held, and one superseded by a refill in flight (the
@@ -1328,6 +1374,22 @@ async function syncOneMintsoftProduct(
   }
   await recordWmsMutationEvent(upsertEvent)
   await clearMintsoftProductLinkError(context.product.id)
+
+  // A clear that went out while the field was being refilled may have landed AFTER another run pushed the refilled value, so
+  // Mintsoft can hold the blank whatever either run stored as its hash. Recovery does not depend on a hash: re-read the product
+  // and push its CURRENT values as a full upsert, so that write is the last one at Mintsoft, and store the hash of THAT payload.
+  if (supersededClears.length > 0 && !context.recovery) {
+    const fresh = await getProductSyncCandidate(context.product.id)
+    if (fresh) {
+      try {
+        return await syncOneMintsoftProduct({ ...context, product: fresh, forceUpsert: true, recovery: true })
+      } catch (recoveryError) {
+        // The stale pending hash must be what stays, so the next run pushes again.
+        await upsertMintsoftProductLink({ productId: context.product.id, externalProductId: synced.externalId, payloadHash: `${payloadHash.replace(/:clear-pending$/, '')}:clear-pending`, lastError: null })
+        throw recoveryError
+      }
+    }
+  }
 
   return {
     sku: context.product.sku,

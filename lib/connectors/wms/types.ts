@@ -161,7 +161,8 @@ export type WmsClearableProductField = 'customsDescription' | 'commodityCode' | 
 /** What happened to the explicit clears of an UPDATE. A rejected clear never fails the update that carried it. */
 export type WmsProductClearOutcome = {
   cleared: WmsClearableProductField[]
-  rejected: { field: WmsClearableProductField; message: string }[]
+  /** `notApplied` is set only when Mintsoft answered and a read-back verified the field still holds a value: the only rejection that counts against the retry cap. */
+  rejected: { field: WmsClearableProductField; message: string; notApplied?: boolean }[]
   /**
    * Not sent: the lease taken immediately before the request was refused. Not a failure. Nothing is retried unless `retry` is
    * set (another run holds the lease: the clear is still wanted and the next run must offer it again).
@@ -317,6 +318,8 @@ export type WmsUpsertProductOptions = {
   clearFields?: WmsClearableProductField[]
   /** Wraps each clear request so a clear planned earlier is re-verified immediately before it is sent. Absent: every clear is sent as planned. */
   clearClaim?: WmsClearClaim
+  /** Read inside the claim, just before a clear request is built: the product's CURRENT payload, so the request never carries a stale planning snapshot. */
+  freshProduct?: () => Promise<WmsProductDto>
 }
 
 /**
