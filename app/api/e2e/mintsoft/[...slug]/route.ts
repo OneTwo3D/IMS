@@ -401,7 +401,10 @@ export function fakeMintsoftAsnListResponse(asns: FakeMintsoftAsn[], params: URL
     ID: /^\d+$/.test(asn.id) ? Number(asn.id) : asn.id,
     POReference: asn.reference,
     WarehouseId: asn.warehouseId && /^\d+$/.test(asn.warehouseId) ? Number(asn.warehouseId) : asn.warehouseId,
-    ASNStatus: { Name: asn.status },
+    // All three status fields, exactly as the by-id fake and live ASN 6114 serve them (swagger types the
+    // list as an array of the same ASN model), so a disagreement on the LIST path is expressible end to end.
+    ASNStatus: { Name: asn.status, Colour: 'purple', TextColour: null, ID: asn.statusId },
+    ASNStatusId: asn.statusId,
     LastUpdated: asn.createdAt,
     Items: includeItems
       ? asn.lines.map((line) => ({

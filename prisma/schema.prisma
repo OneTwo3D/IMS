@@ -209,6 +209,10 @@ enum AccountingLinkSource {
 enum AccountingSyncType {
   PURCHASE_INVOICE
   PURCHASE_INVOICE_UPDATE
+  /// Delete a sales invoice IMS pushed to Xero: renumber it to free its number, then DELETE (draft/submitted) or VOID (authorised, unpaid).
+  SALES_INVOICE_DELETE
+  /// The same for a supplier bill.
+  PURCHASE_INVOICE_DELETE
   COGS_JOURNAL
   INVENTORY_ADJUSTMENT
   SALES_INVOICE
@@ -831,6 +835,7 @@ model Product {
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
   syncMark         ProductSyncMark?
+  customsClears    ProductCustomsClear[]
   shoppingLinks    ShoppingProductLink[]
   wmsProductLinks  WmsProductLink[]
   wmsBundleLinks   WmsBundleLink[]
@@ -1409,6 +1414,7 @@ model PurchaseOrder {
   invoices        PurchaseInvoice[]
   returns         PurchaseReturn[]
   supplierCreditNotes SupplierCreditNote[]
+  attachments     OrderAttachment[]
 
   // Landed cost links — this PO as primary
   landedCostLinks LandedCostLink[]   @relation("PrimaryPO")
@@ -1913,6 +1919,15 @@ model SalesOrder {
   shipFromWarehouseId String?
   expectedDelivery  DateTime?
   salesRep          String?
+  /// o3d-ngmt.16: a QUOTATION is a DRAFT with this flag set, not a status of its own. Nothing downstream is told: every rule that already
+  /// applies to a draft (not pushed to the warehouse, not allocated, no stock reserved, no invoice queued, not mirrored to the storefront)
+  /// applies to a quote unchanged. Cleared by converting the quote to an order; the order stays a plain DRAFT until the operator confirms it.
+  /// WooCommerce imports never set it (the column default is false and no importer names it).
+  isQuote           Boolean    @default(false) @map("is_quote")
+  /// The last day the quoted prices stand (a calendar date, no time zone). NULL on every order that is not a quote, and kept after conversion as the record of what was offered.
+  quoteValidUntil   DateTime?  @map("quote_valid_until") @db.Date
+  /// When the quote was last queued to the customer by email (queued, not delivered: the outbox owns delivery). NULL: never sent from IMS.
+  quoteSentAt       DateTime?  @map("quote_sent_at")
   shippedAt         DateTime?
   trackingNumber    String?
   discountStr       String?    // order-level discount input e.g. "10%" or "5.00"
@@ -2198,8 +2213,10 @@ model SalesOrder {
   refunds           SalesOrderRefund[]
   returnExpectations ReturnExpectation[]
   invoiceDocuments  SalesOrderInvoiceDocument[]
+  attachments       OrderAttachment[]
   invoiceDocumentFetches InvoiceDocumentFetchState[]
   invoiceStorePublication InvoiceStorePublication?
+  trackshipRefireState    TrackshipRefireState?
   payments          Payment[]
   paymentRemovals   PaymentRemovalReconciliation[]
   allocations       OrderAllocation[]
@@ -2489,6 +2506,48 @@ enum InvoiceDocumentFetchStatus {
 ///
 /// This table is the READ side only. It does not write `SalesOrder.accountingInvoiceId` (the ledger document
 /// may be one IMS did not post, and that column drives payment polling and updates).
+/// A supporting document (supplier quote, proforma, packing list, customer PO, email) attached to ONE purchase order OR ONE sales order.
+/// Exactly one of purchase_order_id / sales_order_id is set (a CHECK constraint in the migration enforces it). The bytes live in the private upload
+/// root under order-attachments/<storedName>; the row is the only thing that names the file, and every read goes by this row's id, never by a name.
+/// Soft delete (deletedAt): a deleted row is hidden and its download is refused; the file stays on disk (an operator can recover it) until an erasure or a purge removes it. A sales order's
+/// attachments can hold customer personal data, so a personal-data erasure DELETES the rows and files of the erased orders.
+/// Not pushed to Xero in v1 (the ledger's attachment path is untouched).
+model OrderAttachment {
+  id               String    @id @default(cuid())
+  purchaseOrderId  String?   @map("purchase_order_id")
+  salesOrderId     String?   @map("sales_order_id")
+  /// The name the uploader's browser sent. Shown and offered as the download name after sanitising; never used to locate the file.
+  originalFilename String    @map("original_filename")
+  /// Random, server-chosen file name inside the attachments directory (a uuid plus the extension of the verified type).
+  storedName       String    @unique @map("stored_name")
+  mimeType         String    @map("mime_type")
+  byteSize         Int       @map("byte_size")
+  sha256           String
+  /// The staff user who uploaded it. A plain id (no foreign key) so removing a user never touches the document record.
+  uploadedByUserId String    @map("uploaded_by_user_id")
+  uploadedAt       DateTime  @default(now()) @map("uploaded_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  salesOrder    SalesOrder?    @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderId, deletedAt])
+  @@index([salesOrderId, deletedAt])
+  @@map("order_attachments")
+}
+
+/// FILES OWED A DELETION: the stored names of order-attachment files whose rows were deleted (a personal-data erasure, a deleted draft order). Written in the SAME
+/// transaction as the row deletion, so a crash or a failed unlink can never leave a file with no record pointing at it; a retryable drain removes the file and then
+/// the entry. An UPLOAD reserves its file name here BEFORE the file is written, due 15 minutes ahead (queuedAt is the DUE time; the drain takes only due entries), and the
+/// row insert deletes the reservation in its own transaction: a rejected or crashed upload leaves a reservation that becomes due and is drained. A stored name is a random uuid and identifies no one.
+model OrderAttachmentFileDeletion {
+  storedName String   @id @map("stored_name")
+  queuedAt   DateTime @default(now()) @map("queued_at")
+  attempts   Int      @default(0)
+
+  @@map("order_attachment_file_deletions")
+}
+
 model SalesOrderInvoiceDocument {
   id                 String              @id @default(cuid())
   orderId            String              @map("order_id")
@@ -3923,6 +3982,20 @@ model ProductSyncMark {
   @@map("product_sync_marks")
 }
 
+/// A customs field (hsCode / countryOfOrigin / customsDescription) that was EMPTIED on a product (value -> nothing). Written by a database
+/// trigger on `products` so every write path records it, and removed when the field is populated again or once the warehouse copy is
+/// verified empty. This, not an unset field, is the only evidence that the warehouse copy should be cleared.
+model ProductCustomsClear {
+  productId String
+  field     String
+  createdAt DateTime @default(now())
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([productId, field])
+  @@map("product_customs_clears")
+}
+
 model StockSyncJob {
   connector   String
   productId   String
@@ -4135,6 +4208,12 @@ model WmsOrderStatusSnapshot {
   // Last WMS status successfully pushed to the storefront (G4). Decoupled from `status`
   // so a failed storefront push isn't masked by the cached-status change gate — it retries.
   wcPushedStatus      String?
+  /// CONSECUTIVE status-sweep lookups that found the warehouse order genuinely absent (a 404 and a presence probe that agreed, for an order IMS has
+  /// pushed). Reset by any lookup that finds the order (or finds it merged or ambiguous); left alone by a lookup that failed. At the threshold the
+  /// snapshot becomes NOTFOUND and the sweep stops polling the order. A counter only: no personal data.
+  notFoundStrikes     Int      @default(0)
+  /// When the snapshot became NOTFOUND (the sweep no longer polls it). Null while the order is still polled.
+  notFoundAt          DateTime?
 
   order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -4335,6 +4414,8 @@ enum WmsOperatorTaskReason {
   SHOP_REFUND_DUE
   /// An IMS amendment the warehouse order could not take because it was already past NEW: a person applies the change in the warehouse by hand.
   AMENDMENT_NOT_APPLIED
+  /// The status sweep found the warehouse order absent on several consecutive polls, marked it NOTFOUND and stopped polling it: a person checks it in the warehouse.
+  ORDER_NOT_FOUND
 }
 
 enum WmsOperatorTaskStatus {
@@ -4364,6 +4445,34 @@ model WcStockDirtyOrder {
 
   @@index([syncVersion, checkedAt, releasedAt, id], map: "wc_stock_dirty_orders_refresh_idx")
   @@map("wc_stock_dirty_orders")
+}
+
+/// Per-order state of the TrackShip re-fire sweep (setting `trackship_refire_enabled`, default off). One row per shipped, tracked storefront order
+/// inside the re-fire window. `attempts` counts the re-fires asked of the storefront; `nextAttemptAt` is the exponential back-off (capped) until
+/// the next one. COVERED: the storefront reported a TrackShip shipment for every tracking number. EXPIRED: the order left the re-fire window or
+/// the storefront no longer has it, so nothing more is asked. Order and tracking facts only: no personal data.
+enum TrackshipRefireStatus {
+  ACTIVE
+  COVERED
+  EXPIRED
+}
+
+model TrackshipRefireState {
+  id            String                @id @default(cuid())
+  orderId       String                @unique @map("order_id")
+  status        TrackshipRefireStatus @default(ACTIVE)
+  attempts      Int                   @default(0)
+  nextAttemptAt DateTime              @map("next_attempt_at")
+  lastAttemptAt DateTime?             @map("last_attempt_at")
+  /// The storefront's answer to the last re-fire, in a fixed vocabulary (never remote free text).
+  lastResult    String?               @map("last_result")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+
+  order         SalesOrder            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt], map: "trackship_refire_states_due_idx")
+  @@map("trackship_refire_states")
 }
 
 model WmsOperatorTask {
@@ -5735,6 +5844,44 @@ model PaymentRemovalReconciliation {
 
   @@index([orderId])
   @@map("payment_removal_reconciliations")
+}
+
+/// A synced sales invoice or supplier bill the operator deleted in IMS and Xero together. One row per deleted document (the
+/// external document id is unique and never reused by the ledger), written in the transaction that queues the Xero delete.
+///
+/// `state` PENDING: the delete is queued or in flight and the IMS records are untouched. COMPLETED: the ledger confirmed the
+/// delete and IMS unwound its own records (the order's invoice link, or the bill) in one transaction. The Xero side is two
+/// writes, in this order: `releasedNumber` replaces the document's number (so the original is free for a replacement), then the
+/// status goes to DELETED or VOIDED. `releasedNumber` is fixed when the row is written, so a retry after the first write
+/// succeeded sees the number already changed and never appends a second suffix.
+///
+/// `snapshot` holds what IMS knew of the document (numbers, dates, totals, the bill's lines) and what the unwind did; it carries no
+/// customer or supplier personal data.
+model AccountingDocumentDeletion {
+  id                 String    @id @default(cuid())
+  /// SALES_INVOICE or PURCHASE_BILL.
+  kind               String
+  connector          String    @default("xero")
+  /// SalesOrder (referenceId = the order) or PurchaseOrder (referenceId = the order; `documentId` = the bill).
+  referenceType      String    @map("reference_type")
+  referenceId        String    @map("reference_id")
+  /// The local document: the PurchaseInvoice id for a bill; the order id again for a sales invoice.
+  documentId         String    @map("document_id")
+  /// The ledger's document id. Unique: a ledger document is deleted once.
+  externalDocumentId String    @unique @map("external_document_id")
+  originalNumber     String    @map("original_number")
+  releasedNumber     String    @map("released_number")
+  /// DELETED (DRAFT or SUBMITTED in the ledger) or VOIDED (AUTHORISED, no payments). Set when the ledger write is done.
+  targetStatus       String?   @map("target_status")
+  state              String    @default("PENDING")
+  requestedById      String?   @map("requested_by_id")
+  requestedAt        DateTime  @default(now()) @map("requested_at")
+  completedAt        DateTime? @map("completed_at")
+  snapshot           Json      @default("{}")
+
+  @@index([referenceType, referenceId])
+  @@index([state])
+  @@map("accounting_document_deletions")
 }
 
 /// Operator-defined fields for products (variants included: each variant is a Product row and carries its own values) and

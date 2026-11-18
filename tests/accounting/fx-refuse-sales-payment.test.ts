@@ -33,6 +33,7 @@ function foreignOrder(overrides: Row = {}): Row {
 }
 
 const tx = {
+  accountingDocumentDeletion: { findFirst: async () => null }, // o3d-ngmt.21: no delete is pending
   $queryRaw: async () => [],
   $executeRaw: async () => 0,
   salesOrder: {

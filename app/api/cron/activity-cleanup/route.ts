@@ -4,6 +4,7 @@ import { purgeExpiredActivityLogs, purgeExpiredCronRuns } from '@/lib/activity-l
 import { purgeExpiredDemandHistory } from '@/lib/connectors/woocommerce/sync/initial-import'
 import { purgeExpiredData } from '@/lib/data-retention'
 import { purgeExpiredWmsMutationEvents, WMS_MUTATION_EVENT_RETENTION_DAYS } from '@/lib/domain/wms/mutation-audit'
+import { drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 import { logActivity } from '@/lib/activity-log'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { cronResultResponse } from '@/lib/ops/cron-response'
@@ -47,6 +48,19 @@ export async function GET(request: Request) {
     })
   }
 
-  const body = { totalDeleted, retention, demandDeleted, cronRuns, dataRetention, wmsMutationEvents }
+  // Attachment files owed a deletion (an erasure or a draft-order delete whose unlink failed or was interrupted): retried here until gone.
+  const attachmentFiles = await drainOrderAttachmentFileDeletions()
+  if (attachmentFiles.failed.length > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'attachment_files_not_removed',
+      tag: 'system',
+      level: 'ERROR',
+      description: 'Order attachment files owed a deletion could not be removed; they stay queued',
+      metadata: { storedNames: attachmentFiles.failed },
+    })
+  }
+
+  const body = { totalDeleted, retention, demandDeleted, cronRuns, dataRetention, wmsMutationEvents, attachmentFiles }
   return cronResultResponse(body, { outcomeClass: cronOutcome('activity-cleanup', body) })
 }

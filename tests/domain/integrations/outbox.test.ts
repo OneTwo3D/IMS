@@ -955,6 +955,10 @@ test('every registered outbox operation declares a known replay-safety answer an
       // with the marker row and the activity log outside that guard: an effect sequence, hence unsafe-to-replay; a dead claim is parked.
       'woocommerce/order.invoice-document',
       'woocommerce/stock.push',
+      // The TrackShip re-fire: a signed POST to the companion plugin that fires TrackShip for a tracking number it holds no shipment for, behind a
+      // fresh read of the switch and the re-fire state, with the state row and the activity log outside that guard: an effect sequence, hence
+      // unsafe-to-replay; a dead claim is parked.
+      'woocommerce/trackship.refire',
       'xero/accounting.post',
     ],
     'a new outbox operation was registered — assess its replay safety on o3d-8td2 before adding it here',
@@ -980,6 +984,8 @@ test('the seven verdicts are the round-3 corrected ones', () => {
     'woocommerce/order.hold': 'unsafe-to-replay',
     // The My Account invoice flag: an effect sequence over one guarded meta PUT, so no safe verdict.
     'woocommerce/order.invoice-document': 'unsafe-to-replay',
+    // The TrackShip re-fire: an effect sequence over one signed POST to the companion plugin, so no safe verdict.
+    'woocommerce/trackship.refire': 'unsafe-to-replay',
     // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an EmailOutbox
     // row that no fence couples to this worker's completion. ROUND 16: this line used to add "whose
     // own queue is unfenced — o3d-alnk", and o3d-alnk is the branch that stopped it being true. The

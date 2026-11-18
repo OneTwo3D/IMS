@@ -19,6 +19,7 @@ import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { InvoiceDocumentsRetainedError, invoiceDocumentResetVerdict } from '@/lib/domain/invoice-documents/reset-guard'
 import { AdvisoryLockWaitTimeoutError, lockResetInTransaction, withInvoiceDocumentResetLock } from '@/lib/domain/invoice-documents/reset-lock'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
+import { drainOrderAttachmentFileDeletions, queueOrderAttachmentFilesInTx } from '@/lib/domain/order-attachments'
 import {
   countUnrecordedIncidents,
   describePreservedUnrecordedIncidents,
@@ -132,6 +133,8 @@ async function clearTransactionScope(guards: ResetGuards) {
     await tx.salesOrderRefundLine.deleteMany({})
     await tx.salesOrderRefund.deleteMany({})
     await tx.salesOrderLine.deleteMany({})
+    // Sales-order attachment rows go with their orders (cascade); their files are QUEUED for deletion in this same transaction, so they are removed even if the process dies after the commit.
+    await queueOrderAttachmentFilesInTx(tx, 'sales')
     await tx.salesOrder.deleteMany({})
     // Operator answers for WooCommerce order lines belong to the orders just deleted.
     await tx.euVatGiftCardLineResolution.deleteMany({})
@@ -152,7 +155,12 @@ async function clearTransactionScope(guards: ResetGuards) {
   await db.freightCostLine.deleteMany({})
   await db.landedCostLink.deleteMany({})
   await db.purchaseOrderLine.deleteMany({})
-  await db.purchaseOrder.deleteMany({})
+  // Purchase-order attachment rows cascade with the orders; their files are queued in the same transaction as the delete. Then every queued file is drained.
+  await db.$transaction(async (tx) => {
+    await queueOrderAttachmentFilesInTx(tx, 'purchase')
+    await tx.purchaseOrder.deleteMany({})
+  })
+  await drainOrderAttachmentFileDeletions(100_000)
 
   guards.assertHeld('manufacturing and warehouse ops')
   // Manufacturing / warehouse ops

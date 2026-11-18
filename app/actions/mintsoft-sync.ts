@@ -4027,6 +4027,8 @@ export async function createMintsoftPurchaseOrderAsn(
           // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
           // before any receipt has been applied, would close the very populations that would otherwise
           // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          // INVARIANT: BOOKED_IN written here means "the warehouse says so", NOT "IMS has the receipt". It stays
+          // in the incoming-stock arm while closedAt is null (lib/domain/wms/asn-awaiting-units.ts); keep it null.
           closedAt: null,
         },
       })
@@ -5236,6 +5238,8 @@ export async function createMintsoftTransferAsn(
           // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
           // before any receipt has been applied, would close the very populations that would otherwise
           // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          // INVARIANT: BOOKED_IN written here means "the warehouse says so", NOT "IMS has the receipt". It stays
+          // in the incoming-stock arm while closedAt is null (lib/domain/wms/asn-awaiting-units.ts); keep it null.
           closedAt: null,
         },
       })

@@ -14,6 +14,8 @@ import {
   type Branding,
 } from '@/lib/pdf'
 import { renderPurchaseOrderPdf } from '@/lib/purchase-order-pdf'
+import { loadDocumentTemplate } from '@/lib/sales-order-pdf'
+import { QUOTE_DOCUMENT_TITLE } from '@/lib/domain/sales/sales-quote'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
 
@@ -123,6 +125,54 @@ async function generateSalesOrderPreview(branding: Branding, today: string) {
 
   drawTemplateNotes(doc, tpl, 'footer')
   drawFooter(doc, 'Thank you for your order.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
+  return pdfToBuffer(doc)
+}
+
+async function generateQuotePreview(branding: Branding, today: string) {
+  // The saved Quote template, or the built-in default until one is saved; a quote prints no payment terms.
+  const saved = await loadDocumentTemplate('quote')
+  const tpl = saved ? { ...saved, showPaymentTerms: false } : null
+  const { doc } = createPdfDocument({ title: 'Quote Preview' })
+
+  await drawHeader(doc, branding, {
+    title: QUOTE_DOCUMENT_TITLE,
+    reference: 'SO-2026-00108',
+    date: today,
+    recipient: SAMPLE_RECIPIENT,
+  })
+  doc.font('Helvetica-Bold').fontSize(10).fillColor('#333').text('Valid until 31 December 2026', 50, doc.y)
+  doc.fillColor('#000')
+  doc.y += 8
+
+  drawTemplateNotes(doc, tpl, 'header')
+
+  const columns: PdfTableColumn[] = [
+    { label: '#', width: 25, align: 'right' },
+    { label: 'SKU', width: 70 },
+    { label: 'Description', width: 195, wrap: true },
+    { label: 'Qty', width: 40, align: 'right' },
+    { label: 'Price (£)', width: 65, align: 'right' },
+    { label: 'Discount', width: 50, align: 'right' },
+    { label: 'Total (£)', width: 65, align: 'right' },
+  ]
+  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, String(l.qty), l.price.toFixed(2), '', l.total.toFixed(2)])
+  drawTable(doc, columns, rows, branding)
+
+  doc.y += 5
+  const lastCol = columns[columns.length - 1]
+  const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
+  const vW = lastCol.width
+  const lW = 70
+  const lX = tableRight - vW - lW
+  doc.font('Helvetica').fontSize(9).fillColor('#666')
+  doc.text('Subtotal:', lX, doc.y, { width: lW, align: 'right' })
+  doc.text('£524.50', tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
+  doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
+  doc.text('£524.50', tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+
+  drawTemplateNotes(doc, tpl, 'footer')
+  drawFooter(doc, 'Thank you for your enquiry.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
   return pdfToBuffer(doc)
 }
 
@@ -300,6 +350,7 @@ async function generateManufacturingOrderPreview(branding: Branding, today: stri
 const GENERATORS: Record<string, (b: Branding, today: string) => Promise<Buffer>> = {
   invoice: generateInvoicePreview,
   sales_order: generateSalesOrderPreview,
+  quote: generateQuotePreview,
   purchase_order: generatePurchaseOrderPreview,
   rfq: generateRfqPreview,
   packing_slip: generatePackingSlipPreview,

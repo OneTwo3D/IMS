@@ -317,6 +317,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'KPIs, chart buckets and (round 5) Best Sellers all bucket refunds by stamped basis, subtract only NET, and publish a bound. o3d-7jfq: every bound comes from the unplaced credit\u2019s INTERVAL, recorded as each entry\u2019s positive part, so two opposite same-basis credits can no longer cancel into a \u2264.',
   },
   {
+    file: 'lib/security/dashboard-cost-redaction.ts',
+    figures: ['compMarginPct', 'compMarginPctBound', 'marginBoundComparison', 'marginBoundCurrent', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'profitCurrent'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Computes nothing: it copies the dashboard action\u2019s already-built response through an allowlist and, for roles barred from cost data, overwrites the cost-derived figures (profit, margin and their bound markers) with zero and \u2018exact\u2019. netRevenue and netRevenueBound are passed through unchanged from the basis-aware dashboard action.',
+  },
+  {
     file: 'app/actions/forecasting.ts',
     figures: ['productsByRevenue', 'revenueByProduct', 'totalRevenue'],
     treatment: 'refund-blind',

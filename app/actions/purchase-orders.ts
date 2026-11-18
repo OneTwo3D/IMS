@@ -1,5 +1,6 @@
 'use server'
 
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
@@ -4473,6 +4474,9 @@ export async function updateInvoice(
       },
     })
     if (!invoice) return { success: false, error: 'Bill not found' }
+    // o3d-ngmt.21: no edit of a bill whose delete is pending.
+    const deletePendingForEdit = await pendingDeletionError(invoice.id)
+    if (deletePendingForEdit) return { success: false, error: deletePendingForEdit }
     try {
       assertPurchaseInvoiceEditable(invoice)
     } catch (error) {
@@ -5012,6 +5016,9 @@ export async function markBillPaid(
       },
     })
     if (!invoice) return { success: false, error: 'Bill not found' }
+    // o3d-ngmt.21: no payment against a bill whose delete is pending.
+    const deletePendingForPayment = await pendingDeletionError(invoice.id)
+    if (deletePendingForPayment) return { success: false, error: deletePendingForPayment }
     if (invoice.paidAt) return { success: false, error: 'Bill is already marked as paid' }
     if (!input.bankAccountId) return { success: false, error: 'Select a bank account' }
     if (!input.paymentDate) return { success: false, error: 'Payment date is required' }
@@ -5454,6 +5461,12 @@ export async function recordSupplierFreightCreditNote(input: {
       ? po.invoices.find((inv) => inv.id === input.purchaseInvoiceId) ?? null
       : po.invoices[0] ?? null
 
+    // o3d-ngmt.21: no supplier credit note against a bill whose delete is pending.
+    if (selectedInvoice) {
+      const deletePendingForRecord = await pendingDeletionError(selectedInvoice.id)
+      if (deletePendingForRecord) return { success: false, error: deletePendingForRecord }
+    }
+
     // Remaining creditable = the bill's total minus credit notes already recorded
     // against it, so a PO can't be over-credited (Codex review).
     let remainingCreditableForeign: number | null = null
@@ -5579,6 +5592,11 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     })
     if (!cn) return { success: false, error: 'Credit note not found' }
     if (cn.status !== 'DRAFT') return { success: false, error: 'Credit note is already posted' }
+    // o3d-ngmt.21: no supplier credit note against a bill whose delete is pending.
+    if (cn.purchaseInvoiceId) {
+      const deletePendingForCredit = await pendingDeletionError(cn.purchaseInvoiceId)
+      if (deletePendingForCredit) return { success: false, error: deletePendingForCredit }
+    }
 
     // Resolve connector/settings BEFORE the transaction (Codex review: a lookup
     // failure must not occur after the row is already POSTED).
