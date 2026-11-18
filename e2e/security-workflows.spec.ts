@@ -5,13 +5,21 @@ import { E2E_ADMIN_EMAIL, E2E_ADMIN_PASSWORD } from './test-data'
 
 test.describe.configure({ mode: 'serial' })
 
+// Each TOTP code is accepted once per user (replay protection), so never hand out two codes from the same step.
+let lastStep = -1
+
 async function freshCode(secret: string) {
-  const seconds = Math.floor(Date.now() / 1000)
-  const remaining = 30 - (seconds % 30)
-  if (remaining < 5) {
-    await new Promise((resolve) => setTimeout(resolve, (remaining + 1) * 1000))
+  for (;;) {
+    const seconds = Math.floor(Date.now() / 1000)
+    const remaining = 30 - (seconds % 30)
+    const step = Math.floor(seconds / 30)
+    if (remaining < 5 || step === lastStep) {
+      await new Promise((resolve) => setTimeout(resolve, (remaining + 1) * 1000))
+      continue
+    }
+    lastStep = step
+    return generate({ secret })
   }
-  return generate({ secret })
 }
 
 test.describe('security workflows', () => {

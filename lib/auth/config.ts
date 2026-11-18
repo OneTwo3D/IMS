@@ -5,7 +5,16 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
-import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
+import { cookies } from 'next/headers'
+import {
+  beginLoginAttempt,
+  LOGIN_DEVICE_COOKIE_MAX_AGE_SEC,
+  LOGIN_DEVICE_COOKIE_NAME,
+  LoginThrottledError,
+  readCookie,
+  signDeviceCookie,
+  verifyDeviceCookie,
+} from '@/lib/auth/login-throttle'
 import { getClientIp, isTrustedProxyConfigured } from '@/lib/request-ip'
 import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
 import {
@@ -21,7 +30,25 @@ const loginSchema = z.object({
 
 const DUMMY_BCRYPT_HASH = '$2b$12$Q7QxTQqR0p6vJY9Yx1m8JOkjH3J0mD6G4jY6YtV2v0mL4YvM1gM9S'
 
+const deviceCookieSecret = () => process.env.NEXTAUTH_SECRET || process.env.AUTH_SECRET || ''
+
 const nowSeconds = () => Math.floor(Date.now() / 1000)
+
+const findLoginUser = (email: string) => db.user.findUnique({
+  where: { email },
+  select: {
+    id: true,
+    email: true,
+    name: true,
+    passwordHash: true,
+    role: true,
+    supplierId: true,
+    pictureUrl: true,
+    totpEnabled: true,
+    active: true,
+    sessionVersion: true,
+  },
+})
 
 const getSessionRevalidationUser = cache(async (userId: string) => db.user.findUnique({
   where: { id: userId },
@@ -177,46 +204,46 @@ export const authConfig: NextAuthConfig = {
           if (!turnstileVerified) return null
         }
 
-        // Fail closed so a rate-limit backend outage cannot silently disable
-        // brute-force protection. Keyed on email+IP for targeted-guess throttling.
-        const rlKey = `login:${parsed.data.email.toLowerCase()}:${clientIp}`
-        const rl = await checkRateLimit(rlKey, 10, 15 * 60_000, { failClosed: true })
-        if (!rl.allowed) return null
-
-        // Broader per-IP cap throttles password-spraying (one password across
-        // many accounts from one source). Only enabled when trusted-proxy
-        // resolution is configured: without it every client collapses onto the
-        // fronting proxy's IP and this cap would lock out an entire office.
-        if (isTrustedProxyConfigured() && clientIp !== 'unknown') {
-          const ipRlKey = `login-ip:${clientIp}`
-          const ipRl = await checkRateLimit(ipRlKey, 50, 15 * 60_000, { failClosed: true })
-          if (!ipRl.allowed) return null
-        }
-
-        const user = await db.user.findUnique({
-          where: { email: parsed.data.email },
-          select: {
-            id: true,
-            email: true,
-            name: true,
-            passwordHash: true,
-            role: true,
-            supplierId: true,
-            pictureUrl: true,
-            totpEnabled: true,
-            active: true,
-            sessionVersion: true,
-          },
+        // Per-account cooldown + one in-flight check per account + failed-attempt IP slowdown; none of it
+        // refuses a correct password beyond the short cooldown. See lib/auth/login-throttle.ts.
+        // A valid signed device cookie for this account (set after a previous successful sign-in) skips the
+        // per-account cooldown so an attacker cannot keep the real user locked out.
+        const user = await findLoginUser(parsed.data.email)
+        const secret = deviceCookieSecret()
+        const device = user && secret
+          ? verifyDeviceCookie(readCookie(request.headers.get('cookie'), LOGIN_DEVICE_COOKIE_NAME), user.id, secret)
+          : null
+        const attempt = await beginLoginAttempt({
+          email: parsed.data.email,
+          clientIp,
+          ipIsTrustworthy: isTrustedProxyConfigured(),
+          device,
         })
+        if (!attempt.allowed) throw new LoginThrottledError(attempt.retryAfterSec)
 
-        const passwordHash = user?.passwordHash ?? DUMMY_BCRYPT_HASH
-        const passwordMatch = await bcrypt.compare(
-          parsed.data.password,
-          passwordHash,
-        )
-        if (!user || !user.active || !passwordMatch) return null
+        let outcome: 'success' | 'failure' = 'failure'
+        try {
+          const passwordHash = user?.passwordHash ?? DUMMY_BCRYPT_HASH
+          const passwordMatch = await bcrypt.compare(parsed.data.password, passwordHash)
+          if (user && user.active && passwordMatch) outcome = 'success'
+        } finally {
+          await attempt.finish(outcome)
+        }
+        if (outcome !== 'success' || !user) return null
 
-        await clearRateLimit(rlKey)
+        if (secret) {
+          try {
+            ;(await cookies()).set(LOGIN_DEVICE_COOKIE_NAME, signDeviceCookie(user.id, secret), {
+              httpOnly: true,
+              secure: true,
+              sameSite: 'lax',
+              path: '/',
+              maxAge: LOGIN_DEVICE_COOKIE_MAX_AGE_SEC,
+            })
+          } catch {
+            // No request cookie store in this context: the sign-in still succeeds, just without a device cookie.
+          }
+        }
 
         return {
           id: user.id,

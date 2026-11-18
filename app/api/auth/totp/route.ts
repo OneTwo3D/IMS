@@ -7,11 +7,11 @@ import { randomBytes } from 'crypto'
 import { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
-import { verify } from 'otplib'
 import { z } from 'zod'
 import { setAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
 import { readTotpSecrets } from '@/lib/totp-secrets'
+import { verifyTotpCodeOnce } from '@/lib/auth/totp-replay'
 
 const schema = z.object({ code: z.string().length(6) })
 
@@ -51,9 +51,18 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: '2FA not enabled' }, { status: 400 })
   }
 
-  const result = await verify({ secret: secrets.totpSecret, token: parsed.data.code })
-
-  if (!result.valid) {
+  const outcome = await verifyTotpCodeOnce({
+    userId: session.user.id,
+    secret: secrets.totpSecret,
+    code: parsed.data.code,
+  })
+  if (outcome === 'replayed') {
+    return Response.json(
+      { error: 'That code was already used. Wait for the next code and try again.' },
+      { status: 400 },
+    )
+  }
+  if (outcome !== 'ok') {
     return Response.json({ error: 'Invalid code' }, { status: 400 })
   }
 
