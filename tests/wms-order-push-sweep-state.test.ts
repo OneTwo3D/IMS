@@ -1194,7 +1194,19 @@ test('update: a changed order is amended; pushedAt bumped, error cleared', async
   assert.equal(r.updated, 1)
   assert.equal(updates[0].data.lastError, null)
   assert.equal((updates[0].data.pushedAt as Date).toISOString(), NOW().toISOString())
-  assert.deepEqual(Object.keys(updates[0].data).sort(), ['lastAttemptAt', 'lastError', 'pushedAt'], 'an amendment never rewrites the first-claim stamp')
+  assert.deepEqual(Object.keys(updates[0].data).sort(), ['lastAttemptAt', 'lastError', 'pushWarehouseId', 'pushedAt'], 'an amendment never rewrites the first-claim stamp')
+})
+
+test('update: an applied amendment (header POST carries WarehouseId) stamps pushWarehouseId in the same write; a refused one does not', async () => {
+  const link: WmsPushUpdateLink = { id: 'link-1', externalOrderId: 'wms-1', order: { ...candidate(), shipFromWarehouseId: 'wh-1' } }
+  const applied = makePort({ updatable: [link] })
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', applied.port, { now: NOW })
+  assert.equal(applied.updates.length, 1)
+  assert.equal(applied.updates[0].data.pushWarehouseId, 'wh-1', 'the warehouse order was moved to the new ship-from, so a despatch from it is not foreign')
+  assert.ok(applied.updates[0].data.pushedAt, 'written together with the amend outcome')
+  const refused = makePort({ updatable: [link] })
+  await runWmsOrderPushSweepCore(connector({ updateOrder: async () => ({ updated: false, status: 'NOT_NEW' }) }), 'mintsoft', refused.port, { now: NOW })
+  assert.equal('pushWarehouseId' in refused.updates[0].data, false, 'a refused amendment moved nothing')
 })
 
 test('update: a past-NEW order is not amended but pushedAt is bumped (no futile retries)', async () => {

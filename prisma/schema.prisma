@@ -4420,11 +4420,11 @@ model WmsOrderPushLink {
   /// (sets both columns back to null; the clear is audited). `doublePostageDetail` is the sentence the operator reads: order numbers and amounts only.
   doublePostageAt       DateTime? @map("double_postage_at")
   doublePostageDetail   String?   @map("double_postage_detail")
-  /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
-  /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
   /// The IMS warehouse the warehouse order was created for (the order's ship-from warehouse at create time). A despatch is evidence about
   /// this warehouse only. Null on links created before this column existed (the despatch then falls back to the order's ship-from).
   pushWarehouseId       String?   @map("push_warehouse_id")
+  /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
+  /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
   lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
   /// The generation of the amendment that set the mark above. Only the amendment holding the CURRENT token may store a replacement snapshot
   /// or clear the mark (compare-and-set), so an older amendment finishing late cannot make a newer one's stale state look trustworthy.
