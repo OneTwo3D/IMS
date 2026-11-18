@@ -77,6 +77,8 @@ mock.module('@/lib/db', {
       // Already allocated and already has a shipment, so the auto-allocate / confirm branches stay
       // out of the way and the run is purely the status walk this test is about.
       orderAllocation: { count: async () => 1 },
+      // o3d-hqvrp.78: the WMS push-link read; no link, so the warehouse falls back to the order's ship-from (null here: nothing is refused).
+      wmsOrderPushLink: { findUnique: async () => null },
       shipment: {
         count: async () => 1,
         findMany: async () => [{ id: 'shipment-1', status: 'PACKED' }],

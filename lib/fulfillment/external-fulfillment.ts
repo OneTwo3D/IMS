@@ -75,6 +75,7 @@ export type ExternalFulfillmentRefusal =
   | 'order_not_ready_to_ship'
   | 'shipment_status_transition_failed'
   | 'despatch_review_not_recorded'
+  | 'wms_other_warehouse_shipments'
 
 export type ExternalFulfillmentOutcome =
   | {
@@ -634,6 +635,48 @@ export function describeExternalFulfillmentShortfall(
     + 'shipment, or close the order short deliberately.'
 }
 
+/**
+ * o3d-hqvrp.78: A WMS DISPATCH IS EVIDENCE ABOUT THE WMS WAREHOUSE ONLY. Allocation can place part (or all) of an order in a warehouse the
+ * WMS never served, and driving that shipment to SHIPPED would take stock out of a warehouse the goods never left. A shipment IMS holds in a
+ * different warehouse is therefore never driven by the WMS: the dispatch is refused (retryable, visible on the sync exceptions inbox) until
+ * an operator reallocates the order to the WMS warehouse or ships the other warehouse by hand.
+ *
+ * The WMS warehouse is the one the WMS order was PUSHED for (the push link's `pushWarehouseId`), so a later change of the order's ship-from
+ * warehouse cannot turn the real WMS shipments into "foreign" ones. A link with none (created before the column) falls back to the order's
+ * current ship-from warehouse; with neither, nothing is refused.
+ */
+async function refuseWmsForeignWarehouseShipments(
+  update: ExternalFulfillmentUpdate,
+  orderId: string,
+  orderRef: string,
+  shipments: Array<{ id: string; warehouseId: string | null }>,
+): Promise<ExternalFulfillmentOutcome | null> {
+  if (update.targetShipmentStatus !== 'SHIPPED' || !isWmsConnectorId(update.source)) return null
+  const [link, wmsOrder] = await Promise.all([
+    db.wmsOrderPushLink.findUnique({ where: { orderId }, select: { pushWarehouseId: true } }),
+    db.salesOrder.findUnique({ where: { id: orderId }, select: { shipFromWarehouseId: true } }),
+  ])
+  const wmsWarehouseId = link?.pushWarehouseId ?? wmsOrder?.shipFromWarehouseId ?? null
+  const foreign = wmsWarehouseId
+    ? shipments.filter((shipment) => shipment.warehouseId && shipment.warehouseId !== wmsWarehouseId)
+    : []
+  if (foreign.length === 0) return null
+  const error = `${update.source} despatched order ${orderRef}, but IMS holds ${foreign.length} unshipped shipment(s) in a warehouse other than the one `
+    + `${update.source} serves, so the despatch was not applied to them (the goods did not leave that warehouse). Reallocate the order to the `
+    + 'WMS warehouse or ship the other warehouse by hand, then replay the despatch.'
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'external_fulfillment_other_warehouse_shipments',
+    tag: 'sync',
+    level: 'WARNING',
+    description: error,
+    metadata: { source: update.source, wmsWarehouseId, shipmentIds: foreign.map((shipment) => shipment.id), warehouseIds: [...new Set(foreign.map((shipment) => shipment.warehouseId))] },
+    resolveUser: false,
+  })
+  return refuseExternalFulfillment('wms_other_warehouse_shipments', error)
+}
+
 export async function applyExternalFulfillmentUpdate(
   update: ExternalFulfillmentUpdate,
 ): Promise<ExternalFulfillmentOutcome> {
@@ -670,6 +713,13 @@ export async function applyExternalFulfillmentUpdate(
       })
       return refuseExternalFulfillment('order_not_ready_to_ship', error)
     }
+  }
+
+  // o3d-hqvrp.78: the refusal comes BEFORE any side effect (allocation, shipment creation) for shipments that already exist.
+  if (update.targetShipmentStatus === 'SHIPPED' && isWmsConnectorId(update.source)) {
+    const existing = await db.shipment.findMany({ where: { orderId: order.id, status: { not: update.targetShipmentStatus } }, select: { id: true, warehouseId: true } })
+    const refusedEarly = await refuseWmsForeignWarehouseShipments(update, order.id, orderRef, existing)
+    if (refusedEarly) return refusedEarly
   }
 
   const allocationCount = await db.orderAllocation.count({ where: { orderId: order.id } })
@@ -738,9 +788,13 @@ export async function applyExternalFulfillmentUpdate(
 
   const shipments = await db.shipment.findMany({
     where: { orderId: order.id, status: { not: update.targetShipmentStatus } },
-    select: { id: true, status: true },
+    select: { id: true, status: true, warehouseId: true },
     orderBy: { createdAt: 'asc' },
   })
+
+  // o3d-hqvrp.78: re-checked here as well, because the allocation above may just have created shipments in another warehouse.
+  const refusedForeign = await refuseWmsForeignWarehouseShipments(update, order.id, orderRef, shipments)
+  if (refusedForeign) return refusedForeign
 
   // The unreleased status the dispatch transaction itself found under the order lock (set only when it recorded without promoting).
   let lockedNotReadyStatus: string | null = null

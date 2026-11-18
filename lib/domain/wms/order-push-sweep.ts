@@ -807,6 +807,8 @@ function refundedQtyByLine(order: { refunds?: Array<{ lines: Array<{ salesOrderL
 type PushState = 'MERGED' | 'PENDING_CREATE' | 'PENDING_VERIFY' | 'SYNCED' | 'PENDING_CANCEL' | 'CANCELLED' | 'DEAD_LETTER' | 'HELD' | 'VALIDATION_FAILED' | 'AMBIGUOUS_CREATE'
 type LinkWrite = {
   connector?: string
+  /** The IMS warehouse the warehouse order was created for (the order's ship-from at create time). */
+  pushWarehouseId?: string | null
   externalOrderId?: string | null
   externalOrderNumber?: string | null
   state?: PushState
@@ -2419,7 +2421,7 @@ export async function runWmsOrderPushSweepCore(
           try {
             adopted = await port.updateLinkIfState(link.id, 'AMBIGUOUS_CREATE', {
               state: 'PENDING_VERIFY', externalOrderId: resolution.externalOrderId, externalOrderNumber: resolution.externalOrderNumber,
-              attempts: 0, pushedAt: ts, lastError: null, lastAttemptAt: ts, cancelledAt: null, ...RESET_DISPATCH_FAILURES,
+              pushWarehouseId: link.order.shipFromWarehouseId ?? null, attempts: 0, pushedAt: ts, lastError: null, lastAttemptAt: ts, cancelledAt: null, ...RESET_DISPATCH_FAILURES,
             })
           } catch (error) {
             console.error('[wms-order-push] failed to bind a parked create to the warehouse order', link.id, error)
@@ -2893,14 +2895,14 @@ export async function runWmsOrderPushSweepCore(
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: components=${componentPence ?? 'ok'} payload=${payloadPence ?? 'ok'} (recording ${totalMismatchPence}; pushed, flagged for review)`)
         }
-        const createLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
+        const createLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-        const updateLinkData = { connector: connectorId, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
+        const updateLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
             // A (re-)created warehouse order starts with no amendment in flight and no stale mark, written atomically with the state it is
             // SYNCED under (and with its snapshot, see upsertCreatedLinkWithItems).
             lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }
@@ -3633,6 +3635,9 @@ export async function runWmsOrderPushSweepCore(
           lastAttemptAt: ts,
           pushedAt: ts,
           ...(update.updated && link.amendNoticeAt ? { amendNoticeAt: null } : {}),
+          // The accepted header POST carried WarehouseId, so the warehouse order now lives in the warehouse IMS built the amendment for:
+          // stamped in the same write that records the outcome, or a despatch from it would read as foreign.
+          ...(update.updated ? { pushWarehouseId: link.order.shipFromWarehouseId ?? null } : {}),
           lastError: settled.retryable ? 'Courier-fallback operator task not recorded; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
           ...settled.linkFields,
         })
@@ -3661,7 +3666,7 @@ export async function runWmsOrderPushSweepCore(
         // may have been accepted, so the marker stays and the courier pass records the task.
         if (courierMarkerSetHere && !(error instanceof WmsOrderUpdatePartialError) && isOutboundWriteHeldError(error) && error.nothingSent) await port.clearCourierTaskDue?.(link.order.id, amendService ?? '—').catch(() => {})
         const partial = error instanceof WmsOrderUpdatePartialError ? await settleAmendedCourier(link, error.applied, courierMarkerSetHere, earlierCourierTaskRecorded, amendService, amendEpisode).catch(() => null) : null
-        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial?.linkFields ?? {}) }).catch(() => {})
+        await port.updateLink(link.id, { lastError: message, lastAttemptAt: ts, ...(partial ? { pushWarehouseId: link.order.shipFromWarehouseId ?? null } : {}), ...(partial?.linkFields ?? {}) }).catch(() => {})
         await audit({
           action: 'order_update', outcome: update?.updated ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: link.order.id, externalId: link.externalOrderId,
           summary: update
