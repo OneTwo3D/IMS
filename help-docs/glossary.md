@@ -105,6 +105,9 @@ A workflow that returns money to the customer and optionally restocks goods. Ref
 
 ## Accounting and FX
 
+**GR/IR (goods received, not invoiced)**
+The value of goods received against a purchase order that no supplier bill covers yet (and, for a prepaid supplier, the value billed before the goods arrived). IMS keeps it in its own GR/IR sub-ledger, valued at the purchase-order unit cost of the goods (freight and landed cost are not in it), and shows it per supplier and order, with its age, in **Analytics > GR/IR**. Posting it to Xero is a separate, off-by-default switch (see Xero Accounting Sync).
+
 **Base currency**
 The currency in which the system reports value (stock, COGS, revenue). Set once during initial setup. All multi-currency transactions are converted to base currency for valuation. **Cannot be changed without a database reset** once live data exists.
 

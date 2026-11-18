@@ -46,6 +46,8 @@ export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
   'DAILY_BATCH_COGS_RECONCILIATION',
   // 6oyu.4 (khdw): mirror the STOCK_IN_TRANSIT rounding-difference sweep likewise.
   'DAILY_BATCH_TRANSIT_RECONCILIATION',
+  // GR/IR accrual: the reclass between Stock in Transit and GR/IR, mirrored like the other daily-batch journals.
+  'DAILY_BATCH_GRIR_RECLASS',
   'COGS_REVERSAL',
   'UNEARNED_REV_REVERSAL',
 ] as const

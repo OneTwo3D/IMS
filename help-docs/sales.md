@@ -121,6 +121,10 @@ While an order is Allocated, Picking or Packing and has shipments, a second chip
 | **Delivered** | Order confirmed as delivered (requires delivery tracking module) |
 | **Cancelled** | Order cancelled, stock reservations released |
 
+**Draft is a starting point only.** An order can leave Draft (to Pending Payment, Processing, Allocated, On Hold or Cancelled) but nothing moves back to Draft: once finalised, an order has been priced, allocated and invoiced. To change a finalised order use **Edit order**. A draft cannot be refunded (delete it instead). An order still waiting for payment can be refunded once a payment or receipt has been recorded against it; with nothing recorded there is nothing to refund, so delete the order if it was created in error. Do not cancel an order that has received money: a cancelled order cannot be refunded. A refund line must name a line of the same order.
+
+**Server checks on order money.** Shipping, fees, the order discount and line discounts cannot be negative, and the order's default VAT rate is always the value of the rate you named (a stale value in the form is replaced by the rate's current value).
+
 **Refund state is shown separately.** Refunds no longer change an order's stage. An order that has been refunded keeps its stage (for example **Delivered**) and carries a second badge beside it: **Partially refunded** (orange) or **Fully refunded** (red). So the order detail page can show two badges, the order status and the refund status. Orders that used to read "Partially Refunded" or "Refunded" now show their real stage plus the refund badge, and the stage filter on the list has no refund entries. A fully refunded order takes no further payments.
 
 
