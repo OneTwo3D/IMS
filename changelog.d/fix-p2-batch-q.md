@@ -1,0 +1,7 @@
+### Fulfilment: holds, returns of shipped goods, allocation release (sales / stock control)
+
+- **Fixed: an On Hold order no longer fulfils.** Confirm allocations (Create Shipments) is refused on an On Hold order instead of silently moving it to Allocated (which lifted the hold, and left a withdrawal hold set on an order that no longer showed as held). In-app moves of its shipments through Picking and Packed are refused too. Warehouse progress reports are still recorded.
+- **Fixed: returning units that already shipped no longer cancels the unshipped remainder of a part-shipped line.** Refund lines that restocked goods (measured by their return movements) or were chargebacks no longer net out of what is still to ship, in the dispatch cap, the completion check, shipment building, allocation demand and the allocation sweep. A refund with no return evidence still nets as a cancellation.
+- **Fixed: closing an order as Shipped, Completed or Delivered releases its unshipped allocation.** Previously the excess stayed reserved for ever. Best effort: a release that cannot be made does not block the status change.
+- **Added (flag, off): releasing reserved stock for a stock removal.** With the setting `stock_adjustment_release_reserved` set to `true`, a single stock removal that cuts into reserved stock releases the newest orders' allocations in the same transaction, instead of being refused. The previous post-commit release could never act, because the database never lets reserved exceed on-hand.
+- Help documents: Sales, Stock control.

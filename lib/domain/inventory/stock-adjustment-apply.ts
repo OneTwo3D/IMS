@@ -127,6 +127,12 @@ export type ApplyStockAdjustmentInput = {
    * applies. Backed by StockMovement.idempotencyKey @unique.
    */
   idempotencyToken?: string | null
+  /**
+   * o3d-hqvrp.80: when a removal exceeds the AVAILABLE stock (it would cut into reserved units),
+   * release the newest orders' unshipped allocations first, in this transaction, instead of refusing.
+   * Off unless the caller passes it (the flag `stock_adjustment_release_reserved`, read by the action).
+   */
+  releaseReservedForRemoval?: boolean
 }
 
 export type AppliedStockAdjustment = {
@@ -147,6 +153,7 @@ export async function applyStockAdjustment({
   referenceType,
   referenceId,
   idempotencyToken,
+  releaseReservedForRemoval,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
   // 0tr0/r9y2: content-addressed key from the per-submission token + payload, so an
@@ -178,6 +185,23 @@ export async function applyStockAdjustment({
     if (reason) {
       reasonName = note ? `${reason.name}: ${note}` : reason.name
       accountCode = reason.accountCode
+    }
+  }
+
+  // o3d-hqvrp.80: sales_orders are locked BEFORE stock_levels everywhere, so the release for a removal that
+  // would cut into reserved units runs before this transaction takes the stock-level lock.
+  if (releaseReservedForRemoval && qty < 0) {
+    const level = await tx.stockLevel.findUnique({
+      where: { productId_warehouseId: { productId, warehouseId } },
+      select: { quantity: true, reservedQty: true },
+    })
+    if (level && Number(level.quantity) - Number(level.reservedQty) < Math.abs(qty)) {
+      const { releaseReservationsForRemovalInTx } = await import('@/lib/fulfillment/overallocation-rebalancer')
+      await releaseReservationsForRemovalInTx(tx, { productId, warehouseId }, Math.abs(qty), {
+        source: 'stock_adjustment',
+        referenceId: productId,
+        referenceLabel: `stock adjustment (${qty})`,
+      })
     }
   }
 

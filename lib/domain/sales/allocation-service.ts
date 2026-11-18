@@ -60,6 +60,8 @@ import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { applyPegCapsToStockMap, applyPegHoldsToStockMap, evaluateOrderPegsInTx, loadPegContext } from '@/lib/domain/sales/peg-service'
 import { LEDGER_STANDING_SELECT, isShadowedObligation, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { withSavepoint } from '@/lib/db/savepoint'
+import { netRefundLinesForDemand } from '@/lib/domain/sales/refund-demand-netting'
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
@@ -2252,7 +2254,7 @@ export async function updateSalesOrderStatusUnderLock(
       previousStatus: string
     }) => Promise<void>
   },
-): Promise<{ previousStatus: string }> {
+): Promise<{ previousStatus: string; releasedProductIds: string[] }> {
   await lockSalesOrder(tx, input.orderId)
   const lockedOrder = await tx.salesOrder.findUnique({
     where: { id: input.orderId },
@@ -2272,8 +2274,33 @@ export async function updateSalesOrderStatusUnderLock(
     where: { id: input.orderId },
     data: { ...(input.data ?? {}), status: input.targetStatus },
   })
-  return { previousStatus: lockedOrder.status }
+
+  // o3d-hqvrp.79: closing an order as SHIPPED / COMPLETED / DELIVERED ends its demand, but nothing
+  // gave back the unshipped part of its allocation: the sweep and the backorder allocator skip such
+  // orders, deallocate and cancel refuse them, so the excess stayed reserved for ever (and the stock
+  // invariant counts it as legitimate). Trim every allocation row down to what committed shipments
+  // cover. Best effort inside a savepoint: a reservation that cannot be released (drift) must not
+  // block the status change a storefront or operator is reporting, so it is left as it was today.
+  let releasedProductIds: string[] = []
+  let releaseFailure: unknown = null
+  if (POST_DISPATCH_ORDER_STATUSES.has(input.targetStatus) && !POST_DISPATCH_ORDER_STATUSES.has(lockedOrder.status)) {
+    try {
+      const trimmed = await withSavepoint(tx, () => trimUnshippedAllocationsForRefundTx(tx, {
+        orderId: input.orderId,
+        noDemand: true,
+        userId: null,
+        cause: `the order being closed as ${input.targetStatus}`,
+      }))
+      releasedProductIds = trimmed.syncProductIds
+    } catch (error) {
+      releaseFailure = error
+      console.warn(`[allocation-service] could not release the unshipped allocation of order ${input.orderId} on closing it as ${input.targetStatus}`, releaseFailure)
+    }
+  }
+  return { previousStatus: lockedOrder.status, releasedProductIds }
 }
+
+const POST_DISPATCH_ORDER_STATUSES: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
 /**
  * Give back the UNSHIPPED reservation of the units a refund removed from an order that already has a shipment.
@@ -2288,7 +2315,7 @@ export async function updateSalesOrderStatusUnderLock(
  */
 export async function trimUnshippedAllocationsForRefundTx(
   tx: Prisma.TransactionClient,
-  params: { orderId: string; noDemand: boolean; userId: string | null },
+  params: { orderId: string; noDemand: boolean; userId: string | null; cause?: string },
 ): Promise<{ trimmed: number; syncProductIds: string[]; retiredPendingShipments: RetiredPendingShipment[] }> {
   const rows = await tx.orderAllocation.findMany({
     where: { orderId: params.orderId },
@@ -2309,10 +2336,16 @@ export async function trimUnshippedAllocationsForRefundTx(
       graph,
     ),
   }))
-  const refundLines = await tx.salesOrderRefundLine.findMany({
+  const refundLines = await netRefundLinesForDemand(tx, await tx.salesOrderRefundLine.findMany({
     where: { refund: { orderId: params.orderId } },
-    select: { salesOrderLineId: true, qty: true },
-  })
+    select: {
+      salesOrderLineId: true,
+      productId: true,
+      qty: true,
+      refundId: true,
+      refund: { select: { returnWarehouseId: true, chargeback: true, accountingRetryRequired: true } },
+    },
+  }))
   const refundedByLine = new Map<string, Prisma.Decimal>()
   for (const refundLine of refundLines) {
     if (!refundLine.salesOrderLineId) continue
@@ -2346,7 +2379,7 @@ export async function trimUnshippedAllocationsForRefundTx(
     await applyAllocationReservationDelta(tx, [{ productId: step.productId, warehouseId: step.warehouseId, qty: step.qty }], 'release', params.orderId)
   }
   const reconciliation = await reconcilePendingShipments(tx, params.orderId, {
-    cause: 'a refund releasing the unshipped reservation of its units',
+    cause: params.cause ?? 'a refund releasing the unshipped reservation of its units',
     userId: params.userId,
   })
   return {
@@ -3619,10 +3652,16 @@ export async function allocateSalesOrder(
     // Refunded quantities are no longer outstanding demand — a refund on a not-yet-
     // shipped order removes those units from what needs allocating. Only ever reduces
     // demand, so it is safe for every status (already-shipped lines clamp to 0).
-    const refundLines = await tx.salesOrderRefundLine.findMany({
+    const refundLines = await netRefundLinesForDemand(tx, await tx.salesOrderRefundLine.findMany({
       where: { refund: { orderId } },
-      select: { salesOrderLineId: true, qty: true },
-    })
+      select: {
+        salesOrderLineId: true,
+        productId: true,
+        qty: true,
+        refundId: true,
+        refund: { select: { returnWarehouseId: true, chargeback: true, accountingRetryRequired: true } },
+      },
+    }))
     const refundedByLine = new Map<string, Prisma.Decimal>()
     for (const refundLine of refundLines) {
       if (!refundLine.salesOrderLineId) continue

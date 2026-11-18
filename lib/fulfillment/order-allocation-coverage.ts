@@ -9,6 +9,7 @@ import {
 } from '@/lib/products/fulfillment-coverage'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
+import { netRefundLinesForDemand } from '@/lib/domain/sales/refund-demand-netting'
 
 export type CoverageOrderLine = { id: string; qty: unknown; productId: string | null }
 export type CoverageOrder = {
@@ -153,10 +154,16 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
   // Aggregating under the refund's OWN orderId makes a bad link inert instead of contagious.
   const refundedByOrderLine = new Map<string, Prisma.Decimal>()
   const refundKey = (orderId: string, lineId: string) => `${orderId}\u0000${lineId}`
-  const refundLines = await client.salesOrderRefundLine.findMany({
+  const refundLines = await netRefundLinesForDemand(client, await client.salesOrderRefundLine.findMany({
     where: { refund: { orderId: { in: candidates.map((o) => o.id) } } },
-    select: { salesOrderLineId: true, qty: true, refund: { select: { orderId: true } } },
-  })
+    select: {
+      salesOrderLineId: true,
+      productId: true,
+      qty: true,
+      refundId: true,
+      refund: { select: { orderId: true, returnWarehouseId: true, chargeback: true, accountingRetryRequired: true } },
+    },
+  }))
   for (const row of refundLines) {
     if (!row.salesOrderLineId) continue
     const key = refundKey(row.refund.orderId, row.salesOrderLineId)
