@@ -96,7 +96,7 @@ test('the reader: no attestation is absent (not not-built); a clean report is pr
   const dbWith = (row: { attestedAt: Date; payload: unknown } | null) => ({ writerAttestation: { findFirst: async () => row } }) as never
   assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith(null), now: NOW, probeOnce: noProbe }), { state: 'absent' })
   assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload }), now: NOW, probeOnce: noProbe }), {
-    state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:01.000Z', generatedAt: '2026-12-20T11:55:00.000Z',
+    state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:01.000Z', generatedAt: '2026-12-20T11:55:00.000Z', journalEarliestAt: '2026-10-01T00:00:00.000Z',
   })
   const bad = parseBridgeStatusOutput(sampleReport({ units: { 'wc-mintsoft-webhook.service': 'LoadState=loaded ActiveState=active UnitFileState=enabled' } }))
   assert.ok(bad.ok)
@@ -132,7 +132,7 @@ test('P2-M: a clean report with the last trigger before S passes; absent fails; 
 })
 
 test('P2-M: a trigger AT or AFTER S fails, one before S passes, "never" passes (MUTATION: compare with > instead of >= or drop the comparison => red)', () => {
-  const at = (lastTriggerAt: string | null) => evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt, generatedAt: '2026-12-02T00:00:00.000Z' } }))
+  const at = (lastTriggerAt: string | null) => evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt, generatedAt: '2026-12-02T00:00:00.000Z', journalEarliestAt: '2026-10-01T00:00:00.000Z' } }))
   assert.deepEqual(bridgeFindings(at('2026-11-30T23:59:59.000Z')), [])
   assert.deepEqual(bridgeFindings(at(null)), [])
   for (const late of ['2026-12-01T00:00:00.000Z', '2026-12-01T00:00:01.000Z', '2026-12-10T00:00:00.000Z']) {
@@ -281,7 +281,7 @@ test('ITEM 3: `never` is believed only with journal_exit: 0; `unknown`, a `never
   assert.equal(parseBridgeStatusOutput(sampleReport().replace('journal_exit: 0', 'journal_exit: x')).ok, false)
   const dbWith = (report: ReturnType<typeof parsed>) => ({ writerAttestation: { findFirst: async () => ({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload: bridgePayloadFromReport(report, '') }) } }) as never
   const read = (options: Parameters<typeof sampleReport>[0]) => STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith(parsed(options)), now: NOW, probeOnce: noProbe })
-  assert.deepEqual(await read({ lastTrigger: 'never', journalExit: 0 }), { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: null, generatedAt: '2026-12-20T11:55:00.000Z', journalEarliestAt: '2000-01-01T00:00:00.000Z' })
+  assert.deepEqual(await read({ lastTrigger: 'never', journalExit: 0 }), { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: null, generatedAt: '2026-12-20T11:55:00.000Z', journalEarliestAt: '2026-10-01T00:00:00.000Z' })
   for (const bad of [{ lastTrigger: 'unknown' }, { lastTrigger: 'never', journalExit: null }, { lastTrigger: 'never', journalExit: 2 }]) assert.deepEqual(await read(bad), { state: 'unreadable' }, JSON.stringify(bad))
   // `never` also needs a READABLE, PERSISTENT journal with an earliest entry (exit 0 alone is not proof)
   for (const bad of [{ journalReadable: 0 as const }, { journalPersistent: 0 as const }, { journalEarliest: null }, { journalReadable: null }, { journalPersistent: null }]) {
@@ -383,7 +383,7 @@ test('NEVER proof: the script reports journal_readable / journal_persistent / jo
     assert.match(ok, /^journal_persistent: 1$/m)
     assert.match(ok, /^journal_earliest: 2025-10-09T08:53:20Z$/m)
     assert.match(ok, /^boot_id: 0123456789abcdef0123456789abcdef$/m)
-    assert.match(ok, /^boot_started: 2026-12-01T00:00:00Z$/m)
+    assert.match(ok, /^boot_started: 2025-12-01T00:00:00Z$/m)
     assert.match(ok, /^last_trigger: never$/m)
     const parsedOk = parseBridgeStatusOutput(ok)
     assert.ok(parsedOk.ok && bridgeLastTriggerReadable(parsedOk.report) && parsedOk.report.journalEarliestAt === '2025-10-09T08:53:20.000Z')

@@ -209,7 +209,7 @@ export async function readSwitch(client: AuditReadClient, def: SwitchDefinition)
 export type SwitchWriteInput = { def: SwitchDefinition; value: string; by: string; reason: string; adminConfirmed?: boolean }
 
 type TxClient = ReadClient & {
-  setting: ReadClient['setting'] & { upsert(args: Record<string, unknown>): Promise<unknown> }
+  setting: ReadClient['setting'] & { upsert(args: Record<string, unknown>): Promise<unknown>; deleteMany(args: Record<string, unknown>): Promise<unknown> }
   activityLog: { create(args: Record<string, unknown>): Promise<unknown> }
 }
 
