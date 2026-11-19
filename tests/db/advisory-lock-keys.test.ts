@@ -173,10 +173,24 @@ test('[o3d-4ajo] both daily batches check the lock before every write phase', ()
   // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
   for (const path of ['lib/connectors/xero/daily-sync.ts']) {
     const src = readFileSync(path, 'utf8')
-    const phases = (src.match(/^ {2}\/\/ --- Group [AB]\d?/gm) ?? []).length
-    const checks = (src.match(/batchLock\.assertHeld\(/g) ?? []).length
-    assert.ok(phases > 0, `${path}: expected to find the batch phases`)
-    assert.equal(checks, phases, `${path}: every write phase must assert the lock is still held`)
+    const marker = /^ {2}\/\/ --- Group [AB]\d?/gm
+    const starts = [...src.matchAll(marker)].map((m) => m.index as number)
+    assert.ok(starts.length > 0, `${path}: expected to find the batch phases`)
+    starts.forEach((start, i) => {
+      const section = src.slice(start, starts[i + 1] ?? src.length)
+      const name = section.split('\n', 1)[0].trim()
+      const firstWrite = section.search(/\$transaction\(/)
+      const firstCheck = section.search(/batchLock\.assertHeld\(/)
+      assert.ok(firstCheck >= 0, `${path}: ${name}: every write phase must assert the lock is still held`)
+      assert.ok(firstWrite < 0 || firstCheck < firstWrite, `${path}: ${name}: the check must come before the first write`)
+      // Multi-pass loops: every pass opens its own transaction, so a check at the top of the phase is not enough.
+      for (const loop of section.matchAll(/for \(;;\) \{/g)) {
+        const rest = section.slice((loop.index as number) + loop[0].length)
+        const tx = rest.search(/\$transaction\(/)
+        const check = rest.search(/batchLock\.assertHeld\(/)
+        assert.ok(check >= 0 && (tx < 0 || check < tx), `${path}: ${name}: a pass loop must assert the lock before its transaction, every pass`)
+      }
+    })
   }
 })
 

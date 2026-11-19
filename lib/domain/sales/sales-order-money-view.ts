@@ -260,7 +260,7 @@ export function buildRefundRequest(
  * `postedNet` is the column the credit note actually carries (the base column on a base-currency order, the foreign one otherwise) and
  * `vatRate` the rate of the tax code the line was snapshotted under, or null when that code cannot be priced.
  */
-export type CreditNoteLineFacts = { salesOrderLineId: string | null; postedNet: number; vatRate: number | null }
+export type CreditNoteLineFacts = { salesOrderLineId: string | null; postedNet: number; vatRate: number | null; vatRateEstimated?: boolean }
 
 /**
  * A recorded refund as its credit note carries it: the posted net of each line with the VAT the ledger adds at the rate of its persisted

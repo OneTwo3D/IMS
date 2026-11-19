@@ -38,7 +38,8 @@ import {
   lockPurchaseOrders,
   lockPurchaseOrdersWithCostRows,
 } from '@/lib/domain/wms/transfer-asn-lock-order'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
+import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
+import { queueAccountingSync, queueAccountingSyncTx, readStockReceiptAccountsTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
 import { isShadowedOutcome, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -3242,13 +3243,26 @@ export async function receivePurchaseOrder(
       const receiptJournalValue = receiptJournalAmount(totalReceiptValue)
       if (accountingSettings.syncEnabled && receiptJournalValue != null) {
         const amount = receiptJournalValue
+        // o3d-nne7i: the two account codes are read HERE, inside the transaction, under the accounting mapping lock (the
+        // same lock and reader the WMS book-in uses), not from the pooled read above. A remap committed after that read
+        // is therefore posted on the NEW codes, and one that arrives later waits for this commit. Owner decision Q12:
+        // re-read in the transaction rather than refuse; the operator's intent is "receive these goods". The connector
+        // stays the one `accountingSettings` resolved, which is also the enqueue's chart pin below.
+        let inventoryAccount = accountingSettings.inventoryAccount
+        let transitAccount = accountingSettings.transitAccount
+        if (accountingSettings.connector) {
+          await lockAccountingMappingSelection(tx, accountingSettings.connector)
+          const lockedAccounts = await readStockReceiptAccountsTx(tx, accountingSettings.connector)
+          inventoryAccount = lockedAccounts.inventoryAccount
+          transitAccount = lockedAccounts.transitAccount
+        }
         const payload = {
           date: businessDateYmd(new Date()),
           reference: `Receipt: ${po.reference}`,
           narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}`,
           lines: [
-            { accountCode: accountingSettings.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
-            { accountCode: accountingSettings.transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
+            { accountCode: inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
+            { accountCode: transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
           ],
         }
         const receiptIdempotencyKey = accountingPayloadKey(`purchase-receipt:${id}:${receiptRef}`, payload)
@@ -3848,18 +3862,27 @@ export async function returnPurchaseOrder(
 
       if (accountingSettings.syncEnabled && totalReturnedCostBase.gt(0.000001)) {
         const amount = roundQuantity(totalReturnedCostBase, 2).toNumber()
+        // o3d-nne7i: same as the receipt - the two codes come from the locked in-transaction read, not the pooled one.
+        let returnTransitAccount = accountingSettings.transitAccount
+        let returnInventoryAccount = accountingSettings.inventoryAccount
+        if (accountingSettings.connector) {
+          await lockAccountingMappingSelection(tx, accountingSettings.connector)
+          const lockedAccounts = await readStockReceiptAccountsTx(tx, accountingSettings.connector)
+          returnTransitAccount = lockedAccounts.transitAccount
+          returnInventoryAccount = lockedAccounts.inventoryAccount
+        }
         const payload = {
           date: businessDateYmd(new Date()),
           reference: returnRef,
           narration: `Supplier return for PO ${po.reference}`,
           lines: [
             {
-              accountCode: accountingSettings.transitAccount,
+              accountCode: returnTransitAccount,
               description: `Reverse supplier return ${returnRef}`,
               debit: amount,
             },
             {
-              accountCode: accountingSettings.inventoryAccount,
+              accountCode: returnInventoryAccount,
               description: `Reduce inventory for supplier return ${returnRef}`,
               credit: amount,
             },

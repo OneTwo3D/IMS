@@ -80,7 +80,8 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * rather than skipping sixteen tests under it — an edit that drops the first variable from `test:db`
  * fails loudly.
  *
- * IT COVERS EXACTLY ONE EDIT SHAPE, and the other shapes are not exotic. The tripwire can only fire
+ * ON ITS OWN IT COVERS EXACTLY ONE EDIT SHAPE, and the other shapes are not exotic. (They are now caught by the
+ * skip census that `npm run test:db` ends with - scripts/db-tier-census.mjs; what follows is why the census exists.) The tripwire can only fire
  * once something has set the `REQUIRE_` half, so it sees an edit that drops the `RUN_` half alone.
  * An edit that drops BOTH halves from `test:db`, or RENAMES the pair, or re-gates this file onto a
  * variable that script does not set, puts all sixteen tests back into `# SKIP` inside a green
@@ -88,8 +89,8 @@ import { buildAccountingEventIdempotencyKey } from '../../lib/domain/accounting/
  * this pair exists to repair. So do not read an unset pair as merely "an ordinary local run": locally
  * it is exactly that, but it is also what such a `package.json` edit leaves behind, and there it is a
  * green tick over an unexecuted suite. Nothing here can catch that shape, because a file that skips
- * cannot police its own invocation; o3d-dzsd carries the runtime census that can (require every file
- * the runner collected to have executed at least one test and reported no skips).
+ * cannot police its own invocation; the runtime census now does (every file the runner collected must
+ * have executed at least one test and reported no skips).
  *
  * r13 did add a CI job and a standing guard (`tests/db-suite-ci-wiring.test.ts`) that read the
  * workflow to prove the job invoked the script, on the sound principle that a test which skips

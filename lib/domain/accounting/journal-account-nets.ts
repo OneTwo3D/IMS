@@ -172,3 +172,30 @@ export function journalNetMovement(
   if (!accountCode) return 0
   return summary.accounts[accountCode]?.[side] ?? 0
 }
+
+/** The description every UNEARNED_REV_REVERSAL journal puts on both of its unearned-revenue lines (refund-service). */
+export const UNEARNED_REVERSAL_LINE_DESCRIPTION_PREFIX = 'Unearned revenue reversal'
+
+/**
+ * o3d-nz0e0: the unearned revenue an UNEARNED_REV_REVERSAL journal debited, IDENTIFIED BY WHAT THE LINE IS, not by today's account code.
+ *
+ * `journalNetMovement(row, <current unearned account>, 'debit')` reads zero for a reversal posted under an account the operator has since
+ * re-mapped (including the forced re-map of a Xero tenant rebind), so a later refund saw nothing already reversed and over-debited.
+ * While the payload's lines are legible the debit is read off the lines the reversal labelled as the unearned-revenue reversal, whatever
+ * account they carry. A payload with no such line (a journal written before the label, or one that only moved allocation) falls back to
+ * the current-account read, and a compacted row (no lines, only the per-account summary) can only be read by account code, as before.
+ */
+export function unearnedReversalDebit(row: JournalNetSource, currentUnearnedAccount: string): number | null {
+  if (payloadLinesLegible(row.payload)) {
+    const lines = (row.payload as { lines: Array<{ description?: unknown; debit?: unknown; credit?: unknown }> }).lines
+    const labelled = lines.filter((line) => (
+      line !== null && typeof line === 'object'
+      && typeof line.description === 'string'
+      && line.description.startsWith(UNEARNED_REVERSAL_LINE_DESCRIPTION_PREFIX)
+    ))
+    if (labelled.length > 0) {
+      return labelled.reduce((sum, line) => sum + boundaryNumber(line.debit ?? 0), 0)
+    }
+  }
+  return journalNetMovement(row, currentUnearnedAccount, 'debit')
+}

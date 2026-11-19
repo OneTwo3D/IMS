@@ -306,7 +306,7 @@ test(
     // AND THE ORDER'S OWN PAID DATE IS UNTOUCHED BY THE RULE: `paidAt` still carries the shop's
     // instant, which is what an operator reads. Only the fence is the database's.
     const row = await db.salesOrder.findUnique({ where: { id }, select: { paidAt: true } })
-    assert.equal(row?.paidAt?.toISOString(), new Date('2026-08-02T10:00:00').toISOString())
+    assert.equal(row?.paidAt?.toISOString(), new Date('2026-08-02T10:00:00Z').toISOString())
   },
 )
 
@@ -698,7 +698,7 @@ test(
 
     // AND THE ORDER'S OWN PAID DATE IS UNTOUCHED throughout: only the fence is the database's.
     const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { paidAt: true } })
-    assert.equal(row.paidAt?.toISOString(), new Date('2026-08-02T10:00:00').toISOString())
+    assert.equal(row.paidAt?.toISOString(), new Date('2026-08-02T10:00:00Z').toISOString())
 
     // THE CONTROL, AND IT IS THE POINT. "Never mint again while paidAt stands" would pass everything
     // above and disable the provenance marker for every genuine re-payment. The episode is ENDED by

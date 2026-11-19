@@ -1338,3 +1338,59 @@ test('o3d-2sm1 Codex r1: a PRE-WITNESS row that never staged anything gets the s
   assert.equal(undecidable.severity, 'warning')
   assert.equal((undecidable.details as { reversalStagingState: unknown }).reversalStagingState, null)
 })
+
+// o3d-gzfm: the A2 evidence invariant asked only about the LATEST pass's batch.
+test('o3d-gzfm: an EARLIER A2 pass whose journal is missing is reported, with its own batch reference', () => {
+  const rows = midnightCrossingRows()
+  const EARLIER_A2 = 'A2-2025-12-30-0ddba115'
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    allocationBatchPasses: [
+      { amount: 5, syncLogId: 'log-early', connector: 'xero', accountCode: '631', batchRef: EARLIER_A2, at: '2025-12-30T01:00:00.000Z' },
+      { amount: 5, syncLogId: 'log-late', connector: 'xero', accountCode: '631', batchRef: A2_REF, at: '2026-01-01T01:00:00.000Z' },
+    ],
+  }
+  // The latest pass's journal is live (midnightCrossingRows); the earlier one has no log at all.
+  const missing = evaluateAccountingInvariantRows(rows)
+    .filter((f) => f.code === 'sales_order_inventory_allocation_without_sync_evidence')
+  assert.equal(missing.length, 1, 'exactly the earlier pass is reported')
+  assert.equal((missing[0].details as { expectedReferenceId: string }).expectedReferenceId, EARLIER_A2)
+
+  // Control: with the earlier journal live too, nothing fires.
+  rows.syncLogs = [...rows.syncLogs, { ...rows.syncLogs.find((l) => l.type === 'DAILY_BATCH_INVENTORY_ALLOC')!, referenceId: EARLIER_A2 }]
+  assert.equal(
+    evaluateAccountingInvariantRows(rows).filter((f) => f.code === 'sales_order_inventory_allocation_without_sync_evidence').length,
+    0,
+  )
+})
+
+test('o3d-gzfm: an earlier A2 pass older than the retention window is not asked about', () => {
+  const rows = midnightCrossingRows()
+  rows.historicalBatchCutoff = new Date('2026-01-01T00:00:00.000Z')
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    allocationBatchPasses: [
+      { amount: 5, syncLogId: 'log-early', connector: 'xero', accountCode: '631', batchRef: 'A2-2025-12-30-0ddba115', at: '2025-12-30T01:00:00.000Z' },
+    ],
+  }
+  assert.equal(
+    evaluateAccountingInvariantRows(rows).filter((f) => f.code === 'sales_order_inventory_allocation_without_sync_evidence').length,
+    0,
+    'its log may have been pruned, so absence proves nothing',
+  )
+})
+
+test('o3d-gzfm R1: an earlier A2 pass that raised no journal by design (no log id, zero amount) is not a finding', () => {
+  const rows = midnightCrossingRows()
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    allocationBatchPasses: [
+      { amount: 0, syncLogId: null, connector: 'xero', accountCode: '631', batchRef: 'A2-2025-12-30-0ddba115', at: '2025-12-30T01:00:00.000Z' },
+      { amount: 5, syncLogId: 'log-late', connector: 'xero', accountCode: '631', batchRef: A2_REF, at: '2026-01-01T01:00:00.000Z' },
+    ],
+  }
+  assert.equal(
+    evaluateAccountingInvariantRows(rows).filter((f) => f.code === 'sales_order_inventory_allocation_without_sync_evidence').length,
+    0,
+  )
+})

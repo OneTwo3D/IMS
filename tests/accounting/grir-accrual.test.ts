@@ -263,6 +263,33 @@ test('the opening balance adds back historical return credits: received and bill
   assert.equal((await planGrirOpeningBalance(s.db)).rows.some((r) => r.poId === po2.id), false, 'idempotent')
 })
 
+// [mutation: skip tracked credit notes when seeding the credited quantity (the pre-o3d-o35oo behaviour)]
+test('the opening balance does not subtract a return credit the sub-ledger already tracks: received 10, billed 10, returned 4 and credited 4 afterwards opens nothing (o3d-o35oo)', async () => {
+  const { planGrirOpeningBalance } = await import('@/lib/domain/accounting/grir-opening-balance')
+  const po = await seedPo(10, 12)
+  await s.db.purchaseOrderLine.update({ where: { id: po.lineId }, data: { qtyReceived: '10', qtyReturned: '4' } })
+  await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PARTIALLY_RETURNED' } })
+  const invoice = await s.db.purchaseInvoice.create({
+    data: {
+      poId: po.id, invoiceDate: new Date('2026-10-01'), subtotalForeign: 120, subtotalBase: 120, totalForeign: 120, totalBase: 120, fxRateToBase: 1,
+      lines: { create: [{ poLineId: po.lineId, qtyBilled: 10, unitCostForeign: 12, totalForeign: 120, totalBase: 120 }] },
+    },
+    select: { id: true },
+  })
+  const note = await s.db.supplierCreditNote.create({
+    data: { poId: po.id, purchaseInvoiceId: invoice.id, supplierId, amountForeign: 48, amountBase: 48, currency: 'GBP', fxRateToBase: 1, status: 'POSTED', postedAt: new Date('2026-11-12'), isReturnGenerated: true },
+    select: { id: true },
+  })
+  // The receipt and the bill predate the sub-ledger; the return and its credit were recorded live (net 0 together).
+  const at = new Date('2026-11-12')
+  const base = { poId: po.id, poLineId: po.lineId, supplierId, journalDate: at, occurredAt: at }
+  await s.db.grirSubledgerMovement.create({ data: { ...base, sourceType: 'SUPPLIER_RETURN', sourceRef: `ret-${po.id}`, idempotencyKey: `t-ret-${po.id}`, qtyDelta: '-4', baseDelta: '-48' } })
+  await s.db.grirSubledgerMovement.create({ data: { ...base, sourceType: 'SUPPLIER_CREDIT_NOTE', sourceRef: note.id, idempotencyKey: `t-cn-${po.id}`, qtyDelta: '4', baseDelta: '48' } })
+  const plan = await planGrirOpeningBalance(s.db)
+  const row = plan.rows.find((r) => r.poId === po.id)
+  assert.equal(row, undefined, `expected 10 - 4 - 10 + 4 = 0 against live 0: nothing to open, got ${row?.openQty}`)
+})
+
 // [mutation: make the row key random instead of per source event]
 test('a replayed source event records exactly once (the unique key is the source event)', async () => {
   const { recordGrirReceipt, recordGrirSupplierReturn } = await import('@/lib/domain/accounting/grir-subledger-movement')

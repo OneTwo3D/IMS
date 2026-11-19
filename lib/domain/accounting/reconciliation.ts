@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { allocationDebitRecreateTargets, allocationPassRaisedNoJournalByDesign } from '@/lib/domain/accounting/allocation-debit-passes'
 import { toJsonInputValue } from '@/lib/db/json-input'
 // decimal-boundary-ok: report-only (accounting reconciliation finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
@@ -268,6 +269,12 @@ type SourceOrderRow = {
   // has nothing but the stamp and so falls back to the derived key.
   revenueDeferredBatchRef?: string | null
   inventoryAllocatedBatchRef?: string | null
+  /**
+   * o3d-gzfm: the raw `SalesOrder.allocationBatchPasses` pass history. `inventoryAllocatedBatchRef`
+   * names only the LATEST A2 pass, so the earlier batches an order's cumulative debit spans are read
+   * from here. Optional for pure-evaluator fixtures; absent means one batch (the current stamp).
+   */
+  allocationBatchPasses?: unknown
 }
 
 type SourceShipmentRow = {
@@ -450,6 +457,12 @@ export type AccountingReconciliationRows = {
    * contradictions, and `collectAccountingReconciliationRows` always provides it.
    */
   voidMirrorContradictions?: VoidMirrorContradictions
+  /**
+   * o3d-gzfm: the start of the window this report's rows were read over. An EARLIER A2 pass whose batch
+   * is dated before it is not asked about (its log may be outside what was read, so "no event" could not
+   * be told from "not loaded"). Optional: absent means no bound.
+   */
+  historicalBatchCutoff?: Date | null
   /**
    * o3d-bnp6 — the sync rows no accounting event mirrors, ALREADY FILTERED BY THE DATABASE over the
    * whole of both tables. Not something for this file to work out from `syncLogs` and
@@ -770,6 +783,26 @@ function dailyBatchSourceEntityId(
   if (persisted) return { sourceEntityId: persisted, digestBridged: false }
   const key = dateKey(stagedAt)
   return key ? { sourceEntityId: `${group}-${key}`, digestBridged: true } : null
+}
+
+/**
+ * o3d-gzfm: the A2 batch references of an order's EARLIER passes (everything the pass history names
+ * other than the current stamp), bounded by the same retention window the surface reads over.
+ * Enumeration is `allocationDebitRecreateTargets`, the one the recreate sweep uses, so the two cannot
+ * disagree about which batches an order contributed to.
+ */
+function earlierA2PassBatchRefs(order: SourceOrderRow, currentRef: string, retentionCutoff: Date | null): string[] {
+  if (order.allocationBatchPasses == null) return []
+  const targets = allocationDebitRecreateTargets({
+    allocationBatchAmount: null,
+    allocationBatchPasses: order.allocationBatchPasses,
+    inventoryAllocatedBatchRef: order.inventoryAllocatedBatchRef?.trim() || null,
+    inventoryAllocatedDate: null,
+  }, { retentionCutoff })
+  return targets
+    .flatMap((target) => (target.batchRef && target.batchRef !== currentRef ? [target.batchRef] : []))
+    // A pass that raised no journal by design has nothing to be missing.
+    .filter((ref) => !allocationPassRaisedNoJournalByDesign(order.allocationBatchPasses, ref))
 }
 
 function eventKey(input: {
@@ -1235,6 +1268,22 @@ export function evaluateAccountingReconciliationRows(
         message: `Sales order ${label} has A2 inventory allocation but no mirrored accounting event`,
         details: { status: order.status, inventoryAllocatedDate: order.inventoryAllocatedDate },
       })
+      // o3d-gzfm: the stamp above is the LATEST pass only. Every EARLIER pass's batch is asked about
+      // too, and its key joins `sourceKeys` — otherwise the reverse check below would report that
+      // pass's healthy mirrored event as an orphan.
+      for (const earlier of earlierA2PassBatchRefs(order, a2SourceEntityId.sourceEntityId, rows.historicalBatchCutoff ?? null)) {
+        sourceKeys.add(sourceKey('DAILY_BATCH_INVENTORY_ALLOC', 'DailyBatch', earlier))
+        addExpectedSourceEventFinding(findings, rows, reportedAmbiguousBridges, {
+          code: 'source_order_inventory_allocation_without_event',
+          type: 'DAILY_BATCH_INVENTORY_ALLOC',
+          sourceEntityType: 'DailyBatch',
+          sourceEntityId: earlier,
+          digestBridged: false,
+          orderId: order.id,
+          message: `Sales order ${label} has an earlier A2 inventory allocation pass (${earlier}) but no mirrored accounting event`,
+          details: { status: order.status, inventoryAllocatedDate: order.inventoryAllocatedDate, batchReferenceId: earlier },
+        })
+      }
     }
 
     const orderRefunds = refundsByOrderId.get(order.id) ?? []
@@ -2147,6 +2196,8 @@ export async function collectAccountingReconciliationRows(
         // silently demotes every row to the derive-from-stamp fallback.
         revenueDeferredBatchRef: true,
         inventoryAllocatedBatchRef: true,
+        // o3d-gzfm: the pass history, so earlier A2 batches are asked about too.
+        allocationBatchPasses: true,
       },
     }),
     client.shipment.findMany({
@@ -2270,7 +2321,7 @@ export async function collectAccountingReconciliationRows(
 
   return {
     salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, unmirroredSyncLogs,
-    voidMirrorContradictions,
+    voidMirrorContradictions, historicalBatchCutoff: fromDate,
   }
 }
 

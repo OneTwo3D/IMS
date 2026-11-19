@@ -112,8 +112,16 @@ function reset(connector: 'xero'): void {
   state.enabledPlugins = []
 }
 
-/** The Group A2 window: deferred, not yet stamped. */
-function inA2Window(where: { inventoryAllocatedDate?: unknown; revenueDeferredDate?: unknown } | undefined): boolean {
+type A2Where = {
+  inventoryAllocatedDate?: unknown
+  revenueDeferredDate?: unknown
+  id?: { in?: string[]; notIn?: string[] }
+  status?: { in?: string[] }
+  refundStatus?: { not?: string }
+}
+
+/** The Group A2 window: deferred, not yet stamped. Status and refund state are applied per row. */
+function inA2Window(where: A2Where | undefined): boolean {
   return !!where && where.inventoryAllocatedDate === null && where.revenueDeferredDate != null
 }
 
@@ -179,11 +187,17 @@ const tx = {
     updateMany: async () => ({ count: 0 }),
   },
   salesOrder: {
-    findMany: async (args?: { where?: { inventoryAllocatedDate?: unknown; revenueDeferredDate?: unknown; id?: { in?: string[] } }; select?: Record<string, unknown> }) => {
+    findMany: async (args?: { where?: A2Where; select?: Record<string, unknown> }) => {
       const where = args?.where
       const eligible = state.orders.filter((order) => (
         order.inventoryAllocatedDate === null
         && (where?.id?.in == null || where.id.in.includes(order.id))
+        && (where?.id?.notIn == null || !where.id.notIn.includes(order.id))
+        // o3d-2xdo: status and refundStatus are modelled PER ROW. A where that omits either
+        // predicate lets an ineligible order through, so deleting the line from A2_ELIGIBLE_ORDER
+        // fails the tests that seed such an order instead of passing unnoticed.
+        && (where?.status?.in == null || where.status.in.includes(order.status))
+        && (where?.refundStatus?.not == null || order.refundStatus !== where.refundStatus.not)
       ))
       if (!inA2Window(where)) return []
       if (!args?.select?.allocations) return eligible.map((order) => ({ id: order.id }))
@@ -855,4 +869,23 @@ test('o3d-i0o6 r7: THE CONTROL — with retention disabled the same historical b
   const debit = (rebuilt[0].payload as { lines: Array<{ accountCode?: string; debit?: number }> })
     .lines.find((line) => line.accountCode === CHART.xero.allocated && line.debit != null)
   assert.equal(debit?.debit, 50, 'for the £50 THAT batch carried, not the cumulative £75')
+})
+
+// o3d-2xdo — see daily-batch-a2-incremental-pass-proof.test.ts: the writer's own status and refundStatus
+// predicates must be observable through this double too.
+test('o3d-2xdo: the A2 writer skips a FULLY refunded order and an ineligible-status order', async () => {
+  reset('xero')
+  state.unitCostByProduct = { 'prod-1': 10 }
+  state.orders = [newOrder('order-ok'), newOrder('order-full'), newOrder('order-pending')]
+  state.orders[1].refundStatus = 'FULL'
+  state.orders[2].status = 'PENDING'
+  state.allocations = state.orders.map((order) => ({
+    id: `alloc-${order.id}`, orderId: order.id, lineId: `line-${order.id}`, productId: 'prod-1',
+    warehouseId: 'wh-1', qty: 1, costLayerSnapshot: null, allocationBatchAmount: null,
+  }))
+  await runA2(1)
+  assert.deepEqual(
+    state.orders.filter((order) => order.inventoryAllocatedDate !== null).map((order) => order.id),
+    ['order-ok'],
+  )
 })

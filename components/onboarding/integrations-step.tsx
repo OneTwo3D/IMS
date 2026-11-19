@@ -23,7 +23,6 @@ import {
 } from '@/lib/domain/integrations/plugin-save-outcome'
 import { WmsOnboardingConnection } from '@/components/onboarding/wms-onboarding-connection'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
-import { isIntegrationsStepReady } from '@/lib/domain/onboarding/integrations-step-readiness'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { ShoppingConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
@@ -43,7 +42,6 @@ type Props = {
     accounting?: boolean
     wms?: boolean
   }) => void
-  onReadyChange: (ready: boolean) => void
 }
 
 export function IntegrationsStep({
@@ -55,7 +53,6 @@ export function IntegrationsStep({
   publicAppUrlInfo,
   onPluginStateChange,
   onConnectionStateChange,
-  onReadyChange,
 }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -83,7 +80,6 @@ export function IntegrationsStep({
   const [savingPlugins, setSavingPlugins] = useState(false)
   const [savingWc, setSavingWc] = useState(false)
   const [wmsBusy, setWmsBusy] = useState(false)
-  const [wmsConnected, setWmsConnected] = useState(wmsConnection.configured)
   const [savingAccountingConnection, setSavingAccountingConnection] = useState(false)
   const [connectingAccounting, setConnectingAccounting] = useState(false)
 
@@ -115,10 +111,6 @@ export function IntegrationsStep({
     setWcKey(initialWcCreds.key)
     setWcSecret(initialWcCreds.secretMasked ? '' : initialWcCreds.secret)
   }, [initialWcCreds])
-
-  useEffect(() => {
-    setWmsConnected(wmsConnection.configured)
-  }, [wmsConnection.configured])
 
   useEffect(() => {
     setAcClientId(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? '')
@@ -354,25 +346,6 @@ export function IntegrationsStep({
   const wcConnectedLabel = wcUrl.trim() || initialWcCreds.url || 'WooCommerce store'
   const accountingConnectedLabel = initialAccountingStatus.tenantName || accountingLabel
 
-  useEffect(() => {
-    // THE RULE LIVES IN lib/domain/onboarding/integrations-step-readiness.ts (round 8, Codex HIGH 1,
-    // one layer out). It was written out here, inside an effect the render harness never runs, so
-    // nothing could exercise it — and the WMS arm of it is what turned a mis-reported `configured`
-    // into a wizard that could not be completed at all.
-    onReadyChange(isIntegrationsStepReady(plugins, {
-      woocommerce: wcConnected,
-      accounting: accountingConnected,
-      wms: wmsConnected,
-    }))
-  }, [
-    accountingConnected,
-    wmsConnected,
-    wmsEnabled,
-    onReadyChange,
-    plugins,
-    wcConnected,
-  ])
-
   return (
     <div className="space-y-6">
       {stepUpDialog}
@@ -532,7 +505,6 @@ export function IntegrationsStep({
           onToggle={(value) => togglePlugin(wmsConnection.connectorId, value)}
           onBusyChange={setWmsBusy}
           onConnected={() => {
-            setWmsConnected(true)
             onConnectionStateChange({ wms: true })
           }}
           onError={setError}

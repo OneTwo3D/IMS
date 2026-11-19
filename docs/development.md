@@ -100,7 +100,7 @@ Two tiers want a real, migrated PostgreSQL, and these are the invocations that g
 
 ```bash
 npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1                            -> tests/concurrency/**
-npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 -> tests/db/**
+npm run test:db            # scripts/run-db-tier.mjs: tests/db/** + the skip census (RUN_/REQUIRE_DB_RETENTION_TESTS=1)
 ```
 
 `npm run test:db` also runs ONE FILE AT A TIME (`--test-concurrency=1`). The files in `tests/db/` share
@@ -530,31 +530,28 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
   `lib/domain/wms/booked-in-service.ts` was absent while three concurrency files exist only to pin
   it. A doc-only pull request still skips the job, because `paths-ignore` skips a run only when
   every changed file matches; a PR touching a doc **and** a line of code runs it.
-* **ENFORCED, for `RUN_DB_RETENTION_TESTS` ALONE.** `test:db` sets it together with
-  `REQUIRE_DB_RETENTION_TESTS`, and ALL THREE files gated on it throw on load if they are handed the
-  `REQUIRE_` half without its own. An edit that drops `RUN_DB_RETENTION_TESTS` from `test:db`
-  therefore fails loudly instead of skipping into a green run. This is a property of that one pair,
-  written out by hand in each of those three files. It says nothing about any other gate.
-  `reconciliation-void-mirror-contradictions` was written against a `RUN_DB_MIGRATION_TESTS` pair
-  that never reached this branch, and was re-gated onto this one when it landed — which is exactly the
-  kind of drift the next bullet says nothing catches.
-  **AND IT COVERS EXACTLY ONE EDIT SHAPE.** The tripwire fires only when the `REQUIRE_` half is set,
-  so it catches an edit that drops the `RUN_` half and nothing else. Drop BOTH halves from `test:db`,
-  or RENAME the pair — the second is bit for bit the defect this pair was invented to repair — and
-  every test in all three files reports `# SKIP` in a green CI job, with no error anywhere. Reading an
-  unset pair as merely "an ordinary local run" is therefore the understatement to avoid: it is also
-  what a `package.json` edit leaves behind, and in the `db-backed-regressions` job it means 26
-  unexecuted tests and a green tick. o3d-dzsd carries the runtime census that would close it.
-* **NOT ENFORCED: that a NEW gate cannot hide.** The census above is prose in two files and nothing
-  reads it. A file added to `tests/db/` that gates itself on a variable `npm run test:db` does not set
-  will report `# SKIP` inside a green job, exactly as `RUN_DB_RETENTION_TESTS` did, and only review
-  will catch it — including the review that should have noticed the census went stale. o3d-n3yt
-  r16-r20 built two implementations of a guard against this and **withdrew both**: each asked a *syntactic*
-  question (does this source text read a gate?) about an *open* space (the ways a program can read an
-  environment variable), so each passed shapes its author had not thought of while reporting a clean
-  run. A guard that reports enforcement it does not have is worse than none. o3d-dzsd carries the
-  replacement, which asks a **runtime** question instead: after the tier runs, require every file the
-  runner collected to have executed at least one test and reported no skips.
+* **ENFORCED: every file in `tests/db/` ran, and none was skipped (o3d-dzsd, o3d-7zes).** `test:db` is
+  `node scripts/run-db-tier.mjs`, which runs the tier and then holds it to the **skip census**
+  (`scripts/db-tier-census.mjs`, a node:test reporter): every `*.test.ts` file on disk under `tests/db`
+  must have EXECUTED at least one test and reported NO skips, or the run exits non-zero. It asks a
+  **runtime** question, so it does not care how a gate is spelled or where it is read: a pair renamed, BOTH
+  halves of the pair dropped, a gate on a variable nobody sets, an `env` alias, a gate read in a helper, a
+  file that registers no tests or fails to load - each leaves tests unexecuted and is caught for that, not
+  for its text. The verdict is read back from a file the reporter writes, so a reporter that did not load
+  is a failure too. `tests/scripts/db-tier-census.test.ts` drives it over fixtures of each shape.
+  **Two things it still does not do.** It does not prove the tests assert anything (see the last bullet),
+  and three skips are allowed, by exact test name with a per-file ceiling (`ALLOWED_SKIPS`), because the
+  environment cannot run them: the two built-artifact legs of `startup-option-verdict-across-bundles` (no
+  `.next` output here; the job that builds sets `IMS_REQUIRE_BUILD_ARTIFACT=1`, which turns them into
+  failures) and the Unix-socket leg of `connection-schema-pinning` (CI's PostgreSQL is TCP-only; set
+  `UNIX_SOCKET_DATABASE_URL` locally to run it). Any other skip, or a further skip in those files, fails. It is scoped to `test:db`: `test:unit` also globs `tests/db/**` with no database,
+  where skips are the normal state, and never loads the reporter.
+* **ENFORCED, in addition, for `RUN_DB_RETENTION_TESTS` ALONE.** `test:db` still sets it together with
+  `REQUIRE_DB_RETENTION_TESTS`, and the three files gated on it throw on load if handed the `REQUIRE_` half
+  without their own. That is now a second, narrower net under the census, not the only one.
+* **NOT ENFORCED: that `test:db` still runs the wrapper in CI.** `tests/scripts/db-tier-census.test.ts`
+  asserts `package.json`'s `test:db` is exactly `node scripts/run-db-tier.mjs`, but an edit to the workflow
+  step that stops calling `npm run test:db` is the job-existence hole below.
 * **NOT ENFORCED: that the job keeps existing.** o3d-11rf r13 through r16 attempted that with a
   standing guard that read the workflow to prove the job really invoked the script; the guard was
   withdrawn, because it kept admitting deterministic states in which the job was green and the suites
@@ -571,15 +568,12 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
 * **NOT ENFORCED: that a gated file's tests are non-vacuous.** Only a mutation proves the tests
   behind a gate assert anything.
 
-The two open holes have separate homes, and neither is closed by this branch: **o3d-dzsd** is the
-census — where the two withdrawn implementations are recovered from and where the runtime replacement
-is designed — and **o3d-n3yt** is the job's continued existence. Do not cite one for the other.
+The skip census (o3d-dzsd, o3d-7zes) is the replacement for the two withdrawn syntactic guards; the
+remaining open hole is **o3d-n3yt**, the job's continued existence.
 
-`test:db` sets **`REQUIRE_DB_RETENTION_TESTS=1`** alongside `RUN_DB_RETENTION_TESTS=1`. A gated file
-that finds the `REQUIRE_` half set and its own half not throws on load instead of skipping, so a
-future invocation that sets only half a pair fails loudly rather than quietly running nothing. An
-unset pair is an ordinary local run and still skips. **This is per-pair and hand-written**: adding a
-new gate does not give it a tripwire, and nothing requires that it be given one.
+`test:db` still sets **`REQUIRE_DB_RETENTION_TESTS=1`** alongside `RUN_DB_RETENTION_TESTS=1`. A gated file
+that finds the `REQUIRE_` half set and its own half not throws on load instead of skipping. Run by hand
+with neither set, those files skip; run through `npm run test:db`, the census fails the run for it.
 
 `tests/db/shopping-webhook-retention-evidence.test.ts` **seeds the two rows it probes** in a single
 transaction and removes them afterwards through `tests/helpers/with-cleanup.ts`. It used to select them
@@ -597,7 +591,7 @@ container's own address the way `fresh-db-drift` does and gives it to the suite 
 
 To run either tier locally, point `DATABASE_URL` at a scratch database you do not mind writing to
 and use the script rather than the glob — `npm run test:db` is what un-skips the `RUN_DB_*` file, and
-`npx tsx --test "tests/db/**/*.test.ts"` on its own leaves that file skipping. The suites roll their
+`npx tsx --test "tests/db/**/*.test.ts"` on its own leaves that file skipping (and does not run the census). The suites roll their
 probes back, but they do write.
 
 ### Full-chain E2E tier
