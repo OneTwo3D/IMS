@@ -776,7 +776,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
   // MIXED-WAREHOUSE SCOPE (only ever passed while `wms_mixed_warehouse_push_enabled` is on). A scope that cannot be sent (unallocated units, a split kit,
   // nothing allocated to this warehouse) is a local build failure like a missing SKU: nothing is claimed or sent. FULL / absent leaves the payload below untouched.
   if (scope && scope.mode !== 'FULL' && scope.mode !== 'MIXED') throw new Error(scope.reason)
-  const shippingVatDerived = scope?.mode === 'MIXED' ? 0 : deriveShippingVat(order)
+  const shippingVatDerived = scope?.mode === 'MIXED' ? 0 : deriveShippingVat(order)  // 0 when the order has no shipping charge
   const input: WmsOrderPushInput = {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,
@@ -1347,6 +1347,16 @@ export interface WmsOrderPushPort {
   recordEvent(event: WmsMutationEventInput): Promise<void>
 }
 
+/**
+ * The push input as the connector will actually send it: a connector that derives a figure from its own settings (Mintsoft's shipping VAT) resolves it
+ * HERE, before the total guard and the audit intent read the input, so what is checked and recorded is what goes on the wire. A connector with no such
+ * step, or one whose settings cannot be read now (the send then reads them itself and fails or succeeds on its own terms), leaves the input as built.
+ */
+async function resolveConnectorPushInput(connector: { resolvePushInput?: (input: WmsOrderPushInput) => Promise<WmsOrderPushInput> }, input: WmsOrderPushInput): Promise<WmsOrderPushInput> {
+  if (typeof connector.resolvePushInput !== 'function') return input
+  try { return await connector.resolvePushInput(input) } catch { return input }
+}
+
 /** PII-free projection of a push input for the audit timeline: what IMS asked the WMS to hold. */
 function pushIntentSummary(input: WmsOrderPushInput) {
   return {
@@ -1369,7 +1379,7 @@ type PushConnector = Pick<
   // revalidation pass needs before it may re-open a create whose outcome is unknown. Tri-state on
   // purpose: only MISSING means "verifiably no such order", and a merged/ambiguous match must
   // never be reported as MISSING.
-  'pushOrder' | 'updateOrder' | 'cancelOrder' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems' | 'cancelMergedOrder' | 'fetchOrderItemRefs'
+  'pushOrder' | 'resolvePushInput' | 'updateOrder' | 'cancelOrder' | 'verifyPushedOrder' | 'probeOrderPresence' | 'reconcileAmbiguousCreate' | 'findMergedSurvivor' | 'removeOrderItems' | 'cancelMergedOrder' | 'fetchOrderItemRefs'
 >
 
 /**
@@ -2937,6 +2947,8 @@ export async function runWmsOrderPushSweepCore(
         }
       }
 
+      // The connector's own settings apply HERE, so the total guard, the audit timeline and the wire all see the same figures (shipping VAT included).
+      input = await resolveConnectorPushInput(connector, input)
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // `push` is hoisted so the catch can tell "remote create failed" from "remote
       // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
@@ -3717,6 +3729,7 @@ export async function runWmsOrderPushSweepCore(
         }
         // It builds: any standing unbuildable row is no longer true, whether or not the warehouse then takes the change.
         await closeUnbuildableAmendment(link.order.id)
+        input = await resolveConnectorPushInput(connector, input)
         // FAIL CLOSED: the recorded line ids are marked untrustworthy BEFORE anything is sent. They are trusted again only when a verified
         // fresh snapshot is stored below (replaceOrderItems clears the mark) or the amendment provably changed nothing. A crash, a partial
         // amendment or a failed cleanup therefore always leaves them untrusted. If the mark cannot be written, nothing is sent.

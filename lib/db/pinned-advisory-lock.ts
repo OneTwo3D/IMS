@@ -47,8 +47,10 @@ import { createSessionAdvisoryLockPool } from './session-lock-pool'
  */
 let lockPool: Pool | null = null
 function getLockPool(): Pool {
-  // 6, not 4: the first-load apply runner now holds a run-wide lease beside its step lock for the whole run, and a takeover while the displaced runner still
-  // holds its two (a killed connection stays checked out until its holder releases it) must not wait on the pool.
+  // 6, not 4: the first-load apply runner holds a run-wide lease beside its step lock for the whole run, and a takeover while the displaced runner still
+  // holds its two (a killed connection stays checked out until its holder releases it) must not wait on the pool. Two runners in ONE process (the in-process
+  // takeover tests/first-load/apply-db.test.ts drives: "the lock connection is killed after the first importer call") need lease + step lock twice, plus the
+  // ports' own lock reads; with 4 the resumed runner waits out the connection timeout and fails. Kept after the #1061 review suggested 4 (o3d-c8yg7).
   if (!lockPool) lockPool = createSessionAdvisoryLockPool('advisory locks', 6)
   return lockPool
 }

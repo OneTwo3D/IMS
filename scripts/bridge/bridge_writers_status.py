@@ -6,12 +6,14 @@ as scripts/bridge_writers_status.py) by ops and run there; the bridge repository
 
 It changes nothing: it runs `systemctl show` (and `journalctl -n 1`) and prints a small report. An administrator pastes the output into
 `npm run writers:attest -- --kind bridge-units-masked --output-file -` or the Sync > Writer confirmations screen; IMS parses it strictly and
-`writers:check` (phase P2-M and later) requires all three units masked (LoadState=masked) and inactive (ActiveState=inactive), and the last
-trigger BEFORE the Mintsoft step's live-from instant. Run it AFTER the units are masked, and run it again whenever in doubt: IMS only ever sees the
+`writers:check` (phase P2-M and later) requires all three units masked (LoadState=masked AND UnitFileState=masked: a runtime mask is lost at reboot) and
+inactive (ActiveState=inactive), and the last trigger BEFORE the Mintsoft step's live-from instant. Run it AFTER the units are masked, and run it again whenever in doubt: IMS only ever sees the
 newest report, which is a snapshot, not a watch.
 
 Usage:  bridge_writers_status.py [--systemctl PATH] [--journalctl PATH]
 Exit:   0 the report was printed (whatever the units' state: judging it is IMS's job); 2 a unit could not be read (nothing is printed on stdout).
+
+LIMIT: the output is plain text that an administrator pastes into IMS. It is the owner's word plus a transcript, not evidence signed by this host.
 
 Output format (version 1, kept in step with lib/domain/writer-attestation/bridge-status.ts in IMS):
 
@@ -21,14 +23,31 @@ Output format (version 1, kept in step with lib/domain/writer-attestation/bridge
   unit: wc-mintsoft-order-sweep.timer LoadState=masked ActiveState=inactive UnitFileState=masked
   unit: wc-mintsoft-order-sweep.service LoadState=masked ActiveState=inactive UnitFileState=masked
   unit: wc-mintsoft-webhook.service LoadState=masked ActiveState=inactive UnitFileState=masked
-  last_trigger: 2026-12-30T23:55:01Z        (or: never)
+  journal_exit: 0
+  journal_readable: 1                       (this user can read the SYSTEM journal: root, or in systemd-journal / adm, and `journalctl --header` works)
+  journal_persistent: 1                     (/var/log/journal exists and Storage is not volatile)
+  journal_earliest: 2026-10-01T00:00:00Z    (the earliest journal entry seen, or: none)
+  boot_id: <id>                             (the current boot, or: unknown)
+  boot_started: 2026-12-01T00:00:00Z        (when this boot's journal begins, or: unknown)
+  last_trigger: 2026-12-30T23:55:01Z        (or: never, or: unknown)
 
-`last_trigger` is the LATEST of: the sweep timer's LastTriggerUSec, the sweep service's ExecMainStartTimestamp / InactiveExitTimestamp, and the time of the
-sweep service's newest journal entry, so a sweep started by hand (without the timer) counts too.
+`last_trigger` is the LATEST of: the sweep timer's LastTriggerUSec, the ExecMainStartTimestamp / InactiveExitTimestamp / InactiveEnterTimestamp of the sweep
+service AND of the webhook service, and the time of the newest journal entry of each of the three units, so a sweep started by hand (without the timer)
+and a webhook delivered after the live-from instant both count.
+
+`journal_exit` is the worst exit status of the journalctl reads (0 = all three succeeded). systemd keeps unit timestamps in memory only, so they are LOST by
+a reboot or a daemon-reload that garbage-collects an inactive masked unit. `never` is therefore printed only when every journal read succeeded and found
+nothing, the user can READ the system journal and the journal is PERSISTENT (otherwise exit status 0 with no entries proves nothing: a non-privileged user sees
+no system-unit messages, and a volatile journal is wiped by the same reboot). Otherwise the script prints `unknown`. IMS reads `unknown`, and a `never` without
+journal_exit 0, readable, persistent and an earliest entry BEFORE the live-from instant S, as unreadable, never as clean. Run it as root (or a member of
+systemd-journal / adm).
 """
 import argparse
 import datetime
+import glob
+import grp
 import json
+import os
 import re
 import socket
 import subprocess
@@ -44,8 +63,9 @@ STATE_PROPS = ("LoadState", "ActiveState", "UnitFileState")
 # Properties that carry a time. `systemctl show` prints them as microseconds since the epoch (the *USec ones) or as a human date; both are handled.
 TIME_PROPS = {
     "wc-mintsoft-order-sweep.timer": ("LastTriggerUSec", "LastTriggerUSecMonotonic"),
-    "wc-mintsoft-order-sweep.service": ("ExecMainStartTimestamp", "InactiveExitTimestamp"),
-    "wc-mintsoft-webhook.service": (),
+    "wc-mintsoft-order-sweep.service": ("ExecMainStartTimestamp", "InactiveExitTimestamp", "InactiveEnterTimestamp"),
+    # The webhook service had NO time property before: a webhook processed after the live-from instant (then stopped and masked) was invisible.
+    "wc-mintsoft-webhook.service": ("ExecMainStartTimestamp", "InactiveExitTimestamp", "InactiveEnterTimestamp"),
 }
 SAFE = re.compile(r"^[A-Za-z0-9_.:-]{1,40}$")
 
@@ -111,10 +131,10 @@ def parse_time(text):
 
 
 def journal_last(journalctl, unit):
-    """The newest journal entry of `unit`, or None. A host with no journal access reads as 'no entry': the unit properties still count."""
+    """(newest journal entry of `unit` or None, journalctl exit status). A non-zero status means the journal could not be read, which is NOT the same as 'no entry'."""
     done = run([journalctl, "--no-pager", "-n", "1", "-o", "json", "-u", unit])
     if done.returncode != 0:
-        return None
+        return None, done.returncode
     for line in reversed(done.stdout.splitlines()):
         line = line.strip()
         if not line:
@@ -122,12 +142,94 @@ def journal_last(journalctl, unit):
         try:
             stamp = json.loads(line).get("__REALTIME_TIMESTAMP")
         except ValueError:
-            return None
-        return parse_time(str(stamp)) if stamp else None
-    return None
+            return None, 1
+        return (parse_time(str(stamp)) if stamp else None), 0
+    return None, 0
 
 
-def build(systemctl, journalctl, now):
+def fmt(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def journal_access(journalctl, assume_groups=None):
+    """1 when the user running this script can read the SYSTEM journal, else 0.
+
+    A non-root user outside the systemd-journal / adm groups gets exit status 0 and no entries for `-u <system unit>` (only a hint that it cannot see other
+    users' and the system's messages), which looks exactly like "nothing ever ran". So access is established first: root, or membership of systemd-journal
+    or adm, AND `journalctl --header` (it reads the journal files' headers) succeeding."""
+    if assume_groups is not None:
+        names = set(g for g in assume_groups.split(",") if g)
+        privileged = os.geteuid() == 0 or bool(names & {"systemd-journal", "adm"})
+    else:
+        privileged = os.geteuid() == 0
+        if not privileged:
+            try:
+                gids = set(os.getgroups()) | {os.getegid()}
+                for name in ("systemd-journal", "adm"):
+                    try:
+                        if grp.getgrnam(name).gr_gid in gids:
+                            privileged = True
+                    except KeyError:
+                        pass
+            except OSError:
+                privileged = False
+    if not privileged:
+        return 0
+    done = run([journalctl, "--no-pager", "--header"])
+    return 1 if done.returncode == 0 else 0
+
+
+def journal_persistent(journal_dir, conf_paths):
+    """1 when the journal survives a reboot: the journal directory exists and no journald.conf / drop-in sets Storage=volatile or none (the last setting wins)."""
+    if not os.path.isdir(journal_dir):
+        return 0
+    storage = None
+    files = []
+    for path in conf_paths:
+        if os.path.isdir(path):
+            files += sorted(glob.glob(os.path.join(path, "*.conf")))
+        else:
+            files.append(path)
+    for path in files:
+        try:
+            with open(path, "r") as handle:
+                for line in handle:
+                    match = re.match(r"^\s*Storage\s*=\s*(\S+)", line)
+                    if match:
+                        storage = match.group(1).lower()
+        except OSError:
+            pass
+    return 0 if storage in ("volatile", "none") else 1
+
+
+def journal_boots(journalctl):
+    """(earliest journal entry or None, current boot id or None, start of the current boot's journal or None), from `journalctl --list-boots -o json`."""
+    done = run([journalctl, "--no-pager", "--list-boots", "-o", "json"])
+    if done.returncode != 0:
+        return None, None, None
+    try:
+        boots = json.loads(done.stdout)
+    except ValueError:
+        return None, None, None
+    if not isinstance(boots, list) or not boots:
+        return None, None, None
+    earliest = None
+    for boot in boots:
+        first = boot.get("first_entry")
+        if isinstance(first, int) and first > 0:
+            moment = datetime.datetime.fromtimestamp(first / 1_000_000, tz=datetime.timezone.utc)
+            if earliest is None or moment < earliest:
+                earliest = moment
+    current = max(boots, key=lambda boot: boot.get("index", 0) if isinstance(boot.get("index"), int) else -10**9)
+    boot_id = current.get("boot_id")
+    boot_id = boot_id if isinstance(boot_id, str) and re.match(r"^[0-9a-f-]{8,64}$", boot_id) else None
+    started = current.get("first_entry")
+    started = datetime.datetime.fromtimestamp(started / 1_000_000, tz=datetime.timezone.utc) if isinstance(started, int) and started > 0 else None
+    return earliest, boot_id, started
+
+
+def build(systemctl, journalctl, now, options=None):
+    options = options or {}
     lines = [HEADER, "host: %s" % re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname())[:255],
              "generated_at: %s" % now.strftime("%Y-%m-%dT%H:%M:%SZ")]
     latest = None
@@ -148,10 +250,31 @@ def build(systemctl, journalctl, now):
             moment = parse_time(props.get(prop, ""))
             if moment is not None and (latest is None or moment > latest):
                 latest = moment
-    entry = journal_last(journalctl, "wc-mintsoft-order-sweep.service")
-    if entry is not None and (latest is None or entry > latest):
-        latest = entry
-    lines.append("last_trigger: %s" % (latest.strftime("%Y-%m-%dT%H:%M:%SZ") if latest else "never"))
+    journal_exit = 0
+    for unit in UNITS:
+        entry, status = journal_last(journalctl, unit)
+        journal_exit = max(journal_exit, status)
+        if entry is not None and (latest is None or entry > latest):
+            latest = entry
+    readable = journal_access(journalctl, options.get("assume_groups"))
+    persistent = journal_persistent(options.get("journal_dir", "/var/log/journal"), options.get("journald_conf", ["/etc/systemd/journald.conf", "/etc/systemd/journald.conf.d"]))
+    earliest, boot_id, boot_started = journal_boots(journalctl) if readable else (None, None, None)
+    lines.append("journal_exit: %d" % journal_exit)
+    lines.append("journal_readable: %d" % readable)
+    lines.append("journal_persistent: %d" % persistent)
+    lines.append("journal_earliest: %s" % (fmt(earliest) if earliest is not None else "none"))
+    lines.append("boot_id: %s" % (boot_id or "unknown"))
+    lines.append("boot_started: %s" % (fmt(boot_started) if boot_started is not None else "unknown"))
+    if latest is not None:
+        last = fmt(latest)
+    elif journal_exit == 0 and readable == 1 and persistent == 1 and earliest is not None:
+        # Every journal read succeeded, as a user who can see the system journal, on a persistent journal with entries: `never` here is a claim IMS can
+        # weigh (it still requires the earliest entry to predate the live-from instant S).
+        last = "never"
+    else:
+        # No time anywhere (lost with a reboot or a garbage-collected unit) and the journal could not be read: nothing can be said.
+        last = "unknown"
+    lines.append("last_trigger: %s" % last)
     return "\n".join(lines) + "\n"
 
 
@@ -159,9 +282,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--systemctl", default="systemctl")
     parser.add_argument("--journalctl", default="journalctl")
+    # Test seams (the defaults are the real host):
+    parser.add_argument("--journal-dir", default="/var/log/journal", help=argparse.SUPPRESS)
+    parser.add_argument("--journald-conf", action="append", help=argparse.SUPPRESS)
+    parser.add_argument("--assume-groups", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    options = {"journal_dir": args.journal_dir, "assume_groups": args.assume_groups}
+    if args.journald_conf:
+        options["journald_conf"] = args.journald_conf
     try:
-        report = build(args.systemctl, args.journalctl, datetime.datetime.now(datetime.timezone.utc))
+        report = build(args.systemctl, args.journalctl, datetime.datetime.now(datetime.timezone.utc), options)
     except StatusError as error:
         sys.stderr.write("bridge_writers_status: %s\n" % error)
         return 2

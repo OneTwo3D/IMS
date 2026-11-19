@@ -15,7 +15,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { isUndeliveredEmailCollision } from '@/lib/email-outbox'
-import { isStorefrontCustomerEmailEnabled } from '@/lib/domain/storefront-customer-email/switch'
+import { isStorefrontCustomerEmailEnabled, readStorefrontCustomerEmailEnabledAt } from '@/lib/domain/storefront-customer-email/switch'
 import {
   STOREFRONT_CONFIRMATION_KIND,
   STOREFRONT_DELIVERED_KIND,
@@ -32,10 +32,12 @@ const SUBJECT: Record<StorefrontEmailKindName, (ref: string) => string> = {
   delivered: (ref) => `Your order ${ref} has been delivered`,
 }
 
-async function queueStorefrontEmail(params: { name: StorefrontEmailKindName; kind: string; orderId: string; shipmentId?: string }): Promise<QueueResult> {
+async function queueStorefrontEmail(params: { name: StorefrontEmailKindName; kind: string; orderId: string; shipmentId?: string; releasedAt?: Date }): Promise<QueueResult> {
   const { name, kind, orderId } = params
   try {
     if (!(await isStorefrontCustomerEmailEnabled())) return { queued: false, reason: 'disabled' }
+    // The switch-on instant anchors every history guard; read with the switch, before the order lock.
+    const enabledAt = await readStorefrontCustomerEmailEnabledAt()
 
     const outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
@@ -65,6 +67,7 @@ async function queueStorefrontEmail(params: { name: StorefrontEmailKindName; kin
       const eligibility = evaluateStorefrontEmailEligibility({
         kind: name,
         settingValue: 'true',
+        enabledAt,
         now: new Date(),
         orderId,
         order: order
@@ -75,6 +78,7 @@ async function queueStorefrontEmail(params: { name: StorefrontEmailKindName; kin
             shoppingLinkCount: order._count.shoppingLinks,
             placedAt: order.externalCreatedAt ?? order.createdAt,
             shippedAt: order.shippedAt,
+            releasedAt: params.releasedAt ?? null,
           }
           : null,
         shipment,
@@ -138,9 +142,24 @@ async function recordQueueFailure(name: StorefrontEmailKindName, orderId: string
   })
 }
 
-/** After the order is imported from the storefront. */
-export function queueStorefrontConfirmationIfEligible(orderId: string): Promise<QueueResult> {
-  return queueStorefrontEmail({ name: 'confirmation', kind: STOREFRONT_CONFIRMATION_KIND, orderId })
+/**
+ * After the order is imported from the storefront, or (`releasedAt`) after an order that was imported held (PENDING_PAYMENT / ON_HOLD) moved to processing:
+ * WooCommerce sent its confirmation on that move and is off by then, so the release is the moment the customer is owed one. Same kind, same single-send
+ * dedupe, so an order confirmed at import is never confirmed again at release.
+ */
+export function queueStorefrontConfirmationIfEligible(orderId: string, options?: { releasedAt?: Date }): Promise<QueueResult> {
+  return queueStorefrontEmail({ name: 'confirmation', kind: STOREFRONT_CONFIRMATION_KIND, orderId, ...(options?.releasedAt ? { releasedAt: options.releasedAt } : {}) })
+}
+
+/**
+ * THE PARTIAL-SHIPMENT E-MAIL OF ONE EXTERNAL DISPATCH BATCH. An external (WMS / storefront) dispatch ships an order's open shipments one after another; a
+ * partial e-mail judged shipment by shipment ("the rest will follow") is FALSE for every shipment but the last, because the order only reaches SHIPPED when
+ * the last one has left. So the loop defers the per-shipment hook (`deferStorefrontPartialEmail`) and this runs ONCE after the whole batch has been applied:
+ * each shipment of the batch is judged against the order as it stands NOW (the partial rule needs the order still awaiting despatch, so an order that reached
+ * SHIPPED in the batch gets no partial e-mail, only the dispatched one). Never throws.
+ */
+export async function queueStorefrontPartialShipmentEmailsAfterBatch(shipmentIds: readonly string[]): Promise<void> {
+  for (const shipmentId of shipmentIds) await queueStorefrontPartialShipmentEmailIfEligible(shipmentId)
 }
 
 /** After one shipment of an order that still owes more has despatched. One e-mail per shipment. */

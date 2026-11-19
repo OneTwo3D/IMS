@@ -19,7 +19,7 @@ import { fitMintsoftName } from '../api/product-name'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
 import { applyMintsoftProductParity, applyMintsoftProductParityExceptName, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
 import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation, type ParentDeletionCounters } from './parent-sku-deletion'
-import { describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
+import { CONTENT_REFUSAL_MAX_ATTEMPTS, describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
 const ELIGIBLE_PRODUCT_TYPES = [
   ProductType.SIMPLE,
@@ -772,6 +772,28 @@ async function upsertProductDiscrepancy(params: {
       },
     })
   }
+}
+
+/**
+ * Keeps ONE open PRODUCT_CONTENT_REFUSED discrepancy per product in step with the content Mintsoft keeps refusing: raised once a field's refusal cap
+ * is spent (IMS has stopped sending that value), resolved when the value changed or Mintsoft accepted a send. Nothing is written for a product whose
+ * content outcome did not touch a refusal.
+ */
+export async function syncContentRefusalDiscrepancy(scopes: MintsoftProductSyncScope[], product: { id: string; sku: string }, content: ContentLineResult): Promise<void> {
+  const capped = content.capReachedFields ?? []
+  if (capped.length > 0) {
+    await upsertProductDiscrepancy({
+      scopes,
+      productId: product.id,
+      sku: product.sku,
+      category: 'PRODUCT_CONTENT_REFUSED',
+      imsValue: null,
+      wmsValue: null,
+      message: `${product.sku}: Mintsoft refused the ${capped.join(' and ')} content ${CONTENT_REFUSAL_MAX_ATTEMPTS} times, so IMS has stopped sending that value. Fix the content in WooCommerce (a value Mintsoft will take) or check the field in Mintsoft; this resolves itself when the value changes and Mintsoft accepts it.`,
+    })
+    return
+  }
+  if (content.refusalCleared) await resolveProductDiscrepancy(scopes, product.id, 'PRODUCT_CONTENT_REFUSED')
 }
 
 async function resolveProductDiscrepancy(
@@ -1635,10 +1657,19 @@ async function processMintsoftProductChunk(params: {
             ? 'shadow'
             : result.content.kind === 'held'
               ? 'skip'
-              : null
+              : result.content.kind === 'refused'
+                ? 'error'
+                : null
         if (result.content.kind === 'sent') contentCounters.sent += result.content.fields.length
         if (result.content.kind === 'shadow' || ((result.content.kind === 'sent' || result.content.kind === 'held') && result.content.shadowedFields.length > 0)) contentCounters.shadowed += 1
         if (result.content.kind === 'held') contentCounters.held += 1
+        if (result.content.kind === 'refused') {
+          // Mintsoft answered Success:false. It counts as this run's content error (as the throw did before), but it is recorded against the value,
+          // so the same value is backed off and then left alone instead of being POSTed again every run.
+          contentCounters.errors += 1
+          params.counters.errors += 1
+        }
+        await syncContentRefusalDiscrepancy(params.scopes, result.product, result.content)
         if (logAction) {
           params.logs.push({
             jobId: params.jobId,

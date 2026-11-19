@@ -43,6 +43,13 @@ export async function findDurableShadowRecords(
   client: ShadowEvidenceClient,
   destination: string,
   queries: readonly ShadowSubjectQuery[],
+  options?: {
+    /**
+     * Answer once per (subject type, subject id): the earliest record of each subject. A subject shadowed under several payload digests has several
+     * rows, and with the plain LIMIT 20 a few such subjects starve the rest of the batch. The cap becomes the number of exact ids asked.
+     */
+    onePerSubject?: boolean
+  },
 ): Promise<DurableShadowRecord[]> {
   if (typeof client?.$queryRaw !== 'function') {
     throw new Error('findDurableShadowRecords needs a client that can read outbound_shadow_writes; refusing to treat "could not ask" as "none recorded"')
@@ -61,13 +68,27 @@ export async function findDurableShadowRecords(
     arms.push(Prisma.sql`(subject_type = ${query.subjectType} AND (${Prisma.join(match, ' OR ')})${operation})`)
   }
   if (arms.length === 0) return []
-  const rows = await client.$queryRaw<Array<{ id: string; operation: string; subject_type: string; subject_id: string; occurrences: number | bigint }>>(Prisma.sql`
-    SELECT id, operation, subject_type, subject_id, occurrences
-    FROM outbound_shadow_writes
-    WHERE destination = ${destination} AND (${Prisma.join(arms, ' OR ')})
-    ORDER BY first_produced_at
-    LIMIT 20
-  `)
+  type Row = { id: string; operation: string; subject_type: string; subject_id: string; occurrences: number | bigint }
+  const where = Prisma.sql`destination = ${destination} AND (${Prisma.join(arms, ' OR ')})`
+  const statement = options?.onePerSubject
+    ? Prisma.sql`
+        SELECT id, operation, subject_type, subject_id, occurrences FROM (
+          SELECT DISTINCT ON (subject_type, subject_id) id, operation, subject_type, subject_id, occurrences, first_produced_at
+          FROM outbound_shadow_writes
+          WHERE ${where}
+          ORDER BY subject_type, subject_id, first_produced_at
+        ) one_per_subject
+        ORDER BY first_produced_at
+        LIMIT ${Math.max(20, queries.reduce((sum, query) => sum + (query.exactIds?.length ?? 0), 0))}
+      `
+    : Prisma.sql`
+        SELECT id, operation, subject_type, subject_id, occurrences
+        FROM outbound_shadow_writes
+        WHERE ${where}
+        ORDER BY first_produced_at
+        LIMIT 20
+      `
+  const rows = await client.$queryRaw<Row[]>(statement)
   return rows.map((row) => ({
     id: row.id,
     operation: row.operation,

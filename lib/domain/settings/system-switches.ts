@@ -21,7 +21,10 @@ import { WMS_MERGE_CANDIDATE_MODES, WMS_MERGE_CANDIDATE_MODE_SETTING } from '@/l
  * change what IMS sends to the LIVE warehouse. A shell has no session, so the command assumes ADMIN authority from shell access to the host and, in
  * exchange, refuses to write one without `--confirm-admin` as well as `--yes`, and records the operator (`--by`) and that assumption in the audit entry.
  *
- * KEYS NOT HERE ON PURPOSE: the storefront-customer-email switch exists only in an open pull request and is added with the code that reads it.
+ * THE STOREFRONT CUSTOMER E-MAIL SWITCH (`storefront_customer_email_enabled`) has two rules the screen has too. (1) Turning it ON is refused unless step W is live and
+ * WooCommerce's native customer e-mails are off (lib/domain/storefront-customer-email/switch-on-interlock.ts; it reads the store, so the command runs it, not
+ * this db-free module). (2) Turning it ON records the instant in `storefront_customer_email_enabled_at` in the same transaction (`stampOnKey`): every history guard
+ * of the e-mails is anchored to it.
  */
 
 export type SwitchKind = 'boolean' | 'enum'
@@ -36,6 +39,10 @@ export type SwitchDefinition = {
   readonly requires?: ReadonlyArray<{ key: string; value: string; why: string }>
   /** The screen that sets this switch needs ADMIN and a fresh sign-in; the command needs `--confirm-admin` to write it and records that it assumed ADMIN. */
   readonly adminOnly?: boolean
+  /** A row stamped with the ISO instant, in the same transaction, whenever the switch changes to ON (not when it is left as it is); the row is deleted when the switch changes to OFF. */
+  readonly stampOnKey?: string
+  /** Turning ON is refused by this interlock (run by the command, which may read the store; the registry stays free of the database client). */
+  readonly turnOnInterlock?: 'storefront-customer-email'
 }
 
 const BOOLEAN_VALUES = ['true', 'false'] as const
@@ -63,6 +70,10 @@ const PARENT_SKU_DELETE_NEEDS_PARITY = {
   why: 'deleting a parent SKU does nothing unless product parity is also on',
 }
 
+// Literals for the same reason; tests/settings-cli.test.ts holds them equal to lib/domain/storefront-customer-email/constants.ts.
+export const STOREFRONT_EMAIL_SWITCH_KEY = 'storefront_customer_email_enabled'
+export const STOREFRONT_EMAIL_ENABLED_AT_KEY = 'storefront_customer_email_enabled_at'
+
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
   booleanSwitch('wc_withdrawal_outcome_enabled'),
@@ -80,6 +91,7 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
+  { ...booleanSwitch(STOREFRONT_EMAIL_SWITCH_KEY), stampOnKey: STOREFRONT_EMAIL_ENABLED_AT_KEY, turnOnInterlock: 'storefront-customer-email' },
 ]
 
 export const SYSTEM_SWITCH_KEYS: readonly string[] = SYSTEM_SWITCHES.map((s) => s.key)
@@ -197,7 +209,7 @@ export async function readSwitch(client: AuditReadClient, def: SwitchDefinition)
 export type SwitchWriteInput = { def: SwitchDefinition; value: string; by: string; reason: string; adminConfirmed?: boolean }
 
 type TxClient = ReadClient & {
-  setting: ReadClient['setting'] & { upsert(args: Record<string, unknown>): Promise<unknown> }
+  setting: ReadClient['setting'] & { upsert(args: Record<string, unknown>): Promise<unknown>; deleteMany(args: Record<string, unknown>): Promise<unknown> }
   activityLog: { create(args: Record<string, unknown>): Promise<unknown> }
 }
 
@@ -228,6 +240,13 @@ export async function writeSwitch(client: SwitchWriteClient, input: SwitchWriteI
       const oldValue = before?.value ?? null
       if (oldValue === value) return { ok: true, changed: false, oldValue, newValue: value } as const
       await tx.setting.upsert({ where: { key: def.key }, create: { key: def.key, value }, update: { value } })
+      if (def.stampOnKey && isOn(def, value)) {
+        const at = new Date().toISOString()
+        await tx.setting.upsert({ where: { key: def.stampOnKey }, create: { key: def.stampOnKey, value: at }, update: { value: at } })
+      } else if (def.stampOnKey) {
+        // Turned OFF: the stamp goes with it, so a later switch-on by a direct write (SQL, a restore) has no stale instant to anchor the guards.
+        await tx.setting.deleteMany({ where: { key: def.stampOnKey } })
+      }
       await logActivityInTransaction(tx as never, {
         userId: null,
         entityType: 'SETTING',

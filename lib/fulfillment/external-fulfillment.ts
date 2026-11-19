@@ -802,6 +802,13 @@ async function applyScopedWmsDespatch(
   }
 
   const open = wmsShipments.filter((shipment) => shipment.status !== 'SHIPPED')
+  // The partial-shipment e-mail (storefront switch) is judged ONCE, after the whole batch is applied, never shipment by shipment (see queueStorefrontPartialShipmentEmailsAfterBatch).
+  const processedInBatch: string[] = []
+  const flushPartialEmails = async (): Promise<void> => {
+    const { queueStorefrontPartialShipmentEmailsAfterBatch } = await import('@/lib/storefront-customer-email')
+    await queueStorefrontPartialShipmentEmailsAfterBatch(processedInBatch)
+  }
+  const discardPartialEmails = (): void => { processedInBatch.length = 0 }
   for (let index = 0; index < open.length; index++) {
     const shipment = open[index]
     const tracking = update.tracking?.[index] ?? (update.tracking?.length === 1 ? update.tracking[0] : undefined)
@@ -818,9 +825,15 @@ async function applyScopedWmsDespatch(
           storefrontCompletion: update.storefrontAlreadyCompleted !== true,
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
           ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
+          deferStorefrontPartialEmail: true,
         },
       )
+      if (result.success && target === 'SHIPPED') processedInBatch.push(shipment.id)
       if (!result.success) {
+        // A failed batch judges NO partial e-mail: the failure may be the fence refusing the order flip AFTER the last shipment shipped, in which case the
+        // order is still PROCESSING while the store / WMS reported the whole order despatched. The retry either flips the order (dispatched e-mail, no
+        // partial) or ends in a terminal refusal; the shipments already shipped are not re-judged.
+        discardPartialEmails()
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: order.id,
@@ -836,6 +849,7 @@ async function applyScopedWmsDespatch(
     }
   }
 
+  await flushPartialEmails()
   return recordScopedApplication(db, link, idempotencyKey, open.map((shipment) => shipment.id), update, order, orderRef)
 }
 
@@ -1056,6 +1070,13 @@ export async function applyExternalFulfillmentUpdate(
 
   // The unreleased status the dispatch transaction itself found under the order lock (set only when it recorded without promoting).
   let lockedNotReadyStatus: string | null = null
+  // The partial-shipment e-mail (storefront switch) is judged ONCE, after the whole batch is applied, never shipment by shipment (see queueStorefrontPartialShipmentEmailsAfterBatch).
+  const shippedInBatch: string[] = []
+  const flushPartialEmails = async (): Promise<void> => {
+    const { queueStorefrontPartialShipmentEmailsAfterBatch } = await import('@/lib/storefront-customer-email')
+    await queueStorefrontPartialShipmentEmailsAfterBatch(shippedInBatch)
+  }
+  const discardPartialEmails = (): void => { shippedInBatch.length = 0 }
   for (let index = 0; index < shipments.length; index++) {
     const shipment = shipments[index]
     const transitions = statusesToApply(shipment.status as ExternalShipmentStatus, update.targetShipmentStatus)
@@ -1106,12 +1127,18 @@ export async function applyExternalFulfillmentUpdate(
           storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
           ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
+          deferStorefrontPartialEmail: true,
         },
       )
 
       if (result.success && result.despatchedWhileNotReady) lockedNotReadyStatus = result.despatchedWhileNotReady
+      if (result.success && target === 'SHIPPED') shippedInBatch.push(shipment.id)
 
       if (!result.success) {
+        // A failed batch judges NO partial e-mail: the failure may be the fence refusing the order flip AFTER the last shipment shipped, in which case the
+        // order is still PROCESSING while the store / WMS reported the whole order despatched. The retry either flips the order (dispatched e-mail, no
+        // partial) or ends in a terminal refusal; the shipments already shipped are not re-judged.
+        discardPartialEmails()
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: order.id,
@@ -1129,6 +1156,9 @@ export async function applyExternalFulfillmentUpdate(
       }
     }
   }
+
+  // The whole batch is applied: only now is "the order still owes more" a fact (an order that reached SHIPPED in the batch gets the dispatched e-mail, not a partial one).
+  await flushPartialEmails()
 
   // RETRY OF A COMPLETION THAT LEFT THE ORDER UNFLIPPED. Every shipment may already be SHIPPED while the order itself was not
   // promoted: a verification fence refused at the order flip after the shipment committed, or (SHP-H1) the promotion failed or
