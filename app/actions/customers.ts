@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
-import { parseCsv } from '@/lib/csv'
+import { csvDiagnosticsErrors, parseCsv, parseCsvDiagnosed } from '@/lib/csv'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { eraseCustomerPersonalData } from '@/lib/domain/erasure/erase-personal-data'
 import { openWarehouseOrdersWarning } from '@/lib/domain/erasure/warehouse-obligations'
@@ -368,6 +368,13 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
         : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
     }
     const text = await file.text()
+    const damage = csvDiagnosticsErrors(parseCsvDiagnosed(text).diagnostics)
+    if (damage.length > 0) {
+      const error = `The file is not a well-formed CSV and nothing was imported. ${damage.join('; ')}`
+      return preview
+        ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: damage.length, errors: damage, error })
+        : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: damage, error, success: false })
+    }
     const parsed = parseCsv(text)
     const rows = parsed.slice(0, MAX_IMPORT_ROWS)
     const dropped = parsed.length - rows.length

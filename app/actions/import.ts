@@ -4,7 +4,7 @@ import { parseComponentsCell } from '@/lib/domain/import/component-recipe-cell'
 import { parseTransferDispatchedAt } from '@/lib/domain/import/transfer-dispatch-date'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
-import { parseCsv } from '@/lib/csv'
+import { csvDiagnosticsErrors, parseCsv, parseCsvDiagnosed } from '@/lib/csv'
 import { ProductType, type Prisma, type ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
@@ -96,6 +96,10 @@ async function validateImportFile(
   if (file.size > MAX_IMPORT_BYTES) {
     return { error: `File exceeds maximum size (${MAX_IMPORT_BYTES / (1024 * 1024)} MB)` }
   }
+  // A damaged or hand-made file must not turn into quietly different rows: a short row padded with blanks, an extra cell dropped, a stray quote
+  // swallowing the next cells. Refuse the whole file, naming the lines, before any row is read as data.
+  const damage = csvDiagnosticsErrors(parseCsvDiagnosed(await file.text()).diagnostics)
+  if (damage.length > 0) return { error: `The file is not a well-formed CSV and nothing was imported. ${damage.join('; ')}` }
   return { file }
 }
 

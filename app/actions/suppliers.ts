@@ -3,7 +3,7 @@
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
-import { parseCsv } from '@/lib/csv'
+import { csvDiagnosticsErrors, parseCsv, parseCsvDiagnosed } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { SYSTEM_IMPORT, withSystemActor, withSystemOutcome, type SystemImportContext } from '@/lib/first-load/apply/system-import-capability'
@@ -315,7 +315,15 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
         ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: [error], error })
         : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
     }
-    const parsed = parseCsv(await file.text())
+    const text = await file.text()
+    const damage = csvDiagnosticsErrors(parseCsvDiagnosed(text).diagnostics)
+    if (damage.length > 0) {
+      const error = `The file is not a well-formed CSV and nothing was imported. ${damage.join('; ')}`
+      return preview
+        ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: damage.length, errors: damage, error })
+        : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: damage, error, success: false })
+    }
+    const parsed = parseCsv(text)
     const rows = parsed.slice(0, MAX_IMPORT_ROWS)
     const dropped = parsed.length - rows.length
     const suppliers = await db.supplier.findMany({

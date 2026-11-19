@@ -121,21 +121,46 @@ export function buildTemplateCsv(
   return lines.join('\r\n')
 }
 
-/** Parse CSV text into an array of objects keyed by header row */
-export function parseCsv(text: string): Record<string, string>[] {
-  const rows = parseRows(text)
-  if (rows.length < 2) return []
+/**
+ * What a hand-made or damaged file did that `parseCsv` quietly papered over. Line numbers are physical file lines (1-based, the header is line 1),
+ * so an operator can find the row in a spreadsheet.
+ */
+export type CsvDiagnostics = {
+  /** A data row whose cell count differs from the header's: `parseCsv` pads it with empty strings or drops its extras, so values land in the wrong columns. */
+  raggedRows: Array<{ line: number; expected: number; actual: number }>
+  /** A data row with a quote in the middle of an unquoted field (the quote toggled quoting instead of being an error). */
+  strayQuoteRows: number[]
+  /** Guidance/comment rows skipped, such as the template's "# REQUIRED" row. */
+  commentRowsSkipped: number
+}
 
-  const headers = rows[0]
+// A guidance row is "# " followed by text ("# REQUIRED", "# IMS export metadata", "# notice"). A bare "#X" or "#123" is DATA: a SKU, supplier
+// name or order key may legitimately start with "#" and must not vanish.
+function isCommentCell(value: string): boolean {
+  return /^#(\s|$)/.test(value)
+}
+
+/** Parse CSV text into rows keyed by the header row, and report what the lenient reading hid. */
+export function parseCsvDiagnosed(text: string): { rows: Record<string, string>[]; diagnostics: CsvDiagnostics } {
+  const { rows: parsedRows, lines, strayQuoteRowIndexes } = parseRows(text)
+  const diagnostics: CsvDiagnostics = { raggedRows: [], strayQuoteRows: [], commentRowsSkipped: 0 }
+  if (parsedRows.length < 2) return { rows: [], diagnostics }
+
+  const headers = parsedRows[0]
   const results: Record<string, string>[] = []
 
-  for (let i = 1; i < rows.length; i++) {
-    const values = rows[i]
+  for (let i = 1; i < parsedRows.length; i++) {
+    const values = parsedRows[i]
     if (values.every((value) => value.trim() === '')) continue
     const firstNonEmpty = values.find((value) => value.trim().length > 0)?.trim() ?? ''
     // Allow templates to carry guidance rows such as "# REQUIRED" without
     // turning them into imported records.
-    if (firstNonEmpty.startsWith('#')) continue
+    if (isCommentCell(firstNonEmpty)) {
+      diagnostics.commentRowsSkipped++
+      continue
+    }
+    if (values.length !== headers.length) diagnostics.raggedRows.push({ line: lines[i], expected: headers.length, actual: values.length })
+    if (strayQuoteRowIndexes.has(i)) diagnostics.strayQuoteRows.push(lines[i])
     const obj: Record<string, string> = {}
     headers.forEach((h, idx) => {
       obj[h.trim()] = values[idx]?.trim() ?? ''
@@ -143,40 +168,76 @@ export function parseCsv(text: string): Record<string, string>[] {
     results.push(obj)
   }
 
-  return results
+  return { rows: results, diagnostics }
 }
 
-function parseRows(text: string): string[][] {
+/** Operator-facing errors for the problems `parseCsvDiagnosed` found; empty when the file is well formed. */
+export function csvDiagnosticsErrors(diagnostics: CsvDiagnostics): string[] {
+  const errors: string[] = []
+  for (const row of diagnostics.raggedRows.slice(0, 20)) {
+    errors.push(`Line ${row.line}: has ${row.actual} cell(s) but the header has ${row.expected} — values would land in the wrong columns`)
+  }
+  if (diagnostics.raggedRows.length > 20) errors.push(`...and ${diagnostics.raggedRows.length - 20} more row(s) with the wrong number of cells`)
+  for (const line of diagnostics.strayQuoteRows.slice(0, 20)) {
+    errors.push(`Line ${line}: a quote in the middle of an unquoted field — quote the whole field, or double the quote`)
+  }
+  return errors
+}
+
+/** Parse CSV text into an array of objects keyed by header row. Lenient: use `parseCsvDiagnosed` where a damaged file must be refused. */
+export function parseCsv(text: string): Record<string, string>[] {
+  return parseCsvDiagnosed(text).rows
+}
+
+function parseRows(text: string): { rows: string[][]; lines: number[]; strayQuoteRowIndexes: Set<number> } {
   const input = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   const rows: string[][] = []
+  const lines: number[] = []
+  const strayQuoteRowIndexes = new Set<number>()
   let fields: string[] = []
   let current = ''
   let inQuotes = false
+  let fieldQuoted = false
+  let line = 1
+  let rowLine = 1
+
+  const endRow = () => {
+    fields.push(current)
+    rows.push(fields)
+    lines.push(rowLine)
+    fields = []
+    current = ''
+    fieldQuoted = false
+  }
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i]
+    if (ch === '\n') line++
     if (ch === '"') {
       if (inQuotes && input[i + 1] === '"') {
         current += '"'
         i++
+      } else if (!inQuotes && current !== '' && !fieldQuoted) {
+        // A quote in the middle of an unquoted field.
+        strayQuoteRowIndexes.add(rows.length)
+        current += ch
       } else {
+        if (!inQuotes) fieldQuoted = true
         inQuotes = !inQuotes
       }
     } else if (ch === ',' && !inQuotes) {
       fields.push(current)
       current = ''
+      fieldQuoted = false
     } else if (ch === '\n' && !inQuotes) {
-      fields.push(current)
-      rows.push(fields)
-      fields = []
-      current = ''
+      endRow()
+      rowLine = line
     } else {
       current += ch
     }
   }
-  fields.push(current)
-  rows.push(fields)
-  return rows
+  endRow()
+  return { rows, lines, strayQuoteRowIndexes }
 }
 
 function csvHeaders(filename: string, metadata?: CsvExportMetadata): Record<string, string> {
