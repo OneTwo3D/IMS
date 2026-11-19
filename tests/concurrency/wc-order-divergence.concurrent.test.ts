@@ -401,7 +401,7 @@ test('[divergence] MED (r1): an unreadable warehouse gate queues a live re-read 
     const other = await mk('something else', null)
     const deleted = await mk(amend.WC_AMENDMENT_REFUND_REASON, new Date())
     const fs = await import('node:fs')
-    const sql = fs.readFileSync('prisma/migrations/20261120100000_wc_amendment_round2/migration.sql', 'utf8').split('\n').find((l) => l.startsWith('UPDATE "sales_order_refunds"'))!
+    const sql = fs.readFileSync('prisma/migrations/20261120000000_wc_amendment_round2/migration.sql', 'utf8').split('\n').find((l) => l.startsWith('UPDATE "sales_order_refunds"'))!
     await f.db.$executeRawUnsafe(sql)
     const flags = new Map((await f.db.salesOrderRefund.findMany({ where: { id: { in: [legacy, other, deleted] } }, select: { id: true, wcAmendment: true } })).map((r) => [r.id, r.wcAmendment]))
     assert.equal(flags.get(legacy), true)
