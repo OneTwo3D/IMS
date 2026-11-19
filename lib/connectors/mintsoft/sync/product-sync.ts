@@ -50,7 +50,7 @@ export const PRODUCT_SYNC_CANDIDATE_SELECT = {
   type: true,
   lifecycleStatus: true,
   // Read for the parity setting only (a variation inherits its parent's name base, weight and dimensions); unused while it is off.
-  parent: { select: { name: true, weight: true, widthCm: true, heightCm: true, depthCm: true } },
+  parent: { select: { name: true, weight: true, widthCm: true, heightCm: true, depthCm: true, options: { select: { values: true } } } },
   content: { select: { shortDescription: true, longDescription: true, images: true } },
   // Customs fields emptied in IMS (value -> nothing): the only evidence that Mintsoft's copy is to be cleared.
   customsClears: { select: { field: true, createdAt: true, attempts: true, unverifiedAttempts: true } },
@@ -91,7 +91,7 @@ export type ProductSyncCandidate = {
   imageUrl: string | null
   type: ProductType
   lifecycleStatus: ProductLifecycleStatus
-  parent?: { name: string; weight: Prisma.Decimal | null; widthCm: Prisma.Decimal | null; heightCm: Prisma.Decimal | null; depthCm: Prisma.Decimal | null } | null
+  parent?: { name: string; weight: Prisma.Decimal | null; widthCm: Prisma.Decimal | null; heightCm: Prisma.Decimal | null; depthCm: Prisma.Decimal | null; options?: Array<{ values: string }> } | null
   content?: { shortDescription: string | null; longDescription: string | null; images: Prisma.JsonValue } | null
   /** Customs fields emptied in IMS; absent on a candidate built without the relation (none). */
   customsClears?: Array<{ field: string; createdAt?: Date; attempts?: number; unverifiedAttempts?: number }>

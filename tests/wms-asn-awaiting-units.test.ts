@@ -54,6 +54,15 @@ test('BOOKED_IN with closedAt null still counts as incoming stock; BOOKED_IN wit
   assert.equal(partial.wmsAsn, '10')
 })
 
+// o3d-zz37l (5): a dispatch cancel (or a close-short) sets closedAt and leaves the status OPEN / PARTIALLY_BOOKED_IN; that ASN no longer expects units.
+test('an ASN closed by a dispatch cancel or a close-short (status OPEN / PARTIALLY_BOOKED_IN, closedAt set) is not incoming stock', async () => {
+  for (const status of ['OPEN', 'PARTIALLY_BOOKED_IN']) {
+    const result = await getProductIncomingStock('p', { client: clientWith([line({ status, closedAt: new Date() })]) })
+    assert.equal(result.wmsAsn, '0', status)
+    assert.equal(isWmsAsnAwaitingUnits({ status, closedAt: new Date() }), false, status)
+  }
+})
+
 test('units already accounted on a BOOKED_IN-not-closed ASN are subtracted, never double counted', async () => {
   const result = await getProductIncomingStock('p', {
     client: clientWith([line({ status: 'BOOKED_IN', closedAt: null }, { qtyAccountedViaSnapshot: 4 })]),

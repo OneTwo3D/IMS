@@ -9,6 +9,13 @@ import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { classifyStockCountWmsPolicy, computeStockCountPostings, describeStockCountDrift, detectStockCountDrift, makeStockCountReference, type StockCountDrift, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
+import { getSettingValues, type SettingValueReadClient } from '@/lib/settings-store'
+import {
+  NO_SMALL_VARIANCE,
+  isBulkAcceptable,
+  parseSmallVarianceThreshold,
+  type SmallVarianceThreshold,
+} from '@/lib/domain/inventory/stock-count-triage'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorIds } from '@/lib/connectors/wms/enabled-connector'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
@@ -50,6 +57,8 @@ export type StockCountLineRow = {
   notes: string | null
   /** Neither counted nor reconciled, on an open prepared count: the line can be taken off the count. */
   removable: boolean
+  /** Average cost per unit (base currency) of the stock on hand in this location; null when no cost layer holds stock (and always on a closed count). */
+  unitCost: number | null
 }
 
 export type StockCountRow = {
@@ -100,7 +109,7 @@ const COUNT_SELECT = {
   },
 } as const
 
-function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }>): StockCountRow {
+function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }>, unitCosts: Map<string, number> = new Map()): StockCountRow {
   const planEditable = isStockCountPlanEditable(c.status) && c.prepared
   const lines: StockCountLineRow[] = c.lines.map((l) => ({
     id: l.id,
@@ -111,6 +120,7 @@ function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }
     variance: l.variance == null ? null : Number(l.variance),
     reconciledQty: l.reconciledQty == null ? null : Number(l.reconciledQty),
     notes: l.notes,
+    unitCost: unitCosts.get(l.productId) ?? null,
     removable: planEditable && lineRemovability({
       countedQty: l.countedQty == null ? null : Number(l.countedQty),
       reconciledQty: l.reconciledQty == null ? null : Number(l.reconciledQty),
@@ -135,16 +145,37 @@ function mapCount(c: Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }
   }
 }
 
+/**
+ * Average unit cost of the stock on hand (remaining cost-layer quantity), per product, for one warehouse. A display figure for the
+ * variance value on the reconciliation view; it books nothing. Products with no remaining layer are absent (no cost known).
+ */
+async function unitCostsForWarehouse(warehouseId: string, productIds: string[]): Promise<Map<string, number>> {
+  if (productIds.length === 0) return new Map()
+  const rows = await db.$queryRaw<Array<{ productId: string; unitCost: Prisma.Decimal | null }>>`
+    SELECT "productId", SUM("remainingQty" * "unitCostBase") / NULLIF(SUM("remainingQty"), 0) AS "unitCost"
+    FROM cost_layers
+    WHERE "warehouseId" = ${warehouseId} AND "productId" = ANY(${productIds}::text[]) AND "remainingQty" > 0
+    GROUP BY "productId"`
+  return new Map(rows.filter((r) => r.unitCost != null).map((r) => [r.productId, new Prisma.Decimal(r.unitCost!).toDecimalPlaces(6).toNumber()]))
+}
+
+async function mapCountsWithCost(rows: Array<Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }>>): Promise<StockCountRow[]> {
+  return Promise.all(rows.map(async (r) => {
+    const open = r.status === 'DRAFT' || r.status === 'IN_PROGRESS'
+    return mapCount(r, open ? await unitCostsForWarehouse(r.warehouseId, r.lines.map((l) => l.productId)) : undefined)
+  }))
+}
+
 export async function getStockCounts(limit = 100): Promise<StockCountRow[]> {
   await requirePermission('stock_control.adjust')
   const rows = await db.stockCount.findMany({ orderBy: { createdAt: 'desc' }, take: limit, select: COUNT_SELECT })
-  return rows.map(mapCount)
+  return mapCountsWithCost(rows)
 }
 
 export async function getStockCount(id: string): Promise<StockCountRow | null> {
   await requirePermission('stock_control.adjust')
   const row = await db.stockCount.findUnique({ where: { id }, select: COUNT_SELECT })
-  return row ? mapCount(row) : null
+  return row ? (await mapCountsWithCost([row]))[0]! : null
 }
 
 const createSchema = z.object({
@@ -302,6 +333,93 @@ const reconcileSchema = z.object({
   lineIds: z.array(z.string().min(1)).optional(),
 })
 
+/** A counted line as the in-lock reconcile sees it: its saved counted figure and the live on-hand just read under the stock lock. */
+type ReconcileCandidate = { lineId: string; countedQty: number; liveOnHand: number }
+
+/**
+ * THE ONE ACCEPT PATH. Stamps, under the count lock and the stock-level locks, the on-hand each COUNTED line is
+ * being reconciled against, and refreshes the line's book figure and variance to it. Both the operator's own
+ * Reconcile and the bulk accept run this, so a bulk-accepted line is written exactly as a single accept writes it.
+ *
+ * `eligible`, when given, is evaluated per line AFTER the live on-hand was read under lock; a line it refuses is
+ * left untouched and reported back as excluded. The bulk accept uses it to re-validate every line at commit time.
+ * Writes no stock movement and no ledger entry.
+ */
+async function reconcileCountTx(
+  tx: Prisma.TransactionClient,
+  input: { countId: string; counts?: CountLineInput[]; lineIds?: string[]; eligible?: (c: ReconcileCandidate) => boolean },
+): Promise<{ refreshed: StockCountDrift[]; accepted: string[]; excluded: string[] }> {
+  const { countId, counts, lineIds, eligible } = input
+  await tx.$queryRaw`SELECT id FROM stock_counts WHERE id = ${countId} FOR UPDATE`
+  const count = await tx.stockCount.findUnique({
+    where: { id: countId },
+    select: { status: true, warehouseId: true, lines: { select: { id: true, productId: true, sku: true, expectedQty: true, countedQty: true, reconciledQty: true } } },
+  })
+  if (!count) throw new Error('Stock count not found.')
+  if (count.status === 'COMPLETED' || count.status === 'CANCELLED') throw new Error('This stock count can no longer be reconciled.')
+  const expectedById = new Map(count.lines.map((l) => [l.id, Number(l.expectedQty)]))
+  const previousCountedById = new Map(count.lines.map((l) => [l.id, l.countedQty == null ? null : Number(l.countedQty)]))
+  if (counts && counts.length > 0) await persistCountsTx(tx, counts, expectedById, previousCountedById)
+  const providedById = new Map((counts ?? []).map((c) => [c.lineId, c.countedQty]))
+  const wanted = lineIds ? new Set(lineIds) : null
+
+  const counted = count.lines
+    .map((l) => ({
+      lineId: l.id,
+      productId: l.productId,
+      sku: l.sku,
+      countedQty: providedById.has(l.id) ? providedById.get(l.id)! : (l.countedQty == null ? null : Number(l.countedQty)),
+      // A changed figure was un-stamped by persistCountsTx just above; the row read here predates that.
+      reconciledQty: providedById.has(l.id) && providedById.get(l.id) !== previousCountedById.get(l.id)
+        ? null
+        : (l.reconciledQty == null ? null : Number(l.reconciledQty)),
+    }))
+    .filter((l): l is typeof l & { countedQty: number } => l.countedQty != null && (wanted === null || wanted.has(l.lineId)))
+  if (counted.length === 0 && !eligible) throw new Error('Count at least one line before reconciling.')
+
+  const productIds = counted.map((l) => l.productId)
+  if (productIds.length > 0) {
+    await materialiseStockRowsTx(tx, count.warehouseId, productIds)
+    await tx.$queryRaw`SELECT id FROM stock_levels WHERE "warehouseId" = ${count.warehouseId} AND "productId" = ANY(${productIds}::text[]) FOR UPDATE`
+  }
+  const levels = productIds.length > 0
+    ? await tx.stockLevel.findMany({ where: { warehouseId: count.warehouseId, productId: { in: productIds } }, select: { productId: true, quantity: true } })
+    : []
+  const liveBook = new Map(levels.map((l) => [l.productId, new Prisma.Decimal(l.quantity)]))
+
+  const accepted: string[] = []
+  const excluded: string[] = []
+  const toWrite = counted.filter((l) => {
+    if (!eligible) return true
+    const ok = eligible({ lineId: l.lineId, countedQty: l.countedQty, liveOnHand: (liveBook.get(l.productId) ?? new Prisma.Decimal(0)).toNumber() })
+    ;(ok ? accepted : excluded).push(l.lineId)
+    return ok
+  })
+  if (!eligible) accepted.push(...toWrite.map((l) => l.lineId))
+
+  // What moved since the previous stamp (for the operator); a never-stamped line is not "moved".
+  const refreshed = detectStockCountDrift(toWrite, new Map([...liveBook].map(([k, v]) => [k, v.toNumber()]))).filter((d) => d.earlierOnHand != null)
+
+  for (const l of toWrite) {
+    const live = liveBook.get(l.productId) ?? new Prisma.Decimal(0)
+    await tx.stockCountLine.update({
+      where: { id: l.lineId },
+      data: {
+        reconciledQty: live,
+        expectedQty: live.toDecimalPlaces(4),
+        variance: new Prisma.Decimal(l.countedQty).sub(live).toDecimalPlaces(4),
+      },
+    })
+  }
+  if (toWrite.length > 0) {
+    await tx.stockCount.update({
+      where: { id: countId },
+      data: { reconciledAt: new Date(), ...(count.status === 'DRAFT' ? { status: 'IN_PROGRESS' as const, startedAt: new Date() } : {}) },
+    })
+  }
+  return { refreshed, accepted, excluded }
+}
+
 /**
  * Reconcile a stock count: stamp, under the stock-level lock, the on-hand each COUNTED line is being
  * reconciled against, and refresh the line's book figure and variance to it. Authorising (postStockCount)
@@ -320,58 +438,7 @@ export async function reconcileStockCount(input: unknown): Promise<StockCountRes
   try {
     let refreshed: StockCountDrift[] = []
     await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM stock_counts WHERE id = ${countId} FOR UPDATE`
-      const count = await tx.stockCount.findUnique({
-        where: { id: countId },
-        select: { status: true, warehouseId: true, lines: { select: { id: true, productId: true, sku: true, expectedQty: true, countedQty: true, reconciledQty: true } } },
-      })
-      if (!count) throw new Error('Stock count not found.')
-      if (count.status === 'COMPLETED' || count.status === 'CANCELLED') throw new Error('This stock count can no longer be reconciled.')
-
-      const expectedById = new Map(count.lines.map((l) => [l.id, Number(l.expectedQty)]))
-      const previousCountedById = new Map(count.lines.map((l) => [l.id, l.countedQty == null ? null : Number(l.countedQty)]))
-      if (counts && counts.length > 0) await persistCountsTx(tx, counts, expectedById, previousCountedById)
-      const providedById = new Map((counts ?? []).map((c) => [c.lineId, c.countedQty]))
-      const wanted = lineIds ? new Set(lineIds) : null
-
-      const counted = count.lines
-        .map((l) => ({
-          lineId: l.id,
-          productId: l.productId,
-          sku: l.sku,
-          countedQty: providedById.has(l.id) ? providedById.get(l.id)! : (l.countedQty == null ? null : Number(l.countedQty)),
-          // A changed figure was un-stamped by persistCountsTx just above; the row read here predates that.
-          reconciledQty: providedById.has(l.id) && providedById.get(l.id) !== previousCountedById.get(l.id)
-            ? null
-            : (l.reconciledQty == null ? null : Number(l.reconciledQty)),
-        }))
-        .filter((l): l is typeof l & { countedQty: number } => l.countedQty != null && (wanted === null || wanted.has(l.lineId)))
-      if (counted.length === 0) throw new Error('Count at least one line before reconciling.')
-
-      const productIds = counted.map((l) => l.productId)
-      await materialiseStockRowsTx(tx, count.warehouseId, productIds)
-      await tx.$queryRaw`SELECT id FROM stock_levels WHERE "warehouseId" = ${count.warehouseId} AND "productId" = ANY(${productIds}::text[]) FOR UPDATE`
-      const levels = await tx.stockLevel.findMany({ where: { warehouseId: count.warehouseId, productId: { in: productIds } }, select: { productId: true, quantity: true } })
-      const liveBook = new Map(levels.map((l) => [l.productId, new Prisma.Decimal(l.quantity)]))
-
-      // What moved since the previous stamp (for the operator); a never-stamped line is not "moved".
-      refreshed = detectStockCountDrift(counted, new Map([...liveBook].map(([k, v]) => [k, v.toNumber()]))).filter((d) => d.earlierOnHand != null)
-
-      for (const l of counted) {
-        const live = liveBook.get(l.productId) ?? new Prisma.Decimal(0)
-        await tx.stockCountLine.update({
-          where: { id: l.lineId },
-          data: {
-            reconciledQty: live,
-            expectedQty: live.toDecimalPlaces(4),
-            variance: new Prisma.Decimal(l.countedQty).sub(live).toDecimalPlaces(4),
-          },
-        })
-      }
-      await tx.stockCount.update({
-        where: { id: countId },
-        data: { reconciledAt: new Date(), ...(count.status === 'DRAFT' ? { status: 'IN_PROGRESS' as const, startedAt: new Date() } : {}) },
-      })
+      refreshed = (await reconcileCountTx(tx, { countId, counts, lineIds })).refreshed
     }, STOCK_TX_OPTIONS)
     revalidatePath('/stock-control/stock-counts')
     await logActivity({
@@ -383,6 +450,161 @@ export async function reconcileStockCount(input: unknown): Promise<StockCountRes
   } catch (e) {
     console.error(e)
     return { message: e instanceof Error ? e.message : 'Failed to reconcile the stock count.' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Variance triage (reconciliation view): threshold setting + bulk accept
+// ---------------------------------------------------------------------------
+
+const SMALL_VARIANCE_QTY_KEY = 'stock_count_small_variance_qty'
+const SMALL_VARIANCE_PCT_KEY = 'stock_count_small_variance_pct'
+
+async function readSmallVarianceThreshold(client?: SettingValueReadClient): Promise<SmallVarianceThreshold> {
+  const values = await getSettingValues([SMALL_VARIANCE_QTY_KEY, SMALL_VARIANCE_PCT_KEY], client)
+  const parsed = parseSmallVarianceThreshold({ qty: values.get(SMALL_VARIANCE_QTY_KEY), pct: values.get(SMALL_VARIANCE_PCT_KEY) })
+  // A stored value that no longer parses must not silently widen what counts as small.
+  return parsed.ok ? parsed.value : NO_SMALL_VARIANCE
+}
+
+/** The configured small-variance threshold. 0 / 0 (nothing set) means no line is ever small. */
+export async function getStockCountSmallVarianceThreshold(): Promise<SmallVarianceThreshold> {
+  await requirePermission('stock_control.adjust')
+  return readSmallVarianceThreshold()
+}
+
+const thresholdSchema = z.object({
+  qty: z.union([z.number(), z.string(), z.null()]).optional(),
+  pct: z.union([z.number(), z.string(), z.null()]).optional(),
+})
+
+/** Set the small-variance threshold: an absolute quantity and/or a percentage of on-hand. Blank or 0 clears a criterion. */
+export async function saveStockCountSmallVarianceThreshold(input: unknown): Promise<StockCountResult & { threshold?: SmallVarianceThreshold }> {
+  await requirePermission('stock_control.adjust')
+  const parsedInput = thresholdSchema.safeParse(input)
+  if (!parsedInput.success) return { message: 'Invalid threshold.' }
+  const checked = parseSmallVarianceThreshold({ qty: parsedInput.data.qty, pct: parsedInput.data.pct })
+  if (!checked.ok) return { message: checked.message }
+  const { qty, pct } = checked.value
+  try {
+    await db.$transaction(async (tx) => {
+      for (const [key, value] of [[SMALL_VARIANCE_QTY_KEY, qty], [SMALL_VARIANCE_PCT_KEY, pct]] as const) {
+        await tx.setting.upsert({ where: { key }, create: { key, value: String(value) }, update: { value: String(value) } })
+      }
+    }, STOCK_TX_OPTIONS)
+    revalidatePath('/stock-control/stock-counts')
+    await logActivity({
+      entityType: 'STOCK_COUNT', action: 'small_variance_threshold_set', tag: 'stock',
+      description: `Set the stock count small-variance threshold: quantity ${qty > 0 ? qty : 'not set'}, percentage ${pct > 0 ? `${pct}%` : 'not set'}`,
+      metadata: { qty, pct },
+    })
+    return { success: true, threshold: { qty, pct } }
+  } catch (e) {
+    console.error(e)
+    return { message: e instanceof Error ? e.message : 'Failed to save the threshold.' }
+  }
+}
+
+const bulkAcceptSchema = z.object({
+  countId: z.string().min(1),
+  mode: z.enum(['NO_VARIANCE', 'SMALL_VARIANCE']),
+  // The lines the operator was looking at, each with the counted quantity and on-hand it SHOWED. The server accepts a line only when
+  // both still equal those figures under the locks (and the variance is still in the mode's class), so the variance accepted is the
+  // variance that was confirmed, never a changed one.
+  lines: z.array(z.object({
+    lineId: z.string().min(1),
+    countedQty: countedQtySchema,
+    onHand: z.number().refine(Number.isFinite, 'on hand must be finite'),
+  })).min(1, 'Choose at least one line to accept.'),
+  // The small-variance threshold the operator saw (SMALL_VARIANCE only). A different current threshold refuses the whole accept.
+  threshold: z.object({ qty: z.number().min(0), pct: z.number().min(0) }).optional(),
+  // Accepting lines that DO have a variance needs an explicit yes.
+  confirmSmallVariance: z.boolean().optional(),
+})
+
+export type BulkAcceptResult = StockCountResult & {
+  accepted?: number
+  /** Lines that were asked for but no longer qualified at commit (count changed, stock moved, never counted, not on this count). */
+  excluded?: number
+}
+
+/**
+ * Bulk accept (reconcile) lines of a count by variance triage.
+ *
+ *  - NO_VARIANCE: only lines whose saved counted figure is EXACTLY the live on-hand, read under the count and stock-level locks.
+ *    Such a line has nothing to book. It is stamped reconciled by the same path a single Reconcile uses (reconcileCountTx).
+ *  - SMALL_VARIANCE: lines whose variance against the live on-hand is within the configured threshold, with an explicit confirmation.
+ *    Accepting stamps the line; it books NOTHING. The adjustment is posted when the count is authorised, by postStockCount, for these
+ *    lines exactly as for a single accept, so movements and COGS are identical.
+ *
+ * Nothing is trusted from the page: counted figures and on-hand are re-read under lock, so a count changed or stock moved since the
+ * page loaded drops the line from the accept rather than accepting a stale view.
+ */
+export async function bulkAcceptStockCountLines(input: unknown): Promise<BulkAcceptResult> {
+  await requirePermission('stock_control.adjust')
+  const parsed = bulkAcceptSchema.safeParse(input)
+  if (!parsed.success) return { message: parsed.error.issues[0]?.message ?? 'Invalid bulk accept request.' }
+  const { countId, mode, confirmSmallVariance } = parsed.data
+  const shownById = new Map(parsed.data.lines.map((l) => [l.lineId, l]))
+  const lineIds = [...shownById.keys()]
+  if (mode === 'SMALL_VARIANCE' && confirmSmallVariance !== true) {
+    return { message: 'Accepting lines that have a variance needs your explicit confirmation. Nothing was accepted.' }
+  }
+
+  try {
+    let outcome: { accepted: string[]; excluded: string[]; threshold: SmallVarianceThreshold; notOnCount: number } | null = null
+    await db.$transaction(async (tx) => {
+      let threshold = NO_SMALL_VARIANCE
+      if (mode === 'SMALL_VARIANCE') {
+        // Hold the threshold rows FOR SHARE until commit, so an edit (which updates them) waits for this accept instead of landing mid-way.
+        // The rows are materialised at 0 (= not set) first: an absent row cannot be locked, and a concurrent first save could insert it unseen.
+        // Lock order: settings, then the count, then stock levels. The threshold save touches only the settings rows.
+        await tx.setting.createMany({ data: [{ key: SMALL_VARIANCE_QTY_KEY, value: '0' }, { key: SMALL_VARIANCE_PCT_KEY, value: '0' }], skipDuplicates: true })
+        await tx.$queryRaw`SELECT key FROM settings WHERE key IN (${SMALL_VARIANCE_QTY_KEY}, ${SMALL_VARIANCE_PCT_KEY}) ORDER BY key FOR SHARE`
+        threshold = await readSmallVarianceThreshold(tx)
+        if (threshold.qty <= 0 && threshold.pct <= 0) {
+          throw new Error('No small-variance threshold is set, so no line counts as small. Set a quantity and/or a percentage first.')
+        }
+        const seen = parsed.data.threshold
+        if (!seen || seen.qty !== threshold.qty || seen.pct !== threshold.pct) {
+          throw new Error('The small-variance threshold changed since you loaded this page. Nothing was accepted. Check the new threshold and try again.')
+        }
+      }
+      const result = await reconcileCountTx(tx, {
+        countId,
+        lineIds,
+        eligible: (c) => {
+          const shown = shownById.get(c.lineId)
+          if (!shown) return false
+          // The figures the operator saw must still be the figures now: same counted quantity, same on-hand.
+          if (!new Prisma.Decimal(shown.countedQty).toDecimalPlaces(4).eq(new Prisma.Decimal(c.countedQty).toDecimalPlaces(4))) return false
+          if (!new Prisma.Decimal(shown.onHand).eq(new Prisma.Decimal(c.liveOnHand))) return false
+          return isBulkAcceptable(mode, c.countedQty, c.liveOnHand, threshold)
+        },
+      })
+      const onCount = result.accepted.length + result.excluded.length
+      // Lines asked for that were not counted lines of this count at all are excluded too.
+      outcome = { accepted: result.accepted, excluded: result.excluded, threshold, notOnCount: lineIds.length - onCount }
+    }, STOCK_TX_OPTIONS)
+    if (!outcome) throw new Error('The bulk accept did not run.')
+    const done = outcome as { accepted: string[]; excluded: string[]; threshold: SmallVarianceThreshold; notOnCount: number }
+    const excludedTotal = done.excluded.length + done.notOnCount
+    revalidatePath('/stock-control/stock-counts')
+    await logActivity({
+      entityType: 'STOCK_COUNT', entityId: countId, action: 'bulk_accepted', tag: 'stock',
+      description: `Bulk-accepted ${done.accepted.length} ${mode === 'NO_VARIANCE' ? 'no-variance' : 'small-variance'} line(s) on stock count ${countId}`
+        + `${excludedTotal > 0 ? `; ${excludedTotal} requested line(s) no longer qualified` : ''}`,
+      metadata: {
+        mode,
+        accepted: done.accepted.length,
+        excluded: excludedTotal,
+        ...(mode === 'SMALL_VARIANCE' ? { thresholdQty: done.threshold.qty, thresholdPct: done.threshold.pct, confirmed: true } : {}),
+      },
+    })
+    return { success: true, accepted: done.accepted.length, excluded: excludedTotal }
+  } catch (e) {
+    console.error(e)
+    return { message: e instanceof Error ? e.message : 'Failed to bulk accept lines.' }
   }
 }
 

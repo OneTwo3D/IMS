@@ -230,7 +230,7 @@ ERASURE_CLASSIFICATION.RefusedAction = {
 // from SKUs, quantities and amounts only (never a payload's free text, name, address or note), so nothing is erased and no free-text guard is needed.
 ERASURE_CLASSIFICATION.WcOrderDivergence = {
   erased: [],
-  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution'],
+  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution', 'amendmentClaim'],
   retained: {},
 }
 ERASURE_CLASSIFICATION.WcOrderDivergenceRecheck = { erased: [], notPersonal: ['orderId', 'externalOrderId'], retained: {} }

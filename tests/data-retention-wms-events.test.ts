@@ -259,6 +259,8 @@ test('the ONE dry run a pending ALIGN_TO_WMS confirmation depends on is NOT dele
     { summary: { path: ['dryRun'], equals: true } },
     { summary: { path: ['externalWarehouseId'], equals: 'ext-1' } },
     { summary: { path: ['connectionId'], equals: 'conn-1' } },
+    // o3d-zz37l: the evidence is also matched on the write-off thresholds it ran under ('null' = the binding carries none).
+    { summary: { path: ['thresholdsKey'], equals: 'null' } },
   ])
   assert.deepEqual(dryRun.where.startedAt, { gt: PAIRING.pairingChangedAt }, 'only evidence the confirm action would accept is protected')
 })
