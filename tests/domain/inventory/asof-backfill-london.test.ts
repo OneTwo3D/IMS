@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { Prisma, StockMovementType } from '../../../app/generated/prisma/client.ts'
 import { getOnHandAsOf, type OnHandAsOfClient } from '../../../lib/domain/inventory/get-on-hand-as-of.ts'
-import { backfillInventorySnapshots } from '../../../lib/domain/inventory/inventory-snapshot.ts'
+import { backfill, D, inbound, inRange, NOW, outbound, readerClient, type Move, type Store } from './london-day-fixtures.ts'
 import { getNegativeStockReport, getStockOnHandReport, type StockPositionReportClient } from '../../../lib/domain/inventory/stock-position-reports.ts'
 
 /**
@@ -12,97 +11,6 @@ import { getNegativeStockReport, getStockOnHandReport, type StockPositionReportC
  * negative-stock opening/window line up with no hour counted twice or dropped.
  */
 
-const D = (v: string | number) => new Prisma.Decimal(v)
-
-type Move = { id: string; type: StockMovementType; productId: string; fromWarehouseId: string | null; toWarehouseId: string | null; qty: Prisma.Decimal; totalValueBase: Prisma.Decimal | null; createdAt: Date }
-
-function inbound(id: string, qty: number, at: string): Move {
-  return { id, type: StockMovementType.PURCHASE_RECEIPT, productId: 'p1', fromWarehouseId: null, toWarehouseId: 'w1', qty: D(qty), totalValueBase: D(qty), createdAt: new Date(at) }
-}
-function outbound(id: string, qty: number, at: string): Move {
-  return { id, type: StockMovementType.SALE_DISPATCH, productId: 'p1', fromWarehouseId: 'w1', toWarehouseId: null, qty: D(qty), totalValueBase: D(qty), createdAt: new Date(at) }
-}
-
-type Store = {
-  snapshots: Array<{ snapshotDate: Date; productId: string; warehouseId: string; qty: Prisma.Decimal; valueBase: Prisma.Decimal }>
-  runs: Map<string, Date>
-}
-
-function inRange(at: Date, r: { gt?: Date; gte?: Date; lt?: Date; lte?: Date }): boolean {
-  return (!r.gt || at > r.gt) && (!r.gte || at >= r.gte) && (!r.lt || at < r.lt) && (!r.lte || at <= r.lte)
-}
-
-function movementFindMany(moves: Move[], desc: boolean) {
-  return async (args: unknown) => {
-    const q = args as { where?: { createdAt?: { gt?: Date; gte?: Date; lt?: Date; lte?: Date } }; cursor?: { id: string }; skip?: number; take?: number; orderBy?: unknown }
-    const rows = moves.filter((m) => inRange(m.createdAt, q.where?.createdAt ?? {}))
-      .sort((a, b) => (a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id)) * (desc ? -1 : 1))
-    const orderDesc = JSON.stringify(q.orderBy ?? '').includes('desc')
-    const ordered = orderDesc === desc ? rows : [...rows].reverse()
-    const start = q.cursor ? ordered.findIndex((m) => m.id === q.cursor!.id) + (q.skip ?? 0) : 0
-    return ordered.slice(Math.max(0, start), q.take == null ? undefined : Math.max(0, start) + q.take)
-  }
-}
-
-async function backfill(moves: Move[], current: number, fromDate: string, toDate: string): Promise<Store> {
-  const store: Store = { snapshots: [], runs: new Map() }
-  const client = {
-    stockLevel: { findMany: async () => [{ productId: 'p1', warehouseId: 'w1', quantity: D(current), reservedQty: D(0) }], findUnique: async () => null },
-    costLayer: { findMany: async () => [{ productId: 'p1', warehouseId: 'w1', remainingQty: D(current), unitCostBase: D(1) }] },
-    costLayerRevaluation: { count: async () => 0, findMany: async () => [] },
-    stockMovement: { findMany: movementFindMany(moves, true) },
-    inventorySnapshot: {
-      findMany: async () => [],
-      upsert: async (args: unknown) => {
-        const c = (args as { create: Store['snapshots'][number] }).create
-        store.snapshots = store.snapshots.filter((s) => s.snapshotDate.getTime() !== c.snapshotDate.getTime())
-        store.snapshots.push({ snapshotDate: c.snapshotDate, productId: c.productId, warehouseId: c.warehouseId, qty: new Prisma.Decimal(c.qty as never), valueBase: new Prisma.Decimal(c.valueBase as never) })
-        return {}
-      },
-    },
-    inventorySnapshotRun: {
-      upsert: async (args: unknown) => {
-        const c = (args as { create: { snapshotDate: Date; cutoffAt: Date } }).create
-        store.runs.set(c.snapshotDate.toISOString().slice(0, 10), c.cutoffAt)
-        return {}
-      },
-    },
-    $transaction: async (ops: Promise<unknown>[]) => Promise.all(ops),
-  }
-  await backfillInventorySnapshots({ client: client as never, fromDate, toDate })
-  return store
-}
-
-function readerClient(store: Store, moves: Move[], current: number): OnHandAsOfClient {
-  return {
-    inventorySnapshotRun: {
-      findUnique: async (args: unknown) => {
-        const cutoffAt = store.runs.get((args as { where: { snapshotDate: Date } }).where.snapshotDate.toISOString().slice(0, 10))
-        return cutoffAt ? { cutoffAt } : null
-      },
-    },
-    inventorySnapshot: {
-      findFirst: async (args: unknown) => {
-        const q = args as { where: { snapshotDate: { lte?: Date; lt?: Date; gt?: Date; gte?: Date } }; orderBy: { snapshotDate: 'asc' | 'desc' } }
-        const f = q.where.snapshotDate
-        const rows = store.snapshots.filter((s) => inRange(s.snapshotDate, f))
-          .sort((a, b) => (a.snapshotDate.getTime() - b.snapshotDate.getTime()) * (q.orderBy.snapshotDate === 'asc' ? 1 : -1))
-        return rows[0] ? { snapshotDate: rows[0].snapshotDate } : null
-      },
-      findMany: async (args: unknown) => {
-        const d = (args as { where: { snapshotDate: Date } }).where.snapshotDate
-        return store.snapshots.filter((s) => s.snapshotDate.getTime() === d.getTime())
-      },
-      count: async () => 0,
-    },
-    stockMovement: { findMany: movementFindMany(moves, false) },
-    stockLevel: { findMany: async () => [{ productId: 'p1', warehouseId: 'w1', quantity: D(current) }] },
-    costLayer: { findMany: async () => [{ productId: 'p1', warehouseId: 'w1', remainingQty: D(current), unitCostBase: D(1) }] },
-    costLayerRevaluation: { count: async () => 0 },
-  } as unknown as OnHandAsOfClient
-}
-
-const NOW = () => new Date('2027-12-01T12:00:00.000Z')
 
 async function qtyAt(client: OnHandAsOfClient, asOf: string | Date): Promise<string> {
   const r = await getOnHandAsOf({ client, asOf, now: NOW })
@@ -268,3 +176,28 @@ for (const c of [
     assert.equal(await qtyAt(readerClient(legacy, moves, 1111), c.next), '1111.000000')
   })
 }
+
+test('backfill: a movement in the hour before UTC fromDate (London fromDate, BST) is in the fromDate row, and a null-value one there does not mark the run unreliable', async () => {
+  // 2026-06-30T23:30Z is London 1 July: in 07-01's row, in no earlier one. The fetch lower bound is end(06-30) = 06-30T23:00Z, an hour below UTC fromDate.
+  const moves = [inbound('hour', 5, '2026-06-30T23:30:00.000Z'), { ...inbound('hour-null', 2, '2026-06-30T23:45:00.000Z'), totalValueBase: null }]
+  const store = await backfill(moves, 17, '2026-07-01', '2026-07-01')
+  const row = store.snapshots.find((s) => s.snapshotDate.toISOString() === '2026-07-01T00:00:00.000Z')!
+  assert.equal(row.qty.toString(), '17', 'both movements of London 1 July are in the 07-01 row')
+  assert.equal(store.result!.missingValueMovementCount, 0, 'nothing is reversed past the last written row, so nothing is counted')
+  assert.equal(store.result!.valueReplayReliable, true)
+})
+
+test('backfill: a null-value movement inside fromDate itself does not mark the result unreliable (the trailing reverse pass fed only discarded state)', async () => {
+  const moves = [{ ...inbound('same-day-null', 3, '2026-07-01T10:00:00.000Z'), totalValueBase: null }]
+  const store = await backfill(moves, 13, '2026-07-01', '2026-07-01')
+  assert.equal(store.result!.missingValueMovementCount, 0)
+  assert.equal(store.result!.valueReplayReliable, true)
+})
+
+test('backfill: a null-value movement that an EARLIER-day row depends on still marks the result unreliable', async () => {
+  // fromDate 07-01, toDate 07-02: the null-value movement on 07-02 is reversed to reach 07-01's row, so 07-01 is baked with it and the run is flagged.
+  const moves = [{ ...inbound('later-null', 3, '2026-07-02T10:00:00.000Z'), totalValueBase: null }]
+  const store = await backfill(moves, 13, '2026-07-01', '2026-07-02')
+  assert.equal(store.result!.missingValueMovementCount, 1)
+  assert.equal(store.result!.valueReplayReliable, false)
+})

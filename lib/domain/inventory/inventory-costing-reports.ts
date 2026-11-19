@@ -12,6 +12,7 @@ import {
   MissingAccountBalanceSnapshotError,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on-hand-as-of'
+import { businessDayWindow } from '@/lib/domain/inventory/inventory-snapshot'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -494,17 +495,24 @@ function dateSearchParam(value: string | string[] | undefined): string | undefin
   return isValidDateOnly(param) ? param : undefined
 }
 
+/** Today as a LONDON business day label (YYYY-MM-DD), the day convention as-of valuation, snapshots and the report windows below share. */
 function today(): string {
-  return utcDateOnly(new Date())
+  return businessDateYmd(new Date())
 }
 
 function daysAgo(days: number): string {
-  return utcDateOnly(subtractUtcDays(new Date(), days))
+  return utcDateOnly(subtractUtcDays(parseUtcDateOnly(today(), new Date()), days))
 }
 
-function parseDateOnly(value: string | undefined, fallback: string, endOfDay = false): Date {
-  const source = isValidDateOnly(value) ? value : fallback
-  return parseUtcDateOnly(source, parseUtcDateOnly(fallback, new Date()), { endOfDay })
+/**
+ * The half-open instant window of the LONDON business days `dateFrom`..`dateTo` (inclusive labels): [end of the day before dateFrom, end of dateTo), i.e.
+ * [startOfNextBusinessDay(dateFrom - 1), startOfNextBusinessDay(dateTo)). An unreadable label falls back to the given default. This is the window that makes
+ * opening valuation as-of D0 + ledger movements - COGS over (D0, D1] equal closing valuation as-of D1 (all three end at the same London midnights).
+ */
+function businessWindow(dateFrom: string | undefined, dateTo: string | undefined, fallbackFrom: string, fallbackTo: string): { from: Date; toExclusive: Date } {
+  const label = (value: string | undefined, fallback: string) => parseUtcDateOnly(isValidDateOnly(value) ? value : fallback, parseUtcDateOnly(fallback, new Date()))
+  const { gte, lt } = businessDayWindow(label(dateFrom, fallbackFrom), label(dateTo, fallbackTo))
+  return { from: gte, toExclusive: lt }
 }
 
 function formatDateTime(value: Date): string {
@@ -1614,7 +1622,9 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     }),
     { qty: decimalZero(), totalValueBase: decimalZero() },
   )
-  const gl = await inventoryGlBalanceForDate(snapshot.asOf, totals.totalValueBase, filters)
+  // The ledger balance is dated by LONDON day label (YYYY-MM-DD), never by the report's instant (snapshot.asOf is e.g. 2026-07-01T22:59:59.999Z, the last ms of that
+  // London day): the lookup accepts only a date label and the stored balance is compared with it by label.
+  const gl = await inventoryGlBalanceForDate(businessDateYmd(new Date(snapshot.asOf)), totals.totalValueBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
     asOf: snapshot.asOf,
@@ -2009,9 +2019,12 @@ export function emptyCogsReportForSourceLimit(filters: InventoryCostingFilters, 
 export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(30)
   const dateTo = filters.dateTo ?? today()
-  const from = parseDateOnly(dateFrom, daysAgo(30))
-  const to = parseDateOnly(dateTo, today(), true)
-  const toExclusive = exclusiveEndOfUtcDay(to)
+  const { from, toExclusive } = businessWindow(dateFrom, dateTo, daysAgo(30), today())
+  // The CREDIT window stays the UTC day, on purpose: it is the same expression the Gross Margin report loads (refundLinesRaisedInPeriodWhere over the
+  // sales-analytics UTC period), and the two must agree on the credit they subtract (tests/analytics/cogs-report-refund-basis.test.ts). Credit is revenue-side and
+  // is not part of the stock reconciliation identity; the COGS entries above are, and are on London days. Moving the sales-analytics family is a separate change.
+  const creditFrom = parseUtcDateOnly(isValidDateOnly(dateFrom) ? dateFrom : daysAgo(30), new Date())
+  const creditToExclusive = exclusiveEndOfUtcDay(parseUtcDateOnly(isValidDateOnly(dateTo) ? dateTo : today(), new Date(), { endOfDay: true }))
   const groupBy = isCogsGroupBy(filters.groupBy) ? filters.groupBy : 'product'
   const cogsWhere: Prisma.CogsEntryWhereInput = {
     createdAt: { gte: from, lt: toExclusive },
@@ -2125,7 +2138,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   // credit lands in the bucket of the revenue it reverses. The PERIOD decides what is loaded and the
   // report's own product filter decides what is in scope — two questions, two mechanisms (Codex r2).
   const [refundLines, productScope] = await Promise.all([
-    loadCogsRefundLines(from, toExclusive),
+    loadCogsRefundLines(creditFrom, creditToExclusive),
     cogsRefundProductScope(filters),
   ])
   // ONLY the keys that actually carry revenue. A key whose revenue could not be resolved holds no
@@ -2245,9 +2258,8 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
   const dateFrom = filters.dateFrom ?? daysAgo(90)
   const dateTo = filters.dateTo ?? today()
   const window = normalizeVelocityWindow({ dateFrom, dateTo })
-  const from = window.dateFrom
-  const to = window.dateTo
-  const toExclusive = exclusiveEndOfUtcDay(to)
+  // COGS is windowed on the London business days the snapshots are labelled by; the snapshot range below is by LABEL (date-only), which needs no instant.
+  const { from, toExclusive } = businessWindow(dateFrom, dateTo, daysAgo(90), today())
   const snapshotFrom = window.dateFrom
   const snapshotTo = window.dateTo
   const groupBy = isInventoryTurnoverGroupBy(filters.groupBy) ? filters.groupBy : 'product'
@@ -2419,9 +2431,7 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
 export async function getLandedCostReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<LandedCostReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(90)
   const dateTo = filters.dateTo ?? today()
-  const from = parseDateOnly(dateFrom, daysAgo(90))
-  const to = parseDateOnly(dateTo, today(), true)
-  const toExclusive = exclusiveEndOfUtcDay(to)
+  const { from, toExclusive } = businessWindow(dateFrom, dateTo, daysAgo(90), today())
   const landedCostWhere: Prisma.PurchaseOrderLineWhereInput = {
     po: {
       createdAt: { gte: from, lt: toExclusive },

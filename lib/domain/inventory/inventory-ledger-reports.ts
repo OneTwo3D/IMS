@@ -1,7 +1,7 @@
 import { Prisma, StockCountStatus, StockMovementType, StockTransferStatus } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
-import { startOfNextUtcDay } from '@/lib/domain/math/date-window'
+import { businessDayWindow, startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import {
   loadTransferLineLandedQty,
@@ -357,9 +357,11 @@ function dateRangeWhere(filters: Pick<InventoryLedgerFilters, 'dateFrom' | 'date
   const from = parseDateOnly(filters.dateFrom)
   const to = parseDateOnly(filters.dateTo)
   if (!from && !to) return undefined
+  // The dates name LONDON business days (the days as-of valuation and snapshots are labelled by), so the window is [end of the day before `from`, end of
+  // `to`): in BST that starts and ends at 23:00Z, in GMT at 00:00Z. A UTC-day window put the 23:00Z-24:00Z hour on a different day from the valuation.
   return {
-    ...(from ? { gte: from } : {}),
-    ...(to ? { lt: startOfNextUtcDay(to) } : {}),
+    ...(from ? { gte: businessDayWindow(from, from).gte } : {}),
+    ...(to ? { lt: startOfNextBusinessDay(to) } : {}),
   }
 }
 
@@ -539,7 +541,7 @@ export async function getStockMovementLedgerReport(
   ])
   const from = parseDateOnly(filters.dateFrom)
   const opening = from
-    ? await movementTotals(client, movementWhere(filters, { lt: from }))
+    ? await movementTotals(client, movementWhere(filters, { lt: businessDayWindow(from, from).gte }))
     : { qty: ZERO, valueBase: ZERO }
 
   return {

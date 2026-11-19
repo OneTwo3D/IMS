@@ -351,6 +351,15 @@ export function startOfNextBusinessDay(snapshotDate: Date): Date {
   return utcMidnight
 }
 
+/**
+ * The half-open instant window [gte, lt) covering the London business days labelled `fromLabel` through `toLabel` inclusive (both UTC-midnight label
+ * dates). It is the movement window that reconciles with as-of valuation: opening valuation as-of D0 ends at startOfNextBusinessDay(D0), so the movements and
+ * COGS of (D0, D1] are those in [startOfNextBusinessDay(D0), startOfNextBusinessDay(D1)); a report filtered from day F starts at startOfNextBusinessDay(F - 1).
+ */
+export function businessDayWindow(fromLabel: Date, toLabel: Date): { gte: Date; lt: Date } {
+  return { gte: startOfNextBusinessDay(addUtcDays(fromLabel, -1)), lt: startOfNextBusinessDay(toLabel) }
+}
+
 function calendarDayCount(fromDate: Date, toDate: Date): number {
   return Math.floor((toDate.getTime() - fromDate.getTime()) / 86_400_000) + 1
 }
@@ -1259,7 +1268,9 @@ export async function backfillInventorySnapshots(options: {
       }
     }
 
-    await reverseMovementsOnOrAfter(startOfNextBusinessDay(addUtcDays(day, -1)))
+    // Walk the state back to the end of the previous day for the NEXT row. After the last (earliest) row nothing reads the state again, and the
+    // pass would only count null-value movements of fromDate's own day that no written row depends on, marking the whole result unreliable.
+    if (day > fromDate) await reverseMovementsOnOrAfter(startOfNextBusinessDay(addUtcDays(day, -1)))
   }
 
   // scjz.48: backfilled values seed from CURRENT cost layers, so any revaluation
