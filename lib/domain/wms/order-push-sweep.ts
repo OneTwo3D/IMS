@@ -27,6 +27,7 @@ import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidB
 import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
+import { lineSkuMissingAtWarehouse, SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds, type SkuRenameHold } from '@/lib/domain/wms/sku-rename-hold'
 import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type AmendmentLineChange, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { raiseRefundRemainderTasks } from './refund-remainder'
 import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
@@ -456,6 +457,8 @@ type OrderForPush = {
   discountModel?: string | null
   totalForeign: unknown
   lines: CandidateLine[]
+  /** Open SKU-rename rows that apply to this order's products, for the warehouse it is sent to (set by the port; see sku-rename-hold.ts). Absent = none known. */
+  skuRenameHolds?: ReadonlyArray<SkuRenameHold>
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
   /** The business-event time of the order (paid, else created): the producer-side hold's obligation time. Read-only evidence; absent in a hand-built port. */
   paidAt?: Date | null
@@ -624,8 +627,9 @@ type CandidateLine = {
  */
 export const NO_GOODS_TO_PUSH_REASON = 'Sales order has only fee lines (no goods to fulfil); cannot push to WMS'
 
-export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>): WmsOrderPushLine[] {
+export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>, skuRenameHolds?: ReadonlyArray<SkuRenameHold>): WmsOrderPushLine[] {
   const pushLines: WmsOrderPushLine[] = []
+  const heldSkus: string[] = []
   for (const line of lines) {
     // A mirrored WooCommerce FEE line is not goods: never an order item (see mirrored-fee-line.ts). Skipped BEFORE the
     // SKU check, which would otherwise fail the whole order on it.
@@ -643,6 +647,8 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
     const refunded = (line.id && refundedByLine?.get(line.id)) || 0
     const quantity = Math.max(0, orderedQty - refunded)
     if (quantity <= 0) continue
+    // A line that WILL be sent with a SKU the warehouse does not hold for a product with an open rename row holds the whole order (see sku-rename-hold.ts). Fee lines and fully refunded lines are skipped above.
+    if (skuRenameHolds?.some((hold) => hold.productId === line.productId && lineSkuMissingAtWarehouse(line.sku, hold))) heldSkus.push(line.sku)
     // IMS stores SalesOrderLine.totalForeign as NET (ex-VAT) in both tax-inclusive
     // and tax-exclusive cases; taxForeign is the line VAT. Unit prices are per the
     // ORIGINAL qty so they stay correct when the shipped quantity is reduced.
@@ -656,6 +662,7 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
       description: line.description || null,
     })
   }
+  if (heldSkus.length > 0) throw new Error(skuRenameHoldReason(heldSkus))
   // Fee lines are skipped above, so a stored order made ONLY of them leaves nothing to send. (An order whose goods were all
   // refunded is a different, pre-existing case and keeps its behaviour: it still has goods lines.)
   if (pushLines.length === 0 && lines.length > 0 && lines.every((line) => isMirroredFeeLine(line))) {
@@ -680,6 +687,7 @@ export const ORDER_PUSH_SELECT = {
   shippingService: true,
   courierKey: true,
   shippingMethodId: true,
+  shipFromWarehouseId: true,
   subtotalForeign: true,
   shippingForeign: true,
   taxForeign: true,
@@ -795,7 +803,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
     ...(shippingVatDerived > 0 ? { shippingVatDerived } : {}),
     discountExVat: num(order.discountAmount),
     discountVat: 0,
-    lines: buildLines(order.lines, refundedQtyByLine(order)),
+    lines: buildLines(order.lines, refundedQtyByLine(order), order.skuRenameHolds),
   }
   if (scope?.mode !== 'MIXED') return input
   const minorFactor = 10 ** currencyMinorUnits(order.currency)
@@ -1334,7 +1342,7 @@ export interface WmsOrderPushPort {
    * lock in a short transaction at the push boundary. The core builds the payload it sends from THIS, not from the earlier list
    * read, and refuses an erased order. Absent: the caller uses its snapshot (test doubles). A rejection fails closed.
    */
-  reloadOrderForPush?(orderId: string): Promise<Partial<OrderForPush> | null>
+  reloadOrderForPush?(orderId: string, sentToWarehouseId?: string | null): Promise<Partial<OrderForPush> | null>
   /**
    * The systemic-failure circuit breaker's state and incident (lib/domain/wms/systemic-failure.ts). Optional: a port without one
    * keeps the legacy behaviour (a record is parked the moment its retries run out), which is what test doubles get.
@@ -1534,8 +1542,10 @@ export async function runWmsOrderPushSweepCore(
     if (!port.recordRefusedAction) return
     try {
       const message = error instanceof Error ? error.message : ''
-      let severity: 'HIGH' | 'LOW' = 'HIGH'
-      if (message !== NO_DELIVERY_STREET_REASON) {
+      let severity: 'HIGH' | 'MEDIUM' | 'LOW' = 'HIGH'
+      // A SKU-rename hold is a known, self-clearing wait (the warehouse product has to be renamed), not a change the warehouse is picking stale lines for: MEDIUM.
+      if (message.startsWith(SKU_RENAME_HOLD_REASON_PREFIX)) severity = 'MEDIUM'
+      else if (message !== NO_DELIVERY_STREET_REASON) {
         let lineChange: AmendmentLineChange = 'UNKNOWN'
         try {
           const wanted = buildLines(order.lines, refundedQtyByLine(order)).map((line) => ({ sku: line.sku, quantity: Number(line.quantity) }))
@@ -3704,7 +3714,7 @@ export async function runWmsOrderPushSweepCore(
         // that cannot be read left due (no pushedAt) so the next pass tries again.
         let amendOrder = link.order
         if (port.reloadOrderForPush) {
-          const current = await port.reloadOrderForPush(link.order.id).catch(() => undefined)
+          const current = await port.reloadOrderForPush(link.order.id, linkIsMixed ? (link.pushWarehouseId ?? link.order.shipFromWarehouseId) : link.order.shipFromWarehouseId).catch(() => undefined)
           if (current === undefined || current === null) {
             await port.updateLink(link.id, { lastAttemptAt: ts, lastError: 'Not sent by IMS: the order could not be re-read before the amendment.' })
             continue
@@ -4466,10 +4476,10 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (rotation) {
         // Held walk: id order from the cursor. A short page ends the walk and the sweep clears the cursor, so the next tick starts at the head.
         const tail = await db.salesOrder.findMany({ where: { AND: [where, rotation.afterId ? { id: { gt: rotation.afterId } } : {}] }, select, take: limit, orderBy: { id: 'asc' } })
-        return shape(tail as never) as never
+        return await withSkuRenameHolds(db, shape(tail as never) as unknown as Array<{ lines: CandidateLine[] }>) as never
       }
       const rows = await db.salesOrder.findMany({ where, select, take: limit, orderBy: { updatedAt: 'asc' } })
-      return rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))
+      return await withSkuRenameHolds(db, rows.map(({ wmsOrderPush, ...order }) => ({ ...order, pushAttempts: wmsOrderPush?.attempts ?? 0 }))) as never
     },
     async claimForCreate(orderId, connector, attemptedAt, paidNotBefore) {
       // o3d-1izw — THE WRITE-SITE GUARD. This transaction is the one that mints AMBIGUOUS_CREATE,
@@ -4719,10 +4729,14 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       `
       const dueIds = dueRows.map((row) => row.id)
       if (!dueIds.length) return []
-      return db.wmsOrderPushLink.findMany({
+      const links = await db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
         select: { id: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, pushWarehouseId: true, scopeMode: true, scopeHash: true, scopeDirtyAt: true, scopeFrozenAt: true, scopeFrozenReason: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true, status: true } } },
       })
+      // A mixed-warehouse amendment is sent to the link's push warehouse, which is the warehouse whose rename row holds it.
+      const sentTo = new Map(links.map((link) => [link.order.id, link.scopeMode === 'MIXED' ? (link.pushWarehouseId ?? link.order.shipFromWarehouseId) : link.order.shipFromWarehouseId]))
+      const heldOrders = await withSkuRenameHolds(db, links.map((link) => link.order), (order) => sentTo.get(order.id))
+      return links.map((link, index) => ({ ...link, order: heldOrders[index]! }))
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
       // o3d-92fu. The order predicate is deliberately IDENTICAL to createCandidates', because
@@ -4767,7 +4781,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         // The TRUE total, so the sweep can say what it did not get to this tick.
         db.wmsOrderPushLink.count({ where }),
       ])
-      return { links: rows, total }
+      const heldOrders = await withSkuRenameHolds(db, rows.map((row) => row.order))
+      return { links: rows.map((row, index) => ({ ...row, order: heldOrders[index]! })), total }
     },
     async ambiguousCreateLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
       // o3d-2k5r r4. Same order predicate as createCandidates', for the reason revalidatableLinks
@@ -4798,7 +4813,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         }),
         db.wmsOrderPushLink.count({ where }),
       ])
-      return { links: rows, total }
+      const heldOrders = await withSkuRenameHolds(db, rows.map((row) => row.order))
+      return { links: rows.map((row, index) => ({ ...row, order: heldOrders[index]! })), total }
     },
     // o3d-bjc.8: PENDING_VERIFY is deliberately NOT cancellable or holdable.
     // The tempting argument is urgency — a cancelled order must not ship — but
@@ -4975,10 +4991,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       const { recordMixedScopeOutcome } = await import('@/lib/domain/wms/mixed-scope-record')
       await recordMixedScopeOutcome(db, orderId, scope, readAt)
     },
-    async reloadOrderForPush(orderId) {
+    async reloadOrderForPush(orderId, sentToWarehouseId) {
       return db.$transaction(async (tx) => {
         await lockSalesOrder(tx, orderId)
-        return tx.salesOrder.findUnique({ where: { id: orderId }, select: ORDER_PUSH_SELECT }) as Promise<Partial<OrderForPush> | null>
+        const fresh = await tx.salesOrder.findUnique({ where: { id: orderId }, select: ORDER_PUSH_SELECT })
+        if (!fresh) return null
+        const [held] = await withSkuRenameHolds(tx, [fresh], (order) => sentToWarehouseId ?? order.shipFromWarehouseId)
+        return held as unknown as Partial<OrderForPush>
       })
     },
     async updateLinkIfCreateClaimOwned(orderId, stamp, data) {

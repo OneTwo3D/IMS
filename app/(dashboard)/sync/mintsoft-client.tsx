@@ -8,6 +8,7 @@ import { AlertTriangle, Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } fro
 import {
   confirmMintsoftAlignmentMode,
   deleteMintsoftBinding,
+  ignoreMintsoftSkuRenameHoldAction,
   listMintsoftKeptBundleClaims,
   resolveMintsoftKeptBundleClaim,
   restockMintsoftReturnInboxItem,
@@ -464,6 +465,19 @@ export function MintsoftClient({ data, configured }: Props) {
     })
   }
 
+  function handleIgnoreSkuRenameHold(discrepancyId: string) {
+    const note = window.prompt('This ends the order-push hold: orders carrying the new SKU will be pushed with it. Only do this if the warehouse already has that SKU, or the product no longer syncs. Why can the hold end?')
+    if (!note || note.trim() === '') return
+    setError('')
+    startTransition(async () => {
+      let result: MaybeFreshAuthFailure & { success?: boolean; error?: string } = await ignoreMintsoftSkuRenameHoldAction(discrepancyId, note)
+      if (isFreshAuthFailure(result) && (await promptReauth())) result = await ignoreMintsoftSkuRenameHoldAction(discrepancyId, note)
+      if (isFreshAuthFailure(result)) return setError('A fresh sign-in is needed to end the hold.')
+      if (result.success !== true) return setError(result.error ?? 'The hold was not ended.')
+      router.refresh()
+    })
+  }
+
   function handleRunReturnsSync() {
     setError('')
     startTransition(async () => {
@@ -820,6 +834,9 @@ export function MintsoftClient({ data, configured }: Props) {
                     <div className="text-sm">{discrepancy.category}</div>
                     {discrepancy.message ? (
                       <div className="text-xs text-muted-foreground">{discrepancy.message}</div>
+                    ) : null}
+                    {discrepancy.category === 'PRODUCT_SKU_RENAMED' ? (
+                      <Button size="sm" variant="outline" className="mt-1" disabled={isPending} onClick={() => handleIgnoreSkuRenameHold(discrepancy.id)}>Ignore: end the order hold</Button>
                     ) : null}
                   </TableCell>
                   <TableCell>{discrepancy.imsValue ?? '—'}</TableCell>
