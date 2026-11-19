@@ -272,6 +272,13 @@ export type StockSyncResult = SyncResult & {
    */
   aborted?: boolean
   /**
+   * A credentials rebind aborted the push part-way: how many pushes were never attempted, and the notice for it. Carried on the result,
+   * NOT only as the last entry of `errors`, because a reader that truncates `errors` (the manual sync screen shows 20) would drop it.
+   * Distinct from `aborted` (a refusal before any work started, "nothing was pushed").
+   */
+  abortedRemaining?: number
+  abortNotice?: string
+  /**
    * The producer-side hold kept this push as a shadow instead of sending it. Always accompanies `aborted`. NOT a failure to
    * retry, NOT queued, NOT pushed: nothing was sent and nothing is waiting.
    */

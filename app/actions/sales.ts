@@ -58,7 +58,7 @@ import {
 } from '@/lib/domain/accounting/payment-ledger-hold'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
-import { UNPROVEN_CANCELLED_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { UNPROVEN_CANCELLED_WHERE, WORK_SLOT_OCCUPIED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import {
   queueAccountingSync,
   queueAccountingSyncTxWithOutcome,
@@ -146,7 +146,7 @@ import {
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
-import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
+import { invoiceNumberIsExternallySupplied, resolveInvoiceNumberToRecord, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
 import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
 import {
   loadInvoicePaymentSyncRows,
@@ -375,6 +375,8 @@ export type SoDetail = SoRow & {
       postedNet: number
       /** The rate of the tax code the line posts under (its persisted snapshot), or null when that code cannot be priced. */
       vatRate: number | null
+      /** True when no rate was stored with the refund line (an older refund) and `vatRate` was priced from the current tax table. */
+      vatRateEstimated: boolean
     }[]
   }[]
   payments: PaymentRow[]
@@ -1030,7 +1032,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           id: true, creditNoteNumber: true, reason: true, returnReason: { select: { name: true } }, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
-            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true, lineKind: true },
+            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true, postedTaxRate: true, lineKind: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -1157,6 +1159,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         lineKind: rl.lineKind,
         postedNet: creditFactsByRefund.get(r.id)![index].postedNet,
         vatRate: creditFactsByRefund.get(r.id)![index].vatRate,
+        vatRateEstimated: creditFactsByRefund.get(r.id)![index].vatRateEstimated,
       })),
     })),
     payments: so.payments.map((p) => ({
@@ -4852,6 +4855,7 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
           externalOrderNumber: true,
           orderNumber: true,
           invoiceNumber: true,
+          accountingInvoiceId: true,
           isQuote: true,
           shoppingLinks: { select: { connector: true } },
         },
@@ -4868,10 +4872,33 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
       if (invoiceNumberIsExternallySupplied(so.shoppingLinks.map((l) => l.connector))) {
         return { externallySupplied: true as const, orderNumber: getSalesOrderReference({ id, ...so }) }
       }
-      const invNum = await nextDocumentNumber(tx, {
-        key: 'invoice',
-        prefix: numbering.inv_prefix,
+      // o3d-hqvrp.69: an invoice already queued (or posted) for this order owns the number it was queued under; minting another is what the
+      // back-reference later overwrote. Read under the order lock the enqueue also holds.
+      const queuedInvoices = await tx.accountingSyncLog.findMany({
+        where: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: id, ...WORK_SLOT_OCCUPIED_WHERE },
+        orderBy: { createdAt: 'desc' },
+        select: { payload: true, externalTransactionId: true },
       })
+      const deletions = await tx.accountingDocumentDeletion.findMany({
+        where: { referenceType: 'SalesOrder', referenceId: id, kind: 'SALES_INVOICE' },
+        select: { externalDocumentId: true },
+      })
+      const toRecord = resolveInvoiceNumberToRecord({
+        orderAccountingInvoiceId: so.accountingInvoiceId,
+        deletedExternalIds: deletions.map((d) => d.externalDocumentId),
+        queuedInvoices: queuedInvoices.map((row) => ({
+          invoiceNumber: row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) && typeof (row.payload as Record<string, unknown>).invoiceNumber === 'string'
+            ? (row.payload as Record<string, string>).invoiceNumber
+            : null,
+          externalId: row.externalTransactionId,
+        })),
+      })
+      const invNum = toRecord.action === 'adopt-queued'
+        ? toRecord.invoiceNumber
+        : await nextDocumentNumber(tx, {
+            key: 'invoice',
+            prefix: numbering.inv_prefix,
+          })
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
       return { invoiceNumber: invNum, orderNumber: getSalesOrderReference({ id, ...so }) }
     })

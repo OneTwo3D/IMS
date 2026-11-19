@@ -608,19 +608,29 @@ export function decidePurchaseCreditNotePost(input: {
     }
   }
 
-  if (lookup.claims.length > 1) {
+  // o3d-n0o5f: a VOIDED or DELETED document no longer holds the number, so it is not a duplicate. Once the operator has voided the
+  // extras, the one live survivor is adopted even though the voided siblings still come back from the lookup.
+  const voidedStatuses = new Set(['VOIDED', 'DELETED'])
+  const liveClaims = lookup.claims.filter((c) => !voidedStatuses.has(c.status.toUpperCase()))
+  const claims = liveClaims.length > 0 ? liveClaims : lookup.claims
+
+  if (liveClaims.length > 1) {
     return {
       action: 'refuse',
       retryable: false,
       reason:
-        withLedgerCheck(`NOTHING WAS SENT. The ledger already holds ${lookup.claims.length} credit notes numbered ${number} `
-        + `(${lookup.claims.map((c) => `${c.creditNoteId} ${c.status}`).join(', ')}). That number is minted from `
+        // o3d-n0o5f: the ledger HOLDS these documents - that is what the refusal states - so the generic "act only if it is absent"
+        // preamble (withLedgerCheck) would tell the operator not to do the very repair this message is for. The check comes first
+        // and the repair follows once the duplicate is confirmed.
+        `NOTHING WAS SENT. The ledger already holds ${liveClaims.length} live credit notes numbered ${number} `
+        + `(${liveClaims.map((c) => `${c.creditNoteId} ${c.status}`).join(', ')}). That number is minted from `
         + `this credit note's primary key, so every one of them is a duplicate of THIS credit note and payables `
-        + `is understated by all but one. Void the extras in Xero, then retry so IMS links the survivor.`),
+        + `is understated by all but one. Check them in Xero first; once you have confirmed they are all copies of this credit note, `
+        + `void the extras in Xero (keep one). Voided and deleted copies are ignored, so on the retry IMS links the one that is left.`,
     }
   }
 
-  const [claim] = lookup.claims
+  const [claim] = claims
   if (claim) {
     if (ADOPTABLE_STATUSES.has(claim.status.toUpperCase())) {
       return {

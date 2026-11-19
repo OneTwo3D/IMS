@@ -559,6 +559,18 @@ export type AllocationDebitRecreateTarget = {
 }
 
 /**
+ * o3d-gzfm: true when EVERY recorded pass naming `batchRef` raised no journal BY DESIGN — it carries no
+ * `syncLogId` and a zero amount (a window whose rounded total is not positive writes the stamp and the
+ * pass but no batch log). Such a batch has no journal or event to be missing, so the standing
+ * evidence/reconciliation checks must not ask about it. A pass that carried pounds without a journal
+ * is NOT this case and is still asked about.
+ */
+export function allocationPassRaisedNoJournalByDesign(passesJson: unknown, batchRef: string): boolean {
+  const named = (parseAllocationDebitPasses(passesJson) ?? []).filter((pass) => pass.batchRef === batchRef)
+  return named.length > 0 && named.every((pass) => !pass.syncLogId && Math.abs(pass.amount) < 0.005)
+}
+
+/**
  * o3d-i0o6 r7 (Codex round 6, HIGH 2) — EVERY BATCH THIS ORDER PUT POUNDS INTO, NOT JUST THE LAST.
  *
  * THE DEFECT. The recreate sweep bucketed each staged order by `inventoryAllocatedBatchRef` alone.

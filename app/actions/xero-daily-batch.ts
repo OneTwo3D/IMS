@@ -14,6 +14,7 @@ import {
   countedUnearnedReversalRows,
   describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
+  durableUnearnedReversalTopUp,
   unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
@@ -33,6 +34,7 @@ import {
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
 import { businessDateYmd } from '@/lib/business-date'
+import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
 
 /**
  * Preview & history for the Xero daily batch sub-ledger.
@@ -358,7 +360,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
   const bPartialOrderIds = new Set(
     bShipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
   )
-  const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown }>>()
+  const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown; refundId?: string | null }>>()
+  const bRefundsByOrder = new Map<string, Array<{ id: string; unearnedReversedAmount: unknown; accountingRetryRequired?: boolean | null; shadowed?: boolean }>>()
   const bReversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
   const unearnedReversalWarnings: string[] = []
   const bShippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
@@ -367,8 +370,12 @@ async function computePreview(): Promise<DailyBatchPreview> {
     // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
     const bRefunds = await db.salesOrderRefund.findMany({
       where: { orderId: { in: bOrderIds } },
-      select: { id: true, orderId: true },
+      select: { id: true, orderId: true, unearnedReversedAmount: true, accountingRetryRequired: true },
     })
+    const bShadowedRefundIds = new Set(
+      bRefunds.length === 0 ? [] : (await findDurableShadowRecords(db, 'xero', [{ subjectType: 'SalesOrderRefund', exactIds: bRefunds.map((refund) => refund.id), operations: ['inventory.journals'] }])).map((record) => record.subjectId),
+    )
+    for (const refund of bRefunds) bRefundsByOrder.set(refund.orderId, [...(bRefundsByOrder.get(refund.orderId) ?? []), { ...refund, shadowed: bShadowedRefundIds.has(refund.id) }])
     const bRefundIdToOrderId = new Map(bRefunds.map((refund) => [refund.id, refund.orderId]))
     // o3d-3la07 (M6, D3: REPORT-ONLY): the same read width and the same counted set as the cron's
     // netting (see runDailyBatchSync), so the preview matches what posts AND says what the cron says.
@@ -397,7 +404,11 @@ async function computePreview(): Promise<DailyBatchPreview> {
     for (const [targetOrderId, allRows] of bReversalStandingRowsByOrder) {
       bReversalSyncsByOrder.set(
         targetOrderId,
-        countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload, payloadAccountNets: sync.payloadAccountNets })),
+        countedUnearnedReversalRows(allRows).map((sync) => ({
+          payload: sync.payload,
+          payloadAccountNets: sync.payloadAccountNets,
+          refundId: sync.referenceType === 'SalesOrderRefund' ? sync.referenceId : null,
+        })),
       )
     }
     if (bPartialOrderIds.size > 0) {
@@ -458,9 +469,10 @@ async function computePreview(): Promise<DailyBatchPreview> {
     const recognizedPreviously = order.shipments.reduce((sum, shipment) => (
       shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
     ), 0)
-    const postedUnearnedReversal = sumPostedUnearnedReversal(
-      bReversalSyncsByOrder.get(orderId) ?? [],
-      bSettings.xero_unearned_revenue_account,
+    // o3d-fk9py: mirrors the cron - the durable per-refund figure tops up rows retention has erased.
+    const postedUnearnedReversal = round2(
+      sumPostedUnearnedReversal(bReversalSyncsByOrder.get(orderId) ?? [], bSettings.xero_unearned_revenue_account)
+      + durableUnearnedReversalTopUp(bReversalSyncsByOrder.get(orderId) ?? [], bRefundsByOrder.get(orderId) ?? [], bSettings.xero_unearned_revenue_account),
     )
     const unearnedReport = describeUnearnedReversalReport(
       getSalesOrderReference({ id: orderId, ...order }),

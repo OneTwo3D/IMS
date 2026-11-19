@@ -2466,8 +2466,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                     <TableCell className="py-1 pr-4">{rl.description}</TableCell>
                     <TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty > 0 ? rl.qty : '—'}</TableCell>
                     <TableCell className="py-1 pr-4 text-right font-mono tabular-nums">{rl.qty > 0 ? money(rl.unitPriceForeign) : '—'}</TableCell>
-                    <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground" title={ESTIMATE_NOTE}>≈ {money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].vat)}</TableCell>
-                    <TableCell className="py-1 text-right font-mono tabular-nums" title={ESTIMATE_NOTE}>≈ {money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].gross)}</TableCell>
+                    <TableCell className="py-1 pr-4 text-right font-mono tabular-nums text-muted-foreground" title={rl.vatRateEstimated ? ESTIMATE_NOTE : undefined}>{rl.vatRateEstimated ? '≈ ' : ''}{money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].vat)}</TableCell>
+                    <TableCell className="py-1 text-right font-mono tabular-nums" title={rl.vatRateEstimated ? ESTIMATE_NOTE : undefined}>{rl.vatRateEstimated ? '≈ ' : ''}{money(creditNoteAmounts(moneyOrder, r).perLine[rlIdx].gross)}{rl.vatRateEstimated && <span className="ml-1 text-[10px] font-sans text-muted-foreground">estimated</span>}</TableCell>
                   </TableRow>
                 ))}</TableBody>
               </Table>

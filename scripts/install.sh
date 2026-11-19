@@ -8251,7 +8251,7 @@ header "Pre-flight checks"
 #   migrate_uploads                                     moves the uploads into ${DATA_DIR}
 #   find "${DATA_DIR}" ... -exec chown -h               the recursive chown of the state root
 #   the ownership change under ${LOG_DIR}               made of `.` inside a re-proved root
-#   prepare_crontab_lock                                the root-owned lock under ${DATA_DIR}
+#   prepare_crontab_lock                                the root-owned lock under /etc/ims-cutover-state
 #   mkdir_service_subdir "${DATA_DIR}" 077 …            the deploy key directory
 #   git clone / git fetch / rsync -a --delete           into ${APP_DIR}
 #   copy_tree_into_new_dir … "${APP_DIR}/.git"          and its git metadata
@@ -9329,7 +9329,7 @@ fi
 
 # THE CRONTAB RECONCILIATION LOCK, prepared here and defined in scripts/lib/crontab-lock.sh.
 #
-# Root-owned file inside a root-owned directory inside the service's StateDirectory, created with
+# Root-owned file inside a root-owned directory beneath /etc/ims-cutover-state (not the service's StateDirectory since o3d-txoe), created with
 # primitives that cannot follow a symlink (Codex r24 CRITICAL). It moved into the library in
 # o3d-p9dq: deploy.sh and update.sh need the identical preparation, because they now take the
 # identical lock, and a rule about a root-side write into a directory the service user owns cannot
@@ -9455,7 +9455,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
     privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
-    chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+    chown_app_root_tree "${APP_DIR}" "${APP_USER}" "the application directory" || die "The ownership of ${APP_DIR} could not be set; the reason is above."
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing directory."
   else
@@ -9482,7 +9482,7 @@ else
     "${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"
   rm -f "${APP_DIR}/.env.local"
   privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+  chown_app_root_tree "${APP_DIR}" "${APP_USER}" "the application directory" || die "The ownership of ${APP_DIR} could not be set; the reason is above."
   success "Files copied."
 
   if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" && -n "${GIT_REPO_URL:-}" ]]; then

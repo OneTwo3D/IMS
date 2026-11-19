@@ -332,6 +332,12 @@ row in the integration outbox on the Sync Exceptions page). Neither button is sh
 rather than one being shown and doing nothing — and IMS will not let you reopen anything else on that
 order either, so an order that is already in that position cannot be made worse by a click.
 
+If a release row has a status this version of IMS does not recognise (typically written by a newer
+version before a rollback), IMS cannot finish it and shows no button for it. Dispatch is refused and the
+refusal names the unrecognised status. The row is listed under **Integration outbox** on the Sync
+Exceptions page, marked as needing an administrator, and counted in its total. It cannot be cleared from
+the app: deploy the version that recognises the status, or escalate it to whoever runs IMS deployments.
+
 **Unpack the parcel first, then press "Create Shipments"** in the Stock Allocation panel to rebuild
 the shipment to what actually remains. If every unit was refunded there is nothing left to build and
 IMS says so rather than creating an empty shipment.
