@@ -24,6 +24,11 @@ export function buildWcSeenLines(wcOrder: WcLike): WcSeenLines {
   return { at, digest: createHash('sha256').update(JSON.stringify(lines)).digest('hex').slice(0, 16), lines }
 }
 
+/** A payload that carries no `line_items` array says nothing about the lines: it is never recorded as "no lines". */
+export function hasLineItems(wcOrder: WcLike): boolean {
+  return Array.isArray(wcOrder.line_items)
+}
+
 export function parseWcSeenLines(value: unknown): WcSeenLines | null {
   const v = value as { at?: unknown; digest?: unknown; lines?: unknown } | null
   if (!v || typeof v.digest !== 'string' || !Array.isArray(v.lines)) return null

@@ -242,7 +242,7 @@ export const defaultAmendmentDeps: AmendmentDeps = {
     })
     if (!order || order.erasedAt || order.isQuote) return null
     const lineIds = order.lines.map((l) => l.id)
-    const refundLines = await db.salesOrderRefundLine.findMany({ where: { salesOrderLineId: { in: lineIds } }, select: { salesOrderLineId: true, qty: true, refund: { select: { wcAmendment: true } } } })
+    const refundLines = await db.salesOrderRefundLine.findMany({ where: { salesOrderLineId: { in: lineIds }, refund: { deletedAt: null } }, select: { salesOrderLineId: true, qty: true, refund: { select: { wcAmendment: true } } } })
     const refunded = new Map<string, unknown>()
     const amendmentRefunded = new Map<string, unknown>()
     for (const row of refundLines) {
@@ -292,7 +292,7 @@ export const defaultAmendmentDeps: AmendmentDeps = {
 
 export type AmendmentOutcome =
   | { kind: 'off' }
-  | { kind: 'skipped'; reason: string }
+  | { kind: 'skipped'; reason: string; /** The caller should queue a live re-read so the step runs again without waiting for another WooCommerce delivery. */ retry?: true }
   | { kind: 'applied'; refundedLines: number; taskRaised: boolean }
   | { kind: 'refund-failed'; error: string }
 
@@ -325,7 +325,7 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
       }
 
       // TWO DELIVERIES IN THE SAME SECOND with different lines: the order they arrived in is not the order they were made in. Act on neither; a later delivery (or the next retry) settles it.
-      if (options.sameSecondConflict) return { kind: 'skipped', reason: 'two WooCommerce deliveries with the same modified time show different lines, so their order is unknown (retried on the next delivery)' }
+      if (options.sameSecondConflict) return { kind: 'skipped', retry: true, reason: 'two WooCommerce deliveries with the same modified time show different lines, so their order is unknown (retried by a live re-read)' }
 
       const plan = planWcOrderAmendment(wcOrder, differences, facts)
       if (plan.reductions.length === 0 && plan.wcChanges.length === 0 && plan.restores.length === 0) {
@@ -356,8 +356,8 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
         }
         // A gate that could not be READ says nothing about picking. Failing closed still holds (nothing is refunded or sent), but no claim is taken and no task claims that picking started: the next delivery asks again.
         if (gateUnreadable) {
-          await deps.log({ orderId, level: 'WARNING', action: 'wc_order_amendment_gate_unreadable', description: 'WooCommerce changed the order but the warehouse state could not be read just now. IMS refunded and sent nothing; the next delivery tries again.' })
-          return { kind: 'skipped', reason: 'the warehouse state could not be read (retried on the next delivery)' }
+          await deps.log({ orderId, level: 'WARNING', action: 'wc_order_amendment_gate_unreadable', description: 'WooCommerce changed the order but the warehouse state could not be read just now. IMS refunded and sent nothing; a live re-read of the order tries again shortly.' })
+          return { kind: 'skipped', retry: true, reason: 'the warehouse state could not be read (retried by a live re-read)' }
         }
       }
       let afterPicking: string[] = []

@@ -47,7 +47,8 @@ import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, ledgerMatchEpsilon, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import type { WcFullOrder } from './types'
 import { applyWcOrderAmendment } from './order-amendment'
-import { buildWcSeenLines, isOlderThanSeen, isSameSecondConflict, parseWcSeenLines } from './wc-seen-lines'
+import { parseWcGmtInstant } from './receipt-settlement-rate'
+import { buildWcSeenLines, hasLineItems, isOlderThanSeen, isSameSecondConflict, parseWcSeenLines, type WcSeenLines } from './wc-seen-lines'
 
 export const WC_ORDER_DIVERGENCE_SETTING = 'wc_order_divergence_detection_enabled'
 export const WC_ORDER_DIVERGED_ACTION = 'wc_order_diverged'
@@ -359,6 +360,19 @@ export async function drainDeferredWcOrderDivergences(limit: number = RECHECK_PE
   return out
 }
 
+/**
+ * Store the seen WooCommerce lines, CONDITIONALLY IN SQL on the stored time: an older delivery never overwrites a newer one however the two commit. Raw, so `updatedAt` (client-side @updatedAt) is NOT bumped:
+ * the detection never makes the order a warehouse amend candidate. Never throws.
+ */
+export async function recordWcSeenLines(orderId: string, seen: WcSeenLines): Promise<void> {
+  const json = JSON.stringify(seen)
+  if (seen.at) {
+    await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${json}::jsonb WHERE id = ${orderId} AND (wc_seen_lines IS NULL OR wc_seen_lines->>'at' IS NULL OR (wc_seen_lines->>'at')::timestamp <= ${seen.at}::timestamp)`.catch(() => undefined)
+  } else {
+    await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${json}::jsonb WHERE id = ${orderId} AND wc_seen_lines IS NULL`.catch(() => undefined)
+  }
+}
+
 export async function isWcOrderDivergenceDetectionEnabled(): Promise<boolean> {
   const row = await db.setting.findUnique({ where: { key: WC_ORDER_DIVERGENCE_SETTING }, select: { value: true } })
   return row?.value === 'true'
@@ -375,7 +389,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       where: { id: orderId },
       select: {
         currency: true, status: true, erasedAt: true, shippingForeign: true, taxForeign: true, totalForeign: true, discountAmount: true, discountModel: true, storeCreditForeign: true,
-        externalOrderNumber: true, wcSeenLines: true,
+        externalOrderNumber: true, wcSeenLines: true, externalUpdatedAt: true,
         lines: { select: { id: true, externalLineItemId: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, taxForeign: true, totalForeign: true } },
       },
     })
@@ -394,13 +408,17 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
         refundedQtyByLineId.set(line.salesOrderLineId, (refundedQtyByLineId.get(line.salesOrderLineId) ?? toDecimal(0)).plus(toDecimal(line.qty)))
       }
     }
-    // What WooCommerce shows for the lines, kept for the amendment step (the baseline at an IMS edit; two deliveries in one second). An out-of-order (older) delivery never overwrites it. Best effort.
+    // What WooCommerce shows for the lines, kept for the amendment step (the baseline at an IMS edit; two deliveries in one second). Best effort.
+    // The write is CONDITIONAL IN SQL on the stored time, so two overlapping deliveries cannot put an older one over a newer one whatever order they commit in; and a delivery the core update
+    // already rejected as stale (older than external_updated_at) is not recorded at all. A payload with no line_items array says nothing about the lines and is not recorded either.
     const seen = buildWcSeenLines(wcOrder)
     const previousSeen = parseWcSeenLines(stored.wcSeenLines)
-    const sameSecondConflict = isSameSecondConflict(previousSeen, seen)
-    if (!stored.erasedAt && !isOlderThanSeen(previousSeen, seen) && (previousSeen?.digest !== seen.digest || previousSeen?.at !== seen.at)) {
-      // Raw, so `updatedAt` (client-side @updatedAt) is NOT bumped: the detection never makes the order a warehouse amend candidate.
-      await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${JSON.stringify(seen)}::jsonb WHERE id = ${orderId}`.catch(() => undefined)
+    const incomingInstant = parseWcGmtInstant(String(wcOrder.date_modified_gmt || wcOrder.date_modified || ''))
+    const rejectedAsStale = Boolean(incomingInstant && !Number.isNaN(incomingInstant.getTime()) && stored.externalUpdatedAt && incomingInstant.getTime() < stored.externalUpdatedAt.getTime())
+    const recordable = hasLineItems(wcOrder) && !rejectedAsStale && !stored.erasedAt
+    const sameSecondConflict = recordable && isSameSecondConflict(previousSeen, seen)
+    if (recordable && !isOlderThanSeen(previousSeen, seen) && (previousSeen?.digest !== seen.digest || previousSeen?.at !== seen.at)) {
+      await recordWcSeenLines(orderId, seen)
     }
     const verdict = compareWcOrderWithIms(wcOrder, stored, { recordedExternalRefundIds, refundedQtyByLineId })
     if (verdict.kind === 'deferred') {
@@ -408,7 +426,15 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       await db.wcOrderDivergenceRecheck.upsert({ where: { orderId }, create: { orderId, externalOrderId: String(wcOrder.id) }, update: {} })
       return
     }
+    const priorRecheck = await db.wcOrderDivergenceRecheck.findUnique({ where: { orderId }, select: { attempts: true, deferredAt: true } })
     await db.wcOrderDivergenceRecheck.deleteMany({ where: { orderId } })
+    // The write step asks for a live re-read when it could not decide (warehouse unreadable, two deliveries in one second): the same bounded recheck row the deferred comparisons use, keeping the attempts and age already spent.
+    const runStep = async (differences: ReadonlyArray<DivergenceDifference>, fingerprint: string) => {
+      const outcome = await applyWcOrderAmendment(orderId, wcOrder, differences, fingerprint, undefined, { sameSecondConflict })
+      if (outcome.kind === 'skipped' && outcome.retry) {
+        await db.wcOrderDivergenceRecheck.upsert({ where: { orderId }, create: { orderId, externalOrderId: String(wcOrder.id), attempts: priorRecheck?.attempts ?? 0, ...(priorRecheck ? { deferredAt: priorRecheck.deferredAt } : {}) }, update: {} }).catch(() => undefined)
+      }
+    }
     const now = new Date()
     if (verdict.kind === 'not-comparable' || verdict.differences.length === 0) {
       await db.wcOrderDivergence.updateMany({
@@ -417,7 +443,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       })
       // A REDUCTION WOOCOMMERCE UNDID leaves NO difference (the amendment refund changes neither the lines nor the stored total), so the write step would never run for it. Run it for an order that carries an amendment
       // refund, with no differences: it raises the "a person decides" task when WooCommerce shows more units than IMS holds after those refunds, and does nothing otherwise (off by default; never throws).
-      if (verdict.kind === 'compared' && hasAmendmentRefund) await applyWcOrderAmendment(orderId, wcOrder, [], 'restore', undefined, { sameSecondConflict })
+      if (verdict.kind === 'compared' && hasAmendmentRefund) await runStep([], 'restore')
       return
     }
     const fingerprint = divergenceFingerprint(verdict.differences)
@@ -425,7 +451,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     if (existing && existing.resolvedAt === null && existing.fingerprint === fingerprint) {
       await db.wcOrderDivergence.update({ where: { id: existing.id }, data: { lastSeenAt: now, seenCount: { increment: 1 } } })
       // The write step (off by default) retries a difference it has not yet acted on (a failed refund released its claim); one already acted on is skipped by its claim.
-      await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint, undefined, { sameSecondConflict })
+      await runStep(verdict.differences, fingerprint)
       return
     }
     const data = {
@@ -451,7 +477,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       resolveUser: false,
     })
     // THE WRITE STEP, behind `wc_order_amendment_write_enabled` (off by default; order-amendment.ts). A no-op while it is off, and it never throws.
-    await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint, undefined, { sameSecondConflict })
+    await runStep(verdict.differences, fingerprint)
   } catch (e) {
     console.error('wc_order_divergence: could not compare or record', e instanceof Error ? e.constructor.name : typeof e)
   }

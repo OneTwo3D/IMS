@@ -130,6 +130,12 @@ export function applyMintsoftProductParity(dto: WmsProductDto, product: ParityPr
   }
 }
 
+/** The parity DTO WITHOUT the name rewrite (inherited weight and dimensions, cost): for a product whose parity name was refused. The caller sets the name. Pure. */
+export function applyMintsoftProductParityExceptName(dto: WmsProductDto, product: ParityProduct, costPrice: number | null): WmsProductDto {
+  const inherited = inheritFromParent(dto, product.type === 'VARIANT' ? product.parent : null)
+  return { ...dto, ...inherited, ...(costPrice != null ? { costPrice } : {}) }
+}
+
 /** The Mintsoft echo of a product with `CostPrice` removed, for any record that is shown to people (the sync log). */
 export function redactMintsoftCostPrice<T>(raw: T): T {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw

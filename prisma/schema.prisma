@@ -5093,6 +5093,8 @@ enum WmsDiscrepancyCategory {
   CUSTOMS_CLEAR_MANUAL
   /// An IMS SKU rename the warehouse product does not yet follow: nothing is created, the operator renames it there.
   PRODUCT_SKU_RENAMED
+  /// Mintsoft parity could not rebuild a variation's name with certainty (ambiguous attribute values): the name was withheld (the warehouse's own name kept, or the plain name on create); everything else still syncs.
+  PRODUCT_NAME_REFUSED
 }
 
 enum WmsDiscrepancyStatus {

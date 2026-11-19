@@ -324,3 +324,13 @@ test('LOW 4: a throw after the refund was recorded keeps the claim (the refund s
   assert.equal(calls.refunds.length, 1)
   assert.equal(calls.released, 0)
 })
+
+test('MED (r1): an unreadable gate and a same-second conflict ask the caller for a live re-read (retry), a closed gate does not', async () => {
+  const unreadable = deps(facts({ lines: [reduce3to2] }), { warehouseGate: async () => ({ ok: false as const, externalOrderId: null, unreadable: true }) })
+  assert.deepEqual(await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', unreadable.d), { kind: 'skipped', retry: true, reason: 'the warehouse state could not be read (retried by a live re-read)' })
+  const conflict = deps(facts({ lines: [reduce3to2] }))
+  const out = await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', conflict.d, { sameSecondConflict: true })
+  assert.equal(out.kind === 'skipped' && out.retry, true)
+  const closed = deps(facts({ lines: [reduce3to2] }), { warehouseGate: async () => ({ ok: false as const, externalOrderId: null }) })
+  assert.equal((await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', closed.d)).kind, 'applied')
+})

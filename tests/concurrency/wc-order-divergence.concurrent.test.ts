@@ -340,3 +340,81 @@ test('[divergence] MEDIUM: reduce THEN restore, through the comparison: nothing 
     else await f.db.setting.deleteMany({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
   }
 })
+
+test('[divergence] MED (r1): the seen WooCommerce lines are written conditionally in SQL: an older delivery never overwrites a newer one; a stale-rejected delivery and one without line_items are not recorded', { skip }, async (t) => {
+  const f = await fixture(t)
+  const seenMod = await import('@/lib/connectors/woocommerce/sync/wc-seen-lines')
+  await f.setFlag(true)
+  await f.deliver({})
+  const read = async () => (await f.db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId }, select: { wcSeenLines: true, updatedAt: true } }))
+  const wcAt = (qty: number, at: string) => seenMod.buildWcSeenLines({ date_modified_gmt: at, line_items: [{ id: 1, quantity: qty }] })
+  const before = await read()
+  await f.div.recordWcSeenLines(f.orderId, wcAt(3, '2026-11-02T10:00:00'))
+  // The older delivery commits SECOND (the race the JS pre-check cannot see): the newer state stays.
+  await f.div.recordWcSeenLines(f.orderId, wcAt(5, '2026-11-02T09:30:00'))
+  const after = await read()
+  assert.deepEqual((after.wcSeenLines as { lines: unknown[] }).lines, [{ externalLineItemId: 1, qty: 3 }])
+  assert.equal(after.updatedAt.getTime(), before.updatedAt.getTime(), 'updatedAt untouched')
+  await f.div.recordWcSeenLines(f.orderId, wcAt(4, '2026-11-02T10:00:01'))
+  assert.deepEqual(((await read()).wcSeenLines as { lines: unknown[] }).lines, [{ externalLineItemId: 1, qty: 4 }], 'a newer one is stored')
+
+  // Through the comparison: a delivery older than external_updated_at (the core update rejected it as stale) and one with no line_items are not recorded.
+  await f.db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = NULL WHERE id = ${f.orderId}`
+  await f.db.salesOrder.update({ where: { id: f.orderId }, data: { externalUpdatedAt: new Date('2026-11-02T12:00:00Z') } })
+  await f.div.surfaceWcOrderDivergence(f.orderId, { ...f.payload({ qty: 3 }), date_modified_gmt: '2026-11-02T11:00:00' } as never)
+  assert.equal((await read()).wcSeenLines, null, 'a stale-rejected delivery is not recorded')
+  await f.db.salesOrder.update({ where: { id: f.orderId }, data: { externalUpdatedAt: new Date('2026-11-02T09:00:00Z') } })
+  const noLines = { ...f.payload({}), line_items: undefined }
+  await f.div.surfaceWcOrderDivergence(f.orderId, noLines as never)
+  assert.equal((await read()).wcSeenLines, null, 'a payload without line_items is not recorded')
+  await f.div.surfaceWcOrderDivergence(f.orderId, { ...f.payload({ qty: 3 }), date_modified_gmt: '2026-11-02T11:00:00' } as never)
+  assert.notEqual((await read()).wcSeenLines, null, 'a current delivery is recorded')
+})
+
+test('[divergence] MED (r1): an unreadable warehouse gate queues a live re-read (recheck row), and the migration backfill marks #1055 amendment refunds; soft-deleted refunds are not counted', { skip }, async (t) => {
+  const f = await fixture(t)
+  const amend = await import('@/lib/connectors/woocommerce/sync/order-amendment')
+  const gate = await import('@/lib/domain/sales/order-edit-wms-gate')
+  await f.setFlag(true)
+  const before = await f.db.setting.findUnique({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
+  await f.db.setting.upsert({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING }, create: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING, value: 'true' }, update: { value: 'true' } })
+  const originalGate = gate.orderEditWmsGateDeps.current
+  try {
+    await f.deliver({ qty: 3 })
+    await f.deliver({ qty: 3 })
+    await f.db.salesOrder.update({ where: { id: f.orderId }, data: { paidAt: new Date('2026-11-01T00:00:00Z') } })
+    await f.db.wmsOrderPushLink.create({ data: { orderId: f.orderId, connector: 'mintsoft', externalOrderId: 'MS-3XK03B', externalOrderNumber: 'W-3XK03B', state: 'SYNCED' } })
+    gate.orderEditWmsGateDeps.current = { ...originalGate, probe: async () => { throw new Error('warehouse down') } }
+    await f.deliver({ qty: 2 })
+    assert.equal(await f.db.wcOrderDivergenceRecheck.count({ where: { orderId: f.orderId } }), 1, 'a live re-read is queued')
+    assert.equal(await f.db.salesOrderRefund.count({ where: { orderId: f.orderId } }), 0, 'nothing refunded')
+    assert.equal(await f.db.wmsOperatorTask.count({ where: { orderId: f.orderId } }), 0, 'no task claims picking started')
+
+    // The backfill statement (migration): a refund with the #1055 reason and no flag is marked; another reason is not. A soft-deleted amendment refund is not counted.
+    const lineId = (await f.db.salesOrderLine.findFirstOrThrow({ where: { orderId: f.orderId }, select: { id: true } })).id
+    const mk = async (reason: string, deletedAt: Date | null) => {
+      const r = await f.db.salesOrderRefund.create({ data: { orderId: f.orderId, totalForeign: '1.00', totalBase: '1.00', reason, deletedAt } })
+      await f.db.salesOrderRefundLine.create({ data: { refundId: r.id, salesOrderLineId: lineId, description: 'W', qty: '1', unitPriceForeign: '1', unitPriceBase: '1', totalForeign: '1', totalBase: '1' } })
+      return r.id
+    }
+    const legacy = await mk(amend.WC_AMENDMENT_REFUND_REASON, null)
+    const other = await mk('something else', null)
+    const deleted = await mk(amend.WC_AMENDMENT_REFUND_REASON, new Date())
+    const fs = await import('node:fs')
+    const sql = fs.readFileSync('prisma/migrations/20261120100000_wc_amendment_round2/migration.sql', 'utf8').split('\n').find((l) => l.startsWith('UPDATE "sales_order_refunds"'))!
+    await f.db.$executeRawUnsafe(sql)
+    const flags = new Map((await f.db.salesOrderRefund.findMany({ where: { id: { in: [legacy, other, deleted] } }, select: { id: true, wcAmendment: true } })).map((r) => [r.id, r.wcAmendment]))
+    assert.equal(flags.get(legacy), true)
+    assert.equal(flags.get(other), false)
+    const facts = await amend.defaultAmendmentDeps.loadFacts(f.orderId)
+    assert.equal(Number(facts!.refundedQtyByLineId.get(lineId)), 2, 'the soft-deleted refund is not counted (legacy + other only)')
+    assert.equal(Number(facts!.amendmentRefundedQtyByLineId!.get(lineId)), 1, 'only the live amendment refund')
+  } finally {
+    gate.orderEditWmsGateDeps.current = originalGate
+    await f.db.wcOrderDivergenceRecheck.deleteMany({ where: { orderId: f.orderId } })
+    await f.db.wmsOperatorTask.deleteMany({ where: { orderId: f.orderId } })
+    await f.db.wmsOrderPushLink.deleteMany({ where: { orderId: f.orderId } })
+    if (before) await f.db.setting.update({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING }, data: { value: before.value } })
+    else await f.db.setting.deleteMany({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
+  }
+})

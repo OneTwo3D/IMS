@@ -122,3 +122,20 @@ test('MEDIUM 3: a second genuine remainder on the same SKU raises a task even th
   const second = deps({ raise, refundTotals: async () => ({ gross: new Map([['l1', 3]]), netted: new Map([['l1', 0]]) }) })
   assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, second.d), { raised: 1, failed: 0 })
 })
+
+test('MED (r1): refunding an owed UNSHIPPED unit (gross and netted both +1) is the same episode: no conflicting second task; a further RETURNED shipped unit is a new one', async () => {
+  const seen = new Set<string>()
+  const raise = async (task: { reason: string; dedupeBasis?: string; queryText: string }) => {
+    const hash = createHash('sha256').update(`${task.reason}\n${task.dedupeBasis ?? task.queryText}`).digest('hex')
+    if (seen.has(hash)) return false
+    seen.add(hash)
+    return true
+  }
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, deps({ raise }).d), { raised: 1, failed: 0 })
+  // One of the 2 owed units is cancelled and refunded: gross 3, netted 1, remainder 1. Same returned-and-refunded count (2).
+  const cancelled = deps({ raise, refundTotals: async () => ({ gross: new Map([['l1', 3]]), netted: new Map([['l1', 1]]) }) })
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, cancelled.d), { raised: 0, failed: 0 })
+  // A further shipped unit comes back: gross 3, netted 0 -> new task.
+  const returned = deps({ raise, refundTotals: async () => ({ gross: new Map([['l1', 3]]), netted: new Map([['l1', 0]]) }) })
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, returned.d), { raised: 1, failed: 0 })
+})
