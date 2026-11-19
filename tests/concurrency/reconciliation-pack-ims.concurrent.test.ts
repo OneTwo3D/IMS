@@ -209,10 +209,12 @@ test('[reconciliation pack] the vat section reads the sales tax per month and ra
   }
   try {
     await sql(`INSERT INTO tax_rates (id, name, rate, accounting_tax_type, "countryCode", reporting_category, "updatedAt") VALUES ($1, 'x', 0.2, 'OUTPUT2', 'GB', 'DOMESTIC', now())`, `${VP}-t`)
-    await order('1', 'PROCESSING', '2026-09-30 23:59:59', '10.50')
-    await order('2', 'COMPLETED', '2026-09-01 00:00:00', '4.25')
-    await order('3', 'PROCESSING', '2026-10-01 00:00:00', '99')
-    await order('4', 'PROCESSING', '2026-08-31 23:59:59.999', '98')
+    // o3d-oe1b0: the month and the window are LONDON days (BST in September, UTC+1), so the boundary instants below are the London midnights written in UTC:
+    // 2026-08-31 23:00:00Z is London 1 September 00:00 (in), 2026-09-30 22:59:59Z is London 30 September 23:59:59 (in), 2026-09-30 23:00:00Z is London 1 October 00:00 (out).
+    await order('1', 'PROCESSING', '2026-09-30 22:59:59', '10.50')
+    await order('2', 'COMPLETED', '2026-08-31 23:00:00', '4.25')
+    await order('3', 'PROCESSING', '2026-09-30 23:00:00', '99')
+    await order('4', 'PROCESSING', '2026-08-31 22:59:59.999', '98')
     await order('5', 'CANCELLED', '2026-09-10 10:00:00', '97')
     await order('6', 'PROCESSING', '2026-09-10 10:00:00', '96', { archived: true })
     await order('7', 'PROCESSING', null, '95')

@@ -74,6 +74,24 @@ The list stays editable until the count is posted or cancelled. Open the count a
 
 You can also add products to a whole-location count that is still open, but lines can only be removed from a prepared count (a whole-location count covers every stocked product, so leave one uncounted instead). Products you add are uncounted and are not posted until you enter a quantity for them.
 
+### Triage the variances: tabs, sorting and bulk accept
+
+When you open a count, the lines have a row of tabs above them: **All lines**, **No variance**, **Small variance** and **Needs review**, each with the number of lines in it. A line is judged on its counted quantity against the book quantity shown. Lines you have not counted yet are only under **All lines**.
+
+- **No variance**: the count equals the book quantity exactly.
+- **Small variance**: the count differs, but by no more than the small-variance threshold.
+- **Needs review**: any other difference, which is where your attention goes.
+
+**Small-variance threshold.** Set it with the fields above the table: a number of **units** and/or a **percentage** of the stock on hand, then **Save threshold**. Leave a field blank to not use it; when both are filled in a line must be within both. It starts empty, so until you set it **no line counts as small** and every difference is under **Needs review**. The threshold applies to all counts and is recorded in the activity log when it changes.
+
+**Sorting.** The sort box above the table offers **Default order** (by SKU, as before), **Variance (quantity)** and **Variance (value)**, largest difference first in either direction (short or over). The value is the difference multiplied by the average cost of the stock on hand in that location, shown in **Est. value**; a product with no stock cost shows a dash, sorts after the costed lines, and the value is not shown on a closed count. The value is a guide for ordering, nothing is booked from it. Your tab and sort are kept in the page address, so a refresh or a shared link shows the same view.
+
+**Accepting in bulk.** On the **No variance** tab, **Accept N line(s) with no variance** reconciles all of those lines in one go. It is the same reconcile as above, and nothing is booked for them because there is nothing to book. Save your counts first: only saved counts are accepted. IMS checks every line again at the moment you accept, against the counted quantity as saved and the stock on hand as it is then, and accepts only lines whose difference is still exactly zero, and whose counted quantity and book quantity are still exactly the figures on your screen. If someone recounted a line, or stock moved since you loaded the page, that line is left out and the message tells you how many were; they stay in the list for review.
+
+On the **Small variance** tab, **Accept N small-variance line(s)...** does the same for lines within the threshold, after you confirm. The same exact-figures check applies: a line whose count or stock changed since you loaded the page is left out even if it is still small, and if the threshold itself was changed meanwhile nothing is accepted and you are told. Accepting only reconciles the lines. The differences are still booked, as stock adjustments, when you **Authorise and post variances**, in exactly the way they are for any other line, so the stock movements and costs are the same as if you had accepted them one at a time.
+
+The activity log records who bulk-accepted, which kind of lines, how many were accepted and how many were left out.
+
 ### How posting is protected
 
 Posting is a two-step check so a count is never booked against stock that has since moved:
