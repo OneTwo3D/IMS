@@ -6189,13 +6189,15 @@ model WcStockDriftRun {
 model WcWithdrawalOutcome {
   id          String   @id @default(cuid())
   orderId     String   @map("order_id")
-  /// `r<request id>` when IMS knows the storefront request, else `g<withdrawalHoldGeneration>`.
+  /// `r<request id>` when IMS knows the storefront request, else the fixed `u:<order id>`; `x:<order id>:<request id>` marks an ambiguous-request task.
   requestKey  String   @map("request_key")
   /// The withdrawal log action (wc_withdrawal_approved, wc_withdrawal_after_dispatch, ...).
   outcomeKind String   @map("outcome_kind")
-  /// The storefront's answer: noted, rejected or already_done.
+  /// The storefront's answer: noted, rejected, already_done, or task_raised (a terminal row: it could not be done and a task was raised).
   result      String
   writtenAt   DateTime @default(now()) @map("written_at")
+  /// The order's withdrawalHoldGeneration when the row was written; tells a later submission from the request that was handled.
+  holdGeneration Int?  @map("hold_generation")
 
   order       SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 

@@ -25,7 +25,7 @@ export type HandBackCliOptions = {
   stderr?: Pick<typeof console, 'error'>
   disconnect?: () => Promise<void>
   /** Test seam: the audit entry of an applied run. Absent = the activity log. */
-  audit?: (entry: { since: string; candidates: number; counts: Record<string, number> }) => Promise<void>
+  audit?: (entry: AuditEntry) => Promise<void>
   now?: () => Date
 }
 
@@ -51,9 +51,17 @@ async function liveLoad(since: Date): Promise<{ candidates: HandBackCandidate[];
   }
 }
 
-async function auditApplied(entry: { since: string; candidates: number; counts: Record<string, number> }): Promise<void> {
+type AuditEntry = { phase: 'intent' | 'completed'; since: string; candidates: number; counts?: Record<string, number> }
+
+/** Two rows per applied run: the INTENT is written before any storefront write, the completion (with the counts) after it. */
+async function auditApplied(entry: AuditEntry): Promise<void> {
   const { logActivity } = await import('@/lib/activity-log')
-  await logActivity({ entityType: 'SYSTEM', entityId: 'switchover-hand-back', action: 'switchover_hand_back_applied', tag: 'sync', level: 'WARNING', description: `Switchover hand-back applied for ${entry.candidates} open order(s) since ${entry.since}.`, metadata: entry, resolveUser: false })
+  await logActivity({
+    entityType: 'SYSTEM', entityId: 'switchover-hand-back',
+    action: entry.phase === 'intent' ? 'switchover_hand_back_intent' : 'switchover_hand_back_applied', tag: 'sync', level: 'WARNING',
+    description: entry.phase === 'intent' ? `Switchover hand-back about to write ${entry.candidates} open order(s) since ${entry.since}.` : `Switchover hand-back applied for ${entry.candidates} open order(s) since ${entry.since}.`,
+    metadata: entry, resolveUser: false,
+  })
 }
 
 export async function runHandBackCli(options: HandBackCliOptions = {}): Promise<number> {
@@ -94,8 +102,15 @@ export async function runHandBackCli(options: HandBackCliOptions = {}): Promise<
   }
   try {
     const { candidates, deps } = await (options.load ?? liveLoad)(cutoff.at)
+    const audit = options.audit ?? auditApplied
+    // The audit row comes BEFORE the writes: if it cannot be written nothing is written, and a crash after the writes still leaves the intent on record.
+    if (apply) await audit({ phase: 'intent', since: cutoff.at.toISOString(), candidates: candidates.length })
     const { counts, results } = await runHandBack(candidates, apply, deps)
-    if (apply) await (options.audit ?? auditApplied)({ since: cutoff.at.toISOString(), candidates: candidates.length, counts: { ...counts } })
+    if (apply) {
+      // The writes are done: a failing completion row is reported, never turned into a "failed" run that hides the counts.
+      await audit({ phase: 'completed', since: cutoff.at.toISOString(), candidates: candidates.length, counts: { ...counts } })
+        .catch((error: unknown) => { stderr.error(`The hand-back was applied but its completion audit row could not be written (${error instanceof Error ? error.message : String(error)}); the intent row is on record. Counts: ${JSON.stringify(counts)}`) })
+    }
     if (json) stdout.log(JSON.stringify({ apply, since: cutoff.at.toISOString(), candidates: candidates.length, counts, results }, null, 2))
     else {
       stdout.log(`${apply ? 'APPLY' : 'DRY RUN'}: hand-back of ${candidates.length} open order(s) IMS created since ${cutoff.at.toISOString()}`)

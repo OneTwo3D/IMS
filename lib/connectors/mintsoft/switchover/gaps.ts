@@ -71,13 +71,16 @@ export async function listSwitchoverGaps(input: {
       status: 'SHIPPED',
       erasedAt: null,
       shoppingLinks: { some: { connector: 'woocommerce' } },
-      OR: [{ shippedAt: { gte: windowStart, lt: input.since } }, { shippedAt: null }],
+      refundStatus: { not: 'FULL' },
+      // A row with no shippedAt (an old import) is bounded by its creation time in the same window, so history does not cost a storefront read each.
+      OR: [{ shippedAt: { gte: windowStart, lt: input.since } }, { shippedAt: null, createdAt: { gte: windowStart, lt: input.since } }],
     },
     select: { id: true, orderNumber: true, externalOrderNumber: true, paidAt: true, shippedAt: true, shoppingLinks: { where: { connector: 'woocommerce' }, select: { externalOrderId: true }, take: 1 } },
     orderBy: { shippedAt: 'asc' },
     take: LIST_LIMIT,
   })
-  // Keep only the orders whose storefront order is NOT completed with tracking.
+  // Keep only the orders whose storefront order is still open: completed (with or without tracking: a letter-post or collection despatch has none),
+  // refunded and cancelled storefront orders are closed, not gaps.
   const pause = input.pauseMs ?? STOREFRONT_READ_PAUSE_MS
   const gapDespatch: Array<{ row: (typeof despatch)[number]; unreadable: boolean }> = []
   let reads = 0
@@ -87,7 +90,7 @@ export async function listSwitchoverGaps(input: {
     if (pause > 0 && reads > 0) await new Promise((resolve) => setTimeout(resolve, pause))
     reads += 1
     const store = await input.readStorefront(link.externalOrderId)
-    if (store && store.status === 'completed' && store.trackingItems > 0) continue
+    if (store && STOREFRONT_CLOSED_STATUSES.has(store.status)) continue
     gapDespatch.push({ row, unreadable: store === null })
   }
   return {
@@ -96,6 +99,9 @@ export async function listSwitchoverGaps(input: {
     truncated: create.length >= LIST_LIMIT || despatch.length >= LIST_LIMIT,
   }
 }
+
+/** A storefront order in one of these states needs no despatch written to it. */
+const STOREFRONT_CLOSED_STATUSES: ReadonlySet<string> = new Set(['completed', 'refunded', 'cancelled'])
 
 export type TakeOverResult =
   | { outcome: 'adopted' | 'would-adopt'; kind: 'G_create'; externalOrderId: string }
@@ -135,7 +141,7 @@ export async function takeOverGapOrder(orderId: string, since: Date, apply: bool
     if (!link) return { outcome: 'refused', kind: 'G_despatch', why: 'The order has no WooCommerce link.' }
     const store = await deps.readStorefrontOrder(link.externalOrderId)
     if (!store) return { outcome: 'refused', kind: 'G_despatch', why: 'The storefront order could not be read, so nothing was written.' }
-    if (store.status === 'completed' && store.trackingItems > 0) return { outcome: 'nothing-to-do', kind: 'G_despatch', why: 'The storefront order is already completed and carries tracking.' }
+    if (STOREFRONT_CLOSED_STATUSES.has(store.status)) return { outcome: 'nothing-to-do', kind: 'G_despatch', why: `The storefront order is already ${store.status}: nothing to complete.` }
     if (!apply) return { outcome: 'would-queue', kind: 'G_despatch' }
     // A STABLE key per (order, S): repeating --apply finds the job it already queued instead of queueing another. The obligation time stays NOW.
     const key = await deps.db.$transaction((tx) => deps.queueCompletion(tx, { orderId, at: now, keyPart: `takeover:${since.getTime()}` }))

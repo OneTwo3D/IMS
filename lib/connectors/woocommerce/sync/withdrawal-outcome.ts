@@ -44,7 +44,7 @@ export type WithdrawalOutcomeInput = {
 }
 
 export type WithdrawalOutcomeResult =
-  | { kind: 'written'; result: 'noted' | 'rejected' | 'already_done' | 'no_request' | 'no_withdrawal_plugin' }
+  | { kind: 'written'; result: 'noted' | 'rejected' | 'already_done' | 'no_request' | 'no_withdrawal_plugin' | 'not_rejected' }
   | { kind: 'order-gone' }
   | { kind: 'skipped'; why: 'switch-off' | 'held' }
   | { kind: 'failed'; error: string }
@@ -58,7 +58,7 @@ export function signWithdrawalOutcome(input: { timestamp: number; orderId: strin
   return createHmac('sha256', secret).update(`${input.timestamp}\nPOST\n${withdrawalOutcomePath(input.orderId)}\n${input.body}`).digest('hex')
 }
 
-const RESULTS = new Set(['noted', 'rejected', 'already_done', 'no_request', 'no_withdrawal_plugin'])
+const RESULTS = new Set(['noted', 'rejected', 'already_done', 'no_request', 'no_withdrawal_plugin', 'not_rejected'])
 
 /** The pure half of the transport: the storefront's HTTP answer to a result. Never remote free text. */
 export function classifyWithdrawalOutcomeResponse(status: number, body: unknown): WithdrawalOutcomeResult {
@@ -128,44 +128,62 @@ export const WITHDRAWAL_OUTCOME_BY_ACTION: Readonly<Record<string, { outcome: Wi
 /** The result words that mean the storefront DID what was asked. `no_request` and `no_withdrawal_plugin` are failures of a rejection. */
 const DONE_RESULTS = new Set(['noted', 'rejected', 'already_done'])
 
+/** What the store knows of the order's withdrawal request. `previousRequestId` is what IMS held BEFORE this call recorded `requestId`. */
+export type WithdrawalRequestIdentity = { requestId: string | null; previousRequestId: string | null; generation: number }
+export type WithdrawalOutcomeRow = { result: string; generation: number | null }
+
 /** The durable once-only store. A test seam; absent = the database. */
 export type WithdrawalOutcomeStore = {
-  /** IMS's record of the order's withdrawal request: records `requestId` when given and returns the stable request key. */
-  requestKey(orderId: string, requestId: string | null): Promise<{ requestKey: string; requestId: string | null }>
-  isWritten(orderId: string, requestKey: string, kind: string): Promise<boolean>
-  markWritten(orderId: string, requestKey: string, kind: string, result: string): Promise<void>
-  raiseTask(input: { orderId: string; externalOrderId: string; requestKey: string; queryText: string }): Promise<void>
+  /** IMS's record of the order's withdrawal request: records `incomingRequestId` when given (a different id replaces the recorded one) and returns it. */
+  identity(orderId: string, incomingRequestId: string | null): Promise<WithdrawalRequestIdentity>
+  findRow(orderId: string, requestKey: string, kind: string): Promise<WithdrawalOutcomeRow | null>
+  markWritten(orderId: string, requestKey: string, kind: string, result: string, generation: number): Promise<void>
+  /** One task per order and outcome kind, however often it is raised. */
+  raiseTask(input: { orderId: string; externalOrderId: string; kind: string; queryText: string }): Promise<void>
 }
 
+/** A terminal row: the storefront could not carry the outcome out, a task was raised, and IMS does not try or warn again for this key. */
+export const TASK_RAISED_RESULT = 'task_raised'
+
 const dbStore: WithdrawalOutcomeStore = {
-  async requestKey(orderId, requestId) {
+  async identity(orderId, incomingRequestId) {
     const { db } = await import('@/lib/db')
-    if (requestId) await db.salesOrder.updateMany({ where: { id: orderId, OR: [{ withdrawalRequestId: null }, { withdrawalRequestId: { not: requestId } }] }, data: { withdrawalRequestId: requestId } })
+    const before = await db.salesOrder.findUnique({ where: { id: orderId }, select: { withdrawalRequestId: true } })
+    if (incomingRequestId && before && before.withdrawalRequestId !== incomingRequestId) {
+      await db.salesOrder.updateMany({ where: { id: orderId }, data: { withdrawalRequestId: incomingRequestId } })
+    }
     const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { withdrawalRequestId: true, withdrawalHoldGeneration: true } })
-    const known = order?.withdrawalRequestId ?? null
-    return { requestKey: known ? `r${known}` : `g${order?.withdrawalHoldGeneration ?? 0}`, requestId: known }
+    return { requestId: order?.withdrawalRequestId ?? null, previousRequestId: before?.withdrawalRequestId ?? null, generation: order?.withdrawalHoldGeneration ?? 0 }
   },
-  async isWritten(orderId, requestKey, kind) {
+  async findRow(orderId, requestKey, kind) {
     const { db } = await import('@/lib/db')
-    return (await db.wcWithdrawalOutcome.count({ where: { orderId, requestKey, outcomeKind: kind } })) > 0
+    const row = await db.wcWithdrawalOutcome.findFirst({ where: { orderId, requestKey, outcomeKind: kind }, select: { result: true, holdGeneration: true } })
+    return row ? { result: row.result, generation: row.holdGeneration } : null
   },
-  async markWritten(orderId, requestKey, kind, result) {
+  async markWritten(orderId, requestKey, kind, result, generation) {
     const { db } = await import('@/lib/db')
-    await db.wcWithdrawalOutcome.createMany({ data: [{ orderId, requestKey, outcomeKind: kind, result }], skipDuplicates: true })
+    await db.wcWithdrawalOutcome.createMany({ data: [{ orderId, requestKey, outcomeKind: kind, result, holdGeneration: generation }], skipDuplicates: true })
   },
   async raiseTask(input) {
     const { db } = await import('@/lib/db')
     const { raiseWmsOperatorTask } = await import('@/lib/domain/wms/operator-tasks')
     await raiseWmsOperatorTask(db, {
       connector: 'woocommerce', orderId: input.orderId, externalOrderId: input.externalOrderId, reason: 'WITHDRAWAL_REJECT_NOT_WRITTEN',
-      queryText: input.queryText, dedupeBasis: `wdraw-reject:${input.orderId}:${input.requestKey}`,
+      queryText: input.queryText, dedupeBasis: `wdraw-reject:${input.orderId}:${input.kind}`,
     })
   },
 }
 
+/** The fixed per-order key for "the storefront request id is not known". It never moves with the order's modified time or a counter. */
+export const unknownRequestKey = (orderId: string): string => `u:${orderId}`
+/** The marker for "the request IMS recorded may not be the one now pending": raised once per recorded request. */
+const ambiguousKey = (orderId: string, requestId: string): string => `x:${orderId}:${requestId}`
+
 /**
  * Write the outcome of one withdrawal event, if its action has one and the writer is on. Never throws. The identity is (order, withdrawal request, action):
- * the same event seen again, however often and whatever the order's modified time, adds nothing once the storefront has confirmed it.
+ * the same event seen again, however often and whatever the order's modified time, adds nothing once the storefront has confirmed it. With no request id
+ * known the identity is the fixed key `u:<order>`; a rejection the storefront cannot carry out raises ONE operator task for the order and records a terminal
+ * row for its key, so it is neither re-sent nor re-warned on every webhook.
  * `requestId` is the storefront request id read from the order payload (the helper plugin's `_oti_wdraw_request_id`), when it carries one.
  */
 export async function writeWithdrawalOutcomeForEvent(
@@ -176,8 +194,32 @@ export async function writeWithdrawalOutcomeForEvent(
   if (!mapping) return
   try {
     if (!(await isWithdrawalOutcomeEnabled())) return
-    const { requestKey, requestId } = await store.requestKey(input.orderId, input.requestId ?? null)
-    if (await store.isWritten(input.orderId, requestKey, input.action)) return
+    const identity = await store.identity(input.orderId, input.requestId ?? null)
+    const { requestId, generation } = identity
+    const requestKey = requestId ? `r${requestId}` : unknownRequestKey(input.orderId)
+    const row = await store.findRow(input.orderId, requestKey, input.action)
+    if (row) {
+      // A request IMS has already rejected, and a NEWER submission since, with no new request id to tell them apart: IMS cannot say whether the pending
+      // request is the one it rejected. Never skip it silently: a person looks, once.
+      if (mapping.reject && requestId && row.generation !== null && generation > row.generation) {
+        const marker = ambiguousKey(input.orderId, requestId)
+        if (await store.findRow(input.orderId, marker, input.action)) return
+        await store.markWritten(input.orderId, marker, input.action, TASK_RAISED_RESULT, generation)
+        await store.raiseTask({
+          orderId: input.orderId, externalOrderId: input.externalOrderId, kind: input.action,
+          queryText: `The customer filed another withdrawal request for storefront order ${input.externalOrderId} after despatch, and IMS cannot tell whether it is the one it already rejected (request ${requestId}). Check the order in WooCommerce and reject the pending request by hand.`,
+        })
+      }
+      return
+    }
+    // The request id has just become known for an order whose outcome was already written under the unknown key: the same request, not a second note.
+    if (requestId && identity.previousRequestId === null) {
+      const unknownRow = await store.findRow(input.orderId, unknownRequestKey(input.orderId), input.action)
+      if (unknownRow && DONE_RESULTS.has(unknownRow.result)) {
+        await store.markWritten(input.orderId, requestKey, input.action, unknownRow.result, generation)
+        return
+      }
+    }
     const result = await postWithdrawalOutcome(input.externalOrderId, {
       outcome: mapping.outcome,
       outcomeKey: `wdo:${input.externalOrderId}:${requestKey}:${input.action}`.slice(0, 96),
@@ -186,22 +228,26 @@ export async function writeWithdrawalOutcomeForEvent(
       ...(requestId ? { requestId } : {}),
     })
     if (result.kind === 'written' && DONE_RESULTS.has(result.result)) {
-      await store.markWritten(input.orderId, requestKey, input.action, result.result)
+      await store.markWritten(input.orderId, requestKey, input.action, result.result, generation)
       return
     }
-    const why = result.kind === 'written' ? (result.result === 'no_request' ? 'the storefront holds no withdrawal request for this order' : 'the withdrawal plugin is not active on the storefront')
+    const why = result.kind === 'written' ? (result.result === 'no_request' ? 'the storefront holds no withdrawal request for this order'
+      : result.result === 'not_rejected' ? 'the request is no longer pending and is not rejected (it may have been approved)' : 'the withdrawal plugin is not active on the storefront')
       : result.kind === 'failed' ? result.error : null
     if (why === null) return
+    if (mapping.reject) {
+      await store.raiseTask({
+        orderId: input.orderId, externalOrderId: input.externalOrderId, kind: input.action,
+        queryText: `The customer's withdrawal request for storefront order ${input.externalOrderId} was filed after despatch and IMS could not reject it (${why}). Reject the request in WooCommerce by hand.`,
+      })
+    }
+    // A definite "cannot" from the storefront is terminal for this key once the task is raised: no resend, no new warning per webhook. A transport
+    // failure is not: it is tried again.
+    if (result.kind === 'written') await store.markWritten(input.orderId, requestKey, input.action, TASK_RAISED_RESULT, generation)
     await logActivity({
       entityType: 'SALES_ORDER', entityId: input.orderId, action: 'wc_withdrawal_outcome_failed', tag: 'sync', level: 'WARNING',
       description: `The withdrawal outcome could not be written to the storefront order: ${why}`, resolveUser: false,
     })
-    if (mapping.reject) {
-      await store.raiseTask({
-        orderId: input.orderId, externalOrderId: input.externalOrderId, requestKey,
-        queryText: `The customer's withdrawal request for storefront order ${input.externalOrderId} was filed after despatch and IMS could not reject it (${why}). Reject the request in WooCommerce by hand.`,
-      })
-    }
   } catch {
     // The outcome note must never turn a handled withdrawal into a failure.
   }

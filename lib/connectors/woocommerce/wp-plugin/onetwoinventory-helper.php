@@ -924,6 +924,12 @@ const OTI_BRIDGE_PRODUCT_SYNC_HOOK = 'wc_mintsoft_run_product_sync';
 const OTI_BRIDGE_WEBHOOK_URL_PART = '/webhook/woocommerce/product-update';
 // Xeroom's order-note switch: the option read by the o3d mu-plugin that suppresses only Xeroom's WooCommerce order note.
 const OTI_XEROOM_NOTE_OFF_OPT     = 'o3d_xeroom_order_note_off';
+// Withdrawal-request capture (1.5.0). Neither option is order meta, so neither is ever an order save or an order.updated webhook.
+// OTI_WDRAW_OUTCOME_ON_OPT is switched on by IMS itself, the first time it posts a withdrawal outcome (only when it is live); until then the capture hook is inert.
+const OTI_WDRAW_OUTCOME_ON_OPT    = 'oti_withdrawal_outcome_enabled';
+// A map { order id => withdrawal request id }, autoload off, capped, and pruned when an order is deleted.
+const OTI_WDRAW_REQUEST_IDS_OPT   = 'oti_wdraw_request_ids';
+const OTI_WDRAW_REQUEST_IDS_MAX   = 500;
 
 if (!function_exists('oti_verify_incumbents_signature')) {
     /**
@@ -1183,24 +1189,85 @@ if (!function_exists('oti_verify_withdrawal_outcome_signature')) {
 
 if (!function_exists('oti_capture_wdraw_request')) {
     /**
-     * Record the withdrawal plugin's request id on the order (`_oti_wdraw_request_id`), so IMS reads it from the order payload and keeps its own record. META
-     * ONLY (no full order save, so no extra order.updated webhook). Hooked to the withdrawal plugin's own events; the hook arguments are ($request, $order).
+     * Remember the withdrawal plugin's request id for an order, in a wp_options map (`oti_wdraw_request_ids`), NEVER in order meta. On the HPOS store
+     * save_meta_data() saves the order itself (a new modified time, woocommerce_update_order, an order.updated webhook), so any order-meta write is a live
+     * order write; an option write is not. The id reaches IMS through oti_expose_wdraw_request_id (the order's REST and webhook payload), and the
+     * withdrawal-outcome route reads it back at call time. Hooked to the withdrawal plugin's own events; the arguments are ($request, $order).
+     *
+     * INERT until IMS switches the withdrawal outcome on (option `oti_withdrawal_outcome_enabled`, set by the outcome route): in P1 the plugin writes nothing.
      */
     function oti_capture_wdraw_request($request = null, $order = null)
     {
-        if (!is_object($request) || !isset($request->id) || !is_object($order) || !method_exists($order, 'update_meta_data')) {
+        if (get_option(OTI_WDRAW_OUTCOME_ON_OPT, '') !== 'yes') {
+            return;
+        }
+        if (!is_object($request) || !isset($request->id) || !is_object($order) || !method_exists($order, 'get_id')) {
             return;
         }
         $id = absint($request->id);
-        if (!$id || absint($order->get_meta('_oti_wdraw_request_id')) === $id) {
+        $order_id = absint($order->get_id());
+        if (!$id || !$order_id) {
             return;
         }
-        $order->update_meta_data('_oti_wdraw_request_id', $id);
-        $order->save_meta_data();
+        $map = get_option(OTI_WDRAW_REQUEST_IDS_OPT, []);
+        $map = is_array($map) ? $map : [];
+        if (isset($map[$order_id]) && absint($map[$order_id]) === $id) {
+            return;
+        }
+        unset($map[$order_id]);
+        $map[$order_id] = $id; // re-inserted last, so the cap below drops the oldest
+        update_option(OTI_WDRAW_REQUEST_IDS_OPT, array_slice($map, -OTI_WDRAW_REQUEST_IDS_MAX, null, true), false);
     }
     add_action('wbte_ewb_request_submitted', 'oti_capture_wdraw_request', 5, 2);
     add_action('wbte_ewb_request_approved', 'oti_capture_wdraw_request', 5, 2);
     add_action('wbte_ewb_request_rejected', 'oti_capture_wdraw_request', 5, 2);
+}
+
+if (!function_exists('oti_wdraw_request_id_for_order')) {
+    /** The captured withdrawal request id of an order (0 when none). A read; never writes. */
+    function oti_wdraw_request_id_for_order($order_id)
+    {
+        $map = get_option(OTI_WDRAW_REQUEST_IDS_OPT, []);
+        return is_array($map) ? absint($map[absint($order_id)] ?? 0) : 0;
+    }
+}
+
+if (!function_exists('oti_expose_wdraw_request_id')) {
+    /**
+     * Put the captured request id into the order's REST response (and so its webhook payload) as a `_oti_wdraw_request_id` meta_data entry, which is where
+     * IMS reads it. A response filter: nothing is stored on the order.
+     */
+    function oti_expose_wdraw_request_id($response, $order = null)
+    {
+        $request_id = ($order && method_exists($order, 'get_id')) ? oti_wdraw_request_id_for_order($order->get_id()) : 0;
+        if (!$request_id || !is_object($response) || !isset($response->data) || !is_array($response->data)) {
+            return $response;
+        }
+        $meta = isset($response->data['meta_data']) && is_array($response->data['meta_data']) ? $response->data['meta_data'] : [];
+        foreach ($meta as $entry) {
+            if ((is_object($entry) && ($entry->key ?? '') === '_oti_wdraw_request_id') || (is_array($entry) && ($entry['key'] ?? '') === '_oti_wdraw_request_id')) {
+                return $response;
+            }
+        }
+        $meta[] = ['id' => 0, 'key' => '_oti_wdraw_request_id', 'value' => (string) $request_id];
+        $response->data['meta_data'] = $meta;
+        return $response;
+    }
+    add_filter('woocommerce_rest_prepare_shop_order_object', 'oti_expose_wdraw_request_id', 20, 2);
+}
+
+if (!function_exists('oti_forget_wdraw_request')) {
+    /** Cleanup: an order that is deleted leaves the map. */
+    function oti_forget_wdraw_request($order_id)
+    {
+        $map = get_option(OTI_WDRAW_REQUEST_IDS_OPT, []);
+        if (is_array($map) && isset($map[absint($order_id)])) {
+            unset($map[absint($order_id)]);
+            update_option(OTI_WDRAW_REQUEST_IDS_OPT, $map, false);
+        }
+    }
+    add_action('woocommerce_delete_order', 'oti_forget_wdraw_request', 10, 1);
+    add_action('delete_post', 'oti_forget_wdraw_request', 10, 1);
 }
 
 if (!function_exists('oti_handle_withdrawal_outcome')) {
@@ -1216,7 +1283,7 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
      *
      * Idempotent per outcome_key: a note is added once per key (kept in an order meta), so a retry after a lost answer adds nothing. Answers:
      *   result 'noted' | 'rejected' | 'already_done'; 'no_request' (rejection asked, no request id known: the note was still added);
-     *   'no_withdrawal_plugin' (rejection asked, the withdrawal plugin is not active: nothing rejected, note added); 404 oti_wo_not_found.
+     *   'no_withdrawal_plugin' (rejection asked, the withdrawal plugin is not active: nothing rejected, note added); 'not_rejected' (the request was not pending and is not rejected, e.g. approved meanwhile: no note); 404 oti_wo_not_found.
      */
     function oti_handle_withdrawal_outcome(WP_REST_Request $request)
     {
@@ -1225,10 +1292,6 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
             return new WP_Error('oti_wo_no_wc', 'WooCommerce not active', ['status' => 500]);
         }
         $order_id = absint($request['order_id']);
-        $order = wc_get_order($order_id);
-        if (!$order) {
-            return new WP_Error('oti_wo_not_found', 'Order not found', ['status' => 404]);
-        }
         $data = json_decode((string) $request->get_body(), true);
         $data = is_array($data) ? $data : [];
         $outcome = isset($data['outcome']) ? (string) $data['outcome'] : '';
@@ -1246,6 +1309,15 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
             return new WP_Error('oti_wo_lock', 'Another outcome for this order is running', ['status' => 409]);
         }
         try {
+            // The order and its done-markers are read only AFTER the lock is held: a parallel call that has just released it has written its markers.
+            $order = wc_get_order($order_id);
+            if (!$order) {
+                return new WP_Error('oti_wo_not_found', 'Order not found', ['status' => 404]);
+            }
+            // IMS posting an outcome means the outcome writer is live: switch the capture hook on (an option, not order meta).
+            if (get_option(OTI_WDRAW_OUTCOME_ON_OPT, '') !== 'yes') {
+                update_option(OTI_WDRAW_OUTCOME_ON_OPT, 'yes', false);
+            }
             // Two done-markers per key, so a retry resumes exactly where the last attempt stopped: `n:` the note is written, `r:` the rejection is carried out.
             $done = $order->get_meta('_oti_wdraw_outcome_keys');
             $done = is_array($done) ? $done : [];
@@ -1262,6 +1334,9 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
                     $result = 'no_withdrawal_plugin';
                 } else {
                     $request_id = isset($data['request_id']) ? absint($data['request_id']) : 0;
+                    if (!$request_id) {
+                        $request_id = oti_wdraw_request_id_for_order($order_id);
+                    }
                     if (!$request_id) {
                         $request_id = absint($order->get_meta('_oti_wdraw_request_id'));
                     }
@@ -1284,6 +1359,13 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
                                 if (is_wp_error($rejected) && $rejected->get_error_code() !== 'wbte_ewb_not_pending') {
                                     return new WP_REST_Response(['ok' => false, 'result' => 'reject_failed'], 502);
                                 }
+                                if (is_wp_error($rejected)) {
+                                    // Not pending: only a request that is REJECTED counts as done. One approved meanwhile is not (the bridge checks is_rejected() too).
+                                    $now = method_exists($repo, 'find') ? $repo->find($request_id) : null;
+                                    if (!is_object($now) || !method_exists($now, 'is_rejected') || !$now->is_rejected()) {
+                                        return new WP_REST_Response(['ok' => true, 'result' => 'not_rejected'], 200);
+                                    }
+                                }
                                 $result = 'rejected';
                                 $fresh[] = 'r:' . $key;
                             }
@@ -1300,8 +1382,8 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
                 $fresh[] = 'n:' . $key;
             }
             if ($fresh) {
-                // META ONLY, never a full order save: that stamps a new modified time and fires woocommerce_update_order, whose order.updated webhook would
-                // bring IMS straight back here. add_order_note() above does not save the order either.
+                // The done-markers are order meta. On the HPOS store save_meta_data() saves the order, so this DOES raise one order.updated webhook; IMS's own
+                // ledger (a fixed key per order and request) is what makes that harmless, not the absence of a save.
                 $order->update_meta_data('_oti_wdraw_outcome_keys', array_slice(array_merge($done, $fresh), -40));
                 $order->save_meta_data();
             }

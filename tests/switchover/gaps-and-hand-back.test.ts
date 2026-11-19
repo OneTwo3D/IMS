@@ -23,19 +23,20 @@ test('the gap list asks for paid-before-S, unlinked, still-wanted orders and for
   assert.ok(JSON.stringify(createArgs!.where.OR).includes('"wmsOrderPush":{"is":null}'), 'unlinked')
   assert.equal(despatchArgs!.where.status, 'SHIPPED')
   assert.deepEqual(Object.keys(createArgs!.select).sort(), ['externalOrderNumber', 'id', 'orderNumber', 'paidAt', 'shippedAt'])
-  assert.deepEqual(despatchArgs!.where.OR, [{ shippedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }, { shippedAt: null }], 'despatched before S, inside the look-back window')
+  assert.deepEqual(despatchArgs!.where.OR, [{ shippedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }, { shippedAt: null, createdAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }], 'despatched before S, inside the look-back window; a row with no shippedAt is bounded by createdAt in the same window')
+  assert.deepEqual(despatchArgs!.where.refundStatus, { not: 'FULL' })
   assert.equal(gaps.truncated, false)
 })
 
-test('G_despatch lists ONLY the shipped orders whose storefront order is not completed with tracking; an unreadable storefront order is listed and marked', async () => {
+test('G_despatch lists ONLY the shipped orders whose storefront order is still open (completed with or without tracking, refunded and cancelled are closed); an unreadable storefront order is listed and marked', async () => {
   const row = (id: string, link: string) => ({ id, orderNumber: id, externalOrderNumber: null, paidAt: null, shippedAt: new Date('2027-01-03T12:00:00Z'), shoppingLinks: [{ externalOrderId: link }] })
-  const rows = [row('done', '1'), row('noTracking', '2'), row('processing', '3'), row('unreadable', '4'), { ...row('nolink', '5'), shoppingLinks: [] }]
+  const rows = [row('done', '1'), row('noTracking', '2'), row('processing', '3'), row('unreadable', '4'), { ...row('nolink', '5'), shoppingLinks: [] }, row('refunded', '6'), row('cancelled', '7')]
   const db = { salesOrder: { findMany: async (args: { where: { status?: string } }) => (args.where.status === 'SHIPPED' ? rows : []) } }
-  const states: Record<string, { status: string; trackingItems: number } | null> = { 1: { status: 'completed', trackingItems: 2 }, 2: { status: 'completed', trackingItems: 0 }, 3: { status: 'processing', trackingItems: 0 }, 4: null }
+  const states: Record<string, { status: string; trackingItems: number } | null> = { 1: { status: 'completed', trackingItems: 2 }, 2: { status: 'completed', trackingItems: 0 }, 3: { status: 'processing', trackingItems: 0 }, 4: null, 6: { status: 'refunded', trackingItems: 0 }, 7: { status: 'cancelled', trackingItems: 0 } }
   const asked: string[] = []
   const gaps = await listSwitchoverGaps({ since: S, db, pauseMs: 0, readStorefront: async (id) => { asked.push(id); return states[id] ?? null } })
-  assert.deepEqual(gaps.despatch.map((g) => [g.reference, g.unreadable === true]), [['noTracking', false], ['processing', false], ['unreadable', true]])
-  assert.deepEqual(asked, ['1', '2', '3', '4'], 'every candidate is READ before it is listed')
+  assert.deepEqual(gaps.despatch.map((g) => [g.reference, g.unreadable === true]), [['processing', false], ['unreadable', true]])
+  assert.deepEqual(asked, ['1', '2', '3', '4', '6', '7'], 'every candidate is READ before it is listed')
 })
 
 // ---------------------------------------------------------------- take-over
@@ -213,6 +214,21 @@ test('switchover:hand-back CLI: --apply is refused unless the step-M live-from i
   assert.match(noConfirm.out, /writers-stopped/)
   assert.equal(audits.length, 0, 'a refused run leaves no audit entry')
   const ok = await run(['--apply', '--writers-stopped'], live)
-  assert.deepEqual([ok.code, ok.writes, audits.length], [0, 1, 1])
+  assert.deepEqual([ok.code, ok.writes, audits.length], [0, 1, 2], 'an intent row and a completion row')
+  assert.deepEqual((audits as Array<{ phase: string }>).map((a) => a.phase), ['intent', 'completed'])
   assert.equal((await run([], {})).code, 3, 'a dry run still needs a readable S')
+})
+
+test('switchover:hand-back CLI: the intent row is written BEFORE the writes (a failing one stops them), and a failing completion row does not turn applied writes into a failure', async () => {
+  const live = { MINTSOFT_WRITES_LIVE_FROM: S.toISOString() }
+  const go = async (audit: (e: { phase: string }) => Promise<void>) => {
+    const o = sink(); const hd = handDeps({ status: 'processing', metas: {} })
+    const code = await runHandBackCli({ argv: ['--apply', '--writers-stopped'], env: live, stdout: o, stderr: o, disconnect: async () => {}, now: () => new Date('2027-01-05T00:00:00Z'), audit: audit as never, load: async () => ({ candidates: [cand], deps: hd.d }) })
+    return { code, writes: hd.writes.length, out: o.lines.join('\n') }
+  }
+  const noIntent = await go(async () => { throw new Error('db down') })
+  assert.deepEqual([noIntent.code, noIntent.writes], [5, 0], 'no intent row, no writes')
+  const noCompletion = await go(async (e) => { if (e.phase === 'completed') throw new Error('db down') })
+  assert.deepEqual([noCompletion.code, noCompletion.writes], [0, 1])
+  assert.match(noCompletion.out, /completion audit row could not be written/)
 })

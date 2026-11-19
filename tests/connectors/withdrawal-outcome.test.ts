@@ -87,15 +87,21 @@ test('the answer maps to a closed vocabulary; a missing route is a failure namin
 type Store = import('@/lib/connectors/woocommerce/sync/withdrawal-outcome').WithdrawalOutcomeStore
 function memoryStore(order: { requestId?: string | null; generation?: number } = {}) {
   const written = new Set<string>()
-  const tasks: Array<{ requestKey: string; queryText: string }> = []
+  const rows = new Map<string, { result: string; generation: number | null }>()
+  const tasks: Array<{ kind: string; queryText: string }> = []
   const state = { requestId: order.requestId ?? null, generation: order.generation ?? 1 }
   const store: Store = {
-    requestKey: async (_orderId, requestId) => { if (requestId) state.requestId = requestId; return { requestKey: state.requestId ? `r${state.requestId}` : `g${state.generation}`, requestId: state.requestId } },
-    isWritten: async (orderId, key, kind) => written.has(`${orderId}|${key}|${kind}`),
-    markWritten: async (orderId, key, kind) => { written.add(`${orderId}|${key}|${kind}`) },
-    raiseTask: async (input) => { tasks.push({ requestKey: input.requestKey, queryText: input.queryText }) },
+    identity: async (_orderId, incoming) => {
+      const previousRequestId = state.requestId
+      if (incoming) state.requestId = incoming
+      return { requestId: state.requestId, previousRequestId, generation: state.generation }
+    },
+    findRow: async (orderId, key, kind) => rows.get(`${orderId}|${key}|${kind}`) ?? null,
+    markWritten: async (orderId, key, kind, result, generation) => { written.add(`${orderId}|${key}|${kind}`); rows.set(`${orderId}|${key}|${kind}`, { result, generation }) },
+    // One task per order and kind, as the database dedupe does.
+    raiseTask: async (input) => { if (!tasks.some((t) => t.kind === input.kind)) tasks.push({ kind: input.kind, queryText: input.queryText }) },
   }
-  return { store, written, tasks }
+  return { store, written, rows, tasks, state }
 }
 const event = (action: string, over: Record<string, unknown> = {}) => ({ orderId: 'o1', externalOrderId: '42', action, description: 'held', ...over })
 
@@ -142,7 +148,7 @@ test('the plugin-save echo does not loop: the key does not move when only the or
   await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_hold_applied'), m.store)
   await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_hold_applied'), m.store)
   assert.equal(calls.length, 1)
-  assert.equal(JSON.parse(calls[0]!.body).outcome_key, 'wdo:42:g3:wc_withdrawal_hold_applied', 'with no request id known, the hold generation is the identity')
+  assert.equal(JSON.parse(calls[0]!.body).outcome_key, 'wdo:42:u:o1:wc_withdrawal_hold_applied', 'with no request id known, the fixed per-order key is the identity')
   answer = () => new Response('{"ok":true,"result":"noted"}', { status: 200 })
 })
 
@@ -158,12 +164,14 @@ test('after S a rejection sends IMS\'s own request_id, and a storefront that can
     const bad = memoryStore({ requestId: '9' })
     answer = () => new Response(JSON.stringify({ ok: true, result }), { status: 200 })
     await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch'), bad.store)
-    assert.equal(bad.written.size, 0, `${result} is never recorded as written`)
+    assert.deepEqual([...bad.rows.values()].map((r) => r.result), ['task_raised'], `${result} is recorded as a terminal row, never as written`)
     assert.equal(bad.tasks.length, 1, `${result} raises an operator task`)
     assert.match(bad.tasks[0]!.queryText, /Reject the request in WooCommerce by hand/)
     assert.deepEqual(logged.map((l) => l.action), ['wc_withdrawal_outcome_failed'])
     await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch'), bad.store)
-    assert.equal(calls.length, 2, 'not written, so it is tried again')
+    assert.equal(calls.length, 1, 'terminal: not sent again')
+    assert.equal(bad.tasks.length, 1)
+    assert.equal(logged.length, 1, 'and not warned again')
   }
   // A mere note that fails raises no task: there is no request to reject.
   on()
@@ -171,5 +179,57 @@ test('after S a rejection sends IMS\'s own request_id, and a storefront that can
   answer = () => new Response('{}', { status: 500 })
   await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_hold_applied'), note.store)
   assert.equal(note.tasks.length, 0)
+  answer = () => new Response('{"ok":true,"result":"noted"}', { status: 200 })
+})
+
+test('REPLAY: no request id, ten webhooks with a changing date_modified and an HPOS-style save echo: ONE reject attempt, ONE note, ONE task', async () => {
+  const mod = await import('@/lib/connectors/woocommerce/sync/withdrawal-outcome')
+  on()
+  const m = memoryStore({ generation: 1 })
+  answer = () => new Response('{"ok":true,"result":"no_request"}', { status: 200 })
+  for (let i = 0; i < 10; i += 1) {
+    m.state.generation += 1 // the hold generation moves on every newer submitted event; the key must not
+    await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch'), m.store)
+  }
+  // The plugin's own note write saves the order (HPOS) and fires another webhook.
+  m.state.generation += 1
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch'), m.store)
+  assert.equal(calls.length, 1, 'one reject attempt')
+  assert.equal(m.tasks.length, 1, 'one task')
+  assert.equal(logged.length, 1, 'one warning')
+  assert.equal(JSON.parse(calls[0]!.body).outcome_key, 'wdo:42:u:o1:wc_withdrawal_after_dispatch')
+  // A genuinely NEW request id (a capture) is a new identity and is attempted; the same id again is not.
+  answer = () => new Response('{"ok":true,"result":"rejected"}', { status: 200 })
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch', { requestId: '77' }), m.store)
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch', { requestId: '77' }), m.store)
+  assert.equal(calls.length, 2)
+  assert.equal(JSON.parse(calls[1]!.body).request_id, 77)
+  answer = () => new Response('{"ok":true,"result":"noted"}', { status: 200 })
+})
+
+test('a note written under the unknown key is not written again when the same request\'s id is captured later', async () => {
+  const mod = await import('@/lib/connectors/woocommerce/sync/withdrawal-outcome')
+  on()
+  const m = memoryStore()
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_hold_applied'), m.store)
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_hold_applied', { requestId: '5' }), m.store)
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_hold_applied', { requestId: '5' }), m.store)
+  assert.equal(calls.length, 1, 'one note for the one request')
+})
+
+test('a stale request id: a rejected request A, then a newer submission with no new id, raises ONE task and sends nothing; a new id is rejected', async () => {
+  const mod = await import('@/lib/connectors/woocommerce/sync/withdrawal-outcome')
+  on()
+  const m = memoryStore({ requestId: '9', generation: 1 })
+  answer = () => new Response('{"ok":true,"result":"rejected"}', { status: 200 })
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch'), m.store)
+  assert.equal(calls.length, 1)
+  m.state.generation = 2 // request B filed; the capture for B did not run, so the id still reads 9
+  for (let i = 0; i < 3; i += 1) await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch', { requestId: '9' }), m.store)
+  assert.equal(calls.length, 1, 'IMS does not resend for the request it cannot tell apart')
+  assert.equal(m.tasks.length, 1, 'but it is never silent: one task')
+  assert.match(m.tasks[0]!.queryText, /cannot tell whether/)
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch', { requestId: '10' }), m.store)
+  assert.equal(calls.length, 2, 'a different id is request B: rejected')
   answer = () => new Response('{"ok":true,"result":"noted"}', { status: 200 })
 })

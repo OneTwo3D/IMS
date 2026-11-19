@@ -35,6 +35,10 @@ ${constant('OTI_BRIDGE_SETTINGS_OPT')}
 ${constant('OTI_BRIDGE_PRODUCT_SYNC_HOOK')}
 ${constant('OTI_BRIDGE_WEBHOOK_URL_PART')}
 ${constant('OTI_XEROOM_NOTE_OFF_OPT')}
+${constant('OTI_WDRAW_OUTCOME_ON_OPT')}
+${constant('OTI_WDRAW_REQUEST_IDS_OPT')}
+${constant('OTI_WDRAW_REQUEST_IDS_MAX')}
+function update_option($k, $v, $a = null) { $GLOBALS['options'][$k] = $v; $GLOBALS['option_writes'][] = $k; return true; }
 class WP_Error { public $code; function __construct($c = '', $m = '', $d = []) { $this->code = $c; } function get_error_code() { return $this->code; } }
 function is_wp_error($v) { return $v instanceof WP_Error; }
 class WP_REST_Response { public $data; public $status; function __construct($d, $s = 200) { $this->data = $d; $this->status = $s; } }
@@ -163,9 +167,9 @@ test('withdrawal-outcome: signed over the order path, single-use, and a TrackShi
   assert.equal(outcomeVerify({ order: 78, pathOrder: 78, ts, body, signature: sign(ts, 'POST', OUT_PATH(78), body) }).first, 'oti_wo_bad_body', 'the body names another order')
 })
 
-function outcomeHandle(body: Record<string, unknown>, state: { keys?: string[]; wbte?: 'ok' | 'none' | 'throws' | 'notpending'; requestMeta?: number; ownMeta?: number; owner?: number } = {}) {
+function outcomeHandle(body: Record<string, unknown>, state: { keys?: string[]; wbte?: 'ok' | 'none' | 'throws' | 'notpending' | 'notpendingrejected'; requestMeta?: number; ownMeta?: number; owner?: number; mapped?: number } = {}) {
   return php(`${STUBS}
-$GLOBALS['notes'] = []; $GLOBALS['rejects'] = [];
+$GLOBALS['notes'] = []; $GLOBALS['rejects'] = []; $GLOBALS['options'] = ${state.mapped ? `['${'oti_wdraw_request_ids'}' => [77 => ${state.mapped}]]` : '[]'}; $GLOBALS['option_writes'] = [];
 class FakeWpdb { public $prefix = 'wp_'; function prepare($q, ...$a) { return $q; } function get_var($q) { return strpos($q, 'GET_LOCK') !== false ? 1 : null; } function query($q) { return 1; } }
 $wpdb = new FakeWpdb();
 class FakeOrder { public $meta = ['_oti_wdraw_outcome_keys' => ${JSON.stringify(state.keys ?? [])}, '_mintsoft_wdraw_request_id' => ${state.requestMeta ?? 0}, '_oti_wdraw_request_id' => ${state.ownMeta ?? 0}];
@@ -177,12 +181,14 @@ class FakeOrder { public $meta = ['_oti_wdraw_outcome_keys' => ${JSON.stringify(
 $GLOBALS['full_saved'] = false; $GLOBALS['meta_saved'] = false;
 $GLOBALS['order'] = new FakeOrder();
 function wc_get_order($id) { return $id === 77 ? $GLOBALS['order'] : false; }
-${state.wbte === 'none' ? '' : `class Wbte_Ewb_Request_Repository { function find($id) { return (object) ['id' => $id, 'order_id' => ${state.owner ?? 77}]; } }
-class Wbte_Ewb_Request_Service { function __construct($r) {} function reject($id, $by, $reason) { ${state.wbte === 'throws' ? "throw new Exception('x');" : state.wbte === 'notpending' ? "return new WP_Error('wbte_ewb_not_pending');" : "$GLOBALS['rejects'][] = [$id, $reason]; return true;"} } }`}
+${state.wbte === 'none' ? '' : `class WbteReq { function __construct(public $id, public $order_id) {} function is_rejected() { return ${state.wbte === 'notpendingrejected' ? 'true' : 'false'}; } }
+class Wbte_Ewb_Request_Repository { function find($id) { return new WbteReq($id, ${state.owner ?? 77}); } }
+class Wbte_Ewb_Request_Service { function __construct($r) {} function reject($id, $by, $reason) { ${state.wbte === 'throws' ? "throw new Exception('x');" : state.wbte === 'notpending' || state.wbte === 'notpendingrejected' ? "return new WP_Error('wbte_ewb_not_pending');" : "$GLOBALS['rejects'][] = [$id, $reason]; return true;"} } }`}
+${phpFunction('oti_wdraw_request_id_for_order')}
 ${phpFunction('oti_handle_withdrawal_outcome')}
 $r = new WP_REST_Request('POST', [], ${JSON.stringify(JSON.stringify(body))}, 77);
 $resp = oti_handle_withdrawal_outcome($r);
-echo json_encode(['code' => $resp instanceof WP_Error ? $resp->code : $resp->status, 'data' => $resp instanceof WP_Error ? null : $resp->data, 'notes' => $GLOBALS['notes'], 'rejects' => $GLOBALS['rejects'], 'keys' => $GLOBALS['order']->meta['_oti_wdraw_outcome_keys'], 'fullSaved' => $GLOBALS['full_saved'], 'metaSaved' => $GLOBALS['meta_saved']]);`)
+echo json_encode(['code' => $resp instanceof WP_Error ? $resp->code : $resp->status, 'data' => $resp instanceof WP_Error ? null : $resp->data, 'notes' => $GLOBALS['notes'], 'rejects' => $GLOBALS['rejects'], 'keys' => $GLOBALS['order']->meta['_oti_wdraw_outcome_keys'], 'fullSaved' => $GLOBALS['full_saved'], 'metaSaved' => $GLOBALS['meta_saved'], 'optionWrites' => $GLOBALS['option_writes']]);`)
 }
 
 test('withdrawal-outcome: a note is added once per outcome key; a repeat adds nothing', () => {
@@ -258,4 +264,43 @@ test('withdrawal-outcome: no request id, no withdrawal plugin and a failing reje
 test('withdrawal-outcome: unknown outcome, missing key and unknown order are refused', () => {
   assert.equal(outcomeHandle({ outcome: 'approved', outcome_key: 'k'.repeat(10) }).code, 'oti_wo_bad_outcome')
   assert.equal(outcomeHandle({ outcome: 'noted', outcome_key: '' }).code, 'oti_wo_bad_key')
+})
+
+test('withdrawal-outcome: a request that is not pending counts as rejected only if it IS rejected; an approved one is not_rejected and adds no note', () => {
+  const body = { outcome: 'rejected', outcome_key: 'after:77:3', note: 'IMS: despatched', request_id: 9 }
+  const approved = outcomeHandle(body, { wbte: 'notpending' })
+  assert.equal((approved.data as { result: string }).result, 'not_rejected')
+  assert.deepEqual(approved.notes, [])
+  assert.deepEqual(approved.keys, [])
+  const rejected = outcomeHandle(body, { wbte: 'notpendingrejected' })
+  assert.equal((rejected.data as { result: string }).result, 'rejected')
+})
+
+test('withdrawal-outcome: the lock is taken before the order and its markers are read, and the request id comes from the option map before order meta', () => {
+  const fn = phpFunction('oti_handle_withdrawal_outcome')
+  assert.ok(fn.indexOf('GET_LOCK') < fn.indexOf('wc_get_order('), 'GET_LOCK first, then the order')
+  const mapped = outcomeHandle({ outcome: 'rejected', outcome_key: 'after:77:4', note: 'n', request_id: undefined }, { wbte: 'ok', mapped: 12, ownMeta: 6 })
+  assert.deepEqual(mapped.rejects, [[12, 'order already dispatched']])
+  assert.ok((mapped.optionWrites as string[]).includes('oti_withdrawal_outcome_enabled'), 'IMS posting an outcome switches the capture on')
+})
+
+function captureRun(options: Record<string, unknown>, requestId = 31) {
+  return php(`${STUBS}
+$GLOBALS['options'] = json_decode(${JSON.stringify(JSON.stringify(options))}, true); $GLOBALS['option_writes'] = [];
+class CapOrder { public $meta_writes = 0; function get_id() { return 77; } function update_meta_data($k, $v) { $this->meta_writes++; } function save_meta_data() { $this->meta_writes++; } function save() { $this->meta_writes++; } }
+function add_action() {} function add_filter() {}
+${phpFunction('oti_capture_wdraw_request')}
+$o = new CapOrder();
+oti_capture_wdraw_request((object) ['id' => ${requestId}], $o);
+echo json_encode(['orderWrites' => $o->meta_writes, 'optionWrites' => $GLOBALS['option_writes'], 'map' => $GLOBALS['options']['oti_wdraw_request_ids'] ?? null]);`)
+}
+
+test('capture hook: writes NO order meta ever; inert until IMS switches the outcome on; then it records the id in an option map', () => {
+  const off = captureRun({})
+  assert.deepEqual(off, { orderWrites: 0, optionWrites: [], map: null }, 'P1: the plugin writes nothing')
+  const on = captureRun({ oti_withdrawal_outcome_enabled: 'yes' })
+  assert.equal(on.orderWrites, 0, 'the order is never saved')
+  assert.deepEqual(on.map, { 77: 31 })
+  assert.deepEqual(captureRun({ oti_withdrawal_outcome_enabled: 'yes', oti_wdraw_request_ids: { 77: 31 } }).optionWrites, [], 'an unchanged id writes nothing')
+  assert.ok(!/update_meta_data|save_meta_data|->save\(/.test(phpFunction('oti_capture_wdraw_request')))
 })
