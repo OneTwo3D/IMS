@@ -5,6 +5,7 @@ import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pe
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
+import { wcLinesAtEdit } from '@/lib/connectors/woocommerce/sync/wc-seen-lines'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -1619,6 +1620,7 @@ const EDIT_GUARD_SELECT = {
   _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
   wmsOrderPush: { select: { id: true, externalOrderId: true } },
   wcLineBaseline: true,
+  wcSeenLines: true,
 } as const
 
 /**
@@ -1802,7 +1804,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
           ...(current._count.shoppingLinks > 0 ? { editedInImsAt: new Date() } : {}),
           // The WooCommerce-facing state before the FIRST line edit, so the edited-in-WooCommerce comparison keeps running against what the store holds (drafts have no shop copy).
           ...(current._count.shoppingLinks > 0 && !isDraft && current.wcLineBaseline === null
-            ? { wcLineBaseline: { totalForeign: Number(current.totalForeign), lines: existingLines.filter((l) => l.externalLineItemId !== null).map((l) => ({ externalLineItemId: l.externalLineItemId, qty: Number(l.qty), sku: l.sku })) } as Prisma.InputJsonValue }
+            ? { wcLineBaseline: { totalForeign: Number(current.totalForeign), lines: existingLines.filter((l) => l.externalLineItemId !== null).map((l) => ({ externalLineItemId: l.externalLineItemId, qty: Number(l.qty), sku: l.sku })), wcLines: wcLinesAtEdit(current.wcSeenLines, existingLines) } as Prisma.InputJsonValue }
             : {}),
           lines: { create: lineData.filter((_, index) => continued[index] === null) },
         },
@@ -3423,7 +3425,7 @@ function buildReturnExchangeHook(args: {
           totalBase: { increment: totals.totalBase },
           ...(shopLinked ? { editedInImsAt: new Date() } : {}),
           ...(shopLinked && current.wcLineBaseline === null
-            ? { wcLineBaseline: { totalForeign: Number(current.totalForeign), lines: existingLines.filter((l) => l.externalLineItemId !== null).map((l) => ({ externalLineItemId: l.externalLineItemId, qty: Number(l.qty), sku: l.sku })) } as Prisma.InputJsonValue }
+            ? { wcLineBaseline: { totalForeign: Number(current.totalForeign), lines: existingLines.filter((l) => l.externalLineItemId !== null).map((l) => ({ externalLineItemId: l.externalLineItemId, qty: Number(l.qty), sku: l.sku })), wcLines: wcLinesAtEdit(current.wcSeenLines, existingLines) } as Prisma.InputJsonValue }
             : {}),
         },
       })
@@ -3488,6 +3490,8 @@ export async function createRefund(
      * re-checked inside the refund transaction under the order row lock. The WooCommerce amendment step sets it to the reduction WooCommerce shows, so two racing runs cannot both refund it.
      */
     maxRefundedQtyByLines?: Array<{ lineIds: string[]; maxQty: number }>
+    /** Internal-only: this refund is one the WooCommerce order-amendment step creates (a structured marker; see SalesOrderRefund.wcAmendment). */
+    wcAmendment?: boolean
     /**
      * o3d-w00 (Codex r4 #2): the accounting tax identity each target was CONVERTED at, to be re-checked
      * against the identity the credit note will actually post under, inside the refund transaction's
@@ -3635,6 +3639,7 @@ export async function createRefund(
       enforcePerTargetBalances,
       deriveSaleLineNetsFromStoredBalance,
       maxRefundedQtyByLines: isInternal ? options?.maxRefundedQtyByLines : undefined,
+      wcAmendment: isInternal ? options?.wcAmendment === true : undefined,
       // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
       // only from an internal caller.

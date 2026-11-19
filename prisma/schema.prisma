@@ -2188,6 +2188,9 @@ model SalesOrder {
   /// The WooCommerce-facing state of this order's lines and total BEFORE the first IMS edit of its lines: { totalForeign, lines: [{ externalLineItemId, qty, sku }] }. Taken once, so the "edited in WooCommerce after import" comparison can keep running
   /// after an IMS line edit, against what WooCommerce held (an IMS edit does not reach WooCommerce) instead of against the edited lines. NULL when the lines were never edited in IMS (an address or notes edit takes none), and the comparison is against the lines as usual.
   wcLineBaseline          Json?      @map("wc_line_baseline")
+  /// What WooCommerce showed for this order's lines at the most recent delivery IMS compared: { at: date_modified_gmt, digest, lines: [{ externalLineItemId, qty }] }. Written by the divergence comparison. The first IMS line edit copies the lines into
+  /// `wcLineBaseline.wcLines`, so "latest edit wins" asks whether WooCommerce changed a line SINCE the IMS edit (not whether it differs from IMS's own lines). `at` and `digest` also let the amendment step see two deliveries within one second that differ.
+  wcSeenLines             Json?      @map("wc_seen_lines")
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
@@ -2554,6 +2557,8 @@ model SalesOrderRefund {
   /// When this refund was recorded under the EU IOSS/VOEC/DDP scheme path (the Sales Invoices switch on and the order scheme-stamped, or an unstamped order classified a scheme order on immutable evidence), written under the order lock WHETHER OR NOT any pricing field could be filled. A persisted decision: a credit note for it is scheme-treated or refused, never skipped, whatever the switch says later. NULL: created off the scheme path, or before the column existed.
   schemeTreatedAt DateTime? @map("scheme_treated_at")
   source          String?
+  /// TRUE for a refund the WooCommerce order-amendment step created (a reduction WooCommerce showed on a paid order). A structured marker, so the step tells its own refunds from the shop's without matching the free-text reason. FALSE for every other refund and every row that predates the column.
+  wcAmendment     Boolean   @default(false) @map("wc_amendment")
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")
   // o3d-o97 r3: THE CR ALLOCATED INVENTORY THIS REFUND'S OWN REVERSAL JOURNAL RAISED, written in

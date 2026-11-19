@@ -4,7 +4,8 @@
  * The read-only divergence detection (order-divergence.ts) reports what WooCommerce shows that IMS does not. This step ACTS on part of it, under three rules the owner set:
  *
  *  (a) LATEST EDIT WINS, per line. An order nobody edited in IMS has WooCommerce as the only editor, so WooCommerce wins. An order edited in IMS (`editedInImsAt`) keeps the IMS
- *      value of a line unless WooCommerce changed THAT line: the line differs from the WooCommerce-facing baseline IMS stored before its first edit (`wcLineBaseline`). The
+ *      value of a line unless WooCommerce changed THAT line since the edit: the line differs from what WooCommerce SHOWED at the first IMS edit (`wcLineBaseline.wcLines`, copied from
+ *      `wcSeenLines`; an older baseline without it falls back to the IMS lines at that edit). A WooCommerce change IMS had not acted on before the edit is therefore not a later change. The
  *      modified time is NOT used: IMS's own write-backs (status, notes, tracking) bump it, and the two clocks differ. An order with an IMS edit but no baseline is never overwritten.
  *  (b) A REDUCTION ON A PAID ORDER GOES THROUGH THE REFUND PATH. The paid amount is never edited. The reduced units become an IMS refund (`createRefund`, the same entry the
  *      storefront refund sync uses), which writes the credit note, releases the reservation, raises the shop-refund task and, for an order the warehouse holds, the refund note.
@@ -23,8 +24,15 @@
  * plus a shipping change) finds the units already refunded and refunds nothing. The refund transaction re-checks, under the order row lock, that the line's refunded total plus this refund
  * does not exceed the reduction WooCommerce shows. A failed refund, or a throw after the claim was taken, releases the claim so the next delivery retries.
  *
- * A STALE delivery (older than the WooCommerce modified time already stored) is ignored by this step, as the core update ignores it for the fields it protects. A reduction that WooCommerce
- * later RESTORES leaves the refund standing (IMS refunds are never undone automatically): the step raises an operator task instead, so a person decides.
+ * A STALE delivery (older than the WooCommerce modified time already stored) is ignored by this step, as the core update ignores it for the fields it protects. Two deliveries with the SAME modified
+ * time (one-second resolution) but different lines cannot be ordered: the step acts on neither (`sameSecondConflict`, decided by the caller from `wcSeenLines`) and a later delivery settles it. A reduction that WooCommerce
+ * later RESTORES leaves the refund standing (IMS refunds are never undone automatically): the step raises an operator task instead, so a person decides. The caller runs the step for a restore too, though it
+ * leaves no difference (surfaceWcOrderDivergence calls it with an empty list when the order carries an amendment refund); that path takes no claim (the task's own dedupe keeps it to one).
+ *
+ * LOCK AND POOL (accepted, documented): the per-order lock is a transaction on the main pool, so a runner holds one idle connection for the whole step, including the warehouse probe, and a step that outlasts the
+ * 120 s interactive-transaction timeout loses the lock while createRefund may still commit. A session lock on the dedicated lock pool would avoid that, but that pool offers only try-acquire (no blocking wait) and is
+ * sized for a few low-frequency jobs, so a blocking per-order wait would need a polling loop on a 6-connection pool: not a small change. The backstop is the in-transaction cap (`maxRefundedQtyByLines`, checked under the order
+ * row lock against committed refunds), so a lapsed lock cannot double-refund; a throw AFTER the refund was recorded keeps the claim and logs that the refund stands (it is no longer reported as "could not apply").
  */
 import { createHash } from 'node:crypto'
 import { db } from '@/lib/db'
@@ -40,7 +48,7 @@ import type { DivergenceDifference } from './order-divergence'
 import type { WcFullOrder } from './types'
 
 export const WC_ORDER_AMENDMENT_WRITE_SETTING = 'wc_order_amendment_write_enabled'
-/** The reason recorded on a refund this step creates: how a later run tells its own refunds from the shop's. */
+/** The reason text recorded on a refund this step creates (display only: a later run recognises its own refunds by `SalesOrderRefund.wcAmendment`, never by this text). */
 export const WC_AMENDMENT_REFUND_REASON = 'Order reduced in WooCommerce after payment (IMS amendment, latest edit wins)'
 const QTY_EPS = toDecimal('0.0001')
 const NO_PICKING_YET = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED'])
@@ -62,7 +70,7 @@ export type AmendmentFacts = {
   status: string
   paidAt: Date | null
   editedInImsAt: Date | null
-  /** The WooCommerce-facing lines before IMS's first edit (SalesOrder.wcLineBaseline), or null. */
+  /** What WooCommerce showed for each item at IMS's first edit (SalesOrder.wcLineBaseline.wcLines; the IMS lines then, for an older baseline), or null. */
   baselineQtyByExternalLineId: ReadonlyMap<number, number> | null
   lines: ReadonlyArray<AmendmentLine>
   refundedQtyByLineId: ReadonlyMap<string, unknown>
@@ -73,6 +81,16 @@ export type AmendmentFacts = {
   externalUpdatedAt?: Date | null
   /** The order-level discount (what the refund path reverses server-side for a public refund). Above zero, this step does not refund. */
   orderDiscount?: unknown
+}
+
+/** The per-item WooCommerce quantities a stored baseline holds: what WooCommerce showed at the edit (`wcLines`), else the IMS lines at the edit (a baseline written before `wcLines` existed). Pure. */
+export function baselineQtyMap(raw: unknown): Map<number, number> | null {
+  const value = raw as { lines?: unknown; wcLines?: unknown } | null
+  const source = value && Array.isArray(value.wcLines) ? value.wcLines : value && Array.isArray(value.lines) ? value.lines : null
+  if (!source) return null
+  const out = new Map<number, number>()
+  for (const entry of source as Array<{ externalLineItemId?: unknown; qty?: unknown }>) if (typeof entry.externalLineItemId === 'number' && typeof entry.qty === 'number') out.set(entry.externalLineItemId, entry.qty)
+  return out
 }
 
 export type PlannedReduction = { lineId: string; qty: number; productId: string | null; description: string; totalForeign: number; totalBase: number }
@@ -195,7 +213,8 @@ export type AmendmentDeps = {
   /** Claim the differences for these units (true when this call took the claim). Refused when the divergence row is gone, resolved, or no longer carries this fingerprint. */
   claim(orderId: string, fingerprint: string, claimKey: string): Promise<boolean>
   releaseClaim(orderId: string, claimKey: string): Promise<void>
-  warehouseGate(orderId: string): Promise<{ ok: true; externalOrderId: string | null } | { ok: false; externalOrderId: string | null }>
+  /** `unreadable`: the warehouse could not be read (a transient failure), as opposed to it saying the order is closed. */
+  warehouseGate(orderId: string): Promise<{ ok: true; externalOrderId: string | null } | { ok: false; externalOrderId: string | null; unreadable?: boolean }>
   warehouseLink(orderId: string): Promise<{ connector: string; externalOrderId: string; externalOrderNumber: string | null } | null>
   createRefund(orderId: string, lines: RefundRequestLine[], reason: string, caps: RefundQtyCap[]): Promise<{ success: boolean; error?: string }>
   raiseTask(task: Parameters<typeof raiseWmsOperatorTask>[1]): Promise<boolean>
@@ -223,23 +242,18 @@ export const defaultAmendmentDeps: AmendmentDeps = {
     })
     if (!order || order.erasedAt || order.isQuote) return null
     const lineIds = order.lines.map((l) => l.id)
-    const refundLines = await db.salesOrderRefundLine.findMany({ where: { salesOrderLineId: { in: lineIds } }, select: { salesOrderLineId: true, qty: true, refund: { select: { reason: true } } } })
+    const refundLines = await db.salesOrderRefundLine.findMany({ where: { salesOrderLineId: { in: lineIds } }, select: { salesOrderLineId: true, qty: true, refund: { select: { wcAmendment: true } } } })
     const refunded = new Map<string, unknown>()
     const amendmentRefunded = new Map<string, unknown>()
     for (const row of refundLines) {
       if (!row.salesOrderLineId) continue
       refunded.set(row.salesOrderLineId, toDecimal(refunded.get(row.salesOrderLineId) as never ?? 0).plus(toDecimal(row.qty)))
-      if (row.refund.reason === WC_AMENDMENT_REFUND_REASON) amendmentRefunded.set(row.salesOrderLineId, toDecimal(amendmentRefunded.get(row.salesOrderLineId) as never ?? 0).plus(toDecimal(row.qty)))
+      if (row.refund.wcAmendment) amendmentRefunded.set(row.salesOrderLineId, toDecimal(amendmentRefunded.get(row.salesOrderLineId) as never ?? 0).plus(toDecimal(row.qty)))
     }
     const shipRows = await db.shipmentLine.findMany({ where: { lineId: { in: lineIds }, shipment: { status: 'SHIPPED' } }, select: { lineId: true, qty: true } })
     const shipped = new Map<string, unknown>()
     for (const row of shipRows) shipped.set(row.lineId, toDecimal(shipped.get(row.lineId) as never ?? 0).plus(toDecimal(row.qty)))
-    let baseline: Map<number, number> | null = null
-    const raw = order.wcLineBaseline as { lines?: Array<{ externalLineItemId?: unknown; qty?: unknown }> } | null
-    if (raw && Array.isArray(raw.lines)) {
-      baseline = new Map()
-      for (const entry of raw.lines) if (typeof entry.externalLineItemId === 'number' && typeof entry.qty === 'number') baseline.set(entry.externalLineItemId, entry.qty)
-    }
+    const baseline = baselineQtyMap(order.wcLineBaseline)
     return {
       orderNumber: order.orderNumber, status: order.status, paidAt: order.paidAt, editedInImsAt: order.editedInImsAt,
       baselineQtyByExternalLineId: baseline, lines: order.lines, refundedQtyByLineId: refunded, amendmentRefundedQtyByLineId: amendmentRefunded, shippedQtyByLineId: shipped,
@@ -258,7 +272,7 @@ export const defaultAmendmentDeps: AmendmentDeps = {
   },
   async warehouseGate(orderId) {
     const gate = await resolveOrderEditWmsGate(orderId, 'lines')
-    return gate.ok ? { ok: true, externalOrderId: gate.externalOrderId } : { ok: false, externalOrderId: null }
+    return gate.ok ? { ok: true, externalOrderId: gate.externalOrderId } : { ok: false, externalOrderId: null, unreadable: gate.unreadable === true }
   },
   async warehouseLink(orderId) {
     const link = await db.wmsOrderPushLink.findUnique({ where: { orderId }, select: { connector: true, externalOrderId: true, externalOrderNumber: true } })
@@ -266,7 +280,7 @@ export const defaultAmendmentDeps: AmendmentDeps = {
   },
   async createRefund(orderId, lines, reason, caps) {
     const { createRefund } = await import('@/app/actions/sales')
-    return createRefund(orderId, lines, reason, undefined, { internalBypassToken: INTERNAL_ACTION_BYPASS, enforcePerTargetBalances: true, maxRefundedQtyByLines: caps })
+    return createRefund(orderId, lines, reason, undefined, { internalBypassToken: INTERNAL_ACTION_BYPASS, enforcePerTargetBalances: true, maxRefundedQtyByLines: caps, wcAmendment: true })
   },
   async raiseTask(task) {
     return raiseWmsOperatorTask(db, task)
@@ -294,8 +308,9 @@ function operatorQuery(orderRef: string, warehouseRef: string, items: string[]):
 /**
  * Act on a divergence the detection just recorded. Never throws (the delivery's real work is committed); every outcome is returned for tests and logged.
  */
-export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrder, differences: ReadonlyArray<DivergenceDifference>, fingerprint: string, deps: AmendmentDeps = defaultAmendmentDeps): Promise<AmendmentOutcome> {
+export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrder, differences: ReadonlyArray<DivergenceDifference>, fingerprint: string, deps: AmendmentDeps = defaultAmendmentDeps, options: { sameSecondConflict?: boolean } = {}): Promise<AmendmentOutcome> {
   let claimedKey: string | null = null
+  let refundRecorded = false
   try {
     if (!(await deps.isEnabled())) return { kind: 'off' }
     return await deps.withOrderLock(orderId, async (): Promise<AmendmentOutcome> => {
@@ -308,6 +323,9 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
       if (incoming && !Number.isNaN(incoming.getTime()) && facts.externalUpdatedAt && incoming.getTime() < facts.externalUpdatedAt.getTime()) {
         return { kind: 'skipped', reason: 'a newer WooCommerce delivery has already been stored (stale delivery)' }
       }
+
+      // TWO DELIVERIES IN THE SAME SECOND with different lines: the order they arrived in is not the order they were made in. Act on neither; a later delivery (or the next retry) settles it.
+      if (options.sameSecondConflict) return { kind: 'skipped', reason: 'two WooCommerce deliveries with the same modified time show different lines, so their order is unknown (retried on the next delivery)' }
 
       const plan = planWcOrderAmendment(wcOrder, differences, facts)
       if (plan.reductions.length === 0 && plan.wcChanges.length === 0 && plan.restores.length === 0) {
@@ -327,10 +345,19 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
       let pickingStarted = PICKING_STARTED.has(facts.status)
       const link = await deps.warehouseLink(orderId)
       if (!pickingStarted && link && (toRefund.length > 0 || plan.wcChanges.length > 0 || plan.reductionChanges.length > 0)) {
+        let gateUnreadable = false
         try {
-          pickingStarted = !(await deps.warehouseGate(orderId)).ok
+          const gate = await deps.warehouseGate(orderId)
+          pickingStarted = !gate.ok
+          gateUnreadable = !gate.ok && gate.unreadable === true
         } catch {
           pickingStarted = true
+          gateUnreadable = true
+        }
+        // A gate that could not be READ says nothing about picking. Failing closed still holds (nothing is refunded or sent), but no claim is taken and no task claims that picking started: the next delivery asks again.
+        if (gateUnreadable) {
+          await deps.log({ orderId, level: 'WARNING', action: 'wc_order_amendment_gate_unreadable', description: 'WooCommerce changed the order but the warehouse state could not be read just now. IMS refunded and sent nothing; the next delivery tries again.' })
+          return { kind: 'skipped', reason: 'the warehouse state could not be read (retried on the next delivery)' }
         }
       }
       let afterPicking: string[] = []
@@ -342,8 +369,12 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
       if (toRefund.length === 0 && afterPicking.length === 0 && operatorItems.length === 0) return { kind: 'skipped', reason: 'the changes are left for a person and the warehouse has not started on the order' }
 
       const claimKey = claimKeyOf(fingerprint, { reductions: toRefund }, [...afterPicking, ...operatorItems])
-      if (!(await deps.claim(orderId, fingerprint, claimKey))) return { kind: 'skipped', reason: 'these differences were already acted on' }
-      claimedKey = claimKey
+      // A RESTORE LEAVES NO DIFFERENCE, so there is no divergence row to claim against: that path (empty differences) takes no claim; the operator task's own dedupe keeps it to one.
+      const restoreOnly = differences.length === 0
+      if (!restoreOnly) {
+        if (!(await deps.claim(orderId, fingerprint, claimKey))) return { kind: 'skipped', reason: 'these differences were already acted on' }
+        claimedKey = claimKey
+      }
 
       let refundedLines = 0
       if (toRefund.length > 0) {
@@ -358,6 +389,7 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
           return { kind: 'refund-failed', error: result.error ?? 'unknown reason' }
         }
         refundedLines = lines.length
+        refundRecorded = true
         await deps.log({ orderId, level: 'INFO', action: 'wc_order_amendment_refunded', description: `A paid order was reduced in WooCommerce. IMS recorded the reduction through the refund path (${lines.map((l) => `${l.qty} unit(s)`).join(', ')}); the paid amount was not edited.`, metadata: { lines: toRefund } })
       }
 
@@ -379,7 +411,7 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
             })) || taskRaised
           }
         }
-        await deps.log({
+        if (!restoreOnly || taskRaised) await deps.log({
           orderId, level: 'WARNING', action: 'wc_order_amendment_after_picking',
           description: `WooCommerce changed the order and IMS did not apply it (${pickingStarted ? 'the warehouse has started on the order, so nothing was sent or refunded' : 'a person has to decide'}). ${link ? 'An operator task was raised.' : 'There is no warehouse order, so no task could be raised.'}`,
           metadata: { changes: [...afterPicking, ...operatorItems] },
@@ -389,8 +421,9 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
     })
   } catch (error) {
     // A throw after the claim was taken (a rejected import, a task insert that failed) must not leave the claim behind: the next delivery would skip these differences for good. A repeat is safe (the refunded quantities are read again under the lock).
-    if (claimedKey) await deps.releaseClaim(orderId, claimedKey).catch(() => undefined)
-    console.error('wc_order_amendment: could not apply', error instanceof Error ? error.constructor.name : typeof error)
+    // EXCEPT when the refund was already recorded (the transaction lapsed after it): releasing would invite a second pass; the committed refund and the cap keep that safe, but the claim should stand.
+    if (claimedKey && !refundRecorded) await deps.releaseClaim(orderId, claimedKey).catch(() => undefined)
+    console.error(refundRecorded ? 'wc_order_amendment: the refund was recorded but the step did not finish' : 'wc_order_amendment: could not apply', error instanceof Error ? error.constructor.name : typeof error)
     return { kind: 'skipped', reason: 'an error (logged)' }
   }
 }

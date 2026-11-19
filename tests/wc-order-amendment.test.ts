@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { applyWcOrderAmendment, planWcOrderAmendment, type AmendmentDeps, type AmendmentFacts } from '@/lib/connectors/woocommerce/sync/order-amendment'
+import { applyWcOrderAmendment, baselineQtyMap, planWcOrderAmendment, type AmendmentDeps, type AmendmentFacts } from '@/lib/connectors/woocommerce/sync/order-amendment'
 import type { DivergenceDifference } from '@/lib/connectors/woocommerce/sync/order-divergence'
 import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
+import { buildWcSeenLines, isOlderThanSeen, isSameSecondConflict, wcLinesAtEdit } from '@/lib/connectors/woocommerce/sync/wc-seen-lines'
 
 // o3d-zvec.7 write step. No network, no database: every dependency is injected.
 
@@ -144,13 +145,14 @@ test('HIGH: a PAID order ALLOCATED in IMS whose Mintsoft order is past NEW is NO
   assert.equal(calls.tasks.length, 1)
 })
 
-test('HIGH: a gate that cannot be read fails CLOSED: no refund, the task is raised', async () => {
-  for (const warehouseGate of [async () => { throw new Error('mintsoft down') }, async () => ({ ok: false as const, externalOrderId: null })]) {
-    const { d, calls } = deps(facts({ lines: [reduce3to2] }), { warehouseGate })
-    assert.equal((await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', d)).kind, 'applied')
-    assert.equal(calls.refunds.length, 0)
-    assert.equal(calls.tasks.length, 1)
-  }
+test('HIGH: a gate that is closed (or cannot be read) fails CLOSED: no refund. A closed gate raises the task; an unreadable one retries (see LOW 5)', async () => {
+  const closed = deps(facts({ lines: [reduce3to2] }), { warehouseGate: async () => ({ ok: false as const, externalOrderId: null }) })
+  assert.equal((await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', closed.d)).kind, 'applied')
+  assert.equal(closed.calls.refunds.length, 0)
+  assert.equal(closed.calls.tasks.length, 1)
+  const down = deps(facts({ lines: [reduce3to2] }), { warehouseGate: async () => { throw new Error('mintsoft down') } })
+  assert.equal((await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', down.d)).kind, 'skipped')
+  assert.equal(down.calls.refunds.length, 0)
 })
 
 test('a paid reduction with the warehouse still NEW (gate open) IS refunded, and the cap for the refund transaction is the reduction WooCommerce shows', async () => {
@@ -249,4 +251,76 @@ test('LOW: an order with an ORDER-LEVEL DISCOUNT is not refunded by the internal
   assert.equal(calls.refunds.length, 0)
   assert.equal(calls.tasks.length, 1)
   assert.match(String(calls.tasks[0]!.queryText), /order-level discount/)
+})
+
+// ---- #1055 round 2 (o3d-3xk03) ----
+
+test('MEDIUM 1: a restore (no difference left) raises its task WITHOUT a claim: there is no divergence row to claim against', async () => {
+  const { d, calls } = deps(facts({ lines: [reduce3to2], refundedQtyByLineId: new Map([['l1', 1]]), amendmentRefundedQtyByLineId: new Map([['l1', 1]]) }), { claim: async () => false })
+  const out = await applyWcOrderAmendment('o1', wc(3), [], 'restore', d)
+  assert.equal(out.kind, 'applied')
+  assert.equal(calls.tasks.length, 1)
+  assert.match(String(calls.tasks[0]!.queryText), /WooCommerce shows 3 again/)
+  assert.equal(calls.refunds.length, 0)
+})
+
+test('MEDIUM 2: the baseline is what WooCommerce SHOWED at the IMS edit, so an earlier WooCommerce change does not beat the later IMS edit', () => {
+  // WooCommerce had 3 -> 2 while the order was unpaid; IMS held 3; an operator then edited the line to 4 in IMS. The baseline stored at that edit says WooCommerce showed 2.
+  const stored = { totalForeign: 150, lines: [{ externalLineItemId: 77, qty: 3, sku: 'RED' }], wcLines: [{ externalLineItemId: 77, qty: 2 }] }
+  const base = baselineQtyMap(stored)!
+  assert.equal(base.get(77), 2)
+  const plan = planWcOrderAmendment(wc(2), diffs, facts({ editedInImsAt: new Date('2026-11-19T09:00:00Z'), baselineQtyByExternalLineId: base, lines: [{ ...line, qty: 4 }] }))
+  assert.equal(plan.reductions.length, 0, 'WooCommerce did not change the line since the edit: IMS wins')
+  assert.equal(plan.imsWins.length, 1)
+  // WooCommerce changing it AFTER the edit still wins.
+  assert.equal(planWcOrderAmendment(wc(1), diffs, facts({ editedInImsAt: new Date('2026-11-19T09:00:00Z'), baselineQtyByExternalLineId: base, lines: [{ ...line, qty: 4 }] })).reductions.length, 1)
+  // A baseline written before wcLines existed falls back to the IMS lines at the edit.
+  assert.equal(baselineQtyMap({ totalForeign: 1, lines: [{ externalLineItemId: 77, qty: 3 }] })!.get(77), 3)
+  assert.equal(baselineQtyMap(null), null)
+})
+
+test('MEDIUM 2: the baseline lines come from the seen WooCommerce lines, else from the IMS lines', () => {
+  assert.deepEqual(wcLinesAtEdit(buildWcSeenLines(wc(2)), [{ externalLineItemId: 77, qty: 3 }]), [{ externalLineItemId: 77, qty: 2 }])
+  assert.deepEqual(wcLinesAtEdit(null, [{ externalLineItemId: 77, qty: 3 }, { externalLineItemId: null, qty: 1 }]), [{ externalLineItemId: 77, qty: 3 }])
+})
+
+test('LOW 5: a gate that could not be READ takes no claim, raises no task and does not say picking started; a closed gate still does', async () => {
+  for (const warehouseGate of [async () => ({ ok: false as const, externalOrderId: null, unreadable: true }), async () => { throw new Error('mintsoft down') }]) {
+    const { d, calls } = deps(facts({ lines: [reduce3to2] }), { warehouseGate })
+    const out = await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', d)
+    assert.equal(out.kind, 'skipped')
+    assert.equal(calls.claims, 0, 'no claim: the next delivery tries again')
+    assert.equal(calls.tasks.length, 0)
+    assert.equal(calls.refunds.length, 0)
+    assert.deepEqual(calls.logs, ['wc_order_amendment_gate_unreadable'])
+  }
+  const closed = deps(facts({ lines: [reduce3to2] }), { warehouseGate: async () => ({ ok: false as const, externalOrderId: null }) })
+  assert.equal((await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', closed.d)).kind, 'applied')
+  assert.equal(closed.calls.tasks.length, 1)
+})
+
+test('LOW 8: two deliveries with the same modified time but different lines cannot be ordered: the step acts on neither', async () => {
+  const a = buildWcSeenLines(wc(2, '2026-11-19T10:00:00'))
+  const b = buildWcSeenLines(wc(3, '2026-11-19T10:00:00'))
+  assert.equal(isSameSecondConflict(a, b), true)
+  assert.equal(isSameSecondConflict(a, a), false)
+  assert.equal(isSameSecondConflict(a, buildWcSeenLines(wc(3, '2026-11-19T10:00:01'))), false)
+  assert.equal(isSameSecondConflict(null, a), false)
+  assert.equal(isOlderThanSeen(b, buildWcSeenLines(wc(2, '2026-11-19T09:59:59'))), true)
+  const { d, calls } = deps(facts({ lines: [reduce3to2] }))
+  const out = await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', d, { sameSecondConflict: true })
+  assert.equal(out.kind, 'skipped')
+  assert.equal(calls.refunds.length, 0)
+  assert.equal(calls.claims, 0)
+})
+
+test('LOW 4: a throw after the refund was recorded keeps the claim (the refund stands; a retry would only be capped)', async () => {
+  const { d, calls } = deps(facts({ lines: [reduce3to2] }), { log: async () => { throw new Error('lapsed') } })
+  const origError = console.error
+  console.error = () => undefined
+  try {
+    assert.equal((await applyWcOrderAmendment('o1', wc(2), diffs, 'fp', d)).kind, 'skipped')
+  } finally { console.error = origError }
+  assert.equal(calls.refunds.length, 1)
+  assert.equal(calls.released, 0)
 })

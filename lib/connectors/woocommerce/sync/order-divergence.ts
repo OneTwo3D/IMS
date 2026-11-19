@@ -47,6 +47,7 @@ import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, ledgerMatchEpsilon, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import type { WcFullOrder } from './types'
 import { applyWcOrderAmendment } from './order-amendment'
+import { buildWcSeenLines, isOlderThanSeen, isSameSecondConflict, parseWcSeenLines } from './wc-seen-lines'
 
 export const WC_ORDER_DIVERGENCE_SETTING = 'wc_order_divergence_detection_enabled'
 export const WC_ORDER_DIVERGED_ACTION = 'wc_order_diverged'
@@ -374,23 +375,32 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       where: { id: orderId },
       select: {
         currency: true, status: true, erasedAt: true, shippingForeign: true, taxForeign: true, totalForeign: true, discountAmount: true, discountModel: true, storeCreditForeign: true,
-        externalOrderNumber: true,
+        externalOrderNumber: true, wcSeenLines: true,
         lines: { select: { id: true, externalLineItemId: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, taxForeign: true, totalForeign: true } },
       },
     })
     if (!stored) return
     const refundRows = await db.salesOrderRefund.findMany({
       where: { orderId, deletedAt: null },
-      select: { externalRefundId: true, lines: { select: { salesOrderLineId: true, qty: true } } },
+      select: { externalRefundId: true, wcAmendment: true, lines: { select: { salesOrderLineId: true, qty: true } } },
     })
     const refundedQtyByLineId = new Map<string, Decimal>()
     const recordedExternalRefundIds: number[] = []
+    const hasAmendmentRefund = refundRows.some((refund) => refund.wcAmendment)
     for (const refund of refundRows) {
       if (refund.externalRefundId !== null) recordedExternalRefundIds.push(refund.externalRefundId)
       for (const line of refund.lines) {
         if (!line.salesOrderLineId) continue
         refundedQtyByLineId.set(line.salesOrderLineId, (refundedQtyByLineId.get(line.salesOrderLineId) ?? toDecimal(0)).plus(toDecimal(line.qty)))
       }
+    }
+    // What WooCommerce shows for the lines, kept for the amendment step (the baseline at an IMS edit; two deliveries in one second). An out-of-order (older) delivery never overwrites it. Best effort.
+    const seen = buildWcSeenLines(wcOrder)
+    const previousSeen = parseWcSeenLines(stored.wcSeenLines)
+    const sameSecondConflict = isSameSecondConflict(previousSeen, seen)
+    if (!stored.erasedAt && !isOlderThanSeen(previousSeen, seen) && (previousSeen?.digest !== seen.digest || previousSeen?.at !== seen.at)) {
+      // Raw, so `updatedAt` (client-side @updatedAt) is NOT bumped: the detection never makes the order a warehouse amend candidate.
+      await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${JSON.stringify(seen)}::jsonb WHERE id = ${orderId}`.catch(() => undefined)
     }
     const verdict = compareWcOrderWithIms(wcOrder, stored, { recordedExternalRefundIds, refundedQtyByLineId })
     if (verdict.kind === 'deferred') {
@@ -405,6 +415,9 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
         where: { orderId, resolvedAt: null },
         data: { resolvedAt: now, resolution: verdict.kind === 'not-comparable' ? `Not compared: ${verdict.reason}.` : 'A later WooCommerce delivery matched the IMS order again.' },
       })
+      // A REDUCTION WOOCOMMERCE UNDID leaves NO difference (the amendment refund changes neither the lines nor the stored total), so the write step would never run for it. Run it for an order that carries an amendment
+      // refund, with no differences: it raises the "a person decides" task when WooCommerce shows more units than IMS holds after those refunds, and does nothing otherwise (off by default; never throws).
+      if (verdict.kind === 'compared' && hasAmendmentRefund) await applyWcOrderAmendment(orderId, wcOrder, [], 'restore', undefined, { sameSecondConflict })
       return
     }
     const fingerprint = divergenceFingerprint(verdict.differences)
@@ -412,7 +425,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     if (existing && existing.resolvedAt === null && existing.fingerprint === fingerprint) {
       await db.wcOrderDivergence.update({ where: { id: existing.id }, data: { lastSeenAt: now, seenCount: { increment: 1 } } })
       // The write step (off by default) retries a difference it has not yet acted on (a failed refund released its claim); one already acted on is skipped by its claim.
-      await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint)
+      await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint, undefined, { sameSecondConflict })
       return
     }
     const data = {
@@ -438,7 +451,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       resolveUser: false,
     })
     // THE WRITE STEP, behind `wc_order_amendment_write_enabled` (off by default; order-amendment.ts). A no-op while it is off, and it never throws.
-    await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint)
+    await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint, undefined, { sameSecondConflict })
   } catch (e) {
     console.error('wc_order_divergence: could not compare or record', e instanceof Error ? e.constructor.name : typeof e)
   }

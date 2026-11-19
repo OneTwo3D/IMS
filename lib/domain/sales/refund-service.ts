@@ -4108,6 +4108,8 @@ export async function createSalesOrderRefund(
     enforcePerTargetBalances?: boolean
     /** Per group of order lines: refunded so far plus this refund may not exceed `maxQty` (checked under the order row lock). See createRefund. */
     maxRefundedQtyByLines?: Array<{ lineIds: string[]; maxQty: number }>
+    /** Internal-only: marks the refund as one the WooCommerce order-amendment step created (stored in `wcAmendment`), so a later run recognises it by this field and not by the reason text. */
+    wcAmendment?: boolean
     /**
      * Cut every itemised SALE line (a line with an order-line id and a quantity) from that order line's REMAINING stored value, under this
      * transaction's order lock, instead of trusting the amount the caller states: the stated amount is only a preview of it. Each refund takes
@@ -5455,6 +5457,7 @@ export async function createSalesOrderRefund(
         totalBase: headerTotalBase,
         totalsBasis: 'NET',
         source: refundSource,
+        wcAmendment: input.wcAmendment === true,
         returnWarehouseId: restockWarehouseId || null,
         returnInTransit,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays

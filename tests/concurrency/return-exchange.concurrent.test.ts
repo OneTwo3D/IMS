@@ -381,6 +381,8 @@ test('a WooCommerce-linked order needs the acknowledgement, as exactly true, and
   const baseline = row.wcLineBaseline as { totalForeign: number; lines: Array<{ externalLineItemId: number; qty: number }> }
   assert.equal(baseline.totalForeign, 30, 'the baseline is what WooCommerce holds (the order as it was)')
   assert.deepEqual(baseline.lines.map((l) => [l.externalLineItemId, l.qty]), [[4242, 2]])
+  // o3d-3xk03: the baseline also carries what WooCommerce showed (no delivery was compared here, so it falls back to the IMS lines).
+  assert.deepEqual((row.wcLineBaseline as { wcLines: Array<{ externalLineItemId: number; qty: number }> }).wcLines.map((l) => [l.externalLineItemId, l.qty]), [[4242, 2]])
   const audit = await db.activityLog.findFirstOrThrow({ where: { entityId: linked, action: 'return_exchange_recorded' } })
   assert.equal((audit.metadata as { shopDesyncAcknowledged: boolean }).shopDesyncAcknowledged, true)
   // A manual order needs no acknowledgement (covered by the first test); an ordinary refund of the shop order still raises the "Refund in WooCommerce" task and no WooCommerce write.

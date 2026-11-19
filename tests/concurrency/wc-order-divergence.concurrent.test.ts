@@ -175,7 +175,12 @@ test('[divergence] an added line is reported; the detector writes nothing to the
   assert.ok(fields.includes('LINE_ADDED') && fields.includes('SHIPPING'), `added line and shipping reported: ${fields}`)
   const after = await f.db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId }, include: { lines: { orderBy: { id: 'asc' } } } })
   assert.equal(after.updatedAt.getTime(), before.updatedAt.getTime(), 'SalesOrder.updatedAt is untouched, so the order is not a warehouse amend candidate')
-  assert.deepEqual(JSON.parse(JSON.stringify(after)), JSON.parse(JSON.stringify(before)), 'the order and its lines are byte-identical')
+  // `wcSeenLines` is the detection's own bookkeeping (what WooCommerce showed; written raw so updatedAt stays put), not order state: everything else is byte-identical.
+  const { wcSeenLines: seenAfter, ...afterRest } = after
+  const { wcSeenLines: _seenBefore, ...beforeRest } = before
+  void _seenBefore
+  assert.ok(seenAfter !== null, 'the seen WooCommerce lines are kept')
+  assert.deepEqual(JSON.parse(JSON.stringify(afterRest)), JSON.parse(JSON.stringify(beforeRest)), 'the order and its lines are byte-identical')
 })
 
 test('[divergence] a removed line that IMS has also refunded is not a divergence; the same removal without the refund is', { skip }, async (t) => {
@@ -290,4 +295,48 @@ test('[divergence] a detection failure never fails the import or stops the six-f
     await f.db.$executeRawUnsafe('ALTER TABLE wc_order_divergences_away RENAME TO wc_order_divergences')
   }
   assert.equal((await f.records()).length, 0, 'nothing was recorded')
+})
+
+// ---- #1055 round 2 (o3d-3xk03): through the REAL comparison, on a scratch database. Nothing reaches a network (no warehouse gate is asked on these paths). ----
+
+test('[divergence] MEDIUM: reduce THEN restore, through the comparison: nothing differs, yet the step raises the "a person decides" task; the amendment refund is recognised by its structured flag, not by its reason', { skip }, async (t) => {
+  const f = await fixture(t)
+  const amend = await import('@/lib/connectors/woocommerce/sync/order-amendment')
+  await f.setFlag(true)
+  const before = await f.db.setting.findUnique({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
+  await f.db.setting.upsert({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING }, create: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING, value: 'true' }, update: { value: 'true' } })
+  try {
+    await f.deliver({ qty: 3 })
+    await f.deliver({ qty: 3 }) // the first delivery creates the order; the comparison runs from the second
+    const lineId = (await f.db.salesOrderLine.findFirstOrThrow({ where: { orderId: f.orderId, externalLineItemId: 1 }, select: { id: true } })).id
+    // The seen WooCommerce lines are kept by the comparison (what an IMS edit will take as its baseline).
+    const seen = await f.db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId }, select: { wcSeenLines: true } })
+    assert.deepEqual((seen.wcSeenLines as { lines: unknown[] }).lines, [{ externalLineItemId: 1, qty: 3 }])
+    await f.db.wmsOrderPushLink.create({ data: { orderId: f.orderId, connector: 'mintsoft', externalOrderId: 'MS-3XK03', externalOrderNumber: 'W-3XK03', state: 'SYNCED' } })
+    // One unit refunded by the amendment step (flagged), another by an ordinary refund whose reason merely EQUALS the amendment text (not flagged).
+    const mk = async (wcAmendment: boolean, reason: string) => {
+      const refund = await f.db.salesOrderRefund.create({ data: { orderId: f.orderId, totalForeign: '100.00', totalBase: '100.00', reason, wcAmendment } })
+      await f.db.salesOrderRefundLine.create({ data: { refundId: refund.id, salesOrderLineId: lineId, description: 'Widget', qty: '1', unitPriceForeign: '100', unitPriceBase: '100', totalForeign: '100', totalBase: '100' } })
+      return refund.id
+    }
+    await mk(false, amend.WC_AMENDMENT_REFUND_REASON)
+    const facts = await amend.defaultAmendmentDeps.loadFacts(f.orderId)
+    assert.equal(facts!.amendmentRefundedQtyByLineId!.size, 0, 'the reason text alone does not make a refund an amendment refund')
+    await mk(true, 'anything else')
+    const flagged = await amend.defaultAmendmentDeps.loadFacts(f.orderId)
+    assert.equal(Number(flagged!.amendmentRefundedQtyByLineId!.get(lineId)), 1, 'the structured flag does')
+
+    // WooCommerce restores the quantity: it shows 3 again (IMS holds 3). No difference is left, and the task must still appear.
+    await f.deliver({ qty: 3 })
+    const tasks = await f.db.wmsOperatorTask.findMany({ where: { orderId: f.orderId } })
+    assert.equal(tasks.length, 1, 'one operator task for the restored reduction')
+    assert.match(tasks[0].queryText, /shows 3 again/)
+    await f.deliver({ qty: 3 })
+    assert.equal(await f.db.wmsOperatorTask.count({ where: { orderId: f.orderId } }), 1, 'a repeat delivery does not raise it twice')
+  } finally {
+    await f.db.wmsOperatorTask.deleteMany({ where: { orderId: f.orderId } })
+    await f.db.wmsOrderPushLink.deleteMany({ where: { orderId: f.orderId } })
+    if (before) await f.db.setting.update({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING }, data: { value: before.value } })
+    else await f.db.setting.deleteMany({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
+  }
 })

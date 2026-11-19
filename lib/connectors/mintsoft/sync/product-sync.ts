@@ -980,7 +980,8 @@ async function buildFreshMintsoftClearDto(context: ProductSyncContext, planned: 
   const { commodityCode } = resolveMintsoftCommodityCode(dto.commodityCode)
   if (commodityCode !== dto.commodityCode) dto = { ...dto, commodityCode }
   if (await readMintsoftProductParityEnabled()) {
-    dto = applyMintsoftProductParity(dto, fresh, await readMintsoftProductCost(fresh.id, fresh.type))
+    // A name refused as ambiguous keeps the planned DTO (the one that was already checked).
+    dto = applyMintsoftProductParity(dto, fresh, await readMintsoftProductCost(fresh.id, fresh.type)) ?? planned
   }
   if ((fresh.customsClears ?? []).some((m) => m.field === 'countryOfOrigin') && !trimToNull(fresh.countryOfOrigin)) {
     dto = { ...dto, countryOfManufacture: null }
@@ -1049,7 +1050,20 @@ export async function syncOneMintsoftProduct(
   const parityEnabled = await readMintsoftProductParityEnabled()
   if (parityEnabled) {
     const costPrice = await readMintsoftProductCost(context.product.id, context.product.type)
-    dto = applyMintsoftProductParity(dto, context.product, costPrice)
+    const withParity = applyMintsoftProductParity(dto, context.product, costPrice)
+    if (withParity === null) {
+      // The variation's attribute text cannot be split into values with certainty: a guess would rename the product in live Mintsoft. Nothing is sent for it.
+      await recordMintsoftProductLinkError(context.product.id, 'Parity name refused: the variation name could not be split into attribute values with certainty')
+      return {
+        sku: context.product.sku,
+        productId: context.product.id,
+        action: 'skip',
+        reason: 'Parity name refused: the variation attribute values are ambiguous, so nothing was sent and the product was not renamed in Mintsoft',
+        payload: toJsonPayload(null),
+        remoteUpdated: false,
+      }
+    }
+    dto = withParity
   }
   const logRaw = <T>(raw: T): T => (parityEnabled ? redactMintsoftCostPrice(raw) : raw)
 
