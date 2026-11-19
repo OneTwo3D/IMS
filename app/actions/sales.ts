@@ -11,6 +11,7 @@ import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { getSettingValue } from '@/lib/settings-store'
+import { fullReversalOrderTotal } from '@/lib/domain/accounting/invoice-order-total'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
@@ -2064,6 +2065,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   if (!so) return
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return
+  const roundToOrderTotal = (await getSettingValue('xero_round_to_order_total_enabled')) === 'true'
   if (reverseChargeSwapMissing(so.lines, settings.reverseChargeSalesTaxType)) throw new SalesInvoiceReverseChargeSwapNotSetError(so.currency)
   const multiComponentRateNames = multiComponentTaxRateNames(so.lines)
   if (multiComponentRateNames.length > 0 && !options?.checkOnly) {
@@ -2167,6 +2169,9 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     discountTaxType: orderDefaultTaxType ?? undefined,
     ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
     lineAmountsIncludeTax,
+    // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled` (off by default; with it off the payload is byte for byte what it was): the connector posts a Rounding line so the
+    // document totals what the order totals. Not part of the posting key (lib/accounting/payload-key.ts).
+    ...(roundToOrderTotal ? { orderTotal: Number(so.totalForeign) } : {}),
   }
 
   const sentCodes = [...new Set([...payload.lines.map((l) => l.taxType), payload.shippingTaxType, payload.discountTaxType].filter((c): c is string => typeof c === 'string' && c.trim() !== '' && !isNoTaxType(c)))]
@@ -2860,6 +2865,8 @@ async function queueRefundAccountingActions(input: {
         customer: { select: { firstName: true, lastName: true, email: true } },
         currency: true,
         taxRateName: true,
+        refundStatus: true,
+        refunds: { select: { id: true, chargeback: true } },
         lines: {
           select: {
             id: true,
@@ -2932,6 +2939,9 @@ async function queueRefundAccountingActions(input: {
     date: businessDateYmd(new Date()),
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
+    // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled`: a credit note that FULLY reverses the invoice (a chargeback, or the one refund of an order now fully refunded) carries
+    // the order total the invoice was POSTED with (read from the invoice's own sync row, not the setting's value now), so the connector posts the same Rounding line and the credit note matches the invoice it clears. A partial refund never does.
+    ...(await fullReversalOrderTotal(db, input.orderId, orderForCN, input.refundId)),
     lines: input.lines.map((line) => ({
       // Never sent: ties this posted line to its refund line so the credit-note PDF can read that line's frozen VAT rate (a description cannot: it may be blank or repeated).
       refundLineId: line.id,

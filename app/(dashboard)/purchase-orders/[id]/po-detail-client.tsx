@@ -1601,9 +1601,14 @@ function PayBillDialog({
               <span className="font-medium">{invoice.invoiceNumber ?? '(no number)'}</span>
             </div>
             <div className="flex justify-between mt-1">
-              <span className="text-muted-foreground">Amount</span>
-              <span className="font-mono font-medium">{money(invoice.totalForeign)}</span>
+              <span className="text-muted-foreground">Amount to pay</span>
+              <span className="font-mono font-medium" data-testid="pay-bill-net-payable">{money(invoice.netPayableForeign)}</span>
             </div>
+            {invoice.netPayableForeign < invoice.totalForeign && (
+              <div className="flex justify-between mt-1 text-xs text-muted-foreground" data-testid="pay-bill-gross">
+                <span>Bill total {money(invoice.totalForeign)}, less {money(invoice.totalForeign - invoice.netPayableForeign)} reverse-charge VAT the bill accounts for itself</span>
+              </div>
+            )}
           </div>
 
           <div>
@@ -3120,7 +3125,10 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
                     </div>
                     <div className="flex items-center gap-3 text-xs text-muted-foreground">
                       <span>{formatDateTime(inv.invoiceDate, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
-                      <span className="font-mono font-medium text-foreground">{money(inv.totalForeign)}</span>
+                      <span className="font-mono font-medium text-foreground">{money(inv.netPayableForeign)}</span>
+                      {inv.netPayableForeign < inv.totalForeign && (
+                        <span title="The bill total includes reverse-charge VAT the bill accounts for itself; the net payable is what is owed to the supplier.">(gross {money(inv.totalForeign)})</span>
+                      )}
                       {inv.supplierInvoiceUrl && (
                         <a
                           href={`/api${inv.supplierInvoiceUrl}`}

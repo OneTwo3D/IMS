@@ -1,4 +1,5 @@
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { reconciliationBound } from '@/lib/domain/sales/sales-invoice-reconciliation'
 
 /**
  * Xero rounds every line `UnitAmount` to 2 decimal places unless the request carries `unitdp=4`, which
@@ -121,6 +122,13 @@ export type XeroRoundingPlanInput = {
   rateOf?: XeroTaxRateOf
   account: string | null | undefined
   what: string
+  /**
+   * The IMS ORDER TOTAL the document must come to (owner decision on o3d-hqvrp.389). When set, the adjustment targets this figure instead of the total IMS's own per-line model
+   * predicts: Xero rounds tax per line while the order total is worked out for the whole order, so the two can differ by a few pennies even with no 4dp loss, and a full payment
+   * then cannot settle the document. The adjustment is bounded by the existing tolerance (`reconciliationBound`, capped at 1.00) on top of what 4dp can lose. Absent = the
+   * original behaviour exactly (only the 4dp loss is posted).
+   */
+  orderTotal?: number | null
 }
 
 /** The most the adjustment can legitimately be: what 4dp can lose on each line (0.00005 per unit, with tax) plus two minor units of per-line rounding. Anything past it is not a rounding difference. */
@@ -143,18 +151,23 @@ function adjustmentCap(input: XeroRoundingPlanInput): Decimal {
  */
 export function planXeroRoundingLine(input: XeroRoundingPlanInput): Record<string, unknown> | null {
   const { lines, extraLines = [], lineAmountsIncludeTax: inclusive, rateOf, what } = input
-  if (!unitDpChangesAnyLine(lines)) return null
+  const targetsOrderTotal = typeof input.orderTotal === 'number' && Number.isFinite(input.orderTotal)
+  if (!targetsOrderTotal && !unitDpChangesAnyLine(lines)) return null
   const toTotalLine = (l: PricedLine & { taxType?: string | null }, unit: number): XeroTotalLine => ({ quantity: l.quantity, unitAmount: unit, taxType: l.taxType, discountAmount: l.discountAmount })
   const imsSide = [...lines.map((l) => toTotalLine(l, l.unitAmount)), ...extraLines]
   const xeroSide = [...lines.map((l) => toTotalLine(l, xeroUnitDpFields(l.quantity, l.unitAmount).UnitAmount)), ...extraLines]
-  const ims = predictXeroDocumentTotal(imsSide, inclusive, rateOf)
+  const imsPredicted = predictXeroDocumentTotal(imsSide, inclusive, rateOf)
   const xero = predictXeroDocumentTotal(xeroSide, inclusive, rateOf)
-  if (!ims.ok) throw new XeroRoundingUnreconcilableError(what, ims.why)
+  // Aimed at the order total, a document whose tax cannot be predicted and whose lines lose nothing at 4dp is left as it always was (nothing to adjust that we can measure).
+  if (targetsOrderTotal && !unitDpChangesAnyLine(lines) && (!imsPredicted.ok || !xero.ok)) return null
+  if (!imsPredicted.ok) throw new XeroRoundingUnreconcilableError(what, imsPredicted.why)
   if (!xero.ok) throw new XeroRoundingUnreconcilableError(what, xero.why)
+  const ims = targetsOrderTotal ? { ok: true as const, total: roundQuantity(toDecimal(input.orderTotal as number), 2) } : imsPredicted
   const adjustment = roundQuantity(ims.total.sub(xero.total), 2)
   if (adjustment.isZero()) return null
-  if (adjustment.abs().gt(adjustmentCap(input))) {
-    throw new XeroRoundingUnreconcilableError(what, `Xero would total it ${xero.total.toFixed(2)} against the order's ${ims.total.toFixed(2)}, a difference of ${adjustment.toFixed(2)} that four-decimal unit prices and per-line tax rounding cannot explain.`)
+  const cap = targetsOrderTotal ? adjustmentCap(input).add(reconciliationBound(lines.length + extraLines.length)) : adjustmentCap(input)
+  if (adjustment.abs().gt(cap)) {
+    throw new XeroRoundingUnreconcilableError(what, `Xero would total it ${xero.total.toFixed(2)} against the order's ${ims.total.toFixed(2)}, a difference of ${adjustment.toFixed(2)} that four-decimal unit prices and per-line tax rounding cannot explain.${targetsOrderTotal ? ' It is beyond the reconciliation tolerance, so the order total and the document disagree by more than rounding.' : ''}`)
   }
   const account = input.account?.trim() ?? ''
   if (!account) throw new XeroRoundingAccountMissingError(what, adjustment.toFixed(2))

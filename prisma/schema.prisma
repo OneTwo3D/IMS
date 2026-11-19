@@ -6002,11 +6002,16 @@ model PaymentRemovalReconciliation {
   matchedPaymentIds  Json     @default("[]") @map("matched_payment_ids")
   /// OPERATOR_DECISION while the revenue unwind is owed; NONE for a restoration.
   ledgerAction       String   @default("OPERATOR_DECISION") @map("ledger_action")
+  /// Reserved for the partial payment removal credit note (a separate, parked PR). UNUSED here: nothing reads or writes it, and it is NULL on every row. The column and its indexes
+  /// (migrations 20261118220000 and 20261119000000) were already pushed on the feature branch, so they stay in place, inert; the credit note PR will use them. A plain pointer, no foreign key.
+  refundId           String?  @map("refund_id")
   createdAt          DateTime @default(now()) @map("created_at")
 
   order SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([orderId])
+  @@index([refundId])
+  @@unique([refundId])
   @@map("payment_removal_reconciliations")
 }
 
