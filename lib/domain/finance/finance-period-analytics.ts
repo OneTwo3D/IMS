@@ -5,6 +5,7 @@ import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { isMissingFxRateError, selectFxRateFromRows } from '@/lib/currencies/fx-lookup'
 import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-source-regime'
+import { billNetPayableBase, billNetPayableForeign, type NetPayableLine } from '@/lib/domain/purchasing/bill-net-payable'
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
@@ -290,9 +291,13 @@ type PurchaseInvoiceAgingRow = {
   invoiceDate: Date
   dueDate: Date | null
   paidAt: Date | null
+  totalForeign: DecimalInput
   totalBase: DecimalInput
+  /** The reverse-charge lines: what is owed to the supplier is the NET PAYABLE, not the stored total that includes self-accounted VAT. */
+  lines: ReadonlyArray<NetPayableLine>
   po: {
     supplierId: string
+    currency: string
     supplier: { name: string; email: string | null }
   }
 }
@@ -334,6 +339,7 @@ type PurchaseInvoiceFxRow = {
   totalForeign: DecimalInput
   totalBase: DecimalInput
   fxRateToBase: DecimalInput
+  lines: ReadonlyArray<NetPayableLine>
   po: {
     reference: string
     currency: string
@@ -880,8 +886,10 @@ export async function getApAgingReport(
       invoiceDate: true,
       dueDate: true,
       paidAt: true,
+      totalForeign: true,
       totalBase: true,
-      po: { select: { supplierId: true, supplier: { select: { name: true, email: true } } } },
+      lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
+      po: { select: { supplierId: true, currency: true, supplier: { select: { name: true, email: true } } } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as PurchaseInvoiceAgingRow[]
@@ -901,7 +909,8 @@ export async function getApAgingReport(
     lastPaymentDate: Date | null
   }>()
   for (const invoice of invoices) {
-    const outstanding = toDecimal(invoice.totalBase)
+    // What is owed to the supplier: the stored total less the VAT the bill accounts for itself on reverse-charge lines (o3d-hqvrp.399).
+    const outstanding = invoice.lines?.length ? billNetPayableBase(invoice, invoice.po.currency) : toDecimal(invoice.totalBase)
     if (outstanding.lte(0)) continue
     const key = invoice.po.supplierId
     let row = bySupplier.get(key)
@@ -939,7 +948,7 @@ export async function getApAgingReport(
     bucket2Days: String(buckets[1]),
     bucket3Days: String(buckets[2]),
   }, [
-    `AP aging is as of ${dateOnly(asOf)} and treats PurchaseInvoice.totalBase as fully outstanding until PurchaseInvoice.paidAt is set because the schema does not store partial supplier payments.`,
+    `AP aging is as of ${dateOnly(asOf)} and treats the bill's net payable (PurchaseInvoice.totalBase less the VAT a reverse-charge line accounts for itself) as fully outstanding until PurchaseInvoice.paidAt is set because the schema does not store partial supplier payments.`,
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
   ], options.paginate !== false)
@@ -1313,6 +1322,7 @@ export async function getFxGainLossReport(
         totalForeign: true,
         totalBase: true,
         fxRateToBase: true,
+        lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
         po: { select: { reference: true, currency: true, supplier: { select: { name: true } } } },
       },
       take: SOURCE_ROW_LIMIT + 1,
@@ -1383,6 +1393,9 @@ export async function getFxGainLossReport(
   }
   for (const invoice of purchaseInvoices) {
     if (!invoice.paidAt) continue
+    // The payment IMS registers is the NET payable, so the realised FX is measured on it, not on the stored total that includes self-accounted reverse-charge VAT (o3d-hqvrp.399).
+    const netForeign = invoice.lines?.length ? billNetPayableForeign(invoice, invoice.po.currency) : toDecimal(invoice.totalForeign)
+    const netBase = invoice.lines?.length ? billNetPayableBase(invoice, invoice.po.currency) : toDecimal(invoice.totalBase)
     const settlement = settlementRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt, fxRegime, invoice.paidAtExplicitInstant)
     if (settlement.rate === null) {
       rows.push({
@@ -1393,7 +1406,7 @@ export async function getFxGainLossReport(
         partyName: invoice.po.supplier.name,
         currency: invoice.po.currency,
         paidAt: invoice.paidAt.toISOString(),
-        amountForeign: qtyString(toDecimal(invoice.totalForeign).abs()),
+        amountForeign: qtyString(netForeign.abs()),
         bookedRateToBase: qtyString(invoice.fxRateToBase),
         settlementRateToBase: '',
         bookedBase: '',
@@ -1409,12 +1422,12 @@ export async function getFxGainLossReport(
     const settlementRate = settlement.rate
     const result = computeRealisedFx({
       side: 'payable',
-      amountForeign: toDecimal(invoice.totalForeign).abs().toNumber(),
+      amountForeign: netForeign.abs().toNumber(),
       bookedRateToBase: toDecimal(invoice.fxRateToBase).toNumber(),
       settlementRateToBase: settlementRate.toNumber(),
       // The whole bill settles here, so the booked base is the stored totalBase
       // (cogs-audit scjz.55).
-      bookedBase: toDecimal(invoice.totalBase).toNumber(),
+      bookedBase: netBase.toNumber(),
     })
     rows.push({
       side: 'payable',
@@ -1424,7 +1437,7 @@ export async function getFxGainLossReport(
       partyName: invoice.po.supplier.name,
       currency: invoice.po.currency,
       paidAt: invoice.paidAt.toISOString(),
-      amountForeign: qtyString(toDecimal(invoice.totalForeign).abs()),
+      amountForeign: qtyString(netForeign.abs()),
       bookedRateToBase: qtyString(invoice.fxRateToBase),
       settlementRateToBase: qtyString(settlementRate),
       bookedBase: moneyString(result.bookedBase, baseCurrency),

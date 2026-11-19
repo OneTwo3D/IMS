@@ -795,3 +795,41 @@ test('AR aging keeps an indeterminate zero-balance order as an uncertain row and
   assert.equal(report.rows[0].outstandingBase, '0')
   assert.ok(report.notices.some((n) => /1 order nets to a zero balance only because a credit could not be placed/.test(n)), report.notices.join('\n'))
 })
+
+// o3d-hqvrp.399 (review): a reverse-charge bill is stored GROSS (net 100 + 20 self-accounted VAT = 120) but what is owed, and what markBillPaid registers, is the NET payable (100).
+const reverseChargeLines = [{ totalForeign: decimal('100'), taxRateValue: decimal('0.2'), taxReverseCharge: true }]
+
+test('AP aging counts a reverse-charge bill at its NET payable, not the stored gross (o3d-hqvrp.399)', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    purchaseInvoice: {
+      findMany: async (args: { select: Record<string, unknown> }) => {
+        assert.ok(args.select.lines, 'the reverse-charge lines are read')
+        return [{
+          id: 'pi-rc', invoiceNumber: 'PI-RC', invoiceDate: new Date('2026-05-01T00:00:00.000Z'), dueDate: new Date('2026-05-15T00:00:00.000Z'), paidAt: null,
+          totalForeign: decimal('120'), totalBase: decimal('120'), lines: reverseChargeLines,
+          po: { supplierId: 'supplier-1', currency: 'GBP', supplier: { name: 'Supplier A', email: null } },
+        }]
+      },
+    },
+  }
+
+  const report = await getApAgingReport({ bucket1Days: 30, bucket2Days: 60, bucket3Days: 90 }, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+
+  assert.equal(report.rows[0]?.outstandingBase, '100')
+  assert.equal(report.totals.outstandingBase, '100')
+})
+
+test('FX gain/loss measures a paid reverse-charge bill on its NET payable, the figure the payment journal posts (o3d-hqvrp.399)', async () => {
+  const rates = [{ rate: '1.5', at: '2026-06-09T00:00:00.000Z' }]
+  const bill = {
+    id: 'inv-rc', invoiceNumber: 'BILL-RC', paidAt: new Date('2026-06-10T00:00:00.000Z'), totalForeign: decimal('120'), totalBase: decimal('96'), fxRateToBase: decimal('1.25'),
+    lines: reverseChargeLines, po: { reference: 'PO-1', currency: 'USD', supplier: { name: 'S' } },
+  }
+  const client = { ...fxGainLossClient(rates), payment: { findMany: async () => [] }, purchaseInvoice: { findMany: async () => [bill] } } as FinanceAnalyticsClient
+
+  const report = await getFxGainLossReport(fxWindow, fxOpts(client))
+
+  assert.equal(report.rows[0]?.amountForeign, '100', 'the net payable, not the 120 gross')
+  assert.equal(report.rows[0]?.bookedBase, '80', 'the stored base total prorated by the payable share: 96 x 100 / 120')
+})

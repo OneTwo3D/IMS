@@ -88,7 +88,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     },
   },
   // o3d-cdhl: dated partial-payment-removal history; ids, kinds, amounts and the matched ledger payment ids only.
-  PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction'], retained: {} },
+  PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction', 'refundId'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
     notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],

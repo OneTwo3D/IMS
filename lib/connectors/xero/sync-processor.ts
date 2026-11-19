@@ -6306,6 +6306,7 @@ export async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
+        ...(typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? { orderTotal: payload.orderTotal } : {}),
         // o3d-k26m.5 round 5/6: the number fence's LAST word. Handed in here, scoped around the
         // create by pushSalesInvoice, and evaluated inside the HTTP client on every attempt as the
         // last statement before the socket. Nothing is sent if it refuses.
@@ -6358,6 +6359,7 @@ export async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
+        ...(typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? { orderTotal: payload.orderTotal } : {}),
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: composeFinalBeforePost(null, payload as Record<string, unknown>, 'update'), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
@@ -6819,6 +6821,7 @@ export async function processClaimedEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
+        ...(typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? { orderTotal: payload.orderTotal } : {}),
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
