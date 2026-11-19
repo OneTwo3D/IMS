@@ -17,6 +17,8 @@ import {
   MERGE_HOLD_NEW_GRACE_MS,
   MERGE_HOLD_REQUEST_DEADLINE_MS,
   mergeHoldUnsettledBasis,
+  mergeHoldIneligibleReason,
+  mergeHoldWithdrawalBasis,
   withDeadline,
   type MergeHoldTaskState,
   mergeHoldQuery,
@@ -55,6 +57,8 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
   const cleared: Array<{ orderId: string; reason: string }> = []
   const revised: string[] = []
   let clock = opts.now ?? (() => T0)
+  const dedupe = new Set<string>()
+  const orders = new Map<string, { status: string; refundStatus: string; withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null }>()
   const answers = opts.answers ?? {}
   const port: MergeHoldPort = {
     now: () => clock(),
@@ -63,6 +67,12 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
       const existing = rows.get(m.orderId)
       const decision = decideBeginHold(existing ?? null, m.externalOrderId, basis)
       if (decision === 'skip') return null
+      // Mirrors the database port: an order IMS cancelled / withdrew / fully refunded is never held; a retryable row is settled refused.
+      const ineligible = mergeHoldIneligibleReason(orders.get(m.orderId) ?? { status: 'PROCESSING', refundStatus: 'NONE', withdrawalHoldAt: null, withdrawalApprovedAt: null })
+      if (ineligible) {
+        if (existing && existing.state === 'NOT_HELD' && !existing.refused) { rows.set(m.orderId, { ...existing, refused: true, lastError: `Not held: ${ineligible}` }); writes.push(`ineligible:${m.orderId}`) }
+        return null
+      }
       const row: MergeHoldRow = decision === 'create' || !existing
         ? { id: `r-${m.orderId}`, connector: env.connectorId, orderId: m.orderId, externalOrderId: m.externalOrderId, groupBasis: basis, state: 'HOLDING', episode: 1, attempts: 1, refused: false, lastError: null, heldAt: null, remindedAt: null, clearReason: null, updatedAt: clock() }
         : decision === 'retry'
@@ -143,9 +153,11 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
     async showEditBlocked(_env, obs) { blocked.push(obs.row.orderId) },
     async closeEditBlocked() {},
     async escalate(_env, obs, kind) {
-      const key = `${obs.row.orderId}:${kind}`
-      if (escalated.includes(key)) return false
-      escalated.push(key)
+      // Mirrors the database dedupe: open AND closed tasks of the same basis dedupe.
+      const key = mergeHoldWithdrawalBasis(obs.row, kind)
+      if (dedupe.has(key)) return false
+      dedupe.add(key)
+      escalated.push(`${obs.row.orderId}:${kind}`)
       return true
     },
   }
@@ -161,7 +173,7 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
       ...over,
     })
   }
-  return { port, rows, requests, writes, tasks, blocked, escalated, reminders, cleared, revised, observe, resetObservations: () => { observations.length = 0 }, setClock: (fn: () => Date) => { clock = fn } }
+  return { port, rows, orders, requests, writes, tasks, blocked, escalated, reminders, cleared, revised, observe, resetObservations: () => { observations.length = 0 }, setClock: (fn: () => Date) => { clock = fn } }
 }
 
 test('flag OFF: nothing is requested and nothing is written', async () => {
@@ -730,4 +742,59 @@ test('WHILE HELD: the push sweep queries leave a merge-held order out (edits, ho
   const text = readFileSync(join(process.cwd(), 'lib/domain/wms/order-push-sweep.ts'), 'utf8')
   assert.equal((text.match(/wms_merge_holds/g) ?? []).length >= 1, true, 'the amend query excludes held orders')
   assert.equal((text.match(/wmsMergeHolds: \{ none/g) ?? []).length, 2, 'the hold and cancel queries exclude held orders')
+})
+
+// ---- round 4: an order IMS cancelled / withdrew is never (re-)held ------------------------------------------------------------------------
+
+const reviewerPath = async (variant: 'CANCEL' | 'WITHDRAWAL') => {
+  const f = fakePort({ answers: { o2: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+  assert.equal(f.rows.get('o2')!.state, 'UNKNOWN')
+  // B is cancelled (or withdrawn) in IMS: maintenance escalates the UNKNOWN row; a person closes the task (the escalation key stays recorded, as a DONE task dedupes).
+  f.orders.set('o2', variant === 'CANCEL'
+    ? { status: 'CANCELLED', refundStatus: 'NONE', withdrawalHoldAt: null, withdrawalApprovedAt: null }
+    : { status: 'PROCESSING', refundStatus: 'NONE', withdrawalHoldAt: T0, withdrawalApprovedAt: null })
+  const tooSoon = { status: 'NEW', externalOrderId: 'w2', fetchedAt: new Date(T0.getTime() + 60_000), lastError: null }
+  f.observe('o2', variant === 'CANCEL' ? { orderStatus: 'CANCELLED', snapshot: tooSoon } : { withdrawalHoldAt: T0, snapshot: tooSoon })
+  const first = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.equal(first.escalated, 1, 'the maybe-held order is escalated while it is UNKNOWN')
+  // B then reads NEW after the grace period: settled retryable, and detection / the retry pass runs.
+  f.resetObservations()
+  const at = new Date(T0.getTime() + MERGE_HOLD_NEW_GRACE_MS + 60_000)
+  f.observe('o2', { orderStatus: variant === 'CANCEL' ? 'CANCELLED' : 'PROCESSING', withdrawalHoldAt: variant === 'WITHDRAWAL' ? T0 : null, snapshot: { status: 'NEW', externalOrderId: 'w2', fetchedAt: at, lastError: null } })
+  await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.equal(f.rows.get('o2')!.state, 'NOT_HELD')
+  const before = f.requests.filter((id) => id === 'o2').length
+  const pass = await placeMergeHolds(f.port, ENV, [])
+  assert.equal(f.requests.filter((id) => id === 'o2').length, before, 'B is NOT re-held')
+  assert.equal(pass.held, 0)
+  assert.equal(f.rows.get('o2')!.state, 'NOT_HELD')
+  assert.equal(f.rows.get('o2')!.refused, true, 'settled refused with a recorded reason, so the withheld push resumes')
+  assert.match(f.rows.get('o2')!.lastError ?? '', /Not held: /)
+  // Nothing sits held-and-withheld: the row is not active, so the cancel / withdrawal push is not withheld.
+  assert.ok(!['HOLDING', 'HELD', 'UNKNOWN'].includes(f.rows.get('o2')!.state))
+}
+
+test('REVIEWER PATH (cancel): UNKNOWN B cancelled in IMS, cancel task closed, B reads NEW: B is not re-held and its row stops withholding the cancel', async () => { await reviewerPath('CANCEL') })
+test('REVIEWER PATH (withdrawal): the same for a withdrawn order', async () => { await reviewerPath('WITHDRAWAL') })
+
+test('first-attempt detection never holds an order IMS has cancelled, withdrawn or fully refunded', async () => {
+  for (const order of [
+    { status: 'CANCELLED', refundStatus: 'NONE', withdrawalHoldAt: null, withdrawalApprovedAt: null },
+    { status: 'PROCESSING', refundStatus: 'FULL', withdrawalHoldAt: null, withdrawalApprovedAt: null },
+    { status: 'PROCESSING', refundStatus: 'NONE', withdrawalHoldAt: T0, withdrawalApprovedAt: null },
+    { status: 'PROCESSING', refundStatus: 'NONE', withdrawalHoldAt: null, withdrawalApprovedAt: T0 },
+  ]) {
+    const f = fakePort()
+    f.orders.set('o2', order)
+    await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+    assert.deepEqual(f.requests, ['o1'], JSON.stringify(order))
+    assert.equal(f.rows.has('o2'), false)
+  }
+})
+
+test('a re-held order escalates again: the attempt number is part of the cancel / withdrawal dedupe key', () => {
+  const row = { orderId: 'o2', episode: 1, attempts: 1 }
+  assert.notEqual(mergeHoldWithdrawalBasis(row, 'CANCEL'), mergeHoldWithdrawalBasis({ ...row, attempts: 2 }, 'CANCEL'))
+  assert.equal(mergeHoldIneligibleReason({ status: 'PROCESSING', refundStatus: 'NONE', withdrawalHoldAt: null, withdrawalApprovedAt: null }), null)
 })

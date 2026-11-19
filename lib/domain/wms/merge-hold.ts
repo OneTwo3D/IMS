@@ -203,7 +203,17 @@ export function mergeHoldUnsettledQuery(wmsOrder: string, imsOrder: string, stat
 export const mergeHoldUnsettledBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode'>, kind: string): string => `merge-hold-unsettled:${row.orderId}:${row.episode}:${kind}`
 export const mergeHoldTaskBasis = (group: Pick<MergeGroup, 'basis'>, episodes: ReadonlyArray<number>): string => `merge-hold:${group.basis}:${[...episodes].join('.')}`
 export const mergeHoldOverdueBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode'>): string => `merge-hold-overdue:${row.orderId}:${row.episode}`
-export const mergeHoldWithdrawalBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode'>, kind: string): string => `merge-hold-withdrawal:${row.orderId}:${row.episode}:${kind}`
+/** The attempt number is part of the key: an order that becomes HELD again after a person closed the task raised while it was UNKNOWN gets a fresh task. */
+export const mergeHoldWithdrawalBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode' | 'attempts'>, kind: string): string => `merge-hold-withdrawal:${row.orderId}:${row.episode}:${row.attempts}:${kind}`
+
+/** IMS state that says an order must NEVER be held: it is cancelled / finished, fully refunded, or has a withdrawal (pending or approved). Null when it may be held. */
+export function mergeHoldIneligibleReason(order: { status: string; refundStatus: string; withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null }): string | null {
+  if (order.status === 'CANCELLED') return 'the order is cancelled in IMS'
+  if (['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(order.status)) return `the order is ${order.status.toLowerCase()} in IMS`
+  if (order.refundStatus === 'FULL') return 'the order is fully refunded in IMS'
+  if (order.withdrawalHoldAt || order.withdrawalApprovedAt) return 'the order has a customer withdrawal in IMS'
+  return null
+}
 
 /** The dedupe hash a task of this reason and basis carries (exposed for tests and the clear-by-system lookups). */
 export const mergeHoldTaskHash = (reason: WmsOperatorTaskInput['reason'], dedupeBasis: string): string => wmsOperatorTaskHash({ reason, queryText: '', dedupeBasis })

@@ -30,6 +30,7 @@ import {
   mergeHoldQuery,
   mergeHoldTaskBasis,
   mergeHoldWithdrawalBasis,
+  mergeHoldIneligibleReason,
   mergeHoldWithdrawalQuery,
   runMergeHoldMaintenance,
   type MergeHoldEnvironment,
@@ -96,6 +97,20 @@ export const prismaMergeHoldPort: MergeHoldPort = {
       const existing = await tx.wmsMergeHold.findUnique({ where: { connector_orderId: { connector: env.connectorId, orderId: member.orderId } } })
       const decision = decideBeginHold(existing ? toRow(existing) : null, member.externalOrderId, groupBasis)
       if (decision === 'skip') return null
+      // An order IMS has cancelled / withdrawn / fully refunded is NEVER held (checked under the order lock): its cancel or withdrawal push must go out.
+      const order = await tx.salesOrder.findUnique({ where: { id: member.orderId }, select: { status: true, refundStatus: true, withdrawalHoldAt: true, withdrawalApprovedAt: true } })
+      const ineligible = order ? mergeHoldIneligibleReason(order) : 'the order no longer exists'
+      if (ineligible) {
+        if (existing && existing.state === 'NOT_HELD' && !existing.refused) {
+          await tx.wmsMergeHold.update({ where: { id: existing.id }, data: { refused: true, lastError: `Not held: ${ineligible}` } })
+          await logActivityInTransaction(tx, {
+            userId: null, entityType: 'SALES_ORDER', entityId: member.orderId, action: 'wms_merge_hold_not_held', tag: 'sync', level: 'INFO',
+            description: `Merge hold will not be retried for warehouse order ${existing.externalOrderId}: ${ineligible}. Pushes to the warehouse resume.`,
+            metadata: { connector: env.connectorId, externalOrderId: existing.externalOrderId, groupBasis, episode: existing.episode },
+          })
+        }
+        return null
+      }
       let next
       if (decision === 'create' || !existing) {
         next = await tx.wmsMergeHold.create({
@@ -174,13 +189,14 @@ export const prismaMergeHoldPort: MergeHoldPort = {
       where: { connector: env.connectorId, state: 'NOT_HELD', refused: false, attempts: { lt: MERGE_HOLD_MAX_ATTEMPTS } },
       select: {
         groupBasis: true, externalOrderId: true,
-        order: { select: { id: true, orderNumber: true, wmsOrderPush: { select: { state: true, externalOrderId: true, externalOrderNumber: true } } } },
+        order: { select: { id: true, orderNumber: true, status: true, refundStatus: true, withdrawalHoldAt: true, withdrawalApprovedAt: true, wmsOrderPush: { select: { state: true, externalOrderId: true, externalOrderNumber: true } } } },
       },
     })
     if (rows.length === 0) return []
     const bases = [...new Set(rows.map((row) => row.groupBasis))]
     const active = await db.wmsMergeHold.findMany({ where: { connector: env.connectorId, groupBasis: { in: bases }, state: { in: [...ACTIVE] } }, select: { groupBasis: true } })
     const live = new Set(active.map((row) => row.groupBasis))
+    // An IMS-cancelled / withdrawn order stays in this list ON PURPOSE: beginHold (under the order lock) refuses it and records why, so its row stops being retryable.
     return rows
       .filter((row) => live.has(row.groupBasis) && row.order.wmsOrderPush?.state === 'SYNCED' && row.order.wmsOrderPush.externalOrderId === row.externalOrderId)
       .map((row) => ({

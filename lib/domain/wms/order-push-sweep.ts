@@ -5137,7 +5137,10 @@ export async function runWmsOrderPushSweep(
   // and it never throws: a detection failure cannot affect the push.
   if (locked.created > 0) {
     const mergeCandidateDetection = mergeCandidateNote(await runMergeCandidateDetectionSafe('the order push'))
+    // Maintenance always runs, with or without a detection note.
+    await runMergeHoldMaintenanceSafe('the order push')
     if (mergeCandidateDetection) return { ...locked, mergeCandidateDetection }
+    return locked
   }
   // Merge holds: the sweep withholds the cancel / edit / withdrawal hold of an order with an active hold row, so settle those rows or raise the escalation task
   // now (database only, never throws, returns at once with no active row), not only on the next status sweep.
