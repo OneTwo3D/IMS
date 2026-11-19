@@ -388,6 +388,12 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
       if (error.reason === 'lost') {
         // The run finished (or stopped) but its exclusion failed on the way: a stop that already says why is kept as it is, anything else is never reported as a success.
         if (produced !== null && (produced as ApplyResult).exit !== 'OK') return produced
+        // The run itself finished and its record is persisted: report what the database holds (the produced step results, verification and record, not
+        // an empty list and the stale pre-run record), with the lost lease as a problem. The exit is still never a success: the exclusion failed at the end.
+        if (produced !== null) {
+          const done = produced as ApplyResult
+          return finish('STEP_FAILED', [`the run lease was lost at the very end of the run, after its record was written (the record below is what the database holds); verify that no other runner touched this load`, ...done.problems], done.steps, done.record, done.verification)
+        }
         return finish('STEP_FAILED', ['the run lease was lost while the run went on: another runner may hold this load; verify before resuming'], [], existing)
       }
       return finish('PRECONDITION_REFUSED', [`another runner holds this load (${error.message})`], planSteps, existing)

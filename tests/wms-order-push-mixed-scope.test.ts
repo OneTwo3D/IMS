@@ -377,3 +377,24 @@ function connector(overrides: { pushOrder?: (input: WmsOrderPushInput) => Promis
     cancelOrder: (overrides.cancelOrder ?? (async () => ({ cancelled: true, status: 'CANCELLED' }))) as never,
   }
 }
+
+test('create: a connector that resolves the input from its settings (shipping VAT) is audited and sent with the SAME figure, and the push total guard reads it too', async () => {
+  const sent: WmsOrderPushInput[] = []
+  const events: Array<{ after?: { intent?: { shippingVat?: number } } }> = []
+  const { port } = makePort({ createCandidates: [candidate()] })
+  port.recordEvent = (async (event: never) => { events.push(event) }) as never
+  const resolving = { ...connector({ pushOrder: async (input) => { sent.push(input); return okPush() } }), resolvePushInput: async (input: WmsOrderPushInput) => ({ ...input, shippingVat: input.shippingVatDerived ?? 0 }) }
+  await runWmsOrderPushSweepCore(resolving as never, 'mintsoft', port, { now: NOW })
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0]!.shippingVat, 1, 'the wire carries the derived figure')
+  const created = events.find((event) => event.after?.intent)
+  assert.equal(created?.after?.intent?.shippingVat, 1, 'the audit intent records what was sent, not 0')
+})
+
+test('create: a resolver that throws leaves the input as built (the send reads its own settings)', async () => {
+  const sent: WmsOrderPushInput[] = []
+  const { port } = makePort({ createCandidates: [candidate()] })
+  const resolving = { ...connector({ pushOrder: async (input) => { sent.push(input); return okPush() } }), resolvePushInput: async () => { throw new Error('settings unreadable') } }
+  await runWmsOrderPushSweepCore(resolving as never, 'mintsoft', port, { now: NOW })
+  assert.equal(sent[0]?.shippingVat, 0)
+})

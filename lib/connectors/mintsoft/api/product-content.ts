@@ -57,6 +57,19 @@ export function buildMintsoftProductContentRequest(update: WmsProductContentUpda
   return { path: '/api/Product', method: 'POST', body: JSON.stringify(body) }
 }
 
+/** Mintsoft ANSWERED the content update and said no (HTTP 2xx, `Success: false`). Distinct from a timeout or a transport error, which say nothing about the value. */
+export class MintsoftContentRefusedError extends Error {
+  readonly refusedByMintsoft = true
+  constructor(message: string) {
+    super(message)
+    this.name = 'MintsoftContentRefusedError'
+  }
+}
+
+export function isMintsoftContentRefusal(error: unknown): boolean {
+  return error instanceof MintsoftContentRefusedError || (error instanceof Error && error.name === 'MintsoftContentRefusedError')
+}
+
 export async function updateMintsoftProductContent(update: WmsProductContentUpdate): Promise<WmsProductContentResult> {
   const request = buildMintsoftProductContentRequest(update)
   const result = await mintsoftRequest<unknown>(request.path, { method: request.method, body: request.body })
@@ -67,7 +80,7 @@ export async function updateMintsoftProductContent(update: WmsProductContentUpda
   const body = result.data
   if (typeof body === 'object' && body !== null && !Array.isArray(body) && (body as { Success?: unknown }).Success === false) {
     const message = (body as { Message?: unknown }).Message
-    throw new Error(`Mintsoft rejected the content update${typeof message === 'string' && message.trim() ? `: ${message.trim().slice(0, 300)}` : ''}`)
+    throw new MintsoftContentRefusedError(`Mintsoft rejected the content update${typeof message === 'string' && message.trim() ? `: ${message.trim().slice(0, 300)}` : ''}`)
   }
   return { sent: true }
 }

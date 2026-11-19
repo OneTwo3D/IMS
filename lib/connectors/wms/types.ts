@@ -787,6 +787,11 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   /** Line items (SKU + whole-unit qty) of a single order/part. */
   fetchOrderPartItems?(externalPartId: string): Promise<Array<{ sku: string; qty: number }>>
   /** Push (create) an order into the WMS for fulfilment; idempotent on re-push. */
+  /**
+   * The input as this connector will send it, with its own settings applied (e.g. a derived figure it only sends behind a switch). The sweep runs the total guard and
+   * records the audit intent on THIS result, so what is checked and recorded is what goes on the wire. Absent: the input is sent as built. Read-only; sends nothing.
+   */
+  resolvePushInput?(input: WmsOrderPushInput): Promise<WmsOrderPushInput>
   pushOrder?(input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.create'>): Promise<WmsOrderPushResult>
   /**
    * o3d-bjc.8: prove that a minted id really is ours, without mutating anything.

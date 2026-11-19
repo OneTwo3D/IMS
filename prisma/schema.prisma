@@ -5088,6 +5088,8 @@ enum WmsDiscrepancyCategory {
   CUSTOMS_CLEAR_MANUAL
   /// An IMS SKU rename the warehouse product does not yet follow: nothing is created, the operator renames it there.
   PRODUCT_SKU_RENAMED
+  /// Mintsoft keeps answering a product content update with Success:false: after the retry cap IMS stops re-sending that value and the operator fixes the content or the field.
+  PRODUCT_CONTENT_REFUSED
 }
 
 enum WmsDiscrepancyStatus {

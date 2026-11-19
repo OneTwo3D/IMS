@@ -404,7 +404,7 @@ async function orderIdsWithHeldCreateShadow(connectorId: string, orderIds: strin
   const destination = WMS_PRODUCER_DESTINATION[connectorId as keyof typeof WMS_PRODUCER_DESTINATION]
   for (let i = 0; i < orderIds.length; i += SHADOW_READ_BATCH) {
     try {
-      const records = await findDurableShadowRecords(db, destination, [{ subjectType: 'SalesOrder', exactIds: orderIds.slice(i, i + SHADOW_READ_BATCH), operations: ['order.create'] }])
+      const records = await findDurableShadowRecords(db, destination, [{ subjectType: 'SalesOrder', exactIds: orderIds.slice(i, i + SHADOW_READ_BATCH), operations: ['order.create'] }], { onePerSubject: true })
       for (const record of records) found.add(record.subjectId)
     } catch (error) {
       shadowReadErrors += 1

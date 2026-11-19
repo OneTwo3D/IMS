@@ -7,7 +7,7 @@ import {
 import { updateMintsoftProductContent } from './api/product-content'
 import { createMintsoftAsn, createMintsoftBundle, deleteMintsoftProduct, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
-import { addMintsoftOrderComment, readMintsoftOrderItemRefs, cancelMintsoftOrder, holdMintsoftOrderForMerge, findMintsoftMergedSurvivor, pushMintsoftOrder, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, probeMintsoftOrderAmendable, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
+import { addMintsoftOrderComment, readMintsoftOrderItemRefs, cancelMintsoftOrder, holdMintsoftOrderForMerge, findMintsoftMergedSurvivor, pushMintsoftOrder, resolveMintsoftPushInput, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, probeMintsoftOrderAmendable, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
 import { createMintsoftSupplier, fetchMintsoftSuppliers } from './api/suppliers'
 import { parseMintsoftPositiveId } from './settings/schema'
 import { getSettingValue } from '@/lib/settings-store'
@@ -160,6 +160,10 @@ export class MintsoftConnector implements WmsConnector {
 
   async fetchOrderPartItems(externalPartId: string): Promise<Array<{ sku: string; qty: number }>> {
     return fetchMintsoftPartItems(externalPartId, await getRequiredMintsoftClientId())
+  }
+
+  async resolvePushInput(input: WmsOrderPushInput): Promise<WmsOrderPushInput> {
+    return resolveMintsoftPushInput(input)
   }
 
   async pushOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {

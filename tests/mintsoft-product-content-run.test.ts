@@ -42,6 +42,7 @@ const PRODUCT = {
 }
 
 const linkWrites: Row[] = []
+const discrepancyCalls: Row[] = []
 
 mock.module('@/lib/db', {
   namedExports: {
@@ -60,7 +61,11 @@ mock.module('@/lib/db', {
         updateMany: async ({ data }: { data: Row }) => { linkWrites.push(data); return { count: 1 } },
         update: async ({ data }: { data: Row }) => { linkWrites.push(data); return {} },
       },
-      wmsStockDiscrepancy: { updateMany: async () => ({ count: 0 }), create: async () => ({}), createMany: async () => ({ count: 0 }) },
+      wmsStockDiscrepancy: {
+        updateMany: async (args: Row) => { discrepancyCalls.push({ op: 'updateMany', ...args }); return { count: 0 } },
+        create: async (args: Row) => { discrepancyCalls.push({ op: 'create', ...args }); return {} },
+        createMany: async () => ({ count: 0 }),
+      },
     },
   },
 })
@@ -137,4 +142,23 @@ test('a content failure is its own error line and counted; the meta result is no
   } finally {
     ;(db.wmsProductLink as unknown as { updateMany: unknown }).updateMany = original
   }
+})
+
+test('a refusal cap that is spent raises ONE open PRODUCT_CONTENT_REFUSED discrepancy per scope; a cleared refusal resolves it; an ordinary outcome touches nothing', async () => {
+  const { syncContentRefusalDiscrepancy } = await import('@/lib/connectors/mintsoft/sync/product-sync')
+  const scopes = [{ warehouseId: 'wh-1', warehouseCode: 'MAIN' }] as never
+  const line = (extra: Row) => ({ kind: 'refused_wait', fields: ['imageUrl'], shadowedFields: [], reason: '', payload: {}, ...extra }) as never
+  discrepancyCalls.length = 0
+  await syncContentRefusalDiscrepancy(scopes, { id: 'prod-1', sku: 'SKU-1' }, line({}))
+  assert.deepEqual(discrepancyCalls, [], 'nothing is written for an outcome that does not touch a refusal')
+  await syncContentRefusalDiscrepancy(scopes, { id: 'prod-1', sku: 'SKU-1' }, line({ capReachedFields: ['imageUrl'] }))
+  const created = (discrepancyCalls as Array<Row & { op?: string }>).find((call) => call.op === 'create') as { data: Row } | undefined
+  assert.ok(created, 'the discrepancy is created when no open one exists')
+  assert.equal(created.data.category, 'PRODUCT_CONTENT_REFUSED')
+  assert.equal(created.data.status, 'OPEN')
+  discrepancyCalls.length = 0
+  await syncContentRefusalDiscrepancy(scopes, { id: 'prod-1', sku: 'SKU-1' }, line({ kind: 'sent', capReachedFields: [], refusalCleared: true }))
+  const resolved = (discrepancyCalls as Array<Row & { op?: string }>).find((call) => call.op === 'updateMany') as { data: Row; where: Row } | undefined
+  assert.equal(resolved?.data.status, 'RESOLVED')
+  assert.equal(resolved?.where.category, 'PRODUCT_CONTENT_REFUSED')
 })

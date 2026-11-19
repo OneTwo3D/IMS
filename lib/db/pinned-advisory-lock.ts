@@ -47,9 +47,9 @@ import { createSessionAdvisoryLockPool } from './session-lock-pool'
  */
 let lockPool: Pool | null = null
 function getLockPool(): Pool {
-  // 6, not 4: the first-load apply runner now holds a run-wide lease beside its step lock for the whole run, and a takeover while the displaced runner still
-  // holds its two (a killed connection stays checked out until its holder releases it) must not wait on the pool.
-  if (!lockPool) lockPool = createSessionAdvisoryLockPool('advisory locks', 6)
+  // 4 is enough for the first-load apply runner too: it holds a run-wide lease plus one step lock (2 of the 4), and a competing runner is a separate
+  // process with its own pool, so a takeover never waits on this one. (It was briefly 6; nothing in a single process needs more.)
+  if (!lockPool) lockPool = createSessionAdvisoryLockPool('advisory locks', 4)
   return lockPool
 }
 

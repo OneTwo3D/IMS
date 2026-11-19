@@ -105,6 +105,84 @@ test('d: the state save is compare-and-swap; when another run moved the state th
   assert.equal(after.pushed.imageUrl, undefined, 'no hash is trusted for a field two runs both sent: the next run sends the current value again')
 })
 
+test('d2: when both runs sent the SAME value the other run\'s hash is kept (no redundant re-send), and the fallback write is conditional', async () => {
+  const { syncMintsoftProductContent } = await loadSync()
+  const connector = { async updateProductContent() { return { sent: true as const } } }
+  const imageHash = contentValueHash('https://shop.example.test/p.jpg')
+  const first = { pushed: {}, shadowed: {} }
+  links.set('link-d3', { id: 'link-d3', contentSyncState: first })
+  concurrentWriter = (id) => { concurrentWriter = null; links.get(id)!.contentSyncState = { pushed: { imageUrl: imageHash }, shadowed: {} } }
+  await syncMintsoftProductContent({ product: { id: 'p1', sku: 'SKU-1' }, link: { id: 'link-d3', externalProductId: '168', contentSyncState: first }, content: { ...CONTENT, longDescription: '', shortDescription: '' }, connector, context: LIVE_CONTEXT })
+  const after = links.get('link-d3')!.contentSyncState as { pushed: Record<string, string> }
+  assert.equal(after.pushed.imageUrl, imageHash, 'the same value the other run sent keeps its hash')
+})
+
+const REFUSED_AT = new Date('2026-06-01T12:00:00Z')
+function refusingHarness() {
+  const calls: unknown[] = []
+  const saves: Array<{ refused: Record<string, { hash: string; count: number; at: string }>; pushed: Record<string, string> }> = []
+  return {
+    calls,
+    saves,
+    connector: { async updateProductContent(update: unknown) { calls.push(update); const { MintsoftContentRefusedError } = await loadApi(); throw new MintsoftContentRefusedError('Mintsoft rejected the content update: bad image') } },
+    saveState: async (_id: string, state: unknown) => { saves.push(JSON.parse(JSON.stringify(state))) },
+  }
+}
+const imageOnly: ProductContentSnapshot = { longDescription: '', shortDescription: '', images: CONTENT.images }
+
+test('f: a Success:false answer is RECORDED against the value, backs off, stops at five refusals and names the field for a discrepancy; it is not re-POSTed every run', async () => {
+  const { syncMintsoftProductContent, CONTENT_REFUSAL_MAX_ATTEMPTS, CONTENT_REFUSAL_BACKOFF_MINUTES } = await loadSync()
+  const h = refusingHarness()
+  let state: unknown = null
+  let now = REFUSED_AT
+  const run = async () => {
+    const line = await syncMintsoftProductContent({ product: { id: 'p1', sku: 'SKU-1' }, link: { id: 'link-f', externalProductId: '168', contentSyncState: state }, content: imageOnly, connector: h.connector, context: LIVE_CONTEXT, saveState: h.saveState, now })
+    state = h.saves.at(-1) ?? state
+    return line
+  }
+  const first = await run()
+  assert.equal(first.kind, 'refused')
+  assert.equal(h.calls.length, 1)
+  assert.equal(h.saves.at(-1)!.refused.imageUrl!.count, 1, 'the refusal is in the saved state')
+  assert.equal(h.saves.at(-1)!.refused.imageUrl!.hash, contentValueHash('https://shop.example.test/p.jpg'))
+  assert.deepEqual(h.saves.at(-1)!.pushed, {}, 'a refused value is never recorded as accepted')
+  // Straight away and 29 minutes later: waiting, no POST.
+  assert.equal((await run()).kind, 'refused_wait')
+  now = new Date(REFUSED_AT.getTime() + 29 * 60_000)
+  assert.equal((await run()).kind, 'refused_wait')
+  assert.equal(h.calls.length, 1, 'no request while the back-off holds')
+  // Each refusal waits longer, up to the cap.
+  for (let attempt = 1; attempt < CONTENT_REFUSAL_MAX_ATTEMPTS; attempt += 1) {
+    now = new Date(Date.parse(h.saves.at(-1)!.refused.imageUrl!.at) + CONTENT_REFUSAL_BACKOFF_MINUTES[attempt - 1]! * 60_000)
+    const line = await run()
+    assert.equal(line.kind, 'refused')
+    assert.equal(h.saves.at(-1)!.refused.imageUrl!.count, attempt + 1)
+    if (attempt + 1 === CONTENT_REFUSAL_MAX_ATTEMPTS) assert.deepEqual(line.capReachedFields, ['imageUrl'], 'the cap is reached: the caller raises the discrepancy')
+    else assert.deepEqual(line.capReachedFields, [])
+  }
+  assert.equal(h.calls.length, CONTENT_REFUSAL_MAX_ATTEMPTS)
+  now = new Date(now.getTime() + 365 * 24 * 3_600_000)
+  const capped = await run()
+  assert.equal(capped.kind, 'refused_wait')
+  assert.deepEqual(capped.capReachedFields, ['imageUrl'], 'the cap keeps naming the field every run')
+  assert.equal(h.calls.length, CONTENT_REFUSAL_MAX_ATTEMPTS, 'a year later it is still not sent again')
+  // A CHANGED value starts again at once, and the old refusal record is dropped.
+  const changed = await syncMintsoftProductContent({ product: { id: 'p1', sku: 'SKU-1' }, link: { id: 'link-f', externalProductId: '168', contentSyncState: state }, content: { ...imageOnly, images: normalizeImageRefs([{ id: 1, src: 'https://shop.example.test/other.jpg' }]) }, connector: { async updateProductContent() { return { sent: true as const } } }, context: LIVE_CONTEXT, saveState: h.saveState, now })
+  assert.equal(changed.kind, 'sent')
+  assert.equal(changed.refusalCleared, true)
+  assert.deepEqual(h.saves.at(-1)!.refused, {})
+})
+
+test('g: a transport failure (not an answered refusal) is not counted and still throws', async () => {
+  const { syncMintsoftProductContent } = await loadSync()
+  const saves: unknown[] = []
+  await assert.rejects(syncMintsoftProductContent({
+    product: { id: 'p1', sku: 'SKU-1' }, link: { id: 'link-g', externalProductId: '168', contentSyncState: null }, content: imageOnly,
+    connector: { async updateProductContent() { throw new Error('socket hang up') } }, context: LIVE_CONTEXT, saveState: async (_i: string, state: unknown) => { saves.push(state) },
+  }), /socket hang up/)
+  assert.deepEqual(saves, [], 'nothing is recorded for an unanswered request')
+})
+
 test('e: many variations are stored with ONE read and a write only for a changed one (was a read and a write each)', async () => {
   const { applyIncomingProductContentBatch } = await import('../lib/domain/product-content/store.ts')
   const rows: Array<Record<string, unknown>> = [{ productId: 'same', shortDescription: null, longDescription: 'unchanged', images: [] }]

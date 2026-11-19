@@ -157,6 +157,32 @@ test('RECONCILE WHILE HELD: a held-create shadow record that cannot be read is C
   await withEnv(OFF, async () => assert.equal((await resolve()).shadowReadErrors, 0, 'no hold, no shadow read'))
 })
 
+test('RECONCILE WHILE HELD: orders with many shadow rows (one per payload digest) do not starve the rest of the batch; every order with a held-create record is answered', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `srm${randomUUID().slice(0, 8)}`
+  const wh = await seedWarehouse(d, tag)
+  const orderIds: string[] = []
+  for (let i = 0; i < 3; i += 1) orderIds.push(await seedOrderIn(d, wh, `${tag}${i}`, new Date('2026-05-01T00:00:00Z')))
+  t.after(() => cleanupWarehouse(d, wh))
+  t.after(() => d.db.outboundShadowWrite.deleteMany({ where: { subjectId: { in: orderIds } } }))
+  const findings: Array<{ id: string }> = []
+  for (const orderId of orderIds) findings.push(await d.db.wmsOrderDiscrepancy.create({ data: { connector: 'mintsoft', orderId, category: 'NOT_PUSHED', status: 'OPEN', detail: 'old' }, select: { id: true } }))
+  // The first two orders changed many times while held (12 digests each, produced EARLIER); the third has one row, produced later.
+  let n = 0
+  for (const orderId of orderIds.slice(0, 2)) {
+    for (let k = 0; k < 12; k += 1) {
+      await d.db.outboundShadowWrite.create({ data: { destination: 'mintsoft', operation: 'order.create', subjectType: 'SalesOrder', subjectId: orderId, payloadDigest: String(n++).padStart(64, 'b'), reason: 'HELD', owner: 'bridge', phase: 'P1', grantState: 'none', firstProducedAt: new Date(Date.UTC(2026, 5, 1, 0, 0, n)) } })
+    }
+  }
+  await d.db.outboundShadowWrite.create({ data: { destination: 'mintsoft', operation: 'order.create', subjectType: 'SalesOrder', subjectId: orderIds[2]!, payloadDigest: 'c'.repeat(64), reason: 'HELD', owner: 'bridge', phase: 'P1', grantState: 'none', firstProducedAt: new Date(Date.UTC(2026, 6, 1)) } })
+  await withEnv(HELD, async () => {
+    const outcome = await d.reconcile.resolveNotPushedChunk({ connectorId: 'mintsoft', boundWarehouseIds: [wh.warehouseId], rows: findings.map((finding, i) => ({ id: finding.id, orderId: orderIds[i]! })), now: new Date() })
+    assert.equal(outcome.outOfScope, 3, 'all three held orders are answered, including the one behind 24 earlier rows')
+    const rows = await d.db.wmsOrderDiscrepancy.findMany({ where: { id: { in: findings.map((finding) => finding.id) } }, select: { status: true } })
+    assert.deepEqual(rows.map((row) => row.status), ['RESOLVED', 'RESOLVED', 'RESOLVED'])
+  })
+})
+
 test('HELD CREATE PASS CURSOR: the real port pages candidates by id after the cursor; the cursor is stored and cleared; without a rotation the legacy updatedAt order is untouched', { skip }, async (t) => {
   const d = await deps()
   const tag = `srg${randomUUID().slice(0, 8)}`
