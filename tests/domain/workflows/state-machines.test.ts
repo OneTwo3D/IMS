@@ -157,6 +157,7 @@ test('stock transfer state machine preserves dispatch-receive workflow', () => {
   assert.equal(canTransitionStockTransfer('DRAFT', 'IN_TRANSIT'), true)
   assert.equal(canTransitionStockTransfer('DRAFT', 'CANCELLED'), true)
   assert.equal(canTransitionStockTransfer('IN_TRANSIT', 'RECEIVED'), true)
+  assert.equal(canTransitionStockTransfer('IN_TRANSIT', 'CANCELLED'), true, 'cancelDispatchedTransfer performs it')
   assert.equal(canTransitionStockTransfer('DRAFT', 'RECEIVED'), false)
   assert.equal(canTransitionStockTransfer('RECEIVED', 'CANCELLED'), false)
   assert.throws(

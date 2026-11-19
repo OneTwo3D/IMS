@@ -7,7 +7,7 @@ import {
 
 export const STOCK_TRANSFER_TRANSITIONS = {
   DRAFT: ['IN_TRANSIT', 'CANCELLED'],
-  IN_TRANSIT: ['RECEIVED'],
+  IN_TRANSIT: ['RECEIVED', 'CANCELLED'],
   RECEIVED: [],
   CANCELLED: [],
 } as const satisfies WorkflowTransitions<StockTransferStatus>

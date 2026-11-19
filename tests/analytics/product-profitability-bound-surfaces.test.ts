@@ -55,7 +55,7 @@ const EXACT: Interval = { lower: 0, upper: 0 }
  * that any site deriving a relation from them fails loudly.
  */
 function fy(revenue: number, cogs: number, bound: Interval, disclose: { gross: number; unknown: number }) {
-  return { revenue, cogs, profit: revenue - cogs, qtySold: 1, bound, refundsGrossBasis: disclose.gross, refundsUnknownBasis: disclose.unknown }
+  return { revenue, revenueExact: String(revenue), profitExact: String(revenue - cogs), cogs, profit: revenue - cogs, qtySold: 1, bound, refundsGrossBasis: disclose.gross, refundsUnknownBasis: disclose.unknown }
 }
 
 type Fy = ReturnType<typeof fy>
@@ -347,4 +347,26 @@ test('a zero revenue under an EXACT interval prints a bare em dash, with no rela
   assert.equal(occurrences(html, '— ≤'), 0)
   assert.equal(occurrences(html, '— ?'), 0)
   assert.equal(occurrences(html, '£0.00 ≤'), 0, 'the fat bucket columns do not make an exact figure bounded')
+})
+
+/**
+ * o3d-0868: A BOUNDED FIGURE ABOVE 2^53 LOST ITS PRECISION AT THE WIRE.
+ *
+ * A true revenue of 90071992547409.971 travels as the double 90071992547409.96875 (doubles are 0.015625 apart there),
+ * so a ceiling taken from it prints ...409.97 over a truth that is ...409.971. The exact decimal string travels
+ * beside the number now and every printed digit, including the browser's filtered subtotal, comes from it.
+ */
+test('a bounded figure above 2^53 prints a ceiling at or above its exact value (o3d-0868)', async () => {
+  const exactRevenue = '90071992547409.971'
+  const big = { ...fy(Number(exactRevenue), 0, { lower: -0.001, upper: 0 }, { gross: 0.001, unknown: 0 }), revenueExact: exactRevenue, profitExact: exactRevenue }
+  const clean = fy(0, 0, EXACT, { gross: 0, unknown: 0 })
+  const { html } = (await renderPage(props([
+    row('p1', 'Widget', big, clean),
+    row('p2', 'Gadget', big, clean),
+  ]))).render()
+  // Row cells (revenue + profit) print the ceiling of 90071992547409.971 -> .98, never the float's .97.
+  assert.ok(occurrences(html, '£90071992547409.98 ≤') >= 4, 'ceiling of the exact value')
+  assert.equal(occurrences(html, '£90071992547409.97 ≤'), 0, 'the float-rounded ceiling sits below the truth')
+  // Subtotal of two: 180143985094819.942 -> ceiling .95, summed exactly in the browser.
+  assert.ok(occurrences(html, '£180143985094819.95 ≤') >= 4, 'the filtered subtotal is summed as decimal strings, not doubles')
 })
