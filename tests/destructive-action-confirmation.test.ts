@@ -4,6 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import test, { mock } from 'node:test'
 
+import { alignmentThresholdsKey } from '@/lib/domain/wms/alignment-dry-run'
+
 import {
   CONFIRMATION_REQUIRED_CODE,
   isExplicitlyConfirmed,
@@ -272,7 +274,8 @@ function freshDryRun(over: Partial<DryRunJob> & { summary?: Record<string, unkno
     id: 'job-1',
     startedAt: new Date('2026-11-02T00:00:00Z'),
     ...over,
-    summary: { dryRun: true, externalWarehouseId: 'ext-1', connectionId: 'conn-1', ...over.summary },
+    // thresholdsKey: dry-run evidence is stamped with the write-off thresholds it ran under; this binding carries none.
+    summary: { dryRun: true, externalWarehouseId: 'ext-1', connectionId: 'conn-1', thresholdsKey: alignmentThresholdsKey(undefined), ...over.summary },
   }
 }
 
@@ -340,6 +343,8 @@ test('dry-run evidence from before a re-point, for another external warehouse or
     ['ran against another Mintsoft warehouse', freshDryRun({ summary: { externalWarehouseId: 'ext-OLD' } })],
     ['ran against another connection', freshDryRun({ summary: { connectionId: 'conn-OLD' } })],
     ['recorded before the connection was stamped', freshDryRun({ summary: { connectionId: undefined } })],
+    ['recorded before the thresholds were stamped', freshDryRun({ summary: { thresholdsKey: undefined } })],
+    ['ran under other write-off thresholds', freshDryRun({ summary: { thresholdsKey: alignmentThresholdsKey({ maxUnits: 5 }) } })],
   ]
   for (const [name, job] of stale) {
     reset()
