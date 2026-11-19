@@ -42,6 +42,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   cost_layers: { kind: 'RUNNER_WRITES', reason: 'opening-stock cost layers' },
   cron_runs: { kind: 'CONFIG_ALLOWED', reason: 'run history of scheduled jobs, no business data' },
   currencies: { kind: 'CONFIG_ALLOWED', reason: 'currency list; seeded' },
+  customer_merge_events: { kind: 'MUST_BE_EMPTY', reason: 'CRM merge/unmerge audit rows: ids only, written by operators and the order importer, never by this runner' },
   customers: { kind: 'MUST_BE_EMPTY', reason: 'customers records: business data this runner never writes' },
   document_number_sequences: { kind: 'CONFIG_ALLOWED', reason: 'numbering patterns and counters of the documents IMS numbers itself: configuration an operator may set before the load; a first load takes its document numbers from the file and never mints one' },
   document_templates: { kind: 'CONFIG_ALLOWED', reason: 'configured document templates' },

@@ -53,7 +53,7 @@ function formatAddr(a: AddressData | null): string {
   return [a.line1, a.line2, a.city, a.county, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ') || '—'
 }
 
-function GdprDialog({ customer, onClose }: { customer: CustomerDetail; onClose: () => void }) {
+function GdprDialog({ customer, clusterSize, onClose }: { customer: CustomerDetail; clusterSize: number; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [confirmation, setConfirmation] = useState('')
@@ -93,6 +93,11 @@ function GdprDialog({ customer, onClose }: { customer: CustomerDetail; onClose: 
           <p className="text-muted-foreground">
             The following data will be cleared: name, email, phone, company, tax number, billing/shipping addresses, notes, and all linked order customer details.
           </p>
+          {clusterSize > 1 && (
+            <p role="note" className="text-sm font-medium text-destructive">
+              This customer is merged with {clusterSize - 1} other record{clusterSize - 1 === 1 ? '' : 's'} (the same person). All {clusterSize} records and their orders will be anonymised.
+            </p>
+          )}
           <div className="space-y-1.5">
             <Label className="text-xs">Type <strong>{expectedName}</strong> to confirm</Label>
             <Input
@@ -119,9 +124,9 @@ function GdprDialog({ customer, onClose }: { customer: CustomerDetail; onClose: 
   )
 }
 
-type Props = { customer: CustomerDetail }
+type Props = { customer: CustomerDetail; clusterSize?: number }
 
-export function CustomerDetailClient({ customer }: Props) {
+export function CustomerDetailClient({ customer, clusterSize = 1 }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const fmtDate = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' })
@@ -263,7 +268,7 @@ export function CustomerDetailClient({ customer }: Props) {
         )}
       </Card>
 
-      {showGdpr && <GdprDialog customer={customer} onClose={() => setShowGdpr(false)} />}
+      {showGdpr && <GdprDialog customer={customer} clusterSize={clusterSize} onClose={() => setShowGdpr(false)} />}
     </div>
   )
 }

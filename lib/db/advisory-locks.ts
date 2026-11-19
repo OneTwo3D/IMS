@@ -391,6 +391,15 @@ export const PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE = 411_220_881
 export const WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE = 411_220_882
 
 /**
+ * THE CRM AUTO-MERGE AUDIT LOCK (two-int, key = hashtext of the customer pair).
+ *
+ * Taken (transaction scope) while writing the AUTO_EMAIL audit row of a customer pair, so two concurrent order imports that both see the same new
+ * duplicate write ONE row between them (customer_merge_events has no unique key to say so). Never held across an external call; a hashtext collision
+ * only serialises two pairs' bookkeeping.
+ */
+export const CRM_AUTO_MERGE_AUDIT_LOCK_NAMESPACE = 411_220_890
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -445,5 +454,6 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE,
   WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE,
+  CRM_AUTO_MERGE_AUDIT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

@@ -91,6 +91,8 @@ export async function eraseOrdersPersonalDataInTx(
         customerName: ERASURE_PLACEHOLDER_NAME,
         customerEmail: null,
         customerVatNumber: null,
+        // The storefront customer id the order was placed under names the person's storefront account (CRM): cleared with the order's identity.
+        externalCustomerId: null,
         billingAddress: Prisma.JsonNull,
         shippingAddress: Prisma.JsonNull,
         notes: null,

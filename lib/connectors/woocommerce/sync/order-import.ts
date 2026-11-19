@@ -1555,6 +1555,9 @@ async function updateExistingWcOrderCore(
       data: {
         externalOrderNumber: wcOrder.number,
         ...(erased || staleDelivery ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
+        // CRM: the storefront customer id the order was placed under. Only a positive id is written (a guest order and an anonymised payload report 0, which says nothing
+        // and must never blank an id already stored), never on an erased order (the id names the person's account), and never from a stale delivery.
+        ...(erased || staleDelivery || !(wcOrder.customer_id > 0) ? {} : { externalCustomerId: wcOrder.customer_id }),
         // The shipping label, method id and courier key are refreshed TOGETHER from the CURRENT first shipping line (the key
         // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
         // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
@@ -3778,6 +3781,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           currency,
           fxRateToBase: fxRate,
           customerId: linkCustomerId,
+          // CRM: the storefront customer id (positive only; an erased-on-create order keeps none, the id names the person's account).
+          ...(!erasedOnCreate && wcOrder.customer_id > 0 ? { externalCustomerId: wcOrder.customer_id } : {}),
           ...(erasedOnCreate
             ? { customerName: ERASURE_PLACEHOLDER_NAME, erasedAt }
             : {

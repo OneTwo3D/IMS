@@ -26,6 +26,7 @@ const IDENTITY_MENTION: Record<string, { calls: number; verdict: string }> = {
 }
 const CUSTOMER_ACTIONS: Record<string, string[]> = {
   'app/actions/customers.ts': ["'created'", "'created'", "'updated'", "'updated'"],
+  'lib/domain/crm/merge-service.ts': ['CUSTOMER_MERGED_ACTION', 'CUSTOMER_UNMERGED_ACTION'],
   'lib/domain/erasure/erase-personal-data.ts': ['ERASURE_RECORD_ACTION', 'ERASURE_FAILURE_ACTION'],
 }
 

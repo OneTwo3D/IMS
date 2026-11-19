@@ -1885,6 +1885,42 @@ model Customer {
   @@map("customers")
 }
 
+/// CRM customer identity: the insert-only record of every merge or unmerge between two Customer rows. The Customer rows are NEVER
+/// merged, rewritten or deleted: a cluster is a read-time overlay (lib/domain/crm/cluster-resolver.ts) over the originals, and these rows are
+/// the audit trail and the operator override.
+///   source AUTO_EMAIL  the system saw two customers share a folded email key. Audit only; the resolver re-derives that rule on every read,
+///                      so an auto row never keeps two customers joined after their emails stop matching.
+///   source OPERATOR    a MANAGER or ADMIN merged or unmerged the pair. For a pair, the NEWEST operator row decides (merge forces a link, unmerge blocks
+///                      the derived rule), whatever the email says.
+/// The pair is stored once, smaller id first (customerId < otherCustomerId, enforced by a CHECK). NO FOREIGN KEYS on purpose: the rows must outlive
+/// anything, and the table holds ids only (no name, email or free text), so an erasure has nothing to clear here. INSERT-ONLY by trigger.
+model CustomerMergeEvent {
+  id              String                 @id @default(cuid())
+  /// Strict insertion order. The newest operator row of a pair wins.
+  seq             BigInt                 @unique @default(autoincrement())
+  kind            CustomerMergeEventKind
+  source          CustomerMergeEventSource
+  customerId      String
+  otherCustomerId String
+  /// The staff user for an OPERATOR row; null for AUTO_EMAIL.
+  decidedByUserId String?
+  createdAt       DateTime               @default(now())
+
+  @@index([customerId])
+  @@index([otherCustomerId])
+  @@map("customer_merge_events")
+}
+
+enum CustomerMergeEventKind {
+  MERGE
+  UNMERGE
+}
+
+enum CustomerMergeEventSource {
+  AUTO_EMAIL
+  OPERATOR
+}
+
 // SALES ORDERS
 // ---------------------------------------------------------------------------
 
@@ -1942,6 +1978,11 @@ model SalesOrder {
 
   // Customer
   customerId        String?
+  /// The WooCommerce (storefront) customer id the order was placed under, from the payload's `customer_id` (null for a guest order, a manual
+  /// order, and an order imported before this column existed unless the stored-payload backfill reached it). Written by the order importer
+  /// on create and on every delivery that follows WooCommerce; never read by a money path. It identifies the person's storefront account,
+  /// so an erasure clears it (like Customer.externalCustomerId). Additive, no backfill in the migration.
+  externalCustomerId Int?            @map("external_customer_id")
   customerName      String?
   customerEmail     String?
   customerVatNumber String?          // customer-entered VAT/IOSS number from the storefront, sent to the WMS for customs
@@ -2300,6 +2341,8 @@ model SalesOrder {
   @@index([status])
   @@index([status, updatedAt(sort: Desc)], map: "sales_orders_status_updatedAt_idx")
   @@index([createdAt])
+  /// A customer's timeline: their orders newest first (CRM). Built CONCURRENTLY in its own migration.
+  @@index([customerId, createdAt(sort: Desc)], map: "sales_orders_customerId_createdAt_idx")
   // o3d-0qoo: "which orders are in batch <ref>" — the reverse of the delete guard's lookup.
   @@index([revenueDeferredBatchRef], map: "sales_orders_revenue_deferred_batch_ref_idx")
   @@index([inventoryAllocatedBatchRef], map: "sales_orders_inventory_allocated_batch_ref_idx")

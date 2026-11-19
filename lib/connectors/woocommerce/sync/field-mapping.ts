@@ -2,6 +2,7 @@
  * WooCommerce → IMS field mapping helpers.
  */
 
+import { recordAutoMergeAudit } from '@/lib/domain/crm/merge-service'
 import { db } from '@/lib/db'
 import { getFxRateToBase as getFxRateToBaseFromTable, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -132,7 +133,10 @@ export async function upsertCustomer(order: WcFullOrder, client?: Prisma.Transac
     : null
   if (!existing && cust.email) {
     // An anonymised row is never a match target (its email is already null; this keeps that true if a writer ever changes).
-    existing = await c.customer.findFirst({ where: { email: cust.email, gdprAnonymisedAt: null } })
+    // CRM (owner decision Q9): the email matches CASE-INSENSITIVELY and ignoring surrounding whitespace ("Jane@x.com" is "jane@x.com"). The +tag and Gmail-dot
+    // folds are NOT applied here: those customers stay separate rows and are joined into one person by the read-time cluster (lib/domain/crm/cluster-resolver.ts).
+    // Oldest first, so the same address always lands on the same row.
+    existing = await c.customer.findFirst({ where: { email: { equals: cust.email.trim(), mode: 'insensitive' }, gdprAnonymisedAt: null }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
   }
 
   // A customer matched here can be ERASED at any moment, and a link written to an erased row would put the raw storefront customer
@@ -194,6 +198,10 @@ export async function upsertCustomer(order: WcFullOrder, client?: Prisma.Transac
         : {}),
     },
   })
+  // CRM auto-merge audit: a new customer whose folded email already belongs to another customer (a +tag or Gmail-dot variant) is recorded as joined to it, in
+  // this same transaction. Insert-only bookkeeping that decides nothing (the resolver joins them with or without the row). Only inside the importer's
+  // transaction: the audit write must commit or roll back with the customer it describes.
+  if (client && created.email) await recordAutoMergeAudit(client, created.id)
   return created.id
 }
 
