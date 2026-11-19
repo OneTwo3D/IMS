@@ -1,0 +1,6 @@
+### Step W hand-send: follow-ups from the #1078 review (sales, cutover)
+- `npm run storefront:hand-send`: the `paid` and `released-in-ims` lists now only show orders placed before the switch-on, so an order placed after it and paid while the switch was turned off again (kill switch, rollback) is no longer listed for a hand-send (it would duplicate WooCommerce's e-mail once its natives are back on). The runbook says what to do for that window.
+- An order an IMS user released before natives-off, with no payment reported, is now listed as `released-in-ims` (CHECK) whatever time it was released, so a payment made after natives-off is not confirmed by nobody.
+- `--mark-sent` refuses an allocated order whose release marker is still armed (unpaid) and a number that matches more than one order; its dry run (no `--yes`) now judges every number as `--yes` would and prints the matched order (id, number, status, placement).
+- `--mark-sent` writes its audit row through the activity log's redaction and sanitising, and `--by` must be a plain name (an e-mail address or other free text is refused).
+- Accepted and documented, not changed: an unpaid allocated import with an EU-withdrawal hold keeps its marker armed (as before the marker disarm), so a rejected withdrawal released by an operator within 48 hours of placement can confirm it.
