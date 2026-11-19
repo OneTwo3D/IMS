@@ -79,19 +79,30 @@ test('UNCLOSED PERIOD EXCLUDED: October data present in all three systems on a 1
   // A vendor row in the widened margin but outside the closed months (1 October) is cut, not counted.
   const inMargin = standard({
     xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 100 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }]), invoice(4, '2026-10-01', [{ type: 'OUTPUT2', tax: 7 }]), invoice(5, '2026-07-31', [{ type: 'OUTPUT2', tax: 3 }])],
-    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']]), wooOrder(104, '2026-10-01T00:00:00', [[11, '5.00']]), wooOrder(105, '2026-07-31T23:59:59', [[11, '5.00']])] },
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']]), wooOrder(104, '2026-10-01T00:00:00', [[11, '5.00']]), wooOrder(105, '2026-07-31T22:59:59', [[11, '5.00']])] },
   })
   assert.deepEqual(reasons(await run(inMargin.ctx)), ['pass'])
 })
 
-// [mutation: month boundary compared with <= instead of the period string / the GMT date not used]
-test('a month boundary: an order created at 23:59:59 on 30 September counts in September, one at 00:00:00 on 1 October does not', async () => {
+// [mutation: month boundary compared with <= instead of the period string / the GMT date not used / the UTC month used instead of the London month]
+// o3d-oe1b0: the month is the LONDON month, the calendar the Xero invoice dates and the IMS side use. September is BST (UTC+1), so 22:59:59 GMT on 30 September is
+// still September in London and 23:00:00 GMT is 00:00 on 1 October. Bucketed by the UTC month, order 102 would land in September and order 101's neighbour in October.
+test('a month boundary is the LONDON month: an order created at 22:59:59 GMT on 30 September (BST) counts in September, one at 23:00:00 GMT is already 1 October and does not', async () => {
   const edge = standard({
     ims: { sales: [sale('2026-09', 'rGB', '10.00'), sale('2026-08', 'rGB', '50.00')] },
     xero: [invoice(1, '2026-09-30', [{ type: 'OUTPUT2', tax: 10 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
-    woo: { processing: [wooOrder(101, '2026-09-30T23:59:59', [[11, '10.00']]), wooOrder(102, '2026-10-01T00:00:00', [[11, '77.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+    woo: { processing: [wooOrder(101, '2026-09-30T22:59:59', [[11, '10.00']]), wooOrder(102, '2026-09-30T23:00:00', [[11, '77.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
   })
   assert.deepEqual(reasons(await run(edge.ctx)), ['pass'])
+})
+
+test('o3d-oe1b0: a BST month-end order created at 23:30 GMT is October in London, so September IMS and Xero tax is not matched by it', async () => {
+  const edge = standard({
+    ims: { sales: [sale('2026-09', 'rGB', '10.00'), sale('2026-08', 'rGB', '50.00')] },
+    xero: [invoice(1, '2026-09-30', [{ type: 'OUTPUT2', tax: 10 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
+    woo: { processing: [wooOrder(101, '2026-09-30T23:30:00', [[11, '10.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+  })
+  assert.notEqual((await run(edge.ctx)).outcome, 'pass')
 })
 
 // [mutation: classifyPopulation not consulted]
