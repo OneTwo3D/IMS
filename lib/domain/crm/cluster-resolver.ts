@@ -3,9 +3,9 @@
  *
  * NOTHING IS MERGED IN THE DATABASE. A cluster is computed on read, over the original rows, from two inputs:
  *
- *   1. THE DERIVED RULE (owner decision 2026-11-18): two customers are the same person when their emails are equal after the identity fold
- *      (lib/domain/crm/identity-key.ts `looseIdentityEmail`: case, whitespace, +tag, and Gmail/Googlemail dots), UNLESS both carry storefront ids and
- *      share none (two different storefront accounts are two people), or either is anonymised.
+ *   1. THE DERIVED RULE (owner decisions 2026-11-18 and 2026-11-19): two customers are the same person when their emails are equal after the identity fold
+ *      (lib/domain/crm/identity-key.ts `looseIdentityEmail`: case, whitespace, +tag, and Gmail/Googlemail dots), unless either is anonymised. The storefront
+ *      customer id plays NO part: WooCommerce cannot hold one email on two accounts, so two accounts whose emails differ only by an alias ARE one person.
  *   2. THE OPERATOR OVERRIDE: for a pair, the NEWEST OPERATOR row in customer_merge_events decides. MERGE joins the pair whatever the email says;
  *      UNMERGE separates them whatever the email says. AUTO_EMAIL rows are audit only and are never read here, so a stale auto row can not keep
  *      two customers joined after their emails stop matching.
@@ -23,8 +23,6 @@ export const MAX_CLUSTER_MEMBERS = 200
 export interface ClusterCustomer {
   id: string
   email: string | null
-  /** Every storefront customer id the customer is known by: its own integer, its storefront links, and the id stored on each of its orders. */
-  storefrontIds: ReadonlyArray<string>
   anonymised: boolean
 }
 
@@ -48,19 +46,11 @@ export function newestOperatorDecisions(rows: ReadonlyArray<OperatorDecision>): 
   return out
 }
 
-/** Two customers carry storefront ids and none is shared: two accounts, so two people (the derived rule never joins them). */
-export function storefrontIdsConflict(a: ClusterCustomer, b: ClusterCustomer): boolean {
-  if (a.storefrontIds.length === 0 || b.storefrontIds.length === 0) return false
-  const theirs = new Set(b.storefrontIds)
-  return !a.storefrontIds.some((id) => theirs.has(id))
-}
-
-/** True when the DERIVED rule alone joins the pair (both live, same folded email, no storefront-account conflict). */
+/** True when the DERIVED rule alone joins the pair (both live, same folded email). */
 export function derivedLink(a: ClusterCustomer, b: ClusterCustomer): boolean {
   if (a.id === b.id || a.anonymised || b.anonymised) return false
   const ka = looseIdentityEmail(a.email)
-  if (ka === null || ka !== looseIdentityEmail(b.email)) return false
-  return !storefrontIdsConflict(a, b)
+  return ka !== null && ka === looseIdentityEmail(b.email)
 }
 
 /** True when the pair is linked once the operator decision (if any) is applied. */
@@ -92,18 +82,12 @@ export function resolveCluster(seedId: string, customers: ReadonlyArray<ClusterC
 }
 
 /**
- * THE SQL TWIN OF looseIdentityEmail, used only to find CANDIDATES (the result is re-filtered in TypeScript, so a difference can only cost a missed
- * candidate for an exotic address, never a wrong join). It is byte-for-byte the expression of the partial index
- * customers_identity_key_idx (migration 20261119131200), which is what makes the lookup an index probe; tests/db/crm-identity.test.ts holds the two
- * implementations to the same answers.
+ * THE SQL TWIN OF looseIdentityEmail, used to find CANDIDATES (every candidate is re-filtered in TypeScript, which also rejects placeholder addresses). It is
+ * the database function crm_loose_identity_key (migration 20261119140100): NFC, trim of every JavaScript white-space character, ASCII lower-case under the "C"
+ * collation, the +tag and Gmail dots folded. The partial index customers_loose_identity_key_v2_idx is on the same call, which makes the lookup an index probe,
+ * and tests/db/crm-identity.test.ts holds the two implementations to the same answers on whitespace, NFC/NFD and non-ASCII samples.
  */
-export const CUSTOMER_LOOSE_EMAIL_KEY_SQL = Prisma.sql`(
-  CASE
-    WHEN split_part(lower(btrim("email")), '@', 2) IN ('gmail.com', 'googlemail.com')
-      THEN replace(split_part(split_part(lower(btrim("email")), '@', 1), '+', 1), '.', '') || '@gmail.com'
-    ELSE split_part(split_part(lower(btrim("email")), '@', 1), '+', 1) || '@' || split_part(lower(btrim("email")), '@', 2)
-  END
-)`
+export const CUSTOMER_LOOSE_EMAIL_KEY_SQL = Prisma.sql`crm_loose_identity_key("email")`
 
 type Reader = Pick<Prisma.TransactionClient, '$queryRaw' | 'customer' | 'customerMergeEvent'>
 
@@ -116,21 +100,8 @@ export interface ClusterInputs {
 
 async function readCustomers(db: Reader, ids: string[]): Promise<ClusterCustomer[]> {
   if (ids.length === 0) return []
-  const rows = await db.customer.findMany({
-    where: { id: { in: ids } },
-    select: { id: true, email: true, externalCustomerId: true, gdprAnonymisedAt: true, shoppingLinks: { select: { externalCustomerId: true } } },
-  })
-  const orderIds = await db.$queryRaw<Array<{ customerId: string; external_customer_id: number }>>`
-    SELECT DISTINCT "customerId", "external_customer_id" FROM "sales_orders"
-    WHERE "customerId" IN (${Prisma.join(ids)}) AND "external_customer_id" IS NOT NULL`
-  const fromOrders = new Map<string, string[]>()
-  for (const r of orderIds) fromOrders.set(r.customerId, [...(fromOrders.get(r.customerId) ?? []), String(r.external_customer_id)])
-  return rows.map((r) => ({
-    id: r.id,
-    email: r.email,
-    anonymised: r.gdprAnonymisedAt !== null,
-    storefrontIds: [...new Set([...(r.externalCustomerId != null ? [String(r.externalCustomerId)] : []), ...r.shoppingLinks.map((l) => l.externalCustomerId), ...(fromOrders.get(r.id) ?? [])])],
-  }))
+  const rows = await db.customer.findMany({ where: { id: { in: ids } }, select: { id: true, email: true, gdprAnonymisedAt: true } })
+  return rows.map((r) => ({ id: r.id, email: r.email, anonymised: r.gdprAnonymisedAt !== null }))
 }
 
 /** Read the customers and operator decisions needed to resolve the cluster of `seedId`: expand by shared email key and by operator rows until nothing new appears. */
@@ -174,4 +145,42 @@ export async function loadClusterInputs(db: Reader, seedId: string): Promise<Clu
 export async function clusterOf(db: Reader, customerId: string): Promise<{ ids: string[]; truncated: boolean }> {
   const inputs = await loadClusterInputs(db, customerId)
   return { ids: resolveCluster(customerId, inputs.customers, inputs.decisions), truncated: inputs.truncated }
+}
+
+/**
+ * THE ORDER A CLUSTER IS ERASED IN: members that hold the cluster together ("linking" members: removing one would disconnect others, such as a record joined
+ * to two storefront accounts, or the middle of a chain) go LAST, and the customer the request was made for goes at the very end. Erasing a linking member early
+ * is what used to cut the rest of the cluster off from a re-run. The saved member list (customer_cluster_erasures) is what actually makes a re-run complete; this
+ * order only keeps the cluster intact for as long as possible, so a failure leaves as much as possible still reachable.
+ */
+export function erasureOrder(seedId: string, ids: ReadonlyArray<string>, customers: ReadonlyArray<ClusterCustomer>, decisions: ReadonlyArray<OperatorDecision>): string[] {
+  const byId = new Map(customers.map((c) => [c.id, c]))
+  const newest = newestOperatorDecisions(decisions)
+  const members = ids.filter((id) => byId.has(id))
+  const adjacent = (a: string, b: string) => effectiveLink(byId.get(a)!, byId.get(b)!, newest.get(pairKey(a, b)))
+  const connectedWithout = (removed: string): boolean => {
+    const rest = members.filter((id) => id !== removed)
+    if (rest.length <= 1) return true
+    const seen = new Set([rest[0]!])
+    const queue = [rest[0]!]
+    while (queue.length > 0) {
+      const current = queue.pop()!
+      for (const other of rest) if (!seen.has(other) && adjacent(current, other)) { seen.add(other); queue.push(other) }
+    }
+    return seen.size === rest.length
+  }
+  const linking = new Set(members.filter((id) => id !== seedId && !connectedWithout(id)))
+  const sorted = [...ids].sort()
+  return [
+    ...sorted.filter((id) => id !== seedId && !linking.has(id)),
+    ...sorted.filter((id) => id !== seedId && linking.has(id)),
+    ...(ids.includes(seedId) ? [seedId] : []),
+  ]
+}
+
+/** The cluster of `customerId` with the order to erase it in (see erasureOrder). */
+export async function clusterForErasure(db: Reader, customerId: string): Promise<{ ids: string[]; order: string[]; truncated: boolean }> {
+  const inputs = await loadClusterInputs(db, customerId)
+  const ids = resolveCluster(customerId, inputs.customers, inputs.decisions)
+  return { ids, order: erasureOrder(customerId, ids, inputs.customers, inputs.decisions), truncated: inputs.truncated }
 }

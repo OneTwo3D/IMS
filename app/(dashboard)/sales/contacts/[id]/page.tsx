@@ -31,7 +31,7 @@ export default async function CustomerDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold">{customer.fullName}</h1>
       </div>
-      <CustomerDetailClient customer={customer} clusterSize={identity?.members.filter((m) => !m.anonymised).length ?? 1} />
+      <CustomerDetailClient customer={customer} clusterMembers={(identity?.members ?? []).filter((m) => !m.anonymised).map((m) => ({ id: m.id, fullName: m.fullName, email: m.email }))} />
       {identity && <CustomerIdentityPanel identity={identity} />}
       {timeline && <CustomerTimeline customerId={id} initial={timeline} showPersonScope={(identity?.members.length ?? 1) > 1} />}
     </div>

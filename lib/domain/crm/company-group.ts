@@ -26,7 +26,8 @@ export interface CompanyGroup {
 
 type Reader = Pick<Prisma.TransactionClient, '$queryRaw' | 'customer'>
 
-const COMPANY_NAME_KEY_SQL = Prisma.sql`lower(btrim(regexp_replace(replace(replace("company", '.', ''), ',', ''), '\\s+', ' ', 'g')))`
+/** SQL twin of companyNameKey: the same punctuation, whitespace and trailing legal-suffix words (LEGAL_SUFFIX_WORDS); the first word is always kept. */
+const COMPANY_NAME_KEY_SQL = Prisma.sql`regexp_replace(lower(btrim(regexp_replace(replace(replace("company", '.', ''), ',', ''), '\\s+', ' ', 'g'))), '( (ltd|limited|inc|incorporated|plc|llc|gmbh|co|company|&|and))+$', '')`
 
 export async function loadCompanyGroup(db: Reader, customerId: string, excludeIds: string[]): Promise<CompanyGroup> {
   const self = await db.customer.findUnique({ where: { id: customerId }, select: { company: true, email: true, gdprAnonymisedAt: true } })

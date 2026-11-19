@@ -108,6 +108,9 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   // CRM customer identity: the insert-only merge / unmerge audit. Ids only (the pair of customer ids and the staff user who decided); no name, email or free text,
   // so there is nothing to erase, and the rows are KEPT by an erasure (the audit trail of who was joined to whom must survive). No foreign keys: it is reached by id.
   CustomerMergeEvent: { erased: [], notPersonal: ['customerId', 'otherCustomerId', 'decidedByUserId'], retained: {} },
+  // CRM cluster erasure request: the saved member list of a whole-person erasure. Ids only (the customers it covered and the staff user who asked); no name, email or
+  // free text, so there is nothing to erase and the row is KEPT as the proof of what the erasure covered. No foreign keys: reached by id.
+  CustomerClusterErasure: { erased: [], notPersonal: ['requestedCustomerId', 'memberIds', 'requestedByUserId'], retained: {} },
   // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
   CogsEntry: { erased: [], notPersonal: [], retained: {} },
   CostLayer: { erased: [], notPersonal: ['returnMovementId'], retained: {} },

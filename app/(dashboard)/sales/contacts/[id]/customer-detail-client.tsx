@@ -53,7 +53,9 @@ function formatAddr(a: AddressData | null): string {
   return [a.line1, a.line2, a.city, a.county, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ') || '—'
 }
 
-function GdprDialog({ customer, clusterSize, onClose }: { customer: CustomerDetail; clusterSize: number; onClose: () => void }) {
+export type ClusterMemberView = { id: string; fullName: string; email: string | null }
+
+function GdprDialog({ customer, clusterMembers, onClose }: { customer: CustomerDetail; clusterMembers: ClusterMemberView[]; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [confirmation, setConfirmation] = useState('')
@@ -66,7 +68,8 @@ function GdprDialog({ customer, clusterSize, onClose }: { customer: CustomerDeta
   function handleAnonymise() {
     setError('')
     startTransition(async () => {
-      const result = await anonymiseCustomer(customer.id)
+      // The ids the operator is shown are sent back: a server snapshot that differs (a merge or unmerge since this page opened) is refused, not erased.
+      const result = await anonymiseCustomer(customer.id, clusterMembers.length > 1 ? clusterMembers.map((m) => m.id) : undefined)
       if (result.success) {
         router.refresh()
         // An erasure that left open warehouse orders says so here, and stays open until the operator has read it.
@@ -93,10 +96,17 @@ function GdprDialog({ customer, clusterSize, onClose }: { customer: CustomerDeta
           <p className="text-muted-foreground">
             The following data will be cleared: name, email, phone, company, tax number, billing/shipping addresses, notes, and all linked order customer details.
           </p>
-          {clusterSize > 1 && (
-            <p role="note" className="text-sm font-medium text-destructive">
-              This customer is merged with {clusterSize - 1} other record{clusterSize - 1 === 1 ? '' : 's'} (the same person). All {clusterSize} records and their orders will be anonymised.
-            </p>
+          {clusterMembers.length > 1 && (
+            <div role="note" className="space-y-1.5 rounded-md border border-destructive/40 p-3" data-testid="gdpr-cluster-members">
+              <p className="text-sm font-medium text-destructive">
+                This customer is merged with {clusterMembers.length - 1} other record{clusterMembers.length - 1 === 1 ? '' : 's'} (the same person). All {clusterMembers.length} records and their orders will be anonymised:
+              </p>
+              <ul className="list-disc pl-5 text-sm">
+                {clusterMembers.map((m) => (
+                  <li key={m.id}>{m.fullName || m.id}{m.email ? <span className="text-muted-foreground"> ({m.email})</span> : null}{m.id === customer.id ? <span className="text-muted-foreground"> (this record)</span> : null}</li>
+                ))}
+              </ul>
+            </div>
           )}
           <div className="space-y-1.5">
             <Label className="text-xs">Type <strong>{expectedName}</strong> to confirm</Label>
@@ -124,9 +134,9 @@ function GdprDialog({ customer, clusterSize, onClose }: { customer: CustomerDeta
   )
 }
 
-type Props = { customer: CustomerDetail; clusterSize?: number }
+type Props = { customer: CustomerDetail; clusterMembers?: ClusterMemberView[] }
 
-export function CustomerDetailClient({ customer, clusterSize = 1 }: Props) {
+export function CustomerDetailClient({ customer, clusterMembers = [] }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const fmtDate = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' })
@@ -268,7 +278,7 @@ export function CustomerDetailClient({ customer, clusterSize = 1 }: Props) {
         )}
       </Card>
 
-      {showGdpr && <GdprDialog customer={customer} clusterSize={clusterSize} onClose={() => setShowGdpr(false)} />}
+      {showGdpr && <GdprDialog customer={customer} clusterMembers={clusterMembers} onClose={() => setShowGdpr(false)} />}
     </div>
   )
 }

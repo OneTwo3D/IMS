@@ -1911,6 +1911,28 @@ model CustomerMergeEvent {
   @@map("customer_merge_events")
 }
 
+/// CRM cluster erasure request: the resolved member list of one whole-person erasure, saved before the first member is erased so an erasure that fails part
+/// way is FINISHED FROM THIS LIST (re-resolving would lose members that were reachable only through an already-anonymised one). Ids only, no foreign keys, kept
+/// by an erasure. While PENDING, merge and unmerge refuse the members. Members are stored in erasure order, the requested customer last.
+model CustomerClusterErasure {
+  id                  String                       @id @default(cuid())
+  requestedCustomerId String
+  memberIds           String[]
+  status              CustomerClusterErasureStatus @default(PENDING)
+  requestedByUserId   String?
+  createdAt           DateTime                     @default(now())
+  completedAt         DateTime?
+
+  @@index([status])
+  @@index([memberIds], type: Gin)
+  @@map("customer_cluster_erasures")
+}
+
+enum CustomerClusterErasureStatus {
+  PENDING
+  COMPLETE
+}
+
 enum CustomerMergeEventKind {
   MERGE
   UNMERGE

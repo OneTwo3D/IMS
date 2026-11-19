@@ -131,12 +131,28 @@ export async function upsertCustomer(order: WcFullOrder, client?: Prisma.Transac
         },
       })
     : null
+  // CRM (owner decision Q5): the storefront customer id stored on earlier orders (sales_orders.external_customer_id) is evidence of WHO the customer is, and wins over
+  // the email. It finds the customer of an earlier order of the same storefront account when no link row exists (an order imported before the link, a link removed by
+  // an erasure of a different record, a changed email). An erased customer is never a match target. Oldest order first, so the same account always lands on the same row.
+  if (!existing && cust.externalCustomerId) {
+    const byOrder = await c.$queryRaw<Array<{ id: string }>>`
+      SELECT cu."id" FROM "sales_orders" o JOIN "customers" cu ON cu."id" = o."customerId"
+      WHERE o."external_customer_id" = ${Number(cust.externalCustomerId)}::int AND cu."gdprAnonymisedAt" IS NULL
+      ORDER BY o."createdAt" ASC, o."id" ASC LIMIT 1`
+    if (byOrder[0]) existing = await c.customer.findUnique({ where: { id: byOrder[0].id } })
+  }
   if (!existing && cust.email) {
     // An anonymised row is never a match target (its email is already null; this keeps that true if a writer ever changes).
-    // CRM (owner decision Q9): the email matches CASE-INSENSITIVELY and ignoring surrounding whitespace ("Jane@x.com" is "jane@x.com"). The +tag and Gmail-dot
-    // folds are NOT applied here: those customers stay separate rows and are joined into one person by the read-time cluster (lib/domain/crm/cluster-resolver.ts).
-    // Oldest first, so the same address always lands on the same row.
-    existing = await c.customer.findFirst({ where: { email: { equals: cust.email.trim(), mode: 'insensitive' }, gdprAnonymisedAt: null }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
+    // CRM (owner decision Q9): the email matches CASE-INSENSITIVELY and ignoring surrounding spaces ("Jane@x.com" is "jane@x.com"), as an EXACT comparison:
+    // lower(btrim(email)) = lower(btrim($1)) (index customers_email_lower_btrim_idx). NOT Prisma's `equals` with mode 'insensitive': that compiles to ILIKE with the
+    // value as an unescaped pattern, where `_` and `%` are wildcards ("j_smith@x.com" would match "j.smith@x.com") and a backslash can make the real row miss.
+    // The +tag and Gmail-dot folds are NOT applied here: those customers stay separate rows and are joined into one person by the read-time cluster
+    // (lib/domain/crm/cluster-resolver.ts), also when their storefront ids differ (owner decision 2026-11-19). Oldest first, so the same address always lands on the same row.
+    const byEmail = await c.$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "customers"
+      WHERE "email" IS NOT NULL AND "gdprAnonymisedAt" IS NULL AND lower(btrim("email")) = lower(btrim(${cust.email}))
+      ORDER BY "createdAt" ASC, "id" ASC LIMIT 1`
+    if (byEmail[0]) existing = await c.customer.findUnique({ where: { id: byEmail[0].id } })
   }
 
   // A customer matched here can be ERASED at any moment, and a link written to an erased row would put the raw storefront customer

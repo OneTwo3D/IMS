@@ -531,11 +531,11 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
   }
 }
 
-export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number; erasedRecords?: number }> {
+export async function anonymiseCustomer(customerId: string, expectedMemberIds?: string[]): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number; erasedRecords?: number }> {
   const session = await requirePermission('sync')
   // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure. A customer merged with others is one person (owner decision
   // 2026-11-18): the erasure covers EVERY live record of the cluster, each by the same core, each with its own name-free record.
-  const result = await eraseCustomerClusterPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null })
+  const result = await eraseCustomerClusterPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null, expectedMemberIds })
   if (result.success) revalidatePath('/sales/contacts')
   if (!result.success) return { success: false, error: result.error }
   // The operator is told AT THE TIME OF ERASURE what the erasure did not reach: warehouse orders still open hold the person's name and address, and IMS

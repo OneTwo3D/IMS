@@ -125,11 +125,11 @@ test('reads in batches of 1000 and pages across batch boundaries', async () => {
   assert.equal(r.strictKeyGroupSizeHistogram.size2, 1250)
 })
 
-test('derived clusters follow the resolver: folded email, split by storefront account, sampled as ids only', async () => {
+test('derived clusters follow the resolver: folded email joins whatever the storefront ids, sampled as ids only', async () => {
   const cs: Cust[] = [
     { id: 'c01', email: 'a@example.com', woo: ['10'] },
     { id: 'c02', email: ' A+x@Example.com', woo: ['10'] }, // same person
-    { id: 'c03', email: 'a@example.com', woo: ['11'] }, // same email, different storefront account: separate person
+    { id: 'c03', email: 'a@example.com', woo: ['11'] }, // owner 2026-11-19: an alias on another storefront account is the same person too
     { id: 'c04', email: 'j.ane@gmail.com' },
     { id: 'c05', email: 'jane@googlemail.com' },
     { id: 'c06', email: 'jane+z@gmail.com' },
@@ -138,7 +138,6 @@ test('derived clusters follow the resolver: folded email, split by storefront ac
   ]
   const r = await buildCustomerIdentityReport(fakeTx(cs, []))
   assert.equal(r.derivedClustersOfTwoOrMore, 2)
-  assert.equal(r.derivedClusterCustomerRecords, 5)
-  assert.equal(r.derivedGroupsSplitByStorefrontId, 1)
-  assert.deepEqual(r.sampleClusters, [{ size: 3, customerIds: ['c04', 'c05', 'c06'] }, { size: 2, customerIds: ['c01', 'c02'] }])
+  assert.equal(r.derivedClusterCustomerRecords, 6)
+  assert.deepEqual(r.sampleClusters, [{ size: 3, customerIds: ['c01', 'c02', 'c03'] }, { size: 3, customerIds: ['c04', 'c05', 'c06'] }])
 })

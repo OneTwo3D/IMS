@@ -3,12 +3,26 @@ import test from 'node:test'
 
 import { companyEmailDomain, companyKeys, companyNameKey, sameCompany } from '@/lib/domain/crm/company-key'
 
-test('the company name key ignores case, full stops, commas and spacing, and keeps the legal suffix', () => {
-  assert.equal(companyNameKey('  Acme  Widgets, Ltd. '), 'acme widgets ltd')
-  assert.equal(companyNameKey('ACME WIDGETS LTD'), 'acme widgets ltd')
-  assert.notEqual(companyNameKey('Acme Ltd'), companyNameKey('Acme Limited'))
+test('the company name key ignores case, full stops, commas and spacing', () => {
+  assert.equal(companyNameKey('  Acme  Widgets, Ltd. '), 'acme widgets')
+  assert.equal(companyNameKey('ACME WIDGETS'), 'acme widgets')
   assert.equal(companyNameKey('   '), null)
   assert.equal(companyNameKey(null), null)
+})
+
+test('legal suffixes fold away when comparing and normalising (owner decision 2026-11-19)', () => {
+  const one = companyNameKey('Acme Ltd')
+  for (const variant of ['Acme Limited', 'ACME LTD.', 'Acme, Inc.', 'Acme Incorporated', 'Acme plc', 'Acme PLC', 'Acme L.L.C.', 'Acme LLC', 'Acme GmbH', 'Acme Co', 'Acme Co.', 'Acme Company', 'Acme Company Limited', 'Acme & Co Ltd', 'Acme and Co', 'Acme']) {
+    assert.equal(companyNameKey(variant), one, variant)
+  }
+  assert.equal(one, 'acme')
+  assert.ok(sameCompany(companyKeys({ company: 'Acme Limited', email: null }), companyKeys({ company: 'Acme Ltd', email: null })))
+  // only TRAILING words fold, the first word is never removed, and different companies stay apart
+  assert.equal(companyNameKey('Co Ltd'), 'co')
+  assert.equal(companyNameKey('Company'), 'company')
+  assert.equal(companyNameKey('Limited Edition Widgets'), 'limited edition widgets')
+  assert.equal(companyNameKey('Black and Decker'), 'black and decker')
+  assert.notEqual(companyNameKey('Acme Widgets Ltd'), companyNameKey('Acme Gadgets Ltd'))
 })
 
 test('a company domain is a key, a free-mail domain is not', () => {

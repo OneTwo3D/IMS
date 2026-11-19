@@ -5,7 +5,7 @@
  * opens that transaction REPEATABLE READ and READ ONLY; this module sets READ ONLY again as its first statement so a caller that forgets cannot write.
  */
 import { looseIdentityEmail, normaliseIdentityEmail } from '@/lib/domain/crm/identity-key'
-import { derivedLink, type ClusterCustomer } from '@/lib/domain/crm/cluster-resolver'
+import type { ClusterCustomer } from '@/lib/domain/crm/cluster-resolver'
 
 /** The sample of clusters the report lists (ids only). */
 export const SAMPLE_CLUSTER_COUNT = 10
@@ -70,12 +70,10 @@ export interface CustomerIdentityReport {
   ordersWithoutCustomerNoEmail: number
   ordersWithoutCustomerEmailMatchesLiveCustomer: number
   ordersWithoutCustomerOtherEmail: number
-  /** CLUSTERS AS THE RESOLVER WOULD FORM THEM TODAY (folded email, split where two different storefront accounts are involved; operator merge rows are not read). */
+  /** CLUSTERS AS THE RESOLVER WOULD FORM THEM TODAY (folded email; operator merge rows are not read). */
   derivedClustersOfTwoOrMore: number
   /** Customer records that sit in such a cluster. */
   derivedClusterCustomerRecords: number
-  /** Folded-email groups the storefront-account rule splits into two or more people (the report's measure of how often "same email" is NOT "same person"). */
-  derivedGroupsSplitByStorefrontId: number
   /** The largest derived clusters, by size then first id: CUSTOMER IDS ONLY, capped. No email, name or other personal data. */
   sampleClusters: Array<{ size: number; customerIds: string[] }>
 }
@@ -101,7 +99,6 @@ export const REPORT_COUNT_KEYS: ReadonlyArray<keyof CustomerIdentityReport> = [
   'ordersWithoutCustomerOtherEmail',
   'derivedClustersOfTwoOrMore',
   'derivedClusterCustomerRecords',
-  'derivedGroupsSplitByStorefrontId',
   'sampleClusters',
 ]
 
@@ -141,7 +138,6 @@ export async function buildCustomerIdentityReport(tx: IdentityReportTx): Promise
     ordersWithoutCustomerOtherEmail: 0,
     derivedClustersOfTwoOrMore: 0,
     derivedClusterCustomerRecords: 0,
-    derivedGroupsSplitByStorefrontId: 0,
     sampleClusters: [],
   }
 
@@ -182,7 +178,7 @@ export async function buildCustomerIdentityReport(tx: IdentityReportTx): Promise
       for (const id of wooIds) g.wooIds.add(id)
       const loose = looseIdentityEmail(c.email)
       if (loose !== null) {
-        const member: ClusterCustomer = { id: c.id, email: c.email, storefrontIds: [...wooIds], anonymised: false }
+        const member: ClusterCustomer = { id: c.id, email: c.email, anonymised: false }
         const list = looseMembers.get(loose)
         if (list) list.push(member)
         else looseMembers.set(loose, [member])
@@ -221,30 +217,9 @@ export async function buildCustomerIdentityReport(tx: IdentityReportTx): Promise
     if (plusFolded.size > 1) report.gmailDotVariantGroups++
   }
 
-  // The clusters the resolver would form: per folded email, connected components of the pairwise derived rule.
+  // The clusters the resolver would form: the derived rule is "equal folded email", so each folded-email group of two or more is one cluster.
   const clusters: string[][] = []
-  for (const members of looseMembers.values()) {
-    if (members.length < 2) continue
-    const left = new Set(members.map((m) => m.id))
-    const byId = new Map(members.map((m) => [m.id, m]))
-    const components: string[][] = []
-    while (left.size > 0) {
-      const start = [...left][0]!
-      left.delete(start)
-      const component = [start]
-      for (let i = 0; i < component.length; i++) {
-        for (const id of [...left]) {
-          if (derivedLink(byId.get(component[i]!)!, byId.get(id)!)) {
-            left.delete(id)
-            component.push(id)
-          }
-        }
-      }
-      components.push(component.sort())
-    }
-    if (components.length > 1) report.derivedGroupsSplitByStorefrontId++
-    for (const component of components) if (component.length >= 2) clusters.push(component)
-  }
+  for (const members of looseMembers.values()) if (members.length >= 2) clusters.push(members.map((m) => m.id).sort())
   report.derivedClustersOfTwoOrMore = clusters.length
   report.derivedClusterCustomerRecords = clusters.reduce((n, c) => n + c.length, 0)
   clusters.sort((a, b) => b.length - a.length || (a[0]! < b[0]! ? -1 : 1))

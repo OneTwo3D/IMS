@@ -2,8 +2,10 @@
  * Company grouping keys (CRM foundation). Pure functions, no I/O.
  *
  * Two customers are in one company group when EITHER key matches:
- *   1. the BILLING COMPANY NAME   -> NFC, lower-cased, full stops and commas dropped, runs of whitespace collapsed.
- *      The legal suffix is NOT stripped: "Acme Ltd" and "Acme Limited" are different groups (an operator reads the page; a wrong guess merges two companies).
+ *   1. the BILLING COMPANY NAME   -> NFC, lower-cased, full stops and commas dropped, runs of whitespace collapsed, and TRAILING LEGAL SUFFIXES folded away
+ *      (owner decision 2026-11-19): Ltd / Limited, Inc / Incorporated, plc, LLC, GmbH, Co / Company, and a dangling "&" or "and" before them, so "Acme Ltd",
+ *      "ACME Limited." and "Acme & Co" are one group. The first word is never removed (a name that is only a suffix keeps it). A false group is only a view an
+ *      operator reads: nothing is merged.
  *   2. the EMAIL DOMAIN           -> only a company-owned domain. A free-mail or ISP domain (gmail.com, outlook.com, ...) names nobody's company
  *      and is never a key.
  *
@@ -22,11 +24,17 @@ export const FREE_MAIL_DOMAINS: ReadonlySet<string> = new Set([
   'qq.com', '163.com', '126.com',
 ])
 
-/** The normalised company name, or null when there is none. */
+/** The trailing words folded away. The SQL twin (company-group.ts COMPANY_NAME_KEY_SQL) lists the same words. */
+export const LEGAL_SUFFIX_WORDS: ReadonlySet<string> = new Set(['ltd', 'limited', 'inc', 'incorporated', 'plc', 'llc', 'gmbh', 'co', 'company', '&', 'and'])
+
+/** The normalised company name (legal suffixes folded), or null when there is none. */
 export function companyNameKey(company: string | null | undefined): string | null {
   if (typeof company !== 'string') return null
   const key = company.normalize('NFC').toLowerCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim()
-  return key === '' ? null : key
+  if (key === '') return null
+  const words = key.split(' ')
+  while (words.length > 1 && LEGAL_SUFFIX_WORDS.has(words[words.length - 1]!)) words.pop()
+  return words.join(' ')
 }
 
 /** The email domain when it belongs to a company, or null (no usable email, or a free-mail provider). */

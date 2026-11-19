@@ -2,7 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
-import { requirePermission, requireRole } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshRole, requirePermission, requireRole } from '@/lib/auth/server'
 import { clusterOf } from '@/lib/domain/crm/cluster-resolver'
 import { loadCompanyGroup, type CompanyGroup } from '@/lib/domain/crm/company-group'
 import { mergeCustomers, unmergeCustomer } from '@/lib/domain/crm/merge-service'
@@ -10,7 +10,7 @@ import { loadTimeline, type TimelinePage } from '@/lib/domain/crm/timeline'
 
 /**
  * CRM server actions. Reads need the `sales` permission (every sales user, owner decision Q6); merge and unmerge need the MANAGER or ADMIN role (Q7).
- * None of them writes to a Customer row, an order, or any external system.
+ * Merge and unmerge also need a FRESH sign-in (requireFreshRole) and an explicit confirmation after the operator has seen both customers' names and emails. None of them writes to a Customer row, an order, or any external system.
  */
 
 export type CustomerClusterMember = {
@@ -64,22 +64,63 @@ export async function getCustomerTimeline(
   return loadTimeline(db, ids, { cursor: options.cursor })
 }
 
-export type MergeActionResult = { success: true } | { success: false; error: string }
+export type MergeActionResult = { success: true } | { success: false; error: string; code?: string; reason?: string }
 
-export async function mergeCustomersAction(customerA: string, customerB: string): Promise<MergeActionResult> {
-  const session = await requireRole(...MERGE_ROLES)
-  const result = await mergeCustomers(customerA, customerB, session.user.id!)
-  if (!result.success) return result
-  revalidatePath(`/sales/contacts/${customerA}`)
-  revalidatePath(`/sales/contacts/${customerB}`)
-  return { success: true }
+export type MergePreviewCustomer = { id: string; fullName: string; email: string | null; company: string | null; orderCount: number }
+export type MergePreview = { success: true; a: MergePreviewCustomer; b: MergePreviewCustomer } | { success: false; error: string }
+
+const CONFIRM_REQUIRED = 'Confirm the merge after checking both customers. Nothing was changed.'
+
+/**
+ * What a merge would join: both customers' names and emails, for the confirmation step. A merge decides which strangers a later whole-person erasure
+ * anonymises irreversibly, so the operator must see WHO before it is made. MANAGER or ADMIN only; reads only.
+ */
+export async function previewMergeAction(customerA: string, customerB: string): Promise<MergePreview> {
+  await requireRole(...MERGE_ROLES)
+  if (customerA === customerB) return { success: false, error: 'Choose two different customers' }
+  const rows = await db.customer.findMany({
+    where: { id: { in: [customerA, customerB] } },
+    select: { id: true, firstName: true, lastName: true, email: true, company: true, gdprAnonymisedAt: true, _count: { select: { salesOrders: true } } },
+  })
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  const a = byId.get(customerA)
+  const b = byId.get(customerB)
+  if (!a || !b) return { success: false, error: 'Customer not found' }
+  if (a.gdprAnonymisedAt || b.gdprAnonymisedAt) return { success: false, error: 'An anonymised customer cannot be merged' }
+  const view = (r: typeof a): MergePreviewCustomer => ({ id: r.id, fullName: `${r.firstName} ${r.lastName}`.trim(), email: r.email, company: r.company, orderCount: r._count.salesOrders })
+  return { success: true, a: view(a), b: view(b) }
 }
 
-export async function unmergeCustomerAction(customerId: string): Promise<MergeActionResult> {
-  const session = await requireRole(...MERGE_ROLES)
-  const result = await unmergeCustomer(customerId, session.user.id!)
-  if (!result.success) return result
-  revalidatePath(`/sales/contacts/${customerId}`)
-  for (const id of result.clusterIds) revalidatePath(`/sales/contacts/${id}`)
-  return { success: true }
+/** Merge needs a FRESH sign-in (MANAGER or ADMIN) and an explicit `confirmed: true` given after the preview. */
+export async function mergeCustomersAction(customerA: string, customerB: string, confirmed: boolean): Promise<MergeActionResult> {
+  try {
+    const session = await requireFreshRole(...MERGE_ROLES)
+    if (confirmed !== true) return { success: false, error: CONFIRM_REQUIRED }
+    const result = await mergeCustomers(customerA, customerB, session.user.id!)
+    if (!result.success) return result
+    revalidatePath(`/sales/contacts/${customerA}`)
+    revalidatePath(`/sales/contacts/${customerB}`)
+    return { success: true }
+  } catch (error) {
+    const fresh = freshAuthFailureResult(error)
+    if (fresh) return fresh
+    throw error
+  }
+}
+
+/** Unmerge needs a FRESH sign-in (MANAGER or ADMIN) and an explicit `confirmed: true`. */
+export async function unmergeCustomerAction(customerId: string, confirmed: boolean): Promise<MergeActionResult> {
+  try {
+    const session = await requireFreshRole(...MERGE_ROLES)
+    if (confirmed !== true) return { success: false, error: CONFIRM_REQUIRED }
+    const result = await unmergeCustomer(customerId, session.user.id!)
+    if (!result.success) return result
+    revalidatePath(`/sales/contacts/${customerId}`)
+    for (const id of result.clusterIds) revalidatePath(`/sales/contacts/${id}`)
+    return { success: true }
+  } catch (error) {
+    const fresh = freshAuthFailureResult(error)
+    if (fresh) return fresh
+    throw error
+  }
 }

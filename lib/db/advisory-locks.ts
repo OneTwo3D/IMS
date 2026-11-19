@@ -400,6 +400,16 @@ export const WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE = 411_220_882
 export const CRM_AUTO_MERGE_AUDIT_LOCK_NAMESPACE = 411_220_890
 
 /**
+ * THE CRM IDENTITY LOCK (two-int, key = 0: one global lock).
+ *
+ * Taken (transaction scope) by an operator MERGE, an operator UNMERGE, and the snapshot of a cluster erasure, so a cluster erasure resolves its member list
+ * against a state no merge or unmerge is changing, and a merge or unmerge sees whether an erasure of the same people is in flight. Held only for IMS-local
+ * reads and writes (never across an external call), and only by operator actions and the erasure snapshot, so contention is negligible. Taken BEFORE any pair
+ * lock (CRM_AUTO_MERGE_AUDIT_LOCK_NAMESPACE); the importer takes only the pair lock, so the order cannot cycle.
+ */
+export const CRM_IDENTITY_LOCK_NAMESPACE = 411_220_891
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -455,5 +465,6 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE,
   WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE,
   CRM_AUTO_MERGE_AUDIT_LOCK_NAMESPACE,
+  CRM_IDENTITY_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const
