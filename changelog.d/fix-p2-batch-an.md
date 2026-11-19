@@ -1,0 +1,8 @@
+
+### Fixes (P2 batch AN)
+
+- **WooCommerce stock queue: a switched-off stock push no longer dead-letters its jobs.** When "Push stock levels to WooCommerce" is off, a queued stock push is kept and offered again later without spending an attempt, instead of burning its attempts until it lands in the dead-letter list.
+- **CSV imports refuse a damaged file.** A row with a different number of cells from the header, or a quote in the middle of an unquoted cell, now refuses the whole file with the line numbers (nothing is imported), instead of shifting values into the wrong columns. A SKU, supplier name or order key that starts with `#` is imported as data; only `# ` guidance rows (such as `# REQUIRED`) are skipped.
+- **Reconciliation pack, VAT (R12): months are London months.** IMS sales VAT and WooCommerce orders are bucketed by the London month, the calendar the Xero invoice dates use, so a BST month-end order no longer shows as a difference in two months.
+- **Mintsoft alignment confirmation.** A dry run counts as evidence for confirming live corrections only if it ran under the warehouse binding's current write-off thresholds. Dry runs recorded before this change are not matched; run one fresh dry run.
+- **Transfers: cancelling a dispatch.** The cancel is refused when the warehouse has already acted on the transfer's ASN (partially booked in, a callback received, or a receipt event still pending, retrying or awaiting review). The "ask the warehouse to cancel" notice no longer names placeholder ASNs that never reached the warehouse. An ASN closed by a dispatch cancel is no longer counted as incoming stock.
