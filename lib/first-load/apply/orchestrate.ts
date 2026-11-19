@@ -117,6 +117,11 @@ export interface ApplyPorts {
    */
   preflight?(facts: { resuming: boolean }): Promise<string[]>
   withStepLock<T>(step: ApplyStepId, body: (lock: StepLock) => Promise<T>): Promise<T>
+  /**
+   * The run-wide lease: held while this runner moves the run record (create or resume) through to the end. Throws StepLockError when another runner holds it
+   * (`busy`) or it cannot be taken; `lost` when it failed while the run went on. Optional: a port without it behaves as before.
+   */
+  withRunLease?<T>(body: () => Promise<T>): Promise<T>
   /** Rails re-evaluated at the start of a step and again just before its first write. Returns the problems found (empty = still holds). */
   recheckRails?(step: ApplyStepId, phase: 'step-start' | 'before-first-write'): Promise<string[]>
   /** Persist a residual file exclusively (the file is evidence); optional. */
@@ -302,76 +307,93 @@ export async function runLoad(prepared: PreparedRun, ports: ApplyPorts, options:
 
   if (existing !== null && existing.status === 'APPLIED') return verifyApplied(prepared, ports, existing, planSteps, finish)
 
-  let record: RunRecord
-  try {
-    if (existing === null) {
-      record = { version: 1, manifestDigest: prepared.manifestDigest, runId: prepared.manifest.runId, status: 'RUNNING', currentStep: null, steps: {} }
-      await ports.journal.save(record, null)
-    } else {
-      record = { ...existing, version: existing.version + 1, status: 'RUNNING' }
-      await ports.journal.save(record, existing.version)
-    }
-  } catch (error) {
-    if (error instanceof StaleJournalError) return finish('PRECONDITION_REFUSED', [error.message], planSteps, existing)
-    throw error
-  }
-
-  const results: StepResult[] = []
-  const persist = async (patch: Partial<RunRecord>, step?: { id: ApplyStepId; journal: StepJournal }): Promise<void> => {
-    const next: RunRecord = { ...record, ...patch, version: record.version + 1, steps: step ? { ...record.steps, [step.id]: step.journal } : record.steps }
-    await ports.journal.save(next, record.version)
-    record = next
-  }
-  const stop = async (exit: ApplyExitName, status: RunStatus, problems: string[], step: ApplyStepId | null): Promise<ApplyResult> => {
+  const writeRun = async (): Promise<ApplyResult> => {
+    let record: RunRecord
     try {
-      await persist({ status, currentStep: step })
-    } catch {
-      // The record could not be updated (another runner, or the store is gone). The exit and the report still say what happened.
-    }
-    return finish(exit, problems, results, record)
-  }
-
-  for (const step of prepared.steps) {
-    let outcome: StepOutcome
-    try {
-      outcome = await ports.withStepLock(step.step, (lock) => runStep(step, ports, persist, lock))
-    } catch (error) {
-      if (error instanceof StaleJournalError || error instanceof StepLockError) return finish('STEP_FAILED', [`${step.step}: ${error.message}`], results, record)
-      if (error instanceof ObservationError) {
-        const failed = { ...emptyResult(step.step, 'FAILED'), error: describeError(error) }
-        results.push(failed)
-        return stop('STEP_FAILED', 'STEP_FAILED', [`${step.step}: the database could not be read (${failed.error}); the run is resumable`], step.step)
+      if (existing === null) {
+        record = { version: 1, manifestDigest: prepared.manifestDigest, runId: prepared.manifest.runId, status: 'RUNNING', currentStep: null, steps: {} }
+        await ports.journal.save(record, null)
+      } else {
+        record = { ...existing, version: existing.version + 1, status: 'RUNNING' }
+        await ports.journal.save(record, existing.version)
       }
+    } catch (error) {
+      if (error instanceof StaleJournalError) return finish('PRECONDITION_REFUSED', [error.message], planSteps, existing)
       throw error
     }
-    results.push(outcome.result)
-    if (outcome.halt !== null) return stop(outcome.halt.exit, outcome.halt.exit === 'CONFLICT' ? 'CONFLICT' : 'STEP_FAILED', outcome.halt.problems, step.step)
-  }
 
-  // Self-check: the accounting identity, for every step.
-  for (const r of results) {
-    if (r.emitted !== r.created + r.updated + r.skippedExisting + r.failed) return stop('INTERNAL', 'STEP_FAILED', [`${r.step}: the row accounting does not reconcile (emitted ${r.emitted} != created ${r.created} + updated ${r.updated} + skipped ${r.skippedExisting} + failed ${r.failed})`], r.step)
-  }
+    const results: StepResult[] = []
+    const persist = async (patch: Partial<RunRecord>, step?: { id: ApplyStepId; journal: StepJournal }): Promise<void> => {
+      const next: RunRecord = { ...record, ...patch, version: record.version + 1, steps: step ? { ...record.steps, [step.id]: step.journal } : record.steps }
+      await ports.journal.save(next, record.version)
+      record = next
+    }
+    const stop = async (exit: ApplyExitName, status: RunStatus, problems: string[], step: ApplyStepId | null): Promise<ApplyResult> => {
+      try {
+        await persist({ status, currentStep: step })
+      } catch {
+        // The record could not be updated (another runner, or the store is gone). The exit and the report still say what happened.
+      }
+      return finish(exit, problems, results, record)
+    }
 
-  let verification: VerificationItem[] = []
+    for (const step of prepared.steps) {
+      let outcome: StepOutcome
+      try {
+        outcome = await ports.withStepLock(step.step, (lock) => runStep(step, ports, persist, lock))
+      } catch (error) {
+        if (error instanceof StaleJournalError || error instanceof StepLockError) return finish('STEP_FAILED', [`${step.step}: ${error.message}`], results, record)
+        if (error instanceof ObservationError) {
+          const failed = { ...emptyResult(step.step, 'FAILED'), error: describeError(error) }
+          results.push(failed)
+          return stop('STEP_FAILED', 'STEP_FAILED', [`${step.step}: the database could not be read (${failed.error}); the run is resumable`], step.step)
+        }
+        throw error
+      }
+      results.push(outcome.result)
+      if (outcome.halt !== null) return stop(outcome.halt.exit, outcome.halt.exit === 'CONFLICT' ? 'CONFLICT' : 'STEP_FAILED', outcome.halt.problems, step.step)
+    }
+
+    // Self-check: the accounting identity, for every step.
+    for (const r of results) {
+      if (r.emitted !== r.created + r.updated + r.skippedExisting + r.failed) return stop('INTERNAL', 'STEP_FAILED', [`${r.step}: the row accounting does not reconcile (emitted ${r.emitted} != created ${r.created} + updated ${r.updated} + skipped ${r.skippedExisting} + failed ${r.failed})`], r.step)
+    }
+
+    let verification: VerificationItem[] = []
+    try {
+      await persist({ status: 'APPLIED', currentStep: null })
+      if (ports.verify) verification = await ports.verify(prepared, results)
+    } catch (error) {
+      if (error instanceof StaleJournalError) return finish('STEP_FAILED', [error.message], results, record)
+      throw error
+    }
+    if (verification.some((v) => v.result === 'fail')) {
+      await persist({ status: 'VERIFY_FAILED' }).catch(() => undefined)
+      return finish('VERIFY_FAILED', verification.filter((v) => v.result === 'fail').map((v) => `${v.id}: expected ${v.expected}, found ${v.actual}`), results, record, verification)
+    }
+    if (!ports.verify) {
+      // Nothing verified the load, so it is NOT reported as a success: the record stays APPLIED and a later --resume verifies it.
+      await persist({ status: 'APPLIED' })
+      return finish('APPLIED_UNVERIFIED', ['no post-run verification was run: this runner has no verification port'], results, record, verification)
+    }
+    await persist({ status: 'VERIFIED' })
+    return finish('OK', [], results, record, verification)
+  }
+  if (!ports.withRunLease) return writeRun()
+  let produced: ApplyResult | null = null
   try {
-    await persist({ status: 'APPLIED', currentStep: null })
-    if (ports.verify) verification = await ports.verify(prepared, results)
+    return await ports.withRunLease(async () => (produced = await writeRun()))
   } catch (error) {
-    if (error instanceof StaleJournalError) return finish('STEP_FAILED', [error.message], results, record)
+    if (error instanceof StepLockError) {
+      if (error.reason === 'lost') {
+        // The run finished (or stopped) but its exclusion failed on the way: a stop that already says why is kept as it is, anything else is never reported as a success.
+        if (produced !== null && (produced as ApplyResult).exit !== 'OK') return produced
+        return finish('STEP_FAILED', ['the run lease was lost while the run went on: another runner may hold this load; verify before resuming'], [], existing)
+      }
+      return finish('PRECONDITION_REFUSED', [`another runner holds this load (${error.message})`], planSteps, existing)
+    }
     throw error
   }
-  if (verification.some((v) => v.result === 'fail')) {
-    await persist({ status: 'VERIFY_FAILED' }).catch(() => undefined)
-    return finish('VERIFY_FAILED', verification.filter((v) => v.result === 'fail').map((v) => `${v.id}: expected ${v.expected}, found ${v.actual}`), results, record, verification)
-  }
-  if (!ports.verify) {
-    // Nothing verified the load, so it is NOT reported as a success: the record stays APPLIED and a later --resume verifies it.
-    await persist({ status: 'APPLIED' })
-    return finish('APPLIED_UNVERIFIED', ['no post-run verification was run: this runner has no verification port'], results, record, verification)
-  }
-  await persist({ status: 'VERIFIED' })
-  return finish('OK', [], results, record, verification)
 }
 
 /**

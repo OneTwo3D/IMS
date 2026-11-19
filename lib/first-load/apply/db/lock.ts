@@ -7,12 +7,20 @@
  *
  * ORDER. A runner holds at most one step lock at a time and takes them in load order, because the core runs the steps one after another and each
  * `withStepLock` returns (and releases) before the next starts. Two runners therefore never hold two locks each in opposite orders, and cannot deadlock.
+ *
+ * THE RUN LEASE. Lock number 0 (steps are 1-based, so it never collides with one) is held by the one runner that is moving the run record, from before it
+ * takes the record (create or resume) until it has finished. Without it a second `--resume` of a RUNNING record could advance the journal version while the
+ * first runner was still working, and start an earlier step while the first held a later step's lock. The lease is taken first and released last, so the
+ * order (lease, then one step lock at a time) still cannot deadlock.
  */
 import { FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { db } from '@/lib/db'
 import { AdvisoryLockLostError, acquirePinnedAdvisoryLockOrNull, type PinnedAdvisoryLock } from '@/lib/db/pinned-advisory-lock'
 import { APPLY_STEP_IDS, type ApplyStepId } from '../constants'
 import { StepLockError, type StepLock } from '../orchestrate'
+
+/** The run-wide lease's lock number: outside every step's 1-based range. */
+export const RUN_LEASE_LOCK_NUMBER = 0
 
 /** The lock number of a step: its 1-based position in APPLY_STEP_IDS. */
 export function stepLockNumber(step: ApplyStepId): number {
@@ -57,6 +65,31 @@ export async function withStepLock<T>(step: ApplyStepId, body: (lock: StepLock) 
     const result = await body(liveCheck(step, lock))
     // The exclusion is only as good as its connection: if it failed during the step, another runner may have started, and this step must not report success.
     lock.assertHeld(`finishing the ${step} step`)
+    return result
+  } catch (error) {
+    if (error instanceof AdvisoryLockLostError) throw new StepLockError('lost')
+    throw error
+  } finally {
+    await lock.release()
+  }
+}
+
+/**
+ * The run-wide lease: held for the whole of a run by the one runner that moves the run record. A second runner is refused (`busy`) instead of queuing.
+ * If the lease's connection failed while the run was going the exclusion is gone, and the run reports `lost` rather than success.
+ */
+export async function withRunLease<T>(body: () => Promise<T>): Promise<T> {
+  let lock
+  try {
+    lock = await acquirePinnedAdvisoryLockOrNull(RUN_LEASE_LOCK_NUMBER, FIRST_LOAD_APPLY_STEP_LOCK_NAMESPACE)
+  } catch {
+    throw new StepLockError('unavailable')
+  }
+  if (lock === null) throw new StepLockError('busy')
+  try {
+    lock.assertHeld('the run lease')
+    const result = await body()
+    lock.assertHeld('finishing the run')
     return result
   } catch (error) {
     if (error instanceof AdvisoryLockLostError) throw new StepLockError('lost')

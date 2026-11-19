@@ -91,6 +91,8 @@ export async function eraseOrdersPersonalDataInTx(
         customerName: ERASURE_PLACEHOLDER_NAME,
         customerEmail: null,
         customerVatNumber: null,
+        // The storefront customer id the order was placed under names the person's storefront account (CRM): cleared with the order's identity.
+        externalCustomerId: null,
         billingAddress: Prisma.JsonNull,
         shippingAddress: Prisma.JsonNull,
         notes: null,
@@ -398,9 +400,9 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
 }
 
 /** What an erasure transaction reports to its caller: the warehouse verdicts, and the attachment files to remove once the transaction has committed. */
-type ErasureOutcome = { warehouse: ErasureWarehouseSummary; attachmentStoredNames: string[] }
+export type ErasureOutcome = { warehouse: ErasureWarehouseSummary; attachmentStoredNames: string[] }
 
-const emptyOutcome = (): ErasureOutcome => ({ warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] }, attachmentStoredNames: [] })
+export const emptyOutcome = (): ErasureOutcome => ({ warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] }, attachmentStoredNames: [] })
 
 /**
  * REMOVE THE FILES OF THE ATTACHMENT ROWS AN ERASURE DELETED. Runs after the commit: a file cannot be rolled back, so deleting it inside the
@@ -428,7 +430,7 @@ async function removeErasedAttachmentFiles(storedNames: string[], requestId: str
 }
 
 export type EraseCustomerResult =
-  | { success: true; requestId: string; warehouse: ErasureWarehouseSummary }
+  | { success: true; requestId: string; warehouse: ErasureWarehouseSummary; /** Only on a run with options.tx: remove the erased attachment files once the caller's transaction has committed. */ afterCommit?: () => Promise<void> }
   | { success: false; error: string }
 
 /**
@@ -537,31 +539,59 @@ async function eraseUnderLocksInTx(
   return null
 }
 
+/**
+ * The locked body of the customer erasure, on a transaction the CALLER owns (the cluster erasure runs it inside its own transaction, under the CRM lock). It takes the
+ * storefront key locks, the customer row and the order rows, in that order. Returns the refusal text, or null on success. Throws CustomerKeysChanged when the customer
+ * gained a storefront id after the caller read it: the caller rolls back and retries.
+ */
+export async function eraseCustomerInTx(
+  tx: Prisma.TransactionClient,
+  customerId: string,
+  input: { requestId: string; erasedAt: Date; trigger: ErasureTrigger; userId: string | null; outcome: ReturnType<typeof emptyOutcome> },
+): Promise<string | null> {
+  // LOCKS FIRST. The storefront-customer KEY LOCKS (customer-key-lock.ts) come before the customer row lock, so an import of one of this customer's orders and
+  // this erasure serialise; the ids are read unlocked, locked, and re-read under the customer lock (a new id means retry).
+  const keysLocked = await lockStorefrontCustomerKeys(tx, await readStorefrontCustomerIds(tx, customerId))
+  // Then the customer row is locked, then ALL of the customer's orders in one statement in id order (customer, then orders).
+  // New orders cannot appear under the customer meanwhile: creating one takes the same customer row lock.
+  const lockedCustomer = await tx.$queryRaw<Array<{ id: string; gdprAnonymisedAt: Date | null }>>`SELECT id, "gdprAnonymisedAt" FROM "customers" WHERE id = ${customerId} FOR UPDATE`
+  if (lockedCustomer.length === 0) return 'Customer not found'
+  if (lockedCustomer[0]!.gdprAnonymisedAt) return 'Customer already anonymised'
+  const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
+  if ((await readStorefrontCustomerIds(tx, customerId)).some((id) => !keysLocked.includes(id))) throw new CustomerKeysChanged()
+  return eraseUnderLocksInTx(tx, { customerId, eraseCustomer: true, targetOrderIds: locked.map((o) => o.id), requestId: input.requestId, erasedAt: input.erasedAt, trigger: input.trigger, userId: input.userId, outcome: input.outcome })
+}
+
 /** Erase a customer and every order linked to them. Idempotent: a second call refuses and changes nothing. */
 export async function eraseCustomerPersonalData(
   customerId: string,
-  options: { trigger: ErasureTrigger; userId: string | null },
+  options: {
+    trigger: ErasureTrigger
+    userId: string | null
+    /**
+     * Run on THIS transaction instead of opening one (the cluster erasure does, so that "erase the member" is atomic with its own request check, on the connection
+     * that holds the CRM lock). The caller owns commit, rollback and retry (a thrown CustomerKeysChanged means: roll back and retry), and must call `afterCommit`
+     * once it has committed. A refusal is returned as a result; any other failure is thrown, so the caller's transaction rolls back with it.
+     */
+    tx?: Prisma.TransactionClient
+  },
 ): Promise<EraseCustomerResult> {
   const requestId = randomUUID()
   const erasedAt = new Date()
+  if (options.tx) {
+    const outcome = emptyOutcome()
+    const refusal = await eraseCustomerInTx(options.tx, customerId, { requestId, erasedAt, trigger: options.trigger, userId: options.userId, outcome })
+    if (refusal) return { success: false, error: refusal }
+    return { success: true, requestId, warehouse: outcome.warehouse, afterCommit: () => removeErasedAttachmentFiles(outcome.attachmentStoredNames, requestId, options.userId) }
+  }
   try {
     let refusal: string | null = null
     const outcome = emptyOutcome()
     for (let attempt = 1; ; attempt += 1) {
       try {
         refusal = await db.$transaction(async (tx): Promise<string | null> => {
-      // LOCKS FIRST. The storefront-customer KEY LOCKS (customer-key-lock.ts) come before the customer row lock, so an import of one of this customer's orders and
-      // this erasure serialise; the ids are read unlocked, locked, and re-read under the customer lock (a new id means retry).
-      const keysLocked = await lockStorefrontCustomerKeys(tx, await readStorefrontCustomerIds(tx, customerId))
-      // Then the customer row is locked, then ALL of the customer's orders in one statement in id order (customer, then orders).
-      // New orders cannot appear under the customer meanwhile: creating one takes the same customer row lock.
-      const lockedCustomer = await tx.$queryRaw<Array<{ id: string; gdprAnonymisedAt: Date | null }>>`SELECT id, "gdprAnonymisedAt" FROM "customers" WHERE id = ${customerId} FOR UPDATE`
-      if (lockedCustomer.length === 0) return 'Customer not found'
-      if (lockedCustomer[0]!.gdprAnonymisedAt) return 'Customer already anonymised'
-      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE "customerId" = ${customerId} ORDER BY id FOR UPDATE`
-      if ((await readStorefrontCustomerIds(tx, customerId)).some((id) => !keysLocked.includes(id))) throw new CustomerKeysChanged()
-      return eraseUnderLocksInTx(tx, { customerId, eraseCustomer: true, targetOrderIds: locked.map((o) => o.id), requestId, erasedAt, trigger: options.trigger, userId: options.userId, outcome })
-    }, ERASURE_TRANSACTION_OPTIONS)
+          return eraseCustomerInTx(tx, customerId, { requestId, erasedAt, trigger: options.trigger, userId: options.userId, outcome })
+        }, ERASURE_TRANSACTION_OPTIONS)
         break
       } catch (e) {
         if (e instanceof CustomerKeysChanged && attempt < 3) continue

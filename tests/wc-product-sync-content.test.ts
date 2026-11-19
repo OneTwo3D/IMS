@@ -28,6 +28,7 @@ type Row = Record<string, unknown>
 const state = {
   contents: [] as Row[],
   contentWrites: 0,
+  contentReads: 0,
   products: [] as Row[],
   options: [] as Row[],
   syncLogs: [] as Row[],
@@ -203,6 +204,10 @@ const shoppingSyncLogDelegate = {
 const productContentDelegate = {
   findUnique: async ({ where }: { where: { productId: string } }) =>
     state.contents.find((row) => row.productId === where.productId) ?? null,
+  findMany: async ({ where }: { where: { productId: { in: string[] } } }) => {
+    state.contentReads += 1
+    return state.contents.filter((row) => where.productId.in.includes(row.productId as string))
+  },
   upsert: async ({ where, create, update }: { where: { productId: string }; create: Row; update: Row }) => {
     state.contentWrites += 1
     const row = state.contents.find((candidate) => candidate.productId === where.productId)

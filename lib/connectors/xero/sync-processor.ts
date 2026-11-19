@@ -174,6 +174,7 @@ import {
   XERO_OUTBOX_CONNECTOR,
 } from './outbox'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
+import { isInvoiceNoteEnabled } from '@/lib/connectors/woocommerce/sync/invoice-note-switch'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
@@ -8504,8 +8505,10 @@ async function enqueueFollowUps(
         { from: 'postedRow', record: origin },
       ))
     }
+    // The note is its own switch (default off): until step X Xeroom writes it, and IMS's must not be queued beside it.
+    const noteSwitchedOn = plan.note ? await isInvoiceNoteEnabled() : false
     if (plan.note) {
-      outcomes.push(await enqueueFollowUpSyncLog(
+      if (noteSwitchedOn) outcomes.push(await enqueueFollowUpSyncLog(
         'WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
         { from: 'postedRow', record: origin },
       ))

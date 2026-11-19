@@ -62,5 +62,12 @@ export async function updateMintsoftProductContent(update: WmsProductContentUpda
   const result = await mintsoftRequest<unknown>(request.path, { method: request.method, body: request.body })
   if (result.held) return { sent: false, held: true, message: result.error ?? 'The outbound-write hold refused the request.' }
   if (result.error) throw new Error(result.error)
+  // An HTTP 2xx whose decoded body says `Success: false` is a rejection, not a send: recording it as sent would store a hash Mintsoft does not hold and
+  // the field would never be offered again. Only an EXPLICIT false counts (a body that does not say is the long-standing "accepted").
+  const body = result.data
+  if (typeof body === 'object' && body !== null && !Array.isArray(body) && (body as { Success?: unknown }).Success === false) {
+    const message = (body as { Message?: unknown }).Message
+    throw new Error(`Mintsoft rejected the content update${typeof message === 'string' && message.trim() ? `: ${message.trim().slice(0, 300)}` : ''}`)
+  }
   return { sent: true }
 }
