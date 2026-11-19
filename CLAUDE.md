@@ -8,7 +8,7 @@ For the current production-readiness backlog and execution grouping, see `docs/p
 
 | Layer | Technology | Version | Purpose |
 |-------|------------|---------|---------|
-| Runtime | Node.js | 22+ | JavaScript execution |
+| Runtime | Node.js | 26+ | JavaScript execution |
 | Framework | Next.js | 16.2 | Full-stack React with App Router, Server Components, Server Actions, Turbopack |
 | Language | TypeScript | 5.x | Strict type checking throughout (strict mode enabled) |
 | Database | PostgreSQL | 14+ | Relational database for complex inventory models |
@@ -25,7 +25,7 @@ For the current production-readiness backlog and execution grouping, see `docs/p
 
 ```bash
 # Prerequisites
-- Node.js 22+ installed
+- Node.js 26+ installed
 - PostgreSQL 14+ database running
 - Environment variables configured (.env)
 

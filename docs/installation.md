@@ -4,7 +4,8 @@
 
 - **Operating system**: Debian 11/12/13 or Ubuntu 22.04/24.04 (tested in LXC containers; Debian 13 was rehearsed end to end in a container). The installer accepts any Debian or Ubuntu release and only warns on another distribution.
 - **Memory for the build**: `next build` needs a Node heap well above Node's default (about 2 GB). A rehearsal on an 8 GB host aborted the TypeScript pass at 2 GB and at 3 GB and completed at 5 GB. `install.sh`, `update.sh` and `deploy.sh` therefore start the build step (and only that step) with `NODE_OPTIONS=--max-old-space-size=6144`. This is a ceiling, not a reservation: plan for roughly 5 GB of free memory (RAM plus swap) while the build runs, and add swap on a smaller host, because a host that cannot supply it fails the build -- before anything is stopped or migrated. Override the ceiling with `IMS_BUILD_MAX_OLD_SPACE_MB` (whole megabytes, 1000-999999; pass it through sudo with `sudo env IMS_BUILD_MAX_OLD_SPACE_MB=8192 bash ...`); without it, a `--max-old-space-size` you already put in `NODE_OPTIONS` is left alone. A malformed value is refused up front, before anything is changed.
-- **Node.js**: Version 22 (installed automatically by the install script)
+- **Node.js**: Version 26 (installed automatically by the install script)
+- **Node.js refusal and rollback**: `update.sh` and `deploy.sh` refuse to run, before anything is stopped, built or migrated, when the installed Node major is below the major in `package.json` `engines.node` (`npm ci` alone only warns). To roll a host back from Node 26 to Node 22, as root: run the NodeSource `setup_22.x` script (`curl -fsSL https://deb.nodesource.com/setup_22.x | bash -`); `apt-get install -y --allow-downgrades 'nodejs=22.*'` (a plain `apt-get install nodejs` does not downgrade, and re-running an older `install.sh` is a no-op because it only checks that the installed major is at least its own); as the application user, `npm ci` in the app directory (or `npm rebuild`) so the native modules are rebuilt for the older ABI; then restart the service (`systemctl restart <unit>`). Roll back to a release whose `engines.node` allows 22, or the scripts will refuse. After the forward upgrade to 26, run the same `npm ci`/`npm rebuild` and restart.
 - **PostgreSQL**: Version 14 or later (installed automatically, or provide an external connection)
 - **nginx**: Used as the reverse proxy (installed automatically)
 - **Internet access**: Required during installation for downloading packages
@@ -807,7 +808,7 @@ application database as a last resort — and it re-establishes the proof every 
 The script performs the following steps:
 
 1. **Pre-flight checks** — verifies root access, detects the OS, and checks internet connectivity
-2. **Installs Node.js 22** via NodeSource
+2. **Installs Node.js 26** via NodeSource
 3. **Installs and configures PostgreSQL** — creates the database and user
 4. **Installs nginx**, `fail2ban`, and automatic security updates
 5. **Installs runtime tooling** used by deployment and maintenance scripts

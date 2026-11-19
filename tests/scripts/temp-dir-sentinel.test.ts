@@ -114,9 +114,12 @@ function runFixture(fixture: string, extra: Record<string, string> = {}): Run {
   const env = { ...process.env, ...extra }
   delete env.NODE_TEST_CONTEXT
 
+  // The reporter is pinned: the assertions read TAP (`ok N -`, `exitCode: 1`), but Node's default
+  // for a non-TTY child changed from tap to spec in Node 23+, which would make every match here
+  // read a different format rather than measure the sentinel.
   const result = spawnSync(
     join(process.cwd(), 'node_modules/.bin/tsx'),
-    ['--test', '--import', SENTINEL, join(FIXTURES, fixture)],
+    ['--test', '--test-reporter=tap', '--import', SENTINEL, join(FIXTURES, fixture)],
     { cwd: process.cwd(), encoding: 'utf8', timeout: 120_000, env },
   )
   assert.equal(result.error, undefined, `could not run ${fixture}: ${result.error?.message}`)

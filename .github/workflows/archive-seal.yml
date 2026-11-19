@@ -50,7 +50,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version: 26
       # No `npm ci`: the check shells out to git and reads two files. It must not be able to fail for
       # a reason unrelated to archive/, and it must stay cheap enough that running it on every diff —
       # including a one-line Markdown diff — is never worth gating.

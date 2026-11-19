@@ -168,7 +168,7 @@ Deploy by the full-SHA tag; the moving tags exist for convenience only.
 ### What is in each target
 
 - **`runtime`**: Next.js standalone server (`node server.js`) on `0.0.0.0:3000`, running as
-  non-root uid/gid 1001 `ims`, base `node:22-bookworm-slim`. It does **not** carry the full
+  non-root uid/gid 1001 `ims`, base `node:26-bookworm-slim`. It does **not** carry the full
   `node_modules`: only what Next's file tracing put in `.next/standalone`. Prisma 7 has no
   query-engine binary, and `pg` / `@prisma/adapter-pg` are pure JS, so nothing native is needed
   for the database. `HEALTHCHECK` is `GET /login` expecting 200 (done with `node`; there is no
