@@ -34,11 +34,15 @@ export const REFUSED_ACTIONS = {
   WMS_SPLIT_ORDER_COMPLETE: { label: 'Split order cannot complete', gates: ['WMS_SPLIT_PART_CANCELLED'] },
   /** An ASN create refused because the purchase order's (or the transfer's) supplier has no warehouse supplier mapped. An operator maps it on the connector's supplier mapping screen. */
   WMS_ASN_SUPPLIER: { label: 'ASN not created: supplier not mapped in the warehouse', gates: ['WMS_SUPPLIER_UNMAPPED'] },
+  /** A transfer's dispatch was cancelled in IMS and its warehouse ASN closed here: a person must ask the warehouse to cancel it (IMS writes nothing to the warehouse). Closes when an operator confirms the request or the ASN is resolved. */
+  WMS_ASN_CANCEL_REQUEST: { label: 'Ask the warehouse to cancel an ASN', gates: ['WMS_ASN_CANCEL_NOT_CONFIRMED'] },
 } as const
 export type RefusedActionName = keyof typeof REFUSED_ACTIONS
 
 /** What a refusal's entity is. */
 export const REFUSED_ACTION_ENTITY_SALES_ORDER = 'SALES_ORDER'
+/** The entity of an ASN cancel request: the wms_asn_maps row id. */
+export const REFUSED_ACTION_ENTITY_WMS_ASN = 'WMS_ASN_MAP'
 
 /**
  * HOW LONG A REFUSAL MAY STAND BEFORE IT IS AN ALERT, per severity. `null` = never alerts (it stays on the exceptions page, and is not counted in the
@@ -157,7 +161,7 @@ export async function recordRefusedAction(client: RawClient, input: RefusedActio
 }
 
 /** Why a row was closed. */
-export type RefusedActionResolution = 'ACTION_SUCCEEDED' | 'NO_LONGER_NEEDED'
+export type RefusedActionResolution = 'ACTION_SUCCEEDED' | 'NO_LONGER_NEEDED' | 'OPERATOR_CONFIRMED'
 
 /** Close every open refusal of this entity (and, when named, this action and gate). Returns how many rows were closed. Safe to call when there is none. */
 export async function resolveRefusedActions(
@@ -232,7 +236,7 @@ export function describeRefusedActionAlert(row: EscalationRow, now: Date): { tit
   const standing = row.permanence === 'PERMANENT' ? 'It will not succeed on its own.' : 'IMS is still retrying it.'
   return {
     title: `${refusedActionLabel(row.action)}`,
-    message: `${refusedActionLabel(row.action)} for order ${refusedActionSubject(row)}: refused ${row.attempts} time${row.attempts === 1 ? '' : 's'} over ${age}. ${standing}${row.detail ? ` ${row.detail}` : ''} Open Sync > Exceptions to see what IMS was trying to do.`,
+    message: `${refusedActionLabel(row.action)} for ${row.entityType === REFUSED_ACTION_ENTITY_WMS_ASN ? 'transfer' : 'order'} ${refusedActionSubject(row)}: refused ${row.attempts} time${row.attempts === 1 ? '' : 's'} over ${age}. ${standing}${row.detail ? ` ${row.detail}` : ''} Open Sync > Exceptions to see what IMS was trying to do.`,
   }
 }
 

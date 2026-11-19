@@ -1,7 +1,10 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { requirePermission } from '@/lib/auth/server'
+import { revalidatePath } from 'next/cache'
+import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
+import { resolveAsnCancelRequest } from '@/lib/domain/wms/transfer-dispatch-cancel-asn'
 import { refusedActionLabel, refusedActionSubject, type RefusedActionPermanence, type RefusedActionSeverity } from '@/lib/domain/refused-actions'
 
 /**
@@ -17,6 +20,10 @@ const REFUSED_ACTION_PAGE_SIZE = 100
 export type RefusedActionRow = {
   id: string
   orderId: string | null
+  /** What the row is about (SALES_ORDER, WMS_ASN_MAP, ...). */
+  entityType: string
+  /** The copy-ready text to paste into a warehouse query, for a row that is one (an ASN cancel request). */
+  queryText: string | null
   subject: string
   label: string
   gate: string
@@ -51,6 +58,8 @@ export async function listRefusedActions(): Promise<RefusedActionPage> {
   const rows = found.map((row): RefusedActionRow => ({
     id: row.id,
     orderId: row.entityType === 'SALES_ORDER' ? row.entityId : null,
+    entityType: row.entityType,
+    queryText: row.action === 'WMS_ASN_CANCEL_REQUEST' ? row.detail : null,
     subject: refusedActionSubject(row),
     label: refusedActionLabel(row.action),
     gate: row.gate,
@@ -64,4 +73,26 @@ export async function listRefusedActions(): Promise<RefusedActionPage> {
     alerted: row.alertedAt !== null,
   }))
   return { rows, total, shown: rows.length }
+}
+
+export type ConfirmAsnCancelRequestResult = { success: boolean; error?: string } | FreshAuthFailureResult
+
+/**
+ * Done on an "ask the warehouse to cancel the ASN" row: the operator raised the query in the warehouse's system. Needs the sync permission and a
+ * fresh sign-in. Only that action can be closed here; every other refusal closes itself.
+ */
+export async function confirmAsnCancelRequestAction(refusedActionId: string): Promise<ConfirmAsnCancelRequestResult> {
+  try {
+    await requireFreshPermission('sync')
+    if (typeof refusedActionId !== 'string' || refusedActionId === '') return { success: false, error: 'No request was named.' }
+    const row = await db.refusedAction.findUnique({ where: { id: refusedActionId }, select: { entityId: true, action: true } })
+    if (!row || row.action !== 'WMS_ASN_CANCEL_REQUEST') return { success: false, error: 'That is not an open request to cancel an ASN.' }
+    await resolveAsnCancelRequest(db, row.entityId)
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
 }

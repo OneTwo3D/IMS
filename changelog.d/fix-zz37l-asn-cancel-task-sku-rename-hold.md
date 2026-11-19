@@ -1,0 +1,4 @@
+### Mintsoft inbound follow-ups (follow-up to PR #1025 review)
+- **Cancelling a transfer's dispatch now leaves a durable task.** Each closed ASN that reached Mintsoft gets one "Ask the warehouse to cancel an ASN" row under Sync > Exceptions > Refused or stalled actions, with the text to paste into a warehouse query. One row per ASN; it counts in the banner, alerts after 24 hours and closes with Done once the warehouse was asked. Previously the instruction was a one-off banner.
+- **Order push no longer sends a renamed SKU the warehouse does not know.** While a product has an open "SKU renamed in IMS" discrepancy, orders carrying it are held (new orders parked, changes to pushed orders left due) with a clear reason, and are pushed automatically once the discrepancy closes. Nothing is dropped.
+- Documented: open "SKU renamed" discrepancies must be resolved before rolling back to a build older than the enum value (docs/mintsoft.md).

@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_WMS_ASN, type RefusedActionResolution } from '@/lib/domain/refused-actions'
 import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/inbound-event-status'
 
 /**
@@ -22,6 +23,10 @@ import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/inbound-ev
  * EVIDENCE THAT THE WAREHOUSE HAS ALREADY ACTED blocks too (o3d-zz37l): units actually received on any ASN line (received, accounted via receipt or via snapshot above 0),
  * and a receipt event for it that is still pending, retrying or REQUIRES_REVIEW. The status and the callback time alone do not: a zero-quantity recheck sets both. Closing the ASN under any of those leaves a receipt that a later booked-in
  * run throws on (the transfer is CANCELLED) and dead-letters, losing the receipt.
+ *
+ * THE REQUEST TO THE WAREHOUSE IS A DURABLE TASK (o3d-zz37l). For every closed ASN that reached the warehouse, the same transaction records one
+ * refused-action row (WMS_ASN_CANCEL_REQUEST, entity = the ASN map) with the copy-ready text. It is idempotent per ASN, stays on Sync > Exceptions
+ * until an operator confirms the warehouse was asked (or the ASN is otherwise resolved), and ages into an alert like any other. The banner is kept.
  *
  * LOCKING. Step 3 of the global order (transfer-asn-lock-order.ts): the caller already holds the transfer row, and
  * must call this BEFORE taking the ASN line locks (step 4).
@@ -92,7 +97,28 @@ export async function closeTransferAsnsForDispatchCancel(
     where: { id: { in: open.map((a) => a.id) }, closedAt: null },
     data: { closedAt: input.now, sloAlertedAt: null },
   })
-  return open.map((a) => ({ asnMapId: a.id, externalAsnId: a.externalAsnId, reachedWarehouse: a.status !== 'CREATE_PENDING' }))
+  const closed = open.map((a) => ({ asnMapId: a.id, externalAsnId: a.externalAsnId, reachedWarehouse: a.status !== 'CREATE_PENDING' }))
+  for (const asn of closed) {
+    // A placeholder that never reached the warehouse has nothing to cancel there.
+    if (asn.reachedWarehouse === false) continue
+    await recordRefusedAction(tx, {
+      entityType: REFUSED_ACTION_ENTITY_WMS_ASN,
+      entityId: asn.asnMapId,
+      action: 'WMS_ASN_CANCEL_REQUEST',
+      gate: 'WMS_ASN_CANCEL_NOT_CONFIRMED',
+      permanence: 'PERMANENT',
+      severity: 'MEDIUM',
+      intent: { orderNumber: input.transferReference, externalAsnId: asn.externalAsnId, transferId: input.transferId },
+      detail: asnCancelRequestText(input.transferReference, asn.externalAsnId),
+      now: input.now,
+    })
+  }
+  return closed
+}
+
+/** The copy-ready query for one closed ASN. */
+export function asnCancelRequestText(transferReference: string, externalAsnId: string): string {
+  return `Please cancel ASN ${externalAsnId} (IMS transfer ${transferReference}). The transfer's dispatch was cancelled in IMS and the goods are back in the source warehouse: do not book anything in against it. IMS cannot cancel an ASN in the warehouse system.`
 }
 
 export function describeClosedTransferAsns(transferReference: string, closed: readonly ClosedTransferAsn[]): string | null {
@@ -100,4 +126,18 @@ export function describeClosedTransferAsns(transferReference: string, closed: re
   const reached = closed.filter((a) => a.reachedWarehouse !== false)
   if (reached.length === 0) return null
   return `IMS closed warehouse ASN ${reached.map((a) => a.externalAsnId).join(', ')} for ${transferReference}. IMS cannot cancel it in the warehouse system: ask the warehouse to cancel it so they do not book these goods in.`
+}
+
+/**
+ * Close the cancel request of one ASN: an operator confirmed the warehouse was asked, or the ASN is otherwise resolved. Idempotent; true when an open
+ * request was closed.
+ */
+export async function resolveAsnCancelRequest(
+  client: Pick<Prisma.TransactionClient, 'refusedAction'>,
+  asnMapId: string,
+  resolution: RefusedActionResolution = 'OPERATOR_CONFIRMED',
+  now: Date = new Date(),
+): Promise<boolean> {
+  const count = await resolveRefusedActions(client, { entityType: REFUSED_ACTION_ENTITY_WMS_ASN, entityId: asnMapId, action: 'WMS_ASN_CANCEL_REQUEST' }, resolution, now)
+  return count > 0
 }
