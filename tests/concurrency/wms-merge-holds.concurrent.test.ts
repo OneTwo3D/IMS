@@ -103,7 +103,11 @@ test('while held the amend, hold and cancel queries of the push sweep leave the 
   }
   assert.deepEqual(await seen(), { amend: true, hold: true, cancel: true }, 'without a hold all three are due (the baseline)')
 
+  // beginHold refuses an order IMS has already withdrawn/cancelled, so the hold is placed while the two are still active (the real sequence: held first, withdrawn/cancelled afterwards), then their status is restored.
+  await w.db.salesOrder.updateMany({ where: { id: { in: [withdrawn, cancelled] } }, data: { status: 'PROCESSING' } })
   for (const id of ids) await w.port.beginHold(w.env, memberOf(id), 'g').then((row) => w.port.recordHeld(row!, new Date()))
+  await w.db.salesOrder.update({ where: { id: withdrawn }, data: { status: 'ON_HOLD' } })
+  await w.db.salesOrder.update({ where: { id: cancelled }, data: { status: 'CANCELLED' } })
   assert.deepEqual(await seen(), { amend: false, hold: false, cancel: false }, 'held: nothing is pushed')
 
   await w.db.wmsMergeHold.updateMany({ where: { orderId: { in: ids } }, data: { state: 'CLEARED' } })
