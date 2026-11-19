@@ -549,9 +549,9 @@ its `ssl` setting **undefined** when the URL says nothing about it, and then rea
 this whole section exists to prevent, arriving through the one door the derivation did not look at.
 
 Measured against the driver the release installs, the variables it consults for a URL of this shape
-are `PGSSLMODE`, `PGREPLICATION`, `PGOPTIONS`, `PGAPPNAME`, `PGBINARY`, `PGCLIENT_ENCODING`,
-`PGCONNECT_TIMEOUT` and `NODE_PG_FORCE_NATIVE`. `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE` and
-`PGPASSWORD` are **not** among them, because the emitted URL states all five. Three of the eight
+are `PGSSLMODE`, `PGSSLNEGOTIATION`, `PGREPLICATION`, `PGOPTIONS`, `PGAPPNAME`, `PGBINARY`,
+`PGCLIENT_ENCODING`, `PGCONNECT_TIMEOUT` and `NODE_PG_FORCE_NATIVE`. `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE` and
+`PGPASSWORD` are **not** among them, because the emitted URL states all five. Three of the nine
 change which `pg_hba.conf` record answers:
 
 | variable | what it does to the record |
