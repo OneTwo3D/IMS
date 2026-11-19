@@ -132,6 +132,8 @@ export type CsvDiagnostics = {
   strayQuoteRows: number[]
   /** Guidance/comment rows skipped, such as the template's "# REQUIRED" row. */
   commentRowsSkipped: number
+  /** Physical lines of skipped comment rows that are NOT the template's "# REQUIRED" row or an IMS export metadata/notice row: a real record could have been dropped. */
+  unexpectedCommentRows: number[]
 }
 
 // A guidance row is "# " followed by text ("# REQUIRED", "# IMS export metadata", "# notice"). A bare "#X" or "#123" is DATA: a SKU, supplier
@@ -140,23 +142,38 @@ function isCommentCell(value: string): boolean {
   return /^#(\s|$)/.test(value)
 }
 
+const EXPECTED_COMMENT_CELL = /^#\s*(REQUIRED|IMS export (metadata|notices)|notice)$/i
+const EXPORT_COMMENT_BLOCK_START = /^#\s*IMS export (metadata|notices)$/i
+
+/** Operator-facing notice for comment rows that were skipped and are not the template's guidance row or an export's metadata; null when there are none. */
+export function csvCommentRowsNotice(diagnostics: CsvDiagnostics): string | null {
+  const lines = diagnostics.unexpectedCommentRows
+  if (lines.length === 0) return null
+  const shown = lines.slice(0, 20).join(', ')
+  return `${lines.length} row(s) were skipped as comment rows because their first cell starts with "# " (line ${shown}${lines.length > 20 ? ', ...' : ''}). If one is a real record, remove the "# " from the first cell and import again.`
+}
+
 /** Parse CSV text into rows keyed by the header row, and report what the lenient reading hid. */
 export function parseCsvDiagnosed(text: string): { rows: Record<string, string>[]; diagnostics: CsvDiagnostics } {
   const { rows: parsedRows, lines, strayQuoteRowIndexes } = parseRows(text)
-  const diagnostics: CsvDiagnostics = { raggedRows: [], strayQuoteRows: [], commentRowsSkipped: 0 }
+  const diagnostics: CsvDiagnostics = { raggedRows: [], strayQuoteRows: [], commentRowsSkipped: 0, unexpectedCommentRows: [] }
   if (parsedRows.length < 2) return { rows: [], diagnostics }
 
   const headers = parsedRows[0]
   const results: Record<string, string>[] = []
+  let inExportCommentBlock = false
 
   for (let i = 1; i < parsedRows.length; i++) {
     const values = parsedRows[i]
     if (values.every((value) => value.trim() === '')) continue
-    const firstNonEmpty = values.find((value) => value.trim().length > 0)?.trim() ?? ''
+    // Only the FIRST column decides: a blank key column followed by a note such as "# 2 bolts" is data.
+    const firstCell = values[0]?.trim() ?? ''
     // Allow templates to carry guidance rows such as "# REQUIRED" without
     // turning them into imported records.
-    if (isCommentCell(firstNonEmpty)) {
+    if (isCommentCell(firstCell)) {
       diagnostics.commentRowsSkipped++
+      if (EXPORT_COMMENT_BLOCK_START.test(firstCell)) inExportCommentBlock = true
+      else if (!inExportCommentBlock && !EXPECTED_COMMENT_CELL.test(firstCell)) diagnostics.unexpectedCommentRows.push(lines[i])
       continue
     }
     if (values.length !== headers.length) diagnostics.raggedRows.push({ line: lines[i], expected: headers.length, actual: values.length })
@@ -179,14 +196,77 @@ export function csvDiagnosticsErrors(diagnostics: CsvDiagnostics): string[] {
   }
   if (diagnostics.raggedRows.length > 20) errors.push(`...and ${diagnostics.raggedRows.length - 20} more row(s) with the wrong number of cells`)
   for (const line of diagnostics.strayQuoteRows.slice(0, 20)) {
-    errors.push(`Line ${line}: a quote in the middle of an unquoted field — quote the whole field, or double the quote`)
+    errors.push(`Line ${line}: a stray quote, or text after a closing quote — quote the whole field, or double the quote`)
   }
   return errors
 }
 
-/** Parse CSV text into an array of objects keyed by header row. Lenient: use `parseCsvDiagnosed` where a damaged file must be refused. */
+/**
+ * Parse CSV text into an array of objects keyed by header row. This is the ORIGINAL lenient reading, unchanged: any row whose first
+ * non-empty cell starts with `#` is skipped, and a quote anywhere toggles quoting. The WooCommerce import, the warehouse bulk product data
+ * (LIVE), the products round-trip and first-load rely on exactly that. An importer that refuses damaged files runs `parseCsvDiagnosed`
+ * (and reads its rows, or `parseCsvValidated`) instead.
+ */
 export function parseCsv(text: string): Record<string, string>[] {
+  const rows = parseRowsLegacy(text)
+  if (rows.length < 2) return []
+
+  const headers = rows[0]
+  const results: Record<string, string>[] = []
+
+  for (let i = 1; i < rows.length; i++) {
+    const values = rows[i]
+    if (values.every((value) => value.trim() === '')) continue
+    const firstNonEmpty = values.find((value) => value.trim().length > 0)?.trim() ?? ''
+    // Allow templates to carry guidance rows such as "# REQUIRED" without
+    // turning them into imported records.
+    if (firstNonEmpty.startsWith('#')) continue
+    const obj: Record<string, string> = {}
+    headers.forEach((h, idx) => {
+      obj[h.trim()] = values[idx]?.trim() ?? ''
+    })
+    results.push(obj)
+  }
+
+  return results
+}
+
+/** The rows of the diagnosed reading (the one an importer that already ran `parseCsvDiagnosed` must read, so the checked file and the imported rows agree). */
+export function parseCsvValidated(text: string): Record<string, string>[] {
   return parseCsvDiagnosed(text).rows
+}
+
+function parseRowsLegacy(text: string): string[][] {
+  const input = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  const rows: string[][] = []
+  let fields: string[] = []
+  let current = ''
+  let inQuotes = false
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (ch === '"') {
+      if (inQuotes && input[i + 1] === '"') {
+        current += '"'
+        i++
+      } else {
+        inQuotes = !inQuotes
+      }
+    } else if (ch === ',' && !inQuotes) {
+      fields.push(current)
+      current = ''
+    } else if (ch === '\n' && !inQuotes) {
+      fields.push(current)
+      rows.push(fields)
+      fields = []
+      current = ''
+    } else {
+      current += ch
+    }
+  }
+  fields.push(current)
+  rows.push(fields)
+  return rows
 }
 
 function parseRows(text: string): { rows: string[][]; lines: number[]; strayQuoteRowIndexes: Set<number> } {
@@ -217,12 +297,20 @@ function parseRows(text: string): { rows: string[][]; lines: number[]; strayQuot
       if (inQuotes && input[i + 1] === '"') {
         current += '"'
         i++
-      } else if (!inQuotes && current !== '' && !fieldQuoted) {
+      } else if (!inQuotes && fieldQuoted) {
+        // A quote after a quoted field already closed ("a"b"c,d"): it must not reopen quoting and swallow the next cells.
+        strayQuoteRowIndexes.add(rows.length)
+        current += ch
+      } else if (!inQuotes && current.trim() !== '') {
         // A quote in the middle of an unquoted field.
         strayQuoteRowIndexes.add(rows.length)
         current += ch
       } else {
-        if (!inQuotes) fieldQuoted = true
+        if (!inQuotes) {
+          // Whitespace before an opening quote (`a, "b,c"`) is dropped: the quote opens the field, as it always did.
+          current = ''
+          fieldQuoted = true
+        }
         inQuotes = !inQuotes
       }
     } else if (ch === ',' && !inQuotes) {
@@ -233,6 +321,8 @@ function parseRows(text: string): { rows: string[][]; lines: number[]; strayQuot
       endRow()
       rowLine = line
     } else {
+      // Text straight after a closing quote ("a"b) is as malformed as a quote there; trailing whitespace is harmless.
+      if (!inQuotes && fieldQuoted && ch.trim() !== '') strayQuoteRowIndexes.add(rows.length)
       current += ch
     }
   }

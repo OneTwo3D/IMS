@@ -19,8 +19,8 @@ import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/inbound-ev
  * that may have reached the warehouse (CREATE_IN_FLIGHT, or CREATE_PENDING that was claimed before) and BOOKED_IN
  * (a receipt reconciliation is still owed). The operator settles those first.
  *
- * EVIDENCE THAT THE WAREHOUSE HAS ALREADY ACTED blocks too (o3d-zz37l): a PARTIALLY_BOOKED_IN status, a callback already received for the ASN, and
- * a receipt event for it that is still pending, retrying or REQUIRES_REVIEW. Closing the ASN under any of those leaves a receipt that a later booked-in
+ * EVIDENCE THAT THE WAREHOUSE HAS ALREADY ACTED blocks too (o3d-zz37l): units actually received on any ASN line (received, accounted via receipt or via snapshot above 0),
+ * and a receipt event for it that is still pending, retrying or REQUIRES_REVIEW. The status and the callback time alone do not: a zero-quantity recheck sets both. Closing the ASN under any of those leaves a receipt that a later booked-in
  * run throws on (the transfer is CANCELLED) and dead-letters, losing the receipt.
  *
  * LOCKING. Step 3 of the global order (transfer-asn-lock-order.ts): the caller already holds the transfer row, and
@@ -48,7 +48,10 @@ export async function closeTransferAsnsForDispatchCancel(
   // Re-read under the lock: the decision is made on the locked rows.
   const open = await tx.wmsAsnMap.findMany({
     where: { id: { in: ids }, closedAt: null },
-    select: { id: true, connector: true, externalAsnId: true, status: true, remoteCreateAttemptedAt: true, lastCallbackAt: true },
+    select: {
+      id: true, connector: true, externalAsnId: true, status: true, remoteCreateAttemptedAt: true,
+      lines: { select: { lastProcessedReceivedQty: true, qtyAccountedViaReceipt: true, qtyAccountedViaSnapshot: true } },
+    },
     orderBy: { id: 'asc' },
   })
   const unresolvedEvents = open.length === 0 ? [] : await tx.wmsInboundReceiptEvent.findMany({
@@ -68,16 +71,19 @@ export async function closeTransferAsnsForDispatchCancel(
   })
   const hasUnresolvedEvent = (asn: { connector: string; externalAsnId: string }) =>
     unresolvedEvents.some((event) => event.externalAsnId === asn.externalAsnId && event.connector === asn.connector)
+  // Units actually received are the evidence. PARTIALLY_BOOKED_IN and lastCallbackAt alone are NOT: a zero-quantity recheck, a callback with
+  // QuantityBooked 0 and the post-maintenance pass all set both on an ASN that holds nothing, and a transfer ASN has no close-short path.
+  const hasReceivedUnits = (asn: { lines?: ReadonlyArray<{ lastProcessedReceivedQty: unknown; qtyAccountedViaReceipt: unknown; qtyAccountedViaSnapshot: unknown }> }) =>
+    (asn.lines ?? []).some((line) => Number(line.lastProcessedReceivedQty) > 0 || Number(line.qtyAccountedViaReceipt) > 0 || Number(line.qtyAccountedViaSnapshot) > 0)
   const blocking = open.filter((asn) => asn.status === 'CREATE_IN_FLIGHT'
     || asn.status === 'BOOKED_IN'
-    || asn.status === 'PARTIALLY_BOOKED_IN'
-    || asn.lastCallbackAt !== null
+    || hasReceivedUnits(asn)
     || hasUnresolvedEvent(asn)
     || (asn.status === 'CREATE_PENDING' && asn.remoteCreateAttemptedAt !== null))
   if (blocking.length > 0) {
     throw new TransferAsnBlocksDispatchCancelError(
       `Cannot cancel the dispatch of ${input.transferReference}: warehouse ASN ${blocking.map((a) => `${a.externalAsnId} (${a.status})`).join(', ')} may already hold or have booked these goods. `
-      + 'Reconcile the ASN first (use Recheck booked-in on the transfer once the warehouse has booked the goods in), then cancel the dispatch.',
+      + 'Do not cancel the dispatch yet: if the warehouse has received units, complete the transfer receipt for what arrived (use Recheck booked-in on the transfer so IMS books it in); if its create is still in flight or a receipt event is waiting, wait for it to settle or resolve that event under WMS inbound events, then cancel the dispatch.',
     )
   }
 

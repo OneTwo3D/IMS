@@ -107,7 +107,7 @@ test('o3d-oe1b0: a BST month-end order created at 23:30 GMT is October in London
 
 // [mutation: classifyPopulation not consulted]
 test('POPULATION: a month before the recorded first load or storefront import is left out; an unrecorded boundary is NO_POPULATION_RECORD; nothing left is EMPTY_UNPROVEN', async () => {
-  const cut = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-09-01T00:00:00.000Z' } }
+  const cut = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-08-31T23:00:00.000Z' } }
   const noAug = standard({
     ims: { boundaries: cut, sales: [sale('2026-09', 'rGB', '100.00'), sale('2026-08', 'rGB', '1000.00')] },
   })
@@ -124,6 +124,16 @@ test('POPULATION: a month before the recorded first load or storefront import is
   assert.equal(none.xero.calls.length, 0)
   const retained = standard({ ims: { boundaries: { ...BOUNDARIES, retentionMonths: 1 } } })
   assert.deepEqual(reasons(await run(retained.ctx)), ['inconclusive', 'EMPTY_UNPROVEN'])
+})
+
+// [mutation: the period start taken as the UTC month start instead of London midnight]
+test('POPULATION BOUNDARY is London midnight: a cut at 23:30Z on 31 July (00:30 BST on 1 August) leaves August out, a cut at 23:00Z exactly keeps it', async () => {
+  const partial = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-07-31T23:30:00.000Z' } }
+  const out = standard({ ims: { boundaries: partial, sales: [sale('2026-09', 'rGB', '100.00'), sale('2026-08', 'rGB', '1000.00')] } })
+  assert.deepEqual(keys(await run(out.ctx), 'bothEqual').filter((k) => k.includes('2026-08')), [], 'August began before the cut: not wholly held, so not compared')
+  const whole = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-07-31T23:00:00.000Z' } }
+  const kept = standard({ ims: { boundaries: whole, sales: [sale('2026-09', 'rGB', '100.00'), sale('2026-08', 'rGB', '50.00')] } })
+  assert.ok(keys(await run(kept.ctx), 'bothEqual').some((k) => k.includes('2026-08')))
 })
 
 // ---- tolerance and set -----------------------------------------------------------------------

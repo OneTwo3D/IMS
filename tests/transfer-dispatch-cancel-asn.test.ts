@@ -11,7 +11,7 @@ import {
  * o3d-hqvrp.120: cancelling a transfer's dispatch closes its ASN in IMS (and nothing in Mintsoft), and refuses while the
  * warehouse may already hold or have booked goods against it. Fake transaction: no database, no network.
  */
-type Asn = { id: string; connector: string; externalAsnId: string; status: string; remoteCreateAttemptedAt: Date | null; lastCallbackAt: Date | null; closedAt: Date | null; sourceType: string; sourceId: string }
+type Asn = { id: string; connector: string; externalAsnId: string; status: string; remoteCreateAttemptedAt: Date | null; lastCallbackAt: Date | null; closedAt: Date | null; sourceType: string; sourceId: string; lines?: ReadonlyArray<{ lastProcessedReceivedQty: number; qtyAccountedViaReceipt: number; qtyAccountedViaSnapshot: number }> }
 type ReceiptEvent = { connector: string; externalAsnId: string; processedAt: Date | null; processingStatus: string }
 
 function fakeTx(rows: Asn[], events: ReceiptEvent[] = []) {
@@ -69,8 +69,9 @@ for (const [label, over] of [
   ['a create that may have reached the warehouse', { status: 'CREATE_IN_FLIGHT' }],
   ['a claimed pending create', { status: 'CREATE_PENDING', remoteCreateAttemptedAt: new Date() }],
   ['a booked-in ASN still owed a receipt', { status: 'BOOKED_IN' }],
-  ['a partially booked-in ASN (the warehouse already received some units)', { status: 'PARTIALLY_BOOKED_IN' }],
-  ['an ASN the warehouse has already called back on', { lastCallbackAt: new Date() }],
+  ['a partially booked-in ASN with units really received', { status: 'PARTIALLY_BOOKED_IN', lastCallbackAt: new Date(), lines: [{ lastProcessedReceivedQty: 2, qtyAccountedViaReceipt: 0, qtyAccountedViaSnapshot: 0 }] }],
+  ['an ASN with units accounted via a receipt', { lines: [{ lastProcessedReceivedQty: 0, qtyAccountedViaReceipt: 1, qtyAccountedViaSnapshot: 0 }] }],
+  ['an ASN with units accounted via a snapshot', { lines: [{ lastProcessedReceivedQty: 0, qtyAccountedViaReceipt: 0, qtyAccountedViaSnapshot: 3 }] }],
 ] as const) {
   test(`cancelling the dispatch is refused for ${label}, and nothing is closed`, async () => {
     const blocking = asn(over); const fine = asn({ id: 'a2', externalAsnId: '9002' })
@@ -106,4 +107,20 @@ test('a processed or dead receipt event, or one for another ASN, does not block'
   ])
   const closed = await closeTransferAsnsForDispatchCancel(tx, { transferId: 't1', transferReference: 'TR-1', now })
   assert.deepEqual(closed.map((c) => c.externalAsnId), ['9001'])
+})
+
+// A zero-quantity booked-in recheck (operator recheck, QuantityBooked 0 callback, post-maintenance pass) sets PARTIALLY_BOOKED_IN and lastCallbackAt on an ASN that holds nothing.
+// A transfer ASN has no close-short path, so refusing that for good would strand the transfer IN_TRANSIT.
+test('an OPEN ASN after a zero-delta recheck (PARTIALLY_BOOKED_IN, lastCallbackAt set, nothing received) can still be cancelled', async () => {
+  const rechecked = asn({ status: 'PARTIALLY_BOOKED_IN', lastCallbackAt: new Date('2026-11-18T09:00:00Z'), lines: [{ lastProcessedReceivedQty: 0, qtyAccountedViaReceipt: 0, qtyAccountedViaSnapshot: 0 }] })
+  const { tx } = fakeTx([rechecked])
+  const closed = await closeTransferAsnsForDispatchCancel(tx, { transferId: 't1', transferReference: 'TR-1', now })
+  assert.deepEqual(closed.map((c) => c.externalAsnId), ['9001'])
+  assert.equal(rechecked.closedAt, now)
+})
+
+test('the refusal names a way forward that exists', async () => {
+  const mine = asn({ lines: [{ lastProcessedReceivedQty: 1, qtyAccountedViaReceipt: 0, qtyAccountedViaSnapshot: 0 }] })
+  const { tx } = fakeTx([mine])
+  await assert.rejects(closeTransferAsnsForDispatchCancel(tx, { transferId: 't1', transferReference: 'TR-1', now }), /complete the transfer receipt for what arrived/)
 })

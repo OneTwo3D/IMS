@@ -260,7 +260,7 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
   // The population: months IMS held. An unrecorded boundary is unknown, never in.
   const periods: string[] = []
   for (const period of candidates) {
-    const start = `${period}-01T00:00:00.000Z`
+    const start = londonMonthStart(period)
     const verdicts = [classifyPopulation(boundaries, 'first-load', start, context.asOf), classifyPopulation(boundaries, 'storefront-order', start, context.asOf)]
     if (verdicts.some((verdict) => verdict.kind === 'unknown')) return inconclusive([LEDGER], 'NO_POPULATION_RECORD')
     if (verdicts.every((verdict) => verdict.kind === 'in')) periods.push(period)
@@ -394,4 +394,11 @@ export async function runVatItem(id: VatItemId, context: VatItemContext): Promis
   } catch {
     return inconclusive([], 'INTERNAL_ERROR')
   }
+}
+
+/** The instant (UTC ISO) of London midnight at the start of `YYYY-MM`: 23:00Z the day before in BST, 00:00Z in GMT. The buckets are London months, so the population boundary is tested from here, not from the UTC month start. */
+function londonMonthStart(period: string): string {
+  const utcMidnight = `${period}-01T00:00:00.000Z`
+  const hourEarlier = new Date(Date.parse(utcMidnight) - 3_600_000).toISOString()
+  return businessDateOfStamp(hourEarlier) === `${period}-01` ? hourEarlier : utcMidnight
 }

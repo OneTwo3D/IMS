@@ -3,7 +3,7 @@
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
-import { csvDiagnosticsErrors, parseCsv, parseCsvDiagnosed } from '@/lib/csv'
+import { csvDiagnosticsErrors, parseCsvDiagnosed, parseCsvValidated } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { SYSTEM_IMPORT, withSystemActor, withSystemOutcome, type SystemImportContext } from '@/lib/first-load/apply/system-import-capability'
@@ -15,6 +15,7 @@ import {
   createCsvImportPreviewResult,
   getCsvImportMode,
   isCsvImportDryRunMode,
+  withCsvCommentRowsNotice,
   runCsvImportMutation,
   type CsvImportActionResult,
 } from '@/lib/csv-import'
@@ -296,6 +297,10 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
 }
 
 export async function importSuppliersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importSuppliersCsvInner(formData, system))
+}
+
+async function importSuppliersCsvInner(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   // A system-actor context (the first-load apply runner, a CLI with no session) replaces the session check; anything
@@ -323,7 +328,7 @@ export async function importSuppliersCsv(formData: FormData, system?: SystemImpo
         ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: damage.length, errors: damage, error })
         : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: damage, error, success: false })
     }
-    const parsed = parseCsv(text)
+    const parsed = parseCsvValidated(text)
     const rows = parsed.slice(0, MAX_IMPORT_ROWS)
     const dropped = parsed.length - rows.length
     const suppliers = await db.supplier.findMany({

@@ -1,3 +1,5 @@
+import { csvCommentRowsNotice, parseCsvDiagnosed } from '@/lib/csv'
+
 export type CsvImportMode = 'preview' | 'execute'
 
 export type ImportWarning = string
@@ -151,4 +153,18 @@ export async function runCsvImportMutation<T>(
 ): Promise<T | null> {
   if (isCsvImportDryRunMode(mode)) return null
   return await mutation()
+}
+
+/**
+ * Tell the operator when rows were skipped as `# ` comment rows that are not the template's guidance row or an export's metadata (a real
+ * record whose first cell starts with "# " would otherwise vanish in silence). Reads the uploaded file again; a result with no such rows
+ * is returned untouched.
+ */
+export async function withCsvCommentRowsNotice<T extends CsvImportActionResult>(formData: FormData, result: T): Promise<T> {
+  const file = formData.get('file') as { text?: () => Promise<string> } | null
+  if (!file || typeof file.text !== 'function') return result
+  const notice = csvCommentRowsNotice(parseCsvDiagnosed(await file.text()).diagnostics)
+  if (!notice) return result
+  if (result.preview === true) return { ...result, warnings: [...result.warnings, notice] }
+  return { ...result, message: result.message ? `${result.message} ${notice}` : notice }
 }
