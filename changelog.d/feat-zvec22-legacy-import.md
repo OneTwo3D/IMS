@@ -1,0 +1,3 @@
+### Legacy bridge order import and Step M precondition report (cutover)
+- New `npm run cutover:legacy-import`: reads the legacy bridge's `_mintsoft_*` order meta from WooCommerce (read only) and writes IMS's own warehouse-order links so the push sweep never re-creates an order the bridge created (SYNCED, MERGED, PENDING_VERIFY, DEAD_LETTER). Dry run by default, `--apply` to write, idempotent, never overwrites a differing link (reported as a conflict). No migration; Mintsoft is not called unless the read-only `--verify-mintsoft` flag is given.
+- The dry run is the Step M precondition report: OrderNumber mismatches against the live `woocommerce_order_prefix`, open merge candidates and holds, and every non-empty bridge queue per order.
