@@ -1,5 +1,7 @@
 import { Prisma, type PrismaClient, type ProductType, type StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { businessDateYmd } from '@/lib/business-date'
+import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
 import {
   addMoney,
   roundQuantity,
@@ -63,7 +65,7 @@ export type OnHandAsOfResult = {
 
 export type OnHandAsOfClient = Pick<
   PrismaClient,
-  'inventorySnapshot' | 'stockMovement' | 'stockLevel' | 'costLayer' | 'costLayerRevaluation'
+  'inventorySnapshot' | 'inventorySnapshotRun' | 'stockMovement' | 'stockLevel' | 'costLayer' | 'costLayerRevaluation'
 > & {
   $queryRaw?: PrismaClient['$queryRaw']
   $transaction?: PrismaClient['$transaction']
@@ -304,12 +306,29 @@ function startOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
 }
 
-function startOfNextUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1))
-}
-
 function endOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
+}
+
+/** The BUSINESS (Europe/London) day an instant falls in, as a UTC-midnight label Date (the form `inventory_snapshots.snapshotDate` is keyed on). */
+function businessDayLabel(instant: Date): Date {
+  const [year, month, day] = businessDateYmd(instant).split('-').map(Number)
+  return new Date(Date.UTC(year!, month! - 1, day!))
+}
+
+/**
+ * The instant a snapshot's content stops: movements at or after it are NOT in the snapshot. Snapshots are labelled by London business day, so in BST this
+ * is 23:00Z of the label day, not 24:00Z. The run row's stored `cutoffAt` is authoritative (it is what the writer stamped, and backfilled days stamp their own
+ * UTC cutoff); with none stored, fall back to the end of the London day the label names (identical to the UTC day in GMT). RESIDUAL (o3d-cr517): a legacy BST
+ * run written before the label moved to the London day AND with no stored cutoff is read as a London-labelled day; its movements in the one-hour window are
+ * attributed by the London convention.
+ */
+async function loadSnapshotCutoff(client: OnHandAsOfClient, snapshotDate: Date): Promise<Date> {
+  const run = await client.inventorySnapshotRun.findUnique({
+    where: { snapshotDate },
+    select: { cutoffAt: true },
+  })
+  return run?.cutoffAt ?? startOfNextBusinessDay(snapshotDate)
 }
 
 function formatDate(date: Date): string {
@@ -583,18 +602,18 @@ function rowsFromState(state: OnHandState, options: { excludeZero?: boolean } = 
     ))
 }
 
-async function findPriorSnapshotDate(client: OnHandAsOfClient, asOfDay: Date): Promise<Date | null> {
+async function findPriorSnapshotDate(client: OnHandAsOfClient, asOfDay: Date, inclusive: boolean): Promise<Date | null> {
   const row = await client.inventorySnapshot.findFirst({
-    where: { snapshotDate: { lte: asOfDay } },
+    where: { snapshotDate: inclusive ? { lte: asOfDay } : { lt: asOfDay } },
     select: { snapshotDate: true },
     orderBy: { snapshotDate: 'desc' },
   })
   return row?.snapshotDate ?? null
 }
 
-async function findFutureSnapshotDate(client: OnHandAsOfClient, asOfDay: Date): Promise<Date | null> {
+async function findFutureSnapshotDate(client: OnHandAsOfClient, asOfDay: Date, exclusive: boolean): Promise<Date | null> {
   const row = await client.inventorySnapshot.findFirst({
-    where: { snapshotDate: { gt: asOfDay } },
+    where: { snapshotDate: exclusive ? { gt: asOfDay } : { gte: asOfDay } },
     select: { snapshotDate: true },
     orderBy: { snapshotDate: 'asc' },
   })
@@ -803,12 +822,13 @@ async function replayMovements(
  *   does not replace the inventory snapshot drift checks.
  *
  * Time semantics:
- * - String inputs must be `YYYY-MM-DD` and are interpreted as end-of-day UTC.
+ * - String inputs must be `YYYY-MM-DD` and name a Europe/London business day: the as-of is the END of that London day (23:00Z in BST), the same day
+ *   convention snapshots are labelled by. The returned `asOf` stays the end-of-UTC-day label proxy.
  * - Date/number inputs are accepted for exact instants; ISO datetime strings are intentionally rejected.
- * - `asOf` is inclusive. Snapshot anchors are exclusive because snapshots represent the
- *   just-ended UTC day.
+ * - `asOf` is inclusive. Snapshot anchors are exclusive: replay starts/ends at the snapshot's own `cutoffAt` (the run row's stored value, else the end of
+ *   its London label day), never at a UTC midnight.
  *
- * @throws InventoryAsOfFutureError when `asOf` is after the current UTC day.
+ * @throws InventoryAsOfFutureError when `asOf` is after the current London business day.
  * @throws Error when the date string is invalid or is not `YYYY-MM-DD`.
  */
 export async function getOnHandAsOf(options: {
@@ -827,7 +847,11 @@ export async function getOnHandAsOf(options: {
   const client = options.client ?? db
   const now = options.now?.() ?? new Date()
   const { asOf, isDateOnly } = parseAsOf(options.asOf)
-  if (asOf > endOfUtcDay(now)) {
+  // A date-only as-of NAMES a London business day (the day snapshots are labelled by); `asOf` itself stays the end-of-UTC-day label proxy that reports
+  // and the reservation-snapshot lookup key on. Every boundary below comes from `dayEnd` (start of the next London day), never from the UTC day.
+  const asOfDay = isDateOnly ? startOfUtcDay(asOf) : businessDayLabel(asOf)
+  const dayEnd = startOfNextBusinessDay(asOfDay)
+  if (isDateOnly ? asOfDay > businessDayLabel(now) : asOf > endOfUtcDay(now)) {
     throw new InventoryAsOfFutureError()
   }
 
@@ -841,7 +865,7 @@ export async function getOnHandAsOf(options: {
     excludeZero: options.excludeZero,
   }
 
-  if (asOf >= now) {
+  if (isDateOnly ? dayEnd > now : asOf >= now) {
     const { state, driftCount } = await loadCurrentState(client, filters)
     return buildResult({
       asOf,
@@ -855,32 +879,32 @@ export async function getOnHandAsOf(options: {
     })
   }
 
-  const asOfDay = startOfUtcDay(asOf)
-  // A date-only as-of covers the whole UTC day, so bound replay at the next-day
-  // midnight (half-open) rather than the `.999Z` end-of-day proxy, which would
+  // A date-only as-of covers the whole London business day, so bound replay at the next London midnight (half-open) rather than the `.999Z` end-of-day proxy, which would
   // drop movements in the `.999000`–`.999999` microsecond band (forward replay)
   // or wrongly reverse them out (reverse replay). Precise instants keep their
   // inclusive `lte`/exclusive `gt` semantics (scjz.49).
   const asOfUpperBound: { lt: Date } | { lte: Date } = isDateOnly
-    ? { lt: startOfNextUtcDay(asOfDay) }
+    ? { lt: dayEnd }
     : { lte: asOf }
   const asOfLowerBound: { gte: Date } | { gt: Date } = isDateOnly
-    ? { gte: startOfNextUtcDay(asOfDay) }
+    ? { gte: dayEnd }
     : { gt: asOf }
   // Lower edge of "revalued after asOf" (scjz.43). A date-only as-of covers the
-  // whole UTC day, so "after" starts at next-day midnight (matching the replay
+  // whole London day, so "after" starts at the next London midnight (matching the replay
   // upper bound) — a same-day revaluation is already reflected in the day's value.
   const postAsOfRevaluationLowerBound: Prisma.DateTimeFilter = isDateOnly
-    ? { gte: startOfNextUtcDay(asOfDay) }
+    ? { gte: dayEnd }
     : { gt: asOf }
-  const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay)
+  // A precise instant inside day D cannot anchor on D's own snapshot (it holds the whole of D), so only strictly earlier labels qualify as prior.
+  const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay, isDateOnly)
   if (priorSnapshotDate) {
+    const priorCutoff = await loadSnapshotCutoff(client, priorSnapshotDate)
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
     const replay = await replayMovements(
       client,
       state,
       filters,
-      { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound },
+      { gte: priorCutoff, ...asOfUpperBound },
       'forward',
       options.signal,
     )
@@ -889,7 +913,7 @@ export async function getOnHandAsOf(options: {
     // value, not cost-layer revaluations), and (b) the loaded snapshot row itself
     // persisted stale at write (backfilled from a later basis or missing-value).
     // Tracked separately so reports give the right reason (scjz.43/.48).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { gte: startOfNextUtcDay(priorSnapshotDate), ...asOfUpperBound })
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { gte: priorCutoff, ...asOfUpperBound })
     const staleSnapshotCount = await countUnreliableSnapshots(client, priorSnapshotDate, filters)
     return buildResult({
       asOf,
@@ -904,14 +928,15 @@ export async function getOnHandAsOf(options: {
     })
   }
 
-  const futureSnapshotDate = await findFutureSnapshotDate(client, asOfDay)
+  const futureSnapshotDate = await findFutureSnapshotDate(client, asOfDay, isDateOnly)
   if (futureSnapshotDate) {
+    const futureCutoff = await loadSnapshotCutoff(client, futureSnapshotDate)
     const state = await loadSnapshotState(client, futureSnapshotDate, filters)
     const replay = await replayMovements(
       client,
       state,
       filters,
-      { ...asOfLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) },
+      { ...asOfLowerBound, lt: futureCutoff },
       'reverse',
       options.signal,
     )
@@ -920,7 +945,7 @@ export async function getOnHandAsOf(options: {
     // revaluation. Flag revaluations in (asOf, futureSnapshotDate], plus a future
     // snapshot row itself flagged stale at write (backfilled from a later basis) —
     // either makes the reversed-to-asOf basis not point-in-time (scjz.43/.48).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: startOfNextUtcDay(futureSnapshotDate) })
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: futureCutoff })
     const staleSnapshotCount = await countUnreliableSnapshots(client, futureSnapshotDate, filters)
     return buildResult({
       asOf,

@@ -8,7 +8,8 @@ import {
   type ReservationBreakdownRow,
 } from '@/lib/domain/inventory/reservation-breakdown'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { startOfNextUtcDay } from '@/lib/domain/math/date-window'
+import { businessDateYmd } from '@/lib/business-date'
+import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -373,6 +374,10 @@ function parseDateOnly(value: string | undefined, fallback: Date): Date {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return fallback
   const [year, month, day] = value.split('-').map(Number)
   return new Date(Date.UTC(year!, month! - 1, day!, 0, 0, 0, 0))
+}
+
+function businessDayLabel(instant: Date): Date {
+  return parseDateOnly(businessDateYmd(instant), instant)
 }
 
 function formatDateOnly(value: Date): string {
@@ -1153,14 +1158,18 @@ export async function getNegativeStockReport(
   const getOnHandAsOf = options.deps?.getOnHandAsOf ?? defaultGetOnHandAsOf
   const now = options.now?.() ?? new Date()
   const defaultFrom = subtractDays(now, DEFAULT_NEGATIVE_STOCK_LOOKBACK_DAYS)
-  const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
-  const dateTo = parseDateOnly(filters.dateTo, now)
-  const dateToExclusive = startOfNextUtcDay(dateTo)
-  // The opening balance is the end of the previous UTC day; movements inside
-  // dateFrom..dateTo are then replayed inclusively to find the trough.
+  // dateFrom/dateTo name London business days (the day convention getOnHandAsOf and the snapshots use), so the default window is the London day of
+  // `defaultFrom`/`now`, and the movement window below is bounded by London midnights, not UTC ones (an hour off in BST).
+  const dateFrom = parseDateOnly(filters.dateFrom, businessDayLabel(defaultFrom))
+  const dateTo = parseDateOnly(filters.dateTo, businessDayLabel(now))
+  // The opening balance is the end of the previous London day; movements inside
+  // dateFrom..dateTo are then replayed inclusively to find the trough. The window
+  // starts exactly where the opening balance ends, so no movement falls in the gap.
   const openingAsOf = subtractDays(dateFrom, 1)
+  const windowStart = startOfNextBusinessDay(openingAsOf)
+  const dateToExclusive = startOfNextBusinessDay(dateTo)
   const movementWhere: Prisma.StockMovementWhereInput = {
-    createdAt: { gte: dateFrom, lt: dateToExclusive },
+    createdAt: { gte: windowStart, lt: dateToExclusive },
     ...(filters.warehouseId
       ? { OR: [{ fromWarehouseId: filters.warehouseId }, { toWarehouseId: filters.warehouseId }] }
       : {}),

@@ -553,8 +553,8 @@ test('negative stock report replays movements from an as-of opening balance and 
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.status, 'currently_negative')
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.minimumQty, '-1')
   const createdAt = (observedMovementWhere as { createdAt?: { gte?: Date; lt?: Date; lte?: Date } }).createdAt
-  assert.equal(createdAt?.gte?.toISOString(), '2026-06-01T00:00:00.000Z')
-  assert.equal(createdAt?.lt?.toISOString(), '2026-06-03T00:00:00.000Z')
+  assert.equal(createdAt?.gte?.toISOString(), '2026-05-31T23:00:00.000Z')
+  assert.equal(createdAt?.lt?.toISOString(), '2026-06-02T23:00:00.000Z')
   assert.equal(createdAt?.lte, undefined)
 })
 
