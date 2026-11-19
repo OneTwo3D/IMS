@@ -143,6 +143,8 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   // the staff user who attached a supporting document to a purchase or sales order (no foreign key)
   'OrderAttachment.uploadedByUserId': 'not-customer',
   'NotificationReadReceipt.userId': 'not-customer',
+  // the staff user (or cli:<name>) who confirmed that an incumbent writer has stopped (no foreign key)
+  'WriterAttestation.userId': 'not-customer',
 }
 
 test('every column that stores a customer / contact / account identifier is decided, and the erased ones are erased', () => {

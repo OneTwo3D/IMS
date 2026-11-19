@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WITHDRAWAL_REJECT_NOT_WRITTEN'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL', 'WITHDRAWAL_REJECT_NOT_WRITTEN'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -32,6 +32,9 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   ORDER_NOT_FOUND: 'Warehouse order not found on repeated checks: IMS stopped checking its status',
   CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: the invoice is still uncredited in the ledger',
   WITHDRAWAL_REJECT_NOT_WRITTEN: 'Withdrawal request filed after despatch: IMS could not reject it on the storefront, reject it in WooCommerce',
+  MERGE_HOLD: 'Orders on merge hold in the warehouse: merge them there and confirm the merged order yourself',
+  MERGE_HOLD_OVERDUE: 'Merge hold overdue: merge and confirm the order in the warehouse',
+  MERGE_HOLD_WITHDRAWAL: 'Withdrawal or cancel on an order on merge hold: act in the warehouse',
 }
 
 export type WmsOperatorTaskInput = {
@@ -58,6 +61,10 @@ export type WmsOperatorTaskPayload = {
   items?: WmsOperatorTaskLine[]
   /** Merge candidate: the orders of the group (IMS and warehouse numbers only). */
   members?: Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>
+  /** Merge hold: the group this task is about (so a later retry can re-word it), its warnings, and for an unsettled-hold task which case it is. */
+  groupBasis?: string
+  warnings?: string[]
+  kind?: string
   /** Refund in WooCommerce (SHOP_REFUND_DUE): the IMS refund the task is about and the figures the operator refunds. IMS figures and ids only. */
   shopRefund?: {
     refundId: string

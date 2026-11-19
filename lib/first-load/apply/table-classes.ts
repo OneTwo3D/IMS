@@ -163,6 +163,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   wc_stock_drift_events: { kind: 'MUST_BE_EMPTY', reason: 'stock-drift observer: storefront stock changes that no order or IMS push explains; runtime evidence a first load starts empty' },
   wc_stock_drift_runs: { kind: 'MUST_BE_EMPTY', reason: 'stock-drift observer: one row per look; runtime state a first load starts empty' },
   trackship_refire_states: { kind: 'MUST_BE_EMPTY', reason: 'TrackShip re-fire state: per-order looks and back-off of a sweep that is off by default; runtime state a first load starts empty' },
+  wms_merge_holds: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records: merge-hold state per warehouse order, runtime state a first load starts empty' },
   wms_operator_tasks: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_status_snapshots: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_product_links: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
