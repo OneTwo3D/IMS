@@ -324,7 +324,7 @@ export async function runFencedWcOrderJob(
   if (options.idempotencyKeys?.length === 0) return summary
   // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and spend no attempt. A job queued
   // before the hold was switched on stays exactly as it is and is never sent while the hold stands.
-  if (wooDrainHold().held) return summary
+  if (wooDrainHold(undefined, 'order.status').held) return summary
   const now = options.now
   const clock = options.clock ?? (() => new Date())
   const startedAt = clock().getTime()

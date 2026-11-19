@@ -195,7 +195,7 @@ test('MUTATION MINT-3 (a login helper whose call is gone, and a key test that st
 })
 
 test('MUTATION MINT-4 (a new Mintsoft operation in the ownership map that nothing governs): red', () => {
-  const extra: OwnershipRow = { destination: 'mintsoft', operation: 'order.merge', owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' }, obligationTime: 'not-applicable', note: 'fixture' }
+  const extra: OwnershipRow = { destination: 'mintsoft', operation: 'order.merge', owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' }, step: 'mintsoft', obligationTime: 'not-applicable', note: 'fixture' }
   const report = mintCensusFindings(input({ map: [...(WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]), extra] }))
   assert.equal(red(report, 'MINT-4', 'mintsoft.order.merge').length, 1, JSON.stringify(report.failures))
   const stale = mintCensusFindings(input({ governedElsewhere: { 'auth.login': 'fixture reason that is long enough', 'no.such.operation': 'fixture reason that is long enough', 'asn.create': 'fixture reason that is long enough' } }))

@@ -56,6 +56,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   hs_code_proposals: { kind: 'MUST_BE_EMPTY', reason: 'customs code proposals' },
   incumbent_writer_evidence: { kind: 'CONFIG_ALLOWED', reason: 'marks other writers left on imported storefront orders, kept for the coexistence check; no business data' },
   migration_verification_passes: { kind: 'CONFIG_ALLOWED', reason: 'which migrations passed their own post-migration checks; no business data' },
+  writer_attestations: { kind: 'CONFIG_ALLOWED', reason: 'owner and host confirmations that an incumbent writer stopped: they belong to the installation and hold no business data, and the owner may record one before the first load (the reinstalled production), so one must not block the load; the runner never writes it' },
   integration_outbox: { kind: 'MUST_BE_EMPTY', reason: 'outbound connector queue' },
   inventory_reservation_snapshot_runs: { kind: 'MUST_BE_EMPTY', reason: 'inventory snapshots' },
   inventory_reservation_snapshots: { kind: 'MUST_BE_EMPTY', reason: 'inventory snapshots' },

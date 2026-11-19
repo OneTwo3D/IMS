@@ -2,6 +2,14 @@ import type { TaxRateRow } from '../../lib/reconciliation-pack/ims-readers.ts'
 import type { WooTaxRateDetail } from '../../lib/reconciliation-pack/woo-source.ts'
 import type { WooTaxMappingRow, WooTaxRateFields } from '../../lib/connectors/woocommerce/tax-rate-plan.ts'
 import type { WooTaxPortResult, WooTaxRateWritePort } from '../../lib/connectors/woocommerce/tax-rate-writer.ts'
+import { WRITER_OWNERSHIP_MAP } from '../../lib/security/writer-ownership-map.ts'
+
+// The production map keeps woocommerce.tax-rate with the operator in P2 until its writer is built (owner answer Q5, 2026-11-18). The writer's own tests exercise the
+// writer as if its owner had switched it on, so they flip the row for THIS test process only (each test file runs in its own process).
+for (const row of WRITER_OWNERSHIP_MAP) {
+  if (row.destination === 'woocommerce' && row.operation === 'tax-rate') (row.owners as { P2: string }).P2 = 'IMS'
+}
+
 
 /** Fixtures for the WooCommerce tax-rate writer tests. No network, no database. */
 
