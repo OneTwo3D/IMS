@@ -148,3 +148,29 @@ test('desiredLinkFor with an operator decision: ours is SYNCED/MERGED, cancelled
   assert.notEqual(resolutionSignature(verify), resolutionSignature(state({ _mintsoft_verify_order_id: '9008', _mintsoft_dead_letter: '1' })))
   assert.notEqual(resolutionSignature(queued), resolutionSignature(state({ _mintsoft_order_id: '9100', _mintsoft_merged: '1', _mintsoft_sync_pending: 'cancel' })))
 })
+
+test('r2: the fenced shapes WooCommerce shows (no id): queued update / cancel on a cancelled or refunded order, verify-pending, dead-letter; the dead `_mintsoft_fence*` rule is gone', () => {
+  const read = (status: string, pairs: Record<string, unknown>) => readLegacyOrderState({ id: 1, number: '1001', status, meta_data: Object.entries(pairs).map(([key, value]) => ({ key, value })) })!
+  assert.deepEqual(blockingQueueKinds(read('cancelled', { _mintsoft_sync_pending: 'cancel' })), ['sync-pending-no-id'])
+  assert.deepEqual(blockingQueueKinds(read('refunded', { _mintsoft_sync_pending: 'update' })), ['sync-pending-no-id'])
+  assert.deepEqual(blockingQueueKinds(read('cancelled', { _mintsoft_sync_pending: 'create' })), [])
+  assert.deepEqual(blockingQueueKinds(read('processing', { _mintsoft_sync_pending: 'cancel' })), [])
+  assert.deepEqual(blockingQueueKinds(read('processing', { _mintsoft_verify_pending: '1' })), ['verify-pending-no-id'])
+  assert.deepEqual(blockingQueueKinds(read('cancelled', { _mintsoft_dead_letter: '1' })), ['dead-letter-no-id'])
+  // With an id the existing kinds apply, not the id-less ones.
+  assert.deepEqual(blockingQueueKinds(read('cancelled', { _mintsoft_order_id: '9001', _mintsoft_sync_pending: 'cancel' })), ['sync-pending'])
+  assert.equal('fenceKeys' in read('cancelled', { _mintsoft_fence_at: '1767312000' }), false)
+  assert.deepEqual(blockingQueueKinds(read('cancelled', { _mintsoft_fence_at: '1767312000' })), [])
+})
+
+test('r2: a resolution that found the order by number links the id it found; a merge survivor is MERGED whatever the WooCommerce flag says', () => {
+  const read = (pairs: Record<string, unknown>) => readLegacyOrderState({ id: 1, number: '1001', status: 'processing', meta_data: Object.entries(pairs).map(([key, value]) => ({ key, value })) })!
+  const noId = read({ _mintsoft_dead_letter: '1' })
+  assert.deepEqual(desiredLinkFor(noId, 'ours', { id: '9300', orderNumber: '1001', merged: false }), { kind: 'link', state: 'SYNCED', externalOrderId: '9300', externalOrderNumber: '1001', lastError: null })
+  assert.deepEqual(desiredLinkFor(noId, 'cancelled', { id: '9300', orderNumber: '1001', merged: false }), { kind: 'link', state: 'CANCELLED', externalOrderId: '9300', externalOrderNumber: '1001', lastError: null })
+  assert.equal(desiredLinkFor(noId, 'cancelled', null).kind, 'none')
+  const trusted = read({ _mintsoft_order_id: '9162', _mintsoft_sync_pending: 'update' })
+  assert.deepEqual(desiredLinkFor(trusted, 'ours', { id: '9162', orderNumber: '1001+1099', merged: false }), { kind: 'link', state: 'MERGED', externalOrderId: '9162', externalOrderNumber: '1001+1099', lastError: null })
+  assert.equal((desiredLinkFor(trusted, 'ours', { id: '9162', orderNumber: '1001', merged: true }) as { state: string }).state, 'MERGED')
+  assert.equal((desiredLinkFor(trusted, 'ours', { id: '9162', orderNumber: '1001', merged: false }) as { state: string }).state, 'SYNCED')
+})

@@ -18,28 +18,79 @@ import {
   type ResolutionDecision,
 } from './state'
 import { walkWcOrderPages } from './wc-read'
-import type { ImsOrderContext, LegacyImportPorts, StoredResolution, WcReadResult, WriteOutcome } from './run'
+import type { ImsOrderContext, LegacyImportPorts, StoredHistoricResolution, StoredResolution, WcReadResult, WriteOutcome } from './run'
 
 /** The activity-log action an operator decision (`--resolve`) is stored under. */
 export const RESOLUTION_ACTION = 'legacy_bridge_import_resolved'
+/** The activity-log action the ONE grouped decision for in-window historic cancelled / refunded orders is stored under. */
+export const HISTORIC_RESOLUTION_ACTION = 'legacy_bridge_import_resolved_historic'
+/** The audit action of a full `--apply` import run, and of a run limited to `--resolve` / `--resolve-all-historic-cancelled` (NOT the authoritative import). */
+export const APPLY_ACTION = 'legacy_bridge_import_applied'
+export const RESOLVE_APPLY_ACTION = 'legacy_bridge_import_resolve_applied'
 
 const LINK_SELECT = { id: true, connector: true, state: true, externalOrderId: true, externalOrderNumber: true, attempts: true, lastAttemptAt: true, pushedAt: true } as const
 
-/** The fields the import needs, nothing else: no billing, shipping or customer data leaves WooCommerce into this tool. */
-const WC_FIELDS = 'id,number,status,meta_data'
+/** The minimal field list the import asks for: no billing, shipping or customer data is returned to this tool. `_fields` only trims the RESPONSE: WooCommerce still loads each full order, and `meta_data` is every meta row, not only the `_mintsoft_*` ones. */
+const WC_FIELDS = 'id,number,status,meta_data,date_modified_gmt'
 
-function readWcOrders(statuses: readonly string[]): Promise<WcReadResult> {
+async function walkStatuses(statuses: readonly string[], range: { modifiedAfter?: string; modifiedBefore?: string } | null, driftCheck = true): Promise<WcReadResult> {
   return walkWcOrderPages(
-    async (page) => {
-      const result = await wcFetch('/orders', { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: WC_FIELDS })
+    async (page, pass) => {
+      const params: Record<string, string> = pass === 'high'
+        ? { status: statuses.join(','), per_page: '1', page: '1', orderby: 'id', order: 'desc', _fields: 'id' }
+        : { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: pass === 'verify' ? 'id' : WC_FIELDS }
+      if (range?.modifiedAfter !== undefined) { params.modified_after = range.modifiedAfter; params.dates_are_gmt = 'true' }
+      if (range?.modifiedBefore !== undefined) { params.modified_before = range.modifiedBefore; params.dates_are_gmt = 'true' }
+      const result = await wcFetch('/orders', params)
       return { data: result.data, error: result.error, retryAfterMs: result.retryAfterMs, totalItems: result.totalItemsPresent === true ? result.totalItems : undefined }
     },
     {
       maxPages: MAX_WC_PAGE_WALK_PAGES,
+      // The id-set drift check: a second ids-only walk compared with the first (a new order mid-walk no longer fails the read), anchored on the set's
+      // high-water id taken before the first walk. Skipped only for a read-only preview (`--no-drift-check`), which can never pass the gate.
+      verifyPass: driftCheck,
       describeUnread: (page, error) => describeUnreadWcPage('order', page, error),
       describeUnended: (pagesRead) => describeUnendedWcPageWalk('order', pagesRead),
     },
   )
+}
+
+/**
+ * The orders in `statuses`. With a window, cancelled / refunded (the history statuses) are read in their OWN walk with `modified_after`, so only recently
+ * modified history is read; every other status is read in full. The number of history orders outside the window is counted (one request) for the preview.
+ */
+async function readWcOrders(statuses: readonly string[], window?: { historyStatuses: readonly string[]; modifiedAfter: string }, readOptions: { driftCheck?: boolean } = {}): Promise<WcReadResult> {
+  const driftCheck = readOptions.driftCheck !== false
+  if (!window) return walkStatuses(statuses, null, driftCheck)
+  const history = statuses.filter((s) => window.historyStatuses.includes(s))
+  const rest = statuses.filter((s) => !window.historyStatuses.includes(s))
+  const restRead = rest.length > 0 ? await walkStatuses(rest, null, driftCheck) : { orders: [], pagesRead: 0, complete: true } as WcReadResult
+  if (history.length === 0) return restRead
+  const historyRead = await walkStatuses(history, { modifiedAfter: window.modifiedAfter }, driftCheck)
+  let outside: number | null = null
+  if (historyRead.complete) {
+    const total = await wcFetch('/orders', { status: history.join(','), per_page: '1', page: '1', _fields: 'id' })
+    if (total.error === undefined && total.totalItemsPresent === true) outside = Math.max(0, total.totalItems - historyRead.orders.length)
+  }
+  const notes = [restRead.note, historyRead.note].filter((n): n is string => Boolean(n))
+  return {
+    orders: [...restRead.orders, ...historyRead.orders],
+    pagesRead: restRead.pagesRead + historyRead.pagesRead,
+    complete: restRead.complete && historyRead.complete,
+    ...(restRead.error ?? historyRead.error ? { error: restRead.error ?? historyRead.error } : {}),
+    ...(notes.length > 0 ? { note: notes.join('; ') } : {}),
+    historyOutsideWindow: outside,
+  }
+}
+
+/**
+ * The cancelled / refunded orders OUTSIDE the history window, read ONLY to find a queued bridge action (`_mintsoft_sync_pending`, a verify id, a fence)
+ * that the window would hide: such an order is never written again by the bridge, so its date_modified stays old. One sequential, paced walk
+ * (300 ms between pages, 429 back-off, Retry-After honoured) with a minimal `_fields` list (a smaller response, not a lighter server-side load); the store's order set outside the
+ * window cannot gain members (a modified order moves INTO the window), so the totals check is enough and no second walk is made.
+ */
+async function readOutsideWindowHistory(statuses: readonly string[], modifiedBefore: string): Promise<WcReadResult> {
+  return walkStatuses(statuses, { modifiedBefore }, false)
 }
 
 async function loadIms(wcOrderIds: readonly string[], connector: string): Promise<Map<string, ImsOrderContext>> {
@@ -48,7 +99,7 @@ async function loadIms(wcOrderIds: readonly string[], connector: string): Promis
     const slice = wcOrderIds.slice(i, i + 500)
     const links = await db.shoppingOrderLink.findMany({
       where: { connector: 'woocommerce', externalOrderId: { in: slice } },
-      select: { externalOrderId: true, order: { select: { id: true, orderNumber: true, shipFromWarehouseId: true, wmsOrderPush: { select: LINK_SELECT } } } },
+      select: { externalOrderId: true, order: { select: { id: true, orderNumber: true, status: true, refundStatus: true, shipFromWarehouseId: true, wmsOrderPush: { select: LINK_SELECT } } } },
     })
     for (const row of links) {
       if (!row.order) continue
@@ -56,6 +107,8 @@ async function loadIms(wcOrderIds: readonly string[], connector: string): Promis
         orderId: row.order.id,
         orderNumber: row.order.orderNumber,
         shipFromWarehouseId: row.order.shipFromWarehouseId,
+        status: row.order.status,
+        refundStatus: row.order.refundStatus,
         link: row.order.wmsOrderPush as ExistingLink | null,
       })
     }
@@ -150,6 +203,7 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
 export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; connector?: string } = {}): LegacyImportPorts {
   const ports: LegacyImportPorts = {
     readWcOrders,
+    readOutsideWindowHistory,
     async readOrderPrefix() {
       return (await getShoppingConnectorPrefixes('woocommerce')).orderPrefix
     },
@@ -173,11 +227,14 @@ export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; con
       })
       const out = new Map<string, StoredResolution>()
       for (const row of rows) {
-        const m = row.metadata as { connector?: unknown; wcOrderId?: unknown; decision?: unknown; signature?: unknown; kinds?: unknown } | null
+        const m = row.metadata as { connector?: unknown; wcOrderId?: unknown; decision?: unknown; signature?: unknown; kinds?: unknown; mintsoftRead?: { id?: unknown; orderNumber?: unknown; merged?: unknown } | null } | null
         if (!m || m.connector !== connector || typeof m.wcOrderId !== 'string' || typeof m.signature !== 'string') continue
         if (!(RESOLUTION_DECISIONS as readonly unknown[]).includes(m.decision)) continue
         // Rows are oldest first, so a later decision for the same order replaces an earlier one.
-        out.set(m.wcOrderId, { wcOrderId: m.wcOrderId, decision: m.decision as ResolutionDecision, signature: m.signature, kinds: Array.isArray(m.kinds) ? m.kinds.map(String) : [], recordedAt: row.createdAt.toISOString() })
+        const read = m.mintsoftRead
+        // What the decision learned from Mintsoft (the id found by number for an order with no id, the number, the merge flag) is part of the decision: a later run builds the link from it.
+        const found = read && typeof read === 'object' ? { id: typeof read.id === 'string' ? read.id : null, orderNumber: typeof read.orderNumber === 'string' ? read.orderNumber : null, merged: read.merged === true } : null
+        out.set(m.wcOrderId, { wcOrderId: m.wcOrderId, decision: m.decision as ResolutionDecision, signature: m.signature, kinds: Array.isArray(m.kinds) ? m.kinds.map(String) : [], recordedAt: row.createdAt.toISOString(), found })
       }
       return out
     },
@@ -187,36 +244,81 @@ export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; con
         entityId: entry.wcOrderId,
         action: RESOLUTION_ACTION,
         tag: 'cutover',
-        description: `Legacy bridge import: operator decided WooCommerce order #${entry.wcNumber} (Mintsoft order ${entry.mintsoftOrderId ?? entry.verifyOrderId ?? 'none'}) is "${entry.decision}" after checking Mintsoft by hand (${entry.kinds.join(', ')}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}.`,
-        metadata: { connector: entry.connector, wcOrderId: entry.wcOrderId, wcNumber: entry.wcNumber, decision: entry.decision, signature: entry.signature, kinds: entry.kinds, mintsoftOrderId: entry.mintsoftOrderId, verifyOrderId: entry.verifyOrderId, queued: entry.queued, bridgeStopped: entry.bridgeStopped },
+        description: `Legacy bridge import: operator decided WooCommerce order #${entry.wcNumber} (Mintsoft order ${entry.mintsoftOrderId ?? entry.verifyOrderId ?? entry.mintsoftRead?.id ?? 'none'}) is "${entry.decision}" after checking Mintsoft by hand (${entry.kinds.join(', ')}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}.`,
+        metadata: { connector: entry.connector, wcOrderId: entry.wcOrderId, wcNumber: entry.wcNumber, decision: entry.decision, signature: entry.signature, kinds: entry.kinds, mintsoftOrderId: entry.mintsoftOrderId, verifyOrderId: entry.verifyOrderId, queued: entry.queued, bridgeStopped: entry.bridgeStopped, bridgeEntries: entry.bridgeEntries ?? [], mintsoftRead: entry.mintsoftRead ?? null },
+        resolveUser: false,
+      })
+    },
+    async readHistoricResolutions(connector) {
+      const rows = await db.activityLog.findMany({
+        where: { action: HISTORIC_RESOLUTION_ACTION, entityType: 'SYSTEM' },
+        orderBy: { createdAt: 'asc' },
+        select: { metadata: true, createdAt: true },
+      })
+      const out: StoredHistoricResolution[] = []
+      for (const row of rows) {
+        const m = row.metadata as { connector?: unknown; decision?: unknown; reason?: unknown; members?: unknown } | null
+        if (!m || m.connector !== connector || m.decision !== 'cancelled' || typeof m.members !== 'object' || m.members === null || Array.isArray(m.members)) continue
+        const members: Record<string, string> = {}
+        for (const [id, signature] of Object.entries(m.members as Record<string, unknown>)) if (typeof signature === 'string') members[id] = signature
+        out.push({ decision: 'cancelled', reason: typeof m.reason === 'string' ? m.reason : '', members, recordedAt: row.createdAt.toISOString() })
+      }
+      return out
+    },
+    async recordHistoricResolution(entry) {
+      return logActivityPersisted({
+        entityType: 'SYSTEM',
+        action: HISTORIC_RESOLUTION_ACTION,
+        tag: 'cutover',
+        description: `Legacy bridge import: operator decided ${Object.keys(entry.members).length} in-window cancelled / refunded WooCommerce order(s) are "${entry.decision}" (each re-read in Mintsoft: cancelled or despatched); reason: ${entry.reason.slice(0, 300)}; bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}.`,
+        metadata: { connector: entry.connector, decision: entry.decision, reason: entry.reason, members: entry.members, window: entry.window, bridgeStopped: entry.bridgeStopped },
         resolveUser: false,
       })
     },
     async recordApply(entry) {
+      const resolveOnly = entry.resolveOnly !== null
+      const fence = entry.bridgeFenceCleared !== null ? `; the bridge host's manual-reconcile fence and mint journal were attested resolved (every entry looked up in Mintsoft, then linked or cancelled) by ${entry.bridgeFenceCleared.by}` : '; the bridge host fence attestation was NOT given'
+      const files = entry.bridgeFiles !== null ? `; bridge files read: minted_orders.json sha256 ${entry.bridgeFiles.journalSha256} (${entry.bridgeFiles.journalEntries} entries), manual_reconcile.json sha256 ${entry.bridgeFiles.fenceSha256} (${entry.bridgeFiles.fenceEntries} entries)` : '; the bridge host files were NOT given'
       return logActivityPersisted({
         entityType: 'SYSTEM',
-        action: 'legacy_bridge_import_applied',
+        action: resolveOnly ? RESOLVE_APPLY_ACTION : APPLY_ACTION,
         tag: 'cutover',
-        description: `Legacy bridge import applied (connector ${entry.connector}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}.`,
-        metadata: { connector: entry.connector, bridgeStopped: entry.bridgeStopped, orderPrefix: entry.orderPrefix, statuses: entry.statuses, applied: entry.applied, generatedAt: entry.generatedAt },
+        description: resolveOnly
+          ? `Legacy bridge import: a --resolve run wrote only ${entry.resolveOnly!.length} resolved order link(s) (connector ${entry.connector}); this is NOT the full import; bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}${fence}${files}.`
+          : `Legacy bridge import applied (connector ${entry.connector}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}${fence}${files}.`,
+        metadata: { connector: entry.connector, bridgeStopped: entry.bridgeStopped, bridgeFenceCleared: entry.bridgeFenceCleared, orderPrefix: entry.orderPrefix, statuses: entry.statuses, applied: entry.applied, generatedAt: entry.generatedAt, resolveOnly: entry.resolveOnly, bridgeFiles: entry.bridgeFiles },
         resolveUser: false,
       })
     },
   }
-  if (options.verifyMintsoft) {
-    ports.verifyMintsoftOrder = async (mintsoftOrderId) => {
-      try {
-        const { fetchMintsoftOrderById } = await import('../api/orders')
-        const { getMintsoftSettings, parseMintsoftPositiveId } = await import('../settings/schema')
-        const settings = await getMintsoftSettings()
-        const row = await fetchMintsoftOrderById(mintsoftOrderId, parseMintsoftPositiveId(settings.mintsoft_client_id))
-        if (row === null) return { found: false }
-        const number = (row as Record<string, unknown>).OrderNumber
-        return { found: true, orderNumber: typeof number === 'string' ? number : null }
-      } catch (error) {
-        return { error: error instanceof Error ? error.message.slice(0, 200) : 'read failed' }
-      }
+  // The read-only Mintsoft lookup behind the `--resolve` guards and `--verify-mintsoft`: fetchMintsoftOrderById (GET, paced by the Mintsoft client).
+  ports.readMintsoftOrder = async (mintsoftOrderId) => {
+    try {
+      const { fetchMintsoftOrderById, normalizeMintsoftOrderRow } = await import('../api/orders')
+      const { getMintsoftSettings, parseMintsoftPositiveId } = await import('../settings/schema')
+      const settings = await getMintsoftSettings()
+      const row = await fetchMintsoftOrderById(mintsoftOrderId, parseMintsoftPositiveId(settings.mintsoft_client_id))
+      if (row === null) return { found: false }
+      const number = (row as Record<string, unknown>).OrderNumber
+      const normalized = await normalizeMintsoftOrderRow(row).catch(() => null)
+      const { mintsoftRowIsMergeFlagged } = await import('../api/orders')
+      return { found: true, orderNumber: typeof number === 'string' ? number : null, status: normalized ? normalized.status.toUpperCase() || null : null, dispatched: normalized?.dispatched === true, merged: mintsoftRowIsMergeFlagged(row) }
+    } catch (error) {
+      return { error: error instanceof Error ? error.message.slice(0, 200) : 'read failed' }
     }
   }
+  // The by-NUMBER presence probe (read only, paced by the Mintsoft client): a 404 on an id is not proof that the order is gone, the real one may sit under another id.
+  ports.probeMintsoftOrderNumber = async (orderNumber) => {
+    try {
+      // `probeMintsoftOrderPresence`'s search, plus (when exactly one order carries the number) its id, status and merge flag read by id.
+      const { lookupMintsoftOrderByNumber } = await import('../api/orders')
+      const { getMintsoftSettings, parseMintsoftPositiveId } = await import('../settings/schema')
+      const settings = await getMintsoftSettings()
+      return await lookupMintsoftOrderByNumber(orderNumber, parseMintsoftPositiveId(settings.mintsoft_client_id))
+    } catch (error) {
+      return { error: error instanceof Error ? error.message.slice(0, 200) : 'probe failed' }
+    }
+  }
+  if (options.verifyMintsoft) ports.verifyMintsoftOrder = ports.readMintsoftOrder
   return ports
 }

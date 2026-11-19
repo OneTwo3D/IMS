@@ -12,6 +12,8 @@ import { config } from 'dotenv'
  * idle sweep. WooCommerce and Mintsoft are never contacted: the WooCommerce read is a double, and the connector double records its calls.
  * Fixtures are unique per run and removed afterwards. GATED on RUN_DB_RETENTION_TESTS (npm run test:db).
  */
+const FENCE = { by: 'Test Operator' }
+const FILES = { journalText: '{}', fenceText: '{}' }
 const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
 if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
   throw new Error('REQUIRE_DB_RETENTION_TESTS=1 but RUN_DB_RETENTION_TESTS is not 1: tests/db/legacy-bridge-import.test.ts would have been skipped.')
@@ -98,13 +100,13 @@ test('after the import the push sweep creates zero orders for bridge-created ord
   for (const id of orderIds) assert.ok(before.includes(id), 'precondition: the order is a create candidate before the import')
 
   // DRY RUN writes nothing.
-  const dry = await d.run.runLegacyBridgeImport(ports, { statuses: ['processing'] })
+  const dry = await d.run.runLegacyBridgeImport(ports, { bridgeFenceCleared: FENCE, bridgeFiles: FILES, statuses: ['processing'] })
   assert.equal(dry.plan.create, 6)
   assert.equal(await d.db.wmsOrderPushLink.count({ where: { orderId: { in: orderIds } } }), 0)
   assert.equal(dry.gate.exitCode, 4, 'no blocker, but the OrderNumber check is unverified against Mintsoft')
 
   const auditBefore = await d.db.activityLog.count({ where: { action: 'legacy_bridge_import_applied' } })
-  const applied = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
+  const applied = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, bridgeFenceCleared: FENCE, bridgeFiles: FILES, statuses: ['processing'] })
   assert.equal(applied.auditRecorded, true)
   assert.equal(await d.db.activityLog.count({ where: { action: 'legacy_bridge_import_applied' } }), auditBefore + 1)
   assert.deepEqual(applied.applied, { created: 6, adopted: 0, unchanged: 0, conflict: 0, gone: 0 })
@@ -121,14 +123,14 @@ test('after the import the push sweep creates zero orders for bridge-created ord
 
   // IDEMPOTENT: a rerun changes nothing (not a column, not an updatedAt).
   const snapshot = JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } }))
-  const again = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
-  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 6, advanced: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
+  const again = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, bridgeFenceCleared: FENCE, bridgeFiles: FILES, statuses: ['processing'] })
+  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 6, advanced: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0, notImported: 0 })
   assert.equal(JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } })), snapshot)
 
   // A DIFFERING LINK IS NEVER OVERWRITTEN: point the plain order's link elsewhere; the import reports a conflict and leaves it.
   const plain = seeded.find((s) => s.shape.name === 'plain')!
   await d.db.wmsOrderPushLink.update({ where: { orderId: plain.orderId }, data: { externalOrderId: '123456' } })
-  const conflicted = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
+  const conflicted = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, bridgeFenceCleared: FENCE, bridgeFiles: FILES, statuses: ['processing'] })
   assert.equal(conflicted.conflicts.length, 1)
   assert.equal(conflicted.gate.exitCode, 3)
   assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { orderId: plain.orderId } }))?.externalOrderId, '123456')
@@ -136,7 +138,7 @@ test('after the import the push sweep creates zero orders for bridge-created ord
 
   // THE STATE COUNTS: the same id in a DEAD_LETTER link is a conflict (no sweep pass acts on it), never "unchanged".
   await d.db.wmsOrderPushLink.update({ where: { orderId: plain.orderId }, data: { state: 'DEAD_LETTER' } })
-  const staleState = await d.run.runLegacyBridgeImport(ports, { statuses: ['processing'] })
+  const staleState = await d.run.runLegacyBridgeImport(ports, { bridgeFenceCleared: FENCE, bridgeFiles: FILES, statuses: ['processing'] })
   assert.equal(staleState.conflicts.length, 1)
   assert.equal(staleState.plan.unchanged, 5)
   assert.equal(staleState.gate.exitCode, 3)
@@ -212,11 +214,13 @@ test('a CANCELLED order with a trusted Mintsoft id is imported SYNCED and IMS\'s
     readOrderPrefix: async () => '',
     readConnectorId: async () => 'mintsoft',
     readOpenMergeState: async () => ({ holds: [], tasks: [] }),
+    // The --resolve guards read the Mintsoft order: a double, never the network.
+    readMintsoftOrder: async (id: string) => ({ found: true as const, orderNumber: id === '9302' ? exhausted.number : queued.number, status: id === '9303' ? 'CANCELLED' : 'NEW', dispatched: false }),
   }
   const statuses = ['processing', 'cancelled', 'refunded']
 
   // The cancelled order is linked; the exhausted and queued ones are blocked and NOT linked.
-  const first = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses })
+  const first = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, bridgeFenceCleared: FENCE, bridgeFiles: FILES, statuses })
   assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { orderId: cancelled.orderId } }))?.state, 'SYNCED')
   assert.equal(await d.db.wmsOrderPushLink.count({ where: { orderId: { in: [exhausted.orderId, queued.orderId] } } }), 0)
   assert.equal(first.gate.exitCode, 3)
@@ -239,20 +243,20 @@ test('a CANCELLED order with a trusted Mintsoft id is imported SYNCED and IMS\'s
   assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { orderId: cancelled.orderId } }))?.state, 'CANCELLED')
 
   // --resolve (real activity log): verify-exhausted as ours -> SYNCED naming the verify id; the queued update as cancelled -> CANCELLED.
-  const resolvedOurs = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: [String(exhausted.wcId)], decision: 'ours' }, statuses })
+  const resolvedOurs = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, bridgeFenceCleared: FENCE, bridgeFiles: FILES, resolve: { wcOrderIds: [String(exhausted.wcId)], decision: 'ours' }, statuses })
   assert.deepEqual(resolvedOurs.resolutions.recorded, [{ wcOrderId: String(exhausted.wcId), decision: 'ours' }])
   const ourLink = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: exhausted.orderId } })
   assert.equal(ourLink?.state, 'SYNCED')
   assert.equal(ourLink?.externalOrderId, '9302')
   assert.equal(await d.db.activityLog.count({ where: { action: 'legacy_bridge_import_resolved', entityId: String(exhausted.wcId) } }), 1)
   assert.equal(await d.db.wmsOrderPushLink.count({ where: { orderId: queued.orderId } }), 0, 'only the resolved order is written')
-  await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: [String(queued.wcId)], decision: 'cancelled' }, statuses })
+  await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, bridgeFenceCleared: FENCE, bridgeFiles: FILES, resolve: { wcOrderIds: [String(queued.wcId)], decision: 'cancelled' }, statuses })
   const queuedLink = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: queued.orderId } })
   assert.equal(queuedLink?.state, 'CANCELLED')
   assert.equal(queuedLink?.externalOrderId, '9303')
   assert.notEqual(queuedLink?.cancelledAt, null)
   // A later plain run reads the stored decisions: nothing blocks any more, nothing is rewritten, and the cancel pass's CANCELLED link is an advance, not a conflict.
-  const after = await d.run.runLegacyBridgeImport(ports, { statuses })
+  const after = await d.run.runLegacyBridgeImport(ports, { bridgeFenceCleared: FENCE, bridgeFiles: FILES, statuses })
   assert.equal(after.conflicts.length, 0)
   assert.equal(after.resolutions.inForce.length, 2)
   assert.equal(after.gate.ok, true)
