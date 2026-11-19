@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
+import { useResyncedState } from '@/lib/react/use-render-sync'
 import Link from 'next/link'
 import { Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -25,14 +26,10 @@ type Props = {
 }
 
 export function TransfersClient({ warehouses, products, initialTransfers, wmsAsnStates, stockLevels }: Props) {
-  const [transfers, setTransfers] = useState(initialTransfers)
+  const [transfers, setTransfers] = useResyncedState(initialTransfers)
   const [showCreate, setShowCreate] = useState(false)
   const warehouseCount = warehouses.length
   const canCreateTransfer = warehouseCount >= 2
-
-  useEffect(() => {
-    setTransfers(initialTransfers)
-  }, [initialTransfers])
 
   function handleCreated(t: TransferRow) {
     setTransfers((prev) => [t, ...prev])

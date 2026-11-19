@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
+import { useRenderSync } from '@/lib/react/use-render-sync'
 import { Pencil, Trash2, Plus, Loader2, Warehouse } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CountrySelect } from '@/components/ui/country-select'
@@ -100,11 +101,13 @@ function WarehouseDialog({
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
 
-  useEffect(() => {
-    if (!open) return
-    setFields(initial)
-    setError('')
-  }, [initial, open])
+  // Each time the dialog opens (or its starting values change while open), reset the form.
+  useRenderSync([initial, open], () => {
+    if (open) {
+      setFields(initial)
+      setError('')
+    }
+  })
 
   function set<K extends keyof WarehouseFormFields>(k: K, v: WarehouseFormFields[K]) {
     setFields((f) => ({ ...f, [k]: v }))

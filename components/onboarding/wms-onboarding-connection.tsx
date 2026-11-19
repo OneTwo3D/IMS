@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { useRenderSync } from '@/lib/react/use-render-sync'
 import { useRouter } from 'next/navigation'
 import { Boxes, Check, ExternalLink, Loader2 } from 'lucide-react'
 import Link from 'next/link'
@@ -226,13 +227,13 @@ function MintsoftConnectionForm({
   const [saved, setSaved] = useState(false)
   const [message, setMessage] = useState('')
 
-  useEffect(() => {
+  useRenderSync([data], () => {
     setBaseUrl(data.connection.baseUrl)
     setUsername(data.connection.username)
     setPassword(data.connection.passwordMasked ? '' : data.connection.password)
     setWebhookSecret(data.connection.webhookSecretMasked ? '' : data.connection.webhookSecret)
     setOrderLookupConnector(data.connection.orderLookupConnector)
-  }, [data])
+  })
 
   useEffect(() => {
     function resetTransientBusyState() {

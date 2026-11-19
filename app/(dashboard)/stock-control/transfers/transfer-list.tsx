@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState, useTransition } from 'react'
+import { useState, useTransition } from 'react'
+import { useResyncedState } from '@/lib/react/use-render-sync'
 import { useRouter } from 'next/navigation'
 import { ChevronDown, ChevronUp, Pencil, X, Truck, PackageCheck, Ban, Loader2, Upload } from 'lucide-react'
 import { createWmsTransferAsn } from '@/app/actions/wms-asn'
@@ -583,17 +584,13 @@ function TransferCard({
   const formatDateTime = useFormatDateTime()
   const formatDate = (iso: string) => formatDateTime(iso, DATE_TIME_OPTS)
   const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
-  const [transfer, setTransfer] = useState(initial)
+  const [transfer, setTransfer] = useResyncedState(initial)
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
   const [showWmsDialog, setShowWmsDialog] = useState(false)
   const [showPartialDialog, setShowPartialDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
-
-  useEffect(() => {
-    setTransfer(initial)
-  }, [initial])
 
   async function handleDispatch() {
     // bgoq: dispatch irreversibly books stock OUT of the source warehouse and
@@ -926,17 +923,13 @@ function MobileTransferCard({
   const formatDateTime = useFormatDateTime()
   const formatDate = (iso: string) => formatDateTime(iso, DATE_TIME_OPTS)
   const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
-  const [transfer, setTransfer] = useState(initial)
+  const [transfer, setTransfer] = useResyncedState(initial)
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
   const [showWmsDialog, setShowWmsDialog] = useState(false)
   const [showPartialDialog, setShowPartialDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
-
-  useEffect(() => {
-    setTransfer(initial)
-  }, [initial])
 
   async function handleDispatch() {
     // bgoq: dispatch irreversibly books stock OUT of the source warehouse and

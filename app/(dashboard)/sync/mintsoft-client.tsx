@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useTransition } from 'react'
+import { useResyncedState } from '@/lib/react/use-render-sync'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { AlertTriangle, Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
@@ -1452,11 +1453,10 @@ function KeptBundleClaimsPanel({
   ) => void
   formatDateTime: (value: string) => string
 }) {
-  const [view, setView] = useState(initial)
+  // A refresh of the page (after a resolution) hands in new data: show it.
+  const [view, setView] = useResyncedState(initial)
   const [query, setQuery] = useState(initial.query)
   const [loading, startLoading] = useTransition()
-  // A refresh of the page (after a resolution) hands in new data: show it.
-  useEffect(() => { setView(initial) }, [initial])
 
   function load(page: number, nextQuery: string) {
     startLoading(async () => {

@@ -2,6 +2,7 @@
 
 import { INVOICING_STATE_CLASS, INVOICING_STATE_LABELS } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useTransition, useCallback, useEffect, type ComponentProps } from 'react'
+import { useRenderSync, useResyncedState } from '@/lib/react/use-render-sync'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical, ArrowRightLeft } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -236,14 +237,17 @@ function RefundDialog({ order, warehouses, returnReasons, sym, exchangeOffer, ex
   const [exchangeAcknowledged, setExchangeAcknowledged] = useState(false)
   const exchangePayload = exchangeLines.map((l) => ({ productId: l.productId, qty: l.qty, unitPriceForeign: l.unitPrice }))
   const exchangePayloadKey = JSON.stringify(exchangePayload)
+  const exchangePricable = exchangeOn && exchangePayload.length > 0 && !exchangePayload.some((l) => !(l.qty > 0))
+  // Nothing to price (exchange off, no lines, or a line without a quantity): drop the stale preview in the same render.
+  useRenderSync([exchangePricable], () => { if (!exchangePricable) setExchangePreview(null) })
   useEffect(() => {
-    if (!exchangeOn || exchangePayload.length === 0 || exchangePayload.some((l) => !(l.qty > 0))) { setExchangePreview(null); return }
+    if (!exchangePricable) return
     let cancelled = false
     const timer = setTimeout(() => { previewReturnExchange(order.id, exchangePayload).then((result) => { if (!cancelled) setExchangePreview(result) }).catch(() => { if (!cancelled) setExchangePreview({ success: false, error: 'The replacement could not be priced just now.' }) }) }, 300)
     return () => { cancelled = true; clearTimeout(timer) }
     // exchangePayloadKey stands for exchangePayload's content
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [exchangeOn, exchangePayloadKey, order.id])
+  }, [exchangePricable, exchangePayloadKey, order.id])
   const difference = exchangeOn && exchangePreview?.success && exchangePreview.replacementGross != null
     ? exchangeDifference({ replacementGross: exchangePreview.replacementGross, creditNoteGross: totalRefund.gross })
     : null
@@ -1274,15 +1278,13 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
   // still AUTHORISED"), and a field that vanished on the first correctable mistake would put the
   // operator straight back into the dead end this whole path exists to remove.
   const [undecidedAttempt, setUndecidedAttempt] = useState<string | null>(null)
-  const [allocations, setAllocations] = useState<AllocationRow[]>(initialAllocations)
-  const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
+  const [allocations, setAllocations] = useResyncedState<AllocationRow[]>(initialAllocations)
+  const [shipments, setShipments] = useResyncedState<ShipmentRow[]>(initialShipments)
   const requirementsByLine = new Map(fulfillmentRequirements.map((row) => [row.lineId, row.requirements]))
 
   // Sync client state from server props when router.refresh() delivers fresh data.
   // This eliminates the race between refreshAllocations() and router.refresh() —
   // whichever completes last, state ends up correct.
-  useEffect(() => { setAllocations(initialAllocations) }, [initialAllocations])
-  useEffect(() => { setShipments(initialShipments) }, [initialShipments])
 
   const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
   const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
@@ -1352,12 +1354,15 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
   // o3d-ngmt.22: whether each refund can be deleted, asked of the server (which owns every rule). Nothing is asked, and no control shown, unless the refund
   // permission is held and there is a refund; the server answers `enabled: false` while the switch is off.
   const refundCount = so.refunds.length
+  const deleteEligibilityAsked = canRetryRefundAccounting && refundCount !== 0
+  // Nothing is asked (no permission or no refund): drop any earlier answer in the same render.
+  useRenderSync([deleteEligibilityAsked], () => { if (!deleteEligibilityAsked) setDeleteEligibility(null) })
   useEffect(() => {
-    if (!canRetryRefundAccounting || refundCount === 0) { setDeleteEligibility(null); return }
+    if (!deleteEligibilityAsked) return
     let cancelled = false
     getRefundDeleteEligibility(so.id).then((result) => { if (!cancelled) setDeleteEligibility(result) }).catch(() => { if (!cancelled) setDeleteEligibility(null) })
     return () => { cancelled = true }
-  }, [so.id, refundCount, canRetryRefundAccounting])
+  }, [so.id, refundCount, canRetryRefundAccounting, deleteEligibilityAsked])
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
   const committedByLine = calculateClientCoverageByLine(
@@ -1407,7 +1412,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
   const refreshAllocations = useCallback(() => {
     getOrderAllocations(so.id).then(setAllocations)
     getOrderShipments(so.id).then(setShipments)
-  }, [so.id])
+  }, [so.id, setAllocations, setShipments])
 
   function handleStatusChange(target: SoStatus) {
     if (target === 'ALLOCATED') {

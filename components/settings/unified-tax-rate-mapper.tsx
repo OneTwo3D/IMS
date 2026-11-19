@@ -52,6 +52,7 @@ export function UnifiedTaxRateMapper({ wcConnected, accountingConnected, onChang
     }
   }, [wcConnected, accountingConnected])
 
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch on mount / when connections change: load() raises the loading flag, then sets state only after the awaited fetch
   useEffect(() => { void load() }, [load])
 
   const result: TaxMatchResult | null = useMemo(() => {
