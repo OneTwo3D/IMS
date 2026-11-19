@@ -584,8 +584,10 @@ test('THE NOTE HAS ITS OWN SWITCH, OFF BY DEFAULT: with wc_invoice_note_enabled 
     if (value === null) await d.db.setting.deleteMany({ where: { key: 'wc_invoice_note_enabled' } })
     else await d.db.setting.upsert({ where: { key: 'wc_invoice_note_enabled' }, create: { key: 'wc_invoice_note_enabled', value }, update: { value } })
     const result = await d.note.pushInvoiceNoteToWc(order.id)
-    assert.equal(result.success, false, String(value))
-    assert.match(result.error ?? '', /switched off/)
+    // DELIBERATE CHANGE (switchover withdrawal PR): a note queued while the switch was on and sent after it went off is no longer a FAILURE that retries
+    // to FAILED. The writer returns a clean terminal outcome (success + skipped: 'switched-off') with one WARNING; the queue row is retired by the
+    // processor. The guarantee this test pins is unchanged and is asserted below: no note, no meta, no marker is sent or written.
+    assert.deepEqual(result, { success: true, skipped: 'switched-off' }, String(value))
   }
   assert.equal(transport.posts.length, 0, 'no note')
   assert.equal(transport.puts.length, 0, 'no meta')

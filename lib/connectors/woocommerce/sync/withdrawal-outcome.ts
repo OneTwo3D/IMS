@@ -8,8 +8,9 @@
  * POST /wp-json/oti/v1/order/{id}/withdrawal-outcome, signed exactly like the TrackShip re-fire route (HMAC-SHA256 of `timestamp \n POST \n path \n body`,
  * single-use nonce in the body, 5 minute window).
  *
- * OFF BY DEFAULT: nothing is sent unless the setting `wc_withdrawal_outcome_enabled` is `true`, AND the ownership map's step-M gate lets the operation
- * through (`wooDrainHold(undefined, 'order.withdrawal-outcome')`: step M's live-from instant must have passed; before that it is held). The write is
+ * OFF BY DEFAULT: nothing is sent unless the setting `wc_withdrawal_outcome_enabled` is `true`, AND step M is live. Step M is checked two ways: the ownership
+ * map's gate (`wooDrainHold(undefined, 'order.withdrawal-outcome')`, which only holds while the producer enforcement variable names woocommerce) AND the
+ * step's own live-from read directly (`withdrawalOutcomeStepMHeld`, which holds whatever the enforcement variable says). The write is
  * idempotent TWICE OVER, keyed on the withdrawal's own identity (order + storefront request + outcome kind), never on a modified time: IMS writes each
  * outcome once, recorded durably in `wc_withdrawal_outcomes` after the storefront answers, and the plugin adds a note once per key. A redelivered webhook, a
  * poll, or the plugin's own later order change cannot add a second note. A failure is logged, never thrown: the withdrawal handling itself (the hold, the
@@ -24,6 +25,12 @@ import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { getSettingValue, getSettingValues } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import { wooDrainHold, wooEgressHold } from '../producer-egress'
+import { explainProducerDisposition, type ProducerDecisionContext } from '@/lib/security/producer-disposition'
+
+/** The idempotency key IMS sends for an outcome, and the one the plugin stores (as `n:<key>` / `r:<key>`) in its done-marker meta. */
+export function withdrawalOutcomeKey(externalOrderId: string, requestKey: string, action: string): string {
+  return `wdo:${externalOrderId}:${requestKey}:${action}`.slice(0, 96)
+}
 
 export const WC_WITHDRAWAL_OUTCOME_ENABLED_SETTING = 'wc_withdrawal_outcome_enabled'
 
@@ -80,10 +87,20 @@ export function classifyWithdrawalOutcomeResponse(status: number, body: unknown)
 
 const TIMEOUT_MS = 30_000
 
+/**
+ * Step M's own live-from, read directly (not through the producer enforcement variable): the withdrawal outcome is IMS's only once the step's live-from has
+ * passed and IMS owns the operation there. Anything unreadable holds. Pure; never throws.
+ */
+export function withdrawalOutcomeStepMHeld(context: ProducerDecisionContext = {}): boolean {
+  const decision = explainProducerDisposition('woocommerce', 'order.withdrawal-outcome', undefined, context)
+  return decision.phase !== 'P2' || decision.owner !== 'IMS'
+}
+
 /** The one network call. Every refusal before it is a `skipped` result and sends nothing. */
 export async function postWithdrawalOutcome(externalOrderId: string, input: WithdrawalOutcomeInput): Promise<WithdrawalOutcomeResult> {
   if (!(await isWithdrawalOutcomeEnabled())) return { kind: 'skipped', why: 'switch-off' }
   // The operation's own gate (its step must be live), then the destination-level barrier, the last one before anything leaves.
+  if (withdrawalOutcomeStepMHeld()) return { kind: 'skipped', why: 'held' }
   if (wooDrainHold(undefined, 'order.withdrawal-outcome').held) return { kind: 'skipped', why: 'held' }
   if (wooEgressHold().held) return { kind: 'skipped', why: 'held' }
   const config = await getSettingValues(['wc_url', 'wc_webhook_secret'])
@@ -138,8 +155,11 @@ export type WithdrawalOutcomeStore = {
   identity(orderId: string, incomingRequestId: string | null): Promise<WithdrawalRequestIdentity>
   findRow(orderId: string, requestKey: string, kind: string): Promise<WithdrawalOutcomeRow | null>
   markWritten(orderId: string, requestKey: string, kind: string, result: string, generation: number): Promise<void>
-  /** One task per order and outcome kind, however often it is raised. */
-  raiseTask(input: { orderId: string; externalOrderId: string; kind: string; queryText: string }): Promise<void>
+  /**
+   * One task per order, outcome kind, request key and hold generation, however often it is raised: a LATER request (another key or generation) on the same
+   * order raises its own, even when the earlier task was closed.
+   */
+  raiseTask(input: { orderId: string; externalOrderId: string; kind: string; requestKey: string; generation: number; queryText: string }): Promise<void>
 }
 
 /** A terminal row: the storefront could not carry the outcome out, a task was raised, and IMS does not try or warn again for this key. */
@@ -148,12 +168,21 @@ export const TASK_RAISED_RESULT = 'task_raised'
 const dbStore: WithdrawalOutcomeStore = {
   async identity(orderId, incomingRequestId) {
     const { db } = await import('@/lib/db')
-    const before = await db.salesOrder.findUnique({ where: { id: orderId }, select: { withdrawalRequestId: true } })
-    if (incomingRequestId && before && before.withdrawalRequestId !== incomingRequestId) {
-      await db.salesOrder.updateMany({ where: { id: orderId }, data: { withdrawalRequestId: incomingRequestId } })
-    }
-    const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { withdrawalRequestId: true, withdrawalHoldGeneration: true } })
-    return { requestId: order?.withdrawalRequestId ?? null, previousRequestId: before?.withdrawalRequestId ?? null, generation: order?.withdrawalHoldGeneration ?? 0 }
+    // Read, compare and record under the order's row lock (as withdrawal.ts does), so two events for the same order cannot both read the same
+    // "previous" id and both take the alias or the new-id path.
+    return db.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+      if (locked.length === 0) return { requestId: null, previousRequestId: null, generation: 0 }
+      const before = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { withdrawalRequestId: true, withdrawalHoldGeneration: true } })
+      if (incomingRequestId && before && before.withdrawalRequestId !== incomingRequestId) {
+        await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalRequestId: incomingRequestId } })
+      }
+      return {
+        requestId: incomingRequestId ?? before?.withdrawalRequestId ?? null,
+        previousRequestId: before?.withdrawalRequestId ?? null,
+        generation: before?.withdrawalHoldGeneration ?? 0,
+      }
+    })
   },
   async findRow(orderId, requestKey, kind) {
     const { db } = await import('@/lib/db')
@@ -169,15 +198,15 @@ const dbStore: WithdrawalOutcomeStore = {
     const { raiseWmsOperatorTask } = await import('@/lib/domain/wms/operator-tasks')
     await raiseWmsOperatorTask(db, {
       connector: 'woocommerce', orderId: input.orderId, externalOrderId: input.externalOrderId, reason: 'WITHDRAWAL_REJECT_NOT_WRITTEN',
-      queryText: input.queryText, dedupeBasis: `wdraw-reject:${input.orderId}:${input.kind}`,
+      queryText: input.queryText, dedupeBasis: `wdraw-reject:${input.orderId}:${input.kind}:${input.requestKey}:g${input.generation}`,
     })
   },
 }
 
 /** The fixed per-order key for "the storefront request id is not known". It never moves with the order's modified time or a counter. */
 export const unknownRequestKey = (orderId: string): string => `u:${orderId}`
-/** The marker for "the request IMS recorded may not be the one now pending": raised once per recorded request. */
-const ambiguousKey = (orderId: string, requestId: string): string => `x:${orderId}:${requestId}`
+/** The marker for "the request IMS recorded (or none) may not be the one now pending": raised once per recorded request (or the unknown key) and hold generation. */
+const ambiguousKey = (orderId: string, requestId: string | null, generation: number): string => `x:${orderId}:${requestId ?? 'u'}:g${generation}`
 
 /**
  * Write the outcome of one withdrawal event, if its action has one and the writer is on. Never throws. The identity is (order, withdrawal request, action):
@@ -199,30 +228,36 @@ export async function writeWithdrawalOutcomeForEvent(
     const requestKey = requestId ? `r${requestId}` : unknownRequestKey(input.orderId)
     const row = await store.findRow(input.orderId, requestKey, input.action)
     if (row) {
-      // A request IMS has already rejected, and a NEWER submission since, with no new request id to tell them apart: IMS cannot say whether the pending
-      // request is the one it rejected. Never skip it silently: a person looks, once.
-      if (mapping.reject && requestId && row.generation !== null && generation > row.generation) {
-        const marker = ambiguousKey(input.orderId, requestId)
+      // A request IMS has already handled (or failed to), and a NEWER submission since, with no new request id to tell them apart: IMS cannot say whether the
+      // pending request is the one it handled. Never skip it silently: a person looks, once per generation. This applies to the unknown key too: a later
+      // request B whose id is still unknown must not be swallowed by the row of request A.
+      if (mapping.reject && row.generation !== null && generation > row.generation) {
+        const marker = ambiguousKey(input.orderId, requestId, generation)
         if (await store.findRow(input.orderId, marker, input.action)) return
         await store.markWritten(input.orderId, marker, input.action, TASK_RAISED_RESULT, generation)
         await store.raiseTask({
-          orderId: input.orderId, externalOrderId: input.externalOrderId, kind: input.action,
-          queryText: `The customer filed another withdrawal request for storefront order ${input.externalOrderId} after despatch, and IMS cannot tell whether it is the one it already rejected (request ${requestId}). Check the order in WooCommerce and reject the pending request by hand.`,
+          orderId: input.orderId, externalOrderId: input.externalOrderId, kind: input.action, requestKey: marker, generation,
+          queryText: `The customer filed another withdrawal request for storefront order ${input.externalOrderId} after despatch, and IMS cannot tell whether it is the one it already handled${requestId ? ` (request ${requestId})` : ''}. Check the order in WooCommerce and reject the pending request by hand.`,
         })
       }
       return
     }
-    // The request id has just become known for an order whose outcome was already written under the unknown key: the same request, not a second note.
+    // The request id has just become known for an order whose outcome was already written under the unknown key: the same request, not a second note and
+    // not a second rejection. Only for the SAME submission (equal hold generation): a later submission moves the generation, so a stored outcome says nothing
+    // about it and its own outcome is sent. A rejection already carried out under the unknown key is adopted the same way: the plugin answers 'rejected' to a
+    // request that is already rejected, but it ALSO adds a second admin note, so it is never posted again for the same generation.
     if (requestId && identity.previousRequestId === null) {
       const unknownRow = await store.findRow(input.orderId, unknownRequestKey(input.orderId), input.action)
-      if (unknownRow && DONE_RESULTS.has(unknownRow.result)) {
+      const sameSubmission = unknownRow !== null && DONE_RESULTS.has(unknownRow.result) && unknownRow.generation !== null && unknownRow.generation === generation
+      const sameOutcome = unknownRow !== null && (mapping.reject ? unknownRow.result === 'rejected' || unknownRow.result === 'already_done' : unknownRow.result !== 'rejected')
+      if (unknownRow && sameSubmission && sameOutcome) {
         await store.markWritten(input.orderId, requestKey, input.action, unknownRow.result, generation)
         return
       }
     }
     const result = await postWithdrawalOutcome(input.externalOrderId, {
       outcome: mapping.outcome,
-      outcomeKey: `wdo:${input.externalOrderId}:${requestKey}:${input.action}`.slice(0, 96),
+      outcomeKey: withdrawalOutcomeKey(input.externalOrderId, requestKey, input.action),
       note: `IMS: ${input.description}`,
       ...(mapping.reject ? { rejectReason: 'order already dispatched' } : {}),
       ...(requestId ? { requestId } : {}),
@@ -237,7 +272,7 @@ export async function writeWithdrawalOutcomeForEvent(
     if (why === null) return
     if (mapping.reject) {
       await store.raiseTask({
-        orderId: input.orderId, externalOrderId: input.externalOrderId, kind: input.action,
+        orderId: input.orderId, externalOrderId: input.externalOrderId, kind: input.action, requestKey, generation,
         queryText: `The customer's withdrawal request for storefront order ${input.externalOrderId} was filed after despatch and IMS could not reject it (${why}). Reject the request in WooCommerce by hand.`,
       })
     }

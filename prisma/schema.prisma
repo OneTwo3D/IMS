@@ -6380,6 +6380,10 @@ model WcStockDriftEvent {
   toQuantity         Int?     @map("to_quantity")
   previousObservedAt DateTime @map("previous_observed_at")
   observedAt         DateTime @map("observed_at")
+  /// A reviewed acknowledgement (npm run switchover:stock-drift-ack): an acknowledged event is no longer counted by the STOCK_DRIFT reader. Who and why are kept.
+  acknowledgedAt     DateTime? @map("acknowledged_at")
+  acknowledgedBy     String?   @map("acknowledged_by")
+  acknowledgedNote   String?   @map("acknowledged_note")
 
   @@index([observedAt], map: "wc_stock_drift_events_observed_idx")
   @@map("wc_stock_drift_events")
