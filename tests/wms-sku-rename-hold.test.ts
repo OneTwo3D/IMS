@@ -216,7 +216,7 @@ test('port wiring: every Prisma port method that loads an order to push attaches
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
 // o3d-k6x6m MED 2: the hold lasts only while a row is OPEN. Once the episode ended, a pending order carrying an older snapshot is pushed with the SKU
-// the warehouse holds NOW (the product's confirmed warehouse SKU), never the stale snapshot, and never dropped. Create paths only.
+// the warehouse holds NOW (behind wms_sku_rename_remap_enabled; the remap tests are in wms-sku-rename-remap.test.ts).
 // ---------------------------------------------------------------------------------------------------------------------------------------
 test('confirmedWarehouseSku: only a Mintsoft SKU that IS the product\'s current SKU counts as confirmed', () => {
   assert.equal(confirmedWarehouseSku('C', { SKU: 'C' }), 'C')
@@ -224,66 +224,4 @@ test('confirmedWarehouseSku: only a Mintsoft SKU that IS the product\'s current 
   assert.equal(confirmedWarehouseSku('C', { SKU: 'A' }), null, 'warehouse still on another SKU')
   assert.equal(confirmedWarehouseSku('C', { SKU: 'c' }), null, 'case-sensitive')
   for (const metadata of [null, {}, [], 'x', { SKU: 7 }, { SKU: '' }]) assert.equal(confirmedWarehouseSku('C', metadata), null)
-})
-
-function remapClient(rows: Row[], link: { productId: string; metadata: unknown } | null, productSku = 'C') {
-  const { client } = discrepancies(rows)
-  return {
-    ...(client as object),
-    wmsProductLink: { findMany: async (args: { where: { connector: string } }) => { assert.equal(args.where.connector, 'mintsoft'); return link ? [link] : [] } },
-    product: { findMany: async () => [{ id: 'p1', sku: productSku }] },
-  } as never
-}
-
-test('remap: a pending A or B snapshot is pushed as the warehouse\'s current SKU C once the episode resolved; other products and unlinked products are untouched', async () => {
-  const client = remapClient([], { productId: 'p1', metadata: { SKU: 'C' } })
-  const orders = [{ id: 'o1', shipFromWarehouseId: 'wh-1', lines: [line({ sku: 'A' }), line({ id: 'l2', sku: 'B' }), line({ id: 'l3', sku: 'OK', productId: 'p2' }), line({ id: 'l4', sku: 'X', productId: null })] }]
-  const [marked] = await withSkuRenameHolds(client, orders, undefined, { remapForConnector: 'mintsoft' })
-  assert.deepEqual(marked!.skuRemap, { p1: 'C' })
-  const lines = buildLines(marked!.lines as never, undefined, marked!.skuRenameHolds, marked!.skuRemap)
-  assert.deepEqual(lines.map((l) => l.sku), ['C', 'C', 'OK', 'X'])
-  // Amendments (the default) never remap: the order exists at the warehouse under its recorded SKUs.
-  const [amend] = await withSkuRenameHolds(client, orders)
-  assert.equal('skuRemap' in amend!, false)
-})
-
-test('remap: nothing is remapped while the warehouse is not confirmed on the current SKU (a row still OPEN, no link, or a stale link): the hold decides', async () => {
-  const open1 = open({ wmsValue: 'A' })
-  const stale = remapClient([open1], { productId: 'p1', metadata: { SKU: 'A' } })
-  const [marked] = await withSkuRenameHolds(stale, [{ shipFromWarehouseId: 'wh-1', lines: [line({ sku: 'B' })] }], undefined, { remapForConnector: 'mintsoft' })
-  assert.deepEqual(marked!.skuRemap, {})
-  assert.throws(() => buildLines(marked!.lines as never, undefined, marked!.skuRenameHolds, marked!.skuRemap), /Order held: SKU B/)
-  const none = remapClient([], null)
-  const [unlinked] = await withSkuRenameHolds(none, [{ shipFromWarehouseId: 'wh-1', lines: [line({ sku: 'B' })] }], undefined, { remapForConnector: 'mintsoft' })
-  assert.deepEqual(unlinked!.skuRemap, {})
-})
-
-test('sweep: after the episode resolved, a pending A snapshot is created at the warehouse as C (not A); the amend path is untouched', async () => {
-  const link = { productId: 'p1', metadata: { SKU: 'C' } }
-  const client = remapClient([], link)
-  const pushed: string[][] = []
-  const port: Partial<WmsOrderPushPort> = {
-    activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: '301' }],
-    releasableHeldOrders: async () => [],
-    createCandidates: async () => withSkuRenameHolds(client, [baseOrder('A')], undefined, { remapForConnector: 'mintsoft' }),
-    reloadOrderForPush: async (_id, _wh, createFor) => (await withSkuRenameHolds(client, [baseOrder('A')], undefined, { remapForConnector: createFor }))[0] as never,
-    recordValidationFailure: async () => true,
-    claimForCreate: async () => 'CLAIMED',
-    revalidatableLinks: async () => ({ links: [], total: 0 }),
-    verifiableLinks: async () => [], updatableLinks: async () => [], holdableLinks: async () => [], cancellableLinks: async () => [],
-    upsertByOrder: async () => {}, updateLink: async () => {}, updateLinkIfCreateClaimOwned: async () => true, updateLinkIfState: async () => true, recordEvent: async () => {},
-  }
-  const connector = { pushOrder: async (input: WmsOrderPushInput): Promise<WmsOrderPushResult> => { pushed.push(input.lines.map((l) => l.sku)); return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } }, updateOrder: async () => ({ updated: true, status: 'NEW' }), cancelOrder: async () => ({ cancelled: true, status: 'CANCELLED' }) }
-  const result = await runWmsOrderPushSweepCore(connector as never, 'mintsoft', port as WmsOrderPushPort, { now: NOW })
-  assert.equal(result.created, 1)
-  assert.deepEqual(pushed, [['C']])
-})
-
-test('o3d-k6x6m wiring: only the create-side port methods remap to the warehouse SKU; the amendment load never does', () => {
-  const source = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
-  const port = source.slice(source.indexOf('async createCandidates('))
-  assert.equal((port.match(/remapForConnector: connector/g) ?? []).length, 4, 'createCandidates (2 paths), revalidatableLinks, ambiguousCreateLinks')
-  assert.match(port, /remapForConnector: createConnector/)
-  const updatable = port.slice(port.indexOf('async updatableLinks('), port.indexOf('async revalidatableLinks('))
-  assert.doesNotMatch(updatable, /remapForConnector/)
 })

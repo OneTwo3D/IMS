@@ -77,28 +77,50 @@ export function confirmedWarehouseSku(productSku: string | null | undefined, lin
   return warehouseSku
 }
 
+/** One product's remap: the SKU the warehouse holds now, and the earlier IMS/warehouse SKUs of the product a line snapshot may still carry. */
+export type SkuRemapEntry = { sku: string; earlier: string[] }
+export type SkuRemap = Readonly<Record<string, SkuRemapEntry>>
+
+/**
+ * THE ONE PLACE a line's SKU on the wire is decided (create, amendment, the amendment comparisons and the warehouse query text all go through it, so
+ * they can never disagree about a line). A line is sent as the warehouse's current SKU only when it is bound to a product with a remap entry AND its
+ * snapshot SKU (trimmed, exact) is a KNOWN earlier SKU of that product (from the product's rename history). A case variant, a `wc-<id>` fallback or a
+ * Woo SKU IMS has never known for the product is never remapped. With no remap (the setting is off) it returns the line's own SKU.
+ */
+export function sentSkuForLine(line: { sku?: string | null; productId?: string | null }, remap: SkuRemap | undefined): string {
+  const own = line.sku ?? ''
+  const entry = line.productId && remap ? remap[line.productId] : undefined
+  if (!entry) return own
+  const snapshot = normaliseSkuForHold(own)
+  return snapshot !== entry.sku && entry.earlier.includes(snapshot) ? entry.sku : own
+}
+
 /**
  * Attach `skuRenameHolds` to each order (a copy), from one query for the whole batch. `warehouseOf` names the warehouse the order is actually sent
- * to when that is not its ship-from warehouse (a mixed-warehouse amendment's push warehouse).
+ * to when that is not its ship-from warehouse (a mixed-warehouse amendment's push warehouse). With `options.remapForConnector` (the
+ * `wms_sku_rename_remap_enabled` setting is on) the order also carries `skuRemap`; see sentSkuForLine.
  */
 export async function withSkuRenameHolds<T extends OrderWithLines>(
   client: Client,
   orders: ReadonlyArray<T>,
   warehouseOf: (order: T) => string | null | undefined = (order) => order.shipFromWarehouseId,
   options: { remapForConnector?: string } = {},
-): Promise<Array<T & { skuRenameHolds: SkuRenameHold[]; skuRemap?: Record<string, string> }>> {
+): Promise<Array<T & { skuRenameHolds: SkuRenameHold[]; skuRemap?: SkuRemap }>> {
   const productIds = [...new Set(orders.flatMap((order) => order.lines.flatMap((line) => (line.productId ? [line.productId] : []))))]
   const rows = productIds.length === 0 ? [] : await client.wmsStockDiscrepancy.findMany({
     where: { category: 'PRODUCT_SKU_RENAMED', status: 'OPEN', productId: { in: productIds } },
     select: { productId: true, warehouseId: true, wmsValue: true },
   })
-  // Orders NOT yet at the warehouse (create paths only) carry the product's confirmed warehouse SKU for their bound lines: see buildLines.
+  // Remap inputs: the warehouse SKU product sync confirmed, and the product's rename history (rows of any status).
   const warehouseSkuByProduct = new Map<string, string>()
+  let history: Array<{ productId: string | null; warehouseId: string; imsValue: string | null; wmsValue: string | null }> = []
   if (options.remapForConnector && productIds.length > 0 && client.wmsProductLink && client.product) {
-    const [links, products] = await Promise.all([
+    const [links, products, past] = await Promise.all([
       client.wmsProductLink.findMany({ where: { connector: options.remapForConnector, productId: { in: productIds } }, select: { productId: true, metadata: true } }),
       client.product.findMany({ where: { id: { in: productIds } }, select: { id: true, sku: true } }),
+      client.wmsStockDiscrepancy.findMany({ where: { category: 'PRODUCT_SKU_RENAMED', productId: { in: productIds } }, select: { productId: true, warehouseId: true, imsValue: true, wmsValue: true } }),
     ])
+    history = past
     const skuOf = new Map(products.map((product) => [product.id, product.sku]))
     for (const link of links) {
       const confirmed = confirmedWarehouseSku(skuOf.get(link.productId), link.metadata)
@@ -111,7 +133,18 @@ export async function withSkuRenameHolds<T extends OrderWithLines>(
     const skuRenameHolds = rows.flatMap((row) => (
       row.productId && own.has(row.productId) && (!warehouseId || row.warehouseId === warehouseId) ? [{ productId: row.productId, wmsValue: row.wmsValue }] : []
     ))
-    const skuRemap = options.remapForConnector ? Object.fromEntries([...own].flatMap((id) => (warehouseSkuByProduct.has(id) ? [[id, warehouseSkuByProduct.get(id)!]] : []))) : undefined
-    return { ...order, skuRenameHolds, ...(skuRemap ? { skuRemap } : {}) }
+    if (!options.remapForConnector) return { ...order, skuRenameHolds }
+    const skuRemap: Record<string, SkuRemapEntry> = {}
+    for (const id of own) {
+      const sku = warehouseSkuByProduct.get(id)
+      if (!sku) continue
+      const earlier = new Set(history.flatMap((row) => (
+        row.productId === id && (!warehouseId || row.warehouseId === warehouseId) ? [normaliseSkuForHold(row.imsValue), normaliseSkuForHold(row.wmsValue)] : []
+      )))
+      earlier.delete('')
+      earlier.delete(sku)
+      skuRemap[id] = { sku, earlier: [...earlier] }
+    }
+    return { ...order, skuRenameHolds, skuRemap }
   })
 }

@@ -705,7 +705,7 @@ export async function suppressIgnoredRename(client: Pick<typeof db, 'wmsStockDis
   return ignored !== null
 }
 
-async function upsertProductDiscrepancy(params: {
+export async function upsertProductDiscrepancy(params: {
   scopes: MintsoftProductSyncScope[]
   productId: string
   sku: string
@@ -718,6 +718,23 @@ async function upsertProductDiscrepancy(params: {
   for (const scope of params.scopes) {
     // An operator ignored this exact rename occurrence (same IMS SKU, same Mintsoft SKU): the sync does not reopen it (o3d-zz37l).
     if (await suppressIgnoredRename(db, scope.warehouseId, params)) continue
+    // The OPEN rename row is overwritten in place when the SKU is renamed again (A->B, then B->C): keep the SKU it carried as a RESOLVED history row, because the
+    // product's rename history (any status) is what tells the order push which snapshot SKUs are KNOWN earlier SKUs of the product (sku-rename-hold.ts).
+    if (params.category === 'PRODUCT_SKU_RENAMED') {
+      const standing = await db.wmsStockDiscrepancy.findFirst({
+        where: { connector: 'mintsoft', warehouseId: scope.warehouseId, productId: params.productId, category: params.category, status: 'OPEN' },
+        select: { sku: true, imsValue: true, wmsValue: true },
+      })
+      if (standing && standing.imsValue !== null && standing.imsValue !== params.imsValue) {
+        await db.wmsStockDiscrepancy.create({
+          data: {
+            connector: 'mintsoft', warehouseId: scope.warehouseId, productId: params.productId, sku: standing.sku, category: params.category, status: 'RESOLVED',
+            imsValue: standing.imsValue, wmsValue: standing.wmsValue, message: `IMS SKU was "${standing.imsValue}" while Mintsoft still had "${standing.wmsValue}"; the SKU was renamed again.`,
+            firstSeenAt: now, lastSeenAt: now, resolvedAt: now, resolvedNote: 'History: the IMS SKU was renamed again before Mintsoft caught up',
+          },
+        })
+      }
+    }
     const updated = await db.wmsStockDiscrepancy.updateMany({
       where: {
         connector: 'mintsoft',
@@ -744,7 +761,7 @@ async function upsertProductDiscrepancy(params: {
     if (updated.count > 0) continue
 
     try {
-      await db.wmsStockDiscrepancy.create({
+      const created = await db.wmsStockDiscrepancy.create({
         data: {
           connector: 'mintsoft',
           warehouseId: scope.warehouseId,
@@ -758,9 +775,19 @@ async function upsertProductDiscrepancy(params: {
           firstSeenAt: now,
           lastSeenAt: now,
         },
+        select: { id: true },
       })
-      // An operator may have ignored the row between the check above and this write: the ignore then acts on the new row itself (it matches any OPEN
-      // row), so nothing more is needed here.
+      // An operator may have ignored the OLD row between the check above and this write: the ignore then did not act on the row just created, which would hold
+      // orders until someone ignores it again. Close ONLY the row just created, and only for an ignore of the same pair made during this pass (never another row).
+      if (params.category === 'PRODUCT_SKU_RENAMED') {
+        const ignoredDuringPass = await db.wmsStockDiscrepancy.findFirst({
+          where: { connector: 'mintsoft', warehouseId: scope.warehouseId, productId: params.productId, category: params.category, status: 'IGNORED', imsValue: params.imsValue, wmsValue: params.wmsValue, resolvedAt: { gte: now } },
+          select: { id: true },
+        })
+        if (ignoredDuringPass) {
+          await db.wmsStockDiscrepancy.updateMany({ where: { id: created.id, status: 'OPEN' }, data: { status: 'RESOLVED', resolvedAt: new Date(), resolvedNote: 'Superseded: the operator ignored this rename' } })
+        }
+      }
       continue
     } catch (error) {
       if (!isUniqueConstraintError(error)) {
