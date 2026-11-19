@@ -770,6 +770,8 @@ test('r36/r37: CREATE DATABASE succeeding, on the right server, is the only thin
       ${stub}
       ${shippedFunction(INSTALL_SOURCE, 'pg_extract_server_identity')}
       ${shippedFunction(INSTALL_SOURCE, 'pg_server_identity_select')}
+      ${shippedFunction(INSTALL_SOURCE, 'database_create_locale')}
+      ${shippedFunction(INSTALL_SOURCE, 'warn_if_database_not_utf8')}
       ${shippedFunction(INSTALL_SOURCE, 'create_database_and_record_newness')}
       create_database_and_record_newness
       echo "CREATED=\${DB_CREATED_BY_THIS_RUN}"
