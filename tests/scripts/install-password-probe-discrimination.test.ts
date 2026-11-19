@@ -2400,6 +2400,7 @@ test('r44: the variables the installed driver consults are exactly the ones this
     'PGOPTIONS',
     'PGREPLICATION',
     'PGSSLMODE',
+    'PGSSLNEGOTIATION',
   ], 'the installed driver consults exactly these, and a new one is this finding again')
 
   const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
