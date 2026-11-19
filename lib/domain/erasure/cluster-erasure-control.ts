@@ -32,7 +32,7 @@ export async function cancelClusterErasure(requestId: string, reason: string, us
     const request = await tx.customerClusterErasure.findUnique({ where: { id: requestId } })
     if (!request) return { success: false, error: 'Erasure request not found' }
     if (request.status !== 'PENDING') return { success: false, error: 'This erasure request is not pending' }
-    await tx.customerClusterErasure.update({ where: { id: requestId }, data: { status: 'CANCELLED', cancelledAt: new Date(), cancelledByUserId: userId } })
+    await tx.customerClusterErasure.update({ where: { id: requestId }, data: { status: 'CANCELLED', cancelledAt: new Date(), cancelledByUserId: userId, memberIdentityKeys: {} } })
     const erased = await tx.customer.count({ where: { id: { in: request.memberIds }, gdprAnonymisedAt: { not: null } } })
     await logActivityInTransaction(tx, {
       entityType: 'CUSTOMER',

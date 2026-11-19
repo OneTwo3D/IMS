@@ -694,6 +694,93 @@ test('a wrongly included member can be EXCLUDED from a PENDING erasure; the rest
   assert.ok(await db.activityLog.findFirst({ where: { action: ERASURE_MEMBER_EXCLUDED_ACTION, entityId: c, userId } }), 'audited')
 })
 
+test('EXCLUDE while a run is in flight: the excluded member is NOT erased by that run (checked before each member, under the CRM lock)', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const actions = await import('@/app/actions/customer-identity')
+  const { eraseCustomerClusterPersonalData } = await import('@/lib/domain/erasure/cluster-erasure')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const a = await customer('a', `inflight.${RUN}@example.test`)
+  const b = await customer('b', `inflight.${RUN}+b@example.test`)
+  const c = await customer('c', `inflight.${RUN}+c@example.test`)
+  const d = await customer('d', `inflight.${RUN}+d@example.test`)
+  role = 'ADMIN'
+  const done: string[] = []
+  let excluded = false
+  let victim = ''
+  // The members are erased in the saved order; pause before the SECOND head member and exclude the one that comes after it (still live, still on the list).
+  const beforeMember = async (id: string) => {
+    if (done.length === 1 && !excluded) {
+      const req = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })
+      victim = req.memberIds.slice(0, -1).find((m) => m !== id && !done.includes(m))!
+      assert.ok(victim, 'a later head member exists')
+      assert.deepEqual(await actions.excludeClusterErasureMemberAction(req.id, victim, 'a different end customer'), { success: true })
+      excluded = true
+    }
+  }
+  const recording = async (id: string, opts: Parameters<typeof eraseCustomerPersonalData>[1]) => { done.push(id); return eraseCustomerPersonalData(id, opts) }
+  const result = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [a, b, c, d].sort() }, { eraseCustomer: recording as never, beforeMember })
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.ok(excluded && victim)
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: victim }, select: { gdprAnonymisedAt: true } })).gdprAnonymisedAt, null, 'the excluded member is untouched')
+  assert.equal(done.includes(victim), false, 'the core was never called for it')
+  for (const id of [a, b, c, d].filter((m) => m !== victim)) assert.ok((await db.customer.findUniqueOrThrow({ where: { id }, select: { gdprAnonymisedAt: true } })).gdprAnonymisedAt, `${id} erased`)
+  assert.equal((await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })).status, 'COMPLETE')
+})
+
+test('CANCEL while a run is in flight: the remaining members are NOT erased and the run reports cancelled, not success', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const actions = await import('@/app/actions/customer-identity')
+  const { eraseCustomerClusterPersonalData, ERASURE_CANCELLED_DURING_RUN_ERROR } = await import('@/lib/domain/erasure/cluster-erasure')
+  const a = await customer('a', `inflightc.${RUN}@example.test`)
+  const b = await customer('b', `inflightc.${RUN}+b@example.test`)
+  const c = await customer('c', `inflightc.${RUN}+c@example.test`)
+  const d = await customer('d', `inflightc.${RUN}+d@example.test`)
+  role = 'MANAGER'
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  let seen = 0
+  const beforeMember = async () => {
+    seen += 1
+    if (seen === 2) {
+      const req = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })
+      assert.deepEqual(await actions.cancelClusterErasureAction(req.id, 'wrong person'), { success: true })
+    }
+  }
+  const result = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [a, b, c, d].sort() }, { eraseCustomer: eraseCustomerPersonalData, beforeMember })
+  assert.deepEqual({ success: result.success, error: (result as { error?: string }).error }, { success: false, error: ERASURE_CANCELLED_DURING_RUN_ERROR })
+  assert.equal(result.erasedCustomerIds.length, 1, 'only the member erased before the cancel')
+  const erased = await db.customer.count({ where: { id: { in: [a, b, c, d] }, gdprAnonymisedAt: { not: null } } })
+  assert.equal(erased, 1, 'the remaining members, the requested customer included, are live')
+  assert.equal((await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })).status, 'CANCELLED')
+})
+
+test('an alias imported mid-run of a member that was ALREADY ERASED is erased too (cluster joined only by a merge)', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const actions = await import('@/app/actions/customer-identity')
+  const { eraseCustomerClusterPersonalData } = await import('@/lib/domain/erasure/cluster-erasure')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const r = await customer('r', `root.${RUN}@example.test`)
+  const x = await customer('x', `other.${RUN}@example.test`) // joined to r ONLY by the operator merge
+  role = 'ADMIN'
+  assert.equal((await actions.mergeCustomersAction(r, x, true)).success, true)
+  let alias: string | undefined
+  const order: string[] = []
+  const beforeMember = async (id: string) => {
+    order.push(id)
+    // the importer creates the alias of x while x is still live and BEFORE x is erased; after x is erased nothing but x's saved key reaches it
+    if (id === x && !alias) alias = await customer('alias', `other.${RUN}+shop@example.test`)
+  }
+  const result = await eraseCustomerClusterPersonalData(r, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [r, x].sort() }, { eraseCustomer: eraseCustomerPersonalData, beforeMember })
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.ok(alias, 'x was erased in the head, before the final check (otherwise the test proves nothing)')
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: alias! }, select: { gdprAnonymisedAt: true } })).gdprAnonymisedAt !== null, true, 'the alias is erased')
+  const request = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: r } } })
+  assert.equal(request.status, 'COMPLETE')
+  assert.deepEqual(request.memberIdentityKeys, {}, 'the saved digests are emptied when the request completes')
+})
+
 test('the company-name SQL twin gives the same group as the TypeScript key for NBSP, NFD and mixed white space', { skip }, async (t) => {
   const { db, RUN, customer, cleanup } = await setup()
   t.after(cleanup)

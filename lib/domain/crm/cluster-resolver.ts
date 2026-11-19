@@ -98,6 +98,18 @@ export interface ClusterInputs {
   truncated: boolean
 }
 
+/**
+ * The ids of the LIVE customers whose loose identity key hashes (SHA-256, hex; lib/domain/erasure/cluster-erasure.ts keyDigest) to one of `digests`: how the key an
+ * erased member had before it was erased finds an alias that joined since. At most MAX_CLUSTER_MEMBERS + 1 rows.
+ */
+export async function liveCustomersByIdentityDigest(db: Pick<Prisma.TransactionClient, '$queryRaw'>, digests: string[]): Promise<Array<{ id: string }>> {
+  if (digests.length === 0) return []
+  return db.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "customers"
+    WHERE "email" IS NOT NULL AND "gdprAnonymisedAt" IS NULL AND encode(sha256(convert_to(${CUSTOMER_LOOSE_EMAIL_KEY_SQL}, 'UTF8')), 'hex') = ANY(${digests}::text[])
+    LIMIT ${MAX_CLUSTER_MEMBERS + 1}`
+}
+
 async function readCustomers(db: Reader, ids: string[]): Promise<ClusterCustomer[]> {
   if (ids.length === 0) return []
   const rows = await db.customer.findMany({ where: { id: { in: ids } }, select: { id: true, email: true, gdprAnonymisedAt: true } })

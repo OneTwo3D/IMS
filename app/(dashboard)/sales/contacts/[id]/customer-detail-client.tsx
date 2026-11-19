@@ -53,9 +53,11 @@ function formatAddr(a: AddressData | null): string {
   return [a.line1, a.line2, a.city, a.county, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ') || '—'
 }
 
-export type ClusterMemberView = { id: string; fullName: string; email: string | null }
+export type ClusterMemberView = { id: string; fullName: string; email: string | null; anonymised?: boolean }
 
-function GdprDialog({ customer, clusterMembers, onClose }: { customer: CustomerDetail; clusterMembers: ClusterMemberView[]; onClose: () => void }) {
+function GdprDialog({ customer, clusterMembers: allMembers, onClose }: { customer: CustomerDetail; clusterMembers: ClusterMemberView[]; onClose: () => void }) {
+  // Only LIVE members are shown and sent: the server's cluster never contains an erased record, so sending one would be refused every time.
+  const clusterMembers = allMembers.filter((m) => !m.anonymised)
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [confirmation, setConfirmation] = useState('')

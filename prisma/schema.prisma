@@ -1927,6 +1927,9 @@ model CustomerClusterErasure {
   /// CANCELLED by a MANAGER/ADMIN: releases the merge/unmerge block; records already erased stay erased. The reason lives in the activity log.
   cancelledAt         DateTime?
   cancelledByUserId   String?
+  /// memberId -> SHA-256 (hex) of the loose identity key of the email the member had BEFORE it was erased. An erased member's email is blanked, so the completion
+  /// re-resolve finds an alias imported mid-run through these saved digests. Digests, not emails; emptied ({}) when the request completes or is cancelled.
+  memberIdentityKeys  Json                         @default("{}")
 
   @@index([status])
   @@index([memberIds], type: Gin)
