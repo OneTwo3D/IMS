@@ -93,6 +93,8 @@ export type WcRefundRef = {
 
 export type WcFullOrder = {
   id: number
+  /** The helper plugin's captured withdrawal request id, a TOP-LEVEL response field (never meta_data, so a round-tripping client cannot persist it). */
+  _oti_wdraw_request_id?: number | string | null
   parent_id: number
   number: string
   order_key: string

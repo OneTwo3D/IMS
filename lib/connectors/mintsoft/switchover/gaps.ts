@@ -72,11 +72,14 @@ export async function listSwitchoverGaps(input: {
       erasedAt: null,
       shoppingLinks: { some: { connector: 'woocommerce' } },
       refundStatus: { not: 'FULL' },
-      // A row with no shippedAt (an old import) is bounded by its creation time in the same window, so history does not cost a storefront read each.
-      OR: [{ shippedAt: { gte: windowStart, lt: input.since } }, { shippedAt: null, createdAt: { gte: windowStart, lt: input.since } }],
+      // A row with no shippedAt is listed when it was created before S and touched inside the window, BOUNDED ON BOTH SIDES (windowStart <= updatedAt <= S): an old
+      // backorder despatched just before S with no shippedAt stays in, untouched history does not cost a storefront read each, and a sweep or erasure that bumps old
+      // rows AFTER S does not flood the list.
+      OR: [{ shippedAt: { gte: windowStart, lt: input.since } }, { shippedAt: null, createdAt: { lt: input.since }, updatedAt: { gte: windowStart, lte: input.since } }],
     },
     select: { id: true, orderNumber: true, externalOrderNumber: true, paidAt: true, shippedAt: true, shoppingLinks: { where: { connector: 'woocommerce' }, select: { externalOrderId: true }, take: 1 } },
-    orderBy: { shippedAt: 'asc' },
+    // NULLS FIRST: a truncation drops the newest dated rows, never the (rarer, older) rows that have no shippedAt at all.
+    orderBy: [{ shippedAt: { sort: 'asc', nulls: 'first' } }, { id: 'asc' }],
     take: LIST_LIMIT,
   })
   // Keep only the orders whose storefront order is still open: completed (with or without tracking: a letter-post or collection despatch has none),

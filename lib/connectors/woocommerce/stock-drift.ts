@@ -4,10 +4,12 @@
  * Qoblex pushes stock to the store until the owner stops it (an owner checklist step, recorded as the `qoblex-stock-push-stopped` attestation). IMS
  * cannot see Qoblex, so it watches the store: it READS every managed-stock product and variation (GET only, no write anywhere) and compares each
  * quantity with the one it saw last time. A change is EXPLAINED when
- *   - IMS pushed that very quantity (StockSyncState.lastPushedQty equals it), or
+ *   - IMS pushed that very quantity AFTER the previous look (StockSyncState.lastPushedQty equals it and lastPushedAt is not before the previous snapshot,
+ *     less the slack below: an old push of the same number explains nothing), or
  *   - an order that contains the product was created or changed since the previous look (an order or refund moves stock on its own).
  * A change nothing explains is DRIFT: someone is still writing stock. It is recorded as an event, and the writers:check reader counts the events since
- * the owner's confirmation. The first sighting of a product only sets its baseline.
+ * the owner's confirmation, less those an operator has acknowledged after review (`npm run switchover:stock-drift-ack`, with who and why kept on the
+ * event and an activity-log entry): one reviewed manual edit does not fail the check for good. The first sighting of a product only sets its baseline.
  *
  * A run is `ok` only when the WHOLE catalogue was read (every page, with the store stating its page count) and every snapshot was saved; any other run is
  * recorded as not ok and leaves the snapshots untouched, so a failed read can neither hide drift nor invent it. The reader asks for 24 hours of ok runs
@@ -101,20 +103,22 @@ export async function observeWcStockDrift(deps: StockDriftDeps = {}): Promise<St
     // What explains a change: IMS's own push of that quantity, or an order touching the product since the previous look.
     const explained = new Set<string>()
     if (changed.length > 0) {
-      const byExternal = new Map<string, { id: string; pushed: Set<number> }>()
+      const byExternal = new Map<string, { id: string; pushed: Array<{ qty: number; at: Date | null }> }>()
       for (const part of chunks(changed)) {
         const products = await db.product.findMany({
           where: { externalProductId: { in: part.map((reading) => BigInt(reading.id)) } },
-          select: { id: true, externalProductId: true, stockSyncStates: { where: { connector: 'woocommerce' }, select: { lastPushedQty: true } } },
+          select: { id: true, externalProductId: true, stockSyncStates: { where: { connector: 'woocommerce' }, select: { lastPushedQty: true, lastPushedAt: true } } },
         })
-        for (const product of products) byExternal.set(String(product.externalProductId), { id: product.id, pushed: new Set(product.stockSyncStates.flatMap((state) => (state.lastPushedQty === null ? [] : [state.lastPushedQty]))) })
+        for (const product of products) byExternal.set(String(product.externalProductId), { id: product.id, pushed: product.stockSyncStates.flatMap((state) => (state.lastPushedQty === null ? [] : [{ qty: state.lastPushedQty, at: state.lastPushedAt }])) })
       }
       const needOrders: Array<{ readingId: string; productId: string; since: Date }> = []
       for (const reading of changed) {
         const product = byExternal.get(reading.id)
         if (!product) continue
-        if (product.pushed.has(reading.quantity)) { explained.add(reading.id); continue }
-        needOrders.push({ readingId: reading.id, productId: product.id, since: new Date(snapshots.get(reading.id)!.observedAt.getTime() - EXPLAIN_SLACK_MS) })
+        const since = new Date(snapshots.get(reading.id)!.observedAt.getTime() - EXPLAIN_SLACK_MS)
+        // A push counts only when it was made after the previous look (an unknown push time explains nothing).
+        if (product.pushed.some((push) => push.qty === reading.quantity && push.at !== null && push.at.getTime() >= since.getTime())) { explained.add(reading.id); continue }
+        needOrders.push({ readingId: reading.id, productId: product.id, since })
       }
       for (const part of chunks(needOrders)) {
         const earliest = new Date(Math.min(...part.map((entry) => entry.since.getTime())))
