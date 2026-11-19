@@ -16,7 +16,7 @@ import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
 import { isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
-import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict, xeroResolveObligationAt } from '@/lib/domain/accounting/xero-producer-seam'
+import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict, xeroResolveObligationAt, xeroRowDeliveryHold } from '@/lib/domain/accounting/xero-producer-seam'
 import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
@@ -6209,6 +6209,15 @@ export async function processClaimedEntry(
   if (held.kind === 'shadow') {
     const message = producerHeldNotice({ connector: held.destination, reason: held.decision.reason, owner: held.decision.owner })
     return { success: false, error: message, notPosted: { reason: 'producer-held', operation: type, message } }
+  }
+
+  // THE PER-OPERATION DELIVERY GATE. The decision above said LIVE for this row, but a destination opened by an EARLIER step must not let a LATER step's
+  // row out, and a row that replaces an incumbent the owner stops by hand (step X: Qoblex's Xero posting; the invoice note) waits for the owner's
+  // confirmation. A confirmation that is absent, or not read yet after a start or a failed read, HOLDS the row (handed back unsent, no attempt spent,
+  // retried): it is never turned into a shadow, which would never be delivered.
+  const deliveryHold = xeroRowDeliveryHold({ type })
+  if (deliveryHold !== null) {
+    return { success: false, error: deliveryHold.message, notPosted: { reason: 'producer-held', operation: type, message: deliveryHold.message } }
   }
 
   // THE WRITER-SIDE CUT-OFF, AT THE LAST POINT BEFORE ANYTHING CAN BE SENT. The claim statement and the selections already exclude a row

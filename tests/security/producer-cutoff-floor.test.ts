@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createdBeforeCutoffFloor, producerCutoffFloor } from '../../lib/security/producer-seam.ts'
+import { createdBeforeCutoffFloor, producerCutoffFloor, producerOperationCutoffFloor } from '../../lib/security/producer-seam.ts'
 import {
   PRODUCER_CUTOFF_ENV,
   PRODUCER_HOLD_ENFORCED_ENV,
@@ -113,12 +113,19 @@ test('Outbox: the fragment names each enforced-and-live connector once, exempts 
     process.env[PRODUCER_CUTOFF_ENV.mintsoft] = '2026-12-01T06:00:00Z'
     const fragment = outboxBeforeCutoffWhere({ now: NOW }) as { OR: Array<{ connector: string; createdAt: { lt: Date }; operation?: { notIn: string[] } }> }
     console.log(`# outbox fragment: ${JSON.stringify(fragment)}`)
-    assert.deepEqual(fragment.OR.map((clause) => clause.connector).sort(), ['mintsoft', 'woocommerce'])
+    assert.deepEqual([...new Set(fragment.OR.map((clause) => clause.connector))].sort(), ['mintsoft', 'woocommerce'])
     const mintsoft = fragment.OR.find((clause) => clause.connector === 'mintsoft')!
     assert.deepEqual(mintsoft.operation?.notIn, ['inbound.booked-in'], 'a local effect is never matched')
     assert.equal(mintsoft.createdAt.lt.toISOString(), '2026-12-01T06:00:00.000Z', 'each connector has its own instant')
-    const wc = fragment.OR.find((clause) => clause.connector === 'woocommerce')!
-    assert.equal(wc.operation, undefined, 'every woocommerce operation is a vendor write')
+    // WooCommerce is floored per operation: stock (step W, WC_WRITES_LIVE_FROM) and the bridge writeback (step M, MINTSOFT_WRITES_LIVE_FROM) are live here, the invoice
+    // document (step X) is not, and an operation this build does not know is governed by the destination-level floor.
+    const wcClauses = fragment.OR.filter((clause) => clause.connector === 'woocommerce')
+    const wcOps = wcClauses.flatMap((clause) => (clause.operation as { in?: string[] } | undefined)?.in ?? [])
+    assert.ok(wcOps.includes('stock.push') && wcOps.includes('order.complete'))
+    assert.ok(!wcOps.includes('order.invoice-document'))
+    const stockClause = wcClauses.find((clause) => (clause.operation as { in?: string[] } | undefined)?.in?.includes('stock.push'))!
+    assert.equal(stockClause.createdAt.lt.toISOString(), '2026-12-01T00:00:00.000Z')
+    assert.ok(wcClauses.some((clause) => (clause.operation as { notIn?: string[] } | undefined)?.notIn?.includes('stock.push')), 'unknown operations are governed (fail closed)')
     // The same rule on one row.
     const row = { connector: 'woocommerce', operation: 'stock.push', createdAt: new Date('2026-11-01T00:00:00Z') }
     assert.equal(outboxRowBeforeCutoff(row, { now: NOW })?.toISOString(), '2026-12-01T00:00:00.000Z')
@@ -238,113 +245,179 @@ test('the recreate window is clamped to the cut-off: the later of the retention 
   assert.deepEqual(clampRecreateWindowToCutoff({ cutoff: null, dateFilter: { not: null } }, floor), { cutoff: floor, dateFilter: { gte: floor } }, 'retention disabled: the floor still bounds it')
 })
 
-// ---- Each accounting row is floored by the live-from instant of the destination it writes to (the WooCommerce invoice note) ----------
+
+// ---- Each row is floored by the live-from instant of ITS OWN operation's step, not of the earliest step that opened its destination -----------------
+// Step M (Mintsoft, with the bridge's WooCommerce writeback), then W (WooCommerce stock, webhooks), then X (Xero and the invoice note).
 
 const SHOP = 'https://shop.example.test'
-// The steps go live in the order M, W, X, so WooCommerce's instant (step W) is the earlier one; a destination's floor is the EARLIEST live step that writes to it.
-const WOO_AT = new Date('2026-12-01T00:00:00Z')
-const XERO_AT = new Date('2026-12-10T00:00:00Z')
+const M_AT = new Date('2026-11-20T00:00:00Z')
+const W_AT = new Date('2026-12-01T00:00:00Z')
+const X_AT = new Date('2026-12-10T00:00:00Z')
 const LATER = new Date('2026-12-11T00:00:00Z')
-const bothLive = (extra: Record<string, string> = {}) => ({
-  [PRODUCER_HOLD_ENFORCED_ENV]: 'xero,woocommerce',
+const PRE_M = new Date('2026-11-01T00:00:00Z') // before every step
+const AFTER_M = new Date('2026-11-25T00:00:00Z') // after M, before W
+const BETWEEN = new Date('2026-12-05T00:00:00Z') // after W, before X
+const MINTSOFT_GRANT = 'https://wms.example.test|89'
+const allEnforced = { [PRODUCER_HOLD_ENFORCED_ENV]: 'xero,woocommerce,mintsoft' }
+const grants = {
   [OUTBOUND_GRANT_ENV.xero]: TENANT,
-  [PRODUCER_CUTOFF_ENV.xero]: XERO_AT.toISOString(),
   [OUTBOUND_GRANT_ENV.woocommerce]: SHOP,
-  [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString(),
+  [OUTBOUND_GRANT_ENV.mintsoft]: MINTSOFT_GRANT,
+}
+/** Every step live at its own instant. */
+const allSteps = (extra: Record<string, string> = {}) => ({
+  ...allEnforced, ...grants,
+  [PRODUCER_CUTOFF_ENV.mintsoft]: M_AT.toISOString(),
+  [PRODUCER_CUTOFF_ENV.woocommerce]: W_AT.toISOString(),
+  [PRODUCER_CUTOFF_ENV.xero]: X_AT.toISOString(),
   ...extra,
 })
-const PRE_WOO = new Date('2026-11-15T00:00:00Z') // before the WooCommerce instant
-const BETWEEN = new Date('2026-12-05T00:00:00Z') // after the WooCommerce instant, before the Xero one
+/** ONE step's variable set, and no other. */
+const onlyStep = (name: 'mintsoft' | 'woocommerce' | 'xero', at: Date) => ({ ...allEnforced, ...grants, [PRODUCER_CUTOFF_ENV[name]]: at.toISOString() })
 
-test('the invoice note is floored by the WooCommerce instant, a Xero write by the Xero instant, and neither by the other', () => {
-  const env = bothLive()
-  assert.equal(xeroCutoffFloor({ env, now: LATER })?.toISOString(), XERO_AT.toISOString())
-  assert.equal(wooAccountingCutoffFloor({ env, now: LATER })?.toISOString(), WOO_AT.toISOString())
-  // Created between the two instants: a note is past WooCommerce's (earlier) instant (not refused); a Xero posting is before its own (refused).
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'WC_INVOICE_NOTE' }, { env, now: LATER }), null)
+/** The outbox functions read the process environment (there is no context for it), so these arms install the environment for the duration of the call. */
+function withProcessEnv<T>(env: Record<string, string>, fn: () => T): T {
+  const saved = { ...process.env }
+  try {
+    for (const key of [PRODUCER_HOLD_ENFORCED_ENV, ...Object.values(OUTBOUND_GRANT_ENV), ...Object.values(PRODUCER_CUTOFF_ENV)]) delete process.env[key]
+    Object.assign(process.env, env)
+    return fn()
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]
+    Object.assign(process.env, saved)
+  }
+}
+
+test('each operation is floored by ITS OWN step: the note by step X, stock by step W, the bridge writeback by step M; the destination-level floor is the earliest open', () => {
+  const env = allSteps()
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.invoice-note', { env, now: LATER })?.toISOString(), X_AT.toISOString())
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.invoice-document', { env, now: LATER })?.toISOString(), X_AT.toISOString())
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'stock', { env, now: LATER })?.toISOString(), W_AT.toISOString())
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.status', { env, now: LATER })?.toISOString(), M_AT.toISOString())
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.tracking', { env, now: LATER })?.toISOString(), M_AT.toISOString())
+  assert.equal(producerCutoffFloor('woocommerce', { env, now: LATER })?.toISOString(), M_AT.toISOString(), 'the destination-level floor is only the earliest-open transport barrier')
+  assert.equal(wooAccountingCutoffFloor({ env, now: LATER })?.toISOString(), X_AT.toISOString())
+  assert.equal(xeroCutoffFloor({ env, now: LATER })?.toISOString(), X_AT.toISOString())
+  // A note created after W and before X still belongs to Xeroom (its own step is X): refused, with WooCommerce's sentence. The same row for a Xero write is refused too.
+  const note = xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'WC_INVOICE_NOTE' }, { env, now: LATER })
+  assert.match(String(note), /^Not sent by IMS: this was queued before writes to WooCommerce went live on this installation \(2026-12-10T00:00:00\.000Z\)/)
   assert.match(String(xeroBeforeCutoffRefusal({ createdAt: BETWEEN, type: 'BILL_PAYMENT' }, { env, now: LATER })), /writes to Xero went live/)
   assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER, type: 'WC_INVOICE_NOTE' }, { env, now: LATER }), null)
-  // Created before the WooCommerce instant: a note belongs to its former writer, with WooCommerce's sentence.
-  const note = xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'WC_INVOICE_NOTE' }, { env, now: LATER })
-  assert.match(String(note), /^Not sent by IMS: this was queued before writes to WooCommerce went live on this installation \(2026-12-01T00:00:00\.000Z\)/)
+  // Stock and the bridge writeback rows judged by their own instants.
+  withProcessEnv(env, () => {
+    assert.equal(outboxRowBeforeCutoff({ connector: 'woocommerce', operation: 'stock.push', createdAt: AFTER_M }, { now: LATER })?.toISOString(), W_AT.toISOString(), 'a stock job queued while only step M was live predates step W')
+    assert.equal(outboxRowBeforeCutoff({ connector: 'woocommerce', operation: 'order.complete', createdAt: AFTER_M }, { now: LATER }), null, 'a completion queued after step M is deliverable')
+    assert.equal(outboxRowBeforeCutoff({ connector: 'woocommerce', operation: 'order.invoice-document', createdAt: BETWEEN }, { now: LATER })?.toISOString(), X_AT.toISOString())
+  })
 })
 
-test('a note is not floored by the Xero instant alone, and a Xero posting is not floored by the WooCommerce instant alone', () => {
-  const xeroOnly = live()
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'WC_INVOICE_NOTE' }, { env: xeroOnly, now: NOW }), null, 'Xero is live, WooCommerce is not: the note has no floor')
-  const wooOnly = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString() }
-  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'WC_INVOICE_NOTE' }, { env: wooOnly, now: LATER }), null)
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'BILL_PAYMENT' }, { env: wooOnly, now: LATER }), null)
-  assert.equal(accountingCutoffInForce({ env: wooOnly, now: LATER }), true, 'a WooCommerce-only floor still counts, so the guards that skip a read when no floor applies do not skip')
+test('ONLY step M live: the note and the stock have no floor (their step is not live, so the per-operation gate holds them), the completions are floored at M', () => {
+  const env = onlyStep('mintsoft', M_AT)
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.status', { env, now: LATER })?.toISOString(), M_AT.toISOString())
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'stock', { env, now: LATER }), null)
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.invoice-note', { env, now: LATER }), null)
+  assert.equal(wooAccountingCutoffFloor({ env, now: LATER }), null)
+  assert.equal(xeroCutoffFloor({ env, now: LATER }), null)
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: PRE_M, type: 'WC_INVOICE_NOTE' }, { env, now: LATER }), null, 'the note is not governed by a step that is not live')
+  const fragment = withProcessEnv(env, () => outboxBeforeCutoffWhere({ now: LATER })) as { OR: Array<{ connector?: string; operation?: { in?: string[]; notIn?: string[] }; createdAt: { lt: Date } }> }
+  const wooClauses = fragment.OR.filter((clause) => clause.connector === 'woocommerce')
+  const named = wooClauses.flatMap((clause) => clause.operation?.in ?? [])
+  assert.ok(named.includes('order.complete') && named.includes('trackship.refire'), 'the step-M operations are floored')
+  assert.ok(!named.includes('stock.push') && !named.includes('order.invoice-document'), 'the stock and invoice-document jobs are not floored while their step is not live')
+})
+
+test('ONLY step W live: stock is floored at W; the completions and the note have no floor', () => {
+  const env = onlyStep('woocommerce', W_AT)
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'stock', { env, now: LATER })?.toISOString(), W_AT.toISOString())
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.status', { env, now: LATER }), null)
+  assert.equal(wooAccountingCutoffFloor({ env, now: LATER }), null)
+  withProcessEnv(env, () => {
+    assert.equal(outboxRowBeforeCutoff({ connector: 'woocommerce', operation: 'stock.push', createdAt: PRE_M }, { now: LATER })?.toISOString(), W_AT.toISOString())
+    assert.equal(outboxRowBeforeCutoff({ connector: 'woocommerce', operation: 'order.complete', createdAt: PRE_M }, { now: LATER }), null)
+  })
+})
+
+test('ONLY step X live: the note and the invoice document are floored at X, Xero writes at X; stock and completions have no floor', () => {
+  const env = onlyStep('xero', X_AT)
+  assert.equal(wooAccountingCutoffFloor({ env, now: LATER })?.toISOString(), X_AT.toISOString())
+  assert.equal(xeroCutoffFloor({ env, now: LATER })?.toISOString(), X_AT.toISOString())
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'stock', { env, now: LATER }), null)
+  assert.equal(producerOperationCutoffFloor('woocommerce', 'order.status', { env, now: LATER }), null)
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_M, type: 'WC_INVOICE_NOTE' }, { env, now: LATER }), null)
+  assert.equal(accountingCutoffInForce({ env, now: LATER }), true)
   assert.equal(accountingCutoffInForce({ env: {}, now: LATER }), false)
-  assert.equal(accountingCutoffInForce({ env: wooOnly, now: PRE_WOO }), false, 'before the instant is reached there is no floor')
+  assert.equal(accountingCutoffInForce({ env, now: PRE_M }), false, 'before the instant is reached there is no floor')
 })
 
 test('a row whose type is unknown is refused if EITHER destination would refuse it (fail closed)', () => {
-  const env = bothLive()
+  const env = allSteps()
   assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: BETWEEN }, { env, now: LATER }), null)
-  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z') }, { env, now: LATER }), null)
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_M }, { env, now: LATER }), null)
   assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER }, { env, now: LATER }), null)
 })
 
-test('the where-fragments: none without a floor (the legacy query), one clause for one floor, an OR of the two for both', () => {
-  assert.deepEqual(xeroNotBeforeCutoffWhere(null, null), {})
-  assert.deepEqual(xeroNotNeverDeliverablePendingWhere(null, null), {})
-  const wooOnly = xeroNotBeforeCutoffWhere(null, WOO_AT) as { NOT: { createdAt: { lt: Date }; type: { in: string[] } } }
-  assert.equal(wooOnly.NOT.createdAt.lt.toISOString(), WOO_AT.toISOString())
-  assert.deepEqual(wooOnly.NOT.type.in, ['WC_INVOICE_NOTE'])
-  const both = xeroNotBeforeCutoffWhere(XERO_AT, WOO_AT) as { NOT: { OR: Array<{ createdAt: { lt: Date }; type: Record<string, string[]> }> } }
-  assert.equal(both.NOT.OR.length, 2)
-  const [xeroPart, wooPart] = both.NOT.OR
-  assert.equal(xeroPart!.createdAt.lt.toISOString(), XERO_AT.toISOString())
+test('the where-fragments: none without a floor (the legacy query); the note, the unclassified types and Xero each have their own clause', () => {
+  assert.deepEqual(xeroNotBeforeCutoffWhere(null, null, null), {})
+  assert.deepEqual(xeroNotNeverDeliverablePendingWhere(null, null, null), {})
+  const noteOnly = xeroNotBeforeCutoffWhere(null, X_AT, null) as { NOT: { createdAt: { lt: Date }; type: { in: string[] } } }
+  assert.equal(noteOnly.NOT.createdAt.lt.toISOString(), X_AT.toISOString())
+  assert.deepEqual(noteOnly.NOT.type.in, ['WC_INVOICE_NOTE'])
+  const all = xeroNotBeforeCutoffWhere(X_AT, X_AT, M_AT) as { NOT: { OR: Array<{ createdAt: { lt: Date }; type: Record<string, string[]> }> } }
+  const hasUnmapped = UNMAPPED_SYNC_TYPES.length > 0 // today every enum type is classified, so the clause for unclassified types is absent
+  assert.equal(all.NOT.OR.length, hasUnmapped ? 3 : 2)
+  const [xeroPart, notePart, unmappedPart] = all.NOT.OR
+  assert.equal(xeroPart!.createdAt.lt.toISOString(), X_AT.toISOString())
   assert.ok(xeroPart!.type.notIn!.includes('WC_INVOICE_NOTE') && xeroPart!.type.notIn!.includes('INVOICE_PDF'))
-  assert.equal(wooPart!.createdAt.lt.toISOString(), WOO_AT.toISOString())
-  const pending = xeroNotNeverDeliverablePendingWhere(XERO_AT, WOO_AT) as { NOT: { OR: Array<{ status: string }> } }
-  assert.deepEqual(pending.NOT.OR.map((part) => part.status), ['PENDING', 'PENDING'], 'a PROCESSING row is never excluded from the wait')
-  // The fragment keeps to the single NOT key: the claim predicates spread it next to their own OR.
-  assert.deepEqual(Object.keys(both), ['NOT'])
+  assert.equal(notePart!.createdAt.lt.toISOString(), X_AT.toISOString())
+  assert.deepEqual(notePart!.type.in, ['WC_INVOICE_NOTE'])
+  if (hasUnmapped) {
+    assert.equal(unmappedPart!.createdAt.lt.toISOString(), M_AT.toISOString(), 'a type nobody classified is floored by the destination-level (earliest-open) WooCommerce floor')
+    assert.deepEqual([...unmappedPart!.type.in!].sort(), [...UNMAPPED_SYNC_TYPES].sort())
+  }
+  const pending = xeroNotNeverDeliverablePendingWhere(X_AT, X_AT, M_AT) as { NOT: { OR: Array<{ status: string }> } }
+  assert.deepEqual(pending.NOT.OR.map((part) => part.status), hasUnmapped ? ['PENDING', 'PENDING', 'PENDING'] : ['PENDING', 'PENDING'], 'a PROCESSING row is never excluded from the wait')
+  assert.deepEqual(Object.keys(all), ['NOT'], 'the fragment keeps to the single NOT key: the claim predicates spread it next to their own OR')
 })
 
-test('BOUNDARY: a row created at the instant the decision went live is not before the floor; one millisecond earlier is', () => {
-  const env = bothLive()
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: WOO_AT, type: 'WC_INVOICE_NOTE' }, { env, now: WOO_AT }), null, 'decided live at the instant, created at the instant: sendable')
-  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date(WOO_AT.getTime() - 1), type: 'WC_INVOICE_NOTE' }, { env, now: WOO_AT }), null)
-  assert.equal(createdBeforeCutoffFloor(WOO_AT, WOO_AT), false)
-  assert.equal(createdBeforeCutoffFloor(new Date(WOO_AT.getTime() - 1), WOO_AT), true)
+test('BOUNDARY: a note created at its own step\'s instant is not before the floor; one millisecond earlier is', () => {
+  const env = allSteps()
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: X_AT, type: 'WC_INVOICE_NOTE' }, { env, now: X_AT }), null, 'decided live at the instant, created at the instant: sendable')
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date(X_AT.getTime() - 1), type: 'WC_INVOICE_NOTE' }, { env, now: X_AT }), null)
+  assert.equal(createdBeforeCutoffFloor(X_AT, X_AT), false)
+  assert.equal(createdBeforeCutoffFloor(new Date(X_AT.getTime() - 1), X_AT), true)
 })
 
-test('an explicit type the ownership map does not name is judged by BOTH floors: refused under WooCommerce-only enforcement, and by the WooCommerce clause of the fragment', () => {
-  const wooOnly = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: WOO_AT.toISOString() }
-  const xeroOnly = live()
-  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'A_TYPE_NOBODY_MAPPED' }, { env: wooOnly, now: LATER }), null, 'WooCommerce-only: the unmapped type is refused by the WooCommerce floor')
-  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: new Date('2026-11-01T00:00:00Z'), type: 'A_TYPE_NOBODY_MAPPED' }, { env: xeroOnly, now: NOW }), null, 'Xero-only: refused by the Xero floor')
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER, type: 'A_TYPE_NOBODY_MAPPED' }, { env: bothLive(), now: LATER }), null, 'created after both: sendable')
-  assert.equal(xeroBeforeCutoffRefusal({ createdAt: PRE_WOO, type: 'INVOICE_PDF' }, { env: wooOnly, now: LATER }), null, 'a PDF fetch still has no floor')
-  // The fragment: every enum type the map does not name is in the WooCommerce clause as well as the Xero one.
+test('an explicit type the ownership map does not name is judged by BOTH destinations: the unclassified type is floored by the earliest-open WooCommerce floor and by Xero\'s', () => {
+  const wooOnly = onlyStep('woocommerce', W_AT)
+  const xeroOnly = onlyStep('xero', X_AT)
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_M, type: 'A_TYPE_NOBODY_MAPPED' }, { env: wooOnly, now: LATER }), null, 'WooCommerce-only: refused by the WooCommerce floor')
+  assert.notEqual(xeroBeforeCutoffRefusal({ createdAt: PRE_M, type: 'A_TYPE_NOBODY_MAPPED' }, { env: xeroOnly, now: LATER }), null, 'Xero-only: refused by the Xero floor')
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: LATER, type: 'A_TYPE_NOBODY_MAPPED' }, { env: allSteps(), now: LATER }), null, 'created after both: sendable')
+  assert.equal(xeroBeforeCutoffRefusal({ createdAt: PRE_M, type: 'INVOICE_PDF' }, { env: wooOnly, now: LATER }), null, 'a PDF fetch still has no floor')
   for (const type of UNMAPPED_SYNC_TYPES) assert.ok(WOO_FLOORED_TYPES.includes(type), `${type} is floored by WooCommerce too`)
-  assert.ok(WOO_FLOORED_TYPES.includes('WC_INVOICE_NOTE'))
-  const both = xeroNotBeforeCutoffWhere(XERO_AT, WOO_AT) as { NOT: { OR: Array<{ type: Record<string, string[]> }> } }
-  assert.deepEqual([...both.NOT.OR[1]!.type.in!].sort(), [...WOO_FLOORED_TYPES].sort())
-  assert.ok(!both.NOT.OR[0]!.type.notIn!.some((type) => UNMAPPED_SYNC_TYPES.includes(type)), 'and the Xero clause still floors them')
 })
 
-test('the outbox fragment: a note delivery job is moved from the Xero clause to the WooCommerce clause by id; no ids leave the fragment as before', () => {
+test('the outbox fragment: a note delivery job is judged by the NOTE\'s floor (step X), by id; no ids leave the fragment as before', () => {
   const saved = { ...process.env }
   try {
-    process.env[PRODUCER_HOLD_ENFORCED_ENV] = 'xero,woocommerce'
-    process.env[OUTBOUND_GRANT_ENV.xero] = TENANT
-    process.env[PRODUCER_CUTOFF_ENV.xero] = XERO_AT.toISOString()
-    process.env[OUTBOUND_GRANT_ENV.woocommerce] = SHOP
-    process.env[PRODUCER_CUTOFF_ENV.woocommerce] = WOO_AT.toISOString()
+    for (const [key, value] of Object.entries(allSteps())) process.env[key] = value
     const plain = outboxBeforeCutoffWhere({ now: LATER }) as { OR: Array<Record<string, unknown>> }
-    assert.equal(plain.OR.length, 2)
     assert.ok(!plain.OR.some((clause) => 'id' in clause), 'no ids: the legacy fragment exactly')
     const withIds = outboxBeforeCutoffWhere({ now: LATER, wooAccountingJobIds: ['job-1'] }) as { OR: Array<Record<string, unknown>> }
     const xeroClause = withIds.OR.find((clause) => clause.connector === 'xero')!
     assert.deepEqual(xeroClause.id, { notIn: ['job-1'] })
-    const wooIdClause = withIds.OR.find((clause) => !('connector' in clause))!
-    assert.deepEqual(wooIdClause.id, { in: ['job-1'] })
-    assert.equal((wooIdClause.createdAt as { lt: Date }).lt.toISOString(), WOO_AT.toISOString())
+    const idClause = withIds.OR.find((clause) => !('connector' in clause))!
+    assert.deepEqual(idClause.id, { in: ['job-1'] })
+    assert.equal((idClause.createdAt as { lt: Date }).lt.toISOString(), X_AT.toISOString(), 'the note\'s own step, not the earliest step that opened WooCommerce')
+    // Per-operation clauses for the WooCommerce jobs themselves: stock at W, the invoice document at X, the completions at M.
+    const byOperation = new Map<string, string>()
+    for (const clause of withIds.OR.filter((entry) => entry.connector === 'woocommerce')) {
+      const ops = (clause.operation as { in?: string[] } | undefined)?.in ?? []
+      for (const op of ops) byOperation.set(op, (clause.createdAt as { lt: Date }).lt.toISOString())
+    }
+    assert.equal(byOperation.get('stock.push'), W_AT.toISOString())
+    assert.equal(byOperation.get('order.invoice-document'), X_AT.toISOString())
+    assert.equal(byOperation.get('order.complete'), M_AT.toISOString())
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]
     Object.assign(process.env, saved)

@@ -7,6 +7,11 @@ mock.module('@/lib/activity-log', {
   namedExports: {
     logActivityPersisted: async (entry: { action: string; userId?: string | null; level?: string }) => { logged.push(entry); return logResult },
     logActivity: async (entry: { action: string }) => { logged.push(entry as never) },
+    // Inside the transaction: a failed audit write THROWS (and so rolls the row back), it does not report false.
+    logActivityInTransaction: async (_tx: unknown, entry: { action: string; userId?: string | null; level?: string }) => {
+      if (!logResult) throw new Error('audit write failed')
+      logged.push(entry)
+    },
   },
 })
 
@@ -20,12 +25,27 @@ const load = async () => ({
 type Row = { id: string; kind: string; attestedAt: Date; userId: string }
 function fakeDb(throwOnRead = false) {
   const rows: Row[] = []
+  const tx = {
+    writerAttestation: {
+      create: async ({ data }: { data: { kind: string; userId: string } }) => { const row = { id: `a${rows.length + 1}`, kind: data.kind, attestedAt: new Date(`2026-12-0${rows.length + 1}T00:00:00Z`), userId: data.userId }; rows.push(row); return row },
+    },
+    activityLog: {},
+  }
   return {
     rows,
     db: {
       writerAttestation: {
-        create: async ({ data }: { data: { kind: string; userId: string } }) => { const row = { id: `a${rows.length + 1}`, kind: data.kind, attestedAt: new Date(`2026-12-0${rows.length + 1}T00:00:00Z`), userId: data.userId }; rows.push(row); return row },
         findFirst: async ({ where }: { where: { kind: string } }) => { if (throwOnRead) throw new Error('read failed'); return rows.filter((r) => r.kind === where.kind).sort((a, b) => b.attestedAt.getTime() - a.attestedAt.getTime())[0] ?? null },
+      },
+      // A real transaction rolls back everything the callback wrote when it throws; the double does the same for the rows.
+      $transaction: async <T,>(fn: (client: typeof tx) => Promise<T>): Promise<T> => {
+        const before = rows.length
+        try {
+          return await fn(tx)
+        } catch (error) {
+          rows.length = before
+          throw error
+        }
       },
     },
   }
@@ -46,6 +66,9 @@ test('recording writes the row AND an audit-log entry; an unknown kind, a missin
   const unlogged = await store.recordWriterAttestation(db as never, { kind: 'qoblex-xero-stopped', userId: 'user-1' })
   assert.equal(unlogged.ok, false)
   assert.match((unlogged as { error: string }).error, /audit-log/)
+  assert.equal(rows.length, 1, 'THE ROW AND ITS AUDIT-LOG ENTRY ARE ONE TRANSACTION: a failed audit write rolls the confirmation back, so a refused confirmation is never in force')
+  assert.equal(await store.latestWriterAttestation(db as never, 'qoblex-xero-stopped'), null)
+  logResult = true
 })
 
 test('the setting guard: wc_stock_sync_enabled=true is refused without the stock attestation; xero_sync_enabled=true is NOT guarded (P1 reads from Xero) (MUTATION: drop the guard => red)', async () => {
@@ -91,4 +114,9 @@ test('writers:attest records with --yes only, lists, and refuses bad arguments (
   for (const bad of [['--kind', 'qoblex-xero-stopped'], ['--kind', 'other', '--by', 'x'], ['--bogus'], ['--kind'], []]) assert.equal(await run(bad), 3, JSON.stringify(bad))
   logResult = false
   assert.equal(await run(['--kind', 'qoblex-xero-stopped', '--by', 'owner', '--yes']), 5)
+})
+
+test('first load: writer_attestations is CONFIG_ALLOWED, so a confirmation recorded BEFORE the initial load does not block it (it is installation state, never business data)', async () => {
+  const { TABLE_CLASSES } = await import('../lib/first-load/apply/table-classes')
+  assert.equal(TABLE_CLASSES.writer_attestations?.kind, 'CONFIG_ALLOWED')
 })

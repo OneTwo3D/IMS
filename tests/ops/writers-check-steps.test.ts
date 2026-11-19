@@ -211,3 +211,47 @@ test('the readers: unbuilt sources answer not-built (never clean); the two attes
   assert.deepEqual(broken.QOBLEX_XERO_STOPPED, { state: 'unreadable' })
   assert.equal(Object.keys(STEP_EVIDENCE_READERS).length, STEP_EVIDENCE_KINDS.length)
 })
+
+test('P2-W FAILS without the qoblex-stock-push-stopped confirmation EVEN WHEN wc_stock_sync_enabled is already on, and IMS is not counted as able to write stock (MUTATION: drop the requirement or the per-operation delivery check => red)', () => {
+  assert.equal(SETTINGS_ON.get('wc_stock_sync_enabled'), 'true', 'precondition: the stock switch is already on (turned on in P1, where stock is shadowed)')
+  const absent = evaluateWritersCheck(inputs(STEP_MW, { stepEvidence: { ...clean(), QOBLEX_STOCK_PUSH_STOPPED: { state: 'absent' } } }))
+  assert.equal(absent.phase, 'P2-W')
+  assert.ok(absent.findings.some((f) => f.code === 'attestation-missing' && f.subject === 'QOBLEX_STOCK_PUSH_STOPPED' && f.severity === 'fail'), JSON.stringify(absent.findings))
+  assert.equal(absent.verdict, 'step-gap')
+  assert.notEqual(absent.exitCode, 0)
+  assert.equal(absent.operations.find((op) => op.key === 'woocommerce.stock')?.imsCanWrite, false, 'the producer holds the stock push without the confirmation')
+  const present = evaluateWritersCheck(inputs(STEP_MW))
+  assert.equal(present.operations.find((op) => op.key === 'woocommerce.stock')?.imsCanWrite, true)
+  assert.ok(!present.findings.some((f) => f.subject === 'QOBLEX_STOCK_PUSH_STOPPED'))
+})
+
+test('the legacy single-variable configuration is flagged: WC_WRITES_LIVE_FROM without MINTSOFT_WRITES_LIVE_FROM fails; MINTSOFT_WRITES_LIVE_FROM with the WooCommerce grant but no WC_WRITES_LIVE_FROM warns', () => {
+  // (a) the old stage/e2e shape: the WooCommerce variable alone.
+  const wcOnly = evaluateWritersCheck(inputs({ ...GRANTS, WC_WRITES_LIVE_FROM: W_AT }))
+  const legacyA = wcOnly.findings.find((f) => f.code === 'legacy-live-from')
+  assert.ok(legacyA, JSON.stringify(wcOnly.findings))
+  assert.equal(legacyA.severity, 'fail')
+  assert.match(legacyA.message, /MINTSOFT_WRITES_LIVE_FROM/)
+  assert.match(legacyA.message, /docs\/installation\.md/)
+  assert.notEqual(wcOnly.exitCode, 0)
+  // (b) the Mintsoft variable with the WooCommerce grant: formerly held, now step M writes WooCommerce. A warning only: it is also the intended step-M configuration.
+  const mintsoftWithGrant = evaluateWritersCheck(inputs(STEP_M))
+  const legacyB = mintsoftWithGrant.findings.find((f) => f.code === 'legacy-live-from')
+  assert.ok(legacyB)
+  assert.equal(legacyB.severity, 'warn')
+  assert.ok(!mintsoftWithGrant.findings.some((f) => f.severity === 'fail' && f.code === 'legacy-live-from'), 'a warning is not a failure of its own')
+  // The designed configurations raise nothing.
+  assert.ok(!evaluateWritersCheck(inputs({})).findings.some((f) => f.code === 'legacy-live-from'), 'P1')
+  assert.ok(!evaluateWritersCheck(inputs(STEP_MW)).findings.some((f) => f.code === 'legacy-live-from'), 'steps M and W')
+  assert.ok(!evaluateWritersCheck(inputs(STEP_MWX)).findings.some((f) => f.code === 'legacy-live-from'), 'steps M, W and X')
+})
+
+test('the startup finding is the same pure function: a legacy environment names itself, a designed one is silent', async () => {
+  const { legacyLiveFromFindings } = await import('../../lib/security/live-from-legacy-config')
+  assert.deepEqual(legacyLiveFromFindings({}), [])
+  assert.deepEqual(legacyLiveFromFindings({ WC_WRITES_LIVE_FROM: W_AT, MINTSOFT_WRITES_LIVE_FROM: M_AT }), [])
+  assert.deepEqual(legacyLiveFromFindings({ WC_WRITES_LIVE_FROM: '' }), [], 'empty is unset')
+  assert.deepEqual(legacyLiveFromFindings({ WC_WRITES_LIVE_FROM: W_AT }).map((f) => f.code), ['legacy-wc-only-live-from'])
+  assert.deepEqual(legacyLiveFromFindings({ MINTSOFT_WRITES_LIVE_FROM: M_AT, WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test' }).map((f) => f.code), ['legacy-mintsoft-live-from-with-wc-grant'])
+  assert.deepEqual(legacyLiveFromFindings({ MINTSOFT_WRITES_LIVE_FROM: M_AT }), [], 'no WooCommerce grant: nothing changes for WooCommerce')
+})

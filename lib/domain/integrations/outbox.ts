@@ -11,6 +11,7 @@ import {
   uniqueViolationTargetsField,
 } from '@/lib/db/prisma-unique-violation'
 import {
+  INTEGRATION_OUTBOX_REGISTRY,
   integrationOutboxStaleReclaimScope,
   OUTBOX_CUTOFF_CONNECTORS,
   outboxDestinationOf,
@@ -24,7 +25,7 @@ import { withSavepoint } from '@/lib/db/savepoint'
 import { recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
 import { producerBeforeCutoffNotice, producerShadowNotice, type ProducerReason } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecision } from '@/lib/security/producer-disposition'
-import { createdBeforeCutoffFloor, producerCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { createdBeforeCutoffFloor, producerCutoffFloor, producerOperationCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
 import { floorDestinationsForType, WOO_SYNC_TYPES } from '@/lib/domain/accounting/xero-producer-seam'
 import { ownershipTargetForOutboxOperation, type MappedOperation } from '@/lib/security/writer-ownership-map'
 
@@ -370,17 +371,42 @@ export function outboxBeforeCutoffWhere(context: { now?: Date; wooAccountingJobI
   // jobs whose row writes to WooCommerce (the invoice note) are resolved in SQL by the claim ({@link wooAccountingPostJobIds}) and are judged
   // by the WooCommerce floor instead of the Xero one; every other job keeps its connector's floor.
   const wooJobIds = context.wooAccountingJobIds ?? []
+  const floorContext = context.now ? { now: context.now } : {}
   for (const connector of OUTBOX_CUTOFF_CONNECTORS) {
-    const floor = producerCutoffFloor(connector, context.now ? { now: context.now } : {})
-    if (floor === null) continue
+    const floor = producerCutoffFloor(connector, floorContext)
     const internal = outboxInternalOperationsOf(connector)
+    if (connector === 'woocommerce') {
+      // WooCommerce is written by three steps, and a job is floored by the instant of ITS OWN operation's step, not of the earliest step that opened the
+      // destination: a stock job queued while only step M was live predates step W's instant and is never delivered.
+      const registered = Object.keys((INTEGRATION_OUTBOX_REGISTRY as Record<string, Record<string, unknown>>).woocommerce ?? {})
+      const byFloor = new Map<number, { floor: Date; operations: string[] }>()
+      for (const operation of registered) {
+        if (internal.includes(operation)) continue
+        const own = outboxOperationCutoffFloor('woocommerce', operation, floorContext)
+        if (own === null) continue
+        const entry = byFloor.get(own.getTime()) ?? { floor: own, operations: [] }
+        entry.operations.push(operation)
+        byFloor.set(own.getTime(), entry)
+      }
+      for (const entry of byFloor.values()) {
+        clauses.push({ connector, createdAt: { lt: entry.floor }, operation: { in: entry.operations } })
+      }
+      // An operation this build does not know is governed (fail closed) by the destination-level floor.
+      if (floor !== null) clauses.push({ connector, createdAt: { lt: floor }, operation: { notIn: registered } })
+      // The delivery half of an accounting row that writes to WooCommerce (the invoice note): its own operation's floor.
+      if (wooJobIds.length > 0) {
+        const noteFloor = producerOperationCutoffFloor('woocommerce', 'order.invoice-note', floorContext)
+        if (noteFloor !== null) clauses.push({ id: { in: [...wooJobIds] }, createdAt: { lt: noteFloor } })
+      }
+      continue
+    }
+    if (floor === null) continue
     clauses.push({
       connector,
       createdAt: { lt: floor },
       ...(internal.length > 0 ? { operation: { notIn: internal } } : {}),
       ...(connector === 'xero' && wooJobIds.length > 0 ? { id: { notIn: [...wooJobIds] } } : {}),
     })
-    if (connector === 'woocommerce' && wooJobIds.length > 0) clauses.push({ id: { in: [...wooJobIds] }, createdAt: { lt: floor } })
   }
   return clauses.length > 0 ? { OR: clauses } : null
 }
@@ -402,6 +428,7 @@ function scopeMayIncludeAccountingPost(scope: { connector?: string; operation?: 
 export async function wooAccountingPostJobIds(now: Date): Promise<string[]> {
   const context = { now }
   if (producerCutoffFloor('xero', context) === null && producerCutoffFloor('woocommerce', context) === null) return []
+  // (the invoice note's own floor is never earlier than the destination's, so a destination floor in force is the right guard for the query)
   const rows = await db.$queryRaw<Array<{ id: string }>>`
     SELECT o.id FROM integration_outbox o
     JOIN accounting_sync_logs s ON s.id = o."payloadJson"->>'accountingSyncLogId'
@@ -411,11 +438,27 @@ export async function wooAccountingPostJobIds(now: Date): Promise<string[]> {
   return rows.map((row) => row.id)
 }
 
+/**
+ * The floor of ONE operation of a vendor connector. WooCommerce operations are floored by the instant of the operation's own step (found through the
+ * ownership map); every other connector, and a WooCommerce operation the map does not name, by the connector's own destination-level floor.
+ */
+export function outboxOperationCutoffFloor(connector: string, operation: string, context: { now?: Date } = {}): Date | null {
+  if (!(OUTBOX_CUTOFF_CONNECTORS as readonly string[]).includes(connector)) return null
+  const floorContext = context.now ? { now: context.now } : {}
+  if (connector === 'woocommerce') {
+    const target = ownershipTargetForOutboxOperation(`${connector}/${operation}`)
+    if (target !== null && target.destination === 'woocommerce') {
+      return producerOperationCutoffFloor('woocommerce', target.operation as MappedOperation<'woocommerce'>, floorContext)
+    }
+  }
+  return producerCutoffFloor(connector as (typeof OUTBOX_CUTOFF_CONNECTORS)[number], floorContext)
+}
+
 /** The floor that applies to ONE job (null when none), for a path that holds the row rather than a query. */
 export function outboxRowCutoffFloor(connector: string, operation: string, context: { now?: Date } = {}): Date | null {
   if (!(OUTBOX_CUTOFF_CONNECTORS as readonly string[]).includes(connector)) return null
   if (outboxInternalOperationsOf(connector as (typeof OUTBOX_CUTOFF_CONNECTORS)[number]).includes(operation)) return null
-  return producerCutoffFloor(connector as (typeof OUTBOX_CUTOFF_CONNECTORS)[number], context.now ? { now: context.now } : {})
+  return outboxOperationCutoffFloor(connector, operation, context)
 }
 
 /**
@@ -439,7 +482,10 @@ export async function currentOutboxRowBeforeCutoff(
     // A row that cannot be read keeps the connector's own floor (fail closed on the Xero one).
     const destinations: OutboundConnector[] = row ? floorDestinationsForType(row.type) : ['xero']
     for (const destination of destinations) {
-      const own = (OUTBOX_CUTOFF_CONNECTORS as readonly string[]).includes(destination) ? producerCutoffFloor(destination as (typeof OUTBOX_CUTOFF_CONNECTORS)[number], context) : null
+      // A row that writes to WooCommerce is judged by its own operation's floor (the invoice note: step X), a type nobody classified by the destination's.
+      const own = destination === 'woocommerce' && row && WOO_SYNC_TYPES.includes(row.type)
+        ? producerOperationCutoffFloor('woocommerce', 'order.invoice-note', context)
+        : (OUTBOX_CUTOFF_CONNECTORS as readonly string[]).includes(destination) ? producerCutoffFloor(destination as (typeof OUTBOX_CUTOFF_CONNECTORS)[number], context) : null
       if (own !== null && createdBeforeCutoffFloor(current?.createdAt, own)) return own
     }
     return null

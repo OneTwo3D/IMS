@@ -5,12 +5,13 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 /**
- * THE WOOCOMMERCE INVOICE NOTE IS FLOORED BY THE WOOCOMMERCE LIVE-FROM INSTANT, AGAINST A REAL DATABASE.
+ * THE WOOCOMMERCE INVOICE NOTE IS FLOORED BY ITS OWN STEP'S LIVE-FROM INSTANT (STEP X), AGAINST A REAL DATABASE.
  *
- * A WC_INVOICE_NOTE is an accounting sync-log row whose destination is WooCommerce. WooCommerce and Xero go live at different
- * instants, so the note's claim, selection and last check use the WooCommerce one. Each layer is tested in isolation (the claim
- * statement, the shared selection predicate, the last check before the transport), with Xero live earlier than WooCommerce so a row
- * created between the two instants tells the two floors apart. Also here: the boundary between the producer's decision time and the
+ * A WC_INVOICE_NOTE is an accounting sync-log row whose destination is WooCommerce, but its operation (order.invoice-note) belongs to step X: Xeroom
+ * writes it until then. The destination is also written by step W (stock) and step M (the bridge writeback), and those steps going live must NOT floor,
+ * open or release the note: the claim, selection and last check use the note's own instant (XERO_WRITES_LIVE_FROM), and every fixture below sets the three
+ * live-from values to DIFFERENT instants so a row created between two of them tells the floors apart. Each layer is tested in isolation (the claim
+ * statement, the shared selection predicate, the last check before the transport). Also here: the boundary between the producer's decision time and the
  * stamped creation time (a row decided LIVE is never stamped before the instant). Nothing contacts any vendor: every layer under test
  * refuses before a transport call, and tests/no-outbound-network.cjs fails a test that tried.
  *
@@ -29,21 +30,23 @@ if (skip && process.env.REQUIRE_DB_RETENTION_TESTS === '1') {
 
 const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
 const ENV_KEYS = [
-  'PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM', 'MINTSOFT_WRITES_LIVE_FROM',
+  'PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM', 'MINTSOFT_WRITES_LIVE_FROM', 'MINTSOFT_WRITE_ALLOWED',
 ]
 const DAY = 86_400_000
-// The steps go live in the order M, W, X, and the WooCommerce invoice note is step X's work on a destination that steps W (and M) also write: its floor is the
-// EARLIEST live instant among the steps that write to WooCommerce. WooCommerce went live three days ago, Xero one day ago: a row from two days ago is after the first
-// (a note is deliverable) and before the second (a Xero write is not).
+// The steps go live in the order M, W, X, and the WooCommerce invoice note is step X's work on a destination that steps W (and M) also write: its floor is its OWN
+// step's instant. Step M four days ago, WooCommerce (step W) three days ago, Xero (step X) one day ago: a row from two days ago is after W and before X, so a note
+// (and a Xero write) created then still belongs to the earlier writer.
+const M_AT = new Date(Date.now() - 4 * DAY)
 const WOO_AT = new Date(Date.now() - 3 * DAY)
 const XERO_AT = new Date(Date.now() - DAY)
-const BEFORE_BOTH = new Date(Date.now() - 5 * DAY)
+const BEFORE_BOTH = new Date(Date.now() - 6 * DAY)
 const BETWEEN = new Date(Date.now() - 2 * DAY)
 const AFTER_BOTH = new Date(Date.now() - 60_000)
 const iso = (date: Date) => date.toISOString().replace(/\.\d+Z$/, 'Z')
 const bothLive = {
   PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero,woocommerce', XERO_WRITE_ALLOWED_TENANT: TENANT, XERO_WRITES_LIVE_FROM: iso(XERO_AT),
   WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(WOO_AT),
+  MINTSOFT_WRITE_ALLOWED: 'https://wms.example.test|89', MINTSOFT_WRITES_LIVE_FROM: iso(M_AT),
 }
 
 async function deps() {
@@ -93,7 +96,7 @@ const claim = (d: Deps, row: { id: string }, type: string) => d.processor.claimA
   { id: row.id, type: type as never, referenceType: 'SalesOrder', referenceId: 'x', attemptRevision: 0 }, new Date(), staleCutoff(), { id: row.id, attemptRevision: 1 },
 )
 
-test('NOTE CLAIM STATEMENT: refused before the WooCommerce instant; claimed after it even though Xero is not yet live for a Xero row; a Xero row between the two instants is refused', { skip }, async (t) => {
+test('NOTE CLAIM STATEMENT: refused before ITS OWN step\'s instant (X) even though steps M and W are already live; claimed after it; a Xero row between W and X is refused too', { skip }, async (t) => {
   const d = await deps()
   const tag = tagOf()
   t.after(() => cleanup(d, tag))
@@ -113,12 +116,12 @@ test('NOTE CLAIM STATEMENT: refused before the WooCommerce instant; claimed afte
     }
     console.log(`# note claim: ${JSON.stringify(outcomes)}`)
     assert.equal(outcomes.early, 'not-claimable')
-    assert.equal(outcomes.between, 'claimed', 'created after the WooCommerce instant: a note is past its floor')
+    assert.equal(outcomes.between, 'not-claimable', 'created after step W but before step X: the note is still its former writer\'s (Xeroom), whatever else is live')
     assert.equal(outcomes.late, 'claimed')
     assert.equal(outcomes.xeroBetween, 'not-claimable', 'the same creation time is before the Xero instant for a Xero write')
     assert.equal(outcomes.xeroEarly, 'not-claimable')
-    const untouched = await d.db.accountingSyncLog.findUnique({ where: { id: xeroBetween.id }, select: { status: true, attemptRevision: true, processingStartedAt: true } })
-    assert.deepEqual([untouched?.status, untouched?.attemptRevision, untouched?.processingStartedAt], ['PENDING', 0, null], 'the refused row was not touched at all')
+    const untouched = await d.db.accountingSyncLog.findUnique({ where: { id: between.id }, select: { status: true, attemptRevision: true, processingStartedAt: true } })
+    assert.deepEqual([untouched?.status, untouched?.attemptRevision, untouched?.processingStartedAt], ['PENDING', 0, null], 'the refused note was not touched at all')
   })
   await withEnv({}, async () => {
     assert.equal((await claim(d, control, 'WC_INVOICE_NOTE')).outcome, 'claimed', 'CONTROL, switch off: the same note is claimed (legacy)')
@@ -128,6 +131,11 @@ test('NOTE CLAIM STATEMENT: refused before the WooCommerce instant; claimed afte
   await withEnv({ ...bothLive, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }, async () => {
     const row = await seed(d, `${tag}-xero-only`, 'WC_INVOICE_NOTE', BEFORE_BOTH)
     assert.equal((await claim(d, row, 'WC_INVOICE_NOTE')).outcome, 'claimed', 'WooCommerce not enforced: no WooCommerce floor, and the Xero floor does not govern the note')
+  })
+  // ONLY the step-W variable set (no step X): the note has no floor at all, so it is the per-operation delivery gate (not the floor) that holds it.
+  await withEnv({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(WOO_AT) }, async () => {
+    const row = await seed(d, `${tag}-only-w`, 'WC_INVOICE_NOTE', BEFORE_BOTH)
+    assert.equal((await claim(d, row, 'WC_INVOICE_NOTE')).outcome, 'claimed', 'only step W live: the note\'s step is not live, so no floor applies (the claim boundary holds it instead)')
   })
 })
 
@@ -232,10 +240,11 @@ test('BOUNDARY: a job the producer decided LIVE is never stamped before the inst
 
 // ---- The delivery half (the `xero/accounting.post` outbox job) and the retirement follow the row's destination, in both cut-off orders -------
 
-// Only the designed order exists: WooCommerce (step W) goes live before Xero (step X). A note's floor is the earliest live instant among the steps that write to WooCommerce,
-// so the order "Xero first" would floor the note by Xero's instant: that is covered by tests/security/producer-cutoff-floor.test.ts.
+// Both orders of the two instants, as before: the note is floored by step X's instant in either, whatever step W's is. (writers:check fails "Xero first" as a
+// wrong order; the FLOOR is still well defined, and a note must never be released by an unrelated step.)
 const ORDERS = [
   { name: 'WooCommerce goes live FIRST', xero: new Date(Date.now() - DAY), woo: new Date(Date.now() - 3 * DAY) },
+  { name: 'Xero goes live FIRST', xero: new Date(Date.now() - 3 * DAY), woo: new Date(Date.now() - DAY) },
 ] as const
 const envFor = (order: (typeof ORDERS)[number]) => ({ ...bothLive, XERO_WRITES_LIVE_FROM: iso(order.xero), WC_WRITES_LIVE_FROM: iso(order.woo) })
 const MIDDLE = new Date(Date.now() - 2 * DAY) // between the two instants in both orders
@@ -253,12 +262,12 @@ async function seedJob(d: Deps, tag: string, syncLogId: string, createdAt: Date)
 }
 
 for (const order of ORDERS) {
-  test(`OUTBOX CLAIM, ${order.name}: the delivery job of a note is floored by the WooCommerce instant, a Xero row's job by the Xero one, whichever is later`, { skip }, async (t) => {
+  test(`OUTBOX CLAIM, ${order.name}: the delivery job of a note is floored by its own step's (X) instant, the same one as a Xero row's job, in either order of W and X`, { skip }, async (t) => {
     const d = await deps()
     const tag = tagOf()
     t.after(() => cleanup(d, tag))
     const cases = [
-      { key: 'note-middle', type: 'WC_INVOICE_NOTE', at: MIDDLE, wooLive: order.woo.getTime() <= MIDDLE.getTime() },
+      { key: 'note-middle', type: 'WC_INVOICE_NOTE', at: MIDDLE, wooLive: order.xero.getTime() <= MIDDLE.getTime() },
       { key: 'note-oldest', type: 'WC_INVOICE_NOTE', at: OLDEST, wooLive: false },
       { key: 'note-newest', type: 'WC_INVOICE_NOTE', at: NEWEST, wooLive: true },
       { key: 'bill-middle', type: 'BILL_PAYMENT', at: MIDDLE, wooLive: order.xero.getTime() <= MIDDLE.getTime() },

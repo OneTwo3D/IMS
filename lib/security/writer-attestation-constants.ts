@@ -37,11 +37,27 @@ export const ATTESTATION_GUARDED_SETTINGS: Readonly<Record<string, WriterAttesta
 }
 
 /**
- * The confirmation a step's WRITES need before the producer decision may call them LIVE (the writers:check phase needs the same one). Step X moves Xero posting from
- * Qoblex to IMS, so IMS stays held until the owner has said Qoblex stopped. `xero_sync_enabled` itself is NOT guarded: P1 reads from Xero with it on.
+ * The confirmation a step's WRITES need before they may be DELIVERED (the producer decision does not look at it: work is produced and queued, and the
+ * drains hold it until the owner's word is on record, so nothing is ever shadowed for good because a confirmation had not been read yet). Step X moves
+ * Xero posting from Qoblex to IMS, so IMS holds until the owner has said Qoblex stopped. `xero_sync_enabled` itself is NOT guarded: P1 reads from Xero with it on.
  */
 export const STEP_LIVE_ATTESTATION: Readonly<Partial<Record<LiveWriterStep, WriterAttestationKind>>> = {
   xero: 'qoblex-xero-stopped',
+}
+
+/**
+ * The same, for ONE OPERATION of a step whose other operations need nothing. Step W holds the WooCommerce stock push on the Qoblex stock confirmation;
+ * its webhooks stay separate (no incumbent pushes webhooks). Keyed `<destination>/<operation>`.
+ */
+export const OPERATION_LIVE_ATTESTATION: Readonly<Record<string, WriterAttestationKind>> = {
+  'woocommerce/stock': 'qoblex-stock-push-stopped',
+}
+
+/** The confirmation the delivery of `destination`/`operation` (a row of `step`) waits for, or undefined when it waits for none. */
+export function requiredAttestationFor(destination: string, operation: string, step: string): WriterAttestationKind | undefined {
+  const own = OPERATION_LIVE_ATTESTATION[`${destination}/${operation}`]
+  if (own !== undefined) return own
+  return (STEP_LIVE_ATTESTATION as Readonly<Record<string, WriterAttestationKind | undefined>>)[step]
 }
 
 export function attestationRefusalText(setting: string, kind: WriterAttestationKind): string {

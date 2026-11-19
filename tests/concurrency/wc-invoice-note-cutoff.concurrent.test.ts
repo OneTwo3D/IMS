@@ -8,7 +8,7 @@ import { config } from 'dotenv'
 /**
  * SIXTEEN CLAIMERS AND A RE-QUEUE RACE FOR WOOCOMMERCE INVOICE NOTES ACROSS THE WOOCOMMERCE INSTANT.
  *
- * Xero went live earlier than WooCommerce, so a note created between the two instants belongs to its former writer. Sixteen workers
+ * The note belongs to step X: a note created before the Xero instant belongs to its former writer, whatever WooCommerce's own (step W) instant is. Sixteen workers
  * race to claim each such note, while the same-statement re-queue (the clause the every-run reset of FAILED rows carries) tries to make a
  * FAILED one claimable again. The claim is a compare-and-set in PostgreSQL, so no double can show it. Invariants: a pre-instant note is
  * claimed by NOBODY and never leaves FAILED/PENDING untouched; a post-instant note is claimed by EXACTLY ONE worker.
@@ -22,7 +22,7 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
 const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM', 'MINTSOFT_WRITES_LIVE_FROM']
 const DAY = 86_400_000
-// The steps go live in the order M, W, X: a WooCommerce invoice note's floor is the EARLIEST live instant among the steps that write to WooCommerce (here step W).
+// The steps go live in the order M, W, X: a WooCommerce invoice note's floor is its OWN step's instant (step X); step W going live does not release it.
 const WOO_AT = new Date(Date.now() - 3 * DAY)
 const XERO_AT = new Date(Date.now() - DAY)
 const BETWEEN = new Date(Date.now() - 5 * DAY) // before both instants: a note created then belongs to its former writer
@@ -112,7 +112,7 @@ test('[note floor] the re-queue racing the claimers: a FAILED pre-instant note s
   })
 })
 
-test('[note floor] sixteen drains of the OUTBOX: a note delivery job created after WooCommerce went live but before Xero did is claimed by exactly one', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
+test('[note floor] sixteen drains of the OUTBOX: a note delivery job is claimed by exactly one worker only after ITS OWN step (X) went live, and by nobody between W and X', { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' }, async (t) => {
   const d = await loadDeps()
   const { claimIntegrationOutboxWork } = await import('../../lib/domain/integrations/outbox.ts')
   const tag = `wc${randomUUID().slice(0, 8)}`
@@ -121,8 +121,11 @@ test('[note floor] sixteen drains of the OUTBOX: a note delivery job created aft
     await d.db.accountingSyncLog.deleteMany({ where: { referenceId: { startsWith: tag } } })
   })
   const middle = new Date(Date.now() - 2 * DAY)
+  // The note's floor is its OWN step's instant (step X = Xero's), whatever step W (WooCommerce's) is: a note created two days ago is refused when X went live
+  // one day ago (W three days ago does not release it), and claimed by exactly one worker when X went live three days ago.
   for (const [name, xero, woo, expected] of [
-    ['WooCommerce first', new Date(Date.now() - DAY), new Date(Date.now() - 3 * DAY), 1],
+    ['WooCommerce first', new Date(Date.now() - DAY), new Date(Date.now() - 3 * DAY), 0],
+    ['Xero first', new Date(Date.now() - 3 * DAY), new Date(Date.now() - DAY), 1],
   ] as const) {
     const row = await seed(d, `${tag}-${name.replace(/\W/g, '')}`, middle)
     const job = await d.db.integrationOutbox.create({

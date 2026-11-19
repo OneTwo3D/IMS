@@ -372,7 +372,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
 
   // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and migrate nothing. A job queued
   // before the hold was switched on stays exactly as it is (no claim, no attempt spent) and is never sent while the hold stands.
-  if (wooDrainHold().held) return { ...summary, held: true }
+  if (wooDrainHold(undefined, 'stock').held) return { ...summary, held: true }
 
   if (options?.migrateLegacy !== false) {
     await migrateLegacyWcStockSyncJobs(productIds, limit)

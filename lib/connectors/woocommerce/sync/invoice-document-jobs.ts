@@ -98,8 +98,8 @@ export async function enqueueInvoiceDocumentPublications(
   const summary: WcInvoiceDocumentScanSummary = { scanned: 0, queued: 0, shadowed: 0 }
   if (!(await isInvoiceDocumentPublishingEnabled())) return summary
   const { db } = await import('@/lib/db')
-  const { producerCutoffFloor } = await import('@/lib/security/producer-seam')
-  const floor = producerCutoffFloor('woocommerce')
+  const { producerOperationCutoffFloor } = await import('@/lib/security/producer-seam')
+  const floor = producerOperationCutoffFloor('woocommerce', 'order.invoice-document')
   // The exclusion of documents that already have a job (queued, retrying, parked or done) is made IN THE DATABASE, before the window is
   // cut: a window taken first and filtered after is filled by the oldest unresolved jobs and starves every newer document.
   const orderFilter = options.orderIds ? Prisma.sql`AND d.order_id = ANY(${options.orderIds})` : Prisma.empty
@@ -221,7 +221,7 @@ export async function runWcInvoiceDocumentJobs(options: WcInvoiceDocumentRunOpti
   const summary: WcInvoiceDocumentRunSummary = { claimed: 0, succeeded: 0, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
   if (options.idempotencyKeys?.length === 0) return summary
   // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and spend no attempt.
-  if (wooDrainHold().held) return summary
+  if (wooDrainHold(undefined, 'order.invoice-document').held) return summary
   const now = options.now
   const clock = options.clock ?? (() => new Date())
   const startedAt = clock().getTime()

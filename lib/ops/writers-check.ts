@@ -1,7 +1,8 @@
 import { OUTBOUND_CONNECTORS, type OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
+import { legacyLiveFromFindings } from '@/lib/security/live-from-legacy-config'
 import { explainProducerDisposition, parseProducerCutoff, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
 import { PRODUCER_STEP_ENV, liveStepsOfDestination } from '@/lib/security/producer-disposition-constants'
-import { producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { producerOperationEgressVerdict, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
 import { LIVE_WRITER_STEPS, WRITER_OWNERSHIP_MAP, type LiveWriterStep, type OwnershipRow } from '@/lib/security/writer-ownership-map'
 import {
   EVIDENCE_CONTESTS,
@@ -202,7 +203,7 @@ export type WritersCheckFinding = {
   code: 'ims-writes-owned-elsewhere' | 'ims-writes-undecided' | 'ims-owns-forbidden-row' | 'incumbent-evidence-vs-ims-writer'
     | 'ims-writes-where-nobody-owns' | 'inconsistent-configuration' | 'unreadable' | 'evidence-gap' | 'operator-capability-overlaps'
     | 'step-order' | 'step-missing-grant' | 'no-writer' | 'attestation-missing' | 'step-evidence-violation'
-    | 'evidence-source-not-built' | 'evidence-not-probed'
+    | 'evidence-source-not-built' | 'evidence-not-probed' | 'legacy-live-from'
   severity: 'fail' | 'warn'
   /** `<destination>.<operation>`, or the destination, or null. A map key, never a data key. */
   subject: string | null
@@ -404,6 +405,11 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
     }
   }
 
+  // 2c. The legacy single-variable configuration: an installation that set WC_WRITES_LIVE_FROM or MINTSOFT_WRITES_LIVE_FROM before the per-step phases changes behaviour on upgrade.
+  for (const legacy of legacyLiveFromFindings(inputs.env)) {
+    findings.push({ code: 'legacy-live-from', severity: legacy.severity, subject: legacy.code === 'legacy-wc-only-live-from' ? 'WC_WRITES_LIVE_FROM' : 'MINTSOFT_WRITES_LIVE_FROM', message: legacy.message })
+  }
+
   // 3. Settings, scheduled jobs and plugins must have been read.
   const readable = inputs.settings !== null && inputs.cronEnabled !== null && inputs.pluginEnabled !== null
   if (!readable) unreadable(null, 'The settings, scheduled-job rows or plugin switches could not be read, so what IMS could write cannot be established.')
@@ -429,7 +435,9 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
     const switchedOn = readable
       ? entry.requires.every((req) => requirementOn(req, { settings: inputs.settings!, cronEnabled: inputs.cronEnabled!, pluginEnabled: inputs.pluginEnabled! }))
       : true
-    const imsCanWrite = switchedOn && decision.grant === 'granted' && verdict !== 'shadow'
+    // The owner's confirmation is a DELIVERY condition, not part of the producer decision: while it is missing the work is held, so IMS cannot write it.
+    const delivery = producerOperationEgressVerdict(connector, row.operation as never, context).kind
+    const imsCanWrite = switchedOn && decision.grant === 'granted' && verdict !== 'shadow' && delivery !== 'held'
     writable.set(key, imsCanWrite)
     const owner = row.owners[decision.phase]
     // No-writer gap: IMS owns this operation in the phase its step has reached, and its own switch is off, so nobody is writing it. Today "nobody
@@ -535,7 +543,7 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
 
   const failing = findings.filter((finding) => finding.severity === 'fail')
   const UNREADABLE_CODES: readonly string[] = ['unreadable', 'inconsistent-configuration', 'evidence-source-not-built', 'evidence-not-probed']
-  const STEP_GAP_CODES: readonly string[] = ['step-order', 'step-missing-grant', 'no-writer', 'attestation-missing']
+  const STEP_GAP_CODES: readonly string[] = ['step-order', 'step-missing-grant', 'no-writer', 'attestation-missing', 'legacy-live-from']
   const verdict: WritersCheckVerdict = failing.some((f) => !UNREADABLE_CODES.includes(f.code) && !STEP_GAP_CODES.includes(f.code) && f.code !== 'evidence-gap')
     ? 'double-claim'
     : failing.some((f) => UNREADABLE_CODES.includes(f.code)) ? 'unreadable'

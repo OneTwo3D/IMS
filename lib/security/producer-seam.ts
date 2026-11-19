@@ -24,7 +24,9 @@ import {
   type ProducerDecision,
   type ProducerDecisionContext,
 } from './producer-disposition'
-import { WRITER_OWNERSHIP_MAP, type MappedOperation } from './writer-ownership-map'
+import { WRITER_OWNERSHIP_MAP, ownershipRowFor, type MappedOperation } from './writer-ownership-map'
+import { attestationState } from './writer-attestation-snapshot'
+import { requiredAttestationFor, type WriterAttestationKind } from './writer-attestation-constants'
 
 export type ProducerEnforcement =
   | { enforced: false }
@@ -129,6 +131,81 @@ export function producerEgressVerdict(
       kind: 'held',
       decision: { disposition: 'SHADOW', reason: 'unreadable', owner: 'unknown', phase: 'P1', cutoff: null, grant: 'unreadable' },
     }
+  }
+}
+
+export type ProducerOperationEgressVerdict =
+  | { kind: 'legacy' }
+  | { kind: 'open'; decision: ProducerDecision }
+  | {
+      kind: 'held'
+      decision: ProducerDecision
+      /** Set when the hold is the owner's confirmation not being on record (absent) or not being known yet (unknown): the work is retried, never shadowed. */
+      awaiting?: { kind: WriterAttestationKind; state: 'absent' | 'unknown' }
+    }
+
+/**
+ * THE PER-OPERATION GATE: may queued work of ONE operation of the ownership map leave IMS right now?
+ *
+ * {@link producerEgressVerdict} is the destination-level gate (any step live opens it) and is only the EARLIEST-OPEN TRANSPORT BARRIER. A drain, a claim
+ * boundary or a re-queue that knows which operation it carries asks here, so that work belonging to a step that is not live yet stays held while an
+ * earlier step is live: with only step M live, the WooCommerce completions and tracking go out and the stock, invoice-note and invoice-document rows
+ * do not, whatever put them in the queue.
+ *
+ *   legacy   the hold is not enforced for the destination.
+ *   open     enforced, the operation's own step is in its live phase (grant and that step's live-from instant reached), IMS owns the operation there,
+ *            and, where the operation replaces an incumbent the owner stops by hand, the owner's confirmation is on record.
+ *   held     anything else. When the only thing missing is the confirmation (absent, or not read yet) `awaiting` says so: the work waits and is
+ *            retried, and nothing is shadowed.
+ *
+ * Pure and synchronous; never throws, and anything it cannot read is held.
+ */
+export function producerOperationEgressVerdict<D extends OutboundConnector>(
+  destination: D,
+  operation: MappedOperation<D>,
+  context: ProducerDecisionContext = {},
+): ProducerOperationEgressVerdict {
+  try {
+    const enforcement = readProducerEnforcement(context.env ?? process.env)
+    if (!enforcement.enforced || !enforcement.destinations.has(destination)) return { kind: 'legacy' }
+    const decision = explainProducerDisposition(destination, operation, undefined, context)
+    const row = ownershipRowFor(destination, operation)
+    if (row === null || decision.phase !== 'P2' || decision.owner !== 'IMS') return { kind: 'held', decision }
+    const needed = requiredAttestationFor(destination, operation, row.step)
+    if (needed !== undefined) {
+      const supplied: unknown = Object.prototype.hasOwnProperty.call(context, 'attestations') ? context.attestations : undefined
+      const state = attestationState(needed, supplied instanceof Set ? (supplied as ReadonlySet<string>) : undefined)
+      if (state !== 'present') {
+        return { kind: 'held', decision: { ...decision, disposition: 'SHADOW', reason: 'attestation_missing' }, awaiting: { kind: needed, state } }
+      }
+    }
+    return { kind: 'open', decision }
+  } catch {
+    return {
+      kind: 'held',
+      decision: { disposition: 'SHADOW', reason: 'unreadable', owner: 'unknown', phase: 'P1', cutoff: null, grant: 'unreadable' },
+    }
+  }
+}
+
+/**
+ * THE WRITER-SIDE CUT-OFF OF ONE OPERATION: the live-from instant of the operation's OWN step when that step is in its live phase and IMS owns the
+ * operation there, else null (nothing is filtered: the per-operation gate stands the work down). Work for this operation created before it belongs to
+ * the writer that owned the operation then. The owner's confirmation does not move it: waiting for the confirmation holds the work, it does not change
+ * which writer owned it before the instant. Pure and synchronous; never throws.
+ */
+export function producerOperationCutoffFloor<D extends OutboundConnector>(
+  destination: D,
+  operation: MappedOperation<D>,
+  context: ProducerDecisionContext = {},
+): Date | null {
+  try {
+    const enforcement = readProducerEnforcement(context.env ?? process.env)
+    if (!enforcement.enforced || !enforcement.destinations.has(destination)) return null
+    const decision = explainProducerDisposition(destination, operation, undefined, context)
+    return decision.phase === 'P2' && decision.owner === 'IMS' ? decision.cutoff : null
+  } catch {
+    return null
   }
 }
 

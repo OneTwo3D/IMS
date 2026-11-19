@@ -1,4 +1,4 @@
-import { logActivityPersisted } from '@/lib/activity-log'
+import { logActivityInTransaction, logActivityPersisted } from '@/lib/activity-log'
 import {
   ATTESTATION_GUARDED_SETTINGS,
   WRITER_ATTESTATION_ACTION,
@@ -10,12 +10,20 @@ import {
   type WriterAttestationKind,
 } from '@/lib/security/writer-attestation-constants'
 
+/** What a transaction of this module touches: the confirmation row and its audit-log row. */
+export type AttestationTx = {
+  writerAttestation: {
+    create(args: { data: { kind: string; userId: string; note: string; payload: object } }): Promise<{ id: string; kind: string; attestedAt: Date }>
+  }
+  activityLog: Parameters<typeof logActivityInTransaction>[0]['activityLog']
+}
+
 /** The slice of the database this module uses, so tests hand in a double. */
 export type AttestationDb = {
   writerAttestation: {
-    create(args: { data: { kind: string; userId: string; note: string; payload: object } }): Promise<{ id: string; kind: string; attestedAt: Date }>
     findFirst(args: { where: { kind: string }; orderBy: { attestedAt: 'desc' } }): Promise<{ id: string; kind: string; attestedAt: Date; userId: string } | null>
   }
+  $transaction<T>(fn: (tx: AttestationTx) => Promise<T>): Promise<T>
 }
 
 export type RecordAttestationInput = { kind: string; userId: string; note?: string; payload?: object }
@@ -23,27 +31,37 @@ export type RecordAttestationResult =
   | { ok: true; id: string; kind: WriterAttestationKind; attestedAt: Date }
   | { ok: false; error: string }
 
-/** Record a confirmation. Append-only; the activity-log entry is part of the contract: when it cannot be persisted the confirmation is reported as failed. */
+/**
+ * Record a confirmation. Append-only. THE ROW AND ITS AUDIT-LOG ENTRY ARE ONE TRANSACTION: a confirmation lets IMS start writing to a live system, so it
+ * takes effect only together with the record of who gave it. When the audit row cannot be written the confirmation is rolled back and reported as failed,
+ * so a refused confirmation can never be in force.
+ */
 export async function recordWriterAttestation(db: AttestationDb, input: RecordAttestationInput): Promise<RecordAttestationResult> {
   if (!isWriterAttestationKind(input.kind)) return { ok: false, error: 'Unknown confirmation kind.' }
   const userId = typeof input.userId === 'string' ? input.userId.trim() : ''
   if (userId === '') return { ok: false, error: 'A confirmation needs the user who gives it.' }
   const note = (input.note ?? '').trim()
   if (note.length > WRITER_ATTESTATION_NOTE_MAX) return { ok: false, error: `The note is longer than ${WRITER_ATTESTATION_NOTE_MAX} characters.` }
-  const row = await db.writerAttestation.create({ data: { kind: input.kind, userId, note, payload: input.payload ?? {} } })
-  const logged = await logActivityPersisted({
-    entityType: 'SETTING',
-    entityId: row.id,
-    action: WRITER_ATTESTATION_ACTION,
-    tag: 'settings',
-    level: 'WARNING',
-    description: `Owner confirmation recorded: ${WRITER_ATTESTATION_LABEL[input.kind]}`,
-    metadata: { kind: input.kind, attestedAt: row.attestedAt.toISOString(), note },
-    userId: userId.startsWith('cli:') ? null : userId,
-    resolveUser: false,
-  })
-  if (!logged) return { ok: false, error: 'The confirmation was stored but its audit-log entry could not be written. Check the activity log before relying on it.' }
-  return { ok: true, id: row.id, kind: input.kind, attestedAt: row.attestedAt }
+  const kind = input.kind
+  try {
+    const row = await db.$transaction(async (tx) => {
+      const created = await tx.writerAttestation.create({ data: { kind, userId, note, payload: input.payload ?? {} } })
+      await logActivityInTransaction(tx, {
+        entityType: 'SETTING',
+        entityId: created.id,
+        action: WRITER_ATTESTATION_ACTION,
+        tag: 'settings',
+        level: 'WARNING',
+        description: `Owner confirmation recorded: ${WRITER_ATTESTATION_LABEL[kind]}`,
+        metadata: { kind, attestedAt: created.attestedAt.toISOString(), note },
+        userId: userId.startsWith('cli:') ? null : userId,
+      })
+      return created
+    })
+    return { ok: true, id: row.id, kind, attestedAt: row.attestedAt }
+  } catch {
+    return { ok: false, error: 'The confirmation could not be recorded together with its audit-log entry, so nothing was stored. Try again.' }
+  }
 }
 
 export async function latestWriterAttestation(db: AttestationDb, kind: WriterAttestationKind): Promise<{ id: string; attestedAt: Date; userId: string } | null> {
