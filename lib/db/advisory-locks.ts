@@ -399,6 +399,12 @@ export const WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE = 411_220_882
 export const WC_AMENDMENT_LOCK_NAMESPACE = 411_220_883
 
 /**
+ * The Mintsoft supplier list read sync's single-flight lease (pg_try_advisory_lock(namespace, 0)): two operators clicking Refresh must not double the
+ * request rate on the shared live Mintsoft tenant. Taken on a SESSION-lock connection, never the Prisma pool; a second caller is refused, not queued.
+ */
+export const MINTSOFT_SUPPLIER_SYNC_LOCK_NAMESPACE = 411_220_884
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -453,5 +459,6 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE,
   WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE,
+  MINTSOFT_SUPPLIER_SYNC_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

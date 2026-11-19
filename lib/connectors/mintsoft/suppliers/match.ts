@@ -12,10 +12,15 @@
  * A shared hard signal alone is enough to surface a pair even when the names are far apart.
  */
 
-/** Legal-form words dropped from the END (and, for the dotted forms, anywhere) of a name. Compared after punctuation is removed. */
+/**
+ * TRUE legal-form words dropped from the END of a name, compared after punctuation is removed. Deliberately NOT here: region words (eu, uk, us,
+ * europe) and the two-letter forms (ag, sa, ab, as, oy, bv, nv, kg, ug, kk, lp). They are short enough to be the distinguishing word of a different
+ * entity ("Bambu Lab EU GmbH" is not "Bambu Lab Ltd"), so folding them away made distinct suppliers identical. A pair that differs only there still
+ * scores high and is shown to the operator, but it is never an exact fold.
+ */
 const LEGAL_SUFFIXES = new Set([
-  'ltd', 'limited', 'inc', 'incorporated', 'plc', 'llc', 'llp', 'lp', 'gmbh', 'ag', 'sa', 'sas', 'sarl', 'srl', 'spa', 'bv', 'nv', 'oy', 'ab', 'as', 'aps',
-  'co', 'company', 'corp', 'corporation', 'kg', 'ug', 'pty', 'pvt', 'pte', 'sdn', 'bhd', 'kk', 'ltda', 'mbh', 'ohg', 'eu',
+  'ltd', 'limited', 'inc', 'incorporated', 'plc', 'llc', 'llp', 'gmbh', 'sas', 'sarl', 'srl', 'spa', 'aps',
+  'co', 'company', 'corp', 'corporation', 'pty', 'pvt', 'pte', 'sdn', 'bhd', 'ltda', 'mbh', 'ohg',
 ])
 /** Filler words that carry no identity. */
 const FILLER = new Set(['the', 'and', 'of'])
@@ -130,6 +135,8 @@ const SIGNAL_BONUS: Record<SupplierSignal, number> = { email: 25, vat: 30, code:
 /** A pair is offered when its score reaches this, or when it shares any hard signal. */
 export const SUGGESTION_MIN_SCORE = 55
 export const SUGGESTION_LIMIT = 3
+/** A cached Mintsoft supplier whose pair score reaches this blocks "create in Mintsoft" unless the operator confirms "create anyway" with a reason. */
+export const DUPLICATE_GUARD_MIN_SCORE = 80
 
 export function scoreSupplierPair(ims: ImsSupplierForMatch, remote: MintsoftSupplierForMatch): SupplierSuggestion {
   const nameScore = Math.round(supplierNameSimilarity(ims.name, remote.name) * 100)

@@ -50,3 +50,16 @@ test('at most three suggestions are returned', () => {
   const remotes = ['Acme Tools', 'Acme Tool', 'Acme Tools UK', 'Acme Toolz', 'Acme Tools Europe'].map((name, i) => ({ externalId: String(i + 1), name, code: null, email: null, vatNumber: null, active: true }))
   assert.equal(suggestMintsoftSuppliers(ims, remotes).length, 3)
 })
+
+test('region words and two-letter forms are not legal suffixes: "Bambu Lab EU GmbH" is NOT "Bambu Lab Ltd"', () => {
+  assert.notEqual(normalizeSupplierName('Bambu Lab EU GmbH'), normalizeSupplierName('Bambu Lab Ltd'))
+  assert.equal(normalizeSupplierName('Bambu Lab EU GmbH'), 'bambu lab eu')
+  assert.ok(supplierNameSimilarity('Bambu Lab EU GmbH', 'Bambu Lab Ltd') < 1, 'never an exact fold')
+  for (const [a, b] of [['Acme AG', 'Acme'], ['Acme SA', 'Acme'], ['Acme AB', 'Acme'], ['Acme AS', 'Acme'], ['Acme Europe', 'Acme'], ['Acme UK', 'Acme']]) {
+    assert.notEqual(normalizeSupplierName(a!), normalizeSupplierName(b!), `${a} != ${b}`)
+  }
+  // True legal forms still fold.
+  for (const [a, b] of [['Acme Ltd', 'Acme'], ['Acme Limited', 'Acme'], ['Acme Inc', 'Acme'], ['Acme plc', 'Acme'], ['Acme LLC', 'Acme'], ['Acme GmbH', 'Acme'], ['Acme Co', 'Acme'], ['Acme Company', 'Acme']]) {
+    assert.equal(normalizeSupplierName(a!), normalizeSupplierName(b!), `${a} == ${b}`)
+  }
+})
