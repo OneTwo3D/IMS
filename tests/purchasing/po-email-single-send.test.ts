@@ -34,9 +34,23 @@ test('mailer: a sendMail rejection exactly at the deadline, after DATA, is the s
   const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
   assert.deepEqual(r, { success: false, permanent: true, unknownOutcome: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME })
   // ... and the timer winning gives the identical answer.
-  behave = () => new Promise<never>(() => undefined)
+  behave = (o) => { sendCommand(o, 'DATA'); return new Promise<never>(() => undefined) }
   const t = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
   assert.deepEqual(t, r)
+})
+
+test('mailer: the deadline timer firing BEFORE the message was handed over (no connection, greeting or DATA) is a retryable failure, not an unknown outcome', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  behave = () => new Promise<never>(() => undefined)
+  const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
+  assert.equal(r.success, false)
+  assert.equal(r.permanent, false)
+  assert.equal(r.unknownOutcome, undefined)
+  // DATA command written but no 354 yet: still nothing handed over.
+  behave = (o) => { sendDataCommandOnly(o); return new Promise<never>(() => undefined) }
+  const early = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
+  assert.equal(early.permanent, false)
+  assert.equal(early.unknownOutcome, undefined)
 })
 
 test('mailer: a pre-delivery rejection just before the deadline (no DATA seen) stays retryable', async () => {
@@ -351,6 +365,15 @@ test('outbox: a customer kind refused before DATA is still retryable', async () 
   const { row, logs } = await drainWith(makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1' }), null, false, 'SALES_ORDER')
   assert.equal(row.status, 'PENDING')
   assert.equal(logs.length, 0)
+})
+
+test('outbox: a customer kind whose deadline fires before DATA is retried with backoff, not parked as unknown', async () => {
+  behave = () => new Promise<never>(() => undefined)
+  const { row, logs } = await drainWith(makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1' }), { sendDeadlineMs: 20, singleSend: true }, false, 'SALES_ORDER')
+  assert.equal(row.status, 'PENDING')
+  assert.equal(row.attempts, 1)
+  assert.equal(logs.length, 0)
+  assert.doesNotMatch(String(row.lastError ?? ''), /Outcome unknown/)
 })
 
 test('outbox: a settlement write that fails after an unknown outcome still ends FAILED, and nothing is sent on the next tick', async () => {

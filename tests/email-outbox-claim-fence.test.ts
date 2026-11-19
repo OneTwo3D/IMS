@@ -393,6 +393,7 @@ function makeRow(overrides: Partial<EmailOutboxRow> = {}): EmailOutboxRow {
     processingStartedAt: null,
     lockedBy: null,
     staleReclaimCount: 0,
+    sendEnteredAt: null,
     ...overrides,
   }
 }
@@ -707,7 +708,7 @@ test('o3d-hpeg: the cap is checked by the RECLAIM STATEMENT, not on the swept co
   let workerC: Promise<Awaited<ReturnType<typeof drain>>> | undefined
 
   const { client, rows } = await makeClient(
-    [makeRow({ kind: 'PURCHASE_ORDER', status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'holder-A' })],
+    [makeRow({ kind: 'PURCHASE_ORDER', status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'holder-A', sendEnteredAt: T0 })],
     {
       async pauseBeforeFirstReclaim() {
         workerC = drain({
@@ -3515,7 +3516,7 @@ test('ERASURE control: an unchanged recipient is sent normally, so the refusals 
 test('a stale PROCESSING row of a CUSTOMER kind is PARKED as outcome unknown, never reclaimed or re-sent', async () => {
   const deliveries: string[] = []
   const logged: Array<Record<string, unknown>> = []
-  const { client, rows } = await makeClient([makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'dead-holder' })])
+  const { client, rows } = await makeClient([makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'dead-holder', sendEnteredAt: T0 })])
   const result = await drain({
     client,
     now: () => T_RECLAIM,
@@ -3533,6 +3534,25 @@ test('a stale PROCESSING row of a CUSTOMER kind is PARKED as outcome unknown, ne
   assert.equal(rows[0].staleReclaimCount, 0, 'not a reclaim')
   assert.match(String((rows[0] as { lastError?: string }).lastError ?? ''), /Outcome unknown/)
   assert.match(String(logged[0]?.description ?? ''), /may or may not have reached the recipient/)
+})
+
+test('a stale PROCESSING row of a customer kind whose worker NEVER entered the sender is requeued and sent, not parked as "may have reached the recipient"', async () => {
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'dead-holder', sendEnteredAt: null })])
+  const result = await drain({
+    client,
+    now: () => T_RECLAIM,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      deliveries.push('retry')
+      return { success: true }
+    },
+  })
+  assert.equal(result.parked, 0)
+  assert.deepEqual(deliveries, ['retry'], 'nothing had been sent, so the retry is the first send')
+  assert.equal(rows[0].status, 'SENT')
+  assert.equal(rows[0].staleReclaimCount, 0, 'not counted as a reclaim')
 })
 
 test('the purchase order keeps its single reclaim (it has its own delivery-boundary guard)', async () => {

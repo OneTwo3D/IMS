@@ -93,7 +93,7 @@ import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
 import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
-import { findRestockedInboxesToAdopt, queueAdoptionReclassJournal, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
+import { findRestockedInboxesToAdopt, raiseAdoptionReclassTask, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -5691,10 +5691,10 @@ export async function createSalesOrderRefund(
           metadata: { refundId: createdRefund.id, adoptions: inboxAdoptions },
         },
       })
-      // The restock already booked Dr Inventory / Cr the stock-gain reason; this refund returns no stock of its own, so it books the COGS reversal
-      // at the original cost and moves the restock's credit off the reason account (net: Dr Inventory / Cr COGS, as a normal return).
+      // The restock may already have booked Dr Inventory / Cr the stock-gain reason; this refund returns no stock of its own. IMS posts nothing for the margin:
+      // it raises ONE owed-posting record naming the refund, rows and quantities for a person to reclass by hand.
       const adoptedRows = restockableRows ?? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
-      await queueAdoptionReclassJournal(tx, { refundId: createdRefund.id, orderId: input.orderId, orderRef: so.orderNumber ?? input.orderId, adoptions: inboxAdoptions, rows: adoptedRows })
+      await raiseAdoptionReclassTask(tx, { refundId: createdRefund.id, orderId: input.orderId, orderRef: so.orderNumber ?? input.orderId, adoptions: inboxAdoptions, rows: adoptedRows })
     }
     if (returnInTransit) {
       await createReturnExpectationTx(tx, {

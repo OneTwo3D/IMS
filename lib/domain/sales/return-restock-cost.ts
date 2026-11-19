@@ -1,6 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSyncTxWithOutcome } from '@/lib/accounting'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { ADOPTION_RECLASS_POSTING_SCOPE } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { WORK_SLOT_OCCUPIED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import type { PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
@@ -8,7 +9,6 @@ import { buildInventoryAdjustmentJournal } from '@/lib/domain/inventory/stock-ad
 import { getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 import type { RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
-import { businessDateYmd } from '@/lib/business-date'
 
 /**
  * Layers whose cost an operator or a receipt stated: a purchase receipt line, a manual adjustment, opening stock, or a
@@ -313,24 +313,21 @@ export async function findRestockedInboxesToAdopt(
 const money2 = (n: number): number => Math.round(n * 100) / 100
 
 /**
- * o3d-iil0b (Codex round 1): THE LEDGER SIDE OF AN ADOPTION.
+ * o3d-iil0b (Codex rounds 1-2): THE LEDGER SIDE OF AN ADOPTION IS AN OPERATOR TASK, NEVER AN AUTOMATIC JOURNAL.
  *
- * The warehouse's restock already booked Dr Inventory / Cr the stock-gain reason account (`queueReturnRestockValueJournal`), or nothing when no
- * reason was chosen. A normal return books Dr Inventory / Cr COGS (the refund's COGS reversal at the original cost). An adopting refund books no
- * COGS reversal of its own (it returns no stock), so left alone the shipped COGS would stay expensed and the reason account would hold a customer
- * return as a gain. This books the difference, so the net matches a normal return:
- *   Dr the restock's reason account   what the restock credited it, for the adopted units
- *   Dr / Cr Inventory                 the difference between the original cost and what the restock booked (nothing when they agree)
- *   Cr COGS                           the original cost of the adopted units (the shipment cost the refund's rows carry)
- * Queued through the ordinary journal enqueue (the outbound hold, the period lock and the connector pin apply), in the refund's own transaction.
+ * The warehouse's restock may have booked Dr Inventory / Cr the stock-gain reason account (`queueReturnRestockValueJournal`). An adopting refund
+ * returns no stock of its own and books no COGS reversal, so the shipped cost stays expensed and the reason account holds a customer return as a gain.
+ * Working out the correcting entry across mixed and partly journalled inbox rows is what went wrong twice, so IMS does NOT post one. It still adopts the
+ * units (so stock is not counted twice) and raises ONE owed-posting record that names the refund, the inbox rows and the quantities and says what a
+ * person should check and post by hand:
+ *   Dr the restock's reason account / Cr COGS at the original shipped cost.
+ * It NEVER tells anyone to post Dr Inventory: where the restock journalled, Inventory is already debited by it; where it did not, the restock's own owed
+ * record carries that debit. The amounts are given only where IMS can compute them (every adopted row taken whole); a row only partly adopted, or a
+ * mix of journalled and unjournalled rows, is marked ADVISORY, and where IMS cannot tell which units were journalled the record says so.
  *
- * A restock that booked NO journal (no reason account, or none queued) is NOT guessed at: the Inventory debit is still owed to the ledger by the
- * restock's own owed-posting record, and posting Dr Inventory / Cr COGS here as well could book Inventory twice if that is fixed by hand. It is
- * reported as an owed posting with the exact entry, so a person books the whole of it once.
- *
- * The original cost is split across the adopted inbox rows by quantity.
+ * The original cost is keyed by product (an average per unit within a product).
  */
-export async function queueAdoptionReclassJournal(
+export async function raiseAdoptionReclassTask(
   tx: Prisma.TransactionClient,
   params: {
     refundId: string
@@ -340,12 +337,20 @@ export async function queueAdoptionReclassJournal(
     /** The rows the refund returned in effect (shipped, costed): their value is the original cost being reversed. */
     rows: readonly RefundReturnRow[]
   },
-): Promise<{ queued: boolean; owedValueBase: number }> {
-  const totalQty = params.adoptions.reduce((s, a) => s + a.qty, 0)
-  const originalCost = params.rows.reduce((s, r) => s + r.qty * Number(r.unitCostBase ?? 0), 0)
-  if (!(totalQty > 0) || !(originalCost > 0)) return { queued: false, owedValueBase: 0 }
+): Promise<{ raised: boolean; advisory: boolean; owedCostBase: number }> {
+  const none = { raised: false, advisory: false, owedCostBase: 0 }
+  if (params.adoptions.length === 0) return none
   const settings = await getAccountingSettings()
   const inboxIds = params.adoptions.map((a) => a.inboxId)
+  const inboxes = await tx.wmsReturnsInbox.findMany({ where: { id: { in: inboxIds } }, select: { id: true, productId: true } })
+  const productOf = new Map(inboxes.map((i) => [i.id, i.productId as string | null]))
+  const costByProduct = new Map<string, { qty: number; value: number }>()
+  for (const r of params.rows) {
+    const e = costByProduct.get(r.productId) ?? { qty: 0, value: 0 }
+    e.qty += r.qty
+    e.value += r.qty * Number(r.unitCostBase ?? 0)
+    costByProduct.set(r.productId, e)
+  }
   const movements = await tx.stockMovement.groupBy({
     by: ['referenceId'],
     where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: { in: inboxIds } },
@@ -357,9 +362,10 @@ export async function queueAdoptionReclassJournal(
     where: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'WmsReturnsInbox', referenceId: { in: inboxIds }, ...WORK_SLOT_OCCUPIED_WHERE },
     select: { referenceId: true, payload: true },
   })
-  // What each inbox restock credited to which non-inventory account, for the whole row.
   const creditedByInbox = new Map<string, Map<string, number>>()
+  const journalled = new Set<string>()
   for (const j of restockJournals) {
+    journalled.add(j.referenceId)
     const lines = (j.payload as { lines?: Array<{ accountCode?: string; credit?: number }> } | null)?.lines ?? []
     for (const l of lines) {
       if (!l.accountCode || !(Number(l.credit) > 0) || l.accountCode === settings.inventoryAccount) continue
@@ -368,85 +374,60 @@ export async function queueAdoptionReclassJournal(
       creditedByInbox.set(j.referenceId, byAccount)
     }
   }
-  const debitByAccount = new Map<string, number>()
-  let reclassifiedCost = 0
-  let owedCost = 0
+
+  let advisory = false
+  let owedCostBase = 0
+  let anyJournalled = false
+  let anyUnjournalled = false
+  const rowNotes: string[] = []
+  const rowMeta: Array<Record<string, unknown>> = []
   for (const a of params.adoptions) {
-    const costShare = originalCost * (a.qty / totalQty)
-    const credited = creditedByInbox.get(a.inboxId)
+    const productId = productOf.get(a.inboxId) ?? null
+    const cost = productId ? costByProduct.get(productId) : undefined
+    const unitCost = cost && cost.qty > 0 ? cost.value / cost.qty : 0
+    const original = money2(unitCost * a.qty)
+    owedCostBase += original
     const rowQty = movementQty.get(a.inboxId) ?? 0
-    if (!credited || !(rowQty > 0)) { owedCost += costShare; continue }
-    reclassifiedCost += costShare
-    for (const [account, amount] of credited) {
-      const share = amount * Math.min(1, a.qty / rowQty)
-      debitByAccount.set(account, (debitByAccount.get(account) ?? 0) + share)
+    const whole = rowQty > 0 && Math.abs(rowQty - a.qty) <= 1e-9
+    const hasJournal = journalled.has(a.inboxId)
+    if (hasJournal) anyJournalled = true; else anyUnjournalled = true
+    const credited = creditedByInbox.get(a.inboxId)
+    const creditedText = credited ? [...credited].map(([acc, v]) => `${acc} ${money2(v).toFixed(2)}`).join(', ') : 'none found'
+    const head = `inbox row ${a.inboxId}: ${a.qty} of ${rowQty} unit(s) adopted`
+    if (!hasJournal) {
+      rowNotes.push(`${head}; IMS found no restock journal standing for this row; original cost to reverse ${original.toFixed(2)}`)
+    } else if (whole) {
+      rowNotes.push(`${head}; the restock journalled it (credited ${creditedText}); post Dr that account ${original.toFixed(2)} / Cr COGS ${original.toFixed(2)}`)
+    } else {
+      advisory = true
+      rowNotes.push(`${head}; the restock journalled this row (credited ${creditedText}) but IMS CANNOT TELL WHICH of its units were journalled; original cost of the adopted units ${original.toFixed(2)} is an estimate`)
     }
+    rowMeta.push({ inboxId: a.inboxId, qty: a.qty, rowQty, journalled: hasJournal, originalCostBase: original })
   }
-  let queued = false
-  const cogs = money2(reclassifiedCost)
-  if (cogs > 0 && settings.cogsAccount && settings.inventoryAccount) {
-    const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
-    const description = `Adopted return reclass: ${params.orderRef}`
-    let debited = 0
-    for (const [accountCode, amount] of debitByAccount) {
-      const v = money2(amount)
-      if (v > 0) { lines.push({ accountCode, description, debit: v }); debited = money2(debited + v) }
-    }
-    const inventoryDelta = money2(cogs - debited)
-    if (inventoryDelta > 0) lines.push({ accountCode: settings.inventoryAccount, description, debit: inventoryDelta })
-    else if (inventoryDelta < 0) lines.push({ accountCode: settings.inventoryAccount, description, credit: -inventoryDelta })
-    lines.push({ accountCode: settings.cogsAccount, description, credit: cogs })
-    const outcome = await queueAccountingSyncTxWithOutcome(tx, {
-      type: 'INVENTORY_ADJUSTMENT',
-      referenceType: 'SalesOrderRefund',
-      referenceId: params.refundId,
-      idempotencyKey: `sales-order-refund:${params.refundId}:adoption-reclass`,
-      payload: {
-        date: businessDateYmd(new Date()),
-        reference: `Adopted return: ${params.orderRef}`,
-        narration: `COGS reversal and reclass of the returns-inbox restock — refund on order ${params.orderRef} adopted a returned arrival already restocked`,
-        lines,
-      },
-      chartConnector: settings.connector,
-      recordRefusalAsOutstanding: true,
-    })
-    queued = true
-    if (postingIsOwed(outcome)) {
-      await reportPostingNotQueued({
-        entityType: 'SALES_ORDER',
-        entityId: params.orderId,
-        action: 'refund_adoption_reclass_not_queued',
-        kind: 'refund_adoption_reclass_journal',
-        posting: `the COGS reversal and reclass for the adopted return on order ${params.orderRef}`,
-        committed: 'the refund and its link to the already restocked arrival are written in IMS',
-        remedy: `Post by hand: Dr the restock's stock-gain account / Cr COGS for the adopted units (net Dr Inventory / Cr COGS ${cogs.toFixed(2)} once the restock's own journal is counted).`,
-        outcome,
-        metadata: { refundId: params.refundId, adoptions: params.adoptions, chartConnector: settings.connector },
-        inTransaction: {
-          client: tx as unknown as PostingRefusalClient,
-          withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
-        },
-      })
-    }
+  if (anyJournalled && anyUnjournalled) advisory = true
+  owedCostBase = money2(owedCostBase)
+  if (!(owedCostBase > 0)) return none
+
+  const unqueuedOutcome: EnqueueOutcomeLike = {
+    queued: false,
+    reason: 'refused',
+    connector: settings.connector,
+    posting: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', referenceId: params.refundId, scope: ADOPTION_RECLASS_POSTING_SCOPE },
   }
-  const owed = money2(owedCost + (queued ? 0 : reclassifiedCost))
-  if (owed > 0 && (owedCost > 0 || !queued)) {
-    const unqueuedOutcome: EnqueueOutcomeLike = { queued: false, reason: 'refused', connector: settings.connector }
-    await reportPostingNotQueued({
-      entityType: 'SALES_ORDER',
-      entityId: params.orderId,
-      action: 'refund_adoption_cogs_reversal_owed',
-      kind: 'refund_adoption_reclass_journal',
-      posting: `the COGS reversal for the adopted return on order ${params.orderRef} (${money2(owedCost || reclassifiedCost).toFixed(2)})`,
-      committed: 'the refund and its link to the already restocked arrival are written in IMS',
-      remedy: `The returns-inbox restock booked no inventory journal (no reason account), so the refund's COGS reversal is not booked either: post Dr Inventory / Cr COGS ${owed.toFixed(2)} once, by hand, and do not also post the restock's own Dr Inventory / Cr stock-gain entry.`,
-      outcome: unqueuedOutcome,
-      metadata: { refundId: params.refundId, adoptions: params.adoptions, owedValueBase: owed, chartConnector: settings.connector },
-      inTransaction: {
-        client: tx as unknown as PostingRefusalClient,
-        withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
-      },
-    })
-  }
-  return { queued, owedValueBase: owed }
+  await reportPostingNotQueued({
+    entityType: 'SALES_ORDER',
+    entityId: params.orderId,
+    action: 'refund_adoption_reclass_owed',
+    kind: 'refund_adoption_reclass_journal',
+    posting: `the margin reclass for refund ${params.refundId} on order ${params.orderRef}, which adopted returned stock the warehouse had already restocked${advisory ? ' (ADVISORY: mixed or partly journalled rows)' : ''}`,
+    committed: 'the refund and its link to the already restocked arrival are written in IMS, and the stock is counted once',
+    remedy: `IMS posts nothing for this. Rows: ${rowNotes.join(' | ')}. Total original shipped cost ${owedCostBase.toFixed(2)}. Where the restock journalled, the margin needs a manual reclass: Dr the restock's reason account / Cr COGS at the original shipped cost. Never post Dr Inventory for this: the restock's own journal (or its own owed record) carries the Inventory debit.${advisory ? ' ADVISORY: the rows are mixed or only partly adopted, so check the ledger for which units were journalled before posting anything.' : ''}`,
+    outcome: unqueuedOutcome,
+    metadata: { refundId: params.refundId, adoptions: rowMeta, owedCostBase, advisory, chartConnector: settings.connector },
+    inTransaction: {
+      client: tx as unknown as PostingRefusalClient,
+      withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+    },
+  })
+  return { raised: true, advisory, owedCostBase }
 }

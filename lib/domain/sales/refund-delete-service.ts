@@ -13,6 +13,7 @@ import { XERO_BOOKS_LOCK_DATE_KEY } from '@/lib/connectors/xero/books-lock-date'
 import { lockSalesOrder, lockStockLevels } from '@/lib/domain/sales/allocation-service'
 import { resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { buildOutboxIdempotencyKey } from '@/lib/domain/integrations/outbox'
+import { ADOPTION_RECLASS_POSTING_SCOPE } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   IMS_RECORDED_REFUND_SOURCE,
@@ -545,6 +546,13 @@ export async function deleteSalesOrderRefund(
         data: { status: 'DONE', doneAt: now, doneBy: input.actorUserId },
       })
       reversal.shopRefundTasksClosed = shopTasks.count
+
+      // The owed-posting record an adopting refund raised (a margin reclass for returned stock the warehouse had already restocked) names a refund that is
+      // gone after this delete: close it, so a person does not post a reclass for it. The adoption itself is released by the refund's soft delete.
+      await tx.accountingPostingRefusal.updateMany({
+        where: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', referenceId: refund.id, scope: ADOPTION_RECLASS_POSTING_SCOPE, resolvedAt: null },
+        data: { resolvedAt: now, resolution: 'refund_deleted', resolvedBy: input.actorUserId },
+      })
 
       // ---- 5. THE RECORD: SOFT DELETE (owner decision 2026-11-18). The refund row is KEPT for audit and marked deleted (readers skip it); its LINES are hard-deleted below and live on in the tombstone. ----
       // PDF evidence is withdrawn (kept, still attached) and the credit note's fetch state is closed (DONE, nothing scheduled), not removed.

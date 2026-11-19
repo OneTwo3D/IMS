@@ -320,6 +320,7 @@ async function seed(lane: Lane, reference: string, rows: SeedRow[], t0: Date): P
       availableAt: new Date(t0.getTime() - 60_000),
       processingStartedAt: row.processingStartedAt ?? (row.status === 'PROCESSING' ? t0 : null),
       lockedBy: row.lockedBy ?? (row.status === 'PROCESSING' ? 'holder-token' : null),
+      sendEnteredAt: row.status === 'PROCESSING' ? t0 : null,
       createdAt: row.createdAt,
     })),
   })
@@ -541,7 +542,7 @@ test(
           data: {
             kind: 'PURCHASE_ORDER', toEmail: FIXTURE_RECIPIENT, subject: 'cap race probe', html: 'queued',
             referenceType: 'SalesOrder', referenceId: `cap-race-${randomUUID().slice(0, 8)}`,
-            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', availableAt: new Date(t0.getTime() - 60_000),
+            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', sendEnteredAt: t0, availableAt: new Date(t0.getTime() - 60_000),
           },
         })
         const client = laneHarnessClient(lane)
@@ -585,7 +586,7 @@ test(
           data: {
             kind: 'PURCHASE_ORDER', toEmail: FIXTURE_RECIPIENT, subject: 'cap stale-read probe', html: 'queued',
             referenceType: 'SalesOrder', referenceId: `cap-stale-${randomUUID().slice(0, 8)}`,
-            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', availableAt: new Date(t0.getTime() - 60_000),
+            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', sendEnteredAt: t0, availableAt: new Date(t0.getTime() - 60_000),
           },
         })
 

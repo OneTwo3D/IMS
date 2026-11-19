@@ -162,6 +162,8 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     // The "Refund in WooCommerce" task an IMS refund on a storefront order raises (the person is told to pay the customer back in the shop).
     const shopTask = await rig.db.wmsOperatorTask.create({ data: { connector: 'woocommerce', orderId: w.orderId, externalOrderId: refundId, reason: 'SHOP_REFUND_DUE', queryText: 'Please refund', contentHash: `h-${refundId}` }, select: { id: true } })
 
+    // The owed-posting record an adopting refund raised (a manual margin reclass for a refund that adopted an already restocked arrival).
+    const owed = await rig.db.accountingPostingRefusal.create({ data: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', referenceId: refundId, scope: 'adoption-reclass', kind: 'refund_adoption_reclass_journal', reason: 'refused', committed: 'c', remedy: 'r' }, select: { id: true } })
     const verdict = await rig.evaluateRefundDeletion(rig.db, refundId)
     assert.deepEqual(verdict.refusals, [], 'eligible')
 
@@ -219,6 +221,10 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: cnSync } })).status, 'SYNCED')
     // The task that would have told someone to refund the customer in the shop for a refund that is gone is closed.
     assert.equal((await rig.db.wmsOperatorTask.findUniqueOrThrow({ where: { id: shopTask.id } })).status, 'DONE')
+    // ... and so is the owed-posting record of an adopting refund: nobody posts a reclass for a refund that no longer exists.
+    const closedOwed = await rig.db.accountingPostingRefusal.findUniqueOrThrow({ where: { id: owed.id } })
+    assert.ok(closedOwed.resolvedAt, 'the owed record is closed')
+    assert.equal(closedOwed.resolution, 'refund_deleted')
     // The order's refund status is recomputed from what remains.
     assert.equal((await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId } })).refundStatus, 'NONE')
     // Audit and activity.

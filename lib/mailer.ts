@@ -129,6 +129,8 @@ async function getSmtpSettings(): Promise<SmtpSettingsInput> {
   }
 }
 
+const SEND_DEADLINE_BEFORE_DATA = 'The send deadline passed before the message was handed to the mail server (no connection, greeting or DATA); nothing was sent, so it will be retried.'
+
 function classifySendFailure(e: unknown, unknownOutcome: false | 'deadline' | 'lost-reply'): SendEmailResult {
   if (unknownOutcome) return { success: false, permanent: true, unknownOutcome: true, error: unknownOutcome === 'deadline' ? SEND_DEADLINE_UNKNOWN_OUTCOME : SEND_FINAL_REPLY_UNKNOWN_OUTCOME }
   const error = e as { code?: string; responseCode?: number }
@@ -176,7 +178,7 @@ export async function sendEmailWithSmtpSettings(
         // reply (nodemailer attaches the half-read response to 'Connection closed unexpectedly'): the server may have accepted the message.
         if (typeof responseCode === 'number' && responseCode >= 400 && responseCode < 600) return false
         // Classified by the OBSERVED phase: no DATA seen means nothing was handed over, so a rejection is retryable however late it comes.
-        // (The deadline TIMER below stays terminal: it leaves the send in flight, so its phase cannot be known.)
+        // (The deadline TIMER below is terminal only once DATA has started: before that nothing was handed over, so it is retryable.)
         return dataStarted
       }
     }
@@ -228,6 +230,8 @@ export async function sendEmailWithSmtpSettings(
       if (outcome === 'deadline') {
         sending.catch(() => undefined)
         transport.close()
+        // Before DATA nothing was handed over (no connection, greeting or DATA command): an ordinary retryable failure, not an unknown outcome.
+        if (opts.singleSend && !dataStarted) return { success: false, permanent: false, error: SEND_DEADLINE_BEFORE_DATA }
         return classifySendFailure(null, 'deadline')
       }
     } else {

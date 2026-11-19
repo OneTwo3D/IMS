@@ -237,6 +237,8 @@ export type EmailOutboxRow = {
   lockedBy: string | null
   /** o3d-hpeg: elapsed-time reclaims this row has had. See EMAIL_MAX_STALE_RECLAIMS. */
   staleReclaimCount: number
+  /** When the drain entered the sender for this claim, or null when it never did. */
+  sendEnteredAt?: Date | null
 }
 
 /**
@@ -1965,9 +1967,32 @@ async function claimEmailRow(
       status: 'PROCESSING',
       processingStartedAt: claim.claimedAt,
       lockedBy: claim.token,
+      sendEnteredAt: null,
     },
   })
   if (first.count > 0) return 'claimed'
+
+  // A STALE PROCESSING ROW WHOSE WORKER NEVER ENTERED THE SENDER (it died while preparing: PDF build, recipient confirm) sent nothing. It is put back
+  // to PENDING (not counted as a reclaim: nothing was attempted) and claimed in the ordinary way, for every kind. Conditional on the stale claim and on
+  // the sender never having been entered, so a worker that entered it a moment ago is not requeued.
+  const requeued = await client.emailOutbox.updateMany({
+    where: {
+      id,
+      attempts: { lt: EMAIL_MAX_ATTEMPTS },
+      status: 'PROCESSING',
+      processingStartedAt: { lt: claim.staleCutoff },
+      sendEnteredAt: null,
+    },
+    data: { status: 'PENDING', processingStartedAt: null, lockedBy: null },
+  })
+  if (requeued.count > 0) {
+    const again = await client.emailOutbox.updateMany({
+      where: { id, attempts: { lt: EMAIL_MAX_ATTEMPTS }, status: 'PENDING' },
+      data: { status: 'PROCESSING', processingStartedAt: claim.claimedAt, lockedBy: claim.token, sendEnteredAt: null },
+    })
+    if (again.count > 0) return 'claimed'
+    return 'none'
+  }
 
   const reclaim = await client.emailOutbox.updateMany({
     where: {
@@ -1982,6 +2007,7 @@ async function claimEmailRow(
       processingStartedAt: claim.claimedAt,
       lockedBy: claim.token,
       staleReclaimCount: { increment: 1 },
+      sendEnteredAt: null,
     },
   })
   if (reclaim.count > 0) return 'claimed'
@@ -2606,7 +2632,8 @@ export async function processPendingEmailOutbox(
       // and the row is refused.
       const confirmed = await client.emailOutbox.updateMany({
         where: { id: claim.id, status: 'PROCESSING', lockedBy: claim.token, processingStartedAt: claim.claimedAt, toEmail: email.toEmail },
-        data: { status: 'PROCESSING' },
+        // `sendEnteredAt` is the durable "the sender is about to be entered" mark: a worker that dies after this may have sent; one that dies before provably did not.
+        data: { status: 'PROCESSING', sendEnteredAt: now() },
       })
       if (confirmed.count === 0) {
         await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)

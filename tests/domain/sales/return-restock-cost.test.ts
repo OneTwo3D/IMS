@@ -186,68 +186,80 @@ test('units held by an expectation (net of write-offs) count as covered', async 
   assert.deepEqual(result.rows, [{ productId: 'p1', qty: 1 }])
 })
 
-// ---- o3d-iil0b round 1: the ledger side of an adoption --------------------------------------------------
-const adoptionTx = (opts: { journals?: Array<{ referenceId: string; lines: Array<{ accountCode: string; credit?: number; debit?: number }> }>; movements?: Record<string, number> }) => ({
+// ---- o3d-iil0b rounds 1-2: the ledger side of an adoption is an operator task, never a journal -------------
+const adoptionTx = (opts: { journals?: Array<{ referenceId: string; lines: Array<{ accountCode: string; credit?: number; debit?: number }> }>; movements?: Record<string, number>; products?: Record<string, string> }) => ({
+  wmsReturnsInbox: { findMany: async () => Object.keys(opts.movements ?? { ib1: 2 }).map((id) => ({ id, productId: opts.products?.[id] ?? 'p1' })) },
   stockMovement: { groupBy: async () => Object.entries(opts.movements ?? { ib1: 2 }).map(([referenceId, qty]) => ({ referenceId, _sum: { qty } })) },
   accountingSyncLog: { findMany: async () => (opts.journals ?? []).map((j) => ({ referenceId: j.referenceId, payload: { lines: j.lines } })) },
 }) as unknown as Prisma.TransactionClient
 const adoptionRun = async (tx: Prisma.TransactionClient, adoptions: Array<{ inboxId: string; qty: number }>, rows: Array<{ productId: string; qty: number; unitCostBase?: number }>) =>
-  (await loadModule()).queueAdoptionReclassJournal(tx, { refundId: 'rf1', orderId: 'o1', orderRef: 'SO-1', adoptions, rows })
+  (await loadModule()).raiseAdoptionReclassTask(tx, { refundId: 'rf1', orderId: 'o1', orderRef: 'SO-1', adoptions, rows })
 
-test('an adopting refund reclassifies the restock: Dr the stock-gain account, Dr the cost difference to Inventory, Cr COGS at the original cost', async () => {
+test('the simple case (one journalled row adopted whole) raises one task with the exact amounts and queues no journal', async () => {
   queued.length = 0
   reported.length = 0
-  // The restock (2 units, booked at the average 30 = 60) credited 4900; the original shipment cost was 40 a unit and one unit is adopted.
-  const tx = adoptionTx({ journals: [{ referenceId: 'ib1', lines: [{ accountCode: '1200', debit: 60 }, { accountCode: '4900', credit: 60 }] }] })
+  const tx = adoptionTx({ journals: [{ referenceId: 'ib1', lines: [{ accountCode: '1200', debit: 30 }, { accountCode: '4900', credit: 30 }] }], movements: { ib1: 1 } })
   const result = await adoptionRun(tx, [{ inboxId: 'ib1', qty: 1 }], [{ productId: 'p1', qty: 1, unitCostBase: 40 }])
-  assert.equal(result.queued, true)
-  assert.equal(queued.length, 1)
-  assert.equal(queued[0].type, 'INVENTORY_ADJUSTMENT')
-  assert.equal(queued[0].referenceType, 'SalesOrderRefund')
-  assert.equal(queued[0].referenceId, 'rf1')
-  const lines = (queued[0].payload as { lines: Array<{ accountCode: string; debit?: number; credit?: number }> }).lines
-  assert.deepEqual(lines.map((l) => [l.accountCode, l.debit ?? 0, l.credit ?? 0]), [['4900', 30, 0], ['1200', 10, 0], ['5000', 0, 40]])
-  // Net with the restock (Dr 1200 30 / Cr 4900 30 for the unit): Inventory +40, COGS -40, the reason account nets to nil.
-  assert.equal(lines.reduce((s, l) => s + (l.debit ?? 0) - (l.credit ?? 0), 0), 0, 'balanced')
-  assert.equal(reported.length, 0)
-})
-
-test('when the restock was dearer than the original cost the difference is credited to Inventory', async () => {
-  queued.length = 0
-  const tx = adoptionTx({ journals: [{ referenceId: 'ib1', lines: [{ accountCode: '1200', debit: 100 }, { accountCode: '4900', credit: 100 }] }], movements: { ib1: 2 } })
-  await adoptionRun(tx, [{ inboxId: 'ib1', qty: 1 }], [{ productId: 'p1', qty: 1, unitCostBase: 40 }])
-  const lines = (queued[0].payload as { lines: Array<{ accountCode: string; debit?: number; credit?: number }> }).lines
-  assert.deepEqual(lines.map((l) => [l.accountCode, l.debit ?? 0, l.credit ?? 0]), [['4900', 50, 0], ['1200', 0, 10], ['5000', 0, 40]])
-})
-
-test('a restock that booked NO journal (no reason account) queues nothing and reports the owed posting with the whole entry', async () => {
-  queued.length = 0
-  reported.length = 0
-  const result = await adoptionRun(adoptionTx({}), [{ inboxId: 'ib1', qty: 1 }], [{ productId: 'p1', qty: 1, unitCostBase: 40 }])
-  assert.equal(queued.length, 0)
-  assert.equal(result.queued, false)
-  assert.equal(result.owedValueBase, 40)
+  assert.deepEqual(result, { raised: true, advisory: false, owedCostBase: 40 })
+  assert.equal(queued.length, 0, 'no journal is queued')
   assert.equal(reported.length, 1)
   assert.equal(reported[0].kind, 'refund_adoption_reclass_journal')
-  assert.match(String(reported[0].remedy), /Dr Inventory \/ Cr COGS 40\.00/)
+  const remedy = String(reported[0].remedy)
+  assert.match(remedy, /ib1/)
+  assert.match(remedy, /1 of 1 unit/)
+  assert.match(remedy, /Dr that account 40\.00 \/ Cr COGS 40\.00/)
+  assert.match(remedy, /4900 30\.00/)
+  assert.doesNotMatch(remedy, /Dr Inventory \/ Cr COGS/)
+  assert.match(remedy, /Never post Dr Inventory/)
+  assert.doesNotMatch(String(reported[0].posting), /ADVISORY/)
+  assert.deepEqual((reported[0].outcome as { posting: unknown }).posting, { type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', referenceId: 'rf1', scope: 'adoption-reclass' })
 })
 
-test('a part journaled, part unjournaled adoption splits the original cost by quantity: the journaled share is reclassed, the rest is owed', async () => {
+test('a mixed row (2 units, 1 matched to an expectation, 1 adopted and journalled) books no journal and raises an ADVISORY task', async () => {
   queued.length = 0
   reported.length = 0
-  const tx = adoptionTx({ journals: [{ referenceId: 'ib1', lines: [{ accountCode: '1200', debit: 40 }, { accountCode: '4900', credit: 40 }] }], movements: { ib1: 1, ib2: 1 } })
-  const result = await adoptionRun(tx, [{ inboxId: 'ib1', qty: 1 }, { inboxId: 'ib2', qty: 1 }], [{ productId: 'p1', qty: 2, unitCostBase: 40 }])
-  assert.equal(result.queued, true)
-  assert.equal(result.owedValueBase, 40)
-  const lines = (queued[0].payload as { lines: Array<{ accountCode: string; debit?: number; credit?: number }> }).lines
-  assert.deepEqual(lines.map((l) => [l.accountCode, l.debit ?? 0, l.credit ?? 0]), [['4900', 40, 0], ['5000', 0, 40]])
+  const tx = adoptionTx({ journals: [{ referenceId: 'ib1', lines: [{ accountCode: '1200', debit: 30 }, { accountCode: '4900', credit: 30 }] }], movements: { ib1: 2 } })
+  const result = await adoptionRun(tx, [{ inboxId: 'ib1', qty: 1 }], [{ productId: 'p1', qty: 1, unitCostBase: 40 }])
+  assert.equal(result.advisory, true)
+  assert.equal(queued.length, 0)
   assert.equal(reported.length, 1)
+  assert.match(String(reported[0].posting), /ADVISORY/)
+  assert.match(String(reported[0].remedy), /CANNOT TELL WHICH/)
+  assert.match(String(reported[0].remedy), /1 of 2 unit/)
+})
+
+test('a restock with no journal still raises the task, and never says to post Dr Inventory', async () => {
+  queued.length = 0
+  reported.length = 0
+  const result = await adoptionRun(adoptionTx({ movements: { ib1: 1 } }), [{ inboxId: 'ib1', qty: 1 }], [{ productId: 'p1', qty: 1, unitCostBase: 40 }])
+  assert.equal(result.raised, true)
+  assert.equal(result.owedCostBase, 40)
+  assert.equal(queued.length, 0)
+  const remedy = String(reported[0].remedy)
+  assert.match(remedy, /no restock journal standing/)
+  assert.doesNotMatch(remedy, /Dr Inventory \/ Cr COGS|do not also post/)
+  assert.match(remedy, /Never post Dr Inventory/)
+})
+
+test('rows journalled and unjournalled together are ADVISORY, and the original cost is keyed by product', async () => {
+  queued.length = 0
+  reported.length = 0
+  const tx = adoptionTx({
+    journals: [{ referenceId: 'ib1', lines: [{ accountCode: '1200', debit: 10 }, { accountCode: '4900', credit: 10 }] }],
+    movements: { ib1: 1, ib2: 1 },
+    products: { ib1: 'pA', ib2: 'pB' },
+  })
+  const result = await adoptionRun(tx, [{ inboxId: 'ib1', qty: 1 }, { inboxId: 'ib2', qty: 1 }], [{ productId: 'pA', qty: 1, unitCostBase: 10 }, { productId: 'pB', qty: 1, unitCostBase: 50 }])
+  assert.equal(result.advisory, true)
+  assert.equal(result.owedCostBase, 60)
+  assert.equal(queued.length, 0)
+  assert.match(String(reported[0].remedy), /original cost to reverse 50\.00/)
 })
 
 test('nothing to reverse (no shipped cost) books and reports nothing', async () => {
   queued.length = 0
   reported.length = 0
   const result = await adoptionRun(adoptionTx({}), [{ inboxId: 'ib1', qty: 1 }], [])
-  assert.deepEqual(result, { queued: false, owedValueBase: 0 })
+  assert.deepEqual(result, { raised: false, advisory: false, owedCostBase: 0 })
   assert.equal(queued.length + reported.length, 0)
 })
