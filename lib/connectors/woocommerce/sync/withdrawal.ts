@@ -33,6 +33,7 @@
  */
 
 import { isWcOrderAnonymised } from './anonymisation'
+import { writeWithdrawalOutcomeForEvent } from './withdrawal-outcome'
 import { recordWcErasureObligation } from './erasure-obligation'
 import { WcFirstImportLockUnavailable, withWcFirstImportLock } from './first-import-lock'
 import { randomUUID } from 'node:crypto'
@@ -459,6 +460,14 @@ async function clearStaleMarker(orderId: string, observed: Date | null): Promise
   })
 }
 
+/** The storefront withdrawal request id the helper plugin recorded on the order, when the payload carries one. */
+export function wcWithdrawalRequestId(wcOrder: WcFullOrder): string | null {
+  const meta = (wcOrder.meta_data ?? []).find((m) => m.key === '_oti_wdraw_request_id')
+  const value = meta?.value
+  const text = typeof value === 'number' ? String(value) : typeof value === 'string' ? value.trim() : ''
+  return /^[1-9]\d{0,17}$/.test(text) ? text : null
+}
+
 async function note(
   orderId: string,
   wcOrder: WcFullOrder,
@@ -475,6 +484,13 @@ async function note(
     description,
     metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
     resolveUser: false,
+  })
+  // THE OUTCOME WRITER (withdrawal-outcome.ts): the storefront order note, and the rejection of a request made after despatch. Off unless
+  // `wc_withdrawal_outcome_enabled` is true AND step M is live; never throws, so the handling above never waits on it.
+  await writeWithdrawalOutcomeForEvent({
+    orderId, externalOrderId: String(wcOrder.id), action, description,
+    // The identity is the withdrawal request (IMS's record, filled from the plugin's meta), never a modified time.
+    requestId: wcWithdrawalRequestId(wcOrder),
   })
 }
 

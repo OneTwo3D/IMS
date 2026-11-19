@@ -16,6 +16,9 @@ import { db } from '@/lib/db'
 import { wcFetch, wcPost, wcPut } from '../api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
+import { isInvoiceNoteEnabled, WC_INVOICE_NOTE_ENABLED_SETTING } from './invoice-note-switch'
+
+export { isInvoiceNoteEnabled, WC_INVOICE_NOTE_ENABLED_SETTING }
 
 /**
  * Push the invoice note and link meta for WooCommerce order screens.
@@ -23,6 +26,10 @@ import { logActivity } from '@/lib/activity-log'
  * server-to-server; the flag that shows the download button is written by publishInvoiceDocumentFlagToWc, not here.
  */
 export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: boolean; error?: string }> {
+  // The last barrier: a note queued while the switch was on, sent after it was turned off, is NOT written (and is a failure to look at, not a silent success).
+  if (!(await isInvoiceNoteEnabled())) {
+    return { success: false, error: `The WooCommerce invoice note is switched off (${WC_INVOICE_NOTE_ENABLED_SETTING}), so no note was added.` }
+  }
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
     select: {

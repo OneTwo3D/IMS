@@ -50,8 +50,8 @@ type CompletionTxClient = (Prisma.TransactionClient | typeof db) & IntegrationOu
 
 /** One row per flip to SHIPPED: a STRING epoch (a Date key part is truncated to the day), so a re-ship
  *  after a reopen gets a fresh row while a replayed transaction dedups to the same one. */
-export function wcOrderCompletionIdempotencyKey(orderId: string, shippedAt: Date): string {
-  return buildOutboxIdempotencyKey(CONNECTOR, OPERATION, orderId, String(shippedAt.getTime()))
+export function wcOrderCompletionIdempotencyKey(orderId: string, shippedAt: Date, keyPart?: string): string {
+  return buildOutboxIdempotencyKey(CONNECTOR, OPERATION, orderId, keyPart ?? String(shippedAt.getTime()))
 }
 
 /**
@@ -64,14 +64,14 @@ export function wcOrderCompletionIdempotencyKey(orderId: string, shippedAt: Date
  */
 export async function scheduleWcOrderCompletion(
   tx: CompletionTxClient,
-  input: { orderId: string; shippedAt: Date },
+  input: { orderId: string; shippedAt: Date; /** The switchover take-over's own stable key part (the obligation time is NOW there, so it cannot be the key). */ keyPart?: string },
 ): Promise<string | null> {
   const link = await tx.shoppingOrderLink.findFirst({
     where: { orderId: input.orderId, connector: CONNECTOR },
     select: { id: true },
   })
   if (!link) return null
-  const key = wcOrderCompletionIdempotencyKey(input.orderId, input.shippedAt)
+  const key = wcOrderCompletionIdempotencyKey(input.orderId, input.shippedAt, input.keyPart)
   const enqueued = await enqueueIntegrationOutbox({
     connector: CONNECTOR,
     operation: OPERATION,

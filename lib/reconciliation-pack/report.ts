@@ -446,6 +446,7 @@ export function checkItemConsistency(input: ItemRecordView, applicability: PackA
     }
   } else if (input.outcome === 'fail') {
     if (!has('DIFFERENCES')) fail('a fail names DIFFERENCES')
+    if (findings === 0) fail('a fail lists at least one finding: DIFFERENCES with nothing listed proves nothing')
   } else if (input.outcome === 'inconclusive') {
     if (reasons.length === 0) fail('inconclusive needs a reason code')
     if (has('DIFFERENCES')) fail('an inconclusive item reports no difference')

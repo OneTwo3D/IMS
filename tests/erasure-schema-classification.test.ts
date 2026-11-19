@@ -50,7 +50,7 @@ function modelsLinkedToCustomerOrOrder(): string[] {
 }
 
 /** The two tables that point at an order only by a reference id (referenceType / referenceId, an action url), so no relation finds them. */
-const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation', 'StorefrontCustomerErasureTombstone', 'ShoppingWebhookEvent', 'ShoppingSyncLog', 'AccountingSyncLog', 'AccountingEvent', 'AccountingEventLog', 'RefusedAction', 'XeroPaymentMatch', 'SalesOrderRefundDeletion', 'WcOrderDivergence', 'WcOrderDivergenceRecheck']
+const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation', 'StorefrontCustomerErasureTombstone', 'ShoppingWebhookEvent', 'ShoppingSyncLog', 'AccountingSyncLog', 'AccountingEvent', 'AccountingEventLog', 'RefusedAction', 'XeroPaymentMatch', 'SalesOrderRefundDeletion', 'CustomerMergeEvent', 'CustomerClusterErasure', 'WcOrderDivergence', 'WcOrderDivergenceRecheck']
 
 test('every table with a relation path to Customer or SalesOrder is classified, column by column, and a new linked table fails here', () => {
   const models = parseModels()
@@ -114,6 +114,16 @@ test('the schema parser sees the erasure marker column, so the test would notice
  */
 const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | 'not-customer'> = {
   'Customer.externalCustomerId': 'erased',
+  // CRM: the storefront customer id each order was placed under (an Int). Cleared with the order's identity by eraseOrdersPersonalDataInTx.
+  'SalesOrder.externalCustomerId': 'erased',
+  // CRM merge audit: ids only, no foreign keys, kept by an erasure.
+  'CustomerMergeEvent.customerId': 'surrogate',
+  'CustomerMergeEvent.otherCustomerId': 'surrogate',
+  'CustomerMergeEvent.decidedByUserId': 'not-customer',
+  // CRM cluster erasure request: ids only, no foreign keys, kept by an erasure.
+  'CustomerClusterErasure.requestedCustomerId': 'surrogate',
+  'CustomerClusterErasure.requestedByUserId': 'not-customer',
+  'CustomerClusterErasure.cancelledByUserId': 'not-customer',
   'ShoppingCustomerLink.externalCustomerId': 'erased',
   'Customer.accountingContactId': 'retained',
   'SalesOrder.accountingInvoiceId': 'retained',
@@ -158,10 +168,17 @@ test('every column that stores a customer / contact / account identifier is deci
   }
   assert.deepEqual(found.sort(), Object.keys(IDENTIFIER_COLUMNS).sort())
   for (const [key, verdict] of Object.entries(IDENTIFIER_COLUMNS)) {
-    if (verdict !== 'erased' || key === 'Customer.externalCustomerId') continue // an Int column: not in the String/Json classification; the erasure sets it to null (asserted below)
+    if (verdict !== 'erased' || key === 'Customer.externalCustomerId' || key === 'SalesOrder.externalCustomerId') continue // an Int column: not in the String/Json classification; the erasure sets it to null (asserted below)
     const [model, column] = key.split('.') as [string, string]
     assert.ok(ERASURE_CLASSIFICATION[model]!.erased.includes(column), `${key} is classified erased`)
   }
+})
+
+test('the erasure clears the storefront customer id stored on each erased order', () => {
+  const src = readFileSync(new URL('../lib/domain/erasure/erase-personal-data.ts', import.meta.url), 'utf8')
+  const orderUpdate = src.slice(src.indexOf('counts.salesOrders += (await tx.salesOrder.updateMany('), src.indexOf('await tx.customFieldValue.deleteMany'))
+  assert.match(orderUpdate, /externalCustomerId: null/, 'SalesOrder.externalCustomerId is cleared in the same statement as the order identity')
+  assert.match(orderUpdate, /erasedAt,/)
 })
 
 test('the erasure deletes the storefront account link rows and does not keep the storefront id', () => {
