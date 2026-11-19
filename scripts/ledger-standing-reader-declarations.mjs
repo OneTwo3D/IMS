@@ -15,6 +15,8 @@
 // slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question.
 
 export const DECLARATIONS = [
+  { key: "lib/domain/accounting/invoice-order-total.ts::invoicePostedOrderTotal::where-admits-synced#1", class: "DISPLAY",
+    reason: "o3d-hqvrp.389: chooses which sales-invoice sync row's PAYLOAD a full-reversal credit note copies its order total from (the newest invoice or invoice-update row that is not failed or cancelled). It reads the payload as queued, to make the credit note match the document the invoice was built as; it makes no claim about whether the ledger holds the document and sends nothing." },
   { key: "lib/domain/accounting/document-delete-service.ts::lateActivityOn::where-admits-synced#1", class: "GUARD",
     reason: "o3d-ngmt.21: the unwind's re-check under the document's lock: a bill payment queued, running or synced since the delete was requested stops the unwind (the bill is paid in the ledger sense); a cancelled row is not a payment." },
   { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#1", class: "GUARD",
