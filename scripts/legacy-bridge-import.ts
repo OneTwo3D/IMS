@@ -9,16 +9,16 @@ import {
 } from '@/lib/connectors/mintsoft/legacy-bridge-import/run'
 
 /**
- * `npm run cutover:legacy-import [-- --apply] [-- --verify-mintsoft] [-- --statuses a,b] [-- --connector id] [-- --verify-max N] [-- --json]`
+ * `npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --statuses a,b] [-- --connector id] [-- --verify-max N] [-- --json]`
  *
  * Imports the legacy bridge's `_mintsoft_*` order state into IMS's own link rows (o3d-zvec.22) and prints the Step M precondition report.
  * DRY RUN BY DEFAULT: nothing is written without --apply. WooCommerce is only ever read (GET). Mintsoft is not called at all unless
  * --verify-mintsoft is given, and then only read. Exit 0: the precondition is met; 1: the run failed; 2: usage; 3: the precondition is
- * not met (an OrderNumber mismatch, a conflict, an unimported order or an open merge item).
+ * not met (a non-empty order prefix, an OrderNumber mismatch, a conflict, a verify-pending or queued-update order, no orders read, an unimported order or an open merge item).
  */
 
 const DISCONNECT_TIMEOUT_MS = 5_000
-const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --json]'
+const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --json]'
 
 type Logger = Pick<typeof console, 'log' | 'error'>
 
@@ -45,12 +45,12 @@ async function disconnectDb(): Promise<void> {
   if (timeout) clearTimeout(timeout)
 }
 
-/** The statuses an open bridge order can be in: the configured pull statuses, on-hold, the bridge's partial-shipped, and the withdrawal-submitted status. */
+/** The statuses an open bridge order can be in: the configured pull statuses, on-hold, both spellings of the bridge's partial-shipped status, and the withdrawal-submitted status. */
 async function defaultStatuses(): Promise<string[]> {
   const { getWcPullStatuses } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const { getWithdrawalStatuses } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
   const [pulled, withdrawal] = await Promise.all([getWcPullStatuses('reconcile'), getWithdrawalStatuses()])
-  return [...new Set([...pulled, 'processing', 'on-hold', 'partial-shipped', withdrawal.submitted])].filter((s) => s !== '')
+  return [...new Set([...pulled, 'processing', 'on-hold', 'partial-shipped', 'partially-shipped', withdrawal.submitted])].filter((s) => s !== '')
 }
 
 export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): Promise<number> {
@@ -59,6 +59,7 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
   const args = options.argv ?? process.argv.slice(2)
 
   let apply = false
+  let bridgeStopped = false
   let verifyMintsoft = false
   let json = false
   let verifyMax: number | undefined
@@ -67,6 +68,7 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!
     if (arg === '--apply') { apply = true; continue }
+    if (arg === '--bridge-stopped') { bridgeStopped = true; continue }
     if (arg === '--verify-mintsoft') { verifyMintsoft = true; continue }
     if (arg === '--json') { json = true; continue }
     if (arg === '--verify-max') {
@@ -95,12 +97,17 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     return LEGACY_IMPORT_EXIT.usage
   }
 
+  if (apply && !bridgeStopped) {
+    stderr.error(`--apply refuses without --bridge-stopped: pass it only once the bridge has stopped creating, merging, verifying and syncing orders (design step 3). ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+
   try {
     const ports = options.ports
       ? await options.ports({ verifyMintsoft, connector })
       : (await import('@/lib/connectors/mintsoft/legacy-bridge-import/ports')).createLegacyImportPorts({ verifyMintsoft, connector })
     const resolvedStatuses = statuses ?? await (options.defaultStatuses ?? defaultStatuses)()
-    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, verifyMintsoft, verifyMax, statuses: resolvedStatuses, now: options.now })
+    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, verifyMintsoft, verifyMax, statuses: resolvedStatuses, now: options.now })
     if (json) stdout.log(JSON.stringify(report, null, 2))
     else {
       stdout.log(renderLegacyImportReport(report))

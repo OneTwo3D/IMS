@@ -32,7 +32,7 @@ test('merged order: MERGED naming the survivor, with the combined number only wh
 
 test('split and partially despatched: parts are read, link is SYNCED on the primary id', () => {
   const s = state({ _mintsoft_order_id: '9200', _mintsoft_total_parts: '3', _mintsoft_split_parts_done: [1], _mintsoft_split_part_statuses: { '1': 'despatched', '2': 'NEW', '3': 'ONBACKORDER' } })
-  assert.deepEqual(s.split, { totalParts: 3, thisPart: null, partsDone: [1], partStatuses: { '1': 'DESPATCHED', '2': 'NEW', '3': 'ONBACKORDER' } })
+  assert.deepEqual(s.split, { totalParts: 3, thisPart: null, partsDone: [1], partsResolved: [], partStatuses: { '1': 'DESPATCHED', '2': 'NEW', '3': 'ONBACKORDER' } })
   assert.equal((desiredLinkFor(s) as { state: string }).state, 'SYNCED')
   const csv = state({ _mintsoft_order_id: '9200', _mintsoft_split_parts_done: '1, 2' })
   assert.deepEqual(csv.split?.partsDone, [1, 2])
@@ -56,10 +56,22 @@ test('dead-lettered with no id: DEAD_LETTER; with an id: the order exists so SYN
   assert.equal((desiredLinkFor(state({ _mintsoft_sync_dead: '1', _mintsoft_order_id: '77' })) as { state: string }).state, 'SYNCED')
 })
 
-test('verify-pending: PENDING_VERIFY on the unproved id; the trusted id wins when both exist', () => {
+test('verify-pending: blocked (never a link) on the unproved id; the trusted id wins when both exist', () => {
   const v = state({ _mintsoft_verify_pending: '1', _mintsoft_verify_order_id: '9400' })
-  assert.deepEqual(desiredLinkFor(v), { kind: 'link', state: 'PENDING_VERIFY', externalOrderId: '9400', externalOrderNumber: null, lastError: (desiredLinkFor(v) as { lastError: string }).lastError })
+  assert.deepEqual(desiredLinkFor(v), { kind: 'blocked', reason: 'verify-pending', verifyOrderId: '9400' })
   assert.equal((desiredLinkFor(state({ _mintsoft_verify_pending: '1', _mintsoft_verify_order_id: '9400', _mintsoft_order_id: '9401' })) as { externalOrderId: string }).externalOrderId, '9401')
+})
+
+test('the bridge writeback queues are read: dead-letter, terminal-forced with a clipped reason, resolved split parts', () => {
+  const v = state({ _mintsoft_order_id: '9001', _mintsoft_dead_letter: '1', _mintsoft_terminal_forced: '1', _mintsoft_terminal_forced_reason: `x\ny${'z'.repeat(200)}`, _mintsoft_split_parts_resolved: '2,3' })
+  assert.equal(v.writebackDeadLetter, true)
+  assert.equal(v.terminalForced, true)
+  assert.equal(v.terminalForcedReason!.length, 80)
+  assert.doesNotMatch(v.terminalForcedReason!, /\n/)
+  assert.deepEqual(v.split?.partsResolved, [2, 3])
+  const none = state({ _mintsoft_order_id: '9001' })
+  assert.equal(none.writebackDeadLetter, false)
+  assert.equal(none.terminalForced, false)
 })
 
 test('a queued create with no id is nothing to adopt; a malformed id is unreadable', () => {
@@ -95,4 +107,8 @@ test('decideLink: create, unchanged, adopt a bare placeholder, conflict otherwis
   assert.equal(decideLink(desired, existing({ state: 'PENDING_CREATE', externalOrderId: null, lastAttemptAt: new Date(), pushedAt: null }), 'mintsoft').action, 'conflict')
   assert.equal(decideLink(desired, existing({ state: 'HELD', externalOrderId: null, pushedAt: null }), 'mintsoft').action, 'conflict')
   assert.equal(decideLink(desired, existing({ connector: 'other' }), 'mintsoft').action, 'conflict')
+  // The same id in another state is a conflict, not "unchanged".
+  for (const state of ['DEAD_LETTER', 'CANCELLED', 'HELD', 'AMBIGUOUS_CREATE', 'PENDING_VERIFY', 'MERGED']) {
+    assert.equal(decideLink(desired, existing({ state }), 'mintsoft').action, 'conflict', state)
+  }
 })

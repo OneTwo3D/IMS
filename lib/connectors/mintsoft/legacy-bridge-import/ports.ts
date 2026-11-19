@@ -3,6 +3,7 @@
  * Mintsoft order read (GET only, and only for `--verify-mintsoft`). Kept apart from run.ts so the decision runs without any of them.
  */
 import { db } from '@/lib/db'
+import { logActivityPersisted } from '@/lib/activity-log'
 import { getShoppingConnectorPrefixes } from '@/lib/connectors/shopping-registry'
 import { MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk, describeUnreadWcPage, wcFetch } from '@/lib/connectors/woocommerce/api'
 import { flagDoublePostageForMergedLink } from '@/lib/domain/wms/double-postage'
@@ -14,24 +15,23 @@ import {
   type DesiredLink,
   type ExistingLink,
 } from './state'
-import type { ImsOrderContext, LegacyImportPorts, WcOrderLite, WcReadResult, WriteOutcome } from './run'
+import { walkWcOrderPages } from './wc-read'
+import type { ImsOrderContext, LegacyImportPorts, WcReadResult, WriteOutcome } from './run'
 
 const LINK_SELECT = { id: true, connector: true, state: true, externalOrderId: true, externalOrderNumber: true, attempts: true, lastAttemptAt: true, pushedAt: true } as const
 
 /** The fields the import needs, nothing else: no billing, shipping or customer data leaves WooCommerce into this tool. */
 const WC_FIELDS = 'id,number,status,meta_data'
 
-async function readWcOrders(statuses: readonly string[]): Promise<WcReadResult> {
-  const orders: WcOrderLite[] = []
-  let pagesRead = 0
-  for (let page = 1; page <= MAX_WC_PAGE_WALK_PAGES; page += 1) {
-    const { data, error } = await wcFetch('/orders', { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: WC_FIELDS })
-    if (error || !Array.isArray(data)) return { orders, pagesRead, complete: false, error: describeUnreadWcPage('order', page, error ?? 'unreadable response') }
-    pagesRead += 1
-    if (data.length === 0) return { orders, pagesRead, complete: true }
-    orders.push(...(data as WcOrderLite[]))
-  }
-  return { orders, pagesRead, complete: false, error: describeUnendedWcPageWalk('order', pagesRead) }
+function readWcOrders(statuses: readonly string[]): Promise<WcReadResult> {
+  return walkWcOrderPages(
+    (page) => wcFetch('/orders', { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: WC_FIELDS }),
+    {
+      maxPages: MAX_WC_PAGE_WALK_PAGES,
+      describeUnread: (page, error) => describeUnreadWcPage('order', page, error),
+      describeUnended: (pagesRead) => describeUnendedWcPageWalk('order', pagesRead),
+    },
+  )
 }
 
 async function loadIms(wcOrderIds: readonly string[], connector: string): Promise<Map<string, ImsOrderContext>> {
@@ -128,7 +128,7 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
     })
     return won.count === 1 ? 'adopted' : 'conflict'
   }, { timeout: 30_000 })
-  if (outcome === 'created' && desired.kind === 'link' && desired.state === 'MERGED') {
+  if ((outcome === 'created' || outcome === 'adopted') && desired.kind === 'link' && desired.state === 'MERGED') {
     const link = await db.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
     if (link) await flagDoublePostageForMergedLink(link.id)
   }
@@ -153,6 +153,16 @@ export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; con
     loadIms,
     readOpenMergeState,
     writeLink,
+    async recordApply(entry) {
+      return logActivityPersisted({
+        entityType: 'SYSTEM',
+        action: 'legacy_bridge_import_applied',
+        tag: 'cutover',
+        description: `Legacy bridge import applied (connector ${entry.connector}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}.`,
+        metadata: { connector: entry.connector, bridgeStopped: entry.bridgeStopped, orderPrefix: entry.orderPrefix, statuses: entry.statuses, applied: entry.applied, generatedAt: entry.generatedAt },
+        resolveUser: false,
+      })
+    },
   }
   if (options.verifyMintsoft) {
     ports.verifyMintsoftOrder = async (mintsoftOrderId) => {

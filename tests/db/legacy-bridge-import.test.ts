@@ -4,7 +4,7 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 /**
- * THE LEGACY BRIDGE IMPORT AGAINST A REAL DATABASE (o3d-zvec.22): the seven shapes the stage proof seeds, linked by the REAL ports, and
+ * THE LEGACY BRIDGE IMPORT AGAINST A REAL DATABASE (o3d-zvec.22): the six importable shapes the stage proof seeds (a verify-pending order is a gate blocker, covered by the unit tests: nothing is written for it), linked by the REAL ports, and
  * then the REAL order-push sweep over the REAL Prisma port run three times with a connector double that records its calls.
  *
  * The claim under test is the one the cutover rests on: after the import, the push sweep creates ZERO Mintsoft orders for any order the
@@ -40,7 +40,6 @@ const SHAPES: Shape[] = [
   { name: 'partial', status: 'partial-shipped', meta: { _mintsoft_order_id: '9004', _mintsoft_total_parts: 2, _mintsoft_split_parts_done: [1], _mintsoft_split_part_statuses: { '1': 'DESPATCHED', '2': 'NEW' } }, expect: { state: 'SYNCED', externalOrderId: '9004' } },
   { name: 'withdrawal', status: 'pending-wdraw', meta: { _mintsoft_order_id: '9005', _mintsoft_wdraw_pending: 'hold', _mintsoft_wdraw_token: 't', _mintsoft_wdraw_hold_owned: '1' }, expect: { state: 'SYNCED', externalOrderId: '9005' } },
   { name: 'dead', status: 'processing', meta: { _mintsoft_sync_dead: '1', _mintsoft_sync_attempts: '5', _mintsoft_sync_pending: 'create' }, expect: { state: 'DEAD_LETTER', externalOrderId: null } },
-  { name: 'verify', status: 'processing', meta: { _mintsoft_verify_pending: '1', _mintsoft_verify_order_id: '9007' }, expect: { state: 'PENDING_VERIFY', externalOrderId: '9007' } },
   { name: 'control', status: 'processing', meta: {}, expect: null },
 ]
 
@@ -100,12 +99,15 @@ test('after the import the push sweep creates zero orders for bridge-created ord
 
   // DRY RUN writes nothing.
   const dry = await d.run.runLegacyBridgeImport(ports, { statuses: ['processing'] })
-  assert.equal(dry.plan.create, 7)
+  assert.equal(dry.plan.create, 6)
   assert.equal(await d.db.wmsOrderPushLink.count({ where: { orderId: { in: orderIds } } }), 0)
   assert.equal(dry.gate.exitCode, 0)
 
-  const applied = await d.run.runLegacyBridgeImport(ports, { apply: true, statuses: ['processing'] })
-  assert.deepEqual(applied.applied, { created: 7, adopted: 0, unchanged: 0, conflict: 0, gone: 0 })
+  const auditBefore = await d.db.activityLog.count({ where: { action: 'legacy_bridge_import_applied' } })
+  const applied = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
+  assert.equal(applied.auditRecorded, true)
+  assert.equal(await d.db.activityLog.count({ where: { action: 'legacy_bridge_import_applied' } }), auditBefore + 1)
+  assert.deepEqual(applied.applied, { created: 6, adopted: 0, unchanged: 0, conflict: 0, gone: 0 })
   for (const s of seeded) {
     const link = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: s.orderId } })
     if (s.shape.expect === null) { assert.equal(link, null); continue }
@@ -119,18 +121,27 @@ test('after the import the push sweep creates zero orders for bridge-created ord
 
   // IDEMPOTENT: a rerun changes nothing (not a column, not an updatedAt).
   const snapshot = JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } }))
-  const again = await d.run.runLegacyBridgeImport(ports, { apply: true, statuses: ['processing'] })
-  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 7, conflict: 0, none: 0, unreadable: 0, noImsOrder: 0 })
+  const again = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
+  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 6, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
   assert.equal(JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } })), snapshot)
 
   // A DIFFERING LINK IS NEVER OVERWRITTEN: point the plain order's link elsewhere; the import reports a conflict and leaves it.
   const plain = seeded.find((s) => s.shape.name === 'plain')!
   await d.db.wmsOrderPushLink.update({ where: { orderId: plain.orderId }, data: { externalOrderId: '123456' } })
-  const conflicted = await d.run.runLegacyBridgeImport(ports, { apply: true, statuses: ['processing'] })
+  const conflicted = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
   assert.equal(conflicted.conflicts.length, 1)
   assert.equal(conflicted.gate.exitCode, 3)
   assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { orderId: plain.orderId } }))?.externalOrderId, '123456')
   await d.db.wmsOrderPushLink.update({ where: { orderId: plain.orderId }, data: { externalOrderId: '9001' } })
+
+  // THE STATE COUNTS: the same id in a DEAD_LETTER link is a conflict (no sweep pass acts on it), never "unchanged".
+  await d.db.wmsOrderPushLink.update({ where: { orderId: plain.orderId }, data: { state: 'DEAD_LETTER' } })
+  const staleState = await d.run.runLegacyBridgeImport(ports, { statuses: ['processing'] })
+  assert.equal(staleState.conflicts.length, 1)
+  assert.equal(staleState.plan.unchanged, 5)
+  assert.equal(staleState.gate.exitCode, 3)
+  assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { orderId: plain.orderId } }))?.state, 'DEAD_LETTER')
+  await d.db.wmsOrderPushLink.update({ where: { orderId: plain.orderId }, data: { state: 'SYNCED' } })
 
   // THE SWEEP: three runs create nothing for any bridge-created order; the control (no bridge state, no link) is created, once.
   const calls: string[] = []
@@ -151,7 +162,7 @@ test('after the import the push sweep creates zero orders for bridge-created ord
   assert.deepEqual(results.map((r) => r.created), [1, 0, 0])
   assert.equal(calls.includes('updateOrder'), false, 'adoption does not amend a Mintsoft order')
   assert.equal(calls.includes('cancelOrder'), false)
-  for (const s of seeded.filter((x) => x.shape.expect !== null && x.shape.name !== 'verify')) {
+  for (const s of seeded.filter((x) => x.shape.expect !== null)) {
     const link = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: s.orderId } })
     assert.equal(link?.externalOrderId, s.shape.expect!.externalOrderId, `${s.shape.name} still names the bridge's Mintsoft order`)
   }

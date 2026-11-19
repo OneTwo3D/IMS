@@ -62,10 +62,14 @@ export type LegacyImportPorts = {
   writeLink(input: { orderId: string; connector: string; shipFromWarehouseId: string | null; desired: DesiredLink; now: Date }): Promise<WriteOutcome>
   /** Read-only Mintsoft lookup by id. Only called when `verifyMintsoft` is true. */
   verifyMintsoftOrder?(mintsoftOrderId: string): Promise<MintsoftVerifyResult>
+  /** Record an `--apply` run in the audit trail (best effort); true when the entry reached it. Only called when `apply` is true. */
+  recordApply?(entry: { connector: string; bridgeStopped: boolean; orderPrefix: string; statuses: string[]; applied: LegacyImportReport['applied']; generatedAt: string }): Promise<boolean>
 }
 
 export type LegacyImportOptions = {
   apply?: boolean
+  /** The operator's attestation (`--bridge-stopped`) that the bridge no longer creates, merges, verifies or syncs orders. `apply` refuses without it. */
+  bridgeStopped?: boolean
   verifyMintsoft?: boolean
   statuses: readonly string[]
   now?: () => Date
@@ -73,8 +77,9 @@ export type LegacyImportOptions = {
   verifyMax?: number
 }
 
-export type QueueKind = 'sync-pending' | 'dead-letter' | 'verify-pending' | 'withdrawal-pending'
-export type QueueEntry = { kind: QueueKind; wcOrderId: string; wcNumber: string; wcStatus: string; detail: string }
+export type QueueKind = 'sync-pending' | 'dead-letter' | 'writeback-dead-letter' | 'terminal-forced' | 'verify-pending' | 'withdrawal-pending'
+/** `blocking`: the entry fails the gate by itself (a verify-pending order; a queued bridge update that IMS would otherwise stamp as already pushed). */
+export type QueueEntry = { kind: QueueKind; wcOrderId: string; wcNumber: string; wcStatus: string; detail: string; blocking: boolean }
 
 export type OrderNumberMismatch = { wcOrderId: string; wcNumber: string; imsReference: string; bridgeReference: string; reason: 'prefix' | 'differs' }
 
@@ -83,12 +88,21 @@ export type LegacyImportReport = {
   generatedAt: string
   connector: string
   orderPrefix: string
+  /** The prefix, stated explicitly. Production keeps `woocommerce_order_prefix` EMPTY (owner decision 2026-11-19): anything else fails the gate. */
+  prefix: { value: string; empty: boolean }
+  /** True when `--bridge-stopped` was given. Recorded for the audit; `apply` refuses without it. */
+  bridgeStopped: boolean
+  /** Whether the `--apply` run reached the audit trail (null on a dry run). */
+  auditRecorded: boolean | null
   statuses: string[]
+  /** Orders read per WooCommerce status, so a status that matched nothing is visible. */
+  statusCounts: Record<string, number>
   wc: { ordersRead: number; pagesRead: number; complete: boolean; error: string | null }
   orders: { withBridgeState: number; withMintsoftId: number; withoutBridgeState: number }
-  plan: { create: number; adopt: number; unchanged: number; conflict: number; none: number; unreadable: number; noImsOrder: number }
+  plan: { create: number; adopt: number; unchanged: number; conflict: number; none: number; blocked: number; unreadable: number; noImsOrder: number }
   applied: { created: number; adopted: number; unchanged: number; conflict: number; gone: number }
-  orderNumber: { checked: number; mismatches: OrderNumberMismatch[] }
+  /** `verifiedAgainstMintsoft` is true only when `--verify-mintsoft` read every order with no skip and no error; otherwise the check compared the bridge's own meta only. */
+  orderNumber: { checked: number; mismatches: OrderNumberMismatch[]; verifiedAgainstMintsoft: boolean }
   merge: {
     mergedOrders: Array<{ wcOrderId: string; wcNumber: string; survivorId: string }>
     legacyMergeKeys: Array<{ wcOrderId: string; wcNumber: string; keys: string[] }>
@@ -96,7 +110,7 @@ export type LegacyImportReport = {
     openTasks: OpenMergeTask[]
   }
   queues: QueueEntry[]
-  split: Array<{ wcOrderId: string; wcNumber: string; totalParts: number | null; partsDone: number[]; partStatuses: Record<string, string> }>
+  split: Array<{ wcOrderId: string; wcNumber: string; totalParts: number | null; partsDone: number[]; partsResolved: number[]; partStatuses: Record<string, string> }>
   conflicts: Array<{ wcOrderId: string; wcNumber: string; orderId: string; reason: string }>
   /** Orders that carry a bridge-created Mintsoft order but have no IMS order yet: IMS would CREATE a second one if it imported and pushed them. */
   noImsOrder: Array<{ wcOrderId: string; wcNumber: string; mintsoftOrderId: string }>
@@ -116,6 +130,7 @@ const describeWithdrawal = (state: LegacyOrderState): string => {
 export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: LegacyImportOptions): Promise<LegacyImportReport> {
   const now = options.now ?? (() => new Date())
   const apply = options.apply === true
+  if (apply && options.bridgeStopped !== true) throw new Error('--apply refuses without --bridge-stopped: write the links only after the bridge has stopped creating, merging, verifying and syncing orders.')
   const [orderPrefix, connector] = await Promise.all([ports.readOrderPrefix(), ports.readConnectorId()])
   const read = await ports.readWcOrders(options.statuses)
 
@@ -124,12 +139,16 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
     generatedAt: now().toISOString(),
     connector,
     orderPrefix,
+    prefix: { value: orderPrefix, empty: orderPrefix === '' },
+    bridgeStopped: options.bridgeStopped === true,
+    auditRecorded: null,
     statuses: [...options.statuses],
+    statusCounts: {},
     wc: { ordersRead: read.orders.length, pagesRead: read.pagesRead, complete: read.complete, error: read.error ?? null },
     orders: { withBridgeState: 0, withMintsoftId: 0, withoutBridgeState: 0 },
-    plan: { create: 0, adopt: 0, unchanged: 0, conflict: 0, none: 0, unreadable: 0, noImsOrder: 0 },
+    plan: { create: 0, adopt: 0, unchanged: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 },
     applied: { created: 0, adopted: 0, unchanged: 0, conflict: 0, gone: 0 },
-    orderNumber: { checked: 0, mismatches: [] },
+    orderNumber: { checked: 0, mismatches: [], verifiedAgainstMintsoft: false },
     merge: { mergedOrders: [], legacyMergeKeys: [], openHolds: [], openTasks: [] },
     queues: [],
     split: [],
@@ -142,7 +161,10 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
   }
 
   const states: LegacyOrderState[] = []
+  for (const status of options.statuses) report.statusCounts[status] = 0
   for (const order of read.orders) {
+    const rawStatus = String((order as { status?: unknown }).status ?? '').trim().toLowerCase().replace(/^wc-/, '')
+    report.statusCounts[rawStatus] = (report.statusCounts[rawStatus] ?? 0) + 1
     const state = readLegacyOrderState(order)
     if (state === null) { report.unreadableOrders.push(String(order.id)); continue }
     if (!state.hasBridgeState) { report.orders.withoutBridgeState += 1; continue }
@@ -166,11 +188,19 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
     if (state.mergeStateKeys.length > 0) report.merge.legacyMergeKeys.push({ wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, keys: state.mergeStateKeys })
     if (state.merged && state.mintsoftOrderId !== null) report.merge.mergedOrders.push({ wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, survivorId: state.mintsoftOrderId })
 
-    if (state.syncPending !== null) report.queues.push({ kind: 'sync-pending', wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, wcStatus: state.wcStatus, detail: `outbound ${state.syncPending} queued` })
-    if (state.syncDead) report.queues.push({ kind: 'dead-letter', wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, wcStatus: state.wcStatus, detail: `outbound sync dead-lettered after ${state.syncAttempts} attempt(s)${state.mintsoftOrderId ? `; Mintsoft order ${state.mintsoftOrderId} exists` : '; no Mintsoft order was created'}` })
-    if (state.verifyPending || (state.mintsoftOrderId === null && state.verifyOrderId !== null)) report.queues.push({ kind: 'verify-pending', wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, wcStatus: state.wcStatus, detail: `Mintsoft order ${state.verifyOrderId ?? '(no id)'} created but not proved ours` })
-    if (state.withdrawal) report.queues.push({ kind: 'withdrawal-pending', wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, wcStatus: state.wcStatus, detail: describeWithdrawal(state) })
-    if (state.split) report.split.push({ wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, totalParts: state.split.totalParts, partsDone: state.split.partsDone, partStatuses: state.split.partStatuses })
+    const queue = (kind: QueueKind, detail: string, blocking = false) => report.queues.push({ kind, wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, wcStatus: state.wcStatus, detail, blocking })
+    const hasMintsoftOrder = state.mintsoftOrderId !== null || state.verifyOrderId !== null
+    // A queued bridge update (or any non-create item with a Mintsoft order) is an edit the bridge never pushed. The import stamps pushedAt at the
+    // write, so IMS would never send it: it blocks until the bridge has drained it. A queued CREATE with no Mintsoft order is just an order IMS creates.
+    if (state.syncPending !== null) queue('sync-pending', `outbound ${state.syncPending} queued${state.syncPending === 'create' && !hasMintsoftOrder ? '' : ': an edit the bridge never pushed; drain it (the bridge) before the import stamps the link as pushed'}`, state.syncPending !== 'create' || hasMintsoftOrder)
+    if (state.syncDead) queue('dead-letter', `outbound sync dead-lettered after ${state.syncAttempts} attempt(s)${state.mintsoftOrderId ? `; Mintsoft order ${state.mintsoftOrderId} exists` : '; no Mintsoft order was created'}`)
+    if (state.writebackDeadLetter) queue('writeback-dead-letter', `writeback dead-lettered (_mintsoft_dead_letter): the Mintsoft order ${state.mintsoftOrderId ?? state.verifyOrderId ?? '(no id)'} exists but its tracking / completion / partial-shipment writeback kept failing; the customer may still be owed tracking`)
+    if (state.terminalForced) queue('terminal-forced', `the bridge forced this order terminal (_mintsoft_terminal_forced)${state.terminalForcedReason ? `: ${state.terminalForcedReason}` : ''}`)
+    if (state.verifyPending || (state.mintsoftOrderId === null && state.verifyOrderId !== null)) {
+      queue('verify-pending', `Mintsoft order ${state.verifyOrderId ?? '(no id)'} created but not proved ours; NOT imported (IMS verifies against its own order id, the bridge's reference is the WooCommerce id): the bridge's final sweep must resolve it`, true)
+    }
+    if (state.withdrawal) queue('withdrawal-pending', describeWithdrawal(state))
+    if (state.split) report.split.push({ wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, totalParts: state.split.totalParts, partsDone: state.split.partsDone, partsResolved: state.split.partsResolved, partStatuses: state.split.partStatuses })
 
     // ORDER NUMBER: only an order the bridge created in Mintsoft has a number to agree with.
     if (state.mintsoftOrderId !== null || state.verifyOrderId !== null) {
@@ -181,6 +211,7 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
 
     if (desired.kind === 'unreadable') { report.plan.unreadable += 1; continue }
     if (desired.kind === 'none') { report.plan.none += 1; continue }
+    if (desired.kind === 'blocked') { report.plan.blocked += 1; continue }
     if (ims === null) {
       report.plan.noImsOrder += 1
       if (state.mintsoftOrderId !== null || state.verifyOrderId !== null) report.noImsOrder.push({ wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, mintsoftOrderId: (state.mintsoftOrderId ?? state.verifyOrderId)! })
@@ -209,6 +240,10 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
         report.conflicts.push({ wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, orderId: ims.orderId, reason: 'The link changed while the import was running; nothing was overwritten. Run the dry run again.' })
       }
     }
+    // The audit entry names the attestation the run rested on.
+    if (ports.recordApply) {
+      report.auditRecorded = await ports.recordApply({ connector, bridgeStopped: options.bridgeStopped === true, orderPrefix, statuses: [...options.statuses], applied: { ...report.applied }, generatedAt: report.generatedAt }).catch(() => false)
+    }
   }
 
   if (options.verifyMintsoft) {
@@ -228,9 +263,15 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
       const parts = (result.orderNumber ?? '').includes('+') ? (result.orderNumber ?? '').split('+').map((p) => p.trim()) : [(result.orderNumber ?? '').trim()]
       if (!parts.includes(expected)) verify.numberMismatches.push({ wcOrderId: state.wcOrderId, mintsoftOrderId: id, mintsoftNumber: result.orderNumber, expected })
     }
+    report.orderNumber.verifiedAgainstMintsoft = verify.skipped === 0 && verify.errors.length === 0 && verify.checked >= report.orderNumber.checked
   }
 
   const blockers: string[] = []
+  if (orderPrefix !== '') blockers.push(`woocommerce_order_prefix is "${orderPrefix}", not empty: production keeps it EMPTY (owner decision 2026-11-19), so any non-empty prefix is a gate failure (IMS would send a different OrderNumber from the bridge's).`)
+  if (report.wc.ordersRead === 0) blockers.push('Zero WooCommerce orders were read (check --statuses and the store): a report over nothing proves nothing.')
+  const blockingCount = (kind: QueueKind) => report.queues.filter((q) => q.blocking && q.kind === kind).length
+  if (blockingCount('verify-pending') > 0) blockers.push(`${blockingCount('verify-pending')} bridge order(s) are verify-pending (created in Mintsoft, id not yet proved ours): not imported, because an imported link could never verify. The bridge's final sweep must resolve each one (listed under BRIDGE QUEUES).`)
+  if (blockingCount('sync-pending') > 0) blockers.push(`${blockingCount('sync-pending')} order(s) have a queued bridge outbound update (_mintsoft_sync_pending): the import stamps pushedAt at the write, so IMS would never send that edit. Drain the queue in the bridge first.`)
   if (!report.wc.complete || report.wc.error) blockers.push(`The WooCommerce order read did not complete${report.wc.error ? ` (${report.wc.error})` : ''}: the report is not proof of anything.`)
   if (report.unreadableOrders.length > 0) blockers.push(`${report.unreadableOrders.length} WooCommerce order(s) have a meta list that cannot be read.`)
   if (report.orderNumber.mismatches.length > 0) blockers.push(`${report.orderNumber.mismatches.length} OrderNumber mismatch(es) against woocommerce_order_prefix "${orderPrefix}".`)
@@ -248,13 +289,17 @@ export function renderLegacyImportReport(report: LegacyImportReport): string {
   const lines: string[] = []
   const say = (text = '') => lines.push(text)
   say(`Legacy bridge import (${report.mode.toUpperCase()}) at ${report.generatedAt}`)
-  say(`  connector ${report.connector}; woocommerce_order_prefix "${report.orderPrefix}"; statuses ${report.statuses.join(', ')}`)
+  say(`  connector ${report.connector}; statuses ${report.statuses.join(', ')}`)
+  say(`  woocommerce_order_prefix: ${report.prefix.empty ? '"" (EMPTY, as production requires)' : `"${report.prefix.value}" - NOT EMPTY: GATE FAILURE (production keeps the prefix EMPTY, owner decision 2026-11-19)`}`)
+  say(`  orders read per status: ${Object.entries(report.statusCounts).map(([status, n]) => `${status} ${n}`).join(', ') || '(none)'}`)
+  say(`  bridge stopped attested (--bridge-stopped): ${report.bridgeStopped ? 'yes' : 'no'}${report.mode === 'apply' ? `; audit entry ${report.auditRecorded ? 'recorded' : 'NOT recorded'}` : ''}`)
   say(`  WooCommerce read: ${report.wc.ordersRead} order(s), ${report.wc.pagesRead} page(s), ${report.wc.complete ? 'complete' : 'INCOMPLETE'}${report.wc.error ? `: ${report.wc.error}` : ''}`)
   say(`  orders with bridge state ${report.orders.withBridgeState} (with a Mintsoft id ${report.orders.withMintsoftId}); without ${report.orders.withoutBridgeState}`)
-  say(`  link plan: create ${report.plan.create}, adopt ${report.plan.adopt}, unchanged ${report.plan.unchanged}, conflict ${report.plan.conflict}, nothing-to-adopt ${report.plan.none}, no IMS order ${report.plan.noImsOrder}, unreadable ${report.plan.unreadable}`)
+  say(`  link plan: create ${report.plan.create}, adopt ${report.plan.adopt}, unchanged ${report.plan.unchanged}, conflict ${report.plan.conflict}, nothing-to-adopt ${report.plan.none}, blocked (verify-pending, not imported) ${report.plan.blocked}, no IMS order ${report.plan.noImsOrder}, unreadable ${report.plan.unreadable}`)
   if (report.mode === 'apply') say(`  applied: created ${report.applied.created}, adopted ${report.applied.adopted}, unchanged ${report.applied.unchanged}, conflict ${report.applied.conflict}, gone ${report.applied.gone}`)
   say()
   say(`ORDERNUMBER CHECK (the gate): ${report.orderNumber.checked} checked, ${report.orderNumber.mismatches.length} mismatch(es)`)
+  say(report.orderNumber.verifiedAgainstMintsoft ? '  Verified against the numbers Mintsoft holds (--verify-mintsoft, every order read).' : '  UNVERIFIED against Mintsoft: compared with the bridge\'s own meta only (the plain WooCommerce number when it recorded none). Run with --verify-mintsoft (no skipped reads) to prove what Mintsoft holds.')
   for (const m of report.orderNumber.mismatches) say(`  WC #${m.wcNumber} (id ${m.wcOrderId}): IMS pushes "${m.imsReference}", the bridge used "${m.bridgeReference}" [${m.reason}]`)
   say()
   say(`MERGE: ${report.merge.mergedOrders.length} merged order(s) imported as MERGED; open holds ${report.merge.openHolds.length}, open tasks ${report.merge.openTasks.length}, legacy merge keys on ${report.merge.legacyMergeKeys.length} order(s)`)
@@ -263,10 +308,10 @@ export function renderLegacyImportReport(report: LegacyImportReport): string {
   for (const k of report.merge.legacyMergeKeys) say(`  WC #${k.wcNumber}: ${k.keys.join(', ')}`)
   say()
   say(`BRIDGE QUEUES: ${report.queues.length} entr${report.queues.length === 1 ? 'y' : 'ies'}`)
-  for (const q of report.queues) say(`  [${q.kind}] WC #${q.wcNumber} (id ${q.wcOrderId}, ${q.wcStatus}): ${q.detail}`)
+  for (const q of report.queues) say(`  [${q.kind}]${q.blocking ? ' BLOCKS THE GATE' : ''} WC #${q.wcNumber} (id ${q.wcOrderId}, ${q.wcStatus}): ${q.detail}`)
   say()
   say(`SPLIT / PARTIAL: ${report.split.length} order(s)`)
-  for (const s of report.split) say(`  WC #${s.wcNumber}: parts done [${s.partsDone.join(',')}] of ${s.totalParts ?? '?'}; statuses ${JSON.stringify(s.partStatuses)}`)
+  for (const s of report.split) say(`  WC #${s.wcNumber}: parts done [${s.partsDone.join(',')}], resolved/cancelled [${s.partsResolved.join(',')}] of ${s.totalParts ?? '?'}; statuses ${JSON.stringify(s.partStatuses)}`)
   if (report.conflicts.length > 0) {
     say()
     say(`CONFLICTS (never overwritten): ${report.conflicts.length}`)
@@ -290,8 +335,9 @@ export function renderLegacyImportReport(report: LegacyImportReport): string {
     for (const e of report.verify.errors) say(`  error: WC ${e.wcOrderId}: ${e.error}`)
   }
   say()
-  say(report.gate.ok ? 'STEP M PRECONDITION: MET (zero mismatches, no conflicts, no open merge items).' : 'STEP M PRECONDITION: NOT MET')
+  say(report.gate.ok ? `STEP M PRECONDITION: MET (zero mismatches, no conflicts, no open merge items)${report.orderNumber.verifiedAgainstMintsoft ? '.' : ', with the OrderNumber check UNVERIFIED against Mintsoft.'}` : 'STEP M PRECONDITION: NOT MET')
   for (const b of report.gate.blockers) say(`  - ${b}`)
-  if (report.queues.length > 0) say('  Non-empty bridge queues are listed above: each order needs a named owner, or the queue emptied, before step M.')
+  if (report.queues.length > 0) say('  Non-empty bridge queues are listed above: each non-blocking entry needs a named owner, or the queue emptied, before step M.')
+  say('  Rollback note: once IMS amends an adopted order, Mintsoft\'s ExternalOrderReference becomes the IMS order id (the bridge sent the WooCommerce id), so the bridge\'s reference-based lookups no longer find it; see the runbook.')
   return lines.join('\n')
 }

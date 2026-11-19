@@ -30,6 +30,11 @@ export const LEGACY_META = {
   partStatuses: '_mintsoft_split_part_statuses',
   trackingWritten: '_mintsoft_tracking_written',
   terminal: '_mintsoft_terminal',
+  /** The bridge's WRITEBACK dead-letter (tracking, completion or partial-shipment writebacks kept failing); distinct from `syncDead`, the outbound create dead-letter. */
+  deadLetter: '_mintsoft_dead_letter',
+  terminalForced: '_mintsoft_terminal_forced',
+  terminalForcedReason: '_mintsoft_terminal_forced_reason',
+  partsResolved: '_mintsoft_split_parts_resolved',
 } as const
 
 const META_PREFIX = '_mintsoft_'
@@ -38,7 +43,7 @@ const MERGE_STATE_PREFIX = '_mintsoft_merge_'
 
 export type LegacyMetaEntry = { key: string; value?: unknown; hasValue: boolean }
 
-export type LegacySplit = { totalParts: number | null; thisPart: number | null; partsDone: number[]; partStatuses: Record<string, string> }
+export type LegacySplit = { totalParts: number | null; thisPart: number | null; partsDone: number[]; partsResolved: number[]; partStatuses: Record<string, string> }
 
 export type LegacyWithdrawal = { pending: string; outbox: boolean; token: boolean; holdOwned: boolean; partial: boolean }
 
@@ -60,6 +65,11 @@ export type LegacyOrderState = {
   split: LegacySplit | null
   trackingWritten: boolean
   terminal: boolean
+  /** The bridge's writeback dead-letter: the Mintsoft order exists but a tracking / completion / partial-shipment writeback kept failing, so the customer may still be owed tracking. */
+  writebackDeadLetter: boolean
+  /** The bridge forced this order terminal (`_mintsoft_terminal_forced`), with the short reason it recorded. */
+  terminalForced: boolean
+  terminalForcedReason: string | null
   /** Merge-state keys with a value (candidate, hold, shipping refund): reported only. */
   mergeStateKeys: string[]
   /** Bridge keys that are present but cannot be read, by name. */
@@ -177,10 +187,16 @@ export function readLegacyOrderState(order: { id: unknown; number?: unknown; sta
   const thisPart = readInt(get(LEGACY_META.thisPart))
   const partsDone = parsePartsDone(get(LEGACY_META.partsDone))
   const partStatuses = parsePartStatuses(get(LEGACY_META.partStatuses))
+  const partsResolved = parsePartsDone(get(LEGACY_META.partsResolved))
+  if (partsResolved === null) unreadable.push(LEGACY_META.partsResolved)
   if (partsDone === null) unreadable.push(LEGACY_META.partsDone)
   if (partStatuses === null) unreadable.push(LEGACY_META.partStatuses)
-  const hasSplit = (totalParts !== null && totalParts > 1) || present(LEGACY_META.partsDone) || present(LEGACY_META.partStatuses)
-  const split: LegacySplit | null = hasSplit ? { totalParts, thisPart, partsDone: partsDone ?? [], partStatuses: partStatuses ?? {} } : null
+  const hasSplit = (totalParts !== null && totalParts > 1) || present(LEGACY_META.partsDone) || present(LEGACY_META.partsResolved) || present(LEGACY_META.partStatuses)
+  const split: LegacySplit | null = hasSplit ? { totalParts, thisPart, partsDone: partsDone ?? [], partsResolved: partsResolved ?? [], partStatuses: partStatuses ?? {} } : null
+
+  const forcedRaw = get(LEGACY_META.terminalForcedReason)
+  // A short code the bridge wrote; clipped and stripped of control characters so a long or odd value cannot flood or garble the report.
+  const terminalForcedReason = typeof forcedRaw === 'string' && forcedRaw.trim() !== '' ? forcedRaw.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 80) : null
 
   const mergeStateKeys = entries.filter((e) => e.key.startsWith(MERGE_STATE_PREFIX) && isMark(e.value)).map((e) => e.key).sort()
 
@@ -202,6 +218,9 @@ export function readLegacyOrderState(order: { id: unknown; number?: unknown; sta
     split,
     trackingWritten: truthy(get(LEGACY_META.trackingWritten)),
     terminal: truthy(get(LEGACY_META.terminal)),
+    writebackDeadLetter: present(LEGACY_META.deadLetter),
+    terminalForced: present(LEGACY_META.terminalForced),
+    terminalForcedReason,
     mergeStateKeys,
     unreadable: unreadable.sort(),
     hasBridgeState,
@@ -243,22 +262,28 @@ export function checkOrderNumber(state: Pick<LegacyOrderState, 'wcNumber' | 'min
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 export type DesiredLink =
-  | { kind: 'link'; state: 'SYNCED' | 'MERGED' | 'PENDING_VERIFY'; externalOrderId: string; externalOrderNumber: string | null; lastError: string | null }
+  | { kind: 'link'; state: 'SYNCED' | 'MERGED'; externalOrderId: string; externalOrderNumber: string | null; lastError: string | null }
   | { kind: 'dead-letter'; externalOrderId: null; attempts: number; lastError: string }
+  /**
+   * The bridge created a Mintsoft order but has not proved the id is its own (`_mintsoft_verify_order_id`). NEVER imported: the bridge's
+   * ExternalOrderReference is the WooCommerce order id, but IMS verifies a link against its OWN order id, so an imported PENDING_VERIFY
+   * link can never verify (the first sweep dead-letters it as another tenant's order). The bridge's final sweep has to resolve it; until
+   * then it is a gate blocker the operator is shown.
+   */
+  | { kind: 'blocked'; reason: 'verify-pending'; verifyOrderId: string }
   /** The bridge has not created this order (queued create, or nothing): there is nothing to adopt and IMS creates it as it would any new order. */
   | { kind: 'none'; reason: 'not-created-by-bridge' }
   /** Present but unreadable bridge state: no link is written. */
   | { kind: 'unreadable'; keys: string[] }
 
 export const LEGACY_DEAD_LETTER_ERROR = 'Imported from the legacy bridge: its outbound sync gave up on this order before a Mintsoft order was created. IMS does not re-create it by itself; resolve it by hand.'
-export const LEGACY_VERIFY_PENDING_NOTE = 'Imported from the legacy bridge: the Mintsoft order was created but the bridge had not yet proved the id is ours. IMS verifies it before it touches the order.'
 
 /**
  * The link IMS should hold for an order, from the bridge's state alone.
  *
  * - trusted id, merged flag      -> MERGED, naming the survivor (its number when the bridge recorded the combined "a+b" one);
  * - trusted id                   -> SYNCED (the state the push sweep treats as already created);
- * - no trusted id, a verify id   -> PENDING_VERIFY (created, not yet proved ours: never re-created, only verified);
+ * - no trusted id, a verify id   -> blocked (created, not yet proved ours: NOT imported; the bridge must resolve it first);
  * - no id at all and dead-lettered -> DEAD_LETTER (out of the create queue, surfaced for a person);
  * - nothing created              -> none.
  */
@@ -273,7 +298,7 @@ export function desiredLinkFor(state: LegacyOrderState): DesiredLink {
     return { kind: 'link', state: 'SYNCED', externalOrderId: state.mintsoftOrderId, externalOrderNumber: state.mintsoftOrderNumber, lastError: null }
   }
   if (state.verifyOrderId !== null) {
-    return { kind: 'link', state: 'PENDING_VERIFY', externalOrderId: state.verifyOrderId, externalOrderNumber: state.mintsoftOrderNumber, lastError: LEGACY_VERIFY_PENDING_NOTE }
+    return { kind: 'blocked', reason: 'verify-pending', verifyOrderId: state.verifyOrderId }
   }
   if (state.syncDead) return { kind: 'dead-letter', externalOrderId: null, attempts: Math.max(state.syncAttempts, 1), lastError: LEGACY_DEAD_LETTER_ERROR }
   return { kind: 'none', reason: 'not-created-by-bridge' }
@@ -299,7 +324,9 @@ export type LinkDecision =
 
 const sameLink = (existing: ExistingLink, desired: DesiredLink, connector: string): boolean => {
   if (existing.connector !== connector) return false
-  if (desired.kind === 'link') return existing.externalOrderId === desired.externalOrderId
+  // The STATE has to agree as well as the id: a DEAD_LETTER, CANCELLED, HELD or AMBIGUOUS_CREATE link that names the same id is not "unchanged",
+  // it is a link no sweep pass acts on, so it must surface as a conflict.
+  if (desired.kind === 'link') return existing.externalOrderId === desired.externalOrderId && existing.state === desired.state
   if (desired.kind === 'dead-letter') return existing.externalOrderId === null && existing.state === 'DEAD_LETTER'
   return false
 }
