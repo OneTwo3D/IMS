@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState, useTransition } from 'react'
+import { useState, useTransition } from 'react'
+import { useResyncedState } from '@/lib/react/use-render-sync'
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { ClipboardCheck, ChevronDown, ChevronUp, Ban, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -84,17 +85,14 @@ export function StockCountsClient({
   }
   function setVarianceTab(tab: VarianceTab) { setVarianceTabState(tab); writeUrl({ tab }) }
   function setVarianceSort(sort: VarianceSort) { setVarianceSortState(sort); writeUrl({ sort }) }
-  const [counts, setCounts] = useState(initialCounts)
+  // Re-synced from the server page after a router.refresh() re-fetches it, otherwise statuses/counts shown from the initial render go stale.
+  const [counts, setCounts] = useResyncedState(initialCounts)
   const [expandedId, setExpandedId] = useState<string | null>(initialOpenCountId)
   const [showNew, setShowNew] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<StockCountListFilter>('ALL')
   const visibleCounts = filterCountsByStatus(counts, statusFilter)
-
-  // Codex: re-sync the list after a router.refresh() re-fetches the server page,
-  // otherwise statuses/counts shown from the initial render go stale.
-  useEffect(() => { setCounts(initialCounts) }, [initialCounts])
 
   // Called by a row on a successful action (success message, not an error).
   function refresh(message?: string) {

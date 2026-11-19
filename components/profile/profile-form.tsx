@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useRef, useEffect } from 'react'
+import { useState, useTransition, useRef, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { useRouter } from 'next/navigation'
 import { Camera, Loader2, Check, X, KeyRound, User, Shield } from 'lucide-react'
@@ -24,6 +24,9 @@ type UserData = {
   totpEnabled: boolean
   createdAt: string
 }
+
+// The portal slot never changes after the page is rendered, so there is nothing to subscribe to.
+const subscribeNever = () => () => {}
 
 export function ProfileForm({ user }: { user: UserData }) {
   const formatDateTime = useFormatDateTime()
@@ -50,10 +53,8 @@ export function ProfileForm({ user }: { user: UserData }) {
   const [uploadMsg, setUploadMsg] = useState<{ text: string; isError: boolean } | null>(null)
 
   // Save lives in the page header (top-right), portaled into a slot the page provides
-  const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
-  useEffect(() => {
-    setHeaderSlot(document.getElementById('profile-actions'))
-  }, [])
+  // Read from the DOM with useSyncExternalStore: null on the server and during hydration, the slot element afterwards.
+  const headerSlot = useSyncExternalStore(subscribeNever, () => document.getElementById('profile-actions'), () => null)
 
   // wms-connector-boundary-ok: o3d-remove-shiphero: joins first characters of the user's own name.
   const initials = name

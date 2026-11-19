@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState, useTransition } from 'react'
+import { useState, useTransition } from 'react'
+import { useResyncedState } from '@/lib/react/use-render-sync'
 import { useRouter } from 'next/navigation'
 import { AlertTriangle, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -20,13 +21,9 @@ type Props = {
 export function CurrencyStep({ baseCurrency: initialCurrency, baseCurrencyLocked, currencies, financialYearStart, onSaved }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
-  const [currency, setCurrency] = useState(initialCurrency)
+  const [currency, setCurrency] = useResyncedState(initialCurrency)
   const [error, setError] = useState('')
   const [saved, setSaved] = useState(false)
-
-  useEffect(() => {
-    setCurrency(initialCurrency)
-  }, [initialCurrency])
 
   function handleSaveCurrency() {
     setError('')

@@ -131,6 +131,7 @@ export function ProductsStep({
 
   useEffect(() => {
     if (!(wcEnabled || wcConnected)) return undefined
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mount poll: the fetch is awaited, so state is only set after the response, never synchronously in the effect
     void pollWcProgress()
     return stopWcPolling
   }, [wcConnected, wcEnabled, pollWcProgress, stopWcPolling])

@@ -2,6 +2,7 @@
 
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { useEffect, useState } from 'react'
+import { useRenderSync, useResyncedState } from '@/lib/react/use-render-sync'
 import { useRouter, useSearchParams } from 'next/navigation'
 import {
   BookOpen, CalendarClock, Check, ExternalLink,
@@ -68,7 +69,7 @@ export function IntegrationsStep({
     return result
   }
 
-  const [plugins, setPlugins] = useState(initialPluginState)
+  const [plugins, setPlugins] = useResyncedState(initialPluginState)
   const [error, setError] = useState('')
   /**
    * o3d-osl8 round 7, finding 1. Its own state, deliberately not `error`: the connector selection
@@ -102,28 +103,25 @@ export function IntegrationsStep({
   const [accountingMessage, setAccountingMessage] = useState('')
   const [accountingConnectedLocal, setAccountingConnectedLocal] = useState(initialAccountingStatus.connected)
 
-  useEffect(() => {
-    setPlugins(initialPluginState)
-  }, [initialPluginState])
-
-  useEffect(() => {
+  // Re-sync the editable copies when router.refresh() hands in fresh server props.
+  useRenderSync([initialWcCreds], () => {
     setWcUrl(initialWcCreds.url)
     setWcKey(initialWcCreds.key)
     setWcSecret(initialWcCreds.secretMasked ? '' : initialWcCreds.secret)
-  }, [initialWcCreds])
+  })
 
-  useEffect(() => {
+  useRenderSync([initialAccountingSettings], () => {
     setAcClientId(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? '')
     setAcClientSecret(
       initialAccountingSettings.secretMasked
         ? ''
         : (initialAccountingSettings.client_secret ?? initialAccountingSettings.xero_client_secret ?? ''),
     )
-  }, [initialAccountingSettings])
+  })
 
-  useEffect(() => {
+  useRenderSync([initialAccountingStatus.connected], () => {
     setAccountingConnectedLocal(initialAccountingStatus.connected)
-  }, [initialAccountingStatus.connected])
+  })
 
   const accountingSuccess = searchParams.get('accounting_success')
   const accountingCallbackError = searchParams.get('accounting_error')
@@ -131,6 +129,7 @@ export function IntegrationsStep({
   useEffect(() => {
     if (!accountingSuccess && !accountingCallbackError) return
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- syncs UI to the OAuth callback query params (external URL state), then refreshes the route, so it must run as an effect
     setConnectingAccounting(false)
     setSavingAccountingConnection(false)
 

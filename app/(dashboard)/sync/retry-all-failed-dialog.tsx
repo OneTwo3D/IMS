@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { Loader2 } from 'lucide-react'
+import { useRenderSync } from '@/lib/react/use-render-sync'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { getFailedAccountingSyncSummary, retryFailedAccountingSync } from '@/app/actions/accounting-sync'
 import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
@@ -41,12 +42,17 @@ export function RetryAllFailedDialog({
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
+  // Each time the dialog opens, start from a clean slate (set in the render that opens it), then load the summary.
+  useRenderSync([open], () => {
+    if (open) {
+      setRowIds(null)
+      setLoadError(null)
+      setError(null)
+    }
+  })
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    setRowIds(null)
-    setLoadError(null)
-    setError(null)
     getFailedAccountingSyncSummary()
       .then((summary) => { if (!cancelled) setRowIds(summary.failedRowIds ?? []) })
       .catch(() => { if (!cancelled) setLoadError('Could not load the number of failed rows. Close this dialog and try again.') })

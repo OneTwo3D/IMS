@@ -16,7 +16,9 @@ test('the control is gated on the server verdict: enabled and eligible shows Del
 
 test('the question is only asked of a user who holds the refund permission, and only when there is a refund', async () => {
   const client = await readFile(CLIENT, 'utf8')
-  assert.match(client, /if \(!canRetryRefundAccounting \|\| refundCount === 0\) \{ setDeleteEligibility\(null\); return \}/)
+  assert.match(client, /const deleteEligibilityAsked = canRetryRefundAccounting && refundCount !== 0/)
+  assert.match(client, /useRenderSync\(\[deleteEligibilityAsked\], \(\) => \{ if \(!deleteEligibilityAsked\) setDeleteEligibility\(null\) \}\)/)
+  assert.match(client, /if \(!deleteEligibilityAsked\) return\n/)
   assert.match(client, /const canRetryRefundAccounting = hasPermission\(currentUserRole, 'sales\.refund'\)/, 'the existing refund permission key')
 })
 

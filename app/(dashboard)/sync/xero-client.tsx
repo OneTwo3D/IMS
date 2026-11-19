@@ -232,6 +232,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   useEffect(() => {
     const success = searchParams.get('accounting_success')
     const error = searchParams.get('accounting_error')
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- syncs UI to the OAuth callback query params (external URL state) and then rewrites the URL, so it must run as an effect
     setConnecting(false)
     setSavingConnection(false)
     if (success) {

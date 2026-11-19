@@ -27,6 +27,7 @@ import {
   type ShoppingSyncSettings,
   type ShoppingTaxRateMappingRow,
 } from '@/app/actions/shopping-sync'
+import { receivedWithin, useNow } from '@/lib/react/use-now'
 import { parseWcSyncOrderStatuses } from '@/lib/connectors/woocommerce/order-status-filter'
 import { UnifiedTaxRateMapper } from '@/components/settings/unified-tax-rate-mapper'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
@@ -550,16 +551,9 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   const [wcSecret, setWcSecret] = useState(shoppingCredentials.secret)
   const wcConfigured = !!wcUrl && !!wcKey && !!wcSecret
   const initialImportDone = s.wc_initial_import_completed === 'true'
-  const orderWebhookActive = (() => {
-    if (s.wc_webhook_secret_set !== 'true' || !s.wc_order_webhook_last_received_at) return false
-    const receivedAt = Date.parse(s.wc_order_webhook_last_received_at)
-    return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
-  })()
-  const productWebhookActive = (() => {
-    if (s.wc_webhook_secret_set !== 'true' || !s.wc_product_webhook_last_received_at) return false
-    const receivedAt = Date.parse(s.wc_product_webhook_last_received_at)
-    return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
-  })()
+  const now = useNow()
+  const orderWebhookActive = s.wc_webhook_secret_set === 'true' && receivedWithin(s.wc_order_webhook_last_received_at, now, 24 * 60 * 60 * 1000)
+  const productWebhookActive = s.wc_webhook_secret_set === 'true' && receivedWithin(s.wc_product_webhook_last_received_at, now, 24 * 60 * 60 * 1000)
   const [tab, setTab] = useState<TabId>('connection')
 
   // Initial import progress polling
@@ -690,6 +684,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
   // Check progress on mount if not completed yet
   useEffect(() => {
     if (wcConfigured && !initialImportDone) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- mount poll: the fetch is awaited, so state is only set after the response, never synchronously in the effect
       pollProgress().then((/* void */) => {
         // If running, start polling
       })
@@ -699,6 +694,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
 
   useEffect(() => {
     if (!wcConfigured) return undefined
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mount poll: the fetch is awaited, so state is only set after the response, never synchronously in the effect
     void pollProductSyncProgress()
     return stopProductPolling
   }, [pollProductSyncProgress, stopProductPolling, wcConfigured])
@@ -718,6 +714,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
 
   useEffect(() => {
     if (!wcConfigured) return undefined
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mount poll: the fetch is awaited, so state is only set after the response, never synchronously in the effect
     void pollStockSyncProgress()
     return stopStockPolling
   }, [pollStockSyncProgress, stopStockPolling, wcConfigured])
