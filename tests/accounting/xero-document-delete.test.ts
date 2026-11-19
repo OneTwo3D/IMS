@@ -1,3 +1,4 @@
+import '../helpers/xero-attested.ts'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -326,7 +327,7 @@ test('the processor hands a held delete back unsent: the real processClaimedEntr
       lease, { attemptRevision: 1 } as never,
     )
     assert.equal(result.success, false)
-    assert.equal(result.notPosted?.reason, 'producer-held')
+    assert.equal(result.notPosted?.reason, 'producer-shadowed')
     assert.equal(calls.length, 0, 'not even the read was made')
   } finally {
     for (const key of Object.keys(HELD_ENV)) delete process.env[key]

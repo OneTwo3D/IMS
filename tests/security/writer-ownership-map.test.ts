@@ -60,8 +60,8 @@ test('owner answers of 2026-10-08 are in the map', () => {
   assert.equal(owner('xero.sales.payment', 'P2'), 'IMS')
   assert.equal(owner('xero.sales.invoice', 'P2'), 'xeroom')
   assert.equal(owner('xero.sales.credit-note', 'P2'), 'xeroom')
-  assert.equal(owner('woocommerce.order.withdrawal-outcome', 'P2'), 'woo-mintsoft-plugin')
-  assert.equal(owner('woocommerce.order.trackship-reconcile', 'P2'), 'woo-mintsoft-plugin')
+  assert.equal(owner('woocommerce.order.withdrawal-outcome', 'P2'), 'IMS', 'owner decision 2026-11-18 (1): step M')
+  assert.equal(owner('woocommerce.order.trackship-reconcile', 'P2'), 'IMS', 'owner decision 2026-11-18 (1): step M')
   assert.equal(owner('mintsoft.product.upsert', 'P2'), 'IMS')
   assert.equal(owner('mintsoft.order.cancel', 'P2'), 'IMS')
   assert.equal(owner('mintsoft.order.amend', 'P2'), 'IMS', 'owner answer 2026-10-09')
@@ -169,13 +169,43 @@ test('every outbox registry operation is mapped or explicitly excluded; the excl
   assert.ok(excluded.length <= OUTBOX_EXCLUSION_CEILING, 'the outbox exclusions may only shrink')
 })
 
-test('woocommerce.tax-rate: the owner maintains the store by hand at P1 and IMS owns it at P2; the note says the writer is held and never touches rates IMS does not own', () => {
+test('woocommerce.tax-rate: the owner maintains the store by hand at P1 and (owner answer Q5) at P2 until its writer is built; the note says the writer is held and never touches rates IMS does not own', () => {
   const row = rows.find((candidate) => candidate.destination === 'woocommerce' && candidate.operation === 'tax-rate')
   assert.ok(row, 'woocommerce.tax-rate is mapped')
   assert.equal(row.owners.P1, 'operator-manual')
-  assert.equal(row.owners.P2, 'IMS')
+  assert.equal(row.owners.P2, 'operator-manual')
+  assert.equal(row.step, 'never')
   assert.equal(row.obligationTime, 'not-applicable')
   assert.match(row.note, /held/)
   assert.match(row.note, /never touched/)
   assert.match(row.note, /ShoppingTaxRateMapping/)
+})
+
+test('every row names its switchover step; the step table is the owner-approved one (o3d-zvec.3)', () => {
+  const owner = (key: string, phase: 'P1' | 'P2') => rows.find((candidate) => `${candidate.destination}.${candidate.operation}` === key)?.owners[phase]
+  const step = (key: string) => rows.find((row) => `${row.destination}.${row.operation}` === key)?.step
+  for (const row of rows) assert.ok(['mintsoft', 'woocommerce', 'xero', 'never'].includes(row.step), `${row.destination}.${row.operation} has a step`)
+  // Step M: the bridge is retired, so every row it owned moves with it, including its WooCommerce writeback (owner answers Q8, Q9, Q10).
+  for (const key of [
+    'mintsoft.order.create', 'mintsoft.order.amend', 'mintsoft.order.cancel', 'mintsoft.order.hold', 'mintsoft.order.comment', 'mintsoft.asn.create',
+    'mintsoft.product.upsert', 'mintsoft.product.content', 'mintsoft.product.delete', 'mintsoft.product.bundle',
+    'woocommerce.order.status', 'woocommerce.order.tracking', 'woocommerce.order.partial-shipment', 'woocommerce.product.meta',
+    'woocommerce.order.withdrawal-outcome', 'woocommerce.order.trackship-reconcile', 'woocommerce.order.trackship-refire', 'woocommerce.order.wms-status-meta',
+  ]) {
+    assert.equal(step(key), 'mintsoft', key)
+    assert.equal(owner(key, 'P2'), 'IMS', key)
+  }
+  // Step W: stock, webhooks and the customer e-mail WooCommerce sends natively (Q4). Step X: the invoice note and document, and Xero.
+  for (const key of ['woocommerce.stock', 'woocommerce.webhooks', 'customer-email.despatch', 'customer-email.order-confirmation', 'customer-email.invoice']) assert.equal(step(key), 'woocommerce', key)
+  for (const key of ['woocommerce.order.invoice-note', 'woocommerce.order.invoice-document', 'xero.purchase.bill', 'xero.inventory.journals', 'xero.daily-batch', 'xero.sales.payment']) assert.equal(step(key), 'xero', key)
+  // The operator keeps the tax rate (Q5); the incumbent keeps Xero sales documents and Aelia the rates.
+  for (const key of ['woocommerce.tax-rate', 'xero.tax-rate', 'xero.sales.invoice', 'xero.sales.credit-note', 'woocommerce.fx-rates']) assert.equal(step(key), 'never', key)
+})
+
+test('a row is IMS-owned in P2 exactly when it has a step: `never` rows are never IMS-owned in P2, and a stepped row is not left to another writer', () => {
+  for (const row of rows) {
+    // The one exception: a sales quotation exists only in IMS, so IMS sends it in every phase (enforced by its own setting).
+    if (row.step === 'never') { if (`${row.destination}.${row.operation}` !== 'customer-email.quote') assert.notEqual(row.owners.P2, 'IMS', `${row.destination}.${row.operation}`) }
+    else assert.equal(row.owners.P2, 'IMS', `${row.destination}.${row.operation}`)
+  }
 })

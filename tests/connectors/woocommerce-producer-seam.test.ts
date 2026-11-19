@@ -26,9 +26,9 @@ import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/
  */
 
 const ORIGIN = 'https://shop.example.com'
-const ENV_KEYS = [PRODUCER_HOLD_ENFORCED_ENV, OUTBOUND_GRANT_ENV.woocommerce, PRODUCER_CUTOFF_ENV.woocommerce]
+const ENV_KEYS = [PRODUCER_HOLD_ENFORCED_ENV, OUTBOUND_GRANT_ENV.woocommerce, PRODUCER_CUTOFF_ENV.woocommerce, PRODUCER_CUTOFF_ENV.mintsoft, PRODUCER_CUTOFF_ENV.xero]
 const ON = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce' }
-const LIVE = { ...ON, [OUTBOUND_GRANT_ENV.woocommerce]: ORIGIN, [PRODUCER_CUTOFF_ENV.woocommerce]: '2020-01-01T00:00:00Z' }
+const LIVE = { ...ON, [OUTBOUND_GRANT_ENV.woocommerce]: ORIGIN, [PRODUCER_CUTOFF_ENV.woocommerce]: '2020-01-01T00:00:00Z', [PRODUCER_CUTOFF_ENV.mintsoft]: '2020-01-01T00:00:00Z', [PRODUCER_CUTOFF_ENV.xero]: '2020-01-01T00:00:00Z' }
 
 function withEnv<T>(values: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const saved = ENV_KEYS.map((key) => [key, process.env[key]] as const)
@@ -149,7 +149,7 @@ test('wooProducerSeam: in the live phase an operation IMS owns proceeds; one tha
   await withEnv(LIVE, async () => {
     const { wooProducerSeam: seam } = await import('@/lib/connectors/woocommerce/producer-seam')
     const { explainProducerDisposition } = await import('@/lib/security/producer-disposition')
-    const decision = explainProducerDisposition('woocommerce', 'order.withdrawal-outcome')
+    const decision = explainProducerDisposition('woocommerce', 'fx-rates')
     assert.equal(decision.disposition, 'SHADOW')
     assert.equal(decision.reason, 'not_ims_owned')
     assert.ok(seam)
@@ -176,11 +176,11 @@ test('wooDrainHold / wooEgressHold: not held when OFF; held when ON until the de
     const held = wooEgressHold()
     assert.equal(held.held && held.reason, 'no_cutoff', 'a grant alone does not open the producer hold')
   })
-  await withEnv({ ...ON, [OUTBOUND_GRANT_ENV.woocommerce]: ORIGIN, [PRODUCER_CUTOFF_ENV.woocommerce]: '2999-01-01T00:00:00Z' }, async () => {
+  await withEnv({ ...ON, [OUTBOUND_GRANT_ENV.woocommerce]: ORIGIN, [PRODUCER_CUTOFF_ENV.woocommerce]: '2999-01-01T00:00:00Z', [PRODUCER_CUTOFF_ENV.mintsoft]: '2999-01-01T00:00:00Z', [PRODUCER_CUTOFF_ENV.xero]: '2999-01-01T00:00:00Z' }, async () => {
     const held = wooEgressHold()
     assert.equal(held.held && held.reason, 'before_cutoff')
   })
-  await withEnv({ ...ON, [OUTBOUND_GRANT_ENV.woocommerce]: ORIGIN, [PRODUCER_CUTOFF_ENV.woocommerce]: 'tomorrow' }, async () => {
+  await withEnv({ ...ON, [OUTBOUND_GRANT_ENV.woocommerce]: ORIGIN, [PRODUCER_CUTOFF_ENV.woocommerce]: 'tomorrow', [PRODUCER_CUTOFF_ENV.mintsoft]: 'tomorrow', [PRODUCER_CUTOFF_ENV.xero]: 'tomorrow' }, async () => {
     assert.equal(wooEgressHold().held, true)
   })
   await withEnv(LIVE, async () => assert.deepEqual(wooDrainHold(), { held: false }))

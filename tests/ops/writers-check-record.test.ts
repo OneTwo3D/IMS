@@ -5,9 +5,14 @@ import { evaluateWritersCheck, type WritersCheckReport } from '../../lib/ops/wri
 import { runWritersCheckRecord } from '../../lib/ops/writers-check-record'
 import { WRITERS_CHECK_RECORD_ACTION } from '../../lib/security/writers-check-constants'
 
-function report(settings: Map<string, string> | null): WritersCheckReport {
+const LEGACY_ALL_STEPS = {
+  MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', XERO_WRITE_ALLOWED_TENANT: 'tenant-1',
+  MINTSOFT_WRITES_LIVE_FROM: '2026-10-10T00:00:00Z', WC_WRITES_LIVE_FROM: '2026-10-10T00:00:00Z', XERO_WRITES_LIVE_FROM: '2026-10-10T00:00:00Z',
+}
+
+function report(settings: Map<string, string> | null, env: Record<string, string> = {}): WritersCheckReport {
   return evaluateWritersCheck({
-    env: { XERO_WRITE_ALLOWED_TENANT: 'tenant-1', XERO_WRITES_LIVE_FROM: '2026-10-10T00:00:00Z' }, now: new Date('2026-10-20T00:00:00Z'), windowDays: 14,
+    env, now: new Date('2026-10-20T00:00:00Z'), windowDays: 14,
     settings, cronEnabled: {}, pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
     evidence: Object.fromEntries(['MINTSOFT_ORDER_ID', 'MINTSOFT_OTHER_META', 'XEROOM_MARKER', 'XERO_FOREIGN_NUMBER'].map((k) => [k, { counted: 0, total: 0, unpaid: 0, floor: 'x' }])),
     evidenceUnrecorded: 0,
@@ -20,7 +25,7 @@ test('the record is written for every verdict; only ok is a good run', async () 
   const log = async (params: { action: string; level?: string }) => { logged.push(params); return true }
   const ok = await runWritersCheckRecord({ build: async () => report(new Map([['xero_sync_enabled', 'false']])), log: log as never })
   assert.deepEqual([ok.status, ok.verdict, ok.exitCode], ['RECORDED', 'ok', 0])
-  const bad = await runWritersCheckRecord({ build: async () => report(new Map([['xero_sync_enabled', 'true']])), log: log as never })
+  const bad = await runWritersCheckRecord({ build: async () => report(new Map([['xero_sync_enabled', 'true']]), LEGACY_ALL_STEPS), log: log as never })
   assert.deepEqual([bad.status, bad.verdict, bad.exitCode], ['FAILED', 'double-claim', 1])
   assert.deepEqual(logged.map((entry) => [entry.action, entry.level]), [[WRITERS_CHECK_RECORD_ACTION, 'INFO'], [WRITERS_CHECK_RECORD_ACTION, 'ERROR']])
 })

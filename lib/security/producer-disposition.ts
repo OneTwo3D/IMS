@@ -8,9 +8,13 @@
  *
  * LIVE only when ALL of these hold; otherwise SHADOW, with the FIRST failing reason:
  *  1. the outbound-write grant for the destination reads ok (outbound-write-grant.ts decides what ok is);
- *  2. the destination's live-from variable is set and is one UTC instant in ISO-8601 with an explicit Z;
+ *  2. the live-from variable of the row's SWITCHOVER STEP (PRODUCER_CUTOFF_ENV[row.step]) is set and is one UTC instant in ISO-8601 with an
+ *     explicit Z. The phase is therefore derived per step (P2-M, P2-W, P2-X), not per destination: the WooCommerce rows the bridge wrote are
+ *     step M and read MINTSOFT_WRITES_LIVE_FROM, while their destination's grant is still WC_WRITEBACK_ALLOWED_ORIGIN. A row whose step is
+ *     `never` (an incumbent keeps it in every phase) is read against its destination's own variable and is never IMS-owned;
  *  3. now is at or after that instant (a future instant is a scheduled flip and stays SHADOW until then);
- *  4. the ownership map says IMS owns the operation in the phase that 1-3 establish (P2);
+ *  4. the ownership map says IMS owns the operation in the phase that 1-3 establish (P2). (A step whose incumbent the owner stops by hand needs the
+ *     owner's confirmation before DELIVERY, not before production: see producerOperationEgressVerdict. This decision never reads it.)
  *  5. the business-event time of the work, `obligationAt`, is at or after the instant (work for an event that
  *     happened before it belongs to the writer that owned it then); for a row the map marks obligationTime
  *     'required' it MUST be passed, and omitting it is SHADOW. Rows marked 'not-applicable' may omit it.
@@ -25,6 +29,7 @@
 
 import {
   PRODUCER_CUTOFF_ENV,
+  destinationCutoffEnvNames,
   producerAgreementText,
   type ProducerAgreementState,
   type ProducerReason,
@@ -36,6 +41,8 @@ import { ownershipRowFor, type MappedOperation, type WriterOwner } from './write
 export type ProducerDisposition = 'LIVE' | 'SHADOW'
 
 export type ProducerDecisionContext = {
+  /** The owner's confirmations in force, for the egress gates; defaults to the process snapshot (writer-attestation-snapshot.ts). The decision itself ignores it. */
+  attestations?: ReadonlySet<string>
   /** Defaults to process.env. */
   env?: OutboundEnv
   /** Defaults to the current time. */
@@ -117,10 +124,10 @@ function readInstant(value: unknown): number | null {
   }
 }
 
-/** The two variables the decision reads for a destination, each copied only if it is an OWN string property. */
-function ownEnvironment(source: object, connector: OutboundConnector): Record<string, string> {
+/** The variables the decision reads (the destination's grant and the named live-from variables), each copied only if it is an OWN string property. */
+function ownEnvironment(source: object, connector: OutboundConnector, cutoffNames: readonly string[] = [PRODUCER_CUTOFF_ENV[connector]]): Record<string, string> {
   const env: Record<string, string> = Object.create(null)
-  for (const name of [OUTBOUND_GRANT_ENV[connector], PRODUCER_CUTOFF_ENV[connector]]) {
+  for (const name of [OUTBOUND_GRANT_ENV[connector], ...cutoffNames]) {
     if (hasOwn.call(source, name)) {
       const value: unknown = (source as Record<string, unknown>)[name]
       if (typeof value === 'string') env[name] = value
@@ -164,7 +171,9 @@ function evaluate<D extends OutboundConnector>(
   const row = ownershipRowFor(destination, operation)
   const unreadableBase = { owner: 'unknown' as WriterOwner, phase: 'P1' as const, cutoff: null, grant: 'unreadable' as const }
   if (!hasOwn.call(OUTBOUND_GRANT_ENV, destination)) return shadow('unreadable', unreadableBase)
-  const env = ownEnvironment(suppliedEnv === undefined ? process.env : (suppliedEnv as object), destination)
+  // The live-from variable is the ROW'S STEP's. A step `never` row (and an unmapped one, which can never be IMS-owned) reads its destination's own.
+  const cutoffName = row !== null && row.step !== 'never' ? PRODUCER_CUTOFF_ENV[row.step] : PRODUCER_CUTOFF_ENV[destination]
+  const env = ownEnvironment(suppliedEnv === undefined ? process.env : (suppliedEnv as object), destination, [cutoffName])
 
   const p1Owner = row?.owners.P1 ?? 'unknown'
 
@@ -173,7 +182,7 @@ function evaluate<D extends OutboundConnector>(
   if (state.state === 'held') return shadow('no_grant', { owner: p1Owner, phase: 'P1', cutoff: null, grant: 'absent' })
   if (state.state === 'unreadable') return shadow('unreadable_grant', { owner: p1Owner, phase: 'P1', cutoff: null, grant: 'unreadable' })
 
-  const cutoff = parseProducerCutoff(env[PRODUCER_CUTOFF_ENV[destination]])
+  const cutoff = parseProducerCutoff(env[cutoffName])
   if (!cutoff.ok) {
     return shadow(cutoff.reason === 'absent' ? 'no_cutoff' : 'unreadable_cutoff', { owner: p1Owner, phase: 'P1', cutoff: null, grant: 'granted' })
   }
@@ -187,6 +196,11 @@ function evaluate<D extends OutboundConnector>(
   const base = { owner, phase: 'P2' as const, cutoff: cutoff.at, grant: 'granted' as const }
   const ownerReason = ownerShadowReason(owner)
   if (ownerReason !== null) return shadow(ownerReason, base)
+
+  // THE OWNER'S CONFIRMATION IS NOT PART OF THIS DECISION. A step whose writes replace an incumbent the owner stops by hand (step X, and the step-W
+  // stock push) needs the confirmation before anything is DELIVERED, but a confirmation that has not been read yet, or that the owner records a minute
+  // later, must not turn the work into a SHADOW, which is never delivered. The work is produced and queued, and the egress gate for the operation
+  // (producerOperationEgressVerdict in producer-seam.ts, asked by every drain and claim boundary) holds it until the confirmation is on record.
 
   if (obligationAt === undefined) {
     // A row that says the business-event time is required cannot be LIVE without it: an omitted time would
@@ -242,16 +256,20 @@ export function producerGrantCutoffAgreement(
   env: OutboundEnv = process.env,
 ): ProducerAgreement {
   try {
-    const own = ownEnvironment(env, connector)
+    // The grant of a destination agrees with the live-from instants of the steps whose rows write to it (WooCommerce: all three steps).
+    const cutoffNames = destinationCutoffEnvNames(connector)
+    const own = ownEnvironment(env, connector, cutoffNames.length === 0 ? [PRODUCER_CUTOFF_ENV[connector]] : cutoffNames)
     const state = readOutboundGrantStates(own).find((candidate) => candidate.connector === connector)
     if (!state) throw new Error(`no grant state for ${connector}`)
-    const cutoff = parseProducerCutoff(own[PRODUCER_CUTOFF_ENV[connector]])
+    const reads = (cutoffNames.length === 0 ? [PRODUCER_CUTOFF_ENV[connector]] : cutoffNames).map((name) => parseProducerCutoff(own[name]))
+    const anyUnreadable = reads.some((read) => !read.ok && read.reason === 'unreadable')
+    const anySet = reads.some((read) => read.ok)
     const make = (agreement: ProducerAgreementState, detail: Parameters<typeof producerAgreementText>[1]): ProducerAgreement => ({
       connector, state: agreement, text: producerAgreementText(connector, detail),
     })
-    if (state.state === 'unreadable' || (!cutoff.ok && cutoff.reason === 'unreadable')) return make('unreadable', 'unreadable')
-    if (state.state === 'granted' && cutoff.ok) return make('agreed_live', 'agreed_live')
-    if (state.state === 'held' && !cutoff.ok) return make('agreed_held', 'agreed_held')
+    if (state.state === 'unreadable' || anyUnreadable) return make('unreadable', 'unreadable')
+    if (state.state === 'granted' && anySet) return make('agreed_live', 'agreed_live')
+    if (state.state === 'held' && !anySet) return make('agreed_held', 'agreed_held')
     if (state.state === 'granted') return make('inconsistent', 'grant_without_cutoff')
     return make('inconsistent', 'cutoff_without_grant')
   } catch {

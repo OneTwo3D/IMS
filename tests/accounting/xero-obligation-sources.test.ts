@@ -1,3 +1,4 @@
+import '../helpers/xero-attested.ts'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -159,7 +160,7 @@ const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
 const SHOP = 'https://shop.example.test'
 const LIVE_FROM = '2026-01-01T00:00:00Z'
 const XERO_ENV = { [PRODUCER_HOLD_ENFORCED_ENV]: 'xero', [OUTBOUND_GRANT_ENV.xero]: TENANT, [PRODUCER_CUTOFF_ENV.xero]: LIVE_FROM }
-const WOO_ENV = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: LIVE_FROM }
+const WOO_ENV = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: SHOP, [PRODUCER_CUTOFF_ENV.woocommerce]: LIVE_FROM, [PRODUCER_CUTOFF_ENV.mintsoft]: LIVE_FROM, [PRODUCER_CUTOFF_ENV.xero]: LIVE_FROM }
 const NOW = new Date('2026-06-01T12:00:00Z')
 
 type FakeRow = { type: string; payload: unknown; connector?: string; referenceType?: string; referenceId?: string }

@@ -2363,6 +2363,7 @@ model SalesOrder {
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
   wmsOrderStatus    WmsOrderStatusSnapshot?
   wmsOrderPush      WmsOrderPushLink?
+  wmsMergeHolds     WmsMergeHold[]
   wmsOperatorTasks  WmsOperatorTask[]
   wmsOrderDiscrepancies WmsOrderDiscrepancy[]
 
@@ -4646,6 +4647,12 @@ enum WmsOperatorTaskReason {
   ORDER_NOT_FOUND
   /// A storefront (or approved EU withdrawal) cancelled an order whose invoice is already posted to the ledger: IMS raised no credit note and a cancelled order cannot be refunded, so a person credits the invoice by hand.
   CANCELLED_POSTED_INVOICE
+  /// Merge hold (setting wms_merge_hold_enabled): IMS held every order of a same-customer group in the warehouse so a person can merge them there. Carries the EU and FedEx warnings.
+  MERGE_HOLD
+  /// A merge hold has stood longer than MERGE_HOLD_REMIND_HOURS: a person has to merge and confirm the orders in the warehouse (IMS never releases a merge hold).
+  MERGE_HOLD_OVERDUE
+  /// A withdrawal (or an IMS cancel) reached an order that is on merge hold: IMS did not cancel or release it, a person decides in the warehouse.
+  MERGE_HOLD_WITHDRAWAL
 }
 
 enum WmsOperatorTaskStatus {
@@ -4703,6 +4710,55 @@ model TrackshipRefireState {
 
   @@index([status, nextAttemptAt], map: "trackship_refire_states_due_idx")
   @@map("trackship_refire_states")
+}
+
+/// MERGE HOLD (setting wms_merge_hold_enabled, off by default): the IDENTITY of a hold IMS placed on a warehouse order so a person can merge it with the
+/// customer's other orders. The hold's identity lives HERE, never in warehouse text (warehouse comments are immutable and an operator's own confirm writes
+/// none), so a hold is current only while this row is HOLDING/HELD for the warehouse order it names, and it clears on an OBSERVED status change. One row per
+/// (connector, order); a re-hold after a clear starts a new episode on the same row. IMS never releases a merge hold: nothing writes MarkConfirmed.
+enum WmsMergeHoldState {
+  /// The hold request is about to be / was sent and its answer is not recorded (a crash here leaves HOLDING: treated as possibly held, never re-sent blind).
+  HOLDING
+  HELD
+  /// The request failed or its answer was lost (timeout, 5xx, no Success field): the order MAY be held. Settled by a status read (awaiting confirmation: HELD, NEW: safe to retry,
+  /// anything else: stays UNKNOWN and an operator task asks a person). Counts as held for every "do not touch" query.
+  UNKNOWN
+  /// The warehouse refused (not retried), or an unknown outcome was settled as "still NEW" (retryable): the order is NOT held (the badge says so).
+  NOT_HELD
+  /// The warehouse order left the held status or was merged: nothing is blocked any more.
+  CLEARED
+}
+
+model WmsMergeHold {
+  id                  String            @id @default(cuid())
+  connector           String
+  orderId             String            @map("order_id")
+  /// The warehouse order the hold was placed on (the identity of THIS episode).
+  externalOrderId     String            @map("external_order_id")
+  /// The merge group this hold belongs to (merge-candidate-match basis).
+  groupBasis          String            @map("group_basis")
+  state               WmsMergeHoldState
+  /// Bumped each time the order is held again after a clear.
+  episode             Int               @default(1)
+  attempts            Int               @default(0)
+  /// True when the warehouse answered and said no (not retried); false when the request failed in transport (retried).
+  refused             Boolean           @default(false)
+  lastError           String?           @map("last_error")
+  heldAt              DateTime?         @map("held_at")
+  /// Set once, when the overdue reminder has been raised (compare-and-set): the reminder fires once per episode.
+  remindedAt          DateTime?         @map("reminded_at")
+  clearedAt           DateTime?         @map("cleared_at")
+  clearReason         String?           @map("clear_reason")
+  /// The activity-log/exception text of an edit or cancel IMS did not push because of the hold was last recorded at this time.
+  blockedNoticeAt     DateTime?         @map("blocked_notice_at")
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, orderId], map: "wms_merge_holds_order_key")
+  @@index([state, heldAt], map: "wms_merge_holds_state_idx")
+  @@map("wms_merge_holds")
 }
 
 model WmsOperatorTask {
@@ -6192,4 +6248,22 @@ model CustomFieldValue {
   @@index([productId])
   @@index([salesOrderId])
   @@map("custom_field_values")
+}
+
+/// An owner or host confirmation that an incumbent writer has STOPPED (writers-check-constants.ts STEP_EVIDENCE, writer-attestation-constants.ts kinds).
+/// Append-only: a confirmation is never edited; the newest of a kind is the one in force. Written by `npm run writers:attest` and the ADMIN confirmation
+/// action, always with an activity-log entry. Read by `npm run writers:check` and by the setting writers that refuse to switch an IMS writer on first.
+model WriterAttestation {
+  id         String   @id @default(cuid())
+  /// A closed code (WRITER_ATTESTATION_KINDS).
+  kind       String
+  attestedAt DateTime @default(now()) @map("attested_at")
+  /// The user who confirmed (a User id, or `cli:<name>` for the command line).
+  userId     String   @map("user_id")
+  note       String   @default("")
+  /// Kind-specific evidence (a host status report, never a secret).
+  payload    Json     @default("{}")
+
+  @@index([kind, attestedAt], map: "writer_attestations_kind_attested_idx")
+  @@map("writer_attestations")
 }

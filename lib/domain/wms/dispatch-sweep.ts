@@ -9,7 +9,7 @@ import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/conne
 import { getWmsConnector, getWmsConnectorHooks } from '@/lib/connectors/wms/registry'
 import { readProducerEnforcement } from '@/lib/security/producer-seam'
 import { parseProducerCutoff } from '@/lib/security/producer-disposition'
-import { PRODUCER_CUTOFF_ENV } from '@/lib/security/producer-disposition-constants'
+import { DESPATCH_WRITEBACK_STEP_ENV } from '@/lib/security/producer-disposition-constants'
 import type { ZonelessDespatchReading } from '@/lib/connectors/wms/connector-hooks'
 import {
   decodeWmsDeltaCursor,
@@ -829,13 +829,14 @@ export function hasUndatedDespatch(tracking: ReadonlyArray<{ despatchedAt?: stri
 }
 
 /**
- * The WooCommerce live-from cutoff, but ONLY while WooCommerce producer enforcement is active (the same predicate the producer seam
+ * The step-M live-from cutoff (the WooCommerce despatch writeback goes live with it), but ONLY while WooCommerce producer enforcement is active (the same predicate the producer seam
  * uses): with enforcement off the legacy path applies exactly as before, so no cutoff is read. Null when off, absent or unreadable.
  */
 export function storefrontCutoffWhileEnforced(env: Record<string, string | undefined> = process.env): Date | null {
   const enforcement = readProducerEnforcement(env)
   if (!enforcement.enforced || !enforcement.destinations.has('woocommerce')) return null
-  const read = parseProducerCutoff(env[PRODUCER_CUTOFF_ENV.woocommerce])
+  // The despatch rows it guards (order status, tracking, partial shipments) are step M of the switchover, so the instant is the step's, not WooCommerce's own.
+  const read = parseProducerCutoff(env[DESPATCH_WRITEBACK_STEP_ENV])
   return read.ok ? read.at : null
 }
 

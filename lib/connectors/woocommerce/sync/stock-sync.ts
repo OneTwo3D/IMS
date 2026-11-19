@@ -43,6 +43,7 @@ import { commitDirtyOrderOutcome, loadDirtyOrdersForGuard, parseDirtySnapshot } 
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
+import { wooDrainHold } from '../producer-egress'
 import { loadBackInStockDates } from '@/lib/domain/inventory/back-in-stock-date'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
@@ -704,6 +705,11 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     summary: { source: options?.source ?? null, forceAll: options?.forceAll === true, productCount: scopedProductIds ? scopedProductIds.length : null },
   })
   if (!seam.proceed) return shadowedStockResult(seam)
+  // STEP W NEEDS THE OWNER'S WORD THAT QOBLEX HAS STOPPED PUSHING STOCK. A push decided LIVE but made while that confirmation is absent (or not read yet) is HELD,
+  // not shadowed: nothing is sent, nothing is stamped as pushed, and the next run (or the drain) sends it once the confirmation is recorded. Setting
+  // wc_stock_sync_enabled earlier does not bypass it.
+  const stockHold = wooDrainHold(undefined, 'stock')
+  if (stockHold.held) return heldStockResult(stockHold.queuedNotice)
   // o3d-taro: the back-in-stock date rides this push as product meta, which is its OWN operation of the ownership map ('product.meta':
   // the plugin owns it in P1). Asked only when the setting is on; a shadow switches the date off for this run and leaves the stock push alone.
   const etaSetting = await db.setting.findUnique({ where: { key: WC_BACK_IN_STOCK_DATE_SETTING } })
