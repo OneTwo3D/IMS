@@ -34,7 +34,8 @@ const SETTINGS_ON = new Map<string, string>([
 function clean(): Record<StepEvidenceKind, StepEvidenceReading> {
   const out = {} as Record<StepEvidenceKind, StepEvidenceReading>
   for (const kind of STEP_EVIDENCE_KINDS) {
-    out[kind] = kind === 'BRIDGE_ATTESTATION' || kind.startsWith('QOBLEX') ? { state: 'present', at: '2026-11-01T00:00:00.000Z' }
+    out[kind] = kind === 'BRIDGE_ATTESTATION' ? { state: 'present', at: '2026-11-01T00:00:00.000Z', violations: [], lastTriggerAt: null }
+      : kind.startsWith('QOBLEX') ? { state: 'present', at: '2026-11-01T00:00:00.000Z' }
       : kind === 'BRIDGE_PROBE' ? { state: 'probed', violations: [] }
       : { state: 'counted', counted: 0, floor: M_AT }
   }
@@ -215,13 +216,13 @@ test('bridge evidence on a WooCommerce fulfilment row is a double claim once IMS
   assert.ok(subjects.includes('woocommerce.order.status') && subjects.includes('mintsoft.order.create'), subjects.join(','))
 })
 
-test('the readers: the bridge attestation is still unbuilt (a writers:attest input); every step source is NOT DUE until its step is live; the attestation kinds read the newest attestation; a throwing reader is unreadable', async () => {
+test('the readers: the bridge attestation is built (a writers:attest input; absent until one is recorded); every step source is NOT DUE until its step is live; the attestation kinds read the newest attestation; a throwing reader is unreadable', async () => {
   const rows: Record<string, Date | null> = { 'qoblex-stock-push-stopped': new Date('2026-12-02T00:00:00Z'), 'qoblex-xero-stopped': null }
   const db = { writerAttestation: { findFirst: async (args: { where: { kind: string } }) => { const at = rows[args.where.kind]; return at ? { attestedAt: at } : null } } }
   const read = await readStepEvidence({ db: db as never, now: NOW, env: {} })
   assert.deepEqual(read.QOBLEX_STOCK_PUSH_STOPPED, { state: 'present', at: '2026-12-02T00:00:00.000Z' })
   assert.deepEqual(read.QOBLEX_XERO_STOPPED, { state: 'absent' })
-  assert.deepEqual(read.BRIDGE_ATTESTATION, { state: 'not-built' })
+  assert.deepEqual(read.BRIDGE_ATTESTATION, { state: 'absent' }, 'built: no bridge report recorded reads absent, not not-built')
   for (const kind of ['BRIDGE_PROBE', 'MINTSOFT_FOREIGN_ORDER', 'STOCK_DRIFT', 'XEROOM_NOTE'] as const) assert.deepEqual(read[kind], { state: 'not-due' }, `${kind}: no step is live, so nothing is asked of the store or Mintsoft`)
   const broken = await readStepEvidence({ db: { writerAttestation: { findFirst: async () => { throw new Error('no table') } } } as never, now: NOW, env: {} })
   assert.deepEqual(broken.QOBLEX_XERO_STOPPED, { state: 'unreadable' })

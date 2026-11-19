@@ -12,9 +12,9 @@
 # credential are supplied as environment variables when the container starts. See deploy/README.md,
 # "Container image".
 
-# Major-version pin. Keep in step with package.json "engines" (>=22.11.0) and the Node version the
-# CI workflows use (22).
-ARG NODE_MAJOR=22
+# Major-version pin. Keep in step with package.json "engines" (>=26.0.0) and the Node version the
+# CI workflows use (26).
+ARG NODE_MAJOR=26
 
 FROM node:${NODE_MAJOR}-bookworm-slim AS base
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -33,6 +33,9 @@ RUN --mount=type=cache,target=/root/.npm npm ci
 # build: prisma generate + next build, with the opt-in standalone output enabled for this stage only.
 # --------------------------------------------------------------------------------------------
 FROM base AS build
+# Re-declared so the esbuild --target below follows the same major as the base image (a global ARG
+# is not visible inside a stage until it is declared again).
+ARG NODE_MAJOR
 WORKDIR /app
 ENV NEXT_OUTPUT=standalone
 # Browser error-tracking settings are inlined into the client bundle at build time. Empty (the default)
@@ -63,7 +66,7 @@ RUN NODE_OPTIONS=--max-old-space-size=4096 \
 # extensionless `next/server` from the traced standalone node_modules. Only the optional @opentelemetry/api, which
 # Next's tracer falls back from inside a try/catch, stays external.
 RUN node_modules/.bin/esbuild scripts/reconciliation-pack.ts scripts/read-sync-status.ts scripts/render-managed-crontab.ts \
-      --bundle --platform=node --target=node22 --format=esm --tsconfig=tsconfig.json \
+      --bundle --platform=node --target=node${NODE_MAJOR} --format=esm --tsconfig=tsconfig.json \
       --outdir=dist-scripts --out-extension:.js=.mjs \
       --external:@opentelemetry/api \
       --banner:js="import{createRequire as __cr}from'node:module';import{fileURLToPath as __fu}from'node:url';import{dirname as __dn}from'node:path';const require=__cr(import.meta.url);const __filename=__fu(import.meta.url);const __dirname=__dn(__filename);" \

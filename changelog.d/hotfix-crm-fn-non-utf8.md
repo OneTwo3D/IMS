@@ -1,0 +1,1 @@
+- Fixed: the CRM identity-key function (`crm_loose_identity_key`) no longer fails on a non-UTF8 database. A new migration replaces it with an encoding-safe body there (no Unicode normalisation, ASCII white space only) and changes nothing on UTF8. This unblocks the customer identity index on stage.

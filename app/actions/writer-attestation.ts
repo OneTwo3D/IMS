@@ -7,6 +7,7 @@ import { latestWriterAttestation, recordWriterAttestation, type AttestationDb } 
 import {
   WRITER_ATTESTATION_KINDS,
   WRITER_ATTESTATION_LABEL,
+  WRITER_ATTESTATION_REPORT_KINDS,
   WRITER_ATTESTATION_STATEMENT,
   isWriterAttestationKind,
   type WriterAttestationKind,
@@ -16,6 +17,8 @@ export type WriterConfirmationRow = {
   kind: WriterAttestationKind
   label: string
   statement: string
+  /** True for a kind that needs the host report pasted (the screen shows a text area). */
+  needsReport: boolean
   confirmedAt: string | null
   confirmedBy: string | null
 }
@@ -30,6 +33,7 @@ export async function getWriterConfirmations(): Promise<WriterConfirmationRow[]>
       kind,
       label: WRITER_ATTESTATION_LABEL[kind],
       statement: WRITER_ATTESTATION_STATEMENT[kind],
+      needsReport: (WRITER_ATTESTATION_REPORT_KINDS as readonly string[]).includes(kind),
       confirmedAt: latest ? latest.attestedAt.toISOString() : null,
       confirmedBy: latest ? latest.userId : null,
     })
@@ -41,7 +45,7 @@ export async function getWriterConfirmations(): Promise<WriterConfirmationRow[]>
  * The owner's confirmation that an incumbent writer is stopped. ADMIN only, with a recent sign-in (a confirmation lets IMS start writing to a live
  * system), audit-logged. `acknowledged` must be true: the screen's statement was read and accepted.
  */
-export async function confirmWriterStopped(input: { kind: string; note?: string; acknowledged: boolean }): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
+export async function confirmWriterStopped(input: { kind: string; note?: string; acknowledged: boolean; output?: string }): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   let userId: string
   try {
     const session = await requireFreshAdmin()
@@ -53,7 +57,7 @@ export async function confirmWriterStopped(input: { kind: string; note?: string;
   }
   if (!isWriterAttestationKind(input.kind)) return { success: false, error: 'Unknown confirmation.' }
   if (input.acknowledged !== true) return { success: false, error: 'Tick the box to confirm the statement.' }
-  const result = await recordWriterAttestation(db as unknown as AttestationDb, { kind: input.kind, userId, note: input.note ?? '' })
+  const result = await recordWriterAttestation(db as unknown as AttestationDb, { kind: input.kind, userId, note: input.note ?? '', ...(input.output !== undefined ? { output: input.output } : {}) })
   if (!result.ok) return { success: false, error: result.error }
   revalidatePath('/sync/writer-confirmations')
   return { success: true }

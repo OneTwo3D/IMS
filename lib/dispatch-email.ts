@@ -1,12 +1,21 @@
 /**
  * Direct-order dispatch email (onetwo3d-ims-q66in.1.6).
  *
- * Storefront orders already get a dispatch email from the storefront itself
+ * Storefront orders get their dispatch email from the storefront itself
  * (pushOrderDeliveryMetadata → WC tracking writeback triggers WooCommerce's
- * own "completed" email). Direct IMS orders (no ShoppingOrderLink) get
- * nothing, so this queues an IMS-native dispatch email for them — opt-in via
- * the `dispatch_email_enabled` setting (default OFF), and queued at most once
- * per order (deduped against the outbox under the order row lock).
+ * own "completed" email) until switchover step W. Direct IMS orders (no
+ * ShoppingOrderLink) get nothing, so this queues an IMS-native dispatch email
+ * for them — opt-in via the `dispatch_email_enabled` setting (default OFF),
+ * and queued at most once per order (deduped against the outbox under the
+ * order row lock).
+ *
+ * STOREFRONT ORDERS (o3d-zvec.24): governed by their OWN switch,
+ * `storefront_customer_email_enabled` (default OFF; see
+ * lib/domain/storefront-customer-email/constants.ts). With it off a storefront
+ * order is skipped (`storefront_order`) exactly as before, so WooCommerce's own
+ * e-mail is never doubled. With it on, IMS queues the same single dispatch
+ * email for the storefront order and WooCommerce's native e-mail must be off
+ * (writers:check P2-W reads both).
  *
  * This file is NOT 'use server' — it cannot be called directly from the client.
  */
@@ -15,12 +24,15 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { isUndeliveredEmailCollision } from '@/lib/email-outbox'
+import { STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY } from '@/lib/domain/storefront-customer-email/constants'
 
 export const DISPATCH_EMAIL_SETTING_KEY = 'dispatch_email_enabled'
 export const DISPATCH_EMAIL_KIND = 'SHIPMENT_DISPATCHED'
 
 export type DispatchEmailEligibilityInput = {
   settingValue: string | null
+  /** `storefront_customer_email_enabled`: the switch for a storefront-linked order. Absent reads as off. */
+  storefrontSettingValue?: string | null
   order: { status: string; customerEmail: string | null; shoppingLinkCount: number } | null
   alreadyQueued: boolean
 }
@@ -31,16 +43,19 @@ export type DispatchEmailEligibility =
 
 /**
  * Pure decision: should a dispatch email be queued for this order?
- * Storefront-linked orders are excluded so WooCommerce's own dispatch email
- * is never doubled up. Requiring status exactly SHIPPED (not COMPLETED or
+ * Storefront-linked orders are excluded unless the storefront switch is on, so
+ * WooCommerce's own dispatch email is never doubled up. Requiring status exactly SHIPPED (not COMPLETED or
  * DELIVERED) bounds the retry-heal window so historic orders reprocessed by
  * a sweep never get a late email.
  */
 export function evaluateDispatchEmailEligibility(input: DispatchEmailEligibilityInput): DispatchEmailEligibility {
-  if (input.settingValue !== 'true') return { eligible: false, reason: 'disabled' }
+  const storefront = input.order !== null && input.order.shoppingLinkCount > 0
+  // A storefront-linked order is governed by the storefront switch ALONE; any other order by `dispatch_email_enabled`.
+  if (storefront) {
+    if (input.storefrontSettingValue !== 'true') return { eligible: false, reason: 'storefront_order' }
+  } else if (input.settingValue !== 'true') return { eligible: false, reason: 'disabled' }
   if (!input.order) return { eligible: false, reason: 'order_not_found' }
   if (input.order.status !== 'SHIPPED') return { eligible: false, reason: 'order_not_shipped' }
-  if (input.order.shoppingLinkCount > 0) return { eligible: false, reason: 'storefront_order' }
   if (!input.order.customerEmail) return { eligible: false, reason: 'no_customer_email' }
   if (input.alreadyQueued) return { eligible: false, reason: 'already_queued' }
   return { eligible: true }
@@ -57,8 +72,10 @@ export function evaluateDispatchEmailEligibility(input: DispatchEmailEligibility
  */
 export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ queued: boolean; reason?: string }> {
   try {
-    const setting = await db.setting.findUnique({ where: { key: DISPATCH_EMAIL_SETTING_KEY } })
-    if (setting?.value !== 'true') return { queued: false, reason: 'disabled' }
+    const settings = await db.setting.findMany({ where: { key: { in: [DISPATCH_EMAIL_SETTING_KEY, STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY] } }, select: { key: true, value: true } })
+    const settingValue = settings.find((row) => row.key === DISPATCH_EMAIL_SETTING_KEY)?.value ?? null
+    const storefrontSettingValue = settings.find((row) => row.key === STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY)?.value ?? null
+    if (settingValue !== 'true' && storefrontSettingValue !== 'true') return { queued: false, reason: 'disabled' }
 
     const outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
@@ -82,7 +99,8 @@ export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ q
       })
 
       const eligibility = evaluateDispatchEmailEligibility({
-        settingValue: setting.value,
+        settingValue,
+        storefrontSettingValue,
         order: order
           ? { status: order.status, customerEmail: order.customerEmail, shoppingLinkCount: order._count.shoppingLinks }
           : null,

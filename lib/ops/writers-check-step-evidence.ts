@@ -5,6 +5,9 @@ import {
   type StepEvidenceReading,
 } from '@/lib/security/writers-check-constants'
 import { isWriterAttestationKind } from '@/lib/security/writer-attestation-constants'
+import { BRIDGE_ATTESTATION_KIND, bridgeUnitViolations, readBridgePayload } from '@/lib/domain/writer-attestation/bridge-status'
+import { STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY } from '@/lib/domain/storefront-customer-email/constants'
+import type { WooNativeEmailState } from '@/lib/connectors/woocommerce/native-email-state'
 import { parseProducerCutoff } from '@/lib/security/producer-disposition'
 import { PRODUCER_STEP_ENV } from '@/lib/security/producer-disposition-constants'
 import type { LiveWriterStep } from '@/lib/security/writer-ownership-map'
@@ -30,11 +33,21 @@ type DriftReaderDb = {
   wcStockDriftEvent: { count(args: { where: { observedAt: { gte: Date; lte: Date }; acknowledgedAt: null } }): Promise<number> }
 }
 
+type EvidenceReaderDb = AttestationReaderDb & {
+  writerAttestation: { findFirst(args: { where: { kind: string }; orderBy: { attestedAt: 'desc' }; select: { attestedAt: true; payload?: true } }): Promise<{ attestedAt: Date; payload?: unknown } | null> }
+  setting: { findUnique(args: { where: { key: string }; select: { value: true } }): Promise<{ value: string } | null> }
+}
+
+/**
+ * `env`, `readNativeEmail`, `probe` and `foreignOrders` are what the readers that look outside IMS's database need; all are test seams (absent = the live ones).
+ * `readNativeEmail` is the store's own e-mail settings read (the default is the connector's read-only GET); it is only ever called from step W on.
+ */
 export type StepEvidenceContext = {
-  db: AttestationReaderDb & Partial<DriftReaderDb>
+  db: EvidenceReaderDb & Partial<DriftReaderDb>
   now: Date
   /** The environment the live-from instants are read from. Absent = the process environment. */
   env?: Record<string, string | undefined>
+  readNativeEmail?: () => Promise<WooNativeEmailState>
   /** Test seams: the companion-plugin probe and the foreign-order reader. Absent = the live ones. */
   probe?: () => Promise<IncumbentsProbeResult>
   foreignOrders?: (since: Date) => Promise<{ foreign: number }>
@@ -114,9 +127,45 @@ function attestationReader(kind: string): StepEvidenceReader {
   }
 }
 
+/**
+ * BRIDGE_ATTESTATION: the newest `bridge-units-masked` attestation, which carries the host report. Present with the report's own facts: the unit
+ * violations (anything not masked or not inactive) and the latest trigger time, which the evaluator judges against the step's live-from instant. A row whose
+ * payload is not the shape this version wrote is `unreadable`, never clean. Absent until one is recorded; not due before step M (P1 passes with none).
+ */
+const bridgeAttestationReader: StepEvidenceReader = async ({ db }) => {
+  const row = await db.writerAttestation.findFirst({ where: { kind: BRIDGE_ATTESTATION_KIND }, orderBy: { attestedAt: 'desc' }, select: { attestedAt: true, payload: true } })
+  if (!row) return { state: 'absent' }
+  const report = readBridgePayload(row.payload)
+  if (report === null) return { state: 'unreadable' }
+  return { state: 'present', at: row.attestedAt.toISOString(), violations: bridgeUnitViolations(report), lastTriggerAt: report.lastTriggerAt }
+}
+
+/**
+ * NATIVE_EMAIL_EXCLUSIVE: WooCommerce native customer e-mail and the IMS storefront e-mail switch are mutually exclusive.
+ * Before step W (no WooCommerce live-from) nothing is read from the store at all: the answer is `absent`, which no phase below W requires.
+ * From step W: the IMS switch is read from the settings, the store's two native e-mails from the store. A store that does not answer, or answers
+ * something else than yes/no, is `unreadable` and fails closed. Both on = duplicate e-mails; both off = nobody sends: each is a violation.
+ */
+export const NATIVE_EMAIL_VIOLATION = { bothOn: 'native-and-ims-customer-email-both-on', bothOff: 'native-and-ims-customer-email-both-off' } as const
+
+const nativeEmailExclusiveReader: StepEvidenceReader = async ({ db, env, readNativeEmail }) => {
+  const live = env?.WC_WRITES_LIVE_FROM
+  if (live === undefined || live.trim() === '') return { state: 'absent' }
+  const setting = await db.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY }, select: { value: true } })
+  const imsOn = setting?.value === 'true'
+  const read = readNativeEmail ?? (async () => (await import('@/lib/connectors/woocommerce/native-email-state')).readWooNativeCustomerEmailState())
+  const native = await read()
+  if (!native.ok) return { state: 'unreadable' }
+  const nativeOn = Object.values(native.enabled).some((on) => on)
+  const violations: string[] = []
+  if (imsOn && nativeOn) violations.push(NATIVE_EMAIL_VIOLATION.bothOn)
+  if (!imsOn && !nativeOn) violations.push(NATIVE_EMAIL_VIOLATION.bothOff)
+  return { state: 'probed', violations }
+}
+
 export const STEP_EVIDENCE_READERS: Readonly<Record<StepEvidenceKind, StepEvidenceReader>> = {
-  // Source: scripts/bridge_writers_status.py in the bridge repository, recorded as an attestation. Not built.
-  BRIDGE_ATTESTATION: notBuilt,
+  // Source: scripts/bridge/bridge_writers_status.py run on the bridge host, pasted into `writers:attest` (kind bridge-units-masked).
+  BRIDGE_ATTESTATION: bridgeAttestationReader,
   // Source: the companion plugin's /incumbents route (1.5.0) and its client (lib/connectors/woocommerce/incumbent-plugins.ts). Asked from step M.
   BRIDGE_PROBE: bridgeProbeReader,
   // Source: a Mintsoft read of orders for the client that IMS has no link for (lib/connectors/mintsoft/foreign-orders.ts). Asked from step M.
@@ -127,6 +176,7 @@ export const STEP_EVIDENCE_READERS: Readonly<Record<StepEvidenceKind, StepEviden
   QOBLEX_XERO_STOPPED: attestationReader(STEP_EVIDENCE_ATTESTATION_KIND.QOBLEX_XERO_STOPPED!),
   // Source: the probe's reading of the option o3d_xeroom_order_note_off (the mu-plugin switch that suppresses only Xeroom's order note). Asked from step X.
   XEROOM_NOTE: xeroomNoteReader,
+  NATIVE_EMAIL_EXCLUSIVE: nativeEmailExclusiveReader,
 }
 
 /** Read every kind. A reader that throws gives `unreadable` for that kind alone. */

@@ -184,6 +184,7 @@ test('the central gate runs before the insert in the one primitive that writes a
  */
 const OUTBOX_WRITERS: Record<string, { writers: number; verdict: string }> = {
   'lib/dispatch-email.ts': { writers: 1, verdict: 'dispatch (own transaction: order lock + markers read before the insert)' },
+  'lib/storefront-customer-email.ts': { writers: 1, verdict: 'storefront customer e-mails (own transaction: order lock, erased order / anonymised customer refused before the insert)' },
   'lib/email-outbox.ts': { writers: 2, verdict: 'queueEmail (gated: order-locked transaction for SalesOrder rows) / the harness-only client path' },
 }
 
@@ -198,6 +199,8 @@ test('every writer of email_outbox rows is in the census, and the SalesOrder enq
   assert.match(fn, /reason: 'recipient_erased'/)
   const d = readFileSync(new URL('../lib/dispatch-email.ts', import.meta.url), 'utf8')
   assert.match(d, /lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create/)
+  const sc = readFileSync(new URL('../lib/storefront-customer-email.ts', import.meta.url), 'utf8')
+  assert.match(sc, /lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create/)
 })
 
 /**

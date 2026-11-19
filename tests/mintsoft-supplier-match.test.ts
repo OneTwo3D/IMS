@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { normalizeSupplierName, scoreSupplierPair, suggestMintsoftSuppliers, supplierNameSimilarity } from '../lib/connectors/mintsoft/suppliers/match.ts'
+import { DUPLICATE_GUARD_MIN_SCORE, SUGGESTION_MIN_SCORE, normalizeSupplierName, scoreSupplierPair, suggestMintsoftSuppliers, supplierNameSimilarity } from '../lib/connectors/mintsoft/suppliers/match.ts'
 
 /** Pure: the suggestion engine for IMS supplier -> Mintsoft supplier. It only ever suggests; an operator confirms. */
 
@@ -62,4 +62,13 @@ test('region words and two-letter forms are not legal suffixes: "Bambu Lab EU Gm
   for (const [a, b] of [['Acme Ltd', 'Acme'], ['Acme Limited', 'Acme'], ['Acme Inc', 'Acme'], ['Acme plc', 'Acme'], ['Acme LLC', 'Acme'], ['Acme GmbH', 'Acme'], ['Acme Co', 'Acme'], ['Acme Company', 'Acme']]) {
     assert.equal(normalizeSupplierName(a!), normalizeSupplierName(b!), `${a} == ${b}`)
   }
+})
+
+test('the duplicate guard starts at the suggestion floor: a 55-79 pair that is SUGGESTED also blocks a create', () => {
+  assert.equal(DUPLICATE_GUARD_MIN_SCORE, SUGGESTION_MIN_SCORE)
+  const ims = { id: 'i', name: 'Polymaker', email: null, vatNumber: null, accountNumber: null }
+  const remote = { externalId: '1', name: 'Polymaker Europe B.V.', code: null, email: null, vatNumber: null, active: true }
+  const pair = scoreSupplierPair(ims, remote)
+  assert.ok(pair.score >= 55 && pair.score < 80, `score ${pair.score} is in the previously unguarded band`)
+  assert.ok(pair.score >= DUPLICATE_GUARD_MIN_SCORE)
 })

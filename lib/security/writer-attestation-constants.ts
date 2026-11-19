@@ -8,19 +8,24 @@
 
 import type { LiveWriterStep } from './writer-ownership-map'
 
-export const WRITER_ATTESTATION_KINDS = ['qoblex-stock-push-stopped', 'qoblex-xero-stopped'] as const
+export const WRITER_ATTESTATION_KINDS = ['qoblex-stock-push-stopped', 'qoblex-xero-stopped', 'bridge-units-masked'] as const
 export type WriterAttestationKind = (typeof WRITER_ATTESTATION_KINDS)[number]
 
 export const WRITER_ATTESTATION_LABEL: Record<WriterAttestationKind, string> = {
   'qoblex-stock-push-stopped': 'The Qoblex stock push to WooCommerce is stopped',
   'qoblex-xero-stopped': 'Qoblex\'s native Xero posting (bills, journals, daily batches) is stopped',
+  'bridge-units-masked': 'The bridge host\'s sweep timer, sweep service and webhook service are masked and inactive',
 }
 
 /** What the owner is asked to have done before confirming (shown on the confirmation screen and printed by the command). */
 export const WRITER_ATTESTATION_STATEMENT: Record<WriterAttestationKind, string> = {
   'qoblex-stock-push-stopped': 'I have stopped the stock push from Qoblex to the WooCommerce store, in Qoblex. I understand IMS will start pushing stock once this is recorded and the WooCommerce step goes live.',
   'qoblex-xero-stopped': 'I have stopped Qoblex\'s native posting of bills, journals and daily batches to Xero, in Qoblex. I understand IMS will start posting once this is recorded and the Xero step goes live.',
+  'bridge-units-masked': 'I ran scripts/bridge/bridge_writers_status.py on the bridge host after masking wc-mintsoft-order-sweep.timer, wc-mintsoft-order-sweep.service and wc-mintsoft-webhook.service, and pasted its output unchanged. IMS checks that all three are masked and inactive and that nothing triggered after the Mintsoft step\'s live-from instant.', // wms-connector-boundary-ok: 2026-11-19: names the bridge's own systemd units, not a WMS connector.
 }
+
+/** Kinds whose confirmation carries a pasted host report (`payload`) instead of only the owner's word. */
+export const WRITER_ATTESTATION_REPORT_KINDS: readonly WriterAttestationKind[] = ['bridge-units-masked']
 
 export const WRITER_ATTESTATION_ACTION = 'writer_attestation_recorded'
 export const WRITER_ATTESTATION_REFUSAL_ACTION = 'writer_attestation_setting_refused'

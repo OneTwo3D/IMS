@@ -410,7 +410,7 @@ test('the key-shape scan is not vacuous — it sees a key added to a payload', (
   assert.deepEqual(keysOf(after), ['financial_year_start', 'some_new_preference'])
 
   // And that comments do NOT contribute, which is what makes the strict equality above liveable.
-  assert.deepEqual(keysOf(codeOf(join(REPO, 'components/settings/dispatch-email.tsx'))), ['dispatch_email_enabled'])
+  assert.deepEqual(keysOf(codeOf(join(REPO, 'components/settings/dispatch-email.tsx'))), ['dispatch_email_enabled', 'storefront_customer_email_enabled'])
 })
 
 // ---------------------------------------------------------------------------

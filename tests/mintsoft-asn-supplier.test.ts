@@ -34,7 +34,7 @@ mock.module('@/lib/db', { namedExports: { db: fakeDb } })
 const resolveAsnSupplier = async (...args: Parameters<typeof import('../lib/connectors/mintsoft/suppliers/asn-supplier.ts').resolveAsnSupplier>) =>
   (await import('../lib/connectors/mintsoft/suppliers/asn-supplier.ts')).resolveAsnSupplier(...args)
 const client = fakeDb as never
-const SEND = { mintsoft_asn_send_supplier_enabled: 'true' }
+const SEND = { mintsoft_asn_send_supplier_enabled: 'true', mintsoft_supplier_last_sync_at: new Date().toISOString() }
 
 test('a mapped PO supplier sends its Mintsoft id once sending is on, whether or not required is on', async () => {
   for (const required of ['true', 'false']) {
@@ -118,4 +118,27 @@ test('a later success closes the standing task', async () => {
   reset({ settings: { ...SEND }, po: { reference: 'PO-1', supplierId: 's1' }, suppliers: { s1: { name: 'Acme' } }, links: { s1: { state: 'MAPPED', externalSupplierId: '42' } }, cache: { '42': { missingSince: null, active: true } } })
   await resolveAsnSupplier({ kind: 'PurchaseOrder', id: 'po1' }, client)
   assert.equal(state.resolved.length, 1)
+})
+
+test('send ON: a mapped, present, active supplier is REFUSED when the list was never read or was read longer ago than the ASN limit (default 24 h)', async () => {
+  const base = { po: { reference: 'PO-1', supplierId: 's1' }, suppliers: { s1: { name: 'Acme' } }, links: { s1: { state: 'MAPPED', externalSupplierId: '42' } }, cache: { '42': { missingSince: null, active: true } } }
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString()
+  for (const [label, settings] of [
+    ['never read', { mintsoft_asn_send_supplier_enabled: 'true' }],
+    ['25 hours old', { mintsoft_asn_send_supplier_enabled: 'true', mintsoft_supplier_last_sync_at: hoursAgo(25) }],
+    ['3 hours old with a 2 hour limit', { mintsoft_asn_send_supplier_enabled: 'true', mintsoft_supplier_last_sync_at: hoursAgo(3), mintsoft_asn_supplier_cache_max_age_hours: '2' }],
+  ] as const) {
+    for (const required of ['true', 'false']) {
+      reset({ ...base, settings: { ...settings, mintsoft_asn_supplier_required: required } })
+      const out = await resolveAsnSupplier({ kind: 'PurchaseOrder', id: 'po1' }, client)
+      assert.equal(out.kind, 'refuse', `${label} (required ${required})`)
+      assert.match((out as { error: string }).error, /not been read recently enough/)
+      assert.equal(state.refusals.length, 1, 'a standing operator task is raised')
+    }
+  }
+  // 23 hours is inside the default limit, and a 30 hour limit accepts 25 hours.
+  reset({ ...base, settings: { mintsoft_asn_send_supplier_enabled: 'true', mintsoft_supplier_last_sync_at: hoursAgo(23) } })
+  assert.equal((await resolveAsnSupplier({ kind: 'PurchaseOrder', id: 'po1' }, client)).kind, 'send')
+  reset({ ...base, settings: { mintsoft_asn_send_supplier_enabled: 'true', mintsoft_supplier_last_sync_at: hoursAgo(25), mintsoft_asn_supplier_cache_max_age_hours: '30' } })
+  assert.equal((await resolveAsnSupplier({ kind: 'PurchaseOrder', id: 'po1' }, client)).kind, 'send')
 })

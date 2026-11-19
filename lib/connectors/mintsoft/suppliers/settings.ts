@@ -21,6 +21,9 @@ export const MINTSOFT_ASN_SUPPLIER_REQUIRED_SETTING = 'mintsoft_asn_supplier_req
 export const MINTSOFT_ASN_SEND_SUPPLIER_SETTING = 'mintsoft_asn_send_supplier_enabled'
 export const MINTSOFT_SUPPLIER_CACHE_MAX_AGE_SETTING = 'mintsoft_supplier_cache_max_age_minutes'
 /** Written by the read sync when it finishes (an ISO timestamp): the cache age comes from here, never from row timestamps. */
+/** An ASN carrying a supplier id is refused when the list was last read longer ago than this many HOURS (default 24). */
+export const MINTSOFT_ASN_SUPPLIER_CACHE_MAX_AGE_SETTING = 'mintsoft_asn_supplier_cache_max_age_hours'
+export const DEFAULT_ASN_SUPPLIER_CACHE_MAX_AGE_HOURS = 24
 export const MINTSOFT_SUPPLIER_LAST_SYNC_SETTING = 'mintsoft_supplier_last_sync_at'
 export const MINTSOFT_TRANSFER_SUPPLIER_SETTING = 'mintsoft_transfer_supplier_id'
 export const DEFAULT_SUPPLIER_CACHE_MAX_AGE_MINUTES = 30
@@ -30,6 +33,7 @@ export const MINTSOFT_SUPPLIER_SETTING_KEYS = [
   MINTSOFT_ASN_SUPPLIER_REQUIRED_SETTING,
   MINTSOFT_ASN_SEND_SUPPLIER_SETTING,
   MINTSOFT_SUPPLIER_CACHE_MAX_AGE_SETTING,
+  MINTSOFT_ASN_SUPPLIER_CACHE_MAX_AGE_SETTING,
   MINTSOFT_SUPPLIER_LAST_SYNC_SETTING,
   MINTSOFT_TRANSFER_SUPPLIER_SETTING,
 ] as const
@@ -57,6 +61,13 @@ export async function readMintsoftSupplierCacheMaxAgeMinutes(client?: SupplierSe
   const raw = (await reader(client).setting.findUnique({ where: { key: MINTSOFT_SUPPLIER_CACHE_MAX_AGE_SETTING } }))?.value?.trim() ?? ''
   const parsed = /^\d{1,5}$/.test(raw) ? Number.parseInt(raw, 10) : 0
   return parsed > 0 ? parsed : DEFAULT_SUPPLIER_CACHE_MAX_AGE_MINUTES
+}
+
+/** H, in hours: how old the list may be when an ASN carries a supplier id. A positive whole number from config, else the default. */
+export async function readMintsoftAsnSupplierCacheMaxAgeHours(client?: SupplierSettingReader): Promise<number> {
+  const raw = (await reader(client).setting.findUnique({ where: { key: MINTSOFT_ASN_SUPPLIER_CACHE_MAX_AGE_SETTING } }))?.value?.trim() ?? ''
+  const parsed = /^\d{1,4}$/.test(raw) ? Number.parseInt(raw, 10) : 0
+  return parsed > 0 ? parsed : DEFAULT_ASN_SUPPLIER_CACHE_MAX_AGE_HOURS
 }
 
 /** When the Mintsoft supplier list was last read in full, or null if never. */

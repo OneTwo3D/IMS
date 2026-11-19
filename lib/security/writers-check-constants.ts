@@ -89,11 +89,14 @@ export const PHASE_OF_LIVE_STEP: Readonly<Record<LiveWriterStep, WritersCheckPha
  *   STOCK_DRIFT               a WooCommerce stock change not explained by an order or refund after the confirmation
  *   QOBLEX_XERO_STOPPED       the owner's confirmation (a WriterAttestation) that Qoblex's native Xero posting is stopped
  *   XEROOM_NOTE               Xeroom's order note is still on (the probe reads the option o3d_xeroom_order_note_off, which must be on at step X)
+ *   NATIVE_EMAIL_EXCLUSIVE    WooCommerce's native customer e-mails (processing, completed) and IMS's storefront customer e-mail switch are mutually exclusive: not both on
+ *                             (duplicate e-mails), not both off (nobody sends). Read from the store's e-mail settings; a store that does not answer is `unreadable`
  */
 export const STEP_EVIDENCE_KINDS = [
   'BRIDGE_ATTESTATION', 'BRIDGE_PROBE', 'MINTSOFT_FOREIGN_ORDER',
   'QOBLEX_STOCK_PUSH_STOPPED', 'STOCK_DRIFT',
   'QOBLEX_XERO_STOPPED', 'XEROOM_NOTE',
+  'NATIVE_EMAIL_EXCLUSIVE',
 ] as const
 export type StepEvidenceKind = (typeof STEP_EVIDENCE_KINDS)[number]
 
@@ -106,11 +109,11 @@ export const STEP_EVIDENCE_REQUIRED_FROM: Readonly<Record<StepEvidenceKind, Live
   STOCK_DRIFT: 'woocommerce',
   QOBLEX_XERO_STOPPED: 'xero',
   XEROOM_NOTE: 'xero',
+  NATIVE_EMAIL_EXCLUSIVE: 'woocommerce',
 }
 
 /** Kinds that are an owner/host attestation, with the step whose live-from instant the attestation must precede. */
 export const STEP_ATTESTATION_BEFORE_STEP: Readonly<Partial<Record<StepEvidenceKind, LiveWriterStep>>> = {
-  BRIDGE_ATTESTATION: 'mintsoft',
   QOBLEX_STOCK_PUSH_STOPPED: 'woocommerce',
   QOBLEX_XERO_STOPPED: 'xero',
 }
@@ -123,6 +126,16 @@ export const STEP_EVIDENCE_LABEL: Readonly<Record<StepEvidenceKind, string>> = {
   STOCK_DRIFT: 'the WooCommerce stock-drift observer',
   QOBLEX_XERO_STOPPED: 'the owner\'s confirmation that Qoblex\'s Xero posting is stopped',
   XEROOM_NOTE: 'the Xeroom order-note switch (read by the companion-plugin probe)',
+  NATIVE_EMAIL_EXCLUSIVE: 'the WooCommerce native customer e-mail state against the IMS storefront customer e-mail switch (exactly one of the two sends)',
+}
+
+/**
+ * Host reports: the step whose live-from instant S the report's LAST TRIGGER must precede. Unlike an owner's confirmation, the report is NOT required to
+ * be recorded before S: the runbook records S when the units are masked and takes the report AFTER it (a report taken later still shows them masked and
+ * idle, which is the fact), so the rule is about when the incumbent last ran, not about when the report was pasted.
+ */
+export const STEP_REPORT_TRIGGER_BEFORE_STEP: Readonly<Partial<Record<StepEvidenceKind, LiveWriterStep>>> = {
+  BRIDGE_ATTESTATION: 'mintsoft',
 }
 
 /** The attestation kind (WriterAttestation.kind) behind each attestation-backed evidence kind that a source exists for. */
@@ -142,7 +155,11 @@ export type StepEvidenceReading =
   | { state: 'unreadable' }
   /** An attestation kind with none recorded. */
   | { state: 'absent' }
-  | { state: 'present'; at: string }
+  | { state: 'present'; at: string
+      /** A host report (BRIDGE_ATTESTATION): the violated expectations of the report itself, by closed code (empty or absent = clean). */
+      violations?: readonly string[]
+      /** A host report: the instant of the latest trigger the report shows, or null for `never`. Judged against the step's live-from instant by the evaluator. */
+      lastTriggerAt?: string | null }
   /** A count of offending rows since `floor`. */
   | { state: 'counted'; counted: number; floor: string }
   /** A probe that answered: the violated expectations, by closed code (empty = clean). */
@@ -187,7 +204,7 @@ export const WRITERS_CHECK_CANNOT_SEE: readonly string[] = [
   'an incumbent\'s activity that leaves no trace IMS reads: a write an incumbent makes without a mark on an imported order or a refusal IMS provoked is invisible, and a green result says nothing about it',
   'any order IMS has not imported (its metas are unseen until the order is imported), and any change to an order\'s metas after its last import',
   'what Qoblex, Aelia, an operator working by hand or a Mintsoft channel writes: they leave no evidence IMS reads, so for their operations only the ownership map, IMS\'s own switches and the owner\'s confirmations are checked',
-  'whether the bridge host\'s systemd units are stopped: that is a host attestation the owner records with writers:attest (the status script lives in the bridge repository), and until one is recorded the check FAILS from step M on with "evidence source not built" instead of passing',
+  'whether the bridge host\'s systemd units are stopped: that is seen only through the status report an administrator pasted into writers:attest (the status script lives in the bridge repository; a snapshot: a unit unmasked afterwards is invisible until the report is repeated), and until one is recorded the check FAILS from step M on',
   'anything the companion-plugin probe, the foreign-order reader and the stock-drift observer cannot read: each is only as current as its last run (the probe and the reader run when the check runs; the drift observer runs hourly from the host scheduler and the check asks for a recent complete run), and a source that does not answer FAILS the check',
   'an order whose evidence write did not finish: the import does not wait for it, so a write that timed out and could not log that it did, or that was still running when the process stopped, leaves no trace',
   'anything that changes after the report was taken: the check is a snapshot that detects a shared destination, it does not stop either writer, so only the periodic record narrows the gap',
@@ -198,7 +215,7 @@ export const WRITERS_CHECK_BLOCK_ID = 'writers-check' as const
 
 export function renderWritersCheckDocBlock(): string {
   return [
-    `\`${WRITERS_CHECK_COMMAND} [-- --window-days N] [-- --json]\` is the coexistence interlock: it fails (non-zero) when two writers claim one destination operation in the current phase. It is read-only: it reads the environment and IMS's own database and writes nothing. It makes no call to Xero; once a switchover step is live it makes two GET reads, the companion plugin's \`/incumbents\` probe (step M and later, and again for Xeroom's note at step X) and Mintsoft's order list for the client (step M and later), and before then it makes no vendor call at all. For every operation in the ownership map it works out whether IMS could write it right now (the operation's settings, the plugin switch and the destination's grant all on, and, for a destination named in the enforcement variable, a producer decision that is not SHADOW), and compares that with the owner the map gives for the installation's current phase and with the incumbent evidence IMS holds. It fails when IMS can write an operation that another writer owns (an operation reached only by an operator button is a warning, stated in the report, while the map gives it to the operator, and fails like any other once the map gives it to another writer) (or that nobody has decided: an \`unknown\` owner), when the ownership map gives IMS an operation it must never own (the Xero sales documents), and when IMS can write any operation the bridge plugin owned (the Mintsoft order, product and WooCommerce fulfilment operations, derived from the map) while orders paid since step M's live-from instant still carry the bridge plugin's warehouse-order id.
+    `\`${WRITERS_CHECK_COMMAND} [-- --window-days N] [-- --json]\` is the coexistence interlock: it fails (non-zero) when two writers claim one destination operation in the current phase. It is read-only: it reads the environment and IMS's own database and writes nothing. It makes no call to Xero; once a switchover step is live it makes GET reads: the companion plugin's \`/incumbents\` probe (step M and later, and again for Xeroom's note at step X) and Mintsoft's order list for the client (step M and later), and, in step W and later, the store's own e-mail settings (WooCommerce native processing and completed e-mails), to show that WooCommerce and IMS do not both send customer e-mail; before then it makes no vendor call at all. For every operation in the ownership map it works out whether IMS could write it right now (the operation's settings, the plugin switch and the destination's grant all on, and, for a destination named in the enforcement variable, a producer decision that is not SHADOW), and compares that with the owner the map gives for the installation's current phase and with the incumbent evidence IMS holds. It fails when IMS can write an operation that another writer owns (an operation reached only by an operator button is a warning, stated in the report, while the map gives it to the operator, and fails like any other once the map gives it to another writer) (or that nobody has decided: an \`unknown\` owner), when the ownership map gives IMS an operation it must never own (the Xero sales documents), and when IMS can write any operation the bridge plugin owned (the Mintsoft order, product and WooCommerce fulfilment operations, derived from the map) while orders paid since step M's live-from instant still carry the bridge plugin's warehouse-order id.
 
 PHASES ARE PER SWITCHOVER STEP. Each operation in the map names the step that moves it to IMS, and each step has its own live-from instant, so the installation is in P1 (no step live) or the latest live step: P2-M (Mintsoft, with the bridge's WooCommerce writeback), P2-W (WooCommerce stock, webhooks and customer e-mail) or P2-X (Xero and the invoice note). It also fails when a step's instant is set while the step before it is not set or is later (wrong order), when a step is set and the outbound-write grant of a destination its operations write to is not (a missing grant), and when IMS owns an operation in the phase its step has reached but its own switch is off or no IMS writer exists (the no-writer finding: nobody is writing it). From step M on it requires the evidence that each incumbent has stopped: an evidence source that does not exist yet, or a probe that did not answer (\`not-probed\`), is a failure and never a pass; the owner's confirmations are recorded with \`npm run writers:attest\` or the administrator confirmation screen. In P2-W the missing \`qoblex-stock-push-stopped\` confirmation is a failure, whether or not \`wc_stock_sync_enabled\` is already on, and in P2-X the missing \`qoblex-xero-stopped\` confirmation is a failure; in both, IMS holds the stock push or every step-X write (queued and retried, never shadowed) until the confirmation is recorded. It also reports the legacy single-variable live-from configuration (\`WC_WRITES_LIVE_FROM\` without \`MINTSOFT_WRITES_LIVE_FROM\`, which fails; \`MINTSOFT_WRITES_LIVE_FROM\` with the WooCommerce grant and no \`WC_WRITES_LIVE_FROM\`, which warns), whose meaning changed with the per-step phases. Evidence older than the live-from instant, or (with no instant) older than the window (default ${WRITERS_CHECK_DEFAULT_WINDOW_DAYS} days, \`--window-days\`), is not counted, nor is anything dated after the moment the report is taken, and an order with no readable paid time is reported but never counted, because IMS cannot create an unpaid order.`,
     '',
