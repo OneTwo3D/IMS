@@ -39,7 +39,7 @@ export type SwitchDefinition = {
   readonly requires?: ReadonlyArray<{ key: string; value: string; why: string }>
   /** The screen that sets this switch needs ADMIN and a fresh sign-in; the command needs `--confirm-admin` to write it and records that it assumed ADMIN. */
   readonly adminOnly?: boolean
-  /** A row stamped with the ISO instant, in the same transaction, whenever the switch changes to ON (not when it is left as it is, not when it goes off). */
+  /** A row stamped with the ISO instant, in the same transaction, whenever the switch changes to ON (not when it is left as it is); the row is deleted when the switch changes to OFF. */
   readonly stampOnKey?: string
   /** Turning ON is refused by this interlock (run by the command, which may read the store; the registry stays free of the database client). */
   readonly turnOnInterlock?: 'storefront-customer-email'
@@ -243,6 +243,9 @@ export async function writeSwitch(client: SwitchWriteClient, input: SwitchWriteI
       if (def.stampOnKey && isOn(def, value)) {
         const at = new Date().toISOString()
         await tx.setting.upsert({ where: { key: def.stampOnKey }, create: { key: def.stampOnKey, value: at }, update: { value: at } })
+      } else if (def.stampOnKey) {
+        // Turned OFF: the stamp goes with it, so a later switch-on by a direct write (SQL, a restore) has no stale instant to anchor the guards.
+        await tx.setting.deleteMany({ where: { key: def.stampOnKey } })
       }
       await logActivityInTransaction(tx as never, {
         userId: null,

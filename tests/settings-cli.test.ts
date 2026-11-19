@@ -14,6 +14,7 @@ function fakeDb(initial: Record<string, string> = {}, opts: { failAudit?: boolea
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => s.get(where.key) ?? null,
       upsert: async ({ where, create, update }: { where: { key: string }; create: Row; update: Row }) => { s.set(where.key, s.has(where.key) ? update : create) },
+      deleteMany: async ({ where }: { where: { key: string } }) => { s.delete(where.key) },
     },
     activityLog: {
       create: async (args: { data: Record<string, unknown> }) => { if (opts.failAudit) throw new Error('audit down'); a.push(args) },
@@ -239,10 +240,11 @@ test('storefront e-mail switch: with step W live and both native e-mails off it 
   const stamp = f.settings.get('storefront_customer_email_enabled_at')?.value
   assert.ok(stamp && Date.parse(stamp) >= before && Date.parse(stamp) <= Date.now(), stamp)
   assert.equal(f.transactions, 1, 'one transaction')
-  // turning it OFF is never interlocked, and does not touch the stamp
+  // turning it OFF is never interlocked, and CLEARS the stamp (a later switch-on by a direct write must not inherit it) (MUTATION: keep the stamp => red)
   const off = await run('set', ['--key', 'storefront_customer_email_enabled', '--value', 'false', ...SET, '--yes'], f, { env: {}, now: W_LIVE.now, readNativeEmail: async () => { throw new Error('must not be asked') } })
   assert.equal(off.code, 0, off.err)
-  assert.equal(f.settings.get('storefront_customer_email_enabled_at')?.value, stamp)
+  assert.equal(f.settings.get('storefront_customer_email_enabled')?.value, 'false')
+  assert.equal(f.settings.has('storefront_customer_email_enabled_at'), false, 'the stamp is cleared on off')
   // an already-on switch is not a transition: no interlock, no new stamp
   const again = await run('set', SF, fakeDb({ storefront_customer_email_enabled: 'true', storefront_customer_email_enabled_at: '2026-12-09T00:00:00.000Z' }), { env: {}, now: W_LIVE.now, readNativeEmail: async () => { throw new Error('must not be asked') } })
   assert.equal(again.code, 0, again.err)

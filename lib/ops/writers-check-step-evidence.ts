@@ -7,7 +7,7 @@ import {
 } from '@/lib/security/writers-check-constants'
 import { isWriterAttestationKind } from '@/lib/security/writer-attestation-constants'
 import { BRIDGE_ATTESTATION_KIND, bridgeLastTriggerReadable, bridgeUnitViolations, readBridgePayload } from '@/lib/domain/writer-attestation/bridge-status'
-import { STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY } from '@/lib/domain/storefront-customer-email/constants'
+import { STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY, STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY, parseStorefrontEmailEnabledAt } from '@/lib/domain/storefront-customer-email/constants'
 import type { WooNativeEmailState } from '@/lib/connectors/woocommerce/native-email-state'
 import { parseProducerCutoff } from '@/lib/security/producer-disposition'
 import { PRODUCER_STEP_ENV } from '@/lib/security/producer-disposition-constants'
@@ -141,7 +141,7 @@ const bridgeAttestationReader: StepEvidenceReader = async ({ db }) => {
   // `last_trigger: unknown`, or `never` without proof that the journal was read, is NOT "the bridge never ran": systemd's timestamps are in memory and a reboot
   // wipes them. It is unreadable (fails closed), never a pass.
   if (!bridgeLastTriggerReadable(report)) return { state: 'unreadable' }
-  return { state: 'present', at: row.attestedAt.toISOString(), violations: bridgeUnitViolations(report), lastTriggerAt: report.lastTriggerAt, generatedAt: report.generatedAt }
+  return { state: 'present', at: row.attestedAt.toISOString(), violations: bridgeUnitViolations(report), lastTriggerAt: report.lastTriggerAt, generatedAt: report.generatedAt, journalEarliestAt: report.journalEarliestAt }
 }
 
 /**
@@ -159,14 +159,18 @@ export { NATIVE_EMAIL_VIOLATION }
 const nativeEmailExclusiveReader: StepEvidenceReader = async ({ db, env, now, readNativeEmail }) => {
   const setting = await db.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY }, select: { value: true } })
   const imsOn = setting?.value === 'true'
+  // The switch ON with no readable switch-on stamp (a direct write, a restore): every send fails closed on the missing stamp, so nobody sends any customer
+  // e-mail, yet the native e-mails are off. That is not a pass.
+  const stampRow = imsOn ? await db.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY }, select: { value: true } }) : null
+  const stampMissing = imsOn && parseStorefrontEmailEnabledAt(stampRow?.value) === null
   const liveFrom = stepLiveFrom(env ?? process.env, 'woocommerce')
   if (liveFrom === 'unset' || liveFrom === 'unreadable' || liveFrom.getTime() > now.getTime()) {
-    return imsOn ? { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.imsOnBeforeStepW] } : { state: 'absent' }
+    return imsOn ? { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.imsOnBeforeStepW, ...(stampMissing ? [NATIVE_EMAIL_VIOLATION.onWithoutStamp] : [])] } : { state: 'absent' }
   }
   const read = readNativeEmail ?? (async () => (await import('@/lib/connectors/woocommerce/native-email-state')).readWooNativeCustomerEmailState())
   const native = await read()
   if (!native.ok) return { state: 'unreadable' }
-  const violations: string[] = []
+  const violations: string[] = stampMissing ? [NATIVE_EMAIL_VIOLATION.onWithoutStamp] : []
   for (const [id, on] of Object.entries(native.enabled)) {
     if (imsOn && on) violations.push(`${NATIVE_EMAIL_VIOLATION.bothOn}:${id}`)
     if (!imsOn && !on) violations.push(`${NATIVE_EMAIL_VIOLATION.bothOff}:${id}`)

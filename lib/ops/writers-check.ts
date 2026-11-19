@@ -558,7 +558,13 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
           } else if (generatedMs < triggerRead.read.ms || attestedMs < triggerRead.read.ms) {
             // A report taken (or recorded) before S describes the host before S: it says nothing about the bridge running up to and past S.
             findings.push({ code: 'attestation-missing', severity: 'fail', subject: kind, message: `${STEP_EVIDENCE_LABEL[kind]} was ${generatedMs < triggerRead.read.ms ? 'generated' : 'recorded'} before ${triggerRead.name}: it does not describe the host after IMS went live. Run the script again after ${triggerRead.name} and record the new output.` })
-          } else if (reading.lastTriggerAt !== null) {
+          } else if (reading.lastTriggerAt === null) {
+            // `never`: believed only when the journal it was read from reaches back to before S (a volatile / rotated / vacuumed journal that began after S proves nothing about S).
+            const earliestMs = reading.journalEarliestAt ? Date.parse(reading.journalEarliestAt) : Number.NaN
+            if (!Number.isFinite(earliestMs) || earliestMs >= triggerRead.read.ms) {
+              unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} says the bridge never triggered, but its journal does not reach back before ${triggerRead.name}${Number.isFinite(earliestMs) ? ` (earliest entry ${reading.journalEarliestAt})` : ' (no earliest entry reported)'}: that proves nothing about the bridge.`)
+            }
+          } else {
             const triggerMs = Date.parse(reading.lastTriggerAt)
             if (!triggerRead?.read.ok) {
               // The instant it is judged against cannot be read: no verdict on the trigger, so no pass (the live-from itself is reported separately).

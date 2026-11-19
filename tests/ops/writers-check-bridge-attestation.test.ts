@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -143,7 +143,7 @@ test('P2-M: a trigger AT or AFTER S fails, one before S passes, "never" passes (
 })
 
 test('P2-M: an unmasked or active unit fails, and so does a reading that carries no report facts (fail closed)', () => {
-  const bad = evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: ['bridge-unit-not-masked:wc-mintsoft-webhook.service'], lastTriggerAt: null } }))
+  const bad = evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: ['bridge-unit-not-masked:wc-mintsoft-webhook.service'], lastTriggerAt: null, journalEarliestAt: '2000-01-01T00:00:00.000Z' } }))
   assert.ok(bridgeFindings(bad).some((f) => f.code === 'step-evidence-violation' && /not-masked/.test(f.message)))
   const bare = evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-02T00:00:00.000Z' } }))
   assert.ok(bridgeFindings(bare).some((f) => f.code === 'unreadable'), 'a present reading without facts is not a pass')
@@ -156,7 +156,11 @@ test('the report is NOT required to be recorded before S (the runbook takes it a
 })
 
 test('NATIVE_EMAIL_EXCLUSIVE reader: not read from the store before step W; both on and both off are violations; exactly one passes; an unreadable store is unreadable (MUTATION: treat unreadable as off => red)', async () => {
-  const dbWith = (value: string | null) => ({ setting: { findUnique: async () => (value === null ? null : { value }) } }) as never
+  // The switch row, and (the second argument) the switch-on stamp row: a valid stamp by default.
+  const dbWith = (value: string | null, stamp: string | null = '2026-12-08T00:00:00Z') => ({ setting: { findUnique: async ({ where }: { where: { key: string } }) => {
+    const v = where.key === 'storefront_customer_email_enabled_at' ? stamp : value
+    return v === null ? null : { value: v }
+  } } }) as never
   const on = { ok: true as const, enabled: { customer_processing_order: true, customer_completed_order: false } }
   const off = { ok: true as const, enabled: { customer_processing_order: false, customer_completed_order: false } }
   let reads = 0
@@ -180,6 +184,12 @@ test('NATIVE_EMAIL_EXCLUSIVE reader: not read from the store before step W; both
   }
   assert.equal(reads, 0)
   assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read({ ok: false }) }), { state: 'unreadable' })
+  // The switch ON with NO (or an unreadable) switch-on stamp is a violation: IMS sends nothing (fails closed) while the native e-mails are off (MUTATION: drop the stamp check => red).
+  for (const stamp of [null, 'garbage']) {
+    assert.deepEqual(await reader({ db: dbWith('true', stamp), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(off) } as never), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.onWithoutStamp] }, String(stamp))
+    assert.deepEqual(await reader({ db: dbWith('true', stamp), now: NOW, probeOnce: noProbe, env: {}, readNativeEmail: read(off) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.imsOnBeforeStepW, NATIVE_EMAIL_VIOLATION.onWithoutStamp] })
+  }
+  assert.deepEqual(await reader({ db: dbWith('false', null), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(on) }), { state: 'probed', violations: [`${NATIVE_EMAIL_VIOLATION.bothOff}:customer_completed_order`] }, 'switch off: the stamp is irrelevant')
   const thrown = await readStepEvidence({ db: dbWith('true'), now: NOW, env, readNativeEmail: async () => { throw new Error('network') } })
   assert.deepEqual(thrown.NATIVE_EMAIL_EXCLUSIVE, { state: 'unreadable' })
 })
@@ -271,8 +281,13 @@ test('ITEM 3: `never` is believed only with journal_exit: 0; `unknown`, a `never
   assert.equal(parseBridgeStatusOutput(sampleReport().replace('journal_exit: 0', 'journal_exit: x')).ok, false)
   const dbWith = (report: ReturnType<typeof parsed>) => ({ writerAttestation: { findFirst: async () => ({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload: bridgePayloadFromReport(report, '') }) } }) as never
   const read = (options: Parameters<typeof sampleReport>[0]) => STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith(parsed(options)), now: NOW, probeOnce: noProbe })
-  assert.deepEqual(await read({ lastTrigger: 'never', journalExit: 0 }), { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: null, generatedAt: '2026-12-20T11:55:00.000Z' })
+  assert.deepEqual(await read({ lastTrigger: 'never', journalExit: 0 }), { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: null, generatedAt: '2026-12-20T11:55:00.000Z', journalEarliestAt: '2000-01-01T00:00:00.000Z' })
   for (const bad of [{ lastTrigger: 'unknown' }, { lastTrigger: 'never', journalExit: null }, { lastTrigger: 'never', journalExit: 2 }]) assert.deepEqual(await read(bad), { state: 'unreadable' }, JSON.stringify(bad))
+  // `never` also needs a READABLE, PERSISTENT journal with an earliest entry (exit 0 alone is not proof)
+  for (const bad of [{ journalReadable: 0 as const }, { journalPersistent: 0 as const }, { journalEarliest: null }, { journalReadable: null }, { journalPersistent: null }]) {
+    assert.equal(bridgeLastTriggerReadable(parsed({ lastTrigger: 'never', journalExit: 0, ...bad })), false, JSON.stringify(bad))
+    assert.deepEqual(await read({ lastTrigger: 'never', journalExit: 0, ...bad }), { state: 'unreadable' }, JSON.stringify(bad))
+  }
   // A payload stored before the two fields existed: a time still reads, a `never` is unproven.
   const old = (lastTriggerAt: string | null) => ({ schema: 1, host: 'h', generatedAt: '2026-12-02T00:00:00.000Z', lastTriggerAt, units: Object.fromEntries(['wc-mintsoft-order-sweep.timer', 'wc-mintsoft-order-sweep.service', 'wc-mintsoft-webhook.service'].map((u) => [u, { loadState: 'masked', activeState: 'inactive', unitFileState: 'masked' }])) })
   assert.equal(bridgeLastTriggerReadable(readBridgePayload(old('2026-11-30T00:00:00.000Z'))!), true)
@@ -298,14 +313,17 @@ test('ITEM 3: the real script reports the journalctl exit status, folds the webh
       return path
     }
     const journal = (body: string) => { const path = join(dir, `journal-${body.length}`); writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755); return path }
-    const run = (sys: string, jrn: string) => execFileSync('python3', ['-I', script, '--systemctl', sys, '--journalctl', jrn], { encoding: 'utf8' })
+    const jdir = join(dir, 'persistent-journal')
+    mkdirSync(jdir)
+    // The journal facts are the test's (a readable, persistent journal), so these arms isolate what they are about.
+    const run = (sys: string, jrn: string) => execFileSync('python3', ['-I', script, '--systemctl', sys, '--journalctl', jrn, '--assume-groups', 'systemd-journal', '--journal-dir', jdir, '--journald-conf', join(dir, 'none.conf')], { encoding: 'utf8' })
     // 1. times lost (a reboot) and the journal unreadable: `unknown`, with the exit status printed
     const lost = run(systemctl(''), journal('exit 1'))
     assert.match(lost, /^journal_exit: 1$/m)
     assert.match(lost, /^last_trigger: unknown$/m)
     assert.doesNotMatch(lost, /last_trigger: never/)
     // 2. nothing found and every journal read succeeded: the one case in which `never` is proven
-    const never = run(systemctl(''), journal('exit 0'))
+    const never = run(systemctl(''), journal('case "$*" in *--list-boots*) printf \'[{"index":0,"boot_id":"0123456789abcdef0123456789abcdef","first_entry":1760000000000000}]\';; esac; exit 0'))
     assert.match(never, /^journal_exit: 0$/m)
     assert.match(never, /^last_trigger: never$/m)
     // 3. the WEBHOOK service's own timestamps count (it had no time property before)
@@ -329,4 +347,68 @@ test('FORGERY NOTE: the check\'s own "cannot see" list and the script say the pa
   assert.ok(WRITERS_CHECK_CANNOT_SEE.some((line) => /plain pasted text/.test(line) && /not evidence signed by the host/i.test(line) && /forgery/.test(line)))
   const { readFileSync } = await import('node:fs')
   assert.match(readFileSync('scripts/bridge/bridge_writers_status.py', 'utf8'), /not evidence signed by this host/)
+})
+
+test('NEVER proof: the evaluator believes `never` only when the journal\'s earliest entry is BEFORE S (MUTATION: drop the earliest-before-S comparison => red)', () => {
+  const never = (journalEarliestAt: string | null | undefined) => bridgeFindings(evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: reading({ lastTriggerAt: null, journalEarliestAt }) })))
+  assert.deepEqual(never('2026-10-01T00:00:00.000Z'), [], 'a journal reaching back before S: never is proven')
+  for (const bad of ['2026-12-01T00:00:00.000Z', '2026-12-05T00:00:00.000Z', null, undefined]) {
+    assert.ok(never(bad).some((f) => f.code === 'unreadable' && /does not reach back before/.test(f.message)), String(bad))
+  }
+  // a journal that began after S (a reboot with a volatile journal) is the reviewer's scenario
+})
+
+test('NEVER proof: the script reports journal_readable / journal_persistent / journal_earliest / boot, and prints `never` only for a readable persistent journal with entries', { skip: process.platform === 'win32' }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-status-'))
+  try {
+    const script = join(process.cwd(), 'scripts/bridge/bridge_writers_status.py')
+    const systemctl = join(dir, 'systemctl')
+    writeFileSync(systemctl, '#!/bin/sh\nprintf "LoadState=masked\\nActiveState=inactive\\nUnitFileState=masked\\n"\n')
+    chmodSync(systemctl, 0o755)
+    const boots = '[{"index":-1,"boot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","first_entry":1760000000000000,"last_entry":1764000000000000},{"index":0,"boot_id":"0123456789abcdef0123456789abcdef","first_entry":1764547200000000,"last_entry":1766000000000000}]'
+    const journal = (header: number, listBoots: string) => {
+      const path = join(dir, `journalctl-${header}-${listBoots.length}`)
+      writeFileSync(path, `#!/bin/sh\ncase "$*" in\n  *--header*) exit ${header};;\n  *--list-boots*) printf '%s' '${listBoots}'; exit 0;;\n  *) exit 0;;\nesac\n`)
+      chmodSync(path, 0o755)
+      return path
+    }
+    const persistentDir = join(dir, 'var-log-journal')
+    mkdirSync(persistentDir)
+    const conf = join(dir, 'journald.conf')
+    writeFileSync(conf, '[Journal]\n')
+    const run = (jrn: string, extra: string[]) => execFileSync('python3', ['-I', script, '--systemctl', systemctl, '--journalctl', jrn, '--assume-groups', 'systemd-journal', '--journald-conf', conf, ...extra], { encoding: 'utf8' })
+    // readable + persistent + entries, nothing triggered: `never`, with the evidence printed
+    const ok = run(journal(0, boots), ['--journal-dir', persistentDir])
+    assert.match(ok, /^journal_readable: 1$/m)
+    assert.match(ok, /^journal_persistent: 1$/m)
+    assert.match(ok, /^journal_earliest: 2025-10-09T08:53:20Z$/m)
+    assert.match(ok, /^boot_id: 0123456789abcdef0123456789abcdef$/m)
+    assert.match(ok, /^boot_started: 2026-12-01T00:00:00Z$/m)
+    assert.match(ok, /^last_trigger: never$/m)
+    const parsedOk = parseBridgeStatusOutput(ok)
+    assert.ok(parsedOk.ok && bridgeLastTriggerReadable(parsedOk.report) && parsedOk.report.journalEarliestAt === '2025-10-09T08:53:20.000Z')
+    // a volatile journal (no /var/log/journal): not persistent, so `unknown`
+    const volatile = run(journal(0, boots), ['--journal-dir', join(dir, 'missing')])
+    assert.match(volatile, /^journal_persistent: 0$/m)
+    assert.match(volatile, /^last_trigger: unknown$/m)
+    // Storage=volatile in journald.conf even though the directory exists
+    writeFileSync(conf, '[Journal]\nStorage=volatile\n')
+    assert.match(run(journal(0, boots), ['--journal-dir', persistentDir]), /^journal_persistent: 0$/m)
+    writeFileSync(conf, '[Journal]\n')
+    // `journalctl --header` failing: not readable, so `unknown`, no earliest entry
+    const unreadable = run(journal(1, boots), ['--journal-dir', persistentDir])
+    assert.match(unreadable, /^journal_readable: 0$/m)
+    assert.match(unreadable, /^journal_earliest: none$/m)
+    assert.match(unreadable, /^last_trigger: unknown$/m)
+    // a user outside root / systemd-journal / adm: not readable even though journalctl exits 0
+    const outsider = execFileSync('python3', ['-I', script, '--systemctl', systemctl, '--journalctl', journal(0, boots), '--assume-groups', 'users', '--journald-conf', conf, '--journal-dir', persistentDir], { encoding: 'utf8' })
+    if (process.geteuid?.() !== 0) {
+      assert.match(outsider, /^journal_readable: 0$/m)
+      assert.match(outsider, /^last_trigger: unknown$/m)
+    }
+    const parsedUnreadable = parseBridgeStatusOutput(unreadable)
+    assert.ok(parsedUnreadable.ok && !bridgeLastTriggerReadable(parsedUnreadable.report))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

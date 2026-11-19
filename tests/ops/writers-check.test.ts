@@ -36,7 +36,7 @@ const ALL_ON = new Map<string, string>([['xero_sync_enabled', 'true'], ['xero_da
 export function cleanStepEvidence(): Record<StepEvidenceKind, StepEvidenceReading> {
   const out = {} as Record<StepEvidenceKind, StepEvidenceReading>
   for (const kind of STEP_EVIDENCE_KINDS) {
-    out[kind] = kind === 'BRIDGE_ATTESTATION' ? { state: 'present', at: '2026-10-12T00:00:00.000Z', violations: [], lastTriggerAt: null, generatedAt: '2026-10-12T00:00:00.000Z' }
+    out[kind] = kind === 'BRIDGE_ATTESTATION' ? { state: 'present', at: '2026-10-12T00:00:00.000Z', violations: [], lastTriggerAt: null, generatedAt: '2026-10-12T00:00:00.000Z', journalEarliestAt: '2000-01-01T00:00:00.000Z' }
       : kind.startsWith('QOBLEX') ? { state: 'present', at: '2026-01-01T00:00:00.000Z' }
       : kind === 'BRIDGE_PROBE' ? { state: 'probed', violations: [] }
       : { state: 'counted', counted: 0, floor: '2026-01-01T00:00:00.000Z' }

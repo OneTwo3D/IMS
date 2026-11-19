@@ -1062,6 +1062,8 @@ export async function setSettings(values: Record<string, string>): Promise<Setti
   // (interlock), and it records WHEN it was turned on in the same transaction (the anchor of every history guard). Turning it off, or saving it unchanged, is neither.
   const storefrontEmailEntry = entries.find(([key]) => key === STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY)
   let stampStorefrontEmailOn = false
+  // Turning it OFF clears the stamp (below): a later switch-on by a direct write must not inherit an earlier cycle's instant.
+  const clearStorefrontEmailStamp = storefrontEmailEntry !== undefined && storefrontEmailEntry[1] !== 'true'
   if (storefrontEmailEntry && storefrontEmailEntry[1] === 'true') {
     const current = await db.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY }, select: { value: true } })
     if (current?.value !== 'true') {
@@ -1073,6 +1075,7 @@ export async function setSettings(values: Record<string, string>): Promise<Setti
   }
 
   await db.$transaction(async (tx) => {
+    if (clearStorefrontEmailStamp) await tx.setting.deleteMany({ where: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY } })
     if (stampStorefrontEmailOn) {
       const at = new Date().toISOString()
       await tx.setting.upsert({ where: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY }, create: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY, value: at }, update: { value: at } })

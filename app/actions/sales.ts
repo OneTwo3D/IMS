@@ -2733,16 +2733,26 @@ export async function applySalesOrderStatusTransition(
       const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
       await queueDispatchEmailIfEligible(id)
     }
-    // A storefront order that was imported HELD (PENDING_PAYMENT / ON_HOLD) and now moves to processing (a BACS / cheque payment received): WooCommerce sent its
-    // confirmation on that move before step W and is off after it, so nobody would send one. Same kind and dedupe as the import's confirmation, so once only; the
-    // helper self-guards (switch, switch-on instant, age from the release, storefront order) and never throws.
+    // A storefront order that was imported HELD (PENDING_PAYMENT / ON_HOLD) and now moves to processing for the FIRST time (a BACS / cheque payment received):
+    // WooCommerce sent its confirmation on that move before step W and is off after it, so nobody would send one. The claim is a one-shot marker written only
+    // by the import of a held order (`confirmationOnReleasePendingAt`) and consumed here, so an order that was ever released, imported any other way, or
+    // put on hold later (PROCESSING -> ON_HOLD -> PROCESSING) can never confirm through this path. The release time is the storefront's paid time and only
+    // the full-bypass sync path carries it; an IMS-side move (operator, AUTH_ONLY) has none and is judged on placement (placed at/after the switch-on).
+    // The helper self-guards (switch, switch-on instant, placement, age, storefront order, dedupe) and never throws.
     if (
       (previousStatusForLog === 'PENDING_PAYMENT' || previousStatusForLog === 'ON_HOLD')
       && (targetStatus === 'PROCESSING' || targetStatus === 'ALLOCATED' || targetStatus === 'PICKING' || targetStatus === 'PACKING')
     ) {
-      const { queueStorefrontConfirmationIfEligible } = await import('@/lib/storefront-customer-email')
-      const releasedAt = bypassPermission && options?.releasedAt instanceof Date && Number.isFinite(options.releasedAt.getTime()) ? options.releasedAt : new Date()
-      await queueStorefrontConfirmationIfEligible(id, { releasedAt })
+      try {
+        const claim = await db.salesOrder.updateMany({ where: { id, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })
+        if (claim.count === 1) {
+          const { queueStorefrontConfirmationIfEligible } = await import('@/lib/storefront-customer-email')
+          const releasedAt = bypassPermission && options?.releasedAt instanceof Date && Number.isFinite(options.releasedAt.getTime()) ? options.releasedAt : undefined
+          await queueStorefrontConfirmationIfEligible(id, releasedAt ? { releasedAt } : undefined)
+        }
+      } catch (releaseError) {
+        console.error(releaseError)
+      }
     }
     // Storefront orders (o3d-zvec.24, switch `storefront_customer_email_enabled`, default off): the delivered e-mail, once per order. Self-guarded
     // (status DELIVERED, a recent despatch, dedup under the order row lock) and never throws.

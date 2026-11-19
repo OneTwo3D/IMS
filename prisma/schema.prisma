@@ -2024,6 +2024,8 @@ model SalesOrder {
   /// an operator releases the hold by hand. Automatic release is deliberately not
   /// implemented; see lib/connectors/woocommerce/sync/withdrawal.ts.
   withdrawalHoldAt  DateTime?
+  /// Set ONLY when the storefront import created the order held (PENDING_PAYMENT / ON_HOLD). The one-shot claim of the "order confirmation on release" customer e-mail: the first move to a despatch-pending status consumes it (set null), so an order that was ever released (or imported any other way) never gets a confirmation through the release path.
+  confirmationOnReleasePendingAt DateTime?
   /// o3d-e1yb [wdraw]: set when an EU withdrawal request was APPROVED and the order
   /// cancelled. Deliberately separate from `withdrawalHoldAt`, which is cleared at that
   /// point: the hold is over, but the fact is permanent. A delayed pre-approval

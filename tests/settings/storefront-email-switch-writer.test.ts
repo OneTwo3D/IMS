@@ -13,6 +13,7 @@ const reset = () => { state.rows = new Map(); state.writes = []; state.transacti
 const setting = {
   findUnique: async ({ where }: { where: { key: string } }) => (state.rows.has(where.key) ? { value: state.rows.get(where.key)! } : null),
   upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => { state.rows.set(where.key, create.value); state.writes.push(where.key) },
+  deleteMany: async ({ where }: { where: { key: string } }) => { state.rows.delete(where.key); state.writes.push(`delete:${where.key}`) },
 }
 mock.module('@/lib/db', { namedExports: { db: { setting, $transaction: async (fn: (tx: { setting: typeof setting }) => Promise<unknown>) => { state.transactions += 1; return fn({ setting }) } } } })
 mock.module('@/lib/auth/server', {
@@ -53,14 +54,15 @@ test('allowed: the switch and its switch-on instant are written in ONE transacti
   assert.ok(stamp >= before && stamp <= Date.now())
 })
 
-test('turning it off, or saving it unchanged, neither asks the interlock nor moves the stamp', async () => {
+test('turning it off CLEARS the stamp, in the same transaction; saving it unchanged-on neither asks the interlock nor moves the stamp (MUTATION: no clear => red)', async () => {
   const { setSettings } = await import('@/app/actions/settings')
   state.rows.set(KEY, 'true'); state.rows.set(AT, '2026-12-09T00:00:00.000Z')
   state.refusal = 'would refuse'
   assert.deepEqual(await setSettings({ [KEY]: 'true' }), { status: 'saved' }, 'unchanged: not a transition')
+  assert.equal(state.rows.get(AT), '2026-12-09T00:00:00.000Z', 'unchanged on: the stamp stays')
   assert.deepEqual(await setSettings({ [KEY]: 'false' }), { status: 'saved' }, 'off is never refused')
   assert.equal(state.interlockCalls, 0)
-  assert.equal(state.rows.get(AT), '2026-12-09T00:00:00.000Z')
+  assert.equal(state.rows.has(AT), false, 'off clears the stamp')
 })
 
 test('the switch-on instant is not writable through the generic writer', async () => {

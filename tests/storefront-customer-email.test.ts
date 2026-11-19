@@ -305,18 +305,25 @@ test('BATCH wiring: applyExternalFulfillmentUpdate defers the per-shipment parti
   const { readFileSync } = await import('node:fs')
   const source = readFileSync('lib/fulfillment/external-fulfillment.ts', 'utf8')
   assert.equal((source.match(/deferStorefrontPartialEmail: true/g) ?? []).length, 2, 'both external loops defer the per-shipment hook')
-  assert.equal((source.match(/await flushPartialEmails\(\)/g) ?? []).length, 4, 'each loop flushes on failure and after the loop')
+  assert.equal((source.match(/await flushPartialEmails\(\)/g) ?? []).length, 2, 'each loop flushes after the loop only')
+  assert.equal((source.match(/discardPartialEmails\(\)/g) ?? []).length, 2, 'each loop discards on failure (a failed batch judges no partial)')
   const allocation = readFileSync('app/actions/allocation.ts', 'utf8')
   assert.match(allocation, /options\?\.deferStorefrontPartialEmail !== true/)
 })
 
-test('RELEASE: an order imported held (so the import queued nothing) and later moved to processing is confirmed ONCE, judged on the release, with the same dedupe (MUTATION: no release hook => red)', async () => {
+test('RELEASE: a held order placed AFTER the switch-on and released (paid) after it is confirmed ONCE, judged on the release, with the same dedupe (MUTATION: no release hook => red)', async () => {
   const { queue } = await load()
   reset(); ON(new Date(Date.now() - 3_600_000))
-  // Placed (and held) long before the switch came on: the placement time says "history", the release time says "now".
-  state.order = { ...BASE_ORDER, status: 'PROCESSING', externalCreatedAt: new Date(Date.now() - 5 * 24 * 3_600_000) }
-  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1'), { queued: false, reason: 'before_switch_on' }, 'without a release it is history')
+  // Placed (and held) after the switch-on, but more than the age bound ago: the placement says "too old", the release time says "now".
+  state.order = { ...BASE_ORDER, status: 'PROCESSING', externalCreatedAt: new Date(Date.now() - 3 * 24 * 3_600_000) }
+  // placed before the switch-on: never, release or not
+  state.settings.set('storefront_customer_email_enabled_at', new Date(Date.now() - 2 * 24 * 3_600_000).toISOString())
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date() }), { queued: false, reason: 'before_switch_on' }, 'RELEASE of an order placed before the switch-on: nothing (reviewer scenario)')
+  assert.equal(state.outbox.length, 0)
+  state.settings.set('storefront_customer_email_enabled_at', new Date(Date.now() - 4 * 24 * 3_600_000).toISOString())
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1'), { queued: false, reason: 'too_old' }, 'without a release it is too old (an IMS-side move has no paid time)')
   assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date() }), { queued: true })
+  assert.equal(state.outbox.length, 1)
   assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date() }), { queued: false, reason: 'already_queued' }, 'once only')
   // A release the store made BEFORE the switch came on was confirmed by WooCommerce: not again.
   reset(); ON(new Date())
@@ -328,13 +335,17 @@ test('RELEASE: an order imported held (so the import queued nothing) and later m
   assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date() }), { queued: false, reason: 'wrong_status' })
 })
 
-test('RELEASE wiring: the status transition queues the confirmation for a move out of PENDING_PAYMENT / ON_HOLD into a despatch-pending status, with the store\'s paid time as the release (source pin)', async () => {
+test('RELEASE wiring: the status transition claims the one-shot held-at-import marker, then queues with the store\'s paid time only from the full bypass path (source pin; behaviour is in the DB-tier test)', async () => {
   const { readFileSync } = await import('node:fs')
   const sales = readFileSync('app/actions/sales.ts', 'utf8')
   assert.match(sales, /previousStatusForLog === 'PENDING_PAYMENT' \|\| previousStatusForLog === 'ON_HOLD'/)
-  assert.match(sales, /queueStorefrontConfirmationIfEligible\(id, \{ releasedAt \}\)/)
+  assert.match(sales, /confirmationOnReleasePendingAt: \{ not: null \}/)
+  assert.match(sales, /claim\.count === 1/)
+  assert.match(sales, /bypassPermission && options\?\.releasedAt instanceof Date/)
   const sync = readFileSync('lib/connectors/woocommerce/sync/order-status.ts', 'utf8')
   assert.match(sync, /releasedAt/)
+  const imp = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  assert.match(imp, /confirmationOnReleasePendingAt: new Date\(\)/)
 })
 
 test('INTERLOCK: turning the storefront switch on is refused before step W, with step W in the future, or while a native e-mail is on or unreadable; allowed only with step W live and both native e-mails off (MUTATION: drop any arm => red)', async () => {

@@ -152,6 +152,8 @@ export const NATIVE_EMAIL_VIOLATION = {
   bothOn: 'native-and-ims-customer-email-both-on',
   bothOff: 'native-and-ims-customer-email-both-off',
   imsOnBeforeStepW: 'ims-customer-email-on-before-step-w',
+  /** The IMS switch is ON but `storefront_customer_email_enabled_at` is missing or unreadable: every send fails closed, so nobody e-mails the customer. */
+  onWithoutStamp: 'ims-customer-email-on-without-switch-on-stamp',
 } as const
 
 /** What a reader answers for one step-evidence kind. */
@@ -170,6 +172,8 @@ export type StepEvidenceReading =
       violations?: readonly string[]
       /** A host report: the instant of the latest trigger the report shows, or null for `never`. Judged against the step's live-from instant by the evaluator. */
       lastTriggerAt?: string | null
+      /** A host report with `last_trigger: never`: the earliest journal entry the script saw. The evaluator requires it BEFORE the step's live-from instant, else `never` proves nothing (the journal may not reach back to S). */
+      journalEarliestAt?: string | null
       /** A host report: the instant the report says it was generated. The evaluator requires it, and the attestation time, to be at or after the step's live-from instant. */
       generatedAt?: string }
   /** A count of offending rows since `floor`. */

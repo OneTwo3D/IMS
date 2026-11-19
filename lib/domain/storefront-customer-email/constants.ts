@@ -64,7 +64,7 @@ export function isStorefrontCustomerEmailKind(kind: string): boolean {
 /**
  * HISTORY IS NOT RE-ANNOUNCED, by TWO bounds that must both hold. (1) AGE: an order imported long after it was placed (a back-fill) gets no confirmation, and
  * an order marked delivered or a shipment despatched long ago (an operator bulk-advancing old orders) gets no delivered / partial / dispatched e-mail.
- * (2) THE SWITCH-ON INSTANT (`storefront_customer_email_enabled_at`): an order PLACED before it gets no confirmation (WooCommerce sent it, even when the import
+ * (2) THE SWITCH-ON INSTANT (`storefront_customer_email_enabled_at`): an order PLACED before it gets no confirmation (release included) (WooCommerce sent it, even when the import
  * was retried after the switch came on), and a dispatched / partial / delivered e-mail goes out only for a shipment DISPATCHED after it. The one exception is
  * the RELEASE of an order that was imported held (PENDING_PAYMENT / ON_HOLD) and later moves to processing: its confirmation is anchored on the release
  * (the paid time), because WooCommerce's native confirmation fires on that move and is off by then.
@@ -117,9 +117,11 @@ export function evaluateStorefrontEmailEligibility(input: StorefrontEmailEligibi
   const enabledMs = input.enabledAt.getTime()
   if (input.kind === 'confirmation') {
     if (NOT_YET_ORDER_STATUSES.has(order.status)) return { eligible: false, reason: 'wrong_status' }
-    // A released held order is judged on its release; any other order on its placement.
+    // An order PLACED before the switch-on was confirmed by WooCommerce (or refused as history): never through any path, release included.
+    if (order.placedAt === null) return { eligible: false, reason: 'too_old' }
+    if (order.placedAt.getTime() < enabledMs) return { eligible: false, reason: 'before_switch_on' }
+    // A released held order is judged on its release (the storefront's paid time); any other order on its placement.
     const anchor = order.releasedAt ?? order.placedAt
-    if (anchor === null) return { eligible: false, reason: 'too_old' }
     if (anchor.getTime() < enabledMs) return { eligible: false, reason: 'before_switch_on' }
     if (input.now.getTime() - anchor.getTime() > STOREFRONT_CONFIRMATION_MAX_AGE_MS) return { eligible: false, reason: 'too_old' }
   } else if (input.kind === 'delivered') {
