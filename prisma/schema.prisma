@@ -4650,6 +4650,10 @@ enum WmsOperatorTaskReason {
   ORDER_NOT_FOUND
   /// A storefront (or approved EU withdrawal) cancelled an order whose invoice is already posted to the ledger: IMS raised no credit note and a cancelled order cannot be refunded, so a person credits the invoice by hand.
   CANCELLED_POSTED_INVOICE
+  /// WooCommerce changed an order's lines after the warehouse started picking it: IMS pushed nothing, a person applies the change in the warehouse by hand.
+  WC_EDIT_AFTER_PICKING
+  /// A shipped unit was returned and refunded, so IMS still owes the customer those units but the warehouse push netted the gross refund: a person asks the warehouse to send the remainder. IMS changes no quantity at the warehouse.
+  REFUND_REMAINDER_DUE
   /// Merge hold (setting wms_merge_hold_enabled): IMS held every order of a same-customer group in the warehouse so a person can merge them there. Carries the EU and FedEx warnings.
   MERGE_HOLD
   /// A merge hold has stood longer than MERGE_HOLD_REMIND_HOURS: a person has to merge and confirm the orders in the warehouse (IMS never releases a merge hold).
@@ -4866,6 +4870,8 @@ model WcOrderDivergence {
   /// Set when a later delivery matched the IMS order again (or the order ended). A later difference starts a new episode on the same row.
   resolvedAt          DateTime? @map("resolved_at")
   resolution          String?
+  /// The fingerprint of the differences the amendment write step has already claimed (applied or refused): the same difference is acted on once, even when two deliveries race.
+  amendmentClaim      String?   @map("amendment_claim")
 
   @@index([resolvedAt, firstSeenAt], map: "wc_order_divergences_open_idx")
   @@map("wc_order_divergences")

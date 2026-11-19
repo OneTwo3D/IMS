@@ -3471,6 +3471,11 @@ export async function createRefund(
      */
     enforcePerTargetBalances?: boolean
     /**
+     * Internal-only, a pure tightening: for each group, the refunded quantity already on the order's lines in the group PLUS this refund's quantity on them may not exceed `maxQty`,
+     * re-checked inside the refund transaction under the order row lock. The WooCommerce amendment step sets it to the reduction WooCommerce shows, so two racing runs cannot both refund it.
+     */
+    maxRefundedQtyByLines?: Array<{ lineIds: string[]; maxQty: number }>
+    /**
      * o3d-w00 (Codex r4 #2): the accounting tax identity each target was CONVERTED at, to be re-checked
      * against the identity the credit note will actually post under, inside the refund transaction's
      * order lock. Internal-only and a pure TIGHTENING — it can only refuse a refund, never widen one.
@@ -3616,6 +3621,7 @@ export async function createRefund(
         : true,
       enforcePerTargetBalances,
       deriveSaleLineNetsFromStoredBalance,
+      maxRefundedQtyByLines: isInternal ? options?.maxRefundedQtyByLines : undefined,
       // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
       // only from an internal caller.

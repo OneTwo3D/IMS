@@ -410,6 +410,14 @@ export const CRM_AUTO_MERGE_AUDIT_LOCK_NAMESPACE = 411_220_890
 export const CRM_IDENTITY_LOCK_NAMESPACE = 411_220_891
 
 /**
+ * THE WC ORDER AMENDMENT LOCK (two-int, key = hashtext(orderId)).
+ *
+ * Held (transaction scope) across the whole write step of a WooCommerce order amendment: re-reading the refunded quantities, claiming and creating the refund, so two deliveries for one
+ * order cannot both refund the same units. NOT the order row lock: createRefund takes that in its own transaction and would wait on this one. A hashtext collision only serialises two orders.
+ */
+export const WC_AMENDMENT_LOCK_NAMESPACE = 411_220_883
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:

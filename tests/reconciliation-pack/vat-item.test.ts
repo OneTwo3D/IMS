@@ -79,24 +79,35 @@ test('UNCLOSED PERIOD EXCLUDED: October data present in all three systems on a 1
   // A vendor row in the widened margin but outside the closed months (1 October) is cut, not counted.
   const inMargin = standard({
     xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 100 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }]), invoice(4, '2026-10-01', [{ type: 'OUTPUT2', tax: 7 }]), invoice(5, '2026-07-31', [{ type: 'OUTPUT2', tax: 3 }])],
-    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']]), wooOrder(104, '2026-10-01T00:00:00', [[11, '5.00']]), wooOrder(105, '2026-07-31T23:59:59', [[11, '5.00']])] },
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '100.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']]), wooOrder(104, '2026-10-01T00:00:00', [[11, '5.00']]), wooOrder(105, '2026-07-31T22:59:59', [[11, '5.00']])] },
   })
   assert.deepEqual(reasons(await run(inMargin.ctx)), ['pass'])
 })
 
-// [mutation: month boundary compared with <= instead of the period string / the GMT date not used]
-test('a month boundary: an order created at 23:59:59 on 30 September counts in September, one at 00:00:00 on 1 October does not', async () => {
+// [mutation: month boundary compared with <= instead of the period string / the GMT date not used / the UTC month used instead of the London month]
+// o3d-oe1b0: the month is the LONDON month, the calendar the Xero invoice dates and the IMS side use. September is BST (UTC+1), so 22:59:59 GMT on 30 September is
+// still September in London and 23:00:00 GMT is 00:00 on 1 October. Bucketed by the UTC month, order 102 would land in September and order 101's neighbour in October.
+test('a month boundary is the LONDON month: an order created at 22:59:59 GMT on 30 September (BST) counts in September, one at 23:00:00 GMT is already 1 October and does not', async () => {
   const edge = standard({
     ims: { sales: [sale('2026-09', 'rGB', '10.00'), sale('2026-08', 'rGB', '50.00')] },
     xero: [invoice(1, '2026-09-30', [{ type: 'OUTPUT2', tax: 10 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
-    woo: { processing: [wooOrder(101, '2026-09-30T23:59:59', [[11, '10.00']]), wooOrder(102, '2026-10-01T00:00:00', [[11, '77.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+    woo: { processing: [wooOrder(101, '2026-09-30T22:59:59', [[11, '10.00']]), wooOrder(102, '2026-09-30T23:00:00', [[11, '77.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
   })
   assert.deepEqual(reasons(await run(edge.ctx)), ['pass'])
 })
 
+test('o3d-oe1b0: a BST month-end order created at 23:30 GMT is October in London, so September IMS and Xero tax is not matched by it', async () => {
+  const edge = standard({
+    ims: { sales: [sale('2026-09', 'rGB', '10.00'), sale('2026-08', 'rGB', '50.00')] },
+    xero: [invoice(1, '2026-09-30', [{ type: 'OUTPUT2', tax: 10 }]), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
+    woo: { processing: [wooOrder(101, '2026-09-30T23:30:00', [[11, '10.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+  })
+  assert.notEqual((await run(edge.ctx)).outcome, 'pass')
+})
+
 // [mutation: classifyPopulation not consulted]
 test('POPULATION: a month before the recorded first load or storefront import is left out; an unrecorded boundary is NO_POPULATION_RECORD; nothing left is EMPTY_UNPROVEN', async () => {
-  const cut = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-09-01T00:00:00.000Z' } }
+  const cut = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-08-31T23:00:00.000Z' } }
   const noAug = standard({
     ims: { boundaries: cut, sales: [sale('2026-09', 'rGB', '100.00'), sale('2026-08', 'rGB', '1000.00')] },
   })
@@ -113,6 +124,16 @@ test('POPULATION: a month before the recorded first load or storefront import is
   assert.equal(none.xero.calls.length, 0)
   const retained = standard({ ims: { boundaries: { ...BOUNDARIES, retentionMonths: 1 } } })
   assert.deepEqual(reasons(await run(retained.ctx)), ['inconclusive', 'EMPTY_UNPROVEN'])
+})
+
+// [mutation: the period start taken as the UTC month start instead of London midnight]
+test('POPULATION BOUNDARY is London midnight: a cut at 23:30Z on 31 July (00:30 BST on 1 August) leaves August out, a cut at 23:00Z exactly keeps it', async () => {
+  const partial = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-07-31T23:30:00.000Z' } }
+  const out = standard({ ims: { boundaries: partial, sales: [sale('2026-09', 'rGB', '100.00'), sale('2026-08', 'rGB', '1000.00')] } })
+  assert.deepEqual(keys(await run(out.ctx), 'bothEqual').filter((k) => k.includes('2026-08')), [], 'August began before the cut: not wholly held, so not compared')
+  const whole = { ...BOUNDARIES, firstLoad: { state: 'verified' as const, cutAt: '2026-07-31T23:00:00.000Z' } }
+  const kept = standard({ ims: { boundaries: whole, sales: [sale('2026-09', 'rGB', '100.00'), sale('2026-08', 'rGB', '50.00')] } })
+  assert.ok(keys(await run(kept.ctx), 'bothEqual').some((k) => k.includes('2026-08')))
 })
 
 // ---- tolerance and set -----------------------------------------------------------------------

@@ -761,6 +761,30 @@ test('integration outbox retryable failure promotes to permanent at max attempts
   assert.equal(failure.lockedBy, null)
 })
 
+test('o3d-v17zc: a refusal by an operator\'s own switch keeps the row retryable and spends no attempt, even at the last attempt', async () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const { client } = makeClient([
+    makeRow({ id: 'job-1', status: INTEGRATION_OUTBOX_STATUS.PROCESSING, attempts: 4, lockedAt: now, lockedBy: 'worker-1' }),
+  ])
+
+  const kept = await markIntegrationOutboxRetryableFailure({
+    client,
+    id: 'job-1',
+    workerId: 'worker-1',
+    lockedAt: now,
+    error: 'Stock sync is disabled in settings',
+    now,
+    attemptsBeforeFailure: 4,
+    maxAttempts: 5,
+    refusedBySetting: true,
+  })
+
+  assert.equal(kept.status, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED)
+  assert.equal(kept.attempts, 4, 'no attempt is spent')
+  assert.equal(kept.lockedAt, null)
+  assert.ok(kept.nextAttemptAt && kept.nextAttemptAt.getTime() > now.getTime())
+})
+
 test('integration outbox success clears claim state', async () => {
   const now = new Date('2026-04-27T10:00:00.000Z')
   const { client } = makeClient([

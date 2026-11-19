@@ -4,7 +4,7 @@ import { parseComponentsCell } from '@/lib/domain/import/component-recipe-cell'
 import { parseTransferDispatchedAt } from '@/lib/domain/import/transfer-dispatch-date'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
-import { parseCsv } from '@/lib/csv'
+import { csvDiagnosticsErrors, parseCsvDiagnosed, parseCsvValidated } from '@/lib/csv'
 import { ProductType, type Prisma, type ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
@@ -73,6 +73,7 @@ import {
   createCsvImportPreviewResult,
   getCsvImportMode,
   isCsvImportDryRunMode,
+  withCsvCommentRowsNotice,
   type CsvImportActionResult,
   type CsvImportExecutionResult,
 } from '@/lib/csv-import'
@@ -96,6 +97,10 @@ async function validateImportFile(
   if (file.size > MAX_IMPORT_BYTES) {
     return { error: `File exceeds maximum size (${MAX_IMPORT_BYTES / (1024 * 1024)} MB)` }
   }
+  // A damaged or hand-made file must not turn into quietly different rows: a short row padded with blanks, an extra cell dropped, a stray quote
+  // swallowing the next cells. Refuse the whole file, naming the lines, before any row is read as data.
+  const damage = csvDiagnosticsErrors(parseCsvDiagnosed(await file.text()).diagnostics)
+  if (damage.length > 0) return { error: `The file is not a well-formed CSV and nothing was imported. ${damage.join('; ')}` }
   return { file }
 }
 
@@ -275,6 +280,10 @@ function scheduleProductImportShoppingSync(
 }
 
 export async function importProductsCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importProductsCsvInner(formData, system))
+}
+
+async function importProductsCsvInner(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'inventory.edit', system)
@@ -286,7 +295,7 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
   }
 
   const text = await validated.file.text()
-  const parsed = parseCsv(text)
+  const parsed = parseCsvValidated(text)
   const { rows, dropped } = capRows(parsed)
 
   // inventory.prices gates every price column. The import runs under inventory.edit, so a user without
@@ -1243,6 +1252,10 @@ export async function importProductsCsv(formData: FormData, system?: SystemImpor
 // ---------------------------------------------------------------------------
 
 export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importAdjustmentsCsvInner(formData))
+}
+
+async function importAdjustmentsCsvInner(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'stock_control.adjust')
@@ -1254,7 +1267,7 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
   }
 
   const text = await validated.file.text()
-  const parsed = parseCsv(text)
+  const parsed = parseCsvValidated(text)
   const { rows, dropped } = capRows(parsed)
 
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
@@ -1345,6 +1358,10 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
 // ---------------------------------------------------------------------------
 
 export async function importOpeningStockCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importOpeningStockCsvInner(formData, system))
+}
+
+async function importOpeningStockCsvInner(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'stock_control.adjust', system)
@@ -1356,7 +1373,7 @@ export async function importOpeningStockCsv(formData: FormData, system?: SystemI
   }
 
   const text = await validated.file.text()
-  const parsed = parseCsv(text)
+  const parsed = parseCsvValidated(text)
   const { rows, dropped } = capRows(parsed)
 
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
@@ -1576,6 +1593,10 @@ export async function importOpeningStockCsv(formData: FormData, system?: SystemI
 // ---------------------------------------------------------------------------
 
 export async function importTransfersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importTransfersCsvInner(formData, system))
+}
+
+async function importTransfersCsvInner(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'stock_control.transfer', system)
@@ -1593,7 +1614,7 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
     return createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
   }
 
-  const parsed = parseCsv(await validated.file.text())
+  const parsed = parseCsvValidated(await validated.file.text())
   const { rows, dropped } = capRows(parsed)
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
   if (dropped > 0) {
@@ -1802,6 +1823,10 @@ export async function importTransfersCsv(formData: FormData, system?: SystemImpo
 // ---------------------------------------------------------------------------
 
 export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importSalesOrdersCsvInner(formData))
+}
+
+async function importSalesOrdersCsvInner(formData: FormData): Promise<CsvImportActionResult> {
   await requirePermission('sales.create')
   // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
   // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
@@ -1830,7 +1855,7 @@ async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGu
   }
   const baseCurrency = await getBaseCurrencyCode()
 
-  const parsed = parseCsv(await validated.file.text())
+  const parsed = parseCsvValidated(await validated.file.text())
   const { rows, dropped } = capRows(parsed)
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
   if (dropped > 0) {
@@ -2113,6 +2138,10 @@ async function importSalesOrdersCsvLocked(formData: FormData, fxGuard: FxTableGu
 // ---------------------------------------------------------------------------
 
 export async function importPurchaseOrdersCsv(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importPurchaseOrdersCsvInner(formData, system))
+}
+
+async function importPurchaseOrdersCsvInner(formData: FormData, system?: SystemImportContext): Promise<CsvImportActionResult> {
   if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
   // The exchange-rate table is held still (shared lock) from the first rate check to the last write, so a rate cannot change mid-file and half the file is never saved.
   // A rate writer (fx refresh, a manual override, a base-currency change) waits for this import to finish. See lib/currencies/fx-table-lock.ts.
@@ -2141,7 +2170,7 @@ async function importPurchaseOrdersCsvLocked(formData: FormData, fxGuard: FxTabl
   }
   const baseCurrency = await getBaseCurrencyCode()
 
-  const parsed = parseCsv(await validated.file.text())
+  const parsed = parseCsvValidated(await validated.file.text())
   const { rows, dropped } = capRows(parsed)
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
   if (dropped > 0) {

@@ -19,7 +19,8 @@ is a storefront (WordPress) job, listed under "Follow-up" below; this file is th
 - Where the date comes from (`lib/domain/inventory/back-in-stock-date.ts`): GOODS purchase-order lines on `INCOMING_PO_STATUSES` with
   `qty - qtyReceived - qtyReturned > 0`. Per line, an open WMS ASN (`OPEN`, `PARTIALLY_BOOKED_IN`) that covers it and has an `eta` wins over
   the PO date for the units it covers; an ASN without an eta falls through; uncovered units use `effectiveLineEta` (line date, else the
-  order's). The earliest remaining date is published.
+  order's). The earliest remaining date is published, PLUS a buffer (owner decision 2026-11-18): supplier ETA + 3 days by default, setting
+  `wc_back_in_stock_date_buffer_days` (whole days, 0 = raw date, Sync settings "Back-in-stock buffer (days)"). Lateness is judged on the supplier date, before the buffer.
 - Never published: a date before today (UTC), an undated source, a draft/RFQ/quote order, a closed ASN. Late supply is dropped, never rolled forward.
 - Cleared (value `''`) when stock returns, the supply is received or cancelled, the date goes late or undated. IMS writes the clear only when it had pushed a
   date before (`stock_sync_states.lastPushedEtaDate`), so it never spams empty meta. A forced or hourly reconcile re-evaluates every product, so a date that
