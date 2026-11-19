@@ -15,7 +15,7 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView, resolveSavedViewTab, ownedSavedViews, foreignSavedViewNotice } from '@/lib/analytics/table-filter-sort'
-import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import { boundSuffix, boundDisclosureSentence, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -255,11 +255,7 @@ function SummaryCard({ label, value, bound = 'exact', boundedBy, widthKnown = tr
       </p>
       {marked && (
         <p className="text-[10px] leading-tight text-orange-600" title={title}>
-          {bound === 'upper'
-            ? <>Upper bound &mdash; {boundedBy} of refunds not subtracted</>
-            : widthKnown
-              ? <>Direction not established &mdash; {boundedBy} of refunds not subtracted</>
-              : 'Direction not established \u2014 some credit this figure could not subtract is negative'}
+          {boundDisclosureSentence(bound, boundedBy ?? '', widthKnown === true)}
         </p>
       )}
     </div>

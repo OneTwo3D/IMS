@@ -170,12 +170,13 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
         { label: 'GL variance', value: report.totals.glVarianceBase == null ? 'Not captured' : money(report.totals.glVarianceBase) },
         { label: `Revenue (${currency}, net of credit)`, value: markMoney(report.totals.revenueBase, report.totals.revenueBaseBound) },
         { label: `Gross margin (${currency})`, value: markMoney(report.totals.grossMarginBase, report.totals.grossMarginBaseBound) },
+        { label: `COGS of matched rows (${currency}) \u2014 what Gross margin is taken against`, value: money(report.totals.cogsBaseWithRevenue) },
         { label: 'Revenue matched rows', value: `${report.totals.revenueCapturedRows}/${report.pageInfo.totalRows}` },
         // Credit that reached no row, ON ITS BASIS — three amounts per case, for the reason the
         // per-row columns are three. A zero across all six is the claim that every credit reached a
         // row; anything else is why the period figures carry a mark.
         { label: 'Credit off-report — nothing to attribute to (net / gross / unproven)', value: `${money(report.totals.refundsUnattributedNetBasis)} / ${money(report.totals.refundsUnattributedGrossBasis)} / ${money(report.totals.refundsUnattributedUnknownBasis)}`, tone: 'warning' },
-        { label: 'Credit off-report — no revenue row here (net / gross / unproven)', value: `${money(report.totals.refundsOutsideReportNetBasis)} / ${money(report.totals.refundsOutsideReportGrossBasis)} / ${money(report.totals.refundsOutsideReportUnknownBasis)}`, tone: 'warning' },
+        { label: 'Credit off-report — line or product has no revenue row in this window (net / gross / unproven)', value: `${money(report.totals.refundsOutsideReportNetBasis)} / ${money(report.totals.refundsOutsideReportGrossBasis)} / ${money(report.totals.refundsOutsideReportUnknownBasis)}`, tone: 'warning' },
       ]}
       notices={report.notices}
       dateMode="period"

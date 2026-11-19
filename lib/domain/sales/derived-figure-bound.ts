@@ -79,6 +79,31 @@ export function boundSuffix(bound: DerivedFigureBound): string {
   return ''
 }
 
+/**
+ * o3d-poka: THE TOOLTIP NOTE of a bridge/chart row. Every verdict has a sentence; `lower` used to fall
+ * through to the empty string and so printed an amount with no relation at all. Empty ONLY for `exact`.
+ */
+export function bridgeTooltipNote(bound: DerivedFigureBound): string {
+  if (bound === 'upper') return ' ≤ (upper bound — refunds not on the net basis are not subtracted)'
+  if (bound === 'lower') return ' ≥ (lower bound — the true figure is at least this much)'
+  if (bound === 'indeterminate') return ' ? (direction not established — some credit this period could not subtract is negative)'
+  return ''
+}
+
+/**
+ * o3d-poka: THE DISCLOSURE SENTENCE under a summary card, for a figure that is not exact. `lower` used to
+ * render the INDETERMINATE sentence, a weaker claim than the truth. `boundedBy` is the already-formatted
+ * width; `widthKnown` says whether it is the width (see the summary card). Returns '' for `exact`.
+ */
+export function boundDisclosureSentence(bound: DerivedFigureBound, boundedBy: string, widthKnown: boolean): string {
+  if (bound === 'exact') return ''
+  if (bound === 'upper') return `Upper bound \u2014 ${boundedBy} of refunds not subtracted`
+  if (bound === 'lower') return 'Lower bound \u2014 the true figure is at least this much'
+  return widthKnown
+    ? `Direction not established \u2014 ${boundedBy} of refunds not subtracted`
+    : 'Direction not established \u2014 some credit this figure could not subtract is negative'
+}
+
 // ---------------------------------------------------------------------------
 // The interval
 // ---------------------------------------------------------------------------
