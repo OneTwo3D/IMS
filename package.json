@@ -45,6 +45,7 @@
     "switchover:gaps": "tsx scripts/switchover-gaps.ts",
     "switchover:hand-back": "tsx scripts/switchover-hand-back.ts",
     "switchover:stock-drift": "tsx scripts/switchover-stock-drift.ts",
+    "switchover:stock-drift-ack": "tsx scripts/switchover-stock-drift-ack.ts",
     "writers:attest": "tsx scripts/writers-attest.ts",
     "writers:check": "tsx scripts/writers-check.ts",
     "read-sync:status": "tsx scripts/read-sync-status.ts",

@@ -23,7 +23,7 @@ test('the gap list asks for paid-before-S, unlinked, still-wanted orders and for
   assert.ok(JSON.stringify(createArgs!.where.OR).includes('"wmsOrderPush":{"is":null}'), 'unlinked')
   assert.equal(despatchArgs!.where.status, 'SHIPPED')
   assert.deepEqual(Object.keys(createArgs!.select).sort(), ['externalOrderNumber', 'id', 'orderNumber', 'paidAt', 'shippedAt'])
-  assert.deepEqual(despatchArgs!.where.OR, [{ shippedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }, { shippedAt: null, createdAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }], 'despatched before S, inside the look-back window; a row with no shippedAt is bounded by createdAt in the same window')
+  assert.deepEqual(despatchArgs!.where.OR, [{ shippedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }, { shippedAt: null, createdAt: { lt: S }, updatedAt: { gte: new Date(S.getTime() - 14 * 86_400_000) } }], 'despatched before S, inside the look-back window; a row with no shippedAt (created before S, even long before the window) is bounded by updatedAt in the window')
   assert.deepEqual(despatchArgs!.where.refundStatus, { not: 'FULL' })
   assert.equal(gaps.truncated, false)
 })

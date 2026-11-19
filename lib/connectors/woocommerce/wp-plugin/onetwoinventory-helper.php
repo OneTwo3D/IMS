@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.5.0
+ * Version:     1.5.1
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -924,12 +924,14 @@ const OTI_BRIDGE_PRODUCT_SYNC_HOOK = 'wc_mintsoft_run_product_sync';
 const OTI_BRIDGE_WEBHOOK_URL_PART = '/webhook/woocommerce/product-update';
 // Xeroom's order-note switch: the option read by the o3d mu-plugin that suppresses only Xeroom's WooCommerce order note.
 const OTI_XEROOM_NOTE_OFF_OPT     = 'o3d_xeroom_order_note_off';
-// Withdrawal-request capture (1.5.0). Neither option is order meta, so neither is ever an order save or an order.updated webhook.
+// Withdrawal-request capture (1.5.0, per-order options 1.5.1). Neither option kind is order meta, so neither is ever an order save or an order.updated webhook.
 // OTI_WDRAW_OUTCOME_ON_OPT is switched on by IMS itself, the first time it posts a withdrawal outcome (only when it is live); until then the capture hook is inert.
+// KNOWN LIMIT: a request filed before that first post (or between activation and it) is never captured, so IMS's rejection of it ends as a `no_request`
+// operator task (a person rejects it by hand), not a loss. Later requests are captured.
 const OTI_WDRAW_OUTCOME_ON_OPT    = 'oti_withdrawal_outcome_enabled';
-// A map { order id => withdrawal request id }, autoload off, capped, and pruned when an order is deleted.
-const OTI_WDRAW_REQUEST_IDS_OPT   = 'oti_wdraw_request_ids';
-const OTI_WDRAW_REQUEST_IDS_MAX   = 500;
+// ONE option per order (`oti_wdraw_req_<order id>` => request id), autoload off, deleted with the order. Not one shared map: a read-modify-write of a
+// shared map loses an entry when two submissions land together (update_option has no compare-and-set); a per-order key has no shared state to lose.
+const OTI_WDRAW_REQUEST_ID_OPT_PREFIX = 'oti_wdraw_req_';
 
 if (!function_exists('oti_verify_incumbents_signature')) {
     /**
@@ -1120,7 +1122,7 @@ if (!function_exists('oti_handle_incumbents')) {
         }
         return new WP_REST_Response([
             'ok'            => true,
-            'plugin_version' => '1.5.0',
+            'plugin_version' => '1.5.1',
             'generated_at'  => time(),
             'bridge'        => [
                 'slug'                   => OTI_BRIDGE_PLUGIN_SLUG,
@@ -1189,7 +1191,7 @@ if (!function_exists('oti_verify_withdrawal_outcome_signature')) {
 
 if (!function_exists('oti_capture_wdraw_request')) {
     /**
-     * Remember the withdrawal plugin's request id for an order, in a wp_options map (`oti_wdraw_request_ids`), NEVER in order meta. On the HPOS store
+     * Remember the withdrawal plugin's request id for an order, in a per-order wp_option (`oti_wdraw_req_<order id>`), NEVER in order meta. On the HPOS store
      * save_meta_data() saves the order itself (a new modified time, woocommerce_update_order, an order.updated webhook), so any order-meta write is a live
      * order write; an option write is not. The id reaches IMS through oti_expose_wdraw_request_id (the order's REST and webhook payload), and the
      * withdrawal-outcome route reads it back at call time. Hooked to the withdrawal plugin's own events; the arguments are ($request, $order).
@@ -1209,14 +1211,11 @@ if (!function_exists('oti_capture_wdraw_request')) {
         if (!$id || !$order_id) {
             return;
         }
-        $map = get_option(OTI_WDRAW_REQUEST_IDS_OPT, []);
-        $map = is_array($map) ? $map : [];
-        if (isset($map[$order_id]) && absint($map[$order_id]) === $id) {
+        $option = OTI_WDRAW_REQUEST_ID_OPT_PREFIX . $order_id;
+        if (absint(get_option($option, 0)) === $id) {
             return;
         }
-        unset($map[$order_id]);
-        $map[$order_id] = $id; // re-inserted last, so the cap below drops the oldest
-        update_option(OTI_WDRAW_REQUEST_IDS_OPT, array_slice($map, -OTI_WDRAW_REQUEST_IDS_MAX, null, true), false);
+        update_option($option, $id, false);
     }
     add_action('wbte_ewb_request_submitted', 'oti_capture_wdraw_request', 5, 2);
     add_action('wbte_ewb_request_approved', 'oti_capture_wdraw_request', 5, 2);
@@ -1227,15 +1226,15 @@ if (!function_exists('oti_wdraw_request_id_for_order')) {
     /** The captured withdrawal request id of an order (0 when none). A read; never writes. */
     function oti_wdraw_request_id_for_order($order_id)
     {
-        $map = get_option(OTI_WDRAW_REQUEST_IDS_OPT, []);
-        return is_array($map) ? absint($map[absint($order_id)] ?? 0) : 0;
+        return absint(get_option(OTI_WDRAW_REQUEST_ID_OPT_PREFIX . absint($order_id), 0));
     }
 }
 
 if (!function_exists('oti_expose_wdraw_request_id')) {
     /**
-     * Put the captured request id into the order's REST response (and so its webhook payload) as a `_oti_wdraw_request_id` meta_data entry, which is where
-     * IMS reads it. A response filter: nothing is stored on the order.
+     * Put the captured request id into the order's REST response (and so its webhook payload) as a TOP-LEVEL field `_oti_wdraw_request_id`, which is where IMS
+     * reads it. NOT a meta_data entry: a client that round-trips meta_data in a PUT would persist a meta entry as real order meta, and a stale id could stick.
+     * A response filter: nothing is stored on the order.
      */
     function oti_expose_wdraw_request_id($response, $order = null)
     {
@@ -1243,14 +1242,7 @@ if (!function_exists('oti_expose_wdraw_request_id')) {
         if (!$request_id || !is_object($response) || !isset($response->data) || !is_array($response->data)) {
             return $response;
         }
-        $meta = isset($response->data['meta_data']) && is_array($response->data['meta_data']) ? $response->data['meta_data'] : [];
-        foreach ($meta as $entry) {
-            if ((is_object($entry) && ($entry->key ?? '') === '_oti_wdraw_request_id') || (is_array($entry) && ($entry['key'] ?? '') === '_oti_wdraw_request_id')) {
-                return $response;
-            }
-        }
-        $meta[] = ['id' => 0, 'key' => '_oti_wdraw_request_id', 'value' => (string) $request_id];
-        $response->data['meta_data'] = $meta;
+        $response->data['_oti_wdraw_request_id'] = (int) $request_id;
         return $response;
     }
     add_filter('woocommerce_rest_prepare_shop_order_object', 'oti_expose_wdraw_request_id', 20, 2);
@@ -1260,10 +1252,9 @@ if (!function_exists('oti_forget_wdraw_request')) {
     /** Cleanup: an order that is deleted leaves the map. */
     function oti_forget_wdraw_request($order_id)
     {
-        $map = get_option(OTI_WDRAW_REQUEST_IDS_OPT, []);
-        if (is_array($map) && isset($map[absint($order_id)])) {
-            unset($map[absint($order_id)]);
-            update_option(OTI_WDRAW_REQUEST_IDS_OPT, $map, false);
+        $option = OTI_WDRAW_REQUEST_ID_OPT_PREFIX . absint($order_id);
+        if (get_option($option, null) !== null) {
+            delete_option($option);
         }
     }
     add_action('woocommerce_delete_order', 'oti_forget_wdraw_request', 10, 1);
@@ -1278,8 +1269,7 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
      *
      *   'noted'     add the (admin-only) order note. Nothing else.
      *   'rejected'  the goods have already gone: reject the customer's withdrawal request through the withdrawal plugin's own service (so its e-mails and
-     *               log run), then add the note. The request id is the one in the body, else the one recorded on the order (`_oti_wdraw_request_id`,
-     *               or the bridge's). It must belong to this order, or nothing is rejected ('no_request').
+     *               log run), then add the note. The request id is the one in the body, else the one captured for the order, else the bridge's `_mintsoft_wdraw_request_id`. It must belong to this order, or nothing is rejected ('no_request').
      *
      * Idempotent per outcome_key: a note is added once per key (kept in an order meta), so a retry after a lost answer adds nothing. Answers:
      *   result 'noted' | 'rejected' | 'already_done'; 'no_request' (rejection asked, no request id known: the note was still added);
@@ -1336,9 +1326,6 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
                     $request_id = isset($data['request_id']) ? absint($data['request_id']) : 0;
                     if (!$request_id) {
                         $request_id = oti_wdraw_request_id_for_order($order_id);
-                    }
-                    if (!$request_id) {
-                        $request_id = absint($order->get_meta('_oti_wdraw_request_id'));
                     }
                     if (!$request_id) {
                         $request_id = absint($order->get_meta('_mintsoft_wdraw_request_id'));

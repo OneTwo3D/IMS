@@ -72,8 +72,9 @@ export async function listSwitchoverGaps(input: {
       erasedAt: null,
       shoppingLinks: { some: { connector: 'woocommerce' } },
       refundStatus: { not: 'FULL' },
-      // A row with no shippedAt (an old import) is bounded by its creation time in the same window, so history does not cost a storefront read each.
-      OR: [{ shippedAt: { gte: windowStart, lt: input.since } }, { shippedAt: null, createdAt: { gte: windowStart, lt: input.since } }],
+      // A row with no shippedAt is listed when it was created before S and touched inside the window (updatedAt >= window start): an old backorder despatched
+      // just before S with no shippedAt stays in, while untouched history does not cost a storefront read each.
+      OR: [{ shippedAt: { gte: windowStart, lt: input.since } }, { shippedAt: null, createdAt: { lt: input.since }, updatedAt: { gte: windowStart } }],
     },
     select: { id: true, orderNumber: true, externalOrderNumber: true, paidAt: true, shippedAt: true, shoppingLinks: { where: { connector: 'woocommerce' }, select: { externalOrderId: true }, take: 1 } },
     orderBy: { shippedAt: 'asc' },

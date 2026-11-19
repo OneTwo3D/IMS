@@ -6753,6 +6753,8 @@ export async function processClaimedEntry(
       const fence = await lease.fenceBeforeRemoteWrite('wc-invoice-note')
       if (!fence.ok) return fence.result
       const wcResult = await pushInvoiceNoteToWc(orderId)
+      // Switched off since it was queued: settled as skipped (a terminal outcome with an operator notice), never retried to FAILED.
+      if (wcResult.skipped) return { success: true, skipped: true }
       // The customer download flag is NOT written here: it is the separate operation order.invoice-document, written only by its guarded
       // outbox job (cut-off, claim, deadline and hold checks), never by this follow-up.
       return wcResult.success ? { success: true } : { success: false, error: wcResult.error ?? 'Failed to notify WooCommerce about invoice' }
