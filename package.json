@@ -48,6 +48,7 @@
     "switchover:stock-drift": "tsx scripts/switchover-stock-drift.ts",
     "switchover:stock-drift-ack": "tsx scripts/switchover-stock-drift-ack.ts",
     "settings:get": "tsx scripts/settings-cli.ts get",
+    "storefront:hand-send": "tsx scripts/storefront-hand-send-list.ts",
     "settings:set": "tsx scripts/settings-cli.ts set",
     "writers:attest": "tsx scripts/writers-attest.ts",
     "writers:check": "tsx scripts/writers-check.ts",

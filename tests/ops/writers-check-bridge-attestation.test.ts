@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -294,6 +294,15 @@ test('ITEM 3: `never` is believed only with journal_exit: 0; `unknown`, a `never
   assert.equal(bridgeLastTriggerReadable(readBridgePayload(old(null))!), false)
 })
 
+/** The script's test seams are refused unless this variable is set (only the tests set it). */
+const SEAM_ENV = { ...process.env, BRIDGE_WRITERS_STATUS_TEST_SEAMS: '1' }
+/** A stand-in for /proc/sys/kernel/random/boot_id holding the boot id the fake journals report as current. */
+function kernelBootId(dir: string, value = '01234567-89ab-cdef-0123-456789abcdef'): string {
+  const path = join(dir, `kernel-boot-id-${value.length}-${value.slice(0, 4)}`)
+  writeFileSync(path, `${value}\n`)
+  return path
+}
+
 test('ITEM 3: the real script reports the journalctl exit status, folds the webhook service\'s timestamps into last_trigger, and writes `unknown` (never `never`) when the times were lost and the journal could not be read', { skip: process.platform === 'win32' }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-status-'))
   try {
@@ -316,7 +325,7 @@ test('ITEM 3: the real script reports the journalctl exit status, folds the webh
     const jdir = join(dir, 'persistent-journal')
     mkdirSync(jdir)
     // The journal facts are the test's (a readable, persistent journal), so these arms isolate what they are about.
-    const run = (sys: string, jrn: string) => execFileSync('python3', ['-I', script, '--systemctl', sys, '--journalctl', jrn, '--assume-groups', 'systemd-journal', '--journal-dir', jdir, '--journald-conf', join(dir, 'none.conf')], { encoding: 'utf8' })
+    const run = (sys: string, jrn: string) => execFileSync('python3', ['-I', script, '--systemctl', sys, '--journalctl', jrn, '--assume-groups', 'systemd-journal', '--journal-dir', jdir, '--journald-conf', join(dir, 'none.conf'), '--kernel-boot-id', kernelBootId(dir)], { encoding: 'utf8', env: SEAM_ENV })
     // 1. times lost (a reboot) and the journal unreadable: `unknown`, with the exit status printed
     const lost = run(systemctl(''), journal('exit 1'))
     assert.match(lost, /^journal_exit: 1$/m)
@@ -376,7 +385,7 @@ test('NEVER proof: the script reports journal_readable / journal_persistent / jo
     mkdirSync(persistentDir)
     const conf = join(dir, 'journald.conf')
     writeFileSync(conf, '[Journal]\n')
-    const run = (jrn: string, extra: string[]) => execFileSync('python3', ['-I', script, '--systemctl', systemctl, '--journalctl', jrn, '--assume-groups', 'systemd-journal', '--journald-conf', conf, ...extra], { encoding: 'utf8' })
+    const run = (jrn: string, extra: string[]) => execFileSync('python3', ['-I', script, '--systemctl', systemctl, '--journalctl', jrn, '--assume-groups', 'systemd-journal', '--journald-conf', conf, '--kernel-boot-id', kernelBootId(dir), ...extra], { encoding: 'utf8', env: SEAM_ENV })
     // readable + persistent + entries, nothing triggered: `never`, with the evidence printed
     const ok = run(journal(0, boots), ['--journal-dir', persistentDir])
     assert.match(ok, /^journal_readable: 1$/m)
@@ -401,7 +410,7 @@ test('NEVER proof: the script reports journal_readable / journal_persistent / jo
     assert.match(unreadable, /^journal_earliest: none$/m)
     assert.match(unreadable, /^last_trigger: unknown$/m)
     // a user outside root / systemd-journal / adm: not readable even though journalctl exits 0
-    const outsider = execFileSync('python3', ['-I', script, '--systemctl', systemctl, '--journalctl', journal(0, boots), '--assume-groups', 'users', '--journald-conf', conf, '--journal-dir', persistentDir], { encoding: 'utf8' })
+    const outsider = execFileSync('python3', ['-I', script, '--systemctl', systemctl, '--journalctl', journal(0, boots), '--assume-groups', 'users', '--journald-conf', conf, '--journal-dir', persistentDir, '--kernel-boot-id', kernelBootId(dir)], { encoding: 'utf8', env: SEAM_ENV })
     if (process.geteuid?.() !== 0) {
       assert.match(outsider, /^journal_readable: 0$/m)
       assert.match(outsider, /^last_trigger: unknown$/m)
@@ -411,4 +420,87 @@ test('NEVER proof: the script reports journal_readable / journal_persistent / jo
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('o3d-3634b: the test seams (--assume-groups and the others) are refused outside the tests, so a non-privileged run can never count as privileged (MUTATION: honour the flag without the environment variable => red)', { skip: process.platform === 'win32' }, () => {
+  const script = join(process.cwd(), 'scripts/bridge/bridge_writers_status.py')
+  const env = { ...process.env }
+  delete env.BRIDGE_WRITERS_STATUS_TEST_SEAMS
+  for (const flag of [['--assume-groups', 'systemd-journal'], ['--kernel-boot-id', '/dev/null'], ['--journal-dir', '/tmp'], ['--journald-conf', '/dev/null']]) {
+    const done = spawnSync('python3', ['-I', script, '--systemctl', 'true', '--journalctl', 'true', ...flag], { encoding: 'utf8', env })
+    assert.equal(done.status, 2, flag.join(' '))
+    assert.equal(done.stdout, '', 'nothing is printed')
+    assert.match(done.stderr, /test seams/)
+  }
+})
+
+test('o3d-3634b: the journal proof reads the SYSTEM journal only, honours /run and /usr/lib journald drop-ins, and refuses a journal whose current boot is not this boot (MUTATION: drop --system / a drop-in root / the boot check => red)', { skip: process.platform === 'win32' }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-status-'))
+  try {
+    const script = join(process.cwd(), 'scripts/bridge/bridge_writers_status.py')
+    const systemctl = join(dir, 'systemctl')
+    writeFileSync(systemctl, '#!/bin/sh\nprintf "LoadState=masked\\nActiveState=inactive\\nUnitFileState=masked\\n"\n')
+    chmodSync(systemctl, 0o755)
+    const bootId = '0123456789abcdef0123456789abcdef'
+    const system = `[{"index":0,"boot_id":"${bootId}","first_entry":1764547200000000}]`
+    const everything = `[{"index":-5,"boot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","first_entry":1700000000000000},{"index":0,"boot_id":"${bootId}","first_entry":1764547200000000}]`
+    const journalctl = join(dir, 'journalctl')
+    // A user's own journal files (no --system) reach back to 2023; the system journal only to December 2025. Every call's arguments are recorded.
+    writeFileSync(journalctl, `#!/bin/sh\necho "$*" >> '${join(dir, 'calls')}'\ncase "$*" in\n  *--header*) exit 0;;\n  *--list-boots*) case "$*" in *--system*) printf '%s' '${system}';; *) printf '%s' '${everything}';; esac; exit 0;;\n  *) exit 0;;\nesac\n`)
+    chmodSync(journalctl, 0o755)
+    const persistentDir = join(dir, 'var-log-journal')
+    mkdirSync(persistentDir)
+    const conf = join(dir, 'journald.conf')
+    writeFileSync(conf, '[Journal]\n')
+    const run = (kernelId: string) => execFileSync('python3', ['-I', script, '--systemctl', systemctl, '--journalctl', journalctl, '--assume-groups', 'systemd-journal', '--journald-conf', conf, '--journal-dir', persistentDir, '--kernel-boot-id', kernelBootId(dir, kernelId)], { encoding: 'utf8', env: SEAM_ENV })
+    const ok = run('01234567-89ab-cdef-0123-456789abcdef')
+    assert.match(ok, /^journal_earliest: 2025-12-01T00:00:00Z$/m, 'the user journal (2023) is not the earliest entry')
+    assert.match(ok, /^last_trigger: never$/m)
+    const calls = readFileSync(join(dir, 'calls'), 'utf8').split('\n').filter((line) => line && !line.includes('--header'))
+    const headerCalls = readFileSync(join(dir, 'calls'), 'utf8').split('\n').filter((line) => line.includes('--header'))
+    assert.ok(headerCalls.length >= 1 && headerCalls.every((line) => line.includes('--system')), 'the readability probe is the system journal too')
+    assert.ok(calls.length >= 4 && calls.every((line) => line.includes('--system')), `every journal read is the system journal: ${calls.join(' | ')}`)
+    // The journal's current boot is not this boot (a copied or stale journal): its history is not this host's, so no earliest entry and no `never`.
+    const stale = run('ffffffff-ffff-ffff-ffff-ffffffffffff')
+    assert.match(stale, /^journal_earliest: none$/m)
+    assert.match(stale, /^last_trigger: unknown$/m)
+    const parsedStale = parseBridgeStatusOutput(stale)
+    assert.ok(parsedStale.ok && !bridgeLastTriggerReadable(parsedStale.report))
+    // /run and /usr/lib drop-ins: a Storage=volatile in either (a same-named file in /etc shadows it) makes the journal not persistent.
+    const root = (name: string) => { const r = join(dir, name); mkdirSync(join(r, 'journald.conf.d'), { recursive: true }); return r }
+    const etc = root('etc'); const runRoot = root('run'); const usrLocal = root('usrlocal'); const usr = root('usr')
+    const driver = join(dir, 'drive.py')
+    writeFileSync(driver, [
+      'import importlib.util, json, sys',
+      `spec = importlib.util.spec_from_file_location("b", ${JSON.stringify(script)})`,
+      'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+      'roots = sys.argv[2:]',
+      'print(json.dumps(m.journal_persistent(sys.argv[1], m.journald_conf_files(roots))))',
+    ].join('\n'))
+    const persistent = () => JSON.parse(execFileSync('python3', ['-I', driver, persistentDir, etc, runRoot, usrLocal, usr], { encoding: 'utf8' }))
+    assert.equal(persistent(), 1, 'no drop-in: persistent')
+    writeFileSync(join(usr, 'journald.conf.d', '10-vendor.conf'), '[Journal]\nStorage=volatile\n')
+    assert.equal(persistent(), 0, '/usr/lib drop-in is read')
+    writeFileSync(join(etc, 'journald.conf.d', '10-vendor.conf'), '[Journal]\nStorage=persistent\n')
+    assert.equal(persistent(), 1, 'the /etc file of the same name shadows the /usr/lib one')
+    writeFileSync(join(runRoot, 'journald.conf.d', '20-run.conf'), '[Journal]\nStorage=none\n')
+    assert.equal(persistent(), 0, '/run drop-in is read')
+    rmSync(join(runRoot, 'journald.conf.d', '20-run.conf'))
+    writeFileSync(join(usrLocal, 'journald.conf.d', '30-local.conf'), '[Journal]\nStorage=volatile\n')
+    assert.equal(persistent(), 0, '/usr/local/lib drop-in is read')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('o3d-3634b: `never` also needs a coherent current boot in the report: reported and not after the report (MUTATION: drop the boot check => red)', () => {
+  const never = (edit: (text: string) => string) => {
+    const p = parseBridgeStatusOutput(edit(sampleReport({ lastTrigger: 'never' })))
+    assert.ok(p.ok)
+    return bridgeLastTriggerReadable(p.report)
+  }
+  assert.equal(never((t) => t), true)
+  assert.equal(never((t) => t.replace(/^boot_id: .*$/m, 'boot_id: unknown')), false)
+  assert.equal(never((t) => t.replace(/^boot_started: .*$/m, 'boot_started: unknown')), false)
+  assert.equal(never((t) => t.replace(/^boot_started: .*$/m, 'boot_started: 2027-01-01T00:00:00Z')), false, 'the current boot begins after the report')
 })

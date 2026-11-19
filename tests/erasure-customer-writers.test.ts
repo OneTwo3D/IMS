@@ -200,7 +200,10 @@ test('every writer of email_outbox rows is in the census, and the SalesOrder enq
   const d = readFileSync(new URL('../lib/dispatch-email.ts', import.meta.url), 'utf8')
   assert.match(d, /lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create/)
   const sc = readFileSync(new URL('../lib/storefront-customer-email.ts', import.meta.url), 'utf8')
-  assert.match(sc, /lockSalesOrder\(tx, orderId\)[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create/)
+  // The decision (erasure markers read, then the insert) runs only UNDER the order lock: the stand-alone queue takes it itself, the release claim runs on the status transaction that holds it.
+  assert.match(sc, /lockSalesOrder\(tx, orderId\)\s*return decideAndQueueUnderLock\(tx/)
+  assert.match(sc, /async function decideAndQueueUnderLock[\s\S]*erasedAt[\s\S]*gdprAnonymisedAt[\s\S]*tx\.emailOutbox\.create/)
+  assert.match(sc, /lockSalesOrder\(tx, orderId\)\s*const now = await tx\.salesOrder\.findUnique[\s\S]*claimAndQueueConfirmationOnReleaseInTx\(tx/)
 })
 
 /**

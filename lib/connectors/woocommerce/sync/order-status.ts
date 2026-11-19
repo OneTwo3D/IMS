@@ -154,6 +154,15 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
     // Forward-only: the bypass below skips the state machine, so ask it here (o3d-hqvrp.81).
     const refusal = wcStatusSyncRefusal(so.status, targetStatus)
     if (refusal) {
+      // A held import that the allocation already moved on (ALLOCATED / PICKING / PACKING) and whose payment WooCommerce now reports as `processing`:
+      // the move is refused, but it IS the release the confirmation waits for (`confirmationOnReleasePendingAt`), so it is claimed here, once.
+      if (targetStatus === 'PROCESSING' && IMS_FULFILMENT_IN_PROGRESS.has(so.status)) {
+        const paid = wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null
+        const { releaseStorefrontConfirmationOnPaid } = await import('@/lib/storefront-customer-email')
+        const released = await releaseStorefrontConfirmationOnPaid(so.id, paid && Number.isFinite(paid.getTime()) ? { releasedAt: paid } : undefined)
+        // The release rolled back (the marker is still armed): fail the delivery so the webhook inbox retries it, instead of acknowledging a lost e-mail.
+        if (released.reason === 'error') return { success: false, error: `Could not queue the release confirmation for order #${so.externalOrderNumber}; it will be retried` }
+      }
       await logActivity({
         entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_skipped_backwards', tag: 'sync', level: 'INFO',
         description: `Left order #${so.externalOrderNumber} at ${so.status}: WooCommerce reported ${wcOrder.status} (${targetStatus}), which would move it backwards (${refusal})`,
@@ -177,6 +186,12 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
     })
 
     if (!result.success && result.permanent && String(result.error ?? '').startsWith(STATUS_GUARD_REFUSAL_PREFIX)) {
+      // The order moved on (allocation) between the read and the write: the same release as above.
+      if (targetStatus === 'PROCESSING') {
+        const { releaseStorefrontConfirmationOnPaid } = await import('@/lib/storefront-customer-email')
+        const released = await releaseStorefrontConfirmationOnPaid(so.id, releasedAt ? { releasedAt } : undefined)
+        if (released.reason === 'error') return { success: false, error: `Could not queue the release confirmation for order #${so.externalOrderNumber}; it will be retried` }
+      }
       await logActivity({
         entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_skipped_backwards', tag: 'sync', level: 'INFO',
         description: `Left order #${so.externalOrderNumber} as it is: it moved on while WooCommerce's ${wcOrder.status} (${targetStatus}) was being applied (${String(result.error).slice(STATUS_GUARD_REFUSAL_PREFIX.length)})`,

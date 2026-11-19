@@ -175,6 +175,8 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   queueEmail: { family: 'customer-email' },
   queueDispatchEmailIfEligible: { family: 'customer-email' },
   queueStorefrontConfirmationIfEligible: { family: 'customer-email' },
+  claimAndQueueConfirmationOnReleaseInTx: { family: 'customer-email' },
+  releaseStorefrontConfirmationOnPaid: { family: 'customer-email' },
   queueStorefrontPartialShipmentEmailIfEligible: { family: 'customer-email' },
   queueStorefrontDeliveredEmailIfEligible: { family: 'customer-email' },
 }

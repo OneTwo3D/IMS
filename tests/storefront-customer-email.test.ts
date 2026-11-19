@@ -338,9 +338,9 @@ test('RELEASE: a held order placed AFTER the switch-on and released (paid) after
 test('RELEASE wiring: the status transition claims the one-shot held-at-import marker, then queues with the store\'s paid time only from the full bypass path (source pin; behaviour is in the DB-tier test)', async () => {
   const { readFileSync } = await import('node:fs')
   const sales = readFileSync('app/actions/sales.ts', 'utf8')
-  assert.match(sales, /previousStatusForLog === 'PENDING_PAYMENT' \|\| previousStatusForLog === 'ON_HOLD'/)
+  assert.match(sales, /moved\.previousStatus === 'PENDING_PAYMENT' \|\| moved\.previousStatus === 'ON_HOLD'/)
+  assert.match(sales, /claimAndQueueConfirmationOnReleaseInTx\(tx, id/)
   assert.match(sales, /confirmationOnReleasePendingAt: \{ not: null \}/)
-  assert.match(sales, /claim\.count === 1/)
   assert.match(sales, /bypassPermission && options\?\.releasedAt instanceof Date/)
   const sync = readFileSync('lib/connectors/woocommerce/sync/order-status.ts', 'utf8')
   assert.match(sync, /releasedAt/)

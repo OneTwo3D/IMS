@@ -40,7 +40,9 @@ a reboot or a daemon-reload that garbage-collects an inactive masked unit. `neve
 nothing, the user can READ the system journal and the journal is PERSISTENT (otherwise exit status 0 with no entries proves nothing: a non-privileged user sees
 no system-unit messages, and a volatile journal is wiped by the same reboot). Otherwise the script prints `unknown`. IMS reads `unknown`, and a `never` without
 journal_exit 0, readable, persistent and an earliest entry BEFORE the live-from instant S, as unreadable, never as clean. Run it as root (or a member of
-systemd-journal / adm).
+systemd-journal / adm). The journal facts come from the SYSTEM journal only (user journals are ignored), persistence reads the /etc, /run, /usr/local/lib and
+/usr/lib journald.conf and journald.conf.d, and the journal's current boot must be this boot (kernel boot id) and not in the future, else journal_earliest is `none`.
+The test-only options (--assume-groups and the other seams) are refused unless BRIDGE_WRITERS_STATUS_TEST_SEAMS=1 is set.
 """
 import argparse
 import datetime
@@ -67,6 +69,7 @@ TIME_PROPS = {
     # The webhook service had NO time property before: a webhook processed after the live-from instant (then stopped and masked) was invisible.
     "wc-mintsoft-webhook.service": ("ExecMainStartTimestamp", "InactiveExitTimestamp", "InactiveEnterTimestamp"),
 }
+TEST_SEAM_ENV = "BRIDGE_WRITERS_STATUS_TEST_SEAMS"
 SAFE = re.compile(r"^[A-Za-z0-9_.:-]{1,40}$")
 
 
@@ -132,7 +135,7 @@ def parse_time(text):
 
 def journal_last(journalctl, unit):
     """(newest journal entry of `unit` or None, journalctl exit status). A non-zero status means the journal could not be read, which is NOT the same as 'no entry'."""
-    done = run([journalctl, "--no-pager", "-n", "1", "-o", "json", "-u", unit])
+    done = run([journalctl, "--no-pager", "--system", "-n", "1", "-o", "json", "-u", unit])
     if done.returncode != 0:
         return None, done.returncode
     for line in reversed(done.stdout.splitlines()):
@@ -158,6 +161,10 @@ def journal_access(journalctl, assume_groups=None):
     users' and the system's messages), which looks exactly like "nothing ever ran". So access is established first: root, or membership of systemd-journal
     or adm, AND `journalctl --header` (it reads the journal files' headers) succeeding."""
     if assume_groups is not None:
+        # TEST SEAM ONLY. It makes a non-privileged run count as privileged, which is exactly the false proof this check exists to refuse, so it is honoured
+        # only when the test harness has set the environment variable below; anywhere else it is an error, never a quiet override.
+        if os.environ.get(TEST_SEAM_ENV) != "1":
+            raise StatusError("--assume-groups is a test seam and is not available outside the tests")
         names = set(g for g in assume_groups.split(",") if g)
         privileged = os.geteuid() == 0 or bool(names & {"systemd-journal", "adm"})
     else:
@@ -175,21 +182,46 @@ def journal_access(journalctl, assume_groups=None):
                 privileged = False
     if not privileged:
         return 0
-    done = run([journalctl, "--no-pager", "--header"])
+    done = run([journalctl, "--no-pager", "--system", "--header"])
     return 1 if done.returncode == 0 else 0
 
 
+JOURNALD_ROOTS = ("/etc/systemd", "/run/systemd", "/usr/local/lib/systemd", "/usr/lib/systemd")
+
+
+def journald_conf_files(roots=JOURNALD_ROOTS):
+    """The journald configuration files in the order systemd applies them (later wins). The main journald.conf comes from the first root that has one;
+    the drop-ins of journald.conf.d come from /etc, /run, /usr/local/lib and /usr/lib, a file name in an earlier root shadowing the same name in a later one, applied in
+    file-name order across the roots."""
+    files = []
+    for root in roots:
+        main = os.path.join(root, "journald.conf")
+        if os.path.isfile(main):
+            files.append(main)
+            break
+    dropins = {}
+    for root in roots:
+        for path in sorted(glob.glob(os.path.join(root, "journald.conf.d", "*.conf"))):
+            dropins.setdefault(os.path.basename(path), path)
+    files += [dropins[name] for name in sorted(dropins)]
+    return files
+
+
 def journal_persistent(journal_dir, conf_paths):
-    """1 when the journal survives a reboot: the journal directory exists and no journald.conf / drop-in sets Storage=volatile or none (the last setting wins)."""
+    """1 when the journal survives a reboot: the journal directory exists and no journald.conf / drop-in sets Storage=volatile or none (the last setting wins).
+    `conf_paths` None = the real host (/etc, /run and /usr/lib roots); a list is read in order (files or directories), a test seam."""
     if not os.path.isdir(journal_dir):
         return 0
     storage = None
     files = []
-    for path in conf_paths:
-        if os.path.isdir(path):
-            files += sorted(glob.glob(os.path.join(path, "*.conf")))
-        else:
-            files.append(path)
+    if conf_paths is None:
+        files = journald_conf_files()
+    else:
+        for path in conf_paths:
+            if os.path.isdir(path):
+                files += sorted(glob.glob(os.path.join(path, "*.conf")))
+            else:
+                files.append(path)
     for path in files:
         try:
             with open(path, "r") as handle:
@@ -204,7 +236,7 @@ def journal_persistent(journal_dir, conf_paths):
 
 def journal_boots(journalctl):
     """(earliest journal entry or None, current boot id or None, start of the current boot's journal or None), from `journalctl --list-boots -o json`."""
-    done = run([journalctl, "--no-pager", "--list-boots", "-o", "json"])
+    done = run([journalctl, "--no-pager", "--system", "--list-boots", "-o", "json"])
     if done.returncode != 0:
         return None, None, None
     try:
@@ -226,6 +258,22 @@ def journal_boots(journalctl):
     started = current.get("first_entry")
     started = datetime.datetime.fromtimestamp(started / 1_000_000, tz=datetime.timezone.utc) if isinstance(started, int) and started > 0 else None
     return earliest, boot_id, started
+
+
+def boot_consistent(boot_id, started, now, kernel_boot_id_path="/proc/sys/kernel/random/boot_id"):
+    """True when the journal's idea of the CURRENT boot agrees with the kernel's and with the clock: the boot id equals the kernel's (when it can be read) and
+    the boot's first journal entry is not in the future. A journal whose newest boot is not this one, or whose clock is ahead of this host, cannot vouch for
+    the unit's history."""
+    if boot_id is None or started is None:
+        return False
+    if started > now:
+        return False
+    try:
+        with open(kernel_boot_id_path, "r") as handle:
+            kernel = handle.read().strip().replace("-", "").lower()
+    except OSError:
+        return True  # not readable here (not Linux / no /proc): nothing to compare against
+    return kernel == boot_id.replace("-", "").lower()
 
 
 def build(systemctl, journalctl, now, options=None):
@@ -257,8 +305,11 @@ def build(systemctl, journalctl, now, options=None):
         if entry is not None and (latest is None or entry > latest):
             latest = entry
     readable = journal_access(journalctl, options.get("assume_groups"))
-    persistent = journal_persistent(options.get("journal_dir", "/var/log/journal"), options.get("journald_conf", ["/etc/systemd/journald.conf", "/etc/systemd/journald.conf.d"]))
+    persistent = journal_persistent(options.get("journal_dir", "/var/log/journal"), options.get("journald_conf"))
     earliest, boot_id, boot_started = journal_boots(journalctl) if readable else (None, None, None)
+    if readable and not boot_consistent(boot_id, boot_started, now, options.get("kernel_boot_id", "/proc/sys/kernel/random/boot_id")):
+        # The journal's current boot is not this boot (or it is unreadable / in the future): it is not evidence for this host's unit history.
+        earliest = None
     lines.append("journal_exit: %d" % journal_exit)
     lines.append("journal_readable: %d" % readable)
     lines.append("journal_persistent: %d" % persistent)
@@ -286,8 +337,14 @@ def main(argv=None):
     parser.add_argument("--journal-dir", default="/var/log/journal", help=argparse.SUPPRESS)
     parser.add_argument("--journald-conf", action="append", help=argparse.SUPPRESS)
     parser.add_argument("--assume-groups", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--kernel-boot-id", default="/proc/sys/kernel/random/boot_id", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    options = {"journal_dir": args.journal_dir, "assume_groups": args.assume_groups}
+    seams = (args.journal_dir != "/var/log/journal" or args.journald_conf or args.assume_groups is not None
+             or args.kernel_boot_id != "/proc/sys/kernel/random/boot_id")
+    if seams and os.environ.get(TEST_SEAM_ENV) != "1":
+        sys.stderr.write("bridge_writers_status: the --journal-dir / --journald-conf / --assume-groups / --kernel-boot-id options are test seams and are not available outside the tests\n")
+        return 2
+    options = {"journal_dir": args.journal_dir, "assume_groups": args.assume_groups, "kernel_boot_id": args.kernel_boot_id}
     if args.journald_conf:
         options["journald_conf"] = args.journald_conf
     try:

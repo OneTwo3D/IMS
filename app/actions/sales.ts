@@ -2593,6 +2593,7 @@ export async function applySalesOrderStatusTransition(
 
     const pushStatusToShopping = ownsStorefrontStatus && so.shoppingLinks.length > 0
     let storefrontCompletionKey: string | null = null
+    let releaseConfirmationAfterCommit: (() => Promise<void>) | null = null
     if (!orderUpdated) {
       const transitionResult = await db.$transaction(async (tx) => {
         storefrontCompletionKey = null // a retried callback must not inherit an aborted attempt's key
@@ -2681,6 +2682,32 @@ export async function applySalesOrderStatusTransition(
             }
           },
         })
+        // A storefront order that was imported HELD (PENDING_PAYMENT / ON_HOLD) and now moves to a despatch-pending status for the FIRST time (a BACS / cheque
+        // payment received): WooCommerce sent its confirmation on that move before step W and is off after it, so nobody would send one. The claim is a one-shot
+        // marker written only by the import of a held order (`confirmationOnReleasePendingAt`). It is taken HERE, in the status transaction, after the move has
+        // been validated and written: a crash loses neither the e-mail nor leaves the marker armed, and the atomic claim has one winner. The release time is the
+        // storefront's paid time and only the full-bypass sync path carries it; an IMS-side move (operator, AUTH_ONLY) has none and is judged on placement.
+        // A move OUT of a despatch-pending status INTO an operator (IMS-side) hold disarms an unconsumed marker: such an order was released by the allocation of
+        // a still-unpaid import (its payment is reported by WooCommerce `processing`, handled by `releaseStorefrontConfirmationOnPaid`), and a later
+        // hold-release must not confirm it at an unrelated moment. A storefront-reported hold keeps it armed.
+        releaseConfirmationAfterCommit = null
+        if (
+          (moved.previousStatus === 'PENDING_PAYMENT' || moved.previousStatus === 'ON_HOLD')
+          && (targetStatus === 'PROCESSING' || targetStatus === 'ALLOCATED' || targetStatus === 'PICKING' || targetStatus === 'PACKING')
+        ) {
+          const { claimAndQueueConfirmationOnReleaseInTx } = await import('@/lib/storefront-customer-email')
+          const releasedAt = bypassPermission && options?.releasedAt instanceof Date && Number.isFinite(options.releasedAt.getTime()) ? options.releasedAt : undefined
+          const claim = await claimAndQueueConfirmationOnReleaseInTx(tx, id, releasedAt ? { releasedAt } : undefined)
+          releaseConfirmationAfterCommit = claim.afterCommit
+        } else if (
+          targetStatus === 'ON_HOLD'
+          // An operator hold only (no internal token): a hold WooCommerce itself reports (gateway review, bank transfer on-hold: full bypass) or an
+          // EU-withdrawal hold (AUTH_ONLY) keeps the marker armed, so the payment that follows (processing, with its paid time) still confirms.
+          && !bypassPermission && !authOnly
+          && (moved.previousStatus === 'PROCESSING' || moved.previousStatus === 'ALLOCATED' || moved.previousStatus === 'PICKING' || moved.previousStatus === 'PACKING')
+        ) {
+          await tx.salesOrder.updateMany({ where: { id, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })
+        }
         // DRAFT FINALISATION IS ONE TRANSACTION: the status flip, the stock allocation and the sales invoice commit together or not at all. The allocation runs
         // on this transaction (under the order lock the flip took), the invoice is built from the flipped order and reconciled to its total, and it is queued
         // here; a failure of any of the three (no stock, an invoice that does not reconcile or has an unmapped account, a declined enqueue) throws and the
@@ -2733,27 +2760,10 @@ export async function applySalesOrderStatusTransition(
       const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
       await queueDispatchEmailIfEligible(id)
     }
-    // A storefront order that was imported HELD (PENDING_PAYMENT / ON_HOLD) and now moves to processing for the FIRST time (a BACS / cheque payment received):
-    // WooCommerce sent its confirmation on that move before step W and is off after it, so nobody would send one. The claim is a one-shot marker written only
-    // by the import of a held order (`confirmationOnReleasePendingAt`) and consumed here, so an order that was ever released, imported any other way, or
-    // put on hold later (PROCESSING -> ON_HOLD -> PROCESSING) can never confirm through this path. The release time is the storefront's paid time and only
-    // the full-bypass sync path carries it; an IMS-side move (operator, AUTH_ONLY) has none and is judged on placement (placed at/after the switch-on).
-    // The helper self-guards (switch, switch-on instant, placement, age, storefront order, dedupe) and never throws.
-    if (
-      (previousStatusForLog === 'PENDING_PAYMENT' || previousStatusForLog === 'ON_HOLD')
-      && (targetStatus === 'PROCESSING' || targetStatus === 'ALLOCATED' || targetStatus === 'PICKING' || targetStatus === 'PACKING')
-    ) {
-      try {
-        const claim = await db.salesOrder.updateMany({ where: { id, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })
-        if (claim.count === 1) {
-          const { queueStorefrontConfirmationIfEligible } = await import('@/lib/storefront-customer-email')
-          const releasedAt = bypassPermission && options?.releasedAt instanceof Date && Number.isFinite(options.releasedAt.getTime()) ? options.releasedAt : undefined
-          await queueStorefrontConfirmationIfEligible(id, releasedAt ? { releasedAt } : undefined)
-        }
-      } catch (releaseError) {
-        console.error(releaseError)
-      }
-    }
+    // The release confirmation of a storefront order imported HELD was claimed and queued INSIDE the status transaction above
+    // (`claimAndQueueConfirmationOnReleaseInTx`); only its activity record is written here, after the commit.
+    const releaseActivity = releaseConfirmationAfterCommit as (() => Promise<void>) | null
+    if (releaseActivity) await releaseActivity()
     // Storefront orders (o3d-zvec.24, switch `storefront_customer_email_enabled`, default off): the delivered e-mail, once per order. Self-guarded
     // (status DELIVERED, a recent despatch, dedup under the order row lock) and never throws.
     if (targetStatus === 'DELIVERED') {
