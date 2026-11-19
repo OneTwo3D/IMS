@@ -35,6 +35,7 @@ import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW } from './order-status-c
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
 import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
 import { wooDrainHold } from '../producer-egress'
+import { PRODUCER_HELD_RETRY_DELAY_MS } from '@/lib/security/producer-disposition-constants'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
   parseIntegrationOutboxPayload,
@@ -191,7 +192,7 @@ export async function parkStaleWcInvoiceDocumentClaims(now: Date = new Date()): 
 
 type AttemptVerdict =
   | { kind: 'done' }
-  | { kind: 'retry'; reason: string }
+  | { kind: 'retry'; reason: string; held?: true }
 
 /** ONE ATTEMPT, inside the fence. IMS is re-read inside the writer, then WooCommerce is written through wcPut; the result switch is closed. */
 async function attemptWcInvoiceDocumentPublish(orderId: string): Promise<AttemptVerdict> {
@@ -208,7 +209,7 @@ async function attemptWcInvoiceDocumentPublish(orderId: string): Promise<Attempt
     case 'no-servable-document':
       return { kind: 'retry', reason: 'IMS holds no invoice document it would serve to the customer for this order right now (withdrawn, changed, shared number, or its file is missing), so the flag was not written' }
     case 'failed':
-      return { kind: 'retry', reason: outcome.error }
+      return outcome.held ? { kind: 'retry', reason: outcome.error, held: true } : { kind: 'retry', reason: outcome.error }
     default: {
       const unhandled: never = outcome
       throw new Error(`unhandled invoice publication outcome ${JSON.stringify(unhandled)}`)
@@ -273,10 +274,12 @@ export async function runWcInvoiceDocumentJobs(options: WcInvoiceDocumentRunOpti
     }
 
     const ledger = createWriteLedger()
-    const retry = async (error: string) => {
+    const retry = async (error: string, held = false) => {
       const row = await markIntegrationOutboxRetryableFailure({
         ...claim,
         error,
+        // A write the hold refused before it left is handed back with NO attempt spent (it is not a failure of the work).
+        ...(held ? { heldWithoutAttempt: true, retryDelayMs: PRODUCER_HELD_RETRY_DELAY_MS } : {}),
         noWriteSent: ledger.writes === 0,
         attemptsBeforeFailure: job.attempts,
         maxAttempts: WC_INVOICE_DOCUMENT_MAX_ATTEMPTS,
@@ -321,7 +324,7 @@ export async function runWcInvoiceDocumentJobs(options: WcInvoiceDocumentRunOpti
           }).catch(() => {})
           break
         case 'retry':
-          await retry(verdict.reason)
+          await retry(verdict.reason, verdict.held === true)
           break
         default: {
           const unhandled: never = verdict

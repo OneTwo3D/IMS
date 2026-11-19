@@ -279,6 +279,11 @@ export function xeroRowDeliveryHold(input: {
   }
 }
 
+/** Every accounting sync type whose delivery gate holds right now (see {@link xeroRowDeliveryHold}): a selection leaves these out so held rows cannot fill a bounded batch. */
+export function xeroHeldDeliveryTypes(input: Omit<Parameters<typeof xeroRowDeliveryHold>[0], 'type'> = {}): AccountingSyncType[] {
+  return Object.values(AccountingSyncType).filter((type) => xeroRowDeliveryHold({ ...input, type }) !== null)
+}
+
 /**
  * THE WRITER-SIDE CUT-OFF FOR ACCOUNTING ROWS: EACH ROW IS FLOORED BY THE LIVE-FROM INSTANT OF THE DESTINATION IT WRITES TO.
  *

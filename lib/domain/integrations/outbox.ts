@@ -196,6 +196,12 @@ export type MarkIntegrationOutboxRetryableFailureOptions = MarkIntegrationOutbox
    * before its status) may already have left, and then the hold is not the job's only outcome.
    */
   noWriteSent?: boolean
+  /**
+   * THE FAILURE IS THE PRODUCER-SIDE HOLD HANDING THE WORK BACK UNSENT (producerHeldNotice), not a fault of the work. Such a notice carries no hold
+   * reference (it is not an outbound-write refusal), so the text test below cannot recognise it; the caller that KNOWS says so. The job keeps its
+   * attempt count and is offered again after retryDelayMs (default OUTBOUND_HELD_RETRY_DELAY_MS), however long the hold stands.
+   */
+  heldWithoutAttempt?: boolean
   attemptsBeforeFailure: number
   retryDelayMs?: number
   retryBaseDelayMs?: number
@@ -881,7 +887,7 @@ export async function markIntegrationOutboxRetryableFailure(
   // PERMANENT_FAILED - a dead letter that reads as "the destination rejected this" - merely because the
   // hold lasted longer than the retry budget. The job stays retryable, keeps its attempt count, and is
   // offered again after OUTBOUND_HELD_RETRY_DELAY_MS, for as long as the hold lasts.
-  if (isOutboundWriteHeldText(errorMessage(options.error))) {
+  if (options.heldWithoutAttempt === true || isOutboundWriteHeldText(errorMessage(options.error))) {
     const heldData = {
       status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
       nextAttemptAt: new Date(now.getTime() + normalizeDelayMs(options.retryDelayMs ?? OUTBOUND_HELD_RETRY_DELAY_MS)),

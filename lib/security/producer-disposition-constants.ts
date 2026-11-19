@@ -152,6 +152,12 @@ export function producerShadowNotice(input: { connector: OutboundConnector; reas
 }
 
 /**
+ * HOW LONG A QUEUED ROW HANDED BACK BY THE PRODUCER-SIDE HOLD WAITS BEFORE IT IS OFFERED AGAIN. Short and fixed (no backoff): the hold ends when the
+ * owner records a confirmation, and the work should go out within a tick or so of it. Handing back spends no attempt, so a short delay costs nothing.
+ */
+export const PRODUCER_HELD_RETRY_DELAY_MS = 90_000
+
+/**
  * THE SENTENCE FOR A ROW THAT ALREADY EXISTS AND IS NOT SENT: the claim boundary found a queued row whose decision is not
  * LIVE and handed it back unsent. Unlike {@link producerShadowNotice} it records no shadow (the row is the queued work itself),
  * so it does not say one was kept. It claims only what IMS knows: IMS did not send it, and will not while the hold says so.

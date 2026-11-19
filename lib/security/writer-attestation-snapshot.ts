@@ -3,7 +3,12 @@
  *
  * The producer decision and the egress gates (producer-disposition.ts, producer-seam.ts) are pure and synchronous: no database. The confirmation that an
  * incumbent writer is stopped (WriterAttestation) lives in the database, so every process keeps a snapshot of which kinds are in force and refreshes it
- * in the background (`startAttestationRefresh`, started from instrumentation.ts) or on demand (`ensureAttestationSnapshot`, for a command or script).
+ * in the background (`startAttestationRefresh`, started from instrumentation.ts, the ONLY production caller) or on demand (`ensureAttestationSnapshot`).
+ *
+ * NO COMMAND OR SCRIPT DRAINS A QUEUE TODAY (`writers:check` hands the decision its own `attestations` set; `outbound:status` and `retire:held-backlog` only
+ * read), and none calls `ensureAttestationSnapshot`. A tsx process that evaluated a delivery gate without registering a source would stay `unknown` and HOLD
+ * everything, with nothing in the process saying why: a script that ever drains a queue must call `ensureAttestationSnapshot` first (it is exercised by the
+ * tests as the script-context contract).
  *
  * THE ANSWER IS THREE-VALUED, AND ONLY ONE OF THE THREE MAY REFUSE:
  *   present   a positive read found the confirmation. Confirmations are append-only, so this never changes back.
