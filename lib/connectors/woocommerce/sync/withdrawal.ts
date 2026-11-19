@@ -33,6 +33,7 @@
  */
 
 import { isWcOrderAnonymised } from './anonymisation'
+import { writeWithdrawalOutcomeForEvent } from './withdrawal-outcome'
 import { recordWcErasureObligation } from './erasure-obligation'
 import { WcFirstImportLockUnavailable, withWcFirstImportLock } from './first-import-lock'
 import { randomUUID } from 'node:crypto'
@@ -475,6 +476,12 @@ async function note(
     description,
     metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
     resolveUser: false,
+  })
+  // THE OUTCOME WRITER (withdrawal-outcome.ts): the storefront order note, and the rejection of a request made after despatch. Off unless
+  // `wc_withdrawal_outcome_enabled` is true AND step M is live; never throws, so the handling above never waits on it.
+  await writeWithdrawalOutcomeForEvent({
+    orderId, externalOrderId: String(wcOrder.id), action, description,
+    eventKey: `${wcOrder.id}:${normaliseStatus(wcOrder.status)}:${wcEventTimestamp(wcOrder)?.getTime() ?? 0}`,
   })
 }
 

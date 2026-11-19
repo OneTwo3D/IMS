@@ -28,6 +28,7 @@ const ENFORCE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'all' }
 const SETTINGS_ON = new Map<string, string>([
   ['xero_sync_enabled', 'true'], ['xero_daily_batch_enabled', 'true'], ['wc_stock_sync_enabled', 'true'], ['wc_fx_push_enabled', 'true'],
   ['trackship_refire_enabled', 'true'], ['mintsoft_parent_sku_delete_enabled', 'true'], ['wc_invoice_document_enabled', 'true'],
+  ['wc_invoice_note_enabled', 'true'], ['wc_withdrawal_outcome_enabled', 'true'],
 ])
 
 function clean(): Record<StepEvidenceKind, StepEvidenceReading> {
@@ -114,12 +115,26 @@ test('no-writer: IMS owns an automatic row in a live phase but its switch is off
   assert.equal(billDelete?.severity, 'warn')
 })
 
-test('no-writer: the withdrawal-outcome writer is not built, so from step M the phase fails closed (owner decision 2026-11-18)', () => {
-  const report = evaluateWritersCheck(inputs(STEP_M))
+test('no-writer: from step M the withdrawal-outcome writer must be switched on (wc_withdrawal_outcome_enabled, default off), like every other IMS-owned row', () => {
+  const off = new Map(SETTINGS_ON)
+  off.delete('wc_withdrawal_outcome_enabled')
+  const report = evaluateWritersCheck(inputs(STEP_M, { settings: off }))
   const finding = report.findings.find((f) => f.code === 'no-writer' && f.subject === 'woocommerce.order.withdrawal-outcome')
   assert.ok(finding, JSON.stringify(report.findings))
-  assert.match(finding!.message, /no writer for it yet/)
+  assert.match(finding!.message, /switch is off/)
   assert.notEqual(report.exitCode, 0)
+  assert.ok(!evaluateWritersCheck(inputs(STEP_M)).findings.some((f) => f.subject === 'woocommerce.order.withdrawal-outcome'), 'switched on: no finding')
+})
+
+test('the invoice note has its OWN switch: xero_sync_sales_invoice (which defaults on) no longer makes it writable', () => {
+  const noteOff = new Map(SETTINGS_ON)
+  noteOff.delete('wc_invoice_note_enabled')
+  const report = evaluateWritersCheck(inputs(STEP_MWX, { settings: noteOff }))
+  assert.equal(report.operations.find((op) => op.key === 'woocommerce.order.invoice-note')?.imsCanWrite, false)
+  assert.ok(report.findings.some((f) => f.code === 'no-writer' && f.subject === 'woocommerce.order.invoice-note'))
+  const onWithoutXeroMode = new Map(SETTINGS_ON)
+  onWithoutXeroMode.set('xero_sync_sales_invoice', 'off')
+  assert.equal(evaluateWritersCheck(inputs(STEP_MWX, { settings: onWithoutXeroMode })).operations.find((op) => op.key === 'woocommerce.order.invoice-note')?.imsCanWrite, true, 'the Xero document mode is not the note\'s switch')
 })
 
 test('"evidence source not built" FAILS closed in every phase that requires it; it never passes vacuously', () => {
@@ -200,16 +215,77 @@ test('bridge evidence on a WooCommerce fulfilment row is a double claim once IMS
   assert.ok(subjects.includes('woocommerce.order.status') && subjects.includes('mintsoft.order.create'), subjects.join(','))
 })
 
-test('the readers: unbuilt sources answer not-built (never clean); the two attestation kinds read the newest attestation; a throwing reader is unreadable', async () => {
+test('the readers: the bridge attestation is still unbuilt (a writers:attest input); every step source is NOT DUE until its step is live; the attestation kinds read the newest attestation; a throwing reader is unreadable', async () => {
   const rows: Record<string, Date | null> = { 'qoblex-stock-push-stopped': new Date('2026-12-02T00:00:00Z'), 'qoblex-xero-stopped': null }
   const db = { writerAttestation: { findFirst: async (args: { where: { kind: string } }) => { const at = rows[args.where.kind]; return at ? { attestedAt: at } : null } } }
-  const read = await readStepEvidence({ db: db as never, now: NOW })
+  const read = await readStepEvidence({ db: db as never, now: NOW, env: {} })
   assert.deepEqual(read.QOBLEX_STOCK_PUSH_STOPPED, { state: 'present', at: '2026-12-02T00:00:00.000Z' })
   assert.deepEqual(read.QOBLEX_XERO_STOPPED, { state: 'absent' })
-  for (const kind of ['BRIDGE_ATTESTATION', 'BRIDGE_PROBE', 'MINTSOFT_FOREIGN_ORDER', 'STOCK_DRIFT', 'XEROOM_NOTE'] as const) assert.deepEqual(read[kind], { state: 'not-built' }, kind)
-  const broken = await readStepEvidence({ db: { writerAttestation: { findFirst: async () => { throw new Error('no table') } } } as never, now: NOW })
+  assert.deepEqual(read.BRIDGE_ATTESTATION, { state: 'not-built' })
+  for (const kind of ['BRIDGE_PROBE', 'MINTSOFT_FOREIGN_ORDER', 'STOCK_DRIFT', 'XEROOM_NOTE'] as const) assert.deepEqual(read[kind], { state: 'not-due' }, `${kind}: no step is live, so nothing is asked of the store or Mintsoft`)
+  const broken = await readStepEvidence({ db: { writerAttestation: { findFirst: async () => { throw new Error('no table') } } } as never, now: NOW, env: {} })
   assert.deepEqual(broken.QOBLEX_XERO_STOPPED, { state: 'unreadable' })
   assert.equal(Object.keys(STEP_EVIDENCE_READERS).length, STEP_EVIDENCE_KINDS.length)
+})
+
+test('P1 NEVER asks a vendor: with no live-from set the probe and the Mintsoft reader are not called at all (so a store without the 1.5.0 plugin cannot fail the daily P1 check)', async () => {
+  let calls = 0
+  const db = { writerAttestation: { findFirst: async () => null } }
+  await readStepEvidence({ db: db as never, now: NOW, env: {}, probe: async () => { calls += 1; return { ok: false, reason: 'http_status', message: '' } }, foreignOrders: async () => { calls += 1; return { foreign: 0 } } })
+  assert.equal(calls, 0)
+})
+
+test('step M live: the probe and the foreign-order reader are asked once each; the probe\'s violations and the foreign count become the readings; an unanswered probe is not-probed; a throwing Mintsoft read is unreadable', async () => {
+  const db = { writerAttestation: { findFirst: async () => null } }
+  const env = { MINTSOFT_WRITES_LIVE_FROM: M_AT }
+  const probeOk = async () => ({ ok: true as const, probe: { generatedAt: 1, bridge: { slug: 'wc-mintsoft-sync', pluginActive: false, routesRegistered: true, orderSyncEnabled: false, productWebhook: { total: 1, active: 0 }, pendingProductJobs: 0, latestMintsoftWrite: 0 }, xeroom: { orderNoteOff: false, orderNoteOffPresent: false } } })
+  let probes = 0
+  const read = await readStepEvidence({ db: db as never, now: NOW, env, probe: async () => { probes += 1; return probeOk() }, foreignOrders: async (since) => { assert.equal(since.toISOString(), '2026-12-01T00:00:00.000Z'); return { foreign: 2 } } })
+  assert.deepEqual(read.BRIDGE_PROBE, { state: 'probed', violations: ['bridge-routes-registered'] })
+  assert.deepEqual(read.MINTSOFT_FOREIGN_ORDER, { state: 'counted', counted: 2, floor: '2026-12-01T00:00:00.000Z' })
+  assert.deepEqual(read.XEROOM_NOTE, { state: 'not-due' }, 'step X is not live')
+  assert.equal(probes, 1)
+  const down = await readStepEvidence({ db: db as never, now: NOW, env, probe: async () => ({ ok: false, reason: 'http_status', message: 'x' }), foreignOrders: async () => { throw new Error('mintsoft down') } })
+  assert.deepEqual(down.BRIDGE_PROBE, { state: 'not-probed' })
+  assert.deepEqual(down.MINTSOFT_FOREIGN_ORDER, { state: 'unreadable' })
+  const thrown = await readStepEvidence({ db: db as never, now: NOW, env, probe: async () => { throw new Error('boom') }, foreignOrders: async () => ({ foreign: 0 }) })
+  assert.deepEqual(thrown.BRIDGE_PROBE, { state: 'not-probed' }, 'a probe that throws is not-probed, never a pass')
+  assert.deepEqual((await readStepEvidence({ db: db as never, now: NOW, env: { MINTSOFT_WRITES_LIVE_FROM: 'garbage' } })).BRIDGE_PROBE, { state: 'unreadable' })
+})
+
+test('step X live: Xeroom\'s note reading comes from the probe\'s option (on = violation, off = clean), the same single probe', async () => {
+  const db = { writerAttestation: { findFirst: async () => null } }
+  const env = { MINTSOFT_WRITES_LIVE_FROM: M_AT, WC_WRITES_LIVE_FROM: W_AT, XERO_WRITES_LIVE_FROM: X_AT }
+  const answer = (off: boolean) => async () => ({ ok: true as const, probe: { generatedAt: 1, bridge: { slug: 'wc-mintsoft-sync', pluginActive: false, routesRegistered: false, orderSyncEnabled: false, productWebhook: { total: 0, active: 0 }, pendingProductJobs: 0, latestMintsoftWrite: 0 }, xeroom: { orderNoteOff: off, orderNoteOffPresent: true } } })
+  assert.deepEqual((await readStepEvidence({ db: db as never, now: NOW, env, probe: answer(false), foreignOrders: async () => ({ foreign: 0 }) })).XEROOM_NOTE, { state: 'probed', violations: ['xeroom-note-on'] })
+  assert.deepEqual((await readStepEvidence({ db: db as never, now: NOW, env, probe: answer(true), foreignOrders: async () => ({ foreign: 0 }) })).XEROOM_NOTE, { state: 'probed', violations: [] })
+})
+
+test('step W live: the drift reader needs the owner\'s confirmation, 24 hours of complete runs after it, a recent run, and then counts the events since the confirmation', async () => {
+  const attestedAt = new Date('2026-12-08T00:00:00Z')
+  const runs = { first: new Date('2026-12-08T01:00:00Z'), last: new Date('2026-12-20T08:00:00Z') }
+  let events = 0
+  const mk = (over: { attested?: Date | null; first?: Date | null; last?: Date | null } = {}) => ({
+    writerAttestation: { findFirst: async () => ((over.attested === undefined ? attestedAt : over.attested) ? { attestedAt: over.attested === undefined ? attestedAt : over.attested } : null) },
+    wcStockDriftRun: { findFirst: async (args: { orderBy: { startedAt: string } }) => { const at = args.orderBy.startedAt === 'asc' ? (over.first === undefined ? runs.first : over.first) : (over.last === undefined ? runs.last : over.last); return at ? { startedAt: at } : null } },
+    wcStockDriftEvent: { count: async (args: { where: { observedAt: { gte: Date } } }) => { assert.equal(args.where.observedAt.gte.toISOString(), attestedAt.toISOString()); return events } },
+  })
+  const drift = async (db: ReturnType<typeof mk>) => (await readStepEvidence({ db: db as never, now: NOW, env: { MINTSOFT_WRITES_LIVE_FROM: M_AT, WC_WRITES_LIVE_FROM: W_AT }, probe: async () => ({ ok: false, reason: 'unreachable', message: '' }), foreignOrders: async () => ({ foreign: 0 }) })).STOCK_DRIFT
+  assert.deepEqual(await drift(mk()), { state: 'counted', counted: 0, floor: attestedAt.toISOString() })
+  events = 3
+  assert.deepEqual(await drift(mk()), { state: 'counted', counted: 3, floor: attestedAt.toISOString() })
+  assert.deepEqual(await drift(mk({ attested: null })), { state: 'not-probed' }, 'nothing to measure the quiet from')
+  assert.deepEqual(await drift(mk({ first: null })), { state: 'not-probed' }, 'the observer has not run since the confirmation')
+  assert.deepEqual(await drift(mk({ last: new Date('2026-12-20T05:00:00Z') })), { state: 'not-probed' }, 'the latest complete run is over 6 hours old')
+  assert.deepEqual(await drift(mk({ last: new Date('2026-12-08T20:00:00Z'), first: new Date('2026-12-08T01:00:00Z') })), { state: 'not-probed' }, 'less than 24 hours of watching')
+  assert.deepEqual((await readStepEvidence({ db: { writerAttestation: { findFirst: async () => ({ attestedAt }) } } as never, now: NOW, env: { MINTSOFT_WRITES_LIVE_FROM: M_AT, WC_WRITES_LIVE_FROM: W_AT }, probe: async () => ({ ok: false, reason: 'unreachable', message: '' }), foreignOrders: async () => ({ foreign: 0 }) })).STOCK_DRIFT, { state: 'unreadable' }, 'no observer tables at all')
+})
+
+test('a "not-due" reading where the evaluator REQUIRES the kind fails closed (the reader and the check disagree about the step)', () => {
+  const report = evaluateWritersCheck(inputs(STEP_M, { stepEvidence: { ...clean(), BRIDGE_PROBE: { state: 'not-due' } } }))
+  assert.ok(report.findings.some((f) => f.code === 'unreadable' && f.subject === 'BRIDGE_PROBE'))
+  assert.notEqual(report.exitCode, 0)
+  assert.ok(!evaluateWritersCheck(inputs({}, { stepEvidence: { ...clean(), BRIDGE_PROBE: { state: 'not-due' } } })).findings.some((f) => f.subject === 'BRIDGE_PROBE'), 'in P1 it is simply not required')
 })
 
 test('P2-W FAILS without the qoblex-stock-push-stopped confirmation EVEN WHEN wc_stock_sync_enabled is already on, and IMS is not counted as able to write stock (MUTATION: drop the requirement or the per-operation delivery check => red)', () => {

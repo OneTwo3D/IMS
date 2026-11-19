@@ -6140,3 +6140,40 @@ model WriterAttestation {
   @@index([kind, attestedAt], map: "writer_attestations_kind_attested_idx")
   @@map("writer_attestations")
 }
+
+/// The last stock quantity the drift observer saw for one WooCommerce product or variation (switchover step W). Replaced on every observation.
+model WcStockSnapshot {
+  externalProductId String   @id @map("external_product_id")
+  sku               String?
+  quantity          Int?
+  observedAt        DateTime @map("observed_at")
+
+  @@map("wc_stock_snapshots")
+}
+
+/// A WooCommerce stock change that no order, refund or IMS push explains: Qoblex (or somebody) is still writing stock. Append-only.
+model WcStockDriftEvent {
+  id                 String   @id @default(cuid())
+  externalProductId  String   @map("external_product_id")
+  sku                String?
+  fromQuantity       Int?     @map("from_quantity")
+  toQuantity         Int?     @map("to_quantity")
+  previousObservedAt DateTime @map("previous_observed_at")
+  observedAt         DateTime @map("observed_at")
+
+  @@index([observedAt], map: "wc_stock_drift_events_observed_idx")
+  @@map("wc_stock_drift_events")
+}
+
+/// One look of the drift observer. `ok` only when the whole catalogue was read and every snapshot saved.
+model WcStockDriftRun {
+  id           String    @id @default(cuid())
+  startedAt    DateTime  @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+  ok           Boolean   @default(false)
+  productsSeen Int       @default(0) @map("products_seen")
+  driftFound   Int       @default(0) @map("drift_found")
+
+  @@index([startedAt], map: "wc_stock_drift_runs_started_idx")
+  @@map("wc_stock_drift_runs")
+}

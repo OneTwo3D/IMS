@@ -480,7 +480,7 @@ export async function processShoppingInvoiceDocumentPublications(options?: { ide
 }
 
 /** The TrackShip re-fire sweep (off unless `trackship_refire_enabled` is `true`): register shipped orders, queue the looks that are due, drain. */
-export async function processShoppingTrackshipRefires(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
+export async function processShoppingTrackshipRefires(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date; batch?: boolean }) {
   const { processWcTrackshipRefires } = await import('@/lib/connectors/woocommerce/sync/trackship-refire-jobs')
   return processWcTrackshipRefires(options)
 }

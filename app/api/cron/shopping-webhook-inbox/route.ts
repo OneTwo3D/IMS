@@ -139,7 +139,7 @@ async function drainTrackshipRefires(): Promise<DrainResult> {
       return { skipped: true, reason: 'woocommerce_plugin_disabled' }
     }
     const { processShoppingTrackshipRefires } = await import('@/lib/shopping')
-    return { ...(await processShoppingTrackshipRefires()) }
+    return { ...(await processShoppingTrackshipRefires({ batch: true })) }
   } catch (error) {
     console.warn('[shopping-webhook-inbox] TrackShip re-fire drain failed', { error: normalizeCronError(error) })
     return { skipped: false, error: normalizeCronError(error) }

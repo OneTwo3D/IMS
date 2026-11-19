@@ -127,6 +127,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   pushPartialShipmentToWc: { family: 'woocommerce-writer' },
   pushInvoiceNoteToWc: { family: 'woocommerce-writer' },
   publishInvoiceDocumentFlagToWc: { family: 'woocommerce-writer' },
+  postWithdrawalOutcome: { family: 'woocommerce-writer' },
   pushFxRatesToWc: { family: 'woocommerce-writer' },
   pushCurrentFxRatesToWc: { family: 'woocommerce-writer' },
   probeFxHelperPlugin: { family: 'woocommerce-writer' },

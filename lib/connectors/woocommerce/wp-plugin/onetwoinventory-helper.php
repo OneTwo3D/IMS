@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -38,6 +38,15 @@
  *      and, when it does not, to fire TrackShip's own `send_order_to_trackship`
  *      action again (the call TrackShip makes when an order ships and which has
  *      no retry of its own). Writes nothing itself: TrackShip does the writing.
+ *   5. Incumbents probe (1.5.0) — signed, READ-ONLY route GET /wp-json/oti/v1/incumbents
+ *      that reports whether the legacy bridge plugin (slug wc-mintsoft-sync) and Xeroom's
+ *      order note are still writing: whether the bridge's REST routes are registered, its
+ *      order-sync switch, its product webhook, pending product-sync jobs, the latest
+ *      `_mintsoft_*` write time, and the o3d_xeroom_order_note_off option. Writes nothing.
+ *   6. Withdrawal outcome (1.5.0) — signed route POST /wp-json/oti/v1/order/{id}/withdrawal-outcome
+ *      that IMS posts the outcome of a customer's EU withdrawal request to (an order note, and
+ *      a rejection of the request when the goods have already gone). Replaces the bridge
+ *      plugin's /wdraw-outcome at the Mintsoft switchover step.
  */
 
 defined('ABSPATH') || exit;
@@ -322,6 +331,23 @@ add_action('rest_api_init', function () {
         // Its own verifier: the signature binds method, path (so the order id), body and a timestamp, and the nonce in the body is single-use.
         'permission_callback' => 'oti_verify_trackship_refire_signature',
         'callback'            => 'oti_handle_trackship_refire',
+        'args'                => [
+            'order_id' => [
+                'required'          => true,
+                'sanitize_callback' => 'absint',
+            ],
+        ],
+    ]);
+    // READ ONLY. Its own verifier: the signature binds method, path, timestamp and a single-use nonce, inside a 60 second window.
+    register_rest_route(OTI_FX_NAMESPACE, '/incumbents', [
+        'methods'             => 'GET',
+        'permission_callback' => 'oti_verify_incumbents_signature',
+        'callback'            => 'oti_handle_incumbents',
+    ]);
+    register_rest_route(OTI_FX_NAMESPACE, '/order/(?P<order_id>\d+)/withdrawal-outcome', [
+        'methods'             => 'POST',
+        'permission_callback' => 'oti_verify_withdrawal_outcome_signature',
+        'callback'            => 'oti_handle_withdrawal_outcome',
         'args'                => [
             'order_id' => [
                 'required'          => true,
@@ -878,6 +904,343 @@ if (!function_exists('oti_handle_trackship_refire')) {
                 return new WP_REST_Response(['ok' => false, 'result' => 'trackship_inactive', 'missing' => $missing], 503);
             }
             return new WP_REST_Response(['ok' => true, 'result' => 'fired', 'missing' => $missing, 'outside_window' => $outside], 200);
+        } finally {
+            $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));
+        }
+    }
+}
+
+/* ============================================================
+ * Module 5 — Incumbents probe (READ ONLY)
+ * ============================================================ */
+
+// How far the signed timestamp of the probe may be from this server's clock, in seconds (short: the probe is a read that IMS repeats).
+const OTI_INCUMBENTS_WINDOW = 60;
+// The legacy bridge plugin: its exact slug, REST namespace, settings option and the WooCommerce webhook it relies on.
+const OTI_BRIDGE_PLUGIN_SLUG      = 'wc-mintsoft-sync';
+const OTI_BRIDGE_REST_NAMESPACE   = '/wc-mintsoft/v1';
+const OTI_BRIDGE_SETTINGS_OPT     = 'wc_mintsoft_settings';
+const OTI_BRIDGE_PRODUCT_SYNC_HOOK = 'wc_mintsoft_run_product_sync';
+const OTI_BRIDGE_WEBHOOK_URL_PART = '/webhook/woocommerce/product-update';
+// Xeroom's order-note switch: the option read by the o3d mu-plugin that suppresses only Xeroom's WooCommerce order note.
+const OTI_XEROOM_NOTE_OFF_OPT     = 'o3d_xeroom_order_note_off';
+
+if (!function_exists('oti_verify_incumbents_signature')) {
+    /**
+     * Signature of the probe: HMAC-SHA256, hex, of "timestamp \n METHOD \n path \n nonce" with the shared secret, header X-OTI-Signature, timestamp in
+     * X-OTI-Timestamp, nonce (16 to 64 hex characters) in X-OTI-Nonce. The window is 60 seconds and a nonce is accepted once.
+     */
+    function oti_verify_incumbents_signature(WP_REST_Request $request)
+    {
+        $secret = get_option(OTI_FX_SECRET_OPT, '');
+        if (!is_string($secret) || $secret === '') {
+            return new WP_Error('oti_inc_no_secret', 'onetwoInventory shared secret not configured', ['status' => 401]);
+        }
+        $signature = $request->get_header('x-oti-signature');
+        $ts_header = $request->get_header('x-oti-timestamp');
+        $nonce     = $request->get_header('x-oti-nonce');
+        if (!$signature || !$ts_header || !ctype_digit((string) $ts_header) || !is_string($nonce) || !preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
+            return new WP_Error('oti_inc_missing_sig', 'Missing signature, timestamp or nonce', ['status' => 401]);
+        }
+        $timestamp = (int) $ts_header;
+        if (abs(time() - $timestamp) > OTI_INCUMBENTS_WINDOW) {
+            return new WP_Error('oti_inc_stale', 'Timestamp outside the window', ['status' => 401]);
+        }
+        $path = '/wp-json/oti/v1/incumbents';
+        $expected = hash_hmac('sha256', $timestamp . "\n" . strtoupper($request->get_method()) . "\n" . $path . "\n" . $nonce, $secret);
+        if (!hash_equals($expected, (string) $signature)) {
+            return new WP_Error('oti_inc_bad_sig', 'Invalid signature', ['status' => 401]);
+        }
+        $key = 'oti_incn_' . md5($nonce);
+        if (get_transient($key) !== false) {
+            return new WP_Error('oti_inc_replayed', 'Request already used', ['status' => 401]);
+        }
+        set_transient($key, 1, 2 * OTI_INCUMBENTS_WINDOW);
+        return true;
+    }
+}
+
+if (!function_exists('oti_incumbents_bridge_routes_registered')) {
+    /** Is any REST route of the bridge plugin registered right now? Read from the server's own route table, so it holds however the plugin is loaded. */
+    function oti_incumbents_bridge_routes_registered()
+    {
+        if (!function_exists('rest_get_server')) {
+            return null;
+        }
+        $server = rest_get_server();
+        if (!is_object($server) || !method_exists($server, 'get_routes')) {
+            return null;
+        }
+        $routes = $server->get_routes();
+        if (!is_array($routes)) {
+            return null;
+        }
+        foreach (array_keys($routes) as $route) {
+            if (strpos((string) $route, OTI_BRIDGE_REST_NAMESPACE) === 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+if (!function_exists('oti_incumbents_bridge_webhooks')) {
+    /** The WooCommerce webhooks that deliver to the bridge's product endpoint: how many exist and how many are active. Null when they cannot be read. */
+    function oti_incumbents_bridge_webhooks()
+    {
+        if (!class_exists('WC_Data_Store') || !class_exists('WC_Webhook')) {
+            return null;
+        }
+        try {
+            $store = WC_Data_Store::load('webhook');
+            $ids = $store->search_webhooks(['limit' => 500]);
+            if (!is_array($ids)) {
+                return null;
+            }
+            $total = 0;
+            $active = 0;
+            foreach ($ids as $id) {
+                $hook = new WC_Webhook($id);
+                if (strpos((string) $hook->get_delivery_url(), OTI_BRIDGE_WEBHOOK_URL_PART) === false) {
+                    continue;
+                }
+                $total++;
+                if ($hook->get_status() === 'active') {
+                    $active++;
+                }
+            }
+            return ['total' => $total, 'active' => $active];
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+}
+
+if (!function_exists('oti_incumbents_pending_product_sync_jobs')) {
+    /** Pending Action Scheduler jobs of the bridge's product sync hook. Null when Action Scheduler cannot be read. */
+    function oti_incumbents_pending_product_sync_jobs()
+    {
+        if (!function_exists('as_get_scheduled_actions')) {
+            return null;
+        }
+        try {
+            $ids = as_get_scheduled_actions([
+                'hook'     => OTI_BRIDGE_PRODUCT_SYNC_HOOK,
+                'status'   => 'pending',
+                'per_page' => 1000,
+            ], 'ids');
+            return is_array($ids) ? count($ids) : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+}
+
+if (!function_exists('oti_incumbents_latest_mintsoft_write')) {
+    /** The latest time (unix seconds) the bridge stamped on any order: the newest of its status, sync-queued and withdrawal-queued times. 0 when it never has; null when unreadable. */
+    function oti_incumbents_latest_mintsoft_write()
+    {
+        global $wpdb;
+        if (!isset($wpdb) || !is_object($wpdb)) {
+            return null;
+        }
+        $keys = ['_mintsoft_status_updated_at', '_mintsoft_sync_queued_at', '_mintsoft_wdraw_queued_at'];
+        $tables = [];
+        $hpos = $wpdb->prefix . 'wc_orders_meta';
+        // phpcs:ignore WordPress.DB.PreparedSQL -- table names are internal.
+        if ((string) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $hpos)) === $hpos) {
+            $tables[] = $hpos;
+        }
+        $tables[] = $wpdb->postmeta;
+        $latest = 0;
+        foreach ($tables as $table) {
+            $wpdb->last_error = '';
+            $placeholders = implode(',', array_fill(0, count($keys), '%s'));
+            // phpcs:ignore WordPress.DB.PreparedSQL -- table name is internal; the keys are bound.
+            $value = $wpdb->get_var($wpdb->prepare("SELECT MAX(CAST(meta_value AS UNSIGNED)) FROM {$table} WHERE meta_key IN ({$placeholders})", $keys));
+            if ($wpdb->last_error) {
+                return null;
+            }
+            $latest = max($latest, (int) $value);
+        }
+        return $latest;
+    }
+}
+
+if (!function_exists('oti_handle_incumbents')) {
+    /**
+     * GET /wp-json/oti/v1/incumbents   (signed: see oti_verify_incumbents_signature). READ ONLY: writes nothing, anywhere.
+     *
+     * Every field is a plain value; a field that could not be read is null (IMS reads null as "not probed", never as "fine").
+     */
+    function oti_handle_incumbents(WP_REST_Request $request)
+    {
+        $settings = get_option(OTI_BRIDGE_SETTINGS_OPT, null);
+        $order_sync = null;
+        if (is_array($settings)) {
+            $order_sync = !empty($settings['order_sync_enabled']);
+        } elseif ($settings === null || $settings === false || $settings === '') {
+            // No settings option at all: the bridge was never configured here, so its order sync is not on.
+            $order_sync = false;
+        }
+        $xeroom_off = get_option(OTI_XEROOM_NOTE_OFF_OPT, null);
+        $plugin_active = null;
+        if (function_exists('is_plugin_active')) {
+            $plugin_active = is_plugin_active(OTI_BRIDGE_PLUGIN_SLUG . '/' . OTI_BRIDGE_PLUGIN_SLUG . '.php');
+        }
+        return new WP_REST_Response([
+            'ok'            => true,
+            'plugin_version' => '1.5.0',
+            'generated_at'  => time(),
+            'bridge'        => [
+                'slug'                   => OTI_BRIDGE_PLUGIN_SLUG,
+                // Informational only: whether the plugin is active is NOT the signal. The routes, the switch, the webhook, the jobs and the writes are.
+                'plugin_active'          => $plugin_active,
+                'routes_registered'      => oti_incumbents_bridge_routes_registered(),
+                'order_sync_enabled'     => $order_sync,
+                'product_webhook'        => oti_incumbents_bridge_webhooks(),
+                'pending_product_jobs'   => oti_incumbents_pending_product_sync_jobs(),
+                'latest_mintsoft_write'  => oti_incumbents_latest_mintsoft_write(),
+            ],
+            'xeroom'        => [
+                // Absent means the default (false): Xeroom still writes its note.
+                'order_note_off'         => $xeroom_off === null || $xeroom_off === false ? false : in_array((string) $xeroom_off, ['1', 'yes', 'true', 'on'], true),
+                'order_note_off_present' => $xeroom_off !== null && $xeroom_off !== false,
+            ],
+        ], 200);
+    }
+}
+
+/* ============================================================
+ * Module 6 — Withdrawal outcome
+ * ============================================================ */
+
+if (!function_exists('oti_verify_withdrawal_outcome_signature')) {
+    /**
+     * Same scheme as the TrackShip re-fire route (HMAC of "timestamp \n METHOD \n path \n raw body", body {order_id, ts, nonce, ...}, single-use
+     * nonce, 5 minute window), over this route's own path so a captured re-fire request cannot be replayed here.
+     */
+    function oti_verify_withdrawal_outcome_signature(WP_REST_Request $request)
+    {
+        $secret = get_option(OTI_FX_SECRET_OPT, '');
+        if (!is_string($secret) || $secret === '') {
+            return new WP_Error('oti_wo_no_secret', 'onetwoInventory shared secret not configured', ['status' => 401]);
+        }
+        $signature = $request->get_header('x-oti-signature');
+        $ts_header = $request->get_header('x-oti-timestamp');
+        if (!$signature || !$ts_header || !ctype_digit((string) $ts_header)) {
+            return new WP_Error('oti_wo_missing_sig', 'Missing signature or timestamp', ['status' => 401]);
+        }
+        $timestamp = (int) $ts_header;
+        if (abs(time() - $timestamp) > OTI_TS_REPLAY_WINDOW) {
+            return new WP_Error('oti_wo_stale', 'Timestamp outside the replay window', ['status' => 401]);
+        }
+        $order_id = absint($request['order_id']);
+        $body = (string) $request->get_body();
+        $path = '/wp-json/oti/v1/order/' . $order_id . '/withdrawal-outcome';
+        $expected = hash_hmac('sha256', $timestamp . "\n" . strtoupper($request->get_method()) . "\n" . $path . "\n" . $body, $secret);
+        if (!hash_equals($expected, (string) $signature)) {
+            return new WP_Error('oti_wo_bad_sig', 'Invalid signature', ['status' => 401]);
+        }
+        $payload = json_decode($body, true);
+        if (!is_array($payload) || (int) ($payload['order_id'] ?? 0) !== $order_id || (int) ($payload['ts'] ?? 0) !== $timestamp) {
+            return new WP_Error('oti_wo_bad_body', 'Body does not match the signed request', ['status' => 401]);
+        }
+        $nonce = isset($payload['nonce']) ? (string) $payload['nonce'] : '';
+        if (!preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
+            return new WP_Error('oti_wo_no_nonce', 'Missing nonce', ['status' => 401]);
+        }
+        $key = 'oti_won_' . md5($nonce);
+        if (get_transient($key) !== false) {
+            return new WP_Error('oti_wo_replayed', 'Request already used', ['status' => 401]);
+        }
+        set_transient($key, 1, 2 * OTI_TS_REPLAY_WINDOW);
+        return true;
+    }
+}
+
+if (!function_exists('oti_handle_withdrawal_outcome')) {
+    /**
+     * POST /wp-json/oti/v1/order/{id}/withdrawal-outcome   (signed: see oti_verify_withdrawal_outcome_signature)
+     *
+     * Body: {order_id, ts, nonce, outcome: 'noted'|'rejected', note?: string, reject_reason?: string, request_id?: int, outcome_key: string}
+     *
+     *   'noted'     add the (admin-only) order note. Nothing else.
+     *   'rejected'  the goods have already gone: reject the customer's withdrawal request through the withdrawal plugin's own service (so its e-mails and
+     *               log run), then add the note. The request id is the one in the body, else the one recorded on the order by the bridge plugin.
+     *
+     * Idempotent per outcome_key: a note is added once per key (kept in an order meta), so a retry after a lost answer adds nothing. Answers:
+     *   result 'noted' | 'rejected' | 'already_done'; 'no_request' (rejection asked, no request id known: the note was still added);
+     *   'no_withdrawal_plugin' (rejection asked, the withdrawal plugin is not active: nothing rejected, note added); 404 oti_wo_not_found.
+     */
+    function oti_handle_withdrawal_outcome(WP_REST_Request $request)
+    {
+        global $wpdb;
+        if (!function_exists('wc_get_order')) {
+            return new WP_Error('oti_wo_no_wc', 'WooCommerce not active', ['status' => 500]);
+        }
+        $order_id = absint($request['order_id']);
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            return new WP_Error('oti_wo_not_found', 'Order not found', ['status' => 404]);
+        }
+        $data = json_decode((string) $request->get_body(), true);
+        $data = is_array($data) ? $data : [];
+        $outcome = isset($data['outcome']) ? (string) $data['outcome'] : '';
+        if (!in_array($outcome, ['noted', 'rejected'], true)) {
+            return new WP_Error('oti_wo_bad_outcome', 'Unknown outcome', ['status' => 400]);
+        }
+        $key = isset($data['outcome_key']) ? (string) $data['outcome_key'] : '';
+        if (!preg_match('/^[A-Za-z0-9:_-]{8,96}$/', $key)) {
+            return new WP_Error('oti_wo_bad_key', 'Missing outcome key', ['status' => 400]);
+        }
+        $note = isset($data['note']) ? sanitize_textarea_field((string) $data['note']) : '';
+
+        $lock_name = 'oti_wo_' . $order_id;
+        if ((int) $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock_name, 0)) !== 1) {
+            return new WP_Error('oti_wo_lock', 'Another outcome for this order is running', ['status' => 409]);
+        }
+        try {
+            $done = $order->get_meta('_oti_wdraw_outcome_keys');
+            $done = is_array($done) ? $done : [];
+            if (in_array($key, $done, true)) {
+                return new WP_REST_Response(['ok' => true, 'result' => 'already_done'], 200);
+            }
+            $result = 'noted';
+            if ($outcome === 'rejected') {
+                $reason = isset($data['reject_reason']) && $data['reject_reason'] !== '' ? sanitize_textarea_field((string) $data['reject_reason']) : 'order already dispatched';
+                if (!class_exists('Wbte_Ewb_Request_Service') || !class_exists('Wbte_Ewb_Request_Repository')) {
+                    $result = 'no_withdrawal_plugin';
+                } else {
+                    $request_id = isset($data['request_id']) ? absint($data['request_id']) : 0;
+                    if (!$request_id) {
+                        $request_id = absint($order->get_meta('_mintsoft_wdraw_request_id'));
+                    }
+                    if (!$request_id) {
+                        $result = 'no_request';
+                    } else {
+                        try {
+                            $service = new Wbte_Ewb_Request_Service(new Wbte_Ewb_Request_Repository());
+                            $rejected = $service->reject($request_id, 0, $reason);
+                        } catch (\Throwable $e) {
+                            return new WP_REST_Response(['ok' => false, 'result' => 'reject_failed'], 502);
+                        }
+                        if (is_wp_error($rejected) && $rejected->get_error_code() !== 'wbte_ewb_not_pending') {
+                            return new WP_REST_Response(['ok' => false, 'result' => 'reject_failed'], 502);
+                        }
+                        $result = 'rejected';
+                    }
+                }
+            }
+            if ($note !== '') {
+                if (!$order->add_order_note($note)) {
+                    return new WP_REST_Response(['ok' => false, 'result' => 'note_failed'], 502);
+                }
+            }
+            $done[] = $key;
+            $order->update_meta_data('_oti_wdraw_outcome_keys', array_slice($done, -20));
+            $order->save();
+            return new WP_REST_Response(['ok' => true, 'result' => $result], 200);
         } finally {
             $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));
         }
