@@ -1356,7 +1356,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   </div>
                 </label>
                 <label className="flex items-center gap-3">
-                  <input type="number" min={0} max={365} step={1} value={s.wc_back_in_stock_date_buffer_days ?? '3'} onChange={(e) => setS({ ...s, wc_back_in_stock_date_buffer_days: e.target.value })} className="w-20 rounded border border-input px-2 py-1 text-sm" />
+                  <input type="number" max={365} step={1} value={s.wc_back_in_stock_date_buffer_days ?? '3'} onChange={(e) => setS({ ...s, wc_back_in_stock_date_buffer_days: e.target.value })} className="w-20 rounded border border-input px-2 py-1 text-sm" />
                   <div>
                     <span className="text-sm font-medium">Back-in-stock buffer (days)</span>
                     <p className="text-xs text-muted-foreground">Days added to the supplier ETA before the date is shown to customers. Default 3.</p>

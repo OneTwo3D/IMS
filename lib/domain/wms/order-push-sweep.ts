@@ -1259,7 +1259,7 @@ export interface WmsOrderPushPort {
    * o3d-2q9vp: raise the "ask the warehouse to send the remaining units" tasks for orders whose shipped units were returned and refunded (the push subtracts the GROSS refund;
    * IMS demand nets only returned shipped units). Returns the number of NEW tasks. Behind `wms_refund_remainder_task_enabled`; changes no quantity at the warehouse.
    */
-  raiseRefundRemainderTasks?(connector: string): Promise<number>
+  raiseRefundRemainderTasks?(connector: string): Promise<{ raised: number; failed: number }>
   /**
    * Record a refused or stalled action (lib/domain/refused-actions.ts): an idempotent upsert on (entity, action, gate). THROWS when it cannot be
    * written: the caller then leaves the link due rather than advancing it over a refusal nobody can see. Absent: nothing is recorded (test doubles).
@@ -4287,7 +4287,9 @@ export async function runWmsOrderPushSweepCore(
   if (operatorNoticeCount > 0) result.operatorNotices = operatorNoticeCount
   if (port.raiseRefundRemainderTasks) {
     try {
-      operatorTasksRaised += await port.raiseRefundRemainderTasks(connectorId)
+      const remainder = await port.raiseRefundRemainderTasks(connectorId)
+      operatorTasksRaised += remainder.raised
+      operatorTaskErrorCount += remainder.failed
     } catch (error) {
       operatorTaskErrorCount += 1
       console.error('[wms-order-push] failed to raise the refund remainder tasks', error)

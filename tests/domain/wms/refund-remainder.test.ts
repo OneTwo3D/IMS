@@ -45,7 +45,7 @@ function deps(over: Partial<RefundRemainderDeps> = {}) {
 
 test('raises ONE REFUND_REMAINDER_DUE task with the SKU and quantity, and changes no quantity (there is no push call in this path)', async () => {
   const { d, raised } = deps()
-  assert.equal(await raiseRefundRemainderTasks('mintsoft', 50, d), 1)
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, d), { raised: 1, failed: 0 })
   assert.equal(raised[0]!.reason, 'REFUND_REMAINDER_DUE')
   assert.equal(raised[0]!.externalOrderId, 'MS-1')
   assert.match(String(raised[0]!.queryText), /2 x RED/)
@@ -54,7 +54,7 @@ test('raises ONE REFUND_REMAINDER_DUE task with the SKU and quantity, and change
 
 test('off by default: no read, no task; one failing order does not stop the others', async () => {
   const off = deps({ isEnabled: async () => false, candidates: async () => { throw new Error('must not read') } })
-  assert.equal(await raiseRefundRemainderTasks('mintsoft', 50, off.d), 0)
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, off.d), { raised: 0, failed: 0 })
   const mixed = deps({
     candidates: async () => [
       { orderId: 'bad', orderNumber: null, externalOrderId: 'X', externalOrderNumber: null, lines: [line] },
@@ -65,7 +65,8 @@ test('off by default: no read, no task; one failing order does not stop the othe
   const origError = console.error
   console.error = () => undefined
   try {
-    assert.equal(await raiseRefundRemainderTasks('mintsoft', 50, mixed.d), 1)
+    // the failing order is COUNTED (the sweep reports it into the cron outcome), and the others still raise
+    assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, mixed.d), { raised: 1, failed: 1 })
   } finally { console.error = origError }
 })
 

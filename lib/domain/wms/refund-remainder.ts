@@ -139,12 +139,14 @@ export const defaultRefundRemainderDeps: RefundRemainderDeps = {
 }
 
 /**
- * Raise the remainder task for every pushed order that needs one. Returns how many NEW tasks were recorded. The task is deduplicated on the exact
- * remainder, so the same fact is one task and a changed remainder (a further return) is a new one. Never throws for one order: it is skipped and counted by the caller's log.
+ * Raise the remainder task for every pushed order that needs one. Returns how many NEW tasks were recorded and how many orders FAILED (the sweep counts them into
+ * its operator-task errors, so the cron reports them). The task is deduplicated on the exact remainder, so the same fact is one task and a changed remainder (a further return) is a new one.
+ * Never throws for one order: it is skipped, counted in `failed` and retried by the next sweep.
  */
-export async function raiseRefundRemainderTasks(connector: string, limit = 50, deps: RefundRemainderDeps = defaultRefundRemainderDeps): Promise<number> {
-  if (!(await deps.isEnabled())) return 0
+export async function raiseRefundRemainderTasks(connector: string, limit = 50, deps: RefundRemainderDeps = defaultRefundRemainderDeps): Promise<{ raised: number; failed: number }> {
+  if (!(await deps.isEnabled())) return { raised: 0, failed: 0 }
   let raised = 0
+  let failed = 0
   // A CURSOR, not "the oldest N": once more than `limit` orders match, the same first ones would be examined on every sweep and the newer ones never. The sweep continues after the last order the previous one
   // examined and wraps to the start when it reaches the end.
   const cursor = deps.readCursor ? await deps.readCursor(connector).catch(() => null) : null
@@ -174,8 +176,9 @@ export async function raiseRefundRemainderTasks(connector: string, limit = 50, d
       })
       if (created) raised += 1
     } catch (error) {
+      failed += 1
       console.error('[wms-order-push] could not check the refund remainder of an order', candidate.orderId, error instanceof Error ? error.message : error)
     }
   }
-  return raised
+  return { raised, failed }
 }
