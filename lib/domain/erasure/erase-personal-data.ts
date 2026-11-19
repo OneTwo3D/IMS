@@ -296,6 +296,8 @@ export async function scrubActivityLogIdentity(
  * The posting gate (resolveSalesPostContact) covers any post that happens after the erasure whatever the payload says.
  */
 export async function scrubAccountingPayloadContacts(tx: Prisma.TransactionClient, orderIds: string[]): Promise<number> {
+  // soft-delete exception: erasure covers every refund row, deleted or not (personal data is kept on the row).
+  // soft-delete exception (erasure): includes soft-deleted refunds on purpose, they still carry the customer's personal data.
   const refunds = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
   const refIds = [...orderIds, ...refunds.map((r) => r.id)]
   const scope = { referenceType: { in: ['SalesOrder', 'SalesOrderRefund'] }, referenceId: { in: refIds } }
@@ -375,6 +377,7 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
     changed += (await tx.wmsOrderStatusSnapshot.updateMany({ where: { orderId: { in: ids }, lastError: { not: null }, NOT: { lastError: marker } }, data: { lastError: marker } })).count
     // The merge hold's last error (the connector's refusal or exception text).
     changed += (await tx.wmsMergeHold.updateMany({ where: { orderId: { in: ids }, lastError: { not: null }, NOT: { lastError: marker } }, data: { lastError: marker } })).count
+    // soft-delete exception (erasure): includes soft-deleted refunds on purpose, they still carry the customer's personal data.
     changed += (await tx.salesOrderRefund.updateMany({ where: { orderId: { in: ids }, accountingWarning: { not: null }, NOT: { accountingWarning: marker } }, data: { accountingWarning: marker } })).count
     changed += (await tx.wmsOrderDiscrepancy.updateMany({ where: { orderId: { in: ids }, detail: { not: null }, NOT: { detail: marker } }, data: { detail: marker } })).count
     for (const field of ['reason', 'resolutionNote'] as const) {
@@ -509,6 +512,8 @@ async function eraseUnderLocksInTx(
   input.outcome.warehouse = warehouse
   // The operator notice commits WITH the record or the erasure rolls back (see warehouse-obligations.ts).
   await recordOpenWarehouseOrdersNoticeInTx(tx, warehouse, input.requestId)
+  // soft-delete exception: erasure covers every refund row, deleted or not.
+  // soft-delete exception (erasure): includes soft-deleted refunds on purpose, they still carry the customer's personal data.
   const refundRows = await tx.salesOrderRefund.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
   // The linked customer's ledger contact id: read for an ORDER erasure too (the customer stays live and `before` is null), under the locks already held, so a contact
   // the ledger holds for the person is never recorded as "nothing held".
@@ -517,6 +522,7 @@ async function eraseUnderLocksInTx(
     || (await tx.accountingSyncLog.count({ where: { OR: [{ referenceType: 'SalesOrder', referenceId: { in: orderIds } }, { referenceType: 'SalesOrderRefund', referenceId: { in: refundRows.map((r) => r.id) } }] } })) > 0
     || (await tx.salesOrder.count({ where: { id: { in: orderIds }, accountingInvoiceId: { not: null } } })) > 0
     // A credit note id is retained by decision and outlives the sync-log purge: a retained id alone means the ledger still holds the document and its contact.
+    // soft-delete exception (erasure): includes soft-deleted refunds on purpose, they still carry the customer's personal data.
     || (await tx.salesOrderRefund.count({ where: { orderId: { in: orderIds }, accountingCreditNoteId: { not: null } } })) > 0
   const systems = decideSystemVerdicts({ trigger: input.trigger, warehouse, accountingTraces })
   const counts: ErasureCounts = { customers: eraseCustomer ? 1 : 0, shoppingCustomerLinks: links.count, activityRowsScrubbed, linkedFreeTextScrubbed, ...rawCounts, ...derivedCounts, ...orderCounts }

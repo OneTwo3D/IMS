@@ -82,6 +82,7 @@ async function selectNewFetchCandidates(floor: Date, now: Date, take: number, in
     const refunds = await db.salesOrderRefund.findMany({
       where: {
         creditNoteNumber: { not: null },
+        deletedAt: null,
         createdAt: { gte: floor },
         order: { shoppingLinks: { some: { connector: 'woocommerce' } } },
         invoiceDocuments: { none: { kind: 'CREDIT_NOTE', supersededAt: null } },

@@ -49,6 +49,7 @@ The moment an erasure leaves open warehouse orders, the operator who ran it is w
 - **Files already downloaded.** A CSV export or invoice PDF that someone saved is outside IMS.
 - **Email already sent.** A message on the wire cannot be recalled.
 - **Rows that mention the person but are keyed to something else.** A free-text note on another record cannot be found by key.
+- **Supplier records and the Mintsoft supplier mapping.** The IMS-supplier-to-Mintsoft-supplier links and the cached Mintsoft supplier list hold supplier-company details only (a name, a code, a contact e-mail); they hang off suppliers, not customers or orders, so an erasure neither reads nor changes them (they are not in the erasure classification, which covers the tables that reach a customer or an order).
 - **Mailing suppressions.** A bounced or complained address is stored in the suppression list. An erasure **deletes** the suppression rows for the person's addresses: owner ruling. If the address bounces again it is suppressed again.
 
 ## Retention settings are not erasure

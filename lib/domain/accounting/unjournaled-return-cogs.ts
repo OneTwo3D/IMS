@@ -38,7 +38,7 @@ export async function loadUnjournaledReturnCredits(
   const shipmentById = new Map(batchShipments.map((s) => [s.shipmentId, s]))
   const orderIds = [...new Set(batchShipments.map((s) => s.orderId))]
   const refunds = await tx.salesOrderRefund.findMany({
-    where: { orderId: { in: orderIds }, returnWarehouseId: { not: null }, chargeback: false, returnInTransit: false, returnCostSplit: { not: null as never } },
+    where: { orderId: { in: orderIds }, deletedAt: null, returnWarehouseId: { not: null }, chargeback: false, returnInTransit: false, returnCostSplit: { not: null as never } },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     select: { id: true, orderId: true, returnCostSplit: true, lines: { select: { costLayerSnapshot: true } } },
   })

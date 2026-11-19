@@ -188,7 +188,7 @@ test('every row names its switchover step; the step table is the owner-approved 
   // Step M: the bridge is retired, so every row it owned moves with it, including its WooCommerce writeback (owner answers Q8, Q9, Q10).
   for (const key of [
     'mintsoft.order.create', 'mintsoft.order.amend', 'mintsoft.order.cancel', 'mintsoft.order.hold', 'mintsoft.order.comment', 'mintsoft.asn.create',
-    'mintsoft.product.upsert', 'mintsoft.product.content', 'mintsoft.product.delete', 'mintsoft.product.bundle',
+    'mintsoft.product.upsert', 'mintsoft.product.content', 'mintsoft.product.delete', 'mintsoft.product.bundle', 'mintsoft.supplier.create',
     'woocommerce.order.status', 'woocommerce.order.tracking', 'woocommerce.order.partial-shipment', 'woocommerce.product.meta',
     'woocommerce.order.withdrawal-outcome', 'woocommerce.order.trackship-reconcile', 'woocommerce.order.trackship-refire', 'woocommerce.order.wms-status-meta',
   ]) {

@@ -481,7 +481,7 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
         where: { refundId: null },
         select: { amount: true, currency: true },
       },
-      refunds: { select: { totalForeign: true, ...REFUND_TURNOVER_SELECT.select } },
+      refunds: { where: { deletedAt: null }, select: { totalForeign: true, ...REFUND_TURNOVER_SELECT.select } },
     },
   })
 

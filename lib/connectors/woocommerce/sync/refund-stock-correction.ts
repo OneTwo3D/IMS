@@ -47,6 +47,7 @@ export async function queueRefundStockCorrections(
     where: {
       stockCorrectionRequired: true,
       stockCorrectionQueuedAt: null,
+      deletedAt: null, // a soft-deleted refund queues no storefront stock correction
       ...(scope.externalOrderId !== undefined
         ? { order: { shoppingLinks: { some: { connector: 'woocommerce', externalOrderId: String(scope.externalOrderId) } } } }
         : {}),

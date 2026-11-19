@@ -289,7 +289,7 @@ export async function getDashboardData(
         // o3d-iigc round 5: the refund LINES are what Best Sellers needs — the header total says
         // nothing about which product was credited. `totalsBasis` lives on the header and governs
         // its lines (verified in round 2: the basis audit requires header/line reconciliation).
-        refunds: { select: { totalsBasis: true, totalBase: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
+        refunds: { where: { deletedAt: null }, select: { totalsBasis: true, totalBase: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
       orderBy: { createdAt: 'desc' },
     }),
@@ -313,7 +313,7 @@ export async function getDashboardData(
       select: { totalBase: true },
     }),
     db.salesOrderRefund.findMany({
-      where: { refundedAt: { gte: periodFrom, lte: periodTo } },
+      where: { refundedAt: { gte: periodFrom, lte: periodTo }, deletedAt: null },
       select: { totalBase: true },
     }),
     db.costLayer.findMany({

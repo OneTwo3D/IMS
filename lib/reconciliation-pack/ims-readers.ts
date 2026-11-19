@@ -205,6 +205,8 @@ export const TRANSIT_SOURCE_DOCUMENTS: ReadonlyArray<{ kind: string; sourceTypes
   { kind: 'supplier-credit-notes', sourceTypes: 'SUPPLIER_CREDIT_NOTE', sql: `SELECT count(*)::text AS n FROM supplier_credit_notes WHERE "createdAt" < ($1::date + 1)` },
   { kind: 'landed-cost-links', sourceTypes: 'LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM landed_cost_links WHERE "createdAt" < ($1::date + 1)` },
   { kind: 'landed-cost-revaluations', sourceTypes: 'LANDED_COST_RECLASS, LANDED_COST_CONSUMED_OFFSET', sql: `SELECT count(*)::text AS n FROM landed_cost_revaluation_runs WHERE "createdAt" < ($1::date + 1)` },
+  // DELIBERATE EXCEPTION to the soft-delete filter (o3d-ngmt.22): this counts every refund row, deleted ones included. The pack reconciles rows against the ledger, and a deleted
+  // refund's credit note and journals (or their reversals) are in the ledger, so leaving it out would understate what the books were told.
   { kind: 'sales-order-refunds', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT', sql: `SELECT count(*)::text AS n FROM sales_order_refunds WHERE "createdAt" < ($1::date + 1)` },
   { kind: 'return-expectations', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT', sql: `SELECT count(*)::text AS n FROM return_expectations WHERE created_at < ($1::date + 1)` },
   { kind: 'subledger-rows', sourceTypes: 'every type (the ledger itself)', sql: `SELECT count(*)::text AS n FROM transit_subledger_movements WHERE journal_date < $1::date` },

@@ -307,7 +307,9 @@ async function seed(lane: Lane, reference: string, rows: SeedRow[], t0: Date): P
   await lane.db.emailOutbox.createMany({
     data: rows.map((row) => ({
       id: row.id,
-      kind: row.kind ?? 'ACCOUNTING_INVOICE',
+      // PURCHASE_ORDER: the one kind whose stale PROCESSING row is still reclaimed (a customer kind's is parked, never re-sent), and these probes
+      // seed stale claims whose delivery the collapse rule is about. The collapse does not depend on the kind.
+      kind: row.kind ?? 'PURCHASE_ORDER',
       toEmail: FIXTURE_RECIPIENT,
       subject: `collapse probe ${row.id}`,
       html: 'queued',
@@ -318,6 +320,7 @@ async function seed(lane: Lane, reference: string, rows: SeedRow[], t0: Date): P
       availableAt: new Date(t0.getTime() - 60_000),
       processingStartedAt: row.processingStartedAt ?? (row.status === 'PROCESSING' ? t0 : null),
       lockedBy: row.lockedBy ?? (row.status === 'PROCESSING' ? 'holder-token' : null),
+      sendEnteredAt: row.status === 'PROCESSING' ? t0 : null,
       createdAt: row.createdAt,
     })),
   })
@@ -447,7 +450,7 @@ test(
         await lane.db.emailOutbox.deleteMany({})
         const row = await lane.db.emailOutbox.create({
           data: {
-            kind: 'ACCOUNTING_INVOICE',
+            kind: 'PURCHASE_ORDER',
             toEmail: FIXTURE_RECIPIENT,
             subject: 'fence probe',
             html: 'queued',
@@ -537,9 +540,9 @@ test(
         await lane.db.emailOutbox.deleteMany({})
         const row = await lane.db.emailOutbox.create({
           data: {
-            kind: 'ACCOUNTING_INVOICE', toEmail: FIXTURE_RECIPIENT, subject: 'cap race probe', html: 'queued',
+            kind: 'PURCHASE_ORDER', toEmail: FIXTURE_RECIPIENT, subject: 'cap race probe', html: 'queued',
             referenceType: 'SalesOrder', referenceId: `cap-race-${randomUUID().slice(0, 8)}`,
-            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', availableAt: new Date(t0.getTime() - 60_000),
+            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', sendEnteredAt: t0, availableAt: new Date(t0.getTime() - 60_000),
           },
         })
         const client = laneHarnessClient(lane)
@@ -581,9 +584,9 @@ test(
         await lane.db.emailOutbox.deleteMany({})
         const row = await lane.db.emailOutbox.create({
           data: {
-            kind: 'ACCOUNTING_INVOICE', toEmail: FIXTURE_RECIPIENT, subject: 'cap stale-read probe', html: 'queued',
+            kind: 'PURCHASE_ORDER', toEmail: FIXTURE_RECIPIENT, subject: 'cap stale-read probe', html: 'queued',
             referenceType: 'SalesOrder', referenceId: `cap-stale-${randomUUID().slice(0, 8)}`,
-            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', availableAt: new Date(t0.getTime() - 60_000),
+            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', sendEnteredAt: t0, availableAt: new Date(t0.getTime() - 60_000),
           },
         })
 
@@ -937,7 +940,7 @@ test(
           (error: unknown) => {
             const message = (error as Error).message
             return /refusing to collapse duplicates for/.test(message)
-              && message.includes('ACCOUNTING_INVOICE')
+              && message.includes('PURCHASE_ORDER')
               && message.includes(reference)
               && message.includes('(2 rows)')
           },

@@ -98,6 +98,10 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   purchase_return_lines: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
   purchase_returns: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
   purchase_units: { kind: 'CONFIG_ALLOWED', reason: 'configured units of measure' },
+  // wms-connector-boundary-ok: 2026-11-19: the table name is the database's; these two tables are Mintsoft-specific by content (its supplier list and mapping).
+  mintsoft_supplier_links: { kind: 'MUST_BE_EMPTY', reason: 'IMS supplier to Mintsoft supplier decisions: operator mapping work done after the load, runtime state a first load starts empty' },
+  // wms-connector-boundary-ok: 2026-11-19: as mintsoft_supplier_links.
+  mintsoft_suppliers: { kind: 'MUST_BE_EMPTY', reason: 'read-only cache of the warehouse supplier list: refreshed by the supplier sync, runtime state a first load starts empty' },
   refused_actions: { kind: 'MUST_BE_EMPTY', reason: 'refused-or-stalled action records: runtime state a first load starts empty' },
   xero_payment_matches: { kind: 'MUST_BE_EMPTY', reason: 'Xero customer-payment matching results: runtime state a first load starts empty' },
   return_expectation_lines: { kind: 'MUST_BE_EMPTY', reason: 'return expectations: goods a refund sent back that have not arrived' },
@@ -109,6 +113,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   reorder_threshold_overrides: { kind: 'CONFIG_ALLOWED', reason: 'per-warehouse reorder threshold overrides: planning configuration set by operators; the runner never writes it' },
   sales_order_refund_lines: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
   sales_order_refunds: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
+  sales_order_refund_inbox_adoptions: { kind: 'MUST_BE_EMPTY', reason: 'which returns-inbox arrivals a refund adopted: runtime history a first load starts without' },
   sales_order_refund_deletions: { kind: 'MUST_BE_EMPTY', reason: 'records of refunds deleted in error: runtime history a first load starts without' },
   sales_orders: { kind: 'MUST_BE_EMPTY', reason: 'sales orders and their refunds' },
   sessions: { kind: 'CONFIG_ALLOWED', reason: 'login sessions of operators' },

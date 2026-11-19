@@ -393,6 +393,7 @@ function makeRow(overrides: Partial<EmailOutboxRow> = {}): EmailOutboxRow {
     processingStartedAt: null,
     lockedBy: null,
     staleReclaimCount: 0,
+    sendEnteredAt: null,
     ...overrides,
   }
 }
@@ -441,7 +442,7 @@ type PauseWorld = {
  */
 async function runPauseInterleaving(options: MakeClientOptions): Promise<PauseWorld> {
   const deliveries: string[] = []
-  const { client, rows, updateManyCalls } = await makeClient([makeRow()], options)
+  const { client, rows, updateManyCalls } = await makeClient([makeRow({ kind: 'PURCHASE_ORDER' })], options)
   let reclaimHappened = false
 
   const workerA = await drain({
@@ -573,7 +574,7 @@ const T_FOURTH_TICK = new Date('2026-09-10T12:00:00.000Z')
 test('o3d-hpeg: successive reclaims are CAPPED — the third worker is refused, the row PARKED, two copies at most', async () => {
   const deliveries: string[] = []
   const logged: Array<Record<string, unknown>> = []
-  const { client, rows, updateManyCalls } = await makeClient([makeRow()])
+  const { client, rows, updateManyCalls } = await makeClient([makeRow({ kind: 'PURCHASE_ORDER' })])
   let bReclaimed = false
   let workerB: Awaited<ReturnType<typeof drain>> | undefined
   let workerC: Awaited<ReturnType<typeof drain>> | undefined
@@ -707,7 +708,7 @@ test('o3d-hpeg: the cap is checked by the RECLAIM STATEMENT, not on the swept co
   let workerC: Promise<Awaited<ReturnType<typeof drain>>> | undefined
 
   const { client, rows } = await makeClient(
-    [makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'holder-A' })],
+    [makeRow({ kind: 'PURCHASE_ORDER', status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'holder-A', sendEnteredAt: T0 })],
     {
       async pauseBeforeFirstReclaim() {
         workerC = drain({
@@ -772,7 +773,7 @@ test('REAL: the fence refuses a writer whose TOKEN no longer matches, even when 
   // land. This is the state a future settlement that forgot to null `processingStartedAt` would
   // leave behind, and the reason the column exists rather than the timestamp being trusted as an
   // identity — a timestamp is not one.
-  const { client, rows, updateManyCalls } = await makeClient([makeRow()])
+  const { client, rows, updateManyCalls } = await makeClient([makeRow({ kind: 'PURCHASE_ORDER' })])
   const outcome = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() {
@@ -789,7 +790,7 @@ test('REAL: the fence refuses a writer whose TOKEN no longer matches, even when 
 
 test('REAL: the fence refuses a writer whose CLAIM INSTANT no longer matches, even when the token does', async () => {
   // The mirror image, making `processingStartedAt` independently load-bearing.
-  const { client, rows, updateManyCalls } = await makeClient([makeRow()])
+  const { client, rows, updateManyCalls } = await makeClient([makeRow({ kind: 'PURCHASE_ORDER' })])
   const outcome = await drain({
     client, now: () => T0, prepareQueuedEmail: noPrepare, logActivity: noLog,
     async sendEmail() {
@@ -819,7 +820,7 @@ test('REAL: the fence refuses a writer whose CLAIM INSTANT no longer matches, ev
 for (const settlePath of ['a successful send', 'a failed send', 'a thrown send'] as const) {
   test(`REAL: the fence refuses the terminal write of ${settlePath} too`, async () => {
     const deliveries: string[] = []
-    const { client, rows, updateManyCalls } = await makeClient([makeRow()])
+    const { client, rows, updateManyCalls } = await makeClient([makeRow({ kind: 'PURCHASE_ORDER' })])
     let reclaimHappened = false
 
     const workerA = await drain({
@@ -966,7 +967,7 @@ test('a reclaimed worker cannot write a suppression FAILED over the winner', asy
   // suppression lookup only, so worker B — started from inside it — takes the suppressed branch
   // normally and settles the row it has just reclaimed.
   const { client, rows } = await makeClient(
-    [makeRow()],
+    [makeRow({ kind: 'PURCHASE_ORDER' })],
     {
       suppressions: { 'customer@example.test': { id: 'sup-1', reason: 'hard bounce' } },
       pauseOnFirstSuppressionLookup: async () => {
@@ -3505,4 +3506,104 @@ test('ERASURE control: an unchanged recipient is sent normally, so the refusals 
   })
   assert.deepEqual(deliveries, ['customer@example.test'])
   assert.equal(rows[0].status, 'SENT')
+})
+
+// ---------------------------------------------------------------------------
+// Owner decision 2026-11-18, round-1 review (o3d-hpeg follow-up): a CUSTOMER kind is NEVER reclaimed on elapsed time. A worker that died after the
+// DATA command was accepted leaves the row PROCESSING; a reclaim would send the customer a second copy. Only the purchase order (which has its own
+// delivery-boundary guard and a 60 s deadline) keeps its one reclaim.
+// ---------------------------------------------------------------------------
+test('a stale PROCESSING row of a CUSTOMER kind is PARKED as outcome unknown, never reclaimed or re-sent', async () => {
+  const deliveries: string[] = []
+  const logged: Array<Record<string, unknown>> = []
+  const { client, rows } = await makeClient([makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'dead-holder', sendEnteredAt: T0 })])
+  const result = await drain({
+    client,
+    now: () => T_RECLAIM,
+    prepareQueuedEmail: noPrepare,
+    logActivity: async (entry: Record<string, unknown>) => { logged.push(entry) },
+    async sendEmail() {
+      deliveries.push('reclaimer')
+      return { success: true }
+    },
+  })
+  assert.deepEqual(deliveries, [], 'the sender was never entered')
+  assert.equal(result.processed, 0)
+  assert.equal(result.parked, 1)
+  assert.equal(rows[0].status, 'PARKED_SEND_CAP')
+  assert.equal(rows[0].staleReclaimCount, 0, 'not a reclaim')
+  assert.match(String((rows[0] as { lastError?: string }).lastError ?? ''), /Outcome unknown/)
+  assert.match(String(logged[0]?.description ?? ''), /may or may not have reached the recipient/)
+})
+
+test('a stale PROCESSING row of a customer kind whose worker NEVER entered the sender is requeued and sent, not parked as "may have reached the recipient"', async () => {
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'dead-holder', sendEnteredAt: null })])
+  const result = await drain({
+    client,
+    now: () => T_RECLAIM,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      deliveries.push('retry')
+      return { success: true }
+    },
+  })
+  assert.equal(result.parked, 0)
+  assert.deepEqual(deliveries, ['retry'], 'nothing had been sent, so the retry is the first send')
+  assert.equal(rows[0].status, 'SENT')
+  assert.equal(rows[0].staleReclaimCount, 0, 'not counted as a reclaim')
+  assert.equal(rows[0].attempts, 1, 'but the requeue counts as an attempt')
+})
+
+test('a stale never-entered row whose preparation keeps stalling is PARKED after the requeue cap, with an operator notice, and never sent', async () => {
+  let sends = 0
+  const logged: Array<{ description?: string }> = []
+  const { client, rows } = await makeClient([makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'dead-holder', sendEnteredAt: null, attempts: 3 })])
+  // Round 1: the 4th attempt (a requeue). Its preparation stalls, so the row is claimed but never settled.
+  await drain({
+    client, now: () => T_RECLAIM,
+    prepareQueuedEmail: async () => { throw new Error('preparation hangs') },
+    logActivity: async (e: { description?: string }) => { logged.push(e) },
+    async sendEmail() { sends++; return { success: true } },
+  })
+  assert.equal(sends, 0)
+  // The worker died mid-prepare: put the row back as the stale PROCESSING row it would be, at the last attempt.
+  rows[0].status = 'PROCESSING'; rows[0].processingStartedAt = T0; rows[0].sendEnteredAt = null; rows[0].lockedBy = 'dead-holder'; rows[0].attempts = 4
+  logged.length = 0
+  const r = await drain({
+    client, now: () => T_RECLAIM, prepareQueuedEmail: noPrepare,
+    logActivity: async (e: { description?: string }) => { logged.push(e) },
+    async sendEmail() { sends++; return { success: true } },
+  })
+  assert.equal(r.parked, 1)
+  assert.equal(sends, 0, 'nothing was ever sent')
+  assert.equal(rows[0].status, 'PARKED_SEND_CAP')
+  assert.match(String((rows[0] as { lastError?: string }).lastError ?? ''), /Preparation never completed/)
+  assert.match(String(logged[0]?.description ?? ''), /nothing was sent/)
+})
+
+test('the purchase order keeps its single reclaim (it has its own delivery-boundary guard)', async () => {
+  const { staleReclaimCapForKind, EMAIL_MAX_STALE_RECLAIMS } = await import('@/lib/email-outbox')
+  const { PURCHASE_ORDER_EMAIL_KIND } = await import('@/lib/purchase-order-email')
+  assert.equal(staleReclaimCapForKind(PURCHASE_ORDER_EMAIL_KIND), EMAIL_MAX_STALE_RECLAIMS)
+  for (const kind of ['ACCOUNTING_INVOICE', 'ORDER_CONFIRMATION', 'DISPATCH', 'QUOTATION']) assert.equal(staleReclaimCapForKind(kind), 0, kind)
+})
+
+test('every customer send carries a deadline shorter than the stale window, so a reclaim cannot happen while a send runs', async () => {
+  const { EMAIL_DEFAULT_SEND_DEADLINE_MS } = await import('@/lib/email-outbox')
+  assert.ok(EMAIL_DEFAULT_SEND_DEADLINE_MS > 0 && EMAIL_DEFAULT_SEND_DEADLINE_MS < 15 * 60 * 1000, 'under the 15-minute stale window')
+  const seen: Array<number | undefined> = []
+  const { client } = await makeClient([makeRow()])
+  await drain({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail(opts: { deadlineMs?: number }) {
+      seen.push(opts.deadlineMs)
+      return { success: true }
+    },
+  } as unknown as EmailOutboxHarness)
+  assert.deepEqual(seen, [EMAIL_DEFAULT_SEND_DEADLINE_MS])
 })
