@@ -328,6 +328,9 @@ const ALLOWLIST = [
   // `connector: 'mintsoft'` and writes Mintsoft-worded receipts); it is misfiled under
   // lib/domain/wms/ and belongs under lib/connectors/mintsoft/ — tracked in o3d-c79v.
   'lib/domain/wms/booked-in-service.ts',
+  // The companion-plugin probe of the legacy bridge plugin: a named FILE whose content is the bridge's own slug (`wc-mintsoft-sync`), a WooCommerce plugin
+  // that is retired at switchover step M. It talks to the storefront, not to a warehouse API, and nothing generic imports its connector name.
+  'lib/connectors/woocommerce/incumbent-plugins.ts',
   'app/(dashboard)/sync/mintsoft-client.tsx',
   'app/(dashboard)/sync/mintsoft-courier-map.tsx',
   'app/(dashboard)/sync/wms-sync-panel.tsx',

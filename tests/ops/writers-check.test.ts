@@ -30,7 +30,7 @@ import {
 const NOW = new Date('2026-10-20T12:00:00Z')
 const CUTOFF = '2026-10-10T00:00:00Z'
 
-const ALL_ON = new Map<string, string>([['xero_sync_enabled', 'true'], ['xero_daily_batch_enabled', 'true'], ['wc_stock_sync_enabled', 'true'], ['wc_fx_push_enabled', 'true'], ['trackship_refire_enabled', 'true'], ['mintsoft_parent_sku_delete_enabled', 'true'], ['wc_invoice_document_enabled', 'true']])
+const ALL_ON = new Map<string, string>([['xero_sync_enabled', 'true'], ['xero_daily_batch_enabled', 'true'], ['wc_stock_sync_enabled', 'true'], ['wc_fx_push_enabled', 'true'], ['trackship_refire_enabled', 'true'], ['mintsoft_parent_sku_delete_enabled', 'true'], ['wc_invoice_document_enabled', 'true'], ['wc_invoice_note_enabled', 'true'], ['wc_withdrawal_outcome_enabled', 'true']])
 
 /** Every step evidence source answering clean: attestations present long before any live-from instant, probes clean, no offending rows. */
 export function cleanStepEvidence(): Record<StepEvidenceKind, StepEvidenceReading> {

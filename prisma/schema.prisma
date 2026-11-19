@@ -2004,6 +2004,10 @@ model SalesOrder {
   /// a newer resubmission; without a version it would overwrite the newer
   /// state and leave the generation stale. Older events are ignored.
   withdrawalLastWcEventAt DateTime?
+  /// The storefront withdrawal plugin's request id for the order's CURRENT request (from the helper plugin's `_oti_wdraw_request_id` order meta). IMS's own
+  /// record: the withdrawal outcome writer sends it, so a rejection never depends on a meta only the bridge wrote.
+  withdrawalRequestId String?
+  wcWithdrawalOutcomes WcWithdrawalOutcome[]
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
@@ -4654,6 +4658,8 @@ enum WmsOperatorTaskReason {
   WC_EDIT_AFTER_PICKING
   /// A shipped unit was returned and refunded, so IMS still owes the customer those units but the warehouse push netted the gross refund: a person asks the warehouse to send the remainder. IMS changes no quantity at the warehouse.
   REFUND_REMAINDER_DUE
+  /// An EU withdrawal request filed after despatch could not be rejected on the storefront (no request id known, withdrawal plugin missing, or the write failed): a person rejects it in WooCommerce.
+  WITHDRAWAL_REJECT_NOT_WRITTEN
   /// Merge hold (setting wms_merge_hold_enabled): IMS held every order of a same-customer group in the warehouse so a person can merge them there. Carries the EU and FedEx warnings.
   MERGE_HOLD
   /// A merge hold has stood longer than MERGE_HOLD_REMIND_HOURS: a person has to merge and confirm the orders in the warehouse (IMS never releases a merge hold).
@@ -6275,4 +6281,62 @@ model WriterAttestation {
 
   @@index([kind, attestedAt], map: "writer_attestations_kind_attested_idx")
   @@map("writer_attestations")
+}
+
+/// The last stock quantity the drift observer saw for one WooCommerce product or variation (switchover step W). Replaced on every observation.
+model WcStockSnapshot {
+  externalProductId String   @id @map("external_product_id")
+  sku               String?
+  quantity          Int?
+  observedAt        DateTime @map("observed_at")
+
+  @@map("wc_stock_snapshots")
+}
+
+/// A WooCommerce stock change that no order, refund or IMS push explains: Qoblex (or somebody) is still writing stock. Append-only.
+model WcStockDriftEvent {
+  id                 String   @id @default(cuid())
+  externalProductId  String   @map("external_product_id")
+  sku                String?
+  fromQuantity       Int?     @map("from_quantity")
+  toQuantity         Int?     @map("to_quantity")
+  previousObservedAt DateTime @map("previous_observed_at")
+  observedAt         DateTime @map("observed_at")
+
+  @@index([observedAt], map: "wc_stock_drift_events_observed_idx")
+  @@map("wc_stock_drift_events")
+}
+
+/// One look of the drift observer. `ok` only when the whole catalogue was read and every snapshot saved.
+model WcStockDriftRun {
+  id           String    @id @default(cuid())
+  startedAt    DateTime  @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+  ok           Boolean   @default(false)
+  productsSeen Int       @default(0) @map("products_seen")
+  driftFound   Int       @default(0) @map("drift_found")
+
+  @@index([startedAt], map: "wc_stock_drift_runs_started_idx")
+  @@map("wc_stock_drift_runs")
+}
+
+/// THE ONCE-ONLY RECORD of a withdrawal outcome written to the storefront: one row per (order, request, outcome kind). The identity is the withdrawal request,
+/// never a modified time, so a later change to the order (a tracking update, an admin edit, the plugin's own save) cannot make a second note.
+model WcWithdrawalOutcome {
+  id          String   @id @default(cuid())
+  orderId     String   @map("order_id")
+  /// `r<request id>` when IMS knows the storefront request, else the fixed `u:<order id>`; `x:<order id>:<request id>` marks an ambiguous-request task.
+  requestKey  String   @map("request_key")
+  /// The withdrawal log action (wc_withdrawal_approved, wc_withdrawal_after_dispatch, ...).
+  outcomeKind String   @map("outcome_kind")
+  /// The storefront's answer: noted, rejected, already_done, or task_raised (a terminal row: it could not be done and a task was raised).
+  result      String
+  writtenAt   DateTime @default(now()) @map("written_at")
+  /// The order's withdrawalHoldGeneration when the row was written; tells a later submission from the request that was handled.
+  holdGeneration Int?  @map("hold_generation")
+
+  order       SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, requestKey, outcomeKind], map: "wc_withdrawal_outcomes_once_key")
+  @@map("wc_withdrawal_outcomes")
 }
