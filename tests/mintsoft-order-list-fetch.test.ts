@@ -599,8 +599,14 @@ test('[o3d-6j8] drift lock: every dispatch-relevant row field read by this modul
   // 'Name'/'ExternalName' are read off /Order/Statuses rows rather than ORDER rows, and
   // an absent ExternalName falls back to Name (o3d-bjc.7), so neither can have its
   // absence mistaken for a fact about a dispatch.
+  // 'OrderNameValues' is read only by mintsoftRowIsMergeFlagged(), whose sole callers are the
+  // read-only legacy bridge import (lookupMintsoftOrderByNumber and its port). It decides
+  // linking/skip classification only and never dispatches: an order is never shipped, tracked or
+  // split from it. Its input is the authoritative by-id record, and the merged-number pattern
+  // (mergedParts) is checked independently, so an absent key cannot be read as a dispatch fact.
   const exempt = new Set([
     'ID', 'Id', 'OrderNumber', 'OrderStatusId', 'ClientId', 'Name', 'ExternalName', 'Part',
+    'OrderNameValues',
   ])
 
   // Every PascalCase field read off a raw order/row/detail/record object.
