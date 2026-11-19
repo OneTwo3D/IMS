@@ -230,7 +230,7 @@ ERASURE_CLASSIFICATION.RefusedAction = {
 // from SKUs, quantities and amounts only (never a payload's free text, name, address or note), so nothing is erased and no free-text guard is needed.
 ERASURE_CLASSIFICATION.WcOrderDivergence = {
   erased: [],
-  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution'],
+  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution', 'amendmentClaim'],
   retained: {},
 }
 // Once-only record of a withdrawal outcome written to the storefront: the order id, a request key (`r<request id>` / `u:<order id>` / `x:<order id>:<request id>`), the outcome kind (a log action code) and a result code. Ids and codes: no name, address, email or free text.

@@ -50,7 +50,9 @@ test('the section carries the base currency, the monthly sales tax per rate, the
   // The window is a parameter of the sales statement, and the statement leaves out cancelled and archived orders (the IMS VAT report's own population).
   const sales = client.sent.find((s) => /FROM sales_order_lines/.test(s.sql))!
   assert.deepEqual(sales.values, [WINDOW.from, WINDOW.toExclusive])
-  assert.match(sales.sql, /so\."invoicedAt" >= \$1::date AND so\."invoicedAt" < \$2::date/)
+  // o3d-oe1b0: the month and the window are LONDON days (the calendar of the Xero invoice dates), not UTC ones.
+  assert.match(sales.sql, /to_char\(\(so\."invoicedAt" AT TIME ZONE 'UTC'\) AT TIME ZONE 'Europe\/London', 'YYYY-MM'\)/)
+  assert.match(sales.sql, /so\."invoicedAt" >= \(\$1::date::timestamp AT TIME ZONE 'Europe\/London'\) AT TIME ZONE 'UTC' AND so\."invoicedAt" < \(\$2::date::timestamp AT TIME ZONE 'Europe\/London'\) AT TIME ZONE 'UTC'/)
   assert.match(sales.sql, /so\.status::text <> 'CANCELLED'/)
   assert.match(sales.sql, /so\.archived = false/)
   assert.match(sales.sql, /SUM\(l\."taxBase"\)/)

@@ -402,6 +402,22 @@ test(
     // STEP 2: cancel the dispatch. The units have landed, so this must refuse —
     // restoring them to source would put the same ten units in two warehouses and,
     // worse, give them a second live cost layer.
+    //
+    // Two guards stand in front of the restore. While the transfer's ASN is open and the alignment
+    // credited units against it, the ASN guard (o3d-zz37l) refuses first, with its own message; the
+    // landed-quantity check (the subject of this test) is what refuses once the ASN no longer
+    // blocks, so the test closes the ASN and asks again. Both refusals must leave the stock alone.
+    const asnRefusal = await cancelDispatchedTransfer(transfer.id)
+    assert.match(
+      String(asnRefusal.message),
+      /may already hold or have booked these goods/,
+      `an open ASN with units accounted must refuse the dispatch cancel, got ${JSON.stringify(asnRefusal)}`,
+    )
+    assert.notEqual(asnRefusal.success, true)
+    await db.wmsAsnMap.updateMany({
+      where: { sourceType: 'STOCK_TRANSFER', sourceId: transfer.id },
+      data: { closedAt: new Date() },
+    })
     const result = await cancelDispatchedTransfer(transfer.id)
     assert.match(
       String(result.message),

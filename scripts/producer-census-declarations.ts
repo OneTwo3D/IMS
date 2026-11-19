@@ -108,7 +108,7 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Asks the shopping facade to push the edited products\' stock to the storefront.'),
   d('lib/products/csv-roundtrip/sync-sweep.ts::runProductSyncSweep::enqueueStockSync#2', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of archived edited products, forced so the storefront is told they are gone.'),
-  d('app/actions/import.ts::importOpeningStockCsv::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+  d('app/actions/import.ts::importOpeningStockCsvInner::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/manufacturing.ts::updateManufacturingOrderStatus::queueAccountingSyncTx#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
     'Queues MANUFACTURING_JOURNAL when a manufacturing order completes.'),
