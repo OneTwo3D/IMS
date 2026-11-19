@@ -8,7 +8,8 @@ import {
   type ReservationBreakdownRow,
 } from '@/lib/domain/inventory/reservation-breakdown'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { startOfNextUtcDay } from '@/lib/domain/math/date-window'
+import { businessDateYmd } from '@/lib/business-date'
+import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -375,6 +376,10 @@ function parseDateOnly(value: string | undefined, fallback: Date): Date {
   return new Date(Date.UTC(year!, month! - 1, day!, 0, 0, 0, 0))
 }
 
+function businessDayLabel(instant: Date): Date {
+  return parseDateOnly(businessDateYmd(instant), instant)
+}
+
 function formatDateOnly(value: Date): string {
   return value.toISOString().slice(0, 10)
 }
@@ -728,23 +733,18 @@ async function loadReservationSnapshotRun(
   }) as ReservationSnapshotRunReportRow | null
 }
 
-function isEndOfUtcDay(value: Date): boolean {
-  return value.getUTCHours() === 23 &&
-    value.getUTCMinutes() === 59 &&
-    value.getUTCSeconds() === 59 &&
-    value.getUTCMilliseconds() === 999
-}
-
 function isReservationSnapshotEligibleSource(source: string): boolean {
   return source === 'snapshot_forward_replay' || source === 'future_snapshot_reverse_replay'
 }
 
 function snapshotDateFromAsOf(asOf: string): Date | null {
-  // getOnHandAsOf date-only inputs return end-of-day UTC. Reservation snapshots
-  // are daily end-of-day evidence, so mid-day asOf values cannot use them.
+  // getOnHandAsOf date-only inputs return the last millisecond of the London business day (22:59:59.999Z in BST, 23:59:59.999Z in GMT). Reservation
+  // snapshots are daily end-of-day evidence labelled by that London day, so mid-day asOf values cannot use them.
   const value = new Date(asOf)
-  if (Number.isNaN(value.getTime()) || !isEndOfUtcDay(value)) return null
-  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()))
+  if (Number.isNaN(value.getTime())) return null
+  const [year, month, day] = businessDateYmd(value).split('-').map(Number)
+  const label = new Date(Date.UTC(year!, month! - 1, day!))
+  return startOfNextBusinessDay(label).getTime() - 1 === value.getTime() ? label : null
 }
 
 function reservationScopeFromCounts(input: {
@@ -1153,14 +1153,18 @@ export async function getNegativeStockReport(
   const getOnHandAsOf = options.deps?.getOnHandAsOf ?? defaultGetOnHandAsOf
   const now = options.now?.() ?? new Date()
   const defaultFrom = subtractDays(now, DEFAULT_NEGATIVE_STOCK_LOOKBACK_DAYS)
-  const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
-  const dateTo = parseDateOnly(filters.dateTo, now)
-  const dateToExclusive = startOfNextUtcDay(dateTo)
-  // The opening balance is the end of the previous UTC day; movements inside
-  // dateFrom..dateTo are then replayed inclusively to find the trough.
+  // dateFrom/dateTo name London business days (the day convention getOnHandAsOf and the snapshots use), so the default window is the London day of
+  // `defaultFrom`/`now`, and the movement window below is bounded by London midnights, not UTC ones (an hour off in BST).
+  const dateFrom = parseDateOnly(filters.dateFrom, businessDayLabel(defaultFrom))
+  const dateTo = parseDateOnly(filters.dateTo, businessDayLabel(now))
+  // The opening balance is the end of the previous London day; movements inside
+  // dateFrom..dateTo are then replayed inclusively to find the trough. The window
+  // starts exactly where the opening balance ends, so no movement falls in the gap.
   const openingAsOf = subtractDays(dateFrom, 1)
+  const windowStart = startOfNextBusinessDay(openingAsOf)
+  const dateToExclusive = startOfNextBusinessDay(dateTo)
   const movementWhere: Prisma.StockMovementWhereInput = {
-    createdAt: { gte: dateFrom, lt: dateToExclusive },
+    createdAt: { gte: windowStart, lt: dateToExclusive },
     ...(filters.warehouseId
       ? { OR: [{ fromWarehouseId: filters.warehouseId }, { toWarehouseId: filters.warehouseId }] }
       : {}),

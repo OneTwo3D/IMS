@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { LandedCostMethod, Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -1567,7 +1568,8 @@ async function loadWarehouseMetas(warehouseIds: string[]): Promise<Map<string, W
 }
 
 export async function getInventoryValuationReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<InventoryValuationReport> {
-  const asOf = filters.asOf ?? today()
+  // Default "today" is the London business day, the day convention getOnHandAsOf names its date-only as-of by.
+  const asOf = filters.asOf ?? businessDateYmd(new Date())
   const snapshot = await getOnHandAsOf({
     asOf,
     warehouseId: filters.warehouseId,

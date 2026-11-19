@@ -46,18 +46,29 @@ function createClient(input: {
     categoryId?: string
   }>
   postAsOfRevaluations?: Array<{ productId?: string; warehouseId?: string; effectiveAt: Date }>
+  /** Stored inventory_snapshot_runs.cutoffAt by snapshot label (YYYY-MM-DD); absent = no stored cutoff. */
+  runCutoffs?: Record<string, Date>
 } = {}): OnHandAsOfClient {
   return {
+    inventorySnapshotRun: {
+      findUnique: async (args: unknown) => {
+        const label = (args as { where: { snapshotDate: Date } }).where.snapshotDate.toISOString().slice(0, 10)
+        const cutoffAt = input.runCutoffs?.[label]
+        return cutoffAt ? { cutoffAt } : null
+      },
+    },
     inventorySnapshot: {
       findFirst: async (args: unknown) => {
         const query = args as {
-          where?: { snapshotDate?: { lte?: Date; gt?: Date } }
+          where?: { snapshotDate?: { lte?: Date; lt?: Date; gt?: Date; gte?: Date } }
           orderBy?: { snapshotDate?: 'asc' | 'desc' }
         }
         const dateFilter = query.where?.snapshotDate
         const rows = [...(input.snapshots ?? [])]
           .filter((row) => (
             (!dateFilter?.lte || row.snapshotDate <= dateFilter.lte) &&
+            (!dateFilter?.lt || row.snapshotDate < dateFilter.lt) &&
+            (!dateFilter?.gte || row.snapshotDate >= dateFilter.gte) &&
             (!dateFilter?.gt || row.snapshotDate > dateFilter.gt)
           ))
           .sort((a, b) => query.orderBy?.snapshotDate === 'asc'
@@ -404,7 +415,7 @@ test('getOnHandAsOf replays movements forward from the nearest prior snapshot', 
         toWarehouseId: 'warehouse-1',
         qty: decimal('99'),
         totalValueBase: decimal('99'),
-        createdAt: new Date('2026-05-27T23:59:59.999Z'),
+        createdAt: new Date('2026-05-27T22:59:59.999Z'),
       },
       {
         id: 'next-day-midnight',
@@ -413,7 +424,7 @@ test('getOnHandAsOf replays movements forward from the nearest prior snapshot', 
         toWarehouseId: 'warehouse-1',
         qty: decimal('1'),
         totalValueBase: decimal('2'),
-        createdAt: new Date('2026-05-28T00:00:00.000Z'),
+        createdAt: new Date('2026-05-27T23:00:00.000Z'),
       },
       {
         id: 'inbound',
@@ -839,7 +850,7 @@ function captureMovementRanges(base: OnHandAsOfClient): {
   return { client, ranges }
 }
 
-test('getOnHandAsOf forward replay bounds a date-only as-of with a half-open next-day boundary', async () => {
+test('getOnHandAsOf forward replay bounds a date-only as-of with a half-open next London midnight boundary', async () => {
   const base = createClient({
     snapshots: [{
       snapshotDate: new Date('2026-05-27T00:00:00.000Z'),
@@ -867,7 +878,7 @@ test('getOnHandAsOf forward replay bounds a date-only as-of with a half-open nex
   assert.ok(ranges.length > 0)
   for (const range of ranges) {
     assert.equal(range.lte, undefined)
-    assert.deepEqual(range.lt, new Date('2026-05-29T00:00:00.000Z'))
+    assert.deepEqual(range.lt, new Date('2026-05-28T23:00:00.000Z'))
   }
 })
 
@@ -931,7 +942,7 @@ test('getOnHandAsOf reverse replay reverses out only movements from the next day
   assert.ok(ranges.length > 0)
   for (const range of ranges) {
     assert.equal(range.gt, undefined)
-    assert.deepEqual(range.gte, new Date('2026-05-29T00:00:00.000Z'))
+    assert.deepEqual(range.gte, new Date('2026-05-28T23:00:00.000Z'))
   }
 })
 
@@ -974,4 +985,142 @@ test('getOnHandAsOf current reverse replay reverses a midnight movement when now
     valueBase: '20.000000',
     unitCostBase: '2.000000',
   }])
+})
+
+// ---------------------------------------------------------------------------
+// London business-day anchoring (o3d-cr517 #2). Snapshots are labelled by London day and end at
+// cutoffAt = start of the next London day: 23:00Z in BST, 00:00Z in GMT. The as-of path must use that
+// boundary, never a UTC midnight.
+// ---------------------------------------------------------------------------
+
+function inbound(id: string, qty: number, createdAt: string): MovementFixture {
+  return {
+    id,
+    productId: 'product-1',
+    fromWarehouseId: null,
+    toWarehouseId: 'warehouse-1',
+    qty: decimal(qty),
+    totalValueBase: decimal(qty),
+    createdAt: new Date(createdAt),
+  }
+}
+
+function snapshot(label: string, qty: number) {
+  return {
+    snapshotDate: new Date(`${label}T00:00:00.000Z`),
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: decimal(qty),
+    valueBase: decimal(qty),
+  }
+}
+
+const NOW = () => new Date('2026-08-01T12:00:00.000Z')
+
+test('BST forward replay: a movement at 23:30Z on the snapshot day is after the London cutoff and is replayed', async () => {
+  // Snapshot 2026-07-01 (London) holds movements before 2026-07-01T23:00Z. 23:30Z is London 2 July, so
+  // as-of end of 2 July must include it (a UTC-midnight forward start would skip it).
+  const client = createClient({
+    snapshots: [snapshot('2026-07-01', 10)],
+    movements: [
+      inbound('inside-snapshot', 100, '2026-07-01T22:59:59.999Z'),
+      inbound('bst-late-evening', 5, '2026-07-01T23:30:00.000Z'),
+    ],
+  })
+  const result = await getOnHandAsOf({ client, asOf: '2026-07-02', now: NOW })
+  assert.equal(result.source, 'snapshot_forward_replay')
+  assert.equal(result.rows[0]!.qty, '15.000000')
+})
+
+test('BST forward replay: a movement after the London end of the as-of day is excluded', async () => {
+  const client = createClient({
+    snapshots: [snapshot('2026-07-01', 10)],
+    movements: [
+      inbound('in-day', 5, '2026-07-02T22:59:59.999Z'),
+      inbound('next-london-day', 7, '2026-07-02T23:00:00.000Z'),
+    ],
+  })
+  const result = await getOnHandAsOf({ client, asOf: '2026-07-02', now: NOW })
+  assert.equal(result.rows[0]!.qty, '15.000000')
+})
+
+test('BST reverse replay: undoes the 23:30Z movement of the day after asOf and keeps one the snapshot never held', async () => {
+  // Future snapshot 2026-07-02 ends at 2026-07-02T23:00Z. As-of end of 1 July = 2026-07-01T23:00Z.
+  //  - 07-01T23:30Z (London 2 July): inside the snapshot, after as-of -> must be reversed out.
+  //  - 07-02T23:30Z (London 3 July): NOT in the snapshot -> must not be reversed (UTC anchor undid it).
+  const client = createClient({
+    snapshots: [snapshot('2026-07-02', 100)],
+    movements: [
+      inbound('after-asof-in-snapshot', 5, '2026-07-01T23:30:00.000Z'),
+      inbound('never-in-snapshot', 40, '2026-07-02T23:30:00.000Z'),
+    ],
+  })
+  const result = await getOnHandAsOf({ client, asOf: '2026-07-01', now: NOW })
+  assert.equal(result.source, 'future_snapshot_reverse_replay')
+  assert.equal(result.rows[0]!.qty, '95.000000')
+})
+
+test('GMT control: London day equals the UTC day, boundaries are UTC midnights', async () => {
+  const forward = createClient({
+    snapshots: [snapshot('2026-01-10', 10)],
+    movements: [
+      inbound('inside-snapshot', 100, '2026-01-10T23:59:59.999Z'),
+      inbound('next-day', 5, '2026-01-11T00:00:00.000Z'),
+      inbound('after-asof', 7, '2026-01-12T00:00:00.000Z'),
+    ],
+  })
+  const fwd = await getOnHandAsOf({ client: forward, asOf: '2026-01-11', now: () => new Date('2026-02-01T12:00:00.000Z') })
+  assert.equal(fwd.rows[0]!.qty, '15.000000')
+
+  const reverse = createClient({
+    snapshots: [snapshot('2026-01-12', 100)],
+    movements: [
+      inbound('in-day', 3, '2026-01-11T23:59:59.999Z'),
+      inbound('after', 5, '2026-01-12T00:00:00.000Z'),
+    ],
+  })
+  const rev = await getOnHandAsOf({ client: reverse, asOf: '2026-01-11', now: () => new Date('2026-02-01T12:00:00.000Z') })
+  assert.equal(rev.rows[0]!.qty, '95.000000')
+})
+
+test('a stored run cutoffAt overrides the derived London boundary (backfilled UTC-cutoff runs)', async () => {
+  // A backfilled run stamps its own UTC cutoff: 2026-07-02T00:00Z for label 2026-07-01. The 23:30Z
+  // movement is inside that snapshot, so forward replay must NOT re-apply it.
+  const client = createClient({
+    snapshots: [snapshot('2026-07-01', 10)],
+    runCutoffs: { '2026-07-01': new Date('2026-07-02T00:00:00.000Z') },
+    movements: [
+      inbound('inside-backfill-snapshot', 100, '2026-07-01T23:30:00.000Z'),
+      inbound('after', 5, '2026-07-02T00:00:00.000Z'),
+    ],
+  })
+  const result = await getOnHandAsOf({ client, asOf: '2026-07-02', now: NOW })
+  assert.equal(result.rows[0]!.qty, '15.000000')
+})
+
+test('a date-only as-of for the current London day reads live state, even after 23:00Z in BST', async () => {
+  // 2026-07-01T23:30Z is London 00:30 on 2 July; as-of 2026-07-02 is today in London, so it is not an ended day.
+  const client = createClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('8') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('8'), unitCostBase: decimal('1') }],
+  })
+  const result = await getOnHandAsOf({ client, asOf: '2026-07-02', now: () => new Date('2026-07-01T23:30:00.000Z') })
+  assert.equal(result.source, 'current')
+  await assert.rejects(
+    getOnHandAsOf({ client, asOf: '2026-07-03', now: () => new Date('2026-07-01T23:30:00.000Z') }),
+    InventoryAsOfFutureError,
+  )
+})
+
+test('a precise instant inside the snapshot day anchors on the previous snapshot, not the same-day one', async () => {
+  const client = createClient({
+    snapshots: [snapshot('2026-07-01', 10), snapshot('2026-07-02', 50)],
+    movements: [
+      inbound('morning', 5, '2026-07-02T08:00:00.000Z'),
+      inbound('evening', 30, '2026-07-02T20:00:00.000Z'),
+    ],
+  })
+  const result = await getOnHandAsOf({ client, asOf: new Date('2026-07-02T12:00:00.000Z'), now: NOW })
+  assert.equal(result.anchorDate, '2026-07-01')
+  assert.equal(result.rows[0]!.qty, '15.000000')
 })
