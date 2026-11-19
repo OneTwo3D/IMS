@@ -245,7 +245,7 @@ export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; con
         action: RESOLUTION_ACTION,
         tag: 'cutover',
         description: `Legacy bridge import: operator decided WooCommerce order #${entry.wcNumber} (Mintsoft order ${entry.mintsoftOrderId ?? entry.verifyOrderId ?? entry.mintsoftRead?.id ?? 'none'}) is "${entry.decision}" after checking Mintsoft by hand (${entry.kinds.join(', ')}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}.`,
-        metadata: { connector: entry.connector, wcOrderId: entry.wcOrderId, wcNumber: entry.wcNumber, decision: entry.decision, signature: entry.signature, kinds: entry.kinds, mintsoftOrderId: entry.mintsoftOrderId, verifyOrderId: entry.verifyOrderId, queued: entry.queued, bridgeStopped: entry.bridgeStopped, mintsoftRead: entry.mintsoftRead ?? null },
+        metadata: { connector: entry.connector, wcOrderId: entry.wcOrderId, wcNumber: entry.wcNumber, decision: entry.decision, signature: entry.signature, kinds: entry.kinds, mintsoftOrderId: entry.mintsoftOrderId, verifyOrderId: entry.verifyOrderId, queued: entry.queued, bridgeStopped: entry.bridgeStopped, bridgeEntries: entry.bridgeEntries ?? [], mintsoftRead: entry.mintsoftRead ?? null },
         resolveUser: false,
       })
     },
@@ -277,15 +277,16 @@ export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; con
     },
     async recordApply(entry) {
       const resolveOnly = entry.resolveOnly !== null
-      const fence = entry.bridgeFenceCleared !== null ? `; the bridge host's manual-reconcile fence and mint journal were attested clear by ${entry.bridgeFenceCleared.by}` : '; the bridge host fence attestation was NOT given'
+      const fence = entry.bridgeFenceCleared !== null ? `; the bridge host's manual-reconcile fence and mint journal were attested resolved (every entry looked up in Mintsoft, then linked or cancelled) by ${entry.bridgeFenceCleared.by}` : '; the bridge host fence attestation was NOT given'
+      const files = entry.bridgeFiles !== null ? `; bridge files read: minted_orders.json sha256 ${entry.bridgeFiles.journalSha256} (${entry.bridgeFiles.journalEntries} entries), manual_reconcile.json sha256 ${entry.bridgeFiles.fenceSha256} (${entry.bridgeFiles.fenceEntries} entries)` : '; the bridge host files were NOT given'
       return logActivityPersisted({
         entityType: 'SYSTEM',
         action: resolveOnly ? RESOLVE_APPLY_ACTION : APPLY_ACTION,
         tag: 'cutover',
         description: resolveOnly
-          ? `Legacy bridge import: a --resolve run wrote only ${entry.resolveOnly!.length} resolved order link(s) (connector ${entry.connector}); this is NOT the full import; bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}${fence}.`
-          : `Legacy bridge import applied (connector ${entry.connector}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}${fence}.`,
-        metadata: { connector: entry.connector, bridgeStopped: entry.bridgeStopped, bridgeFenceCleared: entry.bridgeFenceCleared, orderPrefix: entry.orderPrefix, statuses: entry.statuses, applied: entry.applied, generatedAt: entry.generatedAt, resolveOnly: entry.resolveOnly },
+          ? `Legacy bridge import: a --resolve run wrote only ${entry.resolveOnly!.length} resolved order link(s) (connector ${entry.connector}); this is NOT the full import; bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}${fence}${files}.`
+          : `Legacy bridge import applied (connector ${entry.connector}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}${fence}${files}.`,
+        metadata: { connector: entry.connector, bridgeStopped: entry.bridgeStopped, bridgeFenceCleared: entry.bridgeFenceCleared, orderPrefix: entry.orderPrefix, statuses: entry.statuses, applied: entry.applied, generatedAt: entry.generatedAt, resolveOnly: entry.resolveOnly, bridgeFiles: entry.bridgeFiles },
         resolveUser: false,
       })
     },

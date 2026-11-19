@@ -330,7 +330,7 @@ export type ResolutionDecision = (typeof RESOLUTION_DECISIONS)[number]
 /** What a decision learned from Mintsoft about the order it names (read when the decision was checked, kept with it): the id, the number Mintsoft holds, and whether it is a merge survivor. */
 export type ResolutionFound = { id: string | null; orderNumber: string | null; merged: boolean }
 
-export type BlockingQueueKind = 'verify-pending' | 'verify-exhausted' | 'sync-pending' | 'sync-pending-no-id' | 'verify-pending-no-id' | 'dead-letter-no-id'
+export type BlockingQueueKind = 'verify-pending' | 'verify-exhausted' | 'sync-pending' | 'sync-pending-no-id' | 'verify-pending-no-id' | 'dead-letter-no-id' | 'journal-unlinked' | 'fence-entry'
 
 /** The bridge gave up verifying: it cleared its pending flag, kept the id and set `_mintsoft_dead_letter`. Nothing in the bridge revisits it, and the plugin's requeue refuses it. */
 export const isVerifyExhausted = (state: LegacyOrderState): boolean => state.mintsoftOrderId === null && state.verifyOrderId !== null && !state.verifyPending && state.writebackDeadLetter
@@ -351,7 +351,9 @@ export function blockingQueueKinds(state: LegacyOrderState): BlockingQueueKind[]
   // THE SIGNALS WOOCOMMERCE ACTUALLY SHOWS FOR A FENCED ORDER (the bridge's fence is a file on the bridge host, `var/manual_reconcile.json`, and it is written exactly when WooCommerce
   // has NO id: a verify park that ran out of attempts, or a create whose journal and writeback both failed). The Mintsoft order may exist anyway, so each of these blocks until a
   // read-only lookup by order number has settled it:
-  //  - a cancelled / refunded order with a queued update or cancel and no id: a cancel the bridge REFUSED to send (a normal cancel-before-push is cleared by its sweep);
+  //  - a cancelled / refunded order with a queued update or cancel and no id. The plugin DELETES the queue entry when a cancel arrives for an order with no id and no verify marker
+  //    (flag_order_for_cancel), so this shape exists only when a verify marker was present at cancel time (and then verify-pending-no-id or dead-letter-no-id fire as well). A fenced or
+  //    journalled order cancelled WITHOUT a marker shows NOTHING in WooCommerce: it is caught only by the bridge-host files (`journal-unlinked` / `fence-entry`, see bridgeBlockingKinds);
   //  - `_mintsoft_verify_pending` with no id: a create in flight whose outcome was never recorded;
   //  - `_mintsoft_dead_letter` with no id: verification ran out (the fence), nothing revisits it.
   if (noId) {
@@ -362,11 +364,65 @@ export function blockingQueueKinds(state: LegacyOrderState): BlockingQueueKind[]
   return out
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// THE BRIDGE HOST'S TWO FILES (copies of `var/minted_orders.json` and `var/manual_reconcile.json`)
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/** One entry of the bridge's minted-order journal: WooCommerce order id -> a Mintsoft id it minted, or `intent` / `intent-unseen` (a create that may have landed). */
+export type BridgeJournalEntry = { wcOrderId: string; kind: 'id' | 'intent' | 'intent-unseen'; /** The journalled Mintsoft id (kind 'id'), else null. */ mintsoftId: string | null }
+
+/** A bridge file that cannot be read or is in a format this tool does not know: every caller refuses. */
+export class BridgeFileError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BridgeFileError'
+  }
+}
+
+const CANONICAL_ID = /^[1-9][0-9]{0,18}$/
+
+function parseObject(text: string, label: string): Record<string, unknown> {
+  let raw: unknown
+  try { raw = JSON.parse(text) } catch (error) { throw new BridgeFileError(`${label}: not valid JSON (${error instanceof Error ? error.message.slice(0, 120) : 'parse error'})`) }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new BridgeFileError(`${label}: expected a JSON object (WooCommerce order id -> value)`)
+  return raw as Record<string, unknown>
+}
+
+/**
+ * The bridge's `var/minted_orders.json`, as `_load_minted_journal` reads it: an object, key = WooCommerce order id (a canonical positive integer), value = the Mintsoft id (a positive
+ * integer or its decimal text) or the string `intent` / `intent-unseen`. ANYTHING else (a null, a float, a bool, an unknown word, a non-numeric key) is an unknown format and refuses,
+ * exactly as the bridge itself refuses (MintedJournalUnreadable): a guess here is an order that looks like it has no history.
+ */
+export function parseBridgeJournal(text: string): Map<string, BridgeJournalEntry> {
+  const raw = parseObject(text, 'bridge journal (minted_orders.json)')
+  const out = new Map<string, BridgeJournalEntry>()
+  for (const [key, value] of Object.entries(raw)) {
+    if (!CANONICAL_ID.test(key)) throw new BridgeFileError(`bridge journal (minted_orders.json): ${JSON.stringify(key)} is not a WooCommerce order id`)
+    if (value === 'intent' || value === 'intent-unseen') { out.set(key, { wcOrderId: key, kind: value, mintsoftId: null }); continue }
+    const id = typeof value === 'number' ? (Number.isSafeInteger(value) && value > 0 ? String(value) : null) : typeof value === 'string' && CANONICAL_ID.test(value.trim()) ? value.trim() : null
+    if (id === null) throw new BridgeFileError(`bridge journal (minted_orders.json): order ${key} carries an unrecognised entry ${JSON.stringify(value)}`)
+    out.set(key, { wcOrderId: key, kind: 'id', mintsoftId: id })
+  }
+  return out
+}
+
+/** The bridge's `var/manual_reconcile.json`, as `_load_manual_fence` reads it: an object, key = WooCommerce order id, value = the reason text. Every entry is a blocker. */
+export function parseBridgeFence(text: string): Map<string, string> {
+  const raw = parseObject(text, 'bridge fence (manual_reconcile.json)')
+  const out = new Map<string, string>()
+  for (const [key, value] of Object.entries(raw)) {
+    if (!CANONICAL_ID.test(key)) throw new BridgeFileError(`bridge fence (manual_reconcile.json): ${JSON.stringify(key)} is not a WooCommerce order id`)
+    out.set(key, (typeof value === 'string' ? value : JSON.stringify(value)).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 200))
+  }
+  return out
+}
+
 /**
  * What a stored decision was made ABOUT. A decision applies only while the order still looks like that: a different verify id, a newly
  * trusted id or another queued action is a different situation and the decision no longer counts.
  */
-export const resolutionSignature = (state: LegacyOrderState): string => `trusted=${state.mintsoftOrderId ?? ''};verify=${state.verifyOrderId ?? ''};queued=${state.syncPending ?? ''}`
+/** `bridge` is the order's entries in the bridge-host files (`journal:<id|intent|intent-unseen>`, `fence`), part of what a decision is about: a different journal entry is a different situation. */
+export const resolutionSignature = (state: LegacyOrderState, bridge: readonly string[] = []): string => `trusted=${state.mintsoftOrderId ?? ''};verify=${state.verifyOrderId ?? ''};queued=${state.syncPending ?? ''}${bridge.length > 0 ? `;bridge=${bridge.join(',')}` : ''}`
 
 export type ExistingLink = {
   id: string

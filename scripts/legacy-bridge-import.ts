@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 import {
@@ -14,11 +15,16 @@ import {
 import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/mintsoft/legacy-bridge-import/state'
 
 /**
- * `npm run cutover:legacy-import [-- --apply --bridge-stopped --bridge-fence-cleared --by <name>] [-- --verify-mintsoft] [-- --statuses a,b] [-- --connector id] [-- --verify-max N] [-- --json]`
+ * `npm run cutover:legacy-import [-- --apply --bridge-stopped --bridge-journal <path> --bridge-fence <path> --bridge-fence-cleared --by <name>] [-- --verify-mintsoft] [-- --statuses a,b] [-- --connector id] [-- --verify-max N] [-- --json]`
  * `npm run cutover:legacy-import -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped]`
  *
- * A full `--apply` also needs `--bridge-fence-cleared --by <name>` (an attestation, recorded in the apply audit, that on the bridge host `var/manual_reconcile.json` is resolved and empty and
- * `var/minted_orders.json` holds no `intent` / `intent-unseen` entry; IMS cannot read the bridge host). A `--resolve` / grouped apply does not need it.
+ * A full `--apply` also needs `--bridge-journal <path> --bridge-fence <path>` (COPIES of the bridge host's `var/minted_orders.json` and `var/manual_reconcile.json`, taken after the final sweep) and
+ * `--bridge-fence-cleared --by <name>` (an attestation, recorded in the apply audit with both files' sha256, that on the bridge host every entry of both files was RESOLVED, never just cleared: looked up
+ * in Mintsoft, then linked or cancelled there). Both files are parsed strictly (an unreadable file or an unknown format refuses). Every journal entry (a Mintsoft id, `intent`, `intent-unseen`) of an order
+ * WooCommerce shows no trusted Mintsoft id for is a `journal-unlinked` gate blocker, and every fence entry a `fence-entry` blocker; both are resolved like the others (`--resolve <wcOrderId> --as ours|cancelled`,
+ * checked by a read-only Mintsoft lookup: by the journal id when there is one, else by the BARE WooCommerce number). Give both files on every run, `--resolve` runs included: a decision is about the order's
+ * entries. A `--resolve` is refused while `woocommerce_order_prefix` is not empty. `--mintsoft-id <n>` (with `--resolve <one id> --as ours|cancelled`) names the Mintsoft order when the number lookup was AMBIGUOUS:
+ * it is re-read and must carry the number. A dry run or resolve run without the files or the attestation never reads MET (status `met-pending-bridge-step`, exit 3) and says what is still owed.
  *
  * Imports the legacy bridge's `_mintsoft_*` order state into IMS's own link rows (o3d-zvec.22) and prints the Step M precondition report.
  * DRY RUN BY DEFAULT: nothing is written without --apply. WooCommerce is only ever read (GET). Mintsoft is not called at all unless
@@ -52,7 +58,7 @@ import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/
  */
 
 const DISCONNECT_TIMEOUT_MS = 5_000
-const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped --bridge-fence-cleared --by <name>] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --history-days N | --history-since YYYY-MM-DD] [-- --no-drift-check] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped] | -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]'
+const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped --bridge-journal <path> --bridge-fence <path> --bridge-fence-cleared --by <name>] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --history-days N | --history-since YYYY-MM-DD] [-- --no-drift-check] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped] | -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]'
 
 type Logger = Pick<typeof console, 'log' | 'error'>
 
@@ -63,6 +69,8 @@ export type LegacyImportCliOptions = {
   stdout?: Pick<Logger, 'log'>
   stderr?: Pick<Logger, 'error'>
   disconnect?: () => Promise<void>
+  /** Reads a bridge-host file copy as UTF-8 text (default: fs.readFileSync). */
+  readFile?: (path: string) => string
   now?: () => Date
 }
 
@@ -108,6 +116,9 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
   let bridgeStopped = false
   let bridgeFenceCleared = false
   let by: string | undefined
+  let bridgeJournalPath: string | undefined
+  let bridgeFencePath: string | undefined
+  let mintsoftId: string | undefined
   let verifyMintsoft = false
   let json = false
   let noDriftCheck = false
@@ -129,6 +140,21 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
       const raw = (args[index + 1] ?? '').trim()
       if (raw.length < 2 || raw.length > 80 || raw.startsWith('--')) { stderr.error(`--by needs the operator's name (2 to 80 characters). ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
       by = raw
+      index += 1
+      continue
+    }
+    if (arg === '--bridge-journal' || arg === '--bridge-fence') {
+      const raw = args[index + 1]
+      if (raw === undefined || raw === '' || raw.startsWith('--')) { stderr.error(`${arg} needs the path of the copy of the bridge host file. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+      if (arg === '--bridge-journal') bridgeJournalPath = raw
+      else bridgeFencePath = raw
+      index += 1
+      continue
+    }
+    if (arg === '--mintsoft-id') {
+      const raw = args[index + 1]
+      if (raw === undefined || !/^[1-9][0-9]{0,15}$/.test(raw)) { stderr.error(`--mintsoft-id needs a Mintsoft order id. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+      mintsoftId = raw
       index += 1
       continue
     }
@@ -212,7 +238,15 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     stderr.error(`--history-days and --history-since are alternatives: give one. ${USAGE}`)
     return LEGACY_IMPORT_EXIT.usage
   }
-  const resolve: LegacyImportOptions['resolve'] = !resolveAllHistoric && resolveIds !== undefined && resolveAs !== undefined ? { wcOrderIds: resolveIds, decision: resolveAs } : undefined
+  if (mintsoftId !== undefined && (resolveIds === undefined || resolveIds.length !== 1 || resolveAs === undefined || resolveAs === 'not-ours')) {
+    stderr.error(`--mintsoft-id goes with --resolve <one wcOrderId> --as ours|cancelled. ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+  if ((bridgeJournalPath === undefined) !== (bridgeFencePath === undefined)) {
+    stderr.error(`--bridge-journal and --bridge-fence go together (both files are read). ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+  const resolve: LegacyImportOptions['resolve'] = !resolveAllHistoric && resolveIds !== undefined && resolveAs !== undefined ? { wcOrderIds: resolveIds, decision: resolveAs, ...(mintsoftId !== undefined ? { mintsoftId } : {}) } : undefined
   const resolveAllHistoricCancelled: LegacyImportOptions['resolveAllHistoricCancelled'] = resolveAllHistoric && reason !== undefined ? { reason } : undefined
   const nowDate = (options.now ?? (() => new Date()))()
   const historyWindow: HistoryWindow = historySince !== undefined
@@ -234,17 +268,27 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     return LEGACY_IMPORT_EXIT.usage
   }
   if (apply && resolve === undefined && resolveAllHistoricCancelled === undefined && !bridgeFenceCleared) {
-    stderr.error(`--apply refuses without --bridge-fence-cleared --by <name>: on the bridge host, resolve and empty var/manual_reconcile.json and clear the intent / intent-unseen entries of var/minted_orders.json first (runbook, step M). ${USAGE}`)
+    stderr.error(`--apply refuses without --bridge-fence-cleared --by <name>: on the bridge host, resolve every entry of var/manual_reconcile.json and var/minted_orders.json (look each up in Mintsoft, then link or cancel it), never just clear them (runbook, step M). ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+
+  if (apply && resolve === undefined && resolveAllHistoricCancelled === undefined && bridgeJournalPath === undefined) {
+    stderr.error(`--apply refuses without --bridge-journal <path> --bridge-fence <path>: copy var/minted_orders.json and var/manual_reconcile.json from the bridge host after the final sweep (runbook, step M). ${USAGE}`)
     return LEGACY_IMPORT_EXIT.usage
   }
 
   try {
+    let bridgeFiles: LegacyImportOptions['bridgeFiles']
+    if (bridgeJournalPath !== undefined && bridgeFencePath !== undefined) {
+      const read = options.readFile ?? ((path: string) => readFileSync(path, 'utf8'))
+      try { bridgeFiles = { journalText: read(bridgeJournalPath), fenceText: read(bridgeFencePath) } } catch (error) { throw new DecisionRefusedError(`A bridge host file copy cannot be read (${error instanceof Error ? error.message.slice(0, 160) : 'read failed'}): nothing was done.`) }
+    }
     const ports = options.ports
       ? await options.ports({ verifyMintsoft, connector })
       : (await import('@/lib/connectors/mintsoft/legacy-bridge-import/ports')).createLegacyImportPorts({ verifyMintsoft, connector })
     // cancelled and refunded are ALWAYS read: an explicit --statuses never drops them (a queued bridge cancel on one would be invisible).
     const resolvedStatuses = withHistoryStatuses(statuses ?? await (options.defaultStatuses ?? defaultStatuses)())
-    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, ...(bridgeFenceCleared && by !== undefined ? { bridgeFenceCleared: { by } } : {}), verifyMintsoft, verifyMax, resolve, resolveAllHistoricCancelled, historyWindow, driftCheck: !noDriftCheck, statuses: resolvedStatuses, now: options.now })
+    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, ...(bridgeFenceCleared && by !== undefined ? { bridgeFenceCleared: { by } } : {}), ...(bridgeFiles ? { bridgeFiles } : {}), verifyMintsoft, verifyMax, resolve, resolveAllHistoricCancelled, historyWindow, driftCheck: !noDriftCheck, statuses: resolvedStatuses, now: options.now })
     if (json) stdout.log(JSON.stringify(report, null, 2))
     else {
       stdout.log(renderLegacyImportReport(report))
