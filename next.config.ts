@@ -43,8 +43,9 @@ const nextConfig: NextConfig = {
     // No Turbopack filesystem cache for `next dev`. The stage host runs `next dev`, and the
     // persisted cache under .next/dev grew to ~20 GB and was rebuilt after a restart, writing
     // tens of GB a day to the host SSD. Compiles start cold after each restart instead; that
-    // costs seconds per route, not disk wear. Builds are unaffected (their cache is off by default).
+    // costs seconds per route, not disk wear. next 16.4 turned the build cache on by default, so it is switched off explicitly for the same disk-wear reason.
     turbopackFileSystemCacheForDev: false,
+    turbopackFileSystemCacheForBuild: false,
   },
   outputFileTracingExcludes: {
     '/api/backup/restore': ['./next.config.ts'],
