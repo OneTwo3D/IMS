@@ -54,7 +54,13 @@ test('the migration installs a trigger for every guarded table and column, and t
 const WRITERS: Record<string, Record<string, number>> = {
   wmsOrderStatusSnapshot: { 'lib/domain/wms/order-status-sweep.ts': 3 },
   wmsOrderPushLink: {
-    'app/actions/sync-exceptions.ts': 8, 'app/actions/wms-order-push.ts': 2, 'lib/domain/outbound-shadow/retire-held-backlog.ts': 1,
+    'app/actions/sync-exceptions.ts': 8, 'app/actions/wms-order-push.ts': 2,
+    // The switchover take-over (G_create) adopts a Mintsoft order by upserting a link: ids, a state and timestamps only, no free text; the trigger covers it all the same.
+    // The legacy bridge import (`cutover:legacy-import`, and `--resolve`) writes IMS's own link rows from the bridge's order meta: a create and a compare-and-set adopt of an unclaimed
+    // placeholder. It writes ids, a state and timestamps; its only text column is `lastError` (a fixed constant dead-letter reason, never bridge or customer text), which is one of the trigger's guarded columns, so an erased order's
+    // text cannot be written back by it; pinned on purpose.
+    'lib/connectors/mintsoft/legacy-bridge-import/ports.ts': 2,
+    'lib/connectors/mintsoft/switchover/gaps.ts': 1, 'lib/domain/outbound-shadow/retire-held-backlog.ts': 1,
     'lib/domain/wms/dispatch-sweep.ts': 10, 'lib/domain/wms/double-postage.ts': 1, 'lib/domain/wms/mixed-scope-record.ts': 6, 'lib/domain/wms/operator-task-done.ts': 1, 'lib/domain/wms/order-push-sweep.ts': 19, 'lib/domain/wms/order-reconcile-sweep.ts': 1, 'lib/domain/wms/scope-dirty.ts': 1, 'lib/fulfillment/external-fulfillment.ts': 1,
   },
   wmsOrderDiscrepancy: { 'app/actions/sync-exceptions.ts': 2, 'lib/domain/wms/dispatch-sweep.ts': 3, 'lib/domain/wms/order-reconcile-sweep.ts': 12 },
