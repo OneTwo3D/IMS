@@ -14,6 +14,10 @@ import {
   decideBeginHold,
   isMergeHeldWarehouseStatus,
   MERGE_HOLD_ATTEMPT_LEASE_MS,
+  MERGE_HOLD_NEW_GRACE_MS,
+  MERGE_HOLD_REQUEST_DEADLINE_MS,
+  mergeHoldUnsettledBasis,
+  withDeadline,
   type MergeHoldTaskState,
   mergeHoldQuery,
   mergeHoldRemindHours,
@@ -38,9 +42,9 @@ const T0 = new Date('2026-11-18T10:00:00Z')
 const member = (n: number): MergeHoldMember => ({ orderId: `o${n}`, orderNumber: `T-${n}`, externalOrderId: `w${n}`, externalOrderNumber: `W${n}` })
 const group = (members: MergeHoldMember[], warnings: string[] = []): MergeGroup => ({ basis: `merge-candidate:${members.map((m) => m.orderId).join(',')}`, members, warnings })
 
-type Task = { reason: string; basis: string; queryText: string; orderId: string }
+type Task = { reason: string; basis: string; queryText: string; orderId: string; warnings?: string[] }
 
-function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Record<string, WmsOrderHoldResult | 'throw'>; now?: () => Date; snapshotHeld?: Set<string> } = {}) {
+function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Record<string, WmsOrderHoldResult | 'throw'>; now?: () => Date; snapshotHeld?: Set<string>; hang?: Set<string> } = {}) {
   const rows = new Map<string, MergeHoldRow>()
   const requests: string[] = []
   const writes: string[] = []
@@ -71,6 +75,7 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
     async requestHold(_env, m) {
       if (opts.shadowed) return { shadowed: true as const }
       requests.push(m.orderId)
+      if (opts.hang?.has(m.orderId)) return new Promise<never>(() => {})
       const answer = answers[m.orderId] ?? { held: true, status: 'HELD' }
       if (answer === 'throw') throw new Error('Mintsoft 500')
       return answer
@@ -94,15 +99,22 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
       const task = tasks.find((t) => t.reason === 'MERGE_HOLD' && t.basis.startsWith(`merge-hold:${basis}:`))
       if (!task) return
       const ms = [...rows.values()].filter((r) => r.groupBasis === basis)
-      task.queryText = mergeHoldQuery(ms.map((r) => ({ ...member(Number(r.orderId.slice(1))), state: (r.state === 'HELD' ? 'held' : r.state === 'UNKNOWN' || r.state === 'HOLDING' ? 'unknown' : 'not-held') as MergeHoldTaskState })), [], env.connectorLabel)
+      task.queryText = mergeHoldQuery(ms.map((r) => ({ ...member(Number(r.orderId.slice(1))), state: (r.state === 'HELD' ? 'held' : r.state === 'UNKNOWN' || r.state === 'HOLDING' ? 'unknown' : 'not-held') as MergeHoldTaskState })), task.warnings ?? [], env.connectorLabel)
     },
     async raiseGroupTask(env, g, states, episodes) {
       const queryText = mergeHoldQuery(g.members.map((m) => ({ ...m, state: states.get(m.orderId) ?? 'not-held' })), g.warnings, env.connectorLabel)
       const basis = mergeHoldTaskBasis(g, episodes)
-      if (!tasks.some((t) => t.basis === basis)) tasks.push({ reason: 'MERGE_HOLD', basis, queryText, orderId: g.members[0].orderId })
+      if (!tasks.some((t) => t.basis === basis)) tasks.push({ reason: 'MERGE_HOLD', basis, queryText, orderId: g.members[0].orderId, warnings: g.warnings })
     },
     async logNotHeld(row) { writes.push(`log-notheld:${row.orderId}`) },
-    async activeRows() { return observations.filter((o) => ['HELD', 'HOLDING', 'UNKNOWN'].includes(rows.get(o.row.orderId)?.state ?? '')).map((o) => ({ ...o, row: rows.get(o.row.orderId)! })) },
+    async activeRows() {
+      return observations.filter((o) => ['HELD', 'HOLDING', 'UNKNOWN'].includes(rows.get(o.row.orderId)?.state ?? '')).map((o) => {
+        const row = rows.get(o.row.orderId)!
+        // Mirrors the database port: a sibling of the same group CLEARED by a person's confirm (or a merge).
+        const decided = [...rows.values()].some((r) => r.orderId !== row.orderId && r.groupBasis === row.groupBasis && r.state === 'CLEARED' && (r.clearReason?.startsWith('left awaiting confirmation') || r.clearReason === 'merge detected'))
+        return { ...o, row, groupDecidedByPerson: decided }
+      })
+    },
     async clear(row, reason) {
       const current = rows.get(row.orderId)!
       if (!['HELD', 'HOLDING', 'UNKNOWN'].includes(current.state)) return false
@@ -111,11 +123,13 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
       return true
     },
     async promoteToHeld(row, at) { rows.set(row.orderId, { ...rows.get(row.orderId)!, state: 'HELD', heldAt: at }); return true },
-    async settleNotHeld(row, error) { rows.set(row.orderId, { ...rows.get(row.orderId)!, state: 'NOT_HELD', refused: false, lastError: error }); writes.push(`settled:${row.orderId}`); return true },
+    async settleNotHeld(row, error, o) { rows.set(row.orderId, { ...rows.get(row.orderId)!, state: 'NOT_HELD', refused: o?.refused === true, lastError: error }); writes.push(`settled:${row.orderId}`); return true },
     async raiseUnsettledTask(_env, obs, kind) {
-      const basis = `unsettled:${obs.row.orderId}:${obs.row.episode}:${kind}:${obs.snapshot?.status ?? ''}`
-      if (tasks.some((t) => t.basis === basis)) return false
-      tasks.push({ reason: 'MERGE_HOLD', basis, queryText: kind, orderId: obs.row.orderId })
+      const basis = mergeHoldUnsettledBasis(obs.row, kind)
+      const text = `${kind}:${obs.snapshot?.status ?? ''}`
+      const existing = tasks.find((t) => t.basis === basis)
+      if (existing) { existing.queryText = text; return false }
+      tasks.push({ reason: 'MERGE_HOLD', basis, queryText: text, orderId: obs.row.orderId })
       return true
     },
     async remind(_env, obs, hours) {
@@ -128,7 +142,12 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
     },
     async showEditBlocked(_env, obs) { blocked.push(obs.row.orderId) },
     async closeEditBlocked() {},
-    async escalate(_env, obs, kind) { escalated.push(`${obs.row.orderId}:${kind}`) },
+    async escalate(_env, obs, kind) {
+      const key = `${obs.row.orderId}:${kind}`
+      if (escalated.includes(key)) return false
+      escalated.push(key)
+      return true
+    },
   }
   const observations: MergeHoldObservation[] = []
   /** Register what the maintenance will read for an order (its row is read back from `rows`). */
@@ -137,6 +156,7 @@ function fakePort(opts: { enabled?: boolean; shadowed?: boolean; answers?: Recor
     observations.push({
       row: rows.get(orderId)!, orderNumber: `T-${n}`, orderStatus: 'PROCESSING', refundStatus: 'NONE', shippedAt: null, withdrawalHoldAt: null, withdrawalApprovedAt: null, editPending: false,
       link: { state: 'SYNCED', externalOrderId: `w${n}` },
+      groupDecidedByPerson: false,
       snapshot: { status: 'AWAITINGCONFIRMATION', externalOrderId: `w${n}`, fetchedAt: new Date(T0.getTime() + 60_000), lastError: null },
       ...over,
     })
@@ -176,7 +196,7 @@ test('a second pass over the same group sends no second request and raises no se
 
 const settleAsNew = async (f: ReturnType<typeof fakePort>, ...ids: string[]) => {
   f.resetObservations()
-  for (const id of ids) f.observe(id, { snapshot: { status: 'NEW', externalOrderId: `w${id.slice(1)}`, fetchedAt: new Date(T0.getTime() + 60_000), lastError: null } })
+  for (const id of ids) f.observe(id, { snapshot: { status: 'NEW', externalOrderId: `w${id.slice(1)}`, fetchedAt: new Date(T0.getTime() + MERGE_HOLD_NEW_GRACE_MS + 60_000), lastError: null } })
   await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
 }
 
@@ -207,18 +227,21 @@ test('LOST ANSWER on EVERY member: rows are UNKNOWN, the MERGE_HOLD task exists,
   assert.ok(f.tasks[0].queryText.includes('OUTCOME UNKNOWN') && !f.tasks[0].queryText.includes('IMS has put these on HOLD'))
 })
 
-test('LOST ANSWER is settled by the status: AWAITINGCONFIRMATION = HELD, NEW = safe to retry, anything else stays UNKNOWN and raises a task', async () => {
-  const f = fakePort({ answers: { o1: 'throw', o2: 'throw', o3: 'throw' } })
-  await placeMergeHolds(f.port, ENV, [group([member(1), member(2), member(3)])])
-  const at = new Date(T0.getTime() + 60_000)
-  f.observe('o1')
+test('LOST ANSWER is settled by the status: AWAITINGCONFIRMATION = HELD, NEW (after the lease) = safe to retry, past NEW = not held for good, an unrecognised name stays UNKNOWN and raises a task', async () => {
+  const f = fakePort({ answers: { o1: 'throw', o2: 'throw', o3: 'throw', o4: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2), member(3), member(4)])])
+  const at = new Date(T0.getTime() + MERGE_HOLD_NEW_GRACE_MS + 60_000)
+  f.observe('o1', { snapshot: { status: 'AWAITINGCONFIRMATION', externalOrderId: 'w1', fetchedAt: at, lastError: null } })
   f.observe('o2', { snapshot: { status: 'NEW', externalOrderId: 'w2', fetchedAt: at, lastError: null } })
   f.observe('o3', { snapshot: { status: 'PICKING', externalOrderId: 'w3', fetchedAt: at, lastError: null } })
+  f.observe('o4', { snapshot: { status: 'ON_HOLD', externalOrderId: 'w4', fetchedAt: at, lastError: null } })
   const before = f.tasks.length
   const r = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
-  assert.deepEqual([r.confirmedHeld, r.settledNotHeld, r.unsettled], [1, 1, 1])
-  assert.deepEqual([f.rows.get('o1')!.state, f.rows.get('o2')!.state, f.rows.get('o3')!.state], ['HELD', 'NOT_HELD', 'UNKNOWN'])
-  assert.equal(f.tasks.length, before + 1, 'one operator task for the order that cannot be settled')
+  assert.deepEqual([r.confirmedHeld, r.settledNotHeld, r.unsettled], [1, 2, 1])
+  assert.deepEqual([1, 2, 3, 4].map((n) => f.rows.get(`o${n}`)!.state), ['HELD', 'NOT_HELD', 'NOT_HELD', 'UNKNOWN'])
+  assert.equal(f.rows.get('o2')!.refused, false, 'still NEW: retryable')
+  assert.equal(f.rows.get('o3')!.refused, true, 'past NEW: never held again')
+  assert.equal(f.tasks.length, before + 1, 'one operator task for the order whose status IMS does not recognise')
   // an unreadable status ('') is no evidence either
   const g = fakePort({ answers: { o1: 'throw' } })
   await placeMergeHolds(g.port, ENV, [group([member(1), member(2)])])
@@ -238,7 +261,7 @@ test('RETRY hits NOT_HOLDABLE on an order that IS held: recorded HELD (not a ref
   assert.equal(r.held, 1)
   assert.equal(f.rows.get('o2')!.state, 'HELD')
   assert.equal(f.rows.get('o2')!.refused, false)
-  assert.equal(f.revised.length, 1, 'the group task is re-worded')
+  assert.ok(f.revised.length >= 1, 'the group task is re-worded')
   assert.ok(!f.tasks[0].queryText.includes('OUTCOME UNKNOWN') && !f.tasks[0].queryText.includes('NOT held'), f.tasks[0].queryText)
 })
 
@@ -309,7 +332,7 @@ test('decideBeginHold: only a person-decided clear of the SAME group (and wareho
 test('UPKEEP vs IN-FLIGHT: a HOLDING row inside its attempt lease is not demoted or settled by a NEW snapshot; after the lease it is', async () => {
   const f = fakePort()
   f.rows.set('o1', { id: 'r1', connector: 'mintsoft', orderId: 'o1', externalOrderId: 'w1', groupBasis: 'g', state: 'HOLDING', episode: 1, attempts: 1, refused: false, lastError: null, heldAt: null, remindedAt: null, clearReason: null, updatedAt: T0 })
-  f.observe('o1', { snapshot: { status: 'NEW', externalOrderId: 'w1', fetchedAt: new Date(T0.getTime() + 1000), lastError: null } })
+  f.observe('o1', { snapshot: { status: 'NEW', externalOrderId: 'w1', fetchedAt: new Date(T0.getTime() + MERGE_HOLD_NEW_GRACE_MS + 1000), lastError: null } })
   f.setClock(() => new Date(T0.getTime() + MERGE_HOLD_ATTEMPT_LEASE_MS - 1000))
   const r = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
   assert.equal(f.rows.get('o1')!.state, 'HOLDING')
@@ -429,7 +452,7 @@ test('an unrecorded hold answer (HOLDING) is settled by the next fresh status re
   f.rows.set('o1', { id: 'r1', connector: 'mintsoft', orderId: 'o1', externalOrderId: 'w1', groupBasis: 'g', state: 'HOLDING', episode: 1, attempts: 1, refused: false, lastError: null, heldAt: null, remindedAt: null, clearReason: null, updatedAt: T0 })
   f.rows.set('o2', { id: 'r2', connector: 'mintsoft', orderId: 'o2', externalOrderId: 'w2', groupBasis: 'g', state: 'HOLDING', episode: 1, attempts: 1, refused: false, lastError: null, heldAt: null, remindedAt: null, clearReason: null, updatedAt: T0 })
   f.observe('o1')
-  f.observe('o2', { snapshot: { status: 'NEW', externalOrderId: 'w2', fetchedAt: new Date(T0.getTime() + 60_000), lastError: null } })
+  f.observe('o2', { snapshot: { status: 'NEW', externalOrderId: 'w2', fetchedAt: new Date(T0.getTime() + MERGE_HOLD_NEW_GRACE_MS + 500), lastError: null } })
   f.setClock(() => new Date(T0.getTime() + MERGE_HOLD_ATTEMPT_LEASE_MS + 1000))
   const result = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
   assert.equal(result.confirmedHeld, 1)
@@ -512,6 +535,166 @@ test('detection: a candidate task whose group has a member that MAY be held is n
   assert.deepEqual(keep, ['untouched'], 'nothing is resolved when the unsettled holds cannot be read')
 })
 
+
+// ---- round 3: UNKNOWN rows past NEW / cancelled orders, late-landing holds, person decisions, deadline ----------------------------------------
+
+const AFTER_GRACE = new Date(T0.getTime() + MERGE_HOLD_NEW_GRACE_MS + 60_000)
+const snap = (n: number, status: string, fetchedAt: Date = AFTER_GRACE) => ({ status, externalOrderId: `w${n}`, fetchedAt, lastError: null })
+const MAY_BE_HELD = ['HOLDING', 'HELD', 'UNKNOWN']
+
+test('TIMEOUT, then the warehouse allocates, then the customer cancels: the row settles (the push resumes) from a fresh snapshot', async () => {
+  const f = fakePort({ answers: { o2: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+  assert.equal(f.rows.get('o2')!.state, 'UNKNOWN')
+  f.observe('o2', { orderStatus: 'CANCELLED', snapshot: snap(2, 'ALLOCATED') })
+  const r = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.equal(r.settledNotHeld, 1)
+  const row = f.rows.get('o2')!
+  assert.equal(MAY_BE_HELD.includes(row.state), false, 'no longer withholds the push sweep: the cancel is pushed')
+  assert.equal(row.refused, true)
+  assert.ok(row.lastError?.includes('ALLOCATED'), 'the reason is recorded')
+  assert.deepEqual(f.escalated, [])
+})
+
+test('TIMEOUT, warehouse allocates, customer cancels, but no fresh snapshot: the cancel escalates AT ONCE (never withheld silently), once', async () => {
+  const f = fakePort({ answers: { o2: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+  f.observe('o2', { orderStatus: 'CANCELLED', snapshot: null })
+  const first = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  const second = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.deepEqual(f.escalated, ['o2:CANCEL'])
+  assert.deepEqual([first.escalated, second.escalated], [1, 0], 'result.escalated counts only newly created tasks')
+  assert.equal(f.rows.get('o2')!.state, 'UNKNOWN')
+})
+
+test('a withdrawal and a pending edit on an UNKNOWN row escalate / show "act in" like a HELD row', async () => {
+  const f = fakePort({ answers: { o1: 'throw', o2: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+  f.observe('o1', { editPending: true, snapshot: null })
+  f.observe('o2', { withdrawalApprovedAt: AFTER_GRACE, snapshot: null })
+  const r = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.deepEqual(f.blocked, ['o1'])
+  assert.deepEqual(f.escalated, ['o2:WITHDRAWAL'])
+  assert.deepEqual([r.editsBlocked, r.escalated], [1, 1])
+})
+
+test('a TERMINAL (cancelled) IMS order with an UNKNOWN row and an unrecognised status: escalated at once, one unsettled task however often the status moves', async () => {
+  const f = fakePort({ answers: { o2: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+  const before = f.tasks.length
+  for (const status of ['ON_HOLD', 'WEIRD', 'ON_HOLD']) {
+    f.resetObservations()
+    f.observe('o2', { orderStatus: 'CANCELLED', snapshot: snap(2, status) })
+    await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  }
+  assert.deepEqual(f.escalated, ['o2:CANCEL'])
+  assert.equal(f.tasks.length, before + 1, 'one task per order and episode, not per status')
+  assert.ok(f.tasks[f.tasks.length - 1].queryText.includes('ON_HOLD'), 'the open task is re-worded with the current status')
+  assert.equal(f.rows.get('o2')!.state, 'UNKNOWN')
+})
+
+test('the unsettled-task basis has no status in it', () => {
+  assert.equal(mergeHoldUnsettledBasis({ orderId: 'o1', episode: 2 }, 'UNKNOWN_OUTCOME'), 'merge-hold-unsettled:o1:2:UNKNOWN_OUTCOME')
+})
+
+test('PAST NEW settles the row: ALLOCATED, PICKING, PACKED and a warehouse CANCELLED are NOT_HELD (refused, never re-held, no request)', async () => {
+  for (const status of ['ALLOCATED', 'PICKING', 'PACKED', 'CANCELLED']) {
+    const f = fakePort({ answers: { o1: 'throw', o2: 'throw' } })
+    await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+    const sent = f.requests.length
+    f.observe('o1', { snapshot: snap(1, status) })
+    f.observe('o2', { snapshot: snap(2, 'AWAITINGCONFIRMATION') })
+    const r = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+    assert.equal(r.settledNotHeld, 1, status)
+    assert.equal(f.rows.get('o1')!.state, 'NOT_HELD', status)
+    assert.equal(f.rows.get('o1')!.refused, true, status)
+    assert.equal(f.rows.get('o2')!.state, 'HELD', status)
+    await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+    await placeMergeHolds(f.port, ENV, [])
+    assert.equal(f.requests.length, sent, `${status}: no second hold request`)
+  }
+})
+
+test('LATE-LANDING hold: a NEW read inside the grace period (the lease) does not settle an UNKNOWN row; one after it does', async () => {
+  const f = fakePort({ answers: { o1: 'throw', o2: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+  f.observe('o1', { snapshot: snap(1, 'NEW', new Date(T0.getTime() + MERGE_HOLD_NEW_GRACE_MS - 1000)) })
+  f.observe('o2', { snapshot: snap(2, 'NEW', new Date(T0.getTime() + 5000)) })
+  const early = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.deepEqual([early.settledNotHeld, early.unsettled], [0, 2])
+  assert.deepEqual([f.rows.get('o1')!.state, f.rows.get('o2')!.state], ['UNKNOWN', 'UNKNOWN'])
+  assert.equal(f.tasks.filter((t) => t.reason === 'MERGE_HOLD').length, 1, 'the group task stays; a premature NEW raises no new one')
+  f.resetObservations()
+  f.observe('o1', { snapshot: snap(1, 'NEW') })
+  f.observe('o2', { snapshot: snap(2, 'NEW') })
+  const late = await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.equal(late.settledNotHeld, 2)
+})
+
+test('every member UNKNOWN: the group task stays and the overdue reminder covers UNKNOWN rows (once)', async () => {
+  const f = fakePort({ answers: { o1: 'throw', o2: 'throw' } })
+  await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])])
+  f.observe('o1', { snapshot: null })
+  f.observe('o2', { snapshot: null })
+  f.setClock(() => new Date(T0.getTime() + 4 * 3_600_000))
+  assert.equal((await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })).reminded, 2)
+  assert.equal((await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })).reminded, 0, 'once only')
+  assert.equal(f.tasks.filter((t) => t.reason === 'MERGE_HOLD_OVERDUE').length, 2)
+  assert.deepEqual([...f.rows.values()].map((r) => r.state), ['UNKNOWN', 'UNKNOWN'])
+})
+
+test('CONFIRM WITHOUT MERGING with an UNKNOWN-but-held member: the person decision covers it, the next detection pass does not hold it again', async () => {
+  const f = fakePort({ answers: { o2: 'throw' } })
+  const g = group([member(1), member(2)])
+  await placeMergeHolds(f.port, ENV, [g])
+  assert.deepEqual(f.requests, ['o1', 'o2'])
+  // The person confirms both as they are: o1 (HELD) reads NEW, o2 (UNKNOWN, really held) reads NEW after the lease.
+  f.observe('o1', { snapshot: snap(1, 'NEW') })
+  f.observe('o2', { snapshot: snap(2, 'NEW') })
+  await runMergeHoldMaintenance(f.port, ENV, { hours: 4 })
+  assert.equal(f.rows.get('o1')!.state, 'CLEARED')
+  assert.equal(f.rows.get('o2')!.state, 'CLEARED', 'not retryable NOT_HELD')
+  assert.ok(f.rows.get('o2')!.clearReason?.startsWith('left awaiting confirmation'))
+  const tasks = f.tasks.length
+  for (let i = 0; i < 3; i += 1) assert.equal((await placeMergeHolds(f.port, ENV, [g])).skipped, 2)
+  assert.deepEqual(f.requests, ['o1', 'o2'], 'no second MarkAwaitingConfirmation')
+  assert.equal(f.tasks.length, tasks, 'no new group task')
+})
+
+test('REVISE on the re-detection path: all members UNKNOWN, settled NOT_HELD, re-held by detection: the open group task is re-worded', async () => {
+  const answers: Record<string, WmsOrderHoldResult | 'throw'> = { o1: 'throw', o2: 'throw' }
+  const f = fakePort({ answers })
+  const g = group([member(1), member(2)])
+  await placeMergeHolds(f.port, ENV, [g])
+  assert.ok(f.tasks[0].queryText.includes('OUTCOME UNKNOWN'))
+  await settleAsNew(f, 'o1', 'o2')
+  delete answers.o1
+  delete answers.o2
+  const revisedBefore = f.revised.length
+  const again = await placeMergeHolds(f.port, ENV, [g])
+  assert.equal(again.held, 2)
+  assert.ok(f.revised.length > revisedBefore, 'reviseGroupTask is called on the detection path')
+  assert.equal(f.tasks.filter((t) => t.reason === 'MERGE_HOLD').length, 1)
+  assert.ok(!f.tasks[0].queryText.includes('OUTCOME UNKNOWN'), f.tasks[0].queryText)
+})
+
+test('the hold request has an overall deadline shorter than the lease: a request that never answers is an UNKNOWN outcome, not a stuck attempt', async () => {
+  assert.ok(MERGE_HOLD_REQUEST_DEADLINE_MS < MERGE_HOLD_ATTEMPT_LEASE_MS, 'deadline < lease')
+  assert.ok(MERGE_HOLD_NEW_GRACE_MS >= MERGE_HOLD_ATTEMPT_LEASE_MS)
+  const f = fakePort({ hang: new Set(['o2']) })
+  const result = await placeMergeHolds(f.port, ENV, [group([member(1), member(2)])], { requestDeadlineMs: 20 })
+  assert.deepEqual([result.held, result.failed], [1, 1])
+  assert.equal(f.rows.get('o2')!.state, 'UNKNOWN')
+  assert.ok(f.rows.get('o2')!.lastError?.includes('did not finish'))
+  // The deadline cannot be set past the lease.
+  const g = fakePort({ hang: new Set(['o1']) })
+  const started = Date.now()
+  await assert.rejects(withDeadline(new Promise(() => {}), 10, 'x'), /did not finish/)
+  assert.ok(Date.now() - started < 5000)
+  assert.equal((await withDeadline(Promise.resolve(7), 1000, 'x')), 7)
+  void g
+})
+
 // ---- structural: no release path, and the blocked queries -----------------------------------------------------------------------------------
 
 function sources(dir: string): string[] {
@@ -534,6 +717,13 @@ test('NEVER AUTO-RELEASE: the merge-hold modules call nothing that releases, con
     if (file.includes('/merge-hold')) continue
     assert.equal(/holdOrder\s*\(/.test(text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')) && !file.includes('connectors'), false, `${file} calls holdOrder outside the merge-hold port`)
   }
+})
+
+test('the status sweep keeps polling an order with an active hold row after IMS cancels it', () => {
+  const text = readFileSync(join(process.cwd(), 'lib/domain/wms/order-status-sweep.ts'), 'utf8')
+  assert.match(text, /wmsMergeHolds: \{ some: \{ state: \{ in: \['HOLDING', 'HELD', 'UNKNOWN'/)
+  const push = readFileSync(join(process.cwd(), 'lib/domain/wms/order-push-sweep.ts'), 'utf8')
+  assert.match(push, /runMergeHoldMaintenanceSafe\('the order push'\)/, 'the push sweep settles or escalates what it withholds')
 })
 
 test('WHILE HELD: the push sweep queries leave a merge-held order out (edits, holds and cancels are not pushed)', () => {

@@ -81,7 +81,29 @@ export function classifyWarehouseStatus(status: string | null | undefined): Ware
 /** A HOLDING row younger than this is an attempt in flight: the upkeep leaves it alone (the attempt records its own answer). Older: the answer was lost. */
 export const MERGE_HOLD_ATTEMPT_LEASE_MS = 10 * 60_000
 
-export const mergeHoldActInWarehouse = (warehouseLabel: string): string => `This order is on merge hold in the warehouse, so IMS did not send the change. Act in ${warehouseLabel}.`
+/**
+ * The request to the warehouse has its own overall deadline, SHORTER than the lease: the lease assumes an attempt is over (answered, failed or given up on)
+ * well inside it, and this is what enforces that. (A request abandoned at the deadline may still land late: a NEW read is therefore only trusted once the
+ * lease has passed, see MERGE_HOLD_NEW_GRACE_MS.)
+ */
+export const MERGE_HOLD_REQUEST_DEADLINE_MS = 3 * 60_000
+/** An UNKNOWN / unrecorded row settles as "still NEW, not held" only on a snapshot read at least this long after the row was last written (the lease). */
+export const MERGE_HOLD_NEW_GRACE_MS = MERGE_HOLD_ATTEMPT_LEASE_MS
+
+/** Reject when `work` has not settled within `ms` (the work itself is not cancelled: it may still finish, which the caller treats as an unknown outcome). */
+export async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not finish within ${Math.round(ms / 1000)}s`)), ms)
+  })
+  try {
+    return await Promise.race([work, deadline])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+export const mergeHoldActInWarehouse = (warehouseLabel: string, maybe = false): string => `This order ${maybe ? 'may be' : 'is'} on merge hold in the warehouse, so IMS did not send the change. Act in ${warehouseLabel}.`
 
 export const MERGE_HOLD_TASK_REASON = 'MERGE_HOLD' as const
 export const MERGE_HOLD_OVERDUE_TASK_REASON = 'MERGE_HOLD_OVERDUE' as const
@@ -91,6 +113,7 @@ export const MERGE_HOLD_CLEAR_LEFT_STATUS = 'left awaiting confirmation'
 export const MERGE_HOLD_CLEAR_MERGED = 'merge detected'
 export const MERGE_HOLD_CLEAR_SHIPPED = 'order despatched'
 export const MERGE_HOLD_CLEAR_NOT_LANDED = 'hold did not land'
+export const MERGE_HOLD_CLEAR_NOT_HELD_PAST_NEW = 'not held: the order moved past NEW in the warehouse'
 
 export type MergeHoldState = 'HOLDING' | 'HELD' | 'UNKNOWN' | 'NOT_HELD' | 'CLEARED'
 
@@ -160,13 +183,13 @@ export function mergeHoldQuery(members: ReadonlyArray<TaskMember>, warnings: Rea
     + `Please merge them in ${warehouseLabel}, then confirm the merged order there yourself. IMS does not merge orders and will NOT release the hold: until you confirm it, the order is not picked. IMS sends no change to a held order.${extra}`
 }
 
-export function mergeHoldOverdueQuery(wmsOrder: string, imsOrder: string, hours: number, warehouseLabel: string): string {
-  return `${warehouseLabel} order ${wmsOrder} (IMS order ${imsOrder}) has been on merge hold for more than ${hours} hour(s). Please merge it with the customer's other order(s) and confirm it in ${warehouseLabel}, or confirm it as it is if it should not be merged. IMS will not release the hold: nothing ships until a person confirms it.`
+export function mergeHoldOverdueQuery(wmsOrder: string, imsOrder: string, hours: number, warehouseLabel: string, maybe = false): string {
+  return `${warehouseLabel} order ${wmsOrder} (IMS order ${imsOrder}) ${maybe ? 'may be on merge hold (IMS asked for one and never got an answer) and has not been settled' : 'has been on merge hold'} for more than ${hours} hour(s). Please merge it with the customer's other order(s) and confirm it in ${warehouseLabel}, or confirm it as it is if it should not be merged. IMS will not release the hold: nothing ships until a person confirms it.`
 }
 
-export function mergeHoldWithdrawalQuery(wmsOrder: string, imsOrder: string, kind: 'WITHDRAWAL' | 'CANCEL', warehouseLabel: string): string {
+export function mergeHoldWithdrawalQuery(wmsOrder: string, imsOrder: string, kind: 'WITHDRAWAL' | 'CANCEL', warehouseLabel: string, maybe = false): string {
   const what = kind === 'WITHDRAWAL' ? 'has a customer withdrawal' : 'was cancelled or fully refunded in IMS'
-  return `IMS order ${imsOrder} ${what}, but ${warehouseLabel} order ${wmsOrder} is on merge hold. IMS did NOT cancel or release it (it may be merged with another customer order). `
+  return `IMS order ${imsOrder} ${what}, but ${warehouseLabel} order ${wmsOrder} ${maybe ? 'MAY be on merge hold (IMS asked for a hold and never got an answer)' : 'is on merge hold'}. IMS did NOT cancel or release it (it may be merged with another customer order). `
     + `Act in ${warehouseLabel}: decide whether to cancel it, take this order's lines out of the merged order, or confirm it; IMS changes nothing there.`
 }
 
@@ -176,7 +199,8 @@ export function mergeHoldUnsettledQuery(wmsOrder: string, imsOrder: string, stat
     : `${warehouseLabel} order ${wmsOrder} (IMS order ${imsOrder}) is on merge hold in IMS, but its ${warehouseLabel} status is now '${status || 'unreadable'}', which IMS does not recognise, so IMS kept the hold on record and changed nothing. Please check the order in ${warehouseLabel}.`
 }
 
-export const mergeHoldUnsettledBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode'>, status: string, kind: string): string => `merge-hold-unsettled:${row.orderId}:${row.episode}:${kind}:${status.toUpperCase().replace(/[^A-Z]/g, '')}`
+/** One task per order, episode and kind. The status is NOT part of it (a status moving on would raise a task per step): the open task's text is re-worded instead. */
+export const mergeHoldUnsettledBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode'>, kind: string): string => `merge-hold-unsettled:${row.orderId}:${row.episode}:${kind}`
 export const mergeHoldTaskBasis = (group: Pick<MergeGroup, 'basis'>, episodes: ReadonlyArray<number>): string => `merge-hold:${group.basis}:${[...episodes].join('.')}`
 export const mergeHoldOverdueBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode'>): string => `merge-hold-overdue:${row.orderId}:${row.episode}`
 export const mergeHoldWithdrawalBasis = (row: Pick<MergeHoldRow, 'orderId' | 'episode'>, kind: string): string => `merge-hold-withdrawal:${row.orderId}:${row.episode}:${kind}`
@@ -203,6 +227,11 @@ export type MergeHoldObservation = {
   editPending: boolean
   link: { state: string; externalOrderId: string | null } | null
   snapshot: { status: string; externalOrderId: string; fetchedAt: Date; lastError: string | null } | null
+  /**
+   * A person already decided this group: another member of the same group (same basis) is CLEARED because a person confirmed it in the warehouse
+   * ("left awaiting confirmation") or it was merged. An UNKNOWN member that then reads NEW is part of that decision and is not held again.
+   */
+  groupDecidedByPerson: boolean
 }
 
 export type MergeHoldPort = {
@@ -241,26 +270,40 @@ export type MergeHoldPort = {
   clear(row: MergeHoldRow, reason: string, at: Date): Promise<boolean>
   /** A HOLDING / UNKNOWN row whose status read proves the hold landed: HELD. Audit entry. */
   promoteToHeld(row: MergeHoldRow, at: Date): Promise<boolean>
-  /** A HOLDING / UNKNOWN row whose status read shows the order still NEW: NOT_HELD, retryable. Audit entry. */
-  settleNotHeld(row: MergeHoldRow, error: string): Promise<boolean>
-  /** A row whose outcome cannot be settled (the status is neither held nor NEW, or is not recognised): one operator task per episode and status. True when raised. */
+  /**
+   * A HOLDING / UNKNOWN row whose status read proves it is not held: NOT_HELD with a recorded reason. Retryable (it is still NEW), or `refused` when the
+   * order has moved past NEW (never held again). Audit entry.
+   */
+  settleNotHeld(row: MergeHoldRow, error: string, options?: { refused?: boolean }): Promise<boolean>
+  /**
+   * A row whose outcome cannot be settled from the status (a name IMS does not recognise): ONE operator task per order, episode and kind (the status is not
+   * part of the key); a later status re-words the open task. True when a task was newly raised.
+   */
   raiseUnsettledTask(env: MergeHoldEnvironment, obs: MergeHoldObservation, kind: 'UNKNOWN_OUTCOME' | 'UNRECOGNISED_STATUS'): Promise<boolean>
   /** The overdue reminder, ONCE: compare-and-set `remindedAt` and raise the task, the warning entry and the notification in the same step. True when this call fired it. */
   remind(env: MergeHoldEnvironment, obs: MergeHoldObservation, hours: number, at: Date): Promise<boolean>
-  /** An edit IMS did not push: shown as "act in" the warehouse system while the hold stands. */
+  /** An edit IMS did not push: shown as "act in" the warehouse system while the hold stands (or may stand: `obs.row.state` UNKNOWN). */
   showEditBlocked(env: MergeHoldEnvironment, obs: MergeHoldObservation): Promise<void>
   /** Close the "act in Mintsoft" row of a hold that has cleared. */
   closeEditBlocked(orderId: string): Promise<void>
-  /** A withdrawal or cancel reached a held order: one task for a person (once per episode and kind). */
-  escalate(env: MergeHoldEnvironment, obs: MergeHoldObservation, kind: 'WITHDRAWAL' | 'CANCEL'): Promise<void>
+  /** A withdrawal or cancel reached a held (or maybe held) order: one task for a person (once per episode and kind). True only when this call CREATED the task. */
+  escalate(env: MergeHoldEnvironment, obs: MergeHoldObservation, kind: 'WITHDRAWAL' | 'CANCEL'): Promise<boolean>
 }
 
 export type MergeHoldPlacement = { held: number; refused: number; failed: number; shadowed: number; skipped: number }
 
 const scrub = (error: unknown): string => (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').slice(0, 300)
 
+async function reviseSafe(port: MergeHoldPort, env: MergeHoldEnvironment, basis: string): Promise<void> {
+  try {
+    await port.reviseGroupTask(env, basis)
+  } catch (error) {
+    console.error('[wms-merge-hold] could not update the merge-hold task', scrub(error))
+  }
+}
+
 /** One hold attempt on one order. Never throws. */
-async function attemptHold(port: MergeHoldPort, env: MergeHoldEnvironment, member: MergeHoldMember, groupBasis: string): Promise<{ outcome: MergeHoldOutcome; row: MergeHoldRow | null; state: MergeHoldTaskState }> {
+async function attemptHold(port: MergeHoldPort, env: MergeHoldEnvironment, member: MergeHoldMember, groupBasis: string, deadlineMs: number): Promise<{ outcome: MergeHoldOutcome; row: MergeHoldRow | null; state: MergeHoldTaskState }> {
   const row = await port.beginHold(env, member, groupBasis)
   if (!row) return { outcome: 'skipped', row: null, state: 'not-held' }
   const unknown = async (message: string): Promise<{ outcome: MergeHoldOutcome; row: MergeHoldRow; state: MergeHoldTaskState }> => {
@@ -274,7 +317,8 @@ async function attemptHold(port: MergeHoldPort, env: MergeHoldEnvironment, membe
     return { outcome: 'failed', row, state: 'unknown' }
   }
   try {
-    const answer = await port.requestHold(env, member)
+    // An overall deadline well inside the lease: an attempt that outlives it is an UNKNOWN outcome now, not a row the upkeep later settles from under it.
+    const answer = await withDeadline(port.requestHold(env, member), deadlineMs, 'The hold request')
     if ('shadowed' in answer) {
       await port.abandonHold(row)
       return { outcome: 'shadowed', row, state: 'not-held' }
@@ -304,7 +348,8 @@ async function attemptHold(port: MergeHoldPort, env: MergeHoldEnvironment, membe
  * Hold every order of each group (and retry the orders of a group whose earlier attempt failed in transport). Non-fatal: a failing order is recorded and
  * the others go on. Raises ONE operator task per group once at least one order is held. A no-op unless the setting is on.
  */
-export async function placeMergeHolds(port: MergeHoldPort, env: MergeHoldEnvironment, groups: ReadonlyArray<MergeGroup>): Promise<MergeHoldPlacement> {
+export async function placeMergeHolds(port: MergeHoldPort, env: MergeHoldEnvironment, groups: ReadonlyArray<MergeGroup>, options?: { requestDeadlineMs?: number }): Promise<MergeHoldPlacement> {
+  const deadlineMs = Math.min(options?.requestDeadlineMs ?? MERGE_HOLD_REQUEST_DEADLINE_MS, MERGE_HOLD_ATTEMPT_LEASE_MS - 1)
   const total: MergeHoldPlacement = { held: 0, refused: 0, failed: 0, shadowed: 0, skipped: 0 }
   if (!(await port.isEnabled())) return total
   const attempted = new Set<string>()
@@ -314,10 +359,12 @@ export async function placeMergeHolds(port: MergeHoldPort, env: MergeHoldEnviron
     const states = new Map<string, MergeHoldTaskState>()
     const episodes: number[] = []
     let mayBeHeld = 0
+    let anyAttempted = false
     for (const member of group.members) {
       attempted.add(member.orderId)
-      const { outcome, row, state } = await attemptHold(port, env, member, group.basis)
+      const { outcome, row, state } = await attemptHold(port, env, member, group.basis, deadlineMs)
       count(outcome)
+      if (row) anyAttempted = true
       states.set(member.orderId, state)
       // A member whose answer was lost MAY be held, so it counts like a held one: the group gets its task even when every attempt failed.
       if (row && (state === 'held' || state === 'unknown')) {
@@ -331,6 +378,8 @@ export async function placeMergeHolds(port: MergeHoldPort, env: MergeHoldEnviron
     } catch (error) {
       console.error('[wms-merge-hold] could not raise the merge-hold task', scrub(error))
     }
+    // A re-attempt through re-detection dedupes to the SAME open task (same group, same episodes): re-word it from the members' current rows.
+    if (anyAttempted) await reviseSafe(port, env, group.basis)
   }
 
   // An order whose hold failed in transport while a sibling got held no longer sits in a detected group (the held one left NEW), so it is retried here.
@@ -341,18 +390,12 @@ export async function placeMergeHolds(port: MergeHoldPort, env: MergeHoldEnviron
   for (const [basis, members] of byGroup) {
     let changed = false
     for (const member of members) {
-      const { outcome } = await attemptHold(port, env, member, basis)
+      const { outcome } = await attemptHold(port, env, member, basis, deadlineMs)
       count(outcome)
-      if (outcome === 'held') changed = true
+      if (outcome !== 'skipped') changed = true
     }
-    // An order held on a retry must be listed as held in the group's task.
-    if (changed) {
-      try {
-        await port.reviseGroupTask(env, basis)
-      } catch (error) {
-        console.error('[wms-merge-hold] could not update the merge-hold task', scrub(error))
-      }
-    }
+    // An order held (or failed again) on a retry must be listed as such in the group's task.
+    if (changed) await reviseSafe(port, env, basis)
   }
   return total
 }
@@ -363,88 +406,136 @@ export type MergeHoldMaintenance = { cleared: number; confirmedHeld: number; set
  * The upkeep of the holds that stand: CLEAR a hold on an observed status change or a merge, fire the overdue REMINDER once, show a pending edit as
  * "act in Mintsoft" and ESCALATE a withdrawal or cancel. Reads IMS state only (the stored status snapshot): no warehouse call. Runs whether or not the
  * setting is on, so a hold placed before it was turned off still clears and is still reminded; with no active row it writes nothing.
+ *
+ * A row that MAY be held (UNKNOWN) is treated like a held one for everything a person must hear about: the reminder, the "act in" notice of a change IMS
+ * withheld, and the escalation of a cancel / withdrawal. The push sweep withholds a change while a row is HOLDING / HELD / UNKNOWN, so each pass here
+ * either settles the row (the push then resumes) or raises the task: a customer's cancel is never withheld silently.
  */
 export async function runMergeHoldMaintenance(port: MergeHoldPort, env: MergeHoldEnvironment, options?: { hours?: number }): Promise<MergeHoldMaintenance> {
   const result: MergeHoldMaintenance = { cleared: 0, confirmedHeld: 0, settledNotHeld: 0, unsettled: 0, reminded: 0, editsBlocked: 0, escalated: 0 }
   const hours = options?.hours ?? mergeHoldRemindHours()
   const now = port.now()
-  for (const obs of await port.activeRows(env.connectorId)) {
-    const { row } = obs
-    // 1. CLEAR on evidence. The hold is the one this row names: a link re-pointed to another warehouse order (a merge IMS detected) is not it any more.
-    const mergedAway = obs.link !== null && (obs.link.state === 'MERGED' || obs.link.externalOrderId !== row.externalOrderId)
-    if (mergedAway) {
-      if (await port.clear(row, MERGE_HOLD_CLEAR_MERGED, now)) result.cleared += 1
-      await port.closeEditBlocked(row.orderId).catch(() => {})
-      continue
-    }
-    if (obs.shippedAt || ['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(obs.orderStatus)) {
-      if (await port.clear(row, MERGE_HOLD_CLEAR_SHIPPED, now)) result.cleared += 1
-      await port.closeEditBlocked(row.orderId).catch(() => {})
-      continue
-    }
-    // A snapshot proves anything only if it is for THIS warehouse order, was read AFTER the hold was recorded, and carries no lookup error.
-    const since = row.heldAt ?? row.updatedAt
-    const observed = obs.snapshot && obs.snapshot.externalOrderId === row.externalOrderId && !obs.snapshot.lastError && obs.snapshot.fetchedAt.getTime() > since.getTime() ? obs.snapshot : null
-    const status = observed ? classifyWarehouseStatus(observed.status) : null
-    // 1b. A row whose answer was lost (UNKNOWN) or never recorded (HOLDING left behind): settle it from the status, never guess.
-    //     A HOLDING row inside its lease is an attempt in flight: it records its own answer, so it is left alone (no demotion under a running request).
-    if (row.state === 'HOLDING' || row.state === 'UNKNOWN') {
-      if (row.state === 'HOLDING' && now.getTime() - row.updatedAt.getTime() < MERGE_HOLD_ATTEMPT_LEASE_MS) continue
-      if (status === 'held') {
-        if (await port.promoteToHeld(row, now)) result.confirmedHeld += 1
-      } else if (status === 'new') {
-        // Still NEW after the attempt: the request did not land, so it is safe to retry.
-        if (await port.settleNotHeld(row, `${MERGE_HOLD_CLEAR_NOT_LANDED}: the warehouse still shows ${observed?.status}`)) result.settledNotHeld += 1
-      } else {
-        // No evidence yet, or neither held nor NEW (picked, cancelled, an unrecognised name): it stays "may be held" and a person is asked.
-        if (row.state === 'HOLDING') await port.recordUnknown(row, 'The attempt never recorded an answer')
-        if (observed) {
-          try {
-            await port.raiseUnsettledTask(env, obs, 'UNKNOWN_OUTCOME')
-          } catch (error) {
-            console.error('[wms-merge-hold] could not raise the unknown-outcome task', scrub(error))
-          }
-        }
-        result.unsettled += 1
-      }
-      continue
-    }
-    if (status === 'unrecognised') {
-      // '' or a name this code does not know is NO evidence the hold ended: the row stays HELD and a person is told once.
-      try {
-        await port.raiseUnsettledTask(env, obs, 'UNRECOGNISED_STATUS')
-      } catch (error) {
-        console.error('[wms-merge-hold] could not raise the unrecognised-status task', scrub(error))
-      }
-    } else if (status === 'new' || status === 'left') {
-      if (await port.clear(row, `${MERGE_HOLD_CLEAR_LEFT_STATUS} (now ${observed?.status || 'unknown'})`, now)) result.cleared += 1
-      await port.closeEditBlocked(row.orderId).catch(() => {})
-      continue
-    }
-    if (row.state !== 'HELD') continue
-    // 2. REMIND, once.
-    if (row.heldAt && row.remindedAt === null && now.getTime() - row.heldAt.getTime() >= hours * 3_600_000) {
-      try {
-        if (await port.remind(env, obs, hours, now)) result.reminded += 1
-      } catch (error) {
-        console.error('[wms-merge-hold] could not raise the overdue reminder', scrub(error))
-      }
-    }
-    // 3. WHILE HELD: nothing is pushed. Say so, and send a withdrawal or cancel to a person.
+  // Settled rows (HELD) first: a person's confirm of one member decides the whole group in this same pass, before an UNKNOWN sibling is read.
+  const rank = (state: MergeHoldState) => (state === 'HELD' ? 0 : 1)
+  const rows = [...(await port.activeRows(env.connectorId))].sort((a, b) => rank(a.row.state) - rank(b.row.state))
+  const decidedBases = new Set<string>()
+  for (const obs of rows) {
     try {
-      if (obs.withdrawalHoldAt || obs.withdrawalApprovedAt) {
-        await port.escalate(env, obs, 'WITHDRAWAL')
-        result.escalated += 1
-      } else if (obs.orderStatus === 'CANCELLED' || obs.refundStatus === 'FULL') {
-        await port.escalate(env, obs, 'CANCEL')
-        result.escalated += 1
-      } else if (obs.editPending) {
-        await port.showEditBlocked(env, obs)
-        result.editsBlocked += 1
-      }
+      await maintainRow(port, env, { ...obs, groupDecidedByPerson: obs.groupDecidedByPerson || decidedBases.has(obs.row.groupBasis) }, hours, now, result, decidedBases)
     } catch (error) {
-      console.error('[wms-merge-hold] could not record a blocked change', scrub(error))
+      // One row never stops the others.
+      console.error('[wms-merge-hold] maintenance of one hold failed', scrub(error))
     }
   }
   return result
+}
+
+async function maintainRow(port: MergeHoldPort, env: MergeHoldEnvironment, obs: MergeHoldObservation, hours: number, now: Date, result: MergeHoldMaintenance, decidedBases: Set<string>): Promise<void> {
+  const { row } = obs
+  // 1. CLEAR on evidence. The hold is the one this row names: a link re-pointed to another warehouse order (a merge IMS detected) is not it any more.
+  const mergedAway = obs.link !== null && (obs.link.state === 'MERGED' || obs.link.externalOrderId !== row.externalOrderId)
+  if (mergedAway) {
+    if (await port.clear(row, MERGE_HOLD_CLEAR_MERGED, now)) { result.cleared += 1; decidedBases.add(row.groupBasis) }
+    await port.closeEditBlocked(row.orderId).catch(() => {})
+    return
+  }
+  if (obs.shippedAt || ['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(obs.orderStatus)) {
+    if (await port.clear(row, MERGE_HOLD_CLEAR_SHIPPED, now)) result.cleared += 1
+    await port.closeEditBlocked(row.orderId).catch(() => {})
+    return
+  }
+  // A snapshot proves anything only if it is for THIS warehouse order, was read AFTER the hold was recorded, and carries no lookup error.
+  const since = row.heldAt ?? row.updatedAt
+  const observed = obs.snapshot && obs.snapshot.externalOrderId === row.externalOrderId && !obs.snapshot.lastError && obs.snapshot.fetchedAt.getTime() > since.getTime() ? obs.snapshot : null
+  const status = observed ? classifyWarehouseStatus(observed.status) : null
+  // The age of the hold for the reminder: from when it was placed, or (an unsettled row) from when it was last written.
+  const ageFrom = row.heldAt ?? row.updatedAt
+  let state: MergeHoldState = row.state
+
+  // 1b. A row whose answer was lost (UNKNOWN) or never recorded (HOLDING left behind): settle it from the status, never guess.
+  //     A HOLDING row inside its lease is an attempt in flight: it records its own answer, so it is left alone (no demotion under a running request).
+  if (row.state === 'HOLDING' || row.state === 'UNKNOWN') {
+    if (row.state === 'HOLDING' && now.getTime() - row.updatedAt.getTime() < MERGE_HOLD_ATTEMPT_LEASE_MS) return
+    if (status === 'held') {
+      if (await port.promoteToHeld(row, now)) {
+        result.confirmedHeld += 1
+        state = 'HELD'
+        await reviseSafe(port, env, row.groupBasis)
+      } else return
+    } else if (status === 'left') {
+      // Past NEW and not awaiting confirmation (being worked, despatched, cancelled in the warehouse): it is NOT held now. Settle it, never held again, so the
+      // pushes the hold withheld resume. (If a person confirmed a hold that did land, this is the same answer.)
+      if (await port.settleNotHeld(row, `${MERGE_HOLD_CLEAR_NOT_HELD_PAST_NEW}: the warehouse status is ${observed?.status}`, { refused: true })) {
+        result.settledNotHeld += 1
+        await port.closeEditBlocked(row.orderId).catch(() => {})
+        await reviseSafe(port, env, row.groupBasis)
+      }
+      return
+    } else if (status === 'new' && observed && observed.fetchedAt.getTime() - row.updatedAt.getTime() >= MERGE_HOLD_NEW_GRACE_MS) {
+      // Still NEW on a read taken after the lease: a request that finished late has landed by now, so it did not land. A read before that proves nothing
+      // (the warehouse may still be processing a request IMS gave up on).
+      if (obs.groupDecidedByPerson) {
+        // A person already confirmed this group's other order(s) as they are: the decision covers this one too. Not held again.
+        if (await port.clear(row, `${MERGE_HOLD_CLEAR_LEFT_STATUS} (now ${observed.status}; the group was decided by a person)`, now)) result.cleared += 1
+        await port.closeEditBlocked(row.orderId).catch(() => {})
+        await reviseSafe(port, env, row.groupBasis)
+        return
+      }
+      if (await port.settleNotHeld(row, `${MERGE_HOLD_CLEAR_NOT_LANDED}: the warehouse still shows ${observed.status}`)) {
+        result.settledNotHeld += 1
+        await port.closeEditBlocked(row.orderId).catch(() => {})
+        await reviseSafe(port, env, row.groupBasis)
+      }
+      return
+    } else {
+      // No evidence yet (no fresh read, a NEW read too soon after the attempt, or a name IMS does not recognise): it stays "may be held".
+      if (row.state === 'HOLDING') {
+        await port.recordUnknown(row, 'The attempt never recorded an answer')
+        state = 'UNKNOWN'
+      }
+      if (status === 'unrecognised') {
+        try {
+          await port.raiseUnsettledTask(env, obs, 'UNKNOWN_OUTCOME')
+        } catch (error) {
+          console.error('[wms-merge-hold] could not raise the unknown-outcome task', scrub(error))
+        }
+      }
+      result.unsettled += 1
+    }
+  } else if (status === 'unrecognised') {
+    // '' or a name this code does not know is NO evidence the hold ended: the row stays HELD and a person is told once.
+    try {
+      await port.raiseUnsettledTask(env, obs, 'UNRECOGNISED_STATUS')
+    } catch (error) {
+      console.error('[wms-merge-hold] could not raise the unrecognised-status task', scrub(error))
+    }
+  } else if (status === 'new' || status === 'left') {
+    if (await port.clear(row, `${MERGE_HOLD_CLEAR_LEFT_STATUS} (now ${observed?.status || 'unknown'})`, now)) { result.cleared += 1; decidedBases.add(row.groupBasis) }
+    await port.closeEditBlocked(row.orderId).catch(() => {})
+    return
+  }
+
+  // From here the row is HELD or UNKNOWN: the order is (or may be) held, and the push sweep is withholding its changes.
+  const live: MergeHoldObservation = { ...obs, row: { ...row, state } }
+  // 2. REMIND, once (an UNKNOWN row too: nobody may have looked).
+  if (row.remindedAt === null && now.getTime() - ageFrom.getTime() >= hours * 3_600_000) {
+    try {
+      if (await port.remind(env, live, hours, now)) result.reminded += 1
+    } catch (error) {
+      console.error('[wms-merge-hold] could not raise the overdue reminder', scrub(error))
+    }
+  }
+  // 3. WHILE HELD (or maybe held): nothing is pushed. Say so, and send a withdrawal or cancel to a person (a task, so it is never withheld silently).
+  try {
+    if (obs.withdrawalHoldAt || obs.withdrawalApprovedAt) {
+      if (await port.escalate(env, live, 'WITHDRAWAL')) result.escalated += 1
+    } else if (obs.orderStatus === 'CANCELLED' || obs.refundStatus === 'FULL') {
+      if (await port.escalate(env, live, 'CANCEL')) result.escalated += 1
+    } else if (obs.editPending) {
+      await port.showEditBlocked(env, live)
+      result.editsBlocked += 1
+    }
+  } catch (error) {
+    console.error('[wms-merge-hold] could not record a blocked change', scrub(error))
+  }
 }

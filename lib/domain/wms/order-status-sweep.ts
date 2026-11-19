@@ -178,7 +178,14 @@ export async function runWmsOrderStatusSweep(
 
   const notFoundEnabled = await isNotFoundHandlingEnabled()
   const inScope = {
-    status: { notIn: [...TERMINAL_SALES_STATUSES] },
+    // An order with an ACTIVE merge-hold row (HOLDING / HELD / UNKNOWN) keeps being polled after IMS cancels or completes it: the snapshot is what settles
+    // the row, and a customer's cancel must not be withheld for good behind a hold nobody can see the end of (merge-hold.ts).
+    AND: [{
+      OR: [
+        { status: { notIn: [...TERMINAL_SALES_STATUSES] } },
+        { wmsMergeHolds: { some: { state: { in: ['HOLDING', 'HELD', 'UNKNOWN'] as Array<'HOLDING' | 'HELD' | 'UNKNOWN'> } } } },
+      ],
+    }],
     shoppingLinks: { some: { connector: lookupConnector, externalOrderNumber: { not: null } } },
     // An order already marked NOTFOUND is not polled again (an operator task asks a person to look): it is out of the batch and out of the unresolved count.
     ...(notFoundEnabled ? { NOT: { wmsOrderStatus: { is: { status: WMS_STATUS_NOT_FOUND } } } } : {}),

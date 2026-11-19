@@ -1,3 +1,4 @@
+import { runMergeHoldMaintenanceSafe } from '@/lib/domain/wms/merge-hold-port'
 import { mergeCandidateNote, runMergeCandidateDetectionSafe, type MergeCandidateNote } from '@/lib/domain/wms/merge-candidates'
 import { randomUUID } from 'node:crypto'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
@@ -5138,5 +5139,8 @@ export async function runWmsOrderPushSweep(
     const mergeCandidateDetection = mergeCandidateNote(await runMergeCandidateDetectionSafe('the order push'))
     if (mergeCandidateDetection) return { ...locked, mergeCandidateDetection }
   }
+  // Merge holds: the sweep withholds the cancel / edit / withdrawal hold of an order with an active hold row, so settle those rows or raise the escalation task
+  // now (database only, never throws, returns at once with no active row), not only on the next status sweep.
+  await runMergeHoldMaintenanceSafe('the order push')
   return locked
 }
