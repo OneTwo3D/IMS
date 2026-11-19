@@ -29,6 +29,7 @@ const JUSTIFIED: Record<string, string> = {
   uploadBackupArtifactsToTarget: 'its failures THROW (BackupArtifactUploadError) and the backup route catches them into `uploadError`; the success value only carries `orphanCleanupAttempted: false`',
   autoAllocateOrder: 'best-effort allocation after a payment advanced an order: the reallocation sweep re-attempts unallocated orders every run, and its own failures are in that route\'s result',
   queueRefundStockCorrections: 'in the WooCommerce webhook handler (a delivery, not a cron run; the open obligation is retried by the reconcile cron, which now folds this call\'s `failed` count into its result)',
+  applyWcOrderAmendment: 'the best-effort write step behind the divergence report, run after the delivery has already committed (both call sites are inside surfaceWcOrderDivergence, whose own catch is justified for the same reason). A `refund-failed` outcome is recorded durably before it returns: a WARNING activity entry, and the claim is released while the open divergence stays listed under Sync > Exceptions, so the next delivery retries it; nothing the cron run owes is lost. It never throws.',
   syncWcRefund: 'in the WooCommerce refund webhook handler: a delivery answered to the store, retried by the inbox and by the reconcile; not a cron result',
 }
 

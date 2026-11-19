@@ -27,6 +27,7 @@ import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
 import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type AmendmentLineChange, type RefusedActionInput } from '@/lib/domain/refused-actions'
+import { raiseRefundRemainderTasks } from './refund-remainder'
 import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
 import { runSystemicPass, type SystemicFailureStore } from './systemic-failure'
@@ -1257,6 +1258,11 @@ export interface WmsOrderPushPort {
   noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date; orderNumber?: string | null; externalOrderNumber?: string | null; lastError?: string | null }>>
   /** Record one operator task ("raise a query"), once: true when a new row was written, false when the same task already exists. A rejection means it was NOT recorded. */
   raiseOperatorTask?(task: WmsOperatorTaskInput): Promise<boolean>
+  /**
+   * o3d-2q9vp: raise the "ask the warehouse to send the remaining units" tasks for orders whose shipped units were returned and refunded (the push subtracts the GROSS refund;
+   * IMS demand nets only returned shipped units). Returns the number of NEW tasks. Behind `wms_refund_remainder_task_enabled`; changes no quantity at the warehouse.
+   */
+  raiseRefundRemainderTasks?(connector: string): Promise<{ raised: number; failed: number }>
   /**
    * Record a refused or stalled action (lib/domain/refused-actions.ts): an idempotent upsert on (entity, action, gate). THROWS when it cannot be
    * written: the caller then leaves the link due rather than advancing it over a refusal nobody can see. Absent: nothing is recorded (test doubles).
@@ -4282,6 +4288,16 @@ export async function runWmsOrderPushSweepCore(
 
   if (ambiguousCreateAdopted > 0) result.ambiguousCreateAdopted = ambiguousCreateAdopted
   if (operatorNoticeCount > 0) result.operatorNotices = operatorNoticeCount
+  if (port.raiseRefundRemainderTasks) {
+    try {
+      const remainder = await port.raiseRefundRemainderTasks(connectorId)
+      operatorTasksRaised += remainder.raised
+      operatorTaskErrorCount += remainder.failed
+    } catch (error) {
+      operatorTaskErrorCount += 1
+      console.error('[wms-order-push] failed to raise the refund remainder tasks', error)
+    }
+  }
   if (operatorTasksRaised > 0) result.operatorTasksRaised = operatorTasksRaised
   if (operatorTaskErrorCount > 0) result.operatorTaskErrors = operatorTaskErrorCount
   // How many operator tasks are open now. INFORMATION, never a failure: the cron is not red for a task waiting on a person.
@@ -5025,6 +5041,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     },
     async raiseOperatorTask(task) {
       return raiseWmsOperatorTask(db, task)
+    },
+    async raiseRefundRemainderTasks(connector) {
+      return raiseRefundRemainderTasks(connector)
     },
     async recordRefusedAction(input) {
       await recordRefusedAction(db, input)

@@ -18,8 +18,33 @@ import { effectiveLineEta } from '@/lib/domain/purchasing/line-eta'
  *     line's effective ETA (its own date, else the order's: lib/domain/purchasing/line-eta.ts). An ASN with no eta falls through to the PO date;
  *   - a source resolved to a date BEFORE today (UTC calendar day) is LATE and is dropped, never rolled forward and never shown;
  *   - a source with no date is dropped;
- *   - the answer is the earliest date left, or null (the caller then clears the storefront value).
+ *   - the answer is the earliest date left, or null (the caller then clears the storefront value). The customer sees that date PLUS the
+ *     buffer (default 3 days, setting wc_back_in_stock_date_buffer_days; owner decision 2026-11-18). Lateness is judged on the supplier date.
  */
+
+/** Setting key: days added to the supplier ETA before it is shown to customers. */
+export const WC_BACK_IN_STOCK_BUFFER_DAYS_SETTING = 'wc_back_in_stock_date_buffer_days'
+/** Owner decision 2026-11-18: the customer-facing date is supplier ETA + 3 days. */
+export const DEFAULT_BACK_IN_STOCK_BUFFER_DAYS = 3
+const MAX_BACK_IN_STOCK_BUFFER_DAYS = 365
+
+export function parseBackInStockBufferDays(raw: string | null | undefined): number {
+  const text = (raw ?? '').trim()
+  if (!/^\d+$/.test(text)) return DEFAULT_BACK_IN_STOCK_BUFFER_DAYS
+  return Math.min(Number(text), MAX_BACK_IN_STOCK_BUFFER_DAYS)
+}
+
+/** Pure: YYYY-MM-DD plus whole days (UTC calendar arithmetic). */
+export function addDaysToDateOnly(day: string, days: number): string {
+  const date = new Date(`${day}T00:00:00.000Z`)
+  date.setUTCDate(date.getUTCDate() + days)
+  return date.toISOString().slice(0, 10)
+}
+
+async function loadBackInStockBufferDays(): Promise<number> {
+  const row = await db.setting.findUnique({ where: { key: WC_BACK_IN_STOCK_BUFFER_DAYS_SETTING } })
+  return parseBackInStockBufferDays(row?.value)
+}
 
 export type BackInStockPoLine = {
   id: string
@@ -45,7 +70,7 @@ export type BackInStockAsnLine = {
  * date supply.
  */
 /** Pure: product id to its earliest committed, not-late arrival date (YYYY-MM-DD). Products with none are absent. */
-export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: BackInStockAsnLine[], now: Date): Map<string, string> {
+export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: BackInStockAsnLine[], now: Date, bufferDays = 0): Map<string, string> {
   const today = dateOnly(now)
   const asnByLine = new Map<string, BackInStockAsnLine[]>()
   for (const asnLine of asnLines) {
@@ -82,6 +107,10 @@ export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: Ba
     }
     if (outstanding.gt(0)) consider(line.productId, effectiveLineEta(line.expectedDelivery, line.po.expectedDelivery))
   }
+  if (bufferDays > 0) {
+    // The lateness test above is on the SUPPLIER date; the buffer only moves what the customer is shown.
+    for (const [productId, day] of earliest) earliest.set(productId, addDaysToDateOnly(day, bufferDays))
+  }
   return earliest
 }
 
@@ -91,6 +120,7 @@ export function resolveBackInStockDates(lines: BackInStockPoLine[], asnLines: Ba
  */
 export async function loadBackInStockDates(productIds: string[], now: Date = new Date()): Promise<Map<string, string>> {
   if (productIds.length === 0) return new Map()
+  const bufferDays = await loadBackInStockBufferDays()
   const lines = await db.purchaseOrderLine.findMany({
     where: { productId: { in: productIds }, po: { type: 'GOODS', status: { in: INCOMING_PO_STATUSES } } },
     select: {
@@ -110,5 +140,5 @@ export async function loadBackInStockDates(productIds: string[], now: Date = new
       asn: { select: { eta: true, status: true, closedAt: true } },
     },
   })
-  return resolveBackInStockDates(lines, asnLines, now)
+  return resolveBackInStockDates(lines, asnLines, now, bufferDays)
 }

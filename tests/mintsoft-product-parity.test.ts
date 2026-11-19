@@ -164,7 +164,7 @@ test('flag ON: the name is fitted to 99, cut at a word boundary, the variant suf
   await run()
   const name = String(state.upserts[0]!.dto.name)
   assert.ok(name.length <= 99, name)
-  assert.equal(name, 'Mandala Rose Works FireThorn Flex Plate with ThornGrip... — Voron 2.4/Trident 350 (355 x 355mm)')
+  assert.equal(name, 'Mandala Rose Works FireThorn Flex Plate with ThornGrip... (Voron 2.4/Trident 350 (355 x 355mm))')
 })
 
 test('flag ON: CostPrice is the IMS weighted average cost, to four places, and appears in the request body', async () => {
