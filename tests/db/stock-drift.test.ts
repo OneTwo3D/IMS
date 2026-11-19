@@ -107,3 +107,39 @@ test('[db] the STOCK_DRIFT evidence reader against the real tables: quiet only a
   await d.db.wcStockDriftEvent.create({ data: { externalProductId: '2', fromQuantity: 5, toQuantity: 4, previousObservedAt: new Date('2027-01-09T00:00:00Z'), observedAt: new Date('2027-01-09T12:00:00Z') } })
   assert.deepEqual(await stockDrift(), { state: 'counted', counted: 1, floor: '2027-01-10T00:00:00.000Z' }, 'an event from before the confirmation is not counted')
 })
+
+test('[db] a push made BEFORE the previous look does not explain a later change to the same quantity', { skip }, async (t) => {
+  const d = await setup()
+  const suffix = randomUUID().slice(0, 8)
+  const pushId = ID()
+  const product = await d.db.product.create({ data: { sku: `SD-OLD-${suffix}`, name: 'oldpush', type: 'SIMPLE', externalProductId: BigInt(pushId) }, select: { id: true } })
+  t.after(() => wipe(d, async () => { await d.db.stockSyncState.deleteMany({ where: { productId: product.id } }); await d.db.product.deleteMany({ where: { id: product.id } }) }))
+  // IMS pushed 4 two days ago; the store was then read at 10 an hour ago (someone else moved it); now it reads 4 again with no push since.
+  await d.db.stockSyncState.create({ data: { connector: 'woocommerce', productId: product.id, lastPushedQty: 4, lastPushedAt: new Date(Date.now() - 48 * 3_600_000) } })
+  await d.drift.observeWcStockDrift({ readCatalogue: async () => [{ id: pushId, sku: 'a', quantity: 10 }], now: () => new Date(Date.now() - 3_600_000) })
+  const run = await d.drift.observeWcStockDrift({ readCatalogue: async () => [{ id: pushId, sku: 'a', quantity: 4 }], now: () => new Date() })
+  assert.equal(run.driftFound, 1, 'the old push of the same number explains nothing')
+})
+
+test('[db] an operator acknowledgement (who, why, audit entry) takes an event out of the STOCK_DRIFT count; it needs a reason and is never silent', { skip }, async (t) => {
+  const d = await setup()
+  const ack = await import('../../lib/connectors/woocommerce/stock-drift-ack')
+  const attestation = await d.db.writerAttestation.create({ data: { kind: 'qoblex-stock-push-stopped', attestedAt: new Date('2027-01-10T00:00:00Z'), userId: 'cli:test' } })
+  t.after(() => wipe(d, async () => { await d.db.writerAttestation.deleteMany({ where: { id: attestation.id } }); await d.db.activityLog.deleteMany({ where: { action: 'wc_stock_drift_acknowledged' } }) }))
+  const now = new Date('2027-01-12T00:00:00Z')
+  const env = { MINTSOFT_WRITES_LIVE_FROM: '2027-01-05T00:00:00Z', WC_WRITES_LIVE_FROM: '2027-01-11T00:00:00Z' }
+  const stockDrift = async () => (await d.evidence.readStepEvidence({ db: d.db as never, now, env, probe: async () => ({ ok: false, reason: 'unreachable', message: '' }), foreignOrders: async () => ({ foreign: 0 }) })).STOCK_DRIFT
+  await d.db.wcStockDriftRun.createMany({ data: [{ startedAt: new Date('2027-01-10T01:00:00Z'), ok: true }, { startedAt: new Date('2027-01-11T23:00:00Z'), ok: true }] })
+  const first = await d.db.wcStockDriftEvent.create({ data: { externalProductId: '11', fromQuantity: 5, toQuantity: 4, previousObservedAt: new Date('2027-01-11T00:00:00Z'), observedAt: new Date('2027-01-11T12:00:00Z') } })
+  const second = await d.db.wcStockDriftEvent.create({ data: { externalProductId: '12', fromQuantity: 5, toQuantity: 3, previousObservedAt: new Date('2027-01-11T00:00:00Z'), observedAt: new Date('2027-01-11T13:00:00Z') } })
+  assert.deepEqual(await stockDrift(), { state: 'counted', counted: 2, floor: '2027-01-10T00:00:00.000Z' })
+  assert.deepEqual(await ack.acknowledgeStockDriftEvents(d.db as never, { ids: [first.id], by: 'jan', note: '' }), { ok: false, error: 'Say why the event(s) are explained (--note): an acknowledgement needs a reason.' })
+  assert.deepEqual(await stockDrift(), { state: 'counted', counted: 2, floor: '2027-01-10T00:00:00.000Z' }, 'no reason, nothing acknowledged')
+  assert.deepEqual(await ack.acknowledgeStockDriftEvents(d.db as never, { ids: [first.id], by: 'jan', note: 'manual price-list edit in WooCommerce, checked with the buyer' }), { ok: true, acknowledged: 1 })
+  assert.deepEqual(await stockDrift(), { state: 'counted', counted: 1, floor: '2027-01-10T00:00:00.000Z' }, 'only the unacknowledged event still counts')
+  const row = await d.db.wcStockDriftEvent.findUniqueOrThrow({ where: { id: first.id } })
+  assert.deepEqual([row.acknowledgedBy, row.acknowledgedNote, row.acknowledgedAt !== null], ['jan', 'manual price-list edit in WooCommerce, checked with the buyer', true])
+  assert.equal(await d.db.activityLog.count({ where: { action: 'wc_stock_drift_acknowledged' } }), 1, 'the audit entry')
+  assert.equal((await ack.acknowledgeStockDriftEvents(d.db as never, { ids: [first.id], by: 'jan', note: 'again' })).ok, false, 'already acknowledged: not acknowledged twice')
+  assert.equal((await d.db.wcStockDriftEvent.findUniqueOrThrow({ where: { id: second.id } })).acknowledgedAt, null)
+})

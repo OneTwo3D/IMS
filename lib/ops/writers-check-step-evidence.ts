@@ -30,7 +30,7 @@ type DriftReaderDb = {
   wcStockDriftRun: {
     findFirst(args: { where: { ok: true; startedAt?: { gte: Date } }; orderBy: { startedAt: 'asc' | 'desc' }; select: { startedAt: true } }): Promise<{ startedAt: Date } | null>
   }
-  wcStockDriftEvent: { count(args: { where: { observedAt: { gte: Date; lte: Date } } }): Promise<number> }
+  wcStockDriftEvent: { count(args: { where: { observedAt: { gte: Date; lte: Date }; acknowledgedAt: null } }): Promise<number> }
 }
 
 type EvidenceReaderDb = AttestationReaderDb & {
@@ -115,7 +115,7 @@ const stockDriftReader: StepEvidenceReader = whenStepLive('woocommerce', async (
   if (!first || !last) return { state: 'not-probed' }
   if (last.startedAt.getTime() < ctx.now.getTime() - STOCK_DRIFT_MAX_RUN_AGE_MS) return { state: 'not-probed' }
   if (last.startedAt.getTime() - first.startedAt.getTime() < STOCK_DRIFT_QUIET_WINDOW_MS) return { state: 'not-probed' }
-  const counted = await db.wcStockDriftEvent.count({ where: { observedAt: { gte: attestation.attestedAt, lte: ctx.now } } })
+  const counted = await db.wcStockDriftEvent.count({ where: { observedAt: { gte: attestation.attestedAt, lte: ctx.now }, acknowledgedAt: null } })
   return { state: 'counted', counted, floor: attestation.attestedAt.toISOString() }
 })
 

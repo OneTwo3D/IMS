@@ -36,8 +36,8 @@ ${constant('OTI_BRIDGE_PRODUCT_SYNC_HOOK')}
 ${constant('OTI_BRIDGE_WEBHOOK_URL_PART')}
 ${constant('OTI_XEROOM_NOTE_OFF_OPT')}
 ${constant('OTI_WDRAW_OUTCOME_ON_OPT')}
-${constant('OTI_WDRAW_REQUEST_IDS_OPT')}
-${constant('OTI_WDRAW_REQUEST_IDS_MAX')}
+${constant('OTI_WDRAW_REQUEST_ID_OPT_PREFIX')}
+${constant('OTI_WDRAW_STATUSES')}
 function update_option($k, $v, $a = null) { $GLOBALS['options'][$k] = $v; $GLOBALS['option_writes'][] = $k; return true; }
 class WP_Error { public $code; function __construct($c = '', $m = '', $d = []) { $this->code = $c; } function get_error_code() { return $this->code; } }
 function is_wp_error($v) { return $v instanceof WP_Error; }
@@ -77,9 +77,9 @@ $b = oti_verify_incumbents_signature($r);
 echo json_encode(['first' => $a === true ? 'ok' : $a->code, 'second' => $b === true ? 'ok' : $b->code]);`)
 }
 
-test('the plugin is 1.5.0 or later and the file has no syntax error', () => {
+test('the plugin is 1.5.2 or later and the file has no syntax error', () => {
   const version = /^\s*\*\s*Version:\s+(\d+)\.(\d+)\.(\d+)\s*$/m.exec(PHP)!
-  assert.ok(Number(version[1]) > 1 || Number(version[2]) >= 5, `version ${version.slice(1).join('.')}`)
+  assert.ok(Number(version[1]) > 1 || Number(version[2]) > 5 || (Number(version[2]) === 5 && Number(version[3]) >= 2), `version ${version.slice(1).join('.')}`)
   const lint = spawnSync('php', ['-l', 'lib/connectors/woocommerce/wp-plugin/onetwoinventory-helper.php'], { encoding: 'utf8' })
   assert.equal(lint.status, 0, lint.stdout + lint.stderr)
 })
@@ -169,8 +169,9 @@ test('withdrawal-outcome: signed over the order path, single-use, and a TrackShi
 
 function outcomeHandle(body: Record<string, unknown>, state: { keys?: string[]; wbte?: 'ok' | 'none' | 'throws' | 'notpending' | 'notpendingrejected'; requestMeta?: number; ownMeta?: number; owner?: number; mapped?: number } = {}) {
   return php(`${STUBS}
-$GLOBALS['notes'] = []; $GLOBALS['rejects'] = []; $GLOBALS['options'] = ${state.mapped ? `['${'oti_wdraw_request_ids'}' => [77 => ${state.mapped}]]` : '[]'}; $GLOBALS['option_writes'] = [];
-class FakeWpdb { public $prefix = 'wp_'; function prepare($q, ...$a) { return $q; } function get_var($q) { return strpos($q, 'GET_LOCK') !== false ? 1 : null; } function query($q) { return 1; } }
+$GLOBALS['notes'] = []; $GLOBALS['rejects'] = []; $GLOBALS['options'] = ${state.mapped ? `['oti_wdraw_req_77' => ${state.mapped}]` : '[]'}; $GLOBALS['option_writes'] = [];
+class FakeWpdb { public $prefix = 'wp_'; public $options = 'wp_options'; function prepare($q, ...$a) { foreach ($a as $x) { $q = preg_replace('/%[sd]/', is_int($x) ? (string) $x : "'" . $x . "'", $q, 1); } return $q; }
+  function get_var($q) { if (strpos($q, 'GET_LOCK') !== false) { return 1; } if (preg_match("/option_name = '([^']*)'/", $q, $m)) { return $GLOBALS['options'][$m[1]] ?? null; } return null; } function query($q) { return 1; } }
 $wpdb = new FakeWpdb();
 class FakeOrder { public $meta = ['_oti_wdraw_outcome_keys' => ${JSON.stringify(state.keys ?? [])}, '_mintsoft_wdraw_request_id' => ${state.requestMeta ?? 0}, '_oti_wdraw_request_id' => ${state.ownMeta ?? 0}];
   function get_meta($k) { return $this->meta[$k] ?? ''; }
@@ -243,8 +244,11 @@ test('withdrawal-outcome: a rejection goes through the withdrawal plugin with th
   assert.deepEqual(done.notes, ['IMS: despatched'])
   const fromMeta = outcomeHandle({ ...body, request_id: undefined }, { wbte: 'ok', requestMeta: 4 })
   assert.deepEqual(fromMeta.rejects, [[4, 'order already dispatched']])
-  const fromOwn = outcomeHandle({ ...body, request_id: undefined }, { wbte: 'ok', ownMeta: 6 })
+  const fromOwn = outcomeHandle({ ...body, request_id: undefined }, { wbte: 'ok', mapped: 6, requestMeta: 4 })
   assert.deepEqual(fromOwn.rejects, [[6, 'order already dispatched']], 'the helper plugin\'s own record comes before the bridge\'s')
+  // A stale `_oti_wdraw_request_id` order meta (persisted by a round-tripping client) is NOT a source any more.
+  const stale = outcomeHandle({ ...body, request_id: undefined }, { wbte: 'ok', ownMeta: 6 })
+  assert.equal((stale.data as { result: string }).result, 'no_request')
 })
 
 test('withdrawal-outcome: no request id, no withdrawal plugin and a failing reject are told apart; the note is never lost on the first two', () => {
@@ -276,10 +280,10 @@ test('withdrawal-outcome: a request that is not pending counts as rejected only 
   assert.equal((rejected.data as { result: string }).result, 'rejected')
 })
 
-test('withdrawal-outcome: the lock is taken before the order and its markers are read, and the request id comes from the option map before order meta', () => {
+test('withdrawal-outcome: the lock is taken before the order and its markers are read, and the request id comes from the captured option before the bridge meta', () => {
   const fn = phpFunction('oti_handle_withdrawal_outcome')
   assert.ok(fn.indexOf('GET_LOCK') < fn.indexOf('wc_get_order('), 'GET_LOCK first, then the order')
-  const mapped = outcomeHandle({ outcome: 'rejected', outcome_key: 'after:77:4', note: 'n', request_id: undefined }, { wbte: 'ok', mapped: 12, ownMeta: 6 })
+  const mapped = outcomeHandle({ outcome: 'rejected', outcome_key: 'after:77:4', note: 'n', request_id: undefined }, { wbte: 'ok', mapped: 12, requestMeta: 6 })
   assert.deepEqual(mapped.rejects, [[12, 'order already dispatched']])
   assert.ok((mapped.optionWrites as string[]).includes('oti_withdrawal_outcome_enabled'), 'IMS posting an outcome switches the capture on')
 })
@@ -292,15 +296,83 @@ function add_action() {} function add_filter() {}
 ${phpFunction('oti_capture_wdraw_request')}
 $o = new CapOrder();
 oti_capture_wdraw_request((object) ['id' => ${requestId}], $o);
-echo json_encode(['orderWrites' => $o->meta_writes, 'optionWrites' => $GLOBALS['option_writes'], 'map' => $GLOBALS['options']['oti_wdraw_request_ids'] ?? null]);`)
+echo json_encode(['orderWrites' => $o->meta_writes, 'optionWrites' => $GLOBALS['option_writes'], 'map' => $GLOBALS['options']['oti_wdraw_req_77'] ?? null]);`)
 }
 
-test('capture hook: writes NO order meta ever; inert until IMS switches the outcome on; then it records the id in an option map', () => {
+test('capture hook: writes NO order meta ever; inert until IMS switches the outcome on; then it records the id in a per-order option', () => {
   const off = captureRun({})
   assert.deepEqual(off, { orderWrites: 0, optionWrites: [], map: null }, 'P1: the plugin writes nothing')
   const on = captureRun({ oti_withdrawal_outcome_enabled: 'yes' })
   assert.equal(on.orderWrites, 0, 'the order is never saved')
-  assert.deepEqual(on.map, { 77: 31 })
-  assert.deepEqual(captureRun({ oti_withdrawal_outcome_enabled: 'yes', oti_wdraw_request_ids: { 77: 31 } }).optionWrites, [], 'an unchanged id writes nothing')
+  assert.equal(on.map, 31, 'one option per order: no shared map to lose an entry from')
+  assert.deepEqual(captureRun({ oti_withdrawal_outcome_enabled: 'yes', oti_wdraw_req_77: 31 }).optionWrites, [], 'an unchanged id writes nothing')
   assert.ok(!/update_meta_data|save_meta_data|->save\(/.test(phpFunction('oti_capture_wdraw_request')))
+})
+
+function exposeRun(options: Record<string, unknown>, order: { status: string; keys?: string[] }) {
+  return php(`${STUBS}
+$GLOBALS['options'] = json_decode(${JSON.stringify(JSON.stringify(options))}, true); $GLOBALS['lookups'] = 0;
+class ExpWpdb { public $options = 'wp_options'; function prepare($q, ...$a) { foreach ($a as $x) { $q = preg_replace('/%[sd]/', "'" . $x . "'", $q, 1); } return $q; }
+  function get_var($q) { $GLOBALS['lookups']++; preg_match("/option_name = '([^']*)'/", $q, $m); return $GLOBALS['options'][$m[1]] ?? null; } }
+$wpdb = new ExpWpdb();
+function apply_filters($tag, $v) { return $v; }
+class ExpOrder { function get_id() { return 77; } function get_status() { return ${JSON.stringify(order.status)}; } function get_meta($k) { return $k === '_oti_wdraw_outcome_keys' ? ${JSON.stringify(order.keys ?? [])} : ''; } }
+function add_action() {} function add_filter() {}
+${phpFunction('oti_wdraw_request_id_for_order')}
+${phpFunction('oti_expose_wdraw_request_id')}
+$r = new WP_REST_Response(['id' => 77, 'meta_data' => [['id' => 5, 'key' => 'x', 'value' => 'y']]]);
+$out = oti_expose_wdraw_request_id($r, new ExpOrder());
+echo json_encode(['data' => $out->data, 'lookups' => $GLOBALS['lookups']]);`) as { data: { meta_data: unknown[]; _oti_wdraw_request_id?: number }; lookups: number }
+}
+
+test('REST prepare filter: the request id is a TOP-LEVEL response field, never a meta_data entry (so a round-tripping client cannot persist it); nothing is added without a capture', () => {
+  const on = { oti_withdrawal_outcome_enabled: 'yes' }
+  const captured = exposeRun({ ...on, oti_wdraw_req_77: 31 }, { status: 'pending-wdraw' })
+  assert.equal(captured.data._oti_wdraw_request_id, 31)
+  assert.equal(captured.lookups, 1, 'one single-row select')
+  assert.deepEqual(captured.data.meta_data, [{ id: 5, key: 'x', value: 'y' }], 'meta_data is untouched: no synthetic id-0 entry')
+  assert.equal(exposeRun(on, { status: 'pending-wdraw' }).data._oti_wdraw_request_id, undefined)
+  assert.equal(exposeRun({ ...on, oti_wdraw_req_77: 31 }, { status: 'cancelled', keys: ['n:k'] }).data._oti_wdraw_request_id, 31, 'an order IMS already wrote an outcome on stays visible after its status moved on')
+})
+
+test('REST prepare filter: an order that is not in a withdrawal status, or any order while the capture switch is off, does NO lookup (no per-order notoptions entry, no query)', () => {
+  const on = { oti_withdrawal_outcome_enabled: 'yes', oti_wdraw_req_77: 31 }
+  for (const status of ['processing', 'completed', 'on-hold', 'cancelled']) {
+    const run = exposeRun(on, { status })
+    assert.equal(run.lookups, 0, `${status}: no lookup`)
+    assert.equal(run.data._oti_wdraw_request_id, undefined)
+  }
+  const off = exposeRun({ oti_wdraw_req_77: 31 }, { status: 'pending-wdraw' })
+  assert.equal(off.lookups, 0, 'switch off (P1): no lookup even for a withdrawal order')
+  assert.equal(off.data._oti_wdraw_request_id, undefined)
+  const src = phpFunction('oti_expose_wdraw_request_id') + phpFunction('oti_wdraw_request_id_for_order')
+  assert.ok(!/get_option\(\s*OTI_WDRAW_REQUEST_ID_OPT_PREFIX|get_option\(\s*\$option|get_option\(\s*\$name/.test(src), 'the per-order option is read with $wpdb, never get_option (a miss would add a notoptions entry)')
+})
+
+test('order deletion forgets only that order\'s request option; and the outcome route no longer reads a `_oti_wdraw_request_id` order meta', () => {
+  const out = php(`${STUBS}
+$GLOBALS['options'] = ['oti_wdraw_req_77' => 31, 'oti_wdraw_req_78' => 32]; $GLOBALS['deleted'] = [];
+function delete_option($k) { $GLOBALS['deleted'][] = $k; unset($GLOBALS['options'][$k]); return true; }
+${phpFunction('oti_forget_wdraw_request')}
+oti_forget_wdraw_request(77);
+echo json_encode(['deleted' => $GLOBALS['deleted'], 'left' => array_keys($GLOBALS['options'])]);`)
+  assert.deepEqual(out, { deleted: ['oti_wdraw_req_77'], left: ['oti_wdraw_req_78'] })
+  assert.ok(!phpFunction('oti_handle_withdrawal_outcome').includes("get_meta('_oti_wdraw_request_id')"))
+})
+
+test('delete_post cleanup looks only at order post types (a revision, attachment or product delete costs nothing); HPOS order deletion has its own hook', () => {
+  const run = (type: string) => php(`${STUBS}
+$GLOBALS['deleted'] = [];
+function get_post_type($id) { return ${JSON.stringify(type)}; }
+function delete_option($k) { $GLOBALS['deleted'][] = $k; return true; }
+${phpFunction('oti_forget_wdraw_request')}
+${phpFunction('oti_forget_wdraw_request_for_post')}
+oti_forget_wdraw_request_for_post(77);
+echo json_encode(['deleted' => $GLOBALS['deleted']]);`)
+  assert.deepEqual(run('revision'), { deleted: [] })
+  assert.deepEqual(run('attachment'), { deleted: [] })
+  assert.deepEqual(run('product'), { deleted: [] })
+  assert.deepEqual(run('shop_order'), { deleted: ['oti_wdraw_req_77'] })
+  assert.match(PHP, /add_action\('woocommerce_delete_order', 'oti_forget_wdraw_request'/)
+  assert.match(PHP, /add_action\('delete_post', 'oti_forget_wdraw_request_for_post'/)
 })

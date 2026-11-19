@@ -33,7 +33,7 @@
  */
 
 import { isWcOrderAnonymised } from './anonymisation'
-import { writeWithdrawalOutcomeForEvent } from './withdrawal-outcome'
+import { withdrawalOutcomeKey, writeWithdrawalOutcomeForEvent } from './withdrawal-outcome'
 import { recordWcErasureObligation } from './erasure-obligation'
 import { WcFirstImportLockUnavailable, withWcFirstImportLock } from './first-import-lock'
 import { randomUUID } from 'node:crypto'
@@ -266,6 +266,41 @@ async function withOrderLock<T>(
   })
 }
 
+/** The plugin saves the order inside the outcome call, so its modified time falls just before the outcome row IMS writes after the answer. */
+const OUTCOME_ECHO_BEFORE_MS = 5_000
+const OUTCOME_ECHO_AFTER_MS = 90_000
+
+/** The plugin's done-marker meta (an array of `n:<key>` / `r:<key>`), when the order payload carries it: null when the key is absent, [] when present and empty. */
+function payloadOutcomeMarkers(wcOrder: WcFullOrder): string[] | null {
+  const entry = (wcOrder.meta_data ?? []).find((m) => m.key === '_oti_wdraw_outcome_keys')
+  if (!entry) return null
+  return Array.isArray(entry.value) ? entry.value.filter((v): v is string => typeof v === 'string') : null
+}
+
+/**
+ * Is this event the echo of IMS's own outcome write? When the payload carries the plugin's done-markers, the echo is recognised by CONTENT: the newest marker is
+ * one IMS has a row for (so the order was saved by that very call), and the event time sits in that row's window. Without the markers (an older plugin, or a payload
+ * that omits them) the time window alone is used, over any outcome row of the order.
+ */
+async function isOutcomeEcho(tx: TxClient, orderId: string, eventAt: Date, wcOrder: WcFullOrder): Promise<boolean> {
+  const markers = payloadOutcomeMarkers(wcOrder)
+  if (markers !== null && markers.length > 0) {
+    const newest = markers[markers.length - 1]!.replace(/^[nr]:/, '')
+    const rows = await tx.wcWithdrawalOutcome.findMany({
+      where: { orderId },
+      select: { requestKey: true, outcomeKind: true, writtenAt: true },
+    })
+    const row = rows.find((r) => withdrawalOutcomeKey(String(wcOrder.id), r.requestKey, r.outcomeKind) === newest)
+    if (!row) return false
+    return eventAt.getTime() >= row.writtenAt.getTime() - OUTCOME_ECHO_AFTER_MS && eventAt.getTime() <= row.writtenAt.getTime() + OUTCOME_ECHO_BEFORE_MS
+  }
+  const row = await tx.wcWithdrawalOutcome.findFirst({
+    where: { orderId, writtenAt: { gte: new Date(eventAt.getTime() - OUTCOME_ECHO_BEFORE_MS), lte: new Date(eventAt.getTime() + OUTCOME_ECHO_AFTER_MS) } },
+    select: { id: true },
+  })
+  return row !== null
+}
+
 async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promise<TransitionResult> {
   const incomingStatus = normaliseStatus(wcOrder.status)
   const eventAt = wcEventTimestamp(wcOrder)
@@ -285,7 +320,16 @@ async function applyWithdrawalHold(orderId: string, wcOrder: WcFullOrder): Promi
     // generation, leaving a stale operator release able to clear it.
     const isNewer = eventAt !== null
       && (current.withdrawalLastWcEventAt === null || eventAt > current.withdrawalLastWcEventAt)
-    const isNewSubmission = current.withdrawalLastWcStatus !== incomingStatus || isNewer
+    // ...EXCEPT the echo of IMS's own outcome write: the helper plugin saves the order's done-marker (HPOS: a real order save, a newer modified time, one
+    // order.updated webhook) while it writes the outcome note. That newer time is not a customer's submission and must not move the hold generation (it
+    // would raise a false "another request" task and make an operator release look stale). An event with the SAME handled status whose time sits within
+    // the echo window of an outcome row IMS wrote is such an echo: the time advances, the generation does not.
+    const statusMoved = current.withdrawalLastWcStatus !== incomingStatus
+    const isEcho = !statusMoved && isNewer && eventAt !== null && await isOutcomeEcho(tx, orderId, eventAt, wcOrder)
+    const isNewSubmission = statusMoved || (isNewer && !isEcho)
+    if (isEcho) {
+      await tx.salesOrder.update({ where: { id: orderId }, data: { withdrawalLastWcEventAt: eventAt } })
+    }
     if (isNewSubmission) {
       await tx.salesOrder.update({
         where: { id: orderId },
@@ -460,10 +504,12 @@ async function clearStaleMarker(orderId: string, observed: Date | null): Promise
   })
 }
 
-/** The storefront withdrawal request id the helper plugin recorded on the order, when the payload carries one. */
+/**
+ * The storefront withdrawal request id the helper plugin put in the order payload, when it carries one. A top-level field (`_oti_wdraw_request_id`), NOT a
+ * meta_data entry: a client that round-trips meta_data in a PUT would persist a meta entry as real order meta, and a stale id could stick.
+ */
 export function wcWithdrawalRequestId(wcOrder: WcFullOrder): string | null {
-  const meta = (wcOrder.meta_data ?? []).find((m) => m.key === '_oti_wdraw_request_id')
-  const value = meta?.value
+  const value: unknown = wcOrder._oti_wdraw_request_id
   const text = typeof value === 'number' ? String(value) : typeof value === 'string' ? value.trim() : ''
   return /^[1-9]\d{0,17}$/.test(text) ? text : null
 }
