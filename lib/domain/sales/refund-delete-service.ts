@@ -548,9 +548,9 @@ export async function deleteSalesOrderRefund(
       reversal.shopRefundTasksClosed = shopTasks.count
 
       // The owed-posting record an adopting refund raised (a margin reclass for returned stock the warehouse had already restocked) names a refund that is
-      // gone after this delete: close it, so a person does not post a reclass for it. The adoption itself is released by the refund's soft delete.
+      // gone after this delete: close it, so a person does not post a reclass for it. A row somebody has claimed to post by hand is left to them (the predicate `handPostClaimedAt: null`; a claimed row is never resolved from under an operator). The adoption itself is released by the refund's soft delete.
       await tx.accountingPostingRefusal.updateMany({
-        where: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', referenceId: refund.id, scope: ADOPTION_RECLASS_POSTING_SCOPE, resolvedAt: null },
+        where: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', referenceId: refund.id, scope: ADOPTION_RECLASS_POSTING_SCOPE, resolvedAt: null, handPostClaimedAt: null },
         data: { resolvedAt: now, resolution: 'refund_deleted', resolvedBy: input.actorUserId },
       })
 

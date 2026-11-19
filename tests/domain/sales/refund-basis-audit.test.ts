@@ -390,7 +390,8 @@ test('the audit reports the row cap and selects the provenance it classifies by'
   assert.equal(findings[0]?.code, 'refund_basis_audit_row_cap_reached')
 
   const args = requestedArgs[0] as { where: unknown; select: Record<string, { select?: Record<string, unknown> }> }
-  assert.deepEqual(args.where, { refunds: { some: {} } })
+  // Soft-deleted refunds (kept for audit) are not refunds: only a live refund makes an order auditable.
+  assert.deepEqual(args.where, { refunds: { some: { deletedAt: null } } })
   // The classification depends on all of these being loaded.
   assert.equal(args.select.refunds.select?.chargeback, true)
   assert.equal(args.select.refunds.select?.externalRefundId, true)

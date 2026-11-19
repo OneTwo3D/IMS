@@ -104,7 +104,7 @@ export const POSTING_REFUSAL_KINDS = {
   },
   refund_adoption_reclass_journal: {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', clearing: 'manual',
-    how: 'IMS queues no journal for this: a refund that adopts an already restocked arrival raises this owed-posting record once, for a person to post by hand. Deleting the refund closes the record.',
+    how: 'IMS queues no journal for this: a refund that adopts an already restocked arrival raises this owed-posting record once, and it stays in the inbox until it is marked handled. Deleting the refund closes the record.',
   },
   purchase_order_cancellation_reversal: {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseOrder', clearing: 'manual',

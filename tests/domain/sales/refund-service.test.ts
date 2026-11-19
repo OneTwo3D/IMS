@@ -487,6 +487,8 @@ function createClient(state: State): RefundServiceClient {
     },
     // The manual-refund status gate counts the order's recorded payments; the fixture orders are SHIPPED, which the gate never refuses, so none is needed.
     payment: { count: async () => 0 },
+    // o3d-iil0b: an in-transit refund first looks for an already-restocked returns-inbox arrival to adopt; these fixtures have none, so it adopts nothing.
+    wmsReturnsInbox: { findMany: async () => [] },
     organisation: {
       findFirst: async () => ({ baseCurrency: state.baseCurrency ?? 'GBP' }),
     },
