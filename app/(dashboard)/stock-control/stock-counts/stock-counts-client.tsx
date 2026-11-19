@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState, useTransition } from 'react'
-import { useRouter } from 'next/navigation'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { ClipboardCheck, ChevronDown, ChevronUp, Ban, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -16,15 +16,32 @@ import {
   removeStockCountLines,
   saveStockCountCounts,
   reconcileStockCount,
+  bulkAcceptStockCountLines,
+  saveStockCountSmallVarianceThreshold,
   postStockCount,
   cancelStockCount,
   type StockCountRow,
 } from '@/app/actions/stock-counts'
 import type { AdjustmentReasonOption } from '@/app/actions/stock'
 import { filterCountsByStatus, type StockCountListFilter } from '@/lib/domain/inventory/stock-count-plan'
+import {
+  VARIANCE_SORTS,
+  VARIANCE_TABS,
+  filterByTab,
+  sortTriaged,
+  tabCounts,
+  triageLine,
+  type SmallVarianceThreshold,
+  type VarianceSort,
+  type VarianceTab,
+} from '@/lib/domain/inventory/stock-count-triage'
+import { formatMoney } from '@/lib/utils'
 import { ProductPickerDialog } from './product-picker-dialog'
 
 type Warehouse = { id: string; code: string; name: string }
+
+const TAB_LABEL: Record<VarianceTab, string> = { ALL: 'All lines', NONE: 'No variance', SMALL: 'Small variance', REVIEW: 'Needs review' }
+const SORT_LABEL: Record<VarianceSort, string> = { DEFAULT: 'Default order', QTY: 'Variance (quantity)', VALUE: 'Variance (value)' }
 
 const STATUS_CLASS: Record<StockCountRow['status'], string> = {
   DRAFT: 'bg-muted text-muted-foreground',
@@ -37,14 +54,38 @@ export function StockCountsClient({
   initialCounts,
   warehouses,
   reasons,
+  smallVarianceThreshold,
+  initialVarianceTab,
+  initialVarianceSort,
+  initialOpenCountId,
 }: {
   initialCounts: StockCountRow[]
   warehouses: Warehouse[]
   reasons: AdjustmentReasonOption[]
+  smallVarianceThreshold: SmallVarianceThreshold
+  initialVarianceTab: VarianceTab
+  initialVarianceSort: VarianceSort
+  initialOpenCountId: string | null
 }) {
   const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const [varianceTab, setVarianceTabState] = useState<VarianceTab>(initialVarianceTab)
+  const [varianceSort, setVarianceSortState] = useState<VarianceSort>(initialVarianceSort)
+  // The triage choice lives in the URL (?vtab=&vsort=&count=), so a refresh or a shared link shows the same view.
+  function writeUrl(next: { tab?: VarianceTab; sort?: VarianceSort; count?: string | null }) {
+    const params = new URLSearchParams(searchParams.toString())
+    const set = (k: string, v: string | null, empty: string) => { if (v == null || v === empty) params.delete(k); else params.set(k, v) }
+    if (next.tab !== undefined) set('vtab', next.tab.toLowerCase(), 'all')
+    if (next.sort !== undefined) set('vsort', next.sort.toLowerCase(), 'default')
+    if (next.count !== undefined) set('count', next.count, '')
+    const qs = params.toString()
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false })
+  }
+  function setVarianceTab(tab: VarianceTab) { setVarianceTabState(tab); writeUrl({ tab }) }
+  function setVarianceSort(sort: VarianceSort) { setVarianceSortState(sort); writeUrl({ sort }) }
   const [counts, setCounts] = useState(initialCounts)
-  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [expandedId, setExpandedId] = useState<string | null>(initialOpenCountId)
   const [showNew, setShowNew] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -112,7 +153,12 @@ export function StockCountsClient({
                   count={count}
                   reasons={reasons}
                   expanded={expandedId === count.id}
-                  onToggle={() => setExpandedId((id) => (id === count.id ? null : count.id))}
+                  onToggle={() => { const next = expandedId === count.id ? null : count.id; setExpandedId(next); writeUrl({ count: next }) }}
+                  threshold={smallVarianceThreshold}
+                  varianceTab={varianceTab}
+                  varianceSort={varianceSort}
+                  onVarianceTab={setVarianceTab}
+                  onVarianceSort={setVarianceSort}
                   onChanged={refresh}
                 />
               ))}
@@ -202,13 +248,18 @@ function NewCountDialog({ warehouses, onClose, onCreated }: { warehouses: Wareho
 }
 
 function StockCountRowView({
-  count, reasons, expanded, onToggle, onChanged,
+  count, reasons, expanded, onToggle, onChanged, threshold, varianceTab, varianceSort, onVarianceTab, onVarianceSort,
 }: {
   count: StockCountRow
   reasons: AdjustmentReasonOption[]
   expanded: boolean
   onToggle: () => void
   onChanged: (message?: string) => void
+  threshold: SmallVarianceThreshold
+  varianceTab: VarianceTab
+  varianceSort: VarianceSort
+  onVarianceTab: (tab: VarianceTab) => void
+  onVarianceSort: (sort: VarianceSort) => void
 }) {
   const editable = count.status === 'DRAFT' || count.status === 'IN_PROGRESS'
   const [countsByLine, setCountsByLine] = useState<Record<string, string>>(
@@ -272,6 +323,49 @@ function StockCountRowView({
     })
   }
 
+  // Triage runs on the figures as typed, against the line's book quantity. A bulk accept acts on the SAVED counts, re-validated by the server.
+  const typedCount = (l: StockCountRow['lines'][number]): number | null => {
+    const raw = countsByLine[l.id]
+    return raw === '' || raw == null || !Number.isFinite(Number(raw)) ? null : Number(raw)
+  }
+  const triaged = count.lines.map((l) => triageLine({ id: l.id, sku: l.sku, expectedQty: l.expectedQty, countedQty: editable ? typedCount(l) : l.countedQty, unitCost: l.unitCost }, threshold))
+  const lineById = new Map(count.lines.map((l) => [l.id, l]))
+  const tabTotals = tabCounts(triaged)
+  const shown = sortTriaged(filterByTab(triaged, varianceTab), varianceSort)
+  const dirty = count.lines.some((l) => (typedCount(l) ?? null) !== l.countedQty)
+  const [thresholdQty, setThresholdQty] = useState(String(threshold.qty || ''))
+  const [thresholdPct, setThresholdPct] = useState(String(threshold.pct || ''))
+
+  function handleBulkAccept(mode: 'NO_VARIANCE' | 'SMALL_VARIANCE') {
+    // Each line goes with the counted quantity and book quantity on screen; the server accepts it only if both are still exactly those.
+    const picked = shown.filter((t) => (mode === 'NO_VARIANCE' ? t.varianceClass === 'NONE' : t.varianceClass === 'SMALL'))
+    const ids = picked.map((t) => t.line.id)
+    const lines = picked.map((t) => ({ lineId: t.line.id, countedQty: t.line.countedQty as number, onHand: t.line.expectedQty }))
+    if (ids.length === 0) return
+    if (mode === 'SMALL_VARIANCE' && !confirm(
+      `Accept ${ids.length} line(s) that DO have a variance, within your small-variance threshold? `
+      + 'Accepting reconciles them against current stock. The differences are booked as stock adjustments when you authorise and post the count, exactly as for any other line.',
+    )) return
+    setLocalError(null)
+    setDrift([])
+    startTransition(async () => {
+      const res = await bulkAcceptStockCountLines({ countId: count.id, mode, lines, ...(mode === 'SMALL_VARIANCE' ? { confirmSmallVariance: true, threshold } : {}) })
+      if (res.success) {
+        const skipped = res.excluded ?? 0
+        onChanged(`${res.accepted ?? 0} line(s) accepted.${skipped > 0 ? ` ${skipped} line(s) no longer qualified (the count or the stock changed) and were left for you to review.` : ''}`)
+      } else setLocalError(res.message ?? 'Action failed.')
+    })
+  }
+
+  function handleSaveThreshold() {
+    setLocalError(null)
+    startTransition(async () => {
+      const res = await saveStockCountSmallVarianceThreshold({ qty: thresholdQty, pct: thresholdPct })
+      if (res.success) onChanged('Small-variance threshold saved.')
+      else setLocalError(res.message ?? 'The threshold could not be saved.')
+    })
+  }
+
   function buildCounts() {
     return count.lines.map((l) => {
       const raw = countsByLine[l.id]
@@ -321,6 +415,43 @@ function StockCountRowView({
                 </table>
               </div>
             )}
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              {VARIANCE_TABS.map((tab) => (
+                <Button key={tab} size="sm" variant={varianceTab === tab ? 'default' : 'outline'} aria-pressed={varianceTab === tab} onClick={() => onVarianceTab(tab)}>
+                  {TAB_LABEL[tab]} ({tabTotals[tab]})
+                </Button>
+              ))}
+              <Select value={varianceSort} onChange={(e) => onVarianceSort(e.target.value as VarianceSort)} className="h-8 text-xs w-48" aria-label="Sort lines">
+                {VARIANCE_SORTS.map((o) => <option key={o} value={o}>{SORT_LABEL[o]}</option>)}
+              </Select>
+              {editable && varianceTab === 'NONE' && tabTotals.NONE > 0 && (
+                <Button size="sm" disabled={pending || dirty} title={dirty ? 'Save counts first: only saved counts can be accepted' : undefined} onClick={() => handleBulkAccept('NO_VARIANCE')}>
+                  Accept {tabTotals.NONE} line(s) with no variance
+                </Button>
+              )}
+              {editable && varianceTab === 'SMALL' && tabTotals.SMALL > 0 && (
+                <Button size="sm" variant="outline" disabled={pending || dirty} title={dirty ? 'Save counts first: only saved counts can be accepted' : undefined} onClick={() => handleBulkAccept('SMALL_VARIANCE')}>
+                  Accept {tabTotals.SMALL} small-variance line(s)...
+                </Button>
+              )}
+            </div>
+            {editable && (varianceTab === 'NONE' || varianceTab === 'SMALL') && (
+              <p className="text-xs text-muted-foreground mb-2">
+                {varianceTab === 'NONE'
+                  ? 'Accepting reconciles lines whose count equals the stock on hand. Nothing is booked for them. Each line is checked again when you accept, and any that changed are left for review.'
+                  : 'Small variance: the count differs from stock on hand by no more than the threshold below. Accepting reconciles the line; the difference is booked when you authorise and post the count.'}
+              </p>
+            )}
+            {editable && (
+              <div className="flex flex-wrap items-center gap-2 mb-2 text-xs">
+                <span className="text-muted-foreground">Small variance is up to</span>
+                <Input type="number" min={0} value={thresholdQty} onChange={(e) => setThresholdQty(e.target.value)} className="h-7 w-20 text-right text-xs font-mono" aria-label="Small variance quantity" placeholder="qty" />
+                <span className="text-muted-foreground">units and/or</span>
+                <Input type="number" min={0} max={100} value={thresholdPct} onChange={(e) => setThresholdPct(e.target.value)} className="h-7 w-20 text-right text-xs font-mono" aria-label="Small variance percent" placeholder="%" />
+                <span className="text-muted-foreground">% of stock on hand (blank = not used; when both are set a line must meet both; with neither set no line is small)</span>
+                <Button size="sm" variant="outline" disabled={pending} onClick={handleSaveThreshold}>Save threshold</Button>
+              </div>
+            )}
             <div className="border border-border rounded-md overflow-x-auto max-h-[420px] overflow-y-auto">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-background">
@@ -330,10 +461,12 @@ function StockCountRowView({
                     <th className="px-3 py-1.5 text-right">Book qty</th>
                     <th className="px-3 py-1.5 text-right">Counted</th>
                     <th className="px-3 py-1.5 text-right">Variance</th>
+                    <th className="px-3 py-1.5 text-right">Est. value</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {count.lines.map((l) => {
+                  {shown.map((t) => {
+                    const l = lineById.get(t.line.id)!
                     const raw = countsByLine[l.id] ?? ''
                     const variance = raw === '' ? null : Number(raw) - l.expectedQty
                     return (
@@ -366,6 +499,9 @@ function StockCountRowView({
                         </td>
                         <td className={`px-3 py-1 text-right font-mono text-xs ${variance == null ? 'text-muted-foreground' : variance < 0 ? 'text-destructive' : variance > 0 ? 'text-green-700 dark:text-green-400' : ''}`}>
                           {(editable ? variance : l.variance) ?? '—'}
+                        </td>
+                        <td className="px-3 py-1 text-right font-mono text-xs text-muted-foreground">
+                          {t.varianceValue == null ? '—' : formatMoney(t.varianceValue, '£')}
                         </td>
                       </tr>
                     )
