@@ -54,13 +54,15 @@ function stepLiveFrom(env: Record<string, string | undefined>, step: LiveWriterS
 
 /**
  * A reader that only asks once its step is live. Before that the evidence is not required, and asking would make the daily P1 check depend on a
- * plugin that is not deployed yet (an unanswered probe fails the check in every phase). A live-from that cannot be read is `unreadable`.
+ * plugin that is not deployed yet (an unanswered probe fails the check in every phase). A live-from that cannot be read is `unreadable`; one in the future is `not-due`.
  */
 function whenStepLive(step: LiveWriterStep, read: (ctx: Parameters<StepEvidenceReader>[0], liveFrom: Date) => Promise<StepEvidenceReading>): StepEvidenceReader {
   return async (ctx) => {
     const liveFrom = stepLiveFrom(ctx.env ?? process.env, step)
     if (liveFrom === 'unset') return { state: 'not-due' }
     if (liveFrom === 'unreadable') return { state: 'unreadable' }
+    // A live-from still in the future is not live: the evaluator counts a step live only once now >= live-from, so nothing is asked (or required) before.
+    if (liveFrom.getTime() > ctx.now.getTime()) return { state: 'not-due' }
     return read(ctx, liveFrom)
   }
 }

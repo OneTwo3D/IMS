@@ -10,8 +10,11 @@
  *
  * OFF BY DEFAULT: nothing is sent unless the setting `wc_withdrawal_outcome_enabled` is `true`, AND the ownership map's step-M gate lets the operation
  * through (`wooDrainHold(undefined, 'order.withdrawal-outcome')`: step M's live-from instant must have passed; before that it is held). The write is
- * idempotent per outcome key (the plugin adds a note once per key), so a webhook redelivery cannot add a second note. A failure is logged, never thrown:
- * the withdrawal handling itself (the hold, the cancellation) never waits on, or fails because of, the note.
+ * idempotent TWICE OVER, keyed on the withdrawal's own identity (order + storefront request + outcome kind), never on a modified time: IMS writes each
+ * outcome once, recorded durably in `wc_withdrawal_outcomes` after the storefront answers, and the plugin adds a note once per key. A redelivered webhook, a
+ * poll, or the plugin's own later order change cannot add a second note. A failure is logged, never thrown: the withdrawal handling itself (the hold, the
+ * cancellation) never waits on, or fails because of, the note. A rejection the storefront could not carry out (no request, no withdrawal plugin, or a failed
+ * write) is NEVER recorded as written: it raises an operator task so a person rejects the request by hand.
  */
 import { createHmac, randomBytes } from 'node:crypto'
 
@@ -36,6 +39,8 @@ export type WithdrawalOutcomeInput = {
   outcomeKey: string
   note: string
   rejectReason?: string
+  /** The storefront withdrawal request id, from IMS's own record. The plugin checks that it belongs to the order. */
+  requestId?: string
 }
 
 export type WithdrawalOutcomeResult =
@@ -93,6 +98,7 @@ export async function postWithdrawalOutcome(externalOrderId: string, input: With
     order_id: Number(externalOrderId), ts: timestamp, nonce: randomBytes(16).toString('hex'),
     outcome: input.outcome, outcome_key: input.outcomeKey, note: input.note,
     ...(input.rejectReason ? { reject_reason: input.rejectReason } : {}),
+    ...(input.requestId && /^[1-9]\d{0,17}$/.test(input.requestId) ? { request_id: Number(input.requestId) } : {}),
   })
   try {
     const res = await connectorFetch(`${validated.normalizedUrl}${withdrawalOutcomePath(externalOrderId)}`, {
@@ -119,24 +125,81 @@ export const WITHDRAWAL_OUTCOME_BY_ACTION: Readonly<Record<string, { outcome: Wi
   wc_withdrawal_approval_failed: { outcome: 'noted' },
 }
 
+/** The result words that mean the storefront DID what was asked. `no_request` and `no_withdrawal_plugin` are failures of a rejection. */
+const DONE_RESULTS = new Set(['noted', 'rejected', 'already_done'])
+
+/** The durable once-only store. A test seam; absent = the database. */
+export type WithdrawalOutcomeStore = {
+  /** IMS's record of the order's withdrawal request: records `requestId` when given and returns the stable request key. */
+  requestKey(orderId: string, requestId: string | null): Promise<{ requestKey: string; requestId: string | null }>
+  isWritten(orderId: string, requestKey: string, kind: string): Promise<boolean>
+  markWritten(orderId: string, requestKey: string, kind: string, result: string): Promise<void>
+  raiseTask(input: { orderId: string; externalOrderId: string; requestKey: string; queryText: string }): Promise<void>
+}
+
+const dbStore: WithdrawalOutcomeStore = {
+  async requestKey(orderId, requestId) {
+    const { db } = await import('@/lib/db')
+    if (requestId) await db.salesOrder.updateMany({ where: { id: orderId, OR: [{ withdrawalRequestId: null }, { withdrawalRequestId: { not: requestId } }] }, data: { withdrawalRequestId: requestId } })
+    const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { withdrawalRequestId: true, withdrawalHoldGeneration: true } })
+    const known = order?.withdrawalRequestId ?? null
+    return { requestKey: known ? `r${known}` : `g${order?.withdrawalHoldGeneration ?? 0}`, requestId: known }
+  },
+  async isWritten(orderId, requestKey, kind) {
+    const { db } = await import('@/lib/db')
+    return (await db.wcWithdrawalOutcome.count({ where: { orderId, requestKey, outcomeKind: kind } })) > 0
+  },
+  async markWritten(orderId, requestKey, kind, result) {
+    const { db } = await import('@/lib/db')
+    await db.wcWithdrawalOutcome.createMany({ data: [{ orderId, requestKey, outcomeKind: kind, result }], skipDuplicates: true })
+  },
+  async raiseTask(input) {
+    const { db } = await import('@/lib/db')
+    const { raiseWmsOperatorTask } = await import('@/lib/domain/wms/operator-tasks')
+    await raiseWmsOperatorTask(db, {
+      connector: 'woocommerce', orderId: input.orderId, externalOrderId: input.externalOrderId, reason: 'WITHDRAWAL_REJECT_NOT_WRITTEN',
+      queryText: input.queryText, dedupeBasis: `wdraw-reject:${input.orderId}:${input.requestKey}`,
+    })
+  },
+}
+
 /**
- * Write the outcome of one withdrawal event, if its action has one and the writer is on. Never throws. `eventKey` identifies the customer event
- * (the order, the status and when it happened), so the same event written twice adds one note.
+ * Write the outcome of one withdrawal event, if its action has one and the writer is on. Never throws. The identity is (order, withdrawal request, action):
+ * the same event seen again, however often and whatever the order's modified time, adds nothing once the storefront has confirmed it.
+ * `requestId` is the storefront request id read from the order payload (the helper plugin's `_oti_wdraw_request_id`), when it carries one.
  */
-export async function writeWithdrawalOutcomeForEvent(input: { orderId: string; externalOrderId: string; action: string; description: string; eventKey: string }): Promise<void> {
+export async function writeWithdrawalOutcomeForEvent(
+  input: { orderId: string; externalOrderId: string; action: string; description: string; requestId?: string | null },
+  store: WithdrawalOutcomeStore = dbStore,
+): Promise<void> {
   const mapping = WITHDRAWAL_OUTCOME_BY_ACTION[input.action]
   if (!mapping) return
   try {
+    if (!(await isWithdrawalOutcomeEnabled())) return
+    const { requestKey, requestId } = await store.requestKey(input.orderId, input.requestId ?? null)
+    if (await store.isWritten(input.orderId, requestKey, input.action)) return
     const result = await postWithdrawalOutcome(input.externalOrderId, {
       outcome: mapping.outcome,
-      outcomeKey: `${input.action}:${input.eventKey}`.slice(0, 96),
+      outcomeKey: `wdo:${input.externalOrderId}:${requestKey}:${input.action}`.slice(0, 96),
       note: `IMS: ${input.description}`,
       ...(mapping.reject ? { rejectReason: 'order already dispatched' } : {}),
+      ...(requestId ? { requestId } : {}),
     })
-    if (result.kind === 'failed') {
-      await logActivity({
-        entityType: 'SALES_ORDER', entityId: input.orderId, action: 'wc_withdrawal_outcome_failed', tag: 'sync', level: 'WARNING',
-        description: `The withdrawal outcome could not be written to the storefront order: ${result.error}`, resolveUser: false,
+    if (result.kind === 'written' && DONE_RESULTS.has(result.result)) {
+      await store.markWritten(input.orderId, requestKey, input.action, result.result)
+      return
+    }
+    const why = result.kind === 'written' ? (result.result === 'no_request' ? 'the storefront holds no withdrawal request for this order' : 'the withdrawal plugin is not active on the storefront')
+      : result.kind === 'failed' ? result.error : null
+    if (why === null) return
+    await logActivity({
+      entityType: 'SALES_ORDER', entityId: input.orderId, action: 'wc_withdrawal_outcome_failed', tag: 'sync', level: 'WARNING',
+      description: `The withdrawal outcome could not be written to the storefront order: ${why}`, resolveUser: false,
+    })
+    if (mapping.reject) {
+      await store.raiseTask({
+        orderId: input.orderId, externalOrderId: input.externalOrderId, requestKey,
+        queryText: `The customer's withdrawal request for storefront order ${input.externalOrderId} was filed after despatch and IMS could not reject it (${why}). Reject the request in WooCommerce by hand.`,
       })
     }
   } catch {

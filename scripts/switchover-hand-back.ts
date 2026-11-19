@@ -8,7 +8,14 @@ import { PRODUCER_STEP_ENV } from '@/lib/security/producer-disposition-constants
  * `npm run switchover:hand-back [-- --since <ISO UTC>] [-- --apply] [-- --json]`  (rollback of step M, see lib/connectors/mintsoft/switchover/hand-back.ts)
  * Writes `_mintsoft_order_id` and `_mintsoft_order_number` onto the open WooCommerce orders IMS created in Mintsoft, so the resumed bridge adopts them.
  * DRY RUN by default: it reads and reports, writes nothing. `--apply` writes. S is MINTSOFT_WRITES_LIVE_FROM unless --since is given.
- * Exit codes: 0 done, 1 something needs a person (a conflict, an unreadable or held order, a failed write), 3 usage, 5 failed.
+ * Exit codes: 0 done, 1 something needs a person (a conflict, an unreadable or held order, a failed write), 3 usage, 4 preflight refused, 5 failed.
+ *
+ * ORDER (rollback of step M): HAND BACK FIRST, THEN UNSET. The hand-back writes through the ordinary WooCommerce write path, which the producer-side hold keeps
+ * unless step M's live-from is set and reached; the hold is deliberately NOT loosened for it (no special mode that normal writers could share). So `--apply`
+ * is refused unless (1) MINTSOFT_WRITES_LIVE_FROM is set in the environment and has been reached (a `--since` does not count: it would leave the hold shut and
+ * every write `held`), and (2) the operator states with `--writers-stopped` that IMS's other step-M writers (the push sweeps, the completion and tracking
+ * jobs, the withdrawal-outcome writer) are stopped, so unsetting the live-from afterwards re-arms nothing. Only after it ends clean are the live-from and
+ * the grant unset and the bridge resumed. An applied run leaves an audit entry (`switchover_hand_back_applied`).
  */
 export type HandBackCliOptions = {
   argv?: string[]
@@ -17,6 +24,9 @@ export type HandBackCliOptions = {
   stdout?: Pick<typeof console, 'log'>
   stderr?: Pick<typeof console, 'error'>
   disconnect?: () => Promise<void>
+  /** Test seam: the audit entry of an applied run. Absent = the activity log. */
+  audit?: (entry: { since: string; candidates: number; counts: Record<string, number> }) => Promise<void>
+  now?: () => Date
 }
 
 async function liveLoad(since: Date): Promise<{ candidates: HandBackCandidate[]; deps: HandBackDeps }> {
@@ -41,18 +51,25 @@ async function liveLoad(since: Date): Promise<{ candidates: HandBackCandidate[];
   }
 }
 
+async function auditApplied(entry: { since: string; candidates: number; counts: Record<string, number> }): Promise<void> {
+  const { logActivity } = await import('@/lib/activity-log')
+  await logActivity({ entityType: 'SYSTEM', entityId: 'switchover-hand-back', action: 'switchover_hand_back_applied', tag: 'sync', level: 'WARNING', description: `Switchover hand-back applied for ${entry.candidates} open order(s) since ${entry.since}.`, metadata: entry, resolveUser: false })
+}
+
 export async function runHandBackCli(options: HandBackCliOptions = {}): Promise<number> {
   const stdout = options.stdout ?? console
   const stderr = options.stderr ?? console
   const args = options.argv ?? process.argv.slice(2)
   const env = options.env ?? process.env
-  const usage = 'Usage: npm run switchover:hand-back [-- --since <ISO UTC>] [-- --apply] [-- --json]'
+  const usage = 'Usage: npm run switchover:hand-back [-- --since <ISO UTC>] [-- --apply --writers-stopped] [-- --json]'
   let since: string | undefined
   let apply = false
+  let writersStopped = false
   let json = false
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i]!
     if (arg === '--apply') apply = true
+    else if (arg === '--writers-stopped') writersStopped = true
     else if (arg === '--json') json = true
     else if (arg === '--since') {
       const value = args[i + 1]
@@ -63,15 +80,28 @@ export async function runHandBackCli(options: HandBackCliOptions = {}): Promise<
   }
   const cutoff = parseProducerCutoff(since ?? env[PRODUCER_STEP_ENV.mintsoft])
   if (!cutoff.ok) { stderr.error(`S is not readable (${PRODUCER_STEP_ENV.mintsoft} or --since must be an ISO UTC instant).`); return 3 }
+  if (apply) {
+    // PREFLIGHT: the exact order, enforced. The hold is not weakened; the script refuses to run in the wrong state.
+    const live = parseProducerCutoff(env[PRODUCER_STEP_ENV.mintsoft])
+    if (since !== undefined || !live.ok || live.at.getTime() > (options.now ?? (() => new Date()))().getTime()) {
+      stderr.error(`Refused: --apply must run while ${PRODUCER_STEP_ENV.mintsoft} is still set (from the environment, not --since) and reached. Hand back FIRST, then unset the live-from and the grant. Unsetting first leaves every write held.`)
+      return 4
+    }
+    if (!writersStopped) {
+      stderr.error('Refused: pass --writers-stopped to confirm IMS\'s other step-M writers (push sweeps, completion and tracking jobs, withdrawal-outcome) are stopped. Unsetting the live-from afterwards must re-arm nothing.')
+      return 4
+    }
+  }
   try {
     const { candidates, deps } = await (options.load ?? liveLoad)(cutoff.at)
     const { counts, results } = await runHandBack(candidates, apply, deps)
+    if (apply) await (options.audit ?? auditApplied)({ since: cutoff.at.toISOString(), candidates: candidates.length, counts: { ...counts } })
     if (json) stdout.log(JSON.stringify({ apply, since: cutoff.at.toISOString(), candidates: candidates.length, counts, results }, null, 2))
     else {
       stdout.log(`${apply ? 'APPLY' : 'DRY RUN'}: hand-back of ${candidates.length} open order(s) IMS created since ${cutoff.at.toISOString()}`)
       for (const [name, count] of Object.entries(counts)) if (count > 0) stdout.log(`  ${name}: ${count}`)
       for (const r of results) if (!['written', 'would-write', 'already-set', 'closed'].includes(r.outcome)) stdout.log(`  needs a person: ${r.reference} (${r.outcome})`)
-      if (counts.held > 0) stdout.log('  The producer-side hold kept the write: run this while the step-M live-from and grant are still set and IMS\'s other writers are stopped.')
+      if (counts.held > 0) stdout.log('  The producer-side hold kept the write: unset nothing before the hand-back: re-set the live-from and run it again with --writers-stopped.')
     }
     return counts.conflict + counts.unreadable + counts.held + counts.failed > 0 ? 1 : 0
   } catch (error) {

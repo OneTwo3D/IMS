@@ -14,34 +14,36 @@ type Logger = Pick<typeof console, 'log' | 'error'>
 export type SwitchoverGapsCliOptions = {
   argv?: string[]
   env?: Record<string, string | undefined>
-  deps?: () => Promise<{ list: Parameters<typeof listSwitchoverGaps>[0]['db']; takeOver: TakeOverDeps }>
+  deps?: () => Promise<{ list: Parameters<typeof listSwitchoverGaps>[0]['db']; takeOver: TakeOverDeps; readStorefront?: Parameters<typeof listSwitchoverGaps>[0]['readStorefront'] }>
   stdout?: Pick<Logger, 'log'>
   stderr?: Pick<Logger, 'error'>
   disconnect?: () => Promise<void>
 }
 
-async function liveDeps(): Promise<{ list: Parameters<typeof listSwitchoverGaps>[0]['db']; takeOver: TakeOverDeps }> {
+async function liveDeps(): Promise<{ list: Parameters<typeof listSwitchoverGaps>[0]['db']; takeOver: TakeOverDeps; readStorefront?: Parameters<typeof listSwitchoverGaps>[0]['readStorefront'] }> {
   const { db } = await import('@/lib/db')
   const { fetchMintsoftOrderParts } = await import('@/lib/connectors/mintsoft/api/orders')
   const { getMintsoftSettings, parseMintsoftPositiveId } = await import('@/lib/connectors/mintsoft/settings/schema')
   const { wcFetch } = await import('@/lib/connectors/woocommerce/api')
   const { scheduleWcOrderCompletion } = await import('@/lib/connectors/woocommerce/sync/order-completion-jobs')
+  const readStorefrontOrder = async (id: string) => {
+    const result = await wcFetch(`/orders/${id}`, { _fields: 'id,status,meta_data' })
+    const data = result.data as { status?: unknown; meta_data?: Array<{ key?: unknown; value?: unknown }> } | null
+    if (result.error || !data || typeof data.status !== 'string') return null
+    const tracking = (data.meta_data ?? []).find((m) => m.key === '_wc_shipment_tracking_items')
+    return { status: data.status, trackingItems: Array.isArray(tracking?.value) ? tracking.value.length : 0 }
+  }
   const clientId = parseMintsoftPositiveId((await getMintsoftSettings()).mintsoft_client_id)
   if (clientId == null) throw new Error('mintsoft_client_id is not configured')
   return {
     list: db as never,
+    readStorefront: readStorefrontOrder,
     takeOver: {
       db: db as never,
       clientId,
       fetchParts: (number, client) => fetchMintsoftOrderParts(number, client),
-      readStorefrontOrder: async (id) => {
-        const result = await wcFetch(`/orders/${id}`, { _fields: 'id,status,meta_data' })
-        const data = result.data as { status?: unknown; meta_data?: Array<{ key?: unknown; value?: unknown }> } | null
-        if (result.error || !data || typeof data.status !== 'string') return null
-        const tracking = (data.meta_data ?? []).find((m) => m.key === '_wc_shipment_tracking_items')
-        return { status: data.status, trackingItems: Array.isArray(tracking?.value) ? tracking.value.length : 0 }
-      },
-      queueCompletion: (tx, input) => scheduleWcOrderCompletion(tx as never, { orderId: input.orderId, shippedAt: input.at }),
+      readStorefrontOrder,
+      queueCompletion: (tx, input) => scheduleWcOrderCompletion(tx as never, { orderId: input.orderId, shippedAt: input.at, keyPart: input.keyPart }),
     },
   }
 }
@@ -82,15 +84,15 @@ export async function runSwitchoverGapsCli(options: SwitchoverGapsCliOptions = {
       stdout.log(json ? JSON.stringify(result) : `${apply ? 'APPLY' : 'DRY RUN'}: ${result.outcome}${'why' in result ? ` - ${result.why}` : ''}`)
       return result.outcome === 'refused' ? 1 : 0
     }
-    const gaps = await listSwitchoverGaps({ since: cutoff.at, db: deps.list })
+    const gaps = await listSwitchoverGaps({ since: cutoff.at, db: deps.list, readStorefront: deps.readStorefront ?? deps.takeOver.readStorefrontOrder })
     if (json) {
-      stdout.log(JSON.stringify({ since: cutoff.at.toISOString(), truncated: gaps.truncated, G_create: gaps.create.map((g) => ({ orderId: g.orderId, reference: g.reference, at: g.at.toISOString() })), G_despatch: gaps.despatch.map((g) => ({ orderId: g.orderId, reference: g.reference, at: g.at.toISOString() })) }, null, 2))
+      stdout.log(JSON.stringify({ since: cutoff.at.toISOString(), truncated: gaps.truncated, G_create: gaps.create.map((g) => ({ orderId: g.orderId, reference: g.reference, at: g.at.toISOString() })), G_despatch: gaps.despatch.map((g) => ({ orderId: g.orderId, reference: g.reference, at: g.at.toISOString(), unreadable: g.unreadable === true })) }, null, 2))
     } else {
       stdout.log(`Switchover gaps for step mintsoft, S = ${cutoff.at.toISOString()}${gaps.truncated ? ' (LIST CUT AT THE LIMIT)' : ''}`)
       stdout.log(`G_create (paid before S, no Mintsoft link): ${gaps.create.length}`)
       for (const g of gaps.create) stdout.log(`  ${g.reference}  ${g.orderId}  paid ${g.at.toISOString()}`)
-      stdout.log(`G_despatch (despatched before S, storefront not completed): ${gaps.despatch.length}`)
-      for (const g of gaps.despatch) stdout.log(`  ${g.reference}  ${g.orderId}  shipped ${g.at.getTime() === 0 ? 'unknown' : g.at.toISOString()}`)
+      stdout.log(`G_despatch (despatched before S within the window, storefront not completed with tracking): ${gaps.despatch.length}`)
+      for (const g of gaps.despatch) stdout.log(`  ${g.reference}  ${g.orderId}  shipped ${g.at.getTime() === 0 ? 'unknown' : g.at.toISOString()}${g.unreadable ? '  (storefront unreadable)' : ''}`)
     }
     return 0
   } catch (error) {

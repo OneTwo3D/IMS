@@ -235,6 +235,15 @@ test('P1 NEVER asks a vendor: with no live-from set the probe and the Mintsoft r
   assert.equal(calls, 0)
 })
 
+test('a live-from still in the FUTURE is not-due: nothing is asked of the store or Mintsoft until it is reached (the evaluator counts a step live only then)', async () => {
+  let calls = 0
+  const db = { writerAttestation: { findFirst: async () => null } }
+  const future = new Date(NOW.getTime() + 3_600_000).toISOString()
+  const read = await readStepEvidence({ db: db as never, now: NOW, env: { MINTSOFT_WRITES_LIVE_FROM: future }, probe: async () => { calls += 1; return { ok: false, reason: 'http_status', message: '' } }, foreignOrders: async () => { calls += 1; return { foreign: 0 } } })
+  assert.equal(calls, 0)
+  assert.deepEqual([read.BRIDGE_PROBE, read.MINTSOFT_FOREIGN_ORDER], [{ state: 'not-due' }, { state: 'not-due' }])
+})
+
 test('step M live: the probe and the foreign-order reader are asked once each; the probe\'s violations and the foreign count become the readings; an unanswered probe is not-probed; a throwing Mintsoft read is unreadable', async () => {
   const db = { writerAttestation: { findFirst: async () => null } }
   const env = { MINTSOFT_WRITES_LIVE_FROM: M_AT }

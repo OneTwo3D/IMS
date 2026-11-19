@@ -24,6 +24,8 @@ const PER_PAGE = 100
 const MAX_PAGES = 500
 /** An order changed this long before the previous look still counts as explaining a change (clock and webhook slip). */
 const EXPLAIN_SLACK_MS = 10 * 60_000
+/** The pause before every storefront read after the first: the catalogue read shares the store's PHP pool with customer traffic. */
+export const CATALOGUE_READ_PAUSE_MS = 300
 
 type CatalogueFetch = (path: string, params: Record<string, string>) => Promise<{ data: unknown; totalPages: number; error?: string }>
 
@@ -44,8 +46,14 @@ async function readPages(get: CatalogueFetch, path: string): Promise<Record<stri
   return rows
 }
 
-/** Every product and variation of the store that manages stock, with its quantity. Throws when any page cannot be read to a verified end. */
-export async function readWcCatalogueStock(get: CatalogueFetch = (path, params) => wcFetch(path, params)): Promise<StockReading[]> {
+/** Every product and variation of the store that manages stock, with its quantity. Throws when any page cannot be read to a verified end. Reads are paced (`pauseMs` between requests). */
+export async function readWcCatalogueStock(rawGet: CatalogueFetch = (path, params) => wcFetch(path, params), pauseMs: number = CATALOGUE_READ_PAUSE_MS): Promise<StockReading[]> {
+  let reads = 0
+  const get: CatalogueFetch = async (path, params) => {
+    if (reads > 0 && pauseMs > 0) await new Promise((resolve) => setTimeout(resolve, pauseMs))
+    reads += 1
+    return rawGet(path, params)
+  }
   const out = new Map<string, StockReading>()
   const take = (row: Record<string, unknown>): void => {
     const id = typeof row.id === 'number' ? String(row.id) : null

@@ -951,12 +951,31 @@ if (!function_exists('oti_verify_incumbents_signature')) {
         if (!hash_equals($expected, (string) $signature)) {
             return new WP_Error('oti_inc_bad_sig', 'Invalid signature', ['status' => 401]);
         }
-        $key = 'oti_incn_' . md5($nonce);
-        if (get_transient($key) !== false) {
+        if (!oti_claim_nonce('inc', $nonce, OTI_INCUMBENTS_WINDOW)) {
             return new WP_Error('oti_inc_replayed', 'Request already used', ['status' => 401]);
         }
-        set_transient($key, 1, 2 * OTI_INCUMBENTS_WINDOW);
         return true;
+    }
+}
+
+if (!function_exists('oti_claim_nonce')) {
+    /**
+     * Claim a single-use nonce ATOMICALLY: one INSERT IGNORE on the options table's unique option_name, so two parallel replays cannot both pass (a
+     * transient get-then-set can, and without a persistent object cache is not shared at all). True = this call claimed it; false = already used, or the
+     * claim could not be made (fail closed). Claims older than twice the window are deleted on the way.
+     */
+    function oti_claim_nonce($scope, $nonce, $window)
+    {
+        global $wpdb;
+        if (!isset($wpdb) || !is_object($wpdb)) {
+            return false;
+        }
+        $prefix = 'oti_nonce_' . $scope . '_';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- an atomic claim has no API equivalent.
+        $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND CAST(option_value AS UNSIGNED) < %d", $wpdb->esc_like($prefix) . '%', time() - (2 * (int) $window)));
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+        $claimed = $wpdb->query($wpdb->prepare("INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')", $prefix . md5((string) $nonce), (string) time()));
+        return $claimed === 1;
     }
 }
 
@@ -1037,14 +1056,19 @@ if (!function_exists('oti_incumbents_pending_product_sync_jobs')) {
 }
 
 if (!function_exists('oti_incumbents_latest_mintsoft_write')) {
-    /** The latest time (unix seconds) the bridge stamped on any order: the newest of its status, sync-queued and withdrawal-queued times. 0 when it never has; null when unreadable. */
+    /**
+     * The latest time (unix seconds) the bridge stamped on any order. WooCommerce meta rows carry no write time, so this covers exactly the `_mintsoft_*` keys
+     * whose VALUE is a time: `_mintsoft_status_updated_at`, `_mintsoft_sync_queued_at` (the bridge deletes it on success), `_mintsoft_wdraw_queued_at` and
+     * `_mintsoft_wdraw_escalated`. A bridge write that leaves no time (tracking, order id and number links, outcome flags) is NOT visible to it: the probe is one
+     * signal beside the settings and route checks, not proof the bridge is silent. 0 when it never has; null when unreadable.
+     */
     function oti_incumbents_latest_mintsoft_write()
     {
         global $wpdb;
         if (!isset($wpdb) || !is_object($wpdb)) {
             return null;
         }
-        $keys = ['_mintsoft_status_updated_at', '_mintsoft_sync_queued_at', '_mintsoft_wdraw_queued_at'];
+        $keys = ['_mintsoft_status_updated_at', '_mintsoft_sync_queued_at', '_mintsoft_wdraw_queued_at', '_mintsoft_wdraw_escalated'];
         $tables = [];
         $hpos = $wpdb->prefix . 'wc_orders_meta';
         // phpcs:ignore WordPress.DB.PreparedSQL -- table names are internal.
@@ -1150,13 +1174,33 @@ if (!function_exists('oti_verify_withdrawal_outcome_signature')) {
         if (!preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
             return new WP_Error('oti_wo_no_nonce', 'Missing nonce', ['status' => 401]);
         }
-        $key = 'oti_won_' . md5($nonce);
-        if (get_transient($key) !== false) {
+        if (!oti_claim_nonce('wo', $nonce, OTI_TS_REPLAY_WINDOW)) {
             return new WP_Error('oti_wo_replayed', 'Request already used', ['status' => 401]);
         }
-        set_transient($key, 1, 2 * OTI_TS_REPLAY_WINDOW);
         return true;
     }
+}
+
+if (!function_exists('oti_capture_wdraw_request')) {
+    /**
+     * Record the withdrawal plugin's request id on the order (`_oti_wdraw_request_id`), so IMS reads it from the order payload and keeps its own record. META
+     * ONLY (no full order save, so no extra order.updated webhook). Hooked to the withdrawal plugin's own events; the hook arguments are ($request, $order).
+     */
+    function oti_capture_wdraw_request($request = null, $order = null)
+    {
+        if (!is_object($request) || !isset($request->id) || !is_object($order) || !method_exists($order, 'update_meta_data')) {
+            return;
+        }
+        $id = absint($request->id);
+        if (!$id || absint($order->get_meta('_oti_wdraw_request_id')) === $id) {
+            return;
+        }
+        $order->update_meta_data('_oti_wdraw_request_id', $id);
+        $order->save_meta_data();
+    }
+    add_action('wbte_ewb_request_submitted', 'oti_capture_wdraw_request', 5, 2);
+    add_action('wbte_ewb_request_approved', 'oti_capture_wdraw_request', 5, 2);
+    add_action('wbte_ewb_request_rejected', 'oti_capture_wdraw_request', 5, 2);
 }
 
 if (!function_exists('oti_handle_withdrawal_outcome')) {
@@ -1167,7 +1211,8 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
      *
      *   'noted'     add the (admin-only) order note. Nothing else.
      *   'rejected'  the goods have already gone: reject the customer's withdrawal request through the withdrawal plugin's own service (so its e-mails and
-     *               log run), then add the note. The request id is the one in the body, else the one recorded on the order by the bridge plugin.
+     *               log run), then add the note. The request id is the one in the body, else the one recorded on the order (`_oti_wdraw_request_id`,
+     *               or the bridge's). It must belong to this order, or nothing is rejected ('no_request').
      *
      * Idempotent per outcome_key: a note is added once per key (kept in an order meta), so a retry after a lost answer adds nothing. Answers:
      *   result 'noted' | 'rejected' | 'already_done'; 'no_request' (rejection asked, no request id known: the note was still added);
@@ -1201,18 +1246,25 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
             return new WP_Error('oti_wo_lock', 'Another outcome for this order is running', ['status' => 409]);
         }
         try {
+            // Two done-markers per key, so a retry resumes exactly where the last attempt stopped: `n:` the note is written, `r:` the rejection is carried out.
             $done = $order->get_meta('_oti_wdraw_outcome_keys');
             $done = is_array($done) ? $done : [];
-            if (in_array($key, $done, true)) {
+            $note_done = in_array('n:' . $key, $done, true) || in_array($key, $done, true);
+            $reject_done = $outcome !== 'rejected' || in_array('r:' . $key, $done, true) || in_array($key, $done, true);
+            if ($note_done && $reject_done) {
                 return new WP_REST_Response(['ok' => true, 'result' => 'already_done'], 200);
             }
             $result = 'noted';
-            if ($outcome === 'rejected') {
+            $fresh = [];
+            if ($outcome === 'rejected' && !$reject_done) {
                 $reason = isset($data['reject_reason']) && $data['reject_reason'] !== '' ? sanitize_textarea_field((string) $data['reject_reason']) : 'order already dispatched';
                 if (!class_exists('Wbte_Ewb_Request_Service') || !class_exists('Wbte_Ewb_Request_Repository')) {
                     $result = 'no_withdrawal_plugin';
                 } else {
                     $request_id = isset($data['request_id']) ? absint($data['request_id']) : 0;
+                    if (!$request_id) {
+                        $request_id = absint($order->get_meta('_oti_wdraw_request_id'));
+                    }
                     if (!$request_id) {
                         $request_id = absint($order->get_meta('_mintsoft_wdraw_request_id'));
                     }
@@ -1220,26 +1272,39 @@ if (!function_exists('oti_handle_withdrawal_outcome')) {
                         $result = 'no_request';
                     } else {
                         try {
-                            $service = new Wbte_Ewb_Request_Service(new Wbte_Ewb_Request_Repository());
-                            $rejected = $service->reject($request_id, 0, $reason);
+                            $repo = new Wbte_Ewb_Request_Repository();
+                            // The request must be THIS order's: the id in the body is never trusted on its own. Unknown ownership fails closed.
+                            $found = method_exists($repo, 'find') ? $repo->find($request_id) : null;
+                            $owner = is_object($found) ? (isset($found->order_id) ? absint($found->order_id) : (method_exists($found, 'get_order_id') ? absint($found->get_order_id()) : 0)) : 0;
+                            if ($owner !== $order_id) {
+                                $result = 'no_request';
+                            } else {
+                                $service = new Wbte_Ewb_Request_Service($repo);
+                                $rejected = $service->reject($request_id, 0, $reason);
+                                if (is_wp_error($rejected) && $rejected->get_error_code() !== 'wbte_ewb_not_pending') {
+                                    return new WP_REST_Response(['ok' => false, 'result' => 'reject_failed'], 502);
+                                }
+                                $result = 'rejected';
+                                $fresh[] = 'r:' . $key;
+                            }
                         } catch (\Throwable $e) {
                             return new WP_REST_Response(['ok' => false, 'result' => 'reject_failed'], 502);
                         }
-                        if (is_wp_error($rejected) && $rejected->get_error_code() !== 'wbte_ewb_not_pending') {
-                            return new WP_REST_Response(['ok' => false, 'result' => 'reject_failed'], 502);
-                        }
-                        $result = 'rejected';
                     }
                 }
             }
-            if ($note !== '') {
-                if (!$order->add_order_note($note)) {
+            if (!$note_done) {
+                if ($note !== '' && !$order->add_order_note($note)) {
                     return new WP_REST_Response(['ok' => false, 'result' => 'note_failed'], 502);
                 }
+                $fresh[] = 'n:' . $key;
             }
-            $done[] = $key;
-            $order->update_meta_data('_oti_wdraw_outcome_keys', array_slice($done, -20));
-            $order->save();
+            if ($fresh) {
+                // META ONLY, never a full order save: that stamps a new modified time and fires woocommerce_update_order, whose order.updated webhook would
+                // bring IMS straight back here. add_order_note() above does not save the order either.
+                $order->update_meta_data('_oti_wdraw_outcome_keys', array_slice(array_merge($done, $fresh), -40));
+                $order->save_meta_data();
+            }
             return new WP_REST_Response(['ok' => true, 'result' => $result], 200);
         } finally {
             $wpdb->query($wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name));

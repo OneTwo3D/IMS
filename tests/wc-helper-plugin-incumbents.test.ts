@@ -41,9 +41,11 @@ class WP_REST_Response { public $data; public $status; function __construct($d, 
 function get_option($k, $d = '') { return $GLOBALS['options'][$k] ?? ($k === 'secret' ? '${SECRET}' : $d); }
 function absint($v) { return abs((int) $v); }
 function sanitize_textarea_field($v) { return (string) $v; }
-$GLOBALS['t'] = [];
-function get_transient($k) { return isset($GLOBALS['t'][$k]) ? 1 : false; }
-function set_transient($k, $v, $e) { $GLOBALS['t'][$k] = 1; }
+/** The options table as the nonce claim sees it: INSERT IGNORE on a unique option_name answers 1 the first time and 0 after. */
+class NonceWpdb { public $options = 'wp_options'; public $prefix = 'wp_'; public $claimed = [];
+  function esc_like($v) { return $v; }
+  function prepare($q, ...$a) { foreach ($a as $x) { $q = preg_replace('/%[sd]/', is_int($x) ? (string) $x : "'" . $x . "'", $q, 1); } return $q; }
+  function query($q) { if (strpos($q, 'INSERT IGNORE') === 0) { preg_match("/VALUES \\('([^']*)'/", $q, $m); if (isset($this->claimed[$m[1]])) { return 0; } $this->claimed[$m[1]] = 1; return 1; } return 0; } }
 class WP_REST_Request implements ArrayAccess {
   function __construct(public $m, public $h, public $body = "", public $order = 0) {}
   function get_header($k) { return $this->h[$k] ?? null; }
@@ -62,6 +64,8 @@ const PATH = '/wp-json/oti/v1/incumbents'
 
 function probeVerify(input: { method?: string; ts: number; headerTs?: string; nonce?: string; signature: string }) {
   return php(`${STUBS}
+$wpdb = new NonceWpdb();
+${phpFunction('oti_claim_nonce')}
 ${phpFunction('oti_verify_incumbents_signature')}
 $r = new WP_REST_Request(${JSON.stringify(input.method ?? 'GET')}, ['x-oti-signature' => ${JSON.stringify(input.signature)}, 'x-oti-timestamp' => ${JSON.stringify(input.headerTs ?? String(input.ts))}, 'x-oti-nonce' => ${JSON.stringify(input.nonce ?? NONCE)}]);
 $a = oti_verify_incumbents_signature($r);
@@ -141,6 +145,8 @@ test('the probe handler writes nothing: no update_option, no add/update meta, no
 const OUT_PATH = (id: number) => `/wp-json/oti/v1/order/${id}/withdrawal-outcome`
 function outcomeVerify(input: { order: number; ts: number; body: string; signature: string; pathOrder?: number }) {
   return php(`${STUBS}
+$wpdb = new NonceWpdb();
+${phpFunction('oti_claim_nonce')}
 ${phpFunction('oti_verify_withdrawal_outcome_signature')}
 $r = new WP_REST_Request('POST', ['x-oti-signature' => ${JSON.stringify(input.signature)}, 'x-oti-timestamp' => ${JSON.stringify(String(input.ts))}], ${JSON.stringify(input.body)}, ${input.pathOrder ?? input.order});
 $a = oti_verify_withdrawal_outcome_signature($r);
@@ -157,24 +163,26 @@ test('withdrawal-outcome: signed over the order path, single-use, and a TrackShi
   assert.equal(outcomeVerify({ order: 78, pathOrder: 78, ts, body, signature: sign(ts, 'POST', OUT_PATH(78), body) }).first, 'oti_wo_bad_body', 'the body names another order')
 })
 
-function outcomeHandle(body: Record<string, unknown>, state: { keys?: string[]; wbte?: 'ok' | 'none' | 'throws' | 'notpending'; requestMeta?: number } = {}) {
+function outcomeHandle(body: Record<string, unknown>, state: { keys?: string[]; wbte?: 'ok' | 'none' | 'throws' | 'notpending'; requestMeta?: number; ownMeta?: number; owner?: number } = {}) {
   return php(`${STUBS}
 $GLOBALS['notes'] = []; $GLOBALS['rejects'] = [];
 class FakeWpdb { public $prefix = 'wp_'; function prepare($q, ...$a) { return $q; } function get_var($q) { return strpos($q, 'GET_LOCK') !== false ? 1 : null; } function query($q) { return 1; } }
 $wpdb = new FakeWpdb();
-class FakeOrder { public $meta = ['_oti_wdraw_outcome_keys' => ${JSON.stringify(state.keys ?? [])}, '_mintsoft_wdraw_request_id' => ${state.requestMeta ?? 0}];
+class FakeOrder { public $meta = ['_oti_wdraw_outcome_keys' => ${JSON.stringify(state.keys ?? [])}, '_mintsoft_wdraw_request_id' => ${state.requestMeta ?? 0}, '_oti_wdraw_request_id' => ${state.ownMeta ?? 0}];
   function get_meta($k) { return $this->meta[$k] ?? ''; }
   function update_meta_data($k, $v) { $this->meta[$k] = $v; }
   function add_order_note($n) { $GLOBALS['notes'][] = $n; return 1; }
-  function save() { return 1; } }
+  function save_meta_data() { $GLOBALS['meta_saved'] = true; }
+  function save() { $GLOBALS['full_saved'] = true; return 1; } }
+$GLOBALS['full_saved'] = false; $GLOBALS['meta_saved'] = false;
 $GLOBALS['order'] = new FakeOrder();
 function wc_get_order($id) { return $id === 77 ? $GLOBALS['order'] : false; }
-${state.wbte === 'none' ? '' : `class Wbte_Ewb_Request_Repository {}
+${state.wbte === 'none' ? '' : `class Wbte_Ewb_Request_Repository { function find($id) { return (object) ['id' => $id, 'order_id' => ${state.owner ?? 77}]; } }
 class Wbte_Ewb_Request_Service { function __construct($r) {} function reject($id, $by, $reason) { ${state.wbte === 'throws' ? "throw new Exception('x');" : state.wbte === 'notpending' ? "return new WP_Error('wbte_ewb_not_pending');" : "$GLOBALS['rejects'][] = [$id, $reason]; return true;"} } }`}
 ${phpFunction('oti_handle_withdrawal_outcome')}
 $r = new WP_REST_Request('POST', [], ${JSON.stringify(JSON.stringify(body))}, 77);
 $resp = oti_handle_withdrawal_outcome($r);
-echo json_encode(['code' => $resp instanceof WP_Error ? $resp->code : $resp->status, 'data' => $resp instanceof WP_Error ? null : $resp->data, 'notes' => $GLOBALS['notes'], 'rejects' => $GLOBALS['rejects'], 'keys' => $GLOBALS['order']->meta['_oti_wdraw_outcome_keys']]);`)
+echo json_encode(['code' => $resp instanceof WP_Error ? $resp->code : $resp->status, 'data' => $resp instanceof WP_Error ? null : $resp->data, 'notes' => $GLOBALS['notes'], 'rejects' => $GLOBALS['rejects'], 'keys' => $GLOBALS['order']->meta['_oti_wdraw_outcome_keys'], 'fullSaved' => $GLOBALS['full_saved'], 'metaSaved' => $GLOBALS['meta_saved']]);`)
 }
 
 test('withdrawal-outcome: a note is added once per outcome key; a repeat adds nothing', () => {
@@ -182,9 +190,43 @@ test('withdrawal-outcome: a note is added once per outcome key; a repeat adds no
   const first = outcomeHandle(body)
   assert.deepEqual(first.data, { ok: true, result: 'noted' })
   assert.deepEqual(first.notes, ['IMS: held'])
-  const again = outcomeHandle(body, { keys: ['hold:77:1'] })
+  assert.deepEqual(first.keys, ['n:hold:77:1'])
+  const again = outcomeHandle(body, { keys: ['n:hold:77:1'] })
   assert.deepEqual(again.data, { ok: true, result: 'already_done' })
   assert.deepEqual(again.notes, [])
+  assert.deepEqual(outcomeHandle(body, { keys: ['hold:77:1'] }).notes, [], 'a key recorded before the two-marker form still counts')
+})
+
+test('withdrawal-outcome: the note is written WITHOUT a full order save (no modified time, no order.updated webhook, so no loop); only the meta is saved', () => {
+  const done = outcomeHandle({ outcome: 'noted', outcome_key: 'hold:77:1', note: 'IMS: held' })
+  assert.equal(done.fullSaved, false, '$order->save() would fire woocommerce_update_order and bring IMS straight back')
+  assert.equal(done.metaSaved, true)
+  assert.ok(!phpFunction('oti_handle_withdrawal_outcome').includes('$order->save()'), 'the handler never calls save()')
+  assert.ok(!phpFunction('oti_capture_wdraw_request').includes('->save()'), 'capturing the request id never full-saves the order either')
+})
+
+test('withdrawal-outcome: a rejection that found no request is retried without a second note, and is never answered already_done', () => {
+  const body = { outcome: 'rejected', outcome_key: 'after:77:9', note: 'IMS: despatched' }
+  const first = outcomeHandle(body, { wbte: 'ok' })
+  assert.equal((first.data as { result: string }).result, 'no_request')
+  assert.deepEqual(first.keys, ['n:after:77:9'], 'the note is recorded, the rejection is not')
+  const retry = outcomeHandle({ ...body, request_id: 9 }, { wbte: 'ok', keys: ['n:after:77:9'] })
+  assert.equal((retry.data as { result: string }).result, 'rejected')
+  assert.deepEqual(retry.notes, [], 'the note was already written')
+  assert.deepEqual(retry.rejects, [[9, 'order already dispatched']])
+  assert.deepEqual(retry.keys, ['n:after:77:9', 'r:after:77:9'])
+})
+
+test('withdrawal-outcome: a request id that belongs to ANOTHER order is never rejected (no_request)', () => {
+  const body = { outcome: 'rejected', outcome_key: 'after:77:5', note: 'IMS: despatched', request_id: 9 }
+  const foreign = outcomeHandle(body, { wbte: 'ok', owner: 78 })
+  assert.equal((foreign.data as { result: string }).result, 'no_request')
+  assert.deepEqual(foreign.rejects, [])
+})
+
+test('the incumbents nonce is claimed atomically: one INSERT IGNORE per nonce, so two replays cannot both pass', () => {
+  assert.ok(!phpFunction('oti_verify_incumbents_signature').includes('get_transient'))
+  assert.ok(phpFunction('oti_claim_nonce').includes('INSERT IGNORE'))
 })
 
 test('withdrawal-outcome: a rejection goes through the withdrawal plugin with the request id of the body (else the order meta), then the note', () => {
@@ -195,6 +237,8 @@ test('withdrawal-outcome: a rejection goes through the withdrawal plugin with th
   assert.deepEqual(done.notes, ['IMS: despatched'])
   const fromMeta = outcomeHandle({ ...body, request_id: undefined }, { wbte: 'ok', requestMeta: 4 })
   assert.deepEqual(fromMeta.rejects, [[4, 'order already dispatched']])
+  const fromOwn = outcomeHandle({ ...body, request_id: undefined }, { wbte: 'ok', ownMeta: 6 })
+  assert.deepEqual(fromOwn.rejects, [[6, 'order already dispatched']], 'the helper plugin\'s own record comes before the bridge\'s')
 })
 
 test('withdrawal-outcome: no request id, no withdrawal plugin and a failing reject are told apart; the note is never lost on the first two', () => {

@@ -11,8 +11,8 @@ const S = new Date('2027-01-04T00:00:00.000Z')
 // ---------------------------------------------------------------- gap list
 test('the gap list asks for paid-before-S, unlinked, still-wanted orders and for SHIPPED orders despatched before S, and carries no customer data', async () => {
   const wheres: unknown[] = []
-  const db = { salesOrder: { findMany: async (args: { where: Record<string, unknown>; select: Record<string, unknown> }) => { wheres.push(args); return [{ id: 'o1', orderNumber: 'N1', externalOrderNumber: 'W1', paidAt: new Date('2027-01-03T00:00:00Z'), shippedAt: new Date('2027-01-03T12:00:00Z') }] } } }
-  const gaps = await listSwitchoverGaps({ since: S, db })
+  const db = { salesOrder: { findMany: async (args: { where: Record<string, unknown>; select: Record<string, unknown> }) => { wheres.push(args); return [{ id: 'o1', orderNumber: 'N1', externalOrderNumber: 'W1', paidAt: new Date('2027-01-03T00:00:00Z'), shippedAt: new Date('2027-01-03T12:00:00Z'), shoppingLinks: [{ externalOrderId: '501' }] }] } } }
+  const gaps = await listSwitchoverGaps({ since: S, db, readStorefront: async () => ({ status: 'processing', trackingItems: 0 }), pauseMs: 0 })
   assert.deepEqual(gaps.create.map((g) => [g.kind, g.reference]), [['G_create', 'N1']])
   assert.deepEqual(gaps.despatch.map((g) => [g.kind, g.reference]), [['G_despatch', 'N1']])
   const [createArgs, despatchArgs] = wheres as Array<{ where: Record<string, unknown>; select: Record<string, unknown> }>
@@ -23,7 +23,19 @@ test('the gap list asks for paid-before-S, unlinked, still-wanted orders and for
   assert.ok(JSON.stringify(createArgs!.where.OR).includes('"wmsOrderPush":{"is":null}'), 'unlinked')
   assert.equal(despatchArgs!.where.status, 'SHIPPED')
   assert.deepEqual(Object.keys(createArgs!.select).sort(), ['externalOrderNumber', 'id', 'orderNumber', 'paidAt', 'shippedAt'])
+  assert.deepEqual(despatchArgs!.where.OR, [{ shippedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }, { shippedAt: null }], 'despatched before S, inside the look-back window')
   assert.equal(gaps.truncated, false)
+})
+
+test('G_despatch lists ONLY the shipped orders whose storefront order is not completed with tracking; an unreadable storefront order is listed and marked', async () => {
+  const row = (id: string, link: string) => ({ id, orderNumber: id, externalOrderNumber: null, paidAt: null, shippedAt: new Date('2027-01-03T12:00:00Z'), shoppingLinks: [{ externalOrderId: link }] })
+  const rows = [row('done', '1'), row('noTracking', '2'), row('processing', '3'), row('unreadable', '4'), { ...row('nolink', '5'), shoppingLinks: [] }]
+  const db = { salesOrder: { findMany: async (args: { where: { status?: string } }) => (args.where.status === 'SHIPPED' ? rows : []) } }
+  const states: Record<string, { status: string; trackingItems: number } | null> = { 1: { status: 'completed', trackingItems: 2 }, 2: { status: 'completed', trackingItems: 0 }, 3: { status: 'processing', trackingItems: 0 }, 4: null }
+  const asked: string[] = []
+  const gaps = await listSwitchoverGaps({ since: S, db, pauseMs: 0, readStorefront: async (id) => { asked.push(id); return states[id] ?? null } })
+  assert.deepEqual(gaps.despatch.map((g) => [g.reference, g.unreadable === true]), [['noTracking', false], ['processing', false], ['unreadable', true]])
+  assert.deepEqual(asked, ['1', '2', '3', '4'], 'every candidate is READ before it is listed')
 })
 
 // ---------------------------------------------------------------- take-over
@@ -40,7 +52,7 @@ function deps(row: OrderRow | null, over: Partial<TakeOverDeps> = {}) {
     clientId: 89,
     fetchParts: async () => { events.push('read mintsoft'); return [{ externalId: '9001' }] },
     readStorefrontOrder: async () => { events.push('read storefront'); return { status: 'processing', trackingItems: 0 } },
-    queueCompletion: async (_tx, input) => { events.push(`queue ${input.orderId}`); return 'key' },
+    queueCompletion: async (_tx, input) => { events.push(`queue ${input.orderId} ${input.keyPart}`); return 'key' },
     now: () => new Date('2027-01-04T05:00:00Z'),
     ...over,
   }
@@ -71,6 +83,16 @@ test('G_create refuses: nothing in Mintsoft (IMS never creates a pre-S order), s
   assert.equal((await takeOverGapOrder('o1', S, true, deps(null).d)).outcome, 'refused')
 })
 
+test('G_create re-checks eligibility at take-over: a cancelled, fully refunded, withdrawal-held, withdrawn or erased order is refused and nothing is read or written', async () => {
+  for (const over of [{ status: 'CANCELLED' }, { refundStatus: 'FULL' }, { withdrawalHoldAt: new Date() }, { withdrawalApprovedAt: new Date() }, { erasedAt: new Date() }, { paymentRemovedForeign: {} }] as Array<Partial<OrderRow>>) {
+    const d = deps(order(over))
+    const r = await takeOverGapOrder('o1', S, true, d.d)
+    assert.equal(r.outcome, 'refused', JSON.stringify(over))
+    assert.match('why' in r ? r.why : '', /no longer eligible/)
+    assert.deepEqual(d.events, [], 'no Mintsoft read, no write')
+  }
+})
+
 test('G_despatch reads the storefront first: already completed with tracking is nothing to do; otherwise it queues the completion with the obligation time NOW', async () => {
   const done = deps(order({ status: 'SHIPPED', shippedAt: new Date('2027-01-03T00:00:00Z') }), { readStorefrontOrder: async () => ({ status: 'completed', trackingItems: 1 }) })
   assert.equal((await takeOverGapOrder('o1', S, true, done.d)).outcome, 'nothing-to-do')
@@ -80,7 +102,7 @@ test('G_despatch reads the storefront first: already completed with tracking is 
   assert.deepEqual(dry.events, ['read storefront'])
   const live = deps(order({ status: 'SHIPPED', shippedAt: new Date('2027-01-03T00:00:00Z') }))
   assert.equal((await takeOverGapOrder('o1', S, true, live.d)).outcome, 'queued')
-  assert.deepEqual(live.events, ['read storefront', 'queue o1'])
+  assert.deepEqual(live.events, ['read storefront', `queue o1 takeover:${S.getTime()}`], 'the key part is stable (S), not the time of the run: --apply twice queues one job')
 })
 
 test('G_despatch refuses: storefront unreadable, a shadowed (held) completion, a despatch at or after S, no storefront link', async () => {
@@ -161,14 +183,36 @@ test('switchover:gaps CLI: usage errors exit 3; --apply needs --take-over; S mus
 test('switchover:hand-back CLI: dry run by default (apply false), exit 1 when a person is needed', async () => {
   const run = async (argv: string[], read: { status: string; metas: Record<string, string | null> } | null) => {
     const o = sink(); const hd = handDeps(read)
-    const code = await runHandBackCli({ argv, env: { MINTSOFT_WRITES_LIVE_FROM: S.toISOString() }, stdout: o, stderr: o, disconnect: async () => {}, load: async () => ({ candidates: [cand], deps: hd.d }) })
+    const code = await runHandBackCli({ argv, env: { MINTSOFT_WRITES_LIVE_FROM: S.toISOString() }, stdout: o, stderr: o, disconnect: async () => {}, now: () => new Date('2027-01-05T00:00:00Z'), audit: async () => {}, load: async () => ({ candidates: [cand], deps: hd.d }) })
     return { code, out: o.lines.join('\n'), writes: hd.writes.length }
   }
   const dry = await run([], { status: 'processing', metas: {} })
   assert.deepEqual([dry.code, dry.writes], [0, 0])
   assert.match(dry.out, /DRY RUN/)
-  const apply = await run(['--apply'], { status: 'processing', metas: {} })
+  const apply = await run(['--apply', '--writers-stopped'], { status: 'processing', metas: {} })
   assert.deepEqual([apply.code, apply.writes], [0, 1])
-  assert.equal((await run(['--apply'], { status: 'processing', metas: { _mintsoft_order_id: '1' } })).code, 1, 'a conflict needs a person')
+  assert.equal((await run(['--apply', '--writers-stopped'], { status: 'processing', metas: { _mintsoft_order_id: '1' } })).code, 1, 'a conflict needs a person')
   assert.equal((await run(['--wat'], null)).code, 3)
+})
+
+test('switchover:hand-back CLI: --apply is refused unless the step-M live-from is still set and reached AND the writers are confirmed stopped (hand back FIRST, then unset); an applied run is audited', async () => {
+  const audits: unknown[] = []
+  const run = async (argv: string[], env: Record<string, string | undefined>) => {
+    const o = sink(); const hd = handDeps({ status: 'processing', metas: {} })
+    const code = await runHandBackCli({ argv, env, stdout: o, stderr: o, disconnect: async () => {}, now: () => new Date('2027-01-05T00:00:00Z'), audit: async (e) => { audits.push(e) }, load: async () => ({ candidates: [cand], deps: hd.d }) })
+    return { code, out: o.lines.join('\n'), writes: hd.writes.length }
+  }
+  const live = { MINTSOFT_WRITES_LIVE_FROM: S.toISOString() }
+  const unset = await run(['--apply', '--writers-stopped', '--since', S.toISOString()], {})
+  assert.deepEqual([unset.code, unset.writes], [4, 0])
+  assert.match(unset.out, /FIRST, then unset/)
+  assert.deepEqual([(await run(['--apply', '--writers-stopped'], {})).code, (await run(['--apply', '--writers-stopped', '--since', S.toISOString()], live)).code], [3, 4], 'no S at all is a usage error; only a --since (the live-from not set) is refused')
+  assert.equal((await run(['--apply', '--writers-stopped'], { MINTSOFT_WRITES_LIVE_FROM: '2027-02-01T00:00:00Z' })).code, 4, 'a live-from not yet reached keeps the hold shut')
+  const noConfirm = await run(['--apply'], live)
+  assert.deepEqual([noConfirm.code, noConfirm.writes], [4, 0])
+  assert.match(noConfirm.out, /writers-stopped/)
+  assert.equal(audits.length, 0, 'a refused run leaves no audit entry')
+  const ok = await run(['--apply', '--writers-stopped'], live)
+  assert.deepEqual([ok.code, ok.writes, audits.length], [0, 1, 1])
+  assert.equal((await run([], {})).code, 3, 'a dry run still needs a readable S')
 })

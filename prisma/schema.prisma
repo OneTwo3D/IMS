@@ -1937,6 +1937,10 @@ model SalesOrder {
   /// a newer resubmission; without a version it would overwrite the newer
   /// state and leave the generation stale. Older events are ignored.
   withdrawalLastWcEventAt DateTime?
+  /// The storefront withdrawal plugin's request id for the order's CURRENT request (from the helper plugin's `_oti_wdraw_request_id` order meta). IMS's own
+  /// record: the withdrawal outcome writer sends it, so a rejection never depends on a meta only the bridge wrote.
+  withdrawalRequestId String?
+  wcWithdrawalOutcomes WcWithdrawalOutcome[]
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
@@ -4575,6 +4579,8 @@ enum WmsOperatorTaskReason {
   ORDER_NOT_FOUND
   /// A storefront (or approved EU withdrawal) cancelled an order whose invoice is already posted to the ledger: IMS raised no credit note and a cancelled order cannot be refunded, so a person credits the invoice by hand.
   CANCELLED_POSTED_INVOICE
+  /// An EU withdrawal request filed after despatch could not be rejected on the storefront (no request id known, withdrawal plugin missing, or the write failed): a person rejects it in WooCommerce.
+  WITHDRAWAL_REJECT_NOT_WRITTEN
 }
 
 enum WmsOperatorTaskStatus {
@@ -6176,4 +6182,23 @@ model WcStockDriftRun {
 
   @@index([startedAt], map: "wc_stock_drift_runs_started_idx")
   @@map("wc_stock_drift_runs")
+}
+
+/// THE ONCE-ONLY RECORD of a withdrawal outcome written to the storefront: one row per (order, request, outcome kind). The identity is the withdrawal request,
+/// never a modified time, so a later change to the order (a tracking update, an admin edit, the plugin's own save) cannot make a second note.
+model WcWithdrawalOutcome {
+  id          String   @id @default(cuid())
+  orderId     String   @map("order_id")
+  /// `r<request id>` when IMS knows the storefront request, else `g<withdrawalHoldGeneration>`.
+  requestKey  String   @map("request_key")
+  /// The withdrawal log action (wc_withdrawal_approved, wc_withdrawal_after_dispatch, ...).
+  outcomeKind String   @map("outcome_kind")
+  /// The storefront's answer: noted, rejected or already_done.
+  result      String
+  writtenAt   DateTime @default(now()) @map("written_at")
+
+  order       SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, requestKey, outcomeKind], map: "wc_withdrawal_outcomes_once_key")
+  @@map("wc_withdrawal_outcomes")
 }

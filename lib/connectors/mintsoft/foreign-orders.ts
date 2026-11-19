@@ -8,10 +8,13 @@
  *
  * FAIL-CLOSED RULES. Every row must carry a readable ID, an order number and a ClientId equal to ours (the tenant is shared: a row of another client, or one
  * with no ClientId, throws and the whole read fails, which the evidence reader reports as unreadable). The list is read to its end, or it throws (a
- * truncated list is never a clean one). A row whose creation time cannot be read is COUNTED, not skipped: it cannot be shown to predate S.
+ * truncated list is never a clean one). A row whose creation time cannot be read is COUNTED, not skipped: it cannot be shown to predate S. The creation time is only ever read from a
+ * real created field (never OrderDate, the channel's order date, which for a late-created order predates S): with none readable the row is counted as
+ * foreign and undated unless IMS holds a link with that exact ID.
  *
- * A row is LINKED when IMS holds a Mintsoft push link whose external order id equals the row's ID, or (where the link has no id yet) whose external order
- * number equals the row's order number. The reader never writes anything, never mints a key (reads use the stored key) and returns counts only: no order
+ * A row is LINKED when IMS holds a Mintsoft push link whose external order id equals the row's ID, or (only where the link has NO id yet) whose external
+ * order number equals the row's order number. A row whose number matches a link that carries a DIFFERENT id is a DUPLICATE of an order IMS made: it is
+ * counted as foreign (and in `duplicates`), never as linked. The reader never writes anything, never mints a key (reads use the stored key) and returns counts only: no order
  * number, id, name or address leaves it.
  */
 import { db } from '@/lib/db'
@@ -26,7 +29,7 @@ const TENANT_ZONE = 'Europe/London'
 /** The window sent to Mintsoft starts this much before S, which absorbs a clock or zone slip; the count itself is judged against S exactly. */
 const LOOKBACK_MS = 3 * 3_600_000
 /** The fields that can carry the creation time, in order of preference. */
-const CREATED_FIELDS = ['CreatedDate', 'DateCreated', 'Created', 'OrderDate'] as const
+const CREATED_FIELDS = ['CreatedDate', 'DateCreated', 'Created'] as const
 
 export type ForeignOrderRead = {
   /** Rows of our client read. */
@@ -35,14 +38,19 @@ export type ForeignOrderRead = {
   foreign: number
   /** Of `foreign`, those whose creation time could not be read. */
   undated: number
+  /** Of `foreign`, those whose order number is one IMS holds a link for under a DIFFERENT Mintsoft id (a second order for the same storefront order). */
+  duplicates: number
   pages: number
 }
+
+/** `ids`: ids of links. `numbers`: order numbers of links that have NO id yet. `numbersWithOtherId`: order numbers of links that carry an id. */
+export type LinkedSets = { ids: ReadonlySet<string>; numbers: ReadonlySet<string>; numbersWithOtherId?: ReadonlySet<string> }
 
 export type ForeignOrderDeps = {
   /** Test seam: the Mintsoft request. Absent = the connector's own (stored key, read allow-list, egress hold). */
   request?: (path: string) => Promise<MintsoftRequestResult<unknown>>
   /** Test seam: which of these ids / numbers IMS holds a Mintsoft push link for. Absent = the database. */
-  linked?: (ids: string[], numbers: string[]) => Promise<{ ids: ReadonlySet<string>; numbers: ReadonlySet<string> }>
+  linked?: (ids: string[], numbers: string[]) => Promise<LinkedSets>
   clientId?: number
 }
 
@@ -82,12 +90,16 @@ export function mintsoftRowCreatedAt(row: Record<string, unknown>): Date | null 
   return null
 }
 
-async function linkedInDb(ids: string[], numbers: string[]): Promise<{ ids: ReadonlySet<string>; numbers: ReadonlySet<string> }> {
+async function linkedInDb(ids: string[], numbers: string[]): Promise<LinkedSets> {
   const rows = await db.wmsOrderPushLink.findMany({
     where: { connector: 'mintsoft', OR: [{ externalOrderId: { in: ids } }, { externalOrderNumber: { in: numbers } }] },
     select: { externalOrderId: true, externalOrderNumber: true },
   })
-  return { ids: new Set(rows.map((row) => row.externalOrderId).filter((v): v is string => v !== null)), numbers: new Set(rows.map((row) => row.externalOrderNumber).filter((v): v is string => v !== null)) }
+  return {
+    ids: new Set(rows.map((row) => row.externalOrderId).filter((v): v is string => v !== null)),
+    numbers: new Set(rows.filter((row) => row.externalOrderId === null).map((row) => row.externalOrderNumber).filter((v): v is string => v !== null)),
+    numbersWithOtherId: new Set(rows.filter((row) => row.externalOrderId !== null).map((row) => row.externalOrderNumber).filter((v): v is string => v !== null)),
+  }
 }
 
 export async function readMintsoftForeignOrders(since: Date, deps: ForeignOrderDeps = {}): Promise<ForeignOrderRead> {
@@ -96,7 +108,7 @@ export async function readMintsoftForeignOrders(since: Date, deps: ForeignOrderD
   const request = deps.request ?? ((path: string) => mintsoftRequest<unknown>(path))
   const linked = deps.linked ?? linkedInDb
   const cursor = formatTenantCursor(new Date(since.getTime() - LOOKBACK_MS))
-  const out: ForeignOrderRead = { scanned: 0, foreign: 0, undated: 0, pages: 0 }
+  const out: ForeignOrderRead = { scanned: 0, foreign: 0, undated: 0, duplicates: 0, pages: 0 }
 
   for (let pageNo = 1; pageNo <= MAX_PAGES; pageNo += 1) {
     const query = new URLSearchParams({ SinceLastUpdated: cursor, Limit: String(PAGE_LIMIT), PageNo: String(pageNo), SortOldestFirst: 'true', ClientId: String(clientId) })
@@ -122,8 +134,11 @@ export async function readMintsoftForeignOrders(since: Date, deps: ForeignOrderD
     if (candidates.length > 0) {
       const known = await linked(candidates.map((row) => row.id), candidates.map((row) => row.number))
       for (const row of candidates) {
-        if (known.ids.has(row.id) || known.numbers.has(row.number)) continue
+        if (known.ids.has(row.id)) continue
+        // A number-only match is weaker evidence than an id match: it is never enough for a row whose creation time is unreadable.
+        if (row.createdAt !== null && known.numbers.has(row.number)) continue
         out.foreign += 1
+        if (known.numbersWithOtherId?.has(row.number)) out.duplicates += 1
         if (row.createdAt === null) out.undated += 1
       }
     }
