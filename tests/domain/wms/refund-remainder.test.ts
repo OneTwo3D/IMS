@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { createHash } from 'node:crypto'
 import { computeRefundRemainders, raiseRefundRemainderTasks, type RefundRemainderDeps } from '@/lib/domain/wms/refund-remainder'
 
 // o3d-2q9vp: ordered 10, 8 shipped, 2 shipped units returned and refunded. The push sends ordered - GROSS refund = 8 (all gone), IMS still owes 2.
@@ -101,4 +102,40 @@ test('a cursor pages through the orders: the next sweep continues after the last
   await raiseRefundRemainderTasks('mintsoft', 2, d)
   await raiseRefundRemainderTasks('mintsoft', 2, d)
   assert.deepEqual(examined, ['o1', 'o2', 'o3', 'o4', 'o5', 'o1', 'o2'], 'the newest orders are reached, and the sweep wraps')
+})
+
+test('MEDIUM 3: a second genuine remainder on the same SKU raises a task even though the first one is done (the episode, not the SKU alone, is the dedupe key)', async () => {
+  // A raise that behaves like the real one: the unique content hash is checked against EVERY earlier task, open or done.
+  const seen = new Set<string>()
+  const raise = async (task: { reason: string; dedupeBasis?: string; queryText: string }) => {
+    const hash = createHash('sha256').update(`${task.reason}\n${task.dedupeBasis ?? task.queryText}`).digest('hex')
+    if (seen.has(hash)) return false
+    seen.add(hash)
+    return true
+  }
+  // Episode 1: ordered 10, 8 shipped, 2 returned and refunded.
+  const first = deps({ raise })
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, first.d), { raised: 1, failed: 0 })
+  // The same facts again (and a partly delivered remainder): still the one task.
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, deps({ raise, shipped: async () => new Map([['l1', 9]]) }).d), { raised: 0, failed: 0 })
+  // Episode 2: one MORE shipped unit comes back and is refunded (gross 2 -> 3, 7 now shipped-and-kept): a new task.
+  const second = deps({ raise, refundTotals: async () => ({ gross: new Map([['l1', 3]]), netted: new Map([['l1', 0]]) }) })
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, second.d), { raised: 1, failed: 0 })
+})
+
+test('MED (r1): refunding an owed UNSHIPPED unit (gross and netted both +1) is the same episode: no conflicting second task; a further RETURNED shipped unit is a new one', async () => {
+  const seen = new Set<string>()
+  const raise = async (task: { reason: string; dedupeBasis?: string; queryText: string }) => {
+    const hash = createHash('sha256').update(`${task.reason}\n${task.dedupeBasis ?? task.queryText}`).digest('hex')
+    if (seen.has(hash)) return false
+    seen.add(hash)
+    return true
+  }
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, deps({ raise }).d), { raised: 1, failed: 0 })
+  // One of the 2 owed units is cancelled and refunded: gross 3, netted 1, remainder 1. Same returned-and-refunded count (2).
+  const cancelled = deps({ raise, refundTotals: async () => ({ gross: new Map([['l1', 3]]), netted: new Map([['l1', 1]]) }) })
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, cancelled.d), { raised: 0, failed: 0 })
+  // A further shipped unit comes back: gross 3, netted 0 -> new task.
+  const returned = deps({ raise, refundTotals: async () => ({ gross: new Map([['l1', 3]]), netted: new Map([['l1', 0]]) }) })
+  assert.deepEqual(await raiseRefundRemainderTasks('mintsoft', 50, returned.d), { raised: 1, failed: 0 })
 })

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { fitMintsoftName, fitMintsoftProductName, MINTSOFT_NAME_MAX_LEN } from '../lib/connectors/mintsoft/api/product-name.ts'
+import { fitMintsoftName, fitMintsoftProductName, resolveAttributeValues, MINTSOFT_NAME_MAX_LEN } from '../lib/connectors/mintsoft/api/product-name.ts'
 
 /**
  * o3d-zvec.20: `fit_mintsoft_name`, ported from the retired Python sync.
@@ -50,14 +50,14 @@ test('a long parent with oversized variants stays distinct through the SKU, and 
 test('fitMintsoftProductName splits the IMS variation name "<parent> — <attributes>" so the attributes stay whole, in the plugin\'s "<parent> (a, b)" format', () => {
   const parent = 'Mandala Rose Works FireThorn Flex Plate with ThornGrip Textured PEI'
   const name = `${parent} — Voron 2.4/Trident 350 (355 x 355mm)`
-  const fitted = fitMintsoftProductName(name, parent, 'SKU-1')
+  const fitted = fitMintsoftProductName(name, parent, 'SKU-1')!
   assert.ok(fitted.length <= 99)
   assert.ok(fitted.endsWith(' (Voron 2.4/Trident 350 (355 x 355mm))'), fitted)
   assert.ok(fitted.startsWith('Mandala Rose Works FireThorn Flex Plate with ThornGrip...'), fitted)
   // No parent, or a name that does not start with the parent: fitted as a plain name.
   assert.equal(fitMintsoftProductName('Short', null, 'S'), 'Short')
   assert.equal(fitMintsoftProductName('Short', 'Other', 'S'), 'Short')
-  assert.ok(fitMintsoftProductName('W '.repeat(80), null, 'S').length <= 99)
+  assert.ok(fitMintsoftProductName('W '.repeat(80), null, 'S')!.length <= 99)
 })
 
 test('fitMintsoftProductName keeps the plugin "Parent (a, b)" format, not "Parent — a / b" (owner decision 2026-11-18)', () => {
@@ -68,5 +68,16 @@ test('fitMintsoftProductName keeps the plugin "Parent (a, b)" format, not "Paren
 test('a variation value that contains " / " stays whole when the parent\'s option values name it (no split on the slash)', () => {
   assert.equal(fitMintsoftProductName('Plate — Voron 2.4 / Trident / Red', 'Plate', 'S1', ['Voron 2.4 / Trident', 'Red']), 'Plate (Voron 2.4 / Trident, Red)')
   // Unknown values keep the older behaviour (each piece on its own).
+  assert.equal(fitMintsoftProductName('Plate — Red / Large', 'Plate', 'S1', ['Voron 2.4 / Trident']), 'Plate (Red, Large)')
+})
+
+test('LOW 7: an ambiguous variation name is REFUSED (null), never guessed: two attributes that spell one known " / " value, or the same value in other case or spacing', () => {
+  // "Voron 2.4" and "Trident" are values of their own AND "Voron 2.4 / Trident" is one value: the stored text cannot say which it was.
+  assert.equal(fitMintsoftProductName('Plate — Voron 2.4 / Trident', 'Plate', 'S1', ['Voron 2.4 / Trident', 'Voron 2.4', 'Trident']), null)
+  // The IMS option text differs in case from the variation name: the old code split it, renaming the live product.
+  assert.equal(fitMintsoftProductName('Plate — voron 2.4 / trident / Red', 'Plate', 'S1', ['Voron 2.4 / Trident', 'Red']), null)
+  assert.deepEqual(resolveAttributeValues('Voron 2.4 / Trident', ['Voron 2.4 / Trident']), ['Voron 2.4 / Trident'])
+  // Unambiguous cases are unchanged.
+  assert.equal(fitMintsoftProductName('Plate — Voron 2.4 / Trident / Red', 'Plate', 'S1', ['Voron 2.4 / Trident', 'Red']), 'Plate (Voron 2.4 / Trident, Red)')
   assert.equal(fitMintsoftProductName('Plate — Red / Large', 'Plate', 'S1', ['Voron 2.4 / Trident']), 'Plate (Red, Large)')
 })

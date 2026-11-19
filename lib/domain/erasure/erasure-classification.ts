@@ -35,9 +35,10 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     },
   },
   // wcLineBaseline (JSON): WooCommerce line item ids, quantities, SKUs and the order total taken at the first IMS line edit. Product and money figures only: no name, address, email or free text.
+  // wcSeenLines (JSON): the WooCommerce line item ids and quantities of the last compared delivery, plus its modified time and a digest. Product figures only.
   SalesOrder: {
     erased: ['customerName', 'customerEmail', 'customerVatNumber', 'billingAddress', 'shippingAddress', 'notes', 'internalNotes', 'trackingNumber'],
-    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'withdrawalRequestId', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
+    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'withdrawalRequestId', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline', 'wcSeenLines'],
     retained: {
       invoiceNumber: 'issued invoice number, statutory record',
       accountingInvoiceId: 'ledger document id, statutory record',

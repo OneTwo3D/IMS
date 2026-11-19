@@ -49,6 +49,20 @@ export function computeRefundRemainders(input: {
   return out
 }
 
+/**
+ * The dedupe basis of a remainder task: per SKU, the RETURNED-AND-REFUNDED shipped units (gross refunded minus the netted refund), the episode marker. It is stable while the warehouse delivers the remainder
+ * and while an owed UNSHIPPED unit is refunded (gross and netted both move by one), and moves when a further shipped unit comes back. Pure.
+ */
+export function refundRemainderBasis(remainder: ReadonlyArray<{ sku: string }>, lines: ReadonlyArray<Pick<RemainderLine, 'id' | 'sku'>>, grossRefundedByLine: ReadonlyMap<string, unknown>, nettedRefundedByLine: ReadonlyMap<string, unknown>): string {
+  const returnedBySku = new Map<string, Decimal>()
+  for (const line of lines) {
+    if (!line.sku) continue
+    const returned = toDecimal((grossRefundedByLine.get(line.id) ?? 0) as never).minus(toDecimal((nettedRefundedByLine.get(line.id) ?? 0) as never))
+    returnedBySku.set(line.sku, (returnedBySku.get(line.sku) ?? toDecimal(0)).plus(returned))
+  }
+  return `remainder:${JSON.stringify(remainder.map((line) => [line.sku, (returnedBySku.get(line.sku) ?? toDecimal(0)).toString()] as const).sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0)))}`
+}
+
 function maxOf(a: Decimal, b: Decimal): Decimal {
   return a.gt(b) ? a : b
 }
@@ -171,8 +185,9 @@ export async function raiseRefundRemainderTasks(connector: string, limit = 50, d
         reason: 'REFUND_REMAINDER_DUE',
         queryText: refundRemainderQuery(warehouseOrderRef(candidate.externalOrderNumber, candidate.externalOrderId), orderRef, remainder),
         payload: { orderNumber: candidate.orderNumber, externalOrderNumber: candidate.externalOrderNumber },
-        // Per order and SKU, not per exact remainder: a partly delivered remainder (8 shipped, then 9) changes the quantity and must not raise a second "send 1" task while "send 2" is in progress.
-        dedupeBasis: `remainder:${JSON.stringify(remainder.map((line) => line.sku).sort())}`,
+        // Per order, SKU and EPISODE, not per exact remainder: a partly delivered remainder (8 shipped, then 9) changes the quantity and must not raise a second "send 1" task while "send 2" is in progress, but a
+        // FURTHER returned-and-refunded unit of the same SKU is a new episode (the returned-and-refunded quantity, gross minus netted, moved) and must raise its own task even though the first one is done. The dedupe also matches finished tasks.
+        dedupeBasis: refundRemainderBasis(remainder, candidate.lines, totals.gross, totals.netted),
       })
       if (created) raised += 1
     } catch (error) {

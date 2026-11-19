@@ -43,6 +43,8 @@ export type DryRunProductResult = {
   parityDiffs: FieldDiff[]
   /** Fields the parity behaviour would change relative to what IMS sends today. */
   parityChangesVsToday: string[]
+  /** Parity would REFUSE this product (its variation name cannot be split into attribute values with certainty): nothing would be sent for it. */
+  parityRefused?: boolean
 }
 
 const FIELDS = ['Name', 'CustomsDescription', 'EAN', 'UPC', 'Weight', 'Height', 'Width', 'Depth', 'ImageURL', 'CommodityCode', 'CountryOfManufacture', 'CostPrice'] as const
@@ -55,11 +57,15 @@ function wireValue(record: Record<string, unknown>, field: string): string {
   return String(value).trim()
 }
 
-function sendBody(product: ProductSyncCandidate, cost: number | null, parity: boolean, split: boolean): { body: Record<string, unknown>; hash: string } {
+function sendBody(product: ProductSyncCandidate, cost: number | null, parity: boolean, split: boolean): { body: Record<string, unknown>; hash: string; refused?: true } {
   let dto = buildMintsoftProductDto(product)
   const { commodityCode } = resolveMintsoftCommodityCode(dto.commodityCode)
   if (commodityCode !== dto.commodityCode) dto = { ...dto, commodityCode }
-  if (parity) dto = applyMintsoftProductParity(dto, product, cost)
+  if (parity) {
+    const withParity = applyMintsoftProductParity(dto, product, cost)
+    if (withParity === null) return { ...sendBody(product, cost, false, split), refused: true }
+    dto = withParity
+  }
   if (split) {
     const codes = classifyIdentifierCodes({ EAN: product.barcode, UPC: product.mpn })
     dto = { ...dto, barcode: codes.gtin || null, mpn: codes.mpn || null }
@@ -98,6 +104,7 @@ export function compareProductToStored(input: DryRunInput, options: DryRunOption
     todayDiffs: diff(today.body, stored, Boolean(options.showCost)),
     parityDiffs: diff(parity.body, stored, Boolean(options.showCost)),
     parityChangesVsToday,
+    ...(parity.refused ? { parityRefused: true } : {}),
   }
 }
 
@@ -131,6 +138,8 @@ export function renderDryRun(results: readonly DryRunProductResult[], options: {
   lines.push(`  products: ${summary.products}  without a stored Mintsoft record: ${summary.withoutStoredRecord}`)
   lines.push(`  today's payload hash equals the stored one: ${summary.todayMatchesStoredHash}`)
   lines.push(`  differ from the stored record, as sent today: ${summary.todayWithFieldDiffs}; with parity on: ${summary.parityWithFieldDiffs}`)
+  const refused = results.filter((r) => r.parityRefused).map((r) => r.sku)
+  if (refused.length > 0) lines.push(`  parity would REFUSE (ambiguous variation name, nothing sent): ${refused.length} ${JSON.stringify(refused.slice(0, 20))}`)
   lines.push(`  parity would change the payload of: ${summary.parityChangesPayload} ${JSON.stringify(summary.byField)}`)
   let shown = 0
   for (const result of results) {

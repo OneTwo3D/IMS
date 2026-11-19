@@ -114,15 +114,26 @@ export function inheritFromParent(
   }
 }
 
-/** The parity DTO: fitted name, inherited weight and dimensions, and the cost when there is one. Pure. */
-export function applyMintsoftProductParity(dto: WmsProductDto, product: ParityProduct, costPrice: number | null): WmsProductDto {
+/**
+ * The parity DTO: fitted name, inherited weight and dimensions, and the cost when there is one. Pure.
+ * NULL when the variation's name cannot be rebuilt with certainty (ambiguous attribute values, see fitMintsoftProductName): the product is then NOT sent, so a guess never renames it in live Mintsoft.
+ */
+export function applyMintsoftProductParity(dto: WmsProductDto, product: ParityProduct, costPrice: number | null): WmsProductDto | null {
   const inherited = inheritFromParent(dto, product.type === 'VARIANT' ? product.parent : null)
+  const name = fitMintsoftProductName(dto.name, product.type === 'VARIANT' ? product.parent?.name : null, product.sku, product.type === 'VARIANT' ? (product.parent?.options ?? []).flatMap((o) => o.values.split(',')) : undefined)
+  if (name === null) return null
   return {
     ...dto,
     ...inherited,
-    name: fitMintsoftProductName(dto.name, product.type === 'VARIANT' ? product.parent?.name : null, product.sku, product.type === 'VARIANT' ? (product.parent?.options ?? []).flatMap((o) => o.values.split(',')) : undefined),
+    name,
     ...(costPrice != null ? { costPrice } : {}),
   }
+}
+
+/** The parity DTO WITHOUT the name rewrite (inherited weight and dimensions, cost): for a product whose parity name was refused. The caller sets the name. Pure. */
+export function applyMintsoftProductParityExceptName(dto: WmsProductDto, product: ParityProduct, costPrice: number | null): WmsProductDto {
+  const inherited = inheritFromParent(dto, product.type === 'VARIANT' ? product.parent : null)
+  return { ...dto, ...inherited, ...(costPrice != null ? { costPrice } : {}) }
 }
 
 /** The Mintsoft echo of a product with `CostPrice` removed, for any record that is shown to people (the sync log). */

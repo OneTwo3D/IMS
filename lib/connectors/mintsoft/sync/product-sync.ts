@@ -15,8 +15,9 @@ import { classifyIdentifierCodes, sameCode, type IdentifierCodes } from '@/lib/d
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
 import { classifyMintsoftProductRecord } from '../api/normalizers'
 import { mintsoftCanClear, mintsoftFieldIsEmpty, mintsoftFieldValue } from '../api/client'
+import { fitMintsoftName } from '../api/product-name'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
-import { applyMintsoftProductParity, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
+import { applyMintsoftProductParity, applyMintsoftProductParityExceptName, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
 import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation, type ParentDeletionCounters } from './parent-sku-deletion'
 import { CONTENT_REFUSAL_MAX_ATTEMPTS, describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
@@ -1034,7 +1035,8 @@ async function buildFreshMintsoftClearDto(context: ProductSyncContext, planned: 
   const { commodityCode } = resolveMintsoftCommodityCode(dto.commodityCode)
   if (commodityCode !== dto.commodityCode) dto = { ...dto, commodityCode }
   if (await readMintsoftProductParityEnabled()) {
-    dto = applyMintsoftProductParity(dto, fresh, await readMintsoftProductCost(fresh.id, fresh.type))
+    // A name refused as ambiguous keeps the planned DTO (the one that was already checked).
+    dto = applyMintsoftProductParity(dto, fresh, await readMintsoftProductCost(fresh.id, fresh.type)) ?? planned
   }
   if ((fresh.customsClears ?? []).some((m) => m.field === 'countryOfOrigin') && !trimToNull(fresh.countryOfOrigin)) {
     dto = { ...dto, countryOfManufacture: null }
@@ -1105,7 +1107,41 @@ export async function syncOneMintsoftProduct(
   const parityEnabled = await readMintsoftProductParityEnabled()
   if (parityEnabled) {
     const costPrice = await readMintsoftProductCost(context.product.id, context.product.type)
-    dto = applyMintsoftProductParity(dto, context.product, costPrice)
+    const withParity = applyMintsoftProductParity(dto, context.product, costPrice)
+    if (withParity === null) {
+      // The variation's attribute text cannot be split into values with certainty: a guess would rename the product in live Mintsoft. ONLY THE NAME is withheld; weight, dimensions, EAN, customs and cost still sync.
+      //  - an existing Mintsoft product keeps the name Mintsoft already holds (sent back unchanged, so nothing is renamed);
+      //  - a NEW product (nothing in Mintsoft yet, so nothing to rename) is created under the plain fitted name, so order pushes for the SKU still find it;
+      //  - an existing product whose current name cannot be read is not sent at all (nothing can be sent without risking a rename), and the refusal is reported.
+      // Every case opens a visible discrepancy.
+      const remoteName = typeof authoritative?.raw?.Name === 'string' ? (authoritative.raw.Name as string).trim() : ''
+      const isExisting = Boolean(authoritative) || Boolean(existingLink?.externalProductId)
+      const heldName = remoteName || (isExisting ? null : fitMintsoftName(dto.name, '', context.product.sku))
+      await upsertProductDiscrepancy({
+        scopes: context.scopes,
+        productId: context.product.id,
+        sku: context.product.sku,
+        category: 'PRODUCT_NAME_REFUSED',
+        imsValue: dto.name,
+        wmsValue: remoteName || null,
+        message: `The variation name "${dto.name}" cannot be split into attribute values with certainty, so IMS did not rebuild the Mintsoft name. ${heldName === null ? 'The current Mintsoft name could not be read, so nothing was sent for this product.' : remoteName ? 'The name Mintsoft holds was kept; everything else still synced.' : 'The product was created under its plain name; everything else synced.'} Fix the option values of the parent, then the next sync renames it.`,
+      })
+      if (heldName === null) {
+        await recordMintsoftProductLinkError(context.product.id, 'Parity name refused and the current Mintsoft name could not be read: nothing sent')
+        return {
+          sku: context.product.sku,
+          productId: context.product.id,
+          action: 'skip',
+          reason: 'Parity name refused (ambiguous variation attribute values) and the current Mintsoft name could not be read, so nothing was sent and the product was not renamed',
+          payload: toJsonPayload(null),
+          remoteUpdated: false,
+        }
+      }
+      dto = { ...applyMintsoftProductParityExceptName(dto, context.product, costPrice), name: heldName }
+    } else {
+      await resolveProductDiscrepancy(context.scopes, context.product.id, 'PRODUCT_NAME_REFUSED')
+      dto = withParity
+    }
   }
   const logRaw = <T>(raw: T): T => (parityEnabled ? redactMintsoftCostPrice(raw) : raw)
 

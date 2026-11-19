@@ -16,7 +16,7 @@ export const WMS_AMENDMENT_NOT_APPLIED = 'AMENDMENT_NOT_APPLIED'
 
 export type OrderEditWmsGate =
   | { ok: true; /** The warehouse order id the answer was read for; null when the order has none yet. The edit's transaction re-checks it. */ externalOrderId: string | null }
-  | { ok: false; error: string }
+  | { ok: false; error: string; /** True when the answer could not be READ (a probe error), as opposed to the warehouse saying the order is closed: a retry may succeed. */ unreadable?: true }
 
 export type OrderEditWmsGateDeps = {
   readLink(orderId: string): Promise<{ connector: string; externalOrderId: string | null; orderNumber: string | null } | null>
@@ -43,9 +43,10 @@ const defaultDeps: OrderEditWmsGateDeps = {
 /** The dependencies the edit actions use. A holder (not a constant) so a test of the action can supply the warehouse's answer without a network; production never reassigns it. */
 export const orderEditWmsGateDeps: { current: OrderEditWmsGateDeps } = { current: defaultDeps }
 
-function refusal(what: string, why: string): OrderEditWmsGate {
+function refusal(what: string, why: string, unreadable = false): OrderEditWmsGate {
   return {
     ok: false,
+    ...(unreadable ? { unreadable: true as const } : {}),
     error: `${WMS_AMENDMENT_NOT_APPLIED}: ${why} so the warehouse could not take this change to ${what}, and nothing was changed. `
       + 'Wait until the warehouse status has updated, then edit the order again, or cancel it and create a new one.',
   }
@@ -59,7 +60,7 @@ export async function resolveOrderEditWmsGate(orderId: string, scope: 'lines' | 
   try {
     answer = await deps.probe(link.connector, link.externalOrderId, link.orderNumber)
   } catch {
-    return refusal(what, 'the warehouse could not be read just now, so IMS cannot tell whether its order is still open for changes,')
+    return refusal(what, 'the warehouse could not be read just now, so IMS cannot tell whether its order is still open for changes,', true)
   }
   if (answer === 'unsupported') return refusal(what, 'the warehouse connector cannot report whether its order is still open for changes,')
   if (!answer.amendable) return refusal(what, `the warehouse order is no longer open for changes (warehouse answer: ${answer.status}),`)

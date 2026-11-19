@@ -215,9 +215,9 @@ test('inheritance applies to a VARIANT only: a simple product with a (stale) par
   const { parity } = await loadModules()
   const dto = { sku: 'S', name: 'N', customsDescription: null, barcode: null, commodityCode: null, countryOfManufacture: 'CN', weightKg: 0, heightCm: null, widthCm: null, depthCm: null, imageUrl: null }
   const parent = { name: 'P', weight: '3', widthCm: '4', heightCm: '5', depthCm: '6' }
-  const simple = parity.applyMintsoftProductParity(dto, { sku: 'S', name: 'N', type: 'SIMPLE', parent }, null)
-  assert.equal(simple.widthCm, null)
-  const variant = parity.applyMintsoftProductParity(dto, { sku: 'S', name: 'N', type: 'VARIANT', parent }, null)
+  const simple = parity.applyMintsoftProductParity(dto, { sku: 'S', name: 'N', type: 'SIMPLE', parent }, null)!
+  assert.equal(simple.widthCm, null)!
+  const variant = parity.applyMintsoftProductParity(dto, { sku: 'S', name: 'N', type: 'VARIANT', parent }, null)!
   assert.equal(variant.weightKg, 0, 'a recorded zero is the variation\'s own value')
   assert.equal(variant.widthCm, 4)
   assert.equal('costPrice' in variant, false)
@@ -262,4 +262,18 @@ test('metadata confirmation (parent-deletion proof): a LIVE upsert stamps the li
   await run()
   assert.equal(state.upserts.length, 0)
   assert.equal(JSON.stringify(state.linkWrites).includes('_imsMetadataConfirmed'), false, 'a shadow confirms nothing')
+})
+
+test('MED (r1): a refused name withholds ONLY the name: the other parity fields (inherited size, cost) still apply', async () => {
+  const { parity } = await loadModules()
+  const dto = { sku: 'S', name: 'P — Voron 2.4 / Trident', customsDescription: null, barcode: '123', commodityCode: null, countryOfManufacture: 'CN', weightKg: null, heightCm: null, widthCm: null, depthCm: null, imageUrl: null }
+  const parent = { name: 'P', weight: '3', widthCm: '4', heightCm: '5', depthCm: '6', options: [{ values: 'Voron 2.4 / Trident,Voron 2.4,Trident' }] }
+  const product = { sku: 'S', name: dto.name, type: 'VARIANT' as const, parent }
+  assert.equal(parity.applyMintsoftProductParity(dto, product, 7), null, 'the full parity is refused')
+  const rest = parity.applyMintsoftProductParityExceptName(dto, product, 7)
+  assert.equal(rest.name, dto.name, 'the name is untouched (the caller sets it)')
+  assert.equal(rest.weightKg, 3)
+  assert.equal(rest.widthCm, 4)
+  assert.equal((rest as { costPrice?: number }).costPrice, 7)
+  assert.equal(rest.barcode, '123')
 })
