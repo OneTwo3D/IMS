@@ -6,17 +6,22 @@ import { db } from '@/lib/db'
 import { logActivityPersisted } from '@/lib/activity-log'
 import { getShoppingConnectorPrefixes } from '@/lib/connectors/shopping-registry'
 import { MAX_WC_PAGE_WALK_PAGES, describeUnendedWcPageWalk, describeUnreadWcPage, wcFetch } from '@/lib/connectors/woocommerce/api'
-import { flagDoublePostageForMergedLink } from '@/lib/domain/wms/double-postage'
+import { raiseDoublePostageForMergedLink } from '@/lib/domain/wms/double-postage'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import {
+  RESOLUTION_DECISIONS,
   decideLink,
   type DesiredLink,
   type ExistingLink,
+  type ResolutionDecision,
 } from './state'
 import { walkWcOrderPages } from './wc-read'
-import type { ImsOrderContext, LegacyImportPorts, WcReadResult, WriteOutcome } from './run'
+import type { ImsOrderContext, LegacyImportPorts, StoredResolution, WcReadResult, WriteOutcome } from './run'
+
+/** The activity-log action an operator decision (`--resolve`) is stored under. */
+export const RESOLUTION_ACTION = 'legacy_bridge_import_resolved'
 
 const LINK_SELECT = { id: true, connector: true, state: true, externalOrderId: true, externalOrderNumber: true, attempts: true, lastAttemptAt: true, pushedAt: true } as const
 
@@ -25,7 +30,10 @@ const WC_FIELDS = 'id,number,status,meta_data'
 
 function readWcOrders(statuses: readonly string[]): Promise<WcReadResult> {
   return walkWcOrderPages(
-    (page) => wcFetch('/orders', { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: WC_FIELDS }),
+    async (page) => {
+      const result = await wcFetch('/orders', { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: WC_FIELDS })
+      return { data: result.data, error: result.error, retryAfterMs: result.retryAfterMs, totalItems: result.totalItemsPresent === true ? result.totalItems : undefined }
+    },
     {
       maxPages: MAX_WC_PAGE_WALK_PAGES,
       describeUnread: (page, error) => describeUnreadWcPage('order', page, error),
@@ -87,7 +95,7 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
     if (locked.length === 0) return 'gone'
     const existing = await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: LINK_SELECT })
     const decision = decideLink(desired, existing as ExistingLink | null, connector)
-    if (decision.action === 'unchanged') return 'unchanged'
+    if (decision.action === 'unchanged' || decision.action === 'advanced') return 'unchanged'
     if (decision.action === 'conflict') return 'conflict'
     const data = desired.kind === 'link'
       ? {
@@ -100,7 +108,7 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
           lastError: desired.lastError,
           pushedAt: now,
           lastAttemptAt: now,
-          cancelledAt: null,
+          cancelledAt: desired.state === 'CANCELLED' ? now : null,
           courierPending: false,
           // The bridge never told IMS the warehouse's line ids, so the recorded snapshot cannot be trusted: a merged-order line removal
           // falls back to the operator notice until an amendment stores a verified one (the same mark a create with no read-back carries).
@@ -117,8 +125,14 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
           pushedAt: null,
           lastAttemptAt: now,
         }
+    // The double-postage flag of a MERGED link is raised in THIS transaction, so a crash between the link and the flag cannot leave a MERGED link
+    // that a rerun reports as 'unchanged' and never flags (a failure here rolls the link back; the rerun writes both).
+    const flagIfMerged = async (linkId: string) => {
+      if (desired.kind === 'link' && desired.state === 'MERGED') await raiseDoublePostageForMergedLink(tx, linkId)
+    }
     if (decision.action === 'create') {
-      await tx.wmsOrderPushLink.create({ data: { orderId, ...data } })
+      const created = await tx.wmsOrderPushLink.create({ data: { orderId, ...data }, select: { id: true } })
+      await flagIfMerged(created.id)
       return 'created'
     }
     // Compare-and-set: still the same unclaimed placeholder.
@@ -126,12 +140,10 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
       where: { id: decision.existing.id, state: 'PENDING_CREATE', externalOrderId: null, lastAttemptAt: null, pushedAt: null, attempts: 0 },
       data,
     })
-    return won.count === 1 ? 'adopted' : 'conflict'
+    if (won.count !== 1) return 'conflict'
+    await flagIfMerged(decision.existing.id)
+    return 'adopted'
   }, { timeout: 30_000 })
-  if ((outcome === 'created' || outcome === 'adopted') && desired.kind === 'link' && desired.state === 'MERGED') {
-    const link = await db.wmsOrderPushLink.findUnique({ where: { orderId }, select: { id: true } })
-    if (link) await flagDoublePostageForMergedLink(link.id)
-  }
   return outcome
 }
 
@@ -153,6 +165,33 @@ export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; con
     loadIms,
     readOpenMergeState,
     writeLink,
+    async readResolutions(connector) {
+      const rows = await db.activityLog.findMany({
+        where: { action: RESOLUTION_ACTION, entityType: 'SYSTEM' },
+        orderBy: { createdAt: 'asc' },
+        select: { entityId: true, metadata: true, createdAt: true },
+      })
+      const out = new Map<string, StoredResolution>()
+      for (const row of rows) {
+        const m = row.metadata as { connector?: unknown; wcOrderId?: unknown; decision?: unknown; signature?: unknown; kinds?: unknown } | null
+        if (!m || m.connector !== connector || typeof m.wcOrderId !== 'string' || typeof m.signature !== 'string') continue
+        if (!(RESOLUTION_DECISIONS as readonly unknown[]).includes(m.decision)) continue
+        // Rows are oldest first, so a later decision for the same order replaces an earlier one.
+        out.set(m.wcOrderId, { wcOrderId: m.wcOrderId, decision: m.decision as ResolutionDecision, signature: m.signature, kinds: Array.isArray(m.kinds) ? m.kinds.map(String) : [], recordedAt: row.createdAt.toISOString() })
+      }
+      return out
+    },
+    async recordResolution(entry) {
+      return logActivityPersisted({
+        entityType: 'SYSTEM',
+        entityId: entry.wcOrderId,
+        action: RESOLUTION_ACTION,
+        tag: 'cutover',
+        description: `Legacy bridge import: operator decided WooCommerce order #${entry.wcNumber} (Mintsoft order ${entry.mintsoftOrderId ?? entry.verifyOrderId ?? 'none'}) is "${entry.decision}" after checking Mintsoft by hand (${entry.kinds.join(', ')}); bridge-stopped attested: ${entry.bridgeStopped ? 'yes' : 'no'}.`,
+        metadata: { connector: entry.connector, wcOrderId: entry.wcOrderId, wcNumber: entry.wcNumber, decision: entry.decision, signature: entry.signature, kinds: entry.kinds, mintsoftOrderId: entry.mintsoftOrderId, verifyOrderId: entry.verifyOrderId, queued: entry.queued, bridgeStopped: entry.bridgeStopped },
+        resolveUser: false,
+      })
+    },
     async recordApply(entry) {
       return logActivityPersisted({
         entityType: 'SYSTEM',

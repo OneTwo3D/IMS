@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { checkOrderNumber, decideLink, desiredLinkFor, readLegacyOrderState, type ExistingLink } from '@/lib/connectors/mintsoft/legacy-bridge-import/state'
+import { blockingQueueKinds, checkOrderNumber, decideLink, desiredLinkFor, readLegacyOrderState, resolutionSignature, type ExistingLink } from '@/lib/connectors/mintsoft/legacy-bridge-import/state'
 
 const meta = (pairs: Record<string, unknown>) => Object.entries(pairs).map(([key, value]) => ({ id: 1, key, value }))
 const order = (pairs: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ id: 501, number: '1001', status: 'processing', meta_data: meta(pairs), ...extra })
@@ -108,7 +108,43 @@ test('decideLink: create, unchanged, adopt a bare placeholder, conflict otherwis
   assert.equal(decideLink(desired, existing({ state: 'HELD', externalOrderId: null, pushedAt: null }), 'mintsoft').action, 'conflict')
   assert.equal(decideLink(desired, existing({ connector: 'other' }), 'mintsoft').action, 'conflict')
   // The same id in another state is a conflict, not "unchanged".
-  for (const state of ['DEAD_LETTER', 'CANCELLED', 'HELD', 'AMBIGUOUS_CREATE', 'PENDING_VERIFY', 'MERGED']) {
+  for (const state of ['DEAD_LETTER', 'AMBIGUOUS_CREATE', 'PENDING_VERIFY']) {
     assert.equal(decideLink(desired, existing({ state }), 'mintsoft').action, 'conflict', state)
   }
+})
+
+test('decideLink: the one-way transitions IMS makes after switchover are "advanced", never a conflict; backwards or quarantined states still are', () => {
+  const synced = desiredLinkFor(state({ _mintsoft_order_id: '9001' }))
+  for (const st of ['MERGED', 'CANCELLED', 'HELD', 'PENDING_CANCEL']) assert.equal(decideLink(synced, existing({ state: st }), 'mintsoft').action, 'advanced', st)
+  assert.equal(decideLink(synced, existing({ state: 'MERGED', externalOrderId: '7777' }), 'mintsoft').action, 'conflict', 'a different id is never an advance')
+  const merged = desiredLinkFor(state({ _mintsoft_order_id: '9001', _mintsoft_merged: '1' }))
+  assert.equal(decideLink(merged, existing({ state: 'MERGED' }), 'mintsoft').action, 'unchanged')
+  assert.equal(decideLink(merged, existing({ state: 'CANCELLED' }), 'mintsoft').action, 'advanced')
+  assert.equal(decideLink(merged, existing({ state: 'SYNCED' }), 'mintsoft').action, 'conflict', 'MERGED to SYNCED is backwards')
+  const dead = desiredLinkFor(state({ _mintsoft_sync_dead: '1', _mintsoft_sync_attempts: '5' }))
+  assert.equal(decideLink(dead, existing({ state: 'DEAD_LETTER', externalOrderId: null }), 'mintsoft').action, 'unchanged')
+  assert.equal(decideLink(dead, existing({ state: 'SYNCED', externalOrderId: '9555' }), 'mintsoft').action, 'advanced', 'IMS replayed the dead-letter and created the order')
+  assert.equal(decideLink(dead, existing({ connector: 'other', state: 'SYNCED' }), 'mintsoft').action, 'conflict')
+})
+
+test('blocking queue kinds: verify-pending vs verify-exhausted, and an update or cancel with no Mintsoft id blocks nothing', () => {
+  assert.deepEqual(blockingQueueKinds(state({ _mintsoft_verify_pending: '1', _mintsoft_verify_order_id: '9007' })), ['verify-pending'])
+  assert.deepEqual(blockingQueueKinds(state({ _mintsoft_verify_order_id: '9007', _mintsoft_dead_letter: '1' })), ['verify-exhausted'])
+  assert.deepEqual(blockingQueueKinds(state({ _mintsoft_verify_order_id: '9007', _mintsoft_verify_pending: '1', _mintsoft_dead_letter: '1' })), ['verify-pending'])
+  assert.deepEqual(blockingQueueKinds(state({ _mintsoft_order_id: '9001', _mintsoft_sync_pending: 'update' })), ['sync-pending'])
+  assert.deepEqual(blockingQueueKinds(state({ _mintsoft_order_id: '9001', _mintsoft_sync_pending: 'cancel' })), ['sync-pending'])
+  assert.deepEqual(blockingQueueKinds(state({ _mintsoft_verify_order_id: '9007', _mintsoft_verify_pending: '1', _mintsoft_sync_pending: 'cancel' })), ['verify-pending', 'sync-pending'])
+  for (const action of ['create', 'update', 'cancel']) assert.deepEqual(blockingQueueKinds(state({ _mintsoft_sync_pending: action })), [], `${action} with no Mintsoft order`)
+})
+
+test('desiredLinkFor with an operator decision: ours is SYNCED/MERGED, cancelled is a CANCELLED link, not-ours is no link', () => {
+  const verify = state({ _mintsoft_verify_order_id: '9007', _mintsoft_dead_letter: '1', _mintsoft_order_number: '1001' })
+  assert.deepEqual(desiredLinkFor(verify), { kind: 'blocked', reason: 'verify-pending', verifyOrderId: '9007' })
+  assert.deepEqual(desiredLinkFor(verify, 'ours'), { kind: 'link', state: 'SYNCED', externalOrderId: '9007', externalOrderNumber: '1001', lastError: null })
+  assert.deepEqual(desiredLinkFor(verify, 'cancelled'), { kind: 'link', state: 'CANCELLED', externalOrderId: '9007', externalOrderNumber: '1001', lastError: null })
+  assert.deepEqual(desiredLinkFor(verify, 'not-ours'), { kind: 'none', reason: 'not-created-by-bridge' })
+  const queued = state({ _mintsoft_order_id: '9100', _mintsoft_merged: '1', _mintsoft_sync_pending: 'update' })
+  assert.equal((desiredLinkFor(queued, 'ours') as { state: string }).state, 'MERGED')
+  assert.notEqual(resolutionSignature(verify), resolutionSignature(state({ _mintsoft_verify_order_id: '9008', _mintsoft_dead_letter: '1' })))
+  assert.notEqual(resolutionSignature(queued), resolutionSignature(state({ _mintsoft_order_id: '9100', _mintsoft_merged: '1', _mintsoft_sync_pending: 'cancel' })))
 })

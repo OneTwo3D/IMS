@@ -101,7 +101,7 @@ test('after the import the push sweep creates zero orders for bridge-created ord
   const dry = await d.run.runLegacyBridgeImport(ports, { statuses: ['processing'] })
   assert.equal(dry.plan.create, 6)
   assert.equal(await d.db.wmsOrderPushLink.count({ where: { orderId: { in: orderIds } } }), 0)
-  assert.equal(dry.gate.exitCode, 0)
+  assert.equal(dry.gate.exitCode, 4, 'no blocker, but the OrderNumber check is unverified against Mintsoft')
 
   const auditBefore = await d.db.activityLog.count({ where: { action: 'legacy_bridge_import_applied' } })
   const applied = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
@@ -122,7 +122,7 @@ test('after the import the push sweep creates zero orders for bridge-created ord
   // IDEMPOTENT: a rerun changes nothing (not a column, not an updatedAt).
   const snapshot = JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } }))
   const again = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
-  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 6, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
+  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 6, advanced: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
   assert.equal(JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } })), snapshot)
 
   // A DIFFERING LINK IS NEVER OVERWRITTEN: point the plain order's link elsewhere; the import reports a conflict and leaves it.
@@ -166,4 +166,95 @@ test('after the import the push sweep creates zero orders for bridge-created ord
     const link = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: s.orderId } })
     assert.equal(link?.externalOrderId, s.shape.expect!.externalOrderId, `${s.shape.name} still names the bridge's Mintsoft order`)
   }
+})
+
+test('a CANCELLED order with a trusted Mintsoft id is imported SYNCED and IMS\'s own cancel pass then cancels the live Mintsoft order; --resolve is recorded in the real activity log and writes the matching link', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `lbc${randomUUID().slice(0, 8)}`
+  const base = 7_900_000 + Math.floor(Math.random() * 90_000)
+  const warehouse = await d.db.warehouse.create({ data: { code: `${tag}-W`.slice(0, 20), name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
+  const mk = async (i: number, status: 'CANCELLED' | 'PROCESSING') => {
+    const wcId = base + i
+    const order = await d.db.salesOrder.create({
+      data: {
+        orderNumber: `${wcId}`, status, paidAt: new Date('2026-06-10T00:00:00Z'), shipFromWarehouseId: warehouse.id,
+        customerName: 'Pat Example', customerEmail: `${tag}-${i}@example.com`, currency: 'GBP',
+        shippingAddress: { line1: '1 Test Street', city: 'Leeds', postcode: 'LS1 1AA', country: 'GB' },
+        subtotalForeign: 10, totalForeign: 10, subtotalBase: 10, totalBase: 10,
+        lines: { create: [{ description: 'Widget', sku: `SKU-${tag}-${i}`, qty: 1, unitPriceForeign: 10, unitPriceBase: 10, totalForeign: 10, totalBase: 10 }] },
+      },
+      select: { id: true },
+    })
+    await d.db.shoppingOrderLink.create({ data: { orderId: order.id, connector: 'woocommerce', externalOrderId: String(wcId), externalOrderNumber: `${wcId}` } })
+    return { wcId, orderId: order.id, number: `${wcId}` }
+  }
+  const cancelled = await mk(0, 'CANCELLED')
+  const exhausted = await mk(1, 'PROCESSING')
+  const queued = await mk(2, 'PROCESSING')
+  const orderIds = [cancelled.orderId, exhausted.orderId, queued.orderId]
+  t.after(async () => {
+    await d.db.activityLog.deleteMany({ where: { action: 'legacy_bridge_import_resolved', entityId: { in: [exhausted, queued].map((o) => String(o.wcId)) } } })
+    await d.db.wmsOrderPushLink.deleteMany({ where: { orderId: { in: orderIds } } })
+    await d.db.shoppingOrderLink.deleteMany({ where: { orderId: { in: orderIds } } })
+    await d.db.salesOrderLine.deleteMany({ where: { orderId: { in: orderIds } } })
+    await d.db.salesOrder.deleteMany({ where: { id: { in: orderIds } } })
+    await d.db.warehouse.deleteMany({ where: { id: warehouse.id } })
+  })
+  const wcOrders = [
+    { id: cancelled.wcId, number: cancelled.number, status: 'cancelled', meta_data: meta({ _mintsoft_order_id: '9301', _mintsoft_order_number: cancelled.number }) },
+    { id: exhausted.wcId, number: exhausted.number, status: 'processing', meta_data: meta({ _mintsoft_verify_order_id: '9302', _mintsoft_dead_letter: '1' }) },
+    { id: queued.wcId, number: queued.number, status: 'processing', meta_data: meta({ _mintsoft_order_id: '9303', _mintsoft_sync_pending: 'update' }) },
+  ]
+  const real = d.ports.createLegacyImportPorts({})
+  const ports = {
+    ...real,
+    readWcOrders: async () => ({ orders: wcOrders, pagesRead: 1, complete: true }),
+    readOrderPrefix: async () => '',
+    readConnectorId: async () => 'mintsoft',
+    readOpenMergeState: async () => ({ holds: [], tasks: [] }),
+  }
+  const statuses = ['processing', 'cancelled', 'refunded']
+
+  // The cancelled order is linked; the exhausted and queued ones are blocked and NOT linked.
+  const first = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses })
+  assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { orderId: cancelled.orderId } }))?.state, 'SYNCED')
+  assert.equal(await d.db.wmsOrderPushLink.count({ where: { orderId: { in: [exhausted.orderId, queued.orderId] } } }), 0)
+  assert.equal(first.gate.exitCode, 3)
+  assert.deepEqual(first.queues.filter((q) => q.blocking).map((q) => q.kind).sort(), ['sync-pending', 'verify-exhausted'])
+
+  // THE CANCEL PASS: with the Mintsoft order still live (NEW), IMS cancels it through the import's SYNCED link.
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  const cancelCalls: string[] = []
+  const connector = {
+    pushOrder: async () => { throw new Error('the import must leave nothing to create for these orders') },
+    updateOrder: async () => ({ updated: true, status: 'NEW' }),
+    cancelOrder: async (id: string) => { cancelCalls.push(id); return { cancelled: true, status: 'CANCELLED' } },
+    addOrderComment: async () => undefined,
+    verifyPushedOrder: async () => 'ours' as const,
+    probeOrderPresence: async () => 'MISSING' as const,
+  }
+  const result = await d.sweep.runWmsOrderPushSweepCore(connector as never, 'mintsoft', port, { batchSize: 1000 })
+  assert.deepEqual(cancelCalls, ['9301'], 'the live Mintsoft order of the cancelled WooCommerce order is cancelled by IMS')
+  assert.equal(result.cancelled >= 1, true)
+  assert.equal((await d.db.wmsOrderPushLink.findUnique({ where: { orderId: cancelled.orderId } }))?.state, 'CANCELLED')
+
+  // --resolve (real activity log): verify-exhausted as ours -> SYNCED naming the verify id; the queued update as cancelled -> CANCELLED.
+  const resolvedOurs = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: [String(exhausted.wcId)], decision: 'ours' }, statuses })
+  assert.deepEqual(resolvedOurs.resolutions.recorded, [{ wcOrderId: String(exhausted.wcId), decision: 'ours' }])
+  const ourLink = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: exhausted.orderId } })
+  assert.equal(ourLink?.state, 'SYNCED')
+  assert.equal(ourLink?.externalOrderId, '9302')
+  assert.equal(await d.db.activityLog.count({ where: { action: 'legacy_bridge_import_resolved', entityId: String(exhausted.wcId) } }), 1)
+  assert.equal(await d.db.wmsOrderPushLink.count({ where: { orderId: queued.orderId } }), 0, 'only the resolved order is written')
+  await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: [String(queued.wcId)], decision: 'cancelled' }, statuses })
+  const queuedLink = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: queued.orderId } })
+  assert.equal(queuedLink?.state, 'CANCELLED')
+  assert.equal(queuedLink?.externalOrderId, '9303')
+  assert.notEqual(queuedLink?.cancelledAt, null)
+  // A later plain run reads the stored decisions: nothing blocks any more, nothing is rewritten, and the cancel pass's CANCELLED link is an advance, not a conflict.
+  const after = await d.run.runLegacyBridgeImport(ports, { statuses })
+  assert.equal(after.conflicts.length, 0)
+  assert.equal(after.resolutions.inForce.length, 2)
+  assert.equal(after.gate.ok, true)
+  assert.equal(after.plan.advanced, 1, 'the cancelled order\'s link moved SYNCED to CANCELLED after the import')
 })

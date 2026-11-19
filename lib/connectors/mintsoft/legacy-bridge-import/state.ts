@@ -262,7 +262,7 @@ export function checkOrderNumber(state: Pick<LegacyOrderState, 'wcNumber' | 'min
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 export type DesiredLink =
-  | { kind: 'link'; state: 'SYNCED' | 'MERGED'; externalOrderId: string; externalOrderNumber: string | null; lastError: string | null }
+  | { kind: 'link'; state: 'SYNCED' | 'MERGED' | 'CANCELLED'; externalOrderId: string; externalOrderNumber: string | null; lastError: string | null }
   | { kind: 'dead-letter'; externalOrderId: null; attempts: number; lastError: string }
   /**
    * The bridge created a Mintsoft order but has not proved the id is its own (`_mintsoft_verify_order_id`). NEVER imported: the bridge's
@@ -287,9 +287,19 @@ export const LEGACY_DEAD_LETTER_ERROR = 'Imported from the legacy bridge: its ou
  * - no id at all and dead-lettered -> DEAD_LETTER (out of the create queue, surfaced for a person);
  * - nothing created              -> none.
  */
-export function desiredLinkFor(state: LegacyOrderState): DesiredLink {
+export function desiredLinkFor(state: LegacyOrderState, resolution: ResolutionDecision | null = null): DesiredLink {
   const unreadableIds = state.unreadable.filter((key) => key === LEGACY_META.orderId || key === LEGACY_META.verifyOrderId)
   if (unreadableIds.length > 0) return { kind: 'unreadable', keys: unreadableIds }
+  if (resolution !== null) {
+    // THE OPERATOR'S DECISION about the Mintsoft order the bridge left unproved or with an action still queued (the one id the order carries).
+    const id = state.mintsoftOrderId ?? state.verifyOrderId
+    if (id !== null) {
+      if (resolution === 'not-ours') return { kind: 'none', reason: 'not-created-by-bridge' }
+      if (resolution === 'cancelled') return { kind: 'link', state: 'CANCELLED', externalOrderId: id, externalOrderNumber: state.mintsoftOrderNumber, lastError: null }
+      // 'ours': the id is ours, as if the bridge had proved it.
+      return desiredLinkFor({ ...state, mintsoftOrderId: id, verifyOrderId: null, verifyPending: false }, null)
+    }
+  }
   if (state.mintsoftOrderId !== null) {
     if (state.merged) {
       const combined = state.mintsoftOrderNumber !== null && state.mintsoftOrderNumber.includes('+') ? state.mintsoftOrderNumber : null
@@ -303,6 +313,39 @@ export function desiredLinkFor(state: LegacyOrderState): DesiredLink {
   if (state.syncDead) return { kind: 'dead-letter', externalOrderId: null, attempts: Math.max(state.syncAttempts, 1), lastError: LEGACY_DEAD_LETTER_ERROR }
   return { kind: 'none', reason: 'not-created-by-bridge' }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// BLOCKERS AND THE OPERATOR'S WAY THROUGH THEM
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/** What the operator decided about the Mintsoft order, after checking it in Mintsoft by hand: it is ours, it is not ours (or not a live order for this one), or it was cancelled there. */
+export const RESOLUTION_DECISIONS = ['ours', 'not-ours', 'cancelled'] as const
+export type ResolutionDecision = (typeof RESOLUTION_DECISIONS)[number]
+
+export type BlockingQueueKind = 'verify-pending' | 'verify-exhausted' | 'sync-pending'
+
+/** The bridge gave up verifying: it cleared its pending flag, kept the id and set `_mintsoft_dead_letter`. Nothing in the bridge revisits it, and the plugin's requeue refuses it. */
+export const isVerifyExhausted = (state: LegacyOrderState): boolean => state.mintsoftOrderId === null && state.verifyOrderId !== null && !state.verifyPending && state.writebackDeadLetter
+
+/**
+ * The queue entries that block the gate for this order BY THEMSELVES (all cleared by one operator decision):
+ * - a verify id with no trusted id: verify-pending (the bridge is still verifying) or verify-exhausted (it gave up);
+ * - ANY queued outbound action (create, update or cancel) while a Mintsoft order exists for it: the import stamps the link as pushed, so IMS would never
+ *   send that edit and never cancel that order. With NO Mintsoft id and no verify id nothing can be lost (a queued update is a create, a queued cancel
+ *   has nothing to cancel), so it does not block.
+ */
+export function blockingQueueKinds(state: LegacyOrderState): BlockingQueueKind[] {
+  const out: BlockingQueueKind[] = []
+  if (state.mintsoftOrderId === null && state.verifyOrderId !== null) out.push(isVerifyExhausted(state) ? 'verify-exhausted' : 'verify-pending')
+  if (state.syncPending !== null && (state.mintsoftOrderId !== null || state.verifyOrderId !== null)) out.push('sync-pending')
+  return out
+}
+
+/**
+ * What a stored decision was made ABOUT. A decision applies only while the order still looks like that: a different verify id, a newly
+ * trusted id or another queued action is a different situation and the decision no longer counts.
+ */
+export const resolutionSignature = (state: LegacyOrderState): string => `trusted=${state.mintsoftOrderId ?? ''};verify=${state.verifyOrderId ?? ''};queued=${state.syncPending ?? ''}`
 
 export type ExistingLink = {
   id: string
@@ -320,6 +363,8 @@ export type LinkDecision =
   /** An unclaimed PENDING_CREATE placeholder with no warehouse order: nothing to preserve, adopted in place. */
   | { action: 'adopt'; desired: DesiredLink; existing: ExistingLink }
   | { action: 'unchanged'; existing: ExistingLink }
+  /** The link has moved on from what the import wrote, in a way IMS's own passes do (SYNCED to MERGED / CANCELLED / HELD, a replayed dead-letter). Not a conflict; nothing to write. */
+  | { action: 'advanced'; existing: ExistingLink }
   | { action: 'conflict'; desired: DesiredLink; existing: ExistingLink; reason: string }
 
 const sameLink = (existing: ExistingLink, desired: DesiredLink, connector: string): boolean => {
@@ -328,6 +373,28 @@ const sameLink = (existing: ExistingLink, desired: DesiredLink, connector: strin
   // it is a link no sweep pass acts on, so it must surface as a conflict.
   if (desired.kind === 'link') return existing.externalOrderId === desired.externalOrderId && existing.state === desired.state
   if (desired.kind === 'dead-letter') return existing.externalOrderId === null && existing.state === 'DEAD_LETTER'
+  return false
+}
+
+/** The states IMS's own passes move an imported link into after switchover (the design's one-way transitions). */
+const ADVANCED_FROM_SYNCED = new Set(['MERGED', 'CANCELLED', 'HELD', 'PENDING_CANCEL'])
+const ADVANCED_FROM_MERGED = new Set(['CANCELLED', 'HELD', 'PENDING_CANCEL'])
+
+/**
+ * A link that is not what the import would write, but is a normal LATER state of it: the bridge says SYNCED / MERGED and IMS's own passes have since
+ * merged, cancelled or held it (same Mintsoft id); or the bridge says dead-lettered and IMS has since replayed it. A rerun after switchover must not
+ * report these as conflicts. DEAD_LETTER, AMBIGUOUS_CREATE and PENDING_VERIFY naming the same id stay conflicts (nothing acts on them).
+ */
+const isAdvanced = (existing: ExistingLink, desired: DesiredLink, connector: string): boolean => {
+  if (existing.connector !== connector) return false
+  if (desired.kind === 'link') {
+    if (existing.externalOrderId !== desired.externalOrderId) return false
+    if (desired.state === 'SYNCED') return ADVANCED_FROM_SYNCED.has(existing.state)
+    if (desired.state === 'MERGED') return ADVANCED_FROM_MERGED.has(existing.state)
+    return false
+  }
+  // The bridge never created a Mintsoft order for it: whatever IMS holds now, IMS did after its own replay or create.
+  if (desired.kind === 'dead-letter') return existing.state !== 'DEAD_LETTER'
   return false
 }
 
@@ -342,6 +409,7 @@ export function decideLink(desired: DesiredLink, existing: ExistingLink | null, 
   if (existing.connector === connector && existing.state === 'PENDING_CREATE' && existing.externalOrderId === null && existing.lastAttemptAt === null && existing.pushedAt === null && existing.attempts === 0) {
     return { action: 'adopt', desired, existing }
   }
+  if (isAdvanced(existing, desired, connector)) return { action: 'advanced', existing }
   const named = existing.externalOrderId === null ? 'no warehouse order' : `warehouse order ${existing.externalOrderId}`
   return {
     action: 'conflict',

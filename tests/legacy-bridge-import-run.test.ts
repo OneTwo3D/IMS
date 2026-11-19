@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { renderLegacyImportReport, runLegacyBridgeImport, type ImsOrderContext, type LegacyImportPorts, type WcOrderLite } from '@/lib/connectors/mintsoft/legacy-bridge-import/run'
+import { renderLegacyImportReport, runLegacyBridgeImport, type ImsOrderContext, type LegacyImportPorts, type StoredResolution, type WcOrderLite } from '@/lib/connectors/mintsoft/legacy-bridge-import/run'
 import { decideLink, type ExistingLink } from '@/lib/connectors/mintsoft/legacy-bridge-import/state'
-import { runLegacyImportCli } from '../scripts/legacy-bridge-import'
+import { bridgeOrderStatuses, runLegacyImportCli } from '../scripts/legacy-bridge-import'
 
 const meta = (pairs: Record<string, unknown>) => Object.entries(pairs).map(([key, value]) => ({ id: 1, key, value }))
 const wc = (id: number, status: string, pairs: Record<string, unknown>): WcOrderLite => ({ id, number: String(1000 + id), status, meta_data: meta(pairs) })
@@ -20,10 +20,10 @@ const ORDERS: WcOrderLite[] = [
 ]
 const VERIFY_PENDING = wc(7, 'processing', { _mintsoft_verify_pending: '1', _mintsoft_verify_order_id: '9007' })
 
-type Store = { links: Map<string, ExistingLink & { orderId: string; shipFrom: string | null }>; writes: number; mintsoftReads: number; wcReads: number }
+type Store = { links: Map<string, ExistingLink & { orderId: string; shipFrom: string | null }>; writes: number; mintsoftReads: number; wcReads: number; resolutions: Map<string, StoredResolution>; recorded: number }
 
-function makePorts(opts: { prefix?: string; orders?: WcOrderLite[]; preLinks?: Record<string, Partial<ExistingLink> & { orderId?: string }>; skipImsFor?: number[]; complete?: boolean; holds?: number } = {}): { ports: LegacyImportPorts; store: Store } {
-  const store: Store = { links: new Map(), writes: 0, mintsoftReads: 0, wcReads: 0 }
+function makePorts(opts: { prefix?: string; orders?: WcOrderLite[]; preLinks?: Record<string, Partial<ExistingLink> & { orderId?: string }>; skipImsFor?: number[]; complete?: boolean; holds?: number; recordFails?: boolean } = {}): { ports: LegacyImportPorts; store: Store } {
+  const store: Store = { links: new Map(), writes: 0, mintsoftReads: 0, wcReads: 0, resolutions: new Map(), recorded: 0 }
   const orders = opts.orders ?? ORDERS
   const imsOrders = new Map<string, ImsOrderContext & { number: string }>()
   for (const o of orders) {
@@ -50,7 +50,7 @@ function makePorts(opts: { prefix?: string; orders?: WcOrderLite[]; preLinks?: R
       store.writes += 1
       const existing = store.links.get(input.orderId) ?? null
       const decision = decideLink(input.desired, existing, input.connector)
-      if (decision.action === 'unchanged') return 'unchanged'
+      if (decision.action === 'unchanged' || decision.action === 'advanced') return 'unchanged'
       if (decision.action === 'conflict') return 'conflict'
       const d = input.desired
       store.links.set(input.orderId, {
@@ -61,6 +61,13 @@ function makePorts(opts: { prefix?: string; orders?: WcOrderLite[]; preLinks?: R
       return decision.action === 'create' ? 'created' : 'adopted'
     },
     async verifyMintsoftOrder() { store.mintsoftReads += 1; return { found: true, orderNumber: null } },
+    async readResolutions() { return new Map(store.resolutions) },
+    async recordResolution(e) {
+      if (opts.recordFails) return false
+      store.recorded += 1
+      store.resolutions.set(e.wcOrderId, { wcOrderId: e.wcOrderId, decision: e.decision, signature: e.signature, kinds: e.kinds, recordedAt: null })
+      return true
+    },
   }
   return { ports, store }
 }
@@ -75,7 +82,7 @@ test('dry run: classifies all six importable shapes, writes nothing, calls no Mi
   assert.equal(store.links.size, 0)
   assert.equal(store.mintsoftReads, 0)
   assert.deepEqual(report.orders, { withBridgeState: 6, withMintsoftId: 5, withoutBridgeState: 1 })
-  assert.deepEqual(report.plan, { create: 6, adopt: 0, unchanged: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
+  assert.deepEqual(report.plan, { create: 6, adopt: 0, unchanged: 0, advanced: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
   assert.equal(report.verify, null)
   assert.equal(report.orderNumber.checked, 5)
   assert.deepEqual(report.orderNumber.mismatches, [])
@@ -86,7 +93,10 @@ test('dry run: classifies all six importable shapes, writes nothing, calls no Mi
   assert.deepEqual(report.split.map((s) => s.wcOrderId), ['2', '4'])
   assert.deepEqual(report.queues.map((q) => `${q.kind}:${q.wcOrderId}`).sort(), ['dead-letter:6', 'sync-pending:6', 'withdrawal-pending:5'])
   assert.equal(report.gate.ok, true)
-  assert.equal(report.gate.exitCode, 0)
+  // No blocker, but the OrderNumber check was not proved against Mintsoft: the distinct exit code 4, status 'met-unverified'.
+  assert.equal(report.gate.verified, false)
+  assert.equal(report.gate.status, 'met-unverified')
+  assert.equal(report.gate.exitCode, 4)
 })
 
 test('apply writes one link per adoptable order in the state the push sweep treats as created; a rerun changes nothing', async () => {
@@ -106,7 +116,7 @@ test('apply writes one link per adoptable order in the state the push sweep trea
   const snapshot = JSON.stringify([...store.links.entries()])
   const writesBefore = store.writes
   const second = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: STATUSES })
-  assert.deepEqual(second.plan, { create: 0, adopt: 0, unchanged: 6, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
+  assert.deepEqual(second.plan, { create: 0, adopt: 0, unchanged: 6, advanced: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
   assert.equal(store.writes, writesBefore, 'a rerun must not call the writer')
   assert.equal(JSON.stringify([...store.links.entries()]), snapshot)
 })
@@ -139,7 +149,7 @@ test('open merge holds and a bridge order with no IMS order are reported and blo
   const { ports } = makePorts({ holds: 1, skipImsFor: [1] })
   const report = await runLegacyBridgeImport(ports, { statuses: STATUSES })
   assert.equal(report.merge.openHolds.length, 1)
-  assert.deepEqual(report.noImsOrder, [{ wcOrderId: '1', wcNumber: '1001', mintsoftOrderId: '9001' }])
+  assert.deepEqual(report.noImsOrder, [{ wcOrderId: '1', wcNumber: '1001', mintsoftOrderId: '9001', wcStatus: 'processing', resolved: false }])
   assert.equal(report.plan.noImsOrder, 1)
   assert.equal(report.gate.exitCode, 3)
 })
@@ -172,11 +182,11 @@ test('CLI: dry run by default (no writer called, no Mintsoft reader built); --ap
   const flags: Array<{ verifyMintsoft: boolean }> = []
   const out: string[] = []
   const common = { ports: (f: { verifyMintsoft: boolean }) => { flags.push(f); return ports }, defaultStatuses: async () => STATUSES, stdout: { log: (m: string) => { out.push(m) } }, stderr: { error: () => undefined }, disconnect: async () => undefined }
-  assert.equal(await runLegacyImportCli({ ...common, argv: [] }), 0)
+  assert.equal(await runLegacyImportCli({ ...common, argv: [] }), 4)
   assert.equal(store.writes, 0)
   assert.deepEqual(flags, [{ verifyMintsoft: false, connector: undefined }])
   assert.match(out.join('\n'), /DRY-RUN/)
-  assert.equal(await runLegacyImportCli({ ...common, argv: ['--apply', '--bridge-stopped'] }), 0)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--apply', '--bridge-stopped'] }), 4)
   assert.equal(store.writes, 6)
   assert.equal(await runLegacyImportCli({ ...common, argv: ['--bogus'] }), 2)
   assert.equal(await runLegacyImportCli({ ...common, argv: ['--verify-max', '0'] }), 2)
@@ -217,7 +227,7 @@ test('a verify-pending bridge order is a gate blocker, listed for the operator, 
 })
 
 test('an existing link naming the same id in another state is a conflict, never "unchanged"', async () => {
-  for (const state of ['DEAD_LETTER', 'CANCELLED', 'HELD', 'AMBIGUOUS_CREATE', 'PENDING_VERIFY']) {
+  for (const state of ['DEAD_LETTER', 'AMBIGUOUS_CREATE', 'PENDING_VERIFY']) {
     const { ports, store } = makePorts({ preLinks: { 1: { state, externalOrderId: '9001' } } })
     const report = await runLegacyBridgeImport(ports, { statuses: STATUSES })
     assert.equal(report.plan.conflict, 1, state)
@@ -227,18 +237,6 @@ test('an existing link naming the same id in another state is a conflict, never 
   }
   const ok = makePorts({ preLinks: { 1: { state: 'SYNCED', externalOrderId: '9001' } } })
   assert.equal((await runLegacyBridgeImport(ok.ports, { statuses: STATUSES })).plan.unchanged, 1)
-})
-
-test('a queued bridge update blocks the gate; a queued create with no Mintsoft order does not', async () => {
-  const update = wc(1, 'processing', { _mintsoft_order_id: '9001', _mintsoft_sync_pending: 'update' })
-  const blocked = await runLegacyBridgeImport(makePorts({ orders: [update] }).ports, { statuses: STATUSES })
-  assert.equal(blocked.queues.find((q) => q.kind === 'sync-pending')?.blocking, true)
-  assert.equal(blocked.gate.exitCode, 3)
-  assert.match(blocked.gate.blockers.join('\n'), /queued bridge outbound update.*pushedAt/)
-  const create = wc(6, 'processing', { _mintsoft_sync_pending: 'create' })
-  const fine = await runLegacyBridgeImport(makePorts({ orders: [create] }).ports, { statuses: STATUSES })
-  assert.equal(fine.queues.find((q) => q.kind === 'sync-pending')?.blocking, false)
-  assert.equal(fine.gate.exitCode, 0)
 })
 
 test('zero orders read fails the gate (never a vacuous MET)', async () => {
@@ -253,7 +251,8 @@ test('zero orders read fails the gate (never a vacuous MET)', async () => {
 test('the report says the OrderNumber check is unverified without --verify-mintsoft, and verified with a full read', async () => {
   const plain = await runLegacyBridgeImport(makePorts().ports, { statuses: STATUSES })
   assert.match(renderLegacyImportReport(plain), /UNVERIFIED against Mintsoft/)
-  assert.match(renderLegacyImportReport(plain), /MET .*UNVERIFIED against Mintsoft/)
+  assert.match(renderLegacyImportReport(plain), /MET WITH A CAVEAT.*UNVERIFIED against Mintsoft/)
+  assert.equal(plain.gate.exitCode, 4)
   const { ports } = makePorts()
   ports.verifyMintsoftOrder = async (id) => ({ found: true, orderNumber: ({ '9001': '1001', '9002': '1002', '9100': '1003+1010', '9004': '1004', '9005': '1005' } as Record<string, string>)[id] ?? null })
   const full = await runLegacyBridgeImport(ports, { statuses: STATUSES, verifyMintsoft: true })
@@ -271,4 +270,178 @@ test('the writeback dead-letter, terminal-forced and resolved-split-part queues 
   assert.match(report.queues.find((q) => q.kind === 'terminal-forced')!.detail, /cancelled in mintsoft/)
   assert.deepEqual(report.split.map((s) => s.partsResolved), [[2]])
   assert.match(renderLegacyImportReport(report), /resolved\/cancelled \[2\]/)
+})
+
+const EXHAUSTED = wc(9, 'processing', { _mintsoft_verify_order_id: '9009', _mintsoft_dead_letter: '1', _mintsoft_order_number: '1009' })
+const QUEUED_UPDATE = wc(10, 'processing', { _mintsoft_order_id: '9010', _mintsoft_sync_pending: 'update' })
+const CANCELLED_QUEUED_CANCEL = wc(11, 'cancelled', { _mintsoft_verify_pending: '1', _mintsoft_verify_order_id: '9011', _mintsoft_sync_pending: 'cancel' })
+const CANCELLED_TRUSTED = wc(12, 'cancelled', { _mintsoft_order_id: '9012', _mintsoft_order_number: '1012' })
+const ALL_STATUSES = [...STATUSES, 'cancelled', 'refunded']
+
+test('the default statuses include cancelled and refunded, so a queued bridge cancel on such an order is read', () => {
+  const statuses = bridgeOrderStatuses(['completed'], 'pending-wdraw')
+  for (const status of ['completed', 'processing', 'on-hold', 'partial-shipped', 'partially-shipped', 'pending-wdraw', 'cancelled', 'refunded']) assert.ok(statuses.includes(status), status)
+  assert.equal(statuses.includes(''), false)
+})
+
+test('HIGH: a cancelled order with a queued bridge cancel (verify id, no trusted id) is read and BLOCKS the gate; it is not linked', async () => {
+  const { ports, store } = makePorts({ orders: [CANCELLED_QUEUED_CANCEL] })
+  const report = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ALL_STATUSES })
+  assert.equal(report.statusCounts.cancelled, 1)
+  const kinds = report.queues.filter((q) => q.blocking).map((q) => `${q.kind}:${q.wcStatus}`).sort()
+  assert.deepEqual(kinds, ['sync-pending:cancelled', 'verify-pending:cancelled'])
+  assert.equal(report.gate.ok, false)
+  assert.equal(report.gate.exitCode, 3)
+  assert.equal(store.links.size, 0)
+  // A queued cancel on a TRUSTED id blocks too, and is not linked either (MEDIUM): a link stamped as pushed would hide the cancel.
+  const trusted = wc(13, 'cancelled', { _mintsoft_order_id: '9013', _mintsoft_sync_pending: 'cancel' })
+  const t = makePorts({ orders: [trusted] })
+  const second = await runLegacyBridgeImport(t.ports, { apply: true, bridgeStopped: true, statuses: ALL_STATUSES })
+  assert.equal(second.gate.exitCode, 3)
+  assert.match(second.queues.find((q) => q.kind === 'sync-pending')!.detail, /cancellation the bridge never sent/)
+  assert.equal(t.store.links.size, 0)
+  assert.deepEqual(second.notLinked, [{ wcOrderId: '13', wcNumber: '1013', kinds: ['sync-pending'] }])
+})
+
+test('HIGH: a cancelled or refunded order with a trusted Mintsoft id and no queue is imported as SYNCED, so IMS\'s cancel pass owns it', async () => {
+  const refunded = wc(14, 'refunded', { _mintsoft_order_id: '9014' })
+  const { ports, store } = makePorts({ orders: [CANCELLED_TRUSTED, refunded] })
+  const report = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ALL_STATUSES })
+  assert.equal(store.links.get('ims-12')?.state, 'SYNCED')
+  assert.equal(store.links.get('ims-12')?.externalOrderId, '9012')
+  assert.equal(store.links.get('ims-14')?.state, 'SYNCED')
+  assert.equal(report.gate.ok, true)
+})
+
+test('MEDIUM: --apply writes no link for an order whose queued update blocks the gate, and lists it; the other orders are still linked', async () => {
+  const { ports, store } = makePorts({ orders: [ORDERS[0]!, QUEUED_UPDATE] })
+  const report = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: STATUSES })
+  assert.equal(store.links.has('ims-10'), false)
+  assert.equal(store.links.get('ims-1')?.state, 'SYNCED')
+  assert.equal(report.plan.blocked, 1)
+  assert.deepEqual(report.notLinked.map((n) => n.wcOrderId), ['10'])
+  assert.match(renderLegacyImportReport(report), /NOT LINKED[^\n]*: 1\n  WC #1010 \(id 10\): sync-pending/)
+  assert.equal(report.gate.exitCode, 3)
+  assert.match(report.gate.blockers.join('\n'), /queued bridge update or cancel.*NOT linked.*--resolve/)
+})
+
+test('LOW: a queued update, cancel or create with NO Mintsoft id and no verify id does not block (nothing would be lost)', async () => {
+  for (const action of ['create', 'update', 'cancel']) {
+    const order = wc(6, 'processing', { _mintsoft_sync_pending: action })
+    const fine = await runLegacyBridgeImport(makePorts({ orders: [order] }).ports, { statuses: STATUSES })
+    const entry = fine.queues.find((q) => q.kind === 'sync-pending')
+    assert.equal(entry?.blocking, false, action)
+    assert.equal(fine.gate.ok, true, action)
+  }
+})
+
+test('verify-EXHAUSTED is labelled as such (not a tracking writeback dead-letter), and verify-pending stays verify-pending', async () => {
+  const { ports } = makePorts({ orders: [EXHAUSTED, VERIFY_PENDING] })
+  const report = await runLegacyBridgeImport(ports, { statuses: STATUSES })
+  assert.deepEqual(report.queues.map((q) => `${q.kind}:${q.wcOrderId}:${q.blocking}`).sort(), ['verify-exhausted:9:true', 'verify-pending:7:true'])
+  assert.equal(report.queues.some((q) => q.kind === 'writeback-dead-letter'), false)
+  assert.match(report.queues.find((q) => q.kind === 'verify-exhausted')!.detail, /GAVE UP verifying.*--resolve 9 --as ours/)
+  assert.match(report.gate.blockers.join('\n'), /1 bridge order\(s\) are verify-EXHAUSTED/)
+})
+
+test('--resolve (dry run): shows the effect, records nothing, writes nothing', async () => {
+  const { ports, store } = makePorts({ orders: [EXHAUSTED] })
+  const report = await runLegacyBridgeImport(ports, { resolve: { wcOrderIds: ['9'], decision: 'ours' }, statuses: STATUSES })
+  assert.equal(store.recorded, 0)
+  assert.equal(store.writes, 0)
+  assert.equal(report.queues.find((q) => q.kind === 'verify-exhausted')?.blocking, false)
+  assert.equal(report.queues.find((q) => q.kind === 'verify-exhausted')?.resolvedAs, 'ours')
+  assert.equal(report.plan.create, 1)
+  assert.equal(report.gate.ok, true)
+})
+
+test('--resolve --apply: records the decision, writes ONLY the resolved order\'s matching link, and the decision keeps the order unblocked on later runs', async () => {
+  const { ports, store } = makePorts({ orders: [ORDERS[0]!, EXHAUSTED, QUEUED_UPDATE, wc(15, 'processing', { _mintsoft_order_id: '9015' })] })
+  const first = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['9'], decision: 'ours' }, statuses: STATUSES })
+  assert.equal(store.recorded, 1)
+  assert.deepEqual(first.resolutions.recorded, [{ wcOrderId: '9', decision: 'ours' }])
+  assert.equal(store.links.get('ims-9')?.state, 'SYNCED')
+  assert.equal(store.links.get('ims-9')?.externalOrderId, '9009')
+  assert.equal(store.links.has('ims-1'), false, 'a --resolve run writes only the orders it resolved')
+  assert.equal(store.links.has('ims-15'), false)
+  assert.equal(first.gate.ok, false, 'the queued update is still unresolved')
+  // A later plain run: the stored decision clears the exhausted order (unchanged), the rest is linked as usual, and only the queued update still blocks.
+  const later = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: STATUSES })
+  assert.equal(later.queues.find((q) => q.kind === 'verify-exhausted')?.blocking, false)
+  assert.deepEqual(later.resolutions.inForce, [{ wcOrderId: '9', wcNumber: '1009', decision: 'ours' }])
+  assert.equal(store.links.get('ims-1')?.state, 'SYNCED')
+  assert.equal(store.links.has('ims-10'), false)
+  assert.deepEqual(later.notLinked.map((n) => n.wcOrderId), ['10'])
+  // Resolve the queued update as cancelled (the operator cancelled it in Mintsoft): a CANCELLED link naming the id, and the gate opens.
+  const done = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['10'], decision: 'cancelled' }, statuses: STATUSES })
+  assert.equal(store.links.get('ims-10')?.state, 'CANCELLED')
+  assert.equal(store.links.get('ims-10')?.externalOrderId, '9010')
+  assert.equal(done.gate.ok, true)
+})
+
+test('--resolve: not-ours writes no link; an unrelated order, an unknown id or an unrecordable decision is refused with nothing written', async () => {
+  const { ports, store } = makePorts({ orders: [EXHAUSTED, ORDERS[0]!] })
+  const notOurs = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['9'], decision: 'not-ours' }, statuses: STATUSES })
+  assert.equal(store.links.has('ims-9'), false)
+  assert.equal(notOurs.plan.none, 1)
+  assert.equal(notOurs.gate.ok, true)
+  await assert.rejects(runLegacyBridgeImport(ports, { resolve: { wcOrderIds: ['1'], decision: 'ours' }, statuses: STATUSES }), /not a gate blocker/)
+  await assert.rejects(runLegacyBridgeImport(ports, { resolve: { wcOrderIds: ['999'], decision: 'ours' }, statuses: STATUSES }), /no order with that WooCommerce id/)
+  const failing = makePorts({ orders: [EXHAUSTED], recordFails: true })
+  await assert.rejects(runLegacyBridgeImport(failing.ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['9'], decision: 'ours' }, statuses: STATUSES }), /could not be recorded in the activity log; nothing was written/)
+  assert.equal(failing.store.writes, 0)
+})
+
+test('a stored decision made about a DIFFERENT bridge state (another verify id) is stale: ignored, listed, and the order blocks again', async () => {
+  const { ports, store } = makePorts({ orders: [EXHAUSTED] })
+  await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['9'], decision: 'ours' }, statuses: STATUSES })
+  const changed = wc(9, 'processing', { _mintsoft_verify_order_id: '9099', _mintsoft_dead_letter: '1' })
+  const again = makePorts({ orders: [changed] })
+  again.store.resolutions = store.resolutions
+  const report = await runLegacyBridgeImport(again.ports, { statuses: STATUSES })
+  assert.deepEqual(report.resolutions.stale, [{ wcOrderId: '9', decision: 'ours' }])
+  assert.equal(report.gate.ok, false)
+})
+
+test('a cancelled order with a Mintsoft id that IMS never imported blocks, and "cancelled" clears it (no link is possible); "ours" is refused for it', async () => {
+  const { ports } = makePorts({ orders: [CANCELLED_TRUSTED], skipImsFor: [12] })
+  const blocked = await runLegacyBridgeImport(ports, { statuses: ALL_STATUSES })
+  assert.equal(blocked.gate.ok, false)
+  assert.match(blocked.gate.blockers.join('\n'), /no IMS order yet.*--as cancelled/)
+  await assert.rejects(runLegacyBridgeImport(ports, { resolve: { wcOrderIds: ['12'], decision: 'ours' }, statuses: ALL_STATUSES }), /import the order into IMS first/)
+  const cleared = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['12'], decision: 'cancelled' }, statuses: ALL_STATUSES })
+  assert.equal(cleared.noImsOrder[0]?.resolved, true)
+  assert.equal(cleared.gate.ok, true)
+})
+
+test('LOW: a rerun after switchover (links advanced to MERGED / CANCELLED / HELD by IMS) reports no conflict', async () => {
+  const { ports } = makePorts({ preLinks: { 1: { state: 'MERGED', externalOrderId: '9001' }, 2: { state: 'CANCELLED', externalOrderId: '9002' }, 4: { state: 'HELD', externalOrderId: '9004' }, 5: { state: 'SYNCED', externalOrderId: '9005' } } })
+  const report = await runLegacyBridgeImport(ports, { statuses: STATUSES })
+  assert.equal(report.plan.advanced, 3)
+  assert.equal(report.plan.unchanged, 1)
+  assert.equal(report.plan.conflict, 0)
+  assert.deepEqual(report.conflicts, [])
+  assert.equal(report.gate.ok, true)
+})
+
+test('CLI: --resolve needs --as; both are parsed; --resolve --apply refuses without --bridge-stopped', async () => {
+  const { ports } = makePorts({ orders: [EXHAUSTED, ORDERS[0]!] })
+  const errors: string[] = []
+  const out: string[] = []
+  const common = { ports: () => ports, defaultStatuses: async () => STATUSES, stdout: { log: (m: string) => { out.push(m) } }, stderr: { error: (m: string) => { errors.push(m) } }, disconnect: async () => undefined }
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '9'] }), 2)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', 'abc', '--as', 'ours'] }), 2)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '9', '--as', 'maybe'] }), 2)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '9', '--as', 'ours', '--apply'] }), 2)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '9', '--as', 'ours', '--apply', '--bridge-stopped'] }), 4)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '1', '--as', 'ours'] }), 1, 'a refused decision is a failed run')
+  assert.match(errors.join('\n'), /not a gate blocker/)
+})
+
+test('JSON carries the gate status and the verified flag', async () => {
+  const report = await runLegacyBridgeImport(makePorts().ports, { statuses: STATUSES })
+  assert.deepEqual({ ok: report.gate.ok, verified: report.gate.verified, status: report.gate.status, exit: report.gate.exitCode }, { ok: true, verified: false, status: 'met-unverified', exit: 4 })
+  const none = await runLegacyBridgeImport(makePorts({ orders: [wc(8, 'processing', {})] }).ports, { statuses: STATUSES })
+  assert.equal(none.gate.verified, true, 'nothing needed checking')
+  assert.equal(none.gate.exitCode, 0)
 })
