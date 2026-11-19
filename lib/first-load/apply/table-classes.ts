@@ -159,6 +159,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   accounting_document_deletions: { kind: 'MUST_BE_EMPTY', reason: 'record of synced invoices and bills an operator deleted in IMS and the ledger together: runtime accounting state this runner never writes' },
   payment_removal_reconciliations: { kind: 'MUST_BE_EMPTY', reason: 'dated history of partial payment removals the payment poll measured on posted invoices: runtime accounting state this runner never writes' },
   trackship_refire_states: { kind: 'MUST_BE_EMPTY', reason: 'TrackShip re-fire state: per-order looks and back-off of a sweep that is off by default; runtime state a first load starts empty' },
+  wms_merge_holds: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records: merge-hold state per warehouse order, runtime state a first load starts empty' },
   wms_operator_tasks: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_order_status_snapshots: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
   wms_product_links: { kind: 'MUST_BE_EMPTY', reason: 'warehouse-connector records' },
