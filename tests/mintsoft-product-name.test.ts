@@ -64,3 +64,9 @@ test('fitMintsoftProductName keeps the plugin "Parent (a, b)" format, not "Paren
   assert.equal(fitMintsoftProductName('Plate — Red / Large', 'Plate', 'S1'), 'Plate (Red, Large)')
   assert.equal(fitMintsoftProductName('Plate — Red', 'Plate', 'S1'), 'Plate (Red)')
 })
+
+test('a variation value that contains " / " stays whole when the parent\'s option values name it (no split on the slash)', () => {
+  assert.equal(fitMintsoftProductName('Plate — Voron 2.4 / Trident / Red', 'Plate', 'S1', ['Voron 2.4 / Trident', 'Red']), 'Plate (Voron 2.4 / Trident, Red)')
+  // Unknown values keep the older behaviour (each piece on its own).
+  assert.equal(fitMintsoftProductName('Plate — Red / Large', 'Plate', 'S1', ['Voron 2.4 / Trident']), 'Plate (Red, Large)')
+})

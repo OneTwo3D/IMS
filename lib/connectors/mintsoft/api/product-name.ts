@@ -87,12 +87,34 @@ export function fitMintsoftName(name: string, suffix = '', sku = ''): string {
  * kept whole while the parent is cut. A name that does not start `<parent> — ` (or a product with no parent) has no separable
  * suffix and is fitted as a plain name, which is what the plugin did for a simple product.
  */
-export function fitMintsoftProductName(name: string, parentName: string | null | undefined, sku: string): string {
+export function fitMintsoftProductName(name: string, parentName: string | null | undefined, sku: string, parentOptionValues?: ReadonlyArray<string>): string {
   const parent = parentName?.trim() ?? ''
   const separator = ' — '
   if (parent && name.startsWith(`${parent}${separator}`) && name.length > parent.length + separator.length) {
-    const attributes = name.slice(parent.length + separator.length).split(' / ').map((part) => part.trim()).filter(Boolean).join(', ')
+    const attributes = splitAttributeValues(name.slice(parent.length + separator.length), parentOptionValues).join(', ')
     if (attributes) return fitMintsoftName(parent, ` (${attributes})`, sku)
   }
   return fitMintsoftName(name, '', sku)
+}
+
+/**
+ * The attribute values of a stored variation name. IMS joins them with " / ", and a value may itself contain " / " ("Voron 2.4 / Trident"), so a plain split cannot tell the
+ * separator from a slash inside a value. The structured values are the parent's option values (`product_options.values`, comma-separated): a run of pieces that
+ * together spell a known value is kept as ONE value, longest match first. With no known values (or none matching) each piece stands alone, as before.
+ */
+export function splitAttributeValues(joined: string, parentOptionValues?: ReadonlyArray<string>): string[] {
+  const pieces = joined.split(' / ').map((part) => part.trim()).filter(Boolean)
+  const known = new Set((parentOptionValues ?? []).map((value) => value.trim()).filter((value) => value.includes(' / ')))
+  if (known.size === 0) return pieces
+  const maxRun = Math.max(...[...known].map((value) => value.split(' / ').length))
+  const out: string[] = []
+  for (let i = 0; i < pieces.length;) {
+    let took = 1
+    for (let run = Math.min(maxRun, pieces.length - i); run >= 2; run--) {
+      if (known.has(pieces.slice(i, i + run).join(' / '))) { took = run; break }
+    }
+    out.push(pieces.slice(i, i + took).join(' / '))
+    i += took
+  }
+  return out
 }

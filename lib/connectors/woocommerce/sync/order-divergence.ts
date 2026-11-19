@@ -425,7 +425,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     await db.wcOrderDivergence.upsert({
       where: { orderId },
       create: { orderId, ...data },
-      update: { ...data, seenCount: 1, firstSeenAt: now, lastSeenAt: now, resolvedAt: null, resolution: null },
+      update: { ...data, seenCount: 1, firstSeenAt: now, lastSeenAt: now, resolvedAt: null, resolution: null, amendmentClaim: null },
     })
     await logActivity({
       entityType: 'SALES_ORDER',

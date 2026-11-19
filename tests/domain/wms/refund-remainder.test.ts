@@ -68,3 +68,36 @@ test('off by default: no read, no task; one failing order does not stop the othe
     assert.equal(await raiseRefundRemainderTasks('mintsoft', 50, mixed.d), 1)
   } finally { console.error = origError }
 })
+
+test('a partly delivered remainder (shipped 8 then 9) is the SAME task per order and SKU, not a second "send 1" task', async () => {
+  const seen = new Set<string>()
+  const basisOf = async (shipped: number) => {
+    const { d, raised } = deps({ shipped: async () => new Map([['l1', shipped]]) })
+    await raiseRefundRemainderTasks('mintsoft', 50, d)
+    return String(raised[0]!.dedupeBasis)
+  }
+  seen.add(await basisOf(8))
+  seen.add(await basisOf(9))
+  assert.equal(seen.size, 1)
+})
+
+test('a cursor pages through the orders: the next sweep continues after the last one examined, and wraps at the end', async () => {
+  const all = ['o1', 'o2', 'o3', 'o4', 'o5']
+  let cursor: string | null = null
+  const asked: Array<string | null | undefined> = []
+  const examined: string[] = []
+  const { d } = deps({
+    candidates: async (_c, limit, after) => {
+      asked.push(after)
+      return all.filter((id) => !after || id > after).slice(0, limit).map((orderId) => ({ orderId, orderNumber: orderId, externalOrderId: `MS-${orderId}`, externalOrderNumber: null, lines: [line] }))
+    },
+    refundTotals: async (id) => { examined.push(id); return { gross: new Map(), netted: new Map() } },
+    readCursor: async () => cursor,
+    writeCursor: async (_c, id) => { cursor = id },
+  })
+  await raiseRefundRemainderTasks('mintsoft', 2, d)
+  await raiseRefundRemainderTasks('mintsoft', 2, d)
+  await raiseRefundRemainderTasks('mintsoft', 2, d)
+  await raiseRefundRemainderTasks('mintsoft', 2, d)
+  assert.deepEqual(examined, ['o1', 'o2', 'o3', 'o4', 'o5', 'o1', 'o2'], 'the newest orders are reached, and the sweep wraps')
+})

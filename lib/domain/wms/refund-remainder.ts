@@ -55,13 +55,19 @@ function maxOf(a: Decimal, b: Decimal): Decimal {
 
 export type RefundRemainderDeps = {
   isEnabled(): Promise<boolean>
-  candidates(connector: string, limit: number): Promise<Array<{
+  /** Orders after `afterOrderId` (null: from the start), in a stable order, so a sweep can page through all of them instead of re-reading the same first ones. */
+  candidates(connector: string, limit: number, afterOrderId?: string | null): Promise<Array<{
     orderId: string; orderNumber: string | null; externalOrderId: string; externalOrderNumber: string | null; lines: RemainderLine[]
   }>>
   refundTotals(orderId: string): Promise<{ gross: Map<string, unknown>; netted: Map<string, unknown> }>
   shipped(orderId: string, lines: ReadonlyArray<RemainderLine>): Promise<Map<string, unknown>>
   raise(task: WmsOperatorTaskInput): Promise<boolean>
+  /** The sweep cursor: the last order examined, so the next sweep continues after it. */
+  readCursor?(connector: string): Promise<string | null>
+  writeCursor?(connector: string, orderId: string | null): Promise<void>
 }
+
+const cursorKey = (connector: string) => `wms_refund_remainder_cursor:${connector}`
 
 const LIVE_STATUSES = ['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] as const
 
@@ -70,19 +76,19 @@ export const defaultRefundRemainderDeps: RefundRemainderDeps = {
     const row = await db.setting.findUnique({ where: { key: WMS_REFUND_REMAINDER_TASK_SETTING }, select: { value: true } })
     return row?.value === 'true'
   },
-  async candidates(connector, limit) {
+  async candidates(connector, limit, afterOrderId) {
     const links = await db.wmsOrderPushLink.findMany({
       where: {
         connector,
         state: 'SYNCED',
         externalOrderId: { not: null },
-        order: { status: { in: [...LIVE_STATUSES] }, erasedAt: null, refunds: { some: { returnWarehouseId: { not: null }, chargeback: { not: true } } } },
+        order: { ...(afterOrderId ? { id: { gt: afterOrderId } } : {}), status: { in: [...LIVE_STATUSES] }, erasedAt: null, refunds: { some: { returnWarehouseId: { not: null }, chargeback: { not: true } } } },
       },
       select: {
         externalOrderId: true, externalOrderNumber: true,
         order: { select: { id: true, orderNumber: true, lines: { select: { id: true, sku: true, productId: true, qty: true, wclcFeeKind: true } } } },
       },
-      orderBy: { pushedAt: 'asc' },
+      orderBy: { orderId: 'asc' },
       take: limit,
     })
     return links.map((link) => ({
@@ -123,6 +129,13 @@ export const defaultRefundRemainderDeps: RefundRemainderDeps = {
   async raise(task) {
     return raiseWmsOperatorTask(db, task)
   },
+  async readCursor(connector) {
+    const row = await db.setting.findUnique({ where: { key: cursorKey(connector) }, select: { value: true } })
+    return row?.value ? row.value : null
+  },
+  async writeCursor(connector, orderId) {
+    await db.setting.upsert({ where: { key: cursorKey(connector) }, create: { key: cursorKey(connector), value: orderId ?? '' }, update: { value: orderId ?? '' } })
+  },
 }
 
 /**
@@ -132,7 +145,13 @@ export const defaultRefundRemainderDeps: RefundRemainderDeps = {
 export async function raiseRefundRemainderTasks(connector: string, limit = 50, deps: RefundRemainderDeps = defaultRefundRemainderDeps): Promise<number> {
   if (!(await deps.isEnabled())) return 0
   let raised = 0
-  for (const candidate of await deps.candidates(connector, limit)) {
+  // A CURSOR, not "the oldest N": once more than `limit` orders match, the same first ones would be examined on every sweep and the newer ones never. The sweep continues after the last order the previous one
+  // examined and wraps to the start when it reaches the end.
+  const cursor = deps.readCursor ? await deps.readCursor(connector).catch(() => null) : null
+  let batch = await deps.candidates(connector, limit, cursor)
+  if (batch.length === 0 && cursor) batch = await deps.candidates(connector, limit, null)
+  if (deps.writeCursor) await deps.writeCursor(connector, batch.length >= limit ? (batch[batch.length - 1]?.orderId ?? null) : null).catch(() => undefined)
+  for (const candidate of batch) {
     try {
       const totals = await deps.refundTotals(candidate.orderId)
       const remainder = computeRefundRemainders({
@@ -150,7 +169,8 @@ export async function raiseRefundRemainderTasks(connector: string, limit = 50, d
         reason: 'REFUND_REMAINDER_DUE',
         queryText: refundRemainderQuery(warehouseOrderRef(candidate.externalOrderNumber, candidate.externalOrderId), orderRef, remainder),
         payload: { orderNumber: candidate.orderNumber, externalOrderNumber: candidate.externalOrderNumber },
-        dedupeBasis: `remainder:${JSON.stringify(remainder.map((line) => [line.sku, line.quantity]).sort())}`,
+        // Per order and SKU, not per exact remainder: a partly delivered remainder (8 shipped, then 9) changes the quantity and must not raise a second "send 1" task while "send 2" is in progress.
+        dedupeBasis: `remainder:${JSON.stringify(remainder.map((line) => line.sku).sort())}`,
       })
       if (created) raised += 1
     } catch (error) {
