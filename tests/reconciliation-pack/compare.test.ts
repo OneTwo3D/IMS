@@ -270,3 +270,8 @@ test('outcome: a finding beats unsettled; unsettled alone is never a pass', () =
   const mix = compare({ ims: [row('A', '1'), row('B', '1')], vendor: [row('A', '2'), row('C', '1')], settling: { carried: new Map([['A|MAIN', { kind: 'bothDiffer' as const, signature: SIG_A, sequence: 1, first: T1, later: [T2, T3] }]]), stamp: T4, usable: true } })
   assert.deepEqual(outcomeOfComparison(mix), { outcome: 'fail', reasons: ['DIFFERENCES', 'UNSETTLED_PENDING'] })
 })
+
+test('carried state with more later stamps than the settling window is refused, so it cannot settle a difference early', () => {
+  const carried = new Map([['A|MAIN', { kind: 'bothDiffer' as const, signature: SIG_A, sequence: 1, first: T1, later: [T2, T3, T4] }]])
+  assert.deepEqual(compare({ ims: [row('A', '1')], vendor: [row('A', '2')], settling: { carried, stamp: '2026-10-05T00:00:00.000Z', usable: true } }), { status: 'unreadable', reason: 'SOURCE_UNREADABLE' })
+})

@@ -11,6 +11,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
+import { getCustomerIdentity } from '@/app/actions/customer-identity'
 import { createCustomer, updateCustomer, importContactsCsv, anonymiseCustomer, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
@@ -207,14 +208,26 @@ function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () 
   const [confirmation, setConfirmation] = useState('')
   const [error, setError] = useState('')
   const [warning, setWarning] = useState('')
+  // The records of the person this erasure will cover are loaded when the dialog opens, shown, and SENT BACK with the request: the server refuses if they changed.
+  const [members, setMembers] = useState<Array<{ id: string; fullName: string; email: string | null }> | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    void getCustomerIdentity(customer.id).then((identity) => {
+      if (cancelled) return
+      if (!identity) { setError('Customer not found'); return }
+      setMembers(identity.members.filter((m) => !m.anonymised).map((m) => ({ id: m.id, fullName: m.fullName, email: m.email })))
+    }).catch(() => { if (!cancelled) setError('Could not load the records of this person. Close and try again.') })
+    return () => { cancelled = true }
+  }, [customer.id])
 
   const expectedName = customer.fullName
-  const canConfirm = confirmation === expectedName
+  const canConfirm = confirmation === expectedName && members !== null
 
   function handleAnonymise() {
+    if (!members) return
     setError('')
     startTransition(async () => {
-      const result = await anonymiseCustomer(customer.id)
+      const result = await anonymiseCustomer(customer.id, members.map((m) => m.id))
       if (result.success) {
         router.refresh()
         // An erasure that left open warehouse orders says so here, and stays open until the operator has read it.
@@ -241,6 +254,18 @@ function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () 
           <p className="text-muted-foreground">
             The following data will be cleared: name, email, phone, company, tax number, billing/shipping addresses, notes, and all linked order customer details.
           </p>
+          {members && members.length > 1 && (
+            <div role="note" className="space-y-1.5 rounded-md border border-destructive/40 p-3" data-testid="gdpr-cluster-members">
+              <p className="text-sm font-medium text-destructive">
+                This customer is merged with {members.length - 1} other record{members.length - 1 === 1 ? '' : 's'} (the same person). All {members.length} records and their orders will be anonymised:
+              </p>
+              <ul className="list-disc pl-5 text-sm">
+                {members.map((m) => (
+                  <li key={m.id}>{m.fullName || m.id}{m.email ? <span className="text-muted-foreground"> ({m.email})</span> : null}{m.id === customer.id ? <span className="text-muted-foreground"> (this record)</span> : null}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="space-y-1.5">
             <Label className="text-xs">Type <strong>{expectedName}</strong> to confirm</Label>
             <Input

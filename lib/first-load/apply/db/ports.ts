@@ -19,7 +19,7 @@ import { createExecutor } from './execute'
 import { createJournal, setFactOnce } from './journal'
 import { db } from '@/lib/db'
 import { StepLockError, type StepLock } from '../orchestrate'
-import { withStepLock } from './lock'
+import { withRunLease, withStepLock } from './lock'
 import { observeStep } from './observe'
 import { QuiesceError, currentTaxProfiles, evaluateRailResults, quiesceProblems, type RailResult } from './rails'
 import { importSupplierTaxRates } from './tax-import'
@@ -51,7 +51,7 @@ export interface DbPortsOptions {
 }
 
 /** Before every importer call: the step lock is live (pg_locks), and the run record is still this load's and still running. */
-function guardBeforeCall(prepared: PreparedRun) {
+function guardBeforeCall(prepared: PreparedRun, expectedVersion: () => number | null) {
   return async (_step: ApplyStepId, lock: StepLock): Promise<void> => {
     if (!lock) throw new StepLockError('lost')
     await lock.assertLive()
@@ -59,11 +59,14 @@ function guardBeforeCall(prepared: PreparedRun) {
     if ((await quiesceProblems()).length > 0) throw new QuiesceError()
     let row
     try {
-      row = await db.firstLoadApplyRun.findFirst({ select: { manifestDigest: true, runId: true, status: true } })
+      row = await db.firstLoadApplyRun.findFirst({ select: { manifestDigest: true, runId: true, status: true, version: true } })
     } catch {
       throw new StepLockError('unavailable')
     }
     if (row === null || row.manifestDigest !== prepared.manifestDigest || row.runId !== prepared.manifest.runId || row.status !== 'RUNNING') throw new StepLockError('lost')
+    // The record is still the version THIS runner last saved: a runner that was displaced (another one advanced the journal) stops before its next call, not at its next save.
+    const expected = expectedVersion()
+    if (expected !== null && row.version !== expected) throw new StepLockError('lost')
   }
 }
 
@@ -80,8 +83,22 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
     }
     return results.flatMap((r) => r.problems)
   }
+  // The journal version this runner last read or saved, so the per-call guard can tell that another runner has moved the record.
+  const baseJournal = createJournal()
+  let knownVersion: number | null = null
+  const journal: ApplyPorts['journal'] = {
+    async load() {
+      const record = await baseJournal.load()
+      knownVersion = record?.version ?? null
+      return record
+    },
+    async save(record, expectedVersion) {
+      await baseJournal.save(record, expectedVersion)
+      knownVersion = record.version
+    },
+  }
   return {
-    journal: createJournal(),
+    journal,
     observe: (step) => observeStep(prepared, step),
     railTally: () => [...tally.values()],
     preflight: async ({ resuming }) => note(await evaluateRailResults(prepared, { phase: 'preflight', resuming, step: null }, options.preload)),
@@ -110,7 +127,8 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
       return problems
     },
     withStepLock,
+    withRunLease,
     verify: options.verification ? createVerifier(options.verification.preload === undefined && options.preload !== undefined ? { ...options.verification, preload: options.preload } : options.verification) : undefined,
-    execute: createExecutor({ runId: prepared.manifest.runId, operator: options.operator, maxRowsPerCall: options.maxRowsPerCall, beforeCall: guardBeforeCall(prepared), afterCall: options.afterCall }),
+    execute: createExecutor({ runId: prepared.manifest.runId, operator: options.operator, maxRowsPerCall: options.maxRowsPerCall, beforeCall: guardBeforeCall(prepared, () => knownVersion), afterCall: options.afterCall }),
   }
 }
