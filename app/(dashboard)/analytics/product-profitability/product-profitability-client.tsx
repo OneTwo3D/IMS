@@ -9,7 +9,8 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { ProductLink } from '@/components/inventory/product-link'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
-import { formatMoney } from '@/lib/utils'
+import { formatMoney, formatMoneyDecimalString } from '@/lib/utils'
+import { roundDecimalString, sumDecimalStrings } from '@/lib/domain/sales/decimal-string'
 import type { ProfitabilityFyFigures, ProfitabilityRow, ProfitabilitySummary } from '@/app/actions/product-profitability'
 import { buildGuardedCsv } from '@/lib/csv-escape'
 import {
@@ -121,16 +122,23 @@ type MarkedFigure = {
  * reassemble would put the concatenation back on the caller's side of the branch, which is exactly
  * what regressed.
  */
+/** `roundBoundedAmountForDisplay` over an exact decimal string: upper rounds UP, lower DOWN, the rest to nearest. */
+function roundBoundedAmountExact(amountExact: string, bound: ReturnType<typeof classifyLinearFigureBound>): string {
+  return roundDecimalString(amountExact, bound === 'upper' ? 'ceil' : bound === 'lower' ? 'floor' : 'nearest')
+}
+
 function markFigure(
-  amount: number,
+  amountExact: string,
   interval: LinearFigureBoundInterval,
-  renderAmount: (value: number) => string,
+  renderAmount: (value: string) => string,
   summary = false,
 ): MarkedFigure {
   const bound = classifyLinearFigureBound(interval)
   return {
     bound,
-    text: `${renderAmount(roundBoundedAmountForDisplay(amount, bound))}${boundSuffix(bound)}`,
+    // o3d-0868: the amount is an EXACT decimal string end to end — summed, rounded in the bound's direction and
+    // printed without ever being a Number, because above 2^53 a double cannot hold the cent being rounded to.
+    text: `${renderAmount(roundBoundedAmountExact(amountExact, bound))}${boundSuffix(bound)}`,
     tone: boundTone(bound),
     title: boundTitle(bound, summary),
   }
@@ -201,6 +209,7 @@ export function ProductProfitabilityClient({ data }: Props) {
   const { rows, summary } = data
   const baseCurrency = useBaseCurrency()
   const fmtBase = (v: number) => formatMoney(v, baseCurrency.symbol, baseCurrency.symbolPosition)
+  const fmtBaseExact = (v: string) => formatMoneyDecimalString(v, baseCurrency.symbol, baseCurrency.symbolPosition)
 
   // Profitability target
   const [targetPct, setTargetPct] = useState(30)
@@ -346,6 +355,8 @@ export function ProductProfitabilityClient({ data }: Props) {
       const sum = (get: (f: ProfitabilityFyFigures) => number) => parts.reduce((s, f) => s + get(f), 0)
       return {
         revenue: sum((f) => f.revenue),
+        revenueExact: sumDecimalStrings(parts.map((f) => f.revenueExact)),
+        profitExact: sumDecimalStrings(parts.map((f) => f.profitExact)),
         cogs: sum((f) => f.cogs),
         profit: sum((f) => f.profit),
         qtySold: sum((f) => f.qtySold),
@@ -376,9 +387,9 @@ export function ProductProfitabilityClient({ data }: Props) {
       const bound = classifyLinearFigureBound(f.bound)
       const money = (value: number) => roundBoundedAmountForDisplay(value, 'exact')
       return [
-        roundBoundedAmountForDisplay(f.revenue, bound), bound,
+        roundBoundedAmountExact(f.revenueExact, bound), bound,
         money(f.refundsGrossBasis), money(f.refundsUnknownBasis), money(f.cogs),
-        roundBoundedAmountForDisplay(f.profit, bound), bound, round2(f.qtySold),
+        roundBoundedAmountExact(f.profitExact, bound), bound, round2(f.qtySold),
       ]
     }
     const csvRows = filtered.map((r) => [
@@ -449,17 +460,17 @@ export function ProductProfitabilityClient({ data }: Props) {
       // o3d-iigc/o3d-la3n: where the FY refunds could not all be placed on the net basis this
       // figure is bounded. The mark, the colour and the rounding all come out of `markFigure`,
       // which classifies the PRODUCER'S interval — the cells decide nothing.
-      case 'currentFyRevenue': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.revenue} showAmount={r.currentFy.revenue > 0} className="font-medium" />
+      case 'currentFyRevenue': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.revenue} exact={r.currentFy.revenueExact} showAmount={r.currentFy.revenue > 0} className="font-medium" />
       case 'currentFyRefundsGrossBasis': return <DisclosedMoney amount={r.currentFy.refundsGrossBasis} title={GROSS_BUCKET_TITLE} />
       case 'currentFyRefundsUnknownBasis': return <DisclosedMoney amount={r.currentFy.refundsUnknownBasis} title={UNKNOWN_BUCKET_TITLE} />
       case 'currentFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.currentFy.cogs > 0 ? fmtBase(r.currentFy.cogs) : '—'}</span>
-      case 'currentFyProfit': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.profit} showAmount={r.currentFy.revenue > 0 || r.currentFy.cogs > 0} verdictTone />
+      case 'currentFyProfit': return <BoundedMoney fy={r.currentFy} amount={r.currentFy.profit} exact={r.currentFy.profitExact} showAmount={r.currentFy.revenue > 0 || r.currentFy.cogs > 0} verdictTone />
       case 'currentFyQtySold': return <span className="tabular-nums text-xs">{r.currentFy.qtySold > 0 ? round2(r.currentFy.qtySold) : '—'}</span>
-      case 'previousFyRevenue': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.revenue} showAmount={r.previousFy.revenue > 0} />
+      case 'previousFyRevenue': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.revenue} exact={r.previousFy.revenueExact} showAmount={r.previousFy.revenue > 0} />
       case 'previousFyRefundsGrossBasis': return <DisclosedMoney amount={r.previousFy.refundsGrossBasis} title={GROSS_BUCKET_TITLE} />
       case 'previousFyRefundsUnknownBasis': return <DisclosedMoney amount={r.previousFy.refundsUnknownBasis} title={UNKNOWN_BUCKET_TITLE} />
       case 'previousFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.previousFy.cogs > 0 ? fmtBase(r.previousFy.cogs) : '—'}</span>
-      case 'previousFyProfit': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.profit} showAmount={r.previousFy.revenue > 0 || r.previousFy.cogs > 0} verdictTone />
+      case 'previousFyProfit': return <BoundedMoney fy={r.previousFy} amount={r.previousFy.profit} exact={r.previousFy.profitExact} showAmount={r.previousFy.revenue > 0 || r.previousFy.cogs > 0} verdictTone />
       case 'previousFyQtySold': return <span className="tabular-nums text-xs">{r.previousFy.qtySold > 0 ? round2(r.previousFy.qtySold) : '—'}</span>
     }
   }
@@ -473,15 +484,18 @@ export function ProductProfitabilityClient({ data }: Props) {
    * so there is no value of `showAmount` that can reach the relation. The component itself has no
    * branch left around `m.text`: that is the property, and re-introducing one is the regression.
    */
-  function BoundedMoney({ fy, amount, showAmount, verdictTone = false, className = '' }: {
+  function BoundedMoney({ fy, amount, exact, showAmount, verdictTone = false, className = '' }: {
     fy: ProfitabilityFyFigures
+    /** The float figure: sign and tone only. */
     amount: number
+    /** The exact figure every printed digit comes from (o3d-0868). */
+    exact: string
     /** Whether the FIGURE is worth printing. Never whether the RELATION is. */
     showAmount: boolean
     verdictTone?: boolean
     className?: string
   }) {
-    const m = markFigure(amount, fy.bound, (value) => (showAmount ? fmtBase(value) : NO_AMOUNT))
+    const m = markFigure(exact, fy.bound, (value) => (showAmount ? fmtBaseExact(value) : NO_AMOUNT))
     const tone = m.bound !== 'exact'
       ? 'text-orange-600'
       : verdictTone ? (amount > 0 ? 'text-green-600' : amount < 0 ? 'text-destructive' : '') : ''
@@ -495,16 +509,16 @@ export function ProductProfitabilityClient({ data }: Props) {
 
   // Footer totals mapping. Every entry reads the FILTERED subtotal's own folded interval.
   const FOOTER_COLS: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
-    currentFyRevenue: (s) => markFigure(s.currentFy.revenue, s.currentFy.bound, fmtBase, true).text,
+    currentFyRevenue: (s) => markFigure(s.currentFy.revenueExact, s.currentFy.bound, fmtBaseExact, true).text,
     currentFyRefundsGrossBasis: (s) => fmtBase(s.currentFy.refundsGrossBasis),
     currentFyRefundsUnknownBasis: (s) => fmtBase(s.currentFy.refundsUnknownBasis),
     currentFyCogs: (s) => fmtBase(s.currentFy.cogs),
-    currentFyProfit: (s) => markFigure(s.currentFy.profit, s.currentFy.bound, fmtBase, true).text,
-    previousFyRevenue: (s) => markFigure(s.previousFy.revenue, s.previousFy.bound, fmtBase, true).text,
+    currentFyProfit: (s) => markFigure(s.currentFy.profitExact, s.currentFy.bound, fmtBaseExact, true).text,
+    previousFyRevenue: (s) => markFigure(s.previousFy.revenueExact, s.previousFy.bound, fmtBaseExact, true).text,
     previousFyRefundsGrossBasis: (s) => fmtBase(s.previousFy.refundsGrossBasis),
     previousFyRefundsUnknownBasis: (s) => fmtBase(s.previousFy.refundsUnknownBasis),
     previousFyCogs: (s) => fmtBase(s.previousFy.cogs),
-    previousFyProfit: (s) => markFigure(s.previousFy.profit, s.previousFy.bound, fmtBase, true).text,
+    previousFyProfit: (s) => markFigure(s.previousFy.profitExact, s.previousFy.bound, fmtBaseExact, true).text,
   }
 
   const FOOTER_TONE: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
@@ -527,10 +541,12 @@ export function ProductProfitabilityClient({ data }: Props) {
    * ternaries off `…RefundBasisComplete`, which is exactly the shape that let o3d-7jfq fix one
    * reader of this rule and leave five behind (o3d-la3n).
    */
-  function FyCard({ period, label, value, bound, verdictTone = false, disclose = false }: {
+  function FyCard({ period, label, value, exact, bound, verdictTone = false, disclose = false }: {
     period: string
     label: string
     value: number
+    /** Exact decimal string of the same figure; required wherever `bound` is given (o3d-0868). */
+    exact?: string
     /** The producer's interval for this figure. Omitted where no refund can move it (COGS). */
     bound?: LinearFigureBoundInterval
     /** Colour the figure green/red as a profit verdict — dropped the moment it is not exact. */
@@ -542,7 +558,7 @@ export function ProductProfitabilityClient({ data }: Props) {
     // signed sums: +£120 and −£120 of gross-basis credit have already cancelled into a £0.00 that
     // would have been printed as "nothing left unsubtracted" beside a figure that may be £120 out.
     // `linearFigureBoundWidth` returns null wherever no single direction applies.
-    const m = bound ? markFigure(value, bound, fmtBase, true) : null
+    const m = bound && exact != null ? markFigure(exact, bound, fmtBaseExact, true) : null
     const width = bound ? linearFigureBoundWidth(bound) : null
     const marked = m != null && m.bound !== 'exact'
     return (
@@ -582,21 +598,21 @@ export function ProductProfitabilityClient({ data }: Props) {
       {/* Summary cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         <FyCard
-          period={summary.fyLabel} label="Revenue" value={filteredSummary.currentFy.revenue}
+          period={summary.fyLabel} label="Revenue" value={filteredSummary.currentFy.revenue} exact={filteredSummary.currentFy.revenueExact}
           bound={filteredSummary.currentFy.bound} disclose
         />
         <FyCard period={summary.fyLabel} label="COGS" value={filteredSummary.currentFy.cogs} />
         <FyCard
-          period={summary.fyLabel} label="Profit" value={filteredSummary.currentFy.profit}
+          period={summary.fyLabel} label="Profit" value={filteredSummary.currentFy.profit} exact={filteredSummary.currentFy.profitExact}
           bound={filteredSummary.currentFy.bound} verdictTone
         />
         <FyCard
-          period={summary.prevFyLabel} label="Revenue" value={filteredSummary.previousFy.revenue}
+          period={summary.prevFyLabel} label="Revenue" value={filteredSummary.previousFy.revenue} exact={filteredSummary.previousFy.revenueExact}
           bound={filteredSummary.previousFy.bound} disclose
         />
         <FyCard period={summary.prevFyLabel} label="COGS" value={filteredSummary.previousFy.cogs} />
         <FyCard
-          period={summary.prevFyLabel} label="Profit" value={filteredSummary.previousFy.profit}
+          period={summary.prevFyLabel} label="Profit" value={filteredSummary.previousFy.profit} exact={filteredSummary.previousFy.profitExact}
           bound={filteredSummary.previousFy.bound} verdictTone
         />
       </div>

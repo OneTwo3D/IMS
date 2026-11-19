@@ -119,7 +119,7 @@ export const SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED =
 
 /** What the four age buckets, and the without-marker total, actually measure. */
 export const SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS =
-  'Billed value of bills carrying NO payment marker, aged from the INVOICE date. Not an overdue figure and not a balance owed: no payment amount is recorded, supplier credit notes are not netted off it, and the due date on the bill is not used. It states what was billed and never marked.'
+  'Billed value of bills carrying NO payment marker, aged from the INVOICE date. Not an overdue figure and not a balance owed: no payment amount is recorded, supplier credit notes are not netted off it (see the Credited column), and the due date on the bill is not used. It states what was billed and never marked.'
 
 /**
  * o3d-8u4h round 3: HOW THE ROW IS MADE TO ADD UP, said to the reader who was told to add it up.
@@ -132,6 +132,12 @@ export const SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS =
  */
 export const SUPPLIER_BILLED_ROUNDING_RECONCILIATION =
   'Reconciled to the penny. Bills are stored to four decimal places and this report publishes two: every figure is summed at full precision and rounded once (half away from zero), and the rounding residue — never more than a penny or two — is then added to the LARGEST component of each split, so that the two marker groups add back to Billed and the four age bands add back to the without-marker group exactly, on screen and in the exported file. One component therefore carries the residue by rule rather than by accident; no component is claimed exact to the penny in isolation.'
+
+/**
+ * o3d-tomf: the Credited column, and why the billed figures and age bands are NOT reduced by it.
+ */
+export const SUPPLIER_CREDIT_NOTES_NOT_NETTED_BASIS =
+  'POSTED supplier credit notes (SupplierCreditNote.amountBase, VAT-inclusive, the same basis as Billed) on this supplier\'s committed purchase orders. Shown beside the billed figures, not netted into them: a credit note is tied to a specific bill only optionally, so it cannot be assigned to a payment-marker group or an age band without guessing. Billed less Credited is what remains billed after credits; the marker groups and the four age bands are before credits. DRAFT credit notes are not counted.'
 
 /** What the with-marker column measures, which is an amount BILLED and not an amount paid. */
 export const SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS =

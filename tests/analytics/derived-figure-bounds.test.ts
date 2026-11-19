@@ -469,3 +469,19 @@ test('a bounded amount rounds in the direction its relation allows (o3d-la3n r2)
   assert.equal(roundBoundedAmountForDisplay(100, 'upper'), 100, 'an exact-cent figure is not nudged')
 })
 
+
+// o3d-poka: every verdict has a disclosure; `lower` used to render nothing (tooltip) / the indeterminate sentence (card).
+test('bridge tooltip note and summary-card sentence cover the lower verdict (o3d-poka)', async () => {
+  const { bridgeTooltipNote, boundDisclosureSentence } = await import('@/lib/domain/sales/derived-figure-bound')
+  assert.equal(bridgeTooltipNote('exact'), '')
+  assert.match(bridgeTooltipNote('lower'), /^ ≥ \(lower bound/)
+  assert.match(bridgeTooltipNote('upper'), /^ ≤/)
+  assert.match(bridgeTooltipNote('indeterminate'), /^ \?/)
+  assert.equal(boundDisclosureSentence('exact', '£1', true), '')
+  for (const widthKnown of [true, false]) {
+    assert.match(boundDisclosureSentence('lower', '£1', widthKnown), /^Lower bound/)
+    assert.doesNotMatch(boundDisclosureSentence('lower', '£1', widthKnown), /Direction not established/)
+  }
+  assert.match(boundDisclosureSentence('upper', '£1', true), /^Upper bound .* £1 of refunds not subtracted/)
+  assert.match(boundDisclosureSentence('indeterminate', '£1', false), /^Direction not established/)
+})
