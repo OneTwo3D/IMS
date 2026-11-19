@@ -159,6 +159,7 @@ import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
   wooAccountingPostJobIds,
+  accountingPostJobIdsForSyncTypes,
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
@@ -2924,7 +2925,7 @@ function unsentPostEvidence(
         // before they go hunting in the ledger.
         : notPosted.reason === 'transport-refused'
           ? 'xero_sync_transport_refused_before_post'
-          : notPosted.reason === 'producer-held'
+          : notPosted.reason === 'producer-held' || notPosted.reason === 'producer-shadowed'
             ? 'xero_sync_producer_held_before_post'
             : notPosted.reason === 'before-cutoff'
               ? 'xero_sync_before_cutoff_before_post'
@@ -4656,6 +4657,10 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
   const attempted: string[] = []
   // ONE READ OF THE WOOCOMMERCE-WRITING JOB IDS FOR THE WHOLE DRAIN (o3d-jvup3), not one unbounded query per claim.
   const wooAccountingJobIds = await wooAccountingPostJobIds(new Date())
+  // THE JOBS OF THE TYPES THE OWNER'S CONFIRMATION STILL HOLDS ARE LEFT OUT OF THE CANDIDATE WINDOW (as the direct runner's selection leaves the types out), so
+  // held jobs never take a slot of the bounded batch and starve the rows behind them. They are untouched, not failed: read again by every drain, so they are
+  // offered on the first drain after the hold lifts. The pre-claim ask below stays, for a hold that appeared after this read.
+  const heldJobIds = await accountingPostJobIdsForSyncTypes(xeroHeldDeliveryTypes())
   while (attempted.length < MAX_PER_RUN) {
     if (clock() - startedAt > budgetMs) break
     const claimedJobs = await claimIntegrationOutboxWork({
@@ -4663,7 +4668,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
       operation: XERO_ACCOUNTING_POST_OPERATION,
       limit: MAX_PER_RUN,
       claimLimit: 1,
-      excludeIds: attempted,
+      excludeIds: heldJobIds.length > 0 ? [...attempted, ...heldJobIds] : attempted,
       wooAccountingJobIds,
       workerId: XERO_ACCOUNTING_WORKER_ID,
       staleLockMs: CLAIM_STALE_MS,
@@ -5294,7 +5299,7 @@ type EntryResult = {
      * minted — the fence sent nothing because the transport would not. The row is handed back exactly
      * like the other three, and the marker it left behind is a known, named residual (o3d-gvzu).
      */
-    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'before-cutoff'
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'producer-shadowed' | 'before-cutoff'
     operation: string
     message: string
     /**
@@ -6241,7 +6246,10 @@ export async function processClaimedEntry(
   const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload, obligationAt: await xeroResolveObligationAt(db, { type, payload, connector: XERO_CONNECTOR, referenceType, referenceId }) })
   if (held.kind === 'shadow') {
     const message = producerHeldNotice({ connector: held.destination, reason: held.decision.reason, owner: held.decision.owner })
-    return { success: false, error: message, notPosted: { reason: 'producer-held', operation: type, message } }
+    // `producer-shadowed`, NOT `producer-held`: this verdict is PERMANENT for the row (its decision is not LIVE), so it keeps the terminal handling it had
+    // before the delivery hold existed (the ordinary retry accounting, which dead-letters it). Only `producer-held` below (the owner's confirmation absent or
+    // unread, which a later tick can clear) takes the no-attempt hand-back.
+    return { success: false, error: message, notPosted: { reason: 'producer-shadowed', operation: type, message } }
   }
 
   // THE PER-OPERATION DELIVERY GATE. The decision above said LIVE for this row, but a destination opened by an EARLIER step must not let a LATER step's

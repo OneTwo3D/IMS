@@ -64,7 +64,7 @@ test('PRE-EXISTING ROW, switch ON, no grant: handed back unsent as producer-held
   console.log(`# held (ungranted): result=${JSON.stringify(result)} threw=${threw} sent=${sent.length} fenced=${fenced}`)
   assert.equal(threw, null, 'PRECONDITION: the function returned (it did not run on into other machinery)')
   assert.equal(result!.success, false)
-  assert.equal(result!.notPosted?.reason, 'producer-held')
+  assert.equal(result!.notPosted?.reason, 'producer-shadowed')
   assert.match(String(result!.error), /^Not sent by IMS: writes to Xero are held on this installation/)
   assert.match(String(result!.error), /handed back unsent and is not sent while the hold stands/)
   assert.doesNotMatch(String(result!.error), /shadow record/, 'no shadow is recorded here, so none is claimed')
@@ -75,14 +75,14 @@ test('PRE-EXISTING ROW, switch ON, no grant: handed back unsent as producer-held
 test('PRE-EXISTING ROW that Xeroom owns, switch ON and FULLY GRANTED: still held (the grant does not make IMS the owner)', async () => {
   const { result, threw } = await run(GRANTED, 'SALES_INVOICE', { invoiceNumber: 'S-1', date: '2026-06-01' })
   assert.equal(threw, null)
-  assert.equal(result!.notPosted?.reason, 'producer-held')
+  assert.equal(result!.notPosted?.reason, 'producer-shadowed')
   assert.match(String(result!.error), /another writer owns this operation/)
   assert.deepEqual(sent, [])
 })
 
 test('PRE-EXISTING ROW dated BEFORE the live-from instant: held', async () => {
   const { result } = await run({ ...GRANTED, XERO_WRITES_LIVE_FROM: '2026-07-01T00:00:00Z' }, 'PURCHASE_INVOICE', BILL)
-  assert.equal(result?.notPosted?.reason, 'producer-held')
+  assert.equal(result?.notPosted?.reason, 'producer-shadowed')
   assert.match(String(result!.error), /happened before the live-from instant/)
 })
 
@@ -90,12 +90,14 @@ test('CONTROL, switch OFF: the processor goes PAST the gate (it is not held), so
   const { result, threw } = await run({}, 'PURCHASE_INVOICE', BILL)
   console.log(`# switch off: result=${JSON.stringify(result)?.slice(0, 120)} threw=${threw}`)
   assert.notEqual(result?.notPosted?.reason, 'producer-held')
+  assert.notEqual(result?.notPosted?.reason, 'producer-shadowed')
 })
 
 test('CONTROL, FULLY GRANTED, IMS-owned, dated after the cut-off: proceeds past the gate (granted => proceeds)', async () => {
   const { result, threw } = await run(GRANTED, 'PURCHASE_INVOICE', BILL)
   console.log(`# granted: result=${JSON.stringify(result)?.slice(0, 120)} threw=${threw}`)
   assert.notEqual(result?.notPosted?.reason, 'producer-held')
+  assert.notEqual(result?.notPosted?.reason, 'producer-shadowed')
 })
 
 test('STRUCTURAL: the manual retry asks the decision before it plans the revival and refuses a held row with the operator text (the daily-batch reset is driven in daily-batch-producer-seam.test.ts)', () => {

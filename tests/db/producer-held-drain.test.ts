@@ -160,9 +160,8 @@ for (const state of ['absent', 'unknown'] as const) {
           assert.ok(job, `drain ${drain}: the row has an outbox job, so the assertions below are about a real queue`)
           assert.equal(job.attempts, 0, `drain ${drain}: no attempt spent`)
           assert.notEqual(job.status, 'PERMANENT_FAILED', `drain ${drain}: never dead-lettered`)
-          assert.equal(job.status, 'RETRYABLE_FAILED', `drain ${drain}: handed back, retryable`)
+          assert.equal(job.status, 'PENDING', `drain ${drain}: left out of the candidate query, so untouched and still due`)
           assert.equal(job.lockedAt, null, `drain ${drain}: the job is not left claimed`)
-          assert.ok(job.nextAttemptAt && job.nextAttemptAt.getTime() - Date.now() <= 120_000 && job.nextAttemptAt.getTime() - Date.now() > 0, `drain ${drain}: a short fixed delay (1-2 minutes), not a growing back-off`)
           assert.equal(sync?.status, 'PENDING', `drain ${drain}: the sync-log row was never claimed`)
           assert.equal(sync?.processingStartedAt, null, `drain ${drain}: and never stamped as processing`)
           assert.equal(sync?.retryCount, 0)
@@ -266,6 +265,120 @@ test('XERO POST-CLAIM HAND-BACK of a producer-held row (the confirmation went aw
   assert.equal(after?.lockedAt, null)
   const delay = (after!.nextAttemptAt as Date).getTime() - before
   assert.ok(delay >= d.constants.PRODUCER_HELD_RETRY_DELAY_MS - 1000 && delay <= d.constants.PRODUCER_HELD_RETRY_DELAY_MS + 30_000, `deferred by the fixed producer-held delay (was ${delay} ms)`)
+})
+
+// ───────────────── Xero outbox runner: held jobs take no slot of the bounded batch, and are offered again once the hold lifts ─────────────────
+
+test('XERO OUTBOX RUNNER: more held jobs than a batch holds, OLDER than a deliverable one, do not take its slot; once the confirmation is recorded the held jobs are picked up', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupXero(d, tag))
+  posted.length = 0
+  const MAX_PER_RUN = 50
+  await withEnv({ ...xeroLive, XERO_ACCOUNTING_OUTBOX_ENABLED: 'true' }, async () => {
+    setAttestation(d, 'absent', XERO_ATTESTATION)
+    const heldNow = new Set<string>(d.seam.xeroHeldDeliveryTypes())
+    // The invoice note writes to WooCommerce, which is not enforced here, so only Xero's step-X confirmation could hold it and it does not.
+    const free = heldNow.has('WC_INVOICE_NOTE') ? null : 'WC_INVOICE_NOTE'
+    console.log(`# held types=${[...heldNow].join(',')} free=${free}`)
+    assert.ok(free, 'PRECONDITION: a queued type the confirmation does not hold exists, so "the deliverable job is reached" is a real contrast')
+    const heldRows = []
+    for (let i = 0; i < MAX_PER_RUN + 5; i++) heldRows.push(await seedXeroRow(d, `${tag}-held${i}`))
+    assert.notEqual(d.seam.xeroRowDeliveryHold({ type: 'COGS_JOURNAL' }), null, 'PRECONDITION: the journals are held')
+    const deliverable = await seedXeroRow(d, `${tag}-free`, free)
+    // Production queues the job with the row; the drain's own top-up only looks at the oldest MAX_PER_RUN rows, so queue them here as the producers do.
+    const { scheduleXeroAccountingOutbox } = await import('../../lib/connectors/xero/outbox.ts')
+    for (const row of [...heldRows, deliverable]) await scheduleXeroAccountingOutbox(d.db as never, { accountingSyncLogId: row.id, nextAttemptAt: new Date(Date.now() - 1000), attempts: 0, resetAttempts: true })
+    await d.processor.processPendingXeroSync()
+    const freeJob = await outboxOf(d, deliverable.id)
+    assert.ok(freeJob, 'the deliverable row has a job')
+    assert.notEqual(freeJob.status, 'PENDING', 'the deliverable job was reached although more than a batch of OLDER held jobs is queued')
+    const heldJobs = await Promise.all(heldRows.map((row) => outboxOf(d, row.id)))
+    for (const job of heldJobs) assert.deepEqual([job?.status, job?.attempts, job?.lockedAt], ['PENDING', 0, null], 'a held job is untouched: not claimed, not deferred, no attempt')
+    assert.deepEqual(posted, [])
+
+    // THE HOLD LIFTS: the same jobs are offered again with no intervention, and the oldest first.
+    setAttestation(d, 'present', XERO_ATTESTATION)
+    for (let drain = 0; drain < 3; drain++) await d.processor.processPendingXeroSync()   // a drain takes at most MAX_PER_RUN jobs
+    const after = await Promise.all(heldRows.map((row) => outboxOf(d, row.id)))
+    assert.ok(after.every((job) => job?.status === 'SUCCEEDED'), `CONTROL: once recorded every held job was picked up and delivered (${after.map((job) => job?.status).join(',')})`)
+    assert.equal(posted.length, heldRows.length)
+  })
+})
+
+// ───────────────── A permanent SHADOW verdict is not a hold: it must reach its terminal state as it did before the hold existed, and never cycle ─────────────────
+
+/** A row whose decision is SHADOW although its step is open and the confirmation recorded: dated before the live-from instant. */
+async function seedShadowRow(d: Deps, referenceId: string) {
+  const row = await seedXeroRow(d, referenceId)
+  await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { payload: { date: '2020-01-01', narration: referenceId, lines: [{ description: 'Inventory', accountCode: '630', debit: 16 }, { description: 'Allocated Inventory', accountCode: '631', credit: 16 }] } as never } })
+  return row
+}
+const handBackCommits = (d: Deps, syncLogId: string) => d.db.activityLog.count({ where: { entityId: syncLogId, action: 'xero_sync_transport_refusal_handback_committed' } })
+const producerHeldEvidence = (d: Deps, syncLogId: string) => d.db.activityLog.count({ where: { entityId: syncLogId, action: 'xero_sync_producer_held_before_post' } })
+
+test('XERO OUTBOX RUNNER, SHADOW verdict (open step, recorded confirmation): spends attempts and dead-letters as before the hold; no no-attempt hand-back, no per-tick evidence', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupXero(d, tag))
+  posted.length = 0
+  const row = await seedShadowRow(d, `${tag}-shadow`)
+  await withEnv({ ...xeroLive, XERO_ACCOUNTING_OUTBOX_ENABLED: 'true' }, async () => {
+    setAttestation(d, 'present', XERO_ATTESTATION)
+    assert.equal(d.seam.xeroRowDeliveryHold({ type: 'COGS_JOURNAL' }), null, 'PRECONDITION: nothing HOLDS this type, so the verdict below is the shadow arm')
+    const verdict = d.seam.xeroProducerSeamVerdict({ connector: 'xero', type: 'COGS_JOURNAL', payload: { date: '2020-01-01' } })
+    assert.equal(verdict.kind, 'shadow', 'PRECONDITION: the row is a shadow verdict')
+    let last: Awaited<ReturnType<typeof outboxOf>> = null
+    for (let drain = 1; drain <= 8; drain++) {
+      await d.processor.processPendingXeroSync()
+      last = await outboxOf(d, row.id)
+      assert.ok(last, `drain ${drain}: a job exists`)
+      if (last.status === 'PERMANENT_FAILED') break
+      assert.ok(last.attempts >= drain, `drain ${drain}: an attempt is SPENT each tick (it is not a free hand-back): attempts=${last.attempts}`)
+      await tickLater(d, row.id)
+    }
+    console.log(`# outbox shadow: job=${last?.status} attempts=${last?.attempts}`)
+    assert.equal(last?.status, 'PERMANENT_FAILED', 'dead-lettered, not cycling')
+    assert.ok((last?.attempts ?? 0) >= 1)
+    assert.equal(await handBackCommits(d, row.id), 0, 'never taken through the no-attempt hand-back')
+    assert.ok(await producerHeldEvidence(d, row.id) <= 5, 'evidence is bounded by the attempts, not written every tick for ever')
+    assert.deepEqual(posted, [], 'nothing was sent')
+  })
+})
+
+test('XERO DIRECT RUNNER, SHADOW verdict (open step, recorded confirmation): not handed back through the no-attempt path, however many drains; nothing sent', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupXero(d, tag))
+  posted.length = 0
+  const row = await seedShadowRow(d, `${tag}-shadow-direct`)
+  await withEnv({ ...xeroLive, XERO_ACCOUNTING_OUTBOX_ENABLED: 'false' }, async () => {
+    setAttestation(d, 'present', XERO_ATTESTATION)
+    for (let drain = 1; drain <= DRAINS; drain++) {
+      await d.processor.processPendingXeroSync()
+      assert.equal(await handBackCommits(d, row.id), 0, `drain ${drain}: never the no-attempt hand-back`)
+    }
+    assert.ok(await producerHeldEvidence(d, row.id) <= 1, 'the row is not re-offered every tick: at most the one evidence row')
+    assert.deepEqual(posted, [])
+  })
+})
+
+test('XERO DELIVERY HOLD vs SHADOW at the claim boundary: a held row is `producer-held` (waits, no attempt), a shadow verdict is `producer-shadowed`', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanupXero(d, tag))
+  const { claimHeldFrom } = await import('../../lib/domain/accounting/sync-claim-fence.ts')
+  const lease = { ...claimHeldFrom(new Date()), fenceBeforeRemoteWrite: async () => { throw new Error('the fence must not be reached') } } as never
+  const row = await seedXeroRow(d, `${tag}-claim`)
+  const run = (payload: object) => d.processor.processClaimedEntry(row.id, 'COGS_JOURNAL', 'ProducerHeldProbe', `${tag}-claim`, { _postingMode: 'submitted', ...payload } as never, lease, { id: row.id, attemptRevision: 1 } as never)
+  await withEnv({ ...xeroLive }, async () => {
+    setAttestation(d, 'absent', XERO_ATTESTATION)
+    const held = await run({ date: TODAY })
+    assert.equal(held.notPosted?.reason, 'producer-held', 'the owner has not confirmed: a hold')
+    setAttestation(d, 'present', XERO_ATTESTATION)
+    const shadow = await run({ date: '2020-01-01' })
+    assert.equal(shadow.notPosted?.reason, 'producer-shadowed', 'a row dated before the live-from instant is never delivered: not a hold')
+  })
 })
 
 // ───────────────────────────────────── WooCommerce: stock ─────────────────────────────────────
@@ -385,7 +498,7 @@ for (const state of ['absent', 'unknown'] as const) {
         const job = await outboxOf(d, row.id)
         const sync = await syncOf(d, row.id)
         assert.ok(job, `drain ${drain}: the note has an outbox job`)
-        assert.deepEqual([job.status, job.attempts, job.lockedAt, sync?.status, sync?.retryCount, sync?.processingStartedAt], ['RETRYABLE_FAILED', 0, null, 'PENDING', 0, null], `drain ${drain}`)
+        assert.deepEqual([job.status, job.attempts, job.lockedAt, sync?.status, sync?.retryCount, sync?.processingStartedAt], ['PENDING', 0, null, 'PENDING', 0, null], `drain ${drain}`)
         await tickLater(d, row.id)
       }
       setAttestation(d, 'present', XERO_ATTESTATION)

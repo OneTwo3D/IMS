@@ -85,7 +85,7 @@ test('SWITCH ON for WooCommerce, no grant: the note is handed back unsent as pro
   const { result, threw } = await run({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' })
   assert.equal(threw, null, 'PRECONDITION: the function returned (it did not run on into other machinery)')
   assert.equal(result!.success, false)
-  assert.equal(result!.notPosted?.reason, 'producer-held')
+  assert.equal(result!.notPosted?.reason, 'producer-shadowed')
   assert.match(String(result!.error), /^Not sent by IMS: writes to WooCommerce are held on this installation/)
   assert.deepEqual(sent, [])
   assert.equal(fenced, 0)
@@ -94,13 +94,14 @@ test('SWITCH ON for WooCommerce, no grant: the note is handed back unsent as pro
 test('SWITCH ON for XERO only: the note is not held by the Xero switch (its destination is WooCommerce)', async () => {
   const { result } = await run({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' })
   assert.notEqual(result?.notPosted?.reason, 'producer-held')
+  assert.notEqual(result?.notPosted?.reason, 'producer-shadowed')
 })
 
 test('SWITCH ON for WooCommerce, granted, live, but the note is dated BEFORE the live-from instant: held', async () => {
   const { result } = await run({
     PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: '2026-07-01T00:00:00Z', MINTSOFT_WRITES_LIVE_FROM: '2026-07-01T00:00:00Z', XERO_WRITES_LIVE_FROM: '2026-07-01T00:00:00Z',
   }, noteChain('2026-06-01'))
-  assert.equal(result?.notPosted?.reason, 'producer-held')
+  assert.equal(result?.notPosted?.reason, 'producer-shadowed')
   assert.match(String(result?.error), /the business event happened before the live-from instant/, 'held for the RIGHT reason: the invoice predates the instant, not a missing chain')
   assert.deepEqual(sent, [])
   assert.equal(fenced, 0)
@@ -110,7 +111,7 @@ test('SWITCH ON for WooCommerce, granted, live: a note with NO chain is held wha
   const { result } = await run({
     PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z', MINTSOFT_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z', XERO_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z',
   }, { referenceId: 'order-1', date: '2026-06-01' })
-  assert.equal(result?.notPosted?.reason, 'producer-held')
+  assert.equal(result?.notPosted?.reason, 'producer-shadowed')
   assert.match(String(result?.error), /needs the time of its business event/)
   assert.deepEqual(sent, [])
 })
@@ -118,6 +119,7 @@ test('SWITCH ON for WooCommerce, granted, live: a note with NO chain is held wha
 test('CONTROL, switch OFF: the processor goes PAST the gate, so the held arms are not passing because nothing can pass', async () => {
   const { result } = await run({})
   assert.notEqual(result?.notPosted?.reason, 'producer-held')
+  assert.notEqual(result?.notPosted?.reason, 'producer-shadowed')
 })
 
 test('CONTROL, WooCommerce granted and live, note whose invoice is dated after the instant: past the gate', async () => {
@@ -125,4 +127,5 @@ test('CONTROL, WooCommerce granted and live, note whose invoice is dated after t
     PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z', MINTSOFT_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z', XERO_WRITES_LIVE_FROM: '2020-01-01T00:00:00Z',
   }, noteChain('2026-06-01'))
   assert.notEqual(result?.notPosted?.reason, 'producer-held')
+  assert.notEqual(result?.notPosted?.reason, 'producer-shadowed')
 })

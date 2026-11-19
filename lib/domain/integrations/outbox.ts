@@ -445,6 +445,22 @@ export async function wooAccountingPostJobIds(now: Date): Promise<string[]> {
 }
 
 /**
+ * THE QUEUED `xero/accounting.post` JOBS WHOSE SYNC ROW HAS ONE OF THE GIVEN TYPES, by ONE SQL statement (a join on the sync row's type). The Xero outbox
+ * runner passes the jobs of the types the owner's confirmation still holds as `excludeIds`, so a held job never takes a slot of the bounded candidate window.
+ * Nothing is remembered: the set is read again by every drain, so a job is offered again on the first drain after its type stops being held.
+ */
+export async function accountingPostJobIdsForSyncTypes(types: readonly string[]): Promise<string[]> {
+  if (types.length === 0) return []
+  const rows = await db.$queryRaw<Array<{ id: string }>>`
+    SELECT o.id FROM integration_outbox o
+    JOIN accounting_sync_logs s ON s.id = o."payloadJson"->>'accountingSyncLogId'
+    WHERE o.connector = ${ACCOUNTING_POST_JOB.connector} AND o.operation = ${ACCOUNTING_POST_JOB.operation}
+      AND o.status IN ('PENDING', 'RETRYABLE_FAILED', 'PROCESSING')
+      AND s.type::text = ANY(${[...types]})`
+  return rows.map((row) => row.id)
+}
+
+/**
  * The floor of ONE operation of a vendor connector. WooCommerce operations are floored by the instant of the operation's own step (found through the
  * ownership map); every other connector, and a WooCommerce operation the map does not name, by the connector's own destination-level floor.
  */

@@ -195,11 +195,12 @@ test('A parent of the right type from another reference or another connector bre
       console.log(`# claim boundary, ${label}: ${JSON.stringify(claimed.result)} threw=${claimed.threw}`)
       if (live) {
         assert.notEqual(claimed.result?.notPosted?.reason, 'producer-held', `${label}: passes the claim boundary`)
+        assert.notEqual(claimed.result?.notPosted?.reason, 'producer-shadowed', `${label}: passes the claim boundary`)
         assert.notEqual(claimed.result?.notPosted?.reason, 'before-cutoff', `${label}: and the cut-off check`)
       }
       else {
         assert.equal(claimed.threw, null, `${label}: handed back, not run on`)
-        assert.equal(claimed.result?.notPosted?.reason, 'producer-held', `${label}: held at the claim boundary`)
+        assert.equal(claimed.result?.notPosted?.reason, 'producer-shadowed', `${label}: held at the claim boundary`)
       }
     }
   })
