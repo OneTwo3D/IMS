@@ -7,10 +7,24 @@ test('strict key lower-cases and trims', () => {
   assert.equal(normaliseIdentityEmail('  Jane.Doe@Example.COM \n'), 'jane.doe@example.com')
 })
 
-test('strict key NFC-normalises', () => {
-  const decomposed = 'josé@example.com'
-  assert.equal(normaliseIdentityEmail(decomposed), 'josé@example.com')
-  assert.equal(normaliseIdentityEmail(decomposed), normaliseIdentityEmail('JOSÉ@example.com'))
+test('strict key NFC-normalises (decomposed and composed spellings are one key)', () => {
+  const decomposed = 'jose\u0301@example.com'
+  const composed = 'jos\u00e9@example.com'
+  assert.equal(normaliseIdentityEmail(decomposed), composed)
+  assert.equal(normaliseIdentityEmail(decomposed), normaliseIdentityEmail(composed))
+  assert.equal(normaliseIdentityEmail('\u212Aelvin@example.com'), 'kelvin@example.com', 'the Kelvin sign composes to K, then lower-cases')
+})
+
+test('lower-casing is ASCII only (the SQL twin lower-cases ASCII only), so a non-ASCII capital is NOT folded', () => {
+  assert.equal(normaliseIdentityEmail('JOS\u00c9@Example.com'), 'jos\u00c9@example.com')
+  assert.notEqual(normaliseIdentityEmail('JOS\u00c9@example.com'), normaliseIdentityEmail('jos\u00e9@example.com'))
+})
+
+test('strict key trims every Unicode white-space character at the ends, and rejects internal white space', () => {
+  for (const ws of ['\t', '\n', '\r', '\v', '\f', '\u00a0', '\u2003', '\u3000', '\ufeff', '\u2028']) {
+    assert.equal(normaliseIdentityEmail(`${ws}jane@example.com${ws}`), 'jane@example.com', JSON.stringify(ws))
+    assert.equal(normaliseIdentityEmail(`ja${ws}ne@example.com`), null, JSON.stringify(ws))
+  }
 })
 
 test('strict key is null for null, undefined, empty and blank', () => {

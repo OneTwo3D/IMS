@@ -1,10 +1,16 @@
 /**
  * Customer identity email key (CRM foundation). Pure functions, no I/O.
  *
- * `normaliseIdentityEmail` is the STRICT key: NFC, trim, lower-case the whole address. Two customers with the same strict key are the
- * same person unless they carry different WooCommerce ids or are anonymised (that rule lives in the resolver, not here).
+ * `normaliseIdentityEmail` is the STRICT key: NFC, trim (every Unicode white-space character), ASCII lower-case. `looseIdentityEmail` additionally folds a
+ * `+tag` and, for gmail.com / googlemail.com, dots. The cluster resolver (lib/domain/crm/cluster-resolver.ts) JOINS two customers whose LOOSE keys are equal
+ * (owner decisions 2026-11-18 and 2026-11-19: the folded forms are aliases of one mailbox, so they are one person, whatever storefront ids they carry;
+ * an operator UNMERGE overrides). The strict key is used by reports and the company-domain key.
  *
- * `looseIdentityEmail` additionally folds plus-tags and gmail dots. It is for SUGGESTIONS only and must never merge anything on its own.
+ * LOWER-CASING IS ASCII ONLY, on purpose. The database finds candidates with the SQL twin of this fold (function crm_loose_identity_key, migration
+ * 20261119140100), and PostgreSQL's lower() under the "C" collation is ASCII only and byte-deterministic; a Unicode lower-case here would make the two
+ * disagree for a non-ASCII address and an erasure could miss a record. Everything else (NFC, white space, the folds) is identical on both sides, and
+ * tests/db/crm-identity.test.ts holds them to the same answers. Domain names that carry non-ASCII letters travel as punycode (ASCII), so this loses nothing in
+ * practice.
  */
 import { isPlaceholderEmail } from '@/lib/connectors/woocommerce/sync/anonymisation'
 
@@ -13,7 +19,7 @@ const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com'])
 /** The identity key of an email address, or null when it is empty, malformed (not exactly one `@`, internal whitespace) or a placeholder. */
 export function normaliseIdentityEmail(input: string | null | undefined): string | null {
   if (typeof input !== 'string') return null
-  const key = input.normalize('NFC').trim().toLowerCase()
+  const key = input.normalize('NFC').trim().replace(/[A-Z]/g, (ch) => ch.toLowerCase())
   if (key === '') return null
   if (/\s/u.test(key)) return null
   const parts = key.split('@')

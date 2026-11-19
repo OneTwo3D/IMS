@@ -53,7 +53,7 @@ test('PRECONDITION: the real tree is green, and the census reached every part of
   assert.ok(scan.filesScanned >= 800)
   assert.equal(report.counts.seamFunctions, WOO_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamFunctionsConsulting, WOO_SEAM_FUNCTIONS.length)
-  assert.equal(report.counts.transportWrites, 6, 'wcPost, wcPut, the FX push, the FX probe, the partial-shipment push and the TrackShip re-fire')
+  assert.equal(report.counts.transportWrites, 7, 'wcPost, wcPut, the FX push, the FX probe, the partial-shipment push, the TrackShip re-fire and the withdrawal outcome')
   assert.ok(report.counts.transportSites > report.counts.transportWrites, 'the reads were seen too, and are not writes')
   assert.equal(report.counts.outboxEnqueueSites, 6)
   assert.equal(report.counts.mapOperationsGoverned, report.counts.mapOperations)

@@ -509,6 +509,11 @@ export type WmsOrderPushInput = {
   totalVat: number
   shippingExVat: number
   shippingVat: number
+  /**
+   * The shipping VAT derived from the stored order (its tax minus the tax of every line), when that is positive. NEVER sent as it stands: a connector
+   * sends it as `shippingVat` only behind its own setting (Mintsoft: `mintsoft_send_shipping_vat`, default off), so `shippingVat` stays 0 until then.
+   */
+  shippingVatDerived?: number
   discountExVat: number
   discountVat: number
   lines: WmsOrderPushLine[]

@@ -23,6 +23,7 @@ The overlapping user manuals in `docs/` should be symlinks back to this director
 - [Products: Edit by CSV](products.md) — change many products through a spreadsheet
 - [Stock Control](stock-control.md) — adjustments and transfers
 - [Sales Orders](sales.md) — order workflow, allocation, shipments, refunds
+- [Customers: one person, one timeline](customers.md) — joined customer records, company grouping, the customer timeline
 - [Purchasing](purchasing.md) — purchase orders, receiving, suppliers
 - [Manufacturing](manufacturing.md) — build orders and BOMs
 - [Warehouse (Mintsoft)](warehouse.md) — orders, despatch, ASNs, stock sync and exceptions with the Mintsoft warehouse

@@ -1601,7 +1601,7 @@ async function processMintsoftProductChunk(params: {
               ? 'skip'
               : null
         if (result.content.kind === 'sent') contentCounters.sent += result.content.fields.length
-        if (result.content.kind === 'shadow') contentCounters.shadowed += 1
+        if (result.content.kind === 'shadow' || ((result.content.kind === 'sent' || result.content.kind === 'held') && result.content.shadowedFields.length > 0)) contentCounters.shadowed += 1
         if (result.content.kind === 'held') contentCounters.held += 1
         if (logAction) {
           params.logs.push({

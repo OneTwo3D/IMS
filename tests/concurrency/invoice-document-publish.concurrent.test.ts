@@ -109,6 +109,8 @@ async function setup() {
     import('../../lib/connectors/woocommerce/sync/invoice-document'),
     import('../../lib/connectors/woocommerce/sync/invoice-note'),
   ])
+  // The note has its OWN switch (default off); the note tests below are about its idempotency, so it is on here. The off arm sets it back.
+  await db.setting.upsert({ where: { key: 'wc_invoice_note_enabled' }, create: { key: 'wc_invoice_note_enabled', value: 'true' }, update: { value: 'true' } })
   return { db, service, jobs, writer, note }
 }
 type Deps = Awaited<ReturnType<typeof setup>>
@@ -565,4 +567,30 @@ test('TWO CONCURRENT DRAINS WRITE ONCE (repeated: one pass proves nothing about 
       assert.equal(mine.length, 1, `round ${round}: exactly one write (${JSON.stringify([a.succeeded, b.succeeded])})`)
     })
   }
+})
+
+test('THE NOTE HAS ITS OWN SWITCH, OFF BY DEFAULT: with wc_invoice_note_enabled unset, empty or anything but "true" no note and no meta is sent, whatever the Xero mode says (MUTATION: read xero_sync_sales_invoice instead => red)', { skip }, async (t) => {
+  const d = await setup()
+  resetTransport()
+  const order = await seedOrder(d, { stored: false, accountingInvoiceId: `acct-${randomUUID().slice(0, 8)}` })
+  t.after(async () => {
+    await d.db.setting.upsert({ where: { key: 'wc_invoice_note_enabled' }, create: { key: 'wc_invoice_note_enabled', value: 'true' }, update: { value: 'true' } })
+    await d.db.setting.deleteMany({ where: { key: { in: ['accounting_invoice_url_template', 'xero_sync_sales_invoice'] } } })
+    await cleanup(d, [order.id])
+  })
+  await d.db.setting.upsert({ where: { key: 'accounting_invoice_url_template' }, create: { key: 'accounting_invoice_url_template', value: 'https://acct.example.test/{id}' }, update: { value: 'https://acct.example.test/{id}' } })
+  await d.db.setting.upsert({ where: { key: 'xero_sync_sales_invoice' }, create: { key: 'xero_sync_sales_invoice', value: 'submitted' }, update: { value: 'submitted' } })
+  for (const value of [null, '', 'yes', '1', 'TRUE']) {
+    if (value === null) await d.db.setting.deleteMany({ where: { key: 'wc_invoice_note_enabled' } })
+    else await d.db.setting.upsert({ where: { key: 'wc_invoice_note_enabled' }, create: { key: 'wc_invoice_note_enabled', value }, update: { value } })
+    const result = await d.note.pushInvoiceNoteToWc(order.id)
+    assert.equal(result.success, false, String(value))
+    assert.match(result.error ?? '', /switched off/)
+  }
+  assert.equal(transport.posts.length, 0, 'no note')
+  assert.equal(transport.puts.length, 0, 'no meta')
+  assert.equal(await d.db.invoiceStorePublication.count({ where: { orderId: order.id } }), 0, 'no marker')
+  await d.db.setting.upsert({ where: { key: 'wc_invoice_note_enabled' }, create: { key: 'wc_invoice_note_enabled', value: 'true' }, update: { value: 'true' } })
+  assert.equal((await d.note.pushInvoiceNoteToWc(order.id)).success, true, 'on: written, as before')
+  assert.equal(transport.posts.length, 1)
 })
