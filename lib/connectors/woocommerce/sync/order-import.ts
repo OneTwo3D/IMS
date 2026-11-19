@@ -3939,6 +3939,14 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // The order now exists: only here is the unmatched-line warning logged (a refused import must not consume its dedupe key).
     await logWcUnmatchedLines(mappedLines, { orderId: wcOrder.id, orderNumber: wcOrder.number, salesOrderId: so.id })
 
+    // Customer e-mail for a storefront order that IMS sends (o3d-zvec.24, switch `storefront_customer_email_enabled`, default OFF: with it off this does
+    // nothing but read the switch). The confirmation is queued once per order, only for an order placed recently (an import back-fill is not announced),
+    // never throws, and does not run for an order created erased.
+    if (!customerErasedDuringImport) {
+      const { queueStorefrontConfirmationIfEligible } = await import('@/lib/storefront-customer-email')
+      await queueStorefrontConfirmationIfEligible(so.id)
+    }
+
     if (customerErasedDuringImport) {
       // Recorded without any identity: the order id, the customer's surrogate id, and what was done.
       await logActivity({

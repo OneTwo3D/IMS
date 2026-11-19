@@ -2414,7 +2414,27 @@ export async function processPendingEmailOutbox(
     email: { id: string; kind: string; referenceType: string | null; referenceId: string | null },
     reason: string,
   ): Promise<void> => {
-    if (email.referenceType !== 'PurchaseOrder' || !email.referenceId) return
+    if (!email.referenceId) return
+    // A STOREFRONT CUSTOMER E-MAIL (o3d-zvec.24, the only SalesOrder kind prepared as a single send) is a single send: its unknown outcome is shown ON THE ORDER, at WARNING, so an operator checks with the
+    // customer before re-sending it by hand (the automatic path never queues the same e-mail again).
+    if (email.referenceType === 'SalesOrder') {
+      try {
+        await log({
+          entityType: 'SALES_ORDER',
+          entityId: email.referenceId,
+          action: 'email_outcome_unknown',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Customer e-mail (${email.kind}): ${reason} It was not retried. Check with the customer before sending it again.`,
+          metadata: { emailOutboxId: email.id, kind: email.kind },
+          resolveUser: false,
+        })
+      } catch (logError) {
+        console.error('[email-outbox] failed to record an unknown outcome on the sales order:', logError)
+      }
+      return
+    }
+    if (email.referenceType !== 'PurchaseOrder') return
     try {
       await log({
         entityType: 'PURCHASE_ORDER',

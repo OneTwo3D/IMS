@@ -9,6 +9,7 @@ import {
   EVIDENCE_KIND_STEP,
   PHASE_OF_LIVE_STEP,
   STEP_ATTESTATION_BEFORE_STEP,
+  STEP_REPORT_TRIGGER_BEFORE_STEP,
   STEP_EVIDENCE_ATTESTATION_KIND,
   STEP_EVIDENCE_KINDS,
   STEP_EVIDENCE_LABEL,
@@ -520,6 +521,28 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
         else if (stepRead?.read.ok && attestedMs > stepRead.read.ms) {
           findings.push({ code: 'attestation-missing', severity: 'fail', subject: kind, message: `${STEP_EVIDENCE_LABEL[kind]} was recorded after ${stepRead.name}: IMS went live before the incumbent was confirmed stopped.` })
         }
+        // A host report carries its own facts: what it shows is not clean, or the incumbent last triggered at or after the step's live-from instant.
+        if (reading.violations !== undefined && reading.violations.length > 0) {
+          findings.push({ code: 'step-evidence-violation', severity: 'fail', subject: kind, message: `${STEP_EVIDENCE_LABEL[kind]} reports: ${reading.violations.join(', ')}.` })
+        }
+        const triggerStep = STEP_REPORT_TRIGGER_BEFORE_STEP[kind]
+        if (triggerStep !== undefined) {
+          const triggerRead = stepReads.find((entry) => entry.step === triggerStep)
+          if (reading.lastTriggerAt === undefined || reading.violations === undefined) {
+            // A host report that does not say what it showed is not a pass.
+            unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} carries no report facts (units, last trigger), so nothing can be shown from it.`)
+          } else if (reading.lastTriggerAt !== null) {
+            const triggerMs = Date.parse(reading.lastTriggerAt)
+            if (!triggerRead?.read.ok) {
+              // The instant it is judged against cannot be read: no verdict on the trigger, so no pass (the live-from itself is reported separately).
+              unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} cannot be judged: the live-from instant of ${triggerStep} is not readable, so the last trigger cannot be compared with it.`)
+            } else if (!Number.isFinite(triggerMs)) {
+              unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} carries a last-trigger time that cannot be read.`)
+            } else if (triggerMs >= triggerRead.read.ms) {
+              findings.push({ code: 'step-evidence-violation', severity: 'fail', subject: kind, message: `${STEP_EVIDENCE_LABEL[kind]} shows a trigger at ${reading.lastTriggerAt}, not before ${triggerRead.name}: the incumbent was still running when IMS went live.` })
+            }
+          }
+        }
         break
       }
       case 'counted':
@@ -647,7 +670,7 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
 
   // Never throws: a reader that fails answers `unreadable` for its own kind.
   const { readStepEvidence } = await import('@/lib/ops/writers-check-step-evidence')
-  base.stepEvidence = await readStepEvidence({ db: db as never, now })
+  base.stepEvidence = await readStepEvidence({ db: db as never, now, env })
 
   const floors = evidenceFloors(env, now, windowDays)
   try {

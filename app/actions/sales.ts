@@ -2727,6 +2727,12 @@ export async function applySalesOrderStatusTransition(
       const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
       await queueDispatchEmailIfEligible(id)
     }
+    // Storefront orders (o3d-zvec.24, switch `storefront_customer_email_enabled`, default off): the delivered e-mail, once per order. Self-guarded
+    // (status DELIVERED, a recent despatch, dedup under the order row lock) and never throws.
+    if (targetStatus === 'DELIVERED') {
+      const { queueStorefrontDeliveredEmailIfEligible } = await import('@/lib/storefront-customer-email')
+      await queueStorefrontDeliveredEmailIfEligible(id)
+    }
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${id}`)
