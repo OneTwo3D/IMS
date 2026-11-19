@@ -11,11 +11,11 @@ const S = new Date('2027-01-04T00:00:00.000Z')
 // ---------------------------------------------------------------- gap list
 test('the gap list asks for paid-before-S, unlinked, still-wanted orders and for SHIPPED orders despatched before S, and carries no customer data', async () => {
   const wheres: unknown[] = []
-  const db = { salesOrder: { findMany: async (args: { where: Record<string, unknown>; select: Record<string, unknown> }) => { wheres.push(args); return [{ id: 'o1', orderNumber: 'N1', externalOrderNumber: 'W1', paidAt: new Date('2027-01-03T00:00:00Z'), shippedAt: new Date('2027-01-03T12:00:00Z'), shoppingLinks: [{ externalOrderId: '501' }] }] } } }
+  const db = { salesOrder: { findMany: async (args: { where: Record<string, unknown>; select: Record<string, unknown>; orderBy?: unknown }) => { wheres.push(args); return [{ id: 'o1', orderNumber: 'N1', externalOrderNumber: 'W1', paidAt: new Date('2027-01-03T00:00:00Z'), shippedAt: new Date('2027-01-03T12:00:00Z'), shoppingLinks: [{ externalOrderId: '501' }] }] } } }
   const gaps = await listSwitchoverGaps({ since: S, db, readStorefront: async () => ({ status: 'processing', trackingItems: 0 }), pauseMs: 0 })
   assert.deepEqual(gaps.create.map((g) => [g.kind, g.reference]), [['G_create', 'N1']])
   assert.deepEqual(gaps.despatch.map((g) => [g.kind, g.reference]), [['G_despatch', 'N1']])
-  const [createArgs, despatchArgs] = wheres as Array<{ where: Record<string, unknown>; select: Record<string, unknown> }>
+  const [createArgs, despatchArgs] = wheres as Array<{ where: Record<string, unknown>; select: Record<string, unknown>; orderBy?: unknown }>
   assert.deepEqual(createArgs!.where.paidAt, { not: null, lt: S }, 'paid before S')
   assert.deepEqual(createArgs!.where.status, { in: ['PROCESSING', 'ALLOCATED'] }, 'the create fences are the push sweep\'s own')
   assert.equal(createArgs!.where.withdrawalHoldAt, null)
@@ -23,7 +23,8 @@ test('the gap list asks for paid-before-S, unlinked, still-wanted orders and for
   assert.ok(JSON.stringify(createArgs!.where.OR).includes('"wmsOrderPush":{"is":null}'), 'unlinked')
   assert.equal(despatchArgs!.where.status, 'SHIPPED')
   assert.deepEqual(Object.keys(createArgs!.select).sort(), ['externalOrderNumber', 'id', 'orderNumber', 'paidAt', 'shippedAt'])
-  assert.deepEqual(despatchArgs!.where.OR, [{ shippedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }, { shippedAt: null, createdAt: { lt: S }, updatedAt: { gte: new Date(S.getTime() - 14 * 86_400_000) } }], 'despatched before S, inside the look-back window; a row with no shippedAt (created before S, even long before the window) is bounded by updatedAt in the window')
+  assert.deepEqual(despatchArgs!.where.OR, [{ shippedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lt: S } }, { shippedAt: null, createdAt: { lt: S }, updatedAt: { gte: new Date(S.getTime() - 14 * 86_400_000), lte: S } }], 'despatched before S, inside the look-back window; a row with no shippedAt (created before S, even long before the window) is bounded by updatedAt in the window AND at S (a later sweep or erasure bumping old rows is not a gap)')
+  assert.deepEqual(despatchArgs!.orderBy, [{ shippedAt: { sort: 'asc', nulls: 'first' } }, { id: 'asc' }], 'a truncation drops the newest dated rows, never the rows with no shippedAt')
   assert.deepEqual(despatchArgs!.where.refundStatus, { not: 'FULL' })
   assert.equal(gaps.truncated, false)
 })

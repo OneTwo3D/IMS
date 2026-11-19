@@ -185,3 +185,32 @@ test('[db] R3 LOW: the hold generation moves only on a real new submission, not 
   assert.equal(await generation(), afterSubmission + 1)
   answer = '{"ok":true,"result":"noted"}'
 })
+
+test('[db] R1 LOW 3: where the payload carries the plugin\'s done-markers, the echo is recognised by CONTENT (the newest marker is a row IMS wrote); a marker IMS has no row for is no echo, however close another row is in time', { skip }, async (t) => {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
+  const { db } = await import('@/lib/db')
+  const { handleWcWithdrawalStatus } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+  const RUN = `wdk${randomUUID().slice(0, 8)}`
+  const order = await db.salesOrder.create({ data: { orderNumber: RUN, status: 'SHIPPED', currency: 'GBP', subtotalForeign: 1, totalForeign: 1, subtotalBase: 1, totalBase: 1, withdrawalHoldGeneration: 1 }, select: { id: true } })
+  t.after(async () => { await db.wmsOperatorTask.deleteMany({ where: { orderId: order.id } }); await db.activityLog.deleteMany({ where: { entityId: order.id } }); await db.salesOrder.delete({ where: { id: order.id } }) })
+  const kind = 'wc_withdrawal_hold_applied'
+  const known = `wdo:4849:u:${order.id}:${kind}`
+  const wc = (modified: string, markers: string[]) => ({ id: 4849, status: 'pending-wdraw', date_modified_gmt: modified, meta_data: [{ id: 1, key: '_oti_wdraw_outcome_keys', value: markers }] }) as never
+  const row = (over: object = {}) => ({ id: order.id, status: 'SHIPPED', externalOrderNumber: null, withdrawalHoldAt: null, withdrawalApprovedAt: null, ...over })
+  const generation = async () => (await db.salesOrder.findUniqueOrThrow({ where: { id: order.id }, select: { withdrawalHoldGeneration: true } })).withdrawalHoldGeneration
+  const base = Date.now() - 600_000
+  const iso = (offsetMs: number) => new Date(base + offsetMs).toISOString().replace('Z', '')
+  answer = '{"ok":true,"result":"rejected"}'
+  await handleWcWithdrawalStatus(wc(iso(0), []), row())
+  const afterSubmission = await generation()
+  await db.wcWithdrawalOutcome.create({ data: { orderId: order.id, requestKey: `u:${order.id}`, outcomeKind: kind, result: 'noted', writtenAt: new Date(base + 3_000), holdGeneration: afterSubmission } })
+  // The newest marker is the row IMS wrote: an echo.
+  await handleWcWithdrawalStatus(wc(iso(2_000), [`n:${known}`]), row())
+  assert.equal(await generation(), afterSubmission, 'the marker names IMS\'s own row: echo, generation unmoved')
+  // The newest marker is one IMS has NO row for (a foreign or other-path save), though the time sits inside the window of the real row: not an echo.
+  await handleWcWithdrawalStatus(wc(iso(2_500), ['n:wdo:4849:r999:wc_withdrawal_hold_applied']), row())
+  assert.equal(await generation(), afterSubmission + 1, 'content decides: an unknown marker is a new submission, the time window is only the fallback')
+  answer = '{"ok":true,"result":"noted"}'
+})

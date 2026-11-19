@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.5.1
+ * Version:     1.5.2
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -932,6 +932,9 @@ const OTI_WDRAW_OUTCOME_ON_OPT    = 'oti_withdrawal_outcome_enabled';
 // ONE option per order (`oti_wdraw_req_<order id>` => request id), autoload off, deleted with the order. Not one shared map: a read-modify-write of a
 // shared map loses an entry when two submissions land together (update_option has no compare-and-set); a per-order key has no shared state to lose.
 const OTI_WDRAW_REQUEST_ID_OPT_PREFIX = 'oti_wdraw_req_';
+// The order statuses (without the `wc-` prefix) that can carry a withdrawal request: WebToffee's defaults, filterable (`oti_wdraw_statuses`) for a store that renamed them.
+// An order response looks the request id up ONLY for these (or for an order IMS already wrote an outcome marker on), so a normal order costs no query.
+const OTI_WDRAW_STATUSES = ['pending-wdraw', 'withdrawn'];
 
 if (!function_exists('oti_verify_incumbents_signature')) {
     /**
@@ -1122,7 +1125,7 @@ if (!function_exists('oti_handle_incumbents')) {
         }
         return new WP_REST_Response([
             'ok'            => true,
-            'plugin_version' => '1.5.1',
+            'plugin_version' => '1.5.2',
             'generated_at'  => time(),
             'bridge'        => [
                 'slug'                   => OTI_BRIDGE_PLUGIN_SLUG,
@@ -1223,10 +1226,16 @@ if (!function_exists('oti_capture_wdraw_request')) {
 }
 
 if (!function_exists('oti_wdraw_request_id_for_order')) {
-    /** The captured withdrawal request id of an order (0 when none). A read; never writes. */
+    /**
+     * The captured withdrawal request id of an order (0 when none). A read; never writes. It is a single-row SELECT on the options table, NOT get_option():
+     * get_option() records every MISS in the one shared `notoptions` cache array, which would grow by an entry per order read through REST.
+     */
     function oti_wdraw_request_id_for_order($order_id)
     {
-        return absint(get_option(OTI_WDRAW_REQUEST_ID_OPT_PREFIX . absint($order_id), 0));
+        global $wpdb;
+        $name = OTI_WDRAW_REQUEST_ID_OPT_PREFIX . absint($order_id);
+        $value = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1", $name));
+        return absint($value);
     }
 }
 
@@ -1235,11 +1244,26 @@ if (!function_exists('oti_expose_wdraw_request_id')) {
      * Put the captured request id into the order's REST response (and so its webhook payload) as a TOP-LEVEL field `_oti_wdraw_request_id`, which is where IMS
      * reads it. NOT a meta_data entry: a client that round-trips meta_data in a PUT would persist a meta entry as real order meta, and a stale id could stick.
      * A response filter: nothing is stored on the order.
+     *
+     * NO LOOKUP unless the capture switch is on AND the order is in a withdrawal status (or already carries IMS's outcome markers, which is how a request IMS
+     * has rejected, and which has left the withdrawal status, stays visible): every other order response costs nothing.
      */
     function oti_expose_wdraw_request_id($response, $order = null)
     {
-        $request_id = ($order && method_exists($order, 'get_id')) ? oti_wdraw_request_id_for_order($order->get_id()) : 0;
-        if (!$request_id || !is_object($response) || !isset($response->data) || !is_array($response->data)) {
+        if (!is_object($response) || !isset($response->data) || !is_array($response->data) || !is_object($order) || !method_exists($order, 'get_id')) {
+            return $response;
+        }
+        if (get_option(OTI_WDRAW_OUTCOME_ON_OPT, '') !== 'yes') {
+            return $response;
+        }
+        $statuses = apply_filters('oti_wdraw_statuses', OTI_WDRAW_STATUSES);
+        $status = method_exists($order, 'get_status') ? (string) $order->get_status() : '';
+        $has_marker = method_exists($order, 'get_meta') && is_array($order->get_meta('_oti_wdraw_outcome_keys')) && count($order->get_meta('_oti_wdraw_outcome_keys')) > 0;
+        if (!$has_marker && !(is_array($statuses) && in_array($status, $statuses, true))) {
+            return $response;
+        }
+        $request_id = oti_wdraw_request_id_for_order($order->get_id());
+        if (!$request_id) {
             return $response;
         }
         $response->data['_oti_wdraw_request_id'] = (int) $request_id;
@@ -1249,16 +1273,21 @@ if (!function_exists('oti_expose_wdraw_request_id')) {
 }
 
 if (!function_exists('oti_forget_wdraw_request')) {
-    /** Cleanup: an order that is deleted leaves the map. */
+    /** Cleanup: an order that is deleted leaves the map. delete_option on an absent option is one SELECT and records nothing in `notoptions`. */
     function oti_forget_wdraw_request($order_id)
     {
-        $option = OTI_WDRAW_REQUEST_ID_OPT_PREFIX . absint($order_id);
-        if (get_option($option, null) !== null) {
-            delete_option($option);
+        delete_option(OTI_WDRAW_REQUEST_ID_OPT_PREFIX . absint($order_id));
+    }
+    /** The same, for a legacy (post-backed) order: delete_post fires for EVERY post type, so only an order type is looked at. */
+    function oti_forget_wdraw_request_for_post($post_id)
+    {
+        $type = get_post_type($post_id);
+        if ($type === 'shop_order' || $type === 'shop_order_placehold') {
+            oti_forget_wdraw_request($post_id);
         }
     }
     add_action('woocommerce_delete_order', 'oti_forget_wdraw_request', 10, 1);
-    add_action('delete_post', 'oti_forget_wdraw_request', 10, 1);
+    add_action('delete_post', 'oti_forget_wdraw_request_for_post', 10, 1);
 }
 
 if (!function_exists('oti_handle_withdrawal_outcome')) {

@@ -6754,7 +6754,15 @@ export async function processClaimedEntry(
       if (!fence.ok) return fence.result
       const wcResult = await pushInvoiceNoteToWc(orderId)
       // Switched off since it was queued: settled as skipped (a terminal outcome with an operator notice), never retried to FAILED.
-      if (wcResult.skipped) return { success: true, skipped: true }
+      // The warning was written by the writer; the row is retired HERE, claim-fenced, so it is terminal (CANCELLED, not PROCESSING): nothing re-claims it after the stale
+      // window, and turning the switch back on does not bring the note back. A lost claim retires nothing and the new holder decides.
+      if (wcResult.skipped) {
+        await db.accountingSyncLog.updateMany({
+          where: { ...heldClaimWhere(entryId, lease), externalTransactionId: null },
+          data: { status: 'CANCELLED', errorMessage: 'WC_INVOICE_NOTE not sent: the WooCommerce invoice note switch is off. The row was retired and will not be retried.', processingStartedAt: null },
+        })
+        return { success: true, skipped: true }
+      }
       // The customer download flag is NOT written here: it is the separate operation order.invoice-document, written only by its guarded
       // outbox job (cut-off, claim, deadline and hold checks), never by this follow-up.
       return wcResult.success ? { success: true } : { success: false, error: wcResult.error ?? 'Failed to notify WooCommerce about invoice' }

@@ -27,6 +27,11 @@ import { validateWooCommerceBaseUrl } from '../url-safety'
 import { wooDrainHold, wooEgressHold } from '../producer-egress'
 import { explainProducerDisposition, type ProducerDecisionContext } from '@/lib/security/producer-disposition'
 
+/** The idempotency key IMS sends for an outcome, and the one the plugin stores (as `n:<key>` / `r:<key>`) in its done-marker meta. */
+export function withdrawalOutcomeKey(externalOrderId: string, requestKey: string, action: string): string {
+  return `wdo:${externalOrderId}:${requestKey}:${action}`.slice(0, 96)
+}
+
 export const WC_WITHDRAWAL_OUTCOME_ENABLED_SETTING = 'wc_withdrawal_outcome_enabled'
 
 /** OFF BY DEFAULT: only an explicit `true` turns it on. */
@@ -237,19 +242,22 @@ export async function writeWithdrawalOutcomeForEvent(
       }
       return
     }
-    // The request id has just become known for an order whose outcome was already written under the unknown key: the same request, not a second note.
-    // Only for the SAME submission (equal hold generation) and never for a rejection: a stored rejection says nothing about a later request, so the
-    // rejection of the request that now has an id is sent (the storefront refuses a request that is not pending, and says so).
-    if (requestId && identity.previousRequestId === null && !mapping.reject) {
+    // The request id has just become known for an order whose outcome was already written under the unknown key: the same request, not a second note and
+    // not a second rejection. Only for the SAME submission (equal hold generation): a later submission moves the generation, so a stored outcome says nothing
+    // about it and its own outcome is sent. A rejection already carried out under the unknown key is adopted the same way: the plugin answers 'rejected' to a
+    // request that is already rejected, but it ALSO adds a second admin note, so it is never posted again for the same generation.
+    if (requestId && identity.previousRequestId === null) {
       const unknownRow = await store.findRow(input.orderId, unknownRequestKey(input.orderId), input.action)
-      if (unknownRow && DONE_RESULTS.has(unknownRow.result) && unknownRow.result !== 'rejected' && unknownRow.generation !== null && unknownRow.generation === generation) {
+      const sameSubmission = unknownRow !== null && DONE_RESULTS.has(unknownRow.result) && unknownRow.generation !== null && unknownRow.generation === generation
+      const sameOutcome = unknownRow !== null && (mapping.reject ? unknownRow.result === 'rejected' || unknownRow.result === 'already_done' : unknownRow.result !== 'rejected')
+      if (unknownRow && sameSubmission && sameOutcome) {
         await store.markWritten(input.orderId, requestKey, input.action, unknownRow.result, generation)
         return
       }
     }
     const result = await postWithdrawalOutcome(input.externalOrderId, {
       outcome: mapping.outcome,
-      outcomeKey: `wdo:${input.externalOrderId}:${requestKey}:${input.action}`.slice(0, 96),
+      outcomeKey: withdrawalOutcomeKey(input.externalOrderId, requestKey, input.action),
       note: `IMS: ${input.description}`,
       ...(mapping.reject ? { rejectReason: 'order already dispatched' } : {}),
       ...(requestId ? { requestId } : {}),

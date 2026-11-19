@@ -269,6 +269,19 @@ test('R3 MEDIUM 1a: a rejection of request A under the unknown key is NEVER alia
   answer = () => new Response('{"ok":true,"result":"noted"}', { status: 200 })
 })
 
+test('R1 LOW 4: a rejection already carried out under the unknown key is adopted (no second POST, no second admin note) when the request id becomes known in the SAME generation', async () => {
+  const mod = await import('@/lib/connectors/woocommerce/sync/withdrawal-outcome')
+  on()
+  const m = memoryStore({ generation: 1 })
+  answer = () => new Response('{"ok":true,"result":"rejected"}', { status: 200 })
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch'), m.store) // A rejected under u:
+  assert.equal(calls.length, 1)
+  await mod.writeWithdrawalOutcomeForEvent(event('wc_withdrawal_after_dispatch', { requestId: '31' }), m.store) // the echo now carries rA
+  assert.equal(calls.length, 1, 'the same request is not rejected (and noted) a second time')
+  assert.equal(m.rows.get('o1|r31|wc_withdrawal_after_dispatch')?.result, 'rejected', 'the id is recorded as done')
+  answer = () => new Response('{"ok":true,"result":"noted"}', { status: 200 })
+})
+
 test('R3 MEDIUM 1b: the alias of a NOTE needs the same generation; a later submission\'s note under a new id is its own', async () => {
   const mod = await import('@/lib/connectors/woocommerce/sync/withdrawal-outcome')
   on()
