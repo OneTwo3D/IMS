@@ -5,7 +5,7 @@
  * and no request is made. The module is total: whatever it is handed it returns an item and never throws; whatever cannot be proven is
  * inconclusive with closed reasons, and nothing is assumed.
  *
- *   PERIOD. One calendar month, UTC (YYYY-MM). The window is the latest R12_WINDOW_MONTHS months that are CLOSED for the cycle date: a
+ *   PERIOD. One calendar month in LONDON time (YYYY-MM), the calendar of the Xero invoice dates: the IMS side buckets by the London month of the invoice instant, the WooCommerce side by the London month of its creation instant. The window is the latest R12_WINDOW_MONTHS months that are CLOSED for the cycle date: a
  *   month is closed once the cycle date is at least R12_CLOSE_LAG_DAYS days after the month ended (the cycle date is the 8th of the
  *   following month or later), so late postings and status changes have settled and the periods are complete. An unclosed month is never
  *   read. A month that began before the recorded VERIFIED first load, or before the recorded storefront import, or beyond the sales
@@ -75,6 +75,7 @@ import {
   type PackReasonCode,
   type PackSourceCode,
 } from '@/lib/reconciliation-pack/constants'
+import { businessDateOfStamp } from '@/lib/business-date'
 import { xeroDocumentAmountToBase } from '@/lib/connectors/xero/fx'
 import type { KeyPart } from '@/lib/reconciliation-pack/identity'
 import { classifyPopulation, type ImsRead, type ImsReadOptions, type ImsTaxes, type ImsVat, type PopulationBoundaries, type TaxRateRow, type XeroTaxRateStore } from '@/lib/reconciliation-pack/ims-readers'
@@ -259,7 +260,7 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
   // The population: months IMS held. An unrecorded boundary is unknown, never in.
   const periods: string[] = []
   for (const period of candidates) {
-    const start = `${period}-01T00:00:00.000Z`
+    const start = londonMonthStart(period)
     const verdicts = [classifyPopulation(boundaries, 'first-load', start, context.asOf), classifyPopulation(boundaries, 'storefront-order', start, context.asOf)]
     if (verdicts.some((verdict) => verdict.kind === 'unknown')) return inconclusive([LEDGER], 'NO_POPULATION_RECORD')
     if (verdicts.every((verdict) => verdict.kind === 'in')) periods.push(period)
@@ -338,7 +339,8 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
   if (!walked.ok) return inconclusive([LEDGER, XERO, WOO], walked.reason)
   const wooSums: Sums = new Map()
   for (const order of walked.value.orders) {
-    const period = order.createdAt.slice(0, 7)
+    // The London month of the creation instant, the calendar Xero invoice dates and the IMS side use: a BST month-end order is dated in the NEXT month by its UTC stamp.
+    const period = (businessDateOfStamp(order.createdAt) ?? order.createdAt).slice(0, 7)
     if (!periodSet.has(period)) continue
     // Fee-line tax: IMS turns a fee line into a sales line (field-mapping.ts mapWcFeeLines) and WooCommerce's tax_total is understood to
     // include it, but that is not proven on the live store, so any fee tax in the window makes the item unverified.
@@ -392,4 +394,11 @@ export async function runVatItem(id: VatItemId, context: VatItemContext): Promis
   } catch {
     return inconclusive([], 'INTERNAL_ERROR')
   }
+}
+
+/** The instant (UTC ISO) of London midnight at the start of `YYYY-MM`: 23:00Z the day before in BST, 00:00Z in GMT. The buckets are London months, so the population boundary is tested from here, not from the UTC month start. */
+function londonMonthStart(period: string): string {
+  const utcMidnight = `${period}-01T00:00:00.000Z`
+  const hourEarlier = new Date(Date.parse(utcMidnight) - 3_600_000).toISOString()
+  return businessDateOfStamp(hourEarlier) === `${period}-01` ? hourEarlier : utcMidnight
 }

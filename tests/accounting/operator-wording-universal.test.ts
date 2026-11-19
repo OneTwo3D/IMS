@@ -571,6 +571,7 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'Sales invoice update for {} against accounting invoice {} was NOT queued', verdict: 'DESCRIPTION', why: 'states what IMS did and why' },
   { file: 'lib/fulfillment/overallocation-rebalancer.ts', prefix: 'Group A2 will not re-post this order', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
   { file: 'lib/products/bom-recipe.ts', prefix: 'An older BOM recipe for a different product', verdict: 'NON_ACCOUNTING', why: 'manufacturing BOM recipe' },
+  { file: 'lib/csv.ts', prefix: 'If one is a real record, remove the "# " from the first cell and import again.', verdict: 'NON_ACCOUNTING', why: 'CSV import notice: edits the operator\'s own file and re-imports it; the rows were skipped before any import, nothing was recorded or posted, no ledger involved' },
   { file: 'components/settings/backup-restore.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button', count: 2 },
   { file: 'components/settings/database-reset.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button' },
   { file: 'app/actions/sales.ts', prefix: 'Reconcile the reservation manually', verdict: 'NON_ACCOUNTING', why: 'stock reservation release, no ledger posting' },

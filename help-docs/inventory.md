@@ -55,7 +55,7 @@ If you have set up [custom fields](#custom-fields) for products, **Export CSV** 
 Every screen with a **Templates** menu (Inventory, Customers, Suppliers, Sales Orders, Purchase Orders, Stock Adjustments, Transfers, Stock Levels) follows the same conventions:
 
 - **Download a template** before importing. The template ships with the exact columns the importer expects.
-- The template includes a guidance row beginning with **`# REQUIRED`** in the first cell. Cells under each column show `REQUIRED` or `OPTIONAL` so you can see which fields must be filled. **Keep this row in the file** — the importer detects and skips it automatically.
+- The template includes a guidance row beginning with **`# REQUIRED`** in the first cell. Cells under each column show `REQUIRED` or `OPTIONAL` so you can see which fields must be filled. **Keep this row in the file** — the importer detects and skips it automatically. Only a row whose first cell starts with `#` followed by a space (such as `# REQUIRED`) is skipped as guidance; a SKU or name that starts with `#` (for example `#X`) is imported as data. Every row must have exactly as many cells as the header: a file with a short or long row, or a quote in the middle of an unquoted cell, is refused whole, with the line numbers, and nothing is imported.
 - **Empty cells do not overwrite existing values.** If you re-import a row to update one field, leave every other column blank and only fill the field you want changed. This makes partial updates safe.
 - To clear a value, use a sentinel like `NULL` or `-` per column where the importer documents it; a blank cell is read as "leave alone".
 

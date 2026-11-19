@@ -12,6 +12,8 @@ let nowMs = 0
 const claimCalls: Array<{ claimLimit?: number; limit?: number; excludeIds?: string[]; lockedAt: number }> = []
 const pushed: string[] = []
 let queue: string[] = []
+const retryMarks: Array<Record<string, unknown>> = []
+let settingDisabled = false
 
 mock.module('@/lib/db', {
   namedExports: { db: { integrationOutbox: { updateMany: async () => ({ count: 1 }), findUnique: async () => null }, stockSyncState: { upsert: async () => ({}) }, productComponent: { findMany: async () => [] } } },
@@ -23,6 +25,7 @@ mock.module('@/lib/connectors/woocommerce/sync/stock-sync', {
     pushStockToWc: async (o: { productIds: string[] }) => {
       pushed.push(o.productIds[0])
       nowMs += 60_000 // each push takes a minute of the fake clock
+      if (settingDisabled) return { synced: 0, errors: [], message: 'Stock sync is disabled in settings', aborted: true, settingDisabled: true }
       return { synced: 1, errors: [], message: 'ok' }
     },
   },
@@ -34,7 +37,7 @@ mock.module('@/lib/domain/integrations/outbox', {
     enqueueIntegrationOutbox: async () => ({}),
     isOutboxEnqueueShadowed: () => false,
     markIntegrationOutboxPermanentFailure: async () => undefined,
-    markIntegrationOutboxRetryableFailure: async () => undefined,
+    markIntegrationOutboxRetryableFailure: async (o: Record<string, unknown>) => { retryMarks.push(o) },
     currentOutboxRowBeforeCutoff: async () => null,
     outboxRowBeforeCutoff: async () => null,
     refuseClaimedJobBeforeCutoff: async () => null,
@@ -68,4 +71,14 @@ test('stops claiming once the wall-clock budget is spent', async () => {
   const summary = await processQueuedWcStockSyncJobs({ migrateLegacy: false, clock: () => new Date(nowMs), drainBudgetMs: 90_000 })
   assert.equal(summary.processed, 2, 'jobs started at t=0 and t=60s; the drain stops at t=120s > 90s')
   assert.equal(queue.length, 3, 'the rest stay queued, unclaimed')
+})
+
+test('o3d-v17zc: a push the wc_stock_sync_enabled setting refuses is released without spending an attempt', async () => {
+  nowMs = 0; claimCalls.length = 0; pushed.length = 0; retryMarks.length = 0; queue = ['a']; settingDisabled = true
+  try {
+    const { processQueuedWcStockSyncJobs } = await import('../lib/connectors/woocommerce/sync/stock-sync-jobs.ts')
+    await processQueuedWcStockSyncJobs({ migrateLegacy: false, clock: () => new Date(nowMs) })
+  } finally { settingDisabled = false }
+  assert.equal(retryMarks.length, 1)
+  assert.equal(retryMarks[0].refusedBySetting, true, 'the drain says the refusal came from the setting, so the row spends no attempt')
 })
