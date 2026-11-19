@@ -1187,6 +1187,8 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // plugin key; what it can do — and what this classification is here to keep visible
   // — is leave the application unable to connect if a release is ever dropped.
   'scripts/fence-db-connections.mjs': 'deploy-connection-fence',
+  // update.sh's advisory UTF8 check: one SELECT of the current database's encoding, never a write.
+  'scripts/db-encoding-check.mjs': 'deploy-read-only-probe',
   // o3d-2sm1.5 r41's matched-method reader. install.sh runs it before a credential rotation, and
   // before the reconciliation of an interrupted one, to establish which pg_hba method the server
   // matched for the application role on a given endpoint — because a `radius` or `ldap` rule
