@@ -789,7 +789,7 @@ async function getShipmentLineCostSnapshot(
  * This function does not decide WHEN shipped units come back; it only never invents units that did not
  * ship. Nothing here is read outside the order lock: callers build rows inside the refund transaction.
  */
-async function buildRefundFallbackReturnRows(
+export async function buildRefundFallbackReturnRows(
   client: RefundServiceClient,
   orderId: string,
   lines: Array<RefundRequestLine | CreatedRefundLine>,
@@ -853,6 +853,9 @@ async function buildRefundFallbackReturnRows(
           lines: {
             select: { id: true, productId: true, description: true, qty: true, totalBase: true, unitPriceBase: true, salesOrderLineId: true },
           },
+          // o3d-lqcjv: an in-transit refund writes no RETURN_INBOUND movement until its goods arrive; its return document is the record
+          // of what it expects back, per refund line and component product.
+          returnExpectation: { select: { lines: { select: { refundLineId: true, productId: true, qty: true } } } },
         },
       },
     },
@@ -980,19 +983,23 @@ async function buildRefundFallbackReturnRows(
     // configured AND a part-shipped kit AND successive refunds; non-kit lines are unaffected because
     // their estimate is exact. The durable fix is to persist returned component quantities per refund
     // line outside retention.
-    const movements = await client.stockMovement.findMany({
-      where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: refund.id },
-      select: { productId: true, qty: true, idempotencyKey: true },
-    })
+    // o3d-lqcjv: an IN-TRANSIT refund's record is its return document (arrivals book against it, so its quantity already includes what
+    // came in): read it instead of the movements, or a later partial refund of a part-shipped kit builds a second expectation for
+    // components already on the first document.
+    const recordRows: Array<{ refundLineId: string | undefined; productId: string; qty: number }> = refund.returnExpectation
+      ? refund.returnExpectation.lines.map((l) => ({ refundLineId: l.refundLineId, productId: l.productId, qty: refundBoundaryNumber(l.qty) }))
+      : (await client.stockMovement.findMany({
+          where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: refund.id },
+          select: { productId: true, qty: true, idempotencyKey: true },
+        })).map((m) => ({ refundLineId: m.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1], productId: m.productId, qty: refundBoundaryNumber(m.qty) }))
     const attributedLineIds = new Set<string>()
-    for (const movement of movements) {
-      const refundLineId = movement.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1]
-      const refundLine = refundLineId ? refundLineById.get(refundLineId) : undefined
+    for (const movement of recordRows) {
+      const refundLine = movement.refundLineId ? refundLineById.get(movement.refundLineId) : undefined
       if (!refundLine || !refundLine.productId) continue
       debitAcross(
         sortedCandidatesFor({ ...refundLine, lineId: refundLine.salesOrderLineId, productId: refundLine.productId }),
         movement.productId,
-        refundBoundaryNumber(movement.qty),
+        movement.qty,
       )
       attributedLineIds.add(refundLine.id)
     }

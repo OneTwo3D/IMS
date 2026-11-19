@@ -100,11 +100,12 @@ An unvalued document is not usable: nothing may receive against or write off a d
 must enforce it, and the settle step refuses a document that already carries an accounted quantity). Replacing the
 document's lines is allowed only while unvalued, and a valued document is never rewritten (first write wins).
 
-### Known limit: successive partial kit refunds
+### Successive partial kit refunds
 
-Later partial refunds of a kit estimate the components already returned from `RETURN_INBOUND` movements. An in-transit
-refund writes none until its goods arrive (slice 2), so a second partial kit refund on the same order can over-estimate
-the components still returnable. Not fixed in slice 1; it only matters once the switch is on.
+Later partial refunds of a kit take what earlier refunds already returned from their `RETURN_INBOUND` movements, or, for an
+in-transit refund (which writes none until its goods arrive), from its return document lines (per refund line and component).
+A second partial refund of a part-shipped kit therefore never raises a second expectation for components already on the first
+document.
 
 ## Accounting accepted by the owner
 
