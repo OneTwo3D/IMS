@@ -137,6 +137,8 @@ mock.module('@/lib/db', {
       accountingSyncLog: { findMany: async () => syncLogRows },
       // No open foreign-currency balances: the revaluation half has nothing to value unless a test
       // supplies one, which keeps each test's enqueue list attributable to one half of the run.
+      // o3d-cr517: the receivable read asks which refunds / invoices were posted by hand; none here.
+      accountingPostingRefusal: { findMany: async () => [] },
       salesOrder: { findMany: async () => openReceivables },
       purchaseInvoice: { findMany: async () => [] },
       // `buildRevaluationLines` resolves a settlement rate per balance through this transaction, and

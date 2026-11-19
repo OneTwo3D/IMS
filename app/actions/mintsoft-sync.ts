@@ -26,6 +26,7 @@ import {
   parseRoutingMap,
   type ConfigSnapshot,
 } from '@/lib/domain/wms/config-audit'
+import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
@@ -2793,6 +2794,33 @@ export async function runMintsoftProductVerifyNow(): Promise<{
 export async function listMintsoftKeptBundleClaims(input: { page?: number; query?: string }): Promise<KeptBundleClaimPage> {
   await requireMintsoftReadAccess()
   return listKeptBundleClaims({ page: Number(input?.page) || 0, query: String(input?.query ?? '') })
+}
+
+/**
+ * Ignore an OPEN "SKU renamed in IMS" discrepancy: the way out of the order-push hold it causes when product sync can never close it (the product
+ * stopped syncing, or the warehouse left scope). Orders carrying the new SKU are then pushed with it, so only do this when the warehouse really
+ * has that SKU. Sync permission and a fresh sign-in; the actor and note are recorded on the row; the product sync does not reopen it for the same
+ * pair of SKUs.
+ */
+export async function ignoreMintsoftSkuRenameHoldAction(discrepancyId: string, note: string): Promise<{ success: boolean; error?: string } | FreshAuthFailureResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const trimmed = typeof note === 'string' ? note.trim().slice(0, 500) : ''
+    if (typeof discrepancyId !== 'string' || discrepancyId === '') return { success: false, error: 'No discrepancy was named.' }
+    if (trimmed === '') return { success: false, error: 'Say why the hold can end (for example: the warehouse already has the new SKU).' }
+    const { count } = await db.wmsStockDiscrepancy.updateMany({
+      where: { id: discrepancyId, connector: 'mintsoft', category: 'PRODUCT_SKU_RENAMED', status: 'OPEN' },
+      data: { status: 'IGNORED', resolvedAt: new Date(), resolvedBy: session.user.id, resolvedNote: trimmed },
+    })
+    if (count === 0) return { success: false, error: 'That is not an open "SKU renamed" discrepancy.' }
+    await logActivity({ entityType: 'SYNC', entityId: discrepancyId, action: 'sku_rename_hold_ignored', tag: 'sync', userId: session.user.id, level: 'WARNING', description: `Ignored a SKU renamed discrepancy, ending the order-push hold: ${trimmed}` })
+    revalidatePath('/sync')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
 }
 
 export async function resolveMintsoftKeptBundleClaim(input: {

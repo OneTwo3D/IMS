@@ -253,6 +253,16 @@ test('o3d-hqvrp.113: an amendment IMS cannot even build is RECORDED (standing ro
   assert.deepEqual(run.tasks, [], 'no warehouse query: nothing can be asked until IMS can build the change')
 })
 
+test('o3d-zz37l: an amendment held for an unreflected SKU rename sends nothing, stays due, and is MEDIUM (a known wait, not stale lines)', async () => {
+  const run = await amend({ updated: true, status: 'NEW' }, { recorded: [{ externalItemId: 'x1', sku: 'OLD', quantity: 3 }], mutateOrder: (order) => { order.skuRenameHolds = [{ productId: 'p1', wmsValue: 'OLD' }] } })
+  assert.deepEqual(run.connectorCalls, [], 'nothing was sent to the warehouse')
+  assert.equal(run.recordedRefusals.length, 1)
+  assert.equal(run.recordedRefusals[0]!.gate, 'WMS_AMEND_UNBUILDABLE')
+  assert.equal(run.recordedRefusals[0]!.severity, 'MEDIUM')
+  assert.match(run.recordedRefusals[0]!.detail ?? '', /Order held: SKU A was renamed/)
+  assert.equal(run.linkWrites.some((write) => 'pushedAt' in write), false, 'the link stays due')
+})
+
 const sameLines = [{ externalItemId: 'x1', sku: 'A', quantity: 3 }]
 const withheld = (order: Record<string, unknown>) => { order.storeCreditAssessment = 'REVIEW_REQUIRED' }
 

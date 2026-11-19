@@ -97,6 +97,8 @@ mock.module('@/lib/db', {
       accountingSyncLog: {
         findMany: async ({ where }: { where: Record<string, unknown> }) => store.rows.filter((row) => matchesWhere(row, where)),
       },
+      // o3d-cr517: the receivable read asks which refunds / invoices were posted by hand; none here.
+      accountingPostingRefusal: { findMany: async () => [] },
       salesOrder: {
         findMany: async () => [{
           id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null, invoiceNumber: 'INV-1',

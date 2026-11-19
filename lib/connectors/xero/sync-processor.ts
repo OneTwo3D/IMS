@@ -3,7 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
-import { businessDateYmd } from '@/lib/business-date'
+import { businessDateYmd, LONDON_POSTED_DAY_CONVENTION, POSTED_DAY_CONVENTION_FIELD } from '@/lib/business-date'
 import { refusedCreditNoteError as refusedCreditNoteErrorOf } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { composeFinalBeforePost, creditNoteBeforePost, euCreditNoteSchemePostingRefusal, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
@@ -8180,6 +8180,7 @@ async function decideInvoicePaymentFollowUp(
         bankAccountId: stored,
         amount,
         paymentDate,
+        [POSTED_DAY_CONVENTION_FIELD]: LONDON_POSTED_DAY_CONVENTION,
         currency,
         // o3d-q0x56.2: an imported order is paid in the currency and at the time it was booked, so IMS's settlement rate for this payment is the
         // order's own STORED booked rate, carried on the queued work (never looked up). It is usable here by construction - the invoice that

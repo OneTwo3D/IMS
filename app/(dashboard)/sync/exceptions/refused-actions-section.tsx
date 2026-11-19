@@ -1,6 +1,7 @@
 import Link from 'next/link'
 import { Card } from '@/components/ui/card'
 import type { RefusedActionPage } from '@/app/actions/refused-actions'
+import { AsnCancelRequestActions } from './asn-cancel-request-actions'
 
 const SEVERITY_LABEL = { HIGH: 'Serious', MEDIUM: 'Needs a look', LOW: 'Low impact' } as const
 
@@ -26,12 +27,12 @@ export function RefusedActionsSection({ data }: { data: RefusedActionPage }) {
           <div key={row.id} className="rounded-lg border p-3 space-y-1">
             <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
               <div className="font-medium">
-                {`${row.label}: order `}
+                {`${row.label}: ${row.entityType === 'WMS_ASN_MAP' ? 'transfer' : 'order'} `}
                 {row.orderId ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.subject}</Link> : row.subject}
               </div>
               <div className="text-xs text-muted-foreground">{`${SEVERITY_LABEL[row.severity]} · ${row.permanence === 'PERMANENT' ? 'will not succeed on its own' : 'IMS is retrying'}`}</div>
             </div>
-            {row.detail && <p className="text-xs text-muted-foreground">{row.detail}</p>}
+            {row.queryText ? <AsnCancelRequestActions id={row.id} queryText={row.queryText} /> : row.detail && <p className="text-xs text-muted-foreground">{row.detail}</p>}
             {row.wantedLines && <p className="text-xs">{`IMS wanted the order to hold: ${row.wantedLines}`}</p>}
             <p className="text-xs text-muted-foreground">
               {`First seen ${row.firstSeenAt.slice(0, 16).replace('T', ' ')} UTC, last seen ${row.lastSeenAt.slice(0, 16).replace('T', ' ')} UTC, seen ${row.attempts} time${row.attempts === 1 ? '' : 's'}.${row.alerted ? ' An alert was raised.' : ''}`}

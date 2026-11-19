@@ -690,6 +690,25 @@ async function recordMintsoftProductLinkError(productId: string, error: string) 
   })
 }
 
+/**
+ * True when an operator IGNORED this exact PRODUCT_SKU_RENAMED occurrence (same IMS SKU and Mintsoft SKU) for the warehouse. Any other OPEN rename
+ * row for the product and warehouse is then superseded (resolved), so a stale pair cannot keep holding orders. Only the specific occurrence is
+ * suppressed: the ignored row is retired when the episode ends (see resolveProductDiscrepancy), so a later genuine rename starts a fresh row.
+ */
+export async function suppressIgnoredRename(client: Pick<typeof db, 'wmsStockDiscrepancy'>, warehouseId: string, params: { productId: string; category: WmsDiscrepancyCategory; imsValue: string | null; wmsValue: string | null }): Promise<boolean> {
+  if (params.category !== 'PRODUCT_SKU_RENAMED') return false
+  const ignored = await client.wmsStockDiscrepancy.findFirst({
+    where: { connector: 'mintsoft', warehouseId, productId: params.productId, category: params.category, status: 'IGNORED', imsValue: params.imsValue, wmsValue: params.wmsValue },
+    select: { id: true },
+  })
+  if (!ignored) return false
+  await client.wmsStockDiscrepancy.updateMany({
+    where: { connector: 'mintsoft', warehouseId, productId: params.productId, category: params.category, status: 'OPEN' },
+    data: { status: 'RESOLVED', resolvedAt: new Date(), resolvedNote: 'Superseded: the operator ignored this rename' },
+  })
+  return true
+}
+
 async function upsertProductDiscrepancy(params: {
   scopes: MintsoftProductSyncScope[]
   productId: string
@@ -701,6 +720,8 @@ async function upsertProductDiscrepancy(params: {
 }) {
   const now = new Date()
   for (const scope of params.scopes) {
+    // An operator ignored this exact rename occurrence (same IMS SKU, same Mintsoft SKU): the sync does not reopen it (o3d-zz37l).
+    if (await suppressIgnoredRename(db, scope.warehouseId, params)) continue
     const updated = await db.wmsStockDiscrepancy.updateMany({
       where: {
         connector: 'mintsoft',
@@ -742,6 +763,8 @@ async function upsertProductDiscrepancy(params: {
           lastSeenAt: now,
         },
       })
+      // An operator may have ignored the row between the check above and this write: re-check so the hold does not come straight back.
+      await suppressIgnoredRename(db, scope.warehouseId, params)
       continue
     } catch (error) {
       if (!isUniqueConstraintError(error)) {
@@ -817,6 +840,15 @@ async function resolveProductDiscrepancy(
       resolvedAt: new Date(),
       resolvedNote: 'Resolved by Mintsoft product sync',
     },
+  })
+  if (category === 'PRODUCT_SKU_RENAMED') await retireIgnoredRenames(db, warehouseIds, productId)
+}
+
+/** The rename episode is over (the SKUs match again): an IGNORED row of it must not suppress a later, genuine rename to the same pair. */
+export async function retireIgnoredRenames(client: Pick<typeof db, 'wmsStockDiscrepancy'>, warehouseIds: string[], productId: string): Promise<void> {
+  await client.wmsStockDiscrepancy.updateMany({
+    where: { connector: 'mintsoft', warehouseId: { in: warehouseIds }, productId, category: 'PRODUCT_SKU_RENAMED', status: 'IGNORED' },
+    data: { status: 'RESOLVED', resolvedNote: 'Ignored by an operator; the rename episode ended (SKUs match again)' },
   })
 }
 
@@ -1020,6 +1052,8 @@ export async function syncOneMintsoftProduct(
   if (!isMintsoftProductEligible(context.product)) {
     // Nothing is synced (or cleared) for it any more: a manual-clear discrepancy left open would never resolve otherwise.
     await resolveProductDiscrepancy(context.scopes, context.product.id, 'CUSTOMS_CLEAR_MANUAL')
+    // The rename discrepancy is deliberately NOT closed here: archiving a product changes nothing at the warehouse, so the order-push hold it
+    // causes still applies. The operator's exit is the Ignore action (o3d-zz37l).
     return {
       sku: context.product.sku,
       productId: context.product.id,

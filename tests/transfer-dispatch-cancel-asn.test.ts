@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   closeTransferAsnsForDispatchCancel,
   describeClosedTransferAsns,
+  resolveAsnCancelRequest,
   TransferAsnBlocksDispatchCancelError,
 } from '@/lib/domain/wms/transfer-dispatch-cancel-asn'
 
@@ -16,8 +17,18 @@ type ReceiptEvent = { connector: string; externalAsnId: string; processedAt: Dat
 
 function fakeTx(rows: Asn[], events: ReceiptEvent[] = []) {
   const locked: string[][] = []
+  const requests = new Map<string, { entityType: string; action: string; detail: string | null; attempts: number }>()
   const tx = {
-    $queryRaw: async (_strings: TemplateStringsArray, ids: string[]) => { locked.push(ids); return [] },
+    // The lock query takes one parameter (the ids). The cancel-request upsert (INSERT ... ON CONFLICT on entity/action/gate) takes many:
+    // id, entity_type, entity_id, action, gate, permanence, severity, intent, detail, ...
+    $queryRaw: async (_strings: TemplateStringsArray, ...params: unknown[]) => {
+      if (params.length === 1) { locked.push(params[0] as string[]); return [] }
+      const [, entityType, entityId, action, , , , , detail] = params as [string, string, string, string, string, string, string, string, string | null]
+      const key = `${entityType}:${entityId}:${action}`
+      const existing = requests.get(key)
+      requests.set(key, { entityType, action, detail, attempts: (existing?.attempts ?? 0) + 1 })
+      return [{ id: key, attempts: (existing?.attempts ?? 0) + 1 }]
+    },
     wmsInboundReceiptEvent: {
       findMany: async (args: { where: { externalAsnId: { in: string[] }; processedAt: null; processingStatus: { in: string[] } } }) =>
         events.filter((e) => args.where.externalAsnId.in.includes(e.externalAsnId) && e.processedAt === null && args.where.processingStatus.in.includes(e.processingStatus)),
@@ -34,7 +45,7 @@ function fakeTx(rows: Asn[], events: ReceiptEvent[] = []) {
       },
     },
   }
-  return { tx: tx as never, locked }
+  return { tx: tx as never, locked, requests }
 }
 
 const asn = (over: Partial<Asn>): Asn => ({ id: 'a1', connector: 'mintsoft', externalAsnId: '9001', status: 'OPEN', remoteCreateAttemptedAt: null, lastCallbackAt: null, closedAt: null, sourceType: 'STOCK_TRANSFER', sourceId: 't1', ...over })
@@ -123,4 +134,32 @@ test('the refusal names a way forward that exists', async () => {
   const mine = asn({ lines: [{ lastProcessedReceivedQty: 1, qtyAccountedViaReceipt: 0, qtyAccountedViaSnapshot: 0 }] })
   const { tx } = fakeTx([mine])
   await assert.rejects(closeTransferAsnsForDispatchCancel(tx, { transferId: 't1', transferReference: 'TR-1', now }), /complete the transfer receipt for what arrived/)
+})
+
+// o3d-zz37l (3): the instruction to ask the warehouse is a durable row, once per ASN that reached the warehouse.
+test('each closed ASN that reached the warehouse gets exactly one durable cancel request; a placeholder gets none', async () => {
+  const sent = asn({}); const placeholder = asn({ id: 'a2', externalAsnId: '9002', status: 'CREATE_PENDING' })
+  const { tx, requests } = fakeTx([sent, placeholder])
+  await closeTransferAsnsForDispatchCancel(tx, { transferId: 't1', transferReference: 'TR-1', now })
+  assert.deepEqual([...requests.keys()], ['WMS_ASN_MAP:a1:WMS_ASN_CANCEL_REQUEST'])
+  const request = requests.get('WMS_ASN_MAP:a1:WMS_ASN_CANCEL_REQUEST')!
+  assert.match(request.detail ?? '', /Please cancel ASN 9001 \(IMS transfer TR-1\)/)
+  assert.equal(request.attempts, 1)
+})
+
+test('a refused cancel records no request (the whole cancel rolls back)', async () => {
+  const { tx, requests } = fakeTx([asn({ status: 'BOOKED_IN' })])
+  await assert.rejects(closeTransferAsnsForDispatchCancel(tx, { transferId: 't1', transferReference: 'TR-1', now }), TransferAsnBlocksDispatchCancelError)
+  assert.equal(requests.size, 0)
+})
+
+test('resolveAsnCancelRequest closes only that ASN\'s open cancel request, and is idempotent', async () => {
+  const calls: Array<Record<string, unknown>> = []
+  const client = { refusedAction: { updateMany: async (args: { where: Record<string, unknown> }) => { calls.push(args.where); return { count: calls.length === 1 ? 1 : 0 } } } } as never
+  assert.equal(await resolveAsnCancelRequest(client, 'a1'), true)
+  assert.equal(await resolveAsnCancelRequest(client, 'a1'), false)
+  assert.equal(calls[0]!.entityType, 'WMS_ASN_MAP')
+  assert.equal(calls[0]!.entityId, 'a1')
+  assert.equal(calls[0]!.action, 'WMS_ASN_CANCEL_REQUEST')
+  assert.equal(calls[0]!.resolvedAt, null)
 })

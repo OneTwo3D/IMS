@@ -54,6 +54,8 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       accountingSyncLog: { findMany: async () => state.logs },
+      // o3d-cr517: the receivable read asks which refunds / invoices were posted by hand; none here.
+      accountingPostingRefusal: { findMany: async () => [] },
       salesOrder: { findMany: async () => state.receivables },
       purchaseInvoice: { findMany: async () => state.payables },
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
