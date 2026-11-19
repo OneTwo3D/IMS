@@ -1142,6 +1142,14 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
             </label>
 
             <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={s.wc_order_amendment_write_enabled === 'true'} onChange={(e) => setS({ ...s, wc_order_amendment_write_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
+              <div>
+                <span className="text-sm font-medium">Act on orders reduced in WooCommerce</span>
+                <p className="text-xs text-muted-foreground">Off by default; needs the report above to be on. Latest edit wins, line by line. When a PAID order is reduced in WooCommerce, IMS records the reduction through the refund path (credit note, stock released) and never edits the paid amount. When the warehouse has started picking, IMS sends nothing and raises a warehouse task instead. Other differences stay on the exceptions list.</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
               <input type="checkbox" checked={s.wc_ast_provider_mapping_enabled === 'true'} onChange={(e) => setS({ ...s, wc_ast_provider_mapping_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
               <div>
                 <span className="text-sm font-medium">Map couriers to tracking providers</span>
@@ -1345,6 +1353,13 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   <div>
                     <span className="text-sm font-medium">Include estimated back-in-stock date</span>
                     <p className="text-xs text-muted-foreground">For out-of-stock products, pushes the earliest committed supplier arrival date (never a past or undated one) as the _oti_eta_date product meta. Clears it when stock returns.</p>
+                  </div>
+                </label>
+                <label className="flex items-center gap-3">
+                  <input type="number" min={0} max={365} step={1} value={s.wc_back_in_stock_date_buffer_days ?? '3'} onChange={(e) => setS({ ...s, wc_back_in_stock_date_buffer_days: e.target.value })} className="w-20 rounded border border-input px-2 py-1 text-sm" />
+                  <div>
+                    <span className="text-sm font-medium">Back-in-stock buffer (days)</span>
+                    <p className="text-xs text-muted-foreground">Days added to the supplier ETA before the date is shown to customers. Default 3.</p>
                   </div>
                 </label>
                 {isStockPushUnsaved && (

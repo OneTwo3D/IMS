@@ -47,15 +47,20 @@ test('a long parent with oversized variants stays distinct through the SKU, and 
   assert.equal(fitMintsoftName('A'.repeat(120), ' (Variant)').endsWith('... (Variant)'), true)
 })
 
-test('fitMintsoftProductName splits the IMS variation name "<parent> — <attributes>" so the attributes stay whole', () => {
+test('fitMintsoftProductName splits the IMS variation name "<parent> — <attributes>" so the attributes stay whole, in the plugin\'s "<parent> (a, b)" format', () => {
   const parent = 'Mandala Rose Works FireThorn Flex Plate with ThornGrip Textured PEI'
   const name = `${parent} — Voron 2.4/Trident 350 (355 x 355mm)`
   const fitted = fitMintsoftProductName(name, parent, 'SKU-1')
   assert.ok(fitted.length <= 99)
-  assert.ok(fitted.endsWith(' — Voron 2.4/Trident 350 (355 x 355mm)'), fitted)
+  assert.ok(fitted.endsWith(' (Voron 2.4/Trident 350 (355 x 355mm))'), fitted)
   assert.ok(fitted.startsWith('Mandala Rose Works FireThorn Flex Plate with ThornGrip...'), fitted)
   // No parent, or a name that does not start with the parent: fitted as a plain name.
   assert.equal(fitMintsoftProductName('Short', null, 'S'), 'Short')
   assert.equal(fitMintsoftProductName('Short', 'Other', 'S'), 'Short')
   assert.ok(fitMintsoftProductName('W '.repeat(80), null, 'S').length <= 99)
+})
+
+test('fitMintsoftProductName keeps the plugin "Parent (a, b)" format, not "Parent — a / b" (owner decision 2026-11-18)', () => {
+  assert.equal(fitMintsoftProductName('Plate — Red / Large', 'Plate', 'S1'), 'Plate (Red, Large)')
+  assert.equal(fitMintsoftProductName('Plate — Red', 'Plate', 'S1'), 'Plate (Red)')
 })

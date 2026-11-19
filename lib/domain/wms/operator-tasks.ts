@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WC_EDIT_AFTER_PICKING', 'REFUND_REMAINDER_DUE'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -31,6 +31,8 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   AMENDMENT_NOT_APPLIED: 'Order change not applied: the warehouse order is already past NEW',
   ORDER_NOT_FOUND: 'Warehouse order not found on repeated checks: IMS stopped checking its status',
   CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: the invoice is still uncredited in the ledger',
+  WC_EDIT_AFTER_PICKING: 'Order edited in WooCommerce after picking started: IMS sent nothing, apply the change in the warehouse by hand',
+  REFUND_REMAINDER_DUE: 'Returned units were refunded: ask the warehouse to send the remaining units',
 }
 
 export type WmsOperatorTaskInput = {
@@ -186,4 +188,24 @@ export function noticeQuery(intent: 'HOLD' | 'CANCEL', merged: boolean, wmsOrder
   return merged
     ? `IMS order ${imsOrder} was CANCELLED / fully refunded in IMS, and it is part of merged warehouse order ${wmsOrder}. IMS has not cancelled the merged order because it holds other orders' goods. Please take the cancelled order's items out of it before despatch.`
     : `IMS order ${imsOrder} was cancelled / fully refunded in IMS but warehouse order ${wmsOrder} is already being fulfilled and could not be cancelled automatically. Please cancel it before despatch.`
+}
+
+/**
+ * The query for a WooCommerce edit that arrived after the warehouse started picking the order (owner decision 2026-11-18: amendments stop flowing to the
+ * warehouse once picking starts, and a later edit raises a task). IMS pushed nothing and changed nothing at the warehouse. SKUs and quantities only.
+ */
+export function wcEditAfterPickingQuery(wmsOrder: string, imsOrder: string, changes: ReadonlyArray<string>): string {
+  const what = changes.length > 0 ? changes.join('; ') : 'its lines'
+  return `IMS order ${imsOrder} was edited in WooCommerce after warehouse order ${wmsOrder} was picked up for fulfilment, so IMS sent no change to the warehouse. WooCommerce now shows: ${what}. `
+    + 'Please check the warehouse order against this and, if it is not yet despatched, make the change there.'
+}
+
+/**
+ * The query for the units IMS still owes after a shipped unit was returned and refunded. The warehouse order was pushed with the gross refund taken off,
+ * so it holds fewer units than IMS still has to deliver. IMS changes no quantity on the (live) warehouse order. SKUs and quantities only.
+ */
+export function refundRemainderQuery(wmsOrder: string, imsOrder: string, remainder: ReadonlyArray<{ sku: string; quantity: number }>): string {
+  const list = remainder.map((line) => `${line.quantity} x ${line.sku}`).join(', ')
+  return `IMS order ${imsOrder} had shipped units returned and refunded, so IMS still owes the customer units the warehouse order ${wmsOrder} no longer asks for. `
+    + `Please send the remaining units: ${list}. IMS has changed no quantity on the warehouse order.`
 }

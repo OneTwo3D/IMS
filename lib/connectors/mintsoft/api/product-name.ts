@@ -81,16 +81,18 @@ export function fitMintsoftName(name: string, suffix = '', sku = ''): string {
 }
 
 /**
- * The name IMS sends for a variation under the parity setting. IMS stores a variation's name as `<parent name> — <attributes>`
- * (the WooCommerce import's own format), so the parent is the part that may be cut and ` — <attributes>` is the whole suffix. A
- * name that does not start that way (or a product with no parent) has no separable suffix and is fitted as a plain name, which is
- * what the plugin did for a simple product.
+ * The name IMS sends for a variation under the parity setting. IMS stores a variation's name as `<parent name> — <a / b>` (the
+ * WooCommerce import's own format). OWNER DECISION 2026-11-18: keep the retired plugin's `<parent> (a, b)` format so nothing already
+ * held in Mintsoft is renamed at cutover. So the attributes are re-rendered as ` (a, b)` and that whole text is the suffix that is
+ * kept whole while the parent is cut. A name that does not start `<parent> — ` (or a product with no parent) has no separable
+ * suffix and is fitted as a plain name, which is what the plugin did for a simple product.
  */
 export function fitMintsoftProductName(name: string, parentName: string | null | undefined, sku: string): string {
   const parent = parentName?.trim() ?? ''
   const separator = ' — '
   if (parent && name.startsWith(`${parent}${separator}`) && name.length > parent.length + separator.length) {
-    return fitMintsoftName(parent, name.slice(parent.length), sku)
+    const attributes = name.slice(parent.length + separator.length).split(' / ').map((part) => part.trim()).filter(Boolean).join(', ')
+    if (attributes) return fitMintsoftName(parent, ` (${attributes})`, sku)
   }
   return fitMintsoftName(name, '', sku)
 }
