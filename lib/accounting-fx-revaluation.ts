@@ -20,6 +20,7 @@ import {
   type FxSettlementSide,
 } from '@/lib/accounting-fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { invoiceNumberIsExternallySupplied } from '@/lib/domain/accounting/sales-invoice-number'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { endOfBusinessDateUtc, isMissingFxRateError, type FxMissingReason } from '@/lib/currencies/fx-lookup'
 import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
@@ -517,6 +518,8 @@ export async function getOpenReceivables(baseCurrency: string): Promise<OpenBala
       orderNumber: true,
       externalOrderNumber: true,
       invoiceNumber: true,
+      accountingInvoiceId: true,
+      shoppingLinks: { select: { connector: true } },
       currency: true,
       totalForeign: true,
       totalBase: true,
@@ -534,7 +537,13 @@ export async function getOpenReceivables(baseCurrency: string): Promise<OpenBala
   const handPostedCreditNotes = await handPostedLedgerDocumentIds('CREDIT_NOTE', 'SalesOrderRefund', unreferenced)
 
   return orders.flatMap((order) => {
-    const netted = order.refunds.filter((refund) => refund.accountingCreditNoteId || handPostedCreditNotes.has(refund.id))
+    // An order admitted ONLY through the incumbent arm (no IMS-posted invoice, a Xeroom-era invoice number) has its credit notes posted by Xeroom, which owns them
+    // in P1/P2 and writes no IMS back-reference, handled refusal or assertion: every live refund is netted, as before. An IMS-posted invoice keeps the ledger test.
+    const incumbentOnly = !order.accountingInvoiceId && Boolean(order.invoiceNumber)
+      && invoiceNumberIsExternallySupplied((order.shoppingLinks ?? []).map((link) => link.connector))
+    const netted = incumbentOnly
+      ? order.refunds
+      : order.refunds.filter((refund) => refund.accountingCreditNoteId || handPostedCreditNotes.has(refund.id))
     const { outstandingForeign, bookedBase } = receivableOutstanding({ ...order, refunds: netted })
     if (outstandingForeign < 0.01) return []
     return [{
