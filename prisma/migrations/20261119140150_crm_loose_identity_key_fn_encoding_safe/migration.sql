@@ -18,7 +18,7 @@
 -- production must be UTF8 (the installer is tracked separately to create the database as UTF8).
 --
 -- ADDITIVE ONLY: replaces a function body on non-UTF8 databases, creates nothing else.
--- prisma-schema-scope-ok: SQL function | reason: Prisma cannot represent functions
+-- prisma-schema-scope-ok: db-native SQL function body | reason: Prisma cannot represent functions, so this replaces one on non-UTF8 databases only
 
 DO $migration$
 BEGIN
