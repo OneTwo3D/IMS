@@ -1,4 +1,5 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified
+import '../helpers/xero-attested.ts'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, readFileSync } from 'node:fs'
@@ -71,13 +72,13 @@ if (!skip) {
   })
 }
 
-const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM']
+const ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'WC_WRITEBACK_ALLOWED_ORIGIN', 'WC_WRITES_LIVE_FROM', 'XERO_WRITES_LIVE_FROM']
 const DAY = 86_400_000
 const iso = (date: Date) => date.toISOString().replace(/\.\d+Z$/, 'Z')
 // Fixture orders are 30 days old and the storefront went live 60 days ago: another test file in the same database runs the invoice-document
 // sweep with a floor of yesterday, and an order older than that floor is none of its business.
 const FIXTURE_AGE_DAYS = 30
-const LIVE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(new Date(Date.now() - 60 * DAY)) }
+const LIVE = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: iso(new Date(Date.now() - 60 * DAY)), XERO_WRITES_LIVE_FROM: iso(new Date(Date.now() - 60 * DAY)) }
 const HELD = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' }
 
 async function withEnv<T>(values: Record<string, string>, fn: () => Promise<T>): Promise<T> {

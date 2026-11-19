@@ -373,6 +373,8 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
     }
     // The status snapshot's last error (the sweep writes the connector's exception text there) and the refund's accounting warning.
     changed += (await tx.wmsOrderStatusSnapshot.updateMany({ where: { orderId: { in: ids }, lastError: { not: null }, NOT: { lastError: marker } }, data: { lastError: marker } })).count
+    // The merge hold's last error (the connector's refusal or exception text).
+    changed += (await tx.wmsMergeHold.updateMany({ where: { orderId: { in: ids }, lastError: { not: null }, NOT: { lastError: marker } }, data: { lastError: marker } })).count
     // soft-delete exception (erasure): includes soft-deleted refunds on purpose, they still carry the customer's personal data.
     changed += (await tx.salesOrderRefund.updateMany({ where: { orderId: { in: ids }, accountingWarning: { not: null }, NOT: { accountingWarning: marker } }, data: { accountingWarning: marker } })).count
     changed += (await tx.wmsOrderDiscrepancy.updateMany({ where: { orderId: { in: ids }, detail: { not: null }, NOT: { detail: marker } }, data: { detail: marker } })).count

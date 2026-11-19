@@ -188,6 +188,15 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     notPersonal: ['id', 'connector', 'orderId', 'externalOrderId', 'queryText', 'payload', 'contentHash', 'doneBy'],
     retained: {},
   },
+  WmsMergeHold: {
+    // Merge-hold identity: one row per (connector, order). The warehouse order id, the merge group basis (a hash of order ids) and a state machine. lastError is the
+    // connector's refusal or exception text (clipped to 300 chars) and can echo the recipient, so an erasure clears it to the identity-free marker (scrubLinkedFreeText).
+    // clearReason is IMS-built wording naming only a warehouse status. The task payloads a hold raises (WmsOperatorTask) carry order ids and order numbers and fixed warning
+    // text only: no name or address is copied in. Deleted with its order (cascade).
+    erased: ['lastError'],
+    notPersonal: ['id', 'connector', 'orderId', 'externalOrderId', 'groupBasis', 'clearReason'],
+    retained: {},
+  },
   // Supporting documents attached to an order. A SALES order's attachment can hold the customer's personal data in its CONTENT (a customer purchase order, an
   // email, a proof of address), which cannot be redacted, so an erasure DELETES the rows (live and soft-deleted) and the files of the erased orders
   // (deleteSalesOrderAttachmentsInTx + removeOrderAttachmentFiles). The original file name can carry a name and goes with the row. A PURCHASE order's
@@ -225,7 +234,7 @@ ERASURE_CLASSIFICATION.RefusedAction = {
 // from SKUs, quantities and amounts only (never a payload's free text, name, address or note), so nothing is erased and no free-text guard is needed.
 ERASURE_CLASSIFICATION.WcOrderDivergence = {
   erased: [],
-  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution'],
+  notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution', 'amendmentClaim'],
   retained: {},
 }
 ERASURE_CLASSIFICATION.WcOrderDivergenceRecheck = { erased: [], notPersonal: ['orderId', 'externalOrderId'], retained: {} }

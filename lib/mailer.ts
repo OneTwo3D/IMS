@@ -1,4 +1,3 @@
-import net from 'node:net'
 import nodemailer from 'nodemailer'
 import type SMTPTransport from 'nodemailer/lib/smtp-transport'
 import { z } from 'zod'
@@ -33,8 +32,8 @@ type EmailOptions = {
   attachments?: { filename: string; content: Buffer; contentType?: string }[]
   /**
    * An explicit overall deadline for THIS send. Sets the transport's connection, greeting and socket timeouts and races the whole
-   * send; at the deadline the transport is closed (its sockets destroyed) and the answer is a PERMANENT "outcome unknown" failure, because
-   * the message may already have been accepted. Unset: no deadline, as before.
+   * send; at the deadline the send is aborted (an AbortController signal closes the connection). The answer is a PERMANENT "outcome unknown" failure
+   * if the message may already have been accepted (DATA started), else, with singleSend, a retryable failure. Unset: no deadline, as before.
    */
   deadlineMs?: number
   /**
@@ -168,9 +167,13 @@ export async function sendEmailWithSmtpSettings(
     const fromName = sanitizeDisplayName(smtp.fromName)
 
     const deadlineMs = opts.deadlineMs
-    // singleSend: watch the transaction log for the server's 354 reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
+    // singleSend: watch the transaction log for the server's reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
     // fact and discarded; nothing it carries (addresses, credentials) is kept.
-    let awaitingDataReply = false
+    // Replies are matched to commands IN ORDER, as nodemailer's own _responseActions queue does, starting at MAIL FROM: with PIPELINING nodemailer writes MAIL FROM / RCPT TO / DATA before any
+    // reply arrives, without it one at a time, and either way the Nth server line answers the Nth command. The reply that answers DATA starts the DATA phase when it is 2xx or 3xx, the test
+    // nodemailer's _actionDATA applies (some servers answer 250, emailjs#24). No PIPELINING detection is needed. Pinned by the nodemailer-version test.
+    const pendingReplies: Array<'MAIL' | 'RCPT' | 'DATA'> = []
+    let tracking = false
     let dataStarted = false
     if (opts.singleSend) {
       unknownOutcomeProbe = (e) => {
@@ -184,27 +187,28 @@ export async function sendEmailWithSmtpSettings(
       }
     }
     const noop = () => undefined
-    const ownedSocket = new net.Socket()
-    let socketKilled = false
-    // net.Socket.connect() REVIVES a destroyed socket, so a send still resolving DNS when the deadline fires must not be able to connect afterwards.
-    const realConnect = ownedSocket.connect.bind(ownedSocket) as (...a: unknown[]) => net.Socket
-    ;(ownedSocket as unknown as { connect: (...a: unknown[]) => net.Socket }).connect = (...a) => {
-      if (socketKilled) throw new Error('The send was abandoned at its deadline; the connection was not opened.')
-      return realConnect(...a)
-    }
-    const killConnection = () => { socketKilled = true; ownedSocket.destroy() }
+    // One AbortController per send: at the deadline ac.abort() makes nodemailer close the connection (SMTPTransport.send finish -> connection.close()) and refuse any
+    // connect/DNS result that arrives later, so the old send cannot deliver once the retryable answer is given.
+    const ac = new AbortController()
     const transportOptions: SMTPTransport.Options = {
       ...(opts.singleSend ? {
         transactionLog: true,
         logger: {
           debug: (entry: { tnx?: string } | undefined, message?: unknown): void => {
             if (typeof message !== 'string') return
-            if (entry?.tnx === 'client' && message.trim().toUpperCase() === 'DATA') awaitingDataReply = true
-            // The server's answer to DATA is logged ('server') just before nodemailer acts on it; a 354 (nodemailer also accepts 2xx) is what
-            // makes it stream the message. Only from that reply on has anything been handed over. Pinned by the nodemailer-version test.
-            else if (entry?.tnx === 'server' && awaitingDataReply) {
-              awaitingDataReply = false
-              if (/^[23]\d\d/.test(message.trim())) dataStarted = true
+            if (dataStarted) return
+            if (entry?.tnx === 'client') {
+              const command = message.trim().toUpperCase()
+              if (command.startsWith('MAIL FROM')) { tracking = true; pendingReplies.push('MAIL') }
+              else if (tracking && command.startsWith('RCPT TO')) pendingReplies.push('RCPT')
+              else if (tracking && command === 'DATA') pendingReplies.push('DATA')
+            } else if (entry?.tnx === 'server' && tracking) {
+              const answered = pendingReplies.shift()
+              if (answered === 'DATA') {
+                if (/^[23]/.test(message.trim())) dataStarted = true
+                tracking = false
+                pendingReplies.length = 0
+              }
             }
           },
           level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,
@@ -212,9 +216,6 @@ export async function sendEmailWithSmtpSettings(
       } : {}),
       // The connect and greeting phases are bounded at HALF the send deadline so the transport's own timeouts normally settle the send first.
       ...(deadlineMs ? { connectionTimeout: Math.max(1, Math.floor(deadlineMs / 2)), greetingTimeout: Math.max(1, Math.floor(deadlineMs / 2)), socketTimeout: deadlineMs } : {}),
-      // A socket this function OWNS: nodemailer (9.0.3) resolves, connects and (for ssl or STARTTLS) wraps TLS over it, so destroying it kills the send in
-      // every phase. transport.close() does NOT (it only emits an event); a pool's close() leaves a busy connection running.
-      ...(deadlineMs ? { getSocket: (_o: unknown, cb: (err: Error | null, s: { socket: net.Socket }) => void) => { cb(null, { socket: ownedSocket }) } } : {}),
       host: smtp.host,
       port: smtp.port,
       secure: smtp.secure === 'ssl',
@@ -224,6 +225,7 @@ export async function sendEmailWithSmtpSettings(
     const transport = nodemailer.createTransport(transportOptions)
 
     const sending = transport.sendMail({
+      ...(deadlineMs ? { signal: ac.signal } : {}),
       from: fromName ? { name: fromName, address: fromEmail } : fromEmail,
       replyTo: replyToEmail,
       to: toEmail,
@@ -243,9 +245,9 @@ export async function sendEmailWithSmtpSettings(
       ]).finally(() => { if (timer) clearTimeout(timer) })
       if (outcome === 'deadline') {
         sending.catch(() => undefined)
-        // Destroy the connection BEFORE answering (synchronously, so nothing interleaves with the dataStarted read below): from here the background
-        // send cannot deliver, which is what makes the pre-DATA answer below safe to retry and keeps a PO send inside its send lock.
-        killConnection()
+        // Abort the send BEFORE answering (synchronously, so nothing interleaves with the dataStarted read below): nodemailer closes the connection, so from here the
+        // background send cannot deliver, which is what makes the pre-DATA answer below safe to retry and keeps a PO send inside its send lock.
+        ac.abort()
         transport.close()
         // Before DATA nothing was handed over (no connection, greeting or DATA command): an ordinary retryable failure, not an unknown outcome.
         if (opts.singleSend && !dataStarted) return { success: false, permanent: false, error: SEND_DEADLINE_BEFORE_DATA }

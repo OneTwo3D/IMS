@@ -602,7 +602,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     const orgs = await tx.query('SELECT "baseCurrency" AS base FROM organisations ORDER BY id')
     if (orgs.length > 1) throw new Unreadable('DUPLICATE_KEY')
     const baseCurrency = orgs.length === 0 ? 'GBP' : text(orgs[0]!.base, 'CURRENCY_UNKNOWN')
-    const salesRows = await readCapped(tx, `SELECT to_char(so."invoicedAt", 'YYYY-MM') AS period, l."taxRateId" AS rate_id, SUM(l."taxBase")::text AS tax, COUNT(*)::text AS n, (COUNT(*) FILTER (WHERE l."taxBase" <> 0))::text AS nz FROM sales_order_lines l JOIN sales_orders so ON so.id = l."orderId" WHERE so."invoicedAt" >= $1::date AND so."invoicedAt" < $2::date AND so.status::text <> 'CANCELLED' AND so.archived = false GROUP BY 1, 2 ORDER BY 1, 2`, [window.from, window.toExclusive])
+    const salesRows = await readCapped(tx, `SELECT to_char((so."invoicedAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London', 'YYYY-MM') AS period, l."taxRateId" AS rate_id, SUM(l."taxBase")::text AS tax, COUNT(*)::text AS n, (COUNT(*) FILTER (WHERE l."taxBase" <> 0))::text AS nz FROM sales_order_lines l JOIN sales_orders so ON so.id = l."orderId" WHERE so."invoicedAt" >= ($1::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so."invoicedAt" < ($2::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so.status::text <> 'CANCELLED' AND so.archived = false GROUP BY 1, 2 ORDER BY 1, 2`, [window.from, window.toExclusive])
     const sales = salesRows.map((row): VatSalesRow => {
       const period = text(row.period, 'SOURCE_UNREADABLE')
       if (!/^[0-9]{4}-(?:0[1-9]|1[0-2])$/.test(period)) throw new Unreadable('SOURCE_UNREADABLE')

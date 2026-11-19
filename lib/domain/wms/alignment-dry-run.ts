@@ -34,6 +34,11 @@ export type AlignmentDryRunScope = {
   connectionId: string
   /** When the binding was last re-pointed; the evidence must have started after it. */
   pairingChangedAt: Date
+  /**
+   * The write-off thresholds the binding carries NOW. The confirmation is given for one set of thresholds, so a dry run made under other ones is not
+   * evidence for it: it previewed different write-offs.
+   */
+  discrepancyThresholds: unknown
   /** Clock for the age limit; tests pass a fixed one. */
   now?: Date
 }
@@ -59,6 +64,11 @@ function stableJson(value: unknown): string {
  * pairing AND one set of write-off thresholds: changing either re-arms the confirmation, so live
  * corrections stay off until it is typed again. `null` and "no thresholds" compare equal.
  */
+/** The stamp a dry run carries for the thresholds it ran under. `null` and "no thresholds" are the same stamp. */
+export function alignmentThresholdsKey(thresholds: unknown): string {
+  return stableJson(thresholds)
+}
+
 export function alignmentConfirmationSurvivesSave(input: {
   wasAlignToWms: boolean
   willBeAlignToWms: boolean
@@ -93,6 +103,8 @@ export function alignmentDryRunEvidenceQuery(scope: AlignmentDryRunScope) {
         { summary: { path: ['dryRun'], equals: true } },
         { summary: { path: ['externalWarehouseId'], equals: scope.externalWarehouseId } },
         { summary: { path: ['connectionId'], equals: scope.connectionId } },
+        // Runs recorded before the thresholds were stamped carry no key and never match: one fresh dry run re-establishes the evidence.
+        { summary: { path: ['thresholdsKey'], equals: alignmentThresholdsKey(scope.discrepancyThresholds) } },
       ],
     },
     orderBy: [{ finishedAt: 'desc' as const }],

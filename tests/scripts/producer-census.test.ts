@@ -193,7 +193,7 @@ test('KNOWN BLIND SPOTS, measured: a dynamic property call and a caller of a loc
 const row = (destination: string, operation: string, obligationTime: 'required' | 'not-applicable' = 'not-applicable'): OwnershipRow => ({
   destination: destination as OwnershipRow['destination'],
   operation,
-  owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' },
+  owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' }, step: 'mintsoft',
   obligationTime,
   note: 'fixture row',
 })

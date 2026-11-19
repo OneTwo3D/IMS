@@ -23,14 +23,17 @@ export const OPEN_WMS_ASN_STATUSES = ['OPEN', 'PARTIALLY_BOOKED_IN'] as const
 export function wmsAsnAwaitingUnitsWhere(): Prisma.WmsAsnMapWhereInput {
   return {
     OR: [
-      { status: { in: [...OPEN_WMS_ASN_STATUSES] } },
+      // `closedAt` wins for EVERY status: an ASN IMS closed (short, retired, or by a transfer's dispatch cancel) keeps its warehouse status (OPEN / PARTIALLY_BOOKED_IN)
+      // but expects no more units, and every other "open ASN" reader filters on closedAt IS NULL.
+      { status: { in: [...OPEN_WMS_ASN_STATUSES] }, closedAt: null },
       { status: 'BOOKED_IN', closedAt: null },
     ],
   }
 }
 
-/** The same rule over a loaded row. `closedAt` wins for BOOKED_IN only (a closed-short ASN keeps its status). */
+/** The same rule over a loaded row. `closedAt` wins for every status (a closed-short or dispatch-cancelled ASN keeps its status). */
 export function isWmsAsnAwaitingUnits(asn: { status: string; closedAt?: Date | null }): boolean {
-  if (asn.status === 'BOOKED_IN') return asn.closedAt == null
+  if (asn.closedAt != null) return false
+  if (asn.status === 'BOOKED_IN') return true
   return (OPEN_WMS_ASN_STATUSES as readonly string[]).includes(asn.status)
 }

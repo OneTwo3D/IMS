@@ -1,3 +1,4 @@
+import { mergeHoldMaintenanceNote, runMergeHoldMaintenanceSafe, type MergeHoldMaintenanceNote } from '@/lib/domain/wms/merge-hold-port'
 import { mergeCandidateNote, runMergeCandidateDetectionSafe, type MergeCandidateNote } from '@/lib/domain/wms/merge-candidates'
 import { randomUUID } from 'node:crypto'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
@@ -26,6 +27,7 @@ import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
 import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type AmendmentLineChange, type RefusedActionInput } from '@/lib/domain/refused-actions'
+import { raiseRefundRemainderTasks } from './refund-remainder'
 import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
 import { proveMergeLineage } from './merge-lineage'
 import { runSystemicPass, type SystemicFailureStore } from './systemic-failure'
@@ -328,6 +330,8 @@ function noteOutboundHeld(result: { outboundHeld?: number }, error: unknown): vo
 export type WmsOrderPushSweepResult = {
   /** PRESENT ONLY WHEN the merge-candidate pass (flag mode) failed or skipped: best-effort, never changes this sweep's outcome. */
   mergeCandidateDetection?: MergeCandidateNote
+  /** PRESENT ONLY WHEN the merge-hold maintenance threw: counted as a failure by the cron mapping. */
+  mergeHoldMaintenance?: MergeHoldMaintenanceNote
   skipped?: string
   created: number
   /** o3d-bjc.8: links promoted from PENDING_VERIFY to SYNCED this sweep. */
@@ -1254,6 +1258,11 @@ export interface WmsOrderPushPort {
   noticesAwaitingComment?(connector: string, limit: number): Promise<Array<{ id: string; orderId: string; externalOrderId: string; state: 'SYNCED' | 'MERGED'; intent: 'HOLD' | 'CANCEL'; noticeAt: Date; orderNumber?: string | null; externalOrderNumber?: string | null; lastError?: string | null }>>
   /** Record one operator task ("raise a query"), once: true when a new row was written, false when the same task already exists. A rejection means it was NOT recorded. */
   raiseOperatorTask?(task: WmsOperatorTaskInput): Promise<boolean>
+  /**
+   * o3d-2q9vp: raise the "ask the warehouse to send the remaining units" tasks for orders whose shipped units were returned and refunded (the push subtracts the GROSS refund;
+   * IMS demand nets only returned shipped units). Returns the number of NEW tasks. Behind `wms_refund_remainder_task_enabled`; changes no quantity at the warehouse.
+   */
+  raiseRefundRemainderTasks?(connector: string): Promise<{ raised: number; failed: number }>
   /**
    * Record a refused or stalled action (lib/domain/refused-actions.ts): an idempotent upsert on (entity, action, gate). THROWS when it cannot be
    * written: the caller then leaves the link due rather than advancing it over a refusal nobody can see. Absent: nothing is recorded (test doubles).
@@ -4279,6 +4288,16 @@ export async function runWmsOrderPushSweepCore(
 
   if (ambiguousCreateAdopted > 0) result.ambiguousCreateAdopted = ambiguousCreateAdopted
   if (operatorNoticeCount > 0) result.operatorNotices = operatorNoticeCount
+  if (port.raiseRefundRemainderTasks) {
+    try {
+      const remainder = await port.raiseRefundRemainderTasks(connectorId)
+      operatorTasksRaised += remainder.raised
+      operatorTaskErrorCount += remainder.failed
+    } catch (error) {
+      operatorTaskErrorCount += 1
+      console.error('[wms-order-push] failed to raise the refund remainder tasks', error)
+    }
+  }
   if (operatorTasksRaised > 0) result.operatorTasksRaised = operatorTasksRaised
   if (operatorTaskErrorCount > 0) result.operatorTaskErrors = operatorTaskErrorCount
   // How many operator tasks are open now. INFORMATION, never a failure: the cron is not red for a task waiting on a person.
@@ -4670,6 +4689,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
             OR (l.scope_mode::text = 'MIXED' AND l.scope_dirty_at IS NOT NULL AND o.status::text IN ('SHIPPED', 'COMPLETED', 'DELIVERED'))
           )
           AND o."refundStatus"::text <> 'FULL'
+          -- An order on MERGE HOLD in the warehouse is not amended: the change is shown on Exceptions as "act in" the warehouse system (merge-hold.ts).
+          AND NOT EXISTS (SELECT 1 FROM wms_merge_holds h WHERE h.order_id = l."orderId" AND h.state::text IN ('HOLDING', 'HELD', 'UNKNOWN'))
           AND (
             o."updatedAt" > COALESCE(l."pushedAt", to_timestamp(0))
             -- An allocation / shipment writer marked the scope dirty (only read while the mixed-warehouse feature is on; a change the warehouse
@@ -4776,7 +4797,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       db.wmsOrderPushLink.findMany({
         // MERGED links are included (their survivor holds the goods); a link whose hold the WMS already refused carries a notice and is not retried.
         // despatchSettledAt: the warehouse's part has already left (mixed-warehouse scope; null while the feature is off): it is never held or cancelled there.
-        where: { connector, state: { in: ['SYNCED', 'MERGED'] }, holdNoticeAt: null, despatchSettledAt: null, externalOrderId: { not: null }, order: { status: 'ON_HOLD' } },
+        // An order on MERGE HOLD in the warehouse is never cancelled for a withdrawal / IMS hold: a person decides (merge-hold.ts escalates it).
+        where: { connector, state: { in: ['SYNCED', 'MERGED'] }, holdNoticeAt: null, despatchSettledAt: null, externalOrderId: { not: null }, order: { status: 'ON_HOLD', wmsMergeHolds: { none: { state: { in: ['HOLDING', 'HELD', 'UNKNOWN'] } } } } },
         select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true },
         take: limit,
       }) as Promise<WmsPushLinkRef[]>,
@@ -4789,6 +4811,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           // The warehouse's part of a mixed-warehouse order has already despatched: a full refund or cancel of the order never cancels it there.
           despatchSettledAt: null,
           externalOrderId: { not: null },
+          // ...and never cancelled while on merge hold (see the hold pass).
+          AND: [{ order: { wmsMergeHolds: { none: { state: { in: ['HOLDING', 'HELD', 'UNKNOWN'] } } } } }],
           order: WMS_CANCELLABLE_ORDER_WHERE,
         },
         select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true, order: { select: { orderNumber: true } } },
@@ -5018,6 +5042,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async raiseOperatorTask(task) {
       return raiseWmsOperatorTask(db, task)
     },
+    async raiseRefundRemainderTasks(connector) {
+      return raiseRefundRemainderTasks(connector)
+    },
     async recordRefusedAction(input) {
       await recordRefusedAction(db, input)
     },
@@ -5132,7 +5159,13 @@ export async function runWmsOrderPushSweep(
   // and it never throws: a detection failure cannot affect the push.
   if (locked.created > 0) {
     const mergeCandidateDetection = mergeCandidateNote(await runMergeCandidateDetectionSafe('the order push'))
-    if (mergeCandidateDetection) return { ...locked, mergeCandidateDetection }
+    // Maintenance always runs, with or without a detection note. A maintenance that threw is folded into the result (and the cron mapping), never dropped.
+    const mergeHoldMaintenance = mergeHoldMaintenanceNote(await runMergeHoldMaintenanceSafe('the order push'))
+    return { ...locked, ...(mergeCandidateDetection ? { mergeCandidateDetection } : {}), ...(mergeHoldMaintenance ? { mergeHoldMaintenance } : {}) }
   }
+  // Merge holds: the sweep withholds the cancel / edit / withdrawal hold of an order with an active hold row, so settle those rows or raise the escalation task
+  // now (database only, never throws, returns at once with no active row), not only on the next status sweep.
+  const mergeHoldMaintenance = mergeHoldMaintenanceNote(await runMergeHoldMaintenanceSafe('the order push'))
+  if (mergeHoldMaintenance) return { ...locked, mergeHoldMaintenance }
   return locked
 }

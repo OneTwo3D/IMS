@@ -17,7 +17,7 @@ import { explainProducerDisposition, parseProducerCutoff, type ProducerDecision 
 import {
   producerRetiredShadowNotice,
   producerUnknownOutcomeNotice,
-  PRODUCER_CUTOFF_ENV,
+  destinationCutoffEnvNames,
 } from '@/lib/security/producer-disposition-constants'
 import { isOutboundWriteHeldText, OUTBOUND_CONNECTORS, type OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import { ACCOUNTING_SYNC_TYPE_EXCLUSIONS, ownershipRowFor, ownershipTargetForOutboxOperation } from '@/lib/security/writer-ownership-map'
@@ -96,8 +96,11 @@ export function resolveRetirementCutoffs(
       cutoffs[destination] = given
       continue
     }
-    const parsed = parseProducerCutoff(env[PRODUCER_CUTOFF_ENV[destination]])
-    if (parsed.ok) cutoffs[destination] = parsed.at
+    // The earliest readable live-from instant of the steps that write to this destination (WooCommerce: steps M, W and X).
+    const readable = destinationCutoffEnvNames(destination)
+      .map((name) => parseProducerCutoff(env[name]))
+      .flatMap((parsed) => (parsed.ok ? [parsed.at] : []))
+    if (readable.length > 0) cutoffs[destination] = readable.reduce((a, b) => (b.getTime() < a.getTime() ? b : a))
   }
   return cutoffs
 }
