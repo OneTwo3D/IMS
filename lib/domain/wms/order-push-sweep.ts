@@ -692,7 +692,7 @@ export const ORDER_PUSH_SELECT = {
   discountModel: true,
   totalForeign: true,
   lines: { select: { id: true, sku: true, qty: true, taxForeign: true, totalForeign: true, description: true, wclcFeeKind: true, productId: true, externalLineItemId: true } },
-  refunds: { select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
+  refunds: { where: { deletedAt: null }, select: { lines: { select: { salesOrderLineId: true, qty: true } } } },
   paidAt: true,
   createdAt: true,
 } as const

@@ -2214,6 +2214,7 @@ export async function collectAccountingReconciliationRows(
     client.salesOrderRefund.findMany({
       where: {
         refundedAt: { gte: fromDate },
+        deletedAt: null,
       },
       orderBy: { refundedAt: 'desc' },
       take: MAX_RECONCILIATION_ROWS,

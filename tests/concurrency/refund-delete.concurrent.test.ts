@@ -162,6 +162,8 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     // The "Refund in WooCommerce" task an IMS refund on a storefront order raises (the person is told to pay the customer back in the shop).
     const shopTask = await rig.db.wmsOperatorTask.create({ data: { connector: 'woocommerce', orderId: w.orderId, externalOrderId: refundId, reason: 'SHOP_REFUND_DUE', queryText: 'Please refund', contentHash: `h-${refundId}` }, select: { id: true } })
 
+    // The owed-posting record an adopting refund raised (a manual margin reclass for a refund that adopted an already restocked arrival).
+    const owed = await rig.db.accountingPostingRefusal.create({ data: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', referenceId: refundId, scope: 'adoption-reclass', kind: 'refund_adoption_reclass_journal', reason: 'refused', committed: 'c', remedy: 'r' }, select: { id: true } })
     const verdict = await rig.evaluateRefundDeletion(rig.db, refundId)
     assert.deepEqual(verdict.refusals, [], 'eligible')
 
@@ -183,9 +185,13 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     assert.ok(done.ok, done.ok ? '' : done.error)
     const result = { success: true as const, voidQueued: true }
 
-    // The record is gone; the tombstone remembers it.
-    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 0)
-    assert.equal(await rig.db.salesOrderRefundLine.count({ where: { refundId } }), 0)
+    // SOFT DELETE: the record and its lines are KEPT for audit, marked deleted; the tombstone remembers it too.
+    const kept = await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refundId } })
+    assert.ok(kept.deletedAt, 'the refund is marked deleted, not removed')
+    assert.equal(kept.deleteReason, 'entered twice')
+    assert.equal(await rig.db.salesOrderRefundLine.count({ where: { refundId } }), 0, 'no live line counts against refundable quantity')
+    const keptLines = (await rig.db.salesOrderRefundDeletion.findUniqueOrThrow({ where: { refundId } })).reversal as { lines?: unknown[] }
+    assert.equal(keptLines.lines?.length, 1, 'the lines are kept whole in the audit record')
     const tomb = await rig.db.salesOrderRefundDeletion.findUniqueOrThrow({ where: { refundId } })
     assert.equal(tomb.accountingCreditNoteId, 'LEDGER-CN-1')
     assert.equal(tomb.reason, 'entered twice')
@@ -215,6 +221,10 @@ test('an eligible IMS refund is deleted: stock, layers, the COGS sub-ledger and 
     assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: cnSync } })).status, 'SYNCED')
     // The task that would have told someone to refund the customer in the shop for a refund that is gone is closed.
     assert.equal((await rig.db.wmsOperatorTask.findUniqueOrThrow({ where: { id: shopTask.id } })).status, 'DONE')
+    // ... and so is the owed-posting record of an adopting refund: nobody posts a reclass for a refund that no longer exists.
+    const closedOwed = await rig.db.accountingPostingRefusal.findUniqueOrThrow({ where: { id: owed.id } })
+    assert.ok(closedOwed.resolvedAt, 'the owed record is closed')
+    assert.equal(closedOwed.resolution, 'refund_deleted')
     // The order's refund status is recomputed from what remains.
     assert.equal((await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId } })).refundStatus, 'NONE')
     // Audit and activity.
@@ -442,8 +452,8 @@ test('concurrency: the delete waits for the order lock a shipment holds, and run
     ])
     assert.equal(deleted.success, true, deleted.success ? '' : deleted.error)
     assert.equal(created.success, true, created.success ? '' : created.error)
-    const remaining = await rig.db.salesOrderRefund.findMany({ where: { orderId: w.orderId }, select: { totalBase: true } })
-    assert.equal(remaining.length, 1, 'exactly the second refund remains')
+    const remaining = await rig.db.salesOrderRefund.findMany({ where: { orderId: w.orderId, deletedAt: null }, select: { totalBase: true } })
+    assert.equal(remaining.length, 1, 'exactly the second refund remains live')
     const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId }, select: { refundStatus: true } })
     assert.equal(order.refundStatus, 'PARTIAL', 'status follows the refunds that remain (one of two units)')
     const stock = await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })
@@ -467,8 +477,55 @@ test('analytics: the Returns report and the figure reads exclude the deleted ref
     const result = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: null })
     assert.equal(result.success, true, result.success ? '' : result.error)
     assert.equal((await mine()).length, 0, 'and is gone from it once deleted')
-    const aggregate = await rig.db.salesOrderRefund.aggregate({ where: { orderId: w.orderId }, _sum: { totalBase: true }, _count: true })
+    const aggregate = await rig.db.salesOrderRefund.aggregate({ where: { orderId: w.orderId, deletedAt: null }, _sum: { totalBase: true }, _count: true })
     assert.equal(aggregate._count, 0)
+    assert.equal(await rig.db.salesOrderRefund.count({ where: { id: refundId } }), 1, 'the row itself is kept for audit')
+  } finally {
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+test('soft delete: a deleted refund cannot be deleted, retried or paid again, and its units and money count nowhere', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  try {
+    await enable(rig)
+    const refundId = await recordRefund(rig, w, 2)
+    assert.equal((await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId } })).refundStatus, 'FULL')
+    await seedPostedCreditNote(rig, refundId, { status: 'PENDING', id: null })
+    const first = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'entered in error' })
+    assert.equal(first.success, true, first.success ? '' : first.error)
+    assert.ok((await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refundId } })).deletedAt)
+
+    // NOT MUTATED AGAIN: a second delete is the idempotent no-op (no second stock reversal, no second activity row)...
+    const stockBefore = Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity)
+    const activityBefore = await rig.db.activityLog.count({ where: { entityId: w.orderId, action: 'refund_deleted' } })
+    const second = await rig.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'again' })
+    assert.ok(second.success && second.alreadyDeleted)
+    assert.equal(Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity), stockBefore)
+    assert.equal(await rig.db.activityLog.count({ where: { entityId: w.orderId, action: 'refund_deleted' } }), activityBefore)
+    // ...an accounting retry refuses it...
+    const { retrySalesOrderRefundAccounting } = await import('@/lib/domain/sales/refund-service')
+    const retry = await retrySalesOrderRefundAccounting(rig.db as never, { refundId, accountingSettings: {} as never })
+    assert.equal(retry.success, false)
+    // ...and a refund payment cannot be recorded against it.
+    const { addPayment } = await import('@/app/actions/sales')
+    const paid = await addPayment({ orderId: w.orderId, refundId, amount: 100, currency: 'GBP', method: 'BANK', paidAt: new Date().toISOString() } as never).catch((e: unknown) => ({ success: false, error: String(e) }))
+    assert.equal((paid as { success?: boolean }).success, false)
+    assert.equal(await rig.db.payment.count({ where: { refundId } }), 0)
+
+    // NOT COUNTED: the order reads as unrefunded, the whole quantity is refundable again, and the refund report omits it.
+    assert.equal((await rig.db.salesOrder.findUniqueOrThrow({ where: { id: w.orderId } })).refundStatus, 'NONE')
+    const { getRefundStats } = await import('@/app/actions/sales-stats')
+    assert.equal((await getRefundStats()).filter((row) => row.orderId === w.orderId).length, 0)
+    const again = await rig.createSalesOrderRefund(rig.db, {
+      orderId: w.orderId,
+      lines: [{ lineId: w.lineId, productId: w.productId, description: 'rd', qty: 2, totalBase: 200 }],
+      reason: 'real return', returnWarehouseId: w.returnsId, creditNotePrefix: w.prefix,
+    })
+    assert.equal(again.success, true, again.success ? '' : again.error)
   } finally {
     await w.cleanup()
     await rig.db.$disconnect()

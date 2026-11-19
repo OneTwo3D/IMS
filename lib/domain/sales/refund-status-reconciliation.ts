@@ -209,7 +209,7 @@ export async function collectRefundStatusReconciliationRows(
     where: {
       OR: [
         { refundStatus: { not: 'NONE' } },
-        { refunds: { some: {} } },
+        { refunds: { some: { deletedAt: null } } },
       ],
     },
     orderBy: { id: 'asc' },
@@ -223,6 +223,7 @@ export async function collectRefundStatusReconciliationRows(
       totalBase: true,
       taxBase: true,
       refunds: {
+        where: { deletedAt: null },
         orderBy: { refundedAt: 'asc' },
         select: {
           id: true,

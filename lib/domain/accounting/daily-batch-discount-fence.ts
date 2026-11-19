@@ -89,7 +89,7 @@ const DEFERRAL_INPUT_SELECT = {
   // o3d-hqvrp.35 (ACC-H13): the refunds already on the order. Group A1 only ever selects an order that
   // has NOT been deferred, so any refund it carries predates the deferral and took no Unearned
   // Revenue reversal (the refund service stages those only once `revenueDeferredDate` is set).
-  refunds: { select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
+  refunds: { where: { deletedAt: null }, select: { id: true, totalBase: true, totalsBasis: true, refundedAt: true } },
 } as const
 
 type DeferralInputs = {

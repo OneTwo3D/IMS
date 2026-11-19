@@ -32,10 +32,16 @@ type EmailOptions = {
   attachments?: { filename: string; content: Buffer; contentType?: string }[]
   /**
    * An explicit overall deadline for THIS send. Sets the transport's connection, greeting and socket timeouts and races the whole
-   * send; at the deadline the transport is closed (its sockets destroyed) and the answer is a PERMANENT "outcome unknown" failure, because
-   * the message may already have been accepted. Unset: no deadline, as before.
+   * send; at the deadline the send is aborted (an AbortController signal closes the connection). The answer is a PERMANENT "outcome unknown" failure
+   * if the message may already have been accepted (DATA started), else, with singleSend, a retryable failure. Unset: no deadline, as before.
    */
   deadlineMs?: number
+  /**
+   * An EXTERNAL abort (the purchase-order send guard's backstop). Aborting it closes the connection exactly as the deadline does, and a send whose
+   * signal is already aborted when it starts (a slow SMTP-settings read outlived the guard) sends nothing. Without it a guard that gave up could
+   * still see the message delivered after it released its lock.
+   */
+  signal?: AbortSignal
   /**
    * The message must reach the recipient AT MOST ONCE (a purchase order). Once delivery has begun (the DATA command was issued on an
    * established connection), any failure that is not a definite server answer, and the deadline timer firing, is the terminal
@@ -56,7 +62,9 @@ type SendEmailResult = {
 
 
 /** Reason on a send that hit its deadline: the message may or may not have been accepted, so it is never retried automatically. */
-export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending (Email PO).'
+export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending.'
+/** The unknown outcome of a transport failure AFTER the message was handed over (the DATA reply was seen): the server's final answer was lost. */
+export const SEND_FINAL_REPLY_UNKNOWN_OUTCOME = 'Outcome unknown: the connection failed after the message was handed to the mail server and before its final answer arrived, so the message may or may not have been delivered. Check before re-sending.'
 
 const emailSchema = z.email()
 const RESERVED_EXAMPLE_DOMAIN_PATTERN = /\bexample\.(com|org|net)\b/i
@@ -127,8 +135,10 @@ async function getSmtpSettings(): Promise<SmtpSettingsInput> {
   }
 }
 
-function classifySendFailure(e: unknown, unknownOutcome: boolean): SendEmailResult {
-  if (unknownOutcome) return { success: false, permanent: true, unknownOutcome: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME }
+const SEND_DEADLINE_BEFORE_DATA = 'The send deadline passed before the message was handed to the mail server (no connection, greeting or DATA); nothing was sent, so it will be retried.'
+
+function classifySendFailure(e: unknown, unknownOutcome: false | 'deadline' | 'lost-reply'): SendEmailResult {
+  if (unknownOutcome) return { success: false, permanent: true, unknownOutcome: true, error: unknownOutcome === 'deadline' ? SEND_DEADLINE_UNKNOWN_OUTCOME : SEND_FINAL_REPLY_UNKNOWN_OUTCOME }
   const error = e as { code?: string; responseCode?: number }
   const message = normalizeMailError(String(e))
   const responseCode = typeof error.responseCode === 'number' ? error.responseCode : null
@@ -151,6 +161,7 @@ export async function sendEmailWithSmtpSettings(
   opts: EmailOptions,
 ): Promise<SendEmailResult> {
   let unknownOutcomeProbe: ((e: unknown) => boolean) | undefined
+  let forwardAbort: (() => void) | undefined
   try {
     const smtp = normalizeSmtpSettings(smtpInput)
     if (!smtp.fromEmail) {
@@ -163,6 +174,7 @@ export async function sendEmailWithSmtpSettings(
     const fromName = sanitizeDisplayName(smtp.fromName)
 
     const deadlineMs = opts.deadlineMs
+    if (opts.signal?.aborted) return { success: false, permanent: false, error: SEND_DEADLINE_BEFORE_DATA }
     // singleSend: watch the transaction log for the server's reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
     // fact and discarded; nothing it carries (addresses, credentials) is kept.
     // Replies are matched to commands IN ORDER, as nodemailer's own _responseActions queue does, starting at MAIL FROM: with PIPELINING nodemailer writes MAIL FROM / RCPT TO / DATA before any
@@ -178,11 +190,14 @@ export async function sendEmailWithSmtpSettings(
         // reply (nodemailer attaches the half-read response to 'Connection closed unexpectedly'): the server may have accepted the message.
         if (typeof responseCode === 'number' && responseCode >= 400 && responseCode < 600) return false
         // Classified by the OBSERVED phase: no DATA seen means nothing was handed over, so a rejection is retryable however late it comes.
-        // (The deadline TIMER below stays terminal: it leaves the send in flight, so its phase cannot be known.)
+        // (The deadline TIMER below is terminal only once DATA has started: before that nothing was handed over, so it is retryable.)
         return dataStarted
       }
     }
     const noop = () => undefined
+    // One AbortController per send: at the deadline ac.abort() makes nodemailer close the connection (SMTPTransport.send finish -> connection.close()) and refuse any
+    // connect/DNS result that arrives later, so the old send cannot deliver once the retryable answer is given.
+    const ac = new AbortController()
     const transportOptions: SMTPTransport.Options = {
       ...(opts.singleSend ? {
         transactionLog: true,
@@ -207,7 +222,9 @@ export async function sendEmailWithSmtpSettings(
           level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,
         },
       } : {}),
-      ...(deadlineMs ? { connectionTimeout: deadlineMs, greetingTimeout: deadlineMs, socketTimeout: deadlineMs } : {}),
+      // socketCloseTimeout 0 (nodemailer 10.6 smtp-connection): close() DESTROYS the socket instead of ending it and waiting up to 5 s, so an abort cannot let bytes already buffered finish after the answer was given.
+      // The connect and greeting phases are bounded at HALF the send deadline so the transport's own timeouts normally settle the send first.
+      ...(deadlineMs ? { connectionTimeout: Math.max(1, Math.floor(deadlineMs / 2)), greetingTimeout: Math.max(1, Math.floor(deadlineMs / 2)), socketTimeout: deadlineMs, socketCloseTimeout: 0 } : {}),
       host: smtp.host,
       port: smtp.port,
       secure: smtp.secure === 'ssl',
@@ -215,8 +232,13 @@ export async function sendEmailWithSmtpSettings(
       tls: smtp.secure === 'tls' ? { rejectUnauthorized: true } : undefined,
     }
     const transport = nodemailer.createTransport(transportOptions)
+    if (opts.signal) {
+      forwardAbort = () => { ac.abort(); transport.close() }
+      opts.signal.addEventListener('abort', forwardAbort, { once: true })
+    }
 
     const sending = transport.sendMail({
+      ...(deadlineMs || opts.signal ? { signal: ac.signal } : {}),
       from: fromName ? { name: fromName, address: fromEmail } : fromEmail,
       replyTo: replyToEmail,
       to: toEmail,
@@ -236,8 +258,13 @@ export async function sendEmailWithSmtpSettings(
       ]).finally(() => { if (timer) clearTimeout(timer) })
       if (outcome === 'deadline') {
         sending.catch(() => undefined)
+        // Abort the send BEFORE answering (synchronously, so nothing interleaves with the dataStarted read below): nodemailer closes the connection, so from here the
+        // background send cannot deliver, which is what makes the pre-DATA answer below safe to retry and keeps a PO send inside its send lock.
+        ac.abort()
         transport.close()
-        return classifySendFailure(null, true)
+        // Before DATA nothing was handed over (no connection, greeting or DATA command): an ordinary retryable failure, not an unknown outcome.
+        if (opts.singleSend && !dataStarted) return { success: false, permanent: false, error: SEND_DEADLINE_BEFORE_DATA }
+        return classifySendFailure(null, 'deadline')
       }
     } else {
       await sending
@@ -245,7 +272,13 @@ export async function sendEmailWithSmtpSettings(
 
     return { success: true }
   } catch (e) {
-    return classifySendFailure(e, unknownOutcomeProbe?.(e) ?? false)
+    if (unknownOutcomeProbe?.(e)) {
+      // A transport timeout after DATA is the deadline in another form; any other failure after DATA is a lost final reply.
+      return classifySendFailure(e, (e as { code?: string } | null)?.code === 'ETIMEDOUT' ? 'deadline' : 'lost-reply')
+    }
+    return classifySendFailure(e, false)
+  } finally {
+    if (forwardAbort) opts.signal?.removeEventListener('abort', forwardAbort)
   }
 }
 

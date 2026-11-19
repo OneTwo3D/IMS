@@ -88,7 +88,7 @@ export async function requestInvoiceDocumentOnDemand(input: OnDemandRequestInput
     const order = await db.salesOrder.findUnique({ where: { id: input.orderId }, select: { invoiceNumber: true } })
     if (!order?.invoiceNumber?.trim()) return { status: 'unavailable', reason: 'the order has no invoice number' }
   } else {
-    const refund = await db.salesOrderRefund.findUnique({ where: { id: input.refundId! }, select: { orderId: true, creditNoteNumber: true } })
+    const refund = await db.salesOrderRefund.findUnique({ where: { id: input.refundId!, deletedAt: null }, select: { orderId: true, creditNoteNumber: true } }) // a soft-deleted refund has no credit note to fetch
     if (!refund || refund.orderId !== input.orderId) return { status: 'unavailable', reason: 'the refund is not on this order' }
     if (!refund.creditNoteNumber?.trim()) return { status: 'unavailable', reason: 'the refund has no credit note number' }
   }

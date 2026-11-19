@@ -1,0 +1,2 @@
+-- The moment a drain worker enters the SMTP sender for an email row (immediately before the send). NULL = the sender was never entered, so a stale PROCESSING row without it provably sent nothing and is safe to retry. ADDITIVE ONLY: one nullable column; existing rows read as never entered only while PENDING (a stale PROCESSING row from before this column is requeued, which is the pre-existing behaviour for kinds that allow a reclaim).
+ALTER TABLE "email_outbox" ADD COLUMN "sendEnteredAt" TIMESTAMP(3);
