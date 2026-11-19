@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import { buildLines, buildPushInput, runWmsOrderPushSweepCore, type WmsOrderPushPort, type WmsPushCandidate, type WmsPushRevalidateLink } from '@/lib/domain/wms/order-push-sweep'
-import { SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds } from '@/lib/domain/wms/sku-rename-hold'
+import { confirmedWarehouseSku, lineSkuMissingAtWarehouse, normaliseSkuForHold, SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds } from '@/lib/domain/wms/sku-rename-hold'
 import type { WmsOrderPushInput, WmsOrderPushResult } from '@/lib/connectors/wms/types'
 
 /**
@@ -34,16 +34,23 @@ test('buildLines refuses a line whose SKU is not the one the warehouse holds, na
   assert.throws(() => buildLines([line({})], undefined, hold()), (error: Error) => error.message === skuRenameHoldReason(['NEW-1']) && error.message.startsWith(SKU_RENAME_HOLD_REASON_PREFIX))
 })
 
-test('an order placed BEFORE the rename (line still carries the SKU the warehouse holds, in any case or spacing) is not held', () => {
-  for (const sku of ['OLD-1', 'old-1', ' Old-1 ']) {
+test('an order placed BEFORE the rename (line still carries the SKU the warehouse holds, surrounding spaces aside) is not held', () => {
+  for (const sku of ['OLD-1', ' OLD-1 ']) {
     const lines = buildLines([line({ sku })], undefined, hold())
     assert.equal(lines.length, 1)
     assert.equal(lines[0]!.sku, sku)
   }
 })
 
-test('a case or whitespace variant of the NEW SKU is held (WooCommerce binds line SKUs to products case-insensitively)', () => {
+test('a case or whitespace variant of the NEW SKU is held', () => {
   for (const sku of ['new-1', 'New-1', 'NEW-1 ']) assert.throws(() => buildLines([line({ sku })], undefined, hold()), /Order held/)
+})
+
+test('o3d-k6x6m: matching is CASE-SENSITIVE (Mintsoft\'s own matching is unverified, so err to holding): the hold normaliser agrees with the link check', () => {
+  for (const sku of ['old-1', 'Old-1']) assert.throws(() => buildLines([line({ sku })], undefined, hold('OLD-1')), /Order held/, `${sku} is not the warehouse's spelling`)
+  assert.equal(lineSkuMissingAtWarehouse('OLD-1', { wmsValue: ' OLD-1 ' }), false, 'trim only')
+  assert.equal(lineSkuMissingAtWarehouse('old-1', { wmsValue: 'OLD-1' }), true)
+  assert.equal(normaliseSkuForHold(' Ab-1 '), 'Ab-1')
 })
 
 test('A->B->C: a line carrying the MIDDLE SKU B (which the warehouse never had) stays held; the A line pushes', () => {
@@ -180,11 +187,18 @@ test('sweep: a held create is parked VALIDATION_FAILED with no push; revalidatio
   assert.deepEqual(h.pushed, [['NEW-1']])
 })
 
-test('sweep: an order placed before the rename (old SKU snapshot, even in another case) is pushed as before, even while the discrepancy is open', async () => {
-  const h = harness('old-1')
+test('sweep: an order placed before the rename (old SKU snapshot) is pushed as before, even while the discrepancy is open', async () => {
+  const h = harness('OLD-1')
   const result = await h.sweep()
   assert.equal(result.created, 1)
-  assert.deepEqual(h.pushed, [['old-1']])
+  assert.deepEqual(h.pushed, [['OLD-1']])
+})
+
+test('sweep: the old SKU in another case is held (case-sensitive), never pushed', async () => {
+  const h = harness('old-1')
+  const result = await h.sweep()
+  assert.equal(result.validationFailed, 1)
+  assert.deepEqual(h.pushed, [])
 })
 
 test('port wiring: every Prisma port method that loads an order to push attaches the rename holds', () => {
@@ -198,4 +212,16 @@ test('port wiring: every Prisma port method that loads an order to push attaches
     assert.match(body, /withSkuRenameHolds\(/, `${method} must attach the SKU-rename holds`)
   }
   assert.equal((port.match(/withSkuRenameHolds\(/g) ?? []).length >= 6, true, 'createCandidates has two return paths')
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// o3d-k6x6m MED 2: the hold lasts only while a row is OPEN. Once the episode ended, a pending order carrying an older snapshot is pushed with the SKU
+// the warehouse holds NOW (behind wms_sku_rename_remap_enabled; the remap tests are in wms-sku-rename-remap.test.ts).
+// ---------------------------------------------------------------------------------------------------------------------------------------
+test('confirmedWarehouseSku: only a Mintsoft SKU that IS the product\'s current SKU counts as confirmed', () => {
+  assert.equal(confirmedWarehouseSku('C', { SKU: 'C' }), 'C')
+  assert.equal(confirmedWarehouseSku('C', { SKU: ' C ' }), 'C')
+  assert.equal(confirmedWarehouseSku('C', { SKU: 'A' }), null, 'warehouse still on another SKU')
+  assert.equal(confirmedWarehouseSku('C', { SKU: 'c' }), null, 'case-sensitive')
+  for (const metadata of [null, {}, [], 'x', { SKU: 7 }, { SKU: '' }]) assert.equal(confirmedWarehouseSku('C', metadata), null)
 })

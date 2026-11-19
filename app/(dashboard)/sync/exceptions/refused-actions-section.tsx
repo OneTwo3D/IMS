@@ -28,7 +28,9 @@ export function RefusedActionsSection({ data }: { data: RefusedActionPage }) {
             <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
               <div className="font-medium">
                 {`${row.label}: ${row.entityType === 'WMS_ASN_MAP' ? 'transfer' : 'order'} `}
-                {row.orderId ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.subject}</Link> : row.subject}
+                {row.orderId ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.subject}</Link>
+                  : row.transferId ? <Link className="underline underline-offset-2" href={`/stock-control/transfers#transfer-${row.transferId}`}>{row.subject}</Link>
+                    : row.subject}
               </div>
               <div className="text-xs text-muted-foreground">{`${SEVERITY_LABEL[row.severity]} · ${row.permanence === 'PERMANENT' ? 'will not succeed on its own' : 'IMS is retrying'}`}</div>
             </div>

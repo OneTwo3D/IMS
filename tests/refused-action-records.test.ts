@@ -263,6 +263,27 @@ test('o3d-zz37l: an amendment held for an unreflected SKU rename sends nothing, 
   assert.equal(run.linkWrites.some((write) => 'pushedAt' in write), false, 'the link stays due')
 })
 
+test('o3d-k6x6m: the rename hold is MEDIUM only when it is the sole reason; an amendment that also changes the lines is HIGH', async () => {
+  const hold = (order: Record<string, unknown>) => { order.skuRenameHolds = [{ productId: 'p1', wmsValue: 'OLD' }] }
+  const sole = await amend({ updated: true, status: 'NEW' }, { recorded: [{ externalItemId: 'x1', sku: 'OLD', quantity: 3 }], mutateOrder: hold })
+  assert.equal(sole.recordedRefusals[0]!.severity, 'MEDIUM')
+  const quantity = await amend({ updated: true, status: 'NEW' }, { recorded: [{ externalItemId: 'x1', sku: 'OLD', quantity: 2 }], mutateOrder: hold })
+  assert.equal(quantity.recordedRefusals[0]!.severity, 'HIGH', 'the quantity changed as well')
+  const unknown = await amend({ updated: true, status: 'NEW' }, { recorded: [], mutateOrder: hold })
+  assert.equal(unknown.recordedRefusals[0]!.severity, 'HIGH', 'recorded lines unreadable')
+})
+
+test('o3d-k6x6m: an ASN cancel request alert has ASN wording and links to the transfer, never order wording', () => {
+  const row: EscalationRow = { id: 'r1', entityType: 'WMS_ASN_MAP', entityId: 'asn-1', action: 'WMS_ASN_CANCEL_REQUEST', gate: 'WMS_ASN_CANCEL_NOT_CONFIRMED', severity: 'MEDIUM', permanence: 'PERMANENT', intent: { orderNumber: 'TR-7', externalAsnId: 'ASN9', transferId: 'tr-1' }, detail: 'text', attempts: 1, firstSeenAt: new Date('2026-11-15T12:00:00.000Z') }
+  const alert = refused.describeRefusedActionAlert(row, NOW())
+  assert.match(alert.message, /transfer TR-7/)
+  assert.match(alert.message, /warehouse has not been asked to cancel/)
+  assert.doesNotMatch(alert.message, /refused \d|retrying|for order/)
+  assert.equal(alert.actionUrl, '/stock-control/transfers#transfer-tr-1')
+  const order = refused.describeRefusedActionAlert({ ...row, entityType: 'SALES_ORDER', action: 'WMS_ORDER_AMEND', intent: { orderNumber: 'SO-1' } }, NOW())
+  assert.equal(order.actionUrl, '/sync/exceptions')
+})
+
 const sameLines = [{ externalItemId: 'x1', sku: 'A', quantity: 3 }]
 const withheld = (order: Record<string, unknown>) => { order.storeCreditAssessment = 'REVIEW_REQUIRED' }
 

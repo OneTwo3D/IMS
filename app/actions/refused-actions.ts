@@ -27,6 +27,8 @@ export type RefusedActionRow = {
   queryText: string | null
   subject: string
   label: string
+  /** The transfer an ASN cancel request belongs to (its intent names it); null for every other row. */
+  transferId: string | null
   gate: string
   severity: RefusedActionSeverity
   permanence: RefusedActionPermanence
@@ -39,6 +41,12 @@ export type RefusedActionRow = {
   alerted: boolean
 }
 export type RefusedActionPage = { rows: RefusedActionRow[]; total: number; shown: number }
+
+function transferIdOf(intent: unknown): string | null {
+  if (!intent || typeof intent !== 'object' || Array.isArray(intent)) return null
+  const id = (intent as { transferId?: unknown }).transferId
+  return typeof id === 'string' && id !== '' ? id : null
+}
 
 function wantedLinesOf(intent: unknown): string | null {
   if (!intent || typeof intent !== 'object' || Array.isArray(intent)) return null
@@ -60,6 +68,7 @@ export async function listRefusedActions(): Promise<RefusedActionPage> {
     id: row.id,
     orderId: row.entityType === 'SALES_ORDER' ? row.entityId : null,
     entityType: row.entityType,
+    transferId: row.action === 'WMS_ASN_CANCEL_REQUEST' ? transferIdOf(row.intent) : null,
     queryText: row.action === 'WMS_ASN_CANCEL_REQUEST' ? row.detail : null,
     subject: refusedActionSubject(row),
     label: refusedActionLabel(row.action),
