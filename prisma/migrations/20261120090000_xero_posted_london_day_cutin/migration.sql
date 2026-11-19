@@ -1,3 +1,4 @@
+-- prisma-schema-scope-ok: db-native data-only settings seed | reason: inserts one system-managed settings row and changes no table, column, index or type, so there is no schema change for Prisma to represent
 -- o3d-oe1b0: the instant the business (London) day replaced the UTC day on the documents and payments IMS posts to Xero.
 -- The reconciliation pack's R16 holds a posted receipt or storefront invoice to ONE date convention: the UTC day for a posting
 -- created before this instant, the London day for one created on or after it. Stamped once, at deploy, so no manual step is needed;
