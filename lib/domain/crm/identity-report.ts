@@ -5,6 +5,11 @@
  * opens that transaction REPEATABLE READ and READ ONLY; this module sets READ ONLY again as its first statement so a caller that forgets cannot write.
  */
 import { looseIdentityEmail, normaliseIdentityEmail } from '@/lib/domain/crm/identity-key'
+import type { ClusterCustomer } from '@/lib/domain/crm/cluster-resolver'
+
+/** The sample of clusters the report lists (ids only). */
+export const SAMPLE_CLUSTER_COUNT = 10
+export const SAMPLE_CLUSTER_MAX_IDS = 20
 
 export const IDENTITY_REPORT_BATCH = 1000
 
@@ -65,6 +70,12 @@ export interface CustomerIdentityReport {
   ordersWithoutCustomerNoEmail: number
   ordersWithoutCustomerEmailMatchesLiveCustomer: number
   ordersWithoutCustomerOtherEmail: number
+  /** CLUSTERS AS THE RESOLVER WOULD FORM THEM TODAY (folded email; operator merge rows are not read). */
+  derivedClustersOfTwoOrMore: number
+  /** Customer records that sit in such a cluster. */
+  derivedClusterCustomerRecords: number
+  /** The largest derived clusters, by size then first id: CUSTOMER IDS ONLY, capped. No email, name or other personal data. */
+  sampleClusters: Array<{ size: number; customerIds: string[] }>
 }
 
 export const REPORT_COUNT_KEYS: ReadonlyArray<keyof CustomerIdentityReport> = [
@@ -86,6 +97,9 @@ export const REPORT_COUNT_KEYS: ReadonlyArray<keyof CustomerIdentityReport> = [
   'ordersWithoutCustomerNoEmail',
   'ordersWithoutCustomerEmailMatchesLiveCustomer',
   'ordersWithoutCustomerOtherEmail',
+  'derivedClustersOfTwoOrMore',
+  'derivedClusterCustomerRecords',
+  'sampleClusters',
 ]
 
 interface Group {
@@ -122,9 +136,13 @@ export async function buildCustomerIdentityReport(tx: IdentityReportTx): Promise
     ordersWithoutCustomerNoEmail: 0,
     ordersWithoutCustomerEmailMatchesLiveCustomer: 0,
     ordersWithoutCustomerOtherEmail: 0,
+    derivedClustersOfTwoOrMore: 0,
+    derivedClusterCustomerRecords: 0,
+    sampleClusters: [],
   }
 
   const groups = new Map<string, Group>()
+  const looseMembers = new Map<string, ClusterCustomer[]>()
   let cursor: { id: string } | undefined
   for (;;) {
     const batch = await tx.customer.findMany({
@@ -158,6 +176,13 @@ export async function buildCustomerIdentityReport(tx: IdentityReportTx): Promise
       g.size++
       g.rawVariants.add(c.email as string)
       for (const id of wooIds) g.wooIds.add(id)
+      const loose = looseIdentityEmail(c.email)
+      if (loose !== null) {
+        const member: ClusterCustomer = { id: c.id, email: c.email, anonymised: false }
+        const list = looseMembers.get(loose)
+        if (list) list.push(member)
+        else looseMembers.set(loose, [member])
+      }
     }
     cursor = { id: batch[batch.length - 1]!.id }
     if (batch.length < IDENTITY_REPORT_BATCH) break
@@ -191,6 +216,14 @@ export async function buildCustomerIdentityReport(tx: IdentityReportTx): Promise
     if (plusFolded.size < strictKeys.size) report.plusVariantGroups++
     if (plusFolded.size > 1) report.gmailDotVariantGroups++
   }
+
+  // The clusters the resolver would form: the derived rule is "equal folded email", so each folded-email group of two or more is one cluster.
+  const clusters: string[][] = []
+  for (const members of looseMembers.values()) if (members.length >= 2) clusters.push(members.map((m) => m.id).sort())
+  report.derivedClustersOfTwoOrMore = clusters.length
+  report.derivedClusterCustomerRecords = clusters.reduce((n, c) => n + c.length, 0)
+  clusters.sort((a, b) => b.length - a.length || (a[0]! < b[0]! ? -1 : 1))
+  report.sampleClusters = clusters.slice(0, SAMPLE_CLUSTER_COUNT).map((c) => ({ size: c.length, customerIds: c.slice(0, SAMPLE_CLUSTER_MAX_IDS) }))
 
   let orderCursor: { id: string } | undefined
   for (;;) {

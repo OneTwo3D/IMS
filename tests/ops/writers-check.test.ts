@@ -30,7 +30,7 @@ import {
 const NOW = new Date('2026-10-20T12:00:00Z')
 const CUTOFF = '2026-10-10T00:00:00Z'
 
-const ALL_ON = new Map<string, string>([['xero_sync_enabled', 'true'], ['xero_daily_batch_enabled', 'true'], ['wc_stock_sync_enabled', 'true'], ['wc_fx_push_enabled', 'true'], ['trackship_refire_enabled', 'true'], ['mintsoft_parent_sku_delete_enabled', 'true'], ['wc_invoice_document_enabled', 'true']])
+const ALL_ON = new Map<string, string>([['xero_sync_enabled', 'true'], ['xero_daily_batch_enabled', 'true'], ['wc_stock_sync_enabled', 'true'], ['wc_fx_push_enabled', 'true'], ['trackship_refire_enabled', 'true'], ['mintsoft_parent_sku_delete_enabled', 'true'], ['wc_invoice_document_enabled', 'true'], ['wc_invoice_note_enabled', 'true'], ['wc_withdrawal_outcome_enabled', 'true']])
 
 /** Every step evidence source answering clean: attestations present long before any live-from instant, probes clean, no offending rows. */
 export function cleanStepEvidence(): Record<StepEvidenceKind, StepEvidenceReading> {
@@ -231,6 +231,17 @@ test('ARM (b2): IMS able to post the Xero sales documents (legacy path, no produ
   const oneOff = evaluateWritersCheck(inputs({ env: both, settings: new Map([['xero_sync_enabled', 'true'], ['xero_sync_sales_invoice', 'off']]) }))
   assert.ok(!oneOff.findings.some((f) => f.subject === 'xero.sales.invoice' && f.code === 'ims-writes-owned-elsewhere'))
   assert.ok(oneOff.findings.some((f) => f.subject === 'xero.sales.credit-note' && f.code === 'ims-writes-owned-elsewhere'))
+})
+
+test('xero.inventory.journals stays a capability with every per-type journal mode off: STOCK_IN_TRANSIT, UNEARNED_REV_REVERSAL and ALLOCATION_REVERSAL have no switch and queue as submitted', () => {
+  const { PRODUCER_HOLD_ENFORCED_DESTINATIONS: _hold, ...legacyAll } = ALL_STEPS_LIVE_ENV
+  void _hold
+  const modesOff = ['xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_cogs_journal', 'xero_sync_cogs_reversal', 'xero_sync_stock_allocation', 'xero_sync_manufacturing_journal'].map((key): [string, string] => [key, 'off'])
+  const report = evaluateWritersCheck(inputs({ env: legacyAll, settings: new Map([['xero_sync_enabled', 'true'], ...modesOff]) }))
+  const journals = (r: typeof report) => r.operations.find((op) => op.key === 'xero.inventory.journals')
+  assert.equal(journals(report)?.imsSwitchedOn, true, 'the switchless types still post, so IMS can write the journals')
+  const syncOff = evaluateWritersCheck(inputs({ env: legacyAll, settings: new Map([['xero_sync_enabled', 'false'], ...modesOff]) }))
+  assert.equal(journals(syncOff)?.imsSwitchedOn, false)
 })
 
 test('owners: an undecided owner fails, nobody warns, an operator button warns, IMS-owned is clean', () => {

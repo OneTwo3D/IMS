@@ -502,15 +502,46 @@ export async function runWcTrackshipRefireJobs(options: WcTrackshipRefireRunOpti
 
 export type WcTrackshipRefireTickResult = WcTrackshipRefireRunSummary & { reason?: string; scan?: WcTrackshipRefireScanSummary }
 
+/** The bridge plugin's `/trackship/reconcile` took 50 orders a call; the batch reconcile scans the same number per pass. */
+export const WC_TRACKSHIP_RECONCILE_BATCH_LIMIT = 50
+/** Passes per tick of the batch reconcile (so a backlog of several hundred is worked off in a few ticks, not days). */
+export const WC_TRACKSHIP_RECONCILE_BATCH_PASSES = 4
+
+/**
+ * THE BATCH RECONCILE: the catch-up the bridge's `/trackship/reconcile` route did on every sweep, which IMS takes over at step M. It scans in passes
+ * of `limit` orders until a pass finds nothing new to register or queue (or `passes` is spent), so orders the bridge's last sweeps left unregistered are
+ * all looked at in one tick, not 25 per five minutes. Every other rule is the scan's own: off unless `trackship_refire_enabled`, shadowed while the
+ * hold stands, per-order back-off, the 7-day window.
+ */
+export async function enqueueTrackshipRefireBatch(
+  options: { limit?: number; passes?: number; now?: Date; orderIds?: string[] } = {},
+): Promise<WcTrackshipRefireScanSummary & { passes: number }> {
+  const total: WcTrackshipRefireScanSummary & { passes: number } = { registered: 0, expired: 0, queued: 0, shadowed: 0, inFlight: 0, passes: 0 }
+  const limit = options.limit ?? WC_TRACKSHIP_RECONCILE_BATCH_LIMIT
+  const passes = Math.max(1, Math.trunc(options.passes ?? WC_TRACKSHIP_RECONCILE_BATCH_PASSES))
+  for (let pass = 0; pass < passes; pass += 1) {
+    const part = await enqueueTrackshipRefires({ limit, now: options.now, orderIds: options.orderIds })
+    total.passes += 1
+    total.registered += part.registered
+    total.expired += part.expired
+    total.queued += part.queued
+    total.shadowed += part.shadowed
+    total.inFlight += part.inFlight
+    // A pass that moved nothing means the scan has caught up (a shadowed pass moves the state row's time, so it cannot loop on the same orders).
+    if (part.registered + part.queued + part.expired === 0) break
+  }
+  return total
+}
+
 /**
  * The cron entry: park dead claims, queue what is due, drain. Does NOTHING while the switch is off: no scan, no shadow record, no claim.
  */
-export async function processWcTrackshipRefires(options: WcTrackshipRefireRunOptions = {}): Promise<WcTrackshipRefireTickResult> {
+export async function processWcTrackshipRefires(options: WcTrackshipRefireRunOptions & { batch?: boolean } = {}): Promise<WcTrackshipRefireTickResult> {
   const total: WcTrackshipRefireTickResult = { claimed: 0, succeeded: 0, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
   if (!(await isTrackshipRefireEnabled())) return { ...total, reason: 'trackship_refire_disabled' }
   if (!options.idempotencyKeys) {
     total.deadLettered += await parkStaleWcTrackshipRefireClaims(options.now ?? new Date())
-    total.scan = await enqueueTrackshipRefires({ now: options.now })
+    total.scan = options.batch ? await enqueueTrackshipRefireBatch({ now: options.now }) : await enqueueTrackshipRefires({ now: options.now })
   }
   const part = await runWcTrackshipRefireJobs(options)
   total.claimed += part.claimed

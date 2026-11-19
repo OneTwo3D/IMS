@@ -11,6 +11,9 @@ import {
 } from './bridge-status-fixtures'
 import { evaluateWritersCheck, type WritersCheckInputs } from '../../lib/ops/writers-check'
 import { NATIVE_EMAIL_VIOLATION, readStepEvidence, STEP_EVIDENCE_READERS } from '../../lib/ops/writers-check-step-evidence'
+
+/** The two readers under test never use the shared probe; the reader context just requires one. */
+const noProbe = async () => ({ ok: false as const, reason: 'unreachable' as const, message: 'unused' })
 import { bridgePayloadFromReport, bridgeStatusFreshnessError, bridgeUnitViolations, parseBridgeStatusOutput, readBridgePayload } from '../../lib/domain/writer-attestation/bridge-status'
 import { STEP_EVIDENCE_KINDS, type StepEvidenceKind, type StepEvidenceReading } from '../../lib/security/writers-check-constants'
 
@@ -91,18 +94,18 @@ test('the reader: no attestation is absent (not not-built); a clean report is pr
   if (!parsed.ok) return
   const payload = bridgePayloadFromReport(parsed.report, sampleReport())
   const dbWith = (row: { attestedAt: Date; payload: unknown } | null) => ({ writerAttestation: { findFirst: async () => row } }) as never
-  assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith(null), now: NOW }), { state: 'absent' })
-  assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload }), now: NOW }), {
+  assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith(null), now: NOW, probeOnce: noProbe }), { state: 'absent' })
+  assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload }), now: NOW, probeOnce: noProbe }), {
     state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:01.000Z',
   })
   const bad = parseBridgeStatusOutput(sampleReport({ units: { 'wc-mintsoft-webhook.service': 'LoadState=loaded ActiveState=active UnitFileState=enabled' } }))
   assert.ok(bad.ok)
   if (!bad.ok) return
-  const failing = await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload: bridgePayloadFromReport(bad.report, '') }), now: NOW })
+  const failing = await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload: bridgePayloadFromReport(bad.report, '') }), now: NOW, probeOnce: noProbe })
   assert.equal(failing.state, 'present')
   assert.deepEqual((failing.state === 'present' ? (failing.violations ?? []).length : -1), 2)
   for (const garbage of [{}, null, 'text', { schema: 2 }, { ...payload, units: {} }, { ...payload, generatedAt: 'x' }]) {
-    assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload: garbage }), now: NOW }), { state: 'unreadable' })
+    assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload: garbage }), now: NOW, probeOnce: noProbe }), { state: 'unreadable' })
   }
   assert.equal(readBridgePayload(payload)?.host, 'bridge-host')
   const broken = await readStepEvidence({ db: { writerAttestation: { findFirst: async () => { throw new Error('no table') } } } as never, now: NOW })
@@ -159,14 +162,14 @@ test('NATIVE_EMAIL_EXCLUSIVE reader: not read from the store before step W; both
   let reads = 0
   const read = (state: unknown) => async () => { reads += 1; return state as never }
   const reader = STEP_EVIDENCE_READERS.NATIVE_EMAIL_EXCLUSIVE
-  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, env: {}, readNativeEmail: read(on) }), { state: 'absent' })
+  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env: {}, readNativeEmail: read(on) }), { state: 'absent' })
   assert.equal(reads, 0, 'no WC_WRITES_LIVE_FROM: the store is not asked')
   const env = { WC_WRITES_LIVE_FROM: '2026-12-08T00:00:00Z' }
-  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, env, readNativeEmail: read(on) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.bothOn] })
-  assert.deepEqual(await reader({ db: dbWith(null), now: NOW, env, readNativeEmail: read(off) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.bothOff] })
-  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, env, readNativeEmail: read(off) }), { state: 'probed', violations: [] })
-  assert.deepEqual(await reader({ db: dbWith('false'), now: NOW, env, readNativeEmail: read(on) }), { state: 'probed', violations: [] })
-  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, env, readNativeEmail: read({ ok: false }) }), { state: 'unreadable' })
+  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(on) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.bothOn] })
+  assert.deepEqual(await reader({ db: dbWith(null), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(off) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.bothOff] })
+  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(off) }), { state: 'probed', violations: [] })
+  assert.deepEqual(await reader({ db: dbWith('false'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(on) }), { state: 'probed', violations: [] })
+  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read({ ok: false }) }), { state: 'unreadable' })
   const thrown = await readStepEvidence({ db: dbWith('true'), now: NOW, env, readNativeEmail: async () => { throw new Error('network') } })
   assert.deepEqual(thrown.NATIVE_EMAIL_EXCLUSIVE, { state: 'unreadable' })
 })

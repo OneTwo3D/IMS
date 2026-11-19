@@ -236,7 +236,7 @@ function validCarried(carried: unknown): boolean {
     if (r.kind !== 'onlyIms' && r.kind !== 'onlyVendor' && r.kind !== 'bothDiffer') return false
     if (typeof r.signature !== 'string' || r.signature.length === 0) return false
     if (r.sequence !== null && !(typeof r.sequence === 'number' && Number.isSafeInteger(r.sequence) && r.sequence >= 1)) return false
-    if (!isStreamStamp(r.first) || !Array.isArray(r.later) || !r.later.every(isStreamStamp)) return false
+    if (!isStreamStamp(r.first) || !Array.isArray(r.later) || r.later.length > PENDING_PERSISTENCE_RUNS || !r.later.every(isStreamStamp)) return false
     if (new Set([r.first, ...r.later]).size !== r.later.length + 1) return false
   }
   return true

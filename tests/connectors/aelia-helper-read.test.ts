@@ -16,8 +16,8 @@ const BASE = new URL('https://shop.example.com/')
 const hop = (url: string, method = 'GET', redirectCount = 0) => ({ method, url: new URL(url), redirectCount })
 const GOOD = `https://shop.example.com${AELIA_RATES_PATH}`
 
-test('the allowlist is ONE path with NO parameters', () => {
-  assert.deepEqual(HELPER_READ_ALLOWLIST, [{ path: '/wp-json/oti/v1/aelia-rates', params: {} }])
+test('the allowlist is the two read paths, each with NO parameters (the incumbents probe is the second)', () => {
+  assert.deepEqual(HELPER_READ_ALLOWLIST, [{ path: '/wp-json/oti/v1/aelia-rates', params: {} }, { path: '/wp-json/oti/v1/incumbents', params: {} }])
 })
 
 test('hop gate: the one allowed request passes; every other shape is refused before it is sent', () => {

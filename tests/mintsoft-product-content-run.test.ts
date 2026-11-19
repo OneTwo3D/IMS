@@ -57,7 +57,7 @@ mock.module('@/lib/db', {
       wmsSyncLog: { createMany: async ({ data }: { data: Row[] }) => { state.logs.push(...data); return { count: data.length } } },
       wmsProductLink: {
         upsert: async ({ create }: { create: Row }) => { state.metaUpserts += 1; return create },
-        updateMany: async () => ({ count: 1 }),
+        updateMany: async ({ data }: { data: Row }) => { linkWrites.push(data); return { count: 1 } },
         update: async ({ data }: { data: Row }) => { linkWrites.push(data); return {} },
       },
       wmsStockDiscrepancy: { updateMany: async () => ({ count: 0 }), create: async () => ({}), createMany: async () => ({ count: 0 }) },
@@ -123,8 +123,8 @@ test('a content failure is its own error line and counted; the meta result is no
   // The run uses the real environment (no grant, so SHADOW): there is no connector call to fail, so the failure is
   // injected where the shadow is recorded, the content step's own state save.
   const { db } = await import('@/lib/db')
-  const original = db.wmsProductLink.update
-  ;(db.wmsProductLink as unknown as { update: unknown }).update = async () => { throw new Error('state save failed') }
+  const original = db.wmsProductLink.updateMany
+  ;(db.wmsProductLink as unknown as { updateMany: unknown }).updateMany = async (args: { where: Row; data: Row }) => { if ('contentSyncState' in args.where) throw new Error('state save failed'); return original(args as never) }
   try {
     const result = await run()
     console.log(`precondition: the content state save throws; run status=${result.status} errors=${result.errors} content=${JSON.stringify(result.content)}`)
@@ -135,6 +135,6 @@ test('a content failure is its own error line and counted; the meta result is no
     assert.match(String(errorRow.reason), /Content sync failed: state save failed/)
     assert.equal(state.metaUpserts > 0, true, 'the meta step still completed')
   } finally {
-    ;(db.wmsProductLink as unknown as { update: unknown }).update = original
+    ;(db.wmsProductLink as unknown as { updateMany: unknown }).updateMany = original
   }
 })

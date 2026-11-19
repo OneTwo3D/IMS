@@ -50,6 +50,8 @@ export type ContentOutcomeKind =
 export type ContentLineResult = {
   kind: ContentOutcomeKind
   fields: MintsoftContentField[]
+  /** Changed fields that were NOT sent in this run (a shadow), whatever the line's own kind says: a send does not hide them. */
+  shadowedFields: MintsoftContentField[]
   /** Operator text, from `describeContentOutcome` only. */
   reason: string
   payload: Prisma.InputJsonValue
@@ -138,17 +140,33 @@ export type ContentSyncInput = {
   connector: Pick<WmsConnector, 'updateProductContent'>
   /** Environment and clock for the disposition; defaults to the process. Tests pass their own. */
   context?: ProducerDecisionContext
-  /** Where the per-field state is kept; defaults to the product link row. Tests pass a recorder. */
-  saveState?: (linkId: string, state: ContentSyncState) => Promise<void>
+  /**
+   * Where the per-field state is kept; defaults to the product link row. Tests pass a recorder. `context.previous` is the raw state this run read
+   * and `context.sent` the fields it sent: the default saver writes only if the stored state is still `previous`.
+   */
+  saveState?: (linkId: string, state: ContentSyncState, context: { previous: unknown; sent: readonly MintsoftContentField[] }) => Promise<void>
   /** Which fields are verified on the wire; defaults to the connector's own contract. */
   wireContract?: Readonly<Record<MintsoftContentField, { verified: boolean }>>
 }
 
-async function saveStateToLink(linkId: string, state: ContentSyncState): Promise<void> {
-  await db.wmsProductLink.update({
-    where: { id: linkId },
-    data: { contentSyncState: state as unknown as Prisma.InputJsonValue },
+/**
+ * COMPARE-AND-SWAP SAVE. Two runs of the same product (the cron and a manual run) can both read the state, both send, and the slower save would
+ * overwrite the other's hash with one Mintsoft no longer holds. The write therefore lands only if the stored state is still the one this run read.
+ * When it is not, another run moved it: the fields this run sent have no trustworthy hash, so their `pushed` hash is DROPPED from the fresh state and the
+ * next run offers (and sends) the current value again, which converges on what the hub holds.
+ */
+async function saveStateToLink(linkId: string, state: ContentSyncState, context: { previous: unknown; sent: readonly MintsoftContentField[] }): Promise<void> {
+  const next = state as unknown as Prisma.InputJsonValue
+  const swapped = await db.wmsProductLink.updateMany({
+    where: { id: linkId, contentSyncState: context.previous === null || context.previous === undefined ? { equals: Prisma.DbNull } : { equals: context.previous as Prisma.InputJsonValue } },
+    data: { contentSyncState: next },
   })
+  if (swapped.count === 1) return
+  const row = await db.wmsProductLink.findUnique({ where: { id: linkId }, select: { contentSyncState: true } })
+  if (!row) return
+  const fresh = readContentSyncState(row.contentSyncState)
+  for (const field of context.sent) delete fresh.pushed[field]
+  await db.wmsProductLink.update({ where: { id: linkId }, data: { contentSyncState: fresh as unknown as Prisma.InputJsonValue } })
 }
 
 export async function syncMintsoftProductContent(input: ContentSyncInput): Promise<ContentLineResult> {
@@ -157,6 +175,7 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
     fields,
     reason: describeContentOutcome(kind, fields, detail),
     payload: { kind, fields, ...extra } as Prisma.InputJsonValue,
+    shadowedFields: [],
   })
 
   const projection = projectContentForMintsoft(input.content)
@@ -211,7 +230,7 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
   const heldFields = held ? sendable : []
   const newShadows = toShadow.filter((field) => state.shadowed[field] !== contentValueHash(projection[field]!))
   for (const field of newShadows) state.shadowed[field] = contentValueHash(projection[field]!)
-  if (sentFields.length > 0 || newShadows.length > 0) await (input.saveState ?? saveStateToLink)(input.link.id, state)
+  if (sentFields.length > 0 || newShadows.length > 0) await (input.saveState ?? saveStateToLink)(input.link.id, state, { previous: input.link.contentSyncState ?? null, sent: sentFields })
 
   const why = PRODUCER_REASON_TEXT[decision.reason]
   const shadowDetail = live
@@ -227,12 +246,14 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
     dispositionReason: decision.reason,
     wouldSend: Object.fromEntries(toShadow.concat(heldFields).map((field) => [MINTSOFT_CONTENT_WIRE[field].wire, preview(projection[field]!)])),
   }
+  // A send never hides what was NOT sent: every field still a shadow is named on the line, whether or not it was recorded this run.
+  const withShadow = (line: ContentLineResult): ContentLineResult => ({ ...line, shadowedFields: toShadow })
   if (sentFields.length > 0) {
-    return result('sent', sentFields, extra, newShadows.length > 0 ? describeContentOutcome('shadow', newShadows, shadowDetail) : undefined)
+    return withShadow(result('sent', sentFields, extra, toShadow.length > 0 ? describeContentOutcome('shadow', toShadow, shadowDetail) : undefined))
   }
-  if (held) return result('held', heldFields, extra, held.message)
-  if (newShadows.length > 0) return result('shadow', newShadows, extra, shadowDetail)
-  return result('shadow_repeat', toShadow, extra, shadowDetail)
+  if (held) return withShadow(result('held', heldFields, extra, held.message))
+  if (newShadows.length > 0) return withShadow(result('shadow', newShadows, extra, shadowDetail))
+  return withShadow(result('shadow_repeat', toShadow, extra, shadowDetail))
 }
 
 export type ContentRunCounters = { sent: number; shadowed: number; held: number; errors: number }

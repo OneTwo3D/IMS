@@ -98,6 +98,12 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
     why: 'The last barrier in front of the TrackShip re-fire POST to the helper plugin.',
   },
   {
+    file: 'lib/connectors/woocommerce/sync/withdrawal-outcome.ts', decl: 'postWithdrawalOutcome', role: 'transport-barrier',
+    mustCall: ['wooEgressHold'], beforeCalls: ['connectorFetch'],
+    operations: ['order.withdrawal-outcome'],
+    why: 'The last barrier in front of the withdrawal-outcome POST to the helper plugin; the operation\'s own step gate (wooDrainHold with the operation) and the switch wc_withdrawal_outcome_enabled come before it.',
+  },
+  {
     file: 'lib/connectors/woocommerce/api.ts', decl: 'wcPost', role: 'transport-barrier',
     mustCall: ['wooEgressHold'], beforeCalls: ['connectorFetch'],
     operations: [],
@@ -152,7 +158,6 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
  * needs the reason; an entry that no longer matches a map row is red.
  */
 export const WOO_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>> = {
-  'order.withdrawal-outcome': 'No IMS producer exists: the endpoint stays in the WooCommerce withdrawal plugin (producer census NO_PRODUCER).',
   'order.trackship-reconcile': 'No IMS producer exists: the endpoint stays in the TrackShip plugin (producer census NO_PRODUCER).',
 }
 
