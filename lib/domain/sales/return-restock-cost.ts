@@ -395,7 +395,7 @@ export async function raiseAdoptionReclassTask(
     const creditedText = credited ? [...credited].map(([acc, v]) => `${acc} ${money2(v).toFixed(2)}`).join(', ') : 'none found'
     const head = `inbox row ${a.inboxId}: ${a.qty} of ${rowQty} unit(s) adopted`
     if (!hasJournal) {
-      rowNotes.push(`${head}; IMS found no restock journal standing for this row; original cost to reverse ${original.toFixed(2)}`)
+      rowNotes.push(`${head}; IMS found no restock journal standing for this row and recorded no posting instruction for it; original cost to reverse ${original.toFixed(2)}`)
     } else if (whole) {
       rowNotes.push(`${head}; the restock journalled it (credited ${creditedText}); post Dr that account ${original.toFixed(2)} / Cr COGS ${original.toFixed(2)}`)
     } else {
@@ -421,7 +421,7 @@ export async function raiseAdoptionReclassTask(
     kind: 'refund_adoption_reclass_journal',
     posting: `the margin reclass for refund ${params.refundId} on order ${params.orderRef}, which adopted returned stock the warehouse had already restocked${advisory ? ' (ADVISORY: mixed or partly journalled rows)' : ''}`,
     committed: 'the refund and its link to the already restocked arrival are written in IMS, and the stock is counted once',
-    remedy: `IMS posts nothing for this. Rows: ${rowNotes.join(' | ')}. Total original shipped cost ${owedCostBase.toFixed(2)}. Where the restock journalled, the margin needs a manual reclass: Dr the restock's reason account / Cr COGS at the original shipped cost. Never post Dr Inventory for this: the restock's own journal (or its own owed record) carries the Inventory debit.${advisory ? ' ADVISORY: the rows are mixed or only partly adopted, so check the ledger for which units were journalled before posting anything.' : ''}`,
+    remedy: `IMS posts nothing for this. Rows: ${rowNotes.join(' | ')}. Total original shipped cost ${owedCostBase.toFixed(2)}. Where the restock journalled, the margin needs a manual reclass: Dr the restock's reason account / Cr COGS at the original shipped cost. Never post Dr Inventory for this here. For a row with no standing restock journal, no restock record may exist at all (an unmapped-account restock writes only an activity-log entry on that inbox row): IMS recorded no instruction for it, so check the ledger and the row's activity log; if the restock's Dr Inventory / Cr stock-gain entry is posted by hand, also post Dr that stock-gain account / Cr COGS at the cost shown for the row.${advisory ? ' ADVISORY: the rows are mixed or only partly adopted, so check the ledger for which units were journalled before posting anything.' : ''}`,
     outcome: unqueuedOutcome,
     metadata: { refundId: params.refundId, adoptions: rowMeta, owedCostBase, advisory, chartConnector: settings.connector },
     inTransaction: {

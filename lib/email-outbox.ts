@@ -1973,17 +1973,18 @@ async function claimEmailRow(
   if (first.count > 0) return 'claimed'
 
   // A STALE PROCESSING ROW WHOSE WORKER NEVER ENTERED THE SENDER (it died while preparing: PDF build, recipient confirm) sent nothing. It is put back
-  // to PENDING (not counted as a reclaim: nothing was attempted) and claimed in the ordinary way, for every kind. Conditional on the stale claim and on
-  // the sender never having been entered, so a worker that entered it a moment ago is not requeued.
+  // to PENDING and claimed in the ordinary way, for every kind. Conditional on the stale claim and on the sender never having been entered, so a worker
+  // that entered it a moment ago is not requeued. EACH REQUEUE COUNTS AS AN ATTEMPT (not a stale reclaim: no send happened), so a row whose
+  // preparation crashes or hangs the worker cannot loop for ever: at the last attempt it is parked instead (below).
   const requeued = await client.emailOutbox.updateMany({
     where: {
       id,
-      attempts: { lt: EMAIL_MAX_ATTEMPTS },
+      attempts: { lt: EMAIL_MAX_ATTEMPTS - 1 },
       status: 'PROCESSING',
       processingStartedAt: { lt: claim.staleCutoff },
       sendEnteredAt: null,
     },
-    data: { status: 'PENDING', processingStartedAt: null, lockedBy: null },
+    data: { status: 'PENDING', processingStartedAt: null, lockedBy: null, attempts: { increment: 1 } },
   })
   if (requeued.count > 0) {
     const again = await client.emailOutbox.updateMany({
@@ -1993,6 +1994,26 @@ async function claimEmailRow(
     if (again.count > 0) return 'claimed'
     return 'none'
   }
+
+  // The same stale, never-entered row with no attempts left to requeue on: its preparation has now stalled EMAIL_MAX_ATTEMPTS - 1 times. Nothing was
+  // ever sent, so say that (not "may have reached the recipient"); an operator releases or cancels it.
+  const preparationStalled = await client.emailOutbox.updateMany({
+    where: {
+      id,
+      attempts: { gte: EMAIL_MAX_ATTEMPTS - 1 },
+      status: 'PROCESSING',
+      processingStartedAt: { lt: claim.staleCutoff },
+      sendEnteredAt: null,
+    },
+    data: {
+      status: EMAIL_OUTBOX_PARKED_STATUS,
+      processingStartedAt: null,
+      lockedBy: null,
+      lastError: 'Preparation never completed: the worker stopped or stalled while preparing this email (before it was handed to the mail server) '
+        + `${EMAIL_MAX_ATTEMPTS - 1} times in a row, so it was parked instead of being retried again. Nothing was sent. Check the document it builds, then release or cancel it.`,
+    },
+  })
+  if (preparationStalled.count > 0) return 'parked'
 
   const reclaim = await client.emailOutbox.updateMany({
     where: {
@@ -2511,7 +2532,11 @@ export async function processPendingEmailOutbox(
       result.parked++
       const reference = email.referenceType && email.referenceId ? ` for ${email.referenceType} ${email.referenceId}` : ''
       const cap = staleReclaimCapForKind(email.kind)
-      const message = `Email outbox row ${email.id} (${email.kind}${reference}, to ${email.toEmail}) was PARKED: ` + (cap === 0
+      // A swept row that never entered the sender is parked by the preparation-stalled step: nothing can have been sent.
+      const preparationStalled = !email.sendEnteredAt
+      const message = `Email outbox row ${email.id} (${email.kind}${reference}, to ${email.toEmail}) was PARKED: ` + (preparationStalled
+        ? `preparing it stalled or crashed the worker ${EMAIL_MAX_ATTEMPTS - 1} times before it was ever handed to the mail server, so nothing was sent. Check the document it builds. `
+        : cap === 0
         ? 'the worker that claimed it stopped before recording the result, so the message may or may not have reached the recipient (outcome unknown). It was not re-sent, to avoid a duplicate. '
         : `it had already been reclaimed ${cap} time(s) and its holder has gone stale again, so the sender has been entered at least twice for it and a copy may already have reached the customer. `)
         + 'It will not be sent automatically. Check the mail server or provider log, then release it '

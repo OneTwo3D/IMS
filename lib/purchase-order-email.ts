@@ -99,8 +99,9 @@ type GuardOutcome<T> = { refused: string; unknown?: undefined } | { unknown: str
  *
  * THE LOCK IS BOUNDED. The send has a deadline (60 s: the mailer's transport timeouts, then its own race that CLOSES the connection) and the
  * guard races it again at 75 s; the transaction's own timeout is 120 s, so the lock is never released by the transaction timing out under a
- * live send. A send that hits a deadline settles as a terminal "outcome unknown" failure and is NEVER retried automatically, so no email can
- * go out after the lock is released and an Off save has committed: the connection is closed, and the row will not be sent again. A person
+ * live send. A send that hits a deadline AFTER the message began streaming settles as a terminal "outcome unknown" failure, never retried automatically;
+ * one that hits it BEFORE any hand-over is retryable, but the mailer first DESTROYS the connection it owns (transport.close() would not). So in both
+ * cases no email can go out after the lock is released and an Off save has committed. A person
  * can re-queue it with Email PO (which re-checks the flag). An error thrown by the transaction AFTER the send returned (commit, release)
  * returns the send's answer instead of rethrowing, so a delivered email is not left retryable.
  */

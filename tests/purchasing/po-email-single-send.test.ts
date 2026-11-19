@@ -391,3 +391,42 @@ test('outbox: a settlement write that fails after an unknown outcome still ends 
   const guarded = await drainWith(makeRow({}), { sendGuard: async () => ({ unknown: 'Outcome unknown: guard backstop.' }), singleSend: true }, true)
   assert.equal(guarded.row.status, 'FAILED')
 })
+
+test('mailer: after a pre-DATA deadline the connection is DESTROYED before the retryable answer, so the old send cannot deliver (no duplicate, nothing outside the PO lock)', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  let socket: import('node:net').Socket | null = null
+  let delivered = 0
+  let connectAfterKill: unknown = 'not attempted'
+  behave = (o) => new Promise<never>(() => {
+    // nodemailer asks the transport option for the socket it will connect over; this fake "send" only completes if that socket is still alive.
+    ;(o.getSocket as (o: unknown, cb: (e: Error | null, s: { socket: import('node:net').Socket }) => void) => void)(o, (_e, s) => { socket = s.socket })
+    setTimeout(() => {
+      if (!socket!.destroyed) delivered++
+      // nodemailer connects the owned socket only after DNS: a late connect must be refused (net.Socket.connect would revive a destroyed socket).
+      try { socket!.connect(1, '127.0.0.1'); connectAfterKill = 'connected' } catch (e) { connectAfterKill = (e as Error).message }
+    }, 60)
+  })
+  const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
+  assert.equal(r.permanent, false, 'pre-DATA is retryable')
+  assert.equal(socket!.destroyed, true, 'the socket is dead by the time the retryable answer is returned')
+  await new Promise((res) => setTimeout(res, 100))
+  assert.equal(delivered, 0, 'the old connection cannot deliver after the retry is allowed')
+  assert.match(String(connectAfterKill), /abandoned at its deadline/)
+  assert.equal(socket!.connecting, false)
+  assert.equal(lastOptions?.connectionTimeout, 10)
+  assert.equal(lastOptions?.greetingTimeout, 10)
+})
+
+test('mailer: after DATA started the deadline stays terminal (unknown outcome) and the socket is destroyed too', async () => {
+  const { sendEmailWithSmtpSettings, SEND_DEADLINE_UNKNOWN_OUTCOME } = await import('../../lib/mailer.ts')
+  let socket: import('node:net').Socket | null = null
+  behave = (o) => {
+    ;(o.getSocket as (o: unknown, cb: (e: Error | null, s: { socket: import('node:net').Socket }) => void) => void)(o, (_e, s) => { socket = s.socket })
+    sendCommand(o, 'DATA')
+    return new Promise<never>(() => undefined)
+  }
+  const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
+  assert.equal(r.error, SEND_DEADLINE_UNKNOWN_OUTCOME)
+  assert.equal(r.permanent, true)
+  assert.equal(socket!.destroyed, true)
+})

@@ -1,3 +1,4 @@
+import net from 'node:net'
 import nodemailer from 'nodemailer'
 import type SMTPTransport from 'nodemailer/lib/smtp-transport'
 import { z } from 'zod'
@@ -183,6 +184,15 @@ export async function sendEmailWithSmtpSettings(
       }
     }
     const noop = () => undefined
+    const ownedSocket = new net.Socket()
+    let socketKilled = false
+    // net.Socket.connect() REVIVES a destroyed socket, so a send still resolving DNS when the deadline fires must not be able to connect afterwards.
+    const realConnect = ownedSocket.connect.bind(ownedSocket) as (...a: unknown[]) => net.Socket
+    ;(ownedSocket as unknown as { connect: (...a: unknown[]) => net.Socket }).connect = (...a) => {
+      if (socketKilled) throw new Error('The send was abandoned at its deadline; the connection was not opened.')
+      return realConnect(...a)
+    }
+    const killConnection = () => { socketKilled = true; ownedSocket.destroy() }
     const transportOptions: SMTPTransport.Options = {
       ...(opts.singleSend ? {
         transactionLog: true,
@@ -200,7 +210,11 @@ export async function sendEmailWithSmtpSettings(
           level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,
         },
       } : {}),
-      ...(deadlineMs ? { connectionTimeout: deadlineMs, greetingTimeout: deadlineMs, socketTimeout: deadlineMs } : {}),
+      // The connect and greeting phases are bounded at HALF the send deadline so the transport's own timeouts normally settle the send first.
+      ...(deadlineMs ? { connectionTimeout: Math.max(1, Math.floor(deadlineMs / 2)), greetingTimeout: Math.max(1, Math.floor(deadlineMs / 2)), socketTimeout: deadlineMs } : {}),
+      // A socket this function OWNS: nodemailer (9.0.3) resolves, connects and (for ssl or STARTTLS) wraps TLS over it, so destroying it kills the send in
+      // every phase. transport.close() does NOT (it only emits an event); a pool's close() leaves a busy connection running.
+      ...(deadlineMs ? { getSocket: (_o: unknown, cb: (err: Error | null, s: { socket: net.Socket }) => void) => { cb(null, { socket: ownedSocket }) } } : {}),
       host: smtp.host,
       port: smtp.port,
       secure: smtp.secure === 'ssl',
@@ -229,6 +243,9 @@ export async function sendEmailWithSmtpSettings(
       ]).finally(() => { if (timer) clearTimeout(timer) })
       if (outcome === 'deadline') {
         sending.catch(() => undefined)
+        // Destroy the connection BEFORE answering (synchronously, so nothing interleaves with the dataStarted read below): from here the background
+        // send cannot deliver, which is what makes the pre-DATA answer below safe to retry and keeps a PO send inside its send lock.
+        killConnection()
         transport.close()
         // Before DATA nothing was handed over (no connection, greeting or DATA command): an ordinary retryable failure, not an unknown outcome.
         if (opts.singleSend && !dataStarted) return { success: false, permanent: false, error: SEND_DEADLINE_BEFORE_DATA }

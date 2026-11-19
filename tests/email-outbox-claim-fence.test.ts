@@ -3553,6 +3553,34 @@ test('a stale PROCESSING row of a customer kind whose worker NEVER entered the s
   assert.deepEqual(deliveries, ['retry'], 'nothing had been sent, so the retry is the first send')
   assert.equal(rows[0].status, 'SENT')
   assert.equal(rows[0].staleReclaimCount, 0, 'not counted as a reclaim')
+  assert.equal(rows[0].attempts, 1, 'but the requeue counts as an attempt')
+})
+
+test('a stale never-entered row whose preparation keeps stalling is PARKED after the requeue cap, with an operator notice, and never sent', async () => {
+  let sends = 0
+  const logged: Array<{ description?: string }> = []
+  const { client, rows } = await makeClient([makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'dead-holder', sendEnteredAt: null, attempts: 3 })])
+  // Round 1: the 4th attempt (a requeue). Its preparation stalls, so the row is claimed but never settled.
+  await drain({
+    client, now: () => T_RECLAIM,
+    prepareQueuedEmail: async () => { throw new Error('preparation hangs') },
+    logActivity: async (e: { description?: string }) => { logged.push(e) },
+    async sendEmail() { sends++; return { success: true } },
+  })
+  assert.equal(sends, 0)
+  // The worker died mid-prepare: put the row back as the stale PROCESSING row it would be, at the last attempt.
+  rows[0].status = 'PROCESSING'; rows[0].processingStartedAt = T0; rows[0].sendEnteredAt = null; rows[0].lockedBy = 'dead-holder'; rows[0].attempts = 4
+  logged.length = 0
+  const r = await drain({
+    client, now: () => T_RECLAIM, prepareQueuedEmail: noPrepare,
+    logActivity: async (e: { description?: string }) => { logged.push(e) },
+    async sendEmail() { sends++; return { success: true } },
+  })
+  assert.equal(r.parked, 1)
+  assert.equal(sends, 0, 'nothing was ever sent')
+  assert.equal(rows[0].status, 'PARKED_SEND_CAP')
+  assert.match(String((rows[0] as { lastError?: string }).lastError ?? ''), /Preparation never completed/)
+  assert.match(String(logged[0]?.description ?? ''), /nothing was sent/)
 })
 
 test('the purchase order keeps its single reclaim (it has its own delivery-boundary guard)', async () => {
