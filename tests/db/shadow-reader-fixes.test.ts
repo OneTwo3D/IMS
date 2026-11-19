@@ -110,6 +110,15 @@ test('RECONCILE WHILE HELD: an unlinked paid order is NOT_PUSHED drift with the 
     const outcome = await resolve()
     assert.deepEqual([outcome.resolved, outcome.outOfScope], [0, 0], 'CONTROL: still drifting, so the finding stays open')
   })
+  // A finding raised during a live period has NO held-create shadow record: the hold now standing does not explain its missing link.
+  await withEnv(HELD, async () => {
+    const outcome = await resolve()
+    const row = await d.db.wmsOrderDiscrepancy.findUnique({ where: { id: finding.id } })
+    assert.equal(outcome.outOfScope, 0, 'no durable held-create evidence: the finding is not closed by the hold')
+    assert.equal(row?.status, 'OPEN')
+  })
+  await d.db.outboundShadowWrite.create({ data: { destination: 'mintsoft', operation: 'order.create', subjectType: 'SalesOrder', subjectId: orderId, payloadDigest: 'a'.repeat(64), reason: 'HELD', owner: 'bridge', phase: 'P1', grantState: 'none' } })
+  t.after(() => d.db.outboundShadowWrite.deleteMany({ where: { subjectId: orderId } }))
   await withEnv(HELD, async () => {
     const outcome = await resolve()
     const row = await d.db.wmsOrderDiscrepancy.findUnique({ where: { id: finding.id } })

@@ -96,6 +96,11 @@ export type MintsoftSettings = {
    * else, including unset, is OFF: the push payload is then identical to what it was before the setting existed.
    */
   mintsoft_send_ioss_number: string
+  /**
+   * 'true' sends the order's shipping VAT as `ShippingTotalVat` (derived from the stored order tax: the order's tax minus its line tax), as the
+   * woo-mintsoft plugin does. Anything else, including unset, is OFF: `ShippingTotalVat` stays 0 and the push payload is unchanged.
+   */
+  mintsoft_send_shipping_vat: string
 }
 
 export const MINTSOFT_SETTING_KEYS = [
@@ -112,6 +117,7 @@ export const MINTSOFT_SETTING_KEYS = [
   'mintsoft_channel_id',
   'mintsoft_warehouse_id',
   'mintsoft_send_ioss_number',
+  'mintsoft_send_shipping_vat',
 ] as const
 
 // `{id}` is substituted with the Mintsoft internal order id. Matches the proven
@@ -134,6 +140,7 @@ const MINTSOFT_DEFAULTS: MintsoftSettings = {
   mintsoft_channel_id: '',
   mintsoft_warehouse_id: '',
   mintsoft_send_ioss_number: '',
+  mintsoft_send_shipping_vat: '',
 }
 
 /**

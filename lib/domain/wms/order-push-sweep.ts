@@ -13,6 +13,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { currencyMinorUnits, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { MAX_ADVISORY_PENCE } from './push-total-mismatch-note'
 import { isMirroredFeeLine } from './mirrored-fee-line'
+import { deriveShippingVat } from './push-shipping-vat'
 import { reconcilePushTotals, withheldGoodsGross, withheldLineCount } from './push-total-guard'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { WmsOrderUpdatePartialError, legacyCourierFormInput } from '@/lib/connectors/wms/courier-form'
@@ -774,6 +775,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
   // MIXED-WAREHOUSE SCOPE (only ever passed while `wms_mixed_warehouse_push_enabled` is on). A scope that cannot be sent (unallocated units, a split kit,
   // nothing allocated to this warehouse) is a local build failure like a missing SKU: nothing is claimed or sent. FULL / absent leaves the payload below untouched.
   if (scope && scope.mode !== 'FULL' && scope.mode !== 'MIXED') throw new Error(scope.reason)
+  const shippingVatDerived = scope?.mode === 'MIXED' ? 0 : deriveShippingVat(order)
   const input: WmsOrderPushInput = {
     orderNumber: wmsPushOrderReference(order),
     externalReference: order.id,
@@ -789,6 +791,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
     totalVat: num(order.taxForeign),
     shippingExVat: num(order.shippingForeign),
     shippingVat: 0,
+    ...(shippingVatDerived > 0 ? { shippingVatDerived } : {}),
     discountExVat: num(order.discountAmount),
     discountVat: 0,
     lines: buildLines(order.lines, refundedQtyByLine(order)),

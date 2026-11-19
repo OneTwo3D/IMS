@@ -4,7 +4,8 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { wmsCreateObligationFloor, wmsProducerHold } from '@/lib/connectors/wms/producer-seam'
+import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
+import { WMS_PRODUCER_DESTINATION, wmsCreateObligationFloor, wmsProducerHold } from '@/lib/connectors/wms/producer-seam'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus } from '@/lib/connectors/wms/types'
 import { notify } from '@/lib/notifications'
 import { scrubWmsError } from './error-scrub'
@@ -366,18 +367,54 @@ export async function resolveNotPushedChunk(input: {
   now: Date
 }): Promise<{ resolved: number; outOfScope: number }> {
   const { rows } = input
-  // HELD: while the producer-side hold stands for the warehouse every create is a shadow and writes no link, so no order can be "not pushed"
-  // in the sense this finding means. Close every open finding with an explicit disposition (never silently), whatever the order looks like.
+  // HELD: while the producer-side hold stands every create is a shadow and writes no link. That explains the missing link ONLY for an order
+  // IMS actually shadowed: a finding raised during an earlier live period (the push cron really stopped) must not be closed by a later hold.
+  // So while held, close only the findings whose order has a DURABLE held-create shadow record; every other row falls through to the normal
+  // drift predicate and stays open while it drifts. An unreadable record reads as no record (the finding stays open).
+  let heldRows = rows
   if (wmsProducerHold(input.connectorId).held) {
-    const heldIds = rows.map((row) => row.id)
+    const shadowed = await orderIdsWithHeldCreateShadow(input.connectorId, rows.map((row) => row.orderId))
+    const heldIds = rows.filter((row) => shadowed.has(row.orderId)).map((row) => row.id)
     if (heldIds.length > 0) {
       await db.wmsOrderDiscrepancy.updateMany({
         where: { id: { in: heldIds }, status: 'OPEN' },
         data: { status: 'RESOLVED', resolvedAt: input.now, detail: WMS_RECONCILE_HELD_DETAIL },
       })
     }
-    return { resolved: 0, outOfScope: heldIds.length }
+    const closed = new Set(heldIds)
+    heldRows = rows.filter((row) => !closed.has(row.id))
+    if (heldRows.length === 0) return { resolved: 0, outOfScope: heldIds.length }
+    const rest = await resolveNotPushedChunkLive({ ...input, rows: heldRows })
+    return { resolved: rest.resolved, outOfScope: rest.outOfScope + heldIds.length }
   }
+  return resolveNotPushedChunkLive(input)
+}
+
+const SHADOW_READ_BATCH = 10
+
+/** The orders of `orderIds` with a durable held-create shadow record. A record that cannot be read is no record: the finding stays open. */
+async function orderIdsWithHeldCreateShadow(connectorId: string, orderIds: string[]): Promise<Set<string>> {
+  const found = new Set<string>()
+  if (!(connectorId in WMS_PRODUCER_DESTINATION)) return found
+  const destination = WMS_PRODUCER_DESTINATION[connectorId as keyof typeof WMS_PRODUCER_DESTINATION]
+  for (let i = 0; i < orderIds.length; i += SHADOW_READ_BATCH) {
+    try {
+      const records = await findDurableShadowRecords(db, destination, [{ subjectType: 'SalesOrder', exactIds: orderIds.slice(i, i + SHADOW_READ_BATCH), operations: ['order.create'] }])
+      for (const record of records) found.add(record.subjectId)
+    } catch (error) {
+      console.error(`[wms-reconcile] could not read held-create shadow records: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return found
+}
+
+async function resolveNotPushedChunkLive(input: {
+  connectorId: string
+  boundWarehouseIds: string[]
+  rows: Array<{ id: string; orderId: string }>
+  now: Date
+}): Promise<{ resolved: number; outOfScope: number }> {
+  const { rows } = input
   const drifting = async (paidNotBefore: Date | null) => new Set(
     input.boundWarehouseIds.length === 0
       ? []
