@@ -111,9 +111,31 @@ async function queueStorefrontEmail(params: { name: StorefrontEmailKindName; kin
   } catch (error) {
     // The database refused a second undelivered row for this (kind, order): a writer the order lock does not serialise, which is what the index is for.
     if (isUndeliveredEmailCollision(error)) return { queued: false, reason: 'already_queued' }
-    console.error(`Failed to queue storefront ${name} e-mail for order ${orderId}`, error)
+    await recordQueueFailure(name, orderId, error)
     return { queued: false, reason: 'error' }
   }
+}
+
+/**
+ * A storefront e-mail that could not be queued is BEST EFFORT by design: the order import, the shipment despatch and the status change that called
+ * it must not fail because a courtesy e-mail could not be queued, so the failure is returned (`reason: 'error'`), never thrown. It is not silent:
+ * it is logged and written to the order's activity at WARNING (`logActivity` never throws). Nothing re-queues it automatically except a later
+ * run of the same step (a despatch retry re-runs the partial-shipment and dispatched hooks and heals a crashed enqueue); otherwise the customer
+ * misses this one e-mail and an operator can send it by hand.
+ */
+async function recordQueueFailure(name: StorefrontEmailKindName, orderId: string, error: unknown): Promise<void> {
+  console.error(`Failed to queue storefront ${name} e-mail for order ${orderId}`, error)
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'storefront_customer_email_queue_failed',
+    tag: 'sales',
+    level: 'WARNING',
+    description: `Could not queue the ${name} e-mail for this storefront order (${error instanceof Error ? error.message : String(error)}). The order was not affected. `
+      + 'Only a later run of the same step (a despatch retry) queues it again; otherwise the customer misses this one e-mail and an operator can send it by hand.',
+    metadata: { kind: name },
+    resolveUser: false,
+  })
 }
 
 /** After the order is imported from the storefront. */
@@ -123,13 +145,30 @@ export function queueStorefrontConfirmationIfEligible(orderId: string): Promise<
 
 /** After one shipment of an order that still owes more has despatched. One e-mail per shipment. */
 export async function queueStorefrontPartialShipmentEmailIfEligible(shipmentId: string): Promise<QueueResult> {
+  let orderIdOfShipment: string | null = null
   try {
     if (!(await isStorefrontCustomerEmailEnabled())) return { queued: false, reason: 'disabled' }
     const shipment = await db.shipment.findUnique({ where: { id: shipmentId }, select: { orderId: true } })
     if (!shipment) return { queued: false, reason: 'shipment_not_found' }
+    orderIdOfShipment = shipment.orderId
     return await queueStorefrontEmail({ name: 'partial', kind: storefrontPartialKind(shipmentId), orderId: shipment.orderId, shipmentId })
   } catch (error) {
-    console.error(`Failed to queue storefront partial-shipment e-mail for shipment ${shipmentId}`, error)
+    // Reached only when the switch read or the shipment lookup threw (queueStorefrontEmail never throws). With no order id there is no order to
+    // note it on, so it is logged at SYSTEM level and the shipment's own despatch retry queues the e-mail again.
+    if (orderIdOfShipment) await recordQueueFailure('partial', orderIdOfShipment, error)
+    else {
+      console.error(`Failed to queue storefront partial-shipment e-mail for shipment ${shipmentId}`, error)
+      await logActivity({
+        entityType: 'SYSTEM',
+        entityId: shipmentId,
+        action: 'storefront_customer_email_queue_failed',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `Could not queue the partial-shipment e-mail for shipment ${shipmentId} (${error instanceof Error ? error.message : String(error)}). The despatch was not affected; a despatch retry queues it again, otherwise the customer misses this one e-mail and an operator can send it by hand.`,
+        metadata: { kind: 'partial', shipmentId },
+        resolveUser: false,
+      })
+    }
     return { queued: false, reason: 'error' }
   }
 }

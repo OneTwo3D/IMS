@@ -127,6 +127,29 @@ test('delivered: only for DELIVERED, once, and not for an order despatched long 
   assert.deepEqual(await queue.queueStorefrontDeliveredEmailIfEligible('so-1'), { queued: false, reason: 'too_old' })
 })
 
+test('a queue failure never throws into the caller and is recorded at WARNING on the order, for confirmation, partial shipment and delivered (MUTATION: console-only => red)', async () => {
+  reset(); ON()
+  const { queue } = await load()
+  state.shipment = { status: 'SHIPPED', shippedAt: new Date(), orderId: 'so-1' }
+  const original = tx.emailOutbox.create
+  tx.emailOutbox.create = async () => { throw new Error('outbox unavailable') }
+  const quiet = console.error
+  console.error = () => {}
+  try {
+    assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1'), { queued: false, reason: 'error' })
+    assert.deepEqual(await queue.queueStorefrontPartialShipmentEmailIfEligible('sh-1'), { queued: false, reason: 'error' })
+    state.order = { ...BASE_ORDER, status: 'DELIVERED', shippedAt: new Date() }
+    assert.deepEqual(await queue.queueStorefrontDeliveredEmailIfEligible('so-1'), { queued: false, reason: 'error' })
+  } finally {
+    tx.emailOutbox.create = original
+    console.error = quiet
+  }
+  const failures = state.logged.filter((entry) => entry.action === 'storefront_customer_email_queue_failed')
+  assert.deepEqual(failures.map((entry) => entry.metadata?.kind), ['confirmation', 'partial', 'delivered'])
+  assert.ok(failures.every((entry) => (entry as { level?: string }).level === 'WARNING' && (entry as { entityId?: string }).entityId === 'so-1'))
+  assert.match(String((failures[0] as { description?: string }).description), /misses this one e-mail and an operator can send it by hand/)
+})
+
 test('pure eligibility: every refusal reason, in the order the contract states them', async () => {
   const { constants } = await load()
   const e = (kind: 'confirmation' | 'partial' | 'delivered', over: Record<string, unknown> = {}, orderOver: Record<string, unknown> = {}, shipment?: unknown) =>
