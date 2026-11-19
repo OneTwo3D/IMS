@@ -56,6 +56,10 @@ const WRITERS: Record<string, Record<string, number>> = {
   wmsOrderPushLink: {
     'app/actions/sync-exceptions.ts': 8, 'app/actions/wms-order-push.ts': 2,
     // The switchover take-over (G_create) adopts a Mintsoft order by upserting a link: ids, a state and timestamps only, no free text; the trigger covers it all the same.
+    // The legacy bridge import (`cutover:legacy-import`, and `--resolve`) writes IMS's own link rows from the bridge's order meta: a create and a compare-and-set adopt of an unclaimed
+    // placeholder. It writes ids, a state and timestamps; its only text column is `lastError` (a fixed constant dead-letter reason, never bridge or customer text), which is one of the trigger's guarded columns, so an erased order's
+    // text cannot be written back by it; pinned on purpose.
+    'lib/connectors/mintsoft/legacy-bridge-import/ports.ts': 2,
     'lib/connectors/mintsoft/switchover/gaps.ts': 1, 'lib/domain/outbound-shadow/retire-held-backlog.ts': 1,
     'lib/domain/wms/dispatch-sweep.ts': 10, 'lib/domain/wms/double-postage.ts': 1, 'lib/domain/wms/mixed-scope-record.ts': 6, 'lib/domain/wms/operator-task-done.ts': 1, 'lib/domain/wms/order-push-sweep.ts': 19, 'lib/domain/wms/order-reconcile-sweep.ts': 1, 'lib/domain/wms/scope-dirty.ts': 1, 'lib/fulfillment/external-fulfillment.ts': 1,
   },
@@ -70,6 +74,8 @@ const WRITERS: Record<string, Record<string, number>> = {
     'lib/connectors/xero/daily-sync.ts': 1,
     // Sets `externalRefundId` (a WooCommerce refund id) when a person confirms a storefront refund settles an IMS refund: not a free-text column, so the trigger is irrelevant to it; pinned all the same.
     'lib/domain/sales/shop-refund-tasks.ts': 1,
+    // The soft delete marks the row (`deletedAt`, `deletedById`, `deleteReason`); the reason is the operator's own text, retained like the refund reason, and carries no customer detail by contract. Pinned all the same.
+    'lib/domain/sales/refund-delete-service.ts': 1,
   },
 }
 

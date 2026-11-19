@@ -44,6 +44,7 @@ export async function findLiveOrderPostingClaim(
   now: Date,
 ): Promise<{ id: string; connector: string; type: string; processingStartedAt: Date | null } | null> {
   const cutoff = new Date(now.getTime() - STALE_PROCESSING_MS)
+  // In-flight fence: deliberately includes soft-deleted refunds (their credit-note void / counter-journal can be in flight).
   const refunds = await tx.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
   return tx.accountingSyncLog.findFirst({
     where: {

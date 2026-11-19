@@ -633,10 +633,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/refund-service.ts',
-    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'lineDrivenRevenue', 'nonQtyRevenue', 'refundRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue'],
+    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'lineDrivenRevenue', 'margin', 'nonQtyRevenue', 'refundRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue'],
     treatment: 'not-refund-sensitive',
     reason:
-      'The refund WRITER. It creates the rows the reports classify; it publishes no report figure.',
+      'The refund WRITER. It creates the rows the reports classify; it publishes no report figure. `margin` is the word in the comment where an adopting refund (returned stock the warehouse had already restocked) says IMS posts nothing for the margin and raises an owed-posting record for a person: it names a ledger reclass, not a rendered or netted margin figure.',
   },
   {
     file: 'lib/domain/sales/refund-unearned-remainder.ts',

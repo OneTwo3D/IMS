@@ -107,6 +107,7 @@ export async function updateReturnReason(id: string, data: ReturnReasonInput): P
 export async function deleteReturnReason(id: string): Promise<{ error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
+    // soft-delete exception: a soft-deleted refund still references its reason, so it still counts as in use.
     const inUse = await db.salesOrderRefund.count({ where: { returnReasonId: id } })
     if (inUse > 0) {
       return { error: `This reason is used by ${inUse} refund${inUse === 1 ? '' : 's'}. Set it inactive instead, so the returns report keeps its history.` }

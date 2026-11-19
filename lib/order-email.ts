@@ -31,7 +31,7 @@ export type SendGuardOutcome<T> = { refused: string; unknown?: undefined } | { u
  * Optional hook on a prepared email: the drain runs its send INSIDE this, so a kind switched off by a setting can be re-checked at the delivery
  * boundary and held against a concurrent switch-off. A refusal means nothing was sent.
  */
-type SendGuard = <T>(send: () => Promise<T>) => Promise<SendGuardOutcome<T>>
+type SendGuard = <T>(send: (signal: AbortSignal) => Promise<T>) => Promise<SendGuardOutcome<T>>
 export type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[]; sendGuard?: SendGuard; sendDeadlineMs?: number; singleSend?: boolean }
 type QueueEmailData = { to: string; subject: string; reference: string }
 

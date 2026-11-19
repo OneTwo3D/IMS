@@ -25,7 +25,7 @@ export async function getRefundDeleteEligibility(orderId: string): Promise<Refun
   await requirePermission('sales.refund')
   const setting = await db.setting.findUnique({ where: { key: REFUND_DELETE_SETTING }, select: { value: true } })
   if (!refundDeleteEnabledFromSetting(setting?.value)) return { enabled: false, refunds: {} }
-  const refunds = await db.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
+  const refunds = await db.salesOrderRefund.findMany({ where: { orderId, deletedAt: null }, select: { id: true } })
   const out: RefundDeleteEligibility['refunds'] = {}
   for (const refund of refunds) {
     const verdict = await evaluateRefundDeletion(db, refund.id)

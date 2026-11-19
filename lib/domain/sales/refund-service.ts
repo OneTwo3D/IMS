@@ -93,6 +93,7 @@ import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
 import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
+import { findRestockedInboxesToAdopt, raiseAdoptionReclassTask, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -845,6 +846,7 @@ export async function buildRefundFallbackReturnRows(
       // would hand that refund's units to the next one. `returnWarehouseId` says only whether stock came
       // back, and is used to debit stock, never to decide whether the refund consumed line quantity.
       refunds: {
+        where: { deletedAt: null },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         select: {
           id: true,
@@ -1715,7 +1717,7 @@ async function stageRefundAccountingReversals(
           },
         },
         refunds: {
-          where: { id: { not: params.refundId } },
+          where: { id: { not: params.refundId }, deletedAt: null },
           select: {
             id: true,
             // o3d-o97 r3: the CR Allocated Inventory this earlier refund's own reversal raised,
@@ -4580,6 +4582,7 @@ export async function createSalesOrderRefund(
     // intentionally rely on the operator UI's double-submit guard instead of
     // inventing a synthetic service-level idempotency key.
     if (input.externalRefundId != null) {
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       const existingExternalRefund = await tx.salesOrderRefund.findFirst({
         where: {
           orderId: input.orderId,
@@ -4693,7 +4696,7 @@ export async function createSalesOrderRefund(
     // (one credit note per order) instead of posting a duplicate.
     if (input.chargeback) {
       const existingChargeback = await tx.salesOrderRefund.findFirst({
-        where: { orderId: input.orderId, chargeback: true },
+        where: { orderId: input.orderId, chargeback: true, deletedAt: null }, // a soft-deleted chargeback is not replayed
         select: {
           id: true,
           creditNoteNumber: true,
@@ -4775,7 +4778,7 @@ export async function createSalesOrderRefund(
       // A chargeback is refused by ANY prior refund; an ordinary refund only by a chargeback
       // (partial refunds may legitimately stack). An existing chargeback replayed above, so a
       // hit here on the chargeback branch is always the other path's row.
-      where: input.chargeback ? { orderId: input.orderId } : { orderId: input.orderId, chargeback: true },
+      where: input.chargeback ? { orderId: input.orderId, deletedAt: null } : { orderId: input.orderId, chargeback: true, deletedAt: null },
       select: { id: true, creditNoteNumber: true },
     })
     if (conflictingRefund) {
@@ -4811,14 +4814,27 @@ export async function createSalesOrderRefund(
     // o3d-hqvrp.32: shipped units whose issued cost is not on record are NOT restocked (a costless unit must
     // never enter stock) and are not silently dropped either: they are listed in a WARNING on the order below.
     const parkedForUnknownCost: Array<{ productId: string; qty: number; refundLineId: string | null }> = []
+    // The rows this refund would actually return (shipped units with a known cost): also the quantity an adoption is sized from, so a unit that
+    // never shipped, or that is parked for an unknown cost, is not asked of the returns inbox.
+    let restockableRows: RefundReturnRow[] | null = null
     if (storefrontRefund && effectiveReturnWarehouseId) {
-      const restockable = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true, parked: parkedForUnknownCost })
-      if (restockable.length === 0) restockWarehouseId = undefined
+      restockableRows = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true, parked: parkedForUnknownCost })
+      if (restockableRows.length === 0) restockWarehouseId = undefined
     }
 
     // Returned units in transit: decided HERE, once, under the order lock, from the switch as it reads in this
     // transaction, and persisted on the refund below. Only a refund that returns stock can be in transit
     // (a chargeback already has no return warehouse). Nothing later re-reads the switch for this refund.
+    // o3d-iil0b: with returns-in-transit ON, a refund whose returned units the warehouse ALREADY restocked (returns inbox, same order and
+    // product) adopts that arrival: it links to it and books no new expectation or transit debit (and no second stock-in).
+    // Decided under the order lock taken above; the claim on each arrival is recorded per inbox row and quantity in the refund's own transaction (below).
+    let inboxAdoptions: InboxAdoption[] = []
+    if (restockWarehouseId && await readReturnsInTransitEnabled(tx)) {
+      // A storefront refund is sized from the rows it would return (the same quantity the return-expectation path creates); an operator-recorded
+      // refund returns every itemised unit it names (it never skips or parks), so its own lines are that quantity.
+      inboxAdoptions = (await findRestockedInboxesToAdopt(tx, { orderId: input.orderId, lines: restockableRows ?? refundLines })) ?? []
+      if (inboxAdoptions.length > 0) restockWarehouseId = undefined
+    }
     const returnInTransit = Boolean(restockWarehouseId) && await readReturnsInTransitEnabled(tx)
 
     // o3d-w00 #2/#5 + o3d-iup: fail closed on a monetary-only (unlinked) SALE line the order can't tax
@@ -4858,7 +4874,7 @@ export async function createSalesOrderRefund(
     }
 
     const existingRefunds = await tx.salesOrderRefund.findMany({
-      where: { orderId: input.orderId },
+      where: { orderId: input.orderId, deletedAt: null },
       select: { totalBase: true, accountingRetryRequired: true, totalsBasis: true },
     })
     // scjz.22: block a NEW refund while a prior refund on this order still has
@@ -5678,6 +5694,20 @@ export async function createSalesOrderRefund(
     // follows (the same condition that arms `accountingRetryRequired` above), it is left unvalued and the staging
     // transaction values it in the same commit that persists the staged syncs. With no staging to come it is
     // valued now, there being nothing later to price it.
+    if (inboxAdoptions.length > 0) {
+      await tx.salesOrderRefundInboxAdoption.createMany({ data: inboxAdoptions.map((a) => ({ refundId: createdRefund.id, inboxId: a.inboxId, qty: a.qty })) })
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER', entityId: input.orderId, action: 'refund_adopted_returns_inbox', tag: 'sales', level: 'INFO',
+          description: `Refund ${creditNoteNumber ?? createdRefund.id} adopted ${inboxAdoptions.length} returns-inbox arrival(s) the warehouse had already restocked: no new stock, return expectation or stock-in-transit entry was created for those units.`,
+          metadata: { refundId: createdRefund.id, adoptions: inboxAdoptions },
+        },
+      })
+      // The restock may already have booked Dr Inventory / Cr the stock-gain reason; this refund returns no stock of its own. IMS posts nothing for the margin:
+      // it raises ONE owed-posting record naming the refund, rows and quantities for a person to reclass by hand.
+      const adoptedRows = restockableRows ?? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
+      await raiseAdoptionReclassTask(tx, { refundId: createdRefund.id, orderId: input.orderId, orderRef: so.orderNumber ?? input.orderId, adoptions: inboxAdoptions, rows: adoptedRows })
+    }
     if (returnInTransit) {
       await createReturnExpectationTx(tx, {
         refundId: createdRefund.id,
@@ -6331,6 +6361,7 @@ export async function retrySalesOrderRefundAccounting(
         where: { id: input.refundId },
         select: {
           id: true,
+          deletedAt: true,
           orderId: true,
           returnWarehouseId: true,
           // Decided once at creation: the retry stages the same treatment even if the switch has moved.
@@ -6400,7 +6431,8 @@ export async function retrySalesOrderRefundAccounting(
           },
         },
       })
-      if (!refund) return { success: false, error: 'Refund not found' }
+      // SOFT DELETE: a deleted refund is closed; a retry would re-stage its credit note and journals.
+      if (!refund || refund.deletedAt) return { success: false, error: 'Refund not found' }
       if (!refund.accountingRetryRequired) {
         return { success: false, error: 'No failed refund accounting action is pending for this refund' }
       }

@@ -5409,6 +5409,7 @@ export async function guardStoreCreditCreditNote(
     // Read UNDER THE ORDER'S ROW LOCK (the posting-time fence: see store-credit-posting-fence.ts), so a review
     // transition either committed before this read or finds this entry's PROCESSING claim and defers.
     const found = await db.$transaction(async (tx) => {
+      // soft-delete exception: resolves the order of a queued credit-note / void row by id, which must work for a deleted refund (the void cascade).
       const refund = await tx.salesOrderRefund.findUnique({ where: { id: referenceId }, select: { orderId: true } })
       if (!refund) return null
       await lockSalesOrder(tx, refund.orderId)
@@ -6861,6 +6862,7 @@ export async function processClaimedEntry(
       const storeCreditRefusal = await guardStoreCreditCreditNote(referenceType, referenceId)
       if (storeCreditRefusal) return storeCreditRefusal
       const creditCustomerId = referenceType === 'SalesOrderRefund'
+        // soft-delete exception: credit-note builder read by id, kept for the credit-note void cascade of a deleted refund.
         ? (await db.salesOrderRefund.findUnique({
             where: { id: referenceId },
             select: { order: { select: { customerId: true } } },

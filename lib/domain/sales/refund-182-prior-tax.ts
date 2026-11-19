@@ -10,7 +10,7 @@ import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
  */
 export async function priorRefundedTax(client: Pick<typeof db, 'salesOrderRefund'>, orderId: string, refundId: string | null, orderTax: Decimal): Promise<Decimal | null> {
   const others = await client.salesOrderRefund.findMany({
-    where: refundId === null ? { orderId } : { orderId, id: { not: refundId } },
+    where: refundId === null ? { orderId, deletedAt: null } : { orderId, id: { not: refundId }, deletedAt: null },
     select: { source: true, totalsBasis: true, totalForeign: true, statedGrossForeign: true, lines: { select: { totalForeign: true, schemeTaxRateValue: true } } },
   })
   let sum = toDecimal(0)

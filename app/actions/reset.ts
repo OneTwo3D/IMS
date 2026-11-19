@@ -80,6 +80,8 @@ async function clearTransactionScope(guards: ResetGuards) {
   await db.needsAttentionAnnouncement.deleteMany({})
 
   // WMS operational state and history
+  // Refund adoptions of a restocked returns-inbox arrival reference the inbox row AND the refund (both RESTRICT), so they go before either.
+  await db.salesOrderRefundInboxAdoption.deleteMany({})
   await db.wmsReturnsInbox.deleteMany({})
   await db.wmsInboundReceiptEvent.deleteMany({})
   await db.wmsStockDiscrepancy.deleteMany({})

@@ -121,7 +121,7 @@ export async function findOpenShopRefunds(client: OpenClient, orderId: string): 
   })
   if (open.length === 0) return []
   const waiting = new Set((await client.salesOrderRefund.findMany({
-    where: { id: { in: open.map((task) => task.externalOrderId) }, orderId, externalRefundId: null },
+    where: { id: { in: open.map((task) => task.externalOrderId) }, orderId, externalRefundId: null, deletedAt: null },
     select: { id: true },
   })).map((refund) => refund.id))
   return open
@@ -176,9 +176,10 @@ export async function confirmShopRefundSettlement(
   if (!shopRefundAmountEquals(open, input.orderCurrency, input.amountForeign)) {
     return { ok: false, error: `That IMS refund (${open.creditNoteNumber ?? open.refundId}) is not for this WooCommerce refund's amount, so it cannot be confirmed as settled by it. Nothing was changed.` }
   }
+  // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
   const taken = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: input.wcRefundId }, select: { id: true } })
   if (taken) return { ok: false, error: `WooCommerce refund ${input.wcRefundId} is already recorded in IMS. Nothing was changed.` }
-  const linked = await tx.salesOrderRefund.updateMany({ where: { id: input.imsRefundId, orderId: input.orderId, externalRefundId: null }, data: { externalRefundId: input.wcRefundId } })
+  const linked = await tx.salesOrderRefund.updateMany({ where: { id: input.imsRefundId, orderId: input.orderId, deletedAt: null, externalRefundId: null }, data: { externalRefundId: input.wcRefundId } })
   if (linked.count === 0) return { ok: false, error: 'That IMS refund changed while it was being linked. Nothing was changed.' }
   const done = await tx.wmsOperatorTask.updateMany({ where: { id: open.taskId, status: 'OPEN' }, data: { status: 'DONE', doneAt: input.now ?? new Date(), doneBy: input.userId } })
   if (done.count === 0) throw new Error('The refund task was resolved by someone else while the WooCommerce refund was being linked; nothing was changed.')

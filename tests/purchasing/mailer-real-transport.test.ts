@@ -96,23 +96,66 @@ for (const pipelining of [true, false]) {
     } finally { await server.close() }
   })
 
-  test(`real transport (${mode}): a server that stalls before the DATA reply hits the deadline: terminal unknown outcome, and the connection is closed`, async () => {
+  test(`real transport (${mode}): a server that stalls before the DATA reply hits the deadline: retryable (nothing was handed over), and the connection is closed`, async () => {
     const { result, server } = await run({ pipelining, stallOn: 'DATA' }, 400)
     try {
       assert.equal(result.success, false)
+      assert.equal(result.permanent, false)
+      assert.equal(result.unknownOutcome, undefined)
+      await server.allSocketsClosed(3000)
+      assert.equal(server.openSockets(), 0)
+      assert.ok(!server.events.some((e) => e.kind === 'body-start'), 'no body was sent')
+    } finally { await server.close() }
+  })
+
+  test(`real transport (${mode}): a deadline after the 354, while the server never confirms the body, is a terminal unknown outcome`, async () => {
+    const { result, server } = await run({ pipelining, stallOn: 'BODY' }, 600)
+    try {
+      assert.ok(server.events.some((e) => e.kind === 'body-end'), 'the body reached the server, so the outcome really is unknown')
+      assert.equal(result.success, false)
       assert.equal(result.permanent, true)
       assert.equal(result.unknownOutcome, true)
-      // What this branch does at the deadline: transport.close() on nodemailer 10.6. The assertion states the observed behaviour so a change in
-      // either lib/mailer.ts or nodemailer (PR #1052 moves to an AbortController) is caught here.
       await server.allSocketsClosed(3000)
+    } finally { await server.close() }
+  })
+
+  test(`real transport (${mode}): a deadline during a slow EHLO/MAIL/RCPT exchange delivers nothing, closes the connection and is retryable`, async () => {
+    const server = await startFakeSmtpServer({ pipelining, replyDelayMs: 200 })
+    try {
+      // greeting 200 (inside the 250 ms greeting timeout), EHLO 400, then the MAIL/RCPT/DATA replies (pipelined or not) land at 600+: after the 500 ms deadline, before the 354.
+      const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+      const result = await sendEmailWithSmtpSettings(smtpFor(server.port), { ...mail, deadlineMs: 500 })
+      assert.equal(result.success, false)
+      assert.equal(result.permanent, false)
+      assert.equal(result.unknownOutcome, undefined)
+      // Wait past the point where the un-aborted send would have finished: the server must never see the body.
+      await server.allSocketsClosed(3000)
+      await new Promise((res) => setTimeout(res, 800))
+      // body-end (the terminating dot arrived) is what delivery means; a pipelining server logs the 354 when it queues it, so closing bytes can look like a body start.
+      assert.ok(!server.events.some((e) => e.kind === 'body-end'), 'the aborted send delivered nothing')
       assert.equal(server.openSockets(), 0)
     } finally { await server.close() }
   })
 }
 
+// A deadline so short it fires while nodemailer is still connecting / waiting for the greeting: the abort refuses the late connect, nothing is delivered.
+test('real transport: a deadline that fires before the connection is up is retryable and the late connect delivers nothing', async () => {
+  const server = await startFakeSmtpServer({ pipelining: false })
+  try {
+    const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+    const result = await sendEmailWithSmtpSettings(smtpFor(server.port), { ...mail, deadlineMs: 1 })
+    assert.equal(result.success, false)
+    assert.equal(result.permanent, false)
+    assert.equal(result.unknownOutcome, undefined)
+    await new Promise((res) => setTimeout(res, 500))
+    assert.ok(!server.events.some((e) => e.kind === 'body-end'))
+    await server.allSocketsClosed(3000)
+  } finally { await server.close() }
+})
+
 // The deadline TIMER (not nodemailer's own socket timeout) is what fires here: every reply arrives well inside socketTimeout (= deadlineMs), but
-// the conversation as a whole outlasts the deadline. This is the case PR #1052's AbortController has to close; this branch only calls transport.close().
-test('real transport: the overall deadline firing while replies keep arriving is a terminal unknown outcome (classification), whatever happens to the socket', async () => {
+// the conversation as a whole outlasts the deadline. The AbortController closes the connection, so the old send cannot deliver.
+test('real transport: the overall deadline firing while replies keep arriving aborts the send: retryable, no body reaches the server, the socket closes early', async () => {
   const server = await startFakeSmtpServer({ pipelining: false, replyDelayMs: 150 })
   try {
     const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
@@ -120,12 +163,11 @@ test('real transport: the overall deadline firing while replies keep arriving is
     const result = await sendEmailWithSmtpSettings(smtpFor(server.port), { ...mail, deadlineMs: 500 })
     assert.ok(Date.now() - started < 900, 'the deadline answered, not the end of the conversation')
     assert.equal(result.success, false)
-    assert.equal(result.permanent, true)
-    assert.equal(result.unknownOutcome, true)
-    // CHARACTERISATION of this branch: transport.close() does not end a live SMTPConnection, so the in-flight send keeps going and the server still
-    // receives the whole message after we answered. That is why the deadline answer must be a TERMINAL unknown outcome and never retryable.
-    // PR #1052 (AbortController: ac.abort() closes the connection) must flip the assertion below to: no body-end event, and the socket closed early.
-    await server.allSocketsClosed(5000)
-    assert.ok(server.events.some((e) => e.kind === 'body-end'), 'the message was still delivered after the deadline answer')
+    assert.equal(result.permanent, false)
+    assert.equal(result.unknownOutcome, undefined)
+    await server.allSocketsClosed(3000)
+    // Give the un-aborted send ample time to finish; it must not.
+    await new Promise((res) => setTimeout(res, 1000))
+    assert.ok(!server.events.some((e) => e.kind === 'body-end'), 'no message reached the server after the deadline answer')
   } finally { await server.close() }
 })

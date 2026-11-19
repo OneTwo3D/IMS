@@ -442,7 +442,7 @@ type MarginRefundLineRow = {
 async function loadOrderRefunds(client: SalesFulfillmentAnalyticsClient, orderIds: string[]): Promise<OrderRefundRow[]> {
   if (orderIds.length === 0) return []
   const rows = await client.salesOrderRefund.findMany({
-    where: { orderId: { in: [...new Set(orderIds)] } },
+    where: { orderId: { in: [...new Set(orderIds)] }, deletedAt: null },
     select: { orderId: true, totalBase: true, totalForeign: true, totalsBasis: true },
     take: SOURCE_ROW_LIMIT + 1,
   }) as OrderRefundRow[]

@@ -91,20 +91,24 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction', 'refundId'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
+    notPersonal: ['deletedById', 'id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
+      deleteReason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
     },
   },
   // o3d-ngmt.22: the record that a refund recorded in error was deleted. Keyed to its order by id only (no foreign key, so it outlives a deleted order). Ids, a credit note number,
   // amounts and a JSON of the reversed movements (ids and quantities); the one free-text column is the operator's delete reason, retained like the refund's own reason.
   SalesOrderRefundDeletion: {
     erased: [],
-    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId', 'reversal'],
+    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId'],
     retained: {
       reason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
+      reversal: 'the deleted refund\'s lines are copied whole into it (ids, amounts, cost snapshots and each line\'s description text, retained like the line itself); the rest is ids and quantities of reversed movements',
     },
   },
+  // o3d-iil0b: which returns-inbox arrival (and how many of its units) a refund adopted. Ids and a quantity only.
+  SalesOrderRefundInboxAdoption: { erased: [], notPersonal: ['refundId', 'inboxId'], retained: {} },
   // CRM customer identity: the insert-only merge / unmerge audit. Ids only (the pair of customer ids and the staff user who decided); no name, email or free text,
   // so there is nothing to erase, and the rows are KEPT by an erasure (the audit trail of who was joined to whom must survive). No foreign keys: it is reached by id.
   CustomerMergeEvent: { erased: [], notPersonal: ['customerId', 'otherCustomerId', 'decidedByUserId'], retained: {} },

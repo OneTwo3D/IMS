@@ -331,6 +331,7 @@ async function countRefundReservationReleasesAt(
   options: { client?: OutstandingReleaseReadClient },
 ): Promise<number> {
   const client = options.client ?? (db as unknown as OutstandingReleaseReadClient)
+  // Includes soft-deleted refunds on purpose: the release job of a deleted refund is resolved here, not left running.
   const refunds = await client.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
   if (refunds.length === 0) return 0
   const idempotencyKeys = refunds.map((refund) => buildOutboxIdempotencyKey(

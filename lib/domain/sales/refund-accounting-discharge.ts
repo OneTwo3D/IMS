@@ -91,6 +91,7 @@ export async function dischargeRefundAccountingObligation(
       }
       zero = counted.length === 0
     }
+    // Clears flags only (never raises work), so it is harmless on a soft-deleted refund and is not filtered.
     await tx.salesOrderRefund.update({
       where: { id: refundId },
       data: {

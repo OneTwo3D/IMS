@@ -437,6 +437,8 @@ mock.module('@/lib/security/connector-fetch', {
 })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
 mock.module('@/lib/db', { namedExports: { db } })
+// o3d-qk7z0: this file's fake database has no supplier tables; the supplier step is its own test (tests/mintsoft-asn-supplier.test.ts), so here it answers "no supplier", the pre-existing behaviour.
+mock.module('@/lib/connectors/mintsoft/suppliers/asn-supplier', { namedExports: { resolveAsnSupplier: async () => ({ kind: 'none' }) } })
 mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ user: { id: 'user-1', role: 'ADMIN' } }),

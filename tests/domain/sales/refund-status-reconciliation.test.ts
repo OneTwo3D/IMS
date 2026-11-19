@@ -163,7 +163,8 @@ test('refund disposition reconciliation reports source row cap and caps collecte
     where: {
       OR: [
         { refundStatus: { not: 'NONE' } },
-        { refunds: { some: {} } },
+        // A soft-deleted refund (owner decision 2026-11-18) is a kept audit row, not a refund: it neither counts toward nor hides a status.
+        { refunds: { some: { deletedAt: null } } },
       ],
     },
     orderBy: { id: 'asc' },
@@ -177,6 +178,7 @@ test('refund disposition reconciliation reports source row cap and caps collecte
       totalBase: true,
       taxBase: true,
       refunds: {
+        where: { deletedAt: null },
         orderBy: { refundedAt: 'asc' },
         select: {
           id: true,
