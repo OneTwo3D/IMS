@@ -30,10 +30,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
-import { getSettingValue } from '@/lib/settings-store'
-import { PARTIAL_REMOVAL_CREDIT_NOTE_ENABLED_AT_KEY, PARTIAL_REMOVAL_CREDIT_NOTE_SETTING_KEY, REMOVAL_LEDGER_ACTION_BACKLOG } from '@/lib/domain/accounting/partial-payment-removal-credit-note'
-import { removalsCoveredByRestoration, withdrawStagedRemovalCreditNote } from '@/lib/domain/accounting/removal-credit-note-lifecycle'
-import { compareDecimal, ledgerAmountEpsilon, toDecimal as toDecimalSafe, type DecimalInput } from '@/lib/domain/math/decimal'
+import { compareDecimal, ledgerAmountEpsilon, toDecimal as toDecimalSafe } from '@/lib/domain/math/decimal'
 import { xeroGet } from './api'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { notify, notifyPersisted } from '@/lib/notifications'
@@ -790,7 +787,6 @@ function partialRemovalDescription(
   m: Extract<PartialRemovalMeasurement, { kind: 'REMOVED' }>,
   matched: string[],
   shortfall: string,
-  creditNoteRaisedAutomatically = false,
 ): string {
   const named = matched.length > 0
     ? ` The payment IMS registered that Xero no longer lists is ${matched.join(', ')}.`
@@ -799,10 +795,7 @@ function partialRemovalDescription(
     `Xero holds ${m.ledgerPaid.toFixed(2)} ${m.currency} paid against the invoice for order ${ref}, but IMS recorded the order as paid in full `
     + `(${m.recordedPaid.toFixed(2)} of ${m.documentTotal.toFixed(2)} ${m.currency}). ${m.removed.toFixed(2)} ${m.currency} of the payment is no longer in Xero.${named} `
     + `IMS has recorded ${shortfall} ${m.currency} on the order as not received, so the order no longer shows as fully paid and its open balance includes it. `
-    + (creditNoteRaisedAutomatically
-      ? `Under the owner decision IMS raises a credit note for the removed amount itself, a moment after this alert, and it waits behind the outbound write hold like any other credit note; `
-        + `nothing is needed from you unless a warning follows saying it needs manual handling. If the payment comes back before the credit note is released, it is withdrawn. `
-      : `Revenue was NOT unwound and NO credit note was raised: whether to credit the amount or write it off as a bad debt is a decision for the order owner. `)
+    + `Revenue was NOT unwound and NO credit note was raised: whether to credit the amount or write it off as a bad debt is a decision for the order owner. `
     + `This is reported once; it will not repeat unless the ledger changes again.`,
   )
 }
@@ -837,8 +830,6 @@ export async function reconcilePartialRemovals(
             metadata: { connector: XERO_CONNECTOR, accountingInvoiceId: invoice.InvoiceID, restored: measurement.restored.toString(), shortfall: recorded.shortfall.toString() },
             resolveUser: false,
           })
-          // The payment is back: a credit note IMS staged for it and has not sent must not go out (o3d-hqvrp.395). Best effort and reported, never an error that holds the cursor.
-          await withdrawRestoredRemovalCreditNotes(order.id, ref, measurement.restored, measurement.currency)
         }
         continue
       }
@@ -854,7 +845,7 @@ export async function reconcilePartialRemovals(
 
       const before = order.paymentRemovedForeign == null ? 0 : Number(order.paymentRemovedForeign)
       const shortfallText = (before + Number(measurement.removed)).toFixed(2)
-      const description = partialRemovalDescription(ref, measurement, matched, shortfallText, await removalCreditNoteWillBeRaised())
+      const description = partialRemovalDescription(ref, measurement, matched, shortfallText)
       const logged = await logActivityPersisted({
         entityType: 'SALES_ORDER',
         entityId: order.id,
@@ -887,155 +878,10 @@ export async function reconcilePartialRemovals(
       if (recorded.outcome === 'raced') {
         result.errors.push(`Partial payment removal for order ${ref} changed while it was being recorded; it is measured again on the next poll.`)
       }
-      // The credit note for it (owner decision o3d-hqvrp.395) is NOT raised here: this runs inside the per-chunk delta path, where any error holds the cursor. `retryPartialRemovalCreditNotes` raises it once per poll, after the checkpoint.
     } catch (e) {
       result.errors.push(`Partial payment removal for order ${ref} could not be recorded: ${String(e)}`)
     }
   }
-}
-
-async function removalCreditNoteWillBeRaised(): Promise<boolean> {
-  try {
-    return (await getSettingValue(PARTIAL_REMOVAL_CREDIT_NOTE_SETTING_KEY)) === 'true'
-  } catch {
-    return false
-  }
-}
-
-export async function withdrawRestoredRemovalCreditNotes(orderId: string, ref: string, restored: DecimalInput, currency: string): Promise<void> {
-  try {
-    const credited = await db.paymentRemovalReconciliation.findMany({
-      where: { orderId, kind: 'REMOVED', refundId: { not: null } },
-      select: { id: true, refundId: true, amountForeign: true, createdAt: true },
-    })
-    if (credited.length === 0) return
-    const { covered, partlyCovered } = removalsCoveredByRestoration(credited.map((c) => ({ ...c, refundId: c.refundId as string })), restored)
-    const outcomes = [] as string[]
-    for (const refundId of covered) {
-      const w = await withdrawStagedRemovalCreditNote(db, refundId)
-      outcomes.push(`${refundId}: ${w.outcome}`)
-    }
-    if (covered.length === 0 && partlyCovered.length === 0) return
-    const unsent = outcomes.filter((o) => o.endsWith('withdrawn')).length
-    await logActivity({
-      entityType: 'SALES_ORDER', entityId: orderId, action: 'payment_removal_credit_note_withdrawn', tag: 'accounting', level: 'WARNING',
-      description: withLedgerCheck(
-        `The payment removed from order ${ref} is back in the ledger (${toDecimalSafe(restored).toString()} ${currency} restored). `
-        + (covered.length > 0 ? `${unsent} staged removal credit note(s) were withdrawn before they were sent; ${covered.length - unsent} could not be (already past withdrawal, or nothing staged) and need a manual review. ` : '')
-        + (partlyCovered.length > 0 ? `${partlyCovered.length} removal credit note(s) are only partly covered by the restoration and need a manual review. ` : '')
-        + 'The IMS refund record and the revenue-unwind journals staged with a withdrawn credit note remain: review them and remove the refund if the credit is no longer owed.',
-      ),
-      metadata: { connector: XERO_CONNECTOR, outcomes, partlyCovered },
-      resolveUser: false,
-    })
-  } catch (e) {
-    // Never holds the cursor: say so loudly instead, because a staged credit note may go out for money that was received.
-    await logActivity({
-      entityType: 'SALES_ORDER', entityId: orderId, action: 'payment_removal_credit_note_withdraw_failed', tag: 'accounting', level: 'ERROR',
-      description: withLedgerCheck(`The payment removed from order ${ref} is back in the ledger, but checking whether a staged removal credit note must be withdrawn failed: ${String(e)}. Review the order's credit notes manually before the outbound write hold is released.`),
-      resolveUser: false,
-    }).catch(() => undefined)
-  }
-}
-
-/**
- * Keeps the recorded time the credit-note setting was turned on (`xero_partial_payment_removal_credit_note_enabled_at`). Called at the START of every poll, before any
- * chunk is processed, so a removal this poll detects is stamped after it; the first poll to see the setting on stamps it, and a poll that sees it off clears it so that
- * turning it on again starts a new cutoff. Returns the enable time, or null while the setting is off.
- */
-export async function syncRemovalCreditNoteEnabledAt(now: Date = new Date()): Promise<Date | null> {
-  const on = (await getSettingValue(PARTIAL_REMOVAL_CREDIT_NOTE_SETTING_KEY)) === 'true'
-  const stamped = await getSettingValue(PARTIAL_REMOVAL_CREDIT_NOTE_ENABLED_AT_KEY)
-  if (!on) {
-    if (stamped) await db.setting.deleteMany({ where: { key: PARTIAL_REMOVAL_CREDIT_NOTE_ENABLED_AT_KEY } })
-    return null
-  }
-  const parsed = stamped ? new Date(stamped) : null
-  if (parsed && Number.isFinite(parsed.getTime())) return parsed
-  const value = now.toISOString()
-  await db.setting.upsert({ where: { key: PARTIAL_REMOVAL_CREDIT_NOTE_ENABLED_AT_KEY }, create: { key: PARTIAL_REMOVAL_CREDIT_NOTE_ENABLED_AT_KEY, value }, update: { value } })
-  return now
-}
-
-const REMOVAL_CREDIT_NOTES_PER_POLL = 20
-
-/**
- * THE CREDIT NOTES FOR REMOVED PAYMENTS (owner decision o3d-hqvrp.395), run ONCE PER POLL, AFTER THE CHECKPOINT, NEVER INSIDE A CHUNK.
- *
- * It used to run in every `processDeltaChunk`, where any error it left stopped the drain before the cursor was checkpointed: one refusal that never clears (a cancelled
- * order) held the cursor for every later invoice. Now nothing it does can reach `result.errors`: a refusal that will never clear is a terminal state with an operator warning
- * (written by the action), a transient failure is a WARNING activity retried next poll, and the work is bounded.
- *
- * Does nothing while the setting is off. The enable time is kept by `syncRemovalCreditNoteEnabledAt` (stamped at the start of the first poll that sees the setting on); only removals recorded AT OR AFTER it are credited. Older ones are never credited automatically: they are marked BACKLOG_NOT_CREDITED and listed in ONE operator
- * report (activity + admin alert), because the owner may already have credited or written them off directly in Xero.
- */
-export async function retryPartialRemovalCreditNotes(): Promise<void> {
-  try {
-    const enabledAt = await syncRemovalCreditNoteEnabledAt()
-    if (!enabledAt) return
-    const cutoff = enabledAt
-
-    await reportBackloggedRemovals(cutoff)
-
-    const rows = await db.paymentRemovalReconciliation.findMany({
-      where: { kind: 'REMOVED', refundId: null, ledgerAction: 'OPERATOR_DECISION', createdAt: { gte: cutoff }, order: { paymentRemovedForeign: { not: null } } },
-      select: { id: true, orderId: true, amountForeign: true, order: { select: { orderNumber: true, externalOrderNumber: true, paymentRemovedForeign: true } } },
-      orderBy: { createdAt: 'asc' },
-      take: REMOVAL_CREDIT_NOTES_PER_POLL,
-    })
-    const { raisePartialPaymentRemovalCreditNote } = await import('@/app/actions/sales')
-    for (const row of rows) {
-      const ref = row.order.orderNumber ?? row.order.externalOrderNumber ?? row.orderId
-      // Only a removal the order still carries is credited (its shortfall covers the amount).
-      if (row.order.paymentRemovedForeign == null || compareDecimal(toDecimalSafe(row.order.paymentRemovedForeign), toDecimalSafe(row.amountForeign)) < 0) continue
-      try {
-        const raised = await raisePartialPaymentRemovalCreditNote(row.orderId, row.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
-        if (raised.transient) {
-          await logActivity({
-            entityType: 'SALES_ORDER', entityId: row.orderId, action: 'payment_removal_credit_note_retry_pending', tag: 'accounting', level: 'WARNING',
-            description: `The credit note for the payment removed from order ${ref} could not be raised this poll (${raised.error ?? 'no reason given'}); it is retried on the next poll. The payment poll cursor is not held.`,
-            resolveUser: false,
-          })
-        } else if (raised.raised && raised.error) {
-          await logActivity({
-            entityType: 'SALES_ORDER', entityId: row.orderId, action: 'payment_removal_credit_note_accounting_pending', tag: 'accounting', level: 'WARNING',
-            description: `The credit note for the payment removed from order ${ref} was created but its accounting staging is unfinished (${raised.error}); the refund-accounting retry completes it.`,
-            resolveUser: false,
-          })
-        }
-      } catch (e) {
-        await logActivity({
-          entityType: 'SALES_ORDER', entityId: row.orderId, action: 'payment_removal_credit_note_retry_pending', tag: 'accounting', level: 'WARNING',
-          description: `The credit note for the payment removed from order ${ref} failed this poll: ${String(e)}. It is retried on the next poll. The payment poll cursor is not held.`,
-          resolveUser: false,
-        }).catch(() => undefined)
-      }
-    }
-  } catch (e) {
-    // Reported, never an error on the poll result: nothing here may hold the cursor.
-    console.warn(`[xero] retrying the credit notes for removed payments failed: ${String(e)}`)
-  }
-}
-
-/** The operator report of removals older than the enable time: marked so they are listed once and never credited automatically. */
-async function reportBackloggedRemovals(cutoff: Date): Promise<void> {
-  const rows = await db.paymentRemovalReconciliation.findMany({
-    where: { kind: 'REMOVED', refundId: null, ledgerAction: 'OPERATOR_DECISION', createdAt: { lt: cutoff }, order: { paymentRemovedForeign: { not: null } } },
-    select: { id: true, amountForeign: true, currency: true, createdAt: true, order: { select: { id: true, orderNumber: true, externalOrderNumber: true } } },
-    orderBy: { createdAt: 'asc' },
-    take: 200,
-  })
-  if (rows.length === 0) return
-  const marked = await db.paymentRemovalReconciliation.updateMany({ where: { id: { in: rows.map((r) => r.id) }, refundId: null, ledgerAction: 'OPERATOR_DECISION' }, data: { ledgerAction: REMOVAL_LEDGER_ACTION_BACKLOG } })
-  if (marked.count === 0) return
-  const list = rows.slice(0, 50).map((r) => `${r.order.orderNumber ?? r.order.externalOrderNumber ?? r.order.id}: ${r.amountForeign.toString()} ${r.currency} (detected ${r.createdAt.toISOString().slice(0, 10)})`).join('; ')
-  const description = withLedgerCheck(
-    `Credit notes for removed payments were switched on, but ${rows.length} removal(s) were detected BEFORE that and are NOT credited automatically, because the owner may already have credited or written them off in Xero: ${list}${rows.length > 50 ? ` (and ${rows.length - 50} more)` : ''}. `
-    + 'Each still shows as not received on its order. Check the invoice in Xero, then credit or write it off by hand if it is still owed.',
-  )
-  const logged = await logActivityPersisted({ entityType: 'SYSTEM', action: 'payment_removal_backlog_not_credited', tag: 'accounting', level: 'WARNING', description, metadata: { count: rows.length, recordIds: rows.map((r) => r.id) }, resolveUser: false })
-  await alertAdmins({ title: 'Removed payments predating credit notes are not credited', message: description, actionUrl: '/sales' })
-  if (!logged) console.warn('[xero] the backlog operator report could not be persisted')
 }
 
 /**
@@ -1072,8 +918,6 @@ export async function restorePaidAgainOrders(
       const noCredit = credited !== null && compareDecimal(credited.abs(), epsilon) <= 0
 
       if (paid === null || !Number.isFinite(paid) || paid < 0 || !noCredit) {
-        // A credit note IMS raised for the removal (o3d-hqvrp.395) is the answer, not a question for the order owner: nothing to warn about.
-        if (await db.paymentRemovalReconciliation.findFirst({ where: { orderId: order.id, kind: 'REMOVED', refundId: { not: null } }, select: { id: true } })) continue
         // Settled by something other than a proved payment (a credit, or figures not stated): keep the shortfall, say so once.
         const seen = await db.activityLog.findFirst({
           where: { entityId: order.id, action: 'payment_removal_credit_settled', ...(order.paymentRemovedAt ? { createdAt: { gte: order.paymentRemovedAt } } : {}) },
@@ -2091,8 +1935,6 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   // must fall inside the NEXT window, not be skipped by a cursor set to the time we happened to
   // finish. Paired with CURSOR_OVERLAP_MS below.
   const pollStartedAt = new Date()
-  // The credit-note setting's enable time is kept BEFORE any chunk records a removal (o3d-hqvrp.395): only removals recorded after it are credited. Never holds the poll.
-  try { await syncRemovalCreditNoteEnabledAt() } catch (e) { console.warn(`[xero] could not sync the removal credit note enable time: ${String(e)}`) }
   const since = new Date(lastPollDate.getTime() - CURSOR_OVERLAP_MS)
 
   // --- One delta read for all four passes, drained in bounded chunks if it is oversized ---
@@ -2182,9 +2024,6 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       console.warn(`[xero] unreadable-paid-date retry failed: ${String(e)}`)
     }
   }
-
-  // The credit notes for removed payments: once per poll, bounded, AFTER the checkpoint, and nothing in it can reach `result.errors` (o3d-hqvrp.395).
-  await retryPartialRemovalCreditNotes()
 
   if (result.errors.length > 0) {
     await logActivity({

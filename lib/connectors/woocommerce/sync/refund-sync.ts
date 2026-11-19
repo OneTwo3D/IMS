@@ -65,13 +65,6 @@ export type WcRefundSyncDependencies = {
 export const WC_REFUND_SUPPRESSED_BY_CHARGEBACK =
   'WooCommerce refund suppressed: the order was already charged back by the payment poller — no duplicate credit note raised'
 
-/**
- * o3d-hqvrp.395: the same suppression for a WooCommerce refund that arrives on an order IMS already raised a partial payment REMOVAL credit note for. The refund may be
- * the same money, so a second credit note could credit it twice; it is recorded SYNCED (terminal, never retried) with an operator-visible activity to reconcile by hand.
- */
-export const WC_REFUND_SUPPRESSED_BY_REMOVAL_CREDIT_NOTE =
-  'WooCommerce refund suppressed: IMS already raised a credit note for a partial payment removal on this order — no second credit note raised'
-
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
 }
@@ -1254,14 +1247,12 @@ export async function syncWcRefund(
     // dead-letter into the exceptions inbox and be retried forever against a condition that can
     // never clear. The reversal itself is not lost — the poller already raised the credit note
     // and alerted admins; this WARNING records that the Woo-side refund needs reconciling.
-    if (result.conflict === 'prior-chargeback' || result.conflict === 'prior-removal-credit-note') {
-      const byRemoval = result.conflict === 'prior-removal-credit-note'
-      const suppressedMessage = byRemoval ? WC_REFUND_SUPPRESSED_BY_REMOVAL_CREDIT_NOTE : WC_REFUND_SUPPRESSED_BY_CHARGEBACK
+    if (result.conflict === 'prior-chargeback') {
       const alreadyRecorded = await client.shoppingSyncLog.findFirst({
         where: {
           entityType: 'SalesOrder',
           externalId: String(wcRefund.id),
-          errorMessage: suppressedMessage,
+          errorMessage: WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
         },
         select: { id: true },
       })
@@ -1292,7 +1283,7 @@ export async function syncWcRefund(
             entityType: 'SalesOrder',
             entityId: so.id,
             externalId: String(wcRefund.id),
-            errorMessage: suppressedMessage,
+            errorMessage: WC_REFUND_SUPPRESSED_BY_CHARGEBACK,
             syncedAt: new Date(),
           },
         })
@@ -1302,14 +1293,12 @@ export async function syncWcRefund(
         await writeActivity({
           entityType: 'SALES_ORDER',
           entityId: so.id,
-          action: byRemoval ? 'refund_sync_suppressed_by_removal_credit_note' : 'refund_sync_suppressed_by_chargeback',
+          action: 'refund_sync_suppressed_by_chargeback',
           tag: 'sync',
           // A quantity-bearing refund may owe an inventory movement nothing else will make,
           // so it needs action rather than a note. A monetary-only suppression owes nothing.
           level: refundedUnits > 0 ? 'ERROR' : 'WARNING',
-          description: withLedgerCheck(byRemoval
-            ? `WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — IMS already raised a credit note for a partial payment removal on this order, and this refund may be the same money, so a second credit note could credit it twice. Reconcile the Woo refund against that credit note manually.${returnedNote} ${result.error ?? ''}`
-            : `WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — the order was already charged back by the payment poller, and a second credit note would double-reverse it. Reconcile the Woo refund manually.${returnedNote} ${result.error ?? ''}`).trim(),
+          description: withLedgerCheck(`WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — the order was already charged back by the payment poller, and a second credit note would double-reverse it. Reconcile the Woo refund manually.${returnedNote} ${result.error ?? ''}`).trim(),
           metadata: {
             externalRefundId: wcRefund.id,
             parentOrderId: externalOrderId,
@@ -1329,7 +1318,7 @@ export async function syncWcRefund(
       // for ever, because no resolution exists: the whole order was already reversed by the payment
       // poller, and a second credit note is precisely what must not be raised. HTTP 500 on every
       // redelivery with a cursor that never advances is the endless retry o3d-bx9 removed.
-      return { outcome: 'handled-unapplied-terminal', error: suppressedMessage }
+      return { outcome: 'handled-unapplied-terminal', error: WC_REFUND_SUPPRESSED_BY_CHARGEBACK }
     }
 
     if (!result.success) {

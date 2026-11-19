@@ -53,16 +53,6 @@ const state = {
   salesOrderUpdates: [] as { id: unknown; data: Row }[],
   /** Every cursor write the drain made. Empty means the chunk was NOT checkpointed. */
   settingUpserts: [] as unknown[],
-  // --- o3d-hqvrp.395: the removal credit note, run once per poll AFTER the checkpoint ------------------
-  /** Settings other than the poll cursor (key -> value). */
-  settingsMap: {} as Record<string, string>,
-  /** The removal records the retry reads (REMOVED, no credit note, OPERATOR_DECISION), with the order they sit on. */
-  removalRecords: [] as Row[],
-  /** The order in which the cursor write and the credit-note action happened. */
-  removalEvents: [] as string[],
-  raiseCalls: [] as Array<{ orderId: string; recordId: string }>,
-  /** What the (mocked) removal credit note action answers: by default a refusal that will never clear. */
-  raiseResult: { raised: false, reason: 'the credit note was refused: Cannot refund a cancelled order — manual credit note required' } as { raised: boolean; reason?: string; error?: string; transient?: true },
   /** Set to make the activity-log / notification write REPORT failure, as the real ones do. */
   activityWriteFails: false,
   notificationWriteFails: false,
@@ -145,11 +135,6 @@ function reset(): void {
   state.syncLogUpdates = []
   state.salesOrderUpdates = []
   state.settingUpserts = []
-  state.settingsMap = {}
-  state.removalRecords = []
-  state.removalEvents = []
-  state.raiseCalls = []
-  state.raiseResult = { raised: false, reason: 'the credit note was refused: Cannot refund a cancelled order — manual credit note required' }
   state.activityWriteFails = false
   state.notificationWriteFails = false
   state.dbClockSkewMs = 0
@@ -248,11 +233,6 @@ mock.module('@/app/actions/sales', {
     raiseChargebackForReversedOrder: async (orderId: string) => {
       state.chargebacks.push(orderId)
       return { raised: true }
-    },
-    raisePartialPaymentRemovalCreditNote: async (orderId: string, recordId: string) => {
-      state.removalEvents.push('raise')
-      state.raiseCalls.push({ orderId, recordId })
-      return state.raiseResult
     },
   },
 })
@@ -394,33 +374,10 @@ const dbDouble: Record<string, unknown> = {
     },
   },
   setting: {
-    findUnique: async ({ where }: { where: { key: string } }) => {
-      if (where.key === 'xero_last_payment_poll') return { key: where.key, value: new Date(Date.now() - 60_000).toISOString() }
-      const value = state.settingsMap[where.key]
-      return value === undefined ? null : { key: where.key, value }
-    },
-    upsert: async (args: { where?: { key?: string }; create?: { key?: string; value?: string } }) => {
-      if (args.where?.key === 'xero_last_payment_poll') { state.settingUpserts.push(args); state.removalEvents.push('checkpoint') }
-      else if (args.where?.key && args.create?.value !== undefined) state.settingsMap[args.where.key] = args.create.value
-      return {}
-    },
-    deleteMany: async ({ where }: { where: { key: string } }) => { delete state.settingsMap[where.key]; return { count: 1 } },
+    findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
+    upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
   },
   user: { findMany: async () => [{ id: 'admin_1' }] },
-  paymentRemovalReconciliation: {
-    findMany: async ({ where }: { where: { createdAt?: { gte?: Date; lt?: Date } } & Row }) => state.removalRecords.filter((r) => {
-      const at = r.createdAt as Date
-      if (where.createdAt?.gte && at < where.createdAt.gte) return false
-      if (where.createdAt?.lt && at >= where.createdAt.lt) return false
-      const { createdAt: _createdAt, ...rest } = where as Row
-      return rowMatches(r, rest)
-    }),
-    updateMany: async ({ where, data }: { where: { id: { in: string[] } }; data: { ledgerAction: string } }) => {
-      let count = 0
-      for (const r of state.removalRecords) if (where.id.in.includes(r.id as string) && r.ledgerAction === 'OPERATOR_DECISION') { r.ledgerAction = data.ledgerAction; count += 1 }
-      return { count }
-    },
-  },
   salesOrderRefund: { findFirst: async () => null },
   // o3d-cdhl: clearing paidAt also appends the shortfall history inside one transaction; no shortfall exists in these fixtures.
   $transaction: async (fn: (tx: unknown) => unknown) => fn(dbDouble),
@@ -1757,101 +1714,4 @@ test('[o3d-psrx] a REFUND receipt is not an invoice receipt and does not withhol
 
   assert.deepEqual(state.chargebacks, ['so_1'])
   assert.equal(result.salesReversalsWithheld, 0)
-})
-
-// ---------------------------------------------------------------------------
-// o3d-hqvrp.395: THE REMOVAL CREDIT NOTE RUNS ONCE PER POLL, AFTER THE CHECKPOINT, AND CAN NEVER HOLD THE CURSOR.
-// ---------------------------------------------------------------------------
-
-const ENABLED_KEY = 'xero_partial_payment_removal_credit_note_enabled'
-const ENABLED_AT_KEY = 'xero_partial_payment_removal_credit_note_enabled_at'
-
-function removalRecord(over: Row = {}): Row {
-  return {
-    id: 'rem_1', orderId: 'so_cancelled', kind: 'REMOVED', refundId: null, ledgerAction: 'OPERATOR_DECISION',
-    amountForeign: '30', currency: 'GBP', createdAt: new Date(Date.now() - 1_000),
-    order: { id: 'so_cancelled', orderNumber: 'SO-0099', externalOrderNumber: null, paymentRemovedForeign: '30' },
-    ...over,
-  }
-}
-
-test('o3d-hqvrp.395: a cancelled order with a removal (a refusal that never clears) does NOT stop the chunk being checkpointed', async () => {
-  reset()
-  state.settingsMap[ENABLED_KEY] = 'true'
-  state.settingsMap[ENABLED_AT_KEY] = new Date(Date.now() - 3_600_000).toISOString()
-  state.removalRecords = [removalRecord()]
-  state.invoices = [bill({ AmountPaid: 400, AmountDue: 100, Payments: [{ PaymentID: 'pay-ours' }] })]
-  state.purchaseInvoices = [paidBillRow()]
-  state.syncLogs = [billRegistration()]
-
-  const result = await poll()
-
-  assert.deepEqual(result.errors, [], 'the old per-chunk retry pushed the refusal as a poll error, and the drain stopped before the checkpoint')
-  assert.equal(state.settingUpserts.length, 1, 'the cursor advanced')
-  assert.deepEqual(state.removalEvents, ['checkpoint', 'raise'], 'the credit note is attempted ONCE, after the checkpoint')
-})
-
-test('o3d-hqvrp.395: an action that THROWS is reported and cannot reach the poll result either', async () => {
-  reset()
-  state.settingsMap[ENABLED_KEY] = 'true'
-  state.settingsMap[ENABLED_AT_KEY] = new Date(Date.now() - 3_600_000).toISOString()
-  state.removalRecords = [removalRecord()]
-  state.raiseResult = { raised: false, error: 'lock timeout', transient: true }
-  state.invoices = []
-
-  const result = await poll()
-
-  assert.deepEqual(result.errors, [])
-  assert.equal(state.settingUpserts.length, 1)
-  assert.equal(state.activity.some((a) => a.action === 'payment_removal_credit_note_retry_pending' && a.level === 'WARNING'), true, 'a transient failure is a warning, retried next poll')
-})
-
-test('o3d-hqvrp.395: removals recorded BEFORE the setting was enabled are listed in one operator report and never credited', async () => {
-  reset()
-  state.settingsMap[ENABLED_KEY] = 'true'
-  state.settingsMap[ENABLED_AT_KEY] = new Date(Date.now() - 60_000).toISOString()
-  const old = removalRecord({ id: 'rem_old', createdAt: new Date(Date.now() - 86_400_000) })
-  state.removalRecords = [old, removalRecord({ id: 'rem_new', orderId: 'so_2', order: { id: 'so_2', orderNumber: 'SO-0100', externalOrderNumber: null, paymentRemovedForeign: '30' } })]
-  state.invoices = []
-
-  await poll()
-
-  assert.deepEqual(state.raiseCalls.map((c) => c.recordId), ['rem_new'], 'only the removal detected after the enable time is credited')
-  assert.equal(old.ledgerAction, 'BACKLOG_NOT_CREDITED')
-  const report = state.activity.filter((a) => a.action === 'payment_removal_backlog_not_credited')
-  assert.equal(report.length, 1)
-  assert.match(report[0]?.description ?? '', /SO-0099/)
-})
-
-test('o3d-hqvrp.395: the enable time is stamped by the first poll that sees the setting on, so a removal that poll detects is after it', async () => {
-  reset()
-  state.settingsMap[ENABLED_KEY] = 'true'
-  state.invoices = []
-
-  await poll()
-  assert.ok(state.settingsMap[ENABLED_AT_KEY], 'stamped')
-
-  state.settingsMap[ENABLED_KEY] = 'false'
-  await poll()
-  assert.equal(state.settingsMap[ENABLED_AT_KEY], undefined, 'cleared while the setting is off, so turning it on again starts a new cutoff')
-})
-
-test('o3d-hqvrp.395: with the setting off nothing is raised', async () => {
-  reset()
-  state.removalRecords = [removalRecord()]
-  state.invoices = []
-  await poll()
-  assert.deepEqual(state.raiseCalls, [])
-})
-
-test('o3d-hqvrp.395: a payment restored BEFORE the held credit note is released withdraws it and says so', async () => {
-  reset()
-  state.removalRecords = [removalRecord({ ledgerAction: 'CREDIT_NOTE', refundId: 'refund-1', orderId: 'so_1' })]
-  state.syncLogs = [{ id: 'cn-sync', type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', referenceId: 'refund-1', status: 'PENDING', externalTransactionId: null }]
-  const { withdrawRestoredRemovalCreditNotes } = await import('@/lib/connectors/xero/payment-poller')
-
-  await withdrawRestoredRemovalCreditNotes('so_1', 'SO-0001', '30', 'GBP')
-
-  assert.equal(state.syncLogs[0]?.status, 'CANCELLED', 'the unsent credit note will never go out')
-  assert.equal(state.activity.some((a) => a.action === 'payment_removal_credit_note_withdrawn' && a.level === 'WARNING'), true)
 })
