@@ -459,6 +459,8 @@ export async function processQueuedWcStockSyncJobs(options?: {
           attemptsBeforeFailure: job.attempts,
           maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
           noWriteSent: ledger.writes === 0,
+          // The setting is off: keep the job and spend no attempt, or a switched-off setting dead-letters every queued row.
+          refusedBySetting: result.settingDisabled === true,
         })
         summary.failed++
         // Always record a reason: a retained force/abort case (e.g. version_changed

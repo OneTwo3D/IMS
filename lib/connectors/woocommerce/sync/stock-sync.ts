@@ -685,7 +685,8 @@ export function selectChunkWindow<T extends { id: string }>(
 export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
-    return gateRefusalResult('Stock sync is disabled in settings')
+    // `settingDisabled` lets the queue drain keep the job without spending an attempt: a setting an operator switched off is not a failure of the work.
+    return { ...gateRefusalResult('Stock sync is disabled in settings'), settingDisabled: true }
   }
   const scopedProductIds = options?.productIds ? [...new Set(options.productIds)] : null
   // THE PRODUCER SEAM of the stock writer. Every stock push reaches WooCommerce through this function (the queue drain, the

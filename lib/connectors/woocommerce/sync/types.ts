@@ -293,6 +293,11 @@ export type StockSyncResult = SyncResult & {
    * stopped before it read anything. Always accompanies `aborted`. Nothing was sent. NOT a reconciliation: callers must not stamp it.
    */
   held?: boolean
+  /**
+   * The `wc_stock_sync_enabled` setting is off, so the push was refused before it started. Always accompanies `aborted`. Nothing was sent.
+   * A queued job that meets it is kept without spending an attempt: an operator's switch is not a failure of the work.
+   */
+  settingDisabled?: boolean
   /** Variable parents skipped this pass because their variation list could not be read completely (reported, not a window error). */
   skippedParents?: string[]
 }
