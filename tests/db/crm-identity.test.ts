@@ -593,7 +593,7 @@ test('an alias imported AFTER the snapshot is erased with the person before the 
   const request = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })
   assert.equal(request.status, 'COMPLETE')
   assert.ok(request.memberIds.includes(late!), 'the late record is on the saved list')
-  assert.ok(await db.activityLog.findFirst({ where: { entityId: request.id, action: 'customer_erasure_members_grew' } }), 'an operator notice records that the person grew')
+  assert.ok(await db.activityLog.findFirst({ where: { entityId: a, action: 'customer_erasure_members_grew' } }), 'an operator notice records that the person grew')
 })
 
 test('the importer takes the shared CRM lock when it creates a customer, so it waits for a merge or an erasure snapshot', { skip }, async (t) => {
