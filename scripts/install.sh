@@ -8,7 +8,7 @@
 #
 # What this script does:
 #   1. Checks prerequisites and OS compatibility
-#   2. Installs Node.js 22 (via NodeSource)
+#   2. Installs Node.js 26 (via NodeSource)
 #   3. Installs and configures PostgreSQL
 #   4. Installs nginx, fail2ban, and automatic security updates
 #   5. Installs runtime tooling
@@ -1366,7 +1366,7 @@ INVOICE_PDF_STORAGE_DIR="${DATA_DIR}/invoice-pdfs"
 # more: that directory belongs to ${APP_USER}, which could rename the lock directory aside inside
 # it (o3d-txoe).
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
-NODE_VERSION="22"
+NODE_VERSION="26"
 readonly DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
 DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_DIR}/id_ed25519"
 readonly DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"

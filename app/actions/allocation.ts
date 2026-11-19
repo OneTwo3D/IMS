@@ -1690,6 +1690,11 @@ export async function updateShipmentStatus(
       // under the order row lock) and never throws.
       const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
       await queueDispatchEmailIfEligible(reconciliation.orderId)
+      // Storefront orders (o3d-zvec.24, switch `storefront_customer_email_enabled`, default off): the shipment that left while the order still owes
+      // more gets its own partial-shipment e-mail, once per shipment. Self-guarded (order not yet SHIPPED, shipment SHIPPED, dedup under the order
+      // row lock) and never throws; the final shipment's e-mail is the dispatch e-mail above.
+      const { queueStorefrontPartialShipmentEmailIfEligible } = await import('@/lib/storefront-customer-email')
+      await queueStorefrontPartialShipmentEmailIfEligible(shipmentId)
     }
     if (!result.transitioned) return fenceRefusal === null ? { success: true } : { success: false, error: fenceRefusal }
 

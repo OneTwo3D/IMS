@@ -215,12 +215,22 @@ When a sales invoice has been posted to the accounting system, IMS queues the in
 
 ### Dispatch Email (direct orders)
 
-Direct (non-storefront) sales orders can optionally email the customer a branded dispatch notification when the order ships. Storefront orders are always excluded — the storefront (e.g. WooCommerce) sends its own dispatch email once IMS pushes tracking back, so customers are never emailed twice.
+Direct (non-storefront) sales orders can optionally email the customer a branded dispatch notification when the order ships. Storefront orders are excluded by this switch — the storefront (e.g. WooCommerce) sends its own dispatch email once IMS pushes tracking back, so customers are never emailed twice. IMS can send the e-mails for storefront orders itself once the owner moves them over (see the next section).
 
 - **Opt-in** — off by default; enable in **Settings > Sales > Dispatch Email** (`dispatch_email_enabled`).
 - **Trigger** — queued when the order transitions to SHIPPED (all shipments dispatched); queued at most once per order, deduped under the order row lock.
 - **Content** — branded HTML email (no PDF attachment) with the order reference, the dispatched items, carrier and tracking number(s) per shipment, and a "Track your delivery" button linking to the carrier's tracking page (falls back to a universal tracker for unknown carriers).
 - **Delivery** — sent through the email outbox (`SHIPMENT_DISPATCHED` kind) with the same retry/suppression handling as other queued emails.
+
+### Customer e-mail for storefront orders (switchover step W)
+
+Until the WooCommerce step of the switchover, WooCommerce (with its partial-shipment, AST and TrackShip plugins) sends every customer e-mail for a storefront order and IMS sends none. The setting **Settings > Sales > Dispatch Email > Customer e-mail for storefront orders** (`storefront_customer_email_enabled`, **off by default**) lets IMS send them instead. It is not live until the owner turns it on at step W, **after** WooCommerce's native customer e-mails are switched off. With both on, every customer would get two e-mails and a sent e-mail cannot be recalled.
+
+- **Four e-mails** — order confirmation (queued when IMS imports a recent order; an order back-filled long after it was placed is not announced), dispatched (when the order reaches Shipped), partial shipment (one per shipment that leaves while the order still owes more) and delivered (when the order is marked Delivered; not for an order despatched more than 14 days ago).
+- **Sent once** — each e-mail is queued at most once per order (partial shipments: once per shipment), whatever its outcome. An e-mail that ended Failed is not queued again by IMS; check the order's activity and re-send it by hand if it is right to.
+- **Unknown outcome** — if the mail server may have accepted the message but its answer was lost, the e-mail ends Failed, is **not retried**, and a warning is written on the order's activity. Check with the customer before sending again.
+- **Switch read twice** — when the e-mail is queued and again when it is sent, so switching it off also stops e-mails already waiting.
+- **The check** — `npm run writers:check` in phase P2-W reads WooCommerce's native "processing" and "completed" e-mail settings against this switch. Both on, both off, or a store that cannot be read, all fail the check. It cannot see the partial-shipment, AST and TrackShip plugins' own e-mails: switch those off by hand.
 
 ### Email Structure
 
