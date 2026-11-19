@@ -39,15 +39,19 @@ export async function getMintsoftSupplierMappingScreen(): Promise<SupplierMappin
   return { ...(await loadSupplierMappingScreen()), viewerIsAdmin: session.user.role === 'ADMIN' }
 }
 
-export async function refreshMintsoftSuppliers(): Promise<{ success: boolean; error?: string; message?: string }> {
+export async function refreshMintsoftSuppliers(options?: { confirmShrink?: boolean }): Promise<{ success: boolean; error?: string; message?: string; shrinkRefused?: boolean }> {
   const who = await actor()
   if (!await isIntegrationPluginEnabled('mintsoft')) return { success: false, error: 'Mintsoft is disabled.' }
+  // Accepting a much smaller list than the last one is an administrator's call (a fresh sign-in), like the other decisions that change what IMS trusts.
+  const confirmShrink = options?.confirmShrink === true
+  if (confirmShrink) await requireFreshAdmin()
   try {
-    const result = await runMintsoftSupplierSync({ triggeredBy: `operator:${who.userId ?? 'unknown'}`, userId: who.userId })
+    const result = await runMintsoftSupplierSync({ triggeredBy: `operator:${who.userId ?? 'unknown'}`, userId: who.userId, confirmShrink })
     revalidatePath('/sync/mintsoft-suppliers')
     return { success: true, message: `Read ${result.fetched} suppliers from Mintsoft (${result.created} new, ${result.missing} no longer listed). Nothing was written to Mintsoft.` }
   } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : 'The Mintsoft supplier list could not be read.' }
+    const text = error instanceof Error ? error.message : 'The Mintsoft supplier list could not be read.'
+    return { success: false, error: text, shrinkRefused: /list shrank by/.test(text) }
   }
 }
 

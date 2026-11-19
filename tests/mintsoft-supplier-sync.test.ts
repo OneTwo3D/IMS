@@ -8,6 +8,9 @@ import test, { mock } from 'node:test'
 
 const listCalls: number[] = []
 let lockAvailable = true
+let liveCount = 0
+const activity: Array<{ action: string; level?: string }> = []
+let listDelayHook: null | (() => void) = null
 let released = 0
 const transactions: Array<{ upserts: number; sweeps: unknown[]; settings: unknown[] }> = []
 let supplierList: Array<{ externalId: string; name: string; code: null; email: null; vatNumber: null; active: boolean; raw: null }> = []
@@ -25,12 +28,12 @@ const makeTx = () => {
   }
 }
 const fakeDb = {
-  mintsoftSupplier: { count: async () => 0 },
+  mintsoftSupplier: { count: async () => liveCount },
   $transaction: async (fn: (tx: unknown) => unknown) => fn(makeTx()),
 }
 mock.module('@/lib/db', { namedExports: { db: fakeDb } })
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => undefined } })
-mock.module('@/lib/connectors/wms/registry', { namedExports: { getWmsConnector: () => ({ listSuppliers: async () => { listCalls.push(1); return supplierList } }) } })
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async (entry: { action: string; level?: string }) => { activity.push(entry) } } })
+mock.module('@/lib/connectors/wms/registry', { namedExports: { getWmsConnector: () => ({ listSuppliers: async () => { listCalls.push(1); listDelayHook?.(); return supplierList } }) } })
 mock.module('@/lib/db/pinned-advisory-lock', {
   namedExports: {
     acquirePinnedAdvisoryLockOrNull: async () => (lockAvailable ? { assertHeld: () => undefined, release: async () => { released += 1 } } : null),
@@ -70,4 +73,47 @@ test('the missing sweep includes rows whose lastSeenRunId is NULL (an IMS-create
   const where = (transactions.at(-1)!.sweeps[0] as { where: { OR: unknown[]; missingSince: null } }).where
   assert.deepEqual(where.OR[0], { lastSeenRunId: null })
   assert.ok((where.OR[1] as { lastSeenRunId: { not: string } }).lastSeenRunId.not.startsWith('msupp-'))
+})
+
+test('the "last read" stamp is taken BEFORE the walk, and the sweep spares rows created at or after it (an IMS create mid-walk)', async () => {
+  const { runMintsoftSupplierSync } = await import('../lib/connectors/mintsoft/suppliers/supplier-sync.ts')
+  supplierList = [sup(1)]
+  transactions.length = 0
+  const before = Date.now()
+  let walkEnded = 0
+  listDelayHook = () => { const spin = Date.now() + 25; while (Date.now() < spin); walkEnded = Date.now() }
+  await runMintsoftSupplierSync({ triggeredBy: 't' })
+  listDelayHook = null
+  const last = transactions.at(-1)!
+  const stamp = new Date((last.settings[0] as { update: { value: string } }).update.value).getTime()
+  assert.ok(stamp >= before && stamp < walkEnded, 'the stamp predates the end of the walk')
+  const where = (last.sweeps[0] as { where: { createdAt: { lt: Date } } }).where
+  assert.equal(where.createdAt.lt.getTime(), stamp, 'only rows created before the walk started are swept')
+})
+
+test('a list more than 20% smaller than the cached one is refused, recorded, and writes nothing; an administrator can confirm it', async () => {
+  const { runMintsoftSupplierSync } = await import('../lib/connectors/mintsoft/suppliers/supplier-sync.ts')
+  liveCount = 100
+  supplierList = Array.from({ length: 79 }, (_, i) => sup(i + 1))
+  transactions.length = 0
+  activity.length = 0
+  released = 0
+  await assert.rejects(runMintsoftSupplierSync({ triggeredBy: 't' }), /shrank by 21%/)
+  assert.equal(transactions.length, 0, 'nothing written')
+  assert.equal(released, 1, 'the lock is released')
+  assert.deepEqual(activity.map((a) => [a.action, a.level]), [['mintsoft_supplier_sync_refused_shrink', 'WARNING']])
+  // Exactly 20% smaller is allowed; so is a small cache.
+  supplierList = Array.from({ length: 80 }, (_, i) => sup(i + 1))
+  await runMintsoftSupplierSync({ triggeredBy: 't' })
+  liveCount = 9
+  supplierList = [sup(1)]
+  await runMintsoftSupplierSync({ triggeredBy: 't' })
+  // Confirmed: it proceeds and the override is recorded.
+  liveCount = 100
+  supplierList = Array.from({ length: 50 }, (_, i) => sup(i + 1))
+  activity.length = 0
+  const out = await runMintsoftSupplierSync({ triggeredBy: 't', confirmShrink: true })
+  assert.equal(out.fetched, 50)
+  assert.equal(activity[0]?.action, 'mintsoft_supplier_sync_shrink_confirmed')
+  liveCount = 0
 })

@@ -18,6 +18,13 @@ const connector = {
   next: { created: true, externalId: '901' } as { created: true; externalId: string } | { created: false; held?: true; message: string } | Error,
   /** Runs while the "request" is in flight: lets a test change the row the way a second operator would. */
   during: null as null | (() => Promise<void>),
+  /** The list a sync reads; `duringList` runs while the walk is "in flight" (an IMS create landing mid-walk, a second operator acting). */
+  list: [] as Array<{ externalId: string; name: string; code: null; email: null; vatNumber: null; active: boolean; raw: null }>,
+  duringList: null as null | (() => Promise<void>),
+  async listSuppliers() {
+    if (this.duringList) await this.duringList()
+    return this.list
+  },
   async createSupplier(input: { name: string }) {
     this.created.push({ name: input.name })
     if (this.during) await this.during()
@@ -35,6 +42,9 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
   const { db } = await import('@/lib/db')
   const { confirmSupplierMapping, createMintsoftSupplierForImsSupplier, loadSupplierMappingScreen, resolveUnknownSupplierCreate, unmapSupplier } = await import('@/lib/connectors/mintsoft/suppliers/mapping')
   const { markUnseenMintsoftSuppliersMissing, persistMintsoftSupplierList } = await import('@/lib/connectors/mintsoft/suppliers/supplier-sync')
+  const { runMintsoftSupplierSync } = await import('@/lib/connectors/mintsoft/suppliers/supplier-sync')
+  const { acquirePinnedAdvisoryLockOrNull } = await import('@/lib/db/pinned-advisory-lock')
+  const { WMS_SUPPLIER_LIST_SYNC_LOCK_NAMESPACE } = await import('@/lib/db/advisory-locks')
   const { resolveAsnSupplier } = await import('@/lib/connectors/mintsoft/suppliers/asn-supplier')
 
   const RUN = `MS-${process.pid}-${randomUUID().slice(0, 8)}`
@@ -44,8 +54,8 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
   const zed = await mk(`${RUN} Zed Components`)
   const own = await mk(`${RUN} One Two Enterprises Ltd`)
   const ids = [acme.id, zed.id, own.id]
-  const remoteIds = ['9001', '9002', '9003', '901', '902']
-  const settingKeys = ['mintsoft_supplier_create_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_supplier_cache_max_age_minutes', 'mintsoft_supplier_last_sync_at', 'mintsoft_transfer_supplier_id']
+  const remoteIds = ['9001', '9002', '9003', '901', '902', '903']
+  const settingKeys = ['mintsoft_supplier_create_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_supplier_cache_max_age_minutes', 'mintsoft_asn_supplier_cache_max_age_hours', 'mintsoft_supplier_last_sync_at', 'mintsoft_transfer_supplier_id']
   const priorSettings = await db.setting.findMany({ where: { key: { in: settingKeys } } })
   t.after(async () => {
     await db.activityLog.deleteMany({ where: { entityId: { in: ids } } })
@@ -60,6 +70,7 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
   const setSetting = (key: string, value: string) => db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
   const link = (supplierId: string) => db.mintsoftSupplierLink.findUnique({ where: { supplierId } })
   const stampSync = (at = new Date()) => setSetting('mintsoft_supplier_last_sync_at', at.toISOString())
+  const backdateAttempt = (supplierId: string) => db.mintsoftSupplierLink.update({ where: { supplierId }, data: { decidedAt: new Date(Date.now() - 3 * 60_000) } })
   const auditActions = async (supplierId: string) => (await db.activityLog.findMany({ where: { entityId: supplierId, entityType: 'SUPPLIER' }, orderBy: { createdAt: 'asc' } })).map((r) => r.action)
 
   await t.test('the migration: a MAPPED link needs an id, the state is constrained, a supplier delete cascades', async () => {
@@ -160,6 +171,12 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
     assert.equal((await confirmSupplierMapping({ supplierId: zed.id, externalSupplierId: '9002', source: 'OPERATOR_PICKED', actor })).success, false, 'no quiet remap')
     assert.equal((await unmapSupplier({ supplierId: zed.id, actor })).success, false, 'no unmap: that is how a live create loses its record')
     assert.equal((await link(zed.id))?.state, 'CREATING')
+    await stampSync(new Date(Date.now() + 1000))
+    const tooSoon = await resolveUnknownSupplierCreate({ supplierId: zed.id, actor, reason: 'looked in Mintsoft, not there', outcome: { kind: 'NOT_CREATED' } })
+    assert.equal(tooSoon.success, false, 'a create attempt under 2 minutes old cannot be resolved: its request may still be running')
+    assert.match((tooSoon as { error: string }).error, /Wait at least 2 minutes/)
+    assert.equal((await link(zed.id))?.state, 'CREATING')
+    await backdateAttempt(zed.id)
     const lacks = await resolveUnknownSupplierCreate({ supplierId: zed.id, actor, reason: '', outcome: { kind: 'NOT_CREATED' } })
     assert.equal(lacks.success, false, 'a reason is required')
     await db.setting.deleteMany({ where: { key: 'mintsoft_supplier_last_sync_at' } })
@@ -175,6 +192,7 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
     // Unknown again, this time the administrator finds it.
     connector.next = new Error('socket hang up')
     await createMintsoftSupplierForImsSupplier({ supplierId: zed.id, actor, createAnyway: anyway })
+    await backdateAttempt(zed.id)
     await stampSync(new Date(Date.now() + 1000))
     const found = await resolveUnknownSupplierCreate({ supplierId: zed.id, actor, reason: 'Found it by hand in Mintsoft', outcome: { kind: 'FOUND', externalSupplierId: '9002' } })
     assert.equal(found.success, true)
@@ -201,7 +219,11 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
 
     // The pending choice from before is executed once the setting is on, and the cache row is honest.
     connector.next = { created: true, externalId: '901' }
-    const done = await createMintsoftSupplierForImsSupplier({ supplierId: own.id, actor })
+    // (Every name in this file shares the run prefix, so the 55+ guard names the other suppliers: confirmed anyway.)
+    const guarded = await createMintsoftSupplierForImsSupplier({ supplierId: own.id, actor })
+    assert.equal(guarded.success, false, 'the 55-79 band blocks a create too')
+    assert.ok((guarded as { duplicates?: unknown[] }).duplicates?.length)
+    const done = await createMintsoftSupplierForImsSupplier({ supplierId: own.id, actor, createAnyway: { reason: 'Our own company, not a supplier lookalike' } })
     assert.equal(done.success, true)
     const l = await link(own.id)
     assert.deepEqual([l?.state, l?.externalSupplierId, l?.decisionSource], ['MAPPED', '901', 'OPERATOR_CREATE'])
@@ -209,7 +231,7 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
     assert.ok(cachedRow, 'the created supplier is cached')
     assert.equal(cachedRow.lastSeenRunId, 'ims-create', 'stamped, so the next read can mark it missing')
     assert.equal(cachedRow.lastSeenAt.getTime(), 0, 'lastSeenAt is not faked: no read has seen it')
-    assert.deepEqual(await auditActions(own.id), ['mintsoft_supplier_create_pending', 'mintsoft_supplier_create_claimed', 'mintsoft_supplier_created'])
+    assert.deepEqual(await auditActions(own.id), ['mintsoft_supplier_create_pending', 'mintsoft_supplier_create_refused', 'mintsoft_supplier_create_claimed', 'mintsoft_supplier_created'])
     assert.equal((await createMintsoftSupplierForImsSupplier({ supplierId: own.id, actor })).success, false, 'a mapped supplier is never created again')
     const screen = await loadSupplierMappingScreen()
     assert.ok(new Date(screen.lastSyncedAt!).getTime() > Date.now() - 60_000, 'the screen shows the real read time, not the create')
@@ -239,7 +261,83 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
     }
   })
 
+  await t.test('a create and a refresh never interleave; the sweep spares a row created mid-walk; the stamp predates the walk (o3d-ypqzi)', async () => {
+    await setSetting('mintsoft_supplier_create_enabled', 'true')
+    await db.mintsoftSupplierLink.deleteMany({ where: { supplierId: { in: ids } } })
+    const sup = (externalId: string, name: string) => ({ externalId, name, code: null, email: null, vatNumber: null, active: true, raw: null })
+    // 1. A refresh is mid-walk (it holds the lock): a create is refused before anything is claimed or sent.
+    await stampSync()
+    connector.created.length = 0
+    connector.next = { created: true, externalId: '903' }
+    const syncLock = await acquirePinnedAdvisoryLockOrNull(0, WMS_SUPPLIER_LIST_SYNC_LOCK_NAMESPACE)
+    assert.ok(syncLock, 'the sync lock was free')
+    try {
+      const during = await createMintsoftSupplierForImsSupplier({ supplierId: acme.id, actor })
+      assert.equal(during.success, false)
+      assert.match((during as { error: string }).error, /refresh or another create is running/)
+      assert.equal(connector.created.length, 0, 'nothing sent')
+      assert.equal(await link(acme.id), null, 'nothing claimed')
+    } finally {
+      await syncLock.release()
+    }
+    // 2. A create is in flight (the PUT is running): a refresh is refused and never reads Mintsoft, and a second create is refused too.
+    let refreshWhileCreating: unknown = null
+    let secondCreate: unknown = null
+    connector.during = async () => {
+      refreshWhileCreating = await runMintsoftSupplierSync({ triggeredBy: 't' }).then(() => 'ran', (error: Error) => error.message)
+      secondCreate = await createMintsoftSupplierForImsSupplier({ supplierId: zed.id, actor, createAnyway: { reason: 'a different company entirely' } })
+    }
+    const created = await createMintsoftSupplierForImsSupplier({ supplierId: own.id, actor, createAnyway: { reason: 'a different company entirely' } })
+    connector.during = null
+    assert.equal(created.success, true)
+    assert.match(String(refreshWhileCreating), /already running/)
+    assert.equal((secondCreate as { success: boolean }).success, false, 'two creates are serialised')
+    assert.equal(connector.created.length, 1, 'only the first create was sent')
+    assert.equal(await link(zed.id), null)
+    await db.mintsoftSupplierLink.deleteMany({ where: { supplierId: { in: ids } } })
+    await db.mintsoftSupplier.deleteMany({ where: { externalId: '903' } })
+
+    // 3. The sweep itself: a row inserted at or after the walk started is spared; an older unseen row is not.
+    const walkStart = new Date()
+    await db.mintsoftSupplier.create({ data: { externalId: '903', name: `${RUN} mid-walk`, lastSeenRunId: 'ims-create', lastSeenAt: new Date(0), createdAt: new Date(walkStart.getTime() + 5) } })
+    await db.mintsoftSupplier.updateMany({ where: { externalId: { in: ['9001', '9002'] } }, data: { lastSeenRunId: 'old-run', missingSince: null } })
+    const swept = await db.$transaction((tx) => markUnseenMintsoftSuppliersMissing(tx, 'run-new', new Date(walkStart.getTime() + 10), walkStart))
+    assert.ok(swept >= 2, 'older unseen rows are marked missing')
+    assert.equal((await db.mintsoftSupplier.findUnique({ where: { externalId: '903' } }))?.missingSince, null, 'the row created mid-walk is not marked missing')
+    assert.ok((await db.mintsoftSupplier.findUnique({ where: { externalId: '9001' } }))?.missingSince)
+    await db.mintsoftSupplier.updateMany({ where: { externalId: { in: ['9001', '9002'] } }, data: { missingSince: null } })
+
+    // 4. End to end: an IMS create lands while the walk is running, and the attempt is made during the walk. The new row survives, and the stamp is
+    //    NOT newer than the attempt, so "resolve unknown" still demands a later read.
+    connector.list = [sup('9001', `${RUN} ACME PLASTICS LIMITED`), sup('9002', `${RUN} Zed Comp`)]
+    await db.mintsoftSupplier.deleteMany({ where: { externalId: '903' } })
+    let attemptAt = new Date(0)
+    connector.duringList = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      await db.mintsoftSupplier.create({ data: { externalId: '903', name: `${RUN} created mid-walk`, lastSeenRunId: 'ims-create', lastSeenAt: new Date(0) } })
+      attemptAt = new Date()
+      await db.mintsoftSupplierLink.create({ data: { supplierId: zed.id, state: 'CREATING', decisionSource: 'OPERATOR_CREATE', decidedAt: attemptAt } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    await db.setting.deleteMany({ where: { key: 'mintsoft_supplier_last_sync_at' } })
+    await runMintsoftSupplierSync({ triggeredBy: 't' })
+    connector.duringList = null
+    assert.equal((await db.mintsoftSupplier.findUnique({ where: { externalId: '903' } }))?.missingSince, null, 'a supplier created during the refresh is not marked missing')
+    const stamp = (await db.setting.findUnique({ where: { key: 'mintsoft_supplier_last_sync_at' } }))!.value
+    assert.ok(new Date(stamp).getTime() < attemptAt.getTime(), 'the list-last-read stamp predates the walk, so it is older than an attempt made during it')
+    // The rule consumes exactly that comparison: an attempt older than the wait but newer than the last read is refused.
+    const attempt = new Date(Date.now() - 3 * 60_000)
+    await db.mintsoftSupplierLink.update({ where: { supplierId: zed.id }, data: { decidedAt: attempt } })
+    await stampSync(new Date(attempt.getTime() - 1000))
+    const early = await resolveUnknownSupplierCreate({ supplierId: zed.id, actor, reason: 'looked in Mintsoft, not there', outcome: { kind: 'NOT_CREATED' } })
+    assert.equal(early.success, false)
+    assert.match((early as { error: string }).error, /Refresh the Mintsoft supplier list first/)
+    await db.mintsoftSupplierLink.deleteMany({ where: { supplierId: zed.id } })
+    await db.mintsoftSupplier.updateMany({ where: { externalId: { in: ['9001', '9002', '901', '902', '903'] } }, data: { missingSince: null } })
+  })
+
   await t.test('ASN supplier resolution reads the real rows: mapped sends, unmapped is refused only when required, and a mapping closes the task', async () => {
+    await stampSync()
     const po = await db.purchaseOrder.create({ data: { reference: `${RUN}-PO`, supplierId: acme.id, currency: 'GBP', fxRateToBase: 1, subtotalForeign: 0, subtotalBase: 0, totalForeign: 0, totalBase: 0 }, select: { id: true } })
     await db.setting.deleteMany({ where: { key: 'mintsoft_asn_supplier_required' } })
     assert.deepEqual(await resolveAsnSupplier({ kind: 'PurchaseOrder', id: po.id }), { kind: 'none' })
@@ -265,12 +363,20 @@ test('mintsoft supplier mapping: constraints, cache sync, decisions, create clai
     await db.mintsoftSupplier.update({ where: { externalId: '9001' }, data: { active: true, missingSince: new Date() } })
     assert.equal((await resolveAsnSupplier({ kind: 'PurchaseOrder', id: po.id })).kind, 'refuse')
     await db.mintsoftSupplier.update({ where: { externalId: '9001' }, data: { missingSince: null } })
+    // A list last read long ago cannot vouch for the supplier: refused with a task, until a refresh.
+    await stampSync(new Date(Date.now() - 25 * 3_600_000))
+    const staleRead = await resolveAsnSupplier({ kind: 'PurchaseOrder', id: po.id })
+    assert.equal(staleRead.kind, 'refuse')
+    assert.match((staleRead as { error: string }).error, /not been read recently enough/)
+    await stampSync()
+    assert.equal((await resolveAsnSupplier({ kind: 'PurchaseOrder', id: po.id })).kind, 'send')
     // With the send switch OFF the mapped supplier is not sent at all.
     await db.setting.deleteMany({ where: { key: 'mintsoft_asn_supplier_required' } })
     await setSetting('mintsoft_asn_send_supplier_enabled', 'false')
     assert.deepEqual(await resolveAsnSupplier({ kind: 'PurchaseOrder', id: po.id }), { kind: 'none' })
     await setSetting('mintsoft_asn_send_supplier_enabled', 'true')
     await setSetting('mintsoft_transfer_supplier_id', own.id)
+    assert.equal((await confirmSupplierMapping({ supplierId: own.id, externalSupplierId: '901', source: 'OPERATOR_PICKED', actor })).success, true)
     const transfer = await resolveAsnSupplier({ kind: 'Transfer', id: 'no-such-transfer' })
     assert.deepEqual(transfer, { kind: 'send', externalSupplierId: '901', supplierName: `${RUN} One Two Enterprises Ltd` })
   })

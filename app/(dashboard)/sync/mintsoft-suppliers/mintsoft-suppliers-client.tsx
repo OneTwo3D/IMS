@@ -29,6 +29,7 @@ export function MintsoftSuppliersClient({ screen }: { screen: SupplierMappingScr
   const [notice, setNotice] = useState<Notice>(null)
   const [pending, startTransition] = useTransition()
   const [picked, setPicked] = useState<Record<string, string>>({})
+  const [shrinkRefused, setShrinkRefused] = useState(false)
   const [filter, setFilter] = useState<'all' | 'needs'>('needs')
 
   // Rows whose create was refused by the duplicate guard: the similar suppliers, and the reason typed for "create anyway".
@@ -36,11 +37,12 @@ export function MintsoftSuppliersClient({ screen }: { screen: SupplierMappingScr
   // The "resolve unknown outcome" form per row.
   const [resolve, setResolve] = useState<Record<string, { externalId: string; reason: string }>>({})
 
-  function run(task: () => Promise<{ success: boolean; error?: string; message?: string; warning?: string; duplicates?: DuplicateCandidate[] }>, supplierId?: string) {
+  function run(task: () => Promise<{ success: boolean; error?: string; message?: string; warning?: string; duplicates?: DuplicateCandidate[]; shrinkRefused?: boolean }>, supplierId?: string) {
     setNotice(null)
     startTransition(async () => {
       const result = await task()
       if (supplierId) setSimilar((current) => { const next = { ...current }; if (!result.success && result.duplicates?.length) next[supplierId] = { duplicates: result.duplicates, reason: current[supplierId]?.reason ?? '' }; else delete next[supplierId]; return next })
+      setShrinkRefused(Boolean(result.shrinkRefused))
       setNotice(result.success ? { kind: 'ok', text: `${result.message ?? 'Saved.'}${result.warning ? ` ${result.warning}` : ''}` } : { kind: 'error', text: result.error ?? 'Failed.' })
       router.refresh()
     })
@@ -65,6 +67,9 @@ export function MintsoftSuppliersClient({ screen }: { screen: SupplierMappingScr
             </span>
           </div>
           <Button type="button" variant="outline" disabled={pending} onClick={() => run(() => refreshMintsoftSuppliers())}>Refresh Mintsoft supplier list (read-only)</Button>
+          {shrinkRefused && screen.viewerIsAdmin && (
+            <Button type="button" variant="destructive" disabled={pending} onClick={() => run(() => refreshMintsoftSuppliers({ confirmShrink: true }))}>The shorter list is real: read it anyway</Button>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <label htmlFor="transfer-supplier">Supplier carried by transfer ASNs</label>

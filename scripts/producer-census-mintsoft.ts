@@ -144,7 +144,7 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
     why: 'The one parent-SKU deleter: it asks before the connector call, so a shadow deletes nothing and leaves the link as it was.',
   },
   {
-    file: 'lib/connectors/mintsoft/suppliers/mapping.ts', decl: 'createMintsoftSupplierForImsSupplier', role: 'producer',
+    file: 'lib/connectors/mintsoft/suppliers/mapping.ts', decl: 'createLockedMintsoftSupplier', role: 'producer',
     mustCall: ['mintsoftProducerSeam'], beforeCalls: ['createSupplier'],
     operations: ['supplier.create'],
     why: 'The one Mintsoft supplier creator ("create in Mintsoft" on the mapping screen): it asks before the claim and the connector call, so a shadow creates nothing and claims nothing.',
