@@ -194,3 +194,287 @@ Expected result:
 - Exact SKUs, WC order IDs, and tracking numbers used in the run
 - Whether webhook jobs auto-drained or had to be forced manually
 - For the first load: the JSON report of `npm run rehearse:woo-import` run on the commit being deployed (see `docs/installation.md`, "WooCommerce initial-import rehearsal"), and the resolved order-status list the Sync page prints before **Import Active Orders** is pressed
+
+---
+
+# Single-writer switchover: steps M, W and X
+
+This part is the operator runbook for moving every writer from the legacy stack (the Python bridge and its WordPress plugin `wc-mintsoft-sync`, Xeroom, Qoblex) to IMS. It is the written, reversible cutover the interlock needs. The design is `shared/design-zvec3-switchover.md`; the owner's answers of 2026-11-18 (section 9 of it) supersede its text and are built in below.
+
+**Status when this was written (2026-11-19).** Nothing here has been run. IMS is in P1: wired to the live stores, reading, writing nothing. Do not follow this runbook before the dates and gates in "Global gates" are met.
+
+## Who does what
+
+| Marker | Who | Meaning |
+|---|---|---|
+| **[OWNER]** | the owner | A decision, a confirmation in a system IMS cannot see (Qoblex, Mintsoft's user list), or an approval. Nobody else may do it or sign it off. |
+| **[OPS]** | operations | Every action on a production host, store or environment file. Production steps go through ops, never through an agent. |
+| **[CLAUDE]** | Claude or another agent | Read-only checks, preparing records, drafting commands, stage work and reviews. An agent makes no live WooCommerce, Mintsoft or Xero write and runs nothing on production. |
+
+Every command below is run by **[OPS]** unless it says otherwise. IMS commands run from the IMS install directory as the IMS service user, with the production environment loaded (`/etc/ims/ims.env`), so that `PGPORT` and other stray variables are not in the shell: export only what the command needs. Never print a credential, a signed URL or a response object that embeds a token: print status codes and counts only.
+
+## Global gates (before any step)
+
+- [ ] **[OWNER]** The go/no-go verdict (o3d-hcx4c.1) is YES: 14 consecutive clean daily reconciliation runs including a month-end. Dates fixed by the owner on 2026-11-18: the clean runs can start on 2026-12-12 at the earliest; the first month-end in reach is 2026-12-31, so the streak runs through it; the earliest verdict is 2027-01-01. Step M is then the first working days of January; step W is at least one soak after M, and step X at least one soak after W.
+- [ ] `PRODUCER_HOLD_ENFORCED_DESTINATIONS=all` has been in force throughout P1 (see the producer hold above).
+- [ ] `npm run writers:check` has exited 0 on every day of the qualifying window.
+- [ ] The o3d-8f0p6 fix is verified and not enabled.
+- [ ] The stage proof (below) has passed and its record is attached to o3d-zvec.3. Without it step M is not scheduled.
+- [ ] The open enablement beads for each step (see "Beads to close first") are closed.
+- [ ] Each step has a named person on call for its soak, and a roll-back decision-maker.
+
+**Soak.** Each step soaks for **3 days** (owner answer 7) with `writers:check` exiting 0 throughout and none of the step's stop conditions hit. A rollback of a step restarts its count. The bead note of 2026-11-18 first said "3 business days" and the final answer says "3 days": take the longer reading unless the owner says otherwise. The next step does not start while the previous one is unstable.
+
+**Fixed order: M, then W, then X, a few days apart. Each is reversible on its own** (X only with consequences, see its rollback).
+
+## Beads to close first
+
+`bd list` was checked on 2026-11-19; re-run `bd list --status open` before scheduling, since the list moves.
+
+| Before | Bead | What it gates |
+|---|---|---|
+| M | o3d-9zh3c | Withdrawal outcome: the PR #1058 round-3 findings. Needed before `wc_withdrawal_outcome_enabled` is turned on (alias-on-matching-generation and the operator-task dedupe basis are MEDIUM; the capture-gate, unlocked option map, id-0 meta entry, HPOS echo and G_despatch lows ride along). |
+| M | o3d-hsrsi | PR #1058 round-1 lows: a queued invoice note that fails after the switch is turned off (clean up those `WC_INVOICE_NOTE` rows by hand or fix), the held-until-step-M dependency on the enforcement variable, stock-drift explain/acknowledge (the last one is needed before W; see step W). |
+| M | o3d-j8d7l | `wms_merge_hold_enabled` on stage then live. Verify first that the live Mintsoft status for an order awaiting confirmation is `AWAITINGCONFIRMATION` (`docs/mintsoft.md`, controlled run step 3). IMS owns merge-candidate flag and hold from step M, so the switch must already be proven. |
+| M | o3d-s5ljn | `wms_mixed_warehouse_push_enabled` (owner decision 2026-11-18: stage first, single-warehouse payload comparison, review, then decide production). While off, the fail-closed refusal for mixed-warehouse orders stays in force. |
+| M | o3d-k6quj | The live store's registered order statuses audited; every pre-despatch custom status has a mapping row. Otherwise the first real despatches dead-letter as unknown status. |
+| M | o3d-zvec.22 | The legacy-state import and OrderNumber equality dry run (gate below). |
+| M | o3d-dx3m3 | Held installations must use the fixed `api_key` Mintsoft mode (documented); the cancel-swallow bug is a P2 to triage before M. |
+| W | o3d-hsrsi item 3 | Stock-drift explain/acknowledge: today one manual WooCommerce stock edit after go-live fails `writers:check` until a new attestation is recorded. Fix, or the owner accepts and the on-call knows the clearing procedure. |
+| W | o3d-zvec.24 | Customer e-mail from IMS (P4 on the board). See the e-mail finding in step W: IMS has no despatch e-mail for storefront-linked orders yet. Either this is built before W, or e-mail stays with WooCommerce at W. |
+| X | o3d-zjsb5.20 | The opening-balance journal, dated the Xero live-from day. |
+| X | o3d-hcx4c.3 / .4 | Incumbent-plugin disable order, and Qoblex to read-only (the point of no return) are sequenced after X. |
+| all | o3d-2ypv4 | Upload virus scanning ON at the IMS switchover (`FILE_SCAN_MODE`), part of the switchover checklist. |
+| all | o3d-sxu1k | The readiness register; its go/no-go gate. |
+
+Not yet built, and each blocks the step it is named under (they are the "remaining" list on o3d-zvec.3): the bridge status script and its `writers:check` source (M), the zvec.22 import (M), the Xeroom note mu-plugin (X), and the stage proof (M). **Today `BRIDGE_ATTESTATION` reads "not built", which fails `writers:check` from step M on.** M cannot go live until that source exists.
+
+## Stage proof (required before step M is scheduled)
+
+Per the owner (2026-11-18) there is no non-live Mintsoft client: the proof uses **live Mintsoft client 89** with clearly marked test orders that are **cancelled at once** (the o3d-zvec.1 method). Mintsoft is LIVE, so the marking and the speed matter: warehouse staff must never pick a test order.
+
+Stage IMS is wired to the live Mintsoft with the same shared API user, and stage has its own WooCommerce. Its push cron is off. Run the proof as follows.
+
+1. **[OWNER]** Approves the day and tells the warehouse that marked test orders will appear and be cancelled within minutes. **[CLAUDE]** prepares the marking convention: a reserved order-number prefix and an order comment "TEST - DO NOT PICK" on every order.
+2. **[CLAUDE or OPS, stage only]** Create the bridge-created set as the bridge would have made it, each marked and each cancelled in Mintsoft straight after the check it is for: a plain order, a split order (`_mintsoft_split_*`), a merged order (`_mintsoft_merged`), a partially despatched order, a withdrawal-held order, a dead-lettered order and a verify-pending order. Only orders the bridge's metas describe count; do not create orders by hand in Mintsoft that the bridge never would.
+3. Run the zvec.22 import dry run and then the import, then step M exactly as written below, on stage.
+4. **Adoption.** IMS must link every open bridge order and create **zero** orders. Run the order-push sweep three times and confirm the result each time (links count, orders created = 0). Count orders for ClientId 89 before and after; the difference must be zero.
+5. IMS amends one bridge order and cancels one. Cancel the remainder at once.
+6. Despatch one full order and one split part (mark them; the warehouse does not pick). Each must produce exactly one completion, one tracking entry, one partial-shipment row and one TrackShip shipment.
+7. `npm run switchover:gaps -- --step mintsoft --since <rehearsal S>` must list exactly the seeded gap orders, no more and no fewer.
+8. Rehearse the rollback with hand-back, in the corrected order (see Step M rollback): the bridge resumes and creates no duplicate.
+9. **Product delete (owner answer 11).** Prove Mintsoft product delete on stage before step M: with `mintsoft_parent_sku_delete_enabled` on, delete a marked test product, confirm the Mintsoft product is removed and no other product is touched, and confirm it is a no-op when the setting is off. Record the result.
+10. **Mintsoft creation-field name.** Read a live `GET /api/Order/List` row of client 89 (read only) and record which creation-time field it carries. The foreign-order reader tries `CreatedDate`, `DateCreated`, `Created` and never `OrderDate`. If none is present, every pre-S order updated after S counts as foreign and turns `writers:check` red from M. Pin the real name in a test fixture before step M.
+11. **Withdrawal request ownership field.** On stage, with the real withdrawal plugin (`wbte_ewb_*`), confirm that a request object exposes its order id as `order_id` or `get_order_id()`. The helper rejects only a request that belongs to the route's order, and answers `no_request` otherwise (which raises an operator task instead of rejecting). Record the field.
+12. Attach the full record (counts, order references, no customer data) to o3d-zvec.3.
+
+## Step M: Mintsoft, plus the bridge's WooCommerce writeback
+
+M retires the bridge as a unit. The bridge sweep creates Mintsoft orders and also writes WooCommerce status, tracking, partial shipments, withdrawal outcomes and TrackShip reconciliation, and a webhook service syncs products. All of those move to IMS here, behind the single `MINTSOFT_WRITES_LIVE_FROM` instant (S). Customer e-mail does not move at M.
+
+### M preconditions (checklist)
+
+- [ ] Global gates met and the stage proof passed.
+- [ ] **writers:check** exits 0 in P1 today, and has on every day of the window: `npm run writers:check -- --json > /var/tmp/m-pre-writers-check.json; echo $?`. Record the verdict. (Exit 6 means a step is not ready, 4 an evidence gap, 2 unreadable, 1 a double claim.)
+- [ ] **zvec.22 dry-run gate:** the dry run over live WooCommerce meta imports every open order's state with **zero OrderNumber mismatches**, and the live `woocommerce_order_prefix` setting equals the prefix the bridge used. Check with **[CLAUDE]** read-only; **[OPS]** confirms the setting.
+- [ ] **Zero open merge holds and merge candidates.** Resolve by hand in Mintsoft before S (there is no import of that state, owner answer 9). Re-check on the day.
+- [ ] The bridge's dead-letter queue, `_mintsoft_verify_pending` and `_mintsoft_wdraw_pending` are empty, or each order on them is listed and owned by a named person.
+- [ ] In IMS these are false before S: `wc_stock_sync_enabled`, `wc_invoice_note_enabled`, `wc_invoice_document_enabled`, `trackship_refire_enabled`, `wc_withdrawal_outcome_enabled`, `mintsoft_parent_sku_delete_enabled`. (Product delete goes live at M after being proven on stage: turn it on only after the first-day checks below.)
+- [ ] **Product delete proven on stage** (stage proof item 9).
+- [ ] **Helper plugin 1.5.0 deployed. [OWNER] must give the OK first**: it adds the signed `/wp-json/oti/v1/incumbents` probe and the withdrawal-outcome route to the live store. Then **[OPS]** installs it through the usual plugin deploy for the live store. Check: `curl -s -o /dev/null -w '%{http_code}\n' https://<store>/wp-json/oti/v1/incumbents` must answer 401 or 403 unsigned (it is signed-only; a 404 means the route is not there). The `writers:check` probe reads **not-probed** (a fail) from M until this is done; it is asked only after S is set, so P1 does not turn red meanwhile.
+- [ ] **Mintsoft creation-field name verified against live data** (stage proof item 10) and pinned in a test.
+- [ ] **Withdrawal plugin request ownership field verified on stage** (stage proof item 11).
+- [ ] Open beads closed: o3d-9zh3c, o3d-hsrsi (items 1 and 2), o3d-j8d7l, o3d-s5ljn, o3d-k6quj, o3d-zvec.22 (see "Beads to close first").
+- [ ] **The bridge status source exists** (`scripts/bridge_writers_status.py` in the bridge repo, printing `systemctl show` for the three units and the last sweep run) and `writers:check` can read it. Until it exists M cannot pass.
+- [ ] The hand-back script has been rehearsed on stage (proof item 8).
+- [ ] **Mintsoft API user credential:** one shared "API" user, used by the bridge today and by IMS after (owner answer 1). **[OWNER]** has the 'main' Mintsoft login to rotate it. IMS stage is wired to the live Mintsoft with the same user, so stage is updated in the same rotation. Confirm IMS uses the fixed `api_key` Mintsoft mode (o3d-dx3m3).
+- [ ] The Vaultwarden inbox path works: `o3d-vault-put` on pve, read-back verified, with an item name agreed in advance.
+- [ ] A rollback window and a person who can run the rollback within the hour.
+
+### M action, in order (S is recorded at step 7)
+
+1. **[OPS] Stop the timer.** On the bridge host: `systemctl stop wc-mintsoft-order-sweep.timer`. Wait for any running sweep to release `/run/wc_mintsoft_order_sweep.lock` (`flock -n /run/wc_mintsoft_order_sweep.lock true && echo free`).
+2. **[OPS] Final sweep.** Run `run_mintsoft_order_sweep.py --once` by hand. It must exit 0 with empty withdrawal, outbound and verify queues. If it does not, stop here and restart the timer (`systemctl start wc-mintsoft-order-sweep.timer`); nothing has changed.
+3. **[OPS] Disable and mask the units**:
+   - `systemctl disable --now wc-mintsoft-order-sweep.timer wc-mintsoft-webhook.service`
+   - `systemctl mask wc-mintsoft-order-sweep.timer wc-mintsoft-order-sweep.service wc-mintsoft-webhook.service`
+   - Check: `systemctl is-enabled` reads `masked` and `systemctl is-active` reads `inactive` for each of the three.
+4. **[OPS] Flip the plugin settings.** In WordPress (wp-cli, run through the store's cron user as for other live changes; never `--user=1`):
+   - `wc_mintsoft_settings.order_sync_enabled` to false;
+   - disable the WooCommerce webhook that delivers to `127.0.0.1:5001/webhook/woocommerce/product-update`;
+   - cancel pending Action Scheduler jobs `wc_mintsoft_run_product_sync`;
+   - deactivate the plugin `wc-mintsoft-sync` (slug exact). Deactivating is not the signal; the units and switches are. It is done so the plugin cannot be woken by a hook.
+5. **[OPS] Downgrade the bridge's own WooCommerce REST key to Read** (not IMS's key). Do not delete it: rollback needs it.
+6. **Mintsoft credential rotation (hard stop signal).** One shared API user, so there is no bridge-only login to disable. **[OWNER]** rotates that API user's password or API key in Mintsoft, immediately before S. **[OPS]** stores the new credential in Vaultwarden through `o3d-vault-put` on pve (inbox item, read-back verified; never in a ticket, chat or the shell history), then sets it in IMS **only**: production, and stage in the same change (fixed `api_key` mode in the Mintsoft settings). The bridge is not given it, so its stored credential then fails. Confirm IMS authenticates: a read-only connection test in Settings, and the activity log shows no Mintsoft 401. The bridge's failed logins after S are a signal the check reads.
+7. **[OPS] Record S**, the moment steps 3 to 6 are complete, as an ISO UTC instant with a Z, for example `2027-01-05T08:42:00Z`. S must be in the past when IMS is restarted. Write it on the bead.
+8. **[OPS] Bridge attestation.** Run the bridge-host status script and keep its output as the record, then record it with `writers:attest` once the bridge kind exists (today only the two Qoblex kinds can be recorded; the bridge attestation is a host input that is not built). List what is recorded: `npm run writers:attest -- --list`.
+9. **[OPS] Set the IMS environment and switches** in `/etc/ims/ims.env`, then restart:
+   - `MINTSOFT_WRITE_ALLOWED=<the one Mintsoft destination>` and `WC_WRITEBACK_ALLOWED_ORIGIN=<the live store origin>` (formats: see the outbound-write hold above and `npm run outbound:status`);
+   - `MINTSOFT_WRITES_LIVE_FROM=<S>`;
+   - leave `WC_WRITES_LIVE_FROM`, `XERO_WRITES_LIVE_FROM` and `XERO_WRITE_ALLOWED_TENANT` **unset**;
+   - restart IMS and the host scheduler entries that call the Mintsoft, order-status and WooCommerce routes.
+   Then in IMS settings: `trackship_refire_enabled=true`, `wc_withdrawal_outcome_enabled=true`, and `wms_merge_hold_enabled` and `wms_mixed_warehouse_push_enabled` as settled in their beads. Product delete: leave `mintsoft_parent_sku_delete_enabled` off until the first-day verification is clean, then turn it on (it is proven on stage).
+10. **[OPS]** `npm run outbound:status` and then `npm run writers:check -- --json` and keep both outputs. Expected: phase P2-M, exit 0.
+
+`MINTSOFT_WRITES_LIVE_FROM` governs every step-M row, including the WooCommerce fulfilment rows.
+
+### M detection signals (what `writers:check` reads)
+
+All are required. The check does not take "plugin active" as a signal.
+
+- The bridge host attestation: all three units masked and inactive, the timer's last trigger before S.
+- The helper probe: `wc-mintsoft/v1` routes not registered, `order_sync_enabled` false, the product webhook disabled, no pending product-sync jobs, and the newest `_mintsoft_*` write before S. Caveat: the probe's latest-write time covers four time-valued keys only, and the bridge deletes `_mintsoft_sync_queued_at` on success, so bridge writes that carry no stamp (tracking, order-id links from withdrawal recovery, withdrawal outcomes) are invisible to it. The units and credential are the real stop.
+- No order paid at or after S carries bridge evidence (`MINTSOFT_ORDER_ID`, `MINTSOFT_OTHER_META`).
+- No foreign Mintsoft order: no ClientId 89 order created at or after S that IMS has no link for.
+- Bridge Mintsoft login failures logged after S (the rotated credential). **[OPS]** reads the bridge log; the check does not.
+
+### M verification (first 24 hours, then daily for the soak)
+
+- [ ] `npm run writers:check` exits 0 (phase P2-M).
+- [ ] `npm run switchover:gaps -- --step mintsoft` (S is `MINTSOFT_WRITES_LIVE_FROM`):
+  - **G_create**: orders paid before S that are unlinked and not cancelled;
+  - **G_despatch**: Mintsoft despatches before S whose storefront order is not completed with tracking (14-day window before S; the list reads each storefront order, paced, and lists unreadable ones as such).
+
+  Each must be empty or closed within 4 hours. Close one order at a time: `npm run switchover:gaps -- --step mintsoft --take-over <orderId>` (dry run; it reads Mintsoft or the storefront first), then add `--apply`. A G_create order that Mintsoft does not hold is refused: IMS never creates a pre-S order; create it in Mintsoft by hand after a search by number, then take it over. A repeated `--apply` on a G_despatch order only queues an extra job that reads first. Known limit: a SHIPPED order with no `shippedAt` created before the window is not listed (o3d-9zh3c); check the warehouse's last-day despatch list by hand once.
+- [ ] **The first IMS-created order** is created once, and its Mintsoft OrderNumber equals the storefront order number (with the prefix).
+- [ ] **One full despatch and one split (partial) despatch** each produce exactly one completion, one tracking entry, one partial-shipment row and one TrackShip shipment. Look at the storefront order itself, not only IMS.
+- [ ] **One withdrawal** goes through: hold, outcome note, and for a request after the point of no return the rejection. Expect a `WITHDRAWAL_REJECT_NOT_WRITTEN` operator task when the request id is unknown (`no_request`): known limit, one task per order, resolve by hand. The very first request made before IMS's first outcome post may end that way (the capture is switched on by IMS's first post).
+- [ ] A bridge-created order is amended or cancelled by IMS once, with no duplicate.
+- [ ] **Drift observer**: not used at M (it starts at W). Do not run it before the Qoblex stock push is stopped.
+- [ ] The daily reconciliation stays clean.
+- [ ] No Mintsoft 401 in IMS; the foreign-order count is 0.
+
+### M stop conditions (stop means roll back)
+
+- `writers:check` exits non-zero.
+- Any duplicate Mintsoft order.
+- Any storefront order with a second partial-shipment row or tracking entry for one shipment.
+- Any foreign Mintsoft order or fresh `_mintsoft_*` mark.
+- A gap that cannot be closed within 4 hours.
+- A failed reconciliation run.
+
+### M rollback (the corrected order: hand back first, while the live-from is still set)
+
+Do not unset the live-from first. The hand-back writes through the ordinary WooCommerce path, which the producer hold keeps unless the step-M live-from is set and reached, and the hold is deliberately not loosened for it. `--apply` is refused (exit 4) unless `MINTSOFT_WRITES_LIVE_FROM` is still set in the environment and reached (a `--since` does not count) and you confirm with `--writers-stopped`.
+
+1. **[OPS] Stop IMS's other step-M writers while the live-from stays set**: stop the host scheduler entries for the order-push, order-status, dispatch-sync, withdrawal-sweep and webhook-inbox (TrackShip) routes, and set `wc_withdrawal_outcome_enabled=false` and `trackship_refire_enabled=false`. Check nothing is running (`pgrep` is fine for looking; never `pkill`).
+2. **[OPS] Dry run**: `npm run switchover:hand-back`. It lists the open storefront orders IMS created in Mintsoft since S; read it. Exit 1 means something needs a person (a conflict, an unreadable or held order).
+3. **[OPS] Apply**: `npm run switchover:hand-back -- --apply --writers-stopped`. It writes `_mintsoft_order_id` and `_mintsoft_order_number` onto each of those orders so the resumed bridge's second pass covers them (it only covers orders that carry `_mintsoft_order_id`; without this those orders have no writer). It reads each order first, never overwrites a different value, and leaves `switchover_hand_back_intent` and `switchover_hand_back_applied` audit entries. If the run reports `held`, the live-from was not set: set it again and rerun.
+4. **[OPS]** `npm run switchover:gaps -- --step mintsoft` for the hand-back window.
+5. **Only now** unset `MINTSOFT_WRITES_LIVE_FROM` and `MINTSOFT_WRITE_ALLOWED` (and `WC_WRITEBACK_ALLOWED_ORIGIN` if nothing else needs it), restart IMS, and confirm `npm run outbound:status` shows no writable destination.
+6. **[OWNER] gives the bridge the new Mintsoft credential back** (the rotated one), **[OPS]** puts it in the bridge config through Vaultwarden. IMS keeps reading with the same credential; with writes held that is harmless.
+7. **[OPS]** Restore the bridge's WooCommerce REST key permissions, reactivate `wc-mintsoft-sync`, set `order_sync_enabled` back on, re-enable the product webhook, unmask and enable the three units, start the timer. Run one sweep by hand and watch it adopt the handed-back orders.
+8. Restart the soak count when you try again.
+
+### M: what rollback does NOT undo
+
+- Mintsoft orders IMS created and goods already despatched.
+- Product changes made in Mintsoft (including a deleted product).
+- E-mails already sent to customers, partial-shipment rows and tracking entries already written, and withdrawal notes.
+- The rotation: the old credential does not come back (the owner gives the bridge the new one).
+- Gaps in the window the bridge was off and IMS was held: list them with `switchover:gaps`.
+
+## Step W: WooCommerce stock, webhooks and customer e-mail
+
+### W preconditions (checklist)
+
+- [ ] Step M has soaked 3 days with `writers:check` at 0 throughout, and none of its stop conditions hit.
+- [ ] **writers:check verdict** exits 0 in P2-M today.
+- [ ] **Zero open merge holds** still (carried from M).
+- [ ] The beads for W are closed or accepted: o3d-hsrsi item 3 (stock-drift acknowledge) and the e-mail finding below.
+- [ ] **Qoblex stock-stop confirmation. [OWNER]** stops the Qoblex stock push to WooCommerce in Qoblex, then confirms in IMS through writer confirmations: the Owner confirmations page at `/sync/writer-confirmations` (an administrator signs in), or **[OPS]** records it on the owner's word: `npm run writers:attest -- --kind qoblex-stock-push-stopped --by <owner name> --note "<what was stopped, when>" --yes` (without `--yes` it only prints what it would record). The record is append-only and audit-logged with time and user. IMS refuses `wc_stock_sync_enabled=true` without it. Check: `npm run writers:attest -- --list`.
+- [ ] **24 hour quiet window.** From the confirmation, run the drift observer hourly from the host scheduler: `npm run switchover:stock-drift` (read only; exit 0 = a complete run, exit 5 = it could not read the whole catalogue). Run it outside peak trading hours: it reads every managed-stock product and one variations call per variable product, paced, on the PHP pool shared with customers. After 24 hours with **zero** unexplained changes the window is quiet. Any stock change not explained by an order or refund means Qoblex is still pushing: the step stops.
+- [ ] The WooCommerce webhooks list for IMS is known (nothing registered yet; no incumbent registers them).
+- [ ] If customer e-mail is in scope: the e-mail checks below.
+
+### W action, in order
+
+1. **[OPS]** Set `WC_WRITES_LIVE_FROM=<W>` (a past instant, after the attestation) and restart. `WC_WRITEBACK_ALLOWED_ORIGIN` is already set from M. Then set `wc_stock_sync_enabled=true` (refused without the attestation).
+2. **[OPS]** Register the IMS webhooks (the WooCommerce connector's webhook registration, which is held until this step is live).
+3. **[OPS] Customer e-mail (owner answer 4; only if the e-mail checks pass).** Order matters: **turn off the WooCommerce native e-mails first, then turn on IMS's.** A missed e-mail can be re-sent from a list; a duplicate cannot be unsent.
+   1. **[OPS]** In WooCommerce, Settings > Emails: disable the native Completed order, Processing order and invoice e-mails (and the AST/TrackShip despatch e-mail if that is a separate sender; confirm on the live store). Send a test and confirm none arrives.
+   2. Wait until the last in-flight native e-mail has gone, then turn on IMS's: `dispatch_email_enabled=true` and its siblings that exist at that time (the order-confirmation and invoice switches).
+   3. Watch the first orders: each customer receives exactly one e-mail.
+   - **Finding (2026-11-19): IMS's dispatch e-mail is for direct IMS orders only.** `lib/dispatch-email.ts` skips any order with a storefront link (`storefront_order`), on the premise that WooCommerce sends its own "completed" e-mail. So turning WooCommerce's off and IMS's on would send **nothing** for storefront orders today, and customers would not be told their order shipped. **[OWNER] decides** whether customer e-mail from IMS is built before W (o3d-zvec.24) or e-mail stays with WooCommerce at W. Do not execute this action until it is decided, and prove on stage first that a storefront order produces exactly one e-mail. Also record the o3d-zvec.1 result (whether AST Pro's own despatch e-mail fires when IMS writes tracking), since that is the e-mail that exists today.
+
+### W detection signals
+
+- The owner's attestation exists and is earlier than `WC_WRITES_LIVE_FROM`.
+- The drift observer is clean (a recent complete run, no unexplained change since the attestation).
+- After go-live, a WooCommerce stock value that differs from IMS's last absolute push and is not explained by an order is a fail.
+- WooCommerce native e-mail and IMS e-mail are mutually exclusive.
+
+### W verification
+
+- [ ] `npm run writers:check` exits 0 (phase P2-W).
+- [ ] Sample SKUs (a simple product, a variation, a bundle if any) match IMS in WooCommerce. The first push is an absolute state push, so it heals the short no-writer gap; WooCommerce's own decrements on orders cover that gap meanwhile.
+- [ ] `npm run switchover:stock-drift` stays at 0 unexplained changes for the soak.
+- [ ] Webhooks deliver; the first orders after W import normally.
+- [ ] If e-mail moved: exactly one e-mail per customer for the first orders.
+- [ ] `npm run switchover:gaps -- --step mintsoft` is still empty.
+
+### W stop conditions
+
+Drift; `writers:check` non-zero; a failed reconciliation run; a duplicate or missing customer e-mail.
+
+### W rollback
+
+1. **[OWNER]** First tell ops, then re-enable the Qoblex stock push in Qoblex only after IMS has stopped (never both).
+2. **[OPS]** Set `wc_stock_sync_enabled=false`; unset `WC_WRITES_LIVE_FROM`; restart. The step-M rows stay live because their live-from is the Mintsoft one. Remove the IMS webhooks.
+3. If e-mail moved: turn IMS's e-mail off first, then WooCommerce's native e-mails back on (the reverse order: a duplicate is the risk to avoid, a missed e-mail can be re-sent).
+4. Restart the soak count.
+
+W rollback does NOT undo: stock values already written (Qoblex's next push overwrites them), e-mails already sent, and the Qoblex attestation record (it is append-only; record a new one when you try again).
+
+## Step X: Xero, and the invoice note
+
+Xero live-from is the **start of a day**, not a VAT period: 00:00 Europe/London expressed in Z (owner answer 6). In winter that is `YYYY-MM-DDT00:00:00Z`; in British Summer Time it is the previous day at `23:00:00Z`. Choose the day, compute the instant once, and check it twice.
+
+### X preconditions (checklist)
+
+- [ ] Step W has soaked 3 days at 0 throughout.
+- [ ] **writers:check verdict** exits 0 in P2-W today.
+- [ ] **Zero open merge holds**.
+- [ ] **[OWNER]** has stopped Qoblex's native Xero posting (bills, journals, daily batches) in Qoblex and records it: `npm run writers:attest -- --kind qoblex-xero-stopped --by <owner name> --note "<...>" --yes`, or the Owner confirmations page. The attestation must be earlier than the live-from; delivery waits for it.
+- [ ] The opening-balance journal (o3d-zjsb5.20) is dated the live-from day.
+- [ ] **The Xeroom note mu-plugin is deployed (not built yet).** A small mu-plugin on the store (per the patched-fork rule: Xeroom is never edited) with the option `o3d_xeroom_order_note_off` (default false) that suppresses only Xeroom's WooCommerce order note. Xeroom's "Add Order Notes" setting is the reverse direction (WooCommerce notes copied onto the Xero invoice) and is left as it is. The helper probe reads the option. **[OWNER]** OKs the mu-plugin deploy; **[OPS]** deploys it.
+- [ ] IMS can find the invoice from the id/number Xeroom stores on the order, with a Xero lookup by order reference as fallback (proven on stage).
+- [ ] The stage proof shows the first invoice note appears exactly once with Xeroom's note off.
+- [ ] A person with Xero History access is on hand for the first day.
+
+### X action, in order
+
+1. **[OWNER]** Confirms the day and the instant X.
+2. **[OPS]** Turn off Xeroom's WooCommerce order note: set the option `o3d_xeroom_order_note_off` to true (wp-cli option update, through the store's cron user). Xeroom keeps posting sales invoices and keeps its marker on every order for good.
+3. **[OPS]** Set `XERO_WRITE_ALLOWED_TENANT=<the one tenant>` and `XERO_WRITES_LIVE_FROM=<X>`, restart, then set `wc_invoice_note_enabled=true` and `wc_invoice_document_enabled=true`. Both owners move at X, Xeroom's note off first (step 2), then IMS's on.
+4. **[OPS]** `npm run writers:check -- --json` expecting P2-X exit 0, and `npm run outbound:status`.
+
+### X detection signals
+
+- The probe reads Xeroom's note option as off.
+- No new note written by Xeroom on any order with an invoice at or after X (`XEROOM_NOTE`). `XEROOM_MARKER` alone is not a signal: Xeroom marks every order it invoices.
+- Xero History shows no bill or journal created at or after X by the Qoblex app.
+- The Qoblex Xero attestation is present and earlier than X.
+
+### X verification
+
+- [ ] `npm run writers:check` exits 0 (phase P2-X).
+- [ ] The first daily batch, bill and journal each post once.
+- [ ] Each order invoiced after X carries **exactly one** invoice note.
+- [ ] Xero sales invoices and credit notes are still Xeroom's alone (IMS never writes them).
+
+### X stop conditions
+
+A duplicate note; a Qoblex-created document after X; `writers:check` non-zero; a failed reconciliation run.
+
+### X rollback
+
+1. **[OPS]** Unset `XERO_WRITES_LIVE_FROM` and `XERO_WRITE_ALLOWED_TENANT`; set `wc_invoice_note_enabled=false` and `wc_invoice_document_enabled=false`; restart.
+2. **[OPS]** Set `o3d_xeroom_order_note_off` back to false (Xeroom's note on again).
+3. **[OWNER]** Reconnects Qoblex's Xero posting.
+
+X rollback does NOT undo: documents already posted to Xero (bills, journals, batches) stay and need credit notes or manual reversals; notes already written to orders; and the opening-balance journal. X is reversible only with these consequences.
+
+## After the three steps
+
+Record the dates of M, W and X and their soak results on o3d-hcx4c.2. Then o3d-hcx4c.3 (disable the incumbent plugins) and o3d-hcx4c.4 (Qoblex to read-only, the point of no return) follow. Switch virus scanning on (o3d-2ypv4). Remove the rollback keys only after the last step has soaked.
