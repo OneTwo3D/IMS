@@ -22,6 +22,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { endOfBusinessDateUtc, isMissingFxRateError, type FxMissingReason } from '@/lib/currencies/fx-lookup'
 import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { businessDateYmd } from '@/lib/business-date'
+import { billNetPayableBase, billNetPayableForeign, type NetPayableLine } from '@/lib/domain/purchasing/bill-net-payable'
 import { refundCreditsAsGross, REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 
 type JournalLine = {
@@ -449,13 +450,18 @@ export function payableOutstanding(invoice: {
   totalForeign: unknown
   totalBase: unknown
   supplierCreditNotes: Array<{ amountForeign: unknown }>
+  /** The bill's currency and reverse-charge lines: what is owed is the NET PAYABLE (lib/domain/purchasing/bill-net-payable.ts), not the stored total that includes self-accounted VAT. Omitted = the stored total. */
+  currency?: string
+  lines?: ReadonlyArray<NetPayableLine> | null
 }): { outstandingForeign: number; bookedBase: number } {
-  const total = toDecimal(invoice.totalForeign as never)
+  const netBill = invoice.currency ? { totalForeign: invoice.totalForeign as never, totalBase: invoice.totalBase as never, lines: invoice.lines } : null
+  const total = netBill ? billNetPayableForeign(netBill, invoice.currency!) : toDecimal(invoice.totalForeign as never)
   const credited = invoice.supplierCreditNotes.reduce((sum, cn) => sum.add(toDecimal(cn.amountForeign as never)), toDecimal(0))
   const outstanding = total.sub(credited)
   if (!outstanding.gt(0)) return { outstandingForeign: 0, bookedBase: 0 }
   // Preserve the stored bill precision (totalForeign is Decimal(18,4)); computeRealisedFx rounds the journal gain/loss to 2dp.
-  const bookedBase = total.gt(0) ? toDecimal(invoice.totalBase as never).mul(outstanding).div(total) : toDecimal(0)
+  const totalBase = netBill ? billNetPayableBase(netBill, invoice.currency!) : toDecimal(invoice.totalBase as never)
+  const bookedBase = total.gt(0) ? totalBase.mul(outstanding).div(total) : toDecimal(0)
   return { outstandingForeign: outstanding.toNumber(), bookedBase: bookedBase.toNumber() }
 }
 
@@ -508,12 +514,13 @@ async function getOpenPayables(baseCurrency: string): Promise<OpenBalance[]> {
       totalBase: true,
       fxRateToBase: true,
       po: { select: { reference: true, currency: true } },
+      lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
       supplierCreditNotes: { where: { status: 'POSTED' }, select: { amountForeign: true } },
     },
   })
 
   return invoices.flatMap((invoice) => {
-    const { outstandingForeign, bookedBase } = payableOutstanding(invoice)
+    const { outstandingForeign, bookedBase } = payableOutstanding({ ...invoice, currency: invoice.po.currency })
     if (outstandingForeign <= 0) return []
     return [{
       id: invoice.id,

@@ -428,10 +428,21 @@ export type RefundAccountingSyncRequest = {
  *                       already charged the whole order back → a second credit note
  *                       would double-reverse it.
  *
+ *  - `prior-removal-credit-note` (o3d-hqvrp.395) an ordinary or WooCommerce refund was refused because IMS had
+ *                       already raised the credit note for a partial payment REMOVAL on this order: the
+ *                       same money would be credited twice. The reverse case, a removal credit note
+ *                       refused because the order already carries any other refund, is `prior-refund`.
+ *  - `removal-already-credited` the removal record already has its credit note (the claim is taken under
+ *                       this transaction's order lock, so a poller and a server action cannot both win).
+ *
  * A conflict is NOT a failure to retry: the reversal is already recorded. Callers map
  * it to a clean no-op plus an operator-visible warning.
  */
-export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback'
+export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback' | 'prior-removal-credit-note' | 'removal-already-credited'
+
+function removalConflict(conflict: RefundCreationConflict, conflictError: string): { conflict: RefundCreationConflict; conflictError: string } {
+  return { conflict, conflictError }
+}
 
 /**
  * THE EXCHANGE HOOK OF A REFUND (Return exchanges). The refund transaction calls it twice, both under the order's row lock:
@@ -4080,6 +4091,13 @@ export async function createSalesOrderRefund(
      * payment-poller when a payment reversal (chargeback) is detected.
      */
     chargeback?: boolean
+    /**
+     * o3d-hqvrp.395: this refund IS the credit note for the partial payment removal with this record id (internal caller only). The refund transaction claims the
+     * record under the order lock (a record that already has a credit note is refused as `removal-already-credited`), refuses the credit note when the order carries
+     * any refund that is not itself a removal credit note (`prior-refund`: the money may already be credited), and links the record to the refund it creates in the
+     * same transaction. Every OTHER refund on an order that carries a removal credit note is refused as `prior-removal-credit-note`.
+     */
+    paymentRemovalRecordId?: string
     /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
     activeAccountingConnector?: AccountingConnectorId
     /**
@@ -4776,6 +4794,34 @@ export async function createSalesOrderRefund(
       where: input.chargeback ? { orderId: input.orderId } : { orderId: input.orderId, chargeback: true },
       select: { id: true, creditNoteNumber: true },
     })
+    // o3d-hqvrp.395: a REMOVAL CREDIT NOTE is a first-class conflict, decided here under the same two locks as the chargeback guard above.
+    //  - the removal credit note itself is refused when the record already has one, or when the order carries any refund that is not itself a removal credit note
+    //    (a WooCommerce refund may already cover this money, and what remains to credit is ambiguous);
+    //  - any other (ordinary or WooCommerce) refund is refused once the order carries a removal credit note, because it can be the same money again.
+    // Not a unique index: the invariant is a cross-row conditional one, as above.
+    const removalLinks = await tx.paymentRemovalReconciliation.findMany({
+      where: { orderId: input.orderId, kind: 'REMOVED', refundId: { not: null } },
+      select: { id: true, refundId: true },
+    })
+    const removalRefundIds = new Set(removalLinks.map((link) => link.refundId as string))
+    if (input.paymentRemovalRecordId) {
+      const record = await tx.paymentRemovalReconciliation.findUnique({ where: { id: input.paymentRemovalRecordId }, select: { id: true, orderId: true, kind: true, refundId: true } })
+      if (!record || record.orderId !== input.orderId || record.kind !== 'REMOVED') {
+        return removalConflict('removal-already-credited', 'There is no such payment removal record on this order, so no credit note was raised.')
+      }
+      if (record.refundId) {
+        return removalConflict('removal-already-credited', 'A credit note was already raised for this payment removal.')
+      }
+      const others = (await tx.salesOrderRefund.findMany({ where: { orderId: input.orderId }, select: { id: true, creditNoteNumber: true } })).filter((row) => !removalRefundIds.has(row.id))
+      if (others.length > 0) {
+        return removalConflict('prior-refund', withLedgerCheck(`Order already carries refund ${others[0]!.creditNoteNumber ?? others[0]!.id} — the removed payment may already be credited by it, so no credit note was raised for the removal; raise it manually if it is still owed.`))
+      }
+    } else if (removalRefundIds.size > 0 && !input.chargeback) {
+      const firstId = [...removalRefundIds][0]!
+      const removalRefund = await tx.salesOrderRefund.findUnique({ where: { id: firstId }, select: { creditNoteNumber: true } })
+      return removalConflict('prior-removal-credit-note', withLedgerCheck(`Order already carries a credit note for a partial payment removal (${removalRefund?.creditNoteNumber ?? firstId}) — a second credit note could credit the same money twice; reconcile this refund manually against that credit note.`))
+    }
+
     if (conflictingRefund) {
       const conflictRef = conflictingRefund.creditNoteNumber ?? conflictingRefund.id
       const conflictResult: { conflict: RefundCreationConflict; conflictError: string } = input.chargeback
@@ -5459,6 +5505,14 @@ export async function createSalesOrderRefund(
       },
       select: { id: true },
     })
+    // o3d-hqvrp.395: the removal record is linked to the credit note in the SAME transaction (compare-and-set on the claim read above), so a second caller can never create another.
+    if (input.paymentRemovalRecordId) {
+      const linked = await tx.paymentRemovalReconciliation.updateMany({
+        where: { id: input.paymentRemovalRecordId, refundId: null },
+        data: { refundId: createdRefund.id, ledgerAction: 'CREDIT_NOTE' },
+      })
+      if (linked.count !== 1) throw new Error('The payment removal record changed while its credit note was being created; nothing was recorded.')
+    }
 
     // o3d-ee9: the refund has now landed for THIS order, so resolve any actionable same-order WooCommerce
     // park for the same external id atomically (in the same tx, under the per-refund + order locks). Without

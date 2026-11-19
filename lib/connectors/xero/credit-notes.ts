@@ -85,7 +85,7 @@ export async function pushCreditNote(
     currency: data.currency, baseCurrency, rateToBase: data.currencyRateToBase, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}`,
   })
   if (rateProblem) return { success: false, error: rateProblem }
-  const rounding = await resolveUnitDpRoundingAccount({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), what: `Credit note ${data.creditNoteNumber ?? '(no number)'}` })
+  const rounding = await resolveUnitDpRoundingAccount({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), orderTotal: data.orderTotal ?? null, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}` })
   if (!rounding.ok) return { success: false, error: rounding.error }
 
   // Find or create the contact
@@ -124,7 +124,7 @@ export async function pushCreditNote(
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
     return xeroLine
   })
-  const roundingLine = planXeroRoundingLine({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), account: rounding.account, rateOf: rounding.rateOf, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}` })
+  const roundingLine = planXeroRoundingLine({ lines: data.lines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), orderTotal: data.orderTotal ?? null, account: rounding.account, rateOf: rounding.rateOf, what: `Credit note ${data.creditNoteNumber ?? '(no number)'}` })
   if (roundingLine) lineItems.push(roundingLine)
   assertXeroLineQuantitiesKept(data.lines, lineItems)
 

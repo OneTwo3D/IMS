@@ -6002,11 +6002,15 @@ model PaymentRemovalReconciliation {
   matchedPaymentIds  Json     @default("[]") @map("matched_payment_ids")
   /// OPERATOR_DECISION while the revenue unwind is owed; NONE for a restoration.
   ledgerAction       String   @default("OPERATOR_DECISION") @map("ledger_action")
+  /// The credit note (SalesOrderRefund) IMS raised for this removal, when the setting xero_partial_payment_removal_credit_note_enabled was on. NULL = none raised. A plain pointer, no foreign key.
+  refundId           String?  @map("refund_id")
   createdAt          DateTime @default(now()) @map("created_at")
 
   order SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([orderId])
+  @@index([refundId])
+  @@unique([refundId])
   @@map("payment_removal_reconciliations")
 }
 

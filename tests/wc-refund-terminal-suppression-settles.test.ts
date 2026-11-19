@@ -46,7 +46,7 @@ const ORDERED_QTY = 10
 const SHIPPED_QTY = 8
 
 /** How `createRefund` answers — the switch between the two terminal shapes and the resolvable one. */
-let refundVerdict: 'chargeback' | 'applies' = 'chargeback'
+let refundVerdict: 'chargeback' | 'removal' | 'applies' = 'chargeback'
 /** Whether WooCommerce has this refund attached to a DIFFERENT IMS order. */
 let ownedByAnotherOrder = false
 /** A QUARANTINED park on THIS order for THIS refund — the operator-resolvable control. */
@@ -103,6 +103,10 @@ mock.module('@/app/actions/sales', {
         // THE REAL REFUSAL SHAPE. The refund transaction declines because a payment-poller chargeback
         // for the same order committed first; a second credit note would double-reverse it.
         return { success: false, conflict: 'prior-chargeback', error: 'the order was already charged back' }
+      }
+      if (refundVerdict === 'removal') {
+        // o3d-hqvrp.395: IMS already raised the credit note for a partial payment removal; this WooCommerce refund may be the same money.
+        return { success: false, conflict: 'prior-removal-credit-note', error: 'the order already carries a removal credit note' }
       }
       refundLandedInIms = true
       return { success: true }
@@ -437,4 +441,21 @@ test('o3d-xnwu r6: an ALREADY-CREATED refund on another order is still terminal'
     body.permanentFailures?.some((f) => /can NEVER be applied in IMS/.test(f)),
     'recorded, not swallowed',
   )
+})
+
+test('o3d-hqvrp.395: a WooCommerce refund on an order with a partial payment REMOVAL credit note is suppressed with an operator activity and the delivery settles', async () => {
+  reset()
+  refundVerdict = 'removal'
+
+  const response = await deliverCompletedOrder()
+  const body = await response.json() as { ok: boolean; failures?: string[] }
+
+  assert.equal(createRefundCalls, 1)
+  assert.equal(refundLandedInIms, false, 'no second credit note')
+  const suppressed = activityLog.find((entry) => entry.action === 'refund_sync_suppressed_by_removal_credit_note')
+  assert.ok(suppressed, 'the operator is told to reconcile the Woo refund against the removal credit note')
+  assert.match(String(suppressed.description), /partial payment removal/)
+  assert.equal(response.status, 200)
+  assert.equal(body.failures, undefined, 'not a retryable failure: the condition can never clear by retrying')
+  assert.ok(settingUpserts.includes('wc_order_webhook_last_processed_at'), 'the cursor advances')
 })

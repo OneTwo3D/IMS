@@ -11,6 +11,7 @@ import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { getSettingValue } from '@/lib/settings-store'
+import { PARTIAL_REMOVAL_CREDIT_NOTE_ENABLED_AT_KEY, PARTIAL_REMOVAL_CREDIT_NOTE_SETTING_KEY, REMOVAL_LEDGER_ACTION_MANUAL, partialRemovalCreditReason, planRemovalCreditNoteLines } from '@/lib/domain/accounting/partial-payment-removal-credit-note'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorId } from '@/lib/connectors/wms/enabled-connector'
@@ -2064,6 +2065,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   if (!so) return
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return
+  const roundToOrderTotal = (await getSettingValue('xero_round_to_order_total_enabled')) === 'true'
   if (reverseChargeSwapMissing(so.lines, settings.reverseChargeSalesTaxType)) throw new SalesInvoiceReverseChargeSwapNotSetError(so.currency)
   const multiComponentRateNames = multiComponentTaxRateNames(so.lines)
   if (multiComponentRateNames.length > 0 && !options?.checkOnly) {
@@ -2167,6 +2169,9 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     discountTaxType: orderDefaultTaxType ?? undefined,
     ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
     lineAmountsIncludeTax,
+    // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled` (off by default; with it off the payload is byte for byte what it was): the connector posts a Rounding line so the
+    // document totals what the order totals. Not part of the posting key (lib/accounting/payload-key.ts).
+    ...(roundToOrderTotal ? { orderTotal: Number(so.totalForeign) } : {}),
   }
 
   const sentCodes = [...new Set([...payload.lines.map((l) => l.taxType), payload.shippingTaxType, payload.discountTaxType].filter((c): c is string => typeof c === 'string' && c.trim() !== '' && !isNoTaxType(c)))]
@@ -2842,6 +2847,17 @@ async function clearRefundAccountingRetryState(
   return dischargeRefundAccountingObligation(db, refundId, settlement)
 }
 
+async function fullReversalOrderTotal(
+  order: { totalForeign: unknown; refundStatus: string; refunds: Array<{ id: string; chargeback: boolean }> } | null,
+  refundId: string,
+): Promise<{ orderTotal?: number }> {
+  if (!order || (await getSettingValue('xero_round_to_order_total_enabled')) !== 'true') return {}
+  const only = order.refunds.length === 1 && order.refunds[0]!.id === refundId ? order.refunds[0]! : null
+  if (!only || !(only.chargeback || order.refundStatus === 'FULL')) return {}
+  const total = Number(order.totalForeign)
+  return Number.isFinite(total) && total > 0 ? { orderTotal: total } : {}
+}
+
 async function queueRefundAccountingActions(input: {
   orderId: string
   refundId: string
@@ -2860,6 +2876,9 @@ async function queueRefundAccountingActions(input: {
         customer: { select: { firstName: true, lastName: true, email: true } },
         currency: true,
         taxRateName: true,
+        totalForeign: true,
+        refundStatus: true,
+        refunds: { select: { id: true, chargeback: true } },
         lines: {
           select: {
             id: true,
@@ -2932,6 +2951,9 @@ async function queueRefundAccountingActions(input: {
     date: businessDateYmd(new Date()),
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
+    // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled`: a credit note that FULLY reverses the invoice (a chargeback, or the one refund of an order now fully refunded) carries
+    // the order total the invoice was rounded to, so the connector posts the same Rounding line and the credit note matches the invoice it clears. A partial refund never does.
+    ...(await fullReversalOrderTotal(orderForCN, input.refundId)),
     lines: input.lines.map((line) => ({
       // Never sent: ties this posted line to its refund line so the credit-note PDF can read that line's frozen VAT rate (a description cannot: it may be blank or repeated).
       refundLineId: line.id,
@@ -3454,6 +3476,8 @@ export async function createRefund(
     internalBypassToken?: symbol
     externalRefundId?: number
     chargeback?: boolean
+    /** o3d-hqvrp.395: this refund is the credit note for the partial payment removal with this record id. Internal-only (the payment poller's removal credit note); see `createSalesOrderRefund`. */
+    paymentRemovalRecordId?: string
     /**
      * o3d-w00 (Codex r3 #2): cap each order line / the shipping charge at its own remaining balance,
      * inside the refund transaction's order lock. Internal-only, like the other provenance-bearing
@@ -3492,6 +3516,8 @@ export async function createRefund(
   recordedNetForeign?: number
   conflict?: RefundCreationConflict
   quarantine?: true
+  /** o3d-hqvrp.395: the failure was an exception (a lock timeout, a dropped connection) that a later attempt may not meet. Absent on every deliberate refusal, which a retry will meet again. */
+  transient?: true
   /** Set when an exchange was recorded: what the replacement lines added to the order (VAT included, order currency). The caller compares it with the credit note to show the difference; IMS charges and refunds nothing. */
   exchange?: { lineCount: number; replacementGrossForeign: number }
 }> {
@@ -3532,8 +3558,8 @@ export async function createRefund(
     // which supply the unforgeable internal capability. Reject them from a public/manual caller so a
     // network client with sales.refund can't forge a chargeback or squat a replay key (and so the derived
     // `source` is trustworthy).
-    if (!isInternal && (options?.chargeback || options?.externalRefundId != null)) {
-      return { success: false, error: 'chargeback and externalRefundId may only be set by internal sync callers' }
+    if (!isInternal && (options?.chargeback || options?.externalRefundId != null || options?.paymentRemovalRecordId)) {
+      return { success: false, error: 'chargeback, externalRefundId and paymentRemovalRecordId may only be set by internal sync callers' }
     }
     // o3d-w00 (Codex r3 #2): the per-target cap is a TIGHTENING, so a forged `true` cannot over-refund —
     // but a forged `false` from a public caller could turn it off for the hand-recording path, so it is
@@ -3580,6 +3606,7 @@ export async function createRefund(
       // scjz.70: revenue-only chargeback (credit note reverses recognised revenue,
       // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
       chargeback: options?.chargeback,
+      paymentRemovalRecordId: options?.paymentRemovalRecordId,
       // o3d-j625: derived from the chart read above, NOT resolved a second time. Staging stamps this
       // value onto the allocation pin (`allocationProvedOnConnector`) and stamps the chart's own
       // connector onto every staged request; two independent reads could make those two disagree for
@@ -3933,7 +3960,7 @@ export async function createRefund(
       description: `Failed to create refund: ${String(e)}`,
       metadata: null,
     })
-    return { success: false, error: String(e) }
+    return { success: false, error: String(e), transient: true }
   }
 }
 
@@ -4294,6 +4321,100 @@ export async function raiseChargebackForReversedOrder(
     return { raised: false, error: result.error, manualResolutionRequired: true }
   }
   return { raised: result.success, error: result.error }
+}
+
+/**
+ * o3d-hqvrp.395 (owner decision 2026-11-18): book a PARTIAL PAYMENT REMOVAL as a credit note for the removed amount, VAT apportioned pro rata and the deferred
+ * revenue unwound the same way (lib/domain/accounting/partial-payment-removal-credit-note.ts). It goes through the ordinary refund path, so the credit note is
+ * staged behind the outbound write hold like any other. BEHIND the setting `xero_partial_payment_removal_credit_note_enabled`, OFF by default: with it off this does
+ * nothing and a removal stays an operator decision, exactly as before.
+ *
+ * ONE CREDIT NOTE PER REMOVAL RECORD, DECIDED UNDER THE ORDER LOCK. The record is claimed and linked to its credit note INSIDE the refund transaction
+ * (`paymentRemovalRecordId`, lib/domain/sales/refund-service.ts), and `refund_id` is unique, so the poller and this action can never both create one. The same transaction
+ * refuses the credit note when the order carries any refund that is not itself a removal credit note, and refuses every later ordinary/WooCommerce refund once the order
+ * carries one (a conflict, like the chargeback's), so the same money is never credited twice in either order of events.
+ *
+ * ONLY REMOVALS DETECTED AFTER THE SETTING WAS TURNED ON are credited (`xero_partial_payment_removal_credit_note_enabled_at`, stamped by the poller); older ones stay
+ * with the owner and are listed in the poller's operator report. A refusal that will never clear is a TERMINAL state (MANUAL_CREDIT_NOTE) with an operator warning,
+ * never a retry; only an exception is reported as transient.
+ *
+ * Internal only, like the chargeback: the payment poller passes the unforgeable token, any other caller needs sales.refund.
+ */
+export async function raisePartialPaymentRemovalCreditNote(
+  orderId: string,
+  recordId: string,
+  options?: { internalBypassToken?: symbol },
+): Promise<{ raised: boolean; reason?: string; error?: string; /** The refusal was an exception a later attempt may not meet; absent when the outcome is final (raised, already raised, or handed to a person). */ transient?: true }> {
+  if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+    await requirePermission('sales.refund')
+  }
+  if ((await getSettingValue(PARTIAL_REMOVAL_CREDIT_NOTE_SETTING_KEY)) !== 'true') return { raised: false, reason: 'the partial payment removal credit note setting is off' }
+
+  const record = await db.paymentRemovalReconciliation.findUnique({
+    where: { id: recordId },
+    select: { id: true, orderId: true, kind: true, amountForeign: true, refundId: true, createdAt: true, ledgerAction: true },
+  })
+  if (!record || record.orderId !== orderId || record.kind !== 'REMOVED') return { raised: false, reason: 'no such removal record for this order' }
+  if (record.refundId) return { raised: false, reason: 'a credit note was already raised for this removal' }
+  if (record.ledgerAction !== 'OPERATOR_DECISION') return { raised: false, reason: `this removal is already ${record.ledgerAction}; it is not credited automatically` }
+  // Backlog: only a removal detected after the setting was turned on is credited automatically.
+  const enabledAt = parseEnabledAt(await getSettingValue(PARTIAL_REMOVAL_CREDIT_NOTE_ENABLED_AT_KEY))
+  if (!enabledAt) return { raised: false, reason: 'the time the setting was turned on is not recorded yet; the payment poller records it' }
+  if (record.createdAt < enabledAt) return { raised: false, reason: 'this removal was detected before the setting was turned on and stays an operator decision' }
+
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      orderNumber: true, externalOrderNumber: true, totalForeign: true, totalBase: true, taxBase: true, shippingBase: true, discountRestatement: true,
+      lines: { select: { id: true, productId: true, description: true, totalBase: true } },
+    },
+  })
+  if (!order) return { raised: false, error: 'Order not found' }
+  const orderRef = order.orderNumber ?? order.externalOrderNumber ?? orderId
+  // A refusal that needs a person is TERMINAL: the record leaves the retry set, so the poller never raises the same warning every poll.
+  const manual = async (why: string) => {
+    await db.paymentRemovalReconciliation.updateMany({ where: { id: record.id, refundId: null }, data: { ledgerAction: REMOVAL_LEDGER_ACTION_MANUAL } })
+    await logActivity({
+      entityType: 'SALES_ORDER', entityId: orderId, action: 'payment_removal_credit_note_requires_manual_handling', tag: 'accounting', level: 'WARNING',
+      description: withLedgerCheck(`Part of the payment on order ${orderRef} is no longer in the ledger, but ${why}, so no credit note was raised automatically; raise it manually if it is still owed.`),
+      metadata: { recordId: record.id, ledgerAction: REMOVAL_LEDGER_ACTION_MANUAL },
+      resolveUser: false,
+    })
+    return { raised: false, reason: `${why} — manual credit note required` }
+  }
+  if (order.discountRestatement != null) return manual('the order\'s discount was restated after it was invoiced, so the credit cannot be mirrored against the posted invoice')
+
+  const plan = planRemovalCreditNoteLines({
+    lines: order.lines.map((l) => ({ lineId: l.id, productId: l.productId, description: l.description ?? 'Line', totalBase: l.totalBase })),
+    shippingBase: order.shippingBase ?? 0,
+    orderNetTotalBase: subtractMoney(order.totalBase, order.taxBase ?? 0),
+    totalForeign: order.totalForeign,
+    removedForeign: record.amountForeign,
+  })
+  if (!plan.ok) return manual(plan.reason)
+  // The discount line posts to the discount account; without one the invoice carried no such line and mirroring it would under-credit.
+  if (plan.discountBase.gt(0) && !(await getAccountingSettings().catch(() => null))?.discountAccount) {
+    return manual('the order carries an order-level discount but no discount account is configured')
+  }
+
+  const result = await createRefund(orderId, plan.lines, partialRemovalCreditReason(record.id), undefined, { internalBypassToken: INTERNAL_ACTION_BYPASS, paymentRemovalRecordId: record.id })
+  if (result.conflict === 'removal-already-credited') return { raised: false, reason: 'a credit note was already raised for this removal' }
+  if (result.conflict) return manual(result.conflict === 'prior-refund' ? 'the order already carries a refund (it may already credit this money, and what remains is ambiguous)' : 'a refund was recorded concurrently')
+  if (result.quarantine) return manual(`the credit note was refused: ${result.error ?? ''}`.trim())
+  if (!result.success) {
+    // A deliberate refusal (a cancelled order, a legacy-basis refund block, a ceiling) meets the same answer on every retry: hand it to a person. Only an exception is transient.
+    if (result.transient) return { raised: false, error: result.error, transient: true }
+    return manual(`the credit note was refused: ${result.error ?? 'no reason given'}`)
+  }
+  // The credit note exists and the record is linked to it (in the refund transaction). A warning means its accounting staging is unfinished; the refund-accounting retry sweep completes it.
+  if (result.warning) return { raised: true, error: result.warning }
+  return { raised: true }
+}
+
+function parseEnabledAt(value: string | null): Date | null {
+  if (!value) return null
+  const at = new Date(value)
+  return Number.isFinite(at.getTime()) ? at : null
 }
 
 export async function retryRefundAccounting(
