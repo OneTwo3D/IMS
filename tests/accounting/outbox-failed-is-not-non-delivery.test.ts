@@ -72,8 +72,10 @@ const state = {
   suppressed: null as { id: string; reason: string } | null,
   /** Messages the mail server accepted. The ONLY record of what actually went. */
   delivered: [] as string[],
-  /** Set to make the SENT stamp fail the way a lost connection to Postgres would. */
-  failSentStamp: false,
+  /** How many SENT stamps to fail, the way a lost connection to Postgres would. 0 = none. */
+  failSentStamp: 0,
+  /** Make the sender itself throw AFTER the mail server accepted the message (it never reported a result). */
+  senderThrowsAfterAccept: false,
 }
 
 mock.module('@/lib/db', {
@@ -98,7 +100,8 @@ mock.module('@/lib/db', {
           if (where.lockedBy !== row.lockedBy) return { count: 0 }
           // THE INTERLEAVING. The SENT stamp is the write that fails; every other write lands, so
           // the row that comes out of this is the row the shipped catch decided on.
-          if (state.failSentStamp && data.status === 'SENT') {
+          if (state.failSentStamp > 0 && data.status === 'SENT') {
+            state.failSentStamp--
             throw new Error('could not write SENT: connection terminated')
           }
           Object.assign(row, data)
@@ -119,6 +122,7 @@ mock.module('@/lib/mailer', {
   namedExports: {
     sendEmail: async (opts: { to: string }) => {
       state.delivered.push(opts.to)
+      if (state.senderThrowsAfterAccept) throw new Error('connection reset after the server accepted the message')
       return { success: true }
     },
   },
@@ -128,46 +132,60 @@ function reset(rows: OutboxRow[]) {
   state.rows = rows
   state.suppressed = null
   state.delivered = []
-  state.failSentStamp = false
+  state.failSentStamp = 0
+  state.senderThrowsAfterAccept = false
 }
 
-// MUTATION THAT KILLS THIS (run): in lib/email-outbox.ts, change the CATCH's
-// `status: permanentFailure ? 'FAILED' : 'PENDING'` to `status: 'PENDING'` — the row no longer
-// terminalises and the FAILED assertion fails. That write is the whole defect: it is what stamps a
-// delivered copy FAILED, and this test observes it through the shipped sender.
-test('ROUND 8 (Codex HIGH): a delivered copy whose SENT stamp fails ends FAILED — FAILED is not non-delivery', async () => {
-  // attempts 4 so the catch's `attempts >= EMAIL_MAX_ATTEMPTS` is reached on this pass, which is
-  // the terminal FAILED an operator reads. (At attempts < 4 the same catch writes PENDING and the
-  // copy is sent AGAIN — the other half of the same defect.)
-  reset([outboxRow({ attempts: 4 })])
-  state.failSentStamp = true
+// ROUND 8 (Codex HIGH), re-pinned after the owner decision "a customer email is NEVER sent twice" (the catch in
+// processPendingEmailOutbox no longer settles a delivered copy FAILED/PENDING on the strength of a database error).
+//
+// WHAT CHANGED AND WHAT DID NOT. The old route to "a delivered copy ends FAILED" was a failed SENT stamp: that route is
+// closed on purpose — the catch now settles such a copy SENT (see the next test). What round 8 really pinned is that a
+// FAILED row is not proof of non-delivery, and that still has a live route: the sender is entered, the mail server accepts
+// the message, and the sender then throws before reporting a result. The row ends FAILED (unknown outcome) although the
+// copy went. This test drives that route through the shipped sender, so the intent (FAILED is not non-delivery) is kept
+// and only the way the interleaving is produced is changed.
+//
+// MUTATION THAT KILLS THIS (run): in lib/email-outbox.ts, change the CATCH's `status: permanentFailure ? 'FAILED' : 'PENDING'`
+// to `status: 'PENDING'` — the unknown-outcome row no longer terminalises (and the copy would be sent again), so the FAILED
+// assertion fails.
+test('ROUND 8 (Codex HIGH): a delivered copy whose sender never reported ends FAILED — FAILED is not non-delivery', async () => {
+  reset([outboxRow({ attempts: 0 })])
+  state.senderThrowsAfterAccept = true
 
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
   const result = await processPendingEmailOutbox()
 
   assert.deepEqual(state.delivered, ['customer@example.test'], 'the mail server accepted the message')
-  assert.equal(state.rows[0].status, 'FAILED', 'and the row an operator reads afterwards says FAILED')
-  assert.equal(state.rows[0].attempts, 5)
-  assert.match(String(state.rows[0].lastError), /could not write SENT/)
+  assert.equal(state.rows[0].status, 'FAILED', 'and the row an operator reads afterwards says FAILED, even below the attempt cap')
+  assert.match(String(state.rows[0].lastError), /Outcome unknown/, 'with the unknown-outcome notice, which is the honest wording')
   assert.equal(state.rows[0].sentAt, null, 'nothing marks it as gone, though it went')
   assert.equal(result.failed, 1)
   assert.equal(result.sent, 0, 'the sender itself does not know it delivered anything')
+  await processPendingEmailOutbox()
+  assert.deepEqual(state.delivered, ['customer@example.test'], 'and it is never picked up for a second send')
 })
 
-// MUTATION THAT KILLS THIS (run): the mirror of the one above — force the same catch to
-// `status: 'FAILED'` and this assertion fails. Below the attempt cap the shipped catch schedules
-// ANOTHER send of a message that already went, which is the second way a delivered copy is
-// duplicated by a write failure that has nothing to do with the mail server.
-test('ROUND 8: below the attempt cap the same catch returns the delivered copy to PENDING, so it goes again', async () => {
+// OWNER DECISION (round 4): a send that was delivered ends SENT and is NEVER put back to PENDING. This test used to pin the
+// opposite — that a failed SENT stamp below the attempt cap returned the delivered copy to PENDING so it went again — which
+// is exactly the duplicate-customer-email bug the decision removed, so it now pins the new rule: the sender answered
+// success, the stamp failed once, and the catch settles the copy SENT, so a second sweep sends nothing.
+//
+// MUTATION THAT KILLS THIS (run): in the catch, drop the `deliveredByAnswer ? { status: 'SENT', … }` branch (always write
+// the PENDING/FAILED data) — the row ends PENDING, the second sweep delivers again, and the assertions fail.
+test('ROUND 8: below the attempt cap a delivered copy whose SENT stamp failed is settled SENT, never requeued', async () => {
   reset([outboxRow({ attempts: 0 })])
-  state.failSentStamp = true
+  state.failSentStamp = 1
 
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
-  await processPendingEmailOutbox()
+  const result = await processPendingEmailOutbox()
 
   assert.deepEqual(state.delivered, ['customer@example.test'])
-  assert.equal(state.rows[0].status, 'PENDING', 'it will be picked up and sent a second time')
-  assert.equal(state.rows[0].attempts, 1)
+  assert.equal(state.rows[0].status, 'SENT', 'the copy went, so it is SENT')
+  assert.notEqual(state.rows[0].sentAt, null)
+  assert.equal(result.sent, 1)
+  await processPendingEmailOutbox()
+  assert.deepEqual(state.delivered, ['customer@example.test'], 'it is not sent a second time')
 })
 
 // MUTATION THAT KILLS THIS (run): delete the `if (suppression) { … }` short-circuit from
@@ -189,41 +207,41 @@ test('ROUND 8: on the attempt that takes it, the suppression branch refuses befo
   assert.match(String(state.rows[0].lastError), /^Suppressed recipient:/)
 })
 
-// MUTATION THAT KILLS THIS (run): make the suppression branch in lib/email-outbox.ts skip a row
-// that has already been attempted — `if (suppression && email.attempts === 0)` — and the row ends
-// the second pass PENDING rather than FAILED, so both the status and the prefix assertions fail.
-// That mutation is also the shape of the fix this test says does NOT exist today.
+// ROUND 9 (Codex HIGH), re-pinned after the round-4 owner decision. The old interleaving (a delivered copy returned to
+// PENDING by a failed SENT stamp, then overwritten by a later suppression with a `Suppressed recipient:` FAILED) can no
+// longer happen: a delivered copy ends SENT, or FAILED with the unknown-outcome notice, and in neither state is it claimed
+// again, so the suppression branch can never relabel it. The intent of the original test — a `Suppressed recipient:` prefix
+// must not be trusted as proof of non-delivery — is kept by driving both routes a delivered copy can take and asserting the
+// suppression branch never overwrites what an earlier attempt settled.
 //
-// ROUTE: both passes go through the SHIPPED `processPendingEmailOutbox`. The first pass reaches
-// `sendEmail` (recorded in `state.delivered`) and fails only the SENT stamp, so the shipped catch
-// decides the row; the suppression row is inserted between the two calls, exactly as a bounce
-// processed between sweeps would. Nothing about the outcome is asserted from the wording.
-test('ROUND 9 (Codex HIGH): a suppression-prefixed FAILED row can be a copy an EARLIER attempt already delivered', async () => {
-  reset([outboxRow({ attempts: 0 })])
-  state.failSentStamp = true
-
+// MUTATION THAT KILLS THIS (run): make the catch settle a delivered copy PENDING again (drop the `deliveredByAnswer` branch,
+// and the unknown-outcome FAILED) — the second pass then reaches the suppression branch and overwrites the row with
+// `Suppressed recipient:`, so the status and lastError assertions fail.
+test('ROUND 9 (Codex HIGH): a delivered copy is not relabelled by a later suppression — SENT stays SENT, unknown-outcome FAILED keeps its notice', async () => {
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
+
+  // Route A: the sender answered success and the SENT stamp failed once.
+  reset([outboxRow({ id: 'outbox-a', attempts: 0 })])
+  state.failSentStamp = 1
   await processPendingEmailOutbox()
-
   assert.deepEqual(state.delivered, ['customer@example.test'], 'the mail server accepted it on attempt 1')
-  assert.equal(state.rows[0].status, 'PENDING', 'and the catch returned it to the queue')
+  assert.equal(state.rows[0].status, 'SENT')
+  state.suppressed = { id: 'sup-1', reason: 'hard bounce' } // a hard bounce lands before the next sweep
+  await processPendingEmailOutbox()
+  assert.deepEqual(state.delivered, ['customer@example.test'], 'the second pass never reaches the transport')
+  assert.equal(state.rows[0].status, 'SENT', 'the suppression branch does not relabel a copy that went')
+  assert.doesNotMatch(String(state.rows[0].lastError), /^Suppressed recipient:/)
 
-  // A hard bounce lands and the recipient is suppressed before the next sweep.
+  // Route B: the sender threw after the server accepted (outcome unknown).
+  reset([outboxRow({ id: 'outbox-b', attempts: 0 })])
+  state.senderThrowsAfterAccept = true
+  await processPendingEmailOutbox()
   state.suppressed = { id: 'sup-1', reason: 'hard bounce' }
   await processPendingEmailOutbox()
-
-  assert.deepEqual(state.delivered, ['customer@example.test'], 'the second pass never reaches the transport')
+  assert.deepEqual(state.delivered, ['customer@example.test'], 'delivered once, never reclaimed')
   assert.equal(state.rows[0].status, 'FAILED')
-  assert.match(
-    String(state.rows[0].lastError),
-    /^Suppressed recipient:/,
-    'THE DEFECT: the prefix round 8 called conclusive proof of non-delivery, on a copy that went',
-  )
-  assert.equal(
-    state.rows[0].attempts,
-    1,
-    'the row still carries the earlier attempt, and the suppression branch overwrote it without reading it',
-  )
+  assert.match(String(state.rows[0].lastError), /Outcome unknown/, 'the unknown-outcome notice survives; a later suppression does not overwrite it')
+  assert.doesNotMatch(String(state.rows[0].lastError), /^Suppressed recipient:/)
 })
 
 // MUTATION THAT KILLS THIS (run): restore "a FAILED row never went at all", or round 8's "ONE
