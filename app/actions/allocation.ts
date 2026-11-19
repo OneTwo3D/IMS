@@ -1593,6 +1593,12 @@ export async function updateShipmentStatus(
      * for the internal caller (`applyExternalFulfillmentUpdate`).
      */
     allowRecordWhenNotReady?: boolean
+    /**
+     * Do NOT queue the storefront partial-shipment e-mail for this shipment: the caller applies a BATCH of shipments (an external dispatch) and judges the
+     * partial e-mail once the whole batch is applied (queueStorefrontPartialShipmentEmailsAfterBatch). Judged shipment by shipment it is false for every
+     * shipment but the last ("the rest will follow", then the dispatched e-mail seconds later).
+     */
+    deferStorefrontPartialEmail?: boolean
   },
 ): Promise<{ success: boolean; error?: string; despatchedWhileNotReady?: string }> {
   try {
@@ -1693,8 +1699,10 @@ export async function updateShipmentStatus(
       // Storefront orders (o3d-zvec.24, switch `storefront_customer_email_enabled`, default off): the shipment that left while the order still owes
       // more gets its own partial-shipment e-mail, once per shipment. Self-guarded (order not yet SHIPPED, shipment SHIPPED, dedup under the order
       // row lock) and never throws; the final shipment's e-mail is the dispatch e-mail above.
-      const { queueStorefrontPartialShipmentEmailIfEligible } = await import('@/lib/storefront-customer-email')
-      await queueStorefrontPartialShipmentEmailIfEligible(shipmentId)
+      if (options?.deferStorefrontPartialEmail !== true) {
+        const { queueStorefrontPartialShipmentEmailIfEligible } = await import('@/lib/storefront-customer-email')
+        await queueStorefrontPartialShipmentEmailIfEligible(shipmentId)
+      }
     }
     if (!result.transitioned) return fenceRefusal === null ? { success: true } : { success: false, error: fenceRefusal }
 

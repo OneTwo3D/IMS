@@ -11,10 +11,26 @@
  *   unit: wc-mintsoft-order-sweep.timer LoadState=masked ActiveState=inactive UnitFileState=masked  // wms-connector-boundary-ok: 2026-11-19: sample output naming the bridge's own systemd units.
  *   unit: wc-mintsoft-order-sweep.service LoadState=masked ActiveState=inactive UnitFileState=masked  // wms-connector-boundary-ok: 2026-11-19: sample output naming the bridge's own systemd units.
  *   unit: wc-mintsoft-webhook.service LoadState=masked ActiveState=inactive UnitFileState=masked  // wms-connector-boundary-ok: 2026-11-19: sample output naming the bridge's own systemd units.
- *   last_trigger: 2026-12-30T23:55:01Z          (or `never`: no trigger time is recorded for any unit)
+ *   journal_exit: 0                              (the worst exit status of the journal reads; absent in a report from an older script)
+ *   journal_readable: 1                          (the user could read the SYSTEM journal: root, or in systemd-journal / adm, and `journalctl --header` worked)
+ *   journal_persistent: 1                        (/var/log/journal exists and Storage is not volatile)
+ *   journal_earliest: 2026-10-01T00:00:00Z       (the earliest journal entry seen, or `none`)
+ *   boot_id: <id>                                (the current boot, or `unknown`)
+ *   boot_started: 2026-12-01T00:00:00Z           (when this boot's journal begins, or `unknown`)
+ *   last_trigger: 2026-12-30T23:55:01Z          (or `never`, or `unknown`)
  *
- * `last_trigger` is the LATEST of the sweep timer's last trigger, the sweep service's last start and its last journal entry, so a sweep that ran
- * without the timer (by hand) still counts.
+ * `last_trigger` is the LATEST of the sweep timer's last trigger, the sweep service's last start and exit from inactive, the webhook service's last start and
+ * exit from inactive, and the newest journal entry of any of the three units, so a sweep that ran without the timer (by hand) still counts, and so does a
+ * webhook delivery after S.
+ *
+ * `never` is a CLAIM that nothing ever ran, and it is believed only when the report PROVES the journal was read (`journal_exit: 0`, readable by the user, persistent, and
+ * its earliest entry before S, which the evaluator judges): systemd keeps these
+ * timestamps in memory, so a reboot or a daemon-reload that garbage-collects a masked unit wipes them, and an unreadable journal then looks the same as a bridge
+ * that never ran. The script writes `unknown` when it cannot tell, and `never` from a report with no `journal_exit` line, or a non-zero one, reads as
+ * unreadable for the check, exactly as `unknown` does.
+ *
+ * LIMIT: the report is plain text the administrator pastes. It is the owner's word plus a transcript, NOT evidence signed by the host: anyone who can feed a
+ * paste to `writers:attest` can type a passing report with a current `generated_at`. The one-hour freshness limit stops accidents, not forgery.
  */
 
 export const BRIDGE_STATUS_HEADER = '# bridge_writers_status v1'
@@ -33,12 +49,40 @@ export const BRIDGE_STATUS_MAX_FUTURE_MS = 5 * 60 * 1000
 export const BRIDGE_STATUS_MAX_BYTES = 8 * 1024
 
 export type BridgeUnitState = { loadState: string; activeState: string; unitFileState: string }
+export type BridgeLastTriggerState = 'time' | 'never' | 'unknown'
 export type BridgeStatusReport = {
   host: string
   generatedAt: string
   units: Record<BridgeUnitName, BridgeUnitState>
-  /** ISO instant of the latest trigger, or null for `never`. */
+  /** ISO instant of the latest trigger, or null for `never` and `unknown`. */
   lastTriggerAt: string | null
+  /** What `last_trigger` said: a time, `never` (nothing ever ran) or `unknown` (the script could not tell). */
+  lastTriggerState: BridgeLastTriggerState
+  /** The worst exit status of the script's journal reads (0 = every journal read succeeded), or null when the report carries none (an older script). */
+  journalExit: number | null
+  /** Whether the user who ran the script could read the SYSTEM journal (root, or in systemd-journal / adm, and `journalctl --header` worked); null = the report carries none (an older script). */
+  journalReadable: boolean | null
+  /** Whether the journal is persistent (/var/log/journal exists and Storage is not volatile): a volatile journal is wiped by a reboot; null = not reported. */
+  journalPersistent: boolean | null
+  /** The earliest journal entry the script could see, or null (none seen / not reported). `never` is only believed when this is before the live-from instant S (the evaluator judges that). */
+  journalEarliestAt: string | null
+  /** The current boot id and when this boot's journal begins, or null when not reported / unknown. */
+  bootId: string | null
+  bootStartedAt: string | null
+}
+
+/**
+ * True when the report can be judged. A time is judged by the evaluator. `never` PROVES nothing triggered only when ALL hold: every journal read succeeded
+ * (`journal_exit: 0`), the journal was READABLE by the user who ran the script (a non-privileged user gets exit 0 and no entries for a system unit), the journal
+ * is PERSISTENT (a volatile one is wiped by the reboot that also wipes the unit timestamps) and it has an earliest entry. That the earliest entry is BEFORE the
+ * live-from instant S is judged by the evaluator, which alone reads S. `unknown` and an unproven `never` are not a verdict.
+ */
+export function bridgeLastTriggerReadable(report: BridgeStatusReport): boolean {
+  if (report.lastTriggerState === 'unknown') return false
+  if (report.lastTriggerState === 'never') {
+    return report.journalExit === 0 && report.journalReadable === true && report.journalPersistent === true && report.journalEarliestAt !== null
+  }
+  return report.lastTriggerAt !== null
 }
 export type BridgeStatusParse = { ok: true; report: BridgeStatusReport } | { ok: false; error: string }
 
@@ -60,7 +104,15 @@ export function parseBridgeStatusOutput(text: string): BridgeStatusParse {
   if (lines[0] !== BRIDGE_STATUS_HEADER) return { ok: false, error: `The output must start with "${BRIDGE_STATUS_HEADER}" (run scripts/bridge/bridge_writers_status.py on the bridge host).` }
   let host: string | null = null
   let generatedAt: string | null = null
-  let lastTrigger: { at: string | null } | null = null
+  let lastTrigger: { at: string | null; state: BridgeLastTriggerState } | null = null
+  let journalExit: number | null = null
+  let journalExitSeen = false
+  const once = new Set<string>()
+  let journalReadable: boolean | null = null
+  let journalPersistent: boolean | null = null
+  let journalEarliestAt: string | null = null
+  let bootId: string | null = null
+  let bootStartedAt: string | null = null
   const units: Partial<Record<BridgeUnitName, BridgeUnitState>> = {}
   for (const line of lines.slice(1)) {
     if (line.startsWith('host: ')) {
@@ -74,12 +126,42 @@ export function parseBridgeStatusOutput(text: string): BridgeStatusParse {
     } else if (line.startsWith('last_trigger: ')) {
       if (lastTrigger !== null) return { ok: false, error: 'The last_trigger line appears twice.' }
       const value = line.slice('last_trigger: '.length).trim()
-      if (value === 'never') lastTrigger = { at: null }
+      if (value === 'never') lastTrigger = { at: null, state: 'never' }
+      else if (value === 'unknown') lastTrigger = { at: null, state: 'unknown' }
       else {
         const at = instant(value)
-        if (at === null) return { ok: false, error: 'last_trigger is neither "never" nor a UTC time like 2026-12-31T10:00:00Z.' }
-        lastTrigger = { at }
+        if (at === null) return { ok: false, error: 'last_trigger is neither "never", "unknown" nor a UTC time like 2026-12-31T10:00:00Z.' }
+        lastTrigger = { at, state: 'time' }
       }
+    } else if (line.startsWith('journal_exit: ')) {
+      if (journalExitSeen) return { ok: false, error: 'The journal_exit line appears twice.' }
+      journalExitSeen = true
+      const value = line.slice('journal_exit: '.length).trim()
+      if (!/^\d{1,3}$/.test(value)) return { ok: false, error: 'journal_exit is not an exit status number.' }
+      journalExit = Number(value)
+    } else if (line.startsWith('journal_readable: ') || line.startsWith('journal_persistent: ')) {
+      const key = line.slice(0, line.indexOf(':'))
+      if (once.has(key)) return { ok: false, error: `The ${key} line appears twice.` }
+      once.add(key)
+      const value = line.slice(key.length + 1).trim()
+      if (value !== '0' && value !== '1') return { ok: false, error: `${key} must be 0 or 1.` }
+      if (key === 'journal_readable') journalReadable = value === '1'
+      else journalPersistent = value === '1'
+    } else if (line.startsWith('journal_earliest: ') || line.startsWith('boot_started: ')) {
+      const key = line.slice(0, line.indexOf(':'))
+      if (once.has(key)) return { ok: false, error: `The ${key} line appears twice.` }
+      once.add(key)
+      const value = line.slice(key.length + 1).trim()
+      const at = value === 'none' || value === 'unknown' ? null : instant(value)
+      if (at === null && value !== 'none' && value !== 'unknown') return { ok: false, error: `${key} is neither "none"/"unknown" nor a UTC time like 2026-12-31T10:00:00Z.` }
+      if (key === 'journal_earliest') journalEarliestAt = at
+      else bootStartedAt = at
+    } else if (line.startsWith('boot_id: ')) {
+      if (once.has('boot_id')) return { ok: false, error: 'The boot_id line appears twice.' }
+      once.add('boot_id')
+      const value = line.slice('boot_id: '.length).trim()
+      if (value !== 'unknown' && !/^[0-9a-f-]{8,64}$/.test(value)) return { ok: false, error: 'boot_id is not a boot id.' }
+      bootId = value === 'unknown' ? null : value
     } else if (line.startsWith('unit: ')) {
       const parts = line.slice('unit: '.length).trim().split(/\s+/)
       const name = parts[0] as BridgeUnitName
@@ -108,7 +190,7 @@ export function parseBridgeStatusOutput(text: string): BridgeStatusParse {
   if (generatedAt === null) return { ok: false, error: 'The generated_at line is missing.' }
   if (lastTrigger === null) return { ok: false, error: 'The last_trigger line is missing.' }
   for (const name of BRIDGE_UNITS) if (units[name] === undefined) return { ok: false, error: `The unit ${name} is missing.` }
-  return { ok: true, report: { host, generatedAt, units: units as Record<BridgeUnitName, BridgeUnitState>, lastTriggerAt: lastTrigger.at } }
+  return { ok: true, report: { host, generatedAt, units: units as Record<BridgeUnitName, BridgeUnitState>, lastTriggerAt: lastTrigger.at, lastTriggerState: lastTrigger.state, journalExit, journalReadable, journalPersistent, journalEarliestAt, bootId, bootStartedAt } }
 }
 
 /** Refuse a report that does not describe the host now (stale, or stamped in the future). */
@@ -130,6 +212,7 @@ export function bridgePayloadFromReport(report: BridgeStatusReport, raw: string)
 export const BRIDGE_VIOLATION = {
   notMasked: (unit: BridgeUnitName): string => `bridge-unit-not-masked:${unit}`,
   notInactive: (unit: BridgeUnitName): string => `bridge-unit-not-inactive:${unit}`,
+  notPersistentlyMasked: (unit: BridgeUnitName): string => `bridge-unit-not-persistently-masked:${unit}`,
   triggerNotBeforeLiveFrom: 'bridge-last-trigger-not-before-live-from',
   triggerUnknownLiveFrom: 'bridge-live-from-unreadable',
 } as const
@@ -146,6 +229,21 @@ export function readBridgePayload(payload: unknown): BridgeStatusReport | null {
   const p = payload as Record<string, unknown>
   if (p.schema !== 1 || typeof p.host !== 'string' || typeof p.generatedAt !== 'string' || Number.isNaN(Date.parse(p.generatedAt))) return null
   if (p.lastTriggerAt !== null && (typeof p.lastTriggerAt !== 'string' || Number.isNaN(Date.parse(p.lastTriggerAt)))) return null
+  // Payloads recorded before `lastTriggerState` and `journalExit` existed: a time is a time; `never` has no journal proof, so it reads as unproven.
+  const state = p.lastTriggerState === undefined ? (p.lastTriggerAt === null ? 'never' : 'time') : p.lastTriggerState
+  if (state !== 'time' && state !== 'never' && state !== 'unknown') return null
+  if ((state === 'time') !== (p.lastTriggerAt !== null)) return null
+  const journalExit = p.journalExit === undefined || p.journalExit === null ? null : p.journalExit
+  if (journalExit !== null && (typeof journalExit !== 'number' || !Number.isInteger(journalExit))) return null
+  const optBool = (v: unknown): boolean | null | undefined => (v === undefined || v === null ? null : typeof v === 'boolean' ? v : undefined)
+  const optStr = (v: unknown): string | null | undefined => (v === undefined || v === null ? null : typeof v === 'string' ? v : undefined)
+  const journalReadable = optBool(p.journalReadable)
+  const journalPersistent = optBool(p.journalPersistent)
+  const journalEarliestAt = optStr(p.journalEarliestAt)
+  const bootId = optStr(p.bootId)
+  const bootStartedAt = optStr(p.bootStartedAt)
+  if (journalReadable === undefined || journalPersistent === undefined || journalEarliestAt === undefined || bootId === undefined || bootStartedAt === undefined) return null
+  if (journalEarliestAt !== null && Number.isNaN(Date.parse(journalEarliestAt))) return null
   const unitsIn = p.units
   if (typeof unitsIn !== 'object' || unitsIn === null) return null
   const units = {} as Record<BridgeUnitName, BridgeUnitState>
@@ -154,11 +252,11 @@ export function readBridgePayload(payload: unknown): BridgeStatusReport | null {
     if (!isUnitState(unit)) return null
     units[name] = { loadState: unit.loadState, activeState: unit.activeState, unitFileState: unit.unitFileState }
   }
-  return { host: p.host, generatedAt: p.generatedAt, units, lastTriggerAt: p.lastTriggerAt as string | null }
+  return { host: p.host, generatedAt: p.generatedAt, units, lastTriggerAt: p.lastTriggerAt as string | null, lastTriggerState: state, journalExit, journalReadable, journalPersistent, journalEarliestAt, bootId, bootStartedAt }
 }
 
 /**
- * What a report shows against the bridge having stopped: every unit masked (LoadState `masked`) and inactive (ActiveState `inactive`). The last trigger is
+ * What a report shows against the bridge having stopped: every unit masked (LoadState `masked`, UnitFileState exactly `masked`) and inactive (ActiveState `inactive`). The last trigger is
  * judged against the step's live-from instant by the evaluator (it alone reads that instant), which is why the instant is returned, not judged, here.
  * A unit that does not exist (`not-found`) is NOT masked: nothing stops a later install from starting it.
  */
@@ -168,6 +266,9 @@ export function bridgeUnitViolations(report: BridgeStatusReport): string[] {
     const unit = report.units[name]
     if (unit.loadState !== 'masked') out.push(BRIDGE_VIOLATION.notMasked(name))
     if (unit.activeState !== 'inactive') out.push(BRIDGE_VIOLATION.notInactive(name))
+    // EXACTLY `masked`: `masked-runtime` (systemctl mask --runtime) lives in /run and is gone at the next reboot, when the still-enabled timer starts the bridge again.
+    // A unit that is not masked at all is already reported above; this reports the persistent-mask gap for a unit that LOADS as masked.
+    if (unit.loadState === 'masked' && unit.unitFileState !== 'masked') out.push(BRIDGE_VIOLATION.notPersistentlyMasked(name))
   }
   return out
 }

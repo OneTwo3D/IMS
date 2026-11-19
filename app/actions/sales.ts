@@ -2364,7 +2364,9 @@ export async function applySalesOrderStatusTransition(
   // be serialized, so the capability tokens are not forgeable. (o3d-43oz)
   // `guardUnderLock` (a function, so it cannot cross the RPC boundary either) can only REFUSE a move: it is asked the
   // CURRENT status under the order lock and a non-null answer fails the transition (see updateSalesOrderStatusUnderLock).
-  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; guardUnderLock?: (currentStatus: string) => string | null },
+  // `releasedAt` (honoured only with the full bypass token, like every system-only option here): when the storefront moved the order to processing (its paid time), so
+  // the confirmation of an order that was imported held is judged on the release and never on a later observation of it.
+  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; guardUnderLock?: (currentStatus: string) => string | null; releasedAt?: Date },
   // `permanent: true` marks a failure a stable business rule refused, so a caller driving this from a
   // retrying transport (the Woo webhook inbox) can acknowledge it instead of retrying forever (o3d-bx9).
 ): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
@@ -2730,6 +2732,27 @@ export async function applySalesOrderStatusTransition(
       // dedup under the order row lock) and never throws.
       const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
       await queueDispatchEmailIfEligible(id)
+    }
+    // A storefront order that was imported HELD (PENDING_PAYMENT / ON_HOLD) and now moves to processing for the FIRST time (a BACS / cheque payment received):
+    // WooCommerce sent its confirmation on that move before step W and is off after it, so nobody would send one. The claim is a one-shot marker written only
+    // by the import of a held order (`confirmationOnReleasePendingAt`) and consumed here, so an order that was ever released, imported any other way, or
+    // put on hold later (PROCESSING -> ON_HOLD -> PROCESSING) can never confirm through this path. The release time is the storefront's paid time and only
+    // the full-bypass sync path carries it; an IMS-side move (operator, AUTH_ONLY) has none and is judged on placement (placed at/after the switch-on).
+    // The helper self-guards (switch, switch-on instant, placement, age, storefront order, dedupe) and never throws.
+    if (
+      (previousStatusForLog === 'PENDING_PAYMENT' || previousStatusForLog === 'ON_HOLD')
+      && (targetStatus === 'PROCESSING' || targetStatus === 'ALLOCATED' || targetStatus === 'PICKING' || targetStatus === 'PACKING')
+    ) {
+      try {
+        const claim = await db.salesOrder.updateMany({ where: { id, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })
+        if (claim.count === 1) {
+          const { queueStorefrontConfirmationIfEligible } = await import('@/lib/storefront-customer-email')
+          const releasedAt = bypassPermission && options?.releasedAt instanceof Date && Number.isFinite(options.releasedAt.getTime()) ? options.releasedAt : undefined
+          await queueStorefrontConfirmationIfEligible(id, releasedAt ? { releasedAt } : undefined)
+        }
+      } catch (releaseError) {
+        console.error(releaseError)
+      }
     }
     // Storefront orders (o3d-zvec.24, switch `storefront_customer_email_enabled`, default off): the delivered e-mail, once per order. Self-guarded
     // (status DELIVERED, a recent despatch, dedup under the order row lock) and never throws.

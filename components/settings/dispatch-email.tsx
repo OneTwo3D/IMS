@@ -13,7 +13,7 @@ const OPTIONS = [
 
 const STOREFRONT_OPTIONS = [
   { value: 'false', label: 'Off (default)', description: 'IMS sends no e-mail for storefront orders. WooCommerce (and its partial-shipment, AST and TrackShip plugins) keep sending theirs.' },
-  { value: 'true', label: 'On', description: 'IMS sends the order confirmation, dispatch, partial-shipment and delivered e-mails for storefront orders. Switch WooCommerce\'s native customer e-mails OFF first: both on sends every customer two e-mails. The writers:check run reads both.' },
+  { value: 'true', label: 'On', description: 'IMS sends the order confirmation, dispatch, partial-shipment and delivered e-mails for storefront orders. It can only be turned on once step W is live and WooCommerce\'s native processing and completed customer e-mails are OFF (the save is refused otherwise): both on sends every customer two e-mails. The writers:check run reads both.' },
 ]
 
 type Props = { currentValue: string; storefrontValue?: string }
@@ -24,12 +24,23 @@ export function DispatchEmailSetting({ currentValue, storefrontValue = 'false' }
   const [value, setValue] = useState(currentValue)
   const [saved, setSaved] = useState(false)
   const [storefront, setStorefront] = useState(storefrontValue)
+  const [error, setError] = useState<string | null>(null)
 
   function handleSave() {
     setSaved(false)
+    setError(null)
     startTransition(async () => {
       if (value !== currentValue) await setSetting('dispatch_email_enabled', value)
-      if (storefront !== storefrontValue) await setSetting('storefront_customer_email_enabled', storefront)
+      if (storefront !== storefrontValue) {
+        // Turning this ON is refused until step W is live and WooCommerce's native customer e-mails are off: the refusal is shown, and the radio goes back.
+        const result = await setSetting('storefront_customer_email_enabled', storefront)
+        if (result.status === 'refused') {
+          setError(result.error)
+          setStorefront(storefrontValue)
+          router.refresh()
+          return
+        }
+      }
       router.refresh()
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
@@ -66,6 +77,7 @@ export function DispatchEmailSetting({ currentValue, storefrontValue = 'false' }
           {isPending && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}Save
         </Button>
         {saved && <span className="text-xs text-green-600">Saved</span>}
+        {error && <span role="alert" className="text-xs text-destructive">{error}</span>}
       </div>
     </div>
   )

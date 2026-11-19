@@ -82,13 +82,13 @@ export async function runWritersAttestCli(options: WritersAttestCliOptions = {})
     }
     if (!yes) {
       if (output !== undefined) {
-        const { parseBridgeStatusOutput, bridgeStatusFreshnessError, bridgeUnitViolations } = await import('@/lib/domain/writer-attestation/bridge-status')
+        const { parseBridgeStatusOutput, bridgeStatusFreshnessError, bridgeUnitViolations, bridgeLastTriggerReadable } = await import('@/lib/domain/writer-attestation/bridge-status')
         const parsed = parseBridgeStatusOutput(output)
         if (!parsed.ok) { stderr.error(parsed.error); return 3 }
         const stale = bridgeStatusFreshnessError(parsed.report, options.now ?? new Date())
         if (stale !== null) { stderr.error(stale); return 3 }
         const violations = bridgeUnitViolations(parsed.report)
-        stdout.log(`Report parsed: host ${parsed.report.host}, generated ${parsed.report.generatedAt}, last trigger ${parsed.report.lastTriggerAt ?? 'never'}; ${violations.length === 0 ? 'all three units masked and inactive' : `NOT clean (${violations.join(', ')})`}.`)
+        stdout.log(`Report parsed: host ${parsed.report.host}, generated ${parsed.report.generatedAt}, last trigger ${parsed.report.lastTriggerAt ?? (bridgeLastTriggerReadable(parsed.report) ? 'never (journal read)' : `${parsed.report.lastTriggerState} (NOT proven: the check will read this as unreadable)`)}; ${violations.length === 0 ? 'all three units persistently masked and inactive' : `NOT clean (${violations.join(', ')})`}.`)
       }
       stdout.log(`Would record: ${WRITER_ATTESTATION_LABEL[kind]} (by ${by}). Nothing recorded; add --yes to record it.`)
       return 0

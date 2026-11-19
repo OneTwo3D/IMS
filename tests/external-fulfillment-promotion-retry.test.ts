@@ -33,6 +33,7 @@ const state = {
   failingAdmins: [] as string[],
   allocationCount: 1,
   autoAllocations: 0,
+  shipmentResults: null as null | (() => Row),
 }
 
 mock.module('@/lib/activity-log', {
@@ -73,6 +74,7 @@ mock.module('@/app/actions/allocation', {
     confirmAllocations: async () => ({ success: true }),
     updateShipmentStatus: async (_id: string, target: string, _extra: unknown, options: Row | undefined) => {
       state.transitions.push({ target, options })
+      if (state.shipmentResults) return state.shipmentResults()
       return state.lockedStatus ? { success: true, despatchedWhileNotReady: state.lockedStatus } : { success: true }
     },
   },
@@ -97,7 +99,16 @@ mock.module('@/lib/domain/sales/shipment-service', {
   },
 })
 
+const partialFlushes: string[][] = []
+mock.module('@/lib/storefront-customer-email', {
+  namedExports: {
+    queueStorefrontPartialShipmentEmailsAfterBatch: async (ids: readonly string[]) => { partialFlushes.push([...ids]) },
+    queueStorefrontPartialShipmentEmailIfEligible: async () => undefined,
+  },
+})
+
 function reset() {
+  partialFlushes.length = 0
   state.orderStatus = 'PROCESSING'
   state.reconcileCalls = []
   state.reconcileResult = { orderReachedShipped: true }
@@ -114,6 +125,7 @@ function reset() {
   state.failingAdmins = []
   state.allocationCount = 1
   state.autoAllocations = 0
+  state.shipmentResults = null
 }
 
 async function apply(extra: Row = {}) {
@@ -362,4 +374,23 @@ test('o3d-hqvrp.330: a failed marker write is a retryable failure, so the notice
 
   assert.equal(result.success, false)
   assert.equal((result as { refusal?: string }).refusal, 'despatch_review_not_recorded')
+})
+
+test('PARTIAL e-mail: when a later shipment of the batch FAILS (the fence refusing the order flip after the last shipment shipped), no partial e-mail is judged for the earlier ones (MUTATION: flush on failure => red)', async () => {
+  reset()
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }, { id: 'shp-2', status: 'PACKED' }]
+  state.totalShipments = 2
+  let call = 0
+  state.shipmentResults = () => (++call === 1 ? { success: true } : { success: false, error: 'verification fence refused the order flip' })
+  const result = await apply()
+  assert.equal(result.success, false)
+  assert.equal(state.transitions.length, 2, 'precondition: both shipments were attempted, the second failed')
+  assert.deepEqual(partialFlushes, [], 'a failed batch queues no partial e-mail')
+  // CONTROL: the same batch succeeding is flushed once with both shipments.
+  reset()
+  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }, { id: 'shp-2', status: 'PACKED' }]
+  state.totalShipments = 2
+  state.shipmentResults = null
+  await apply()
+  assert.deepEqual(partialFlushes, [['shp-1', 'shp-2']], 'CONTROL: a successful batch is flushed once')
 })

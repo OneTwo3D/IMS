@@ -3805,6 +3805,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           externalUpdatedAt: parseWcGmtInstant(wcOrder.date_modified_gmt || wcOrder.date_modified),
           ...(options.useWcDateAsCreatedAt ? { createdAt: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
           status: lifecycleStatus,
+          // Imported held: the release-time confirmation e-mail is claimable once (consumed by the first move to a despatch-pending status).
+          ...(lifecycleStatus === 'PENDING_PAYMENT' || lifecycleStatus === 'ON_HOLD' ? { confirmationOnReleasePendingAt: new Date() } : {}),
           // The invoice this import will queue is OWED from the moment the order commits, and stays owed until the enqueue or the park records it (same predicate as the enqueue below).
           ...(imsStatus === 'PROCESSING' && !options.skipAccounting ? { salesInvoiceOwedAt: new Date() } : {}),
           refundStatus: importRefundDisposition,

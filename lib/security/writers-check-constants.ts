@@ -89,8 +89,9 @@ export const PHASE_OF_LIVE_STEP: Readonly<Record<LiveWriterStep, WritersCheckPha
  *   STOCK_DRIFT               a WooCommerce stock change not explained by an order or refund after the confirmation
  *   QOBLEX_XERO_STOPPED       the owner's confirmation (a WriterAttestation) that Qoblex's native Xero posting is stopped
  *   XEROOM_NOTE               Xeroom's order note is still on (the probe reads the option o3d_xeroom_order_note_off, which must be on at step X)
- *   NATIVE_EMAIL_EXCLUSIVE    WooCommerce's native customer e-mails (processing, completed) and IMS's storefront customer e-mail switch are mutually exclusive: not both on
- *                             (duplicate e-mails), not both off (nobody sends). Read from the store's e-mail settings; a store that does not answer is `unreadable`
+ *   NATIVE_EMAIL_EXCLUSIVE    WooCommerce's native customer e-mails (processing, completed) and IMS's storefront customer e-mail switch are mutually exclusive, JUDGED PER E-MAIL:
+ *                             each needs exactly one sender (not both on = duplicate, not both off = nobody sends). The IMS switch on before step W is flagged in every
+ *                             phase. Read from the store's e-mail settings; a store that does not answer is `unreadable`
  */
 export const STEP_EVIDENCE_KINDS = [
   'BRIDGE_ATTESTATION', 'BRIDGE_PROBE', 'MINTSOFT_FOREIGN_ORDER',
@@ -133,6 +134,8 @@ export const STEP_EVIDENCE_LABEL: Readonly<Record<StepEvidenceKind, string>> = {
  * Host reports: the step whose live-from instant S the report's LAST TRIGGER must precede. Unlike an owner's confirmation, the report is NOT required to
  * be recorded before S: the runbook records S when the units are masked and takes the report AFTER it (a report taken later still shows them masked and
  * idle, which is the fact), so the rule is about when the incumbent last ran, not about when the report was pasted.
+ * BUT the report must DESCRIBE THE HOST AFTER S: both its own `generated_at` and the time it was recorded must be at or after S. A report taken before S (a
+ * rehearsal mask, then unmasked) shows nothing about the bridge running up to and past S, and would otherwise stay "clean" indefinitely.
  */
 export const STEP_REPORT_TRIGGER_BEFORE_STEP: Readonly<Partial<Record<StepEvidenceKind, LiveWriterStep>>> = {
   BRIDGE_ATTESTATION: 'mintsoft',
@@ -143,6 +146,15 @@ export const STEP_EVIDENCE_ATTESTATION_KIND: Readonly<Partial<Record<StepEvidenc
   QOBLEX_STOCK_PUSH_STOPPED: 'qoblex-stock-push-stopped',
   QOBLEX_XERO_STOPPED: 'qoblex-xero-stopped',
 }
+
+/** The closed violation codes of the NATIVE_EMAIL_EXCLUSIVE reader (the per-e-mail ones are suffixed `:<woo e-mail id>`). */
+export const NATIVE_EMAIL_VIOLATION = {
+  bothOn: 'native-and-ims-customer-email-both-on',
+  bothOff: 'native-and-ims-customer-email-both-off',
+  imsOnBeforeStepW: 'ims-customer-email-on-before-step-w',
+  /** The IMS switch is ON but `storefront_customer_email_enabled_at` is missing or unreadable: every send fails closed, so nobody e-mails the customer. */
+  onWithoutStamp: 'ims-customer-email-on-without-switch-on-stamp',
+} as const
 
 /** What a reader answers for one step-evidence kind. */
 export type StepEvidenceReading =
@@ -159,7 +171,11 @@ export type StepEvidenceReading =
       /** A host report (BRIDGE_ATTESTATION): the violated expectations of the report itself, by closed code (empty or absent = clean). */
       violations?: readonly string[]
       /** A host report: the instant of the latest trigger the report shows, or null for `never`. Judged against the step's live-from instant by the evaluator. */
-      lastTriggerAt?: string | null }
+      lastTriggerAt?: string | null
+      /** A host report with `last_trigger: never`: the earliest journal entry the script saw. The evaluator requires it BEFORE the step's live-from instant, else `never` proves nothing (the journal may not reach back to S). */
+      journalEarliestAt?: string | null
+      /** A host report: the instant the report says it was generated. The evaluator requires it, and the attestation time, to be at or after the step's live-from instant. */
+      generatedAt?: string }
   /** A count of offending rows since `floor`. */
   | { state: 'counted'; counted: number; floor: string }
   /** A probe that answered: the violated expectations, by closed code (empty = clean). */
@@ -204,7 +220,7 @@ export const WRITERS_CHECK_CANNOT_SEE: readonly string[] = [
   'an incumbent\'s activity that leaves no trace IMS reads: a write an incumbent makes without a mark on an imported order or a refusal IMS provoked is invisible, and a green result says nothing about it',
   'any order IMS has not imported (its metas are unseen until the order is imported), and any change to an order\'s metas after its last import',
   'what Qoblex, Aelia, an operator working by hand or a Mintsoft channel writes: they leave no evidence IMS reads, so for their operations only the ownership map, IMS\'s own switches and the owner\'s confirmations are checked',
-  'whether the bridge host\'s systemd units are stopped: that is seen only through the status report an administrator pasted into writers:attest (the status script lives in the bridge repository; a snapshot: a unit unmasked afterwards is invisible until the report is repeated), and until one is recorded the check FAILS from step M on',
+  'whether the bridge host\'s systemd units are stopped: that is seen only through the status report an administrator pasted into writers:attest (the status script lives in the bridge repository; a snapshot: a unit unmasked afterwards is invisible until the report is repeated; and the report is plain pasted text, the owner\'s word plus a transcript, NOT evidence signed by the host: anyone who can feed a paste to writers:attest can type a passing report, and the one-hour freshness limit stops accidents, not forgery), and until one is recorded the check FAILS from step M on',
   'anything the companion-plugin probe, the foreign-order reader and the stock-drift observer cannot read: each is only as current as its last run (the probe and the reader run when the check runs; the drift observer runs hourly from the host scheduler and the check asks for a recent complete run), and a source that does not answer FAILS the check',
   'an order whose evidence write did not finish: the import does not wait for it, so a write that timed out and could not log that it did, or that was still running when the process stopped, leaves no trace',
   'anything that changes after the report was taken: the check is a snapshot that detects a shared destination, it does not stop either writer, so only the periodic record narrows the gap',

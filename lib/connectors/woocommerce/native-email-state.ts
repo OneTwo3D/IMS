@@ -1,8 +1,8 @@
 /**
  * WHETHER WOOCOMMERCE STILL SENDS ITS NATIVE CUSTOMER E-MAILS (read-only: two GETs of the store's own e-mail settings).
  *
- * At step W the customer e-mail moves from WooCommerce to IMS and the two must be mutually exclusive: both on is a duplicate e-mail to the customer
- * (which cannot be unsent), both off is nobody sending. This reads the two native e-mails IMS's storefront e-mails replace:
+ * At step W the customer e-mail moves from WooCommerce to IMS and the two must be mutually exclusive, PER E-MAIL: both on is a duplicate e-mail to the customer
+ * (which cannot be unsent), both off is nobody sending. This reads the two native e-mails IMS's storefront e-mails replace (each is judged on its own):
  *
  *   customer_processing_order   the order confirmation ("we have received your order")
  *   customer_completed_order    the completed / despatch e-mail
@@ -22,6 +22,11 @@ export type WooNativeEmailState =
   | { ok: false }
 
 type Fetcher = (path: string, params?: Record<string, string>) => Promise<{ data: unknown; error?: string }>
+
+/** The native e-mails that are on, by id (empty when every one is off). */
+export function nativeEmailsOn(state: Extract<WooNativeEmailState, { ok: true }>): WooNativeCustomerEmailId[] {
+  return WOO_NATIVE_CUSTOMER_EMAIL_IDS.filter((id) => state.enabled[id])
+}
 
 export function parseWooEmailEnabled(data: unknown): boolean | null {
   if (!Array.isArray(data)) return null

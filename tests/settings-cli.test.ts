@@ -14,6 +14,7 @@ function fakeDb(initial: Record<string, string> = {}, opts: { failAudit?: boolea
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => s.get(where.key) ?? null,
       upsert: async ({ where, create, update }: { where: { key: string }; create: Row; update: Row }) => { s.set(where.key, s.has(where.key) ? update : create) },
+      deleteMany: async ({ where }: { where: { key: string } }) => { s.delete(where.key) },
     },
     activityLog: {
       create: async (args: { data: Record<string, unknown> }) => { if (opts.failAudit) throw new Error('audit down'); a.push(args) },
@@ -40,9 +41,9 @@ function fakeDb(initial: Record<string, string> = {}, opts: { failAudit?: boolea
   }
 }
 
-async function run(mode: 'get' | 'set', argv: string[], f = fakeDb()) {
+async function run(mode: 'get' | 'set', argv: string[], f = fakeDb(), interlock?: Parameters<typeof runSettingsCli>[0]['interlock']) {
   const out: string[] = []; const err: string[] = []
-  const code = await runSettingsCli({ mode, argv, db: f.db as never, stdout: { log: (m: string) => out.push(m) }, stderr: { error: (m: string) => err.push(m) }, disconnect: async () => {} })
+  const code = await runSettingsCli({ mode, argv, db: f.db as never, ...(interlock ? { interlock } : {}), stdout: { log: (m: string) => out.push(m) }, stderr: { error: (m: string) => err.push(m) }, disconnect: async () => {} })
   return { code, out: out.join('\n'), err: err.join('\n'), f }
 }
 const SET = ['--by', 'jan', '--reason', 'switchover step M']
@@ -50,7 +51,7 @@ const SET = ['--by', 'jan', '--reason', 'switchover step M']
 test('allowlist contains exactly the switches that exist on development, and none is a credential', () => {
   assert.deepEqual([...SYSTEM_SWITCH_KEYS].sort(), [
     'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled',
-    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
+    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
     'wc_invoice_note_enabled', 'wc_order_amendment_write_enabled', 'wc_withdrawal_outcome_enabled', 'wms_merge_candidate_mode',
     'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled',
   ])
@@ -206,4 +207,53 @@ test('required needs send on; send cannot be turned off while required is on', a
 test('the registry keys equal the connector constants the readers use', async () => {
   const c = await import('../lib/connectors/mintsoft/suppliers/settings')
   assert.deepEqual([...ASN_KEYS].sort(), [c.MINTSOFT_SUPPLIER_CREATE_SETTING, c.MINTSOFT_ASN_SEND_SUPPLIER_SETTING, c.MINTSOFT_ASN_SUPPLIER_REQUIRED_SETTING].sort())
+})
+
+// o3d-pdnzu item 4 and 6: the storefront customer e-mail switch in the CLI: interlocked, and stamped with its switch-on instant.
+const SF = ['--key', 'storefront_customer_email_enabled', '--value', 'true', ...SET, '--yes']
+const W_LIVE = { env: { WC_WRITES_LIVE_FROM: '2026-12-08T00:00:00Z' }, now: new Date('2026-12-20T12:00:00Z') }
+const nativeOff = async () => ({ ok: true as const, enabled: { customer_processing_order: false, customer_completed_order: false } })
+
+test('storefront e-mail switch: refused before step W and while a native e-mail is on or unreadable, in the dry run and with --yes; nothing is written (MUTATION: drop the interlock => red)', async () => {
+  for (const [name, interlock] of [
+    ['step W unset', { env: {}, now: W_LIVE.now, readNativeEmail: nativeOff }],
+    ['native processing on', { ...W_LIVE, readNativeEmail: async () => ({ ok: true as const, enabled: { customer_processing_order: true, customer_completed_order: false } }) }],
+    ['native unreadable', { ...W_LIVE, readNativeEmail: async () => ({ ok: false as const }) }],
+  ] as const) {
+    for (const extra of [[], ['--yes']]) {
+      const f = fakeDb()
+      const r = await run('set', ['--key', 'storefront_customer_email_enabled', '--value', 'true', ...SET, ...extra], f, interlock as never)
+      assert.equal(r.code, 3, `${name} ${extra.join(' ')}: ${r.err}`)
+      assert.match(r.err, /Cannot turn on customer e-mail for storefront orders/)
+      assert.equal(f.settings.size, 0, name)
+      assert.equal(f.audits.length, 0, name)
+    }
+  }
+})
+
+test('storefront e-mail switch: with step W live and both native e-mails off it is set, and the switch-on instant is recorded in the same transaction (MUTATION: no stamp => red)', async () => {
+  const f = fakeDb()
+  const before = Date.now()
+  const r = await run('set', SF, f, { ...W_LIVE, readNativeEmail: nativeOff })
+  assert.equal(r.code, 0, r.err)
+  assert.equal(f.settings.get('storefront_customer_email_enabled')?.value, 'true')
+  const stamp = f.settings.get('storefront_customer_email_enabled_at')?.value
+  assert.ok(stamp && Date.parse(stamp) >= before && Date.parse(stamp) <= Date.now(), stamp)
+  assert.equal(f.transactions, 1, 'one transaction')
+  // turning it OFF is never interlocked, and CLEARS the stamp (a later switch-on by a direct write must not inherit it) (MUTATION: keep the stamp => red)
+  const off = await run('set', ['--key', 'storefront_customer_email_enabled', '--value', 'false', ...SET, '--yes'], f, { env: {}, now: W_LIVE.now, readNativeEmail: async () => { throw new Error('must not be asked') } })
+  assert.equal(off.code, 0, off.err)
+  assert.equal(f.settings.get('storefront_customer_email_enabled')?.value, 'false')
+  assert.equal(f.settings.has('storefront_customer_email_enabled_at'), false, 'the stamp is cleared on off')
+  // an already-on switch is not a transition: no interlock, no new stamp
+  const again = await run('set', SF, fakeDb({ storefront_customer_email_enabled: 'true', storefront_customer_email_enabled_at: '2026-12-09T00:00:00.000Z' }), { env: {}, now: W_LIVE.now, readNativeEmail: async () => { throw new Error('must not be asked') } })
+  assert.equal(again.code, 0, again.err)
+  assert.match(again.out, /already true/)
+})
+
+test('the storefront e-mail registry keys equal the constants the readers use', async () => {
+  const c = await import('../lib/domain/storefront-customer-email/constants')
+  const sw = await import('../lib/domain/settings/system-switches')
+  assert.equal(sw.STOREFRONT_EMAIL_SWITCH_KEY, c.STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY)
+  assert.equal(sw.STOREFRONT_EMAIL_ENABLED_AT_KEY, c.STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY)
 })
