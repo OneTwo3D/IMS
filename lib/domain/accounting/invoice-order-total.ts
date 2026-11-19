@@ -1,3 +1,6 @@
+import { invoiceToReverse } from '@/lib/domain/accounting/eu-vat-credit-note'
+import { LEDGER_STANDING_SELECT, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
+
 /**
  * o3d-hqvrp.389: whether a credit note that FULLY reverses an invoice carries the order total follows HOW THE INVOICE WAS POSTED, never the setting's current value.
  * An invoice posted with `xero_round_to_order_total_enabled` on carries a Rounding line and totals the order total; one posted with it off totals the per-line figure. A credit
@@ -6,23 +9,26 @@
  */
 export interface InvoiceSyncRowReader {
   accountingSyncLog: {
-    findFirst(args: {
-      where: { referenceType: 'SalesOrder'; referenceId: string; type: { in: Array<'SALES_INVOICE' | 'SALES_INVOICE_UPDATE'> }; status: { in: Array<'SYNCED' | 'PENDING' | 'PROCESSING'> } }
-      orderBy: Array<{ createdAt: 'desc' }>
-      select: { payload: true }
-    }): Promise<{ payload: unknown } | null>
+    findMany(args: {
+      where: { referenceType: 'SalesOrder'; referenceId: string; type: { in: Array<'SALES_INVOICE' | 'SALES_INVOICE_UPDATE'> } }
+      select: typeof LEDGER_STANDING_SELECT & { createdAt: true; payload: true }
+    }): Promise<Array<LedgerStandingRow & { createdAt: Date; payload: unknown }>>
   }
 }
 
-/** The order total the order's invoice was (or is queued to be) posted with; null when it carried none (the invoice was posted per line). */
+/**
+ * The order total of the invoice VERSION XERO HOLDS; null when it carried none (posted per line) or when which version Xero holds is not known.
+ * The version is chosen by `invoiceToReverse`, the same rule a whole-order reversal uses: the newest row not proven unposted must be CONFIRMED_POSTED. A newer queued, failed-unknown
+ * or cancelled-unproven row is never read from, and when the newest version's standing is unknown nothing is carried (the credit note posts per line, which can differ by pennies).
+ */
 export async function invoicePostedOrderTotal(client: InvoiceSyncRowReader, orderId: string): Promise<number | null> {
-  // The latest invoice document row decides: an update re-posts the whole document, so the newest SYNCED row is what the ledger holds; a newer queued row is what it is about to hold.
-  const row = await client.accountingSyncLog.findFirst({
-    where: { referenceType: 'SalesOrder', referenceId: orderId, type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, status: { in: ['SYNCED', 'PENDING', 'PROCESSING'] } },
-    orderBy: [{ createdAt: 'desc' }],
-    select: { payload: true },
+  const rows = await client.accountingSyncLog.findMany({
+    where: { referenceType: 'SalesOrder', referenceId: orderId, type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] } },
+    select: { ...LEDGER_STANDING_SELECT, createdAt: true, payload: true },
   })
-  const payload = row?.payload
+  const picked = invoiceToReverse(rows)
+  if (!picked.ok) return null
+  const payload = picked.payload
   if (!payload || typeof payload !== 'object') return null
   const total = (payload as { orderTotal?: unknown }).orderTotal
   return typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : null
