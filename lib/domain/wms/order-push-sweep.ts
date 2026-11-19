@@ -2966,12 +2966,18 @@ export async function runWmsOrderPushSweepCore(
           // exactly what the candidate build records. Writing PENDING_CREATE back made the next pass convert it, and a conversion raises attempts to
           // AMBIGUOUS_ATTEMPTS (a presence probe before any release). The revalidation pass re-queues it once it builds, like any other hold.
           const message = scrubWmsError(buildError, 'WMS order payload could not be built')
-          const parked = await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
-            state: 'VALIDATION_FAILED', attempts: order.pushAttempts,
-            lastError: message,
-            lastAttemptAt: ts,
-          }).catch(() => false)
-          if (parked) result.validationFailed += 1
+          try {
+            const parked = await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
+              state: 'VALIDATION_FAILED', attempts: order.pushAttempts,
+              lastError: message,
+              lastAttemptAt: ts,
+            })
+            if (parked) result.validationFailed += 1
+          } catch (parkError) {
+            // Reported, not swallowed: the claim stamp lapses and the order is re-selected, but this sweep answers failed.
+            console.error('[wms-order-push] could not park a refused create after the post-claim reload', order.id, parkError)
+            result.failed += 1
+          }
           continue
         }
       }
