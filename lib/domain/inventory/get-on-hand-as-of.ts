@@ -318,11 +318,18 @@ function businessDayLabel(instant: Date): Date {
 
 /**
  * The instant a snapshot's content stops: movements at or after it are NOT in the snapshot. Snapshots are labelled by London business day, so in BST this
- * is 23:00Z of the label day, not 24:00Z. The run row's stored `cutoffAt` is authoritative (it is what the writer stamped, and backfilled days stamp their own
- * UTC cutoff); with none stored, fall back to the end of the London day the label names (identical to the UTC day in GMT). RESIDUAL (o3d-cr517): a legacy BST
- * run written before the label moved to the London day (the cron fired at London 00:00 and labelled the run D-1, so its content runs to D 23:00Z) AND with no
- * stored cutoff is read with a cutoff at D-1 23:00Z, so about 24h (a whole day, not one hour) of movements is double-applied by forward replay. This falls under
- * the accepted relabel limit documented on `previousBusinessDate` (inventory-snapshot.ts).
+ * is 23:00Z of the label day, not 24:00Z. The run row's stored `cutoffAt` is authoritative (it is what the writer stamped); with none stored, fall back to the
+ * end of the London day the label names (identical to the UTC day in GMT).
+ *
+ * ACCEPTED LIMITS for legacy summer-time (BST) rows, written before the label moved to the London day (the cron fired at London 00:00, which is 23:00Z, and
+ * labelled the run D-1 by the UTC day):
+ * - a legacy CRON run WITH a stored cutoff stamped `startOfNextUtcDay(label)`, i.e. D 00:00Z, while its content runs to D 23:00Z: the stored cutoff is 23h BEFORE
+ *   the content end. This reader trusts the stored value, so forward replay from it re-applies about 23h of movements, and a same-day date-only as-of reverses
+ *   only [D-1 23:00Z, D 00:00Z), leaving about 23h in;
+ * - a legacy run with NO stored cutoff is read with a cutoff at D-1 23:00Z, so about 24h of movements is double-applied by forward replay.
+ * Neither is a regression, and both fall under the accepted relabel limit documented on `previousBusinessDate` (inventory-snapshot.ts). Legacy BACKFILLED rows
+ * stored a UTC midnight cutoff AFTER their London day end, which is the opposite direction and is handled by reverse replay (see the anchor range below).
+ * Only stage carries such rows; production is to be reinstalled.
  */
 async function loadSnapshotCutoff(client: OnHandAsOfClient, snapshotDate: Date): Promise<Date> {
   const run = await client.inventorySnapshotRun.findUnique({
@@ -911,8 +918,8 @@ export async function getOnHandAsOf(options: {
   if (priorSnapshotDate) {
     const priorCutoff = await loadSnapshotCutoff(client, priorSnapshotDate)
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
-    // The anchor's cutoff is NOT always at or before the as-of bound: a backfilled summer-time day carries a cutoff past its own London day end (legacy
-    // runs stored UTC midnight), so the snapshot already holds movements beyond the bound. Those are reversed out, never left in (o3d-cr517).
+    // The anchor's cutoff is NOT always at or before the as-of bound: a legacy BACKFILLED summer-time day carries a cutoff past its own London day end (those
+    // runs stored UTC midnight), so the snapshot already holds movements beyond the bound. (Legacy CRON rows are the other way round; see loadSnapshotCutoff.) Those are reversed out, never left in (o3d-cr517).
     const anchorRange = anchorReplayRange(priorCutoff)
     const replay = await replayMovements(client, state, filters, anchorRange.range, anchorRange.direction, options.signal)
     // Two distinct snapshot-backed inaccuracies: (a) a revaluation between the anchor and asOf the replay does not apply (movements carry
