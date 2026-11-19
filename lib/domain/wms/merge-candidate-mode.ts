@@ -10,8 +10,9 @@ import { db } from '@/lib/db'
  *   flag  IMS flags the group: a Mergeable badge on each order, an activity entry, a list on the Mintsoft screen and ONE operator task
  *         per group asking a person to check the orders in Mintsoft and merge them there. Flag mode writes NOTHING to Mintsoft or WooCommerce.
  *
- * `hold` (hold every order of the group in Mintsoft until a person has merged them) is NOT built: it needs live warehouse writes. It is
- * reserved: the value is not recognised, so it reads as `off`, exactly like any unknown value (a typo must never turn a feature on).
+ * Holding the orders of a group in Mintsoft until a person has merged them is NOT a mode of this setting: it is the separate, off-by-default setting
+ * `wms_merge_hold_enabled` (lib/domain/wms/merge-hold.ts), which needs this mode to be `flag`. The value `hold` is not recognised here, so it reads as
+ * `off`, exactly like any unknown value (a typo must never turn a feature on).
  *
  * A read failure PROPAGATES; an unreadable setting must not read as consent.
  */

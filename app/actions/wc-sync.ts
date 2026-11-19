@@ -1,5 +1,6 @@
 'use server'
 
+import { refuseGuardedSettingWithoutAttestation, type AttestationDb } from '@/lib/domain/writer-attestation/store'
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { lockStorefrontMappingWrites, repointStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { revalidatePath } from 'next/cache'
@@ -329,6 +330,12 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   if (typeof data.wc_back_in_stock_date_buffer_days === 'string' && !/^\d{1,3}$/.test(data.wc_back_in_stock_date_buffer_days.trim())) {
     return { success: false, error: 'The back-in-stock buffer must be a whole number of days (0-365).', code: 'wc_back_in_stock_buffer_invalid' }
   }
+  // Turning the stock push ON needs the owner's confirmation that Qoblex's push is stopped (two writers would otherwise push stock).
+  const attestationRefusal = await refuseGuardedSettingWithoutAttestation(data, {
+    db: db as unknown as AttestationDb,
+    currentValue: (key) => getSettingValue(key),
+  })
+  if (attestationRefusal) return { success: false, error: attestationRefusal, code: 'writer_attestation_required' }
   const emptyStatusSelection = rejectEmptyWcOrderStatusSelection(data.wc_sync_order_statuses)
   if (emptyStatusSelection) {
     return { success: false, error: emptyStatusSelection, code: 'wc_no_order_statuses_selected' }

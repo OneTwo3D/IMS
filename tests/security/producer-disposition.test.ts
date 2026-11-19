@@ -1,3 +1,4 @@
+import '../helpers/xero-attested.ts'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -88,7 +89,7 @@ const OBLIGATION_CASES: ObligationCase[] = [
 const OPERATION: Record<OutboundConnector, Record<OwnerCase, string>> = {
   xero: { IMS: 'purchase.bill', other: 'sales.invoice', unknown: 'no-such-operation' },
   mintsoft: { IMS: 'order.create', other: 'auth.login', unknown: 'no-such-operation' },
-  woocommerce: { IMS: 'order.status', other: 'order.withdrawal-outcome', unknown: 'no-such-operation' },
+  woocommerce: { IMS: 'order.status', other: 'fx-rates', unknown: 'no-such-operation' },
 }
 /** IMS-owned operations whose row says obligationTime 'not-applicable'. Xero has none: every IMS-owned Xero row needs a document date. */
 const OPERATION_NOT_APPLICABLE: Partial<Record<OutboundConnector, string>> = { mintsoft: 'order.cancel', woocommerce: 'stock' }
@@ -96,7 +97,13 @@ const OPERATION_NOT_APPLICABLE: Partial<Record<OutboundConnector, string>> = { m
 function envFor(destination: OutboundConnector, grant: GrantCase, cutoff: string | undefined): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {}
   if (grant !== 'absent') env[OUTBOUND_GRANT_ENV[destination]] = GRANT_VALUE[destination][grant]
-  if (cutoff !== undefined) env[PRODUCER_CUTOFF_ENV[destination]] = cutoff
+  if (cutoff !== undefined) {
+    // The live-from variable is the switchover STEP's: set the destination's own (read by an operation no step moves, and by step-W/M/X-named steps of the same
+    // name) and the step variable of the destination's IMS operation (order.status is step M although it writes to WooCommerce).
+    env[PRODUCER_CUTOFF_ENV[destination]] = cutoff
+    const imsRow = WRITER_OWNERSHIP_MAP.find((row) => row.destination === destination && row.operation === OPERATION[destination].IMS)
+    if (imsRow && imsRow.step !== 'never') env[PRODUCER_CUTOFF_ENV[imsRow.step]] = cutoff
+  }
   return env
 }
 
@@ -598,9 +605,12 @@ test('every connector row, every phase: the decision reports that phase\'s owner
   for (const row of rows) {
     const destination = row.destination as OutboundConnector
     const operation = row.operation as never
-    const held = explainProducerDisposition(destination, operation, LATE, { env: envFor(destination, 'absent', undefined), now: NOW })
-    const beforeCutoff = explainProducerDisposition(destination, operation, LATE, { env: envFor(destination, 'ok', '2026-12-01T00:00:00Z'), now: NOW })
-    const p2 = explainProducerDisposition(destination, operation, LATE, { env: envFor(destination, 'ok', '2026-01-01T00:00:00Z'), now: NOW })
+    // The phase is per STEP: the live-from variable that applies is the row's step's (its destination's own for a row no step moves).
+    const stepVar = PRODUCER_CUTOFF_ENV[row.step === 'never' ? destination : row.step]
+    const rowEnv = (cutoff: string | undefined) => ({ ...envFor(destination, cutoff === undefined ? 'absent' : 'ok', cutoff), ...(cutoff === undefined ? {} : { [stepVar]: cutoff }) })
+    const held = explainProducerDisposition(destination, operation, LATE, { env: rowEnv(undefined), now: NOW })
+    const beforeCutoff = explainProducerDisposition(destination, operation, LATE, { env: rowEnv('2026-12-01T00:00:00Z'), now: NOW })
+    const p2 = explainProducerDisposition(destination, operation, LATE, { env: rowEnv('2026-01-01T00:00:00Z'), now: NOW })
     for (const decision of [held, beforeCutoff]) {
       assert.equal(decision.disposition, 'SHADOW', `${destination}.${row.operation} P1`)
       assert.equal(decision.phase, 'P1')

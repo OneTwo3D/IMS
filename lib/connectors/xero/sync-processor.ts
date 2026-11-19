@@ -16,8 +16,8 @@ import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
 import { isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
-import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict, xeroResolveObligationAt } from '@/lib/domain/accounting/xero-producer-seam'
-import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
+import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict, xeroHeldDeliveryTypes, xeroResolveObligationAt, xeroRowDeliveryHold } from '@/lib/domain/accounting/xero-producer-seam'
+import { PRODUCER_HELD_RETRY_DELAY_MS, producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
@@ -159,6 +159,7 @@ import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
   wooAccountingPostJobIds,
+  accountingPostJobIdsForSyncTypes,
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
@@ -2924,7 +2925,7 @@ function unsentPostEvidence(
         // before they go hunting in the ledger.
         : notPosted.reason === 'transport-refused'
           ? 'xero_sync_transport_refused_before_post'
-          : notPosted.reason === 'producer-held'
+          : notPosted.reason === 'producer-held' || notPosted.reason === 'producer-shadowed'
             ? 'xero_sync_producer_held_before_post'
             : notPosted.reason === 'before-cutoff'
               ? 'xero_sync_before_cutoff_before_post'
@@ -3130,12 +3131,15 @@ export async function recordAndReleaseUnsentTransportRefusal(
   const markerReleased = args.notPosted.releaseCreateDispatch
     ? await releaseCreateDispatchMarker(tx, args.entry.id, args.lease, args.attempt)
     : null
+  // A row the PRODUCER-SIDE HOLD handed back waits a short fixed interval instead of none: there is no replay window racing it, and offering it
+  // again every tick would only re-ask a question whose answer changes when the owner records a confirmation.
+  const handBackDelayMs = args.notPosted.reason === 'producer-held' ? PRODUCER_HELD_RETRY_DELAY_MS : 0
   const released = await releaseUnsentTransportRefusal(
-    tx, args.entry.id, args.lease, args.attempt, args.notPosted.message,
+    tx, args.entry.id, args.lease, args.attempt, args.notPosted.message, new Date(Date.now() + handBackDelayMs),
   )
   // AND NOT `markXeroOutboxRetry`: that one counts the attempt against MAX_RETRIES and its first
   // backoff floor is five minutes, which would burn the replay window this is racing.
-  if (args.job) await deferOutboxWithoutSpendingAnAttempt(tx, args.job, args.notPosted.message, 0)
+  if (args.job) await deferOutboxWithoutSpendingAnAttempt(tx, args.job, args.notPosted.message, handBackDelayMs)
   // AND LAST, WHAT THE FENCED RELEASE MATCHED — see UNSENT_HANDBACK_COMMIT_ACTION. Written after the
   // release, so this row cannot exist unless the release returned; committed with everything else, so
   // it cannot exist unless the whole hand-back landed. This, not the evidence row, is what the
@@ -4139,8 +4143,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 
   // THE WRITER-SIDE CUT-OFF: a row created before the destination's live-from instant is not even selected, so a bounded batch of them
   // can never occupy the oldest-first window and starve every row behind it. The claim re-asserts the same floor in its own statement.
+  // Types the owner's confirmation still holds are left out of the selection too, so held rows cannot fill the bounded batch and starve the rest.
+  const heldTypes = xeroHeldDeliveryTypes()
   const pending = await db.accountingSyncLog.findMany({
-    where: claimableXeroSyncLogWhere(new Date(), staleClaimCutoff, xeroCutoffFloor()),
+    where: heldTypes.length > 0
+      ? { AND: [claimableXeroSyncLogWhere(new Date(), staleClaimCutoff, xeroCutoffFloor()), { type: { notIn: heldTypes } }] }
+      : claimableXeroSyncLogWhere(new Date(), staleClaimCutoff, xeroCutoffFloor()),
     orderBy: { createdAt: 'asc' },
     take: MAX_PER_RUN,
   })
@@ -4148,6 +4156,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
   const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, pending)
 
   for (const entry of pending) {
+    // THE OWNER'S CONFIRMATION IS ASKED BEFORE ANYTHING IS CLAIMED (the selection above already leaves held types out; this is the same question
+    // asked once more at the claim boundary, for a confirmation that went away since). A held row is not claimed and not attempted: it stays PENDING.
+    if (xeroRowDeliveryHold({ type: entry.type }) !== null) {
+      result.skipped++
+      continue
+    }
     const claimedAt = new Date()
     // The claim, not the bare instant (Codex r2, medium 2). Nothing in this runner renews it, so the
     // holder answers the same instant every time — but every fence below asks the holder rather than
@@ -4329,7 +4343,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         // has no claim to give back — the release would match nothing, which is correct but pointless
         // — and `lease-expired` and `dispatch-unrecorded` are the outcomes o3d-xl63 and r1 settled on
         // their own terms, with no replay window running against them.
-        if (notPosted.reason === 'transport-refused') {
+        if (notPosted.reason === 'transport-refused' || notPosted.reason === 'producer-held') {
+          // `producer-held` is handed back the same way (claim released, short fixed delay in the row's next-attempt): a row left PROCESSING would
+          // wait out the stale-claim cut-off for nothing.
           // o3d-jit6 r5 (Codex HIGH): THE EVIDENCE AND THE RELEASE ARE ONE COMMIT.
           //
           // r4 established the right ORDER — log first, release second, so no worker can meet the
@@ -4641,6 +4657,10 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
   const attempted: string[] = []
   // ONE READ OF THE WOOCOMMERCE-WRITING JOB IDS FOR THE WHOLE DRAIN (o3d-jvup3), not one unbounded query per claim.
   const wooAccountingJobIds = await wooAccountingPostJobIds(new Date())
+  // THE JOBS OF THE TYPES THE OWNER'S CONFIRMATION STILL HOLDS ARE LEFT OUT OF THE CANDIDATE WINDOW (as the direct runner's selection leaves the types out), so
+  // held jobs never take a slot of the bounded batch and starve the rows behind them. They are untouched, not failed: read again by every drain, so they are
+  // offered on the first drain after the hold lifts. The pre-claim ask below stays, for a hold that appeared after this read.
+  const heldJobIds = await accountingPostJobIdsForSyncTypes(xeroHeldDeliveryTypes())
   while (attempted.length < MAX_PER_RUN) {
     if (clock() - startedAt > budgetMs) break
     const claimedJobs = await claimIntegrationOutboxWork({
@@ -4648,7 +4668,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
       operation: XERO_ACCOUNTING_POST_OPERATION,
       limit: MAX_PER_RUN,
       claimLimit: 1,
-      excludeIds: attempted,
+      excludeIds: heldJobIds.length > 0 ? [...attempted, ...heldJobIds] : attempted,
       wooAccountingJobIds,
       workerId: XERO_ACCOUNTING_WORKER_ID,
       staleLockMs: CLAIM_STALE_MS,
@@ -4708,9 +4728,24 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
     // THE WRITER-SIDE CUT-OFF, FOR A JOB WHOSE ROW PREDATES IT. The row is never claimed (the claim statement would refuse it too), so
     // this job can never deliver anything: it is dead-lettered with the single-sourced sentence rather than retried for ever. A bounded
     // oldest-first batch of such jobs would otherwise be re-offered every tick and starve the jobs behind them.
-    const beforeCutoff = entry.status === 'SYNCED' || entry.status === 'CANCELLED' ? null : xeroBeforeCutoffRefusal({ createdAt: entry.createdAt, type: entry.type })
+    const rowIsSettled = entry.status === 'SYNCED' || entry.status === 'CANCELLED'
+    const beforeCutoff = rowIsSettled ? null : xeroBeforeCutoffRefusal({ createdAt: entry.createdAt, type: entry.type })
     if (beforeCutoff !== null) {
       await markXeroOutboxPermanent(job, beforeCutoff)
+      result.skipped++
+      continue
+    }
+
+    // THE OWNER'S CONFIRMATION IS ASKED BEFORE ANYTHING IS CLAIMED. A row whose operation is held (the owner has not confirmed the incumbent stopped, or
+    // the confirmation is not read yet) is neither claimed nor attempted: the sync-log row stays as it is, and the job goes back with NO attempt spent after a
+    // short fixed delay, so the work is released within a tick or so of the confirmation and never marches towards PERMANENT_FAILED.
+    const deliveryHoldBeforeClaim = rowIsSettled ? null : xeroRowDeliveryHold({ type: entry.type })
+    if (deliveryHoldBeforeClaim !== null) {
+      try {
+        await deferOutboxWithoutSpendingAnAttempt(db, job, deliveryHoldBeforeClaim.message, PRODUCER_HELD_RETRY_DELAY_MS)
+      } catch (deferError) {
+        await reportUnsentHandBackAborted(entry, { reason: 'producer-held', operation: entry.type, message: deliveryHoldBeforeClaim.message }, deferError, job.id)
+      }
       result.skipped++
       continue
     }
@@ -4948,7 +4983,10 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
         // so rather than letting the fence's own throw escape into the generic failure handler and
         // spend a retry on a row that was never posted.
         try {
-          if (notPosted.reason === 'transport-refused') {
+          if (notPosted.reason === 'transport-refused' || notPosted.reason === 'producer-held') {
+            // `producer-held` (the claim boundary found the row's decision not LIVE, or the owner's confirmation absent) takes the SAME hand-back: the
+            // sync-log claim is released and the job deferred WITHOUT spending an attempt. The generic arm below would count it toward MAX_RETRIES
+            // and dead-letter work that is merely waiting for the owner. (The common case never gets here: the pre-claim ask below claims nothing.)
             // o3d-jit6 r4 (Codex HIGH): ONE TRANSACTION, because on this path the row and the job are
             // two halves of one retry. A released row whose job stayed PROCESSING waits for the
             // queue's own fifteen-minute stale-lock sweep — the same fifteen minutes the release
@@ -5261,7 +5299,7 @@ type EntryResult = {
      * minted — the fence sent nothing because the transport would not. The row is handed back exactly
      * like the other three, and the marker it left behind is a known, named residual (o3d-gvzu).
      */
-    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'before-cutoff'
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'producer-shadowed' | 'before-cutoff'
     operation: string
     message: string
     /**
@@ -6208,7 +6246,19 @@ export async function processClaimedEntry(
   const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload, obligationAt: await xeroResolveObligationAt(db, { type, payload, connector: XERO_CONNECTOR, referenceType, referenceId }) })
   if (held.kind === 'shadow') {
     const message = producerHeldNotice({ connector: held.destination, reason: held.decision.reason, owner: held.decision.owner })
-    return { success: false, error: message, notPosted: { reason: 'producer-held', operation: type, message } }
+    // `producer-shadowed`, NOT `producer-held`: this verdict is PERMANENT for the row (its decision is not LIVE), so it keeps the terminal handling it had
+    // before the delivery hold existed (the ordinary retry accounting, which dead-letters it). Only `producer-held` below (the owner's confirmation absent or
+    // unread, which a later tick can clear) takes the no-attempt hand-back.
+    return { success: false, error: message, notPosted: { reason: 'producer-shadowed', operation: type, message } }
+  }
+
+  // THE PER-OPERATION DELIVERY GATE. The decision above said LIVE for this row, but a destination opened by an EARLIER step must not let a LATER step's
+  // row out, and a row that replaces an incumbent the owner stops by hand (step X: Qoblex's Xero posting; the invoice note) waits for the owner's
+  // confirmation. A confirmation that is absent, or not read yet after a start or a failed read, HOLDS the row (handed back unsent, no attempt spent,
+  // retried): it is never turned into a shadow, which would never be delivered.
+  const deliveryHold = xeroRowDeliveryHold({ type })
+  if (deliveryHold !== null) {
+    return { success: false, error: deliveryHold.message, notPosted: { reason: 'producer-held', operation: type, message: deliveryHold.message } }
   }
 
   // THE WRITER-SIDE CUT-OFF, AT THE LAST POINT BEFORE ANYTHING CAN BE SENT. The claim statement and the selections already exclude a row

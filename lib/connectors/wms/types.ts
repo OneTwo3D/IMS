@@ -605,6 +605,18 @@ export type WmsOrderCancelResult = {
   // proved to be this order, so NOTHING was written.
 }
 
+/**
+ * The answer to a MERGE HOLD request (see `holdOrder`). Only `held: true` means the warehouse now holds the order awaiting a person's confirmation.
+ * A request that FAILED (transport, timeout, an unreadable answer) is not an answer: `holdOrder` THROWS, so a caller can never read it as a refusal.
+ */
+export type WmsOrderHoldResult = {
+  held: boolean
+  /** HELD; or why nothing was held: NOT_FOUND, IDENTITY_MISMATCH / IDENTITY_UNVERIFIABLE (the order cannot be proved to be this order), MERGED_SURVIVOR (already merged), ALREADY_CANCELLED, NOT_HOLDABLE (past NEW), REFUSED (the warehouse said no; see `message`). */
+  status: 'HELD' | 'NOT_FOUND' | 'IDENTITY_MISMATCH' | 'IDENTITY_UNVERIFIABLE' | 'MERGED_SURVIVOR' | 'ALREADY_CANCELLED' | 'NOT_HOLDABLE' | 'REFUSED'
+  mergedSurvivorNumber?: string
+  message?: string
+}
+
 export type WmsOrderUpdateResult = {
   /** False when the WMS order is past NEW and can no longer be amended. */
   updated: boolean
@@ -790,6 +802,12 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
   cancelOrder?(externalOrderId: string, expected: WmsExpectedOrder, clearance: WmsWriteClearance<'order.cancel' | 'order.hold'>): Promise<WmsOrderCancelResult>
+  /**
+   * Hold a warehouse order for a person to MERGE it (awaiting confirmation), keeping it alive. Only for merge holds; the withdrawal hold is the cancel-based
+   * `cancelOrder` and is unchanged. There is deliberately NO release counterpart: a merge hold is confirmed by a person in the warehouse's own system.
+   * Throws when the outcome is unknown (transport failure); answers `held: false` only for a definite refusal or a gate that proved the hold wrong.
+   */
+  holdOrder?(externalOrderId: string, expected: WmsExpectedOrder, clearance: WmsWriteClearance<'order.hold'>): Promise<WmsOrderHoldResult>
   /**
    * Cancel a MERGED order, but only while it still holds EXACTLY `items` (the lines of the order being cancelled; the connector re-reads
    * them immediately before the cancel and answers status MERGED_LINES_CHANGED, cancelling nothing, when they differ). `cancelOrder` refuses a merged order (status MERGED_SURVIVOR) because it holds other orders' goods.

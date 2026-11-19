@@ -80,8 +80,8 @@ test('PRECONDITION: the real tree is green, and the census reached every part of
   assert.equal(report.counts.seamFunctions, MINT_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamFunctionsConsulting, MINT_SEAM_FUNCTIONS.length)
   assert.equal(report.counts.seamOperationsNamed, report.counts.seamOperations)
-  // 14: the comment writers are gone (the sweep's note and the refund note: IMS raises operator tasks instead), so the sweep has 9 and the rest are unchanged; the parent-SKU deleter (o3d-zvec.20) is the fourteenth.
-  assert.equal(report.counts.writeCalls, 14, 'the sweep (9), the product, bundle, content and parent-SKU delete writers and the two ASN buttons')
+  // 14: the comment writers are gone (the sweep's note and the refund note: IMS raises operator tasks instead), so the sweep has 9 and the rest are unchanged; the parent-SKU deleter (o3d-zvec.20) is the fourteenth; the merge hold (holdOrder, a GET MarkAwaitingConfirmation, behind its producer-seam clearance) is the fifteenth.
+  assert.equal(report.counts.writeCalls, 15, 'the sweep (9), the merge hold, the product, bundle, content and parent-SKU delete writers and the two ASN buttons')
   assert.equal(report.counts.writeCallsWithClearance, report.counts.writeCalls)
   assert.equal(report.counts.transportSites, 3, 'sendMintsoftRequest and the two login helpers')
   assert.equal(report.counts.clearanceCasts, 1)
@@ -195,7 +195,7 @@ test('MUTATION MINT-3 (a login helper whose call is gone, and a key test that st
 })
 
 test('MUTATION MINT-4 (a new Mintsoft operation in the ownership map that nothing governs): red', () => {
-  const extra: OwnershipRow = { destination: 'mintsoft', operation: 'order.merge', owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' }, obligationTime: 'not-applicable', note: 'fixture' }
+  const extra: OwnershipRow = { destination: 'mintsoft', operation: 'order.merge', owners: { P0: 'nobody', P1: 'nobody', P2: 'IMS' }, step: 'mintsoft', obligationTime: 'not-applicable', note: 'fixture' }
   const report = mintCensusFindings(input({ map: [...(WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]), extra] }))
   assert.equal(red(report, 'MINT-4', 'mintsoft.order.merge').length, 1, JSON.stringify(report.failures))
   const stale = mintCensusFindings(input({ governedElsewhere: { 'auth.login': 'fixture reason that is long enough', 'no.such.operation': 'fixture reason that is long enough', 'asn.create': 'fixture reason that is long enough' } }))
