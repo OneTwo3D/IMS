@@ -40,7 +40,7 @@ a reboot or a daemon-reload that garbage-collects an inactive masked unit. `neve
 nothing, the user can READ the system journal and the journal is PERSISTENT (otherwise exit status 0 with no entries proves nothing: a non-privileged user sees
 no system-unit messages, and a volatile journal is wiped by the same reboot). Otherwise the script prints `unknown`. IMS reads `unknown`, and a `never` without
 journal_exit 0, readable, persistent and an earliest entry BEFORE the live-from instant S, as unreadable, never as clean. Run it as root (or a member of
-systemd-journal / adm). The journal facts come from the SYSTEM journal only (user journals are ignored), persistence reads the /etc, /run and
+systemd-journal / adm). The journal facts come from the SYSTEM journal only (user journals are ignored), persistence reads the /etc, /run, /usr/local/lib and
 /usr/lib journald.conf and journald.conf.d, and the journal's current boot must be this boot (kernel boot id) and not in the future, else journal_earliest is `none`.
 The test-only options (--assume-groups and the other seams) are refused unless BRIDGE_WRITERS_STATUS_TEST_SEAMS=1 is set.
 """
@@ -182,16 +182,16 @@ def journal_access(journalctl, assume_groups=None):
                 privileged = False
     if not privileged:
         return 0
-    done = run([journalctl, "--no-pager", "--header"])
+    done = run([journalctl, "--no-pager", "--system", "--header"])
     return 1 if done.returncode == 0 else 0
 
 
-JOURNALD_ROOTS = ("/etc/systemd", "/run/systemd", "/usr/lib/systemd")
+JOURNALD_ROOTS = ("/etc/systemd", "/run/systemd", "/usr/local/lib/systemd", "/usr/lib/systemd")
 
 
 def journald_conf_files(roots=JOURNALD_ROOTS):
     """The journald configuration files in the order systemd applies them (later wins). The main journald.conf comes from the first root that has one;
-    the drop-ins of journald.conf.d come from /etc, /run and /usr/lib, a file name in an earlier root shadowing the same name in a later one, applied in
+    the drop-ins of journald.conf.d come from /etc, /run, /usr/local/lib and /usr/lib, a file name in an earlier root shadowing the same name in a later one, applied in
     file-name order across the roots."""
     files = []
     for root in roots:

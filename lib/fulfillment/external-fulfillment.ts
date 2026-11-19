@@ -830,14 +830,13 @@ async function applyScopedWmsDespatch(
       )
       if (result.success && target === 'SHIPPED') processedInBatch.push(shipment.id)
       if (!result.success) {
-        // A failed batch judges NO partial e-mail when the failing shipment is the LAST one: the failure may be the fence refusing the order flip AFTER it
-        // shipped, in which case the order is still PROCESSING while the store / WMS reported the whole order despatched, so "the rest will follow" would be
-        // false. The retry either flips the order (dispatched e-mail, no partial) or ends in a terminal refusal.
-        // When a LATER shipment of the batch is still unshipped the order genuinely owes more (the partial rule re-checks the order under its lock), and the
-        // shipments already shipped would never be judged again (the retry's open list excludes them), so their partial e-mails are flushed now. One e-mail
-        // per shipment (the kind carries the shipment id), so nothing can go out twice.
-        if (index < open.length - 1) await flushPartialEmails()
-        else discardPartialEmails()
+        // A failed batch judges NO partial e-mail: the failure may be the fence refusing the order flip AFTER the last shipment shipped, in which case the
+        // order is still PROCESSING while the store / WMS reported the whole order despatched. The retry either flips the order (dispatched e-mail, no
+        // partial) or ends in a terminal refusal; the shipments already shipped are not re-judged.
+        // ACCEPTED LIMIT (o3d-3634b): when a transient failure hits a non-last shipment, the partial e-mail of the shipments that already shipped is lost
+        // (the retry's open list excludes them), and the customer gets the dispatched e-mail only. Flushing instead would send "part of your order" for a
+        // despatch the external system reported as complete, which is false; a lost partial is the safer failure. Runbook step W lists it.
+        discardPartialEmails()
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: order.id,
@@ -1139,14 +1138,8 @@ export async function applyExternalFulfillmentUpdate(
       if (result.success && target === 'SHIPPED') shippedInBatch.push(shipment.id)
 
       if (!result.success) {
-        // A failed batch judges NO partial e-mail when the failing shipment is the LAST one: the failure may be the fence refusing the order flip AFTER it
-        // shipped, in which case the order is still PROCESSING while the store / WMS reported the whole order despatched, so "the rest will follow" would be
-        // false. The retry either flips the order (dispatched e-mail, no partial) or ends in a terminal refusal.
-        // When a LATER shipment of the batch is still unshipped the order genuinely owes more (the partial rule re-checks the order under its lock), and the
-        // shipments already shipped would never be judged again (the retry's open list excludes them), so their partial e-mails are flushed now. One e-mail
-        // per shipment (the kind carries the shipment id), so nothing can go out twice.
-        if (index < shipments.length - 1) await flushPartialEmails()
-        else discardPartialEmails()
+        // A failed batch judges NO partial e-mail (see the first loop: accepted limit, a lost partial is safer than a false one).
+        discardPartialEmails()
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: order.id,

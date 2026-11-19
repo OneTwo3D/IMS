@@ -13,7 +13,7 @@
 
 import { db } from '@/lib/db'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { isUndeliveredEmailCollision } from '@/lib/email-outbox'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -36,6 +36,9 @@ const SUBJECT: Record<StorefrontEmailKindName, (ref: string) => string> = {
   partial: (ref) => `Part of your order ${ref} has been dispatched`,
   delivered: (ref) => `Your order ${ref} has been delivered`,
 }
+
+/** The activity written when a held order's release is refused as history: the source of the hand-send `--paid-since` list. */
+export const RELEASE_NOT_SENT_ACTION = 'storefront_confirmation_not_sent_on_release'
 
 type EmailParams = { name: StorefrontEmailKindName; kind: string; orderId: string; shipmentId?: string; releasedAt?: Date }
 type InTxOutcome = { queued: false; reason: string } | { queued: true; ref: string }
@@ -176,7 +179,23 @@ export async function claimAndQueueConfirmationOnReleaseInTx(
   const outcome = await decideAndQueueUnderLock(tx, {
     name: 'confirmation', kind: STOREFRONT_CONFIRMATION_KIND, orderId, ...(options?.releasedAt ? { releasedAt: options.releasedAt } : {}),
   }, { enabledAt: parseStorefrontEmailEnabledAt(stampRow?.value), skipDuplicates: true })
-  if (!outcome.queued) return { claimed: true, queued: false, reason: outcome.reason, afterCommit: null }
+  if (!outcome.queued) {
+    // A confirmation refused because the order predates the switch-on (or is too old) is a hand-send candidate once it is paid: record it durably, in this
+    // transaction, so `npm run storefront:hand-send -- --paid-since <W>` can list it. (A release with the switch off is not recorded: nothing is owed then.)
+    if (outcome.reason === 'before_switch_on' || outcome.reason === 'too_old') {
+      await logActivityInTransaction(tx, {
+        userId: null,
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: RELEASE_NOT_SENT_ACTION,
+        tag: 'sales',
+        level: 'INFO',
+        description: `The order confirmation was not queued on release (${outcome.reason}); if the customer has none from WooCommerce it is sent by hand.`,
+        metadata: { reason: outcome.reason, ...(options?.releasedAt ? { releasedAt: options.releasedAt.toISOString() } : {}) },
+      })
+    }
+    return { claimed: true, queued: false, reason: outcome.reason, afterCommit: null }
+  }
   return { claimed: true, queued: true, afterCommit: () => recordQueued('confirmation', STOREFRONT_CONFIRMATION_KIND, orderId, outcome.ref).catch(() => undefined) }
 }
 

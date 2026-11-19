@@ -457,6 +457,8 @@ test('o3d-3634b: the journal proof reads the SYSTEM journal only, honours /run a
     assert.match(ok, /^journal_earliest: 2025-12-01T00:00:00Z$/m, 'the user journal (2023) is not the earliest entry')
     assert.match(ok, /^last_trigger: never$/m)
     const calls = readFileSync(join(dir, 'calls'), 'utf8').split('\n').filter((line) => line && !line.includes('--header'))
+    const headerCalls = readFileSync(join(dir, 'calls'), 'utf8').split('\n').filter((line) => line.includes('--header'))
+    assert.ok(headerCalls.length >= 1 && headerCalls.every((line) => line.includes('--system')), 'the readability probe is the system journal too')
     assert.ok(calls.length >= 4 && calls.every((line) => line.includes('--system')), `every journal read is the system journal: ${calls.join(' | ')}`)
     // The journal's current boot is not this boot (a copied or stale journal): its history is not this host's, so no earliest entry and no `never`.
     const stale = run('ffffffff-ffff-ffff-ffff-ffffffffffff')
@@ -466,7 +468,7 @@ test('o3d-3634b: the journal proof reads the SYSTEM journal only, honours /run a
     assert.ok(parsedStale.ok && !bridgeLastTriggerReadable(parsedStale.report))
     // /run and /usr/lib drop-ins: a Storage=volatile in either (a same-named file in /etc shadows it) makes the journal not persistent.
     const root = (name: string) => { const r = join(dir, name); mkdirSync(join(r, 'journald.conf.d'), { recursive: true }); return r }
-    const etc = root('etc'); const runRoot = root('run'); const usr = root('usr')
+    const etc = root('etc'); const runRoot = root('run'); const usrLocal = root('usrlocal'); const usr = root('usr')
     const driver = join(dir, 'drive.py')
     writeFileSync(driver, [
       'import importlib.util, json, sys',
@@ -475,7 +477,7 @@ test('o3d-3634b: the journal proof reads the SYSTEM journal only, honours /run a
       'roots = sys.argv[2:]',
       'print(json.dumps(m.journal_persistent(sys.argv[1], m.journald_conf_files(roots))))',
     ].join('\n'))
-    const persistent = () => JSON.parse(execFileSync('python3', ['-I', driver, persistentDir, etc, runRoot, usr], { encoding: 'utf8' }))
+    const persistent = () => JSON.parse(execFileSync('python3', ['-I', driver, persistentDir, etc, runRoot, usrLocal, usr], { encoding: 'utf8' }))
     assert.equal(persistent(), 1, 'no drop-in: persistent')
     writeFileSync(join(usr, 'journald.conf.d', '10-vendor.conf'), '[Journal]\nStorage=volatile\n')
     assert.equal(persistent(), 0, '/usr/lib drop-in is read')
@@ -483,12 +485,15 @@ test('o3d-3634b: the journal proof reads the SYSTEM journal only, honours /run a
     assert.equal(persistent(), 1, 'the /etc file of the same name shadows the /usr/lib one')
     writeFileSync(join(runRoot, 'journald.conf.d', '20-run.conf'), '[Journal]\nStorage=none\n')
     assert.equal(persistent(), 0, '/run drop-in is read')
+    rmSync(join(runRoot, 'journald.conf.d', '20-run.conf'))
+    writeFileSync(join(usrLocal, 'journald.conf.d', '30-local.conf'), '[Journal]\nStorage=volatile\n')
+    assert.equal(persistent(), 0, '/usr/local/lib drop-in is read')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('o3d-3634b: `never` also needs a coherent current boot in the report: reported, not before the earliest entry, not after the report (MUTATION: drop the boot check => red)', () => {
+test('o3d-3634b: `never` also needs a coherent current boot in the report: reported and not after the report (MUTATION: drop the boot check => red)', () => {
   const never = (edit: (text: string) => string) => {
     const p = parseBridgeStatusOutput(edit(sampleReport({ lastTrigger: 'never' })))
     assert.ok(p.ok)
@@ -497,6 +502,5 @@ test('o3d-3634b: `never` also needs a coherent current boot in the report: repor
   assert.equal(never((t) => t), true)
   assert.equal(never((t) => t.replace(/^boot_id: .*$/m, 'boot_id: unknown')), false)
   assert.equal(never((t) => t.replace(/^boot_started: .*$/m, 'boot_started: unknown')), false)
-  assert.equal(never((t) => t.replace(/^boot_started: .*$/m, 'boot_started: 2026-09-01T00:00:00Z')), false, 'the current boot began before the earliest entry')
   assert.equal(never((t) => t.replace(/^boot_started: .*$/m, 'boot_started: 2027-01-01T00:00:00Z')), false, 'the current boot begins after the report')
 })

@@ -2687,9 +2687,9 @@ export async function applySalesOrderStatusTransition(
         // marker written only by the import of a held order (`confirmationOnReleasePendingAt`). It is taken HERE, in the status transaction, after the move has
         // been validated and written: a crash loses neither the e-mail nor leaves the marker armed, and the atomic claim has one winner. The release time is the
         // storefront's paid time and only the full-bypass sync path carries it; an IMS-side move (operator, AUTH_ONLY) has none and is judged on placement.
-        // A move OUT of a despatch-pending status INTO a hold disarms an unconsumed marker: such an order was released by the allocation of a still-unpaid
-        // import (its payment is reported by WooCommerce `processing`, handled by `releaseStorefrontConfirmationOnPaid`), and a later hold-release must not
-        // confirm it at an unrelated moment.
+        // A move OUT of a despatch-pending status INTO an operator (IMS-side) hold disarms an unconsumed marker: such an order was released by the allocation of
+        // a still-unpaid import (its payment is reported by WooCommerce `processing`, handled by `releaseStorefrontConfirmationOnPaid`), and a later
+        // hold-release must not confirm it at an unrelated moment. A storefront-reported hold keeps it armed.
         releaseConfirmationAfterCommit = null
         if (
           (moved.previousStatus === 'PENDING_PAYMENT' || moved.previousStatus === 'ON_HOLD')
@@ -2701,6 +2701,9 @@ export async function applySalesOrderStatusTransition(
           releaseConfirmationAfterCommit = claim.afterCommit
         } else if (
           targetStatus === 'ON_HOLD'
+          // An IMS-side (operator) hold only: a hold WooCommerce itself reports (gateway review, bank transfer on-hold) arrives through the full bypass and
+          // keeps the marker armed, so the payment that follows (processing, with its paid time) still confirms.
+          && !bypassPermission
           && (moved.previousStatus === 'PROCESSING' || moved.previousStatus === 'ALLOCATED' || moved.previousStatus === 'PICKING' || moved.previousStatus === 'PACKING')
         ) {
           await tx.salesOrder.updateMany({ where: { id, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })

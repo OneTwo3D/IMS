@@ -26,7 +26,7 @@ test('o3d-3634b: release of an allocated-while-unpaid import, hold/release never
   const { applySalesOrderStatusTransition } = await import('../../app/actions/sales.ts')
   const { syncWcOrderStatus } = await import('../../lib/connectors/woocommerce/sync/order-status.ts')
   const { releaseStorefrontConfirmationOnPaid } = await import('../../lib/storefront-customer-email.ts')
-  const { INTERNAL_STATUS_TRANSITION_BYPASS } = await import('../../lib/sales/status-transition-bypass.ts')
+  const { INTERNAL_STATUS_TRANSITION_BYPASS, INTERNAL_STATUS_TRANSITION_AUTH_ONLY } = await import('../../lib/sales/status-transition-bypass.ts')
   const D = (v: string) => new Prisma.Decimal(v)
   const keys = ['storefront_customer_email_enabled', 'storefront_customer_email_enabled_at']
   const saved = await db.setting.findMany({ where: { key: { in: keys } } })
@@ -62,7 +62,8 @@ test('o3d-3634b: release of an allocated-while-unpaid import, hold/release never
   }
   const mails = (id: string) => db.emailOutbox.count({ where: { referenceId: id, kind: 'STOREFRONT_ORDER_CONFIRMATION' } })
   const marker = async (id: string) => (await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { confirmationOnReleasePendingAt: true } })).confirmationOnReleasePendingAt
-  const move = (id: string, status: string) => applySalesOrderStatusTransition(id, status as never, undefined, { internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS, pushStatusToWooCommerce: false })
+  const move = (id: string, status: string, token: symbol = INTERNAL_STATUS_TRANSITION_BYPASS) => applySalesOrderStatusTransition(id, status as never, undefined, { internalBypassToken: token, pushStatusToWooCommerce: false })
+  const wcStatus = (id: string, status: string, paidAt: Date | null) => ({ id: externalIds.get(id)!, number: String(externalIds.get(id)), status, date_paid_gmt: paidAt ? paidAt.toISOString().slice(0, 19) : null, date_modified_gmt: new Date().toISOString().slice(0, 19) }) as never
   const wcProcessing = (id: string, paidAt: Date) => ({ id: externalIds.get(id)!, number: String(externalIds.get(id)), status: 'processing', date_paid_gmt: paidAt.toISOString().slice(0, 19), date_modified_gmt: paidAt.toISOString().slice(0, 19) }) as never
 
   // (1a) The import allocated an unpaid order (status ALLOCATED, marker still armed); WooCommerce then reports `processing` (paid): ONE confirmation, marker consumed.
@@ -76,10 +77,29 @@ test('o3d-3634b: release of an allocated-while-unpaid import, hold/release never
 
   // (1b) The leftover marker cannot fire at an unrelated moment: allocated-while-unpaid, put on hold and released: nothing, marker disarmed by the hold.
   const held = await seed('hold', 'ALLOCATED', new Date(Date.now() - HOUR))
-  assert.equal((await move(held, 'ON_HOLD')).success, true)
-  assert.equal(await marker(held), null, 'the hold disarms the unconsumed marker')
-  assert.equal((await move(held, 'ALLOCATED')).success, true)
+  assert.equal((await move(held, 'ON_HOLD', INTERNAL_STATUS_TRANSITION_AUTH_ONLY)).success, true)
+  assert.equal(await marker(held), null, 'an operator hold disarms the unconsumed marker')
+  assert.equal((await move(held, 'ALLOCATED', INTERNAL_STATUS_TRANSITION_AUTH_ONLY)).success, true)
   assert.equal(await mails(held), 0, 'a hold-release of an allocated-while-unpaid import confirms nothing')
+
+  // (1d) A hold the STORE reports (gateway review / bank transfer on-hold) keeps the marker armed: pending import, auto-allocated, WC on-hold, WC processing (paid)
+  // => exactly ONE confirmation.
+  const storeHold = await seed('storehold', 'ALLOCATED', new Date(Date.now() - HOUR))
+  assert.equal((await syncWcOrderStatus(wcStatus(storeHold, 'on-hold', null))).success, true)
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: storeHold }, select: { status: true } })).status, 'ON_HOLD')
+  assert.notEqual(await marker(storeHold), null, 'a store-reported hold keeps the marker armed')
+  assert.equal(await mails(storeHold), 0, 'nothing is sent while it is on hold')
+  assert.equal((await syncWcOrderStatus(wcStatus(storeHold, 'processing', new Date()))).success, true)
+  assert.equal(await mails(storeHold), 1, 'the payment that follows confirms exactly once')
+  assert.equal((await syncWcOrderStatus(wcStatus(storeHold, 'processing', new Date()))).success, true)
+  assert.equal(await mails(storeHold), 1, 'a redelivery sends nothing more')
+
+  // (2) A pre-switch-on held order released (paid) after it: no confirmation, but the refusal is recorded durably (the source of `--paid-since`).
+  const pre = await seed('pre', 'PENDING_PAYMENT', new Date(enabledAt.getTime() - HOUR))
+  assert.equal((await move(pre, 'PROCESSING')).success, true)
+  assert.equal(await mails(pre), 0)
+  assert.equal(await db.activityLog.count({ where: { entityId: pre, action: 'storefront_confirmation_not_sent_on_release' } }), 1)
+  await db.activityLog.deleteMany({ where: { entityId: pre } })
 
   // (1c) Two racing releases queue exactly one e-mail (the claim is one atomic update).
   const race = await seed('race', 'ALLOCATED', new Date(Date.now() - HOUR))
@@ -96,7 +116,14 @@ test('o3d-3634b: release of an allocated-while-unpaid import, hold/release never
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: atomic }, select: { status: true } })).status, 'PENDING_PAYMENT', 'the status did not move')
   assert.notEqual(await marker(atomic), null, 'the marker is still armed')
   assert.equal(await mails(atomic), 0)
+  // The refusal-branch release (allocated-while-unpaid, WC processing) that cannot queue FAILS the webhook (so WooCommerce retries) and keeps the marker armed.
+  const retry = await seed('retry', 'ALLOCATED', new Date(Date.now() - HOUR))
+  const failed = await syncWcOrderStatus(wcProcessing(retry, new Date()))
+  assert.equal(failed.success, false, 'the delivery is not acknowledged')
+  assert.notEqual(await marker(retry), null)
   await db.$executeRawUnsafe('DROP TRIGGER o3d_3634b_block ON email_outbox')
+  assert.equal((await syncWcOrderStatus(wcProcessing(retry, new Date()))).success, true, 'the retry succeeds')
+  assert.equal(await mails(retry), 1)
   // The same order, retried once the queue works: the status moves and the confirmation is queued, exactly once.
   assert.equal((await move(atomic, 'PROCESSING')).success, true)
   assert.equal(await mails(atomic), 1)

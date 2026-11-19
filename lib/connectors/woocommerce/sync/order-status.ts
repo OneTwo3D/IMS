@@ -159,7 +159,9 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
       if (targetStatus === 'PROCESSING' && IMS_FULFILMENT_IN_PROGRESS.has(so.status)) {
         const paid = wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null
         const { releaseStorefrontConfirmationOnPaid } = await import('@/lib/storefront-customer-email')
-        await releaseStorefrontConfirmationOnPaid(so.id, paid && Number.isFinite(paid.getTime()) ? { releasedAt: paid } : undefined)
+        const released = await releaseStorefrontConfirmationOnPaid(so.id, paid && Number.isFinite(paid.getTime()) ? { releasedAt: paid } : undefined)
+        // The release rolled back (the marker is still armed): fail the delivery so the webhook inbox retries it, instead of acknowledging a lost e-mail.
+        if (released.reason === 'error') return { success: false, error: `Could not queue the release confirmation for order #${so.externalOrderNumber}; it will be retried` }
       }
       await logActivity({
         entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_skipped_backwards', tag: 'sync', level: 'INFO',
@@ -187,7 +189,8 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
       // The order moved on (allocation) between the read and the write: the same release as above.
       if (targetStatus === 'PROCESSING') {
         const { releaseStorefrontConfirmationOnPaid } = await import('@/lib/storefront-customer-email')
-        await releaseStorefrontConfirmationOnPaid(so.id, releasedAt ? { releasedAt } : undefined)
+        const released = await releaseStorefrontConfirmationOnPaid(so.id, releasedAt ? { releasedAt } : undefined)
+        if (released.reason === 'error') return { success: false, error: `Could not queue the release confirmation for order #${so.externalOrderNumber}; it will be retried` }
       }
       await logActivity({
         entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_skipped_backwards', tag: 'sync', level: 'INFO',

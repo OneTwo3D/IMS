@@ -1,7 +1,8 @@
 /**
- * `npm run storefront:hand-send -- [--natives-off-at <ISO>] [--switch-on-at <ISO>]` — read-only list for runbook step W: storefront orders whose confirmation
- * nobody sends (open unpaid held orders, and orders placed between natives-off and the switch-on). See lib/ops/storefront-held-orders-at-w.ts.
- * Without `--switch-on-at` the stored switch-on instant is used; without `--natives-off-at` only the held list is printed.
+ * `npm run storefront:hand-send -- [--natives-off-at <ISO>] [--paid-since <ISO>] [--switch-on-at <ISO>]` — read-only lists for runbook step W (see
+ * lib/ops/storefront-held-orders-at-w.ts for what each row means and whether to send). Without `--switch-on-at` the stored switch-on instant is used (no
+ * stamp = nothing is listed). Held-unpaid is always listed; `--natives-off-at` adds the paid orders of the gap; `--paid-since` adds the pre-switch-on orders
+ * that were paid since. Nothing here confirms an unpaid order and nothing duplicates an IMS send.
  */
 import { config } from 'dotenv'
 
@@ -25,8 +26,9 @@ async function main() {
   const { readStorefrontCustomerEmailEnabledAt } = await import('../lib/domain/storefront-customer-email/switch')
   const { listStorefrontHandSendOrders, renderHandSendList } = await import('../lib/ops/storefront-held-orders-at-w')
   const nativesOffAt = instant('natives-off-at')
+  const paidSince = instant('paid-since')
   const switchOnAt = instant('switch-on-at') ?? await readStorefrontCustomerEmailEnabledAt()
-  console.log(renderHandSendList(await listStorefrontHandSendOrders({ nativesOffAt, switchOnAt })))
+  console.log(renderHandSendList(await listStorefrontHandSendOrders({ nativesOffAt, paidSince, switchOnAt })))
   await db.$disconnect()
 }
 

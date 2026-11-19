@@ -395,7 +395,7 @@ test('PARTIAL e-mail: when a later shipment of the batch FAILS (the fence refusi
   assert.deepEqual(partialFlushes, [['shp-1', 'shp-2']], 'CONTROL: a successful batch is flushed once')
 })
 
-test('o3d-3634b PARTIAL e-mail: when a MIDDLE shipment fails and a later one is still unshipped, the partial e-mails of the shipments that DID ship are flushed (the retry never judges them again); the failing LAST shipment still flushes nothing (MUTATION: always discard => red)', async () => {
+test('o3d-3634b PARTIAL e-mail: a failure on a NON-last shipment flushes no partial either (the external system reported the whole despatch; a partial would be false). Accepted limit: that partial is lost (MUTATION: flush on a middle failure => red)', async () => {
   reset()
   state.openShipments = [{ id: 'shp-1', status: 'PACKED' }, { id: 'shp-2', status: 'PACKED' }, { id: 'shp-3', status: 'PACKED' }]
   state.totalShipments = 3
@@ -404,13 +404,5 @@ test('o3d-3634b PARTIAL e-mail: when a MIDDLE shipment fails and a later one is 
   const result = await apply()
   assert.equal(result.success, false)
   assert.equal(state.transitions.length, 2, 'precondition: shipment 1 shipped, shipment 2 failed, shipment 3 was never attempted')
-  assert.deepEqual(partialFlushes, [['shp-1']], 'only the shipment that shipped, once')
-  // the failing LAST shipment: no partial (the order may be complete in the store)
-  reset()
-  state.openShipments = [{ id: 'shp-1', status: 'PACKED' }, { id: 'shp-2', status: 'PACKED' }, { id: 'shp-3', status: 'PACKED' }]
-  state.totalShipments = 3
-  call = 0
-  state.shipmentResults = () => (++call === 3 ? { success: false, error: 'fence refused' } : { success: true })
-  await apply()
-  assert.deepEqual(partialFlushes, [], 'the last shipment failing flushes nothing')
+  assert.deepEqual(partialFlushes, [], 'no partial e-mail is judged on any failure')
 })
