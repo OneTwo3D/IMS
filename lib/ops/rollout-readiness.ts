@@ -313,24 +313,70 @@ export async function collectAccountingReconciliationReadiness(
   return { latest, proof, blockers, warnings }
 }
 
+/**
+ * o3d-65f4b: what an `?allowWarnings=true` override writes to the audit trail: who, when, which warnings.
+ * The sink (the activity log) redacts; this module stays free of the auth stack so the CLI gate can import it.
+ */
+export type ReadinessOverrideAuditEntry = {
+  actorId: string
+  at: string
+  warnings: Array<{ id: string; source: string; message: string }>
+}
+
+/**
+ * `?allowWarnings=true` turns a warnings-only report into HTTP 200, so it is an OVERRIDE and is gated twice over:
+ *  - it needs a signed-in ADMIN (`resolveOverrideActor` returns the admin's user id, or null). Without a resolver, or
+ *    without an admin, the request is REFUSED with 403 rather than quietly served without the flag: a caller who
+ *    asked for an override and did not get it must be told, not handed a 412 that reads as "the system has warnings".
+ *  - it must leave an audit row BEFORE it takes effect. If the row cannot be written the override is not applied
+ *    (HTTP 412, header `X-Readiness-Override: not-applied-audit-failed`), because an unrecorded override is the
+ *    thing this exists to prevent. Blockers are never overridden, so no row is written for them.
+ */
 export function createRolloutReadinessHandler({
   authorize,
   collect = collectCachedRolloutReadiness,
+  resolveOverrideActor,
+  recordOverride,
 }: {
   authorize: AdminHealthAuthorizer
   collect?: () => Promise<RolloutReadinessResponse>
+  resolveOverrideActor?: () => Promise<{ id: string } | null>
+  recordOverride?: (entry: ReadinessOverrideAuditEntry) => Promise<boolean>
 }) {
   return async function rolloutReadinessHandler(request?: Request) {
     const denyResponse = await authorize()
     if (denyResponse) return denyResponse
 
-    const report = await collect()
     const allowWarnings = request ? new URL(request.url).searchParams.get('allowWarnings') === 'true' : false
-    const statusCode = report.status === 'ready' || (report.status === 'warning' && allowWarnings) ? 200 : 412
-    return Response.json(report, {
-      status: statusCode,
-      headers: HEALTH_NO_STORE_HEADERS,
-    })
+    let actor: { id: string } | null = null
+    if (allowWarnings) {
+      actor = resolveOverrideActor ? await resolveOverrideActor() : null
+      if (!actor) {
+        return Response.json(
+          { error: 'Forbidden', message: 'allowWarnings=true overrides warnings and requires a signed-in administrator.' },
+          { status: 403, headers: HEALTH_NO_STORE_HEADERS },
+        )
+      }
+    }
+
+    const report = await collect()
+    let statusCode = report.status === 'ready' ? 200 : 412
+    const headers: Record<string, string> = { ...HEALTH_NO_STORE_HEADERS }
+    if (report.status === 'warning' && allowWarnings && actor) {
+      const recorded = recordOverride
+        ? await recordOverride({
+          actorId: actor.id,
+          at: new Date().toISOString(),
+          warnings: report.warnings.map((warning) => ({ id: warning.id, source: warning.source, message: warning.message })),
+        }).catch(() => false)
+        : false
+      if (recorded) {
+        statusCode = 200
+      } else {
+        headers['X-Readiness-Override'] = 'not-applied-audit-failed'
+      }
+    }
+    return Response.json(report, { status: statusCode, headers })
   }
 }
 
@@ -426,6 +472,17 @@ export async function getAccountingReconciliationHistory(
   `
   const recordedBeforeNewest = recordedBefore[0]?.found === true
 
+  // o3d-65f4b: does any legacy NULL row remain besides the run(s) being judged? Computed on every read.
+  const judgedIds = newest.tiedRunIds && newest.tiedRunIds.length > 0 ? newest.tiedRunIds : [newest.id]
+  const otherNull = await client.$queryRaw<Array<{ found: boolean }>>`
+    SELECT EXISTS (
+      SELECT 1 FROM "accounting_reconciliation_runs"
+      WHERE "truncations" IS NULL
+        AND "id" <> ALL(${judgedIds}::text[])
+    ) AS "found"
+  `
+  const otherNullRowsRemain = otherNull[0]?.found === true
+
   // Raw SQL rather than findMany: Prisma hands back a JSON `null` payload as JS `null`, which is exactly
   // what an SQL NULL looks like — and the two mean different things here. SQL NULL is "not recorded"; a
   // JSON null is a non-NULL record that is not an array, i.e. UNREADABLE. `jsonb_typeof` tells them apart,
@@ -462,6 +519,7 @@ export async function getAccountingReconciliationHistory(
     })),
     overflow: rows.length > RECONCILIATION_HISTORY_READ_LIMIT,
     recordedBeforeNewest,
+    otherNullRowsRemain,
   }
 }
 
@@ -784,6 +842,20 @@ function classifyInvariantCheck(
     return
   }
 
+  // o3d-65f4b: a run EXISTS but its count payload cannot be read, so whether it found anything critical is unknown.
+  // That is a blocker no override passes (`?allowWarnings=true`; the CLI gate's acceptance file only covers findings
+  // the gate labels warnings). "No run found" (lastRunAt null) keeps its warning.
+  if (check.countShape === 'mismatch' && check.lastRunAt !== null) {
+    blockers.push({
+      id: 'latest-invariant-check:count-shape-unreadable',
+      severity: 'blocker',
+      source: 'invariants',
+      message: check.message ?? 'Latest invariant check count payload is unrecognized, so its critical count is unknown.',
+      details: latestOperationDetails(check),
+    })
+    return
+  }
+
   if (check.status !== 'ok') {
     warnings.push({
       id: 'latest-invariant-check',
@@ -1050,8 +1122,9 @@ export function classifyReconciliationProof(
       severity: proof.notRecordedAfterRecording ? 'blocker' : 'warning',
       source: 'accounting-reconciliation',
       message: proof.notRecordedAfterRecording
-        ? 'The newest accounting reconciliation run did not record whether it was complete, although earlier runs '
-          + 'did: the build that wrote it is not recording completeness. Run reconciliation again on this build.'
+        ? 'The newest accounting reconciliation run did not record whether it was complete, although recording has '
+          + 'begun (earlier runs recorded it, or no older run without a record remains): the build that wrote it is not '
+          + 'recording completeness. Run reconciliation again on this build.'
         : 'The newest accounting reconciliation run predates completeness recording, so whether it was complete '
           + 'is unknown. Run reconciliation again on this build.',
     }

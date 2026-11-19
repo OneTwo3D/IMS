@@ -208,6 +208,8 @@ test('rollout readiness handler uses precondition-failed for blocked and warning
   })
   const warningHandler = createRolloutReadinessHandler({
     authorize: async () => null,
+    resolveOverrideActor: async () => ({ id: 'admin-1' }),
+    recordOverride: async () => true,
     collect: async () => collectRolloutReadiness(createAdapters({
       latestAccountingReconciliationRun: null,
     })),
@@ -459,3 +461,115 @@ function okLatest(lastStatus: string) {
     reference: 'ok-ref',
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// o3d-65f4b: audited admin-only override, unreadable invariant counts block, not-recorded escalation.
+// ---------------------------------------------------------------------------------------------
+
+function warningCollect() {
+  return () => collectRolloutReadiness(createAdapters({ latestAccountingReconciliationRun: null }))
+}
+const WARN_URL = 'https://ims.example.test/api/admin/rollout-readiness?allowWarnings=true'
+
+test('[o3d-65f4b] allowWarnings is refused with 403 when no admin actor resolves, and collects nothing', async () => {
+  let collected = false
+  const audits: unknown[] = []
+  for (const resolveOverrideActor of [undefined, async () => null]) {
+    const handler = createRolloutReadinessHandler({
+      authorize: async () => null,
+      collect: async () => { collected = true; return warningCollect()() },
+      resolveOverrideActor,
+      recordOverride: async (entry) => { audits.push(entry); return true },
+    })
+    const response = await handler(new Request(WARN_URL))
+    assert.equal(response.status, 403)
+  }
+  assert.equal(collected, false)
+  assert.deepEqual(audits, [])
+})
+
+test('[o3d-65f4b] an admin override of a warnings-only report is audited (who, when, which warnings) and then applied', async () => {
+  const audits: Array<{ actorId: string; at: string; warnings: Array<{ id: string }> }> = []
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: warningCollect(),
+    resolveOverrideActor: async () => ({ id: 'admin-1' }),
+    recordOverride: async (entry) => { audits.push(entry); return true },
+  })
+  const response = await handler(new Request(WARN_URL))
+  assert.equal(response.status, 200)
+  assert.equal(audits.length, 1)
+  assert.equal(audits[0]!.actorId, 'admin-1')
+  assert.ok(Number.isFinite(Date.parse(audits[0]!.at)))
+  assert.ok(audits[0]!.warnings.length > 0)
+  // Without the flag nothing is written and the warning still answers 412.
+  const plain = await handler(new Request('https://ims.example.test/api/admin/rollout-readiness'))
+  assert.equal(plain.status, 412)
+  assert.equal(audits.length, 1)
+})
+
+test('[o3d-65f4b] if the audit row cannot be written the override is NOT applied', async () => {
+  for (const recordOverride of [async () => false, async () => { throw new Error('db down') }]) {
+    const handler = createRolloutReadinessHandler({
+      authorize: async () => null,
+      collect: warningCollect(),
+      resolveOverrideActor: async () => ({ id: 'admin-1' }),
+      recordOverride,
+    })
+    const response = await handler(new Request(WARN_URL))
+    assert.equal(response.status, 412)
+    assert.equal(response.headers.get('X-Readiness-Override'), 'not-applied-audit-failed')
+  }
+})
+
+test('[o3d-65f4b] a blocked report is never overridden and writes no audit row', async () => {
+  const audits: unknown[] = []
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: async () => collectRolloutReadiness(createAdapters({
+      preflight: createPreflight([{ id: 'database-url', name: 'DATABASE_URL', status: 'fail', message: 'required' }]),
+    })),
+    resolveOverrideActor: async () => ({ id: 'admin-1' }),
+    recordOverride: async (entry) => { audits.push(entry); return true },
+  })
+  assert.equal((await handler(new Request(WARN_URL))).status, 412)
+  assert.deepEqual(audits, [])
+})
+
+test('[o3d-65f4b] an unreadable invariant count shape is a BLOCKER that allowWarnings cannot pass', async () => {
+  const health = createAdminHealth()
+  health.checks.latestInvariantCheck = {
+    ...health.checks.latestInvariantCheck,
+    status: 'warning',
+    message: 'Invariant check count payload is unrecognized',
+    lastRunAt: FIXED_DATE.toISOString(),
+    criticalCount: 0,
+    countShape: 'mismatch',
+  }
+  const report = await collectRolloutReadiness(createAdapters({ adminHealth: health }))
+  assert.equal(report.status, 'blocked')
+  assert.ok(report.blockers.some((finding) => finding.id === 'latest-invariant-check:count-shape-unreadable'))
+  assert.equal(report.warnings.some((finding) => finding.id === 'latest-invariant-check'), false)
+  const audits: unknown[] = []
+  const handler = createRolloutReadinessHandler({
+    authorize: async () => null,
+    collect: async () => report,
+    resolveOverrideActor: async () => ({ id: 'admin-1' }),
+    recordOverride: async (entry) => { audits.push(entry); return true },
+  })
+  assert.equal((await handler(new Request(WARN_URL))).status, 412)
+  assert.deepEqual(audits, [])
+})
+
+test('[o3d-65f4b] "no invariant run found" (no run, shape unknown) stays a warning', async () => {
+  const health = createAdminHealth()
+  health.checks.latestInvariantCheck = {
+    ...health.checks.latestInvariantCheck,
+    status: 'warning',
+    lastRunAt: null,
+    criticalCount: 0,
+    countShape: 'mismatch',
+  }
+  const report = await collectRolloutReadiness(createAdapters({ adminHealth: health }))
+  assert.equal(report.status, 'warning')
+})

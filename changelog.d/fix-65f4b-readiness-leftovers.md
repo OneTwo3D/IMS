@@ -1,0 +1,5 @@
+### Rollout readiness: audited override, unreadable invariant counts block, not-recorded escalation (ops)
+
+- **`/api/admin/rollout-readiness?allowWarnings=true` now needs a signed-in administrator and is audited.** Any other caller gets HTTP 403 and the flag is not honoured. A warnings-only report answered 200 through the override first writes an activity-log row (action `rollout_readiness.allow_warnings_override`: who, when, which warnings, redacted); if the row cannot be written the override is not applied (HTTP 412, `X-Readiness-Override: not-applied-audit-failed`). The CLI gate and its acceptance file are unchanged.
+- **Changed behaviour: a latest invariant check whose count payload is unreadable is now a blocker** (it was a warning that `allowWarnings=true` passed). "No invariant run found" stays a warning.
+- **Changed behaviour: a not-recorded newest reconciliation run becomes a blocker once no other run with a NULL completeness record remains** (computed on every read; while an older NULL row exists it stays a warning).
