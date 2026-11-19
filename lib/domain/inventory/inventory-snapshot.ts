@@ -1125,7 +1125,7 @@ export async function backfillInventorySnapshots(options: {
 
     if (movementPageIndex >= movementPage.length) {
       movementPage = await client.stockMovement.findMany({
-        where: { createdAt: { gte: fromDate } },
+        where: { createdAt: { gte: startOfNextBusinessDay(addUtcDays(fromDate, -1)) } },
         select: {
           id: true,
           type: true,
@@ -1167,7 +1167,7 @@ export async function backfillInventorySnapshots(options: {
     }
   }
 
-  await reverseMovementsOnOrAfter(startOfNextUtcDay(toDate))
+  await reverseMovementsOnOrAfter(startOfNextBusinessDay(toDate))
 
   // scjz.43/.48: backfilled values seed from CURRENT cost layers. A snapshot for
   // pair (p,w) on day D is point-in-time accurate only if no cost layer for that
@@ -1178,7 +1178,7 @@ export async function backfillInventorySnapshots(options: {
   // [fromDate, toDate] stale (an earlier one is already reflected for every day
   // in range), so bound the scan instead of loading the whole log.
   const revaluationRows = await client.costLayerRevaluation.findMany({
-    where: { effectiveAt: { gte: startOfNextUtcDay(fromDate) } },
+    where: { effectiveAt: { gte: startOfNextBusinessDay(fromDate) } },
     select: { effectiveAt: true, costLayer: { select: { productId: true, warehouseId: true } } },
   }) as Array<{ effectiveAt: Date; costLayer: { productId: string; warehouseId: string } | null }>
   for (const row of revaluationRows) {
@@ -1192,7 +1192,7 @@ export async function backfillInventorySnapshots(options: {
     // A reversed null-value movement is baked into this and every earlier day.
     if (nullValueAffectedPairs.has(key)) return false
     const latest = latestRevalByPair.get(key)
-    return latest == null || startOfNextUtcDay(day) > latest
+    return latest == null || startOfNextBusinessDay(day) > latest
   }
 
   for (let day = toDate; day >= fromDate; day = addUtcDays(day, -1)) {
@@ -1209,12 +1209,12 @@ export async function backfillInventorySnapshots(options: {
         snapshotCount: rows.length,
         source: 'backfill',
         checkMethod: INVENTORY_SNAPSHOT_BACKFILL_CHECK_METHOD,
-        cutoffAt: startOfNextUtcDay(day),
+        cutoffAt: startOfNextBusinessDay(day),
       })
     }
 
     if (options.includeReservationSnapshots) {
-      const cutoff = startOfNextUtcDay(day)
+      const cutoff = startOfNextBusinessDay(day)
       const unsupportedWarnings = reservationSupport
         ? reservationBackfillUnsupportedWarnings(day, cutoff, reservationSupport)
         : []
@@ -1259,7 +1259,7 @@ export async function backfillInventorySnapshots(options: {
       }
     }
 
-    await reverseMovementsOnOrAfter(day)
+    await reverseMovementsOnOrAfter(startOfNextBusinessDay(addUtcDays(day, -1)))
   }
 
   // scjz.48: backfilled values seed from CURRENT cost layers, so any revaluation
@@ -1269,7 +1269,7 @@ export async function backfillInventorySnapshots(options: {
   // a backfilled date unreliable. Surface the count and downgrade reliability
   // rather than silently writing post-revaluation values onto historical dates.
   const postBackfillRevaluationCount = await client.costLayerRevaluation.count({
-    where: { effectiveAt: { gte: startOfNextUtcDay(fromDate) } },
+    where: { effectiveAt: { gte: startOfNextBusinessDay(fromDate) } },
   })
 
   return {

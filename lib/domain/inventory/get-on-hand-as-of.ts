@@ -320,8 +320,9 @@ function businessDayLabel(instant: Date): Date {
  * The instant a snapshot's content stops: movements at or after it are NOT in the snapshot. Snapshots are labelled by London business day, so in BST this
  * is 23:00Z of the label day, not 24:00Z. The run row's stored `cutoffAt` is authoritative (it is what the writer stamped, and backfilled days stamp their own
  * UTC cutoff); with none stored, fall back to the end of the London day the label names (identical to the UTC day in GMT). RESIDUAL (o3d-cr517): a legacy BST
- * run written before the label moved to the London day AND with no stored cutoff is read as a London-labelled day; its movements in the one-hour window are
- * attributed by the London convention.
+ * run written before the label moved to the London day (the cron fired at London 00:00 and labelled the run D-1, so its content runs to D 23:00Z) AND with no
+ * stored cutoff is read with a cutoff at D-1 23:00Z, so about 24h (a whole day, not one hour) of movements is double-applied by forward replay. This falls under
+ * the accepted relabel limit documented on `previousBusinessDate` (inventory-snapshot.ts).
  */
 async function loadSnapshotCutoff(client: OnHandAsOfClient, snapshotDate: Date): Promise<Date> {
   const run = await client.inventorySnapshotRun.findUnique({
@@ -823,7 +824,7 @@ async function replayMovements(
  *
  * Time semantics:
  * - String inputs must be `YYYY-MM-DD` and name a Europe/London business day: the as-of is the END of that London day (23:00Z in BST), the same day
- *   convention snapshots are labelled by. The returned `asOf` stays the end-of-UTC-day label proxy.
+ *   convention snapshots are labelled by. The returned `asOf` is the last millisecond of that London day (22:59:59.999Z in BST).
  * - Date/number inputs are accepted for exact instants; ISO datetime strings are intentionally rejected.
  * - `asOf` is inclusive. Snapshot anchors are exclusive: replay starts/ends at the snapshot's own `cutoffAt` (the run row's stored value, else the end of
  *   its London label day), never at a UTC midnight.
@@ -847,10 +848,11 @@ export async function getOnHandAsOf(options: {
   const client = options.client ?? db
   const now = options.now?.() ?? new Date()
   const { asOf, isDateOnly } = parseAsOf(options.asOf)
-  // A date-only as-of NAMES a London business day (the day snapshots are labelled by); `asOf` itself stays the end-of-UTC-day label proxy that reports
-  // and the reservation-snapshot lookup key on. Every boundary below comes from `dayEnd` (start of the next London day), never from the UTC day.
+  // A date-only as-of NAMES a London business day (the day snapshots are labelled by); `asOf` is the raw parsed value (an end-of-UTC-day proxy for date-only); the returned asOf is `resultAsOf` below. Every boundary below comes from `dayEnd` (start of the next London day), never from the UTC day.
   const asOfDay = isDateOnly ? startOfUtcDay(asOf) : businessDayLabel(asOf)
   const dayEnd = startOfNextBusinessDay(asOfDay)
+  // The instant reported back: a date-only as-of ends at the last millisecond of the London day (22:59:59.999Z in BST), a precise instant is echoed as given.
+  const resultAsOf = isDateOnly ? new Date(dayEnd.getTime() - 1) : asOf
   if (isDateOnly ? asOfDay > businessDayLabel(now) : asOf > endOfUtcDay(now)) {
     throw new InventoryAsOfFutureError()
   }
@@ -868,7 +870,7 @@ export async function getOnHandAsOf(options: {
   if (isDateOnly ? dayEnd > now : asOf >= now) {
     const { state, driftCount } = await loadCurrentState(client, filters)
     return buildResult({
-      asOf,
+      asOf: resultAsOf,
       generatedAt: now,
       anchorDate: null,
       source: 'current',
@@ -895,28 +897,32 @@ export async function getOnHandAsOf(options: {
   const postAsOfRevaluationLowerBound: Prisma.DateTimeFilter = isDateOnly
     ? { gte: dayEnd }
     : { gt: asOf }
+  // Replay range that moves a snapshot whose content stops at `cutoff` to the as-of bound, in either direction. cutoff <= bound: apply the movements in
+  // [cutoff, bound) forward. cutoff > bound: reverse the movements in [bound, cutoff) out of the snapshot (date-only bound is the exclusive `dayEnd`;
+  // a precise instant is inclusive, so only movements after it are reversed).
+  const anchorReplayRange = (cutoff: Date): { range: ReplayDateRange; direction: 'forward' | 'reverse' } => {
+    const cutoffAfterBound = isDateOnly ? cutoff > dayEnd : cutoff > asOf
+    return cutoffAfterBound
+      ? { range: { ...asOfLowerBound, lt: cutoff }, direction: 'reverse' }
+      : { range: { gte: cutoff, ...asOfUpperBound }, direction: 'forward' }
+  }
   // A precise instant inside day D cannot anchor on D's own snapshot (it holds the whole of D), so only strictly earlier labels qualify as prior.
   const priorSnapshotDate = await findPriorSnapshotDate(client, asOfDay, isDateOnly)
   if (priorSnapshotDate) {
     const priorCutoff = await loadSnapshotCutoff(client, priorSnapshotDate)
     const state = await loadSnapshotState(client, priorSnapshotDate, filters)
-    const replay = await replayMovements(
-      client,
-      state,
-      filters,
-      { gte: priorCutoff, ...asOfUpperBound },
-      'forward',
-      options.signal,
-    )
-    // Two distinct snapshot-backed inaccuracies: (a) a revaluation in
-    // (priorSnapshotDate, asOf] the forward replay does not apply (movements carry
+    // The anchor's cutoff is NOT always at or before the as-of bound: a backfilled summer-time day carries a cutoff past its own London day end (legacy
+    // runs stored UTC midnight), so the snapshot already holds movements beyond the bound. Those are reversed out, never left in (o3d-cr517).
+    const anchorRange = anchorReplayRange(priorCutoff)
+    const replay = await replayMovements(client, state, filters, anchorRange.range, anchorRange.direction, options.signal)
+    // Two distinct snapshot-backed inaccuracies: (a) a revaluation between the anchor and asOf the replay does not apply (movements carry
     // value, not cost-layer revaluations), and (b) the loaded snapshot row itself
     // persisted stale at write (backfilled from a later basis or missing-value).
     // Tracked separately so reports give the right reason (scjz.43/.48).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { gte: priorCutoff, ...asOfUpperBound })
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, anchorRange.range)
     const staleSnapshotCount = await countUnreliableSnapshots(client, priorSnapshotDate, filters)
     return buildResult({
-      asOf,
+      asOf: resultAsOf,
       generatedAt: now,
       anchorDate: priorSnapshotDate,
       source: 'snapshot_forward_replay',
@@ -932,23 +938,17 @@ export async function getOnHandAsOf(options: {
   if (futureSnapshotDate) {
     const futureCutoff = await loadSnapshotCutoff(client, futureSnapshotDate)
     const state = await loadSnapshotState(client, futureSnapshotDate, filters)
-    const replay = await replayMovements(
-      client,
-      state,
-      filters,
-      { ...asOfLowerBound, lt: futureCutoff },
-      'reverse',
-      options.signal,
-    )
+    const anchorRange = anchorReplayRange(futureCutoff)
+    const replay = await replayMovements(client, state, filters, anchorRange.range, anchorRange.direction, options.signal)
     // The future snapshot is frozen at a date AFTER asOf, so it already reflects any
     // revaluation effective up to then; reversing movements does not undo a
     // revaluation. Flag revaluations in (asOf, futureSnapshotDate], plus a future
     // snapshot row itself flagged stale at write (backfilled from a later basis) —
     // either makes the reversed-to-asOf basis not point-in-time (scjz.43/.48).
-    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, { ...postAsOfRevaluationLowerBound, lt: futureCutoff })
+    const postAsOfRevaluationCount = await countPostAsOfRevaluations(client, filters, anchorRange.range)
     const staleSnapshotCount = await countUnreliableSnapshots(client, futureSnapshotDate, filters)
     return buildResult({
-      asOf,
+      asOf: resultAsOf,
       generatedAt: now,
       anchorDate: futureSnapshotDate,
       source: 'future_snapshot_reverse_replay',
@@ -978,7 +978,7 @@ export async function getOnHandAsOf(options: {
       options.signal,
     )
     return buildResult({
-      asOf,
+      asOf: resultAsOf,
       generatedAt: now,
       anchorDate: null,
       source: 'current_reverse_replay',

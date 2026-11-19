@@ -733,23 +733,18 @@ async function loadReservationSnapshotRun(
   }) as ReservationSnapshotRunReportRow | null
 }
 
-function isEndOfUtcDay(value: Date): boolean {
-  return value.getUTCHours() === 23 &&
-    value.getUTCMinutes() === 59 &&
-    value.getUTCSeconds() === 59 &&
-    value.getUTCMilliseconds() === 999
-}
-
 function isReservationSnapshotEligibleSource(source: string): boolean {
   return source === 'snapshot_forward_replay' || source === 'future_snapshot_reverse_replay'
 }
 
 function snapshotDateFromAsOf(asOf: string): Date | null {
-  // getOnHandAsOf date-only inputs return end-of-day UTC. Reservation snapshots
-  // are daily end-of-day evidence, so mid-day asOf values cannot use them.
+  // getOnHandAsOf date-only inputs return the last millisecond of the London business day (22:59:59.999Z in BST, 23:59:59.999Z in GMT). Reservation
+  // snapshots are daily end-of-day evidence labelled by that London day, so mid-day asOf values cannot use them.
   const value = new Date(asOf)
-  if (Number.isNaN(value.getTime()) || !isEndOfUtcDay(value)) return null
-  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()))
+  if (Number.isNaN(value.getTime())) return null
+  const [year, month, day] = businessDateYmd(value).split('-').map(Number)
+  const label = new Date(Date.UTC(year!, month! - 1, day!))
+  return startOfNextBusinessDay(label).getTime() - 1 === value.getTime() ? label : null
 }
 
 function reservationScopeFromCounts(input: {

@@ -48,7 +48,7 @@ function makeClient(overrides: Partial<StockPositionReportClient>): StockPositio
 test('stock-on-hand report enriches as-of rows, totals the full filtered set, and paginates', async (t) => {
   void t
   const getOnHandAsOf = async () => ({
-    asOf: '2026-06-01T23:59:59.999Z',
+    asOf: '2026-06-01T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: '2026-06-01',
     source: 'snapshot_forward_replay' as const,
@@ -148,7 +148,7 @@ test('stock-on-hand current report keeps live reservation scope', async () => {
 
 test('stock-on-hand as-of report uses reservation snapshots when available', async () => {
   const getOnHandAsOf = async () => ({
-    asOf: '2026-06-01T23:59:59.999Z',
+    asOf: '2026-06-01T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: '2026-06-01',
     source: 'snapshot_forward_replay' as const,
@@ -200,7 +200,7 @@ test('stock-on-hand as-of report uses reservation snapshots when available', asy
 
 test('stock-on-hand as-of report surfaces missing reservation snapshots and marks current fallback rows', async () => {
   const getOnHandAsOf = async () => ({
-    asOf: '2026-06-01T23:59:59.999Z',
+    asOf: '2026-06-01T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: '2026-06-01',
     source: 'snapshot_forward_replay' as const,
@@ -243,7 +243,7 @@ test('stock-on-hand as-of report surfaces missing reservation snapshots and mark
 
 test('stock-on-hand as-of report treats sparse missing rows as zero reserved when the snapshot run exists', async () => {
   const getOnHandAsOf = async () => ({
-    asOf: '2026-06-01T23:59:59.999Z',
+    asOf: '2026-06-01T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: '2026-06-01',
     source: 'snapshot_forward_replay' as const,
@@ -292,7 +292,7 @@ test('stock-on-hand as-of report treats sparse missing rows as zero reserved whe
 
 test('stock-on-hand as-of report marks mixed snapshot and current fallback rows when no run marker exists', async () => {
   const getOnHandAsOf = async () => ({
-    asOf: '2026-06-01T23:59:59.999Z',
+    asOf: '2026-06-01T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: '2026-06-01',
     source: 'snapshot_forward_replay' as const,
@@ -351,7 +351,7 @@ test('stock-on-hand as-of report marks mixed snapshot and current fallback rows 
 
 test('stock-on-hand current reverse replay uses current reservations instead of reservation snapshots', async () => {
   const getOnHandAsOf = async () => ({
-    asOf: '2026-06-01T23:59:59.999Z',
+    asOf: '2026-06-01T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: null,
     source: 'current_reverse_replay' as const,
@@ -394,7 +394,7 @@ test('stock-on-hand current reverse replay uses current reservations instead of 
 
 test('stock-on-hand reservation snapshot lookup filters cross-pair noise', async () => {
   const getOnHandAsOf = async () => ({
-    asOf: '2026-06-01T23:59:59.999Z',
+    asOf: '2026-06-01T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: '2026-06-01',
     source: 'snapshot_forward_replay' as const,
@@ -485,7 +485,7 @@ test('negative stock report replays movements from an as-of opening balance and 
   void t
   let observedMovementWhere: unknown
   const getOnHandAsOf = async () => ({
-    asOf: '2026-05-31T23:59:59.999Z',
+    asOf: '2026-05-31T22:59:59.999Z',
     generatedAt: '2026-06-02T10:00:00.000Z',
     anchorDate: null,
     source: 'current_reverse_replay' as const,

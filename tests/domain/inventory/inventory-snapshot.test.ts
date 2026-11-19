@@ -455,8 +455,8 @@ test('historical backfill replays later movements backwards from current state',
       }
     }),
     [
-      { snapshotDate: '2026-05-28T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-29T00:00:00.000Z' },
-      { snapshotDate: '2026-05-27T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-28T00:00:00.000Z' },
+      { snapshotDate: '2026-05-28T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-28T23:00:00.000Z' },
+      { snapshotDate: '2026-05-27T00:00:00.000Z', stockLevelCount: 1, snapshotCount: 1, source: 'backfill', checkMethod: 'aggregated_movement_replay_v1', cutoffAt: '2026-05-27T23:00:00.000Z' },
     ],
   )
 })
@@ -570,7 +570,7 @@ test('reservation backfill writes sparse rows and run markers for reliable days'
     snapshotDate: '2026-05-28T00:00:00.000Z',
     source: 'backfill',
     checkMethod: 'current_sources_updated_at_gate_v2',
-    cutoffAt: '2026-05-29T00:00:00.000Z',
+    cutoffAt: '2026-05-28T23:00:00.000Z',
     reservationSourceCount: 1,
   })
 })
@@ -610,7 +610,7 @@ test('reservation backfill warns and skips run marker when source state changed 
     warnings: [{
       snapshotDate: '2026-05-28',
       code: 'reservation_source_changed_after_cutoff',
-      message: 'Reservation sources changed on or after 2026-05-29T00:00:00.000Z; historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
+      message: 'Reservation sources changed on or after 2026-05-28T23:00:00.000Z; historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
     }],
     knownLimitations: EXPECTED_RESERVATION_BACKFILL_LIMITATIONS,
   })
@@ -895,7 +895,7 @@ test('reservation backfill reruns are idempotent by snapshot date and stock pair
       {
         source: 'backfill',
         checkMethod: 'current_sources_updated_at_gate_v2',
-        cutoffAt: '2026-05-29T00:00:00.000Z',
+        cutoffAt: '2026-05-28T23:00:00.000Z',
         stockLevelCount: 1,
         reservationSnapshotCount: 1,
         reservationSourceCount: 1,
@@ -903,7 +903,7 @@ test('reservation backfill reruns are idempotent by snapshot date and stock pair
       {
         source: 'backfill',
         checkMethod: 'current_sources_updated_at_gate_v2',
-        cutoffAt: '2026-05-29T00:00:00.000Z',
+        cutoffAt: '2026-05-28T23:00:00.000Z',
         stockLevelCount: 1,
         reservationSnapshotCount: 1,
         reservationSourceCount: 1,
