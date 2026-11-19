@@ -1,6 +1,7 @@
 import { pathToFileURL } from 'node:url'
 
 import {
+  DecisionRefusedError,
   LEGACY_IMPORT_EXIT,
   renderLegacyImportReport,
   withHistoryStatuses,
@@ -20,15 +21,25 @@ import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/
  * DRY RUN BY DEFAULT: nothing is written without --apply. WooCommerce is only ever read (GET). Mintsoft is not called at all unless
  * --verify-mintsoft is given, and then only read. Exit 0: the precondition is met and the OrderNumber check was proved against Mintsoft; 1: the run
  * failed; 2: usage; 3: the precondition is not met (a non-empty order prefix, an OrderNumber mismatch, a conflict, a verify-pending / verify-exhausted
- * order, a queued bridge update or cancel with a Mintsoft order, no orders read, an unimported order or an open merge item); 4: no blocker, but the
- * OrderNumber check is UNVERIFIED (it compared the bridge's own meta only: rerun with --verify-mintsoft). In --json the same is `gate.status`
- * ('met' | 'met-unverified' | 'not-met') and `gate.verified`.
+ * order, a queued bridge update or cancel with a Mintsoft order, no orders read, an unimported order, a historic-queued order or an open merge item, or a
+ * preview); 4: no blocker, but the OrderNumber check is UNVERIFIED (it compared the bridge's own meta only: rerun with --verify-mintsoft); 5: a --resolve or
+ * grouped decision was REFUSED by a guard (a Mintsoft mismatch, a live order, a wrong decision): nothing was recorded, and it is not a crash. In --json the same is
+ * `gate.status` ('met' | 'met-unverified' | 'met-if-recorded' | 'not-met') and `gate.verified`; `met-if-recorded` (exit 3, `report.preview` true) is a dry run that
+ * carries a requested decision nobody has recorded: it is never MET.
  *
- * CANCELLED / REFUNDED HISTORY is read only when modified inside a window: `--history-days N` (default 60) or `--history-since YYYY-MM-DD`. Older cancelled
- * and refunded orders are never read and never block. The report previews the counts (in window, outside it, linked, not linked) before anything is applied.
+ * CANCELLED / REFUNDED HISTORY: only orders modified inside a window are LINKED or GROUPED: `--history-days N` (default 60) or `--history-since YYYY-MM-DD`. The window
+ * never hides a queued bridge action: the WHOLE older cancelled / refunded history is also read (paced, only the meta fields), and an order outside the window that
+ * carries `_mintsoft_sync_pending` with a Mintsoft id, a `_mintsoft_fence*` mark, or a verify id with no trusted id is a gate blocker of its own kind, `historic-queued`,
+ * never linked, cleared by `--resolve <wcOrderId> --as cancelled` after the Mintsoft order is cancelled (read-checked). The report previews the counts.
  * `--statuses` is always unioned with cancelled and refunded. An in-window cancelled / refunded order with a Mintsoft order that IMS will not link (no IMS order,
  * IMS does not show it cancelled, or it is fully refunded and still PROCESSING) is ONE grouped gate blocker, cleared by ONE decision:
- * `--resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]` (each member is re-read in Mintsoft: cancelled or despatched).
+ * `--resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]` (each member is re-read in Mintsoft: cancelled or despatched; a member
+ * that is live there, a merge survivor holding another order, or only found by number is LEFT OUT and resolved on its own: `--resolve <wcOrderId> --as cancelled`, or
+ * `--as ours` for a merge survivor whose other order is live). Historic orders IMS still holds as PROCESSING are flagged in the report: they stay out of creation only
+ * while the step M create floor (paidNotBefore; PRODUCER_HOLD_ENFORCED_DESTINATIONS covering mintsoft) is in force.
+ *
+ * READ COST: each status set is walked twice (the second walk, ids only, is the id-set drift check anchored on the set's high-water id) plus the outside-window
+ * history read. `--no-drift-check` skips the second walk for a READ-ONLY PREVIEW (the report then fails the gate); `--apply` refuses it.
  *
  * `--resolve` records the operator's decision, taken after checking the Mintsoft order BY HAND, for a blocked order (verify-pending, verify-exhausted,
  * a queued bridge update or cancel left by a stopped bridge, or a cancelled WooCommerce order IMS never imported): `ours` (the Mintsoft order is this
@@ -39,7 +50,7 @@ import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/
  */
 
 const DISCONNECT_TIMEOUT_MS = 5_000
-const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --history-days N | --history-since YYYY-MM-DD] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped] | -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]'
+const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --history-days N | --history-since YYYY-MM-DD] [-- --no-drift-check] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped] | -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]'
 
 type Logger = Pick<typeof console, 'log' | 'error'>
 
@@ -95,6 +106,7 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
   let bridgeStopped = false
   let verifyMintsoft = false
   let json = false
+  let noDriftCheck = false
   let verifyMax: number | undefined
   let connector: string | undefined
   let statuses: string[] | undefined
@@ -110,6 +122,7 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     if (arg === '--bridge-stopped') { bridgeStopped = true; continue }
     if (arg === '--verify-mintsoft') { verifyMintsoft = true; continue }
     if (arg === '--json') { json = true; continue }
+    if (arg === '--no-drift-check') { noDriftCheck = true; continue }
     if (arg === '--verify-max') {
       const raw = args[index + 1]
       if (raw === undefined || !/^[1-9][0-9]{0,5}$/.test(raw)) { stderr.error(`--verify-max needs a whole number. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
@@ -199,13 +212,18 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     return LEGACY_IMPORT_EXIT.usage
   }
 
+  if (apply && noDriftCheck) {
+    stderr.error(`--no-drift-check is for a read-only preview: --apply refuses it (the drift check proves the read skipped no order). ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+
   try {
     const ports = options.ports
       ? await options.ports({ verifyMintsoft, connector })
       : (await import('@/lib/connectors/mintsoft/legacy-bridge-import/ports')).createLegacyImportPorts({ verifyMintsoft, connector })
     // cancelled and refunded are ALWAYS read: an explicit --statuses never drops them (a queued bridge cancel on one would be invisible).
     const resolvedStatuses = withHistoryStatuses(statuses ?? await (options.defaultStatuses ?? defaultStatuses)())
-    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, verifyMintsoft, verifyMax, resolve, resolveAllHistoricCancelled, historyWindow, statuses: resolvedStatuses, now: options.now })
+    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, verifyMintsoft, verifyMax, resolve, resolveAllHistoricCancelled, historyWindow, driftCheck: !noDriftCheck, statuses: resolvedStatuses, now: options.now })
     if (json) stdout.log(JSON.stringify(report, null, 2))
     else {
       stdout.log(renderLegacyImportReport(report))
@@ -214,7 +232,7 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     return report.gate.exitCode
   } catch (error) {
     stderr.error(error instanceof Error ? error.message : String(error))
-    return LEGACY_IMPORT_EXIT.failed
+    return error instanceof DecisionRefusedError ? LEGACY_IMPORT_EXIT.refused : LEGACY_IMPORT_EXIT.failed
   } finally {
     await (options.disconnect ?? disconnectDb)().catch(() => undefined)
   }

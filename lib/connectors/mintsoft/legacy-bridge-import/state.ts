@@ -40,6 +40,7 @@ export const LEGACY_META = {
 const META_PREFIX = '_mintsoft_'
 /** The merge-candidate / merge-hold / merge-shipping-refund keys the cutover design names. The bridge in this tree writes none of them; any that appear are reported, never imported. */
 const MERGE_STATE_PREFIX = '_mintsoft_merge_'
+const FENCE_PREFIX = '_mintsoft_fence'
 
 export type LegacyMetaEntry = { key: string; value?: unknown; hasValue: boolean }
 
@@ -72,6 +73,8 @@ export type LegacyOrderState = {
   terminalForcedReason: string | null
   /** Merge-state keys with a value (candidate, hold, shipping refund): reported only. */
   mergeStateKeys: string[]
+  /** `_mintsoft_fence*` marks with a value (the bridge fenced this order: its sweep skips it without writing, so it never leaves the history window). Reported by name. */
+  fenceKeys: string[]
   /** Bridge keys that are present but cannot be read, by name. */
   unreadable: string[]
   /** True when the order carries at least one non-empty `_mintsoft_*` mark. */
@@ -200,6 +203,8 @@ export function readLegacyOrderState(order: { id: unknown; number?: unknown; sta
 
   const mergeStateKeys = entries.filter((e) => e.key.startsWith(MERGE_STATE_PREFIX) && isMark(e.value)).map((e) => e.key).sort()
 
+  const fenceKeys = entries.filter((e) => e.key.startsWith(FENCE_PREFIX) && isMark(e.value)).map((e) => e.key).sort()
+
   const hasBridgeState = entries.some((e) => e.key.startsWith(META_PREFIX) && isMark(e.value))
 
   return {
@@ -222,6 +227,7 @@ export function readLegacyOrderState(order: { id: unknown; number?: unknown; sta
     terminalForced: present(LEGACY_META.terminalForced),
     terminalForcedReason,
     mergeStateKeys,
+    fenceKeys,
     unreadable: unreadable.sort(),
     hasBridgeState,
   }

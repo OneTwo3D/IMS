@@ -33,18 +33,22 @@ const LINK_SELECT = { id: true, connector: true, state: true, externalOrderId: t
 /** The fields the import needs, nothing else: no billing, shipping or customer data leaves WooCommerce into this tool. */
 const WC_FIELDS = 'id,number,status,meta_data,date_modified_gmt'
 
-async function walkStatuses(statuses: readonly string[], modifiedAfter: string | null): Promise<WcReadResult> {
+async function walkStatuses(statuses: readonly string[], range: { modifiedAfter?: string; modifiedBefore?: string } | null, driftCheck = true): Promise<WcReadResult> {
   return walkWcOrderPages(
     async (page, pass) => {
-      const params: Record<string, string> = { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: pass === 'verify' ? 'id' : WC_FIELDS }
-      if (modifiedAfter !== null) { params.modified_after = modifiedAfter; params.dates_are_gmt = 'true' }
+      const params: Record<string, string> = pass === 'high'
+        ? { status: statuses.join(','), per_page: '1', page: '1', orderby: 'id', order: 'desc', _fields: 'id' }
+        : { status: statuses.join(','), per_page: '100', page: String(page), orderby: 'id', order: 'asc', _fields: pass === 'verify' ? 'id' : WC_FIELDS }
+      if (range?.modifiedAfter !== undefined) { params.modified_after = range.modifiedAfter; params.dates_are_gmt = 'true' }
+      if (range?.modifiedBefore !== undefined) { params.modified_before = range.modifiedBefore; params.dates_are_gmt = 'true' }
       const result = await wcFetch('/orders', params)
       return { data: result.data, error: result.error, retryAfterMs: result.retryAfterMs, totalItems: result.totalItemsPresent === true ? result.totalItems : undefined }
     },
     {
       maxPages: MAX_WC_PAGE_WALK_PAGES,
-      // The id-set drift check: a second ids-only walk compared with the first (a new order mid-walk no longer fails the read).
-      verifyPass: true,
+      // The id-set drift check: a second ids-only walk compared with the first (a new order mid-walk no longer fails the read), anchored on the set's
+      // high-water id taken before the first walk. Skipped only for a read-only preview (`--no-drift-check`), which can never pass the gate.
+      verifyPass: driftCheck,
       describeUnread: (page, error) => describeUnreadWcPage('order', page, error),
       describeUnended: (pagesRead) => describeUnendedWcPageWalk('order', pagesRead),
     },
@@ -55,13 +59,14 @@ async function walkStatuses(statuses: readonly string[], modifiedAfter: string |
  * The orders in `statuses`. With a window, cancelled / refunded (the history statuses) are read in their OWN walk with `modified_after`, so only recently
  * modified history is read; every other status is read in full. The number of history orders outside the window is counted (one request) for the preview.
  */
-async function readWcOrders(statuses: readonly string[], window?: { historyStatuses: readonly string[]; modifiedAfter: string }): Promise<WcReadResult> {
-  if (!window) return walkStatuses(statuses, null)
+async function readWcOrders(statuses: readonly string[], window?: { historyStatuses: readonly string[]; modifiedAfter: string }, readOptions: { driftCheck?: boolean } = {}): Promise<WcReadResult> {
+  const driftCheck = readOptions.driftCheck !== false
+  if (!window) return walkStatuses(statuses, null, driftCheck)
   const history = statuses.filter((s) => window.historyStatuses.includes(s))
   const rest = statuses.filter((s) => !window.historyStatuses.includes(s))
-  const restRead = rest.length > 0 ? await walkStatuses(rest, null) : { orders: [], pagesRead: 0, complete: true } as WcReadResult
+  const restRead = rest.length > 0 ? await walkStatuses(rest, null, driftCheck) : { orders: [], pagesRead: 0, complete: true } as WcReadResult
   if (history.length === 0) return restRead
-  const historyRead = await walkStatuses(history, window.modifiedAfter)
+  const historyRead = await walkStatuses(history, { modifiedAfter: window.modifiedAfter }, driftCheck)
   let outside: number | null = null
   if (historyRead.complete) {
     const total = await wcFetch('/orders', { status: history.join(','), per_page: '1', page: '1', _fields: 'id' })
@@ -76,6 +81,16 @@ async function readWcOrders(statuses: readonly string[], window?: { historyStatu
     ...(notes.length > 0 ? { note: notes.join('; ') } : {}),
     historyOutsideWindow: outside,
   }
+}
+
+/**
+ * The cancelled / refunded orders OUTSIDE the history window, read ONLY to find a queued bridge action (`_mintsoft_sync_pending`, a verify id, a fence)
+ * that the window would hide: such an order is never written again by the bridge, so its date_modified stays old. One sequential, paced walk
+ * (300 ms between pages, 429 back-off, Retry-After honoured) with `_fields` cut to what carries the bridge meta; the store's order set outside the
+ * window cannot gain members (a modified order moves INTO the window), so the totals check is enough and no second walk is made.
+ */
+async function readOutsideWindowHistory(statuses: readonly string[], modifiedBefore: string): Promise<WcReadResult> {
+  return walkStatuses(statuses, { modifiedBefore }, false)
 }
 
 async function loadIms(wcOrderIds: readonly string[], connector: string): Promise<Map<string, ImsOrderContext>> {
@@ -188,6 +203,7 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
 export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; connector?: string } = {}): LegacyImportPorts {
   const ports: LegacyImportPorts = {
     readWcOrders,
+    readOutsideWindowHistory,
     async readOrderPrefix() {
       return (await getShoppingConnectorPrefixes('woocommerce')).orderPrefix
     },
@@ -283,6 +299,17 @@ export function createLegacyImportPorts(options: { verifyMintsoft?: boolean; con
       return { found: true, orderNumber: typeof number === 'string' ? number : null, status: normalized ? normalized.status.toUpperCase() || null : null, dispatched: normalized?.dispatched === true }
     } catch (error) {
       return { error: error instanceof Error ? error.message.slice(0, 200) : 'read failed' }
+    }
+  }
+  // The by-NUMBER presence probe (read only, paced by the Mintsoft client): a 404 on an id is not proof that the order is gone, the real one may sit under another id.
+  ports.probeMintsoftOrderNumber = async (orderNumber) => {
+    try {
+      const { probeMintsoftOrderPresence } = await import('../api/orders')
+      const { getMintsoftSettings, parseMintsoftPositiveId } = await import('../settings/schema')
+      const settings = await getMintsoftSettings()
+      return await probeMintsoftOrderPresence(orderNumber, parseMintsoftPositiveId(settings.mintsoft_client_id))
+    } catch (error) {
+      return { error: error instanceof Error ? error.message.slice(0, 200) : 'probe failed' }
     }
   }
   if (options.verifyMintsoft) ports.verifyMintsoftOrder = ports.readMintsoftOrder

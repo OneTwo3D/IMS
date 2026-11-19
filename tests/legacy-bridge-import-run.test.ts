@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { renderLegacyImportReport, runLegacyBridgeImport, type ImsOrderContext, type LegacyImportPorts, type StoredResolution, type WcOrderLite } from '@/lib/connectors/mintsoft/legacy-bridge-import/run'
+import { DecisionRefusedError, renderLegacyImportReport, runLegacyBridgeImport, type ImsOrderContext, type LegacyImportPorts, type StoredResolution, type WcOrderLite } from '@/lib/connectors/mintsoft/legacy-bridge-import/run'
 import { decideLink, type ExistingLink } from '@/lib/connectors/mintsoft/legacy-bridge-import/state'
 import { bridgeOrderStatuses, runLegacyImportCli } from '../scripts/legacy-bridge-import'
 
@@ -20,10 +20,10 @@ const ORDERS: WcOrderLite[] = [
 ]
 const VERIFY_PENDING = wc(7, 'processing', { _mintsoft_verify_pending: '1', _mintsoft_verify_order_id: '9007' })
 
-type Store = { links: Map<string, ExistingLink & { orderId: string; shipFrom: string | null }>; writes: number; mintsoftReads: number; wcReads: number; resolutions: Map<string, StoredResolution>; recorded: number; historic: Array<{ reason: string; members: Record<string, string> }>; audits: Array<{ resolveOnly: string[] | null }>; statusReads: string[]; windows: Array<unknown> }
+type Store = { links: Map<string, ExistingLink & { orderId: string; shipFrom: string | null }>; writes: number; mintsoftReads: number; wcReads: number; resolutions: Map<string, StoredResolution>; recorded: number; historic: Array<{ reason: string; members: Record<string, string> }>; audits: Array<{ resolveOnly: string[] | null }>; statusReads: string[]; windows: Array<unknown>; probes: string[]; driftChecks: Array<boolean | undefined>; outsideReads: number }
 
-function makePorts(opts: { prefix?: string; orders?: WcOrderLite[]; preLinks?: Record<string, Partial<ExistingLink> & { orderId?: string }>; skipImsFor?: number[]; complete?: boolean; holds?: number; recordFails?: boolean; imsState?: Record<number, { status: string; refundStatus: string }>; mintsoft?: Record<string, { found?: boolean; number?: string | null; status?: string | null; dispatched?: boolean; error?: string }>; readNote?: string } = {}): { ports: LegacyImportPorts; store: Store } {
-  const store: Store = { links: new Map(), writes: 0, mintsoftReads: 0, wcReads: 0, resolutions: new Map(), recorded: 0, historic: [], audits: [], statusReads: [], windows: [] }
+function makePorts(opts: { prefix?: string; orders?: WcOrderLite[]; preLinks?: Record<string, Partial<ExistingLink> & { orderId?: string }>; skipImsFor?: number[]; complete?: boolean; holds?: number; recordFails?: boolean; imsState?: Record<number, { status: string; refundStatus: string }>; mintsoft?: Record<string, { found?: boolean; number?: string | null; status?: string | null; dispatched?: boolean; error?: string }>; readNote?: string; outside?: WcOrderLite[]; outsideComplete?: boolean; probe?: Record<string, 'FOUND' | 'MISSING' | 'AMBIGUOUS'> } = {}): { ports: LegacyImportPorts; store: Store } {
+  const store: Store = { links: new Map(), writes: 0, mintsoftReads: 0, wcReads: 0, resolutions: new Map(), recorded: 0, historic: [], audits: [], statusReads: [], windows: [], probes: [], driftChecks: [], outsideReads: 0 }
   const orders = opts.orders ?? ORDERS
   const imsOrders = new Map<string, ImsOrderContext & { number: string }>()
   for (const o of orders) {
@@ -35,7 +35,9 @@ function makePorts(opts: { prefix?: string; orders?: WcOrderLite[]; preLinks?: R
     store.links.set(`ims-${wcId}`, { id: `pl-${wcId}`, connector: 'mintsoft', state: 'SYNCED', externalOrderId: '1', externalOrderNumber: null, attempts: 0, lastAttemptAt: null, pushedAt: null, orderId: `ims-${wcId}`, shipFrom: 'wh1', ...over })
   }
   const ports: LegacyImportPorts = {
-    async readWcOrders(_statuses, window) { store.wcReads += 1; store.windows.push(window); return { orders, pagesRead: 1, complete: opts.complete ?? true, ...(opts.readNote ? { note: opts.readNote } : {}) } },
+    async readWcOrders(_statuses, window, readOptions) { store.wcReads += 1; store.windows.push(window); store.driftChecks.push(readOptions?.driftCheck); return { orders, pagesRead: 1, complete: opts.complete ?? true, ...(opts.readNote ? { note: opts.readNote } : {}) } },
+    async readOutsideWindowHistory() { store.outsideReads += 1; return { orders: opts.outside ?? [], pagesRead: 1, complete: opts.outsideComplete ?? true, ...(opts.outsideComplete === false ? { error: 'outside page 2 unreadable' } : {}) } },
+    async probeMintsoftOrderNumber(number) { store.probes.push(number); return opts.probe?.[number] ?? 'MISSING' },
     async readOrderPrefix() { return opts.prefix ?? '' },
     async readConnectorId() { return 'mintsoft' },
     async loadIms(ids) {
@@ -362,9 +364,13 @@ test('o3d-l3jkv: --resolve-all-historic-cancelled clears the whole in-window gro
   const blocked = await runLegacyBridgeImport(more.ports, { statuses: ALL_STATUSES })
   assert.equal(blocked.gate.ok, false)
   assert.deepEqual(blocked.history.unlinked.filter((u) => !u.resolved).map((u) => u.wcOrderId), ['17'])
-  // A member still live in Mintsoft (NEW) refuses the whole decision, recording nothing.
-  await assert.rejects(runLegacyBridgeImport(more.ports, { apply: true, bridgeStopped: true, resolveAllHistoricCancelled: { reason: 'checked' }, statuses: ALL_STATUSES }), /neither cancelled nor despatched/)
-  assert.equal(more.store.historic.length, 1)
+  // A member still live in Mintsoft (NEW) is LEFT OUT of the group (it must not deadlock the others) and stays a blocker.
+  const live = makePorts({ orders: [a, b, c], skipImsFor: [16], mintsoft })
+  const partial = await runLegacyBridgeImport(live.ports, { apply: true, bridgeStopped: true, resolveAllHistoricCancelled: { reason: 'checked' }, statuses: ALL_STATUSES })
+  assert.deepEqual(Object.keys(live.store.historic[0]!.members).sort(), ['14', '16'])
+  assert.deepEqual(partial.history.groupResolution.excluded.map((e) => e.wcOrderId), ['17'])
+  assert.match(partial.history.groupResolution.excluded[0]!.reason, /neither cancelled nor despatched/)
+  assert.equal(partial.gate.ok, false)
 })
 
 test('o3d-l3jkv: cancelled / refunded history is read only inside the window; orders older than it are dropped, counted, and never block', async () => {
@@ -381,7 +387,7 @@ test('o3d-l3jkv: cancelled / refunded history is read only inside the window; or
   assert.equal(report.history.linked, 1)
   assert.equal(report.noImsOrder.length, 0)
   assert.equal(report.gate.ok, true, 'the old order with no IMS order is not a blocker')
-  assert.match(renderLegacyImportReport(report), /only orders modified since 2026-09-20.*last 60 days.*outside the window \(never read, never a blocker\) 1/)
+  assert.match(renderLegacyImportReport(report), /only orders modified since 2026-09-20.*last 60 days.*outside the window 1 \(never linked or grouped; read only for a queued action/)
 })
 
 test('o3d-l3jkv: --statuses always gets cancelled and refunded added', async () => {
@@ -557,7 +563,7 @@ test('CLI: --resolve needs --as; both are parsed; --resolve --apply refuses with
   assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '9', '--as', 'maybe'] }), 2)
   assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '9', '--as', 'ours', '--apply'] }), 2)
   assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '9', '--as', 'ours', '--apply', '--bridge-stopped'] }), 4)
-  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '1', '--as', 'ours'] }), 1, 'a refused decision is a failed run')
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '1', '--as', 'ours'] }), 5, 'a refused decision is exit 5, not a failed run')
   assert.match(errors.join('\n'), /not a gate blocker/)
 })
 
@@ -567,4 +573,123 @@ test('JSON carries the gate status and the verified flag', async () => {
   const none = await runLegacyBridgeImport(makePorts({ orders: [wc(8, 'processing', {})] }).ports, { statuses: STATUSES })
   assert.equal(none.gate.verified, true, 'nothing needed checking')
   assert.equal(none.gate.exitCode, 0)
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// round-1 review of PR #1069
+// ---------------------------------------------------------------------------------------------------------------------------------
+const WINDOW = { modifiedAfter: '2026-09-20T12:00:00.000Z', days: 60, since: null }
+const NOW = () => new Date('2026-11-19T12:00:00Z')
+const oldOrder = (id: number, status: string, pairs: Record<string, unknown>): WcOrderLite => ({ ...wc(id, status, pairs), date_modified_gmt: '2026-01-02T00:00:00' })
+
+test('HIGH: a cancelled order OUTSIDE the window with a queued cancel behind an unproved verify id BLOCKS (historic-queued), is never linked, and is cleared only by --resolve --as cancelled (Mintsoft read-checked)', async () => {
+  // Cancelled on day 0, verify given up on day 1, never written again: on day 61 the window no longer returns it.
+  const queued = oldOrder(30, 'cancelled', { _mintsoft_verify_order_id: '9100', _mintsoft_dead_letter: '1', _mintsoft_sync_pending: 'cancel' })
+  const harmless = oldOrder(31, 'cancelled', { _mintsoft_order_id: '9101' })
+  const fenced = oldOrder(32, 'refunded', { _mintsoft_order_id: '9102', _mintsoft_fence_at: '1767312000' })
+  const { ports, store } = makePorts({ orders: [wc(40, 'processing', {})], outside: [queued, harmless, fenced], mintsoft: { '9100': { status: 'NEW', number: '1030' } } })
+  const report = await runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ALL_STATUSES, historyWindow: WINDOW, now: NOW })
+  assert.equal(store.outsideReads, 1)
+  assert.deepEqual(report.history.outsideQueued.map((q) => [q.wcOrderId, q.kinds.join('+'), q.resolved]), [['30', 'verify-exhausted+sync-pending+historic-queued'.replace('+historic-queued', ''), false], ['32', 'fenced', false]])
+  assert.equal(report.gate.ok, false)
+  assert.equal(report.gate.exitCode, 3)
+  assert.match(report.gate.blockers.join('\n'), /OUTSIDE the history window.*\[historic-queued\]/)
+  assert.equal(store.links.size, 0, 'an outside-window order is never linked')
+  assert.match(renderLegacyImportReport(report), /\[historic-queued\] WC #1030/)
+  // Still live in Mintsoft: --as cancelled is refused (exit 5 class), nothing recorded.
+  await assert.rejects(runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['30'], decision: 'cancelled' }, statuses: ALL_STATUSES, historyWindow: WINDOW, now: NOW }), DecisionRefusedError)
+  assert.equal(store.recorded, 0)
+  // "ours" would hide the queued cancel.
+  await assert.rejects(runLegacyBridgeImport(ports, { resolve: { wcOrderIds: ['30'], decision: 'ours' }, statuses: ALL_STATUSES, historyWindow: WINDOW, now: NOW }), /would hide the queued cancel/)
+  // Cancelled in Mintsoft: recorded, and the order stops blocking.
+  const m2 = makePorts({ orders: [wc(40, 'processing', {})], outside: [queued, fenced], mintsoft: { '9100': { status: 'CANCELLED', number: '1030' }, '9102': { status: 'CANCELLED', number: '1032' } } })
+  const cleared = await runLegacyBridgeImport(m2.ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['30', '32'], decision: 'cancelled' }, statuses: ALL_STATUSES, historyWindow: WINDOW, now: NOW })
+  assert.equal(m2.store.recorded, 2)
+  assert.equal(m2.store.links.size, 0)
+  assert.equal(cleared.history.outsideQueued.every((q) => q.resolved), true)
+  assert.equal(cleared.gate.ok, true)
+  // The old harmless order never blocked, and an unreadable outside read is never proof.
+  const incomplete = await runLegacyBridgeImport(makePorts({ orders: [wc(40, 'processing', {})], outsideComplete: false }).ports, { statuses: ALL_STATUSES, historyWindow: WINDOW, now: NOW })
+  assert.equal(incomplete.gate.ok, false)
+  assert.match(incomplete.gate.blockers.join('\n'), /OUTSIDE the window did not complete/)
+})
+
+test('MEDIUM: "cancelled" for a Mintsoft order absent by id needs the order-number search to find nothing too', async () => {
+  const order = wc(50, 'processing', { _mintsoft_verify_order_id: '9150', _mintsoft_verify_pending: '1' })
+  const found = makePorts({ orders: [order], mintsoft: { '9150': { found: false } }, probe: { '1050': 'FOUND' } })
+  await assert.rejects(runLegacyBridgeImport(found.ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['50'], decision: 'cancelled' }, statuses: ALL_STATUSES }), (error: unknown) => error instanceof DecisionRefusedError && /search for the order number "1050" says FOUND/.test(error.message))
+  assert.equal(found.store.recorded, 0)
+  const ambiguous = makePorts({ orders: [order], mintsoft: { '9150': { found: false } }, probe: { '1050': 'AMBIGUOUS' } })
+  await assert.rejects(runLegacyBridgeImport(ambiguous.ports, { resolve: { wcOrderIds: ['50'], decision: 'cancelled' }, statuses: ALL_STATUSES }), /AMBIGUOUS/)
+  const missing = makePorts({ orders: [order], mintsoft: { '9150': { found: false } }, probe: { '1050': 'MISSING' } })
+  const ok = await runLegacyBridgeImport(missing.ports, { apply: true, bridgeStopped: true, resolve: { wcOrderIds: ['50'], decision: 'cancelled' }, statuses: ALL_STATUSES })
+  assert.deepEqual(missing.store.probes, ['1050'])
+  assert.equal(ok.resolutions.recorded.length, 1)
+  assert.equal(missing.store.links.get('ims-50')?.state, 'CANCELLED')
+})
+
+test('MEDIUM: the grouped decision cannot deadlock: IMS-present members are resolved on their own, a live merge survivor is left out and resolved with --as ours', async () => {
+  const done = wc(60, 'cancelled', { _mintsoft_order_id: '9160' })
+  const live = wc(61, 'cancelled', { _mintsoft_order_id: '9161' })
+  const survivor = wc(62, 'cancelled', { _mintsoft_order_id: '9162', _mintsoft_merged: '1', _mintsoft_order_number: '1062+1099' })
+  const mintsoft = { '9160': { status: 'CANCELLED' }, '9161': { status: 'NEW' }, '9162': { status: 'NEW', number: '1062+1099' } }
+  const { ports, store } = makePorts({ orders: [done, live, survivor], mintsoft, imsState: { 62: { status: 'PROCESSING', refundStatus: 'NONE' } } })
+  const base = { bridgeStopped: true, statuses: ALL_STATUSES }
+  const group = await runLegacyBridgeImport(ports, { ...base, apply: true, resolveAllHistoricCancelled: { reason: 'checked in Mintsoft' } })
+  assert.deepEqual(Object.keys(store.historic[0]!.members), ['60'])
+  assert.deepEqual(group.history.groupResolution.excluded.map((e) => e.wcOrderId).sort(), ['61', '62'])
+  assert.match(group.history.groupResolution.excluded.find((e) => e.wcOrderId === '62')!.reason, /merge survivor/)
+  assert.equal(group.gate.ok, false)
+  assert.match(group.gate.blockers.join('\n'), /--resolve <wcOrderId> --as cancelled/)
+  // The live non-merged member: refused until cancelled in Mintsoft (the real cancel), then resolved alone.
+  await assert.rejects(runLegacyBridgeImport(ports, { ...base, resolve: { wcOrderIds: ['61'], decision: 'cancelled' } }), DecisionRefusedError)
+  // ours is only for a survivor holding another order.
+  await assert.rejects(runLegacyBridgeImport(ports, { ...base, resolve: { wcOrderIds: ['61'], decision: 'ours' } }), /only for a merge survivor/)
+  // The survivor: its own decision, a MERGED link, never blocks the group.
+  const survived = await runLegacyBridgeImport(ports, { ...base, apply: true, resolve: { wcOrderIds: ['62'], decision: 'ours' } })
+  assert.equal(store.links.get('ims-62')?.state, 'MERGED')
+  assert.equal(survived.history.unlinked.some((u) => u.wcOrderId === '62'), false)
+  // Once Mintsoft shows 9161 cancelled, --as cancelled links CANCELLED and the gate passes.
+  const cancelledNow = makePorts({ orders: [done, live, survivor], mintsoft: { ...mintsoft, '9161': { status: 'CANCELLED' } }, imsState: { 62: { status: 'PROCESSING', refundStatus: 'NONE' } } })
+  cancelledNow.store.historic = store.historic
+  cancelledNow.store.resolutions = store.resolutions
+  const final = await runLegacyBridgeImport(cancelledNow.ports, { ...base, apply: true, resolve: { wcOrderIds: ['61'], decision: 'cancelled' } })
+  assert.equal(cancelledNow.store.links.get('ims-61')?.state, 'CANCELLED')
+  assert.equal(final.gate.ok, true)
+  assert.equal(final.history.imsProcessing, 1, 'order 60 is resolved by the group but IMS still holds it as PROCESSING: flagged')
+})
+
+test('LOW: historic orders IMS still holds as PROCESSING are flagged with the create-floor dependency', async () => {
+  const { ports } = makePorts({ orders: [wc(70, 'cancelled', { _mintsoft_order_id: '9170' })] })
+  const report = await runLegacyBridgeImport(ports, { statuses: ALL_STATUSES })
+  assert.equal(report.history.imsProcessing, 1)
+  assert.match(renderLegacyImportReport(report), /still held by IMS as PROCESSING.*create floor/)
+})
+
+test('LOW: --no-drift-check is a preview only: it reaches the read, never passes the gate, and --apply refuses it; the default runs the check', async () => {
+  const { ports, store } = makePorts()
+  const preview = await runLegacyBridgeImport(ports, { statuses: STATUSES, driftCheck: false })
+  assert.deepEqual(store.driftChecks, [false])
+  assert.equal(preview.driftCheck, false)
+  assert.equal(preview.gate.ok, false)
+  assert.match(preview.gate.blockers.join('\n'), /drift check was skipped/)
+  await assert.rejects(runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: STATUSES, driftCheck: false }), /--apply refuses with --no-drift-check/)
+  await runLegacyBridgeImport(ports, { statuses: STATUSES })
+  assert.equal(store.driftChecks[1], true)
+  const errors: string[] = []
+  const code = await runLegacyImportCli({ argv: ['--no-drift-check', '--apply', '--bridge-stopped'], ports: () => ports, defaultStatuses: async () => STATUSES, stdout: { log: () => undefined }, stderr: { error: (m: string) => { errors.push(m) } }, disconnect: async () => undefined })
+  assert.equal(code, 2)
+  assert.match(errors.join(' '), /--no-drift-check is for a read-only preview/)
+})
+
+test('LOW: a refused --resolve or grouped decision exits 5 (not the failure code 1)', async () => {
+  const { ports } = makePorts({ orders: [CANCELLED_TRUSTED], skipImsFor: [12], mintsoft: { '9012': { status: 'NEW' } } })
+  const errors: string[] = []
+  const common = { ports: () => ports, defaultStatuses: async () => ALL_STATUSES, stdout: { log: () => undefined }, stderr: { error: (m: string) => { errors.push(m) } }, disconnect: async () => undefined }
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '12', '--as', 'cancelled'] }), 5)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve', '999', '--as', 'cancelled'] }), 5)
+  assert.equal(await runLegacyImportCli({ ...common, argv: ['--resolve-all-historic-cancelled', '--as', 'cancelled', '--reason', 'checked it'] }), 5, 'every member excluded: nothing to record')
+  // A real failure stays 1.
+  const broken = { ...ports, async readWcOrders(): Promise<never> { throw new Error('boom') } }
+  assert.equal(await runLegacyImportCli({ ...common, ports: () => broken, argv: [] }), 1)
 })

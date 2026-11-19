@@ -18,6 +18,7 @@ import {
   decideLink,
   desiredLinkFor,
   isVerifyExhausted,
+  LEGACY_META,
   readLegacyOrderState,
   resolutionSignature,
   type BlockingQueueKind,
@@ -77,7 +78,14 @@ export type MintsoftVerifyResult =
 
 export type LegacyImportPorts = {
   /** WooCommerce orders in these statuses, with their meta. READ ONLY. */
-  readWcOrders(statuses: readonly string[], window?: { historyStatuses: readonly string[]; modifiedAfter: string }): Promise<WcReadResult>
+  readWcOrders(statuses: readonly string[], window?: { historyStatuses: readonly string[]; modifiedAfter: string }, readOptions?: { driftCheck?: boolean }): Promise<WcReadResult>
+  /**
+   * The cancelled / refunded orders modified BEFORE `modifiedBefore` (outside the history window), read cheaply (only the fields carrying the bridge meta) and paced,
+   * ONLY to find a queued bridge action, a fence or an unproved verify id that the window would hide. READ ONLY.
+   */
+  readOutsideWindowHistory(statuses: readonly string[], modifiedBefore: string): Promise<WcReadResult>
+  /** Read-only Mintsoft search BY ORDER NUMBER (`probeMintsoftOrderPresence`): a 404 on an id does not prove the order is gone. */
+  probeMintsoftOrderNumber?(orderNumber: string): Promise<'FOUND' | 'MISSING' | 'AMBIGUOUS' | { error: string }>
   /** The live `woocommerce_order_prefix` (empty when unset). */
   readOrderPrefix(): Promise<string>
   /** The IMS WMS connector id the links are written for. */
@@ -105,7 +113,7 @@ export type LegacyImportPorts = {
   /** The operator decisions recorded earlier (`--resolve`), the latest per WooCommerce order id. */
   readResolutions?(connector: string): Promise<Map<string, StoredResolution>>
   /** Record ONE operator decision durably in the activity log; true only when the entry reached it. Only called when `apply` is true. */
-  recordResolution?(entry: { connector: string; wcOrderId: string; wcNumber: string; decision: ResolutionDecision; signature: string; kinds: string[]; mintsoftOrderId: string | null; verifyOrderId: string | null; queued: string | null; bridgeStopped: boolean; mintsoftRead?: { orderNumber: string | null; status: string | null } | null }): Promise<boolean>
+  recordResolution?(entry: { connector: string; wcOrderId: string; wcNumber: string; decision: ResolutionDecision; signature: string; kinds: string[]; mintsoftOrderId: string | null; verifyOrderId: string | null; queued: string | null; bridgeStopped: boolean; mintsoftRead?: { orderNumber: string | null; status: string | null; probe?: string } | null }): Promise<boolean>
   /** Record an `--apply` run in the audit trail (best effort); true when the entry reached it. Only called when `apply` is true. */
   recordApply?(entry: { connector: string; bridgeStopped: boolean; orderPrefix: string; statuses: string[]; applied: LegacyImportReport['applied']; generatedAt: string; /** The WooCommerce ids a `--resolve` run was limited to (null: a full import run). A resolve-only run is NOT the authoritative import. */ resolveOnly: string[] | null }): Promise<boolean>
 }
@@ -127,6 +135,11 @@ export type LegacyImportOptions = {
   historyWindow?: HistoryWindow
   statuses: readonly string[]
   now?: () => Date
+  /**
+   * False skips the second (id-set drift) walk: for a READ-ONLY preview only (`--no-drift-check`). The report then can never pass the gate, and `apply` refuses.
+   * Default true.
+   */
+  driftCheck?: boolean
   /** Stop verifying after this many Mintsoft reads (the API is rate limited). */
   verifyMax?: number
 }
@@ -195,16 +208,34 @@ export type LegacyImportReport = {
     outsideWindow: number | null
     linked: number
     unlinked: Array<{ wcOrderId: string; wcNumber: string; wcStatus: string; mintsoftOrderId: string; reason: 'no-ims-order' | 'ims-not-cancelled' | 'dispatch-guard'; resolved: boolean }>
-    groupResolution: { requested: boolean; recorded: boolean; reason: string | null }
+    groupResolution: { requested: boolean; recorded: boolean; reason: string | null; /** Members the grouped decision LEFT OUT (live in Mintsoft, a merge survivor holding another order, status unresolved, absent but found by number): each is resolved on its own with `--resolve <id> --as ...`. */ excluded: Array<{ wcOrderId: string; wcNumber: string; reason: string }> }
+    /** Historic orders IMS holds with a Mintsoft order but NOT as cancelled (still PROCESSING in IMS although WooCommerce shows them cancelled / refunded): nothing in IMS cancels them. */
+    imsProcessing: number
+    /**
+     * The cancelled / refunded orders OUTSIDE the window that still carry a queued bridge action, a fence, or a verify id with no trusted id (kind `historic-queued`): the
+     * bridge never writes such an order again, so its modified date stays old and the window would hide it. Each is a gate blocker until resolved on its own.
+     */
+    outsideQueued: Array<{ wcOrderId: string; wcNumber: string; wcStatus: string; kinds: string[]; mintsoftOrderId: string | null; resolved: boolean }>
+    outsideRead: { ordersRead: number; pagesRead: number; complete: boolean; error: string | null } | null
   }
+  /** True when the id-set drift check (the second walk) ran. False only for a `--no-drift-check` preview, which never passes the gate. */
+  driftCheck: boolean
   /** True when this run only PREVIEWS a decision (a `--resolve` / group dry run): the gate verdict then rests on a decision nobody has recorded. */
   preview: boolean
   /** A remark about the WooCommerce read (orders that joined mid-walk). */
   readNote: string | null
 }
 
-/** 0: met and verified; 1: failed; 2: usage; 3: not met; 4: no blocker but the OrderNumber check is UNVERIFIED against Mintsoft (rerun with --verify-mintsoft). */
-export const LEGACY_IMPORT_EXIT = { ok: 0, failed: 1, usage: 2, gateNotMet: 3, unverified: 4 } as const
+/** 0: met and verified; 1: failed; 2: usage; 3: not met (or a preview); 4: no blocker but the OrderNumber check is UNVERIFIED against Mintsoft (rerun with --verify-mintsoft); 5: a decision was REFUSED by a guard (nothing recorded). */
+export const LEGACY_IMPORT_EXIT = { ok: 0, failed: 1, usage: 2, gateNotMet: 3, unverified: 4, refused: 5 } as const
+
+/** A `--resolve` / grouped decision the tool REFUSED on a guard (a Mintsoft mismatch, a live order, a wrong decision): exit 5, never the failure code 1 of a crash. Nothing was recorded. */
+export class DecisionRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DecisionRefusedError'
+  }
+}
 
 const describeWithdrawal = (state: LegacyOrderState): string => {
   const w = state.withdrawal!
@@ -219,7 +250,9 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
   // cancelled and refunded are ALWAYS read (a queued bridge cancel must never be invisible), whatever `--statuses` says; only their HISTORY is windowed.
   const statuses = withHistoryStatuses(options.statuses)
   const windowCutoff = options.historyWindow ? Date.parse(options.historyWindow.modifiedAfter) : null
-  const read = await ports.readWcOrders(statuses, options.historyWindow ? { historyStatuses: HISTORY_STATUSES, modifiedAfter: options.historyWindow.modifiedAfter } : undefined)
+  const driftCheck = options.driftCheck !== false
+  if (apply && !driftCheck) throw new Error('--apply refuses with --no-drift-check: the id-set drift check is what proves the read skipped no order; skipping it is for a read-only preview only.')
+  const read = await ports.readWcOrders(statuses, options.historyWindow ? { historyStatuses: HISTORY_STATUSES, modifiedAfter: options.historyWindow.modifiedAfter } : undefined, { driftCheck })
 
   const report: LegacyImportReport = {
     mode: apply ? 'apply' : 'dry-run',
@@ -247,7 +280,8 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
     unreadableOrders: [],
     verify: null,
     gate: { ok: false, verified: false, status: 'not-met', blockers: [], exitCode: 3 },
-    history: { window: options.historyWindow ?? null, inWindow: {}, outsideWindow: read.historyOutsideWindow ?? null, linked: 0, unlinked: [], groupResolution: { requested: options.resolveAllHistoricCancelled !== undefined, recorded: false, reason: options.resolveAllHistoricCancelled?.reason ?? null } },
+    history: { window: options.historyWindow ?? null, inWindow: {}, outsideWindow: read.historyOutsideWindow ?? null, linked: 0, unlinked: [], groupResolution: { requested: options.resolveAllHistoricCancelled !== undefined, recorded: false, reason: options.resolveAllHistoricCancelled?.reason ?? null, excluded: [] }, imsProcessing: 0, outsideQueued: [], outsideRead: null },
+    driftCheck,
     preview: false,
     readNote: read.note ?? null,
   }
@@ -274,6 +308,27 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
   }
 
   if (report.history.outsideWindow === null && outsideByWindow > 0) report.history.outsideWindow = outsideByWindow
+
+  // THE WINDOW HIDES NOTHING THAT IS QUEUED: the window limits linking and the grouped decision only. The WHOLE older cancelled / refunded history is also read (cheaply, paced)
+  // for a queued bridge action, a fence or an unproved verify id. The bridge never writes such an order again (its cancel is left queued behind an unproved id), so its
+  // modified date stays old and, without this read, it would age out of the window while the gate said MET.
+  const historicQueued: Array<{ state: LegacyOrderState; kinds: string[] }> = []
+  if (options.historyWindow) {
+    const seen = new Set(read.orders.map((o) => String(o.id)))
+    const outside = await ports.readOutsideWindowHistory(statuses.filter((status) => (HISTORY_STATUSES as readonly string[]).includes(status)), options.historyWindow.modifiedAfter)
+    report.history.outsideRead = { ordersRead: outside.orders.length, pagesRead: outside.pagesRead, complete: outside.complete, error: outside.error ?? null }
+    report.wc.pagesRead += outside.pagesRead
+    for (const order of outside.orders) {
+      if (seen.has(String(order.id))) continue
+      const state = readLegacyOrderState(order)
+      if (state === null) { report.unreadableOrders.push(String(order.id)); continue }
+      const kinds: string[] = [...blockingQueueKinds(state)]
+      const hasId = state.mintsoftOrderId !== null || state.verifyOrderId !== null
+      if (state.fenceKeys.length > 0 && hasId) kinds.push('fenced')
+      if (state.unreadable.some((key) => key === LEGACY_META.orderId || key === LEGACY_META.verifyOrderId)) kinds.push('unreadable-id')
+      if (kinds.length > 0) historicQueued.push({ state, kinds })
+    }
+  }
   const imsByWc = await ports.loadIms(states.map((s) => s.wcOrderId), connector)
   const openMerge = await ports.readOpenMergeState(connector)
   report.merge.openHolds = openMerge.holds
@@ -283,49 +338,82 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
   const stored = ports.readResolutions ? await ports.readResolutions(connector) : new Map<string, StoredResolution>()
   const storedHistoric = ports.readHistoricResolutions ? await ports.readHistoricResolutions(connector) : []
   const requested = new Map<string, StoredResolution>()
-  const mintsoftRead = new Map<string, { orderNumber: string | null; status: string | null }>()
+  const mintsoftRead = new Map<string, { orderNumber: string | null; status: string | null; probe?: string }>()
+  // WHY an in-window historic order is not linked (null: it is linked, or it is not a historic order with a Mintsoft order).
+  const historicReasonFor = (state: LegacyOrderState): 'no-ims-order' | 'ims-not-cancelled' | 'dispatch-guard' | null => {
+    if (!(HISTORY_STATUSES as readonly string[]).includes(state.wcStatus)) return null
+    if (state.mintsoftOrderId === null && state.verifyOrderId === null) return null
+    if (blockingQueueKinds(state).length > 0) return null
+    if (desiredLinkFor(state, null).kind !== 'link') return null
+    const ims = imsByWc.get(state.wcOrderId) ?? null
+    if (ims !== null && ims.status === 'CANCELLED') return null
+    return ims === null ? 'no-ims-order' : ims.refundStatus === 'FULL' ? 'dispatch-guard' : 'ims-not-cancelled'
+  }
   // THE MINTSOFT CHECK behind a decision: a read-only lookup of the order's number and status (one id at a time; the client paces it). The operator's word is
-  // not enough: "ours" must be an order carrying THIS order's number that is not cancelled, "cancelled" must be cancelled there (or gone), and a grouped
-  // historic decision needs every member cancelled or already despatched (anything still live would ship with nothing in IMS to cancel it).
-  const checkAgainstMintsoft = async (state: LegacyOrderState, mode: 'ours' | 'cancelled' | 'historic', label: string) => {
+  // not enough: "ours" must be an order carrying THIS order's number that is not cancelled, "cancelled" must be cancelled there, and a grouped historic decision
+  // needs every member cancelled or already despatched (anything still live would ship with nothing in IMS to cancel it). "Absent" is accepted as cancelled only
+  // when the id AND the order number both say absent: a 404 on a verify id means the id may be wrong, not that the order is gone.
+  // A refusal throws DecisionRefusedError (exit 5); for a grouped decision (`historic`) it instead returns the reason, and the member is LEFT OUT of the group.
+  type MintsoftCheck = { ok: true } | { ok: false; reason: string }
+  const checkAgainstMintsoft = async (state: LegacyOrderState, mode: 'ours' | 'cancelled' | 'historic', label: string): Promise<MintsoftCheck> => {
     const id = state.mintsoftOrderId ?? state.verifyOrderId
-    if (id === null) return
+    if (id === null) return { ok: true }
+    const deny = (reason: string): MintsoftCheck => {
+      if (mode === 'historic') return { ok: false, reason }
+      throw new DecisionRefusedError(`${label}: ${reason} Nothing was recorded.`)
+    }
     if (!ports.readMintsoftOrder) throw new Error(`${label}: the read-only Mintsoft check is not configured, so the decision cannot be checked; nothing was recorded.`)
     const result = await ports.readMintsoftOrder(id)
     if ('error' in result) throw new Error(`${label}: the read-only Mintsoft check of order ${id} failed (${result.error}); nothing was recorded.`)
-    if (!result.found) {
-      if (mode === 'ours') throw new Error(`${label}: Mintsoft has no order ${id}, so "ours" cannot be right; nothing was recorded.`)
-      mintsoftRead.set(state.wcOrderId, { orderNumber: null, status: null })
-      return
-    }
     const expected = `${orderPrefix}${state.wcNumber}`
+    if (!result.found) {
+      if (mode === 'ours') return deny(`Mintsoft has no order ${id}, so "ours" cannot be right.`)
+      if (!ports.probeMintsoftOrderNumber) throw new Error(`${label}: the read-only Mintsoft search by order number is not configured, so "absent" cannot be confirmed; nothing was recorded.`)
+      const probe = await ports.probeMintsoftOrderNumber(expected)
+      if (typeof probe === 'object') throw new Error(`${label}: the read-only Mintsoft search for order number "${expected}" failed (${probe.error}); nothing was recorded.`)
+      if (probe !== 'MISSING') return deny(`Mintsoft has no order ${id}, but a search for the order number "${expected}" says ${probe}: the real order may sit under another id and would ship with nothing in IMS tracking it.`)
+      mintsoftRead.set(state.wcOrderId, { orderNumber: null, status: null, probe })
+      return { ok: true }
+    }
     const parts = (result.orderNumber ?? '').split('+').map((part) => part.trim())
-    if (!parts.includes(expected)) throw new Error(`${label}: Mintsoft order ${id} carries the number "${result.orderNumber ?? ''}", not "${expected}": it is not this order's; nothing was recorded.`)
+    if (!parts.includes(expected)) return deny(`Mintsoft order ${id} carries the number "${result.orderNumber ?? ''}", not "${expected}": it is not this order's.`)
     const status = (result.status ?? '').toUpperCase() || null
-    if (mode === 'ours' && status === 'CANCELLED') throw new Error(`${label}: Mintsoft order ${id} is CANCELLED, so it cannot be "ours" to adopt; use --as cancelled. Nothing was recorded.`)
-    if (mode === 'cancelled' && status !== 'CANCELLED') throw new Error(`${label}: Mintsoft order ${id} has status ${status ?? '(unresolved)'}, not CANCELLED: recording "cancelled" would leave a live order shipping with nothing to cancel it. Cancel it in Mintsoft first. Nothing was recorded.`)
-    if (mode === 'historic' && status !== 'CANCELLED' && result.dispatched !== true) throw new Error(`${label}: Mintsoft order ${id} has status ${status ?? '(unresolved)'}: it is neither cancelled nor despatched, so it would still ship. Resolve it on its own. Nothing was recorded.`)
+    if (mode === 'ours' && status === 'CANCELLED') return deny(`Mintsoft order ${id} is CANCELLED, so it cannot be "ours" to adopt; use --as cancelled.`)
+    const survivor = parts.length > 1 ? ` It is a merge survivor (${result.orderNumber}) that still holds other orders: resolve this order on its own (--resolve ${state.wcOrderId} --as ours, a MERGED link, with a named owner; or --as cancelled once the survivor is cancelled), never by cancelling the survivor.` : ''
+    if (mode === 'cancelled' && status !== 'CANCELLED') return deny(`Mintsoft order ${id} has status ${status ?? '(unresolved)'}, not CANCELLED: recording "cancelled" would leave a live order shipping with nothing to cancel it. Cancel it in Mintsoft first.${survivor}`)
+    if (mode === 'historic' && status !== 'CANCELLED' && result.dispatched !== true) return deny(`Mintsoft order ${id} has status ${status ?? '(unresolved)'}: it is neither cancelled nor despatched, so it would still ship.${survivor}`)
     mintsoftRead.set(state.wcOrderId, { orderNumber: result.orderNumber, status })
+    return { ok: true }
   }
   if (options.resolve) {
     if (options.resolve.wcOrderIds.length === 0) throw new Error('--resolve needs at least one WooCommerce order id.')
     for (const wcOrderId of options.resolve.wcOrderIds) {
-      const state = states.find((candidate) => candidate.wcOrderId === wcOrderId)
-      if (!state) throw new Error(`--resolve ${wcOrderId}: no order with that WooCommerce id was read with bridge state (check the id and --statuses).`)
+      const outsideEntry = historicQueued.find((candidate) => candidate.state.wcOrderId === wcOrderId)
+      const state = states.find((candidate) => candidate.wcOrderId === wcOrderId) ?? outsideEntry?.state
+      if (!state) throw new DecisionRefusedError(`--resolve ${wcOrderId}: no order with that WooCommerce id was read with bridge state (check the id and --statuses), and it is not a cancelled / refunded order outside the window with a queued action.`)
       const kinds: string[] = [...blockingQueueKinds(state)]
-      const noIms = !imsByWc.has(wcOrderId) && (state.mintsoftOrderId !== null || state.verifyOrderId !== null)
+      if (outsideEntry) kinds.push(...outsideEntry.kinds.filter((kind) => !kinds.includes(kind)), 'historic-queued')
+      const noIms = outsideEntry === undefined && !imsByWc.has(wcOrderId) && (state.mintsoftOrderId !== null || state.verifyOrderId !== null)
       if (noIms) kinds.push('no-ims-order')
-      if (kinds.length === 0) throw new Error(`--resolve ${wcOrderId}: this order is not a gate blocker (no verify-pending / verify-exhausted entry, no queued bridge update or cancel with a Mintsoft order, and it has a Mintsoft id and an IMS order); there is nothing to resolve.`)
-      if (kinds.length === 1 && kinds[0] === 'no-ims-order' && options.resolve.decision === 'ours') throw new Error(`--resolve ${wcOrderId}: the order has no IMS order, so there is no link to write for "ours"; import the order into IMS first, or use --as cancelled / not-ours if the Mintsoft order is gone.`)
+      // An in-window historic order IMS holds (not cancelled) has its own path: it is not stuck behind the group.
+      const historicReason = outsideEntry === undefined ? historicReasonFor(state) : null
+      if (historicReason !== null && historicReason !== 'no-ims-order') kinds.push(historicReason)
+      if (kinds.length === 0) throw new DecisionRefusedError(`--resolve ${wcOrderId}: this order is not a gate blocker (no verify-pending / verify-exhausted entry, no queued bridge update or cancel with a Mintsoft order, no unlinked cancelled / refunded history, and it has a Mintsoft id and an IMS order); there is nothing to resolve.`)
+      if (outsideEntry && options.resolve.decision === 'ours') throw new DecisionRefusedError(`--resolve ${wcOrderId}: this cancelled / refunded order sits outside the history window with a queued bridge action; "ours" would hide the queued cancel. Cancel the Mintsoft order, then --as cancelled. Nothing was recorded.`)
+      if (kinds.length === 1 && kinds[0] === 'no-ims-order' && options.resolve.decision === 'ours') throw new DecisionRefusedError(`--resolve ${wcOrderId}: the order has no IMS order, so there is no link to write for "ours"; import the order into IMS first, or use --as cancelled / not-ours if the Mintsoft order is gone.`)
       // `not-ours` on an id the bridge PROVED would create a second Mintsoft order for an order that is already there.
-      if (options.resolve.decision === 'not-ours' && state.mintsoftOrderId !== null) throw new Error(`--resolve ${wcOrderId}: the bridge PROVED Mintsoft order ${state.mintsoftOrderId} is this order's (_mintsoft_order_id), so "not-ours" would make IMS create a second Mintsoft order. Use --as ours (or --as cancelled once it is cancelled in Mintsoft). Nothing was recorded.`)
+      if (options.resolve.decision === 'not-ours' && state.mintsoftOrderId !== null) throw new DecisionRefusedError(`--resolve ${wcOrderId}: the bridge PROVED Mintsoft order ${state.mintsoftOrderId} is this order's (_mintsoft_order_id), so "not-ours" would make IMS create a second Mintsoft order. Use --as ours (or --as cancelled once it is cancelled in Mintsoft). Nothing was recorded.`)
       if (options.resolve.decision !== 'not-ours') await checkAgainstMintsoft(state, options.resolve.decision, `--resolve ${wcOrderId}`)
+      // A finished (cancelled / refunded) order with an IMS order is adopted as live ("ours") only when it is a merge survivor that holds another order; otherwise it is cancelled.
+      if (historicReason !== null && historicReason !== 'no-ims-order' && kinds.length === 1 && options.resolve.decision === 'ours' && !(mintsoftRead.get(wcOrderId)?.orderNumber ?? state.mintsoftOrderNumber ?? '').includes('+')) {
+        throw new DecisionRefusedError(`--resolve ${wcOrderId}: this is a ${state.wcStatus} order; "ours" (a live link IMS would amend) is only for a merge survivor that still holds another order. Use --as cancelled once Mintsoft shows it cancelled. Nothing was recorded.`)
+      }
       requested.set(wcOrderId, { wcOrderId, decision: options.resolve.decision, signature: resolutionSignature(state), kinds, recordedAt: null })
     }
     if (apply) {
       if (!ports.recordResolution) throw new Error('--resolve with --apply needs the activity-log writer, which is not configured.')
       for (const [wcOrderId, resolution] of requested) {
-        const state = states.find((candidate) => candidate.wcOrderId === wcOrderId)!
+        const state = (states.find((candidate) => candidate.wcOrderId === wcOrderId) ?? historicQueued.find((candidate) => candidate.state.wcOrderId === wcOrderId)?.state)!
         const ok = await ports.recordResolution({ connector, wcOrderId, wcNumber: state.wcNumber, decision: resolution.decision, signature: resolution.signature, kinds: resolution.kinds, mintsoftOrderId: state.mintsoftOrderId, verifyOrderId: state.verifyOrderId, queued: state.syncPending, bridgeStopped: options.bridgeStopped === true, mintsoftRead: mintsoftRead.get(wcOrderId) ?? null }).catch(() => false)
         // Not durably recorded: nothing is written (the decision would be lost while its link was not).
         if (!ok) throw new Error(`--resolve ${wcOrderId}: the decision could not be recorded in the activity log; nothing was written.`)
@@ -347,6 +435,11 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
   const resolveOnly = (options.resolve !== undefined || options.resolveAllHistoricCancelled !== undefined) && apply ? new Set(options.resolve?.wcOrderIds ?? []) : null
   const historicStoredCovers = (state: LegacyOrderState): boolean => storedHistoric.some((r) => r.members[state.wcOrderId] === resolutionSignature(state))
   const historicStates: LegacyOrderState[] = []
+
+  for (const { state, kinds } of historicQueued) {
+    const resolution = decisionFor(state)
+    report.history.outsideQueued.push({ wcOrderId: state.wcOrderId, wcNumber: state.wcNumber, wcStatus: state.wcStatus, kinds, mintsoftOrderId: state.mintsoftOrderId ?? state.verifyOrderId, resolved: resolution !== null })
+  }
 
   const decisions: Array<{ state: LegacyOrderState; ims: ImsOrderContext; decision: LinkDecision }> = []
   for (const state of states) {
@@ -405,8 +498,9 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
     // hand a finished order to IMS's live passes: an order IMS holds PROCESSING with a FULL refund would get a years-old despatch applied by the dispatch
     // sweep, and one IMS holds as plain PROCESSING is never selected by the cancel pass at all (the Mintsoft order ships). It is LISTED instead, as one group.
     const isHistory = (HISTORY_STATUSES as readonly string[]).includes(state.wcStatus)
-    if (isHistory && resolution === null && desired.kind === 'link' && hasMintsoftOrder && !(ims !== null && ims.status === 'CANCELLED')) {
-      const reason = ims === null ? 'no-ims-order' as const : ims.refundStatus === 'FULL' ? 'dispatch-guard' as const : 'ims-not-cancelled' as const
+    const historicReason = resolution === null ? historicReasonFor(state) : null
+    if (historicReason !== null) {
+      const reason = historicReason
       if (ims === null) report.plan.noImsOrder += 1
       else report.plan.notImported += 1
       historicStates.push(state)
@@ -428,22 +522,26 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
   // ONE decision for the whole in-window historic group: the operator checked the group, the tool re-checks every member read-only in Mintsoft.
   if (options.resolveAllHistoricCancelled) {
     const reason = options.resolveAllHistoricCancelled.reason.trim()
-    if (reason === '') throw new Error('--resolve-all-historic-cancelled needs a --reason (it is recorded in the activity log).')
+    if (reason === '') throw new DecisionRefusedError('--resolve-all-historic-cancelled needs a --reason (it is recorded in the activity log).')
     const pending = report.history.unlinked.filter((u) => !u.resolved)
-    if (pending.length === 0) throw new Error('--resolve-all-historic-cancelled: there are no unresolved in-window cancelled / refunded orders to resolve.')
+    if (pending.length === 0) throw new DecisionRefusedError('--resolve-all-historic-cancelled: there are no unresolved in-window cancelled / refunded orders to resolve.')
     const members: Record<string, string> = {}
     for (const entry of pending) {
       const state = historicStates.find((candidate) => candidate.wcOrderId === entry.wcOrderId)!
-      await checkAgainstMintsoft(state, 'historic', `--resolve-all-historic-cancelled (WC #${entry.wcNumber}, id ${entry.wcOrderId})`)
+      const verdict = await checkAgainstMintsoft(state, 'historic', `--resolve-all-historic-cancelled (WC #${entry.wcNumber}, id ${entry.wcOrderId})`)
+      // A member that is live in Mintsoft, a merge survivor holding another order, unresolved, or only found by number is LEFT OUT (it would otherwise block everyone
+      // else): it stays a blocker and is resolved on its own.
+      if (!verdict.ok) { report.history.groupResolution.excluded.push({ wcOrderId: entry.wcOrderId, wcNumber: entry.wcNumber, reason: verdict.reason }); continue }
       members[entry.wcOrderId] = resolutionSignature(state)
     }
+    if (Object.keys(members).length === 0) throw new DecisionRefusedError(`--resolve-all-historic-cancelled: none of the ${pending.length} unresolved member(s) could be recorded as a group (${report.history.groupResolution.excluded.slice(0, 5).map((e) => `WC #${e.wcNumber}: ${e.reason}`).join(' | ')}); resolve each on its own with --resolve <wcOrderId> --as cancelled (or --as ours for a merge survivor). Nothing was recorded.`)
     if (apply) {
       if (!ports.recordHistoricResolution) throw new Error('--resolve-all-historic-cancelled with --apply needs the activity-log writer, which is not configured.')
       const ok = await ports.recordHistoricResolution({ connector, decision: 'cancelled', reason, members, window: options.historyWindow ?? null, bridgeStopped: options.bridgeStopped === true }).catch(() => false)
       if (!ok) throw new Error('--resolve-all-historic-cancelled: the decision could not be recorded in the activity log; nothing was written.')
       report.history.groupResolution.recorded = true
     }
-    for (const entry of pending) entry.resolved = true
+    for (const entry of pending) if (entry.wcOrderId in members) entry.resolved = true
   }
   // A dry run that asked for a decision only PREVIEWS it: its verdict rests on something nobody has recorded.
   report.preview = !apply && (requested.size > 0 || options.resolveAllHistoricCancelled !== undefined)
@@ -507,7 +605,12 @@ export async function runLegacyBridgeImport(ports: LegacyImportPorts, options: L
   if (report.conflicts.length > 0) blockers.push(`${report.conflicts.length} order(s) where an existing IMS link differs from the bridge's state.`)
   const unresolvedNoIms = report.noImsOrder.filter((n) => !n.resolved)
   const unresolvedHistoric = report.history.unlinked.filter((u) => !u.resolved)
-  if (unresolvedHistoric.length > 0) blockers.push(`${unresolvedHistoric.length} cancelled / refunded order(s) modified inside the history window have a bridge-created Mintsoft order that IMS will not link (no IMS order, IMS does not show it cancelled, or it is fully refunded and still PROCESSING): ONE decision clears them all, after you have checked them in Mintsoft: npm run cutover:legacy-import -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" --apply --bridge-stopped (each order is re-read in Mintsoft first and must be cancelled or already despatched).`)
+  report.history.imsProcessing = report.history.unlinked.filter((u) => u.reason !== 'no-ims-order').length
+  const unresolvedOutside = report.history.outsideQueued.filter((q) => !q.resolved)
+  if (report.history.outsideRead && (!report.history.outsideRead.complete || report.history.outsideRead.error)) blockers.push(`The read of the cancelled / refunded history OUTSIDE the window did not complete${report.history.outsideRead.error ? ` (${report.history.outsideRead.error})` : ''}: a queued bridge cancel on an old order could be hidden, so the report is not proof of anything.`)
+  if (unresolvedOutside.length > 0) blockers.push(`${unresolvedOutside.length} cancelled / refunded order(s) OUTSIDE the history window still carry a queued bridge action, a fence, or a verify id with no trusted id [historic-queued] (WC ids ${unresolvedOutside.slice(0, 10).map((q) => q.wcOrderId).join(', ')}${unresolvedOutside.length > 10 ? ', ...' : ''}): the bridge never writes such an order again, so its modified date is old, but its queued cancel would be lost and the Mintsoft order would ship. They are not linked. Cancel each Mintsoft order by hand, then npm run cutover:legacy-import -- --resolve <wcOrderId>[,<id>...] --as cancelled --apply --bridge-stopped (read-checked in Mintsoft first).`)
+  if (!driftCheck) blockers.push('The id-set drift check was skipped (--no-drift-check): this read is a read-only preview and proves nothing about skipped orders. Rerun without the flag.')
+  if (unresolvedHistoric.length > 0) blockers.push(`${unresolvedHistoric.length} cancelled / refunded order(s) modified inside the history window have a bridge-created Mintsoft order that IMS will not link (no IMS order, IMS does not show it cancelled, or it is fully refunded and still PROCESSING): ONE decision clears every member that is cancelled or despatched in Mintsoft: npm run cutover:legacy-import -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" --apply --bridge-stopped (each order is re-read in Mintsoft first; a member that is live there, a merge survivor holding another order, or found only by number is LEFT OUT and stays a blocker). Resolve any member on its own with: npm run cutover:legacy-import -- --resolve <wcOrderId> --as cancelled --apply --bridge-stopped (or --as ours for a merge survivor whose other order is live).`)
   if (unresolvedNoIms.length > 0) blockers.push(`${unresolvedNoIms.length} bridge-created Mintsoft order(s) have no IMS order yet (import them, then rerun; for a cancelled WooCommerce order that IMS will never import, cancel the Mintsoft order by hand and record --resolve <wcOrderId> --as cancelled).`)
   if (report.unreadable.length > 0) blockers.push(`${report.unreadable.length} order(s) carry unreadable bridge meta.`)
   const openMergeCount = report.merge.openHolds.length + report.merge.openTasks.length + report.merge.legacyMergeKeys.length
@@ -531,11 +634,15 @@ export function renderLegacyImportReport(report: LegacyImportReport): string {
   say(`  woocommerce_order_prefix: ${report.prefix.empty ? '"" (EMPTY, as production requires)' : `"${report.prefix.value}" - NOT EMPTY: GATE FAILURE (production keeps the prefix EMPTY, owner decision 2026-11-19)`}`)
   say(`  orders read per status: ${Object.entries(report.statusCounts).map(([status, n]) => `${status} ${n}`).join(', ') || '(none)'}`)
   say(`  bridge stopped attested (--bridge-stopped): ${report.bridgeStopped ? 'yes' : 'no'}${report.mode === 'apply' ? `; audit entry ${report.auditRecorded ? 'recorded' : 'NOT recorded'}` : ''}`)
-  say(`  WooCommerce read: ${report.wc.ordersRead} order(s), ${report.wc.pagesRead} page(s), ${report.wc.complete ? 'complete' : 'INCOMPLETE'}${report.wc.error ? `: ${report.wc.error}` : ''}`)
+  say(`  WooCommerce read: ${report.wc.ordersRead} order(s), ${report.wc.pagesRead} page(s), ${report.wc.complete ? 'complete' : 'INCOMPLETE'}${report.wc.error ? `: ${report.wc.error}` : ''}${report.driftCheck ? '' : '; the id-set drift check was SKIPPED (--no-drift-check): preview only'}`)
   if (report.readNote) say(`  note: ${report.readNote}`)
   const h = report.history
-  say(`  CANCELLED / REFUNDED HISTORY (preview): ${h.window ? `only orders modified since ${h.window.modifiedAfter}${h.window.days !== null ? ` (last ${h.window.days} days)` : ''} are read` : 'the WHOLE history is read (no window)'}; in window ${Object.entries(h.inWindow).map(([status, n]) => `${status} ${n}`).join(', ') || 'none'}; outside the window (never read, never a blocker) ${h.outsideWindow ?? 'not counted'}`)
+  say(`  CANCELLED / REFUNDED HISTORY (preview): ${h.window ? `only orders modified since ${h.window.modifiedAfter}${h.window.days !== null ? ` (last ${h.window.days} days)` : ''} are linked or grouped` : 'the WHOLE history is read (no window)'}; in window ${Object.entries(h.inWindow).map(([status, n]) => `${status} ${n}`).join(', ') || 'none'}; outside the window ${h.outsideWindow ?? 'not counted'} (never linked or grouped; read only for a queued action, below)`)
   say(`    linked for IMS's own cancel pass (IMS already shows them CANCELLED): ${h.linked}; NOT linked, listed as ONE grouped blocker: ${h.unlinked.length} (${h.unlinked.filter((u) => u.resolved).length} resolved)`)
+  if (h.outsideRead) say(`    OUTSIDE the window (read ONLY for a queued bridge action; ${h.outsideRead.ordersRead} order(s), ${h.outsideRead.pagesRead} page(s), ${h.outsideRead.complete ? 'complete' : 'INCOMPLETE'}${h.outsideRead.error ? `: ${h.outsideRead.error}` : ''}): ${h.outsideQueued.length} with a queued action / fence / unproved verify id [historic-queued], ${h.outsideQueued.filter((q) => q.resolved).length} resolved`)
+  for (const q of h.outsideQueued) say(`    [historic-queued] WC #${q.wcNumber} (id ${q.wcOrderId}, ${q.wcStatus}): ${q.kinds.filter((k) => k !== 'historic-queued').join(', ')}; Mintsoft order ${q.mintsoftOrderId ?? '(none)'}${q.resolved ? ' [cleared by the operator\'s decision]' : ' BLOCKS THE GATE'}`)
+  if (h.imsProcessing > 0) say(`    WARNING: ${h.imsProcessing} historic order(s) are still held by IMS as PROCESSING although WooCommerce shows them cancelled / refunded: nothing in IMS cancels them. They are kept from a fresh Mintsoft order ONLY by the step M create floor (paidNotBefore, which exists only while PRODUCER_HOLD_ENFORCED_DESTINATIONS covers mintsoft): confirm the floor is in force before step S, and fix the IMS orders.`)
+  for (const e of h.groupResolution.excluded) say(`    LEFT OUT of the grouped decision: WC #${e.wcNumber} (id ${e.wcOrderId}): ${e.reason}`)
   for (const u of h.unlinked) say(`    WC #${u.wcNumber} (id ${u.wcOrderId}, ${u.wcStatus}): Mintsoft order ${u.mintsoftOrderId}; ${u.reason === 'no-ims-order' ? 'IMS has no such order' : u.reason === 'dispatch-guard' ? 'IMS holds it with a FULL refund and not cancelled (a SYNCED link would let the dispatch sweep apply an old despatch)' : 'IMS does not show it cancelled (the cancel pass would never select it)'}${u.resolved ? ' [cleared by the grouped decision]' : ''}`)
   say(`  orders with bridge state ${report.orders.withBridgeState} (with a Mintsoft id ${report.orders.withMintsoftId}); without ${report.orders.withoutBridgeState}`)
   say(`  link plan: create ${report.plan.create}, adopt ${report.plan.adopt}, unchanged ${report.plan.unchanged}, conflict ${report.plan.conflict}, nothing-to-adopt ${report.plan.none}, advanced since import ${report.plan.advanced}, blocked (verify / queued action, not linked) ${report.plan.blocked}, no IMS order ${report.plan.noImsOrder}, historic not imported ${report.plan.notImported}, unreadable ${report.plan.unreadable}`)

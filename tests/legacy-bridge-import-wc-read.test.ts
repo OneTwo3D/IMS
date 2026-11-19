@@ -94,7 +94,9 @@ test('parseRetryAfterMs reads delta-seconds and HTTP dates, and nothing else', a
 
 test('o3d-l3jkv drift: with the id-set check a NEW order joining mid-walk does not fail the read, and a leave plus a join that keeps the totals equal is still caught', async () => {
   const opts = { maxPages: 10, ...describe, sleep: async () => undefined, pageDelayMs: 0, verifyPass: true }
-  const paged = (sets: { read: number[][]; verify: number[][]; totals?: { read: number[]; verify: number[] } }) => async (page: number, pass?: 'read' | 'verify') => {
+  const paged = (sets: { read: number[][]; verify: number[][]; totals?: { read: number[]; verify: number[] }; high?: number }) => async (page: number, pass?: 'read' | 'verify' | 'high') => {
+    // The high-water probe: the set's highest id BEFORE the first walk (default: the highest id of the first walk).
+    if (pass === 'high') return { data: [{ id: sets.high ?? Math.max(0, ...sets.read.flat()) }], totalItems: undefined }
     const pages = (pass === 'verify' ? sets.verify : sets.read)
     const totals = pass === 'verify' ? sets.totals?.verify : sets.totals?.read
     return { data: (pages[page - 1] ?? []).map((id) => ({ id })), totalItems: totals?.[page - 1] }
@@ -114,6 +116,14 @@ test('o3d-l3jkv drift: with the id-set check a NEW order joining mid-walk does n
   const dup = await walkWcOrderPages(paged({ read: [[1, 2], [2, 3]], verify: [[1, 2, 3]] }), opts)
   assert.equal(dup.complete, false)
   assert.match(dup.error ?? '', /same order id twice/)
+  // TAIL SKIP: 1..3 are in the set (high-water 3). An earlier order leaves before the last page is fetched, so the walk misses the newest order 3 at the tail;
+  // 3 is at or below the high-water id, so it is a SKIPPED order, not a join.
+  const tail = await walkWcOrderPages(paged({ read: [[1, 2]], verify: [[1, 2, 3]], high: 3 }), opts)
+  assert.equal(tail.complete, false)
+  assert.match(tail.error ?? '', /found 1 order\(s\) the read skipped \(ids 3\)/)
+  // The high-water probe failing is an incomplete read, never a pass.
+  const probeFails = await walkWcOrderPages(async (page, pass) => (pass === 'high' ? { data: null, error: 'WC API error: 500' } : { data: [], totalItems: undefined }), opts)
+  assert.equal(probeFails.complete, false)
   // An order that LEFT the set (only the first walk saw it) is fine.
   const left = await walkWcOrderPages(paged({ read: [[1, 2, 3]], verify: [[1, 3]] }), opts)
   assert.equal(left.complete, true)
