@@ -20,3 +20,11 @@ export function businessDateOfStamp(stamp: string, timeZone: string = DEFAULT_TI
   const instant = new Date(/(?:Z|[+-]\d{2}:?\d{2})$/.test(stamp) ? stamp : `${stamp}Z`)
   return Number.isNaN(instant.getTime()) ? null : businessDateYmd(instant, timeZone)
 }
+
+/**
+ * THE DAY CONVENTION A POSTED RECEIPT'S `paymentDate` CARRIES, recorded IN THE PAYLOAD when it is built (o3d-oe1b0). Every INVOICE_PAYMENT payload built after
+ * the London-day change carries `dateConvention: 'london'`; a payload without it predates the change and is judged by its row's creation instant against the
+ * recorded cut-in. Recording it is what keeps a revived FAILED row (a fresh payload on an old row) from being judged by the old row's createdAt.
+ */
+export const POSTED_DAY_CONVENTION_FIELD = 'dateConvention'
+export const LONDON_POSTED_DAY_CONVENTION = 'london'

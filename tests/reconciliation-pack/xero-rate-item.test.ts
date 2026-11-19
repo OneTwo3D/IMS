@@ -602,6 +602,27 @@ test('R16 receipt on the UTC/London boundary: the UTC day is accepted ONLY for a
   }
 })
 
+// [mutation: the receipt row's createdAt decides the rate-stamp convention / the recorded dateConvention is ignored]
+test('R16 receipt: the rate stamp is judged by the SOURCE invoice\'s createdAt and the posted day by the recorded convention (o3d-oe1b0)', async () => {
+  // Order created 23:30 UTC 9 Sep = 00:30 London 10 Sep. The payment is at 00:30 UTC 10 Sep (01:30 London): posted on the London day 10 Sep.
+  // Under the UTC rule the order (9 Sep) and the payment (10 Sep) are on different days, so an importer working before the cut-in stamped the TABLE rate (1.4);
+  // under the London rule both are 10 Sep and the order rate (1.2) is stamped.
+  const rows = [{ currency: 'EUR', rate: '1.4', fetchedAt: '2026-09-09T06:00:00.000Z', manualOverride: false }]
+  const created = '2026-09-09T23:30:00.000Z'
+  const receipt = (rate: string, xero: number, over: Record<string, unknown>) => context({ payments: [paymentRow({ n: 1, date: '2026-09-10', currency: 'EUR', rate: xero })] }, { ims: { rows, posted: [postedRow(1, 'INVOICE_PAYMENT', { rate, orderRate: '1.2', wooReceipt: true, orderCreatedAt: created, date: '2026-09-10', londonDayCutIn: CUT_IN, ...over })] } }).ctx
+  // (a) Imported before the cut-in (the source invoice), follow-up row created after it: the stamp was the UTC rule's (table rate). The row's own createdAt alone would call it London and want the order rate.
+  const imported = { sourceCreatedAt: BEFORE_CUT_IN, createdAt: AFTER_CUT_IN }
+  assert.equal((await runXeroRateItem('R16', receipt('1.4', 0.714286, imported))).outcome, 'pass', 'the table rate the UTC-era importer stamped')
+  // (a') Imported after the cut-in, too: the London rule is exact, so the table rate is a finding and the order rate is right.
+  const importedAfter = { sourceCreatedAt: AFTER_CUT_IN, createdAt: AFTER_CUT_IN }
+  assert.equal((await runXeroRateItem('R16', receipt('1.2', 0.833333, importedAfter))).outcome, 'pass')
+  assert.equal((await runXeroRateItem('R16', receipt('1.4', 0.714286, importedAfter))).outcome, 'fail')
+  // (b) A FAILED row revived after the cut-in keeps its old createdAt but carries a fresh payload recording the London day: not judged by the old instant alone.
+  const revived = { sourceCreatedAt: BEFORE_CUT_IN, createdAt: BEFORE_CUT_IN }
+  assert.equal((await runXeroRateItem('R16', receipt('1.2', 0.833333, { ...revived, dateConvention: 'london' }))).outcome, 'pass', 'recorded London day')
+  assert.equal((await runXeroRateItem('R16', receipt('1.2', 0.833333, revived))).outcome, 'fail', 'no recorded convention: the old row is judged UTC, the London day is not the order\'s UTC day')
+})
+
 // [mutation: the invoice day rows cut on the London day for a pre-cut-in invoice / on the UTC day for a post-cut-in one]
 test('R16 SALES_INVOICE fallback (order instant unknown): the rows "of the day" are the UTC day before the cut-in and the London day after it', async () => {
   // 1.3 is the rate of 23:30 UTC 14 Aug (London 15 Aug), 1.6 that of 23:15 UTC 15 Aug (London 2 Jul): neither is the rate at the start or the end of 15 Aug UTC (1.31 / 1.7).

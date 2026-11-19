@@ -21,3 +21,10 @@ test('the follow-up enqueue reads the payment day through it, and the manual pay
   const sales = await readFile('app/actions/sales.ts', 'utf8')
   assert.match(sales, /date: businessDateYmd\(txResult\.paidAt\)/)
 })
+
+// o3d-oe1b0: every INVOICE_PAYMENT payload records the day convention of its own paymentDate, so R16 does not have to infer it from a row's creation instant (a revived FAILED row keeps an old one).
+test('both INVOICE_PAYMENT payload builders record the London day convention', async () => {
+  const marker = /\[POSTED_DAY_CONVENTION_FIELD\]: LONDON_POSTED_DAY_CONVENTION/
+  assert.match(await readFile('lib/domain/accounting/invoice-payment-enqueue.ts', 'utf8'), marker)
+  assert.match(await readFile('lib/connectors/xero/sync-processor.ts', 'utf8'), marker)
+})

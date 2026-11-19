@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { getAccountingSettings, queueAccountingSyncTxWithOutcome, type AccountingSettings, type AccountingEnqueueOutcome } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import {
+  ASSERTED_POSTED_WHERE,
   LEDGER_STANDING_SELECT,
   WORK_SLOT_OCCUPIED_WHERE,
   ledgerStanding,
@@ -19,6 +20,7 @@ import {
   type FxSettlementSide,
 } from '@/lib/accounting-fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { endOfBusinessDateUtc, isMissingFxRateError, type FxMissingReason } from '@/lib/currencies/fx-lookup'
 import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { businessDateYmd } from '@/lib/business-date'
@@ -390,27 +392,57 @@ async function revaluedSidesForDate(
 }
 
 /**
- * o3d-hqvrp.60 - THE UNREALISED-FX POPULATION. Receivables are orders whose INVOICE HAS BEEN POSTED to the ledger (`accountingInvoiceId`, the
- * back-reference the posting writes): the journal revalues the ledger's receivable balance, and an order the ledger does not hold an invoice for
- * (PENDING_PAYMENT, ON_HOLD, or any status before the invoice posts) owes nothing there yet (o3d-cr517). A DRAFT order, a quotation and a cancelled
- * one are not receivables either. There is deliberately NO refund-status filter: a fully refunded order whose credit note has not reached the ledger is
- * still open there, and one whose credit note has is netted to nothing by `receivableOutstanding`. Exported so the population is testable.
+ * o3d-hqvrp.60 - THE UNREALISED-FX POPULATION. Receivables are orders whose INVOICE IS IN THE LEDGER, by any route IMS records (o3d-cr517): the journal
+ * revalues the ledger's receivable balance, and an order the ledger holds no invoice for (PENDING_PAYMENT, ON_HOLD, or any status before the invoice
+ * posts) owes nothing there yet. "In the ledger" is the shared invoiced-revenue basis (`INVOICED_ORDER_WHERE`: IMS's `accountingInvoiceId`, or a
+ * Xeroom-era invoice number on a WooCommerce-linked order, neither of which the daily batch's narrower IMS-only question may share) PLUS the orders in
+ * `handPostedInvoiceOrderIds`: a SALES_INVOICE posted by hand and marked handled, or asserted by an operator, carries no back-reference at all.
+ * A DRAFT order, a quotation and a cancelled one are not receivables either. There is deliberately NO refund-status filter: a fully refunded order
+ * whose credit note has not reached the ledger is still open there, and one whose credit note has is netted to nothing by `receivableOutstanding`.
+ * Exported so the population is testable.
  */
-export const OPEN_RECEIVABLE_ORDER_WHERE = (baseCurrency: string) => ({
+export const OPEN_RECEIVABLE_ORDER_WHERE = (baseCurrency: string, handPostedInvoiceOrderIds: readonly string[] = []) => ({
   currency: { not: baseCurrency },
   status: { notIn: ['CANCELLED', 'DRAFT'] as Array<'CANCELLED' | 'DRAFT'> },
   isQuote: false,
-  accountingInvoiceId: { not: null },
+  OR: [
+    ...(INVOICED_ORDER_WHERE.OR ?? []),
+    ...(handPostedInvoiceOrderIds.length > 0 ? [{ id: { in: [...handPostedInvoiceOrderIds] } }] : []),
+  ],
   totalForeign: { gt: 0 },
 })
 
 /**
- * THE CREDIT NOTES THAT REDUCE A RECEIVABLE (o3d-cr517). The same ledger basis as the payable side (`supplierCreditNotes: { status: 'POSTED' }`): a refund
- * reduces what the ledger holds as owed only once its credit note has reached the ledger (`accountingCreditNoteId`, the back-reference the posting writes).
- * Netting a refund whose credit note is still queued would revalue less than the ledger's own balance; the revaluation journal revalues THAT balance, so the
- * ledger basis is the one that keeps the journal and the ledger in step. Exported so the basis is testable.
+ * THE REFUNDS THAT MAY REDUCE A RECEIVABLE (o3d-cr517): the live ones. Whether one DOES is decided in `getOpenReceivables` on the ledger basis (the
+ * payable side's `supplierCreditNotes: { status: 'POSTED' }`): its credit note must have reached the ledger, which is `accountingCreditNoteId` (the
+ * back-reference the posting writes) or a hand-posted / operator-asserted credit note (`handPostedLedgerDocumentIds`), neither of which writes it.
+ * Netting a refund whose credit note is still queued would revalue less than the ledger's own balance. Exported so the basis is testable.
  */
-export const RECEIVABLE_NETTING_REFUND_WHERE = { deletedAt: null, accountingCreditNoteId: { not: null } } as const
+export const RECEIVABLE_NETTING_REFUND_WHERE = { deletedAt: null } as const
+
+/**
+ * THE DOCUMENTS (by referenceId) OF ONE TYPE THAT REACHED THE LEDGER WITHOUT AN IMS BACK-REFERENCE: a sync row an operator ASSERTED posted, or a
+ * refusal marked HANDLED BY HAND (`handled_manually`: the operator posted it themselves).
+ */
+async function handPostedLedgerDocumentIds(
+  type: 'SALES_INVOICE' | 'CREDIT_NOTE',
+  referenceType: 'SalesOrder' | 'SalesOrderRefund',
+  referenceIds?: readonly string[],
+): Promise<Set<string>> {
+  if (referenceIds && referenceIds.length === 0) return new Set()
+  const reference = referenceIds ? { referenceId: { in: [...referenceIds] } } : {}
+  const [asserted, handled] = await Promise.all([
+    db.accountingSyncLog.findMany({
+      where: { type, referenceType, ...reference, ...ASSERTED_POSTED_WHERE },
+      select: { referenceId: true },
+    }),
+    db.accountingPostingRefusal.findMany({
+      where: { type, referenceType, ...reference, resolution: 'handled_manually' },
+      select: { referenceId: true },
+    }),
+  ])
+  return new Set([...asserted, ...handled].map((row) => row.referenceId))
+}
 
 /**
  * What is still owed on an order: total, less receipts, less the credit notes raised against it (a credit note reduces the
@@ -476,9 +508,10 @@ export function payableOutstanding(invoice: {
   return { outstandingForeign: outstanding.toNumber(), bookedBase: bookedBase.toNumber() }
 }
 
-async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> {
+export async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> {
+  const handPostedInvoices = await handPostedLedgerDocumentIds('SALES_INVOICE', 'SalesOrder')
   const orders = await db.salesOrder.findMany({
-    where: OPEN_RECEIVABLE_ORDER_WHERE(baseCurrency),
+    where: OPEN_RECEIVABLE_ORDER_WHERE(baseCurrency, [...handPostedInvoices]),
     select: {
       id: true,
       orderNumber: true,
@@ -492,12 +525,17 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
         where: { refundId: null },
         select: { amount: true, currency: true },
       },
-      refunds: { where: RECEIVABLE_NETTING_REFUND_WHERE, select: { totalForeign: true, ...REFUND_TURNOVER_SELECT.select } },
+      refunds: { where: RECEIVABLE_NETTING_REFUND_WHERE, select: { id: true, accountingCreditNoteId: true, totalForeign: true, ...REFUND_TURNOVER_SELECT.select } },
     },
   })
 
+  // A refund reduces the receivable once its credit note is in the ledger: back-referenced, or posted by hand / asserted (no back-reference).
+  const unreferenced = orders.flatMap((order) => order.refunds.filter((refund) => !refund.accountingCreditNoteId).map((refund) => refund.id))
+  const handPostedCreditNotes = await handPostedLedgerDocumentIds('CREDIT_NOTE', 'SalesOrderRefund', unreferenced)
+
   return orders.flatMap((order) => {
-    const { outstandingForeign, bookedBase } = receivableOutstanding(order)
+    const netted = order.refunds.filter((refund) => refund.accountingCreditNoteId || handPostedCreditNotes.has(refund.id))
+    const { outstandingForeign, bookedBase } = receivableOutstanding({ ...order, refunds: netted })
     if (outstandingForeign < 0.01) return []
     return [{
       id: order.id,

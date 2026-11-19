@@ -51,7 +51,7 @@ import { invoicePaymentReceiptId } from '@/lib/domain/accounting/operator-ledger
 import { loadLiveReceipts } from '@/lib/domain/accounting/payment-identity'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { isShadowedOutcome } from '@/lib/domain/accounting/enqueue-outcome'
-import { businessDateYmd } from '@/lib/business-date'
+import { businessDateYmd, LONDON_POSTED_DAY_CONVENTION, POSTED_DAY_CONVENTION_FIELD } from '@/lib/business-date'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   REGISTERED_AMOUNT_DECIMAL_FIELD,
@@ -1841,6 +1841,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           ...(settlementRateForPayload !== undefined ? { settlementRateToBase: settlementRateForPayload } : {}),
           // The business (London) day, the day the realised-FX journal for this receipt is dated on (sales.ts).
           paymentDate: businessDateYmd(params.paidAt),
+          [POSTED_DAY_CONVENTION_FIELD]: LONDON_POSTED_DAY_CONVENTION,
           method: params.method ?? '',
           reference: params.reference ?? undefined,
           // Which local receipt this is, so deletePayment can retract exactly this row rather than any

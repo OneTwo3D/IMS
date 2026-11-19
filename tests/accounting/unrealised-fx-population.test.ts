@@ -55,40 +55,53 @@ test('o3d-cr517: a fully refunded NET order in a high-ratio currency leaves noth
   assert.equal(receivableOutstanding(order).outstandingForeign, 0)
 })
 
-// The where objects are evaluated against rows by the sync-log store's matcher (it throws on an operator it does not implement), so a clause that did not mean what the
-// comment says would select the wrong rows rather than pass a structural assertion.
+// The where objects are evaluated against rows (the sync-log store's matcher throws on an operator it does not implement), so a clause that did not mean what the
+// comment says would select the wrong rows rather than pass a structural assertion. `shoppingLinks: { some }` is a relation filter the store matcher has no
+// operator for, so the order matcher evaluates that one arm itself.
 const asRow = (row: Record<string, unknown>) => row as unknown as SyncLogRow
-const order = (over: Record<string, unknown> = {}) => ({ currency: 'EUR', status: 'PROCESSING', isQuote: false, accountingInvoiceId: 'INV-1', totalForeign: 100, refundStatus: 'NONE', ...over })
+function orderMatches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
+  for (const [key, condition] of Object.entries(where)) {
+    if (key === 'OR') { if (!(condition as Array<Record<string, unknown>>).some((arm) => orderMatches(row, arm))) return false; continue }
+    if (key === 'shoppingLinks') {
+      const links = (row.shoppingLinks ?? []) as Array<Record<string, unknown>>
+      if (!links.some((link) => matchesWhere(asRow(link), (condition as { some: Record<string, unknown> }).some))) return false
+      continue
+    }
+    if (!matchesWhere(asRow(row), { [key]: condition })) return false
+  }
+  return true
+}
+const order = (over: Record<string, unknown> = {}) => ({ id: 'so-1', currency: 'EUR', status: 'PROCESSING', isQuote: false, accountingInvoiceId: 'INV-1', invoiceNumber: null, shoppingLinks: [], totalForeign: 100, refundStatus: 'NONE', ...over })
 
-// [mutation: the invoice-posted clause dropped, so population is keyed on status again]
-test('o3d-cr517: the receivable population is keyed on the invoice being POSTED, not on order status', () => {
-  const where = OPEN_RECEIVABLE_ORDER_WHERE('GBP')
-  const included = (over: Record<string, unknown>) => matchesWhere(asRow(order(over)), where)
+// [mutation: the invoice clause dropped, so population is keyed on status again / keyed on accountingInvoiceId alone]
+test('o3d-cr517: the receivable population is keyed on the invoice being IN THE LEDGER, by any recorded route, not on order status', () => {
+  const where = OPEN_RECEIVABLE_ORDER_WHERE('GBP', ['so-hand'])
+  const included = (over: Record<string, unknown>) => orderMatches(order(over), where)
   assert.equal(included({}), true)
   // PENDING_PAYMENT and ON_HOLD orders the ledger holds no invoice for are not receivables; once the invoice has posted they are.
-  for (const status of ['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'SHIPPED']) assert.equal(included({ status, accountingInvoiceId: null }), false, `${status}, invoice not posted`)
+  for (const status of ['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'SHIPPED']) assert.equal(included({ status, accountingInvoiceId: null }), false, `${status}, no invoice`)
   for (const status of ['PENDING_PAYMENT', 'ON_HOLD']) assert.equal(included({ status }), true, `${status}, invoice posted`)
+  // A Xeroom-era invoice has a number but no back-reference: in the ledger, on a WooCommerce-linked order. An IMS-minted number on any other order is not proof.
+  const xeroom = { accountingInvoiceId: null, invoiceNumber: 'INV-0001', shoppingLinks: [{ connector: 'woocommerce' }] }
+  assert.equal(included(xeroom), true, 'Xeroom-era invoice')
+  assert.equal(included({ ...xeroom, shoppingLinks: [] }), false, 'IMS-minted number, not posted')
+  assert.equal(included({ ...xeroom, status: 'PENDING_PAYMENT' }), true)
+  // An invoice posted by hand (marked handled) or asserted by an operator has no back-reference either: it is in the id list the query is given.
+  assert.equal(included({ id: 'so-hand', accountingInvoiceId: null }), true, 'hand-posted / asserted invoice')
+  assert.equal(included({ id: 'so-other', accountingInvoiceId: null }), false)
   // Unchanged exclusions.
   assert.equal(included({ status: 'CANCELLED' }), false)
   assert.equal(included({ status: 'DRAFT' }), false)
   assert.equal(included({ isQuote: true }), false)
   assert.equal(included({ currency: 'GBP' }), false)
-  // A fully refunded order stays in the population: whether it is still owed is decided by the credit notes the ledger holds (below), not by IMS's refund state.
+  // A fully refunded order stays in the population: whether it is still owed is decided by the credit notes the ledger holds, not by IMS's refund state.
   assert.equal(included({ refundStatus: 'FULL' }), true)
 })
 
-// [mutation: the credit-note-posted clause dropped, so a refund still queued for the ledger is netted]
-test('o3d-cr517: receivables net only refunds whose credit note has reached the ledger, the payable side\'s POSTED basis', () => {
+test('o3d-cr517: the refunds offered for netting are the live ones; the ledger test is applied by getOpenReceivables', () => {
   const refunds = [
-    { id: 'posted', deletedAt: null, accountingCreditNoteId: 'CN-1', totalForeign: '30' },
-    { id: 'queued', deletedAt: null, accountingCreditNoteId: null, totalForeign: '25' },
-    { id: 'deleted', deletedAt: new Date(), accountingCreditNoteId: 'CN-2', totalForeign: '10' },
+    { id: 'live', deletedAt: null },
+    { id: 'deleted', deletedAt: new Date() },
   ]
-  const netted = refunds.filter((refund) => matchesWhere(asRow(refund), RECEIVABLE_NETTING_REFUND_WHERE))
-  assert.deepEqual(netted.map((r) => r.id), ['posted'])
-  const base = { totalForeign: '100', totalBase: '80', currency: 'EUR', payments: [] }
-  assert.equal(receivableOutstanding({ ...base, refunds: netted }).outstandingForeign, 70, 'the queued credit note is not subtracted')
-  // A fully credited order whose credit note HAS posted leaves nothing; with it still queued the ledger still holds the whole invoice.
-  assert.equal(receivableOutstanding({ ...base, refunds: [refunds[0]!, { ...refunds[1]!, accountingCreditNoteId: 'CN-3', totalForeign: '70' }].filter((r) => matchesWhere(asRow(r), RECEIVABLE_NETTING_REFUND_WHERE)) }).outstandingForeign, 0)
-  assert.equal(receivableOutstanding({ ...base, refunds: [{ ...refunds[1]!, totalForeign: '100' }].filter((r) => matchesWhere(asRow(r), RECEIVABLE_NETTING_REFUND_WHERE)) }).outstandingForeign, 100)
+  assert.deepEqual(refunds.filter((refund) => matchesWhere(asRow(refund), RECEIVABLE_NETTING_REFUND_WHERE)).map((r) => r.id), ['live'])
 })

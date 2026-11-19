@@ -59,7 +59,7 @@ import {
   type PackSourceCode,
 } from '@/lib/reconciliation-pack/constants'
 import { imsRateToXeroCurrencyRate } from '@/lib/connectors/xero/fx'
-import { businessDateYmd } from '@/lib/business-date'
+import { businessDateYmd, LONDON_POSTED_DAY_CONVENTION } from '@/lib/business-date'
 import { postedReceiptOnOrderDay, utcCalendarDate } from '@/lib/connectors/woocommerce/sync/receipt-settlement-rate'
 import { endOfBusinessDateUtc, isMissingFxRateError, selectFxRateFromRows, type FxRateRow as SelectRow } from '@/lib/currencies/fx-select'
 import type { KeyPart } from '@/lib/reconciliation-pack/identity'
@@ -195,11 +195,24 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
     }
     // THE DATE CONVENTION. A posting created before the recorded London-day cut-in carries the UTC day; one created on or after it carries the London day. No recorded
     // cut-in means none is pending (a fresh install: the migration stamps one at install), so every posting is post-cut-in.
-    const createdMs = log.createdAt === null ? Number.NaN : Date.parse(log.createdAt)
     const cutInMs = log.londonDayCutIn === null ? Number.NaN : Date.parse(log.londonDayCutIn)
     if (log.londonDayCutIn !== null && Number.isNaN(cutInMs)) return unreadablePosting(log.id, 'cut-in-unreadable')
-    if (!Number.isNaN(cutInMs) && Number.isNaN(createdMs)) return unreadablePosting(log.id, 'created-unreadable')
-    const legacy = !Number.isNaN(cutInMs) && createdMs < cutInMs
+    // Whether a record created at `instant` is before the cut-in (null = the instant cannot be read). No recorded cut-in: nothing is legacy.
+    const legacyAt = (instant: string | null): boolean | null => {
+      if (Number.isNaN(cutInMs)) return false
+      const ms = instant === null ? Number.NaN : Date.parse(instant)
+      return Number.isNaN(ms) ? null : ms < cutInMs
+    }
+    const ownLegacy = legacyAt(log.createdAt)
+    if (ownLegacy === null) return unreadablePosting(log.id, 'created-unreadable')
+    const legacy = ownLegacy
+    // THE TWO CONVENTIONS OF A RECEIPT (o3d-oe1b0). They are decided at different moments, so each is read from its own evidence:
+    //   - the importer's rate STAMP (`_paymentSettlementRateToBase`) was decided at import, on the SOURCE SALES_INVOICE: judged by that row's creation instant;
+    //   - the posted paymentDate was decided when this INVOICE_PAYMENT payload was built: the payload records it (`dateConvention`), and a payload from before that
+    //     falls back to this row's creation instant. A revived FAILED row keeps its old createdAt but carries a fresh payload, hence the recorded convention.
+    const sourceLegacy = log.type === 'INVOICE_PAYMENT' && log.sourceCreatedAt !== null ? legacyAt(log.sourceCreatedAt) : ownLegacy
+    if (sourceLegacy === null) return unreadablePosting(log.id, 'created-unreadable')
+    const postedDayLegacy = log.type === 'INVOICE_PAYMENT' && log.dateConvention === LONDON_POSTED_DAY_CONVENTION ? false : ownLegacy
     const key = [...baseKey(document), sku('ims-posting'), sku(log.id)]
     summary.compared += 1
     if (expectedSent.eq(xeroRate)) summary.equal += 1
@@ -223,7 +236,11 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
       // `day` is the POSTED payment day: the London day for a posting created on or after the recorded London-day cut-in (LONDON_DAY_CUTIN_SETTING_KEY), the UTC day
       // for one created before it. Each posting is judged by the ONE convention in force when it was made, never by both: accepting either day for every receipt
       // could not catch a wrong rate on exactly the boundary cases (o3d-oe1b0).
-      const wantsOrder = [postedReceiptOnOrderDay(created, day, legacy)]
+      // The posted day is on `postedDayLegacy`'s convention and the stamp was decided on `sourceLegacy`'s: when they agree the same-day test is exact. When they differ (a receipt imported
+      // before the cut-in and posted after it) the payment's instant is not recoverable from a day, so the rate either interpretation wants is accepted, never a false finding.
+      const wantsOrder = sourceLegacy === postedDayLegacy
+        ? [postedReceiptOnOrderDay(created, day, sourceLegacy)]
+        : [postedReceiptOnOrderDay(created, day, true), postedReceiptOnOrderDay(created, day, false)]
       candidates = []
       if (wantsOrder.some(Boolean)) {
         const order = postedRateOf(log.orderRate)
