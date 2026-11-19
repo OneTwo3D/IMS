@@ -167,6 +167,9 @@ export async function sendEmailWithSmtpSettings(
     // fact and discarded; nothing it carries (addresses, credentials) is kept.
     let awaitingDataReply = false
     let dataStarted = false
+    // nodemailer >= 10 pipelines MAIL FROM / RCPT TO / DATA when the server offers PIPELINING, so 'DATA' is logged BEFORE the replies to MAIL and RCPT
+    // (2xx) and the 354 comes last: with PIPELINING only a 3xx line is the DATA reply. Without it the very next server line is the DATA reply.
+    let serverPipelines = false
     if (opts.singleSend) {
       unknownOutcomeProbe = (e) => {
         const responseCode = (e as { responseCode?: unknown } | null)?.responseCode
@@ -188,9 +191,13 @@ export async function sendEmailWithSmtpSettings(
             if (entry?.tnx === 'client' && message.trim().toUpperCase() === 'DATA') awaitingDataReply = true
             // The server's answer to DATA is logged ('server') just before nodemailer acts on it; a 354 (nodemailer also accepts 2xx) is what
             // makes it stream the message. Only from that reply on has anything been handed over. Pinned by the nodemailer-version test.
-            else if (entry?.tnx === 'server' && awaitingDataReply) {
-              awaitingDataReply = false
-              if (/^[23]\d\d/.test(message.trim())) dataStarted = true
+            else if (entry?.tnx === 'server') {
+              if (/[ -]PIPELINING\b/i.test(message)) serverPipelines = true
+              else if (awaitingDataReply) {
+                const reply = message.trim()
+                if (serverPipelines ? /^3\d\d/.test(reply) : /^[23]\d\d/.test(reply)) { awaitingDataReply = false; dataStarted = true }
+                else if (!serverPipelines) awaitingDataReply = false
+              }
             }
           },
           level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,

@@ -1,0 +1,4 @@
+### Security patch upgrades of production dependencies (deps)
+- next 16.2.10 -> 16.4.6 (and eslint-config-next to match), next-auth 5.0.0-beta.30 -> beta.32 (@auth/core 0.41.3), nodemailer 9.0.3 -> 10.6.0, sharp 0.34 -> 0.35.5, zod 4.3 -> 4.6.7, @sentry/nextjs 11.10 -> 11.14, prisma / @prisma/client / @prisma/adapter-pg 7.8 -> 7.10.1, pg 8.20 -> 8.23.1.
+- Transitive nanoid and source-map-js moved to patched releases via `npm audit fix`. `npm audit --omit=dev` goes from 3 critical / 5 high to 0 critical / 0 high.
+- nodemailer 10 pipelines MAIL FROM / RCPT TO / DATA on servers that offer PIPELINING, so the single-send phase tracker (PO emails) now treats only the 354 as the reply to DATA on such servers; the mailer tests mock both the ESM and CJS builds and the version-pin test reads the new `dist/` layout.

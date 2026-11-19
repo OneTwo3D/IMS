@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import test, { mock } from 'node:test'
 
 // nodemailer is a double: no socket is opened, no network is reached. `behave` decides what each sendMail does and may drive the
@@ -7,14 +9,17 @@ type Options = { logger: { debug(entry: unknown, message: string): void } } & Re
 let behave: (o: Options) => Promise<unknown> = async () => ({})
 let lastOptions: Record<string, unknown> | null = null
 let sendMailCalls = 0
-mock.module('nodemailer', {
+// nodemailer 10 ships separate ESM and CJS entries; lib/mailer.ts is loaded through whichever one the loader picks, so the double is installed on both.
+const nodemailerDouble = {
   defaultExport: {
     createTransport: (o: Options) => {
       lastOptions = o
       return { sendMail: () => { sendMailCalls++; return behave(o) }, close: () => undefined }
     },
   },
-})
+}
+mock.module('nodemailer', nodemailerDouble)
+mock.module(pathToFileURL(createRequire(import.meta.url).resolve('nodemailer')).href, nodemailerDouble)
 
 const SMTP = { host: 'smtp.invalid', port: 587, user: '', pass: '', secure: 'none', fromName: 'X', fromEmail: 'from@example.test', replyTo: '' }
 const mail = { to: 'to@example.test', subject: 's', html: 'h' }
@@ -90,12 +95,18 @@ test('mailer: the installed nodemailer logs the DATA command and the server repl
   const { createRequire } = await import('node:module')
   const req = createRequire(import.meta.url)
   const dir = req.resolve('nodemailer/package.json').replace(/package\.json$/, '')
-  const src = readFileSync(`${dir}lib/smtp-connection/index.js`, 'utf8')
-  assert.match(src, /this\._sendCommand\('DATA'\)/, 'nodemailer writes DATA itself')
-  assert.match(src, /tnx: 'client'/, "client commands are logged with tnx 'client' when transactionLog is on")
-  assert.match(src, /tnx: 'server'/, "server replies are logged with tnx 'server' before the response action runs")
-  assert.match(src, /new Error\('Connection closed unexpectedly'\), 'ECONNECTION', serverResponse, 'CONN'/, 'a mid-reply close attaches the partial response (and so a responseCode) to the ECONNECTION error')
-  assert.match(src, /_actionDATA\(str, callback\) \{\s*\n[^\n]*\n[^\n]*\n\s*if \(!\/\^\[23\]\/\.test\(str\)\)/, 'DATA accepts a 2xx/3xx reply, then streams')
+  // nodemailer 10 ships dist/esm and dist/cjs builds; the two are generated from one source, so both must carry the behaviour the phase tracker reads.
+  for (const build of ['esm', 'cjs']) {
+    const src = readFileSync(`${dir}dist/${build}/smtp-connection/index.js`, 'utf8')
+    assert.match(src, /this\._sendCommand\('DATA'\)/, `${build}: nodemailer writes DATA itself`)
+    assert.match(src, /tnx: 'client'/, `${build}: client commands are logged with tnx 'client' when transactionLog is on`)
+    assert.match(src, /tnx: 'server'/, `${build}: server replies are logged with tnx 'server' before the response action runs`)
+    assert.match(src, /new Error\('Connection closed unexpectedly'\), 'ECONNECTION', failureResponse, 'CONN'/, `${build}: a mid-reply close attaches the partial response (and so a responseCode) to the ECONNECTION error`)
+    assert.match(src, /_actionDATA\(str, callback\) \{[\s\S]*?if \(!\/\^\[23\]\/\.test\(str\)\)/, `${build}: DATA accepts a 2xx/3xx reply, then streams`)
+    // PIPELINING: DATA is written together with MAIL FROM / RCPT TO, so its log line precedes the replies to those commands.
+    assert.match(src, /this\._envelope\.pipelined = this\._supportedExtensions\.includes\('PIPELINING'\)/, `${build}: an envelope is pipelined when the server offers PIPELINING`)
+    assert.match(src, /\[ -\]PIPELINING\\b/, `${build}: PIPELINING is detected from the EHLO reply`)
+  }
 })
 
 test('mailer: a socket failure after DATA started is terminal, however early it comes', async () => {
@@ -345,4 +356,27 @@ test('outbox: a settlement write that fails after an unknown outcome still ends 
   // The guard's unknown-outcome branch has the same protection.
   const guarded = await drainWith(makeRow({}), { sendGuard: async () => ({ unknown: 'Outcome unknown: guard backstop.' }), singleSend: true }, true)
   assert.equal(guarded.row.status, 'FAILED')
+})
+
+test('mailer: with a PIPELINING server the replies to MAIL FROM / RCPT TO after DATA are not the DATA reply; only the 354 is', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  const pipelinedUntil354 = (o: Options, final: string | null) => {
+    o.logger.debug({ tnx: 'server' }, '250-PIPELINING')
+    o.logger.debug({ tnx: 'client' }, 'MAIL FROM:<a@b>')
+    o.logger.debug({ tnx: 'client' }, 'RCPT TO:<c@d>')
+    o.logger.debug({ tnx: 'client' }, 'DATA')
+    o.logger.debug({ tnx: 'server' }, '250 2.1.0 Ok')
+    o.logger.debug({ tnx: 'server' }, '250 2.1.5 Ok')
+    if (final) o.logger.debug({ tnx: 'server' }, final)
+  }
+  // Dropped after the MAIL/RCPT replies, before the 354: nothing was handed over, so the failure stays retryable.
+  behave = async (o) => { pipelinedUntil354(o, null); throw reject('ECONNECTION', 'Connection closed unexpectedly') }
+  const early = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
+  assert.equal(early.permanent, false)
+  assert.equal(early.unknownOutcome, undefined)
+  // Dropped after the 354: terminal unknown outcome.
+  behave = async (o) => { pipelinedUntil354(o, '354 End data with <CR><LF>.<CR><LF>'); throw reject('ECONNECTION', 'Connection closed unexpectedly') }
+  const late = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
+  assert.equal(late.permanent, true)
+  assert.equal(late.unknownOutcome, true)
 })
