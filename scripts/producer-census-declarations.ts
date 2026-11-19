@@ -50,11 +50,16 @@ export const EXCLUDED_OPERATIONS: Readonly<Record<string, string>> = {
  * producer nor an entry here fails.
  */
 export const NO_PRODUCER: Readonly<Record<string, string>> = {
-  'woocommerce.order.withdrawal-outcome': 'Owner answer 6: the endpoint stays in the WooCommerce withdrawal plugin; IMS only RECEIVES the outcome through an authenticated API, so IMS has no outbound producer for it.',
   'woocommerce.order.trackship-reconcile': 'Owner answer 6: the endpoint stays in the TrackShip plugin; IMS only receives TrackShip events through an authenticated API, so IMS has no outbound producer for it.',
 }
 
 export const DECLARATIONS: readonly Declaration[] = [
+  d('lib/connectors/woocommerce/sync/withdrawal-outcome.ts::writeWithdrawalOutcomeForEvent::postWithdrawalOutcome#1', 'woocommerce', 'order.withdrawal-outcome', 'direct-write', 'not-applicable',
+    'Owner decision 2026-11-18 (1): at step M IMS writes the outcome of a customer\'s EU withdrawal request (an order note, and the rejection of a request made after despatch) through the companion plugin\'s signed route; off unless wc_withdrawal_outcome_enabled, held until step M is live, behind the egress barrier, idempotent per outcome key.'),
+  d('scripts/switchover-gaps.ts::liveDeps::scheduleWcOrderCompletion#1', 'woocommerce', 'order.status', 'script', 'required',
+    'The per-order take-over of a G_despatch order (npm run switchover:gaps -- --take-over): it reads the storefront order first, then queues the ordinary completion job with the obligation time now (dry run by default); the producer seam keeps it a shadow until step M is live.'),
+  d('scripts/switchover-hand-back.ts::liveLoad::wcPut#1', 'woocommerce', 'order.status', 'script', 'required',
+    'Rollback of step M (npm run switchover:hand-back): writes the bridge\'s link metas _mintsoft_order_id and _mintsoft_order_number onto open orders IMS created in Mintsoft, so the resumed bridge adopts them. Dry run by default, reads each order first, goes through wcPut and so through the egress barrier.'),
   d('app/(dashboard)/sync/exceptions/exceptions-client.tsx::ExceptionsClient::replayWmsOrderPush#1', 'mintsoft', 'order.create', 'operator-action', 'required',
     'Exceptions-inbox button that re-arms the create of a Mintsoft order.'),
   d('app/(dashboard)/sync/exceptions/exceptions-client.tsx::ExceptionsClient::repushMissingWmsOrder#1', 'mintsoft', 'order.create', 'operator-action', 'required',
@@ -103,7 +108,7 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Asks the shopping facade to push the edited products\' stock to the storefront.'),
   d('lib/products/csv-roundtrip/sync-sweep.ts::runProductSyncSweep::enqueueStockSync#2', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of archived edited products, forced so the storefront is told they are gone.'),
-  d('app/actions/import.ts::importOpeningStockCsv::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+  d('app/actions/import.ts::importOpeningStockCsvInner::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/manufacturing.ts::updateManufacturingOrderStatus::queueAccountingSyncTx#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
     'Queues MANUFACTURING_JOURNAL when a manufacturing order completes.'),

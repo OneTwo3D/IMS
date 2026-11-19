@@ -19,11 +19,14 @@ import { getSettingValues } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from './url-safety'
 
 export const AELIA_RATES_PATH = '/wp-json/oti/v1/aelia-rates'
+/** The incumbents probe (incumbent-plugins.ts): READ ONLY, signed over method, path, timestamp and nonce. */
+export const INCUMBENTS_PATH = '/wp-json/oti/v1/incumbents'
 const READ_TIMEOUT_MS = 15_000
 
 /** The GET allowlist for the helper plugin's namespace: exact path -> the query parameters allowed on it (name -> the one value it may carry). Adding a read adds a row HERE. */
 export const HELPER_READ_ALLOWLIST: ReadonlyArray<{ path: string; params: Readonly<Record<string, string>> }> = [
   { path: AELIA_RATES_PATH, params: {} },
+  { path: INCUMBENTS_PATH, params: {} },
 ]
 
 /** The decision the hop gate makes for one hop. A string refuses the hop (nothing is sent). Exported so a test drives it directly. */

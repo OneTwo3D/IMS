@@ -22,6 +22,8 @@ export type ParityParent = {
   widthCm: DecimalLike
   heightCm: DecimalLike
   depthCm: DecimalLike
+  /** The parent's option rows (`values` is comma-separated): the structured attribute values a variation's name was built from. */
+  options?: ReadonlyArray<{ values: string }>
 }
 
 export type ParityProduct = {
@@ -118,7 +120,7 @@ export function applyMintsoftProductParity(dto: WmsProductDto, product: ParityPr
   return {
     ...dto,
     ...inherited,
-    name: fitMintsoftProductName(dto.name, product.type === 'VARIANT' ? product.parent?.name : null, product.sku),
+    name: fitMintsoftProductName(dto.name, product.type === 'VARIANT' ? product.parent?.name : null, product.sku, product.type === 'VARIANT' ? (product.parent?.options ?? []).flatMap((o) => o.values.split(',')) : undefined),
     ...(costPrice != null ? { costPrice } : {}),
   }
 }

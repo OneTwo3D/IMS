@@ -33,22 +33,27 @@ export type ApplyContentResult = {
   created: boolean
 }
 
-export async function applyIncomingProductContent(
+export type IncomingContentParams = {
+  productId: string
+  incoming: ProductContentSnapshot
+  /** The source product's own last-modified stamp, when it supplied one. */
+  sourceModifiedAt?: Date | null
+  sourceSystem?: string
+  now?: Date
+}
+
+type ContentRowShape = Pick<ProductContent, 'shortDescription' | 'longDescription' | 'images'>
+
+/** Plan and (only when something changed) write one product's content against the row already read for it. Returns the snapshot now stored. */
+async function applyAgainstRow(
   client: ContentClient,
-  params: {
-    productId: string
-    incoming: ProductContentSnapshot
-    /** The source product's own last-modified stamp, when it supplied one. */
-    sourceModifiedAt?: Date | null
-    sourceSystem?: string
-    now?: Date
-  },
-): Promise<ApplyContentResult> {
+  params: IncomingContentParams,
+  existing: ContentRowShape | null,
+): Promise<{ result: ApplyContentResult; stored: ContentRowShape | null }> {
   const now = params.now ?? new Date()
-  const existing = await client.productContent.findUnique({ where: { productId: params.productId } })
   const plan = planContentUpdate(snapshotFromRow(existing), params.incoming)
   if (plan.changed.length === 0) {
-    return { changed: [], keptDespiteEmpty: plan.keptDespiteEmpty, created: false }
+    return { result: { changed: [], keptDespiteEmpty: plan.keptDespiteEmpty, created: false }, stored: existing }
   }
   const stamps: { shortDescriptionChangedAt?: Date; longDescriptionChangedAt?: Date; imagesChangedAt?: Date } = {
     ...(plan.changed.includes('shortDescription') ? { shortDescriptionChangedAt: now } : {}),
@@ -67,5 +72,30 @@ export async function applyIncomingProductContent(
     create: { productId: params.productId, sourceSystem: params.sourceSystem ?? 'woocommerce', ...data },
     update: data,
   })
-  return { changed: plan.changed, keptDespiteEmpty: plan.keptDespiteEmpty, created: existing === null }
+  return {
+    result: { changed: plan.changed, keptDespiteEmpty: plan.keptDespiteEmpty, created: existing === null },
+    stored: { shortDescription: plan.next.shortDescription, longDescription: plan.next.longDescription, images: plan.next.images as unknown as ProductContent['images'] },
+  }
+}
+
+export async function applyIncomingProductContent(client: ContentClient, params: IncomingContentParams): Promise<ApplyContentResult> {
+  const existing = await client.productContent.findUnique({ where: { productId: params.productId } })
+  return (await applyAgainstRow(client, params, existing)).result
+}
+
+/**
+ * The same as `applyIncomingProductContent` for many products with ONE read: the rows are fetched together and the items applied in order against
+ * that copy (kept current as items change it, so a product repeated in the list sees the earlier item's result). Only a changed product costs a write.
+ */
+export async function applyIncomingProductContentBatch(client: ContentClient, items: readonly IncomingContentParams[]): Promise<ApplyContentResult[]> {
+  if (items.length === 0) return []
+  const rows = await client.productContent.findMany({ where: { productId: { in: [...new Set(items.map((item) => item.productId))] } } })
+  const byProduct = new Map<string, ContentRowShape | null>(rows.map((row) => [row.productId, row]))
+  const results: ApplyContentResult[] = []
+  for (const item of items) {
+    const { result, stored } = await applyAgainstRow(client, item, byProduct.get(item.productId) ?? null)
+    byProduct.set(item.productId, stored)
+    results.push(result)
+  }
+  return results
 }

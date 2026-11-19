@@ -1,8 +1,8 @@
 /**
  * READ-ONLY report: how the customer identity email key would group today's customers and customerless orders (CRM foundation).
  *
- * Every query runs inside ONE `REPEATABLE READ` transaction that is set `READ ONLY` before the first read. It prints COUNTS ONLY: never an
- * email, a name or any other personal data. A run against production needs the owner's approval.
+ * Every query runs inside ONE `REPEATABLE READ` transaction that is set `READ ONLY` before the first read. It prints COUNTS and a SAMPLE OF CLUSTERS AS CUSTOMER IDS: never an
+ * email, a name or any other personal data. The owner has approved running it against production (read-only, one REPEATABLE READ transaction).
  *
  *   runuser -u ims -- env HOME=/tmp npx tsx scripts/report-customer-identity.ts [--json]
  */
@@ -22,6 +22,7 @@ async function main() {
   console.log(`Customer identity report (read-only, counts only) @ ${new Date().toISOString()}`)
   for (const [key, value] of Object.entries(report)) {
     if (typeof value === 'number') console.log(`  ${key.padEnd(48)} ${value}`)
+    else if (Array.isArray(value)) value.forEach((cluster, i) => console.log(`  ${`${key}[${i}]`.padEnd(48)} size ${cluster.size}: ${cluster.customerIds.join(' ')}`))
     else for (const [k, v] of Object.entries(value)) console.log(`  ${`${key}.${k}`.padEnd(48)} ${v}`)
   }
   console.log('\nNothing was written.')

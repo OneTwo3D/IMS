@@ -1612,6 +1612,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
         externalWarehouseId: binding.externalWarehouseId,
         connectionId: binding.connectionId,
         pairingChangedAt: binding.pairingChangedAt,
+        discrepancyThresholds: binding.discrepancyThresholds,
       }),
       select: { id: true },
     })
@@ -2616,6 +2617,7 @@ export async function confirmMintsoftAlignmentMode(
       externalWarehouseId: true,
       connectionId: true,
       pairingChangedAt: true,
+      discrepancyThresholds: true,
       warehouse: { select: { code: true } },
     },
   })
@@ -2647,6 +2649,7 @@ export async function confirmMintsoftAlignmentMode(
       externalWarehouseId: binding.externalWarehouseId,
       connectionId: binding.connectionId,
       pairingChangedAt: binding.pairingChangedAt,
+      discrepancyThresholds: binding.discrepancyThresholds,
     }),
     select: {
       id: true,

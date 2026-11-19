@@ -1,4 +1,5 @@
 import { asnHasReceiptEvidence, readAlignUpReceiptEvidenceEnabled } from '@/lib/connectors/mintsoft/settings/align-up-receipt-evidence'
+import { alignmentThresholdsKey } from '@/lib/domain/wms/alignment-dry-run'
 import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -147,6 +148,8 @@ type SyncSummary = {
   externalWarehouseId: string
   /** Stamped so dry-run evidence can be matched to the connection it ran against. */
   connectionId: string
+  /** Stamped so dry-run evidence can be matched to the write-off thresholds it ran under (alignmentThresholdsKey). */
+  thresholdsKey?: string
   thresholdBreaches: number
   notifiedUsers: number
   dryRun?: boolean
@@ -3147,6 +3150,7 @@ export async function runStockSyncForBinding(
     const summary: SyncSummary = {
       externalWarehouseId: binding.externalWarehouseId,
       connectionId: binding.connectionId,
+      thresholdsKey: alignmentThresholdsKey(binding.discrepancyThresholds),
       thresholdBreaches,
       notifiedUsers,
       dryRun: alignmentDryRun,
@@ -3198,6 +3202,7 @@ export async function runStockSyncForBinding(
     await completeJob(job.id, 'FAILED', counters, {
       externalWarehouseId: binding.externalWarehouseId,
       connectionId: binding.connectionId,
+      thresholdsKey: alignmentThresholdsKey(binding.discrepancyThresholds),
       thresholdBreaches: 0,
       notifiedUsers: 0,
       dryRun: alignmentDryRun,

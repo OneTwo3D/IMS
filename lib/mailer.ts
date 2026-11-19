@@ -163,9 +163,13 @@ export async function sendEmailWithSmtpSettings(
     const fromName = sanitizeDisplayName(smtp.fromName)
 
     const deadlineMs = opts.deadlineMs
-    // singleSend: watch the transaction log for the server's 354 reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
+    // singleSend: watch the transaction log for the server's reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
     // fact and discarded; nothing it carries (addresses, credentials) is kept.
-    let awaitingDataReply = false
+    // Replies are matched to commands IN ORDER, as nodemailer's own _responseActions queue does, starting at MAIL FROM: with PIPELINING nodemailer writes MAIL FROM / RCPT TO / DATA before any
+    // reply arrives, without it one at a time, and either way the Nth server line answers the Nth command. The reply that answers DATA starts the DATA phase when it is 2xx or 3xx, the test
+    // nodemailer's _actionDATA applies (some servers answer 250, emailjs#24). No PIPELINING detection is needed. Pinned by the nodemailer-version test.
+    const pendingReplies: Array<'MAIL' | 'RCPT' | 'DATA'> = []
+    let tracking = false
     let dataStarted = false
     if (opts.singleSend) {
       unknownOutcomeProbe = (e) => {
@@ -185,12 +189,19 @@ export async function sendEmailWithSmtpSettings(
         logger: {
           debug: (entry: { tnx?: string } | undefined, message?: unknown): void => {
             if (typeof message !== 'string') return
-            if (entry?.tnx === 'client' && message.trim().toUpperCase() === 'DATA') awaitingDataReply = true
-            // The server's answer to DATA is logged ('server') just before nodemailer acts on it; a 354 (nodemailer also accepts 2xx) is what
-            // makes it stream the message. Only from that reply on has anything been handed over. Pinned by the nodemailer-version test.
-            else if (entry?.tnx === 'server' && awaitingDataReply) {
-              awaitingDataReply = false
-              if (/^[23]\d\d/.test(message.trim())) dataStarted = true
+            if (dataStarted) return
+            if (entry?.tnx === 'client') {
+              const command = message.trim().toUpperCase()
+              if (command.startsWith('MAIL FROM')) { tracking = true; pendingReplies.push('MAIL') }
+              else if (tracking && command.startsWith('RCPT TO')) pendingReplies.push('RCPT')
+              else if (tracking && command === 'DATA') pendingReplies.push('DATA')
+            } else if (entry?.tnx === 'server' && tracking) {
+              const answered = pendingReplies.shift()
+              if (answered === 'DATA') {
+                if (/^[23]/.test(message.trim())) dataStarted = true
+                tracking = false
+                pendingReplies.length = 0
+              }
             }
           },
           level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,

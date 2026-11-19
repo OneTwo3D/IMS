@@ -51,10 +51,10 @@ test('only a dry run for the binding\'s current pairing, started after the last 
       })
       const after = new Date(paired.getTime() + 60_000)
       const before = new Date(paired.getTime() - 60_000)
-      const stamp = { externalWarehouseId: 'ext-1', connectionId: connection.id }
+      const stamp = { externalWarehouseId: 'ext-1', connectionId: connection.id, thresholdsKey: 'null' }
 
       const query = () => alignmentDryRunEvidenceQuery({
-        connector: 'mintsoft', warehouseId: warehouse.id, externalWarehouseId: 'ext-1', connectionId: connection.id, pairingChangedAt: paired,
+        connector: 'mintsoft', warehouseId: warehouse.id, externalWarehouseId: 'ext-1', connectionId: connection.id, pairingChangedAt: paired, discrepancyThresholds: null,
       })
       const find = () => tx.wmsSyncJob.findFirst({ ...query(), select: { id: true } })
 
@@ -63,6 +63,10 @@ test('only a dry run for the binding\'s current pairing, started after the last 
       await job(after, { ...stamp, connectionId: 'conn-OLD' })
       await job(after, { externalWarehouseId: 'ext-1' }) // recorded before connectionId was stamped
       assert.equal(await find(), null, 'none of the four stale runs is evidence')
+
+      await job(after, { ...stamp, thresholdsKey: '{"absolute":5}' }) // a dry run made under other thresholds
+      await job(after, { externalWarehouseId: 'ext-1', connectionId: connection.id }) // recorded before the thresholds were stamped
+      assert.equal(await find(), null, 'a run under other (or unstamped) thresholds is not evidence')
 
       const good = await job(after, stamp)
       assert.equal((await find())?.id, good.id, 'a run for this pairing started after the re-point is')

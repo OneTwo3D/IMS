@@ -276,7 +276,7 @@ export const WRITER_OWNERSHIP_MAP = [
   row('woocommerce', 'order.withdrawal-outcome', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     step: 'mintsoft',
     obligationTime: 'not-applicable',
-    note: 'Owner decision 2026-11-18 (1): in step M IMS takes the withdrawal outcome over from the bridge, which is fully disabled then. The IMS writer (a companion-plugin route) is not built yet, so writers:check fails closed in phase P2-M until it is.',
+    note: 'Owner decision 2026-11-18 (1): in step M IMS takes the withdrawal outcome over from the bridge, which is fully disabled then. The IMS writer is built (lib/connectors/woocommerce/sync/withdrawal-outcome.ts, the companion plugin\'s /order/{id}/withdrawal-outcome route, 1.5.0) behind the setting wc_withdrawal_outcome_enabled (default off); it is held until step M is live.',
   }),
   row('woocommerce', 'order.trackship-reconcile', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     step: 'mintsoft',

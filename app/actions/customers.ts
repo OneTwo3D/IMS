@@ -3,9 +3,9 @@
 import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
-import { parseCsv } from '@/lib/csv'
+import { csvDiagnosticsErrors, parseCsvDiagnosed, parseCsvValidated } from '@/lib/csv'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
-import { eraseCustomerPersonalData } from '@/lib/domain/erasure/erase-personal-data'
+import { eraseCustomerClusterPersonalData } from '@/lib/domain/erasure/cluster-erasure'
 import { openWarehouseOrdersWarning } from '@/lib/domain/erasure/warehouse-obligations'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { orderTurnoverBase, REFUND_TURNOVER_SELECT } from '@/lib/domain/sales/customer-turnover'
@@ -15,6 +15,7 @@ import {
   createCsvImportPreviewResult,
   getCsvImportMode,
   isCsvImportDryRunMode,
+  withCsvCommentRowsNotice,
   runCsvImportMutation,
   type CsvImportActionResult,
 } from '@/lib/csv-import'
@@ -351,6 +352,10 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
 }
 
 export async function importContactsCsv(formData: FormData): Promise<CsvImportActionResult> {
+  return withCsvCommentRowsNotice(formData, await importContactsCsvInner(formData))
+}
+
+async function importContactsCsvInner(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = isCsvImportDryRunMode(mode)
   await requirePermission('sales.create')
@@ -368,7 +373,14 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
         : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
     }
     const text = await file.text()
-    const parsed = parseCsv(text)
+    const damage = csvDiagnosticsErrors(parseCsvDiagnosed(text).diagnostics)
+    if (damage.length > 0) {
+      const error = `The file is not a well-formed CSV and nothing was imported. ${damage.join('; ')}`
+      return preview
+        ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: damage.length, errors: damage, error })
+        : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: damage, error, success: false })
+    }
+    const parsed = parseCsvValidated(text)
     const rows = parsed.slice(0, MAX_IMPORT_ROWS)
     const dropped = parsed.length - rows.length
     const customers = await db.customer.findMany({
@@ -531,10 +543,12 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
   }
 }
 
-export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number }> {
+/** `expectedMemberIds` is REQUIRED: the ids of the person's records the operator was shown. The server computes the cluster and refuses unless it is exactly that list. */
+export async function anonymiseCustomer(customerId: string, expectedMemberIds: string[]): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number; erasedRecords?: number }> {
   const session = await requirePermission('sync')
-  // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure.
-  const result = await eraseCustomerPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null })
+  // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure. A customer merged with others is one person (owner decision
+  // 2026-11-18): the erasure covers EVERY live record of the cluster, each by the same core, each with its own name-free record.
+  const result = await eraseCustomerClusterPersonalData(customerId, { trigger: 'ON_REQUEST', userId: session.user.id ?? null, expectedMemberIds })
   if (result.success) revalidatePath('/sales/contacts')
   if (!result.success) return { success: false, error: result.error }
   // The operator is told AT THE TIME OF ERASURE what the erasure did not reach: warehouse orders still open hold the person's name and address, and IMS
@@ -542,6 +556,6 @@ export async function anonymiseCustomer(customerId: string): Promise<{ success: 
   const open = result.warehouse.open
   const ambiguous = result.warehouse.ambiguous
   return open + ambiguous > 0
-    ? { success: true, openWarehouseOrders: open, ambiguousWarehouseOrders: ambiguous, warning: openWarehouseOrdersWarning(open, ambiguous) }
-    : { success: true }
+    ? { success: true, erasedRecords: result.erasedCustomerIds.length, openWarehouseOrders: open, ambiguousWarehouseOrders: ambiguous, warning: openWarehouseOrdersWarning(open, ambiguous) }
+    : { success: true, erasedRecords: result.erasedCustomerIds.length }
 }

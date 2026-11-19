@@ -86,7 +86,9 @@ test('fail, inconclusive and not-applicable have invariants of their own', () =>
   // fail
   rejects(put(base(), R('fail', ['READ_INCOMPLETE'])))
   rejects(put(base(), R('fail', [])))
-  accepts(put(base(), R('fail', ['DIFFERENCES'])))
+  // a fail with DIFFERENCES but nothing listed proves nothing: it needs at least one finding
+  rejects(put(base(), R('fail', ['DIFFERENCES'])))
+  accepts(put(base(), R('fail', ['DIFFERENCES'], { entries: { onlyVendor: [soloV('A|MAIN')] } })))
   // a finding is always a fail with DIFFERENCES
   rejects(put(base(), R('inconclusive', ['READ_INCOMPLETE'], { entries: { onlyVendor: [soloV('A|MAIN')] } })))
   rejects(put(base(), R('fail', ['UNSETTLED_PENDING'], { entries: { onlyVendor: [soloV('A|MAIN')] } })))

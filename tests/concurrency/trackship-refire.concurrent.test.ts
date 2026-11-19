@@ -393,3 +393,33 @@ test('the storefront refusing an order past the window (outside_window) closes i
     assert.equal(requests.length, 1)
   })
 })
+
+test('BATCH RECONCILE: a backlog larger than one scan page is registered and queued in ONE tick (the bridge\'s /trackship/reconcile covered it call after call); the plain scan only does one page', { skip }, async (t) => {
+  const d = await setup()
+  const orders = [await seedOrder(d), await seedOrder(d), await seedOrder(d)]
+  const ids = orders.map((o) => o.id)
+  t.after(() => cleanup(d, ids))
+  await setSwitch(d, 'true')
+  await withEnv(LIVE, async () => {
+    const single = await d.jobs.enqueueTrackshipRefires({ orderIds: ids, limit: 1 })
+    assert.deepEqual([single.registered, single.queued], [1, 1], 'one page: one order registered, one look queued')
+    const batch = await d.jobs.enqueueTrackshipRefireBatch({ orderIds: ids, limit: 1, passes: 6 })
+    assert.equal(batch.registered, 2, 'the remaining two are registered by the later passes')
+    assert.equal(batch.queued, 2)
+    assert.ok(batch.passes >= 3 && batch.passes <= 6)
+    for (const id of ids) assert.equal((await jobsFor(d, id)).length, 1, 'exactly one look per order: a repeat pass never queues a second')
+    const again = await d.jobs.enqueueTrackshipRefireBatch({ orderIds: ids, limit: 1, passes: 6 })
+    assert.deepEqual([again.registered, again.queued, again.passes], [0, 0, 1], 'caught up: the batch stops after one empty pass')
+  })
+})
+
+test('BATCH RECONCILE is OFF with the switch: no scan, one pass, zero everything', { skip }, async (t) => {
+  const d = await setup()
+  const order = await seedOrder(d)
+  t.after(() => cleanup(d, [order.id]))
+  await setSwitch(d, null)
+  await withEnv(LIVE, async () => {
+    assert.deepEqual(await d.jobs.enqueueTrackshipRefireBatch({ orderIds: [order.id] }), { registered: 0, expired: 0, queued: 0, shadowed: 0, inFlight: 0, passes: 1 })
+    assert.equal(await d.db.trackshipRefireState.count({ where: { orderId: order.id } }), 0)
+  })
+})

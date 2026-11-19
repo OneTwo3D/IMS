@@ -4104,6 +4104,8 @@ export async function createSalesOrderRefund(
      * money to specific parts of the order.
      */
     enforcePerTargetBalances?: boolean
+    /** Per group of order lines: refunded so far plus this refund may not exceed `maxQty` (checked under the order row lock). See createRefund. */
+    maxRefundedQtyByLines?: Array<{ lineIds: string[]; maxQty: number }>
     /**
      * Cut every itemised SALE line (a line with an order-line id and a quantity) from that order line's REMAINING stored value, under this
      * transaction's order lock, instead of trusting the amount the caller states: the stated amount is only a preview of it. Each refund takes
@@ -4903,6 +4905,16 @@ export async function createSalesOrderRefund(
       where: { refund: { orderId: input.orderId } },
       select: { productId: true, qty: true, salesOrderLineId: true, lineKind: true, totalForeign: true, accountingTaxType: true, chargedTaxForeign: true },
     })
+
+    // A CALLER'S OWN CEILING ON REFUNDED UNITS (the WooCommerce amendment step), re-read here under the order row lock: a run that planned its refund before another committed one is refused.
+    for (const cap of input.maxRefundedQtyByLines ?? []) {
+      const ids = new Set(cap.lineIds)
+      const already = existingRefundLines.filter((l) => l.salesOrderLineId && ids.has(l.salesOrderLineId)).reduce((sum, l) => sum + Math.max(0, refundBoundaryNumber(l.qty)), 0)
+      const now = refundLines.filter((l) => l.lineId && ids.has(l.lineId)).reduce((sum, l) => sum + Math.max(0, l.qty), 0)
+      if (now > 0 && already + now > cap.maxQty + 0.0001) {
+        return { error: `Refund not created: the order's lines already have ${already} unit(s) refunded and this refund adds ${now}, which is more than the ${cap.maxQty} unit(s) WooCommerce shows removed.` } as const
+      }
+    }
 
     // THE CURRENCY THE CREDIT NOTE POSTS IN. The ceiling above sums BASE; a foreign-currency credit note posts the FOREIGN column. So a public refund's
     // cumulative foreign net, and that net grossed up at the rate each row posts under, are each held to what the order was paid in its own currency.

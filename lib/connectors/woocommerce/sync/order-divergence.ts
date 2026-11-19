@@ -6,7 +6,7 @@
  * edit-drift row (order-edit-drift.ts) notices a changed quantity or total; this compares the rest as well (unit prices, added and removed lines,
  * shipping, discount, tax) and does it against refunds, so a refund is never reported as an edit.
  *
- * WHAT IT NEVER DOES
+ * WHAT IT NEVER DOES (the detection itself; the separate write step in order-amendment.ts is behind `wc_order_amendment_write_enabled`, off by default)
  *   - It writes to `wc_order_divergences` only. Not to the order (so `SalesOrder.updatedAt` never moves and the order never becomes a warehouse
  *     amend candidate), not to WooCommerce, not to the warehouse, not to the ledger.
  *   - It does not touch status handling, the echo guard or the refund sync. It runs after the existing update, behind a setting that is OFF by default,
@@ -46,6 +46,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, ledgerMatchEpsilon, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import type { WcFullOrder } from './types'
+import { applyWcOrderAmendment } from './order-amendment'
 
 export const WC_ORDER_DIVERGENCE_SETTING = 'wc_order_divergence_detection_enabled'
 export const WC_ORDER_DIVERGED_ACTION = 'wc_order_diverged'
@@ -410,6 +411,8 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     const existing = await db.wcOrderDivergence.findUnique({ where: { orderId }, select: { id: true, fingerprint: true, resolvedAt: true } })
     if (existing && existing.resolvedAt === null && existing.fingerprint === fingerprint) {
       await db.wcOrderDivergence.update({ where: { id: existing.id }, data: { lastSeenAt: now, seenCount: { increment: 1 } } })
+      // The write step (off by default) retries a difference it has not yet acted on (a failed refund released its claim); one already acted on is skipped by its claim.
+      await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint)
       return
     }
     const data = {
@@ -422,7 +425,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     await db.wcOrderDivergence.upsert({
       where: { orderId },
       create: { orderId, ...data },
-      update: { ...data, seenCount: 1, firstSeenAt: now, lastSeenAt: now, resolvedAt: null, resolution: null },
+      update: { ...data, seenCount: 1, firstSeenAt: now, lastSeenAt: now, resolvedAt: null, resolution: null, amendmentClaim: null },
     })
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -434,6 +437,8 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
       metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), differences: verdict.differences },
       resolveUser: false,
     })
+    // THE WRITE STEP, behind `wc_order_amendment_write_enabled` (off by default; order-amendment.ts). A no-op while it is off, and it never throws.
+    await applyWcOrderAmendment(orderId, wcOrder, verdict.differences, fingerprint)
   } catch (e) {
     console.error('wc_order_divergence: could not compare or record', e instanceof Error ? e.constructor.name : typeof e)
   }

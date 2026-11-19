@@ -115,7 +115,7 @@ const poLine = (id: string, productId: string, lineEta: Date | null, headerEta: 
 
 function reset(list: Level[]) {
   settings.clear()
-  for (const [key, value] of Object.entries({ wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_stock_sync_enabled: 'true', last_wc_order_sync_at: '2026-11-15T00:00:00.000Z' })) settings.set(key, value)
+  for (const [key, value] of Object.entries({ wc_url: ORIGIN, wc_consumer_key: 'ck_x', wc_consumer_secret: 'cs_x', wc_stock_sync_enabled: 'true', wc_back_in_stock_date_buffer_days: '0', last_wc_order_sync_at: '2026-11-15T00:00:00.000Z' })) settings.set(key, value)
   levels = list
   candidates = [product('a', 'S1', BigInt(1)), product('b', 'S2', BigInt(2))]
   posts = []
@@ -352,4 +352,27 @@ test('producer census: the stock writer is listed as governing product.meta as w
   assert.ok(stock)
   assert.deepEqual([...stock.operations].sort(), ['product.meta', 'stock'])
   assert.ok(WRITER_OWNERSHIP_MAP.some((row) => row.destination === 'woocommerce' && row.operation === 'product.meta'))
+})
+
+test('buffer: the shown date is the supplier ETA + 3 days by default (owner decision 2026-11-18); lateness is judged on the supplier date', async () => {
+  reset([])
+  settings.delete('wc_back_in_stock_date_buffer_days')
+  poLines = [poLine('l1', 'a', null, realAt(4)), poLine('l2', 'b', null, realAt(-1))]
+  const { loadBackInStockDates } = await import('@/lib/domain/inventory/back-in-stock-date')
+  const result = await loadBackInStockDates(['a', 'b'])
+  assert.equal(result.get('a'), realYmd(7))
+  assert.equal(result.has('b'), false, 'a late supplier date is still dropped, not rescued by the buffer')
+})
+
+test('buffer: configurable, 0 means the raw ETA, garbage falls back to 3', async () => {
+  const { loadBackInStockDates, addDaysToDateOnly, parseBackInStockBufferDays } = await import('@/lib/domain/inventory/back-in-stock-date')
+  reset([])
+  poLines = [poLine('l1', 'a', null, realAt(4))]
+  settings.set('wc_back_in_stock_date_buffer_days', '10')
+  assert.equal((await loadBackInStockDates(['a'])).get('a'), realYmd(14))
+  settings.set('wc_back_in_stock_date_buffer_days', '0')
+  assert.equal((await loadBackInStockDates(['a'])).get('a'), realYmd(4))
+  assert.equal(parseBackInStockBufferDays('abc'), 3)
+  assert.equal(parseBackInStockBufferDays(undefined), 3)
+  assert.equal(addDaysToDateOnly('2026-12-30', 3), '2027-01-02')
 })
