@@ -12,7 +12,7 @@ import type { WmsOrderPushInput, WmsOrderPushResult } from '@/lib/connectors/wms
  */
 const line = (over: Record<string, unknown>) => ({ id: 'l1', sku: 'NEW-1', productId: 'p1', qty: 1, taxForeign: 0, totalForeign: 10, description: 'x', ...over }) as never
 
-type Row = { productId: string; warehouseId: string; imsValue: string; wmsValue: string }
+type Row = { productId: string; warehouseId: string; wmsValue: string | null }
 function discrepancies(rows: Row[]) {
   const queries: unknown[] = []
   const client = {
@@ -27,36 +27,54 @@ function discrepancies(rows: Row[]) {
   }
   return { client: client as never, queries, rows }
 }
-const open = (over: Partial<Row> = {}): Row => ({ productId: 'p1', warehouseId: 'wh-1', imsValue: 'NEW-1', wmsValue: 'OLD-1', ...over })
+const open = (over: Partial<Row> = {}): Row => ({ productId: 'p1', warehouseId: 'wh-1', wmsValue: 'OLD-1', ...over })
+const hold = (wmsValue: string | null = 'OLD-1') => [{ productId: 'p1', wmsValue }]
 
-test('buildLines refuses a line carrying the NEW IMS SKU, naming it', () => {
-  assert.throws(() => buildLines([line({})], undefined, ['NEW-1']), (error: Error) => error.message === skuRenameHoldReason(['NEW-1']) && error.message.startsWith(SKU_RENAME_HOLD_REASON_PREFIX))
+test('buildLines refuses a line whose SKU is not the one the warehouse holds, naming it', () => {
+  assert.throws(() => buildLines([line({})], undefined, hold()), (error: Error) => error.message === skuRenameHoldReason(['NEW-1']) && error.message.startsWith(SKU_RENAME_HOLD_REASON_PREFIX))
 })
 
-test('an order placed BEFORE the rename (line still carries the old SKU the warehouse knows) is not held', () => {
-  const lines = buildLines([line({ sku: 'OLD-1' })], undefined, ['NEW-1'])
-  assert.equal(lines.length, 1)
-  assert.equal(lines[0]!.sku, 'OLD-1')
+test('an order placed BEFORE the rename (line still carries the SKU the warehouse holds, in any case or spacing) is not held', () => {
+  for (const sku of ['OLD-1', 'old-1', ' Old-1 ']) {
+    const lines = buildLines([line({ sku })], undefined, hold())
+    assert.equal(lines.length, 1)
+    assert.equal(lines[0]!.sku, sku)
+  }
 })
 
-test('no held SKU, or an unrelated one, builds as before', () => {
+test('a case or whitespace variant of the NEW SKU is held (WooCommerce binds line SKUs to products case-insensitively)', () => {
+  for (const sku of ['new-1', 'New-1', 'NEW-1 ']) assert.throws(() => buildLines([line({ sku })], undefined, hold()), /Order held/)
+})
+
+test('A->B->C: a line carrying the MIDDLE SKU B (which the warehouse never had) stays held; the A line pushes', () => {
+  // The row now says (ims C, wms A): only wmsValue matters.
+  assert.throws(() => buildLines([line({ sku: 'B' })], undefined, hold('A')), /Order held: SKU B/)
+  assert.throws(() => buildLines([line({ sku: 'C' })], undefined, hold('A')), /Order held: SKU C/)
+  assert.equal(buildLines([line({ sku: 'A' })], undefined, hold('A')).length, 1)
+})
+
+test('a rename row that does not record the warehouse SKU holds (erring towards holding)', () => {
+  assert.throws(() => buildLines([line({ sku: 'OLD-1' })], undefined, hold(null)), /Order held/)
+})
+
+test('no holds, or holds for another product, build as before', () => {
   assert.equal(buildLines([line({})]).length, 1)
   assert.equal(buildLines([line({})], undefined, []).length, 1)
-  assert.equal(buildLines([line({})], undefined, ['OTHER']).length, 1)
+  assert.equal(buildLines([line({})], undefined, [{ productId: 'other', wmsValue: 'X' }]).length, 1)
 })
 
 test('one held line holds the whole order: nothing is sent partially', () => {
-  assert.throws(() => buildLines([line({}), line({ id: 'l2', sku: 'OK', productId: 'p2' })], undefined, ['NEW-1']), /Order held/)
+  assert.throws(() => buildLines([line({}), line({ id: 'l2', sku: 'OK', productId: 'p2' })], undefined, hold()), /Order held/)
 })
 
 test('a fully refunded held line and a fee line do not hold the order', () => {
   const refunded = new Map([['l1', 1]])
-  assert.equal(buildLines([line({}), line({ id: 'l2', sku: 'OK', productId: 'p2' })], refunded, ['NEW-1']).length, 1)
-  assert.equal(buildLines([line({ wclcFeeKind: 'duty_flat' }), line({ id: 'l2', sku: 'OK', productId: 'p2' })], undefined, ['NEW-1']).length, 1)
+  assert.equal(buildLines([line({}), line({ id: 'l2', sku: 'OK', productId: 'p2' })], refunded, hold()).length, 1)
+  assert.equal(buildLines([line({ wclcFeeKind: 'duty_flat' }), line({ id: 'l2', sku: 'OK', productId: 'p2' })], undefined, hold()).length, 1)
 })
 
-test('the hold is read from the discrepancy once per batch, by IMS SKU, scoped to the order\'s ship-from warehouse', async () => {
-  const { client, queries } = discrepancies([open(), open({ productId: 'p3', warehouseId: 'wh-2', imsValue: 'THREE' })])
+test('holds are read once per batch and scoped to the warehouse the order is sent to (a mixed amendment\'s push warehouse overrides ship-from)', async () => {
+  const { client, queries } = discrepancies([open(), open({ productId: 'p3', warehouseId: 'wh-2', wmsValue: 'THREE' })])
   const orders = [
     { id: 'o1', shipFromWarehouseId: 'wh-1', lines: [line({})] },
     { id: 'o2', shipFromWarehouseId: 'wh-2', lines: [line({})] }, // same product, other warehouse: not held
@@ -66,8 +84,11 @@ test('the hold is read from the discrepancy once per batch, by IMS SKU, scoped t
   ]
   const marked = await withSkuRenameHolds(client, orders)
   assert.equal(queries.length, 1)
-  assert.deepEqual(marked.map((o) => o.skuRenameHeldSkus), [['NEW-1'], [], ['NEW-1'], [], []])
-  assert.equal('skuRenameHeldSkus' in orders[0]!, false, 'the input is not mutated')
+  assert.deepEqual(marked.map((o) => o.skuRenameHolds), [[{ productId: 'p1', wmsValue: 'OLD-1' }], [], [{ productId: 'p1', wmsValue: 'OLD-1' }], [], []])
+  assert.equal('skuRenameHolds' in orders[0]!, false, 'the input is not mutated')
+  // A MIXED link pushed to wh-1 whose order now ships from wh-2 is checked against wh-1, where the update is actually sent.
+  const mixed = await withSkuRenameHolds(client, [orders[1]!], () => 'wh-1')
+  assert.deepEqual(mixed[0]!.skuRenameHolds, [{ productId: 'p1', wmsValue: 'OLD-1' }])
 })
 
 test('no products: no query', async () => {
@@ -80,7 +101,7 @@ test('buildPushInput refuses an order carrying a held SKU', () => {
   const order = {
     id: 'o1', orderNumber: 'SO-1', externalOrderNumber: null, currency: 'GBP', customerName: 'A', customerEmail: null, customerVatNumber: null,
     shippingAddress: { address1: '1 Road', city: 'X', postcode: 'AB1', country: 'GB' }, subtotalForeign: 10, shippingForeign: 0, taxForeign: 0, taxRatePercent: 0,
-    pricesIncludeVat: false, discountAmount: 0, totalForeign: 10, lines: [line({})], skuRenameHeldSkus: ['NEW-1'],
+    pricesIncludeVat: false, discountAmount: 0, totalForeign: 10, lines: [line({})], skuRenameHolds: hold(),
   }
   assert.throws(() => buildPushInput(order as never, '1'), /Order held: SKU NEW-1 was renamed/)
 })
@@ -159,11 +180,11 @@ test('sweep: a held create is parked VALIDATION_FAILED with no push; revalidatio
   assert.deepEqual(h.pushed, [['NEW-1']])
 })
 
-test('sweep: an order placed before the rename (old SKU snapshot) is pushed as before, even while the discrepancy is open', async () => {
-  const h = harness('OLD-1')
+test('sweep: an order placed before the rename (old SKU snapshot, even in another case) is pushed as before, even while the discrepancy is open', async () => {
+  const h = harness('old-1')
   const result = await h.sweep()
   assert.equal(result.created, 1)
-  assert.deepEqual(h.pushed, [['OLD-1']])
+  assert.deepEqual(h.pushed, [['old-1']])
 })
 
 test('port wiring: every Prisma port method that loads an order to push attaches the rename holds', () => {

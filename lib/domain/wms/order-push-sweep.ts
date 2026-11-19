@@ -27,7 +27,7 @@ import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidB
 import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
-import { SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds } from '@/lib/domain/wms/sku-rename-hold'
+import { lineSkuMissingAtWarehouse, SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds, type SkuRenameHold } from '@/lib/domain/wms/sku-rename-hold'
 import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type AmendmentLineChange, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { raiseRefundRemainderTasks } from './refund-remainder'
 import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
@@ -457,8 +457,8 @@ type OrderForPush = {
   discountModel?: string | null
   totalForeign: unknown
   lines: CandidateLine[]
-  /** The new IMS SKUs on this order that the warehouse does not have yet (set by the port; see sku-rename-hold.ts). Absent = none known. */
-  skuRenameHeldSkus?: ReadonlyArray<string>
+  /** Open SKU-rename rows that apply to this order's products, for the warehouse it is sent to (set by the port; see sku-rename-hold.ts). Absent = none known. */
+  skuRenameHolds?: ReadonlyArray<SkuRenameHold>
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
   /** The business-event time of the order (paid, else created): the producer-side hold's obligation time. Read-only evidence; absent in a hand-built port. */
   paidAt?: Date | null
@@ -627,7 +627,7 @@ type CandidateLine = {
  */
 export const NO_GOODS_TO_PUSH_REASON = 'Sales order has only fee lines (no goods to fulfil); cannot push to WMS'
 
-export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>, skuRenameHeldSkus?: ReadonlyArray<string>): WmsOrderPushLine[] {
+export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>, skuRenameHolds?: ReadonlyArray<SkuRenameHold>): WmsOrderPushLine[] {
   const pushLines: WmsOrderPushLine[] = []
   const heldSkus: string[] = []
   for (const line of lines) {
@@ -647,8 +647,8 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
     const refunded = (line.id && refundedByLine?.get(line.id)) || 0
     const quantity = Math.max(0, orderedQty - refunded)
     if (quantity <= 0) continue
-    // A line that WILL be sent with a new IMS SKU the warehouse does not have yet holds the whole order (see sku-rename-hold.ts). Fee lines and fully refunded lines are skipped above.
-    if (skuRenameHeldSkus?.includes(line.sku)) heldSkus.push(line.sku)
+    // A line that WILL be sent with a SKU the warehouse does not hold for a product with an open rename row holds the whole order (see sku-rename-hold.ts). Fee lines and fully refunded lines are skipped above.
+    if (skuRenameHolds?.some((hold) => hold.productId === line.productId && lineSkuMissingAtWarehouse(line.sku, hold))) heldSkus.push(line.sku)
     // IMS stores SalesOrderLine.totalForeign as NET (ex-VAT) in both tax-inclusive
     // and tax-exclusive cases; taxForeign is the line VAT. Unit prices are per the
     // ORIGINAL qty so they stay correct when the shipped quantity is reduced.
@@ -803,7 +803,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
     ...(shippingVatDerived > 0 ? { shippingVatDerived } : {}),
     discountExVat: num(order.discountAmount),
     discountVat: 0,
-    lines: buildLines(order.lines, refundedQtyByLine(order), order.skuRenameHeldSkus),
+    lines: buildLines(order.lines, refundedQtyByLine(order), order.skuRenameHolds),
   }
   if (scope?.mode !== 'MIXED') return input
   const minorFactor = 10 ** currencyMinorUnits(order.currency)
@@ -1342,7 +1342,7 @@ export interface WmsOrderPushPort {
    * lock in a short transaction at the push boundary. The core builds the payload it sends from THIS, not from the earlier list
    * read, and refuses an erased order. Absent: the caller uses its snapshot (test doubles). A rejection fails closed.
    */
-  reloadOrderForPush?(orderId: string): Promise<Partial<OrderForPush> | null>
+  reloadOrderForPush?(orderId: string, sentToWarehouseId?: string | null): Promise<Partial<OrderForPush> | null>
   /**
    * The systemic-failure circuit breaker's state and incident (lib/domain/wms/systemic-failure.ts). Optional: a port without one
    * keeps the legacy behaviour (a record is parked the moment its retries run out), which is what test doubles get.
@@ -3702,7 +3702,7 @@ export async function runWmsOrderPushSweepCore(
         // that cannot be read left due (no pushedAt) so the next pass tries again.
         let amendOrder = link.order
         if (port.reloadOrderForPush) {
-          const current = await port.reloadOrderForPush(link.order.id).catch(() => undefined)
+          const current = await port.reloadOrderForPush(link.order.id, linkIsMixed ? (link.pushWarehouseId ?? link.order.shipFromWarehouseId) : link.order.shipFromWarehouseId).catch(() => undefined)
           if (current === undefined || current === null) {
             await port.updateLink(link.id, { lastAttemptAt: ts, lastError: 'Not sent by IMS: the order could not be re-read before the amendment.' })
             continue
@@ -4720,7 +4720,9 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
         where: { id: { in: dueIds } },
         select: { id: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, pushWarehouseId: true, scopeMode: true, scopeHash: true, scopeDirtyAt: true, scopeFrozenAt: true, scopeFrozenReason: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true, status: true } } },
       })
-      const heldOrders = await withSkuRenameHolds(db, links.map((link) => link.order))
+      // A mixed-warehouse amendment is sent to the link's push warehouse, which is the warehouse whose rename row holds it.
+      const sentTo = new Map(links.map((link) => [link.order.id, link.scopeMode === 'MIXED' ? (link.pushWarehouseId ?? link.order.shipFromWarehouseId) : link.order.shipFromWarehouseId]))
+      const heldOrders = await withSkuRenameHolds(db, links.map((link) => link.order), (order) => sentTo.get(order.id))
       return links.map((link, index) => ({ ...link, order: heldOrders[index]! }))
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
@@ -4976,12 +4978,12 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       const { recordMixedScopeOutcome } = await import('@/lib/domain/wms/mixed-scope-record')
       await recordMixedScopeOutcome(db, orderId, scope, readAt)
     },
-    async reloadOrderForPush(orderId) {
+    async reloadOrderForPush(orderId, sentToWarehouseId) {
       return db.$transaction(async (tx) => {
         await lockSalesOrder(tx, orderId)
         const fresh = await tx.salesOrder.findUnique({ where: { id: orderId }, select: ORDER_PUSH_SELECT })
         if (!fresh) return null
-        const [held] = await withSkuRenameHolds(tx, [fresh])
+        const [held] = await withSkuRenameHolds(tx, [fresh], (order) => sentToWarehouseId ?? order.shipFromWarehouseId)
         return held as unknown as Partial<OrderForPush>
       })
     },
