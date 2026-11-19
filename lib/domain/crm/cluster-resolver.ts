@@ -157,25 +157,57 @@ export function erasureOrder(seedId: string, ids: ReadonlyArray<string>, custome
   const byId = new Map(customers.map((c) => [c.id, c]))
   const newest = newestOperatorDecisions(decisions)
   const members = ids.filter((id) => byId.has(id))
-  const adjacent = (a: string, b: string) => effectiveLink(byId.get(a)!, byId.get(b)!, newest.get(pairKey(a, b)))
-  const connectedWithout = (removed: string): boolean => {
-    const rest = members.filter((id) => id !== removed)
-    if (rest.length <= 1) return true
-    const seen = new Set([rest[0]!])
-    const queue = [rest[0]!]
-    while (queue.length > 0) {
-      const current = queue.pop()!
-      for (const other of rest) if (!seen.has(other) && adjacent(current, other)) { seen.add(other); queue.push(other) }
+  // Each member's loose key is computed ONCE (the fold is the costly part of a link check), then the adjacency is built over every pair with O(1) comparisons
+  // (O(n^2) for n <= MAX_CLUSTER_MEMBERS), and the linking members are the ARTICULATION POINTS of that graph, found in one Tarjan pass (O(V+E)). This runs inside the
+  // erasure snapshot transaction, which holds the global CRM lock, so it must stay cheap at the largest cluster.
+  const keys = new Map(members.map((id) => { const c = byId.get(id)!; return [id, c.anonymised ? null : looseIdentityEmail(c.email)] as const }))
+  const adj = new Map<string, string[]>(members.map((id) => [id, []]))
+  for (let i = 0; i < members.length; i += 1) {
+    for (let j = i + 1; j < members.length; j += 1) {
+      const a = members[i]!
+      const b = members[j]!
+      if (byId.get(a)!.anonymised || byId.get(b)!.anonymised) continue
+      const decision = newest.get(pairKey(a, b))
+      const ka = keys.get(a)
+      const linked = decision ? decision.kind === 'MERGE' : ka != null && ka === keys.get(b)
+      if (linked) { adj.get(a)!.push(b); adj.get(b)!.push(a) }
     }
-    return seen.size === rest.length
   }
-  const linking = new Set(members.filter((id) => id !== seedId && !connectedWithout(id)))
+  const linking = articulationPoints(members, adj)
+  linking.delete(seedId)
   const sorted = [...ids].sort()
   return [
     ...sorted.filter((id) => id !== seedId && !linking.has(id)),
     ...sorted.filter((id) => id !== seedId && linking.has(id)),
     ...(ids.includes(seedId) ? [seedId] : []),
   ]
+}
+
+/** The articulation points (cut vertices) of an undirected graph: vertices whose removal disconnects the rest of their component. One DFS, O(V+E). */
+function articulationPoints(vertices: ReadonlyArray<string>, adj: ReadonlyMap<string, string[]>): Set<string> {
+  const disc = new Map<string, number>()
+  const low = new Map<string, number>()
+  const cut = new Set<string>()
+  let clock = 0
+  const visit = (v: string, parent: string | null): void => {
+    clock += 1
+    disc.set(v, clock)
+    low.set(v, clock)
+    let children = 0
+    for (const w of adj.get(v) ?? []) {
+      if (!disc.has(w)) {
+        children += 1
+        visit(w, v)
+        low.set(v, Math.min(low.get(v)!, low.get(w)!))
+        if (parent !== null && low.get(w)! >= disc.get(v)!) cut.add(v)
+      } else if (w !== parent) {
+        low.set(v, Math.min(low.get(v)!, disc.get(w)!))
+      }
+    }
+    if (parent === null && children > 1) cut.add(v)
+  }
+  for (const v of vertices) if (!disc.has(v)) visit(v, null)
+  return cut
 }
 
 /** The cluster of `customerId` with the order to erase it in (see erasureOrder). */

@@ -25,7 +25,7 @@ The **Same person** card lists the records shown together. Users with the **MANA
 - **Merge**: paste another customer's id, or the address of its customer page, to join it to this person even when the emails differ. The company list below has a **Merge as same person** button for each customer. IMS first shows **both customers' names and emails** and asks you to confirm.
 - **Separate this customer**: splits this record away from everyone it is joined to, after showing who it separates from and asking you to confirm. Use it when two different people share an address. Records that are still joined to each other stay together.
 
-Because a merge decides who a later erasure also anonymises, both need you to have **signed in recently** (you are asked to sign in again otherwise). While an erasure of a person is unfinished, merge and separate refuse its records. Both are recorded with who did it and when, and the latest decision for a pair always wins: a separate holds even though the emails match, and a later merge overrides an earlier separate. Other roles can see the card but not change it.
+Capital letters outside the basic Latin alphabet (for example É) are not folded when records are compared by email: `JOSÉ@x.com` and `josé@x.com` stay separate until you merge them. Because a merge decides who a later erasure also anonymises, both need you to have **signed in recently** (you are asked to sign in again otherwise). While an erasure of a person is unfinished, merge and separate refuse its records. Both are recorded with who did it and when, and the latest decision for a pair always wins: a separate holds even though the emails match, and a later merge overrides an earlier separate. Other roles can see the card but not change it.
 
 ## Company grouping
 

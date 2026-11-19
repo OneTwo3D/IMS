@@ -280,29 +280,38 @@ test('aliases merge into one person even across DIFFERENT storefront customer id
   for (const seed of expected) assert.deepEqual((await clusterOf(db, seed)).ids, expected)
 })
 
-test('the importer matches an order to its customer by the stored storefront customer id, ahead of the email (owner Q5)', { skip }, async (t) => {
+test('the importer matches a storefront customer id ONLY through the customer-link table, then the email, and never through the id stored on an order', { skip }, async (t) => {
   const { db, RUN, customer, order, cleanup } = await setup()
   t.after(cleanup)
   const { upsertCustomer } = await import('@/lib/connectors/woocommerce/sync/field-mapping')
   const storefrontId = 8_000_000 + Math.floor(Math.random() * 1_000_000)
-  const owner = await customer('owner', `old.${RUN}@example.test`)
+  const linked = await customer('linked', `old.${RUN}@example.test`)
+  await db.shoppingCustomerLink.create({ data: { customerId: linked, connector: 'woocommerce', externalCustomerId: String(storefrontId) } })
   const emailTwin = await customer('twin', `new.${RUN}@example.test`)
   const erasedOwner = await customer('erased', null, { gdprAnonymisedAt: new Date() })
-  await order('q5', owner, { externalCustomerId: storefrontId })
   await order('q5e', erasedOwner, { externalCustomerId: storefrontId + 1 })
   const wcOrder = (email: string, customerId: number) => ({
     customer_id: customerId,
     billing: { first_name: 'Q', last_name: RUN, email, phone: '', company: '', address_1: '1 High St', address_2: '', city: 'Town', state: '', postcode: 'AB1 2CD', country: 'GB' },
     shipping: { first_name: 'Q', last_name: RUN, company: '', phone: '', address_1: '1 High St', address_2: '', city: 'Town', state: '', postcode: 'AB1 2CD', country: 'GB' },
   }) as never
-  // the account changed its email to one another customer already has: the stored id wins
-  assert.equal(await upsertCustomer(wcOrder(`new.${RUN}@example.test`, storefrontId)), owner)
-  assert.notEqual(owner, emailTwin)
+  // the account changed its email to one another customer already has: the LINK for that storefront id wins
+  assert.equal(await upsertCustomer(wcOrder(`new.${RUN}@example.test`, storefrontId)), linked)
+  assert.notEqual(linked, emailTwin)
+  // THE REVIEW SCENARIO: an order stored under account 42 (person P, linked to 42) was moved to account 43 (person Q, no link). The id stored on P's order is NOT a
+  // match source: the next order of account 43 goes to Q by email, and Q gets the link.
+  const p = await customer('p', `p.${RUN}@example.test`)
+  const q = await customer('q', `q.${RUN}@example.test`)
+  await db.shoppingCustomerLink.create({ data: { customerId: p, connector: 'woocommerce', externalCustomerId: String(storefrontId + 10) } })
+  await order('moved', p, { externalCustomerId: storefrontId + 11 }) // the stored id of the moved order names account 43
+  assert.equal(await upsertCustomer(wcOrder(`q.${RUN}@example.test`, storefrontId + 11)), q, 'Q, not P')
+  assert.equal((await db.shoppingCustomerLink.findFirstOrThrow({ where: { customerId: q } })).externalCustomerId, String(storefrontId + 11))
+  assert.equal(await upsertCustomer(wcOrder(`q.${RUN}@example.test`, storefrontId + 11)), q, 'and every later order of account 43')
   // an erased customer is never a match target: a fresh customer is created
   const fresh = await upsertCustomer(wcOrder(`fresh.${RUN}@example.test`, storefrontId + 1))
   t.after(async () => { await db.shoppingCustomerLink.deleteMany({ where: { customerId: fresh! } }); await db.customer.deleteMany({ where: { id: fresh! } }) })
   assert.notEqual(fresh, erasedOwner)
-  // no stored id anywhere: the email decides, as before
+  // no id anywhere: the email decides, as before
   assert.equal(await upsertCustomer(wcOrder(`NEW.${RUN}@example.test`, 0)), emailTwin)
 })
 
@@ -371,7 +380,7 @@ test('erasing one customer erases the whole cluster, keeps the audit rows, and l
   const oc = await order('c', c)
   const ox = await order('x', bystander, { externalCustomerId: 4244 })
 
-  const result = await customers.anonymiseCustomer(b)
+  const result = await customers.anonymiseCustomer(b, [a, b, c].sort())
   assert.equal(result.success, true, JSON.stringify(result))
   assert.equal(result.erasedRecords, 3)
   const rows = await db.customer.findMany({ where: { id: { in: [a, b, c, bystander] } }, select: { id: true, email: true, phone: true, gdprAnonymisedAt: true } })
@@ -389,7 +398,7 @@ test('erasing one customer erases the whole cluster, keeps the audit rows, and l
     else assert.deepEqual([o.erasedAt !== null, o.customerEmail, o.externalCustomerId], [true, null, null], 'erased order lost its identity and its storefront customer id')
   }
   assert.ok((await db.customerMergeEvent.count({ where: { OR: [{ customerId: { in: [a, b, c] } }, { otherCustomerId: { in: [a, b, c] } }] } })) >= 1, 'the audit rows are kept')
-  assert.equal((await customers.anonymiseCustomer(a)).success, false, 'a second request refuses')
+  assert.equal((await customers.anonymiseCustomer(a, [a])).success, false, 'a second request refuses')
 })
 
 test('a chained cluster erasure that fails part way is FINISHED by running it again from the first member (saved member list)', { skip }, async (t) => {
@@ -417,7 +426,8 @@ test('a chained cluster erasure that fails part way is FINISHED by running it ag
     if (id === c && failOnce) { failOnce = false; return { success: false as const, error: 'injected failure' } }
     return eraseCustomerPersonalData(id, opts)
   }
-  const first = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId }, { eraseCustomer: failingOnC as never })
+  const chain = [a, b, c, d].sort()
+  const first = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: chain }, { eraseCustomer: failingOnC as never })
   assert.equal(first.success, false)
   const request = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })
   assert.equal(request.status, 'PENDING')
@@ -436,7 +446,7 @@ test('a chained cluster erasure that fails part way is FINISHED by running it ag
   assert.equal((await actions.mergeCustomersAction(stranger, c, true) as { error?: string }).error, ERASURE_IN_PROGRESS_ERROR)
   assert.equal((await actions.unmergeCustomerAction(c, true) as { error?: string }).error, ERASURE_IN_PROGRESS_ERROR)
 
-  const again = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId })
+  const again = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [] })
   assert.equal(again.success, true, JSON.stringify(again))
   for (const id of [a, b, c, d]) assert.equal(await live(id), false, `${id} erased after the re-run`)
   assert.equal(await live(stranger), true)
@@ -447,7 +457,7 @@ test('a chained cluster erasure that fails part way is FINISHED by running it ag
   const erasedOrder = await db.salesOrder.findUniqueOrThrow({ where: { id: oc }, select: { erasedAt: true } })
   assert.ok(erasedOrder.erasedAt, 'the order of the member that failed first is erased')
   // finished: a third request finds nothing to do
-  assert.equal((await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId })).success, false)
+  assert.equal((await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [a] })).success, false)
   // and merge is possible again for people outside the finished request
   assert.equal((await actions.mergeCustomersAction(stranger, await customer('t', `t.${RUN}@example.test`), true)).success, true)
 })
@@ -522,6 +532,7 @@ test('the stored-payload backfill fills the storefront customer id from a delive
   const erased = await order('erased', c, { erasedAt: new Date() })
   const unlinked = await order('unlinked', c)
   await link(fill, String(base)); await link(guest, String(base + 1)); await link(have, String(base + 2)); await link(erased, String(base + 3))
+  // two deliveries of one order carry two different ids (the order was moved between accounts): the FIRST one is the account it was placed under
   await delivery(String(base), { customer_id: 11 }, 'old', new Date('2026-01-01'))
   await delivery(String(base), { customer_id: 12 }, 'new', new Date('2026-02-01'))
   await delivery(String(base + 1), { customer_id: 0 }, 'guest', new Date('2026-01-01'))
@@ -536,10 +547,165 @@ test('the stored-payload backfill fills the storefront customer id from a delive
   assert.equal(applied.orders >= 1 && applied.batches === applied.orders, true, 'one order per batch when the batch size is 1')
   assert.ok(applied.unfillable >= 1, 'the guest order has a link and no delivery that carries a customer id: reported as unfillable')
   const after = new Map((await stamp()).map((r) => [r.id, r]))
-  assert.equal(after.get(fill)!.e, 12, 'the NEWEST delivery wins')
+  assert.equal(after.get(fill)!.e, 11, 'the FIRST delivery wins (the importer keeps the first id too), never the newest')
   assert.equal(after.get(guest)!.e, null, 'customer_id 0 is no evidence')
   assert.equal(after.get(have)!.e, 99, 'a stored id is never overwritten')
   assert.equal(after.get(erased)!.e, null, 'an erased order is never refilled')
   assert.equal(after.get(unlinked)!.e, null)
   for (const row of before) assert.equal(after.get(row.id)!.u.getTime(), row.u.getTime(), 'updatedAt is not raised')
+})
+
+test('a cluster erasure with no expectedMemberIds is refused (the server computes the cluster and the client must have confirmed it), also for a record shown alone', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const { eraseCustomerClusterPersonalData, CLUSTER_CHANGED_ERROR } = await import('@/lib/domain/erasure/cluster-erasure')
+  const customers = await import('@/app/actions/customers')
+  const a = await customer('a', `solo.${RUN}@example.test`)
+  // the page showed ONE record (no list); a merge or an alias exists by the time the operator confirms
+  const alias = await customer('alias', `solo.${RUN}+gift@example.test`)
+  const missing = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId })
+  assert.deepEqual([missing.success, (missing as { error: string }).error], [false, CLUSTER_CHANGED_ERROR])
+  const single = await customers.anonymiseCustomer(a, [a])
+  assert.deepEqual([single.success, single.error], [false, CLUSTER_CHANGED_ERROR], 'the one record the page showed is not the whole person')
+  assert.equal(await db.customerClusterErasure.count({ where: { memberIds: { has: a } } }), 0)
+  assert.equal((await db.customer.findUniqueOrThrow({ where: { id: alias }, select: { gdprAnonymisedAt: true } })).gdprAnonymisedAt, null)
+  // a lone customer with the exact list goes through
+  const lone = await customer('lone', `lone.${RUN}@example.test`)
+  assert.equal((await customers.anonymiseCustomer(lone, [lone])).success, true)
+})
+
+test('an alias imported AFTER the snapshot is erased with the person before the request is marked COMPLETE', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const { eraseCustomerClusterPersonalData } = await import('@/lib/domain/erasure/cluster-erasure')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const a = await customer('a', `late.${RUN}@example.test`, { phone: '1' })
+  const b = await customer('b', `late.${RUN}+x@example.test`, { phone: '2' })
+  let late: string | undefined
+  const creatingLate = async (id: string, opts: Parameters<typeof eraseCustomerPersonalData>[1]) => {
+    if (!late) late = await customer('late', `late.${RUN}+gift@example.test`, { phone: '3' }) // the importer creates this customer between the snapshot and the end of the run
+    return eraseCustomerPersonalData(id, opts)
+  }
+  const result = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [a, b].sort() }, { eraseCustomer: creatingLate as never })
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.ok(late)
+  for (const id of [a, b, late!]) assert.ok((await db.customer.findUniqueOrThrow({ where: { id }, select: { gdprAnonymisedAt: true } })).gdprAnonymisedAt, `${id} erased`)
+  const request = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })
+  assert.equal(request.status, 'COMPLETE')
+  assert.ok(request.memberIds.includes(late!), 'the late record is on the saved list')
+  assert.ok(await db.activityLog.findFirst({ where: { entityId: request.id, action: 'customer_erasure_members_grew' } }), 'an operator notice records that the person grew')
+})
+
+test('the importer takes the shared CRM lock when it creates a customer, so it waits for a merge or an erasure snapshot', { skip }, async (t) => {
+  const { db, RUN, cleanup } = await setup()
+  t.after(cleanup)
+  const { lockCrmIdentity } = await import('@/lib/domain/crm/identity-lock')
+  const { upsertCustomer } = await import('@/lib/connectors/woocommerce/sync/field-mapping')
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  let taken!: () => void
+  const lockTaken = new Promise<void>((resolve) => { taken = resolve })
+  const holder = db.$transaction(async (tx) => { await lockCrmIdentity(tx); taken(); await held }, { timeout: 30_000 })
+  await lockTaken
+  const email = `import.${RUN}@example.test`
+  const wc = { customer_id: 0, billing: { first_name: 'I', last_name: RUN, email, phone: '', company: '', address_1: '1 St', address_2: '', city: 'T', state: '', postcode: 'AB1', country: 'GB' }, shipping: { first_name: 'I', last_name: RUN, company: '', phone: '', address_1: '1 St', address_2: '', city: 'T', state: '', postcode: 'AB1', country: 'GB' } } as never
+  let created: string | null | undefined
+  const importing = db.$transaction(async (tx) => { created = await upsertCustomer(wc, tx); return created }, { timeout: 30_000 })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  assert.equal(created, undefined, 'the creation waits while the exclusive CRM lock is held')
+  release()
+  await holder
+  const id = await importing
+  assert.ok(id)
+  t.after(async () => { await db.activityLog.deleteMany({ where: { entityId: id! } }); await db.customer.deleteMany({ where: { id: id! } }) })
+})
+
+test('a PENDING erasure can be cancelled (MANAGER/ADMIN, fresh sign-in, a reason, audited); records already erased stay erased and merge is unblocked', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const actions = await import('@/app/actions/customer-identity')
+  const { eraseCustomerClusterPersonalData } = await import('@/lib/domain/erasure/cluster-erasure')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { ERASURE_CANCELLED_ACTION, ERASURE_REASON_REQUIRED_ERROR } = await import('@/lib/domain/erasure/cluster-erasure-control')
+  const { ERASURE_IN_PROGRESS_ERROR } = await import('@/lib/domain/crm/merge-service')
+  const a = await customer('a', `cx.${RUN}@example.test`)
+  const b = await customer('b', `cx.${RUN}+b@example.test`)
+  const c = await customer('c', `cx.${RUN}+c@example.test`)
+  const stranger = await customer('s', `cxs.${RUN}@example.test`)
+  const failOnC = async (id: string, opts: Parameters<typeof eraseCustomerPersonalData>[1]) => (id === c ? { success: false as const, error: 'injected failure' } : eraseCustomerPersonalData(id, opts))
+  const run = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [a, b, c].sort() }, { eraseCustomer: failOnC as never })
+  assert.equal(run.success, false)
+  const request = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })
+  assert.equal(request.status, 'PENDING')
+  const erasedNow = async () => (await db.customer.findMany({ where: { id: { in: [a, b, c] }, gdprAnonymisedAt: { not: null } }, select: { id: true } })).map((r) => r.id).sort()
+  const erasedBefore = await erasedNow()
+  assert.ok(erasedBefore.length >= 1 && !erasedBefore.includes(c))
+  assert.equal((await actions.mergeCustomersAction(c, stranger, true) as { error?: string }).error, ERASURE_IN_PROGRESS_ERROR)
+  // refused: a role without the right, a stale sign-in, no reason
+  role = 'USER'
+  await assert.rejects(actions.cancelClusterErasureAction(request.id, 'wrong person'), /forbidden/)
+  role = 'MANAGER'
+  freshSignIn = false
+  assert.equal((await actions.cancelClusterErasureAction(request.id, 'wrong person') as { success: boolean }).success, false)
+  freshSignIn = true
+  assert.deepEqual(await actions.cancelClusterErasureAction(request.id, '  '), { success: false, error: ERASURE_REASON_REQUIRED_ERROR })
+  assert.equal((await db.customerClusterErasure.findUniqueOrThrow({ where: { id: request.id } })).status, 'PENDING')
+  // allowed
+  assert.deepEqual(await actions.cancelClusterErasureAction(request.id, 'c is a different end customer'), { success: true })
+  const cancelled = await db.customerClusterErasure.findUniqueOrThrow({ where: { id: request.id } })
+  assert.equal(cancelled.status, 'CANCELLED')
+  assert.equal(cancelled.cancelledByUserId, userId)
+  assert.ok(cancelled.cancelledAt)
+  assert.deepEqual(await erasedNow(), erasedBefore, 'records already erased stay erased; nothing more is erased')
+  const audit = await db.activityLog.findFirstOrThrow({ where: { action: ERASURE_CANCELLED_ACTION, userId } })
+  assert.equal((audit.metadata as { reason: string }).reason, 'c is a different end customer')
+  assert.equal((await actions.cancelClusterErasureAction(request.id, 'again please') as { success: boolean }).success, false, 'only a pending request can be cancelled')
+  assert.equal((await actions.mergeCustomersAction(c, stranger, true)).success, true, 'the block is released')
+})
+
+test('a wrongly included member can be EXCLUDED from a PENDING erasure; the rest is finished and the excluded record is neither erased nor added back', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const actions = await import('@/app/actions/customer-identity')
+  const { eraseCustomerClusterPersonalData } = await import('@/lib/domain/erasure/cluster-erasure')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const { ERASURE_MEMBER_EXCLUDED_ACTION } = await import('@/lib/domain/erasure/cluster-erasure-control')
+  const a = await customer('a', `ex.${RUN}@example.test`)
+  const b = await customer('b', `ex.${RUN}+b@example.test`)
+  const c = await customer('c', `ex.${RUN}+reseller@example.test`) // a different end customer that the alias rule joined
+  let failing = true
+  const failOnB = async (id: string, opts: Parameters<typeof eraseCustomerPersonalData>[1]) => (id === b && failing ? { success: false as const, error: 'injected failure' } : eraseCustomerPersonalData(id, opts))
+  assert.equal((await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [a, b, c].sort() }, { eraseCustomer: failOnB as never })).success, false)
+  const request = await db.customerClusterErasure.findFirstOrThrow({ where: { memberIds: { has: a } } })
+  role = 'ADMIN'
+  assert.equal((await actions.excludeClusterErasureMemberAction(request.id, a, 'x is the requested customer') as { success: boolean }).success, false, 'the requested customer cannot be excluded')
+  assert.equal((await actions.excludeClusterErasureMemberAction(request.id, c, 'no') as { success: boolean }).success, false, 'a reason is required')
+  assert.deepEqual(await actions.excludeClusterErasureMemberAction(request.id, c, 'reseller is a different end customer'), { success: true })
+  failing = false
+  const done = await eraseCustomerClusterPersonalData(a, { trigger: 'ON_REQUEST', userId, expectedMemberIds: [] }, { eraseCustomer: failOnB as never })
+  assert.equal(done.success, true, JSON.stringify(done))
+  const state = async (id: string) => (await db.customer.findUniqueOrThrow({ where: { id }, select: { gdprAnonymisedAt: true } })).gdprAnonymisedAt
+  assert.ok(await state(a)); assert.ok(await state(b))
+  assert.equal(await state(c), null, 'the excluded record is untouched')
+  const finished = await db.customerClusterErasure.findUniqueOrThrow({ where: { id: request.id } })
+  assert.equal(finished.status, 'COMPLETE')
+  assert.deepEqual(finished.excludedMemberIds, [c])
+  assert.equal(finished.memberIds.includes(c), false, 'not added back by the re-resolve')
+  assert.ok(await db.activityLog.findFirst({ where: { action: ERASURE_MEMBER_EXCLUDED_ACTION, entityId: c, userId } }), 'audited')
+})
+
+test('the company-name SQL twin gives the same group as the TypeScript key for NBSP, NFD and mixed white space', { skip }, async (t) => {
+  const { db, RUN, customer, cleanup } = await setup()
+  t.after(cleanup)
+  const { loadCompanyGroup } = await import('@/lib/domain/crm/company-group')
+  const name = `Café ${RUN} Ltd`
+  const self = await customer('self', `self.${RUN}@gmail.com`, { company: name })
+  const nfd = await customer('nfd', `nfd.${RUN}@gmail.com`, { company: `Café ${RUN} Limited` })
+  const nbsp = await customer('nbsp', `nbsp.${RUN}@gmail.com`, { company: `Café ${RUN} LTD.` })
+  const tabs = await customer('tab', `tab.${RUN}@gmail.com`, { company: `\tCafé\t${RUN}  Inc \n` })
+  const other = await customer('other', `other.${RUN}@gmail.com`, { company: `Different ${RUN}` })
+  const group = await loadCompanyGroup(db, self, [])
+  const ids = group.peers.map((p) => p.id).sort()
+  assert.deepEqual(ids, [nfd, nbsp, tabs].sort())
+  assert.equal(ids.includes(other), false)
 })

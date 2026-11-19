@@ -6,6 +6,7 @@ import { freshAuthFailureResult, requireFreshRole, requirePermission, requireRol
 import { clusterOf } from '@/lib/domain/crm/cluster-resolver'
 import { loadCompanyGroup, type CompanyGroup } from '@/lib/domain/crm/company-group'
 import { mergeCustomers, unmergeCustomer } from '@/lib/domain/crm/merge-service'
+import { cancelClusterErasure, excludeClusterErasureMember } from '@/lib/domain/erasure/cluster-erasure-control'
 import { loadTimeline, type TimelinePage } from '@/lib/domain/crm/timeline'
 
 /**
@@ -30,6 +31,15 @@ export type CustomerIdentityView = {
   truncated: boolean
   company: CompanyGroup
   canMerge: boolean
+  /** A PENDING whole-person erasure that covers this customer's cluster, or null. Shown with cancel / exclude controls to MANAGER and ADMIN. */
+  pendingErasure: PendingErasureView | null
+}
+
+export type PendingErasureView = {
+  requestId: string
+  requestedCustomerId: string
+  /** The saved list: erased members have no name or email left. */
+  members: Array<{ id: string; label: string; erased: boolean }>
 }
 
 const MERGE_ROLES = ['MANAGER', 'ADMIN'] as const
@@ -49,7 +59,22 @@ export async function getCustomerIdentity(customerId: string): Promise<CustomerI
     return r ? [{ id: r.id, fullName: `${r.firstName} ${r.lastName}`.trim(), email: r.email, company: r.company, orderCount: r._count.salesOrders, anonymised: r.gdprAnonymisedAt !== null }] : []
   })
   const company = await loadCompanyGroup(db, customerId, cluster.ids)
-  return { customerId, members, truncated: cluster.truncated, company, canMerge: (MERGE_ROLES as readonly string[]).includes(session.user.role) }
+  const pending = await db.customerClusterErasure.findFirst({ where: { status: 'PENDING', memberIds: { hasSome: cluster.ids } }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
+  let pendingErasure: PendingErasureView | null = null
+  if (pending) {
+    const saved = await db.customer.findMany({ where: { id: { in: pending.memberIds } }, select: { id: true, firstName: true, lastName: true, email: true, gdprAnonymisedAt: true } })
+    const savedById = new Map(saved.map((r) => [r.id, r]))
+    pendingErasure = {
+      requestId: pending.id,
+      requestedCustomerId: pending.requestedCustomerId,
+      members: pending.memberIds.map((id) => {
+        const r = savedById.get(id)
+        if (!r || r.gdprAnonymisedAt) return { id, label: 'Erased record', erased: true }
+        return { id, label: [`${r.firstName} ${r.lastName}`.trim(), r.email].filter(Boolean).join(' - ') || id, erased: false }
+      }),
+    }
+  }
+  return { customerId, members, truncated: cluster.truncated, company, canMerge: (MERGE_ROLES as readonly string[]).includes(session.user.role), pendingErasure }
 }
 
 /** The timeline of one customer, or of its whole cluster (`scope: 'person'`, the default). Keyset pagination: pass the previous page's `nextCursor`. */
@@ -117,6 +142,36 @@ export async function unmergeCustomerAction(customerId: string, confirmed: boole
     if (!result.success) return result
     revalidatePath(`/sales/contacts/${customerId}`)
     for (const id of result.clusterIds) revalidatePath(`/sales/contacts/${id}`)
+    return { success: true }
+  } catch (error) {
+    const fresh = freshAuthFailureResult(error)
+    if (fresh) return fresh
+    throw error
+  }
+}
+
+/** Cancel a PENDING person erasure: MANAGER or ADMIN, FRESH sign-in, a reason, audited. Records already erased stay erased; the merge/unmerge block is released. */
+export async function cancelClusterErasureAction(requestId: string, reason: string): Promise<MergeActionResult> {
+  try {
+    const session = await requireFreshRole(...MERGE_ROLES)
+    const result = await cancelClusterErasure(requestId, reason, session.user.id!)
+    if (!result.success) return result
+    revalidatePath('/sales/contacts')
+    return { success: true }
+  } catch (error) {
+    const fresh = freshAuthFailureResult(error)
+    if (fresh) return fresh
+    throw error
+  }
+}
+
+/** Exclude one wrongly included member from a PENDING person erasure before it is resumed: MANAGER or ADMIN, FRESH sign-in, a reason, audited. */
+export async function excludeClusterErasureMemberAction(requestId: string, customerId: string, reason: string): Promise<MergeActionResult> {
+  try {
+    const session = await requireFreshRole(...MERGE_ROLES)
+    const result = await excludeClusterErasureMember(requestId, customerId, reason, session.user.id!)
+    if (!result.success) return result
+    revalidatePath(`/sales/contacts/${customerId}`)
     return { success: true }
   } catch (error) {
     const fresh = freshAuthFailureResult(error)

@@ -68,8 +68,8 @@ function GdprDialog({ customer, clusterMembers, onClose }: { customer: CustomerD
   function handleAnonymise() {
     setError('')
     startTransition(async () => {
-      // The ids the operator is shown are sent back: a server snapshot that differs (a merge or unmerge since this page opened) is refused, not erased.
-      const result = await anonymiseCustomer(customer.id, clusterMembers.length > 1 ? clusterMembers.map((m) => m.id) : undefined)
+      // The ids the operator is shown are sent back, ALWAYS (a page that shows one record sends that one id): a server snapshot that differs (a merge or unmerge since this page opened) is refused, not erased.
+      const result = await anonymiseCustomer(customer.id, clusterMembers.some((m) => m.id === customer.id) ? clusterMembers.map((m) => m.id) : [customer.id, ...clusterMembers.map((m) => m.id)])
       if (result.success) {
         router.refresh()
         // An erasure that left open warehouse orders says so here, and stays open until the operator has read it.

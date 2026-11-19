@@ -3,6 +3,7 @@
  */
 
 import { recordAutoMergeAudit } from '@/lib/domain/crm/merge-service'
+import { lockCrmIdentityShared } from '@/lib/domain/crm/identity-lock'
 import { db } from '@/lib/db'
 import { getFxRateToBase as getFxRateToBaseFromTable, isMissingFxRateError, MissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -131,16 +132,9 @@ export async function upsertCustomer(order: WcFullOrder, client?: Prisma.Transac
         },
       })
     : null
-  // CRM (owner decision Q5): the storefront customer id stored on earlier orders (sales_orders.external_customer_id) is evidence of WHO the customer is, and wins over
-  // the email. It finds the customer of an earlier order of the same storefront account when no link row exists (an order imported before the link, a link removed by
-  // an erasure of a different record, a changed email). An erased customer is never a match target. Oldest order first, so the same account always lands on the same row.
-  if (!existing && cust.externalCustomerId) {
-    const byOrder = await c.$queryRaw<Array<{ id: string }>>`
-      SELECT cu."id" FROM "sales_orders" o JOIN "customers" cu ON cu."id" = o."customerId"
-      WHERE o."external_customer_id" = ${Number(cust.externalCustomerId)}::int AND cu."gdprAnonymisedAt" IS NULL
-      ORDER BY o."createdAt" ASC, o."id" ASC LIMIT 1`
-    if (byOrder[0]) existing = await c.customer.findUnique({ where: { id: byOrder[0].id } })
-  }
+  // CRM (owner decision Q5): the storefront customer id wins over the email, but ONLY through the link table above (WooCommerce customer id -> IMS customer). The id
+  // stored on an order (sales_orders.external_customer_id) is NOT a match source: it is kept from the first delivery and an order moved between accounts in
+  // WooCommerce keeps its customer, so "the oldest order carrying id N" can name another person. With no link the email decides, and the link is created below.
   if (!existing && cust.email) {
     // An anonymised row is never a match target (its email is already null; this keeps that true if a writer ever changes).
     // CRM (owner decision Q9): the email matches CASE-INSENSITIVELY and ignoring surrounding spaces ("Jane@x.com" is "jane@x.com"), as an EXACT comparison:
@@ -193,32 +187,38 @@ export async function upsertCustomer(order: WcFullOrder, client?: Prisma.Transac
   }
 
   // Create new customer
-  const created = await c.customer.create({
-    data: {
-      firstName: cust.firstName,
-      lastName: cust.lastName,
-      email: cust.email,
-      phone: cust.phone,
-      company: cust.company,
-      billingAddress: mapWcAddress(order.billing),
-      shippingAddress: mapWcAddress(order.shipping),
-      ...(cust.externalCustomerId
-        ? {
-            shoppingLinks: {
-              create: {
-                connector: 'woocommerce',
-                externalCustomerId: String(cust.externalCustomerId),
+  const create = async (tx: Prisma.TransactionClient): Promise<string> => {
+    // CRM: the SHARED CRM identity lock (see lockCrmIdentityShared) serialises this creation with a person erasure's snapshot and completion check, so an alias of a
+    // person being erased is either created before that check (and erased with the person) or after it. Taken before the pair locks of the audit below.
+    await lockCrmIdentityShared(tx)
+    const created = await tx.customer.create({
+      data: {
+        firstName: cust.firstName,
+        lastName: cust.lastName,
+        email: cust.email,
+        phone: cust.phone,
+        company: cust.company,
+        billingAddress: mapWcAddress(order.billing),
+        shippingAddress: mapWcAddress(order.shipping),
+        ...(cust.externalCustomerId
+          ? {
+              shoppingLinks: {
+                create: {
+                  connector: 'woocommerce',
+                  externalCustomerId: String(cust.externalCustomerId),
+                },
               },
-            },
-          }
-        : {}),
-    },
-  })
-  // CRM auto-merge audit: a new customer whose folded email already belongs to another customer (a +tag or Gmail-dot variant) is recorded as joined to it, in
-  // this same transaction. Insert-only bookkeeping that decides nothing (the resolver joins them with or without the row). Only inside the importer's
-  // transaction: the audit write must commit or roll back with the customer it describes.
-  if (client && created.email) await recordAutoMergeAudit(client, created.id)
-  return created.id
+            }
+          : {}),
+      },
+    })
+    // CRM auto-merge audit: a new customer whose folded email already belongs to another customer (a +tag or Gmail-dot variant) is recorded as joined to it, in
+    // this same transaction. Insert-only bookkeeping that decides nothing (the resolver joins them with or without the row). Only inside the importer's
+    // transaction: the audit write must commit or roll back with the customer it describes.
+    if (client && created.email) await recordAutoMergeAudit(tx, created.id)
+    return created.id
+  }
+  return client ? create(client) : db.$transaction(create)
 }
 
 // ---------------------------------------------------------------------------

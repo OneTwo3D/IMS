@@ -26,8 +26,11 @@ export interface CompanyGroup {
 
 type Reader = Pick<Prisma.TransactionClient, '$queryRaw' | 'customer'>
 
-/** SQL twin of companyNameKey: the same punctuation, whitespace and trailing legal-suffix words (LEGAL_SUFFIX_WORDS); the first word is always kept. */
-const COMPANY_NAME_KEY_SQL = Prisma.sql`regexp_replace(lower(btrim(regexp_replace(replace(replace("company", '.', ''), ',', ''), '\\s+', ' ', 'g'))), '( (ltd|limited|inc|incorporated|plc|llc|gmbh|co|company|&|and))+$', '')`
+/** The JavaScript white-space class, the same one as crm_loose_identity_key (migration 20261119140100): what JS `\s` and trim() treat as white space. PostgreSQL's own `\s` is narrower. */
+const WS = '[\\t\\n\\v\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]'
+
+/** SQL twin of companyNameKey: NFC, lower-case, full stops and commas dropped, runs of JS white space collapsed and trimmed, then the trailing legal-suffix words (LEGAL_SUFFIX_WORDS); the first word is always kept. */
+const COMPANY_NAME_KEY_SQL = Prisma.sql`regexp_replace(regexp_replace(regexp_replace(replace(replace(lower(normalize("company", NFC)), '.', ''), ',', ''), ${WS + '+'}, ' ', 'g'), '^ +| +$', '', 'g'), '( (ltd|limited|inc|incorporated|plc|llc|gmbh|co|company|&|and))+$', '')`
 
 export async function loadCompanyGroup(db: Reader, customerId: string, excludeIds: string[]): Promise<CompanyGroup> {
   const self = await db.customer.findUnique({ where: { id: customerId }, select: { company: true, email: true, gdprAnonymisedAt: true } })

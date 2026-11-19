@@ -123,6 +123,7 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   // CRM cluster erasure request: ids only, no foreign keys, kept by an erasure.
   'CustomerClusterErasure.requestedCustomerId': 'surrogate',
   'CustomerClusterErasure.requestedByUserId': 'not-customer',
+  'CustomerClusterErasure.cancelledByUserId': 'not-customer',
   'ShoppingCustomerLink.externalCustomerId': 'erased',
   'Customer.accountingContactId': 'retained',
   'SalesOrder.accountingInvoiceId': 'retained',

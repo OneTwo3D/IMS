@@ -8,3 +8,12 @@ import { CRM_IDENTITY_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 export async function lockCrmIdentity(tx: Pick<Prisma.TransactionClient, '$executeRaw'>): Promise<void> {
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CRM_IDENTITY_LOCK_NAMESPACE}::int, 0)`
 }
+
+/**
+ * The SHARED mode of the same lock, taken by the WooCommerce order importer when it CREATES a customer. Many importers can hold it together; it conflicts with the
+ * exclusive lock of merge, unmerge and the erasure snapshot / completion check, so a customer created while a person is being erased is either committed before
+ * that check (and found by it) or created after it. Held to the end of the importer's transaction. Order: this lock first, then any pair lock (merge-service.ts).
+ */
+export async function lockCrmIdentityShared(tx: Pick<Prisma.TransactionClient, '$executeRaw'>): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${CRM_IDENTITY_LOCK_NAMESPACE}::int, 0)`
+}

@@ -531,7 +531,8 @@ export async function importContactsCsv(formData: FormData): Promise<CsvImportAc
   }
 }
 
-export async function anonymiseCustomer(customerId: string, expectedMemberIds?: string[]): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number; erasedRecords?: number }> {
+/** `expectedMemberIds` is REQUIRED: the ids of the person's records the operator was shown. The server computes the cluster and refuses unless it is exactly that list. */
+export async function anonymiseCustomer(customerId: string, expectedMemberIds: string[]): Promise<{ success: boolean; error?: string; warning?: string; openWarehouseOrders?: number; ambiguousWarehouseOrders?: number; erasedRecords?: number }> {
   const session = await requirePermission('sync')
   // The erasure itself, and its name-free proof, live in one place: see lib/domain/erasure. A customer merged with others is one person (owner decision
   // 2026-11-18): the erasure covers EVERY live record of the cluster, each by the same core, each with its own name-free record.

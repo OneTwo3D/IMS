@@ -1922,6 +1922,11 @@ model CustomerClusterErasure {
   requestedByUserId   String?
   createdAt           DateTime                     @default(now())
   completedAt         DateTime?
+  /// Members an operator EXCLUDED from the request (wrongly included): never erased by it, and not added back when the cluster is re-resolved.
+  excludedMemberIds   String[]                     @default([])
+  /// CANCELLED by a MANAGER/ADMIN: releases the merge/unmerge block; records already erased stay erased. The reason lives in the activity log.
+  cancelledAt         DateTime?
+  cancelledByUserId   String?
 
   @@index([status])
   @@index([memberIds], type: Gin)
@@ -1931,6 +1936,7 @@ model CustomerClusterErasure {
 enum CustomerClusterErasureStatus {
   PENDING
   COMPLETE
+  CANCELLED
 }
 
 enum CustomerMergeEventKind {

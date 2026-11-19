@@ -27,6 +27,7 @@ test('only the decided modules import lib/domain/crm', () => {
     'lib/domain/crm/company-key.ts',
     'lib/domain/crm/identity-report.ts',
     'lib/domain/crm/merge-service.ts',
+    'lib/domain/erasure/cluster-erasure-control.ts',
     'lib/domain/erasure/cluster-erasure.ts',
     'scripts/crm-backfill-order-customer-id.ts',
     'scripts/report-customer-identity.ts',

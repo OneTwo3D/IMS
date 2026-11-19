@@ -7,7 +7,7 @@ import { Loader2, Users, Building2 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { mergeCustomersAction, previewMergeAction, unmergeCustomerAction, type CustomerIdentityView, type MergePreview } from '@/app/actions/customer-identity'
+import { cancelClusterErasureAction, excludeClusterErasureMemberAction, mergeCustomersAction, previewMergeAction, unmergeCustomerAction, type CustomerIdentityView, type MergePreview } from '@/app/actions/customer-identity'
 
 /** Accepts a customer id or a pasted customer page address (/sales/contacts/<id>). */
 export function customerIdFromInput(value: string): string {
@@ -25,6 +25,8 @@ export function CustomerIdentityPanel({ identity }: { identity: CustomerIdentity
   // A merge or unmerge is made in two steps: the operator first sees WHO is affected (names and emails), then confirms. The server action refuses without the confirmation.
   const [preview, setPreview] = useState<Extract<MergePreview, { success: true }> | null>(null)
   const [confirmUnmerge, setConfirmUnmerge] = useState(false)
+  // A pending person erasure: cancel it, or exclude one wrongly included member, each with a reason (MANAGER or ADMIN, fresh sign-in; audited).
+  const [erasureReason, setErasureReason] = useState('')
 
   function run(action: () => Promise<{ success: boolean; error?: string }>, after?: () => void) {
     setError('')
@@ -112,6 +114,34 @@ export function CustomerIdentityPanel({ identity }: { identity: CustomerIdentity
             <Button size="sm" disabled={pending} onClick={() => run(() => unmergeCustomerAction(identity.customerId, true))}>Confirm separate</Button>
             <Button size="sm" variant="outline" disabled={pending} onClick={() => setConfirmUnmerge(false)}>Cancel</Button>
           </div>
+        </div>
+      )}
+      {identity.pendingErasure && (
+        <div role="note" className="rounded-md border border-destructive/40 p-3 space-y-2 text-sm" data-testid="pending-erasure">
+          <p className="font-medium text-destructive">A whole-person erasure is in progress for these records. Merge and separate are blocked until it is finished (run the erasure again) or cancelled.</p>
+          <ul className="list-disc pl-5">
+            {identity.pendingErasure.members.map((m) => (
+              <li key={m.id}>
+                {m.label}{m.erased ? <span className="ml-2 text-xs text-muted-foreground">erased</span> : null}
+                {identity.canMerge && !m.erased && m.id !== identity.pendingErasure!.requestedCustomerId && (
+                  <Button variant="ghost" size="sm" className="ml-2 h-6 text-xs" disabled={pending || erasureReason.trim().length < 5}
+                    onClick={() => run(() => excludeClusterErasureMemberAction(identity.pendingErasure!.requestId, m.id, erasureReason), () => setErasureReason(''))}>
+                    Exclude from erasure
+                  </Button>
+                )}
+              </li>
+            ))}
+          </ul>
+          {identity.canMerge && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Input className="h-8 w-80 text-xs" placeholder="Reason (required, at least 5 characters)" value={erasureReason} onChange={(e) => setErasureReason(e.target.value)} aria-label="Reason" />
+              <Button variant="outline" size="sm" disabled={pending || erasureReason.trim().length < 5}
+                onClick={() => run(() => cancelClusterErasureAction(identity.pendingErasure!.requestId, erasureReason), () => setErasureReason(''))}>
+                Cancel the erasure request
+              </Button>
+              <p className="text-xs text-muted-foreground basis-full">Cancelling releases the block only: records already erased stay erased. Both actions ask you to have signed in recently.</p>
+            </div>
+          )}
         </div>
       )}
       {error && <p className="text-destructive text-sm" role="alert">{error}</p>}

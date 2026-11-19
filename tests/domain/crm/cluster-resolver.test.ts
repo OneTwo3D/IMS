@@ -86,3 +86,25 @@ test('the erasure order puts the members that hold the cluster together last, an
   const clique = [c('x', 'q@example.com'), c('y', 'q+1@example.com'), c('z', 'q+2@example.com')]
   assert.deepEqual(erasureOrder('y', ['x', 'y', 'z'], clique, []), ['x', 'z', 'y'])
 })
+
+test('erasureOrder finds the linking members of a large cluster in one pass (a 200-member chain), and keeps the seed last', () => {
+  const n = 200
+  const customers = Array.from({ length: n }, (_, i) => c(`m${String(i).padStart(3, '0')}`, `person${i}@example.com`))
+  // a chain of operator merges: every inner member is a cut vertex, both ends are leaves
+  const decisions = Array.from({ length: n - 1 }, (_, i) => d(`m${String(i).padStart(3, '0')}`, `m${String(i + 1).padStart(3, '0')}`, 'MERGE', i + 1))
+  const ids = customers.map((x) => x.id)
+  const started = Date.now()
+  const order = erasureOrder('m000', ids, customers, decisions)
+  assert.ok(Date.now() - started < 1500, 'fast enough to run inside the snapshot transaction')
+  assert.equal(order.length, n)
+  assert.equal(order.at(-1), 'm000')
+  assert.deepEqual(order.slice(0, 1), ['m199'], 'the far leaf is erased first, the linking members after it')
+  assert.equal(new Set(order).size, n)
+})
+
+test('erasureOrder: a clique of equal-key records has no linking member; a record joined to two groups does', () => {
+  const customers = [c('a', 'x@example.com'), c('b', 'x+1@example.com'), c('c', 'x+2@example.com'), c('hub', 'other@example.com'), c('y', 'y@example.com')]
+  const decisions = [d('a', 'hub', 'MERGE', 1), d('hub', 'y', 'MERGE', 2)]
+  const order = erasureOrder('y', ['a', 'b', 'c', 'hub', 'y'], customers, decisions)
+  assert.deepEqual(order, ['b', 'c', 'a', 'hub', 'y'])
+})

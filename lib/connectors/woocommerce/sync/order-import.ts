@@ -1475,6 +1475,32 @@ async function recordRepopulationRefused(orderId: string, wcOrder: WcFullOrder):
   }
 }
 
+/**
+ * CRM operator notice: a delivery for an order IMS already holds names a DIFFERENT storefront customer account than the first delivery did (staff moved the order
+ * between accounts in WooCommerce). The stored id and the order's customer are left as they were; an operator decides whether the order belongs to the other person.
+ * Ids are deliberately not in the entry (they name a person's account). Best effort and de-duplicated per day, like recordRepopulationRefused.
+ */
+export const CUSTOMER_ACCOUNT_MOVED_ACTION = 'inbound_customer_account_moved'
+async function recordCustomerAccountMoved(orderId: string, wcOrder: WcFullOrder): Promise<void> {
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    const recent = await db.activityLog.findFirst({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: CUSTOMER_ACCOUNT_MOVED_ACTION, createdAt: { gte: since } }, select: { id: true } })
+    if (recent) return
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: CUSTOMER_ACCOUNT_MOVED_ACTION,
+      tag: 'sync',
+      level: 'WARNING',
+      description: 'WooCommerce now shows this order under a different customer account than when it was first imported (moved between accounts). The order kept its original customer and stored account; check whether it belongs to someone else.',
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
+      resolveUser: false,
+    })
+  } catch (e) {
+    console.error(`${CUSTOMER_ACCOUNT_MOVED_ACTION}: could not record`, e instanceof Error ? e.constructor.name : typeof e)
+  }
+}
+
 async function updateExistingWcOrderCore(
   orderId: string,
   wcOrder: WcFullOrder,
@@ -1492,6 +1518,7 @@ async function updateExistingWcOrderCore(
   const payloadHasCreditConflict = reclassified.signalProblems.length > 0
   let reviewFlagged = false
   let repopulationRefused = false
+  let customerAccountMoved = false
   let storedComponents: { wclcDutyComponent?: unknown; wclcTaxComponent?: unknown; wclcHandlingComponent?: unknown } | null = null
   await db.$transaction(async (tx) => {
     // Only a payload that shows credit or any credit-evidence problem can need a review; the steady state reads nothing.
@@ -1519,7 +1546,7 @@ async function updateExistingWcOrderCore(
     // the very next order.updated would undo the erasure silently. Only the identity columns are withheld; the
     // rest of the update (shipping, paid state, order number) proceeds exactly as before.
     await lockSalesOrder(tx, orderId)
-    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true, externalUpdatedAt: true } })
+    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true, externalUpdatedAt: true, externalCustomerId: true } })
     // The stored split is read only when this delivery carries one (an order without wclc components reads nothing extra).
     if (Array.isArray(wcOrder.meta_data) && Object.values(wclcComponentColumns(wcOrder)).some((v) => v !== null)) {
       storedComponents = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
@@ -1538,6 +1565,7 @@ async function updateExistingWcOrderCore(
     if (staleDelivery) storedComponents = null
     // Recorded after the transaction (below). Only a delivery that still carries real identity counts: an anonymised delivery, or one whose placeholders
     // WooCommerce wrote, is the expected steady state and says nothing.
+    customerAccountMoved = !erased && !staleDelivery && wcOrder.customer_id > 0 && erasure?.externalCustomerId != null && erasure.externalCustomerId !== wcOrder.customer_id
     repopulationRefused = erased && !isWcOrderAnonymised(wcOrder) && wcPayloadCarriesIdentity(wcOrder)
     await tx.shoppingOrderLink.updateMany({
       where: {
@@ -1572,9 +1600,11 @@ async function updateExistingWcOrderCore(
               shippingAddress: mapWcAddress(wcOrder.shipping),
               notes: wcOrder.customer_note || null,
             }),
-        // CRM: the storefront customer id the order was placed under. Only a positive id is written (a guest order and an anonymised payload report 0, which says nothing
-        // and must never blank an id already stored), never on an erased order (the id names the person's account), and never from a stale delivery.
-        ...(erased || staleDelivery || !(wcOrder.customer_id > 0) ? {} : { externalCustomerId: wcOrder.customer_id }),
+        // CRM: the storefront customer id the order was placed under is KEPT FROM THE FIRST DELIVERY. A positive id is written only when none is stored (a guest or
+        // anonymised payload reports 0, which says nothing), never on an erased order (the id names the person's account) and never from a stale delivery. A LATER
+        // delivery that carries a DIFFERENT id (staff moved the order to another account in WooCommerce) never overwrites it: the importer's update path does not move
+        // the order's customer, so a rewritten id would point at an account the order's customer has no link to. It is reported as an operator notice below instead.
+        ...(erased || staleDelivery || !(wcOrder.customer_id > 0) || erasure?.externalCustomerId != null ? {} : { externalCustomerId: wcOrder.customer_id }),
         // The stored modified time follows the newest delivery applied (it was only ever written on create).
         ...(!staleDelivery && incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) ? { externalUpdatedAt: incomingModifiedAt } : {}),
         paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
@@ -1608,6 +1638,7 @@ async function updateExistingWcOrderCore(
   })
 
   if (repopulationRefused) await recordRepopulationRefused(orderId, wcOrder)
+  if (customerAccountMoved) await recordCustomerAccountMoved(orderId, wcOrder)
   await warnWhenWclcComponentsMoved(orderId, wcOrder, storedComponents)
 
   if (reviewFlagged) {
