@@ -122,7 +122,7 @@ test('after the import the push sweep creates zero orders for bridge-created ord
   // IDEMPOTENT: a rerun changes nothing (not a column, not an updatedAt).
   const snapshot = JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } }))
   const again = await d.run.runLegacyBridgeImport(ports, { apply: true, bridgeStopped: true, statuses: ['processing'] })
-  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 6, advanced: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0 })
+  assert.deepEqual(again.plan, { create: 0, adopt: 0, unchanged: 6, advanced: 0, conflict: 0, none: 0, blocked: 0, unreadable: 0, noImsOrder: 0, notImported: 0 })
   assert.equal(JSON.stringify(await d.db.wmsOrderPushLink.findMany({ where: { orderId: { in: orderIds } }, orderBy: { orderId: 'asc' } })), snapshot)
 
   // A DIFFERING LINK IS NEVER OVERWRITTEN: point the plain order's link elsewhere; the import reports a conflict and leaves it.
@@ -212,6 +212,8 @@ test('a CANCELLED order with a trusted Mintsoft id is imported SYNCED and IMS\'s
     readOrderPrefix: async () => '',
     readConnectorId: async () => 'mintsoft',
     readOpenMergeState: async () => ({ holds: [], tasks: [] }),
+    // The --resolve guards read the Mintsoft order: a double, never the network.
+    readMintsoftOrder: async (id: string) => ({ found: true as const, orderNumber: id === '9302' ? exhausted.number : queued.number, status: id === '9303' ? 'CANCELLED' : 'NEW', dispatched: false }),
   }
   const statuses = ['processing', 'cancelled', 'refunded']
 

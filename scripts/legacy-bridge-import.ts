@@ -3,7 +3,9 @@ import { pathToFileURL } from 'node:url'
 import {
   LEGACY_IMPORT_EXIT,
   renderLegacyImportReport,
+  withHistoryStatuses,
   runLegacyBridgeImport,
+  type HistoryWindow,
   type LegacyImportOptions,
   type LegacyImportPorts,
   type LegacyImportReport,
@@ -22,15 +24,22 @@ import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/
  * OrderNumber check is UNVERIFIED (it compared the bridge's own meta only: rerun with --verify-mintsoft). In --json the same is `gate.status`
  * ('met' | 'met-unverified' | 'not-met') and `gate.verified`.
  *
+ * CANCELLED / REFUNDED HISTORY is read only when modified inside a window: `--history-days N` (default 60) or `--history-since YYYY-MM-DD`. Older cancelled
+ * and refunded orders are never read and never block. The report previews the counts (in window, outside it, linked, not linked) before anything is applied.
+ * `--statuses` is always unioned with cancelled and refunded. An in-window cancelled / refunded order with a Mintsoft order that IMS will not link (no IMS order,
+ * IMS does not show it cancelled, or it is fully refunded and still PROCESSING) is ONE grouped gate blocker, cleared by ONE decision:
+ * `--resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]` (each member is re-read in Mintsoft: cancelled or despatched).
+ *
  * `--resolve` records the operator's decision, taken after checking the Mintsoft order BY HAND, for a blocked order (verify-pending, verify-exhausted,
  * a queued bridge update or cancel left by a stopped bridge, or a cancelled WooCommerce order IMS never imported): `ours` (the Mintsoft order is this
  * order's: SYNCED link), `not-ours` (it is not: no link, IMS creates the order afresh) or `cancelled` (it was cancelled in Mintsoft: CANCELLED link).
- * Without --apply it only shows what would happen; with --apply (and --bridge-stopped) it records the decision in the activity log and writes ONLY
+ * `not-ours` is refused when the bridge PROVED the id, and `ours` / `cancelled` are checked read-only against Mintsoft (order number; status) first: any mismatch refuses.
+ * Without --apply it only shows what would happen (the gate then reads "MET IF RECORDED", exit 3, never MET); with --apply (and --bridge-stopped) it records the decision in the activity log and writes ONLY
  * those orders' links. A recorded decision clears the blocker on every later run, until the order's bridge state changes.
  */
 
 const DISCONNECT_TIMEOUT_MS = 5_000
-const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped]'
+const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --history-days N | --history-since YYYY-MM-DD] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped] | -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]'
 
 type Logger = Pick<typeof console, 'log' | 'error'>
 
@@ -63,6 +72,9 @@ async function disconnectDb(): Promise<void> {
  * is unproved or the cancel keeps failing), and the WooCommerce REST API cannot filter orders by meta, so the bridge's status-independent queues
  * (`_mintsoft_sync_pending`, `_mintsoft_verify_order_id`, `_mintsoft_dead_letter`) are reached by reading those statuses too.
  */
+/** The default window for cancelled / refunded history. */
+export const DEFAULT_HISTORY_DAYS = 60
+
 export function bridgeOrderStatuses(pulled: readonly string[], withdrawalSubmitted: string): string[] {
   return [...new Set([...pulled, 'processing', 'on-hold', 'partial-shipped', 'partially-shipped', withdrawalSubmitted, 'cancelled', 'refunded'])].filter((s) => s !== '')
 }
@@ -88,6 +100,10 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
   let statuses: string[] | undefined
   let resolveIds: string[] | undefined
   let resolveAs: ResolutionDecision | undefined
+  let resolveAllHistoric = false
+  let reason: string | undefined
+  let historyDays: number | undefined
+  let historySince: string | undefined
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!
     if (arg === '--apply') { apply = true; continue }
@@ -115,6 +131,28 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
       index += 1
       continue
     }
+    if (arg === '--resolve-all-historic-cancelled') { resolveAllHistoric = true; continue }
+    if (arg === '--reason') {
+      const raw = (args[index + 1] ?? '').trim()
+      if (raw.length < 5 || raw.length > 500 || raw.startsWith('--')) { stderr.error(`--reason needs a sentence (5 to 500 characters). ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+      reason = raw
+      index += 1
+      continue
+    }
+    if (arg === '--history-days') {
+      const raw = args[index + 1]
+      if (raw === undefined || !/^[1-9][0-9]{0,3}$/.test(raw)) { stderr.error(`--history-days needs a whole number of days. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+      historyDays = Number(raw)
+      index += 1
+      continue
+    }
+    if (arg === '--history-since') {
+      const raw = args[index + 1]
+      if (raw === undefined || !/^\d{4}-\d{2}-\d{2}$/.test(raw) || Number.isNaN(Date.parse(`${raw}T00:00:00Z`))) { stderr.error(`--history-since needs a date, YYYY-MM-DD. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+      historySince = raw
+      index += 1
+      continue
+    }
     if (arg === '--as') {
       const raw = args[index + 1]
       if (raw === undefined || !(RESOLUTION_DECISIONS as readonly string[]).includes(raw)) { stderr.error(`--as needs one of ${RESOLUTION_DECISIONS.join(', ')}. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
@@ -134,11 +172,27 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     return LEGACY_IMPORT_EXIT.usage
   }
 
-  if ((resolveIds === undefined) !== (resolveAs === undefined)) {
+  if (resolveAllHistoric) {
+    if (resolveIds !== undefined) { stderr.error(`--resolve-all-historic-cancelled and --resolve are separate decisions: run them one at a time. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+    if (resolveAs !== 'cancelled') { stderr.error(`--resolve-all-historic-cancelled needs --as cancelled. ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+    if (reason === undefined) { stderr.error(`--resolve-all-historic-cancelled needs a --reason (it is recorded in the activity log). ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+  } else if (reason !== undefined) {
+    stderr.error(`--reason belongs to --resolve-all-historic-cancelled. ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  } else if ((resolveIds === undefined) !== (resolveAs === undefined)) {
     stderr.error(`--resolve and --as go together. ${USAGE}`)
     return LEGACY_IMPORT_EXIT.usage
   }
-  const resolve: LegacyImportOptions['resolve'] = resolveIds !== undefined && resolveAs !== undefined ? { wcOrderIds: resolveIds, decision: resolveAs } : undefined
+  if (historyDays !== undefined && historySince !== undefined) {
+    stderr.error(`--history-days and --history-since are alternatives: give one. ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+  const resolve: LegacyImportOptions['resolve'] = !resolveAllHistoric && resolveIds !== undefined && resolveAs !== undefined ? { wcOrderIds: resolveIds, decision: resolveAs } : undefined
+  const resolveAllHistoricCancelled: LegacyImportOptions['resolveAllHistoricCancelled'] = resolveAllHistoric && reason !== undefined ? { reason } : undefined
+  const nowDate = (options.now ?? (() => new Date()))()
+  const historyWindow: HistoryWindow = historySince !== undefined
+    ? { modifiedAfter: `${historySince}T00:00:00.000Z`, days: null, since: historySince }
+    : { modifiedAfter: new Date(nowDate.getTime() - (historyDays ?? DEFAULT_HISTORY_DAYS) * 86_400_000).toISOString(), days: historyDays ?? DEFAULT_HISTORY_DAYS, since: null }
 
   if (apply && !bridgeStopped) {
     stderr.error(`--apply refuses without --bridge-stopped: pass it only once the bridge has stopped creating, merging, verifying and syncing orders (design step 3). ${USAGE}`)
@@ -149,8 +203,9 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     const ports = options.ports
       ? await options.ports({ verifyMintsoft, connector })
       : (await import('@/lib/connectors/mintsoft/legacy-bridge-import/ports')).createLegacyImportPorts({ verifyMintsoft, connector })
-    const resolvedStatuses = statuses ?? await (options.defaultStatuses ?? defaultStatuses)()
-    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, verifyMintsoft, verifyMax, resolve, statuses: resolvedStatuses, now: options.now })
+    // cancelled and refunded are ALWAYS read: an explicit --statuses never drops them (a queued bridge cancel on one would be invisible).
+    const resolvedStatuses = withHistoryStatuses(statuses ?? await (options.defaultStatuses ?? defaultStatuses)())
+    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, verifyMintsoft, verifyMax, resolve, resolveAllHistoricCancelled, historyWindow, statuses: resolvedStatuses, now: options.now })
     if (json) stdout.log(JSON.stringify(report, null, 2))
     else {
       stdout.log(renderLegacyImportReport(report))

@@ -91,3 +91,30 @@ test('parseRetryAfterMs reads delta-seconds and HTTP dates, and nothing else', a
   assert.equal(parseRetryAfterMs('Thu, 19 Nov 2026 10:00:30 GMT', now), 30_000)
   assert.equal(parseRetryAfterMs('Thu, 19 Nov 2026 09:00:00 GMT', now), 0)
 })
+
+test('o3d-l3jkv drift: with the id-set check a NEW order joining mid-walk does not fail the read, and a leave plus a join that keeps the totals equal is still caught', async () => {
+  const opts = { maxPages: 10, ...describe, sleep: async () => undefined, pageDelayMs: 0, verifyPass: true }
+  const paged = (sets: { read: number[][]; verify: number[][]; totals?: { read: number[]; verify: number[] } }) => async (page: number, pass?: 'read' | 'verify') => {
+    const pages = (pass === 'verify' ? sets.verify : sets.read)
+    const totals = pass === 'verify' ? sets.totals?.verify : sets.totals?.read
+    return { data: (pages[page - 1] ?? []).map((id) => ({ id })), totalItems: totals?.[page - 1] }
+  }
+  // Order 4 is created after the first walk passed the tail: the totals differ (2 at the start, 3 at the end) but nothing was skipped.
+  const joined = await walkWcOrderPages(paged({ read: [[1, 2]], verify: [[1, 2, 4]], totals: { read: [2, 2], verify: [3, 3] } }), opts)
+  assert.equal(joined.complete, true)
+  assert.match(joined.note ?? '', /1 order\(s\) joined/)
+  // The old totals-only check fails the same read.
+  const old = await walkWcOrderPages(async (page) => ({ data: (page === 1 ? [{ id: 1 }, { id: 2 }] : []), totalItems: page === 1 ? 2 : 3 }), { ...opts, verifyPass: false })
+  assert.equal(old.complete, false)
+  // Order 1 left the set mid-walk (page shifted: 3 was skipped) while 5 joined: both totals say 3, the id sets say 3 was missed.
+  const shifted = await walkWcOrderPages(paged({ read: [[2, 4]], verify: [[2, 3, 4, 5]], totals: { read: [3, 3], verify: [3, 3] } }), opts)
+  assert.equal(shifted.complete, false)
+  assert.match(shifted.error ?? '', /found 1 order\(s\) the read skipped \(ids 3\)/)
+  // The same id twice is a shifted page too.
+  const dup = await walkWcOrderPages(paged({ read: [[1, 2], [2, 3]], verify: [[1, 2, 3]] }), opts)
+  assert.equal(dup.complete, false)
+  assert.match(dup.error ?? '', /same order id twice/)
+  // An order that LEFT the set (only the first walk saw it) is fine.
+  const left = await walkWcOrderPages(paged({ read: [[1, 2, 3]], verify: [[1, 3]] }), opts)
+  assert.equal(left.complete, true)
+})

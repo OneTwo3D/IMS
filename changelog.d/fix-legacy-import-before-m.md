@@ -1,0 +1,7 @@
+### Legacy bridge import before step M: windowed history, grouped blocker, resolve guards
+- `cutover:legacy-import` reads cancelled and refunded WooCommerce orders only when modified inside a window: `--history-days N` (default 60) or `--history-since YYYY-MM-DD`. Older ones are never read and never block; the report previews the counts (in window, outside it, linked, not linked) before anything is applied.
+- A cancelled or refunded order is linked for IMS's own cancel pass only when IMS already shows it CANCELLED. One IMS holds PROCESSING (a missed cancel) or PROCESSING with a full refund (an old despatch the dispatch sweep would apply) is listed instead of imported.
+- Every in-window cancelled or refunded order with a Mintsoft order that is not linked is ONE grouped gate blocker, cleared by `--resolve-all-historic-cancelled --as cancelled --reason "..."` (each member is re-read in Mintsoft and must be cancelled or despatched; a new order after the decision blocks again).
+- `--statuses` always gets cancelled and refunded added.
+- `--resolve`: `not-ours` is refused when the bridge proved the id; `ours` and `cancelled` first read the order's number and status from Mintsoft (read only) and refuse any mismatch; a `--resolve` dry run reports "MET IF RECORDED" (exit 3), never MET.
+- A resolve-only `--apply` is audited as `legacy_bridge_import_resolve_applied`. The WooCommerce read compares id sets (a second ids-only walk) instead of X-WP-Total, so a new order mid-walk no longer fails it and a leave plus a join is caught. No migration.
