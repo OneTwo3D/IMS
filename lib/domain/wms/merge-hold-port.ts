@@ -441,8 +441,15 @@ export function mergeHoldMaintenanceNote(run: MergeHoldMaintenance | { error: st
 
 /** For the sweeps: never throws; null when there is nothing to do. */
 export async function runMergeHoldMaintenanceSafe(trigger: string, port: MergeHoldPort = prismaMergeHoldPort): Promise<MergeHoldMaintenance | { error: string } | null> {
+  // The cheap "is any hold standing" probe is not the maintenance: if it cannot answer, nothing was attempted, so (as before) it is logged and the sweep's result is untouched.
+  // Only a failure once a hold stands (the maintenance itself) is reported into the cron outcome.
   try {
     if (!(await anyActiveHold())) return null
+  } catch (error) {
+    console.warn(`[wms-merge-hold] active-hold probe after ${trigger} failed: ${error instanceof Error ? error.message : String(error)}`)
+    return null
+  }
+  try {
     const env = await mergeHoldEnvironment()
     if ('skipped' in env) return null
     return await runMergeHoldMaintenance(port, env)
