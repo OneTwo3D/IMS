@@ -15,6 +15,8 @@ import {
   type MergeCandidateOrder,
   type MergeGroup,
 } from './merge-candidate-match'
+import { isMergeHoldEnabled, placeMergeHolds, type MergeHoldPlacement } from './merge-hold'
+import { mergeGroupBasesWithUnsettledHolds, prismaMergeHoldPort } from './merge-hold-port'
 import { mergeCandidateQuery, raiseWmsOperatorTask, wmsOperatorTaskHash, type WmsOperatorTaskPayload } from './operator-tasks'
 
 /**
@@ -66,6 +68,13 @@ export type MergeCandidatePort = {
   isOwed(connector: string): Promise<boolean>
   /** Resolve this connector's OPEN merge-candidate tasks whose group is not in `keepBases`. Returns how many. */
   resolveTasksNotIn(connector: string, keepBases: readonly string[]): Promise<number>
+  /**
+   * OPTIONAL (merge holds, setting `wms_merge_hold_enabled`, off by default): hold the orders of these groups in the warehouse. Absent, or the setting off,
+   * it does nothing and the pass is exactly the flag-mode pass. A failure is caught by the pass and never fails the detection.
+   */
+  placeHolds?(env: MergeCandidateEnvironment, groups: readonly MergeGroup[]): Promise<MergeHoldPlacement | null>
+  /** Group bases with a member whose hold may have landed but is not settled: their candidate task is NOT resolved while the group no longer qualifies. */
+  unsettledHoldBases?(connector: string): Promise<string[]>
   /** Run the whole compute, raise, resolve pass holding the connector's detection lock; `null` when another pass holds it. */
   withLock<T>(connector: string, fn: () => Promise<T>): Promise<T | null>
   now(): Date
@@ -74,7 +83,7 @@ export type MergeCandidatePort = {
 export type MergeCandidateRun =
   | { mode: 'off'; groups: [] }
   | { mode: 'flag'; skipped: string; groups: [] }
-  | { mode: 'flag'; groups: MergeGroup[]; created: number; reopened: number; resolved: number }
+  | { mode: 'flag'; groups: MergeGroup[]; created: number; reopened: number; resolved: number; /** Present only when merge holds are on. */ holds?: MergeHoldPlacement }
 
 /** The groups, computed from the port's data. Writes nothing. */
 async function computeGroups(port: MergeCandidatePort, env: MergeCandidateEnvironment): Promise<MergeGroup[]> {
@@ -128,14 +137,38 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
       else if (outcome === 'reopened') reopened += 1
     }
     // A stale group is not kept: an open task it already had is resolved like any group that stopped qualifying.
-    const resolved = await port.resolveTasksNotIn(env.connectorId, kept)
-    return { mode: 'flag', groups: groups.filter((group) => kept.includes(group.basis)), created, reopened, resolved }
+    // A member whose hold answer was lost may be held (so no longer NEW, so the group no longer qualifies): its candidate task stays open until that is settled.
+    let unsettled: string[] | null = []
+    if (port.unsettledHoldBases) {
+      unsettled = await port.unsettledHoldBases(env.connectorId).catch((error) => {
+        console.warn(`[wms-merge-candidates] unsettled holds unreadable: ${error instanceof Error ? error.message : String(error)}`)
+        return null
+      })
+    }
+    // (When the unsettled holds cannot be read, nothing is resolved: a task is never closed on a guess.)
+    const resolved = unsettled === null ? 0 : await port.resolveTasksNotIn(env.connectorId, [...kept, ...unsettled])
+    const keptGroups = groups.filter((group) => kept.includes(group.basis))
+    // MERGE HOLDS (off by default): only groups that still qualified under their order locks just now are held. Non-fatal.
+    let holds: MergeHoldPlacement | null = null
+    if (port.placeHolds) {
+      try {
+        holds = await port.placeHolds(env, keptGroups)
+      } catch (error) {
+        console.warn(`[wms-merge-candidates] merge holds failed: ${error instanceof Error ? error.message : String(error)}`)
+        // Reported, not swallowed: the placement threw, so every group it was to hold counts as failed (the sweep's note and the cron outcome read it).
+        holds = { held: 0, refused: 0, failed: Math.max(1, keptGroups.length), shadowed: 0, skipped: 0 }
+      }
+    }
+    return { mode: 'flag', groups: keptGroups, created, reopened, resolved, ...(holds ? { holds } : {}) }
   }
   const pass = await port.withLock(env.connectorId, async () => {
     let result = await onePass()
     if (await port.isOwed(env.connectorId)) {
       const again = await onePass()
-      result = { mode: 'flag', groups: again.groups, created: result.created + again.created, reopened: result.reopened + again.reopened, resolved: result.resolved + again.resolved }
+      const holds = result.holds || again.holds
+        ? { held: (result.holds?.held ?? 0) + (again.holds?.held ?? 0), refused: (result.holds?.refused ?? 0) + (again.holds?.refused ?? 0), failed: (result.holds?.failed ?? 0) + (again.holds?.failed ?? 0), shadowed: (result.holds?.shadowed ?? 0) + (again.holds?.shadowed ?? 0), skipped: (result.holds?.skipped ?? 0) + (again.holds?.skipped ?? 0) }
+        : undefined
+      result = { mode: 'flag', groups: again.groups, created: result.created + again.created, reopened: result.reopened + again.reopened, resolved: result.resolved + again.resolved, ...(holds ? { holds } : {}) }
     }
     return result
   })
@@ -147,11 +180,12 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
 }
 
 /** What a sweep records of a detection pass: only a failure or a skip is worth a field. Off, or a pass that ran, is nothing. */
-export type MergeCandidateNote = { detection: 'did-not-complete' | 'skipped'; reason: string }
+export type MergeCandidateNote = { detection: 'did-not-complete' | 'skipped' | 'holds-failed'; reason: string }
 
 export function mergeCandidateNote(run: MergeCandidateRun | { error: string }): MergeCandidateNote | undefined {
   if ('error' in run) return { detection: 'did-not-complete', reason: run.error }
   if ('skipped' in run) return { detection: 'skipped', reason: run.skipped }
+  if ('holds' in run && run.holds && run.holds.failed > 0) return { detection: 'holds-failed', reason: `${run.holds.failed} merge hold(s) could not be placed (retried on the next sweep)` }
   return undefined
 }
 
@@ -222,6 +256,18 @@ export const prismaMergeCandidatePort: MergeCandidatePort = {
     return outcome !== null && typeof outcome === 'object' && 'lockSkipped' in outcome ? null : outcome as Awaited<ReturnType<typeof fn>>
   },
   readMode: () => readWmsMergeCandidateMode(),
+  async placeHolds(env, groups) {
+    if (!(await isMergeHoldEnabled())) return null
+    // A group a person already marked DONE (their own decision, not the system's auto-resolve) is not held: they chose to leave it as it is. A changed group has a new basis.
+    const done = groups.length === 0 ? [] : await db.wmsOperatorTask.findMany({
+      where: { connector: env.connectorId, reason: MERGE_TASK_REASON, status: 'DONE', NOT: { doneBy: MERGE_TASK_SYSTEM_ACTOR }, contentHash: { in: groups.map((group) => wmsOperatorTaskHash({ reason: MERGE_TASK_REASON, queryText: '', dedupeBasis: group.basis })) } },
+      select: { contentHash: true },
+    })
+    const decided = new Set(done.map((task) => task.contentHash))
+    const open = groups.filter((group) => !decided.has(wmsOperatorTaskHash({ reason: MERGE_TASK_REASON, queryText: '', dedupeBasis: group.basis })))
+    return placeMergeHolds(prismaMergeHoldPort, { connectorId: env.connectorId, connectorLabel: env.connectorLabel }, open)
+  },
+  unsettledHoldBases: (connector) => mergeGroupBasesWithUnsettledHolds(connector),
 
   async environment() {
     const state = await getIntegrationPluginState()

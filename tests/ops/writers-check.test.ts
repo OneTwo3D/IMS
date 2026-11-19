@@ -14,6 +14,9 @@ import {
 } from '../../lib/ops/writers-check'
 import { WRITER_OWNERSHIP_MAP, type OwnershipRow } from '../../lib/security/writer-ownership-map'
 import {
+  STEP_EVIDENCE_KINDS,
+  type StepEvidenceKind,
+  type StepEvidenceReading,
   IMS_FORBIDDEN_OWNERSHIP_ROWS,
   WRITERS_CHECK_CANNOT_SEE,
   WRITERS_CHECK_EXIT_CODES,
@@ -27,7 +30,23 @@ import {
 const NOW = new Date('2026-10-20T12:00:00Z')
 const CUTOFF = '2026-10-10T00:00:00Z'
 
-const ALL_ON = new Map<string, string>([['xero_sync_enabled', 'true'], ['xero_daily_batch_enabled', 'true'], ['wc_stock_sync_enabled', 'true'], ['wc_fx_push_enabled', 'true']])
+const ALL_ON = new Map<string, string>([['xero_sync_enabled', 'true'], ['xero_daily_batch_enabled', 'true'], ['wc_stock_sync_enabled', 'true'], ['wc_fx_push_enabled', 'true'], ['trackship_refire_enabled', 'true'], ['mintsoft_parent_sku_delete_enabled', 'true'], ['wc_invoice_document_enabled', 'true']])
+
+/** Every step evidence source answering clean: attestations present long before any live-from instant, probes clean, no offending rows. */
+export function cleanStepEvidence(): Record<StepEvidenceKind, StepEvidenceReading> {
+  const out = {} as Record<StepEvidenceKind, StepEvidenceReading>
+  for (const kind of STEP_EVIDENCE_KINDS) {
+    out[kind] = kind === 'BRIDGE_ATTESTATION' || kind.startsWith('QOBLEX') ? { state: 'present', at: '2026-01-01T00:00:00.000Z' }
+      : kind === 'BRIDGE_PROBE' ? { state: 'probed', violations: [] }
+      : { state: 'counted', counted: 0, floor: '2026-01-01T00:00:00.000Z' }
+  }
+  return out
+}
+
+/** The failing findings that are not the no-writer gap the unbuilt withdrawal-outcome writer causes in every live phase. */
+function realFailures(report: ReturnType<typeof evaluateWritersCheck>) {
+  return report.findings.filter((f) => f.severity === 'fail' && !(f.code === 'no-writer' && f.subject === 'woocommerce.order.withdrawal-outcome'))
+}
 
 function reading(counted: number, total = counted): EvidenceReading {
   return { counted, total, unpaid: 0, floor: '2026-10-10T00:00:00.000Z' }
@@ -46,13 +65,14 @@ function inputs(overrides: Partial<WritersCheckInputs> = {}): WritersCheckInputs
     cronEnabled: { 'wms-order-push': true },
     pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
     evidence: cleanEvidence(),
+    stepEvidence: cleanStepEvidence(),
     evidenceUnrecorded: 0,
     unknownEvidenceKinds: 0,
     ...overrides,
   }
 }
 
-const MINTSOFT_LIVE_ENV = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', MINTSOFT_WRITES_LIVE_FROM: CUTOFF, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'mintsoft' }
+const MINTSOFT_LIVE_ENV = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', MINTSOFT_WRITES_LIVE_FROM: CUTOFF, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'all' }
 
 test('precondition: the harness reaches the grant, the switches and the evidence (a held installation is ok, and IMS can write nothing)', () => {
   const report = evaluateWritersCheck(inputs())
@@ -69,7 +89,7 @@ test('ARM (a): IMS live for mintsoft.order.create while orders paid after the cu
   const clean = evaluateWritersCheck(inputs({ env }))
   console.log(`# live, no evidence: imsCanWrite create=${clean.operations.find((op) => op.key === 'mintsoft.order.create')?.imsCanWrite} verdict=${clean.verdict}`)
   assert.equal(clean.operations.find((op) => op.key === 'mintsoft.order.create')?.imsCanWrite, true, 'precondition: IMS can create orders')
-  assert.equal(clean.verdict, 'ok', 'precondition: with no evidence the same installation is clean, so the evidence is what fails it')
+  assert.deepEqual(realFailures(clean), [], 'precondition: with no evidence the same installation is clean, so the evidence is what fails it')
 
   const evidence = { ...cleanEvidence(), MINTSOFT_ORDER_ID: reading(3, 9) }
   const dirty = evaluateWritersCheck(inputs({ env, evidence }))
@@ -82,26 +102,26 @@ test('ARM (a): IMS live for mintsoft.order.create while orders paid after the cu
   assert.match(finding!.message, /^3 MINTSOFT_ORDER_ID marks/)
 })
 
-const WOO_LIVE_ENV = { WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', WC_WRITES_LIVE_FROM: CUTOFF, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'woocommerce' }
 
-test('ARM (a5): XEROOM_MARKER evidence while IMS can write the WooCommerce invoice note is a double claim (the invoicing plugin is still writing it)', () => {
-  const env = WOO_LIVE_ENV
+const ALL_STEPS_LIVE_ENV = { ...MINTSOFT_LIVE_ENV, WC_WRITES_LIVE_FROM: CUTOFF, XERO_WRITE_ALLOWED_TENANT: 'tenant-1', XERO_WRITES_LIVE_FROM: CUTOFF }
+
+test('ARM (a5): with step X live, Xeroom\'s permanent marker contests nothing, but a Xeroom-written invoice note after the step is a double claim (the invoicing plugin is still writing it)', () => {
+  const env = ALL_STEPS_LIVE_ENV
   const clean = evaluateWritersCheck(inputs({ env }))
   const note = clean.operations.find((op) => op.key === 'woocommerce.order.invoice-note')
-  console.log(`# woo live, no evidence: imsCanWrite invoice-note=${note?.imsCanWrite} verdict=${clean.verdict}`)
   assert.equal(note?.imsCanWrite, true, 'precondition: IMS can write the invoice note')
-  assert.equal(clean.verdict, 'ok', 'precondition: with no evidence the same installation is clean, so the evidence is what fails it')
+  assert.equal(clean.phase, 'P2-X')
+  assert.deepEqual(realFailures(clean), [], 'precondition: with no evidence the same installation is clean')
 
-  const dirty = evaluateWritersCheck(inputs({ env, evidence: { ...cleanEvidence(), XEROOM_MARKER: reading(4, 9) } }))
-  // MUTATION: drop XEROOM_MARKER from EVIDENCE_CONTESTS (or skip the evidence) => verdict ok => red.
+  // Xeroom marks every order it invoices, for good: the marker alone is not a claim (derived contests: none).
+  const marked = evaluateWritersCheck(inputs({ env, evidence: { ...cleanEvidence(), XEROOM_MARKER: reading(4, 9) } }))
+  assert.ok(!marked.findings.some((f) => f.code === 'incumbent-evidence-vs-ims-writer'))
+
+  // MUTATION: ignore the XEROOM_NOTE reading => verdict stays clean => red.
+  const dirty = evaluateWritersCheck(inputs({ env, stepEvidence: { ...cleanStepEvidence(), XEROOM_NOTE: { state: 'counted', counted: 2, floor: CUTOFF } } }))
   assert.equal(dirty.verdict, 'double-claim')
   assert.equal(dirty.exitCode, 1)
-  const finding = dirty.findings.find((f) => f.code === 'incumbent-evidence-vs-ims-writer' && f.subject === 'woocommerce.order.invoice-note')
-  assert.ok(finding, JSON.stringify(dirty.findings))
-  assert.match(finding!.message, /^4 XEROOM_MARKER marks/)
-  // Evidence that predates the cut-off is not a current claim.
-  const old = evaluateWritersCheck(inputs({ env, evidence: { ...cleanEvidence(), XEROOM_MARKER: reading(0, 9) } }))
-  assert.equal(old.verdict, 'ok')
+  assert.ok(dirty.findings.some((f) => f.code === 'step-evidence-violation' && f.subject === 'XEROOM_NOTE'))
 })
 
 test('ARM (a6): the WooCommerce writeback the woo-mintsoft plugin owns (status, tracking, partial shipment) is a double claim the moment IMS can write it; the real map is clean while IMS cannot', () => {
@@ -132,7 +152,7 @@ test('ARM (a6): the WooCommerce writeback the woo-mintsoft plugin owns (status, 
 test('ARM (a2): evidence that predates the cut-off or is not current does not fail (no false finding for pre-cutoff orders)', () => {
   const evidence = { ...cleanEvidence(), MINTSOFT_ORDER_ID: { counted: 0, total: 40, unpaid: 2, floor: '2026-10-10T00:00:00.000Z' } }
   const report = evaluateWritersCheck(inputs({ env: MINTSOFT_LIVE_ENV, evidence }))
-  assert.equal(report.verdict, 'ok')
+  assert.deepEqual(realFailures(report), [])
   // The floor the reader counts from is the LATER of the cut-off and the window start.
   const floors = evidenceFloors(MINTSOFT_LIVE_ENV, NOW, 14)
   assert.equal(floors.MINTSOFT_ORDER_ID.toISOString(), '2026-10-10T00:00:00.000Z')
@@ -177,11 +197,11 @@ test('ARM (a3): bridge evidence does not fail while IMS cannot write (the health
 })
 
 test('ARM (b): xero.sales.invoice owned by IMS in any phase fails; the real map does not', () => {
-  const env = { XERO_WRITE_ALLOWED_TENANT: 'tenant-1', XERO_WRITES_LIVE_FROM: CUTOFF, PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }
+  const env = ALL_STEPS_LIVE_ENV
   const real = evaluateWritersCheck(inputs({ env }))
   assert.equal(real.operations.find((op) => op.key === 'xero.sales.invoice')?.imsCanWrite, false, 'precondition: the producer decision keeps IMS off the sales invoice')
   assert.equal(real.findings.filter((f) => f.code === 'ims-owns-forbidden-row').length, 0)
-  assert.equal(real.verdict, 'ok')
+  assert.deepEqual(realFailures(real), [])
 
   for (const phase of ['P1', 'P2'] as const) {
     const mutated = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).map((row) =>
@@ -200,10 +220,12 @@ test('ARM (b2): IMS able to post the Xero sales documents (legacy path, no produ
   console.log(`# legacy xero claims: ${claimed.join(', ')}`)
   for (const key of IMS_FORBIDDEN_OWNERSHIP_ROWS) assert.ok(claimed.includes(key), `${key} must be a double claim`)
   assert.equal(report.verdict, 'double-claim')
-  // Switching the master off removes the claim.
-  const both = { ...env, XERO_WRITES_LIVE_FROM: CUTOFF }
+  // Switching the master off removes the claim (all three steps are set, in order, with their grants: the legacy path has no producer hold).
+  const { PRODUCER_HOLD_ENFORCED_DESTINATIONS: _hold, ...legacyAll } = ALL_STEPS_LIVE_ENV
+  void _hold
+  const both = legacyAll
   const off = evaluateWritersCheck(inputs({ env: both, settings: new Map([['xero_sync_enabled', 'false']]) }))
-  assert.equal(off.verdict, 'ok')
+  assert.ok(!off.findings.some((f) => f.code === 'ims-writes-owned-elsewhere' && f.subject?.startsWith('xero.')))
   // A per-type mode of 'off' removes only that type.
   const oneOff = evaluateWritersCheck(inputs({ env: both, settings: new Map([['xero_sync_enabled', 'true'], ['xero_sync_sales_invoice', 'off']]) }))
   assert.ok(!oneOff.findings.some((f) => f.subject === 'xero.sales.invoice' && f.code === 'ims-writes-owned-elsewhere'))
@@ -211,7 +233,7 @@ test('ARM (b2): IMS able to post the Xero sales documents (legacy path, no produ
 })
 
 test('owners: an undecided owner fails, nobody warns, an operator button warns, IMS-owned is clean', () => {
-  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', MINTSOFT_WRITES_LIVE_FROM: CUTOFF }
+  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', MINTSOFT_WRITES_LIVE_FROM: CUTOFF }
   const base = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])
   const withOwner = (key: string, owner: 'unknown' | 'nobody' | 'operator-manual' | 'IMS') =>
     base.map((row) => `${row.destination}.${row.operation}` === key ? { ...row, owners: { P0: row.owners.P0, P1: owner, P2: owner } } : row)
@@ -301,7 +323,7 @@ test('OPERATOR-TRIGGERED operations: owned by the operator is a stated warning; 
   const run = (owner: OwnershipRow['owners']['P1']) => evaluateWritersCheck(inputs({ env, settings: new Map(), cronEnabled: {}, map: withOwner('mintsoft.asn.create', owner) }))
 
   const manual = run('operator-manual')
-  assert.equal(manual.verdict, 'ok', 'the operator acting through the button is the owner acting')
+  assert.ok(!manual.findings.some((f) => f.code === 'ims-writes-owned-elsewhere'), 'the operator acting through the button is the owner acting')
   assert.ok(manual.findings.some((f) => f.code === 'operator-capability-overlaps' && f.severity === 'warn' && f.subject === 'mintsoft.asn.create' && /operator-manual/.test(f.message)))
   const text = renderWritersCheckText(manual)
   assert.match(text, /operator-manual operations \(IMS writes them only by an operator action\): .*mintsoft\.asn\.create/)
@@ -332,9 +354,9 @@ test('INCONSISTENT configuration fails: a live-from instant with no grant, and a
   }
   assert.equal(cutoffOnly.verdict, 'unreadable', 'no grant: IMS cannot write, so the configuration finding alone decides')
   assert.match(cutoffOnly.findings.find((f) => f.code === 'inconsistent-configuration')!.message, /mintsoft/i)
-  for (const clean of [find({}), find({ MINTSOFT_WRITE_ALLOWED: grant, MINTSOFT_WRITES_LIVE_FROM: CUTOFF })]) {
+  assert.equal(find({}).exitCode, 0)
+  for (const clean of [find({}), find({ MINTSOFT_WRITE_ALLOWED: grant, WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', MINTSOFT_WRITES_LIVE_FROM: CUTOFF })]) {
     assert.ok(!clean.findings.some((f) => f.code === 'inconsistent-configuration'))
-    assert.equal(clean.exitCode, 0)
   }
   // Garbage stays the unreadable finding, not a second inconsistent one.
   const garbage = find({ MINTSOFT_WRITES_LIVE_FROM: 'tomorrow' })

@@ -400,7 +400,7 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
         // Only the queue drains reach this (a job produced under a LIVE decision), so it asks the destination-level gate
         // and not a per-operation decision: a job found while the destination is held is handed back unsent, with no
         // new shadow record (the queued row is the work, and it stays as it is).
-        const hold = wooDrainHold()
+        const hold = wooDrainHold(undefined, 'order.status')
         if (hold.held) return { connector, result: { success: false, shadowed: true, error: hold.queuedNotice } }
         const { pushImsStatusToWc } = await import('@/lib/connectors/woocommerce/sync/order-status')
         const outcome = await pushImsStatusToWc(orderId, status)
