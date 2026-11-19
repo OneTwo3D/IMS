@@ -26,6 +26,7 @@ export default async function SalesSettingsPage() {
   const [
     invoiceTrigger,
     dispatchEmailEnabled,
+    storefrontCustomerEmailEnabled,
     returnExchangeEnabled,
     trackingEnabled,
     trackingSource,
@@ -37,6 +38,7 @@ export default async function SalesSettingsPage() {
   ] = await Promise.all([
     getSetting('invoice_trigger'),
     getSetting('dispatch_email_enabled'),
+    getSetting('storefront_customer_email_enabled'),
     getSetting('return_exchange_enabled'),
     getSetting('delivery_tracking_enabled'),
     getSetting('delivery_tracking_source'),
@@ -77,7 +79,7 @@ export default async function SalesSettingsPage() {
         <p className="text-sm text-muted-foreground mb-4">
           Send direct (non-storefront) customers a dispatch notification with tracking when their order ships.
         </p>
-        <DispatchEmailSetting currentValue={dispatchEmailEnabled ?? 'false'} />
+        <DispatchEmailSetting currentValue={dispatchEmailEnabled ?? 'false'} storefrontValue={storefrontCustomerEmailEnabled ?? 'false'} />
       </Card>
 
       <Card className="p-6">

@@ -101,7 +101,7 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
     'trackship_api_key',
     'shipping_carriers',
   ],
-  'components/settings/dispatch-email.tsx': ['dispatch_email_enabled'],
+  'components/settings/dispatch-email.tsx': ['dispatch_email_enabled', 'storefront_customer_email_enabled'],
   'components/settings/financial-year-start.tsx': ['financial_year_start'],
   'components/settings/invoice-trigger.tsx': ['invoice_trigger'],
   'components/settings/landed-cost-method.tsx': ['default_landed_cost_method'],

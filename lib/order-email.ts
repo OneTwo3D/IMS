@@ -22,6 +22,14 @@ import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { getTrackingUrl } from '@/lib/tracking'
 import { getCurrencyFormat, renderSalesOrderPdf, SALES_ORDER_PDF_LINE_SELECT, type SalesOrderPdfSource } from '@/lib/sales-order-pdf'
+import { EmailKindDisabledError } from '@/lib/email-kind-disabled'
+import { isStorefrontCustomerEmailEnabled } from '@/lib/domain/storefront-customer-email/switch'
+import {
+  STOREFRONT_CONFIRMATION_KIND,
+  STOREFRONT_CUSTOMER_EMAIL_DISABLED_REASON,
+  STOREFRONT_DELIVERED_KIND,
+  shipmentIdOfPartialKind,
+} from '@/lib/domain/storefront-customer-email/constants'
 import { buildSalesQuoteEmail } from '@/lib/sales-quote-email'
 import { buildPurchaseOrderEmail, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 
@@ -267,10 +275,10 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
   })
   if (!so) throw new Error('Order not found')
   if (!so.customerEmail) throw new Error('No customer email address')
-  // Re-check at send time: if the order gained a storefront link after the
-  // email was queued, the storefront sends its own dispatch email — bail out
-  // rather than double-emailing the customer.
-  if (so._count.shoppingLinks > 0) throw new Error('Order is storefront-linked; dispatch email suppressed')
+  // Re-check at send time: an order that is (or became) storefront-linked is mailed only while IMS sends the storefront customer e-mails (the
+  // switch, read now); otherwise the storefront sends its own dispatch email and this stays silent rather than double-emailing the customer.
+  const storefront = so._count.shoppingLinks > 0
+  if (storefront && !(await isStorefrontCustomerEmailEnabled())) throw new EmailKindDisabledError(STOREFRONT_CUSTOMER_EMAIL_DISABLED_REASON)
 
   const branding = await getBranding()
   const ref = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
@@ -317,7 +325,107 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
     hideAttachmentNote: true,
   })
 
-  return { to: so.customerEmail, subject, html }
+  return { to: so.customerEmail, subject, html, ...(storefront ? STOREFRONT_SINGLE_SEND : {}) }
+}
+
+/** A storefront customer e-mail is a SINGLE SEND: a send that may have been accepted but whose outcome is unknown is terminal and never retried (the customer would get it twice). */
+export const STOREFRONT_EMAIL_SEND_DEADLINE_MS = 60_000
+const STOREFRONT_SINGLE_SEND = { singleSend: true, sendDeadlineMs: STOREFRONT_EMAIL_SEND_DEADLINE_MS } as const
+
+async function assertStorefrontEmailOn(): Promise<void> {
+  // Checked at SEND time, so a row queued before the switch was turned off is refused too (the drain settles it FAILED, address kept, nothing sent).
+  if (!(await isStorefrontCustomerEmailEnabled())) throw new EmailKindDisabledError(STOREFRONT_CUSTOMER_EMAIL_DISABLED_REASON)
+}
+
+async function buildStorefrontConfirmationEmail(orderId: string): Promise<PreparedEmail> {
+  await assertStorefrontEmailOn()
+  const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, _count: { select: { shoppingLinks: true } } } })
+  if (!so) throw new Error('Order not found')
+  if (so._count.shoppingLinks === 0) throw new Error('Order is not a storefront order; the storefront confirmation is not sent')
+  if (so.status === 'CANCELLED') throw new Error('Order is cancelled; no confirmation is sent')
+  return { ...(await buildSalesOrderConfirmationEmail(orderId)), ...STOREFRONT_SINGLE_SEND }
+}
+
+async function loadStorefrontShipmentOrder(orderId: string) {
+  return db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true, orderNumber: true, externalOrderNumber: true, customerName: true, customerEmail: true, status: true, shippedAt: true,
+      trackingNumber: true, shippingService: true,
+      _count: { select: { shoppingLinks: true } },
+    },
+  })
+}
+
+function trackingBlock(entries: { trackingNumber: string; carrier: string | null }[]): { lines: string[]; cta: { ctaLabel: string; ctaUrl: string } | null } {
+  const lines = entries.map((t) => (t.carrier ? `${t.carrier} — tracking number ${t.trackingNumber}` : `Tracking number ${t.trackingNumber}`))
+  const first = entries[0]
+  const url = first ? getTrackingUrl(first.carrier, first.trackingNumber) ?? `https://t.17track.net/en#nums=${encodeURIComponent(first.trackingNumber)}` : null
+  return { lines, cta: url ? { ctaLabel: 'Track your delivery', ctaUrl: url } : null }
+}
+
+async function buildStorefrontPartialShipmentEmail(orderId: string, shipmentId: string): Promise<PreparedEmail> {
+  await assertStorefrontEmailOn()
+  const so = await loadStorefrontShipmentOrder(orderId)
+  if (!so) throw new Error('Order not found')
+  if (so._count.shoppingLinks === 0) throw new Error('Order is not a storefront order; the partial-shipment e-mail is not sent')
+  if (!so.customerEmail) throw new Error('No customer email address')
+  const shipment = await db.shipment.findUnique({
+    where: { id: shipmentId },
+    select: { orderId: true, status: true, trackingNumber: true, shippingService: true, shippedAt: true, lines: { select: { qty: true, line: { select: { description: true, sku: true } } } } },
+  })
+  if (!shipment || shipment.orderId !== orderId) throw new Error('Shipment not found on this order')
+  if (shipment.status !== 'SHIPPED') throw new Error('Shipment has not been despatched; no partial-shipment e-mail is sent')
+
+  const branding = await getBranding()
+  const ref = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
+  const tz = await getDisplayTimeZone()
+  const entries = shipment.trackingNumber ? [{ trackingNumber: shipment.trackingNumber, carrier: shipment.shippingService ?? so.shippingService }] : []
+  const { lines: trackingLines, cta } = trackingBlock(entries)
+  const itemLines = shipment.lines.map((l) => `${Number(l.qty)} × ${l.line.description}${l.line.sku ? ` (${l.line.sku})` : ''}`)
+  const subject = `Part of your order ${ref} has been dispatched`
+  const html = await renderEmailHtml(branding, {
+    recipientName: so.customerName ?? 'Customer',
+    recipientEmail: so.customerEmail,
+    reference: ref,
+    date: formatDateTime(shipment.shippedAt ?? new Date(), { day: 'numeric', month: 'long', year: 'numeric' }, tz),
+    subject,
+    bodyLines: [
+      `Part of your order ${ref} has been dispatched. The rest will follow in a separate delivery.`,
+      ...(itemLines.length > 0 ? ['In this delivery:', ...itemLines] : []),
+      ...trackingLines,
+      'If you have any questions about your delivery, please don\'t hesitate to contact us.',
+    ],
+    ...(cta ?? {}),
+    hideAttachmentNote: true,
+  })
+  return { to: so.customerEmail, subject, html, ...STOREFRONT_SINGLE_SEND }
+}
+
+async function buildStorefrontDeliveredEmail(orderId: string): Promise<PreparedEmail> {
+  await assertStorefrontEmailOn()
+  const so = await loadStorefrontShipmentOrder(orderId)
+  if (!so) throw new Error('Order not found')
+  if (so._count.shoppingLinks === 0) throw new Error('Order is not a storefront order; the delivered e-mail is not sent')
+  if (!so.customerEmail) throw new Error('No customer email address')
+  if (so.status !== 'DELIVERED') throw new Error(`Order is ${so.status}, not delivered; no delivered e-mail is sent`)
+  const branding = await getBranding()
+  const ref = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
+  const tz = await getDisplayTimeZone()
+  const subject = `Your order ${ref} has been delivered`
+  const html = await renderEmailHtml(branding, {
+    recipientName: so.customerName ?? 'Customer',
+    recipientEmail: so.customerEmail,
+    reference: ref,
+    date: formatDateTime(new Date(), { day: 'numeric', month: 'long', year: 'numeric' }, tz),
+    subject,
+    bodyLines: [
+      `Your order ${ref} has been delivered.`,
+      'If anything is not as it should be, please reply to this email and we will put it right.',
+    ],
+    hideAttachmentNote: true,
+  })
+  return { to: so.customerEmail, subject, html, ...STOREFRONT_SINGLE_SEND }
 }
 
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
@@ -371,6 +479,10 @@ export async function prepareQueuedEmail(kind: string, referenceType: string | n
   if (kind === 'INVOICE') return buildInvoiceEmail(referenceId)
   if (kind === 'ACCOUNTING_INVOICE') return buildInvoiceEmail(referenceId, { accountingPdf: true })
   if (kind === 'SHIPMENT_DISPATCHED') return buildDispatchEmail(referenceId)
+  if (kind === STOREFRONT_CONFIRMATION_KIND) return buildStorefrontConfirmationEmail(referenceId)
+  if (kind === STOREFRONT_DELIVERED_KIND) return buildStorefrontDeliveredEmail(referenceId)
+  const partialShipmentId = shipmentIdOfPartialKind(kind)
+  if (partialShipmentId !== null) return buildStorefrontPartialShipmentEmail(referenceId, partialShipmentId)
   if (kind === 'SALES_QUOTE') return buildSalesQuoteEmail(referenceId) // SALES_QUOTE_EMAIL_KIND, spelled out so the document census sees the kind
   return null
 }

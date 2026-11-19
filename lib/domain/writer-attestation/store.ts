@@ -1,10 +1,12 @@
 import { logActivityInTransaction, logActivityPersisted } from '@/lib/activity-log'
+import { bridgePayloadFromReport, bridgeStatusFreshnessError, parseBridgeStatusOutput } from '@/lib/domain/writer-attestation/bridge-status'
 import {
   ATTESTATION_GUARDED_SETTINGS,
   WRITER_ATTESTATION_ACTION,
   WRITER_ATTESTATION_LABEL,
   WRITER_ATTESTATION_NOTE_MAX,
   WRITER_ATTESTATION_REFUSAL_ACTION,
+  WRITER_ATTESTATION_REPORT_KINDS,
   attestationRefusalText,
   isWriterAttestationKind,
   type WriterAttestationKind,
@@ -26,7 +28,8 @@ export type AttestationDb = {
   $transaction<T>(fn: (tx: AttestationTx) => Promise<T>): Promise<T>
 }
 
-export type RecordAttestationInput = { kind: string; userId: string; note?: string; payload?: object }
+/** `output`: the pasted host report, required for the kinds in WRITER_ATTESTATION_REPORT_KINDS (and refused for the others). `now` is for tests. */
+export type RecordAttestationInput = { kind: string; userId: string; note?: string; payload?: object; output?: string; now?: Date }
 export type RecordAttestationResult =
   | { ok: true; id: string; kind: WriterAttestationKind; attestedAt: Date }
   | { ok: false; error: string }
@@ -43,9 +46,23 @@ export async function recordWriterAttestation(db: AttestationDb, input: RecordAt
   const note = (input.note ?? '').trim()
   if (note.length > WRITER_ATTESTATION_NOTE_MAX) return { ok: false, error: `The note is longer than ${WRITER_ATTESTATION_NOTE_MAX} characters.` }
   const kind = input.kind
+  let payload: object = input.payload ?? {}
+  let reportSummary: Record<string, unknown> = {}
+  if ((WRITER_ATTESTATION_REPORT_KINDS as readonly string[]).includes(kind)) {
+    // A host report is parsed STRICTLY and must be fresh: the confirmation is the report, not the administrator's word that it was fine. Whether the
+    // units are masked is NOT judged here (the history keeps a failing report too); the check judges the newest one.
+    const parsed = parseBridgeStatusOutput(input.output ?? '')
+    if (!parsed.ok) return { ok: false, error: parsed.error }
+    const stale = bridgeStatusFreshnessError(parsed.report, input.now ?? new Date())
+    if (stale !== null) return { ok: false, error: stale }
+    payload = bridgePayloadFromReport(parsed.report, input.output ?? '')
+    reportSummary = { host: parsed.report.host, generatedAt: parsed.report.generatedAt, lastTriggerAt: parsed.report.lastTriggerAt }
+  } else if (input.output !== undefined) {
+    return { ok: false, error: 'This confirmation does not take a pasted report.' }
+  }
   try {
     const row = await db.$transaction(async (tx) => {
-      const created = await tx.writerAttestation.create({ data: { kind, userId, note, payload: input.payload ?? {} } })
+      const created = await tx.writerAttestation.create({ data: { kind, userId, note, payload } })
       await logActivityInTransaction(tx, {
         entityType: 'SETTING',
         entityId: created.id,
@@ -53,7 +70,7 @@ export async function recordWriterAttestation(db: AttestationDb, input: RecordAt
         tag: 'settings',
         level: 'WARNING',
         description: `Owner confirmation recorded: ${WRITER_ATTESTATION_LABEL[kind]}`,
-        metadata: { kind, attestedAt: created.attestedAt.toISOString(), note },
+        metadata: { kind, attestedAt: created.attestedAt.toISOString(), note, ...reportSummary },
         userId: userId.startsWith('cli:') ? null : userId,
       })
       return created

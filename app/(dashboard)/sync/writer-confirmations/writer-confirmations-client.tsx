@@ -14,6 +14,7 @@ export function WriterConfirmationsClient({ rows }: { rows: WriterConfirmationRo
 function ConfirmationCard({ row }: { row: WriterConfirmationRow }) {
   const [acknowledged, setAcknowledged] = useState(false)
   const [note, setNote] = useState('')
+  const [output, setOutput] = useState('')
   const [message, setMessage] = useState<string | null>(null)
   const [pending, startTransition] = useTransition()
 
@@ -30,6 +31,16 @@ function ConfirmationCard({ row }: { row: WriterConfirmationRow }) {
         <input type="checkbox" checked={acknowledged} onChange={(e) => setAcknowledged(e.target.checked)} className="mt-1 rounded border-input" />
         <span>I confirm the statement above.</span>
       </label>
+      {row.needsReport ? (
+        <textarea
+          value={output}
+          maxLength={8192}
+          rows={8}
+          onChange={(e) => setOutput(e.target.value)}
+          placeholder="Paste the output of bridge_writers_status.py here, unchanged"
+          className="w-full rounded border border-input bg-background px-2 py-1 font-mono text-xs"
+        />
+      ) : null}
       <input
         value={note}
         maxLength={500}
@@ -39,12 +50,12 @@ function ConfirmationCard({ row }: { row: WriterConfirmationRow }) {
       />
       <button
         type="button"
-        disabled={!acknowledged || pending}
+        disabled={!acknowledged || pending || (row.needsReport && output.trim() === '')}
         className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
         onClick={() => startTransition(async () => {
-          const result = await confirmWriterStopped({ kind: row.kind, note, acknowledged })
+          const result = await confirmWriterStopped({ kind: row.kind, note, acknowledged, ...(row.needsReport ? { output } : {}) })
           setMessage(result.success ? 'Recorded.' : (result.error ?? 'Could not record the confirmation.'))
-          if (result.success) { setAcknowledged(false); setNote('') }
+          if (result.success) { setAcknowledged(false); setNote(''); setOutput('') }
         })}
       >
         {row.confirmedAt ? 'Confirm again' : 'Record confirmation'}
