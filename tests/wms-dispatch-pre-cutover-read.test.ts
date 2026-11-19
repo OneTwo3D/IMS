@@ -18,7 +18,7 @@ import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/
  */
 
 const ORIGIN = 'https://shop.example.com'
-const ENV_KEYS = [PRODUCER_HOLD_ENFORCED_ENV, OUTBOUND_GRANT_ENV.woocommerce, PRODUCER_CUTOFF_ENV.woocommerce]
+const ENV_KEYS = [PRODUCER_HOLD_ENFORCED_ENV, OUTBOUND_GRANT_ENV.woocommerce, PRODUCER_CUTOFF_ENV.woocommerce, PRODUCER_CUTOFF_ENV.mintsoft, PRODUCER_CUTOFF_ENV.xero]
 const SEAM_ON = { [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [OUTBOUND_GRANT_ENV.woocommerce]: ORIGIN }
 
 async function withEnv<T>(values: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
@@ -214,7 +214,7 @@ async function sweep(parts: Part[], options: { verifier?: boolean; zoneless?: 'e
   return { out, applyOptions, asked, fences, fenceFns }
 }
 
-const LIVE_AT_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }
+const LIVE_AT_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF, [PRODUCER_CUTOFF_ENV.mintsoft]: CUTOFF, [PRODUCER_CUTOFF_ENV.xero]: CUTOFF }
 
 test('VERIFIED: completed now, completion at or after the LATEST despatch: the IMS side completes as "storefront already completed", ONE read, no write, outcome logged', async () => {
   reset()
@@ -379,14 +379,14 @@ test('PENDING: no WooCommerce link, store not configured, or no despatch time: n
 
 test('BEFORE the cutoff, or with NO GRANT, or for any other shadow reason: UNCHANGED - the verifier is not asked and nothing is read', async () => {
   reset()
-  await withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: '2099-01-01T00:00:00Z' }, async () => {
+  await withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: '2099-01-01T00:00:00Z', [PRODUCER_CUTOFF_ENV.mintsoft]: '2099-01-01T00:00:00Z', [PRODUCER_CUTOFF_ENV.xero]: '2099-01-01T00:00:00Z' }, async () => {
     const run = await sweep([part(1, PRE)])
     assert.deepEqual(run.asked, [])
     assert.equal(run.out.counters.pending, 1)
     assert.deepEqual(transport, [])
   })
   reset()
-  await withEnv({ [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }, async () => {
+  await withEnv({ [PRODUCER_HOLD_ENFORCED_ENV]: 'woocommerce', [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF, [PRODUCER_CUTOFF_ENV.mintsoft]: CUTOFF, [PRODUCER_CUTOFF_ENV.xero]: CUTOFF }, async () => {
     const run = await sweep([part(1, PRE)])
     assert.deepEqual(run.asked, [])
     assert.equal(run.out.counters.dispatched, 0)
@@ -632,7 +632,7 @@ test('UNKNOWN DESPATCH TIME, NORMAL: an undated entry on an ordinary split order
 })
 
 test('IMPRECISE DESPATCH DATES, PRE-CUTOVER: a date-only value on the cutoff day, or a datetime with no zone, never classifies a part as pre-cutover for verification: pending, no read, no flag', async () => {
-  const MIDDAY_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: '2026-06-01T12:00:00Z' }
+  const MIDDAY_CUTOFF = { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: '2026-06-01T12:00:00Z', [PRODUCER_CUTOFF_ENV.mintsoft]: '2026-06-01T12:00:00Z', [PRODUCER_CUTOFF_ENV.xero]: '2026-06-01T12:00:00Z' }
   const withDate = (n: number, at: string): Part => ({ ...part(n, at), tracking: [{ trackingNumber: `TN-${n}`, carrier: 'DPD', despatchedAt: at }] })
   // a date-only value is midnight UTC, hours BEFORE a cutoff at noon the same day: the push is shadowed as pre-cutover
   // (the real despatch may have been after the cutoff), and a completion earlier that day must not verify it
@@ -821,7 +821,7 @@ test('DISPOSITION: a gap, ambiguous or date-only time next to the cutover stays 
   ]
   for (const [at, cutoff] of cases) {
     reset()
-    await withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+    await withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff, [PRODUCER_CUTOFF_ENV.mintsoft]: cutoff, [PRODUCER_CUTOFF_ENV.xero]: cutoff }, async () => {
       const run = await sweep([part(1, at)], { zoneless: 'europe-london' })
       assert.equal(run.out.counters.dispatched, 0, at)
       assert.equal(run.out.counters.pending, 1, at)
@@ -848,7 +848,7 @@ test('DISPOSITION: without the reading (any non-Mintsoft source) the lenient tim
 test('RANGE: a date-only or clock-change time is judged by every instant it could mean: clearly after is live, clearly before is pre-cutover, straddling is held', async () => {
   const run = async (at: string, cutoff: string) => {
     reset()
-    return withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+    return withEnv({ ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff, [PRODUCER_CUTOFF_ENV.mintsoft]: cutoff, [PRODUCER_CUTOFF_ENV.xero]: cutoff }, async () => {
       const out = await sweep([part(1, at)], { zoneless: 'europe-london' })
       return { out, writes: writes().length, reads: reads().length }
     })
@@ -1138,7 +1138,7 @@ test('ORDER LEVEL, MIXED: despatches on both sides of the cutover are IMS-owned:
 test('ORDER LEVEL, CUTOFF STATE: no cutoff holds nothing; a future cutoff holds only what could be after it; a past cutoff is covered above', async () => {
   const sweepAt = async (cutoff: string | undefined, at: string) => {
     reset()
-    return withEnv(cutoff === undefined ? SEAM_ON : { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, () =>
+    return withEnv(cutoff === undefined ? SEAM_ON : { ...SEAM_ON, [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff, [PRODUCER_CUTOFF_ENV.mintsoft]: cutoff, [PRODUCER_CUTOFF_ENV.xero]: cutoff }, () =>
       sweep([part(1, at)], { zoneless: 'europe-london', shape: 'single', verifier: false }))
   }
   // no cutoff configured: the existing shadowed path, nothing is held, even for an unreadable or date-only value
@@ -1164,7 +1164,7 @@ test('ENFORCEMENT OFF: the legacy path is exactly as on development, with a futu
   for (const cutoff of [CUTOFF, '2099-06-01T00:00:00Z']) {
     for (const [at, shape] of [['2026-05-20T10:00:00', 'single'], ['2026-06-01', 'single'], ['2026-13-45', 'single'], ['2026-05-20T10:00:00', 'merged'], ['', 'single']] as const) {
       reset()
-      await withEnv({ [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff }, async () => {
+      await withEnv({ [PRODUCER_CUTOFF_ENV.woocommerce]: cutoff, [PRODUCER_CUTOFF_ENV.mintsoft]: cutoff, [PRODUCER_CUTOFF_ENV.xero]: cutoff }, async () => {
         const run = await sweep([part(1, at)], { zoneless: 'europe-london', shape, verifier: false })
         assert.equal(run.out.counters.dispatched, 1, `${cutoff} ${shape} ${at}`)
         assert.deepEqual(run.applyOptions, [undefined], `${cutoff} ${shape} ${at}`)
@@ -1173,7 +1173,7 @@ test('ENFORCEMENT OFF: the legacy path is exactly as on development, with a futu
   }
   // enforcement for another destination only is also off for WooCommerce
   reset()
-  await withEnv({ [PRODUCER_HOLD_ENFORCED_ENV]: 'xero', [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF }, async () => {
+  await withEnv({ [PRODUCER_HOLD_ENFORCED_ENV]: 'xero', [PRODUCER_CUTOFF_ENV.woocommerce]: CUTOFF, [PRODUCER_CUTOFF_ENV.mintsoft]: CUTOFF, [PRODUCER_CUTOFF_ENV.xero]: CUTOFF }, async () => {
     const run = await sweep([part(1, '2026-05-20T10:00:00')], { zoneless: 'europe-london', shape: 'single', verifier: false })
     assert.deepEqual(run.applyOptions, [undefined])
   })

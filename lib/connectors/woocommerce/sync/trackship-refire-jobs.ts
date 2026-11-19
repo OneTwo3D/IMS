@@ -389,7 +389,7 @@ export async function runWcTrackshipRefireJobs(options: WcTrackshipRefireRunOpti
   const summary: WcTrackshipRefireRunSummary = { claimed: 0, succeeded: 0, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
   if (options.idempotencyKeys?.length === 0) return summary
   // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and spend no attempt.
-  if (wooDrainHold().held) return summary
+  if (wooDrainHold(undefined, 'order.trackship-refire').held) return summary
   const now = options.now
   const clock = options.clock ?? (() => new Date())
   const startedAt = clock().getTime()

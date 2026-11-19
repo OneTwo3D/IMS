@@ -39,6 +39,11 @@ import { counts, from, enumResult, noFailureSignal, num, permanentLists, structu
 import { mintsoftCronOutcomes as warehouseConnectorCronOutcomes } from '@/lib/connectors/mintsoft/cron-outcomes' // wms-connector-boundary-ok: 2026-11-13: the registry spreads the connector's own entries
 import type { CronOutcomeClass } from './cron-run'
 
+/** A merge-hold failure carried on a WMS sweep result: the maintenance threw, or a hold could not be placed. */
+function mergeHoldFailure(r: { mergeHoldMaintenance?: unknown; mergeCandidateDetection?: { detection: string } }): CronOutcomeClass | null {
+  return r.mergeHoldMaintenance || r.mergeCandidateDetection?.detection === 'holds-failed' ? 'failed' : null
+}
+
 export { worstOutcome }
 
 /**
@@ -214,11 +219,12 @@ export const cronOutcomes = {
   // fenceCheckErrors, claimErrors and linkWriteErrors: a withdrawal-fence check, create-claim transaction or recovery-pass link write that THREW (the order is skipped and retried, but the sweep could not decide it)
   // systemicSuppressed: orders and links that ran out of retries in a pass read as a connector-wide fault and so were left unparked (the breaker's verdict). A FAILED run, never green: an outage handled gracefully is still an outage
   // operatorTaskErrors: operator tasks ("raise a warehouse query") that could not be recorded this run (retried next run). operatorTasksRaised and operatorTasksOpen are information: an open task is a person's to-do, never a failure
-  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked', 'fenceCheckErrors', 'claimErrors', 'linkWriteErrors', 'operatorTaskErrors', 'systemicSuppressed'])),
+  // mergeHoldMaintenance (the merge-hold upkeep threw) and mergeCandidateDetection.detection 'holds-failed' (a merge hold could not be placed): a FAILED run, retried on the next sweep
+  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked', 'fenceCheckErrors', 'claimErrors', 'linkWriteErrors', 'operatorTaskErrors', 'systemicSuppressed']), mergeHoldFailure(r)),
   // status enum; counters.errors: number
   'wms-order-reconcile': (r: WmsOrderReconcileResult) => enumResult(r, ['errors']),
   // failed: number; probeFailures: number (a presence probe that threw, apart from the expected unresolved states); pushFailures / pushHeld: whole-batch counts of failed and hold-refused pushes (`errors` is cut at 20 for display, so the mapping reads the counts); errors: string[] (storefront status pushes that failed, held-aware)
-  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed', 'probeFailures', 'pushFailures']), structural(r)),
+  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed', 'probeFailures', 'pushFailures']), structural(r), mergeHoldFailure(r)),
   // status: FAILED = breaches nobody could be alerted to
   'wms-watchdog': (r: WmsWatchdogResult): CronOutcomeClass => (r.status === 'FAILED' ? 'failed' : r.status === 'SKIPPED' ? 'skipped' : 'ok'),
   // status: FAILED

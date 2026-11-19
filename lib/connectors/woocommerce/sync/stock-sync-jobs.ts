@@ -23,6 +23,7 @@ import {
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
 import { wooDrainHold } from '../producer-egress'
+import { PRODUCER_HELD_RETRY_DELAY_MS } from '@/lib/security/producer-disposition-constants'
 import { runWithWcAttemptFence } from '../attempt-fence'
 import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
 import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW } from './order-status-claim-gate'
@@ -376,7 +377,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
 
   // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and migrate nothing. A job queued
   // before the hold was switched on stays exactly as it is (no claim, no attempt spent) and is never sent while the hold stands.
-  if (wooDrainHold().held) return { ...summary, held: true }
+  if (wooDrainHold(undefined, 'stock').held) return { ...summary, held: true }
 
   if (options?.migrateLegacy !== false) {
     await migrateLegacyWcStockSyncJobs(productIds, limit)
@@ -449,6 +450,25 @@ export async function processQueuedWcStockSyncJobs(options?: {
           source: payload.reason,
         }),
       ))
+
+      // A push the producer-side hold refused AFTER this job was claimed (the confirmation went away between the drain's ask and the push) is handed
+      // back unsent, with NO attempt spent: a hold is the installation's decision, not a failure of the work, and must never march the job to PERMANENT_FAILED.
+      if (result.held === true) {
+        await markIntegrationOutboxRetryableFailure({
+          id: job.id,
+          workerId: WC_STOCK_SYNC_WORKER_ID,
+          lockedAt: job.lockedAt,
+          error: result.errors.join(' | ') || result.message || 'WooCommerce stock sync held',
+          attemptsBeforeFailure: job.attempts,
+          maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+          noWriteSent: ledger.writes === 0,
+          heldWithoutAttempt: true,
+          retryDelayMs: PRODUCER_HELD_RETRY_DELAY_MS,
+        })
+        summary.failed++
+        summary.errors.push(...(result.errors.length > 0 ? result.errors : [result.message || `Product ${payload.productId}: stock held`]))
+        continue
+      }
 
       if (shouldRetainJob(result, payload)) {
         await markIntegrationOutboxRetryableFailure({

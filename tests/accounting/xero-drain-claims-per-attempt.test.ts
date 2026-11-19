@@ -61,6 +61,7 @@ mock.module('@/lib/domain/integrations/outbox', {
   namedExports: {
     INTEGRATION_OUTBOX_STATUS: { PENDING: 'PENDING', PROCESSING: 'PROCESSING', SUCCEEDED: 'SUCCEEDED', RETRYABLE_FAILED: 'RETRYABLE_FAILED', PERMANENT_FAILED: 'PERMANENT_FAILED' },
     wooAccountingPostJobIds: async () => { wooIdReads++; return [] },
+    accountingPostJobIdsForSyncTypes: async () => [],
     claimIntegrationOutboxWork: async (options: ClaimOptions) => {
       claimCalls.push({ limit: options.limit, claimLimit: options.claimLimit, excludeIds: [...(options.excludeIds ?? [])] })
       // The real claim honours claimLimit and excludeIds; a stub that ignored them would hand out the whole batch.

@@ -5,6 +5,7 @@ import type {
   WmsMergedSurvivorLookup,
   WmsOrderItemRef,
   WmsOrderCancelResult,
+  WmsOrderHoldResult,
   WmsOrderPushInput,
   WmsOrderPushLine,
   WmsOrderPushResult,
@@ -1168,6 +1169,46 @@ export async function cancelMintsoftOrder(
     return { cancelled: true, status: 'CANCELLED' }
   }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order cancel failed')
+}
+
+/**
+ * HOLD a Mintsoft order for a person to merge (GET /api/Order/{id}/MarkAwaitingConfirmation), for MERGE HOLDS ONLY (o3d-zvec.12).
+ *
+ * Unlike the cancel-based hold of a withdrawal, this keeps the order (a cancelled order cannot be merged). It is a WRITE through GET, classified so by
+ * read-allowlist.ts. There is NO release verb here and none is called anywhere: a merge hold is confirmed by a person in the warehouse's own screens
+ * (the owner's ruling; the stale-marker hazard of o3d-3a0t is why IMS keeps the hold's identity in its own table and never releases on a guess).
+ *
+ * The gate is the cancel gate's: the order is read through the ClientId-scoped ownership read, must carry exactly the number IMS pushed, must not be
+ * merged already, and must be NEW (a merge hold on an order past NEW would be a lie). Then ONE request. The answer is told apart:
+ *   - a READ or REQUEST that failed in transport (timeout, 5xx, a redirect-followed 4xx, the outbound-write hold) THROWS: the outcome is unknown and the
+ *     caller must not treat it as a refusal or as a hold;
+ *   - a definite refusal (Success false, or a direct 4xx) RETURNS `held: false, status: 'REFUSED'` with the warehouse's message: nothing changed.
+ */
+export async function holdMintsoftOrderForMerge(
+  externalOrderId: string,
+  /** REQUIRED: the number IMS pushed for the order (null is refused as unverifiable). */
+  options: { expectedOrderNumber: string | null },
+): Promise<WmsOrderHoldResult> {
+  const clientId = await getPushClientId('Mintsoft order merge hold')
+  const { found, statusId, merged, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, options.expectedOrderNumber)
+  if (!found) return { held: false, status: 'NOT_FOUND' }
+  if (identity === 'MISMATCH') return { held: false, status: 'IDENTITY_MISMATCH', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  if (identity === 'UNVERIFIABLE') return { held: false, status: 'IDENTITY_UNVERIFIABLE' }
+  if (merged) return { held: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  if (statusId === MINTSOFT_STATUS_CANCELLED) return { held: false, status: 'ALREADY_CANCELLED' }
+  if (statusId !== MINTSOFT_STATUS_NEW) return { held: false, status: 'NOT_HOLDABLE' }
+
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/MarkAwaitingConfirmation`)
+  if (result.error) {
+    const refused = result.held !== true && result.status >= 400 && result.status < 500 && result.status !== 408 && result.redirectsFollowed === 0
+    if (refused) return { held: false, status: 'REFUSED', message: result.error }
+    throw new Error(result.error)
+  }
+  const data = extractMintsoftObjectPayload(result.data) as RawOrder | null
+  if (data?.Success === true) return { held: true, status: 'HELD' }
+  if (data && data.Success === false) return { held: false, status: 'REFUSED', message: toStr(data.Message) ?? 'Mintsoft refused the hold' }
+  // No readable verdict: the outcome is unknown, so it is not a refusal.
+  throw new Error('Mintsoft order merge hold: the answer carried no Success verdict, so IMS cannot tell whether the order was held')
 }
 
 const sameRef = (a: WmsOrderItemRef, b: WmsOrderItemRef) => a.externalItemId === b.externalItemId && a.sku === b.sku && a.quantity === b.quantity
