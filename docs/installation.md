@@ -815,7 +815,12 @@ The script performs the following steps:
 6. **Prompts for configuration** values (see below)
 7. **Creates the app system user** (`imsapp`)
 8. **Deploys the application** — clones from git or copies from a local directory
-9. **Installs npm dependencies** and builds the Next.js application
+9. **Installs npm dependencies** and builds the Next.js application. npm 11 (bundled with Node 26)
+   runs a dependency's install script only when `allowScripts` in `package.json` covers it. IMS
+   allows `prisma`, `@prisma/engines`, `esbuild`, `unrs-resolver` and `ssh2`, and denies
+   `cpu-features` (an optional native speed-up of `ssh2`) and `msw` (a test-only mock server's
+   browser worker copy). `install.sh` and `update.sh` stop if the Prisma schema engine is missing
+   after `npm ci`; the manual fix is `npm rebuild --foreground-scripts @prisma/engines prisma esbuild unrs-resolver ssh2`.
 10. **Runs database migrations** via Prisma
 11. **Optionally seeds public URL, SMTP settings, and a default admin user**
 12. **Configures a native systemd service** for the application
@@ -993,6 +998,23 @@ After installation, sign in and set the organisation base currency in **Settings
   defaults to the credential already in `${APP_DIR}/.env`, so accepting the default changes nothing
   about the role. Entering a different one requests a rotation, performed only after the existing
   installation has been stopped and the database fenced.
+
+#### Database encoding
+
+The IMS database must be **UTF8**. Migrations normalise text (the CRM identity key uses
+`normalize(..., NFC)`), and PostgreSQL refuses that on a `SQL_ASCII` or other non-UTF8 database.
+
+- **A new database** is created by `install.sh` with `ENCODING 'UTF8' TEMPLATE template0` and an
+  explicit `LC_COLLATE` / `LC_CTYPE`: the pair `template1` already carries when it can sit beside
+  UTF8 (the `C`/`POSIX` locale or a UTF-8 locale), otherwise `C.UTF-8`. A bare `CREATE DATABASE`
+  would copy `template1`, which on a cluster initialised as `SQL_ASCII` hands IMS that encoding.
+- **An existing database** is checked, never changed. `install.sh` (local PostgreSQL) and
+  `update.sh` print a loud warning when the database is not UTF8 and carry on: an installation that
+  already runs on such a database is live data, and refusing would strand it. If the check cannot be
+  made, that is a warning too. To move to UTF8, take a backup, create a new database with the
+  statement above, restore into it (`pg_dump` / `pg_restore`; the text is converted on the way in,
+  so a byte that is not valid in the source encoding has to be fixed first), point `DATABASE_URL`
+  at it and re-run `update.sh`.
 
 ### Redis
 - **Install Redis on this server** — install and configure a local Redis, or point at one you already run

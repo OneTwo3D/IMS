@@ -14799,6 +14799,7 @@ function migrationConsumerCensus(lines: ReadonlyArray<string>, carriers: Readonl
 /** What each consumer is called in the assertions below, so a failure names a step. */
 const CONSUMER_LABELS: ReadonlyArray<[RegExp, string]> = [
   [/prisma generate/, 'prisma generate'],
+  [/db-encoding-check/, 'db-encoding-check.mjs'],
   [/npm run build/, 'npm run build'],
   [/check-wms-push-state-enum/, 'check-wms-push-state-enum.mjs'],
   [/check-db-writers/, 'check-db-writers.mjs'],
@@ -14843,7 +14844,7 @@ for (const [name, lines, expectedConsumers, expectedClassified] of [
     'mechanism:release_db_connections',
   ]],
   ['update.sh', UPDATE_LINES, [
-    'prisma generate', 'npm run build',
+    'prisma generate', 'db-encoding-check.mjs', 'npm run build',
     'check-db-writers.mjs', 'pg_dump', 'prisma migrate deploy', 'check-prisma-drift.mjs',
     'check-app-db-object-access.mjs', 'run-migration-verifications.mjs',
   ], [
@@ -14853,6 +14854,7 @@ for (const [name, lines, expectedConsumers, expectedClassified] of [
     'mechanism:adopt_db_connections',
     'mechanism:release_db_connections',
     'consumer:prisma generate', 'placement:pin "The Prisma client generation"',
+    'consumer:db-encoding-check.mjs', 'placement:pin "The database encoding check"',
     'consumer:npm run build', 'placement:pin "The build"',
     'mechanism:fence_db_connections',
     'consumer:check-db-writers.mjs', 'placement:pin "The drain probe"',

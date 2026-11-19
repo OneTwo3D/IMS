@@ -2989,6 +2989,45 @@ EOSQL
   fi
 }
 
+# The collation and ctype a new UTF8 database is created with (o3d-rb9l4): the pair template1 carries
+# when it can sit beside UTF8 (the C/POSIX locale, or any UTF-8 locale), else C.UTF-8. Both are
+# returned through the two named variables. A template1 that cannot be read gives C.UTF-8 as well:
+# the CREATE that follows then says, in the server's own words, what is wrong with the connection.
+database_create_locale() {
+  local -n _collate_out="$1" _ctype_out="$2"
+  local row="" collate="C.UTF-8" ctype="C.UTF-8"
+  row="$(pg_local_psql -q -tA -F '|' -c "SELECT datcollate, datctype FROM pg_database WHERE datname = 'template1'" 2>/dev/null | tail -n 1)" || row=""
+  if [[ "${row}" == ?*'|'?* ]]; then
+    collate="${row%%|*}"
+    ctype="${row#*|}"
+  fi
+  case "${collate}" in C | POSIX | *[Uu][Tt][Ff]-8 | *[Uu][Tt][Ff]8) ;; *) collate="C.UTF-8" ;; esac
+  case "${ctype}" in C | POSIX | *[Uu][Tt][Ff]-8 | *[Uu][Tt][Ff]8) ;; *) ctype="C.UTF-8" ;; esac
+  _collate_out="${collate}"
+  _ctype_out="${ctype}"
+}
+
+# THE ENCODING OF THE DATABASE THE RUN IS ABOUT TO MIGRATE (o3d-rb9l4). The statement above creates
+# UTF8; this is for the database that was ALREADY THERE (a duplicate, a database an earlier run or
+# an operator created with a bare CREATE DATABASE). It WARNS and never refuses: an existing
+# SQL_ASCII installation is live data, and the migrations that need UTF8 name themselves when they
+# fail. scripts/update.sh carries the same check for the upgrade path.
+warn_if_database_not_utf8() {
+  local encoding=""
+  # On stdin, not -c: psql interpolates :'dbname' only in a script it reads, not in a -c string.
+  encoding="$(pg_local_psql -q -tA -v dbname="${DB_NAME}" 2>/dev/null <<'EOSQL' | tail -n 1
+SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = :'dbname';
+EOSQL
+  )" || true
+  if [[ -z "${encoding}" ]]; then
+    warn "Could not read the encoding of database '${DB_NAME}'; skipping the UTF8 check."
+  elif [[ "${encoding}" != "UTF8" ]]; then
+    warn "DATABASE '${DB_NAME}' IS ENCODED ${encoding}, NOT UTF8. Migrations that normalise text (the CRM identity key uses normalize(..., NFC)) fail on a non-UTF8 database, and so does storing any non-ASCII name. This run did not create it and will not change it. See docs/installation.md, 'Database encoding'."
+  else
+    success "Database '${DB_NAME}' is UTF8."
+  fi
+}
+
 # THE ONE STATEMENT IN THIS FILE THAT CAN SET DB_CREATED_BY_THIS_RUN (o3d-2sm1.5 r36, Codex
 # CRITICAL). Called only on the INSTALL_POSTGRES=y path, which is the only path that creates
 # anything at all.
@@ -3017,13 +3056,21 @@ EOSQL
 # here" was classified as indeterminate. `VERBOSITY=verbose` puts the SQLSTATE in the ERROR line
 # itself, and 42P04 is the same five bytes in every locale.
 create_database_and_record_newness() {
-  local output="" status=0 created_identity=""
+  local output="" status=0 created_identity="" lc_collate="" lc_ctype=""
+  # ENCODING 'UTF8' TEMPLATE template0, WITH THE LOCALE STATED (o3d-rb9l4). A bare CREATE DATABASE
+  # copies template1, and a cluster whose template1 is SQL_ASCII/C (stage's was) hands the IMS
+  # database that encoding: normalize(..., NFC) — which crm_loose_identity_key needs — then fails
+  # on every non-UTF8 database. template0 is the one template that may be created with a different
+  # encoding. The collation and ctype follow what the cluster already chose (template1's own pair),
+  # because that is the locale this host's operator picked at initdb; a pair that is neither the
+  # C locale nor a UTF-8 one cannot be paired with UTF8 and is replaced by C.UTF-8.
+  database_create_locale lc_collate lc_ctype
   # ONE SESSION, ON STDIN: the identity is read on the connection that performed the CREATE, and
   # ON_ERROR_STOP means the SELECT never runs if the CREATE did not. -c is not usable here —
   # psql does no variable interpolation on a -c string, so `:"dbname"` would reach the server as
   # a syntax error rather than as a quoted identifier.
-  output="$(pg_local_psql -q -tA -v dbname="${DB_NAME}" <<EOSQL 2>&1
-CREATE DATABASE :"dbname";
+  output="$(pg_local_psql -q -tA -v dbname="${DB_NAME}" -v lc_collate="${lc_collate}" -v lc_ctype="${lc_ctype}" <<EOSQL 2>&1
+CREATE DATABASE :"dbname" ENCODING 'UTF8' TEMPLATE template0 LC_COLLATE :'lc_collate' LC_CTYPE :'lc_ctype';
 $(pg_server_identity_select);
 EOSQL
   )" || status=$?
@@ -3043,6 +3090,7 @@ EOSQL
     DB_CREATED_BY_THIS_RUN=false
     DB_NEWNESS_FINDING="database '${DB_NAME}' already existed on this server — CREATE DATABASE was refused as a duplicate (SQLSTATE 42P04) — so this run did not create it and cannot say who else is using it"
     warn "Database '${DB_NAME}' already existed. This run did NOT create it, so it is treated as a live database and this run is fenced."
+    warn_if_database_not_utf8
     return 0
   fi
   die "Creating database '${DB_NAME}' failed for a reason that is not SQLSTATE 42P04 duplicate_database, so this run cannot say whether that database exists, is reachable, or is safe to migrate. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
@@ -9866,8 +9914,13 @@ resolve_role_rotation_journal_after_env_publication
 # ---------------------------------------------------------------------------
 header "Installing npm dependencies"
 
+# npm 11 (Node 26) only runs a dependency's install script when package.json's allowScripts covers
+# it (o3d-0yepo). The "install-scripts" warning is therefore NOT filtered out below: it is the one
+# line that says a package was left half-installed.
 run_as_user "${APP_USER}" npm ci --include=dev --prefix "${APP_DIR}" 2>&1 | \
-  grep -v "^npm warn" || true
+  grep -Ev "^npm warn (deprecated|EBADENGINE|cleanup|config|ERESOLVE|peer)" || true
+compgen -G "${APP_DIR}/node_modules/@prisma/engines/schema-engine-*" >/dev/null \
+  || die "npm ci finished but the Prisma schema engine is not in ${APP_DIR}/node_modules/@prisma/engines: its lifecycle script did not run (npm 11 skips scripts package.json's allowScripts does not cover). Nothing has been migrated. Check allowScripts in package.json, then run: npm rebuild --foreground-scripts @prisma/engines prisma esbuild unrs-resolver ssh2"
 success "Dependencies installed."
 
 # ---------------------------------------------------------------------------

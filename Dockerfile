@@ -93,6 +93,7 @@ RUN --mount=type=cache,target=/root/.npm \
     PRISMA_V="$(node -p "require('/tmp/app-package-lock.json').packages['node_modules/prisma'].version")" \
  && DOTENV_V="$(node -p "require('/tmp/app-package-lock.json').packages['node_modules/dotenv'].version")" \
  && npm init -y >/dev/null \
+ && npm pkg set --json allowScripts='{"prisma":true,"@prisma/engines":true}' >/dev/null \
  && npm install --no-audit --no-fund --legacy-peer-deps "prisma@${PRISMA_V}" "dotenv@${DOTENV_V}"
 
 FROM base AS migrate

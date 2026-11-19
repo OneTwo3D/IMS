@@ -5291,6 +5291,11 @@ if ! $SKIP_BUILD; then
   header "Installing dependencies and building (old version still serving)"
 
   run run_as_user "${APP_USER}" npm ci --include=dev --prefix "${APP_DIR}"
+  # npm 11 (Node 26) skips a dependency's install script that package.json's allowScripts does not
+  # cover (o3d-0yepo). Without the Prisma schema engine the migration below fails AFTER the stop.
+  if ! $DRY_RUN && ! compgen -G "${APP_DIR}/node_modules/@prisma/engines/schema-engine-*" >/dev/null; then
+    die "npm ci finished but the Prisma schema engine is not in ${APP_DIR}/node_modules/@prisma/engines: its lifecycle script did not run (npm 11 skips scripts package.json's allowScripts does not cover). Nothing has been stopped and nothing has been migrated. Check allowScripts in package.json, then run as ${APP_USER}: npm rebuild --foreground-scripts @prisma/engines prisma esbuild unrs-resolver ssh2"
+  fi
   success "Dependencies updated."
 fi
 
@@ -5308,6 +5313,27 @@ run run_as_user_db \
 pin_migration_window "The Prisma client generation"
 [[ "${prisma_generate_rc}" -eq 0 ]] || die "prisma generate exited ${prisma_generate_rc} — see above. Nothing has been stopped and nothing has been migrated."
 success "Prisma client generated."
+
+# THE DATABASE MUST BE UTF8 (o3d-rb9l4). A SQL_ASCII database (created from a SQL_ASCII template1)
+# makes normalize(..., NFC) fail, which the CRM identity key relies on. This WARNS and never
+# refuses on the answer: an installation that already runs on such a database is live data, and
+# refusing would strand it. scripts/db-encoding-check.mjs therefore exits 0 whatever it finds and
+# prints a verdict (UTF8, NOT_UTF8 <encoding>, UNKNOWN <why>); a non-zero exit means the probe
+# itself broke, and that is fatal like any other consumer's failure.
+db_encoding_rc=0
+db_encoding_out=""
+if $DRY_RUN; then
+  echo -e "${YELLOW}[DRY]${RESET}   would check that the database is UTF8 (scripts/db-encoding-check.mjs) and warn if it is not"
+else
+  db_encoding_out="$(run_as_user_db node "${APP_DIR}/scripts/db-encoding-check.mjs" 2>&1)" || db_encoding_rc=$?
+fi
+pin_migration_window "The database encoding check"
+[[ "${db_encoding_rc}" -eq 0 ]] || die "The database encoding check exited ${db_encoding_rc}: ${db_encoding_out}. Nothing has been stopped and nothing has been migrated."
+case "${db_encoding_out}" in
+  UTF8) success "The database is UTF8." ;;
+  NOT_UTF8\ *) warn "THE DATABASE IS ENCODED ${db_encoding_out#NOT_UTF8 }, NOT UTF8. Migrations that normalise text (the CRM identity key uses normalize(..., NFC)) fail on a non-UTF8 database. This run goes on; see docs/installation.md, 'Database encoding' for the dump-and-restore into a UTF8 database." ;;
+  ?*) warn "The database encoding could not be checked (${db_encoding_out}); expecting UTF8, see docs/installation.md, 'Database encoding'." ;;
+esac
 
 if ! $SKIP_BUILD; then
   header "Building the application"

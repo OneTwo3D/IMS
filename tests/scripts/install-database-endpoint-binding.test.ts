@@ -47,6 +47,8 @@ const SHIPPED = [
   // interpolating it into the literal, so the role work these tests run needs the quoter.
   'sql_quote_literal',
   'verify_created_database_endpoint',
+  'database_create_locale',
+  'warn_if_database_not_utf8',
   'create_database_and_record_newness',
   'ensure_database_role_exists',
   'provision_database_role_and_privileges',

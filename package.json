@@ -154,5 +154,15 @@
   "overrides": {
     "@hono/node-server": ">=1.19.13 <2",
     "postcss": "^8.5.17"
+  },
+  "allowScripts": {
+    "prisma": true,
+    "@prisma/engines": true,
+    "esbuild": true,
+    "unrs-resolver": true,
+    "ssh2": true,
+    "cpu-features": false,
+    "msw": false,
+    "fsevents": false
   }
 }
