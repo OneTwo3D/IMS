@@ -390,16 +390,27 @@ async function revaluedSidesForDate(
 }
 
 /**
- * o3d-hqvrp.60 - THE UNREALISED-FX POPULATION. Receivables are orders that have been INVOICED: a DRAFT order and a quotation are
- * not receivables (they were revalued before), and a cancelled one is not either. Exported so the population is testable.
+ * o3d-hqvrp.60 - THE UNREALISED-FX POPULATION. Receivables are orders whose INVOICE HAS BEEN POSTED to the ledger (`accountingInvoiceId`, the
+ * back-reference the posting writes): the journal revalues the ledger's receivable balance, and an order the ledger does not hold an invoice for
+ * (PENDING_PAYMENT, ON_HOLD, or any status before the invoice posts) owes nothing there yet (o3d-cr517). A DRAFT order, a quotation and a cancelled
+ * one are not receivables either. There is deliberately NO refund-status filter: a fully refunded order whose credit note has not reached the ledger is
+ * still open there, and one whose credit note has is netted to nothing by `receivableOutstanding`. Exported so the population is testable.
  */
 export const OPEN_RECEIVABLE_ORDER_WHERE = (baseCurrency: string) => ({
   currency: { not: baseCurrency },
   status: { notIn: ['CANCELLED', 'DRAFT'] as Array<'CANCELLED' | 'DRAFT'> },
   isQuote: false,
-  refundStatus: { not: 'FULL' as const },
+  accountingInvoiceId: { not: null },
   totalForeign: { gt: 0 },
 })
+
+/**
+ * THE CREDIT NOTES THAT REDUCE A RECEIVABLE (o3d-cr517). The same ledger basis as the payable side (`supplierCreditNotes: { status: 'POSTED' }`): a refund
+ * reduces what the ledger holds as owed only once its credit note has reached the ledger (`accountingCreditNoteId`, the back-reference the posting writes).
+ * Netting a refund whose credit note is still queued would revalue less than the ledger's own balance; the revaluation journal revalues THAT balance, so the
+ * ledger basis is the one that keeps the journal and the ledger in step. Exported so the basis is testable.
+ */
+export const RECEIVABLE_NETTING_REFUND_WHERE = { deletedAt: null, accountingCreditNoteId: { not: null } } as const
 
 /**
  * What is still owed on an order: total, less receipts, less the credit notes raised against it (a credit note reduces the
@@ -481,7 +492,7 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
         where: { refundId: null },
         select: { amount: true, currency: true },
       },
-      refunds: { where: { deletedAt: null }, select: { totalForeign: true, ...REFUND_TURNOVER_SELECT.select } },
+      refunds: { where: RECEIVABLE_NETTING_REFUND_WHERE, select: { totalForeign: true, ...REFUND_TURNOVER_SELECT.select } },
     },
   })
 

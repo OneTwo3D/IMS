@@ -27,10 +27,10 @@
  *
  *   IMS POSTINGS (Codex round 2). A record IMS posted (an IMS sync record, connector-confirmed, names its Xero id) is held to the rate that posting CARRIED, converted
  *   by the poster's own helper, not to the table now: the poster sends the stored rate and never looks one up. A second check holds that stored rate to the table
- *   where a date rule is stated in code (a storefront invoice at the order's instant, a receipt by the importer's same-day test; a receipt is identified by its payments-row
+ *   where a date rule is stated in code (a storefront invoice at the order's instant, a receipt by the importer's same-day test, under the date convention the posting was made under: the UTC day when it was created before the recorded London-day cut-in (LONDON_DAY_CUTIN_SETTING_KEY, stamped by migration), the London day on or after it, never both; a receipt is identified by its payments-row
  *   provenance as well as the importer's marker, and unproven provenance on a storefront order is a finding); other posted records are counted, not table-checked. Records IMS did not post keep the
  *   reconstruction below. An IMS link whose rate cannot be read is IMS_POSTING_UNREADABLE (a finding), never a pass. The date Xero holds must be the date the posting
- *   carried (the same UTC day): a moved date is XERO_DATE_DIFFERS, listed as a pair of dates (YYYYMMDD); a posting with no readable date is IMS_POSTING_UNREADABLE.
+ *   carried (the same calendar day, as a plain date): a moved date is XERO_DATE_DIFFERS, listed as a pair of dates (YYYYMMDD); a posting with no readable date is IMS_POSTING_UNREADABLE.
  *
  *   FINDINGS, each a closed reason (the item fails with DIFFERENCES and the specific reasons):
  *     XERO_RATE_DIFFERS    both rates exist and differ: listed as a pair (the IMS rate in Xero's convention against Xero's).
@@ -60,7 +60,7 @@ import {
 } from '@/lib/reconciliation-pack/constants'
 import { imsRateToXeroCurrencyRate } from '@/lib/connectors/xero/fx'
 import { businessDateYmd } from '@/lib/business-date'
-import { postedReceiptOnOrderDay } from '@/lib/connectors/woocommerce/sync/receipt-settlement-rate'
+import { postedReceiptOnOrderDay, utcCalendarDate } from '@/lib/connectors/woocommerce/sync/receipt-settlement-rate'
 import { endOfBusinessDateUtc, isMissingFxRateError, selectFxRateFromRows, type FxRateRow as SelectRow } from '@/lib/currencies/fx-select'
 import type { KeyPart } from '@/lib/reconciliation-pack/identity'
 import type { FxRateRow, ImsRead, ImsReadOptions, XeroPostedRateRow } from '@/lib/reconciliation-pack/ims-readers'
@@ -193,6 +193,13 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
       ims.push({ key: dateKey, value: day.replace(/-/g, '') })
       vendor.push({ key: dateKey, value: document.date.replace(/-/g, '') })
     }
+    // THE DATE CONVENTION. A posting created before the recorded London-day cut-in carries the UTC day; one created on or after it carries the London day. No recorded
+    // cut-in means none is pending (a fresh install: the migration stamps one at install), so every posting is post-cut-in.
+    const createdMs = log.createdAt === null ? Number.NaN : Date.parse(log.createdAt)
+    const cutInMs = log.londonDayCutIn === null ? Number.NaN : Date.parse(log.londonDayCutIn)
+    if (log.londonDayCutIn !== null && Number.isNaN(cutInMs)) return unreadablePosting(log.id, 'cut-in-unreadable')
+    if (!Number.isNaN(cutInMs) && Number.isNaN(createdMs)) return unreadablePosting(log.id, 'created-unreadable')
+    const legacy = !Number.isNaN(cutInMs) && createdMs < cutInMs
     const key = [...baseKey(document), sku('ims-posting'), sku(log.id)]
     summary.compared += 1
     if (expectedSent.eq(xeroRate)) summary.equal += 1
@@ -213,9 +220,10 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
       // rate on such a day is IMS_RATE_MISSING, never a pass through the order's rate.
       const created = log.orderCreatedAt === null ? null : new Date(log.orderCreatedAt)
       if (created !== null && Number.isNaN(created.getTime())) return unreadablePosting(log.id, 'order-date-unreadable')
-      // `day` is the POSTED payment day: the London day now, the UTC day for a payment queued before the move. Both conventions are accepted: a candidate of each rule (the same
-      // function on each convention); when they agree there is one candidate.
-      const wantsOrder = [false, true].map((legacy) => postedReceiptOnOrderDay(created, day, legacy))
+      // `day` is the POSTED payment day: the London day for a posting created on or after the recorded London-day cut-in (LONDON_DAY_CUTIN_SETTING_KEY), the UTC day
+      // for one created before it. Each posting is judged by the ONE convention in force when it was made, never by both: accepting either day for every receipt
+      // could not catch a wrong rate on exactly the boundary cases (o3d-oe1b0).
+      const wantsOrder = [postedReceiptOnOrderDay(created, day, legacy)]
       candidates = []
       if (wantsOrder.some(Boolean)) {
         const order = postedRateOf(log.orderRate)
@@ -232,7 +240,9 @@ export function buildRateRows(input: { documents: readonly XeroRateDocument[]; r
       // that row when the instant is known. Only when it is unknown is the order's day the bound: a central rate in force at some instant of that UTC day.
       const created = log.orderCreatedAt === null ? null : new Date(log.orderCreatedAt)
       if (created !== null && Number.isNaN(created.getTime())) return unreadablePosting(log.id, 'order-date-unreadable')
-      const instants = created !== null ? [created] : [new Date(`${day}T00:00:00.000Z`), endOfBusinessDateUtc(day), ...(byCurrency.get(document.currency) ?? []).filter((r) => businessDateYmd(r.fetchedAt) === day).map((r) => r.fetchedAt)]
+      // The posted day is the London day (post cut-in) or the UTC day (a posting made before it): the rows "of that day" are cut by the same convention.
+      const dayOf = (instant: Date): string => (legacy ? utcCalendarDate(instant) : businessDateYmd(instant))
+      const instants = created !== null ? [created] : [new Date(`${day}T00:00:00.000Z`), endOfBusinessDateUtc(day), ...(byCurrency.get(document.currency) ?? []).filter((r) => dayOf(r.fetchedAt) === day).map((r) => r.fetchedAt)]
       candidates = []
       for (const instant of instants) { const t = tableRate(document.currency, instant); if (t !== null) candidates.push(t) }
     }

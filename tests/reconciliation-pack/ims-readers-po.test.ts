@@ -236,7 +236,7 @@ test('transitSchedule: counts, per DURABLE source document kind, what predates t
 
 // [mutation: the status or settlement-basis filter dropped, a posting type added or removed, the payment rate read from the document key, a null flag defaulted]
 test('xeroPostedRates: reads the connector-confirmed creates of the six posting types with the rate the stored payload carried, as text; a bad flag is unreadable and a read over the cap is CAP_EXCEEDED', async () => {
-  const row = (over: Record<string, unknown> = {}) => ({ id: 'l1', type: 'SALES_INVOICE', external_id: 'x1', no_payload: false, currency: 'EUR', doc_date: '2026-09-10', rate: '1.25', woo_receipt: false, order_rate: null, woo_order: true, has_payment_id: true, payment_found: true, payment_woo: false, order_created: '2026-09-10T08:30:00.000Z', ...over })
+  const row = (over: Record<string, unknown> = {}) => ({ id: 'l1', type: 'SALES_INVOICE', external_id: 'x1', no_payload: false, currency: 'EUR', doc_date: '2026-09-10', rate: '1.25', woo_receipt: false, order_rate: null, woo_order: true, has_payment_id: true, payment_found: true, payment_woo: false, order_created: '2026-09-10T08:30:00.000Z', created_at: '2026-09-10T12:00:00.000Z', london_cutin: null, ...over })
   const client = fake((sql) => (/FROM accounting_sync_logs l/.test(sql) ? [row(), row({ id: 'l2', type: 'INVOICE_PAYMENT', external_id: 'x2', woo_receipt: true, order_rate: '1.2', woo_order: null, payment_woo: true }), row({ id: 'l3', no_payload: true, currency: null, doc_date: null, rate: null })] : []))
   const section = await sectionOf('xeroPostedRates', client)
   assert.ok(section.ok)
@@ -260,6 +260,13 @@ test('xeroPostedRates: reads the connector-confirmed creates of the six posting 
   }
   assert.equal(await reason([row({ woo_receipt: null })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([row({ no_payload: 'f' })]), 'SOURCE_UNREADABLE')
+  // o3d-oe1b0: the posting's creation instant and the recorded London-day cut-in (the system-managed setting) are read with each row; a malformed cut-in is unreadable, never guessed.
+  assert.match(sql, /to_char\(l\."createdAt"[^)]*\) AS created_at/)
+  assert.match(sql, /SELECT st\.value FROM settings st WHERE st\.key = 'xero_posted_london_day_cutin_at'\) AS london_cutin/)
+  const withCutIn = await sectionOf('xeroPostedRates', fake((q) => (/accounting_sync_logs l/.test(q) ? [row({ created_at: '2026-08-20T12:00:00.000Z', london_cutin: '2026-09-01T00:00:00.000Z' })] : [])))
+  assert.ok(withCutIn.ok)
+  assert.deepEqual([withCutIn.value[0]!.createdAt, withCutIn.value[0]!.londonDayCutIn], ['2026-08-20T12:00:00.000Z', '2026-09-01T00:00:00.000Z'])
+  assert.equal(await reason([row({ created_at: '2026-08-20T12:00:00.000Z', london_cutin: 'tomorrow' })]), 'SOURCE_UNREADABLE')
   assert.equal(await reason([row(), row()]), 'DUPLICATE_KEY')
   assert.equal(await reason([row(), row({ id: 'l2' })], 1), 'CAP_EXCEEDED')
 })

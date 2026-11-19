@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { OPEN_RECEIVABLE_ORDER_WHERE, payableOutstanding, receivableOutstanding } from '@/lib/accounting-fx-revaluation'
+import { OPEN_RECEIVABLE_ORDER_WHERE, RECEIVABLE_NETTING_REFUND_WHERE, payableOutstanding, receivableOutstanding } from '@/lib/accounting-fx-revaluation'
+import { matchesWhere, type SyncLogRow } from '@/tests/fixtures/accounting-sync-log-store'
 
 test('drafts, quotes and cancelled orders are not receivables', () => {
   const where = OPEN_RECEIVABLE_ORDER_WHERE('GBP')
@@ -52,4 +53,42 @@ test('o3d-cr517: a fully refunded NET order in a high-ratio currency leaves noth
     }],
   }
   assert.equal(receivableOutstanding(order).outstandingForeign, 0)
+})
+
+// The where objects are evaluated against rows by the sync-log store's matcher (it throws on an operator it does not implement), so a clause that did not mean what the
+// comment says would select the wrong rows rather than pass a structural assertion.
+const asRow = (row: Record<string, unknown>) => row as unknown as SyncLogRow
+const order = (over: Record<string, unknown> = {}) => ({ currency: 'EUR', status: 'PROCESSING', isQuote: false, accountingInvoiceId: 'INV-1', totalForeign: 100, refundStatus: 'NONE', ...over })
+
+// [mutation: the invoice-posted clause dropped, so population is keyed on status again]
+test('o3d-cr517: the receivable population is keyed on the invoice being POSTED, not on order status', () => {
+  const where = OPEN_RECEIVABLE_ORDER_WHERE('GBP')
+  const included = (over: Record<string, unknown>) => matchesWhere(asRow(order(over)), where)
+  assert.equal(included({}), true)
+  // PENDING_PAYMENT and ON_HOLD orders the ledger holds no invoice for are not receivables; once the invoice has posted they are.
+  for (const status of ['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'SHIPPED']) assert.equal(included({ status, accountingInvoiceId: null }), false, `${status}, invoice not posted`)
+  for (const status of ['PENDING_PAYMENT', 'ON_HOLD']) assert.equal(included({ status }), true, `${status}, invoice posted`)
+  // Unchanged exclusions.
+  assert.equal(included({ status: 'CANCELLED' }), false)
+  assert.equal(included({ status: 'DRAFT' }), false)
+  assert.equal(included({ isQuote: true }), false)
+  assert.equal(included({ currency: 'GBP' }), false)
+  // A fully refunded order stays in the population: whether it is still owed is decided by the credit notes the ledger holds (below), not by IMS's refund state.
+  assert.equal(included({ refundStatus: 'FULL' }), true)
+})
+
+// [mutation: the credit-note-posted clause dropped, so a refund still queued for the ledger is netted]
+test('o3d-cr517: receivables net only refunds whose credit note has reached the ledger, the payable side\'s POSTED basis', () => {
+  const refunds = [
+    { id: 'posted', deletedAt: null, accountingCreditNoteId: 'CN-1', totalForeign: '30' },
+    { id: 'queued', deletedAt: null, accountingCreditNoteId: null, totalForeign: '25' },
+    { id: 'deleted', deletedAt: new Date(), accountingCreditNoteId: 'CN-2', totalForeign: '10' },
+  ]
+  const netted = refunds.filter((refund) => matchesWhere(asRow(refund), RECEIVABLE_NETTING_REFUND_WHERE))
+  assert.deepEqual(netted.map((r) => r.id), ['posted'])
+  const base = { totalForeign: '100', totalBase: '80', currency: 'EUR', payments: [] }
+  assert.equal(receivableOutstanding({ ...base, refunds: netted }).outstandingForeign, 70, 'the queued credit note is not subtracted')
+  // A fully credited order whose credit note HAS posted leaves nothing; with it still queued the ledger still holds the whole invoice.
+  assert.equal(receivableOutstanding({ ...base, refunds: [refunds[0]!, { ...refunds[1]!, accountingCreditNoteId: 'CN-3', totalForeign: '70' }].filter((r) => matchesWhere(asRow(r), RECEIVABLE_NETTING_REFUND_WHERE)) }).outstandingForeign, 0)
+  assert.equal(receivableOutstanding({ ...base, refunds: [{ ...refunds[1]!, totalForeign: '100' }].filter((r) => matchesWhere(asRow(r), RECEIVABLE_NETTING_REFUND_WHERE)) }).outstandingForeign, 100)
 })

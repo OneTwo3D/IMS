@@ -207,6 +207,26 @@ test('startOfNextBusinessDay is London midnight: 23:00 UTC in BST, 00:00 UTC in 
   assert.equal(startOfNextBusinessDay(new Date('2026-01-01T00:00:00.000Z')).toISOString(), '2026-01-02T00:00:00.000Z')
 })
 
+// o3d-cr517 (item 4): the daily snapshot's label and cutoffAt are computed in Europe/London explicitly, so they do not depend on the zone the cron host runs in.
+// [mutation: startOfNextBusinessDay / previousBusinessDate computed with the host's local zone]
+test('the snapshot label and cutoffAt are the same whatever zone the host runs in, across both BST changes', () => {
+  const original = process.env.TZ
+  const cutoffs = (): string[] => ['2026-03-28', '2026-03-29', '2026-07-01', '2026-10-24', '2026-10-25', '2027-01-01'].map((day) => startOfNextBusinessDay(new Date(`${day}T00:00:00.000Z`)).toISOString())
+  const labels = (): string[] => ['2026-03-28T23:30:00.000Z', '2026-03-29T23:00:00.000Z', '2026-07-01T23:00:00.000Z', '2026-10-24T23:00:00.000Z', '2026-10-25T00:00:00.000Z'].map((at) => previousBusinessDate(new Date(at)).toISOString())
+  try {
+    process.env.TZ = 'Europe/London'
+    const expected = { cutoffs: cutoffs(), labels: labels() }
+    assert.deepEqual(expected.cutoffs, ['2026-03-29T00:00:00.000Z', '2026-03-29T23:00:00.000Z', '2026-07-01T23:00:00.000Z', '2026-10-24T23:00:00.000Z', '2026-10-26T00:00:00.000Z', '2027-01-02T00:00:00.000Z'])
+    for (const zone of ['UTC', 'America/Los_Angeles', 'Pacific/Auckland', 'Asia/Kolkata']) {
+      process.env.TZ = zone
+      assert.deepEqual({ cutoffs: cutoffs(), labels: labels() }, expected, zone)
+    }
+  } finally {
+    if (original === undefined) delete process.env.TZ
+    else process.env.TZ = original
+  }
+})
+
 test('the cron route labels a BST-midnight run with the business day that ended', async () => {
   let seen: string | null = null
   await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {

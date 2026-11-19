@@ -701,6 +701,14 @@ export type PackBasisAccountKind = (typeof PACK_BASIS_ACCOUNTS)[number]['kind']
 /** The setting that records the first day the transit sub-ledger covers (a YYYY-MM-DD text). The transit leg of the basis needs it. */
 export const TRANSIT_COVERAGE_SETTING_KEY = 'transit_ledger_coverage_start_date'
 
+/**
+ * The system-managed setting that records the instant the business (London) day replaced the UTC day on every document and payment IMS posts to Xero (a UTC ISO text,
+ * `YYYY-MM-DDTHH:MM:SS.mmmZ`). A migration stamps it once, at deploy (ON CONFLICT DO NOTHING), so it needs no manual step: a posting created BEFORE it carries the UTC day,
+ * one created on or after it the London day. On a fresh install the stamp precedes every posting, so everything is post-cut-in. R16 reads it to hold each receipt and
+ * invoice to the one date convention it was posted under.
+ */
+export const LONDON_DAY_CUTIN_SETTING_KEY = 'xero_posted_london_day_cutin_at'
+
 /** Why the Stock in Transit leg of R10 cannot be built. The leg is separate: the inventory basis (R6) does not depend on it. */
 export const PACK_TRANSIT_LEG_REASONS = {
   transit_ledger_not_covering: 'the recorded first day the transit sub-ledger covers is missing, is not a date, or is later than the day before the cycle date, so the sub-ledger does not cover the window',
