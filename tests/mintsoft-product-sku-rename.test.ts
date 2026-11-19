@@ -47,7 +47,7 @@ test('a never-linked product and a link to a deleted Mintsoft product are not re
 })
 
 // o3d-zz37l: an operator's Ignore suppresses only that rename OCCURRENCE.
-type Row = { id: string; connector?: string; warehouseId: string; productId: string; category: string; status: string; imsValue: string | null; wmsValue: string | null; resolvedNote?: string }
+type Row = { id: string; connector?: string; warehouseId: string; productId: string; category: string; status: string; imsValue: string | null; wmsValue: string | null; resolvedNote?: string; resolvedAt?: Date }
 function fakeDiscrepancies(rows: Row[]) {
   const matches = (row: Row, where: Record<string, unknown>) => Object.entries(where).every(([key, want]) => {
     const have = (row as Record<string, unknown>)[key]
@@ -67,15 +67,30 @@ function fakeDiscrepancies(rows: Row[]) {
 const rename = (over: Partial<Row>): Row => ({ id: 'r1', connector: 'mintsoft', warehouseId: 'wh-1', productId: 'p1', category: 'PRODUCT_SKU_RENAMED', status: 'OPEN', imsValue: 'B', wmsValue: 'A', ...over })
 const pair = (ims: string, wms: string) => ({ productId: 'p1', category: 'PRODUCT_SKU_RENAMED' as const, imsValue: ims, wmsValue: wms })
 
-test('an ignored rename suppresses the same pair, supersedes a stale OPEN row of another pair, and nothing else', async () => {
+test('an ignored rename suppresses the same pair and nothing else', async () => {
   const ignored = rename({ status: 'IGNORED' })
-  const stale = rename({ id: 'r2', imsValue: 'C' })
-  const rows = [ignored, stale]
-  const client = fakeDiscrepancies(rows)
+  const client = fakeDiscrepancies([ignored])
   assert.equal(await productSync.suppressIgnoredRename(client, 'wh-1', pair('B', 'A')), true)
-  assert.equal(stale.status, 'RESOLVED', 'the stale OPEN row no longer holds orders')
   assert.equal(await productSync.suppressIgnoredRename(client, 'wh-1', pair('D', 'A')), false, 'another pair is a different rename')
   assert.equal(await productSync.suppressIgnoredRename(client, 'wh-2', pair('B', 'A')), false, 'another warehouse')
+})
+
+test('o3d-k6x6m MED 1: returning to an ignored pair never closes another OPEN row (ignore A->B, B->C opens (C,A), C->B): orders carrying C stay held', async () => {
+  const ignored = rename({ status: 'IGNORED' })
+  const other = rename({ id: 'r2', imsValue: 'C' })
+  const rows = [ignored, other]
+  assert.equal(await productSync.suppressIgnoredRename(fakeDiscrepancies(rows), 'wh-1', pair('B', 'A')), true)
+  assert.equal(other.status, 'OPEN', 'only the Ignore action or a genuine SKU match closes a row')
+  assert.equal(other.resolvedNote, undefined)
+})
+
+test('o3d-k6x6m: retiring an ignored rename keeps the operator\'s note and the time of the ignore', async () => {
+  const at = new Date('2026-11-18T10:00:00Z')
+  const ignored = rename({ status: 'IGNORED', resolvedNote: 'Product retired in Mintsoft', resolvedAt: at } as Partial<Row>)
+  await productSync.retireIgnoredRenames(fakeDiscrepancies([ignored]), ['wh-1'], 'p1')
+  assert.equal(ignored.status, 'RESOLVED')
+  assert.equal(ignored.resolvedNote, 'Product retired in Mintsoft')
+  assert.equal((ignored as unknown as { resolvedAt: Date }).resolvedAt, at)
 })
 
 test('a later genuine rename to the same pair is NOT suppressed once the episode ended (renamed back)', async () => {

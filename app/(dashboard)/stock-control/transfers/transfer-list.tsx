@@ -658,7 +658,7 @@ function TransferCard({
   return (
     <>
       {/* Summary row */}
-      <TableRow className="group cursor-pointer" onClick={() => { setExpanded((v) => !v); setEditing(false) }}>
+      <TableRow id={`transfer-${transfer.id}`} className="group cursor-pointer scroll-mt-4" onClick={() => { setExpanded((v) => !v); setEditing(false) }}>
         <TableCell className="font-mono text-xs font-medium whitespace-nowrap">{transfer.reference}</TableCell>
         <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
           {transfer.fromWarehouseCode} → {transfer.toWarehouseCode}

@@ -398,3 +398,29 @@ test('create: a resolver that throws leaves the input as built (the send reads i
   await runWmsOrderPushSweepCore(resolving as never, 'mintsoft', port, { now: NOW })
   assert.equal(sent[0]?.shippingVat, 0)
 })
+
+// ---- o3d-k6x6m ------------------------------------------------------------------------------------------------------------------------------------
+test('o3d-k6x6m: a MIXED amendment is held against the warehouse it is actually sent to (an unmapped push warehouse falls back to ship-from)', async () => {
+  const seen: Array<string | null | undefined> = []
+  for (const bindings of [BINDINGS, [...BINDINGS, { warehouseId: 'wh-2', externalWarehouseId: '302' }]]) {
+    const { port } = makePort({ updatable: [dirtyLink({ pushWarehouseId: 'wh-2' })], loadMixedScope: async () => MIXED, bindings })
+    port.reloadOrderForPush = async (_id: string, sentTo?: string | null) => { seen.push(sentTo); return {} }
+    await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  }
+  assert.deepEqual(seen, ['wh-1', 'wh-2'], 'unmapped: ship-from (where it goes); mapped: the push warehouse')
+})
+
+test('o3d-k6x6m: a post-claim reload that no longer builds is a VALIDATION hold at the claim\'s own attempts, not PENDING_CREATE (which the next pass would convert to AMBIGUOUS_ATTEMPTS)', async () => {
+  const writes: Array<Record<string, unknown>> = []
+  let pushed = 0
+  const { port } = makePort({ createCandidates: [candidate()] })
+  port.reloadOrderForPush = async () => ({ ...candidate(), lines: [{ id: 'l1', sku: 'NEW', productId: 'p1', qty: 1, taxForeign: 0, totalForeign: 10, description: 'W' }], skuRenameHolds: [{ productId: 'p1', wmsValue: 'OLD' }] }) as never
+  port.updateLinkIfCreateClaimOwned = async (_id, _stamp, data) => { writes.push(data as Record<string, unknown>); return true }
+  const r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { pushed += 1; return okPush() } }), 'mintsoft', port, { now: NOW })
+  assert.equal(pushed, 0)
+  assert.equal(r.validationFailed, 1)
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0]!.state, 'VALIDATION_FAILED')
+  assert.equal(writes[0]!.attempts, 0)
+  assert.match(String(writes[0]!.lastError), /Order held: SKU NEW was renamed/)
+})

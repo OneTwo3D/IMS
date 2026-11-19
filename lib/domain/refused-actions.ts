@@ -229,14 +229,24 @@ export function refusedActionLabel(action: string): string {
 }
 
 /** The alert text. Fixed wording: what, which order, how long, whether it can ever succeed. No remote text, no personal data. */
-export function describeRefusedActionAlert(row: EscalationRow, now: Date): { title: string; message: string } {
+export function describeRefusedActionAlert(row: EscalationRow, now: Date): { title: string; message: string; actionUrl: string } {
   const days = Math.max(0, Math.floor((now.getTime() - row.firstSeenAt.getTime()) / 86_400_000))
   const hours = Math.max(0, Math.floor((now.getTime() - row.firstSeenAt.getTime()) / 3_600_000))
   const age = days >= 1 ? `${days} day${days === 1 ? '' : 's'}` : `${hours} hour${hours === 1 ? '' : 's'}`
   const standing = row.permanence === 'PERMANENT' ? 'It will not succeed on its own.' : 'IMS is still retrying it.'
+  if (row.action === 'WMS_ASN_CANCEL_REQUEST') {
+    // An ASN cancel request is not an order change IMS is retrying: a person has to ask the warehouse. Its own wording, never the order-shaped text.
+    const transferId = row.intent && typeof row.intent === 'object' && !Array.isArray(row.intent) && typeof row.intent.transferId === 'string' && row.intent.transferId !== '' ? row.intent.transferId : null
+    return {
+      title: refusedActionLabel(row.action),
+      actionUrl: transferId ? `/stock-control/transfers#transfer-${transferId}` : '/sync/exceptions',
+      message: `The dispatch of transfer ${refusedActionSubject(row)} was cancelled in IMS and its warehouse ASN was closed here, but the warehouse has not been asked to cancel it (${age} ago). IMS cannot cancel an ASN in the warehouse system. Open the transfer, or Sync > Exceptions to copy the request, raise it with the warehouse, then press Done.`,
+    }
+  }
   return {
     title: `${refusedActionLabel(row.action)}`,
-    message: `${refusedActionLabel(row.action)} for ${row.entityType === REFUSED_ACTION_ENTITY_WMS_ASN ? 'transfer' : 'order'} ${refusedActionSubject(row)}: refused ${row.attempts} time${row.attempts === 1 ? '' : 's'} over ${age}. ${standing}${row.detail ? ` ${row.detail}` : ''} Open Sync > Exceptions to see what IMS was trying to do.`,
+    actionUrl: '/sync/exceptions',
+    message: `${refusedActionLabel(row.action)} for order ${refusedActionSubject(row)}: refused ${row.attempts} time${row.attempts === 1 ? '' : 's'} over ${age}. ${standing}${row.detail ? ` ${row.detail}` : ''} Open Sync > Exceptions to see what IMS was trying to do.`,
   }
 }
 
@@ -270,12 +280,12 @@ export async function escalateAgedRefusedActions(
   let alerts = 0
   let deliveryFailures = 0
   for (const row of rows) {
-    const { title, message } = describeRefusedActionAlert(row, now)
+    const { title, message, actionUrl } = describeRefusedActionAlert(row, now)
     try {
       const claimed = await client.$transaction(async (tx) => {
         const stamped = await tx.refusedAction.updateMany({ where: { id: row.id, resolvedAt: null, alertedAt: null }, data: { alertedAt: now } })
         if (stamped.count === 0) return false
-        await notifyAdmins(tx, title, message, '/sync/exceptions')
+        await notifyAdmins(tx, title, message, actionUrl)
         return true
       })
       if (claimed) alerts += 1
